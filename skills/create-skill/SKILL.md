@@ -30,7 +30,7 @@ Detect the invocation mode from `$ARGUMENTS`:
 ## Context
 
 Existing skills:
-!`find ${CLAUDE_SKILL_DIR}/../.. -path "*/skills/*/SKILL.md" 2>/dev/null | head -20 || echo "No skills found yet"`
+!`find ${CLAUDE_SKILL_DIR}/../.. -path "*/skills/*/SKILL.md" | head -20`
 
 Existing commands (for reference):
 !`ls ${CLAUDE_SKILL_DIR}/../../commands/`
