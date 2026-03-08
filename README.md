@@ -26,8 +26,14 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 | Path | Description |
 |------|-------------|
 | `CLAUDE.md` | Global instructions for Claude Code |
-| `agents/` | 12 custom agent definitions |
-| `commands/` | 20 custom slash commands |
+| `agents/` | 12 custom agent definitions (flat) |
+| `commands/` | 20 slash commands organized into 6 categories |
+| `commands/dev/` | Core development lifecycle (brainstorm, requirements, stories, build) |
+| `commands/issues/` | Issue creation and fixing |
+| `commands/quality/` | Coverage, code review, roasting |
+| `commands/project/` | Progress tracking, stats, documentation |
+| `commands/devops/` | Release management |
+| `commands/research/` | Domain-specific analysis (crypto, client, profile) |
 | `settings.json` | Settings (statusline, plugins) |
 | `statusline-command.sh` | Statusline display script |
 | `keybindings.json` | Keyboard shortcuts |

@@ -541,15 +541,15 @@ Workflow:
 ### Example 9: Microservices Containerization
 ```
 Story: "Containerize monolithic application into microservices"
-Primary Agent: docker-expert
+Primary Agent: podman-container-architect
 Supporting: backend-typescript-architect, python-backend-engineer, bash-zsh-macos-engineer, qa-engineer, senior-code-reviewer
 
 Workflow:
-1. docker-expert: Design microservices container architecture
-2. docker-expert: Create Dockerfiles and multi-stage builds
+1. podman-container-architect: Design microservices container architecture
+2. podman-container-architect: Create Dockerfiles and multi-stage builds
 3. backend-typescript-architect: Refactor API for service separation
 4. python-backend-engineer: Optimize data services for containers
-5. docker-expert: Implement service discovery and networking
+5. podman-container-architect: Implement service discovery and networking
 6. bash-zsh-macos-engineer: Automate container deployment pipeline
 7. qa-engineer: Design container testing strategy
 8. senior-code-reviewer: Security and performance review
@@ -559,16 +559,16 @@ Workflow:
 ### Example 10: Kubernetes Orchestration Implementation
 ```
 Story: "Deploy application to Kubernetes with auto-scaling"
-Primary Agent: docker-expert
+Primary Agent: podman-container-architect
 Supporting: bash-zsh-macos-engineer, qa-engineer, senior-code-reviewer
 
 Workflow:
-1. docker-expert: Design Kubernetes deployment architecture
-2. docker-expert: Create manifests for deployments, services, ingress
-3. docker-expert: Implement auto-scaling and resource management
+1. podman-container-architect: Design Kubernetes deployment architecture
+2. podman-container-architect: Create manifests for deployments, services, ingress
+3. podman-container-architect: Implement auto-scaling and resource management
 4. bash-zsh-macos-engineer: Integrate K8s deployment into CI/CD
 5. qa-engineer: Design containerized environment testing
-6. docker-expert: Configure monitoring and logging
+6. podman-container-architect: Configure monitoring and logging
 7. senior-code-reviewer: Security and reliability review
 8. ALL: Production readiness validation
 ```
@@ -576,16 +576,16 @@ Workflow:
 ### Example 11: Multi-Environment Container Strategy
 ```
 Story: "Implement consistent dev/staging/prod container environments"
-Primary Agent: docker-expert
+Primary Agent: podman-container-architect
 Supporting: bash-zsh-macos-engineer, backend-typescript-architect, qa-engineer
 
 Workflow:
-1. docker-expert: Design multi-environment container strategy
-2. docker-expert: Create environment-specific configurations
+1. podman-container-architect: Design multi-environment container strategy
+2. podman-container-architect: Create environment-specific configurations
 3. bash-zsh-macos-engineer: Automate environment provisioning
 4. backend-typescript-architect: Ensure application environment compatibility
 5. qa-engineer: Validate environment consistency testing
-6. docker-expert: Implement secrets and configuration management
+6. podman-container-architect: Implement secrets and configuration management
 7. ALL: Multi-environment deployment validation
 ```
 ```

@@ -29,22 +29,22 @@
 ### 1. Requirements Definition & Approval
 ```bash
 # Generate requirements through structured discovery
-claude brainstorm "<project-idea>"
+claude /dev:brainstorm "<project-idea>"
 
 # Cryptographically sign requirements for integrity
-claude approve-requirements
+claude /dev:approve-requirements
 ```
 
 ### 2. Story Creation & Planning
 ```bash
 # Generate epics, features, and user stories from requirements
-claude create-stories
+claude /dev:create-stories
 ```
 
 ### 3. Iterative Development
 ```bash
 # Launch specialized agents for incremental development
-claude resume-build-agents next
+claude /dev:resume-build-agents next
 
 # Available agents:
 # - backend-typescript-architect: Bun + TypeScript backend
@@ -59,25 +59,25 @@ claude resume-build-agents next
 ### 4. Issue Management
 ```bash
 # Investigate and create comprehensive GitHub issues
-claude create-issue "<defect-description>"
+claude /issues:create-issue "<defect-description>"
 ```
 
 ### 5. Quality Assurance
 ```bash
 # Achieve 100% test coverage with comprehensive testing
-claude coverage
+claude /quality:coverage
 ```
 
 ### 6. Project Intelligence
 ```bash
 # Generate project metrics and insights
-claude create-project-summary-stats
+claude /project:create-project-summary-stats
 
 # Update development time estimation
-claude update-estimated-time-spent
+claude /project:update-estimated-time-spent
 
 # Create production-ready documentation
-claude create-user-documentation
+claude /project:create-user-documentation
 ```
 
 ## Code Quality Standards
