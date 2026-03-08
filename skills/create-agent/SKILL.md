@@ -1,6 +1,6 @@
 ---
 name: create-agent
-description: Generate a new Claude Code agent definition (agents/<name>.md) with frontmatter and delegation examples
+description: Use when you want to create a new sub-agent that Claude can delegate tasks to. Generates an agents/<name>.md definition.
 user-invocable: true
 disable-model-invocation: true
 argument-hint: "[description or --scaffold]"

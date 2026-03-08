@@ -1,6 +1,6 @@
 ---
 name: create-skill
-description: Generate a new modern Claude Code skill (skills/<name>/SKILL.md) with supporting files
+description: Use when you want to create a new skill with supporting files, tool restrictions, or auto-invocation. Generates a skills/<name>/ directory.
 user-invocable: true
 disable-model-invocation: true
 argument-hint: "[description or --scaffold]"

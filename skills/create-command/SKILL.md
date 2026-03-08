@@ -1,6 +1,6 @@
 ---
 name: create-command
-description: Generate a new legacy slash command (commands/<category>/<name>.md) with interactive or direct mode
+description: Use when you want to create a simple slash command (single markdown file). For complex needs, use /create-skill instead.
 user-invocable: true
 disable-model-invocation: true
 argument-hint: "[description or --scaffold]"
