@@ -149,9 +149,9 @@ project/
 
 ## Reference Materials
 - **TDD Process**: Red → Green → Refactor cycle
-- **Python**: `@~/.claude/docs/python.md`
-- **Source Control**: `@~/.claude/docs/source-control.md`
-- **Container Tools**: `@~/.claude/docs/docker-uv.md`
+- **Python**: `@~/.claude/reference-docs/python.md`
+- **Source Control**: `@~/.claude/reference-docs/source-control.md`
+- **Container Tools**: `@~/.claude/reference-docs/docker-uv.md`
 
 ---
 *Multi-agent orchestration for enterprise-grade development workflows*

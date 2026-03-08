@@ -1,6 +1,6 @@
 # claude-code-config
 
-Standalone Claude Code configuration — agents, commands, MCP servers, settings, docs, hooks, and keybindings.
+Standalone Claude Code configuration — agents, commands, skills, MCP servers, settings, hooks, and keybindings.
 
 ## Quick Start
 
@@ -27,19 +27,69 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 |------|-------------|
 | `CLAUDE.md` | Global instructions for Claude Code |
 | `agents/` | 12 custom agent definitions (flat) |
+| `skills/` | 3 modern skills (generators for skills, agents, commands) |
 | `commands/` | 20 slash commands organized into 6 categories |
-| `commands/dev/` | Core development lifecycle (brainstorm, requirements, stories, build) |
-| `commands/issues/` | Issue creation and fixing |
-| `commands/quality/` | Coverage, code review, roasting |
-| `commands/project/` | Progress tracking, stats, documentation |
-| `commands/devops/` | Release management |
-| `commands/research/` | Domain-specific analysis (crypto, client, profile) |
+| `templates/` | Shared reference templates used by generator skills |
+| `reference-docs/` | Claude context references (python, source-control, containers) |
+| `docs/` | User-facing documentation |
 | `settings.json` | Settings (statusline, plugins) |
 | `statusline-command.sh` | Statusline display script |
 | `keybindings.json` | Keyboard shortcuts |
-| `docs/` | Reference docs (python, source-control, containers) |
 | `hooks/` | Hook configurations |
 | `mcp/config.template.json` | MCP server template (env var substitution) |
+
+### Commands by category
+
+| Category | Commands |
+|----------|----------|
+| `commands/dev/` | brainstorm, approve-requirements, create-stories, create-todo, resume-build-agents |
+| `commands/issues/` | create-issue, fix-github-issue |
+| `commands/quality/` | coverage, project-review, roast |
+| `commands/project/` | create-project-summary-stats, create-user-documentation, sync-progress, update-estimated-time-spent, update-progress |
+| `commands/devops/` | check-releases, plan-release-update |
+| `commands/research/` | client-analysis, crypto-analysis, profile-analysis |
+
+### Agents
+
+| Agent | Domain |
+|-------|--------|
+| `backend-typescript-architect` | Bun + TypeScript backend systems |
+| `bash-zsh-macos-engineer` | macOS shell scripting and automation |
+| `crypto-coin-analyzer` | Single crypto ticker analysis |
+| `crypto-market-agent` | Crypto market data retrieval |
+| `executive-summary-generator` | Client company executive summaries |
+| `meta-agent` | Generates new agent definitions |
+| `podman-container-architect` | OCI containers, Podman, Containerfiles |
+| `professional-profile-researcher` | LinkedIn and professional profile research |
+| `python-backend-engineer` | FastAPI + uv + modern Python |
+| `qa-engineer` | Testing strategy and quality assurance |
+| `senior-code-reviewer` | Architecture, security, and code review |
+| `ui-engineer` | Frontend components and UI design |
+
+## Generator Skills
+
+Three skills for scaffolding new Claude Code components from within Claude Code. See [`docs/generators.md`](docs/generators.md) for full documentation.
+
+```bash
+# Generate a command from a description
+/dev:create-command "a command that generates changelog entries"
+
+# Generate an agent interactively (asks questions one at a time)
+/dev:create-agent
+
+# Scaffold a skill with TODO placeholders
+/dev:create-skill --scaffold "lint fixer"
+```
+
+Each generator supports three modes:
+
+| Mode | Invocation | Behavior |
+|------|------------|----------|
+| **Interactive** | `/dev:create-agent` | Asks questions one at a time |
+| **Direct** | `/dev:create-agent "query optimizer"` | Generates from description |
+| **Scaffold** | `/dev:create-agent --scaffold` | Minimal template with TODOs |
+
+All generators ask whether to install **globally** (this config repo, shared via symlink) or **locally** (current project's `.claude/`), and include a review cycle (approve, edit, or cancel) before writing files.
 
 ## Install options
 
@@ -49,6 +99,8 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 ./install.sh --dry-run    # Preview changes
 ./install.sh --uninstall  # Remove symlinks
 ```
+
+The installer creates symlinks from `~/.claude/` to this repo for: `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `reference-docs/`, `docs/`, `settings.json`, `statusline-command.sh`, `keybindings.json`, and `hooks/`.
 
 ## Environment variables
 
