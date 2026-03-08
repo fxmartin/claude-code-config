@@ -62,7 +62,7 @@ After gathering requirements (or parsing arguments), ask:
 - SKILL.md is a **thin orchestrator** — heavy content goes in supporting files
 - Always generate at least `SKILL.md`; supporting files depend on complexity
 - Use `${CLAUDE_SKILL_DIR}` for self-referential paths to supporting files
-- Use `` !`command` `` preprocessing for dynamic context injection where useful
+- Use bang-backtick preprocessing for dynamic context injection where useful
 - Keep `description` under 200 characters (context window budget)
 - Set `disable-model-invocation: true` for skills with side effects
 
