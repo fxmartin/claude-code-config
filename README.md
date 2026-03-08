@@ -27,8 +27,8 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 |------|-------------|
 | `CLAUDE.md` | Global instructions for Claude Code |
 | `agents/` | 12 custom agent definitions (flat) |
-| `skills/` | 3 modern skills (generators for skills, agents, commands) |
-| `commands/` | 20 slash commands organized into 6 categories |
+| `skills/` | 7 skills (generators + approve-requirements, create-stories, resume-build-agents, claude-docs) |
+| `commands/` | 17 slash commands organized into 6 categories |
 | `templates/` | Shared reference templates used by generator skills |
 | `reference-docs/` | Claude context references (python, source-control, containers) |
 | `docs/` | User-facing documentation |
@@ -42,7 +42,8 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 
 | Category | Commands |
 |----------|----------|
-| `commands/dev/` | brainstorm, approve-requirements, create-stories, create-todo, resume-build-agents |
+| `commands/dev/` | brainstorm, create-todo |
+| `skills/` | approve-requirements, create-stories, resume-build-agents (converted from commands) |
 | `commands/issues/` | create-issue, fix-github-issue |
 | `commands/quality/` | coverage, project-review, roast |
 | `commands/project/` | create-project-summary-stats, create-user-documentation, sync-progress, update-estimated-time-spent, update-progress |

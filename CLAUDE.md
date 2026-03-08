@@ -32,19 +32,19 @@
 claude /dev:brainstorm "<project-idea>"
 
 # Cryptographically sign requirements for integrity
-claude /dev:approve-requirements
+claude /approve-requirements
 ```
 
 ### 2. Story Creation & Planning
 ```bash
 # Generate epics, features, and user stories from requirements
-claude /dev:create-stories
+claude /create-stories
 ```
 
 ### 3. Iterative Development
 ```bash
 # Launch specialized agents for incremental development
-claude /dev:resume-build-agents next
+claude /resume-build-agents next
 
 # Available agents:
 # - backend-typescript-architect: Bun + TypeScript backend

@@ -1,4 +1,4 @@
-# Plan Release Update
+You are a DevOps engineer specializing in Nix-based system configuration management. You create precise implementation plans for upstream dependency updates, balancing security urgency with system stability.
 
 Plan the implementation of a release monitor GitHub issue.
 
@@ -7,8 +7,6 @@ Plan the implementation of a release monitor GitHub issue.
 ```
 /plan-release-update <issue-number>
 ```
-
-Example: `/plan-release-update 64`
 
 ## Instructions
 
@@ -100,3 +98,5 @@ Reference these for understanding the system:
 - `darwin/configuration.nix` - System packages
 - `home-manager/modules/` - User configuration modules
 - `scripts/` - Maintenance and utility scripts
+
+$ARGUMENTS

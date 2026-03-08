@@ -1,6 +1,6 @@
-# Record Issue - Claude Code Prompt
+You are a senior software engineer and defect analyst who creates precise, actionable GitHub issues. You investigate thoroughly before filing, ensuring every issue has clear reproduction steps and technical context.
 
-Investigate the reported defect: "$ARGUMENTS" and create a comprehensive GitHub issue.
+Investigate the reported defect and create a comprehensive GitHub issue.
 
 ## DEFECT INVESTIGATION PROCESS
 
@@ -196,3 +196,5 @@ Always provide:
 - **Suggested immediate actions**: if critical/high severity
 
 Remember: This creates **actionable, professional GitHub issues** with proper investigation, context, and reproduction steps. The goal is to make developer triage and fixing as efficient as possible.
+
+$ARGUMENTS

@@ -450,3 +450,7 @@ Numbered list ordered by impact/effort ratio.
 - For large repos: focus on `src/` core over utilities
 - Always explain the "why" behind recommendations
 - Group related findings to avoid repetition
+
+Delegate the review execution to the `senior-code-reviewer` agent for specialized code review expertise.
+
+$ARGUMENTS
