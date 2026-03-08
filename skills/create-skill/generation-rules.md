@@ -6,10 +6,9 @@ When generating a complete skill from a description, use ultrathink to produce h
 
 ### Step 1: Determine Metadata
 
-- **Name**: derive a human-readable display name (e.g., "Create Skill", "Run Tests")
-- **Namespace**: choose or create a namespace (e.g., `dev`, `quality`, `ops`)
-- **Directory name**: kebab-case derived from name (e.g., `create-skill`, `run-tests`)
-- **Invocation**: `/<namespace>:<directory-name>` (e.g., `/dev:create-skill`)
+- **Name**: lowercase kebab-case (e.g., `create-skill`, `run-tests`) — this becomes the `/slash-command`
+- **Directory name**: same as name (e.g., `create-skill/SKILL.md`)
+- **Invocation**: `/<name>` (e.g., `/create-skill`)
 
 ### Step 2: Choose Frontmatter Fields
 
@@ -97,7 +96,7 @@ When `--scaffold` is specified, generate minimal files:
 **SKILL.md:**
 ```markdown
 ---
-name: <Name>
+name: <kebab-case-name>
 description: <TODO: brief description under 200 chars>
 user-invocable: true
 disable-model-invocation: true

@@ -7,9 +7,9 @@ When no arguments are provided, guide the user through these questions **one at 
 ### 1. Purpose
 > What should this skill do? Describe its purpose and the problem it solves.
 
-### 2. Namespace
-> What namespace should it live under? Existing namespaces include `dev`. You can also create a new one.
-> The skill will be invoked as `/<namespace>:<name>`.
+### 2. Name
+> What should this skill be called? Use lowercase letters, numbers, and hyphens only (e.g., `run-tests`, `lint-fixer`).
+> The skill will be invoked as `/<name>`.
 
 ### 3. Invocation Style
 > How should this skill be triggered?
@@ -53,7 +53,7 @@ When no arguments are provided, guide the user through these questions **one at 
 ### 8. Confirmation
 Summarize the gathered requirements and ask:
 > Here's what I'll generate:
-> - **Skill**: `/<namespace>:<name>`
+> - **Skill**: `/<name>`
 > - **Purpose**: `<purpose-summary>`
 > - **Invocation**: `<user-only|auto|both>`
 > - **Arguments**: `<argument-description>`
@@ -65,4 +65,4 @@ Summarize the gathered requirements and ask:
 ## Complexity Check
 
 If the described skill seems simple enough for a command (no supporting files, no tool restrictions, no auto-invocation), suggest:
-> This seems simple enough to be a **command** instead of a skill. Commands are single-file and easier to maintain. Want to use `/dev:create-command` instead, or continue with a skill?
+> This seems simple enough to be a **command** instead of a skill. Commands are single-file and easier to maintain. Want to use `/create-command` instead, or continue with a skill?

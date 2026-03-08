@@ -1,6 +1,6 @@
 ---
 name: create-skill
-description: Generate a new modern Claude Code skill (skills/<namespace>/<name>/SKILL.md) with supporting files
+description: Generate a new modern Claude Code skill (skills/<name>/SKILL.md) with supporting files
 user-invocable: true
 disable-model-invocation: true
 argument-hint: "[description or --scaffold]"
@@ -39,8 +39,8 @@ Existing commands (for reference):
 
 After gathering requirements (or parsing arguments), ask:
 > Install globally (this config repo) or locally (current project's `.claude/`)?
-> - **Global**: writes to `${CLAUDE_SKILL_DIR}/../../skills/<namespace>/`
-> - **Local**: writes to `.claude/skills/<namespace>/`
+> - **Global**: writes to `${CLAUDE_SKILL_DIR}/../../skills/<name>/`
+> - **Local**: writes to `.claude/skills/<name>/`
 
 ## Generation Flow
 

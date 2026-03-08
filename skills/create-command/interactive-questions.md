@@ -58,4 +58,4 @@ After question 1, if the described command seems to need:
 - Complex conditional flows
 
 Then suggest:
-> This sounds like it might benefit from being a **skill** instead of a command. Skills support supporting files, tool restrictions, and richer capabilities. Want to use `/dev:create-skill` instead, or continue with a command?
+> This sounds like it might benefit from being a **skill** instead of a command. Skills support supporting files, tool restrictions, and richer capabilities. Want to use `/create-skill` instead, or continue with a command?

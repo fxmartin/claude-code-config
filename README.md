@@ -72,22 +72,22 @@ Three skills for scaffolding new Claude Code components from within Claude Code.
 
 ```bash
 # Generate a command from a description
-/dev:create-command "a command that generates changelog entries"
+/create-command "a command that generates changelog entries"
 
 # Generate an agent interactively (asks questions one at a time)
-/dev:create-agent
+/create-agent
 
 # Scaffold a skill with TODO placeholders
-/dev:create-skill --scaffold "lint fixer"
+/create-skill --scaffold "lint fixer"
 ```
 
 Each generator supports three modes:
 
 | Mode | Invocation | Behavior |
 |------|------------|----------|
-| **Interactive** | `/dev:create-agent` | Asks questions one at a time |
-| **Direct** | `/dev:create-agent "query optimizer"` | Generates from description |
-| **Scaffold** | `/dev:create-agent --scaffold` | Minimal template with TODOs |
+| **Interactive** | `/create-agent` | Asks questions one at a time |
+| **Direct** | `/create-agent "query optimizer"` | Generates from description |
+| **Scaffold** | `/create-agent --scaffold` | Minimal template with TODOs |
 
 All generators ask whether to install **globally** (this config repo, shared via symlink) or **locally** (current project's `.claude/`), and include a review cycle (approve, edit, or cancel) before writing files.
 

@@ -9,22 +9,22 @@ Three skills for scaffolding new Claude Code components from within Claude Code 
 ./install.sh
 
 # Generate a command from a description
-/dev:create-command "a command that generates changelog entries from git history"
+/create-command "a command that generates changelog entries from git history"
 
 # Generate an agent interactively
-/dev:create-agent
+/create-agent
 
 # Scaffold a skill with TODOs
-/dev:create-skill --scaffold "lint fixer"
+/create-skill --scaffold "lint fixer"
 ```
 
 ## Available Skills
 
 | Skill | Generates | Output |
 |-------|-----------|--------|
-| `/dev:create-command` | Legacy slash commands | `commands/<category>/<name>.md` |
-| `/dev:create-agent` | Agent definitions | `agents/<name>.md` |
-| `/dev:create-skill` | Modern skills | `skills/<ns>/<name>/SKILL.md` + directory |
+| `/create-command` | Legacy slash commands | `commands/<category>/<name>.md` |
+| `/create-agent` | Agent definitions | `agents/<name>.md` |
+| `/create-skill` | Modern skills | `skills/<name>/SKILL.md` + directory |
 
 ## Three Invocation Modes
 
@@ -32,20 +32,20 @@ Every generator supports the same three modes:
 
 ### Interactive (no arguments)
 ```bash
-/dev:create-agent
+/create-agent
 ```
 Asks questions one at a time to gather requirements, then generates.
 
 ### Direct (with description)
 ```bash
-/dev:create-agent "a database query optimizer that analyzes slow queries and suggests indexes"
+/create-agent "a database query optimizer that analyzes slow queries and suggests indexes"
 ```
 Generates a complete definition from the freeform description.
 
 ### Scaffold (quick template)
 ```bash
-/dev:create-agent --scaffold
-/dev:create-agent --scaffold "query optimizer"
+/create-agent --scaffold
+/create-agent --scaffold "query optimizer"
 ```
 Generates a minimal file with TODO placeholders. Optionally pre-fills name/description.
 
@@ -60,11 +60,11 @@ Each generator asks where to write the output:
 
 | Need | Use |
 |------|-----|
-| Simple prompt, one file, no tool restrictions | `/dev:create-command` |
-| Auto-delegated sub-agent with specific tools | `/dev:create-agent` |
-| Multi-file skill with supporting docs, tool restrictions, or auto-invocation | `/dev:create-skill` |
+| Simple prompt, one file, no tool restrictions | `/create-command` |
+| Auto-delegated sub-agent with specific tools | `/create-agent` |
+| Multi-file skill with supporting docs, tool restrictions, or auto-invocation | `/create-skill` |
 
-If you start with `/dev:create-command` and the requirements grow complex, the skill will suggest upgrading to `/dev:create-skill`.
+If you start with `/create-command` and the requirements grow complex, the skill will suggest upgrading to `/create-skill`.
 
 ## Templates
 
@@ -81,7 +81,7 @@ Templates are read by the generators at generation time — not loaded into cont
 Each skill follows a **thin orchestrator** pattern to minimize token usage:
 
 ```
-skills/dev/create-<type>/
+skills/create-<type>/
 ├── SKILL.md                 # ~100 lines: mode detection, flow control, file refs
 ├── generation-rules.md      # Detailed generation instructions (loaded on demand)
 └── interactive-questions.md  # Q&A flow (loaded only in interactive mode)
