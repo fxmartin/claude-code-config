@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@anthropic-ai/context7-mcp@latest"],
+      "env": {},
+      "headers": {}
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@anthropic-ai/mcp-server-sequential-thinking@latest"],
+      "env": {},
+      "headers": {}
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y", "@anthropic-ai/playwright-mcp@latest",
+        "--executable-path", "$BROWSER_PATH"
+      ],
+      "env": {},
+      "headers": {}
+    }
+  }
+}

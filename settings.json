@@ -1,0 +1,9 @@
+{
+  "enabledPlugins": {
+"typescript-lsp@claude-plugins-official": true
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline-command.sh"
+  }
+}
