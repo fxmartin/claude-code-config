@@ -1,5 +1,5 @@
 ---
-name: Create Agent
+name: create-agent
 description: Generate a new Claude Code agent definition (agents/<name>.md) with frontmatter and delegation examples
 user-invocable: true
 disable-model-invocation: true
@@ -30,18 +30,18 @@ Detect the invocation mode from `$ARGUMENTS`:
 ## Context
 
 Existing agents:
-!`ls ${CLAUDE_SKILL_DIR}/../../../agents/`
+!`ls ${CLAUDE_SKILL_DIR}/../../agents/`
 
 ## Install Location
 
 After gathering requirements (or parsing arguments), ask:
 > Install globally (this config repo) or locally (current project's `.claude/`)?
-> - **Global**: writes to `${CLAUDE_SKILL_DIR}/../../../agents/`
+> - **Global**: writes to `${CLAUDE_SKILL_DIR}/../../agents/`
 > - **Local**: writes to `.claude/agents/`
 
 ## Generation Flow
 
-1. Read the shared template: `${CLAUDE_SKILL_DIR}/../../../templates/agent-template.md`
+1. Read the shared template: `${CLAUDE_SKILL_DIR}/../../templates/agent-template.md`
 2. Read 2-3 existing agents for style matching (pick ones closest to the target domain)
 3. Generate the agent definition with proper frontmatter and body
 4. **Critical**: ensure the `description` field includes `<example>` blocks for reliable auto-delegation

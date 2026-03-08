@@ -1,5 +1,5 @@
 ---
-name: Create Command
+name: create-command
 description: Generate a new legacy slash command (commands/<category>/<name>.md) with interactive or direct mode
 user-invocable: true
 disable-model-invocation: true
@@ -30,18 +30,18 @@ Detect the invocation mode from `$ARGUMENTS`:
 ## Context
 
 Existing command categories and files:
-!`ls -R ${CLAUDE_SKILL_DIR}/../../../commands/`
+!`ls -R ${CLAUDE_SKILL_DIR}/../../commands/`
 
 ## Install Location
 
 After gathering requirements (or parsing arguments), ask:
 > Install globally (this config repo) or locally (current project's `.claude/`)?
-> - **Global**: writes to `${CLAUDE_SKILL_DIR}/../../../commands/<category>/`
+> - **Global**: writes to `${CLAUDE_SKILL_DIR}/../../commands/<category>/`
 > - **Local**: writes to `.claude/commands/<category>/`
 
 ## Generation Flow
 
-1. Read the shared template: `${CLAUDE_SKILL_DIR}/../../../templates/command-template.md`
+1. Read the shared template: `${CLAUDE_SKILL_DIR}/../../templates/command-template.md`
 2. Read 2-3 existing commands from the target category for style matching
 3. Generate the command content following template structure and existing conventions
 4. Display the complete generated file content for review
@@ -55,7 +55,7 @@ After gathering requirements (or parsing arguments), ask:
 - Command files are plain markdown with an optional YAML frontmatter
 - Always end the prompt body with `$ARGUMENTS` so user input is passed through
 - Match the persona/style of existing commands in the same category
-- If the user's needs are complex (supporting files, tool restrictions, auto-invocation), suggest upgrading to a skill via `/dev:create-skill` instead
+- If the user's needs are complex (supporting files, tool restrictions, auto-invocation), suggest upgrading to a skill via `/create-skill` instead
 - Keep commands focused — one clear purpose per command
 
 $ARGUMENTS

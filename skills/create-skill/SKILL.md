@@ -1,5 +1,5 @@
 ---
-name: Create Skill
+name: create-skill
 description: Generate a new modern Claude Code skill (skills/<namespace>/<name>/SKILL.md) with supporting files
 user-invocable: true
 disable-model-invocation: true
@@ -30,21 +30,21 @@ Detect the invocation mode from `$ARGUMENTS`:
 ## Context
 
 Existing skills:
-!`find ${CLAUDE_SKILL_DIR}/../../.. -path "*/skills/*/SKILL.md" 2>/dev/null | head -20 || echo "No skills found yet"`
+!`find ${CLAUDE_SKILL_DIR}/../.. -path "*/skills/*/SKILL.md" 2>/dev/null | head -20 || echo "No skills found yet"`
 
 Existing commands (for reference):
-!`ls ${CLAUDE_SKILL_DIR}/../../../commands/`
+!`ls ${CLAUDE_SKILL_DIR}/../../commands/`
 
 ## Install Location
 
 After gathering requirements (or parsing arguments), ask:
 > Install globally (this config repo) or locally (current project's `.claude/`)?
-> - **Global**: writes to `${CLAUDE_SKILL_DIR}/../../../skills/<namespace>/`
+> - **Global**: writes to `${CLAUDE_SKILL_DIR}/../../skills/<namespace>/`
 > - **Local**: writes to `.claude/skills/<namespace>/`
 
 ## Generation Flow
 
-1. Read the shared template: `${CLAUDE_SKILL_DIR}/../../../templates/skill-template.md`
+1. Read the shared template: `${CLAUDE_SKILL_DIR}/../../templates/skill-template.md`
 2. Read 2-3 existing skills (including this one) for style matching
 3. Generate the skill directory contents:
    - `SKILL.md` — thin orchestrator (100-150 lines max)
