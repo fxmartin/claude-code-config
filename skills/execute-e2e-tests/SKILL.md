@@ -1,5 +1,5 @@
 ---
-name: playwright-e2e
+name: execute-e2e-tests
 description: Run and manage Playwright E2E tests. Setup, write, execute, and debug end-to-end tests for any project.
 user-invocable: true
 disable-model-invocation: true
