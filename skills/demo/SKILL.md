@@ -54,10 +54,14 @@ Parse `$ARGUMENTS` — extract target selector and optional flags:
 
 **`--silent`** — Disable voice narration, text-only output (original behavior)
 
-**`--voice:<name>`** — Use a specific macOS TTS voice (default: `Samantha`)
-→ Recommended voices: `Samantha` (en_US female), `Daniel` (en_GB male), `Reed` (en_US male), `Shelley` (en_US female)
+**`--voice:<name>`** — Use a specific ElevenLabs voice (default: `Rachel`)
+→ Recommended voices: `Rachel` (calm, narration), `Drew` (confident, male), `Clyde` (deep, male), `Domi` (assertive, female)
+→ Accepts any ElevenLabs voice name — resolved to voice ID at runtime
 
-Examples: `/demo`, `/demo --silent`, `/demo epic-01 --voice:Daniel`
+**`--tts:say`** — Force macOS `say` instead of ElevenLabs (offline fallback)
+→ Accepts optional voice: `--tts:say:Daniel`
+
+Examples: `/demo`, `/demo --silent`, `/demo epic-01 --voice:Drew`, `/demo --tts:say`
 
 ## Execution Flow
 
@@ -67,7 +71,7 @@ Examples: `/demo`, `/demo --silent`, `/demo epic-01 --voice:Daniel`
 4. Detect or prompt for the app URL
 5. Present the **Demo Script** for review before starting
 6. Execute each demo step using Playwright MCP tools
-7. Narrate each step with text output AND voice (via macOS `say` in background), unless `--silent`
+7. Narrate each step with text output AND voice (ElevenLabs API or macOS `say` fallback), unless `--silent`
 8. Take screenshots at key moments as evidence
 9. Generate a **Demo Report** summarizing what was demonstrated
 10. Ask: **"Re-run, demo another story, or done?"**
