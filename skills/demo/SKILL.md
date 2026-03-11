@@ -3,7 +3,7 @@ name: demo
 description: Demonstrate completed features using Playwright MCP browser automation. Auto-discovers latest sprint/story and walks through a live demo.
 user-invocable: true
 disable-model-invocation: true
-argument-hint: "[epic-XX | story-id | all | url:http://...]"
+argument-hint: "[epic-XX | story-id | all | url:http://...] [--silent] [--voice:<name>]"
 allowed-tools: Agent, Read, Write, Edit, Glob, Grep, Bash, mcp__playwright__browser_navigate, mcp__playwright__browser_snapshot, mcp__playwright__browser_click, mcp__playwright__browser_fill_form, mcp__playwright__browser_take_screenshot, mcp__playwright__browser_console_messages, mcp__playwright__browser_network_requests, mcp__playwright__browser_close, mcp__playwright__browser_hover, mcp__playwright__browser_type, mcp__playwright__browser_press_key, mcp__playwright__browser_select_option, mcp__playwright__browser_handle_dialog, mcp__playwright__browser_wait_for, mcp__playwright__browser_tabs, mcp__playwright__browser_navigate_back, mcp__playwright__browser_evaluate, mcp__playwright__browser_install, mcp__playwright__browser_resize
 ---
 
@@ -22,7 +22,9 @@ Running services:
 
 ## Mode Detection
 
-Parse `$ARGUMENTS`:
+Parse `$ARGUMENTS` — extract target selector and optional flags:
+
+### Target Selectors (mutually exclusive)
 
 **`epic-XX`** — Demo all completed stories from a specific epic:
 → Read `${CLAUDE_SKILL_DIR}/demo-rules.md` for execution instructions
@@ -48,17 +50,27 @@ Parse `$ARGUMENTS`:
 → Scan stories directory for most recently completed stories
 → Generate and execute demo script for those stories
 
+### Optional Flags (composable with any target)
+
+**`--silent`** — Disable voice narration, text-only output (original behavior)
+
+**`--voice:<name>`** — Use a specific macOS TTS voice (default: `Samantha`)
+→ Recommended voices: `Samantha` (en_US female), `Daniel` (en_GB male), `Reed` (en_US male), `Shelley` (en_US female)
+
+Examples: `/demo`, `/demo --silent`, `/demo epic-01 --voice:Daniel`
+
 ## Execution Flow
 
 1. Read `${CLAUDE_SKILL_DIR}/demo-rules.md` for detailed demo instructions
-2. Discover completed stories and acceptance criteria
-3. Detect or prompt for the app URL
-4. Present the **Demo Script** for review before starting
-5. Execute each demo step using Playwright MCP tools
-6. Narrate each step with clear descriptions of what's being shown
-7. Take screenshots at key moments as evidence
-8. Generate a **Demo Report** summarizing what was demonstrated
-9. Ask: **"Re-run, demo another story, or done?"**
+2. Parse flags: detect `--silent` and `--voice:<name>` from arguments
+3. Discover completed stories and acceptance criteria
+4. Detect or prompt for the app URL
+5. Present the **Demo Script** for review before starting
+6. Execute each demo step using Playwright MCP tools
+7. Narrate each step with text output AND voice (via macOS `say` in background), unless `--silent`
+8. Take screenshots at key moments as evidence
+9. Generate a **Demo Report** summarizing what was demonstrated
+10. Ask: **"Re-run, demo another story, or done?"**
 
 ## Important Rules
 
