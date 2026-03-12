@@ -186,11 +186,11 @@ Parse the `MERGE_STATUS:` line from the result.
 
 If build, coverage, review, or merge failed:
 
-**Step 5d1: Detect test failure as code bug**
+**Step 5d1: Detect test/code failure**
 
-Inspect the failure output from the failed step. If the failure is a **test failure** (test assertion failed, runtime error in code under test, coverage gap due to broken code) — this indicates a code bug. Proceed to Step 5d2.
+Inspect the failure output from the failed step. If the failure involves **test assertions, runtime errors, or code behavior** — proceed to Step 5d2 for triage.
 
-If the failure is **not a test failure** (git error, network issue, auth failure, tool crash) — skip to Step 5d3 (standard error handling).
+If the failure is clearly **infrastructure** (git error, network timeout, auth failure, tool crash) — skip to Step 5d3 (standard error handling).
 
 **Step 5d2: Launch Bugfix Agent**
 
@@ -203,17 +203,25 @@ Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/bugfi
 - `{{FAILED_STEP}}` → which step failed (build | coverage | e2e)
 - `{{FAILURE_OUTPUT}}` → the error/failure text from the failed agent
 
-Extract `ISSUE_NUMBER`, `FIX_STATUS`, and `TESTS_PASSING` from the agent result.
+The agent classifies the failure as **CODE_BUG**, **TEST_BUG**, or **ENV_ISSUE**:
+- **CODE_BUG**: creates a GH issue → fixes the code → retests → closes the issue if fixed
+- **TEST_BUG**: fixes the test directly (no GH issue)
+- **ENV_ISSUE**: reports the issue, attempts to fix if possible (no GH issue)
+
+Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER`, `FIX_STATUS`, `TESTS_PASSING`, `BUGS_FIXED`, and `TESTS_FIXED` from the agent result.
 
 - If `FIX_STATUS: FIXED` and `TESTS_PASSING: true`:
-  - Log: "Bug #[ISSUE_NUMBER] fixed and closed — retrying from failed step"
+  - Log: "Fixed ([FAILURE_CATEGORY]) — retrying from failed step"
+  - If `ISSUE_NUMBER` is set: log "GH issue #[ISSUE_NUMBER] closed"
   - **Re-run from the step that failed** (not from Step 5a):
     - If build failed → re-run Step 5a
     - If coverage failed → re-run Step 5a2
     - If review flagged test issues → re-run Step 5b
   - Allow **max 2 bugfix iterations** per story to prevent infinite loops
 - If `FIX_STATUS: UNFIXED`:
-  - Log: "Bug #[ISSUE_NUMBER] could not be auto-fixed — issue left open"
+  - If `ISSUE_NUMBER` is set: log "Bug #[ISSUE_NUMBER] could not be auto-fixed — issue left open"
+  - Fall through to Step 5d3
+- If `FIX_STATUS: N/A` (ENV_ISSUE that couldn't be resolved):
   - Fall through to Step 5d3
 
 **Step 5d3: Standard error handling**
