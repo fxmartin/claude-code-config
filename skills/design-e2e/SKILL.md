@@ -64,13 +64,31 @@ The agent returns: test plan summary and generated `.spec.ts` file contents.
 Launch a `qa-expert` agent to:
 1. Use Playwright MCP to explore the app UI and validate selectors
 2. Run the generated tests: `npx playwright test <spec-file>`
-3. Capture results, fix any failing tests
-4. Iterate until all tests pass or failures are explained
+3. Capture results and return test output with pass/fail status per test
+
+### Phase 4b: Bugfix Loop (AGENT — runs if any tests failed)
+
+If Phase 4 reports test failures, launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/bugfix-prompt.md`, substituting:
+- `{{TEST_FILE}}` → the failing spec file(s)
+- `{{FAILED_TESTS}}` → list of failed test names
+- `{{FAILURE_OUTPUT}}` → test error output from Phase 4
+- `{{STORY_ID}}` and `{{STORY_TITLE}}` → from the target story (if single story)
+
+The bugfix agent:
+1. Diagnoses each failure as **CODE_BUG**, **TEST_BUG**, or **ENV_ISSUE**
+2. For code bugs: creates a GitHub issue → fixes the code → retests → closes the issue if fixed
+3. For test bugs: fixes the test directly (no GH issue)
+4. For env issues: reports to user without creating an issue
+
+Extract `FIX_STATUS`, `ISSUE_NUMBER`, `BUGS_FIXED`, and `TESTS_PASSING` from the result.
+
+If `TESTS_PASSING: false` after the bugfix agent — allow **one more iteration** (max 2 total). If still failing, log the open issue(s) and continue to Phase 5.
 
 ### Phase 5: Report (DIRECT)
 
 1. Update `tests/e2e/TEST-INVENTORY.md` and `tests/e2e/TEST-RESULTS.md`
 2. Print summary: tests designed, passed, failed, coverage of acceptance criteria
+3. If bugfix loop ran: include bugs found, GH issues created/closed, fixes applied
 
 ## Important Rules
 

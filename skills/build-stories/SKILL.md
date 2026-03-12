@@ -182,9 +182,42 @@ Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/merge
 
 Parse the `MERGE_STATUS:` line from the result.
 
-### Step 5d: Error Handling (DIRECT)
+### Step 5d: Error Handling & Bugfix Loop (DIRECT + conditional agent)
 
 If build, coverage, review, or merge failed:
+
+**Step 5d1: Detect test failure as code bug**
+
+Inspect the failure output from the failed step. If the failure is a **test failure** (test assertion failed, runtime error in code under test, coverage gap due to broken code) — this indicates a code bug. Proceed to Step 5d2.
+
+If the failure is **not a test failure** (git error, network issue, auth failure, tool crash) — skip to Step 5d3 (standard error handling).
+
+**Step 5d2: Launch Bugfix Agent**
+
+Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/bugfix-agent-prompt.md`, substituting:
+- `{{STORY_ID}}` → current story ID
+- `{{STORY_TITLE}}` → current story title
+- `{{EPIC_NAME}}` → current epic name
+- `{{EPIC_FILE}}` → story's epic file path
+- `{{BRANCH_NAME}}` → the story's branch (`feature/[ID]`)
+- `{{FAILED_STEP}}` → which step failed (build | coverage | e2e)
+- `{{FAILURE_OUTPUT}}` → the error/failure text from the failed agent
+
+Extract `ISSUE_NUMBER`, `FIX_STATUS`, and `TESTS_PASSING` from the agent result.
+
+- If `FIX_STATUS: FIXED` and `TESTS_PASSING: true`:
+  - Log: "Bug #[ISSUE_NUMBER] fixed and closed — retrying from failed step"
+  - **Re-run from the step that failed** (not from Step 5a):
+    - If build failed → re-run Step 5a
+    - If coverage failed → re-run Step 5a2
+    - If review flagged test issues → re-run Step 5b
+  - Allow **max 2 bugfix iterations** per story to prevent infinite loops
+- If `FIX_STATUS: UNFIXED`:
+  - Log: "Bug #[ISSUE_NUMBER] could not be auto-fixed — issue left open"
+  - Fall through to Step 5d3
+
+**Step 5d3: Standard error handling**
+
 - If `--auto` flag: log failure, mark story FAILED in progress file, continue to next story
 - If no `--auto`: ask user: **retry** (re-run from Step 5a), **skip** (mark SKIPPED, continue), or **abort** (save progress, stop)
 - On abort: skip to Phase 6 for summary
