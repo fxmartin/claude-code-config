@@ -38,6 +38,15 @@ gh auth status
 
 Determine the progress file path: `docs/stories/.build-progress.md` (or `stories/.build-progress.md`).
 
+### Telegram Notification: Build Started
+
+Send a Telegram notification (skip if `--dry-run`):
+```bash
+bash -c 'source ~/.claude/config/.env 2>/dev/null && [ -n "$TELEGRAM_BOT_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"🔨 *Build Stories Started*\nScope: [SCOPE]\nTime: $(TZ=Europe/Paris date +"%Y-%m-%d %H:%M:%S CET")\", \"parse_mode\": \"Markdown\"}" > /dev/null'
+```
+
+If `TELEGRAM_BOT_TOKEN` is not set, skip silently — notifications are optional.
+
 ## Phase 2: Dispatch Discovery Agent
 
 Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/discovery-agent-prompt.md`, substituting:
@@ -210,9 +219,20 @@ Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/summa
 - `{{CLAUDE_SKILL_DIR}}` → `${CLAUDE_SKILL_DIR}`
 - `{{BATCH_START}}` → recorded batch start time
 
-## Phase 7: Print Report (DIRECT)
+## Phase 7: Print Report & Notify (DIRECT)
 
-Print the formatted summary returned by the summary agent. Done.
+Print the formatted summary returned by the summary agent.
+
+### Telegram Notification: Build Finished
+
+Send a Telegram notification with the build result:
+```bash
+bash -c 'source ~/.claude/config/.env 2>/dev/null && [ -n "$TELEGRAM_BOT_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"✅ *Build Stories Finished*\nScope: [SCOPE]\nStories: [COMPLETED]/[TOTAL] completed, [FAILED] failed\nDuration: [DURATION]\nTime: $(TZ=Europe/Paris date +"%Y-%m-%d %H:%M:%S CET")\", \"parse_mode\": \"Markdown\"}" > /dev/null'
+```
+
+Substitute `[COMPLETED]`, `[TOTAL]`, `[FAILED]`, and `[DURATION]` from the summary agent results. If any stories failed, use ⚠️ instead of ✅ in the message.
+
+If `TELEGRAM_BOT_TOKEN` is not set, skip silently.
 
 ## Context Budget Rules
 
