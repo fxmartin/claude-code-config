@@ -2,7 +2,7 @@
 name: telegram
 description: Post messages to Telegram via Bot API. Supports Markdown formatting, reply-to, and silent mode.
 user-invocable: true
-disable-model-invocation: true
+disable-model-invocation: false
 argument-hint: "<message> [--chat:<id>] [--silent] [--reply:<msg_id>] [--html]"
 allowed-tools: Bash, Read, WebFetch
 ---
