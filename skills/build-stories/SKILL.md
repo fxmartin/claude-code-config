@@ -70,7 +70,7 @@ If `TELEGRAM_BOT_TOKEN` is not set, skip silently — notifications are optional
 
 ## Phase 2: Dispatch Discovery Agent
 
-Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/discovery-agent-prompt.md`, substituting:
+Launch a `general-purpose` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/discovery-agent-prompt.md`, substituting:
 - `{{SCOPE}}` → parsed scope
 - `{{E2E_GATE}}` → parsed e2e-gate mode
 - `{{CLAUDE_SKILL_DIR}}` → `${CLAUDE_SKILL_DIR}`
@@ -127,7 +127,7 @@ Record batch start time. Initialize progress file if this is a fresh run (not re
 
 ### Step 5a: Launch Build Agent
 
-Use the Agent tool with `subagent_type` set to the story's `agent_type`. Include in the prompt:
+Use the Agent tool with `subagent_type` set to the story's `agent_type` and model: **opus**. Include in the prompt:
 
 **If `--skip-coverage` is set** (build agent handles push + PR):
 
@@ -185,7 +185,7 @@ Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Step 
 
 ### Step 5a2: Launch Coverage Gate Agent (skip if `--skip-coverage`)
 
-Launch a `qa-expert` agent with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
+Launch a `qa-expert` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
 - `{{STORY_ID}}` → current story ID
 - `{{STORY_TITLE}}` → current story title
 - `{{EPIC_NAME}}` → current epic name
@@ -204,7 +204,7 @@ If the coverage agent fails entirely — treat as a build failure (Step 5d error
 ### Step 5b: Launch Review Agent
 
 ```
-Agent(subagent_type="senior-code-reviewer", prompt="""
+Agent(subagent_type="senior-code-reviewer", model="opus", prompt="""
 Review the PR for story [ID]: [TITLE]
 
 1. gh pr view [PR_NUMBER]
@@ -223,7 +223,7 @@ If `APPROVAL_STATUS: CHANGES_NEEDED` persists after review agent's fixes, treat 
 
 > Note: The PR was created by either the build agent (`--skip-coverage`) or the coverage agent (default).
 
-Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/merge-update-prompt.md`, substituting:
+Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAUDE_SKILL_DIR}/merge-update-prompt.md`, substituting:
 - `{{STORY_ID}}` → current story ID
 - `{{STORY_TITLE}}` → current story title
 - `{{PR_NUMBER}}` → PR number from build agent (if `--skip-coverage`) or coverage agent (default)
@@ -258,7 +258,7 @@ If the failure is clearly **infrastructure** (git error, network timeout, auth f
 
 **Step 5d2: Launch Bugfix Agent**
 
-Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/bugfix-agent-prompt.md`, substituting:
+Launch a `general-purpose` agent (model: **opus**) with the prompt from `${CLAUDE_SKILL_DIR}/bugfix-agent-prompt.md`, substituting:
 - `{{STORY_ID}}` → current story ID
 - `{{STORY_TITLE}}` → current story title
 - `{{EPIC_NAME}}` → current epic name
@@ -303,7 +303,7 @@ After each successful story, check if this was the last story for its epic in th
 Read `${CLAUDE_SKILL_DIR}/e2e-gate.md` for the full logic, then launch:
 
 ```
-Agent(subagent_type="qa-expert", prompt="""
+Agent(subagent_type="qa-expert", model="sonnet", prompt="""
 Epic [EPIC_ID]: [EPIC_NAME] — all stories built and merged.
 
 [Include full prompt from e2e-gate.md with substitutions]
@@ -319,7 +319,7 @@ Handle result per `--e2e-gate` mode:
 
 ## Phase 6: Dispatch Summary Agent
 
-Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/summary-prompt.md`, substituting:
+Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAUDE_SKILL_DIR}/summary-prompt.md`, substituting:
 - `{{PROGRESS_FILE}}` → progress file path
 - `{{CLAUDE_SKILL_DIR}}` → `${CLAUDE_SKILL_DIR}`
 - `{{BATCH_START}}` → recorded batch start time
