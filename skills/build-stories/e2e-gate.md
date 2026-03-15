@@ -40,6 +40,13 @@ Create test file: e2e/epic-[EPIC_ID].spec.ts
 ## Step 4: Run Tests
 Run: npx playwright test e2e/epic-[EPIC_ID].spec.ts
 
+### Step 4b: Configure Screenshot Capture
+
+Before running tests, ensure screenshot capture is configured for failure diagnosis:
+- Pass `--screenshot=only-on-failure` to capture screenshots only when tests fail
+- If a `playwright.config.ts` exists, verify `use.screenshot` is set (do not override if already configured)
+- Screenshots will be stored in the default Playwright output directory (typically `test-results/`)
+
 ## Step 5: Fix & Rerun Loop
 If any tests fail:
 1. Analyze the failure (error message, screenshots, traces)
@@ -54,7 +61,20 @@ If any tests fail:
 - Update tests/e2e/TEST-INVENTORY.md with new tests
 - Update tests/e2e/TEST-RESULTS.md with run results
 
+## Step 7: Capture Failure Artifacts
+
+After the test run completes (whether pass or fail):
+1. List any screenshots in the Playwright output directory: `find test-results/ -name "*.png" 2>/dev/null`
+2. List any trace files: `find test-results/ -name "*.zip" 2>/dev/null`
+3. Include artifact paths in the output for the orchestrator to reference
+
 Return: PASS (all green) or FAIL (still failing after 5 fix attempts) with summary.
+
+Return values:
+- E2E_RESULT: PASS | FAIL
+- E2E_TESTS_WRITTEN: [count of test cases generated]
+- E2E_TESTS_PASSING: [count of passing test cases]
+- E2E_SCREENSHOTS: [comma-separated list of screenshot paths, or NONE]
 """)
 ```
 
@@ -81,7 +101,12 @@ Use the order number of the last story in that epic suffixed with `.e2e`.
 ## Edge Cases
 
 - **No Playwright config**: Check for `playwright.config.ts` or `playwright.config.js`. If not found, warn: "No Playwright config found. Run `/execute-e2e-tests setup` to initialize Playwright." Skip the gate.
-- **No running app server**: Check `playwright.config.ts` for a `webServer` block. If present, Playwright auto-starts it. If absent, warn that the app may need to be started manually.
+- **No running app server**: Detect the app server using this sequence:
+  1. Check `playwright.config.ts` for a `webServer` block — if present, Playwright auto-starts it
+  2. Parse `playwright.config.ts` for `baseURL` and curl the health endpoint: `curl -sf [baseURL] > /dev/null`
+  3. If no `webServer` and health check fails, look for a dev server script: check `package.json` for `scripts.dev` or `scripts.start`
+  4. If a dev script is found, auto-start it in background: `npm run dev &` (or equivalent), wait up to 15 seconds for the health check to pass
+  5. If no dev script found or health check still fails after auto-start, warn: "App server not detected. E2E tests may fail. Start the server manually or add a `webServer` block to playwright.config.ts."
 - **All stories already complete for an epic**: No E2E gate fires — nothing was built in this batch.
 - **Max retry limit (5)**: Prevents infinite fix loops. After 5 attempts, report remaining failures and let the gate flag decide next steps.
 

@@ -22,6 +22,18 @@ Read `{{CLAUDE_SKILL_DIR}}/story-parser.md` for the full parsing rules.
    - `epic-name` — case-insensitive partial match on epic file name
    - `resume` — handled in Step 3
 
+## Step 1b: Validate Story Sections
+
+Read `{{CLAUDE_SKILL_DIR}}/story-validation.md` for the full validation rules.
+
+For each parsed story, check:
+1. **Acceptance Criteria** — does the story have a section headed "Acceptance Criteria" (any heading level) with at least one bullet or numbered item?
+2. **Definition of Done** — does the story have a DoD section with at least one checkbox (`- [ ]` or `- [x]`)?
+3. **Priority value** — is the priority one of `Must Have`, `Should Have`, `Could Have`, `Won't Have`?
+4. **Content depth** — does the story body contain at least 5 non-blank lines (excluding the heading)?
+
+Collect warnings for any story that fails one or more checks. Validation is **warn-only** — flagged stories are still included in the build queue.
+
 ## Step 2: Resolve Dependencies
 
 Read `{{CLAUDE_SKILL_DIR}}/dependency-resolver.md` for the full algorithm.
@@ -75,6 +87,21 @@ If E2E gate is not `off`, insert `--- E2E Gate: Epic NN ---` separator rows at e
 ### Already Complete
 - 01.1-001: Project Setup (all DoD checked)
 ```
+
+### Validation Warnings
+
+If any stories were flagged during Step 1b, output a warnings table:
+
+```
+### Validation Warnings
+
+| Story ID | Warning | Detail |
+|----------|---------|--------|
+| 01.1-001 | Missing AC | No "Acceptance Criteria" section found |
+| 02.1-003 | Thin story | Only 3 lines of content (minimum: 5) |
+```
+
+Omit this section if no warnings were generated.
 
 ### Machine-Readable Queue
 

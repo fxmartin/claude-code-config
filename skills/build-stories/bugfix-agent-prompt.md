@@ -16,6 +16,22 @@ You are a senior software engineer triaging a test failure to determine its root
 
 Analyze the failure output and classify the root cause:
 
+### Step 1b: Structured Debugging Checklist
+
+Before attempting any fix, work through this checklist systematically:
+
+1. **Reproduce**: Run the exact failing command from `{{FAILURE_OUTPUT}}` to confirm the failure is consistent
+2. **Isolate**: Narrow down to the specific test(s) or code path(s) failing — run tests individually if needed
+3. **Inspect**: Read the failing source code and test code side by side — check for mismatches in expectations vs implementation
+4. **Check environment**: Verify dependencies are installed, configs are correct, environment variables are set
+5. **Compare with main**: `git diff main...HEAD -- [failing files]` — confirm the failure was introduced by this branch, not pre-existing
+
+Record your findings from each step — they will be included in the GH issue if a CODE_BUG is confirmed.
+
+### Step 1c: Classify Root Cause
+
+Based on the debugging checklist findings, classify:
+
 - **CODE_BUG** — the application/implementation code is wrong (wrong behavior, missing feature, runtime error, logic error)
 - **TEST_BUG** — the test itself is wrong (bad selector, incorrect assertion, timing issue, flaky test)
 - **ENV_ISSUE** — environment problem (missing dependency, config error, port conflict, network issue)
@@ -43,6 +59,13 @@ Analyze the failure output and classify the root cause:
    ## Root Cause
 
    [Your diagnosis]
+
+   ## Diagnostic Checklist Results
+
+   - **Reproduce**: [Could the failure be reproduced? Consistent or intermittent?]
+   - **Isolated to**: [Specific file(s), function(s), or test(s)]
+   - **Environment check**: [Any env issues found? deps, config, ports]
+   - **Diff from main**: [Was this introduced by the branch or pre-existing?]
 
    ---
    Automatically created by build-stories orchestrator.
@@ -100,4 +123,6 @@ ROOT_CAUSE: [one-line description]
 TESTS_PASSING: true | false
 BUGS_FIXED: [count]
 TESTS_FIXED: [count]
+DIAGNOSTIC_STEPS: [comma-separated list of checklist steps completed, e.g. reproduce,isolate,inspect]
+ISOLATED_TO: [file:function or file:line where the root cause was found, or UNKNOWN]
 ```

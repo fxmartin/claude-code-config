@@ -3,7 +3,7 @@ name: build-stories
 description: Batch build all incomplete stories across epics — thin dispatcher that delegates all heavy work to sub-agents for maximum context efficiency.
 user-invocable: true
 disable-model-invocation: true
-argument-hint: "[all|resume|epic-NN|epic-name] [--dry-run] [--auto] [--skip-coverage]"
+argument-hint: "[all|resume|epic-NN|epic-name] [--dry-run] [--auto] [--skip-coverage] [--limit=N] [--parallel] [--coverage-threshold=N] [--skip-preflight]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 ---
 
@@ -20,6 +20,10 @@ Parse `$ARGUMENTS` for:
   - `--e2e-gate=block|warn|off` — E2E test gate behavior between epics (default: `block`)
   - `--skip-e2e` — shorthand for `--e2e-gate=off`
   - `--skip-coverage` — bypass the coverage gate (build agent creates PR directly)
+  - `--limit=N` — build at most N stories from the queue (useful for incremental runs)
+  - `--parallel` — enable parallel story builds within dependency cohorts (max 3 concurrent agents)
+  - `--coverage-threshold=N` — override the default 90% coverage threshold (e.g., `--coverage-threshold=80`)
+  - `--skip-preflight` — skip the pre-flight health check (Step 1b)
 
 Run these 5 quick validation checks directly (too trivial to delegate):
 
@@ -37,6 +41,23 @@ gh auth status
 ```
 
 Determine the progress file path: `docs/stories/.build-progress.md` (or `stories/.build-progress.md`).
+
+### Pre-Flight Health Check (skip if `--skip-preflight`)
+
+Before dispatching any agents, verify the project's test suite is green on main:
+
+1. **Detect test command**: Check for test scripts in order of preference:
+   - `package.json` → `scripts.test` → run `npm test`
+   - `pyproject.toml` → detect pytest → run `uv run pytest`
+   - `Makefile` → check for `test` target → run `make test`
+   - `bats` test files → run `bats test/`
+2. **Run tests**: Execute the detected test command
+3. **Fail-fast if red**: If tests fail on main before any stories are built, STOP with:
+   ```
+   PRE_FLIGHT_FAILURE: Test suite is failing on main — fix before running build-stories.
+   [test output excerpt]
+   ```
+   This prevents building stories on top of a broken baseline.
 
 ### Telegram Notification: Build Started
 
@@ -64,11 +85,39 @@ Extract the `QUEUE_JSON:` line from the discovery agent result. Parse it into an
 If the agent returned `DISCOVERY_ERROR:` — print the error and STOP.
 If the agent returned `RESUME_WARNING:` — print warning, ask user to confirm or use `resume`.
 
-## Phase 4: Dry Run Check (DIRECT)
+### Queue Truncation (`--limit=N`)
+
+If `--limit=N` was specified, truncate the parsed queue to the first N entries. Log:
+```
+Queue truncated to N stories (--limit=N). Remaining stories deferred to next run.
+```
+Dependency integrity: if truncation would split a dependency pair (story A depends on B, A is included but B is not), include B as well (even if it exceeds the limit by 1).
+
+## Phase 4: Dry Run Check & Parallel Mode Setup (DIRECT)
 
 If `--dry-run` was specified:
 1. Print the display table from the discovery agent (it's already formatted)
 2. STOP — do not execute any builds
+
+### Phase 4b: Parallel Scheduling (if `--parallel`)
+
+When `--parallel` is enabled, organize the build queue into **dependency cohorts** — groups of stories that can be built concurrently because they share no dependencies between them.
+
+**Cohort computation:**
+1. From the topologically sorted queue, identify stories whose dependencies are ALL already completed (or have no dependencies)
+2. Group these into Cohort 1
+3. Remove Cohort 1 from the queue, mark as "scheduled"
+4. Repeat: find stories whose remaining dependencies are all in completed cohorts → Cohort 2, etc.
+
+**Execution rules:**
+- Launch up to **3 build agents concurrently** per cohort (agent tool supports parallel calls)
+- Wait for ALL agents in a cohort to complete before starting the next cohort
+- **Post-build steps are always sequential**: coverage gate → review → merge happen one story at a time, even in parallel mode (to avoid merge conflicts)
+- If any story in a cohort fails, remaining cohorts still execute (failed story is marked FAILED, dependents become BLOCKED)
+
+**Dry-run with `--parallel`**: Show the cohort groupings in the display table with `--- Cohort N ---` separator rows.
+
+If `--parallel` is NOT set, fall through to the standard sequential Phase 5.
 
 ## Phase 5: Build Loop
 
@@ -142,10 +191,12 @@ Launch a `qa-expert` agent with the prompt from `${CLAUDE_SKILL_DIR}/coverage-ga
 - `{{EPIC_NAME}}` → current epic name
 - `{{EPIC_FILE}}` → story's epic file path
 - `{{BRANCH_NAME}}` → branch name from build agent result
+- `{{COVERAGE_THRESHOLD}}` → value from `--coverage-threshold` flag (default: `90`)
+- `{{SECURITY_SCAN}}` → `on` (default) or `off` if security scanning is not desired
 
 The agent runs coverage analysis, adds tests, pushes the branch, and creates the PR.
 
-Extract `PR_NUMBER`, `PR_URL`, `COVERAGE_PCT`, `TESTS_ADDED`, and `COVERAGE_STATUS` from the agent result.
+Extract `PR_NUMBER`, `PR_URL`, `COVERAGE_PCT`, `TESTS_ADDED`, `COVERAGE_STATUS`, and `SECURITY_STATUS` from the agent result.
 
 If `COVERAGE_STATUS: WARN` — log a warning but continue (coverage was best-effort).
 If the coverage agent fails entirely — treat as a build failure (Step 5d error handling applies).
@@ -181,6 +232,19 @@ Launch a `general-purpose` agent with the prompt from `${CLAUDE_SKILL_DIR}/merge
 - `{{CLAUDE_SKILL_DIR}}` → `${CLAUDE_SKILL_DIR}`
 
 Parse the `MERGE_STATUS:` line from the result.
+
+### Step 5c2: Per-Story Telegram Notification
+
+After a story completes (success or failure), send a per-story progress notification:
+
+```bash
+bash -c 'source ~/.claude/config/.env 2>/dev/null && [ -n "$TELEGRAM_BOT_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"[EMOJI] *Story [STORY_ID]*: [STORY_TITLE]\nStatus: [STATUS]\nPR: [PR_URL or N/A]\nProgress: [CURRENT]/[TOTAL] stories\", \"parse_mode\": \"Markdown\"}" > /dev/null'
+```
+
+- Use the appropriate emoji: `✅` for success, `❌` for failure, `⏭️` for skipped
+- `[CURRENT]` = number of stories processed so far (done + failed + skipped)
+- `[TOTAL]` = total stories in the queue
+- If `TELEGRAM_BOT_TOKEN` is not set, skip silently
 
 ### Step 5d: Error Handling & Bugfix Loop (DIRECT + conditional agent)
 

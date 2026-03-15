@@ -15,6 +15,15 @@ You are a batch summary agent. You read the progress file and produce a formatte
 3. Compute the batch duration from `{{BATCH_START}}` to now
 4. Aggregate counts by status (DONE, FAILED, SKIPPED, BLOCKED, PENDING)
 5. Collect completed PRs, failures with reasons, and remaining stories
+6. Compute velocity metrics:
+   - **Story points completed**: sum of points for all DONE stories
+   - **Points per hour**: story points completed / batch duration in hours
+   - **Average story duration**: mean time from start to completion across DONE stories
+   - **Bugfix iterations**: total number of bugfix agent invocations (count FIX_STATUS entries in progress)
+7. Compute coverage summary (from coverage gate results in progress):
+   - **Average coverage**: mean COVERAGE_PCT across all DONE stories that went through coverage gate
+   - **Min/Max coverage**: lowest and highest COVERAGE_PCT values
+   - **Tests added total**: sum of TESTS_ADDED across all coverage gate runs
 
 ## Output Contract
 
@@ -41,6 +50,24 @@ Output the summary in this exact markdown format:
 
 ### Remaining (for next run)
 - [STORY_ID]: [Title]
+
+### Velocity
+
+| Metric | Value |
+|--------|-------|
+| Story points completed | N |
+| Points per hour | N.N |
+| Average story duration | Xm |
+| Bugfix iterations | N |
+
+### Coverage Summary
+
+| Metric | Value |
+|--------|-------|
+| Average coverage | N% |
+| Min coverage | N% |
+| Max coverage | N% |
+| Total tests added | N |
 
 ### E2E Test Results
 | Epic | Tests Written | Status | Fix Iterations | Duration |
