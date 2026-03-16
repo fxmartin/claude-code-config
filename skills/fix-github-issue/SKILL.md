@@ -7,6 +7,8 @@ argument-hint: "<issue-number|issue-url|next> [--skip-coverage] [--e2e-gate=bloc
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 ---
 
+> **DEPRECATED**: Use `/fix-issue` instead. This skill is retained for reference but will be removed in a future update.
+
 You are a **thin dispatcher** orchestrator. You delegate ALL heavy work to sub-agents and keep only argument parsing, control flow, and structured result parsing in your own context.
 
 ## Phase 1: Parse Arguments & Validate Environment (DIRECT)
