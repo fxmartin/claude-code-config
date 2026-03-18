@@ -29,12 +29,10 @@ flowchart TD
     subgraph P1 [" Phase 1 — Discovery & Requirements "]
         BRAIN["/brainstorm\nInteractive requirements discovery\n8 structured questions"]:::skill
         BRAIN --> REQ_MD[(REQUIREMENTS.md)]:::artifact
-        REQ_MD --> APPROVE["/approve-requirements\nCryptographic integrity hash\nStakeholder sign-off"]:::skill
-        APPROVE --> REQ_SIGNED[(Approved REQUIREMENTS.md\n+ integrity.json\n+ verify script)]:::artifact
     end
 
     %% ── Phase 2: Planning ──
-    REQ_SIGNED --> STORIES_GEN
+    REQ_MD --> STORIES_GEN
 
     subgraph P2 [" Phase 2 — Story Planning "]
         STORIES_GEN["/generate-epics\nTransform requirements into\nmodular AGILE epics"]:::skill

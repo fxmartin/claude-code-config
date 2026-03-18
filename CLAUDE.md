@@ -26,13 +26,10 @@
 
 ## Multi-Agent Development Workflow
 
-### 1. Requirements Definition & Approval
+### 1. Requirements Definition
 ```bash
 # Generate requirements through structured discovery
 claude /dev:brainstorm "<project-idea>"
-
-# Cryptographically sign requirements for integrity
-claude /approve-requirements
 ```
 
 ### 2. Story Creation & Planning
@@ -103,7 +100,7 @@ claude /project:create-user-documentation
 ### File Structure
 ```
 project/
-├── REQUIREMENTS.md          # Signed requirements (SHA-256)
+├── REQUIREMENTS.md          # Project requirements
 ├── STORIES.md              # Overview and navigation
 ├── PROJECT-STATS.md        # Condensed project health
 ├── docs/                   # User documentation

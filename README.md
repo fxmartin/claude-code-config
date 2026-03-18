@@ -27,7 +27,7 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 |------|-------------|
 | `CLAUDE.md` | Global instructions for Claude Code |
 | `agents/` | 12 custom agent definitions (flat) |
-| `skills/` | 15 skills (generators, approve-requirements, generate-epics, create-epic, build-stories, fix-issue, resume-build-agents, claude-docs, and more) |
+| `skills/` | 14 skills (generators, generate-epics, create-epic, build-stories, fix-issue, resume-build-agents, claude-docs, and more) |
 | `commands/` | 17 slash commands organized into 6 categories |
 | `templates/` | Shared reference templates used by generator skills |
 | `reference-docs/` | Claude context references (python, source-control, containers) |
@@ -43,7 +43,7 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 | Category | Commands |
 |----------|----------|
 | `commands/dev/` | brainstorm, create-todo |
-| `skills/` | approve-requirements, generate-epics, create-epic, build-stories, fix-issue, resume-build-agents, and more |
+| `skills/` | generate-epics, create-epic, build-stories, fix-issue, resume-build-agents, and more |
 | `commands/issues/` | create-issue, fix-github-issue |
 | `commands/quality/` | coverage, project-review, roast |
 | `commands/project/` | create-project-summary-stats, create-user-documentation, sync-progress, update-estimated-time-spent, update-progress |
@@ -95,10 +95,11 @@ All generators ask whether to install **globally** (this config repo, shared via
 ## Install options
 
 ```bash
-./install.sh              # Full install with MCP config
-./install.sh --skip-mcp   # Skip MCP (Nix handles it)
-./install.sh --dry-run    # Preview changes
-./install.sh --uninstall  # Remove symlinks
+./install.sh                # Full install (symlinks + tools + MCP config)
+./install.sh --skip-mcp     # Skip MCP (Nix handles it)
+./install.sh --skip-tools   # Skip CLI tools (yazi, bat, fd, etc.)
+./install.sh --dry-run      # Preview changes
+./install.sh --uninstall    # Remove symlinks
 ```
 
 The installer creates symlinks from `~/.claude/` to this repo for: `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `reference-docs/`, `docs/`, `settings.json`, `statusline-command.sh`, `keybindings.json`, and `hooks/`.
@@ -125,6 +126,42 @@ Running on [cmux](https://www.cmux.dev/) — native macOS terminal built on Ghos
 Skills with sidebar integration: `/brainstorm`, `/create-epic`, `/generate-epics`, `/fix-issue` (11-phase progress bar), `/build-stories` (per-story progress + parallel pane management).
 
 See [`docs/cmux-integration.md`](docs/cmux-integration.md) for full architecture and [`WORKFLOW-v2.md`](WORKFLOW-v2.md) for the enriched workflow.
+
+## CLI Tools (Yazi file manager & utilities)
+
+The install script can set up [Yazi](https://yazi-rs.github.io/) — a blazing-fast terminal file manager — along with supporting CLI tools. This lets you browse files and preview markdown without leaving cmux.
+
+### What gets installed
+
+| Tool | Purpose |
+|------|---------|
+| `yazi` | Terminal file manager with built-in previews |
+| `bat` | Syntax-highlighted file viewer (`bat file.py` instead of `cat`) |
+| `fd` | Fast `find` alternative, used by yazi for search |
+| `ripgrep` | Fast `grep` alternative, used by yazi for content search |
+| `fzf` | Fuzzy finder, used by yazi for interactive filtering |
+| `zoxide` | Smarter `cd` with frecency, used by yazi for jump-to-directory |
+| `ffmpeg` | Media preview support in yazi |
+| `imagemagick` | Image preview/conversion in yazi |
+| `poppler` | PDF preview in yazi |
+| `sevenzip` | Archive preview in yazi |
+| `jq` | JSON processing (used by install script and yazi) |
+| `font-symbols-only-nerd-font` | File icons in yazi |
+
+### What gets configured
+
+- **`~/.config/yazi/yazi.toml`** — Layout ratio `[1,2,5]` (wide preview pane), hidden files visible, dir-first sorting
+- **`~/.config/yazi/init.lua`** — Loads `full-border` and `git` plugins
+- **`~/.zshrc`** — Adds `y()` shell function (launches yazi, `cd`s to last directory on exit)
+
+### Usage
+
+```bash
+y              # Launch yazi in current directory
+y ~/projects   # Launch in a specific directory
+# Navigate with arrows/hjkl, preview files in right pane, q to quit
+# Shell automatically cd's to the last directory you browsed
+```
 
 ## MCP Servers
 
