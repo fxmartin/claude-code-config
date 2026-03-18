@@ -23,13 +23,14 @@ warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
 
 usage() {
-  echo "Usage: $0 [--uninstall] [--dry-run] [--skip-mcp]"
+  echo "Usage: $0 [--uninstall] [--dry-run] [--skip-mcp] [--skip-tools]"
   echo ""
   echo "Options:"
-  echo "  --uninstall   Remove symlinks created by this script"
-  echo "  --dry-run     Show what would be done without making changes"
-  echo "  --skip-mcp    Skip MCP config generation (useful on Nix-managed machines)"
-  echo "  --help        Show this help"
+  echo "  --uninstall    Remove symlinks created by this script"
+  echo "  --dry-run      Show what would be done without making changes"
+  echo "  --skip-mcp     Skip MCP config generation (useful on Nix-managed machines)"
+  echo "  --skip-tools   Skip CLI tools installation (yazi, bat, fd, etc.)"
+  echo "  --help         Show this help"
   exit 0
 }
 
@@ -37,13 +38,15 @@ usage() {
 UNINSTALL=false
 DRY_RUN=false
 SKIP_MCP=false
+SKIP_TOOLS=false
 for arg in "$@"; do
   case "$arg" in
-    --uninstall) UNINSTALL=true ;;
-    --dry-run)   DRY_RUN=true ;;
-    --skip-mcp)  SKIP_MCP=true ;;
-    --help)      usage ;;
-    *)           error "Unknown option: $arg"; usage ;;
+    --uninstall)   UNINSTALL=true ;;
+    --dry-run)     DRY_RUN=true ;;
+    --skip-mcp)    SKIP_MCP=true ;;
+    --skip-tools)  SKIP_TOOLS=true ;;
+    --help)        usage ;;
+    *)             error "Unknown option: $arg"; usage ;;
   esac
 done
 
@@ -149,6 +152,119 @@ create_symlink "$SCRIPT_DIR/reference-docs"            "$CLAUDE_DIR/reference-do
 create_symlink "$SCRIPT_DIR/docs"                     "$CLAUDE_DIR/docs"
 create_symlink "$SCRIPT_DIR/skills"                    "$CLAUDE_DIR/skills"
 create_symlink "$SCRIPT_DIR/hooks"                    "$CLAUDE_DIR/hooks"
+
+# ─── CLI Tools (Yazi + utilities) ────────────────────────────────────
+if $SKIP_TOOLS; then
+  warn "Skipping CLI tools (--skip-tools)"
+elif [ "$PLATFORM" != "macOS" ]; then
+  warn "CLI tools install is macOS-only (brew). Skipping on $PLATFORM."
+else
+  echo ""
+  echo "Installing CLI tools (yazi file manager & utilities)..."
+
+  BREW_PACKAGES=(
+    yazi        # Terminal file manager
+    bat         # Syntax-highlighted file viewer
+    fd          # Fast find alternative
+    ripgrep     # Fast grep alternative
+    fzf         # Fuzzy finder
+    zoxide      # Smarter cd with frecency
+    ffmpeg      # Media preview support
+    imagemagick # Image preview/conversion
+    poppler     # PDF preview
+    sevenzip    # Archive preview
+    jq          # JSON processing
+  )
+  BREW_CASKS=(
+    font-symbols-only-nerd-font  # File icons in yazi
+  )
+
+  if command -v brew &>/dev/null; then
+    run brew install "${BREW_PACKAGES[@]}"
+    run brew install --cask "${BREW_CASKS[@]}"
+    info "CLI tools installed"
+  else
+    warn "Homebrew not found — skipping CLI tools. Install from https://brew.sh"
+  fi
+
+  # Install yazi plugins
+  if command -v ya &>/dev/null; then
+    echo ""
+    echo "Installing yazi plugins..."
+    run ya pkg add yazi-rs/plugins:full-border
+    run ya pkg add yazi-rs/plugins:git
+    info "Yazi plugins installed"
+  fi
+
+  # Configure yazi
+  YAZI_DIR="$HOME/.config/yazi"
+  run mkdir -p "$YAZI_DIR"
+
+  if [ ! -f "$YAZI_DIR/yazi.toml" ] || $DRY_RUN; then
+    if ! $DRY_RUN; then
+      cat > "$YAZI_DIR/yazi.toml" << 'TOML'
+[mgr]
+ratio = [1, 2, 5]
+sort_by = "natural"
+sort_sensitive = false
+sort_reverse = false
+sort_dir_first = true
+show_hidden = true
+show_symlink = true
+
+[preview]
+max_width = 1000
+max_height = 1000
+
+[opener]
+edit = [
+  { run = '$EDITOR %s', block = true, for = "unix" },
+]
+
+[plugin]
+TOML
+    fi
+    info "Created yazi.toml"
+  else
+    info "yazi.toml already exists — skipping"
+  fi
+
+  if [ ! -f "$YAZI_DIR/init.lua" ] || $DRY_RUN; then
+    if ! $DRY_RUN; then
+      cat > "$YAZI_DIR/init.lua" << 'LUA'
+-- full-border plugin
+require("full-border"):setup()
+
+-- git plugin
+require("git"):setup()
+LUA
+    fi
+    info "Created init.lua"
+  else
+    info "init.lua already exists — skipping"
+  fi
+
+  # Add y() shell function to .zshrc if not present
+  if ! grep -q 'function y()' "$HOME/.zshrc" 2>/dev/null; then
+    if ! $DRY_RUN; then
+      cat >> "$HOME/.zshrc" << 'ZSH'
+
+# Yazi file manager — cd to last browsed directory on exit
+function y() {
+  local tmp="$(mktemp -t "yazi-cwd.XXXXXX")" cwd
+  yazi "$@" --cwd-file="$tmp"
+  if cwd="$(command cat -- "$tmp")" && [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
+    builtin cd -- "$cwd"
+  fi
+  rm -f -- "$tmp"
+}
+ZSH
+    fi
+    info "Added y() function to ~/.zshrc"
+  else
+    info "y() function already in ~/.zshrc — skipping"
+  fi
+fi
 
 # ─── MCP Configuration ───────────────────────────────────────────────
 if $SKIP_MCP; then
