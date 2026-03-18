@@ -66,17 +66,22 @@ Determine `AGENT_TYPE` for the build agent:
 - If `pyproject.toml` or `requirements.txt` → `python-backend-engineer`
 - Otherwise → `general-purpose`
 
-### Telegram Notification: Fix Started
+### Notification: Fix Started
 
 ```bash
-bash -c 'source ~/.claude/config/.env 2>/dev/null && [ -n "$TELEGRAM_BOT_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"🔧 *Fix Issue Started*\nIssue: #[ISSUE_NUMBER]\nTime: $(TZ=Europe/Paris date +"%Y-%m-%d %H:%M:%S CET")\", \"parse_mode\": \"Markdown\"}" > /dev/null'
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Validating issue" --icon hammer --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.09 --label "Phase 1: Validate"'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "Fix Issue Started" "#[ISSUE_NUMBER] — [ISSUE_TITLE]"'
 ```
-
-If `TELEGRAM_BOT_TOKEN` is not set, skip silently — notifications are optional.
 
 Record `FIX_START_TIME` for duration tracking.
 
 ## Phase 2: Fetch Issue & Validate (DIRECT)
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Fetching issue" --icon hammer --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.18 --label "Phase 2: Fetch issue"'
+```
 
 ```bash
 gh issue view $ISSUE_NUMBER --json number,title,body,state,assignees,labels
@@ -90,6 +95,11 @@ gh issue view $ISSUE_NUMBER --json number,title,body,state,assignees,labels
 Extract: `ISSUE_NUMBER`, `ISSUE_TITLE`, `ISSUE_BODY`, `ISSUE_LABELS`.
 
 ## Phase 3: Investigation Agent (DISPATCHED — general-purpose, sonnet)
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Investigating" --icon hammer --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.27 --label "Phase 3: Investigate"'
+```
 
 Launch a `general-purpose` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/investigation-agent-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -108,6 +118,11 @@ If `INVESTIGATION_STATUS: BLOCKED` — print the reason and STOP.
 
 ## Phase 4: Build Agent (DISPATCHED — dynamic AGENT_TYPE, opus)
 
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Building fix" --icon hammer --color "#FF9500"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.36 --label "Phase 4: Build"'
+```
+
 Launch an agent with `subagent_type` set to `AGENT_TYPE` (detected in Phase 1) and model: **opus**, with the prompt from `${CLAUDE_SKILL_DIR}/build-agent-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
@@ -122,6 +137,11 @@ Launch an agent with `subagent_type` set to `AGENT_TYPE` (detected in Phase 1) a
 **If coverage enabled** (default): Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Phase 5.
 
 ## Phase 5: Coverage Gate (DISPATCHED — qa-expert, sonnet) — skip if `--skip-coverage`
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Coverage check" --icon hammer --color "#FF9500"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.45 --label "Phase 5: Coverage"'
+```
 
 Launch a `qa-expert` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -139,6 +159,11 @@ If the coverage agent fails entirely — proceed to Phase 8 (bugfix loop).
 
 ## Phase 6: Review Gate (DISPATCHED — senior-code-reviewer, opus)
 
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Code review" --icon hammer --color "#FF9500"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.64 --label "Phase 6: Review"'
+```
+
 Launch a `senior-code-reviewer` agent (model: **opus**) with the prompt from `${CLAUDE_SKILL_DIR}/review-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
@@ -151,6 +176,11 @@ Extract `APPROVAL_STATUS`, `REVIEW_SUMMARY`, and `FIXES_APPLIED` from the agent 
 If `APPROVAL_STATUS: CHANGES_NEEDED` persists after the review agent's fixes, proceed to Phase 8 (bugfix loop).
 
 ## Phase 7: E2E Gate (DISPATCHED — qa-expert, sonnet) — skip unless `--e2e-gate=block|warn`
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "E2E testing" --icon hammer --color "#FF9500"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.73 --label "Phase 7: E2E"'
+```
 
 Launch a `qa-expert` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/e2e-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -166,6 +196,11 @@ Handle result per `--e2e-gate` mode:
 If FAIL and not continuing, proceed to Phase 8 (bugfix loop).
 
 ## Phase 8: Bugfix Loop (on any gate failure — general-purpose, opus)
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Bugfix loop" --icon hammer --color "#FF3B30"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log warning "Gate failure — entering bugfix loop" --source fix-issue'
+```
 
 Launch a `general-purpose` agent (model: **opus**) with the prompt from `${CLAUDE_SKILL_DIR}/bugfix-agent-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -190,6 +225,11 @@ Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER` (sub-issue), `FIX_STATUS`, `TESTS_PAS
 
 ## Phase 9: Merge Agent (DISPATCHED — general-purpose, haiku)
 
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Merging" --icon hammer --color "#34C759"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.82 --label "Phase 9: Merge"'
+```
+
 Once all gates pass, launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAUDE_SKILL_DIR}/merge-agent-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
@@ -202,6 +242,11 @@ Extract `MERGE_STATUS` from the agent result.
 If `MERGE_STATUS: CONFLICT` or `MERGE_STATUS: FAILED` — log error and STOP.
 
 ## Phase 10: Summary Agent (DISPATCHED — general-purpose, haiku)
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Summarizing" --icon hammer --color "#34C759"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.91 --label "Phase 10: Summary"'
+```
 
 Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAUDE_SKILL_DIR}/summary-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -230,14 +275,16 @@ The agent produces a formatted markdown summary.
 
 Print the formatted summary returned by the summary agent.
 
-### Telegram Notification: Fix Complete
+### Notification: Fix Complete
 
 ```bash
-bash -c 'source ~/.claude/config/.env 2>/dev/null && [ -n "$TELEGRAM_BOT_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"[EMOJI] *Fix Issue Complete*\nIssue: #[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]\nTime: $(TZ=Europe/Paris date +"%Y-%m-%d %H:%M:%S CET")\", \"parse_mode\": \"Markdown\"}" > /dev/null'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 1.0 --label "Complete"'
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Complete" --icon sparkle --color "#34C759"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "Fix complete: #[ISSUE_NUMBER] — [ISSUE_TITLE]" --source fix-issue'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Fix Issue Complete" "#[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]"'
 ```
 
 - Use `✅` if all gates passed cleanly, `⚠️` if any gate had warnings
-- If `TELEGRAM_BOT_TOKEN` is not set, skip silently
 
 ### Batch Loop (if `next --limit=N`)
 

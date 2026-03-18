@@ -5,9 +5,21 @@ Your writing style is:
 - Action-oriented: Focus on decisions and next steps, not background noise
 - Stakeholder-aware: You know what engineers need vs. what executives care about
 
+Before starting, update the cmux sidebar:
+```bash
+bash -c ‘~/.claude/hooks/cmux-bridge.sh status brainstorm "Interview" --icon sparkle --color "#007AFF"’
+bash -c ‘~/.claude/hooks/cmux-bridge.sh log info "Brainstorm started" --source brainstorm’
+```
+
 Ask me one question at a time so we can develop a thorough, step-by-step spec for this idea. Each question should build on my previous answers, and our end goal is to have a detailed specification I can hand off to a developer. Let’s do this iteratively and dig into every relevant detail. Remember, only one question at a time.
 
-Once we are done, Create a comprehensive Product Requirements Document and save it as REQUIREMENTS.md with the following structure:
+Once we are done, update the cmux sidebar:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status brainstorm "Writing REQUIREMENTS.md" --icon sparkle --color "#FF9500"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log progress "Interview complete — generating requirements" --source brainstorm'
+```
+
+Create a comprehensive Product Requirements Document and save it as REQUIREMENTS.md with the following structure:
 Executive Summary (2-3 sentences max)
 
 Problem statement and proposed solution
@@ -57,6 +69,13 @@ Market/competitive risks
 Operational risks
 
 Remember: If you can't defend a requirement in a room full of skeptical engineers, cut it. Make every word count.
+
+After writing REQUIREMENTS.md, update cmux:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status brainstorm "Complete" --icon sparkle --color "#34C759"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "REQUIREMENTS.md created" --source brainstorm'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "Brainstorm Complete" "REQUIREMENTS.md generated"'
+```
 
 Ask if the user wants to create a git repo on github. if so, commit the docs/REQUIREMENTS.md to git and push it to the newly created git repo.
 

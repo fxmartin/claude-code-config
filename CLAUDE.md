@@ -38,7 +38,7 @@ claude /approve-requirements
 ### 2. Story Creation & Planning
 ```bash
 # Generate epics, features, and user stories from requirements
-claude /create-stories
+claude /generate-epics
 ```
 
 ### 3. Iterative Development
@@ -112,6 +112,30 @@ project/
     ├── epic-02-[epic-name].md
     ├── epic-03-[epic-name].md
     └── non-functional-requirements.md
+```
+
+## cmux Observability
+
+Running on **cmux** — native macOS terminal for multi-agent AI development. All workflow visibility is routed through `~/.claude/hooks/cmux-bridge.sh` which provides graceful degradation (silent no-op if cmux unavailable).
+
+### Automatic (via hooks in settings.json)
+- **SessionStart**: Renames workspace to repo/folder name, logs session start
+- **SubagentStart/Stop**: Status pills for running agents, desktop notifications on completion
+- **Stop**: Clears progress bar
+- **Notification (permission_prompt)**: Red "Permission Needed" pill + desktop alert
+
+### Per-Skill Sidebar Updates
+Skills call `cmux-bridge.sh` at phase boundaries for status pills, progress bars, sidebar logs, and desktop+Telegram notifications. Integrated skills: `/brainstorm`, `/create-epic`, `/generate-epics`, `/fix-issue`, `/build-stories`.
+
+### Bridge Subcommands
+```bash
+cmux-bridge.sh status <key> <text> [--icon name] [--color #hex]
+cmux-bridge.sh progress <0.0-1.0> [--label text]
+cmux-bridge.sh log <level> <message> [--source name]
+cmux-bridge.sh notify <title> <body>          # Desktop + Telegram fallback
+cmux-bridge.sh clear [key]
+cmux-bridge.sh pane-create <label> [direction] # Returns surface:N ref
+cmux-bridge.sh pane-close <surface:N>
 ```
 
 ## Integration Patterns

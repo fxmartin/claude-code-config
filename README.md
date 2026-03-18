@@ -27,15 +27,15 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 |------|-------------|
 | `CLAUDE.md` | Global instructions for Claude Code |
 | `agents/` | 12 custom agent definitions (flat) |
-| `skills/` | 7 skills (generators + approve-requirements, create-stories, resume-build-agents, claude-docs) |
+| `skills/` | 15 skills (generators, approve-requirements, generate-epics, create-epic, build-stories, fix-issue, resume-build-agents, claude-docs, and more) |
 | `commands/` | 17 slash commands organized into 6 categories |
 | `templates/` | Shared reference templates used by generator skills |
 | `reference-docs/` | Claude context references (python, source-control, containers) |
 | `docs/` | User-facing documentation |
-| `settings.json` | Settings (statusline, plugins) |
+| `settings.json` | Settings (statusline, plugins, cmux lifecycle hooks) |
 | `statusline-command.sh` | Statusline display script |
 | `keybindings.json` | Keyboard shortcuts |
-| `hooks/` | Hook configurations |
+| `hooks/` | cmux integration: bridge utility, lifecycle hooks (agent tracking, notifications, workspace rename) |
 | `mcp/config.template.json` | MCP server template (env var substitution) |
 
 ### Commands by category
@@ -43,7 +43,7 @@ On Nix-managed machines, this repo is consumed as a submodule at `config/claude-
 | Category | Commands |
 |----------|----------|
 | `commands/dev/` | brainstorm, create-todo |
-| `skills/` | approve-requirements, create-stories, resume-build-agents (converted from commands) |
+| `skills/` | approve-requirements, generate-epics, create-epic, build-stories, fix-issue, resume-build-agents, and more |
 | `commands/issues/` | create-issue, fix-github-issue |
 | `commands/quality/` | coverage, project-review, roast |
 | `commands/project/` | create-project-summary-stats, create-user-documentation, sync-progress, update-estimated-time-spent, update-progress |
@@ -108,6 +108,23 @@ The installer creates symlinks from `~/.claude/` to this repo for: `CLAUDE.md`, 
 See `.env.example`. Currently:
 
 - `BROWSER_PATH` — path to Chromium-based browser for Playwright MCP server
+
+## cmux Integration
+
+Running on [cmux](https://www.cmux.dev/) — native macOS terminal built on Ghostty for multi-agent AI development. The `hooks/` directory provides real-time sidebar integration:
+
+| Hook Script | Event | What it does |
+|------------|-------|-------------|
+| `cmux-bridge.sh` | — | Central utility: wraps all cmux CLI calls with graceful degradation + Telegram fallback |
+| `cmux-session-start.sh` | `SessionStart` | Renames workspace to repo/folder name, logs session start |
+| `cmux-agent-start.sh` | `SubagentStart` | Shows "Running: {agent}" status pill |
+| `cmux-agent-stop.sh` | `SubagentStop` | Clears pill, desktop notification with result excerpt |
+| `cmux-stop.sh` | `Stop` | Clears progress bar |
+| `cmux-permission.sh` | `Notification` | Red "Permission Needed" alert + desktop notification |
+
+Skills with sidebar integration: `/brainstorm`, `/create-epic`, `/generate-epics`, `/fix-issue` (11-phase progress bar), `/build-stories` (per-story progress + parallel pane management).
+
+See [`docs/cmux-integration.md`](docs/cmux-integration.md) for full architecture and [`WORKFLOW-v2.md`](WORKFLOW-v2.md) for the enriched workflow.
 
 ## MCP Servers
 

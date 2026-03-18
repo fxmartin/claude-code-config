@@ -59,16 +59,20 @@ Before dispatching any agents, verify the project's test suite is green on main:
    ```
    This prevents building stories on top of a broken baseline.
 
-### Telegram Notification: Build Started
+### Notification: Build Started (skip if `--dry-run`)
 
-Send a Telegram notification (skip if `--dry-run`):
 ```bash
-bash -c 'source ~/.claude/config/.env 2>/dev/null && [ -n "$TELEGRAM_BOT_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"🔨 *Build Stories Started*\nScope: [SCOPE]\nTime: $(TZ=Europe/Paris date +"%Y-%m-%d %H:%M:%S CET")\", \"parse_mode\": \"Markdown\"}" > /dev/null'
+bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Starting" --icon hammer --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.0 --label "Build Stories: [SCOPE]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "Build Stories Started" "Scope: [SCOPE]"'
 ```
 
-If `TELEGRAM_BOT_TOKEN` is not set, skip silently — notifications are optional.
-
 ## Phase 2: Dispatch Discovery Agent
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Discovering stories" --icon hammer --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "Discovery agent launched" --source build-stories'
+```
 
 Launch a `general-purpose` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/discovery-agent-prompt.md`, substituting:
 - `{{SCOPE}}` → parsed scope
@@ -115,11 +119,45 @@ When `--parallel` is enabled, organize the build queue into **dependency cohorts
 - **Post-build steps are always sequential**: coverage gate → review → merge happen one story at a time, even in parallel mode (to avoid merge conflicts)
 - If any story in a cohort fails, remaining cohorts still execute (failed story is marked FAILED, dependents become BLOCKED)
 
+**Workspace management for parallel cohorts:**
+
+Before launching each cohort, create split panes so each concurrent agent has visual separation in the cmux sidebar:
+
+```bash
+# Before launching cohort N (up to 3 agents), create split panes:
+# First agent uses the current pane. Additional agents get new splits.
+# Alternate right/down for a grid-like layout.
+
+# For agent 2 in cohort:
+SURFACE_2=$(bash -c '~/.claude/hooks/cmux-bridge.sh pane-create "Story [STORY_2_ID]" right')
+
+# For agent 3 in cohort:
+SURFACE_3=$(bash -c '~/.claude/hooks/cmux-bridge.sh pane-create "Story [STORY_3_ID]" down')
+
+# Each pane gets its own status pill:
+bash -c '~/.claude/hooks/cmux-bridge.sh status "story-[STORY_ID]" "Building" --icon hammer --color "#007AFF"'
+```
+
+After ALL agents in the cohort complete, close the extra panes:
+
+```bash
+# Close cohort panes (the original pane stays)
+bash -c '~/.claude/hooks/cmux-bridge.sh pane-close [SURFACE_2]'
+bash -c '~/.claude/hooks/cmux-bridge.sh pane-close [SURFACE_3]'
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "Cohort [N] complete: [COMPLETED]/[COHORT_SIZE] succeeded" --source build-stories'
+```
+
+Capture the `surface:N` refs returned by `pane-create` so they can be closed after the cohort finishes. If `pane-create` returns empty (cmux unavailable), skip pane management silently.
+
 **Dry-run with `--parallel`**: Show the cohort groupings in the display table with `--- Cohort N ---` separator rows.
 
 If `--parallel` is NOT set, fall through to the standard sequential Phase 5.
 
 ## Phase 5: Build Loop
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Building stories" --icon hammer --color "#FF9500"'
+```
 
 Record batch start time. Initialize progress file if this is a fresh run (not resume).
 
@@ -233,18 +271,28 @@ Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAU
 
 Parse the `MERGE_STATUS:` line from the result.
 
-### Step 5c2: Per-Story Telegram Notification
+### Step 5c2: Per-Story Notification
 
-After a story completes (success or failure), send a per-story progress notification:
+After a story completes (success or failure), update sidebar and notify:
 
 ```bash
-bash -c 'source ~/.claude/config/.env 2>/dev/null && [ -n "$TELEGRAM_BOT_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"[EMOJI] *Story [STORY_ID]*: [STORY_TITLE]\nStatus: [STATUS]\nPR: [PR_URL or N/A]\nProgress: [CURRENT]/[TOTAL] stories\", \"parse_mode\": \"Markdown\"}" > /dev/null'
+# Update progress bar: [CURRENT] / [TOTAL]
+bash -c '~/.claude/hooks/cmux-bridge.sh progress [CURRENT_FRACTION] --label "Story [CURRENT]/[TOTAL]"'
+
+# Per-story status pill (green=success, red=failure)
+bash -c '~/.claude/hooks/cmux-bridge.sh status "story-[STORY_ID]" "[STATUS]" --color "[#34C759 or #FF3B30]"'
+
+# Sidebar log
+bash -c '~/.claude/hooks/cmux-bridge.sh log [success|error] "Story [CURRENT]/[TOTAL]: [STORY_TITLE] — [STATUS]" --source build-stories'
+
+# Desktop + Telegram notification
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Story [STORY_ID]" "[STORY_TITLE]\nStatus: [STATUS]\nPR: [PR_URL or N/A]\nProgress: [CURRENT]/[TOTAL]"'
 ```
 
 - Use the appropriate emoji: `✅` for success, `❌` for failure, `⏭️` for skipped
 - `[CURRENT]` = number of stories processed so far (done + failed + skipped)
 - `[TOTAL]` = total stories in the queue
-- If `TELEGRAM_BOT_TOKEN` is not set, skip silently
+- `[CURRENT_FRACTION]` = `[CURRENT] / [TOTAL]` as a decimal (e.g., 3/12 = 0.25)
 
 ### Step 5d: Error Handling & Bugfix Loop (DIRECT + conditional agent)
 
@@ -328,16 +376,16 @@ Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAU
 
 Print the formatted summary returned by the summary agent.
 
-### Telegram Notification: Build Finished
+### Notification: Build Finished
 
-Send a Telegram notification with the build result:
 ```bash
-bash -c 'source ~/.claude/config/.env 2>/dev/null && [ -n "$TELEGRAM_BOT_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"✅ *Build Stories Finished*\nScope: [SCOPE]\nStories: [COMPLETED]/[TOTAL] completed, [FAILED] failed\nDuration: [DURATION]\nTime: $(TZ=Europe/Paris date +"%Y-%m-%d %H:%M:%S CET")\", \"parse_mode\": \"Markdown\"}" > /dev/null'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 1.0 --label "Build Complete"'
+bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Complete" --icon sparkle --color "#34C759"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "Build finished: [COMPLETED]/[TOTAL] completed, [FAILED] failed" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nStories: [COMPLETED]/[TOTAL] completed, [FAILED] failed\nDuration: [DURATION]"'
 ```
 
-Substitute `[COMPLETED]`, `[TOTAL]`, `[FAILED]`, and `[DURATION]` from the summary agent results. If any stories failed, use ⚠️ instead of ✅ in the message.
-
-If `TELEGRAM_BOT_TOKEN` is not set, skip silently.
+Substitute `[COMPLETED]`, `[TOTAL]`, `[FAILED]`, and `[DURATION]` from the summary agent results. If any stories failed, use `⚠️` instead of `✅` for `[EMOJI]`.
 
 ## Context Budget Rules
 
