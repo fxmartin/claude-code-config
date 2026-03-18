@@ -72,6 +72,7 @@ Determine `AGENT_TYPE` for the build agent:
 bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Validating issue" --icon hammer --color "#007AFF"'
 bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.09 --label "Phase 1: Validate"'
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "Fix Issue Started" "#[ISSUE_NUMBER] — [ISSUE_TITLE]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "🔧 Fix Issue Started" "#[ISSUE_NUMBER] — [ISSUE_TITLE]"'
 ```
 
 Record `FIX_START_TIME` for duration tracking.
@@ -282,6 +283,7 @@ bash -c '~/.claude/hooks/cmux-bridge.sh progress 1.0 --label "Complete"'
 bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Complete" --icon sparkle --color "#34C759"'
 bash -c '~/.claude/hooks/cmux-bridge.sh log success "Fix complete: #[ISSUE_NUMBER] — [ISSUE_TITLE]" --source fix-issue'
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Fix Issue Complete" "#[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Fix Issue Complete" "#[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]"'
 ```
 
 - Use `✅` if all gates passed cleanly, `⚠️` if any gate had warnings

@@ -7,12 +7,11 @@ set -euo pipefail
 
 # Graceful degradation: if cmux isn't available or socket is down, silently exit
 if ! command -v cmux &>/dev/null || [ -z "${CMUX_SOCKET_PATH:-}" ]; then
-    # Still handle notify → Telegram fallback even without cmux
-    if [ "${1:-}" = "notify" ]; then
+    # Still handle telegram subcommand even without cmux
+    if [ "${1:-}" = "telegram" ]; then
         shift
         TITLE="${1:-Notification}"
         BODY="${2:-}"
-        # Telegram fallback
         source ~/.claude/config/.env 2>/dev/null || true
         if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -48,12 +47,15 @@ case "$SUBCOMMAND" in
         cmux log --level "$LEVEL" "$@" -- "$MESSAGE" 2>/dev/null || true
         ;;
     notify)
-        # notify <title> <body>
+        # notify <title> <body> — desktop only
         TITLE="${1:-Notification}"
         BODY="${2:-}"
-        # cmux desktop notification
         cmux notify --title "$TITLE" --body "$BODY" 2>/dev/null || true
-        # Telegram fallback
+        ;;
+    telegram)
+        # telegram <title> <body> — Telegram only, for long-running autonomous skills
+        TITLE="${1:-Notification}"
+        BODY="${2:-}"
         source ~/.claude/config/.env 2>/dev/null || true
         if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \

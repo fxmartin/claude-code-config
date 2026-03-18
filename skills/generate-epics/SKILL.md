@@ -40,6 +40,7 @@ bash -c '~/.claude/hooks/cmux-bridge.sh log progress "Requirements analyzed — 
 bash -c '~/.claude/hooks/cmux-bridge.sh status generate-epics "Complete" --icon sparkle --color "#34C759"'
 bash -c '~/.claude/hooks/cmux-bridge.sh log success "Stories generated" --source generate-epics'
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "Stories Created" "STORIES.md + epic files generated"'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "✅ Stories Created" "STORIES.md + epic files generated"'
 ```
 
 ## Output Structure

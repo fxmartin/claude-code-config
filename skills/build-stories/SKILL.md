@@ -65,6 +65,7 @@ Before dispatching any agents, verify the project's test suite is green on main:
 bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Starting" --icon hammer --color "#007AFF"'
 bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.0 --label "Build Stories: [SCOPE]"'
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "Build Stories Started" "Scope: [SCOPE]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "🔨 Build Stories Started" "Scope: [SCOPE]"'
 ```
 
 ## Phase 2: Dispatch Discovery Agent
@@ -285,8 +286,9 @@ bash -c '~/.claude/hooks/cmux-bridge.sh status "story-[STORY_ID]" "[STATUS]" --c
 # Sidebar log
 bash -c '~/.claude/hooks/cmux-bridge.sh log [success|error] "Story [CURRENT]/[TOTAL]: [STORY_TITLE] — [STATUS]" --source build-stories'
 
-# Desktop + Telegram notification
+# Desktop notification + Telegram per-story progress
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Story [STORY_ID]" "[STORY_TITLE]\nStatus: [STATUS]\nPR: [PR_URL or N/A]\nProgress: [CURRENT]/[TOTAL]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Story [STORY_ID]" "[STORY_TITLE]\nStatus: [STATUS]\nPR: [PR_URL or N/A]\nProgress: [CURRENT]/[TOTAL]"'
 ```
 
 - Use the appropriate emoji: `✅` for success, `❌` for failure, `⏭️` for skipped
@@ -383,6 +385,7 @@ bash -c '~/.claude/hooks/cmux-bridge.sh progress 1.0 --label "Build Complete"'
 bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Complete" --icon sparkle --color "#34C759"'
 bash -c '~/.claude/hooks/cmux-bridge.sh log success "Build finished: [COMPLETED]/[TOTAL] completed, [FAILED] failed" --source build-stories'
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nStories: [COMPLETED]/[TOTAL] completed, [FAILED] failed\nDuration: [DURATION]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nStories: [COMPLETED]/[TOTAL] completed, [FAILED] failed\nDuration: [DURATION]"'
 ```
 
 Substitute `[COMPLETED]`, `[TOTAL]`, `[FAILED]`, and `[DURATION]` from the summary agent results. If any stories failed, use `⚠️` instead of `✅` for `[EMOJI]`.

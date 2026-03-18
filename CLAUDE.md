@@ -132,7 +132,8 @@ Skills call `cmux-bridge.sh` at phase boundaries for status pills, progress bars
 cmux-bridge.sh status <key> <text> [--icon name] [--color #hex]
 cmux-bridge.sh progress <0.0-1.0> [--label text]
 cmux-bridge.sh log <level> <message> [--source name]
-cmux-bridge.sh notify <title> <body>          # Desktop + Telegram fallback
+cmux-bridge.sh notify <title> <body>          # Desktop only
+cmux-bridge.sh telegram <title> <body>        # Telegram only (autonomous skills)
 cmux-bridge.sh clear [key]
 cmux-bridge.sh pane-create <label> [direction] # Returns surface:N ref
 cmux-bridge.sh pane-close <surface:N>
@@ -161,6 +162,24 @@ cmux-bridge.sh pane-close <surface:N>
 - Clear, structured responses with actionable insights
 - ALWAYS ask for clarification rather than making assumptions.
 - If you're having trouble with something, it's ok to stop and ask for help. Especially if it's something your human might be better at.
+
+## CLI Tools — Prefer installed utilities over builtins
+The following tools are installed and SHOULD be used via Bash when the built-in Claude Code tools (Read, Grep, Glob, Edit) are insufficient or when working in shell scripts, pipelines, or subagents:
+
+| Instead of | Use | Why |
+|------------|-----|-----|
+| `find` | `fd` | Faster, respects `.gitignore`, sane defaults. E.g. `fd '\.py$'` instead of `find . -name '*.py'` |
+| `grep` / `rg` (via Bash) | `rg` (ripgrep) | Already installed — use when Grep tool can't cover the need (e.g. complex piped workflows) |
+| `cat` (for reading) | `bat` | Syntax highlighting, line numbers, git integration. E.g. `bat src/main.ts` |
+| `cd` (manual navigation) | `zoxide` (`z`) | Jump to frecent directories. E.g. `z myproject` instead of `cd ~/dev/long/path/myproject` |
+| Interactive file selection | `fzf` | Pipe any list into `fzf` for interactive filtering. E.g. `fd '\.ts$' \| fzf` |
+| `ls -la` for file browsing | `yazi` (`y`) | Full terminal file manager with previews. Available as `y` shell function |
+| `jq` for JSON | `jq` | Installed — use for JSON processing in shell pipelines |
+
+**Rules:**
+- Prefer Claude Code's built-in tools (Read, Grep, Glob, Edit) for direct file operations — they give the user better visibility
+- Use these CLI tools via Bash when you need shell pipelines, complex filtering, or when the built-in tools are too limited
+- In shell scripts and automation, always use `fd`/`rg`/`bat`/`jq` over legacy alternatives
 
 ## GitHub Operations — Use `gh` CLI (NOT MCP)
 - **Always use `gh` CLI** for all GitHub operations (issues, PRs, releases, API calls)
