@@ -244,6 +244,59 @@ LUA
     info "init.lua already exists — skipping"
   fi
 
+  # Add dev() shell function to .zshrc if not present
+  if ! grep -q 'function dev()' "$HOME/.zshrc" 2>/dev/null; then
+    if ! $DRY_RUN; then
+      cat >> "$HOME/.zshrc" << 'ZSH'
+
+# cmux dev workspace — opens 3 workspaces: claude/shell | terminal | yazi
+function dev() {
+  local dir="${1:-.}"
+  dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo "Invalid directory: $1"; return 1; }
+  local is_repo=false
+  git -C "$dir" rev-parse --is-inside-work-tree &>/dev/null && is_repo=true
+
+  # Workspace 1 — claude code (if repo) or plain terminal
+  local ws1_out
+  ws1_out="$(cmux new-workspace --cwd "$dir" 2>&1)" || { echo "Failed to open cmux workspace"; return 1; }
+  local ws1_ref
+  ws1_ref="$(echo "$ws1_out" | grep -oE 'workspace:[0-9]+')"
+  if $is_repo; then
+    sleep 0.3
+    cmux send --workspace "$ws1_ref" "claude\n"
+  fi
+
+  # Workspace 2 — pure terminal, renamed "terminal"
+  sleep 0.3
+  local ws2_out
+  ws2_out="$(cmux new-workspace --cwd "$dir" 2>&1)"
+  local ws2_ref
+  ws2_ref="$(echo "$ws2_out" | grep -oE 'workspace:[0-9]+')"
+  if [ -n "$ws2_ref" ]; then
+    cmux rename-workspace "$ws2_ref" "terminal"
+  fi
+
+  # Workspace 3 — yazi file manager
+  sleep 0.3
+  local ws3_out
+  ws3_out="$(cmux new-workspace --cwd "$dir" 2>&1)"
+  local ws3_ref
+  ws3_ref="$(echo "$ws3_out" | grep -oE 'workspace:[0-9]+')"
+  if [ -n "$ws3_ref" ]; then
+    cmux send --workspace "$ws3_ref" "yazi\n"
+  fi
+
+  # Focus back on workspace 1
+  sleep 0.3
+  [ -n "$ws1_ref" ] && cmux focus --workspace "$ws1_ref"
+}
+ZSH
+    fi
+    info "Added dev() function to ~/.zshrc"
+  else
+    info "dev() function already in ~/.zshrc — skipping"
+  fi
+
   # Add y() shell function to .zshrc if not present
   if ! grep -q 'function y()' "$HOME/.zshrc" 2>/dev/null; then
     if ! $DRY_RUN; then
