@@ -80,6 +80,7 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 
 ## Reference Materials
 - **Python**: `docs/python-best-practices.md`
+- **Database**: `docs/database-best-practices.md`
 - **Containers**: `docs/container-best-practices.md`
 - **Testing & TDD**: `docs/testing-best-practices.md`
 - **Source Control**: `@~/.claude/reference-docs/source-control.md`
