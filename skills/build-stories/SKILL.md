@@ -9,6 +9,26 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 
 You are a **thin dispatcher** orchestrator. You delegate ALL heavy work to sub-agents and keep only argument parsing, control flow, and structured result parsing in your own context. This preserves your context window across 20+ story builds.
 
+## Sidebar Notification Architecture
+
+Use exactly **2 status pill keys** throughout the entire run. Never create per-story keyed pills.
+
+| Key | Purpose | Lifecycle |
+|-----|---------|-----------|
+| `phase` | Current macro-phase (Preflight, Discovery, Building, Summarizing, Complete) | Overwritten at each phase transition |
+| `current` | Current sub-step (story ID + step name) | Overwritten at each sub-step, cleared at finish |
+
+**Notification channels:**
+- **`status`**: Real-time sidebar visibility (every phase/step transition)
+- **`progress`**: Global progress bar (updated per story)
+- **`log`**: Permanent sidebar ledger (every significant event)
+- **`notify`** (desktop): Milestones only — preflight failure, E2E gates, abort, finish
+- **`telegram`**: Envelope only — start, first failure, E2E failure, abort, finish
+
+**Orchestrator variables** (track across build loop):
+- `stories_processed` (counter) — for progress fraction
+- `first_failure_sent` (boolean) — gate Telegram to one failure alert per run
+
 ## Phase 1: Parse Arguments & Validate Environment (DIRECT)
 
 Parse `$ARGUMENTS` for:
@@ -28,8 +48,8 @@ Parse `$ARGUMENTS` for:
 Run these 5 quick validation checks directly (too trivial to delegate):
 
 ```bash
-# 1. Stories file exists
-ls STORIES.md docs/STORIES.md 2>/dev/null
+# 1. Stories file exists (use || true — ls returns non-zero if any path is missing)
+ls STORIES.md docs/STORIES.md 2>/dev/null || true
 # 2. Clean git state
 git status --porcelain
 # 3. On main branch
@@ -37,12 +57,27 @@ git branch --show-current
 # 4. Pull latest
 git pull
 # 5. GitHub CLI auth
-gh auth status
+gh auth status 2>&1
 ```
 
 Determine the progress file path: `docs/stories/.build-progress.md` (or `stories/.build-progress.md`).
 
+### Activate Skill Sentinel
+
+Write a sentinel file so cmux hooks suppress noisy behavior (agent pills, desktop notifications, progress clearing) while the skill manages its own sidebar:
+
+```bash
+echo "build-stories" > /tmp/.claude-skill-active
+```
+
+**Important:** This file MUST be removed on every exit path (finish, abort, preflight failure, discovery failure). See Phase 7 and error paths below.
+
 ### Pre-Flight Health Check (skip if `--skip-preflight`)
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Preflight" --icon shield --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "Preflight: validating environment" --source build-stories'
+```
 
 Before dispatching any agents, verify the project's test suite is green on main:
 
@@ -51,27 +86,36 @@ Before dispatching any agents, verify the project's test suite is green on main:
    - `pyproject.toml` → detect pytest → run `uv run pytest`
    - `Makefile` → check for `test` target → run `make test`
    - `bats` test files → run `bats test/`
-2. **Run tests**: Execute the detected test command
-3. **Fail-fast if red**: If tests fail on main before any stories are built, STOP with:
-   ```
-   PRE_FLIGHT_FAILURE: Test suite is failing on main — fix before running build-stories.
-   [test output excerpt]
-   ```
-   This prevents building stories on top of a broken baseline.
 
-### Notification: Build Started (skip if `--dry-run`)
+2. **Run tests** with sidebar visibility:
+   ```bash
+   bash -c '~/.claude/hooks/cmux-bridge.sh status current "Running test suite" --icon flask --color "#FF9500"'
+   bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.0 --label "Preflight: test suite"'
+   ```
+   Execute the detected test command.
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Starting" --icon hammer --color "#007AFF"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.0 --label "Build Stories: [SCOPE]"'
-bash -c '~/.claude/hooks/cmux-bridge.sh notify "Build Stories Started" "Scope: [SCOPE]"'
-bash -c '~/.claude/hooks/cmux-bridge.sh telegram "🔨 Build Stories Started" "Scope: [SCOPE]"'
-```
+3. **On success**:
+   ```bash
+   bash -c '~/.claude/hooks/cmux-bridge.sh clear current'
+   bash -c '~/.claude/hooks/cmux-bridge.sh log success "Preflight passed" --source build-stories'
+   ```
+
+4. **Fail-fast if red**: If tests fail on main before any stories are built:
+   ```bash
+   bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Preflight FAILED" --icon x.circle --color "#FF3B30"'
+   bash -c '~/.claude/hooks/cmux-bridge.sh clear current'
+   bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.0 --label "Preflight failed"'
+   bash -c '~/.claude/hooks/cmux-bridge.sh log error "Preflight failed: test suite red on main" --source build-stories'
+   bash -c '~/.claude/hooks/cmux-bridge.sh notify "Build Stories: Preflight Failed" "Test suite is failing on main. Fix before running."'
+   bash -c '~/.claude/hooks/cmux-bridge.sh telegram "Build Stories: Preflight Failed" "Test suite is red on main. Cannot proceed."'
+   rm -f /tmp/.claude-skill-active
+   ```
+   STOP with: `PRE_FLIGHT_FAILURE: Test suite is failing on main — fix before running build-stories.`
 
 ## Phase 2: Dispatch Discovery Agent
 
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Discovering stories" --icon hammer --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Discovery" --icon search --color "#007AFF"'
 bash -c '~/.claude/hooks/cmux-bridge.sh log info "Discovery agent launched" --source build-stories'
 ```
 
@@ -82,6 +126,20 @@ Launch a `general-purpose` agent (model: **sonnet**) with the prompt from `${CLA
 - `{{PROGRESS_FILE}}` → resolved progress file path
 
 The agent returns: a display table, blocked/completed lists, and a `QUEUE_JSON:` line.
+
+On success:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "Discovered [N] stories across [M] epics" --source build-stories'
+```
+
+On error:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Discovery FAILED" --icon x.circle --color "#FF3B30"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log error "Discovery failed: [reason]" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "Build Stories: Discovery Failed" "[reason]"'
+rm -f /tmp/.claude-skill-active
+```
+Print the error and STOP. No Telegram — discovery failures are config issues, user is at keyboard.
 
 ## Phase 3: Parse Queue (DIRECT)
 
@@ -102,7 +160,13 @@ Dependency integrity: if truncation would split a dependency pair (story A depen
 
 If `--dry-run` was specified:
 1. Print the display table from the discovery agent (it's already formatted)
-2. STOP — do not execute any builds
+2. Notify and STOP:
+   ```bash
+   bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Dry Run" --icon eye --color "#5856D6"'
+   bash -c '~/.claude/hooks/cmux-bridge.sh log info "Dry run: [N] stories queued (not building)" --source build-stories'
+   bash -c '~/.claude/hooks/cmux-bridge.sh clear phase'
+   rm -f /tmp/.claude-skill-active
+   ```
 
 ### Phase 4b: Parallel Scheduling (if `--parallel`)
 
@@ -122,30 +186,32 @@ When `--parallel` is enabled, organize the build queue into **dependency cohorts
 
 **Workspace management for parallel cohorts:**
 
-Before launching each cohort, create split panes so each concurrent agent has visual separation in the cmux sidebar:
+Before launching each cohort:
 
 ```bash
-# Before launching cohort N (up to 3 agents), create split panes:
+# Cohort-level status (overwrites `current`, no per-story pills)
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "Cohort [C]/[TC]: [K] stories" --icon layers --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "Cohort [C] started: [story IDs]" --source build-stories'
+
+# Split panes for concurrent agents (up to 3):
 # First agent uses the current pane. Additional agents get new splits.
-# Alternate right/down for a grid-like layout.
-
-# For agent 2 in cohort:
 SURFACE_2=$(bash -c '~/.claude/hooks/cmux-bridge.sh pane-create "Story [STORY_2_ID]" right')
-
-# For agent 3 in cohort:
 SURFACE_3=$(bash -c '~/.claude/hooks/cmux-bridge.sh pane-create "Story [STORY_3_ID]" down')
-
-# Each pane gets its own status pill:
-bash -c '~/.claude/hooks/cmux-bridge.sh status "story-[STORY_ID]" "Building" --icon hammer --color "#007AFF"'
 ```
 
-After ALL agents in the cohort complete, close the extra panes:
+After ALL agents in the cohort complete:
 
 ```bash
-# Close cohort panes (the original pane stays)
 bash -c '~/.claude/hooks/cmux-bridge.sh pane-close [SURFACE_2]'
 bash -c '~/.claude/hooks/cmux-bridge.sh pane-close [SURFACE_3]'
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "Cohort [N] complete: [COMPLETED]/[COHORT_SIZE] succeeded" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "Cohort [C] complete: [passed]/[K] succeeded" --source build-stories'
+# If any failed:
+bash -c '~/.claude/hooks/cmux-bridge.sh log error "Cohort [C]: [ID] failed, dependents blocked: [list]" --source build-stories'
+```
+
+Progress in parallel mode is updated per-cohort:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh progress [FRACTION] --label "Cohort [C]/[TC], Story [N]/[TOTAL]"'
 ```
 
 Capture the `surface:N` refs returned by `pane-create` so they can be closed after the cohort finishes. If `pane-create` returns empty (cmux unavailable), skip pane management silently.
@@ -157,14 +223,22 @@ If `--parallel` is NOT set, fall through to the standard sequential Phase 5.
 ## Phase 5: Build Loop
 
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Building stories" --icon hammer --color "#FF9500"'
+bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Building" --icon hammer --color "#FF9500"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.0 --label "Story 0/[TOTAL]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "Build started: [TOTAL] stories, scope=[SCOPE]" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "Build Stories Started" "Scope: [SCOPE]\nStories: [TOTAL]\nMode: [sequential|parallel]"'
 ```
 
-Record batch start time. Initialize progress file if this is a fresh run (not resume).
+Record batch start time. Initialize `stories_processed = 0` and `first_failure_sent = false`. Initialize progress file if this is a fresh run (not resume).
 
 **FOR EACH story in the queue:**
 
 ### Step 5a: Launch Build Agent
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "[ID] Building" --icon code --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress [FRACTION] --label "Story [N]/[TOTAL]: [ID]"'
+```
 
 Use the Agent tool with `subagent_type` set to the story's `agent_type` and model: **opus**. Include in the prompt:
 
@@ -224,6 +298,10 @@ Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Step 
 
 ### Step 5a2: Launch Coverage Gate Agent (skip if `--skip-coverage`)
 
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "[ID] Coverage" --icon flask --color "#5856D6"'
+```
+
 Launch a `qa-expert` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
 - `{{STORY_ID}}` → current story ID
 - `{{STORY_TITLE}}` → current story title
@@ -241,6 +319,10 @@ If `COVERAGE_STATUS: WARN` — log a warning but continue (coverage was best-eff
 If the coverage agent fails entirely — treat as a build failure (Step 5d error handling applies).
 
 ### Step 5b: Launch Review Agent
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "[ID] Review" --icon magnifier --color "#FF9500"'
+```
 
 ```
 Agent(subagent_type="senior-code-reviewer", model="opus", prompt="""
@@ -262,6 +344,10 @@ If `APPROVAL_STATUS: CHANGES_NEEDED` persists after review agent's fixes, treat 
 
 > Note: The PR was created by either the build agent (`--skip-coverage`) or the coverage agent (default).
 
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "[ID] Merging" --icon merge --color "#34C759"'
+```
+
 Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAUDE_SKILL_DIR}/merge-update-prompt.md`, substituting:
 - `{{STORY_ID}}` → current story ID
 - `{{STORY_TITLE}}` → current story title
@@ -272,29 +358,22 @@ Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAU
 
 Parse the `MERGE_STATUS:` line from the result.
 
-### Step 5c2: Per-Story Notification
+### Step 5c2: Per-Story Completion
 
-After a story completes (success or failure), update sidebar and notify:
+After a story completes, increment `stories_processed` and update the sidebar log:
 
+**On success:**
 ```bash
-# Update progress bar: [CURRENT] / [TOTAL]
-bash -c '~/.claude/hooks/cmux-bridge.sh progress [CURRENT_FRACTION] --label "Story [CURRENT]/[TOTAL]"'
-
-# Per-story status pill (green=success, red=failure)
-bash -c '~/.claude/hooks/cmux-bridge.sh status "story-[STORY_ID]" "[STATUS]" --color "[#34C759 or #FF3B30]"'
-
-# Sidebar log
-bash -c '~/.claude/hooks/cmux-bridge.sh log [success|error] "Story [CURRENT]/[TOTAL]: [STORY_TITLE] — [STATUS]" --source build-stories'
-
-# Desktop notification + Telegram per-story progress
-bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Story [STORY_ID]" "[STORY_TITLE]\nStatus: [STATUS]\nPR: [PR_URL or N/A]\nProgress: [CURRENT]/[TOTAL]"'
-bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Story [STORY_ID]" "[STORY_TITLE]\nStatus: [STATUS]\nPR: [PR_URL or N/A]\nProgress: [CURRENT]/[TOTAL]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "[N]/[TOTAL] [ID] [TITLE] -- PR #[PR]" --source build-stories'
 ```
 
-- Use the appropriate emoji: `✅` for success, `❌` for failure, `⏭️` for skipped
-- `[CURRENT]` = number of stories processed so far (done + failed + skipped)
-- `[TOTAL]` = total stories in the queue
-- `[CURRENT_FRACTION]` = `[CURRENT] / [TOTAL]` as a decimal (e.g., 3/12 = 0.25)
+**On failure:**
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "[ID] FAILED" --icon x.circle --color "#FF3B30"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log error "[N]/[TOTAL] [ID] [TITLE] -- [step] failed" --source build-stories'
+```
+
+No per-story desktop notifications. No per-story Telegram.
 
 ### Step 5d: Error Handling & Bugfix Loop (DIRECT + conditional agent)
 
@@ -307,6 +386,11 @@ Inspect the failure output from the failed step. If the failure involves **test 
 If the failure is clearly **infrastructure** (git error, network timeout, auth failure, tool crash) — skip to Step 5d3 (standard error handling).
 
 **Step 5d2: Launch Bugfix Agent**
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "[ID] Bugfix [1/2]" --icon wrench --color "#FF9500"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log warning "[ID] Bugfix attempt [1/2]: [FAILURE_CATEGORY]" --source build-stories'
+```
 
 Launch a `general-purpose` agent (model: **opus**) with the prompt from `${CLAUDE_SKILL_DIR}/bugfix-agent-prompt.md`, substituting:
 - `{{STORY_ID}}` → current story ID
@@ -325,7 +409,9 @@ The agent classifies the failure as **CODE_BUG**, **TEST_BUG**, or **ENV_ISSUE**
 Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER`, `FIX_STATUS`, `TESTS_PASSING`, `BUGS_FIXED`, and `TESTS_FIXED` from the agent result.
 
 - If `FIX_STATUS: FIXED` and `TESTS_PASSING: true`:
-  - Log: "Fixed ([FAILURE_CATEGORY]) — retrying from failed step"
+  - ```bash
+    bash -c '~/.claude/hooks/cmux-bridge.sh log success "[ID] Bugfix resolved: [FAILURE_CATEGORY], retrying from [step]" --source build-stories'
+    ```
   - If `ISSUE_NUMBER` is set: log "GH issue #[ISSUE_NUMBER] closed"
   - **Re-run from the step that failed** (not from Step 5a):
     - If build failed → re-run Step 5a
@@ -333,6 +419,9 @@ Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER`, `FIX_STATUS`, `TESTS_PASSING`, `BUGS
     - If review flagged test issues → re-run Step 5b
   - Allow **max 2 bugfix iterations** per story to prevent infinite loops
 - If `FIX_STATUS: UNFIXED`:
+  - ```bash
+    bash -c '~/.claude/hooks/cmux-bridge.sh log error "[ID] Bugfix exhausted after [N] attempts" --source build-stories'
+    ```
   - If `ISSUE_NUMBER` is set: log "Bug #[ISSUE_NUMBER] could not be auto-fixed — issue left open"
   - Fall through to Step 5d3
 - If `FIX_STATUS: N/A` (ENV_ISSUE that couldn't be resolved):
@@ -340,15 +429,35 @@ Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER`, `FIX_STATUS`, `TESTS_PASSING`, `BUGS
 
 **Step 5d3: Standard error handling**
 
+If `first_failure_sent` is false, send Telegram alert and flip to true:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "Build Stories: First Failure" "[ID] [TITLE]\nStep: [step]\nStory [N]/[TOTAL]\nBugfix: [attempted|skipped]"'
+```
+
 - If `--auto` flag: log failure, mark story FAILED in progress file, continue to next story
 - If no `--auto`: ask user: **retry** (re-run from Step 5a), **skip** (mark SKIPPED, continue), or **abort** (save progress, stop)
-- On abort: skip to Phase 6 for summary
+- On abort:
+  ```bash
+  bash -c '~/.claude/hooks/cmux-bridge.sh status phase "ABORTED" --icon stop --color "#FF3B30"'
+  bash -c '~/.claude/hooks/cmux-bridge.sh clear current'
+  bash -c '~/.claude/hooks/cmux-bridge.sh progress [FRACTION] --label "Aborted at story [N]/[TOTAL]"'
+  bash -c '~/.claude/hooks/cmux-bridge.sh log error "Build aborted by user at story [N]/[TOTAL]" --source build-stories'
+  bash -c '~/.claude/hooks/cmux-bridge.sh notify "Build Stories Aborted" "Stopped at [N]/[TOTAL]\nCompleted: [C], Failed: [F]"'
+  bash -c '~/.claude/hooks/cmux-bridge.sh telegram "Build Stories Aborted" "Stopped at story [N]/[TOTAL]\nCompleted: [C], Failed: [F]"'
+  rm -f /tmp/.claude-skill-active
+  ```
+  Skip to Phase 6 for summary.
 
 ### Step 5e: E2E Gate Check (DIRECT + conditional agent)
 
 After each successful story, check if this was the last story for its epic in the queue:
 - Compare `epic_id` of current story with remaining stories
 - If no more stories from this `epic_id` remain AND `--e2e-gate` is not `off`:
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "E2E: [EPIC_NAME]" --icon flask --color "#5856D6"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "E2E gate: epic [EPIC_ID] -- all stories merged, running tests" --source build-stories'
+```
 
 Read `${CLAUDE_SKILL_DIR}/e2e-gate.md` for the full logic, then launch:
 
@@ -363,11 +472,30 @@ Return: E2E_RESULT: PASS or E2E_RESULT: FAIL with summary.
 ```
 
 Handle result per `--e2e-gate` mode:
+
+**E2E PASS:**
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "E2E gate: epic [EPIC_ID] PASSED" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "E2E Gate Passed" "Epic [EPIC_ID]: [EPIC_NAME]"'
+```
+
+**E2E FAIL:**
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh log error "E2E gate: epic [EPIC_ID] FAILED" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "E2E Gate FAILED" "Epic [EPIC_ID]: [EPIC_NAME]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "E2E Gate Failed" "Epic [EPIC_ID]: [EPIC_NAME]\nMode: [block|warn]"'
+```
+
 - `block` + FAIL: if `--auto` treat as `warn`, otherwise ask user
 - `warn` + FAIL: log warning, continue
 - Record E2E gate result in progress file
 
 ## Phase 6: Dispatch Summary Agent
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Summarizing" --icon doc --color "#007AFF"'
+bash -c '~/.claude/hooks/cmux-bridge.sh clear current'
+```
 
 Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAUDE_SKILL_DIR}/summary-prompt.md`, substituting:
 - `{{PROGRESS_FILE}}` → progress file path
@@ -381,14 +509,16 @@ Print the formatted summary returned by the summary agent.
 ### Notification: Build Finished
 
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 1.0 --label "Build Complete"'
-bash -c '~/.claude/hooks/cmux-bridge.sh status build-stories "Complete" --icon sparkle --color "#34C759"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "Build finished: [COMPLETED]/[TOTAL] completed, [FAILED] failed" --source build-stories'
-bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nStories: [COMPLETED]/[TOTAL] completed, [FAILED] failed\nDuration: [DURATION]"'
-bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nStories: [COMPLETED]/[TOTAL] completed, [FAILED] failed\nDuration: [DURATION]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh clear current'
+bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Complete" --icon sparkle --color "#34C759"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 1.0 --label "Done: [COMPLETED]/[TOTAL]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "Build finished: [COMPLETED] done, [FAILED] failed, [SKIPPED] skipped, [DURATION]" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nDone: [COMPLETED]/[TOTAL]\nFailed: [FAILED]\nDuration: [DURATION]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nDone: [COMPLETED]/[TOTAL]\nFailed: [FAILED]\nDuration: [DURATION]"'
+rm -f /tmp/.claude-skill-active
 ```
 
-Substitute `[COMPLETED]`, `[TOTAL]`, `[FAILED]`, and `[DURATION]` from the summary agent results. If any stories failed, use `⚠️` instead of `✅` for `[EMOJI]`.
+Substitute `[COMPLETED]`, `[TOTAL]`, `[FAILED]`, `[SKIPPED]`, and `[DURATION]` from the summary agent results. If any stories failed, use `⚠️` instead of `✅` for `[EMOJI]`.
 
 ## Context Budget Rules
 

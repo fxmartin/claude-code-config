@@ -2,8 +2,8 @@
 name: fix-issue
 description: Fully autonomous issue fixer — thin orchestrator that delegates investigation, build, quality gates, merge, and summary to sub-agents.
 user-invocable: true
-disable-model-invocation: true
-argument-hint: "<issue-number|issue-url|next> [--confirm] [--skip-coverage] [--e2e-gate=block|warn|off] [--skip-e2e] [--auto] [--limit=N] [--coverage-threshold=N] [--skip-preflight]"
+disable-model-invocation: false
+argument-hint: "<issue-number|issue-url|next|all> [--skip-coverage] [--e2e-gate=warn|off] [--skip-e2e] [--limit=N] [--coverage-threshold=N] [--skip-preflight]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 ---
 
@@ -12,20 +12,23 @@ You are a **thin dispatcher** orchestrator. You delegate ALL heavy work to sub-a
 ## Phase 1: Parse Arguments & Validate Environment (DIRECT)
 
 Parse `$ARGUMENTS` for:
-- **Target**: issue number (e.g., `123`), issue URL (e.g., `https://github.com/owner/repo/issues/123`), or `next` (highest priority open bug)
+- **Target**: issue number (e.g., `123`), issue URL (e.g., `https://github.com/owner/repo/issues/123`), `next` (highest priority open bug), or `all`/`opened issues` (all open issues sequentially)
 - **Flags**:
-  - `--confirm` — stop after investigation for user approval before building
   - `--skip-coverage` — bypass coverage gate (build agent creates PR directly)
-  - `--e2e-gate=block|warn|off` — E2E test gate behavior (default: `off`)
+  - `--e2e-gate=warn|off` — E2E test gate behavior (default: `off`)
   - `--skip-e2e` — shorthand for `--e2e-gate=off`
-  - `--auto` — skip interactive prompts on failure
   - `--limit=N` — when using `next`, process up to N open bugs sequentially
   - `--coverage-threshold=N` — override the default 90% coverage threshold
   - `--skip-preflight` — skip the pre-flight health check
 
+**Removed flags** (fully autonomous mode — no user interaction):
+- `--confirm` is removed — always proceed autonomously after investigation
+- `--auto` is removed — autonomous behavior is now the default
+
 Extract the issue number from the argument:
 - If URL: extract number from path
 - If `next`: run `gh issue list --label bug --state open --limit 1 --json number,title -q '.[0]'` to get the highest priority open bug
+- If `all` or `opened issues`: run `gh issue list --state open --json number,title,labels --limit 50` to get all open issues, then process each sequentially (bugs first, then enhancements by priority)
 - If number: use directly
 
 Run these validation checks directly:
@@ -113,9 +116,7 @@ The agent investigates the codebase, finds the root cause, and produces a fix pl
 Extract from the agent result:
 - `ROOT_CAUSE`, `COMPLEXITY`, `FIX_APPROACH`, `FILES_TO_MODIFY`, `RISK`, `INVESTIGATION_STATUS`
 
-**If `--confirm` flag is set**: Print the investigation results as a structured plan and STOP for user approval before proceeding. Otherwise: continue autonomously.
-
-If `INVESTIGATION_STATUS: BLOCKED` — print the reason and STOP.
+If `INVESTIGATION_STATUS: BLOCKED` — log the reason, skip this issue, and continue to the next issue (if batch mode) or STOP (if single issue).
 
 ## Phase 4: Build Agent (DISPATCHED — dynamic AGENT_TYPE, opus)
 
@@ -190,11 +191,10 @@ Launch a `qa-expert` agent (model: **sonnet**) with the prompt from `${CLAUDE_SK
 - `{{BRANCH_NAME}}` → branch name
 
 Handle result per `--e2e-gate` mode:
-- `block` + FAIL: if `--auto` treat as `warn`, otherwise ask user: retry / continue / abort
-- `warn` + FAIL: log warning, continue
+- `warn` + FAIL: log warning, continue to next phase
 - PASS: continue
 
-If FAIL and not continuing, proceed to Phase 8 (bugfix loop).
+If FAIL with `--e2e-gate=warn`, log the failure and proceed (do not block).
 
 ## Phase 8: Bugfix Loop (on any gate failure — general-purpose, opus)
 
@@ -221,8 +221,7 @@ Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER` (sub-issue), `FIX_STATUS`, `TESTS_PAS
     - If E2E failed → re-run Phase 7
   - Allow **max 2 bugfix iterations** to prevent infinite loops
 - If `FIX_STATUS: UNFIXED`:
-  - If `--auto`: log failure and STOP
-  - Otherwise: ask user what to do
+  - Log the failure details and skip this issue (continue to next issue in batch mode, or STOP if single issue)
 
 ## Phase 9: Merge Agent (DISPATCHED — general-purpose, haiku)
 
@@ -288,13 +287,13 @@ bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Fix Issue Complete" "#
 
 - Use `✅` if all gates passed cleanly, `⚠️` if any gate had warnings
 
-### Batch Loop (if `next --limit=N`)
+### Batch Loop (if `next --limit=N` or `all`)
 
-If the original target was `next` and `--limit=N` was specified (N > 1):
-1. Decrement remaining count
-2. If remaining > 0: run `gh issue list --label bug --state open --limit 1 --json number,title -q '.[0]'` to get next open bug
-3. If an issue is found: loop back to Phase 2 with the new issue
-4. If no more issues: stop
+If the original target was `next --limit=N` or `all`/`opened issues`:
+1. After completing (or skipping) the current issue, move to the next issue in the queue
+2. Before each new issue: `git checkout main && git pull` to ensure clean state
+3. If more issues remain: loop back to Phase 2 with the next issue
+4. If no more issues: stop and print a batch summary of all issues processed (fixed / skipped / failed)
 
 ## Context Budget Rules
 
