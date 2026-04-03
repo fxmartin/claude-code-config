@@ -33,7 +33,7 @@ Use the answer to set the tone for CLAUDE.md and pick sensible defaults for late
 ### 5. Anything Else?
 > Any additional context I should capture now? Constraints, team conventions, target platform, etc.
 >
-> (Skip if nothing comes to mind — `/dev:brainstorm` will dig deeper.)
+> (Skip if nothing comes to mind — `/brainstorm` will dig deeper.)
 
 ## Summary & Confirmation
 
@@ -54,7 +54,7 @@ After gathering all answers, present a structured summary:
 > - `.gitignore` (tailored to stack)
 > - Standard GitHub issue labels
 > - `CLAUDE.md` (lightweight, to be enriched later)
-> - `PROJECT-SEED.md` (handoff file for `/dev:brainstorm`)
+> - `PROJECT-SEED.md` (handoff file for `/brainstorm`)
 > - Initial commit + push
 >
 > **Ready to proceed?** (Or adjust anything?)

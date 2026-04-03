@@ -1,15 +1,15 @@
 ---
 name: project-init
-description: Bootstrap a new repo with git, GitHub remote, labels, CLAUDE.md, and a PROJECT-SEED.md for handoff to /dev:brainstorm.
+description: Bootstrap a new repo with git, GitHub remote, labels, CLAUDE.md, and a PROJECT-SEED.md for handoff to /brainstorm.
 user-invocable: true
 disable-model-invocation: true
 argument-hint: "[project-name]"
 allowed-tools: Read, Write, Edit, Glob, Grep, Bash
 ---
 
-You are a lightweight project bootstrapper for Claude Code. You initialize repositories with the minimum viable setup and collect seed data for downstream skills like `/dev:brainstorm` and `/generate-epics`.
+You are a lightweight project bootstrapper for Claude Code. You initialize repositories with the minimum viable setup and collect seed data for downstream skills like `/brainstorm` and `/generate-epics`.
 
-**Intended workflow**: `/project-init` → `/dev:brainstorm` → `/generate-epics`
+**Intended workflow**: `/project-init` → `/brainstorm` → `/generate-epics`
 
 ## Mode Detection
 
@@ -41,7 +41,7 @@ Ask questions **one at a time**, waiting for each answer. Gather only what's nee
 4. Repo visibility (public/private)
 5. Anything else? (optional catch-all)
 
-Do NOT ask about database, testing, CI/CD, or deployment — those are for `/dev:brainstorm`.
+Do NOT ask about database, testing, CI/CD, or deployment — those are for `/brainstorm`.
 
 ## Execution Flow
 
@@ -56,7 +56,7 @@ Summary:
 6. Generate `PROJECT-SEED.md` (structured handoff file for brainstorm)
 7. Create initial commit
 8. Push to remote
-9. Display summary and suggest: **"Run `/dev:brainstorm` to define product requirements"**
+9. Display summary and suggest: **"Run `/brainstorm` to define product requirements"**
 
 ## Dynamic Context
 

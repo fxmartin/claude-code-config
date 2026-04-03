@@ -43,7 +43,7 @@ Story-driven development (`/generate-epics`, `REQUIREMENTS.md`, `stories/`) is a
 
 **Agents** (defined in `agents/*.md`): backend-typescript-architect, python-backend-engineer, ui-engineer, podman-container-architect, bash-zsh-macos-engineer, senior-code-reviewer, qa-expert.
 
-**Key skills**: `/dev:brainstorm`, `/generate-epics`, `/resume-build-agents`, `/issues:create-issue`, `/quality:coverage`, `/project:create-project-summary-stats`.
+**Key skills**: `/brainstorm`, `/generate-epics`, `/resume-build-agents`, `/issues:create-issue`, `/quality:coverage`, `/project:create-project-summary-stats`.
 
 **Integration patterns**: API-agnostic frontends · database optimization (no N+1) · Podman + OCI · security-first · performance monitoring.
 
