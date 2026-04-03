@@ -43,8 +43,37 @@ fi
 
 If rebase fails:
 - Output `MERGE_STATUS: REBASE_CONFLICT` with conflict details
-- Do NOT proceed to Step 1
+- Do NOT proceed to Step 0b
 - STOP here (orchestrator will route to bugfix agent)
+
+## Step 0b: Pre-Merge Full Test Suite
+
+After successful rebase, run the full test suite against the rebased branch to catch cross-story regressions:
+
+```bash
+# Ensure we're on the story branch for testing
+git fetch origin feature/{{STORY_ID}}
+git checkout feature/{{STORY_ID}}
+
+# Detect and run full test suite
+npm test 2>/dev/null || uv run pytest 2>/dev/null || make test 2>/dev/null || bats test/ 2>/dev/null
+TEST_EXIT=$?
+
+git checkout main
+
+if [ $TEST_EXIT -ne 0 ]; then
+  echo "MERGE_STATUS: PRE_MERGE_FAILURE"
+  echo "FAILURE_DETAILS: Full test suite failed after rebase onto main"
+  exit 1
+fi
+```
+
+If tests fail:
+- Output `MERGE_STATUS: PRE_MERGE_FAILURE` with failure details
+- Do NOT proceed to Step 1
+- STOP here (orchestrator will route to bugfix agent with FAILED_STEP: pre-merge)
+
+If no test suite is detected (all commands return "not found"), skip this step and proceed to merge.
 
 ## Step 1: Merge PR
 
@@ -97,6 +126,7 @@ Output exactly one of these status lines:
 
 - `MERGE_STATUS: SUCCESS` — merge, progress update, and DoD update all completed
 - `MERGE_STATUS: REBASE_CONFLICT` — branch could not be rebased onto updated main (parallel mode baseline drift)
+- `MERGE_STATUS: PRE_MERGE_FAILURE` — full test suite failed after rebase (regression detected before merge)
 - `MERGE_STATUS: CONFLICT` — PR could not merge due to conflicts
 - `MERGE_STATUS: FAILED` — PR merge failed for another reason (include error details on next line)
 

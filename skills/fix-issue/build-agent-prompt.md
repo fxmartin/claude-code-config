@@ -40,12 +40,24 @@ Beyond the reproduction test, add tests for:
 - Error conditions the fix should handle
 - Regression prevention
 
-### Step 5: Run Quality Gates
+### Step 5: Run Targeted Quality Gates
 
-Run all available quality checks:
+Run tests scoped to changed files only (fast feedback). The full suite runs at merge time.
+
 ```bash
-# Tests
+# 1. Identify changed files
+CHANGED_FILES=$(git diff --name-only main...HEAD)
+
+# 2. Run targeted tests based on project type
+# For JS/TS projects:
+npx jest --findRelatedTests $CHANGED_FILES 2>/dev/null || \
+# For Python projects:
+uv run pytest $(echo "$CHANGED_FILES" | grep '\.py$' | sed 's/src\//test_/;s/\.py$/.py/' | tr '\n' ' ') 2>/dev/null || \
+# Fallback: run full suite if targeted detection fails
 npm test || uv run pytest || make test
+```
+
+```bash
 # Type checking (if applicable)
 npx tsc --noEmit || uv run mypy . || true
 # Linting (if applicable)

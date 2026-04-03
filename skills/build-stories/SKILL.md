@@ -281,7 +281,14 @@ Agent(
   1. Create branch: git checkout -b feature/[ID]
   2. Read [EPIC_FILE] and find the full story section for [ID]
   3. Follow TDD: write failing tests first, then implement
-  4. Run all quality gates (tests, types, lint, security)
+  4. Run TARGETED quality gates (changed files only — full suite runs at merge time):
+     ```
+     CHANGED_FILES=$(git diff --name-only main...HEAD)
+     # JS/TS: npx jest --findRelatedTests $CHANGED_FILES
+     # Python: uv run pytest [mapped test files from changed sources]
+     # Fallback: npm test || uv run pytest || make test
+     ```
+     Also run type checking and linting as usual.
   5. Commit: feat([epic-name]): [story title] (#[ID])
   6. PUSH the branch (required for parallel mode):
      git push -u origin feature/[ID]
@@ -398,7 +405,14 @@ Before starting development, update the progress file at [PROGRESS_FILE]:
 1. Create branch: git checkout -b feature/[ID]
 2. Read [EPIC_FILE] and find the full story section for [ID]
 3. Follow TDD: write failing tests first, then implement
-4. Run all quality gates (tests, types, lint, security)
+4. Run TARGETED quality gates (changed files only — full suite runs at merge time):
+   ```
+   CHANGED_FILES=$(git diff --name-only main...HEAD)
+   # JS/TS: npx jest --findRelatedTests $CHANGED_FILES
+   # Python: uv run pytest [mapped test files from changed sources]
+   # Fallback: npm test || uv run pytest || make test
+   ```
+   Also run type checking and linting as usual.
 5. Commit: feat([epic-name]): [story title] (#[ID])
 6. Push and create PR:
    git push -u origin feature/[ID]
@@ -426,7 +440,14 @@ Before starting development, update the progress file at [PROGRESS_FILE]:
 1. Create branch: git checkout -b feature/[ID]
 2. Read [EPIC_FILE] and find the full story section for [ID]
 3. Follow TDD: write failing tests first, then implement
-4. Run all quality gates (tests, types, lint, security)
+4. Run TARGETED quality gates (changed files only — full suite runs at merge time):
+   ```
+   CHANGED_FILES=$(git diff --name-only main...HEAD)
+   # JS/TS: npx jest --findRelatedTests $CHANGED_FILES
+   # Python: uv run pytest [mapped test files from changed sources]
+   # Fallback: npm test || uv run pytest || make test
+   ```
+   Also run type checking and linting as usual.
 5. Commit locally: feat([epic-name]): [story title] (#[ID])
 6. DO NOT push or create a PR — the coverage agent handles that next.
 

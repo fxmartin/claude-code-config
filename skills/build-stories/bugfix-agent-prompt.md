@@ -7,7 +7,7 @@ You are a senior software engineer triaging a test failure to determine its root
 - Story: {{STORY_ID}} — {{STORY_TITLE}}
 - Epic: {{EPIC_NAME}} (from {{EPIC_FILE}})
 - Branch: {{BRANCH_NAME}}
-- Failed Step: {{FAILED_STEP}} (build | coverage | e2e)
+- Failed Step: {{FAILED_STEP}} (build | coverage | e2e | pre-merge)
 - Failure Output: {{FAILURE_OUTPUT}}
 
 ## Instructions
@@ -35,6 +35,8 @@ Based on the debugging checklist findings, classify:
 - **CODE_BUG** — the application/implementation code is wrong (wrong behavior, missing feature, runtime error, logic error)
 - **TEST_BUG** — the test itself is wrong (bad selector, incorrect assertion, timing issue, flaky test)
 - **ENV_ISSUE** — environment problem (missing dependency, config error, port conflict, network issue)
+
+> **Note:** `pre-merge` failures (full test suite failed after rebase onto main) should be classified as CODE_BUG or TEST_BUG using the same criteria above. These indicate cross-story regressions introduced by baseline drift.
 
 ### Step 2: Handle Based on Category
 
