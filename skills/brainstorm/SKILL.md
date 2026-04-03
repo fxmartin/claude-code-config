@@ -2,7 +2,7 @@
 name: brainstorm
 description: Senior PM persona — interview-driven requirements discovery that produces REQUIREMENTS.md. Integrates with project-init and generate-epics.
 user-invocable: true
-disable-model-invocation: false
+disable-model-invocation: true
 argument-hint: "[idea description]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 ---
