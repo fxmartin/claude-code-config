@@ -214,3 +214,11 @@ Show the user:
 - Number of labels created (base + project-specific)
 - Files created: `.gitignore`, `CLAUDE.md`, `PROJECT-SEED.md`
 - **Next step**: "Run `/brainstorm` to define product requirements. It will pick up your PROJECT-SEED.md automatically."
+
+> **⚠️ Session restart required**: Claude Code cached your git status before `git init` ran.
+> Exit and relaunch the session from this directory — then run `/brainstorm` to continue.
+> Your repo, remote, labels, and seed file are all in place.
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh notify "⚠️ Restart Session" "project-init complete — restart session before running /brainstorm" 2>/dev/null || true'
+```
