@@ -41,7 +41,7 @@ Parse `$ARGUMENTS` for:
   - `--skip-e2e` — shorthand for `--e2e-gate=off`
   - `--skip-coverage` — bypass the coverage gate (build agent creates PR directly)
   - `--limit=N` — build at most N stories from the queue (useful for incremental runs)
-  - `--parallel` — enable parallel story builds within dependency cohorts (max 3 concurrent agents)
+  - `--parallel` — enable parallel story builds within dependency cohorts using **git worktree isolation** (max 5 concurrent agents per stage)
   - `--coverage-threshold=N` — override the default 90% coverage threshold (e.g., `--coverage-threshold=80`)
   - `--skip-preflight` — skip the pre-flight health check (Step 1b)
 
@@ -168,9 +168,9 @@ If `--dry-run` was specified:
    rm -f /tmp/.claude-skill-active
    ```
 
-### Phase 4b: Parallel Scheduling (if `--parallel`)
+### Phase 4b: Parallel Worktree Scheduling (if `--parallel`)
 
-When `--parallel` is enabled, organize the build queue into **dependency cohorts** — groups of stories that can be built concurrently because they share no dependencies between them.
+When `--parallel` is enabled, organize the build queue into **dependency cohorts** and execute using **batch-per-stage parallelism with git worktree isolation**.
 
 **Cohort computation:**
 1. From the topologically sorted queue, identify stories whose dependencies are ALL already completed (or have no dependencies)
@@ -178,11 +178,33 @@ When `--parallel` is enabled, organize the build queue into **dependency cohorts
 3. Remove Cohort 1 from the queue, mark as "scheduled"
 4. Repeat: find stories whose remaining dependencies are all in completed cohorts → Cohort 2, etc.
 
+**Batch-per-stage execution model:**
+
+Each cohort runs through 4 stages. Stages 1-3 are parallel (up to 5 concurrent agents). Stage 4 is sequential.
+
+```
+Cohort N:
+  Stage 1: [build A, B, C, D, E] ← parallel, each in own worktree
+  Stage 2: [coverage A, B, C, D, E] ← parallel, each in own worktree
+  Stage 3: [review A, B, C, D, E] ← parallel, via gh CLI (no worktree)
+  Stage 4: [merge A → merge B → merge C → merge D → merge E] ← sequential, with rebase-before-merge
+```
+
+**Why worktrees:** Each build/coverage agent gets an isolated copy of the repo via `isolation: "worktree"` on the Agent tool. This prevents file conflicts between concurrent agents working on different stories. Worktrees share the same `.git` directory, so branches created in one worktree are visible to others.
+
+**Key rule — build agents ALWAYS push:** In parallel mode, even when coverage gate is enabled, the build agent must `git push -u origin feature/[ID]` before returning. This ensures the coverage agent (in a separate worktree) can `git fetch && git checkout feature/[ID]` to pick up the build work.
+
 **Execution rules:**
-- Launch up to **3 build agents concurrently** per cohort (agent tool supports parallel calls)
-- Wait for ALL agents in a cohort to complete before starting the next cohort
-- **Post-build steps are always sequential**: coverage gate → review → merge happen one story at a time, even in parallel mode (to avoid merge conflicts)
-- If any story in a cohort fails, remaining cohorts still execute (failed story is marked FAILED, dependents become BLOCKED)
+- Launch up to **5 agents concurrently** per stage within a cohort
+- Wait for ALL agents in a stage to complete before starting the next stage
+- **Stage 4 (merge) is always sequential** with rebase-before-merge to prevent conflicts
+- If any story fails in Stage 1-3, it is excluded from subsequent stages (marked FAILED, dependents become BLOCKED in future cohorts)
+- If any merge in Stage 4 fails after rebase, route to bugfix agent (same as sequential mode)
+
+**Progress tracking in parallel mode:**
+- The orchestrator tracks progress centrally — agents do NOT update the progress file
+- After each stage completes, the orchestrator updates the progress file for all stories in that batch
+- This prevents race conditions from concurrent agents writing to the same file
 
 **Workspace management for parallel cohorts:**
 
@@ -191,32 +213,35 @@ Before launching each cohort:
 ```bash
 # Cohort-level status (overwrites `current`, no per-story pills)
 bash -c '~/.claude/hooks/cmux-bridge.sh status current "Cohort [C]/[TC]: [K] stories" --icon layers --color "#007AFF"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log info "Cohort [C] started: [story IDs]" --source build-stories'
-
-# Split panes for concurrent agents (up to 3):
-# First agent uses the current pane. Additional agents get new splits.
-SURFACE_2=$(bash -c '~/.claude/hooks/cmux-bridge.sh pane-create "Story [STORY_2_ID]" right')
-SURFACE_3=$(bash -c '~/.claude/hooks/cmux-bridge.sh pane-create "Story [STORY_3_ID]" down')
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "Cohort [C] started: [story IDs] (worktree isolation)" --source build-stories'
 ```
 
-After ALL agents in the cohort complete:
+Before each stage within a cohort:
 
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh pane-close [SURFACE_2]'
-bash -c '~/.claude/hooks/cmux-bridge.sh pane-close [SURFACE_3]'
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "Cohort [C] Stage [S]: [stage-name] ([K] stories)" --icon [stage-icon] --color "[stage-color]"'
+```
+
+Stage icons and colors:
+- Stage 1 (Build): icon `code`, color `#007AFF`
+- Stage 2 (Coverage): icon `flask`, color `#5856D6`
+- Stage 3 (Review): icon `magnifier`, color `#FF9500`
+- Stage 4 (Merge): icon `merge`, color `#34C759`
+
+After ALL stages for the cohort complete:
+
+```bash
 bash -c '~/.claude/hooks/cmux-bridge.sh log success "Cohort [C] complete: [passed]/[K] succeeded" --source build-stories'
 # If any failed:
 bash -c '~/.claude/hooks/cmux-bridge.sh log error "Cohort [C]: [ID] failed, dependents blocked: [list]" --source build-stories'
 ```
 
-Progress in parallel mode is updated per-cohort:
+Progress in parallel mode is updated per-stage:
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh progress [FRACTION] --label "Cohort [C]/[TC], Story [N]/[TOTAL]"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress [FRACTION] --label "Cohort [C]/[TC], Stage [S]/4"'
 ```
 
-Capture the `surface:N` refs returned by `pane-create` so they can be closed after the cohort finishes. If `pane-create` returns empty (cmux unavailable), skip pane management silently.
-
-**Dry-run with `--parallel`**: Show the cohort groupings in the display table with `--- Cohort N ---` separator rows.
+**Dry-run with `--parallel`**: Show the cohort groupings in the display table with `--- Cohort N ---` separator rows and indicate worktree isolation will be used.
 
 If `--parallel` is NOT set, fall through to the standard sequential Phase 5.
 
@@ -230,6 +255,120 @@ bash -c '~/.claude/hooks/cmux-bridge.sh telegram "Build Stories Started" "Scope:
 ```
 
 Record batch start time. Initialize `stories_processed = 0` and `first_failure_sent = false`. Initialize progress file if this is a fresh run (not resume).
+
+---
+
+### Phase 5 — Parallel Worktree Mode (if `--parallel`)
+
+When `--parallel` is set, execute each cohort using batch-per-stage parallelism. **FOR EACH cohort** computed in Phase 4b:
+
+#### Parallel Stage 1: Build (concurrent, worktree-isolated)
+
+Launch up to 5 build agents concurrently **in a single message with multiple Agent tool calls**, each with `isolation: "worktree"`:
+
+```
+Agent(
+  subagent_type=[story.agent_type],
+  model="opus",
+  isolation="worktree",
+  prompt="""
+  You are building story [ID]: [TITLE]
+
+  Epic: [EPIC_NAME] (from [EPIC_FILE])
+  Priority: [PRIORITY]
+
+  ## Instructions
+  1. Create branch: git checkout -b feature/[ID]
+  2. Read [EPIC_FILE] and find the full story section for [ID]
+  3. Follow TDD: write failing tests first, then implement
+  4. Run all quality gates (tests, types, lint, security)
+  5. Commit: feat([epic-name]): [story title] (#[ID])
+  6. PUSH the branch (required for parallel mode):
+     git push -u origin feature/[ID]
+
+  Return BRANCH_NAME: feature/[ID] and BUILD_STATUS: SUCCESS when done.
+  If failed, return BUILD_STATUS: FAILED with error details.
+  """
+)
+```
+
+After all build agents return, collect results. For each `BUILD_STATUS: FAILED`, mark story FAILED and exclude from subsequent stages. Update progress file centrally:
+- Mark successful builds as IN_PROGRESS (branch pushed)
+- Mark failed builds as FAILED
+
+#### Parallel Stage 2: Coverage Gate (concurrent, worktree-isolated)
+
+Skip if `--skip-coverage`. For each successfully built story, launch coverage agents concurrently with `isolation: "worktree"`:
+
+```
+Agent(
+  subagent_type="qa-expert",
+  model="sonnet",
+  isolation="worktree",
+  prompt="""
+  [coverage-gate-prompt.md with substitutions]
+  NOTE: The branch {{BRANCH_NAME}} has been pushed to remote. Start by fetching and checking it out:
+    git fetch origin
+    git checkout {{BRANCH_NAME}}
+  Then proceed with coverage analysis.
+  """
+)
+```
+
+Each coverage agent fetches the story's branch (pushed in Stage 1), adds tests, pushes, and creates the PR. Collect PR_NUMBER and COVERAGE_PCT from all agents.
+
+If `--skip-coverage`: The build agents already pushed branches. Launch PR creation in parallel (or combine into Stage 3).
+
+#### Parallel Stage 3: Review (concurrent, no worktree needed)
+
+Launch review agents concurrently **in a single message** (no `isolation` needed — reviews use `gh` CLI only):
+
+```
+Agent(
+  subagent_type="senior-code-reviewer",
+  model="opus",
+  prompt="""
+  Review the PR for story [ID]: [TITLE]
+  1. gh pr view [PR_NUMBER]
+  2. gh pr diff [PR_NUMBER]
+  3. Check: architecture, security, performance, test coverage, code quality
+  4. If changes needed: checkout branch, fix, commit, push, re-review
+  5. When satisfied: gh pr review [PR_NUMBER] --approve
+  Return APPROVAL_STATUS: APPROVED or APPROVAL_STATUS: CHANGES_NEEDED
+  """
+)
+```
+
+Collect results. Stories with `CHANGES_NEEDED` that persisted after the review agent's fixes are marked FAILED.
+
+#### Parallel Stage 4: Merge (SEQUENTIAL, with rebase-before-merge)
+
+For each approved story **one at a time, in topological order**:
+
+Launch the merge agent with the prompt from `${CLAUDE_SKILL_DIR}/merge-update-prompt.md`. The merge agent now includes a **rebase-before-merge step** to handle baseline drift from earlier merges in this stage (see updated merge-update-prompt.md).
+
+After each merge:
+- Update progress file centrally: mark story DONE, record PR number and completion time
+- Increment `stories_processed`
+- Log success/failure per Step 5c2
+
+If merge fails (conflict after rebase):
+- Route to bugfix agent (Step 5d applies)
+- If bugfix resolves it, retry the merge
+- If not, mark FAILED, continue to next story
+
+After all stories in the cohort are processed, proceed to next cohort.
+
+**Error handling in parallel mode:**
+- Build failures (Stage 1): Mark FAILED immediately, exclude from Stages 2-4
+- Coverage failures (Stage 2): Route to bugfix agent per Step 5d (one at a time)
+- Review failures (Stage 3): Mark FAILED, exclude from Stage 4
+- Merge failures (Stage 4): Rebase + retry, then bugfix agent if needed
+- Telegram alert: sent on first failure across all stages (same `first_failure_sent` gate)
+
+---
+
+### Phase 5 — Sequential Mode (default, no `--parallel`)
 
 **FOR EACH story in the queue:**
 
@@ -270,7 +409,7 @@ Return PR_NUMBER: [number] and PR_URL: [url] when done.
 
 Extract `PR_NUMBER` from the agent result. Skip Step 5a2.
 
-**If coverage gate is enabled** (default — build agent commits locally only):
+**If coverage gate is enabled** (default — build agent commits locally only in sequential mode):
 
 ```
 You are building story [ID]: [TITLE]
@@ -293,6 +432,8 @@ Before starting development, update the progress file at [PROGRESS_FILE]:
 
 Return BRANCH_NAME: feature/[ID] and BUILD_STATUS: SUCCESS when done.
 ```
+
+> **Note:** In `--parallel` mode, the build agent prompt differs — see Phase 5 Parallel Worktree Mode above. The parallel build agent always pushes the branch so that the coverage agent (in a separate worktree) can access it.
 
 Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Step 5a2.
 
@@ -501,6 +642,35 @@ Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAU
 - `{{PROGRESS_FILE}}` → progress file path
 - `{{CLAUDE_SKILL_DIR}}` → `${CLAUDE_SKILL_DIR}`
 - `{{BATCH_START}}` → recorded batch start time
+
+## Phase 6b: Dispatch Documentation Update Agent
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status phase "Updating Docs" --icon pencil --color "#5856D6"'
+bash -c '~/.claude/hooks/cmux-bridge.sh status current "README + story docs" --icon doc --color "#5856D6"'
+```
+
+If at least one story completed successfully, launch a `general-purpose` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/doc-update-prompt.md`, substituting:
+- `{{PROGRESS_FILE}}` → progress file path
+- `{{SCOPE}}` → parsed scope
+- `{{COMPLETED_STORIES}}` → comma-separated list of completed story IDs and titles from this run
+- `{{COMPLETED_PRS}}` → comma-separated list of PR numbers merged in this run
+
+The agent reviews what changed across all merged stories and updates documentation in a single pass, avoiding the per-merge overhead.
+
+On success:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "Documentation updated for [N] merged stories" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh clear current'
+```
+
+On failure (non-blocking — doc update failures should not fail the build):
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh log warning "Documentation update failed — manual review needed" --source build-stories'
+bash -c '~/.claude/hooks/cmux-bridge.sh clear current'
+```
+
+If no stories completed successfully, skip this phase entirely.
 
 ## Phase 7: Print Report & Notify (DIRECT)
 

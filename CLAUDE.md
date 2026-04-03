@@ -63,6 +63,9 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 | Interactive file selection | `fzf` | Pipe any list into `fzf` for interactive filtering. E.g. `fd '\.ts$' \| fzf` |
 | `ls -la` for file browsing | `yazi` (`y`) | Full terminal file manager with previews. Available as `y` shell function |
 | `jq` for JSON | `jq` | Installed — use for JSON processing in shell pipelines |
+| PDF text/info extraction | `pdftotext`, `pdfinfo` | Poppler utils — extract text, metadata, images from PDFs. E.g. `pdftotext doc.pdf -` for stdout |
+| `wc -l`, manual LOC counting | `scc` | Fast code counter with complexity and COCOMO estimates. **Always use `scc` for any LOC counting task.** E.g. `scc .` or `scc src/` |
+| PDF generation (`reportlab`, `weasyprint`, etc.) | `typst` | Modern typesetting → PDF. **Always use `typst` for PDF generation.** Write a `.typ` file then `typst compile file.typ`. No Python libs or venvs needed |
 
 **Rules:**
 - Prefer Claude Code's built-in tools (Read, Grep, Glob, Edit) for direct file operations — they give the user better visibility

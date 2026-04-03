@@ -3,7 +3,7 @@ name: fix-issue
 description: Fully autonomous issue fixer — thin orchestrator that delegates investigation, build, quality gates, merge, and summary to sub-agents.
 user-invocable: true
 disable-model-invocation: false
-argument-hint: "<issue-number|issue-url|next|all> [--skip-coverage] [--e2e-gate=warn|off] [--skip-e2e] [--limit=N] [--coverage-threshold=N] [--skip-preflight]"
+argument-hint: "<issue-number|issue-url|next|all> [--skip-coverage] [--e2e-gate=warn|off] [--skip-e2e] [--limit=N] [--coverage-threshold=N] [--skip-preflight] [--sequential]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 ---
 
@@ -20,6 +20,7 @@ Parse `$ARGUMENTS` for:
   - `--limit=N` — when using `next`, process up to N open bugs sequentially
   - `--coverage-threshold=N` — override the default 90% coverage threshold
   - `--skip-preflight` — skip the pre-flight health check
+  - `--sequential` — disable parallel mode and process issues one at a time (batch mode only). By default, batch mode (`all`, `next --limit=N`) uses **parallel worktree isolation** — issues with overlapping files are serialized; independent issues run concurrently (max 5 agents per stage). Use `--sequential` to force the old one-at-a-time behavior.
 
 **Removed flags** (fully autonomous mode — no user interaction):
 - `--confirm` is removed — always proceed autonomously after investigation
@@ -28,7 +29,7 @@ Parse `$ARGUMENTS` for:
 Extract the issue number from the argument:
 - If URL: extract number from path
 - If `next`: run `gh issue list --label bug --state open --limit 1 --json number,title -q '.[0]'` to get the highest priority open bug
-- If `all` or `opened issues`: run `gh issue list --state open --json number,title,labels --limit 50` to get all open issues, then process each sequentially (bugs first, then enhancements by priority)
+- If `all` or `opened issues`: run `gh issue list --state open --json number,title,labels --limit 50` to get all open issues, then process using parallel worktree mode (bugs first, then enhancements by priority). Use `--sequential` to force one-at-a-time processing.
 - If number: use directly
 
 Run these validation checks directly:
@@ -271,6 +272,34 @@ Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAU
 
 The agent produces a formatted markdown summary.
 
+## Phase 10b: Documentation Update (DISPATCHED — general-purpose, sonnet) — batch mode only
+
+In batch mode (when multiple issues were fixed), update documentation once after all issues are processed:
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Updating docs" --icon pencil --color "#5856D6"'
+bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.95 --label "Phase 10b: Docs"'
+```
+
+If at least one issue was fixed successfully, launch a `general-purpose` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/doc-update-prompt.md`, substituting:
+- `{{SCOPE}}` → batch scope description (e.g., "all open issues" or "next 5 bugs")
+- `{{COMPLETED_ISSUES}}` → comma-separated list of fixed issue numbers and titles
+- `{{COMPLETED_PRS}}` → comma-separated list of merged PR numbers
+
+The agent reviews all fixes and updates README + story docs in a single pass. **Non-blocking** — if it fails, the batch still reports success.
+
+On success:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "Documentation updated for [N] fixed issues" --source fix-issue'
+```
+
+On failure:
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh log warning "Documentation update failed — manual review needed" --source fix-issue'
+```
+
+Skip this phase entirely for single-issue fixes (the PostToolUse hook handles those).
+
 ## Phase 11: Print & Notify (DIRECT)
 
 Print the formatted summary returned by the summary agent.
@@ -287,13 +316,147 @@ bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Fix Issue Complete" "#
 
 - Use `✅` if all gates passed cleanly, `⚠️` if any gate had warnings
 
-### Batch Loop (if `next --limit=N` or `all`)
+### Batch Loop — Sequential (if `next --limit=N` or `all`, WITH `--sequential`)
 
-If the original target was `next --limit=N` or `all`/`opened issues`:
+If the original target was `next --limit=N` or `all`/`opened issues` and `--sequential` is set:
 1. After completing (or skipping) the current issue, move to the next issue in the queue
 2. Before each new issue: `git checkout main && git pull` to ensure clean state
 3. If more issues remain: loop back to Phase 2 with the next issue
 4. If no more issues: stop and print a batch summary of all issues processed (fixed / skipped / failed)
+
+---
+
+### Batch Loop — Parallel Worktree Mode (DEFAULT for `next --limit=N` or `all`)
+
+In batch mode (default, unless `--sequential` is set), issues are processed using **batch-per-stage parallelism with git worktree isolation and a file-overlap guard**.
+
+#### Phase P1: Fetch & Investigate All Issues in Parallel
+
+1. **Fetch all issues** (DIRECT): Run `gh issue list` to get the full batch, then fetch metadata for each issue (Phase 2 logic) sequentially — this is fast and low-cost.
+
+2. **Investigate all issues in parallel**: Launch up to 5 investigation agents concurrently (no worktree needed — read-only):
+
+```
+Agent(subagent_type="general-purpose", model="sonnet", prompt="""
+[investigation-agent-prompt.md with substitutions for issue A]
+""")
+// + same for issues B, C, D, E — all in a single message
+```
+
+Collect `ROOT_CAUSE`, `FILES_TO_MODIFY`, `INVESTIGATION_STATUS` from each. Remove any `BLOCKED` issues from the batch.
+
+#### Phase P2: File-Overlap Guard (DIRECT)
+
+Compare `FILES_TO_MODIFY` across all investigated issues to detect potential merge conflicts:
+
+```
+Issue #42: src/auth/login.ts, src/auth/session.ts
+Issue #57: src/api/routes.ts, src/utils/logger.ts
+Issue #63: src/auth/login.ts, src/auth/middleware.ts  ← overlaps with #42!
+Issue #71: tests/e2e/checkout.spec.ts
+```
+
+**Grouping algorithm:**
+1. Build an undirected graph: issues are nodes, edges connect issues that share at least one file
+2. Connected components become **serial groups** — issues within a group must be processed sequentially
+3. Independent groups (no shared files) can run in parallel
+
+From the example above:
+- **Parallel Group A**: Issue #42, then Issue #63 (serialized — shared `src/auth/login.ts`)
+- **Parallel Group B**: Issue #57 (independent)
+- **Parallel Group C**: Issue #71 (independent)
+
+Groups A, B, and C run their stages concurrently. Within Group A, #42 completes fully before #63 starts.
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "Parallel batch: [N] issues in [G] groups ([S] serialized due to file overlap)" --source fix-issue'
+```
+
+#### Phase P3: Parallel Build (concurrent, worktree-isolated)
+
+For all issues that can run concurrently (one per group), launch build agents with `isolation: "worktree"`:
+
+```
+Agent(
+  subagent_type=[AGENT_TYPE],
+  model="opus",
+  isolation="worktree",
+  prompt="""
+  [build-agent-prompt.md with substitutions]
+  IMPORTANT: Push the branch before returning:
+    git push -u origin fix/issue-{{ISSUE_NUMBER}}-[slug]
+  Return BRANCH_NAME and BUILD_STATUS.
+  """
+)
+```
+
+**Key rule:** In parallel mode, build agents ALWAYS push the branch (even when coverage gate is enabled), so coverage agents in separate worktrees can access it.
+
+#### Phase P4: Parallel Coverage (concurrent, worktree-isolated)
+
+Skip if `--skip-coverage`. For each successfully built issue, launch coverage agents concurrently with `isolation: "worktree"`:
+
+```
+Agent(
+  subagent_type="qa-expert",
+  model="sonnet",
+  isolation="worktree",
+  prompt="""
+  [coverage-gate-prompt.md with substitutions]
+  NOTE: Branch {{BRANCH_NAME}} has been pushed. Start by:
+    git fetch origin
+    git checkout {{BRANCH_NAME}}
+  """
+)
+```
+
+#### Phase P5: Parallel Review (concurrent, no worktree)
+
+Launch review agents concurrently (they use `gh` CLI, no worktree needed):
+
+```
+Agent(subagent_type="senior-code-reviewer", model="opus", prompt="""
+[review-gate-prompt.md with substitutions for each issue]
+""")
+```
+
+#### Phase P6: Parallel E2E (concurrent, worktree-isolated) — if enabled
+
+Launch E2E agents concurrently with `isolation: "worktree"` (each needs to checkout the PR branch to run Playwright).
+
+#### Phase P7: Sequential Merge (with rebase-before-merge)
+
+For each approved issue **one at a time**:
+
+Launch the merge agent with `${CLAUDE_SKILL_DIR}/merge-agent-prompt.md`. The merge agent includes a **rebase-before-merge step** to handle baseline drift from earlier merges.
+
+After each merge:
+- Log success/failure
+- If this completes a serial group (e.g., #42 done in Group A), the next issue in that group (#63) can now start from Phase P3 in the next round
+- Increment counters for batch summary
+
+#### Phase P8: Serial Group Continuation
+
+If any serial groups have remaining issues after the first round:
+1. Loop back to Phase P3 for the next issue in each serial group
+2. Independent issues that completed in round 1 are done
+3. Continue until all serial groups are exhausted
+
+#### Error Handling in Parallel Mode
+
+- Investigation failures (Phase P1): Remove issue from batch, continue
+- Build failures (Phase P3): Mark FAILED, exclude from subsequent stages. Route to bugfix agent (one at a time) if the failure is code/test related. Allow max 2 bugfix iterations.
+- Coverage/Review/E2E failures: Same as sequential mode — bugfix loop applies per issue
+- Merge conflicts (Phase P7): Rebase + retry, then bugfix if needed
+- First failure triggers Telegram alert (same gate as sequential)
+
+#### Progress Tracking in Parallel Mode
+
+The orchestrator tracks progress centrally — agents do NOT update any shared progress files. Progress notifications update per-stage:
+
+```bash
+bash -c '~/.claude/hooks/cmux-bridge.sh progress [FRACTION] --label "Stage [S]: [stage-name] ([N] issues)"'
+```
 
 ## Context Budget Rules
 

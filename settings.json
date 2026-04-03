@@ -58,6 +58,16 @@
             "command": "~/.claude/hooks/cmux-permission-clear.sh"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(gh pr merge *)",
+            "command": "~/.claude/hooks/on-pr-merge-docs.sh"
+          }
+        ]
       }
     ],
     "Notification": [
