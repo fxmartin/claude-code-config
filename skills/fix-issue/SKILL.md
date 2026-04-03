@@ -208,7 +208,7 @@ Launch a `general-purpose` agent (model: **opus**) with the prompt from `${CLAUD
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
 - `{{BRANCH_NAME}}` → the fix branch
-- `{{FAILED_STEP}}` → which phase failed (build | coverage | review | e2e)
+- `{{FAILED_STEP}}` → which phase failed (build | coverage | review | e2e | pre-merge)
 - `{{FAILURE_OUTPUT}}` → the error/failure text from the failed agent
 
 Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER` (sub-issue), `FIX_STATUS`, `TESTS_PASSING` from the agent result.
@@ -220,6 +220,7 @@ Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER` (sub-issue), `FIX_STATUS`, `TESTS_PAS
     - If coverage failed → re-run Phase 5
     - If review flagged issues → re-run Phase 6
     - If E2E failed → re-run Phase 7
+    - If pre-merge failed → re-run Phase 9 (merge agent will re-rebase and re-run full suite)
   - Allow **max 2 bugfix iterations** to prevent infinite loops
 - If `FIX_STATUS: UNFIXED`:
   - Log the failure details and skip this issue (continue to next issue in batch mode, or STOP if single issue)
@@ -240,6 +241,8 @@ The agent merges the PR, comments on and closes the issue, returns to main.
 
 Extract `MERGE_STATUS` from the agent result.
 
+If `MERGE_STATUS: PRE_MERGE_FAILURE` — route to Phase 8 (bugfix loop) with `FAILED_STEP: pre-merge`.
+If `MERGE_STATUS: REBASE_CONFLICT` — route to Phase 8 (bugfix loop) with `FAILED_STEP: pre-merge`.
 If `MERGE_STATUS: CONFLICT` or `MERGE_STATUS: FAILED` — log error and STOP.
 
 ## Phase 10: Summary Agent (DISPATCHED — general-purpose, haiku)

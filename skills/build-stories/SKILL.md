@@ -520,6 +520,8 @@ Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAU
 
 Parse the `MERGE_STATUS:` line from the result.
 
+If `MERGE_STATUS: PRE_MERGE_FAILURE` or `MERGE_STATUS: REBASE_CONFLICT` — route to Step 5d (bugfix loop) with `FAILED_STEP: pre-merge`.
+
 ### Step 5c2: Per-Story Completion
 
 After a story completes, increment `stories_processed` and update the sidebar log:
@@ -539,7 +541,7 @@ No per-story desktop notifications. No per-story Telegram.
 
 ### Step 5d: Error Handling & Bugfix Loop (DIRECT + conditional agent)
 
-If build, coverage, review, or merge failed:
+If build, coverage, review, merge, or pre-merge failed:
 
 **Step 5d1: Detect test/code failure**
 
@@ -560,7 +562,7 @@ Launch a `general-purpose` agent (model: **opus**) with the prompt from `${CLAUD
 - `{{EPIC_NAME}}` → current epic name
 - `{{EPIC_FILE}}` → story's epic file path
 - `{{BRANCH_NAME}}` → the story's branch (`feature/[ID]`)
-- `{{FAILED_STEP}}` → which step failed (build | coverage | e2e)
+- `{{FAILED_STEP}}` → which step failed (build | coverage | e2e | pre-merge)
 - `{{FAILURE_OUTPUT}}` → the error/failure text from the failed agent
 
 The agent classifies the failure as **CODE_BUG**, **TEST_BUG**, or **ENV_ISSUE**:
@@ -579,6 +581,7 @@ Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER`, `FIX_STATUS`, `TESTS_PASSING`, `BUGS
     - If build failed → re-run Step 5a
     - If coverage failed → re-run Step 5a2
     - If review flagged test issues → re-run Step 5b
+    - If pre-merge failed → re-run Step 5c (merge agent will re-rebase and re-run full suite)
   - Allow **max 2 bugfix iterations** per story to prevent infinite loops
 - If `FIX_STATUS: UNFIXED`:
   - ```bash
