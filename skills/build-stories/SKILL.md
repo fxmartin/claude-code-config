@@ -3,7 +3,7 @@ name: build-stories
 description: Batch build all incomplete stories across epics — thin dispatcher that delegates all heavy work to sub-agents for maximum context efficiency.
 user-invocable: true
 disable-model-invocation: true
-argument-hint: "[all|resume|epic-NN|epic-name] [--dry-run] [--auto] [--skip-coverage] [--limit=N] [--parallel] [--coverage-threshold=N] [--skip-preflight]"
+argument-hint: "[all|resume|epic-NN|epic-name] [--dry-run] [--auto] [--skip-coverage] [--limit=N] [--sequential] [--coverage-threshold=N] [--skip-preflight]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 ---
 
@@ -41,7 +41,7 @@ Parse `$ARGUMENTS` for:
   - `--skip-e2e` — shorthand for `--e2e-gate=off`
   - `--skip-coverage` — bypass the coverage gate (build agent creates PR directly)
   - `--limit=N` — build at most N stories from the queue (useful for incremental runs)
-  - `--parallel` — enable parallel story builds within dependency cohorts using **git worktree isolation** (max 5 concurrent agents per stage)
+  - `--sequential` — disable parallel mode and build stories one at a time (default is parallel with git worktree isolation, max 5 concurrent agents per stage)
   - `--coverage-threshold=N` — override the default 90% coverage threshold (e.g., `--coverage-threshold=80`)
   - `--skip-preflight` — skip the pre-flight health check (Step 1b)
 
@@ -168,9 +168,9 @@ If `--dry-run` was specified:
    rm -f /tmp/.claude-skill-active
    ```
 
-### Phase 4b: Parallel Worktree Scheduling (if `--parallel`)
+### Phase 4b: Parallel Worktree Scheduling (default, skip if `--sequential`)
 
-When `--parallel` is enabled, organize the build queue into **dependency cohorts** and execute using **batch-per-stage parallelism with git worktree isolation**.
+Unless `--sequential` is set, organize the build queue into **dependency cohorts** and execute using **batch-per-stage parallelism with git worktree isolation**.
 
 **Cohort computation:**
 1. From the topologically sorted queue, identify stories whose dependencies are ALL already completed (or have no dependencies)
@@ -241,9 +241,9 @@ Progress in parallel mode is updated per-stage:
 bash -c '~/.claude/hooks/cmux-bridge.sh progress [FRACTION] --label "Cohort [C]/[TC], Stage [S]/4"'
 ```
 
-**Dry-run with `--parallel`**: Show the cohort groupings in the display table with `--- Cohort N ---` separator rows and indicate worktree isolation will be used.
+**Dry-run in parallel mode**: Show the cohort groupings in the display table with `--- Cohort N ---` separator rows and indicate worktree isolation will be used.
 
-If `--parallel` is NOT set, fall through to the standard sequential Phase 5.
+If `--sequential` is set, fall through to the standard sequential Phase 5.
 
 ## Phase 5: Build Loop
 
@@ -258,9 +258,9 @@ Record batch start time. Initialize `stories_processed = 0` and `first_failure_s
 
 ---
 
-### Phase 5 — Parallel Worktree Mode (if `--parallel`)
+### Phase 5 — Parallel Worktree Mode (default)
 
-When `--parallel` is set, execute each cohort using batch-per-stage parallelism. **FOR EACH cohort** computed in Phase 4b:
+In parallel mode (the default), execute each cohort using batch-per-stage parallelism. **FOR EACH cohort** computed in Phase 4b:
 
 #### Parallel Stage 1: Build (concurrent, worktree-isolated)
 
@@ -368,7 +368,7 @@ After all stories in the cohort are processed, proceed to next cohort.
 
 ---
 
-### Phase 5 — Sequential Mode (default, no `--parallel`)
+### Phase 5 — Sequential Mode (only if `--sequential`)
 
 **FOR EACH story in the queue:**
 
@@ -433,7 +433,7 @@ Before starting development, update the progress file at [PROGRESS_FILE]:
 Return BRANCH_NAME: feature/[ID] and BUILD_STATUS: SUCCESS when done.
 ```
 
-> **Note:** In `--parallel` mode, the build agent prompt differs — see Phase 5 Parallel Worktree Mode above. The parallel build agent always pushes the branch so that the coverage agent (in a separate worktree) can access it.
+> **Note:** In parallel mode (default), the build agent prompt differs — see Phase 5 Parallel Worktree Mode above. The parallel build agent always pushes the branch so that the coverage agent (in a separate worktree) can access it.
 
 Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Step 5a2.
 
