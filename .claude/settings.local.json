@@ -1,16 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls /Users/user/dev/claude-code-config/*.md)",
-      "Bash(npx --yes @mermaid-js/mermaid-cli --version)",
-      "Bash(npx --yes @mermaid-js/mermaid-cli -i /tmp/workflow-diagram.mmd -o ./workflow-diagram.png -b transparent -w 2400 -H 3200)",
-      "Bash(uv pip install reportlab Pillow)",
-      "Bash(uv pip install --system reportlab Pillow)",
-      "Bash(uv tool run --with reportlab --with Pillow python3 -c \"import reportlab; print\\(reportlab.Version\\)\")",
-      "Bash(uv tool run --with reportlab --with Pillow python3 /tmp/generate_workflow_pdf.py)",
-      "Bash(brew install poppler)",
-      "Bash(pdftoppm -v)",
-      "Bash(pdfinfo /Users/user/dev/claude-code-config/WORKFLOW.pdf)"
+      "WebFetch(domain:docs.anthropic.com)"
     ]
   }
 }
