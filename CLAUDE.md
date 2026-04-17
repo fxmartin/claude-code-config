@@ -93,6 +93,7 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 - The `gh` CLI is pre-authenticated and available in all dev shells
 
 ## Reference Materials
+- **CLAUDE.md guide**: `docs/claude-md-guide.md` — structure, guardrails, maintenance, and how this file itself is organized
 - **Python**: `docs/python-best-practices.md`
 - **Database**: `docs/database-best-practices.md`
 - **Containers**: `docs/container-best-practices.md`
