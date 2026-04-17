@@ -35,6 +35,6 @@ Merge all agent results into a unified report.
 - Skip unavailable metrics but note limitations
 
 ## Final Output
-Create a condensed `PROJECT-STATS.md` containing essential metrics only, scannable in under 30 seconds.
+Create a condensed `PROJECT-STATS.<YYYY-MM-DD>.md` (e.g. `PROJECT-STATS.2026-04-13.md`), where the date is the generation date in ISO format. Obtain it via `date +%Y-%m-%d` from the shell so the filename always reflects the actual run date. File contains essential metrics only, scannable in under 30 seconds. Do **not** overwrite prior dated files — each run produces a new dated snapshot so history is preserved alongside earlier runs.
 
 $ARGUMENTS
