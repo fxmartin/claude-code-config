@@ -104,6 +104,19 @@ Start and completion notifications are sent via `cmux-bridge.sh notify` (desktop
   - Per-story desktop + Telegram notifications
 - **Phase 7**: Progress 1.0, status "Complete"
 
+#### Subagent Event Schema
+
+Parallel cohort subagents emit structured `cmux-bridge.sh log` entries tagged with `--source story-<ID>` so the sidebar ledger shows interleaved per-agent progress. Each subagent's prompt includes a "Sidebar Ledger" addendum listing the events it must emit. Subagents check `$CMUX_SOCKET_PATH` before emitting — Claude Desktop sessions skip the calls.
+
+| Agent | Events (emission order) | Levels |
+|---|---|---|
+| build | `BUILD_STARTED`, `BRANCH_CREATED`, `TESTS_GREEN`, `BRANCH_PUSHED`, `BUILD_FAILED` | info / success / error |
+| coverage | `COVERAGE_STARTED`, `COVERAGE_MEASURED`, `TESTS_ADDED`, `SECURITY_SCANNED`, `PR_CREATED`, `COVERAGE_DONE` | info / success |
+| review | `REVIEW_STARTED`, `CHANGES_REQUESTED`, `APPROVED`, `REVIEW_FAILED` | info / warning / success / error |
+| merge | `MERGE_STARTED`, `REBASE_DONE`, `MERGED`, `DOD_UPDATED`, `MERGE_DONE`, `MERGE_FAILED` | info / success / error |
+
+Event format: `<EVENT> <story-id>: <human-readable tail>`. Filter by source tag (`story-<ID>`) to trace a single story's timeline across all four agents.
+
 ## Notification Flow
 
 All notifications now route through `cmux-bridge.sh notify`, which handles dual-channel delivery:
