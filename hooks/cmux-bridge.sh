@@ -72,35 +72,6 @@ case "$SUBCOMMAND" in
             cmux clear-progress 2>/dev/null || true
         fi
         ;;
-    pane-create)
-        # pane-create <label> [direction] — split a new pane, label it, print surface ref
-        # Usage: cmux-bridge.sh pane-create "Story 01.2-001" [right|down]
-        LABEL="${1:-agent}"
-        DIRECTION="${2:-right}"
-        OUTPUT=$(cmux new-split "$DIRECTION" 2>/dev/null) || exit 0
-        # Parse: "OK surface:N workspace:N"
-        SURFACE_REF=$(echo "$OUTPUT" | grep -oE 'surface:[0-9]+' | head -1)
-        if [ -n "$SURFACE_REF" ]; then
-            cmux rename-tab --surface "$SURFACE_REF" -- "$LABEL" >/dev/null 2>&1 || true
-            echo "$SURFACE_REF"
-        fi
-        ;;
-    pane-close)
-        # pane-close <surface-ref> — close a specific surface
-        # Usage: cmux-bridge.sh pane-close surface:4
-        SURFACE_REF="${1:-}"
-        if [ -n "$SURFACE_REF" ]; then
-            cmux close-surface --surface "$SURFACE_REF" >/dev/null 2>&1 || true
-        fi
-        ;;
-    pane-close-all)
-        # pane-close-all <surface-refs...> — close multiple surfaces
-        # Usage: cmux-bridge.sh pane-close-all surface:4 surface:5 surface:6
-        shift 0 || true
-        for REF in "$@"; do
-            cmux close-surface --surface "$REF" >/dev/null 2>&1 || true
-        done
-        ;;
     *)
         # Unknown subcommand — silently ignore
         ;;
