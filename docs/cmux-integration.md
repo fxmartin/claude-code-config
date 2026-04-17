@@ -10,7 +10,7 @@ This integration connects Claude Code's multi-agent orchestration system to cmux
 
 **Before**: Run `/fix-issue 42`, switch tabs, no feedback for 10-30 minutes. Permission prompts block silently. Telegram notification arrives at the end (if configured). Must scroll terminal to understand what happened.
 
-**After**: Sidebar status pill shows current phase. Progress bar advances through each stage. Sidebar logs show key milestones. Permission prompts trigger desktop notifications. Agent completion triggers desktop + Telegram. Parallel agents get dedicated split panes.
+**After**: Sidebar status pill shows current phase. Progress bar advances through each stage. Sidebar logs show key milestones. Permission prompts trigger desktop notifications. Agent completion triggers desktop + Telegram.
 
 ## Architecture
 
@@ -82,7 +82,7 @@ Each phase updates the sidebar progress bar and status pill:
 
 Start and completion notifications are sent via `cmux-bridge.sh notify` (desktop + Telegram).
 
-### `/build-stories` — Per-Story Progress + Parallel Panes
+### `/build-stories` — Per-Story Progress
 
 - **Phase 1**: Status pill "Starting", progress bar at 0.0
 - **Phase 2**: Status pill "Discovering stories"
@@ -126,7 +126,7 @@ No direct Telegram `curl` blocks remain in any skill except the dedicated `/tele
 |------|---------|
 | `settings.json` | Added `hooks` configuration block (5 event types) |
 | `skills/fix-issue/SKILL.md` | Added bridge calls at 11 phase boundaries, replaced 2 Telegram curl blocks |
-| `skills/build-stories/SKILL.md` | Added bridge calls at phase boundaries + per-story progress + parallel pane management, replaced 3 Telegram curl blocks |
+| `skills/build-stories/SKILL.md` | Added bridge calls at phase boundaries + per-story progress, replaced 3 Telegram curl blocks |
 
 ## Verification
 
