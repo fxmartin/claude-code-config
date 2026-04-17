@@ -290,6 +290,19 @@ Agent(
 
   Return BRANCH_NAME: feature/[ID] and BUILD_STATUS: SUCCESS when done.
   If failed, return BUILD_STATUS: FAILED with error details.
+
+  ## Sidebar Ledger
+  After each milestone, emit a structured log entry so the cmux sidebar shows parallel-agent progress. Only emit if $CMUX_SOCKET_PATH is set (same guard as the orchestrator preamble).
+
+  bash -c '~/.claude/hooks/cmux-bridge.sh log info "BUILD_STARTED [ID]: [TITLE]" --source story-[ID]'
+  # After git checkout -b succeeds:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log info "BRANCH_CREATED [ID]: feature/[ID]" --source story-[ID]'
+  # After all quality gates pass:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log success "TESTS_GREEN [ID]: all gates passed" --source story-[ID]'
+  # After git push succeeds:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log success "BRANCH_PUSHED [ID]: feature/[ID] pushed" --source story-[ID]'
+  # On failure:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log error "BUILD_FAILED [ID]: [error summary]" --source story-[ID]'
   """
 )
 ```
@@ -313,6 +326,21 @@ Agent(
     git fetch origin
     git checkout {{BRANCH_NAME}}
   Then proceed with coverage analysis.
+
+  ## Sidebar Ledger
+  Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set.
+
+  bash -c '~/.claude/hooks/cmux-bridge.sh log info "COVERAGE_STARTED {{STORY_ID}}: {{STORY_TITLE}}" --source story-{{STORY_ID}}'
+  # After running the test suite:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log info "COVERAGE_MEASURED {{STORY_ID}}: [PCT]% current" --source story-{{STORY_ID}}'
+  # After adding gap-filling tests:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log info "TESTS_ADDED {{STORY_ID}}: [N] tests, [PCT]% coverage" --source story-{{STORY_ID}}'
+  # After security scan:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log info "SECURITY_SCANNED {{STORY_ID}}: [CLEAN|WARN|BLOCK|SKIPPED]" --source story-{{STORY_ID}}'
+  # After gh pr create:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log success "PR_CREATED {{STORY_ID}}: PR #[PR_NUMBER]" --source story-{{STORY_ID}}'
+  # Final status:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log success "COVERAGE_DONE {{STORY_ID}}: [PASS|WARN] [PCT]%" --source story-{{STORY_ID}}'
   """
 )
 ```
@@ -337,6 +365,17 @@ Agent(
   4. If changes needed: checkout branch, fix, commit, push, re-review
   5. When satisfied: gh pr review [PR_NUMBER] --approve
   Return APPROVAL_STATUS: APPROVED or APPROVAL_STATUS: CHANGES_NEEDED
+
+  ## Sidebar Ledger
+  Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set.
+
+  bash -c '~/.claude/hooks/cmux-bridge.sh log info "REVIEW_STARTED [ID]: [TITLE]" --source story-[ID]'
+  # If changes are needed and applied:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log warning "CHANGES_REQUESTED [ID]: fixes applied, re-reviewing" --source story-[ID]'
+  # After gh pr review --approve:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log success "APPROVED [ID]: PR #[PR_NUMBER] approved" --source story-[ID]'
+  # If CHANGES_NEEDED persists:
+  bash -c '~/.claude/hooks/cmux-bridge.sh log error "REVIEW_FAILED [ID]: changes still needed" --source story-[ID]'
   """
 )
 ```
@@ -478,6 +517,17 @@ Review the PR for story [ID]: [TITLE]
 5. When satisfied: gh pr review [PR_NUMBER] --approve
 
 Return APPROVAL_STATUS: APPROVED or APPROVAL_STATUS: CHANGES_NEEDED
+
+## Sidebar Ledger
+Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set.
+
+bash -c '~/.claude/hooks/cmux-bridge.sh log info "REVIEW_STARTED [ID]: [TITLE]" --source story-[ID]'
+# If changes are needed and applied:
+bash -c '~/.claude/hooks/cmux-bridge.sh log warning "CHANGES_REQUESTED [ID]: fixes applied, re-reviewing" --source story-[ID]'
+# After gh pr review --approve:
+bash -c '~/.claude/hooks/cmux-bridge.sh log success "APPROVED [ID]: PR #[PR_NUMBER] approved" --source story-[ID]'
+# If CHANGES_NEEDED persists:
+bash -c '~/.claude/hooks/cmux-bridge.sh log error "REVIEW_FAILED [ID]: changes still needed" --source story-[ID]'
 """)
 ```
 
