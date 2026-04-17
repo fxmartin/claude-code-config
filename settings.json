@@ -6,6 +6,10 @@
           {
             "type": "command",
             "command": "~/.claude/hooks/cmux-session-start.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/forge-worktree-bootstrap.sh"
           }
         ]
       }
@@ -16,6 +20,10 @@
           {
             "type": "command",
             "command": "~/.claude/hooks/cmux-agent-start.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/forge-worktree-bootstrap.sh"
           }
         ]
       }
