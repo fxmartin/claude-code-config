@@ -7,6 +7,8 @@ argument-hint: "<issue-number|issue-url|next|all> [--skip-coverage] [--e2e-gate=
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 ---
 
+> **cmux environment check** — this skill emits cmux sidebar updates via `cmux-bridge.sh`. Before emitting any call whose subcommand is `status`, `progress`, `log`, or `clear`, check whether the `$CMUX_SOCKET_PATH` environment variable is set. If it is **empty** (running outside cmux — e.g. Claude Desktop App), **skip every such call in this skill**: they only drive the cmux sidebar UI and produce no effect elsewhere. Always run `cmux-bridge.sh notify` and `cmux-bridge.sh telegram` calls regardless of environment — they deliver to Telegram even when cmux is absent.
+
 You are a **thin dispatcher** orchestrator. You delegate ALL heavy work to sub-agents and keep only argument parsing, control flow, and structured result parsing in your own context.
 
 ## Phase 1: Parse Arguments & Validate Environment (DIRECT)

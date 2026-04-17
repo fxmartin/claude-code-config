@@ -5,20 +5,30 @@
 
 set -euo pipefail
 
-# Graceful degradation: if cmux isn't available or socket is down, silently exit
-if ! command -v cmux &>/dev/null || [ -z "${CMUX_SOCKET_PATH:-}" ]; then
-    # Still handle telegram subcommand even without cmux
-    if [ "${1:-}" = "telegram" ]; then
-        shift
-        TITLE="${1:-Notification}"
-        BODY="${2:-}"
-        source ~/.claude/config/.env 2>/dev/null || true
-        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                -H "Content-Type: application/json" \
-                -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${TITLE}\n${BODY}\", \"parse_mode\": \"Markdown\"}" > /dev/null 2>&1 || true
-        fi
+# Shared Telegram sender — used by both the graceful-degradation block
+# (when cmux is absent) and the main telegram) case branch.
+_send_telegram() {
+    local TITLE="${1:-Notification}"
+    local BODY="${2:-}"
+    source ~/.claude/config/.env 2>/dev/null || true
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${TITLE}\n${BODY}\", \"parse_mode\": \"Markdown\"}" > /dev/null 2>&1 || true
     fi
+}
+
+# Graceful degradation: if cmux isn't available or socket is down, silently exit.
+# Exception: notify and telegram subcommands still deliver via Telegram —
+# desktop notifications are impossible without cmux, but Telegram pings
+# remain valuable for long-running skills invoked from Claude Desktop.
+if ! command -v cmux &>/dev/null || [ -z "${CMUX_SOCKET_PATH:-}" ]; then
+    case "${1:-}" in
+        telegram|notify)
+            shift
+            _send_telegram "${1:-Notification}" "${2:-}"
+            ;;
+    esac
     exit 0
 fi
 
@@ -54,14 +64,7 @@ case "$SUBCOMMAND" in
         ;;
     telegram)
         # telegram <title> <body> — Telegram only, for long-running autonomous skills
-        TITLE="${1:-Notification}"
-        BODY="${2:-}"
-        source ~/.claude/config/.env 2>/dev/null || true
-        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                -H "Content-Type: application/json" \
-                -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${TITLE}\n${BODY}\", \"parse_mode\": \"Markdown\"}" > /dev/null 2>&1 || true
-        fi
+        _send_telegram "${1:-Notification}" "${2:-}"
         ;;
     clear)
         # clear [key] — clears status pill by key, or progress if no key

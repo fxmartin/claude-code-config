@@ -22,6 +22,17 @@ Single entry point for all cmux sidebar interaction. Every subcommand follows th
 2. **Telegram fallback**: The `notify` subcommand always attempts Telegram delivery even without cmux
 3. **Silent failures**: All cmux CLI calls are wrapped in `|| true` to never break caller workflows
 
+### Environment Detection
+
+Skills auto-detect cmux availability via the `$CMUX_SOCKET_PATH` environment variable — the same signal the bridge checks internally at line 9. The detection split:
+
+| Scope | Subcommands | Behavior in Claude Desktop |
+|---|---|---|
+| **Sidebar** | `status`, `progress`, `log`, `clear` | Skipped by skills; bridge also silently no-ops if called |
+| **Notifications** | `notify`, `telegram` | Always fire; fall through to Telegram `curl` even when cmux is absent |
+
+Skills that produce cmux output include a preamble instructing Claude to check `$CMUX_SOCKET_PATH` once and suppress sidebar calls when it's empty. Notification calls run unconditionally — Telegram works without cmux.
+
 #### Subcommands
 
 | Subcommand | Usage | What it does |
@@ -29,7 +40,7 @@ Single entry point for all cmux sidebar interaction. Every subcommand follows th
 | `status` | `cmux-bridge.sh status <key> <text> [--icon name] [--color #hex]` | Set a sidebar status pill |
 | `progress` | `cmux-bridge.sh progress <0.0-1.0> [--label text]` | Set sidebar progress bar |
 | `log` | `cmux-bridge.sh log <level> <message> [--source name]` | Append sidebar log entry |
-| `notify` | `cmux-bridge.sh notify <title> <body>` | Desktop notification + Telegram |
+| `notify` | `cmux-bridge.sh notify <title> <body>` | Desktop notification (via cmux) + Telegram; falls through to Telegram only when cmux is absent |
 | `clear` | `cmux-bridge.sh clear [key]` | Clear status pill (by key) or progress bar (no key) |
 
 ### Hook Scripts
