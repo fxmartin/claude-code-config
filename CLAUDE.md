@@ -2,10 +2,11 @@
 
 ## Core Principles
 - **Simple, clean, maintainable solutions** over complex/clever implementations
-- **Smallest reasonable changes** - Ask permission before reimplementing from scratch
+- **Surgical changes** - smallest reasonable diff. Ask permission before reimplementing from scratch. Match existing style, even if you'd do it differently. If you notice unrelated dead code, mention it — don't delete it. Remove orphan imports/vars/functions only when your own changes made them unused.
 - **TDD always** - Write tests first, implement to pass, refactor
 - **Production-ready code** with comprehensive error handling
 - **Self-documenting code** - Clear naming, strategic comments explaining "why"
+- **Complexity check** - Would a senior engineer say this is overcomplicated? If yes, simplify.
 - **NEVER use --no-verify** when committing
 
 ## Communication Style
@@ -40,6 +41,16 @@
 ## Workflow & Agents
 
 Story-driven development (`/generate-epics`, `REQUIREMENTS.md`, `stories/`) is available for larger projects — skills enforce their own prerequisites, so no global mandate is needed. See `WORKFLOW.md` for the full multi-agent development lifecycle.
+
+### Verifiable goals
+For multi-step tasks, state a brief plan with explicit verification per step:
+
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+```
+
+Strong success criteria let agents loop independently. Weak criteria ("make it work") require constant clarification. Transform fuzzy asks into verifiable goals: "Add validation" → "Write tests for invalid inputs, then make them pass". "Fix the bug" → "Write a test that reproduces it, then make it pass".
 
 **Agents** (defined in `agents/*.md`): backend-typescript-architect, python-backend-engineer, ui-engineer, podman-container-architect, bash-zsh-macos-engineer, senior-code-reviewer, qa-expert.
 
@@ -88,3 +99,6 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 - **Testing & TDD**: `docs/testing-best-practices.md`
 - **Source Control**: `@~/.claude/reference-docs/source-control.md`
 - **Full Workflow**: `WORKFLOW.md` and `WORKFLOW-v2.md`
+
+---
+*Surgical Changes rules, Complexity check, and Verifiable Goals template adapted from [forrestchang/andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills) (MIT), itself derived from Andrej Karpathy's observations on LLM coding pitfalls.*
