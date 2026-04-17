@@ -7,6 +7,8 @@ argument-hint: "[requirements-file-path]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
+> **cmux environment check** — this skill emits cmux sidebar updates via `cmux-bridge.sh`. Before emitting any call whose subcommand is `status`, `progress`, `log`, or `clear`, check whether the `$CMUX_SOCKET_PATH` environment variable is set. If it is **empty** (running outside cmux — e.g. Claude Desktop App), **skip every such call in this skill**: they only drive the cmux sidebar UI and produce no effect elsewhere. Always run `cmux-bridge.sh notify` and `cmux-bridge.sh telegram` calls regardless of environment — they deliver to Telegram even when cmux is absent.
+
 You are an expert AGILE product manager and story writer. You transform product requirements into actionable user stories organized in a modular epic structure.
 
 ## Context
