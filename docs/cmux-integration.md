@@ -31,9 +31,6 @@ Single entry point for all cmux sidebar interaction. Every subcommand follows th
 | `log` | `cmux-bridge.sh log <level> <message> [--source name]` | Append sidebar log entry |
 | `notify` | `cmux-bridge.sh notify <title> <body>` | Desktop notification + Telegram |
 | `clear` | `cmux-bridge.sh clear [key]` | Clear status pill (by key) or progress bar (no key) |
-| `pane-create` | `cmux-bridge.sh pane-create <label> [right\|down]` | Split pane, label it, return `surface:N` ref |
-| `pane-close` | `cmux-bridge.sh pane-close <surface:N>` | Close a specific surface |
-| `pane-close-all` | `cmux-bridge.sh pane-close-all <surface:N> ...` | Close multiple surfaces |
 
 ### Hook Scripts
 
@@ -96,18 +93,6 @@ Start and completion notifications are sent via `cmux-bridge.sh notify` (desktop
   - Per-story desktop + Telegram notifications
 - **Phase 7**: Progress 1.0, status "Complete"
 
-#### Parallel Mode (`--parallel`)
-
-When building cohorts concurrently (up to 3 agents), cmux workspace management creates visual separation:
-
-1. **Before cohort**: Split panes for agents 2 and 3 (agent 1 uses current pane)
-   - Direction alternates: right for agent 2, down for agent 3
-   - Each pane is labeled with the story ID
-2. **During cohort**: Each pane has its own status pill
-3. **After cohort**: Extra panes are closed, cohort result is logged
-
-Surface refs (`surface:N`) are captured from `pane-create` and used for cleanup. If cmux is unavailable, pane management is silently skipped.
-
 ## Notification Flow
 
 All notifications now route through `cmux-bridge.sh notify`, which handles dual-channel delivery:
@@ -128,7 +113,7 @@ No direct Telegram `curl` blocks remain in any skill except the dedicated `/tele
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `hooks/cmux-bridge.sh` | ~105 | Central utility with 8 subcommands |
+| `hooks/cmux-bridge.sh` | ~78 | Central utility with 5 subcommands |
 | `hooks/cmux-session-start.sh` | ~6 | SessionStart lifecycle hook |
 | `hooks/cmux-agent-start.sh` | ~8 | SubagentStart lifecycle hook |
 | `hooks/cmux-agent-stop.sh` | ~10 | SubagentStop lifecycle hook |
@@ -159,10 +144,6 @@ cmux-bridge.sh log success "Bridge test passed" --source test  # OK
 
 # Desktop notification
 cmux-bridge.sh notify "cmux Bridge Test" "All subcommands working"  # OK
-
-# Pane management
-SURF=$(cmux-bridge.sh pane-create "Test Agent" right)  # Returns surface:N
-cmux-bridge.sh pane-close $SURF                          # Closes cleanly
 
 # Graceful degradation (no socket)
 CMUX_SOCKET_PATH="" cmux-bridge.sh status test "hello"  # Exit 0, no error
