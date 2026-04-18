@@ -72,8 +72,8 @@
         "hooks": [
           {
             "type": "command",
-            "if": "Bash(gh pr merge *)",
-            "command": "~/.claude/hooks/on-pr-merge-docs.sh"
+            "command": "~/.claude/hooks/on-pr-merge-docs.sh",
+            "if": "Bash(gh pr merge *)"
           }
         ]
       }
@@ -96,7 +96,16 @@
   },
   "enabledPlugins": {
     "typescript-lsp@claude-plugins-official": true,
-    "pyright-lsp@claude-plugins-official": true
+    "pyright-lsp@claude-plugins-official": true,
+    "example-skills@anthropic-agent-skills": true
+  },
+  "extraKnownMarketplaces": {
+    "anthropic-agent-skills": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/skills"
+      }
+    }
   },
   "voiceEnabled": true
 }
