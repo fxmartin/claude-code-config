@@ -5,16 +5,29 @@
 
 set -euo pipefail
 
+# Resolve the parent repo name, stripping any `.claude/worktrees/<slug>` suffix
+# so sub-agent notifications identify the real repo, not the worktree.
+_repo_tag() {
+    local TOPLEVEL
+    TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL="$PWD"
+    # Strip `/.claude/worktrees/<anything>` to reveal the parent repo path
+    local PARENT="${TOPLEVEL%%/.claude/worktrees/*}"
+    basename "$PARENT"
+}
+
 # Shared Telegram sender — used by both the graceful-degradation block
 # (when cmux is absent) and the main telegram) case branch.
 _send_telegram() {
     local TITLE="${1:-Notification}"
     local BODY="${2:-}"
+    local REPO
+    REPO=$(_repo_tag)
+    local TAGGED_TITLE="[${REPO}] ${TITLE}"
     source ~/.claude/config/.env 2>/dev/null || true
     if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
         curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${TITLE}\n${BODY}\", \"parse_mode\": \"Markdown\"}" > /dev/null 2>&1 || true
+            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${TAGGED_TITLE}\n${BODY}\", \"parse_mode\": \"Markdown\"}" > /dev/null 2>&1 || true
     fi
 }
 
