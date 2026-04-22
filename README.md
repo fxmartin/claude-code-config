@@ -9,7 +9,10 @@ This is the harness behind a multi-agent AGILE pipeline that runs on [cmux](http
 ## What this harness achieves
 
 ```
- idea ─▶ /brainstorm ─▶ REQUIREMENTS.md
+ idea ─▶ /project-init ─▶ git repo + GitHub remote + labels + CLAUDE.md + PROJECT-SEED.md
+         │
+         ▼
+     /brainstorm ─▶ REQUIREMENTS.md  (seed-aware: skips what /project-init already answered)
          │
          ▼
      /generate-epics ─▶ STORIES.md + epic-NN-*.md + NFRs
@@ -33,11 +36,28 @@ Every phase emits structured events to a cmux sidebar pill + progress bar + ledg
 
 ---
 
-## The workflow, in four phases
+## The workflow, in five phases
+
+### Phase 0 — Bootstrap (`/project-init`)
+
+A lightweight bootstrapper for a brand-new repo. Turns an empty directory into a project the rest of the pipeline can consume — no more, no less.
+
+Pre-flight checks gate the run: empty directory (dotfiles allowed), `gh` authenticated, no existing `.git/`. Then a **5-question interactive discovery** (objective, tech stack, architecture style, repo visibility, catch-all) — deliberately narrow. Database, testing, CI/CD, and deployment questions are **not** asked here; those belong to `/brainstorm`.
+
+Output:
+
+- `git init` + first commit
+- GitHub remote created via `gh repo create` (public or private per your answer)
+- **26 standard labels** applied (bug, enhancement, priority:*, epic:*, etc.) plus any project-specific ones
+- `.gitignore` tailored to the detected tech stack
+- **`CLAUDE.md`** — lightweight scaffold with placeholders for sections `/brainstorm` will fill in later (testing strategy, CI/CD, DB, deployment)
+- **`PROJECT-SEED.md`** — structured handoff file that `/brainstorm` detects and reads to skip redundant questions
+
+The skill closes by suggesting `/brainstorm` as the next step. If you already have a repo, skip Phase 0 — `/brainstorm` runs fine without a seed, just asks the full 8-question set from scratch.
 
 ### Phase 1 — Discovery (`/brainstorm`)
 
-A Senior PM persona conducts a structured 8-question interview covering problem space, personas, success metrics, capabilities, scope boundaries, technical constraints, priority, and acceptance criteria. Output: `REQUIREMENTS.md`. If `PROJECT-SEED.md` already exists (via `/project-init`), the interview skips questions already answered and drills deeper into product/market fit.
+A Senior PM persona conducts a structured 8-question interview covering problem space, personas, success metrics, capabilities, scope boundaries, technical constraints, priority, and acceptance criteria. Output: `REQUIREMENTS.md`. If `PROJECT-SEED.md` exists (from `/project-init`), the interview skips questions already answered (objective, stack, architecture) and drills deeper into product/market fit — requirements, user problems, competitive landscape, success metrics. After the interview, `CLAUDE.md` is updated with any newly determined sections (testing, CI/CD, database, deployment).
 
 ### Phase 2 — Planning (`/generate-epics`, `/create-epic`)
 
@@ -256,6 +276,16 @@ See [`docs/generators.md`](docs/generators.md).
 - [`docs/cmux-integration.md`](docs/cmux-integration.md) — full cmux integration architecture and event schema
 - [`docs/generators.md`](docs/generators.md) — generator skills documentation
 - [`docs/python-best-practices.md`](docs/python-best-practices.md) · [`docs/testing-best-practices.md`](docs/testing-best-practices.md) · [`docs/container-best-practices.md`](docs/container-best-practices.md) · [`docs/database-best-practices.md`](docs/database-best-practices.md)
+
+---
+
+## Acknowledgements
+
+Three external sources shaped this harness:
+
+- **[forrestchang/andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills)** (MIT) — the *Surgical Changes* sub-rules, *Complexity check* heuristic, and *Verifiable Goals* plan template in [`CLAUDE.md`](CLAUDE.md) are adapted from this repo, which itself derives from Andrej Karpathy's observations on LLM coding pitfalls. Absorbed as prose rather than installed as a plugin, for single-source ownership.
+- **[anthropics/skills](https://github.com/anthropics/skills)** — Anthropic's official example-skills marketplace, wired in via `settings.json`. Provides the `example-skills` plugin bundle (web-artifacts-builder, webapp-testing, frontend-design, canvas-design, algorithmic-art, skill-creator, claude-api, theme-factory, mcp-builder, docx/xlsx/pptx/pdf, brand-guidelines, internal-comms, doc-coauthoring, slack-gif-creator).
+- **[cmux](https://www.cmux.dev/)** — native macOS terminal built on Ghostty for multi-agent AI development. The entire observability layer (sidebar pills, progress bar, structured ledger, desktop notifications, workspace management) is built against cmux's CLI via [`hooks/cmux-bridge.sh`](hooks/cmux-bridge.sh), with graceful degradation when cmux is absent.
 
 ---
 
