@@ -4,6 +4,8 @@ A complete, opinionated Claude Code configuration: agents, skills, slash command
 
 This is the harness behind a multi-agent AGILE pipeline that runs on [cmux](https://www.cmux.dev/) (native macOS terminal for AI development) with full real-time visibility, parallel worktree execution, and automatic bug triage.
 
+The repo now also ships a **Codex plugin** at `plugins/autonomous-sdlc/` so the same SDLC workflows are available as Codex-native skills outside Claude Code.
+
 ---
 
 ## What this harness achieves
@@ -173,6 +175,7 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | Path | Description | Count |
 |------|-------------|-------|
 | `CLAUDE.md` | Global instructions loaded into every Claude Code session | 1 |
+| `plugins/autonomous-sdlc/` | Codex plugin manifest, hooks, and SDLC skills mirrored from this harness | 1 plugin |
 | `skills/` | Model-invocable skills (brainstorm, build-stories, fix-issue, generate-epics, create-epic, resume-build-agents, project-init, generators, and more) | 16 |
 | `commands/` | Namespaced slash commands (`dev/`, `devops/`, `issues/`, `project/`, `quality/`, `research/`) | 17 |
 | `agents/` | Specialist agent definitions (flat) | 12 |
@@ -185,6 +188,25 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `keybindings.json` | Keybindings override | — |
 | `mcp/config.template.json` | MCP server template (env-var substituted at install) | — |
 | `install.sh` | Portable symlink installer (`--skip-mcp`, `--skip-tools`, `--dry-run`, `--uninstall`) | — |
+
+### Codex plugin skills
+
+The bundled `plugins/autonomous-sdlc/` package exposes these Codex skills:
+
+- `brainstorm`
+- `build-stories`
+- `check-releases`
+- `coverage`
+- `create-epic`
+- `create-issue`
+- `create-project-summary-stats`
+- `fix-issue`
+- `generate-epics`
+- `plan-release-update`
+- `project-init`
+- `project-review`
+- `resume-build-agents`
+- `roast`
 
 ### Agent roster
 
@@ -226,6 +248,34 @@ The installer symlinks from `~/.claude/` to this repo for `CLAUDE.md`, `agents/`
 ### As a submodule (Nix-managed machines)
 
 Consumed at `config/claude-code-config/`. The Nix activation script handles symlinks and MCP config generation — run the installer with `--skip-mcp`.
+
+### Codex plugin install
+
+This repo also contains a local Codex plugin:
+
+```text
+plugins/autonomous-sdlc/
+```
+
+For a home-level Codex install, register the local marketplace rooted at your home directory:
+
+```bash
+codex plugin marketplace add "$HOME"
+```
+
+The home-rooted marketplace file lives at:
+
+```text
+~/.agents/plugins/marketplace.json
+```
+
+and resolves:
+
+```text
+./plugins/autonomous-sdlc -> ~/plugins/autonomous-sdlc
+```
+
+If `~/plugins/autonomous-sdlc` is symlinked to this repo's plugin directory, Codex sessions will pick up future skill changes from this repo after a restart. If automatic install is not honored by the current Codex build, install the plugin once from `/plugins` inside Codex and keep using the shared plugin path on disk.
 
 ---
 
