@@ -97,6 +97,8 @@ The skill is a **thin dispatcher** — argument parsing, control flow, and struc
      Stage 4: [merge A → B → C → D → E] ← sequential, rebase-before-merge
    ```
 
+   ![Parallel build workflow](docs/ParallelBuild.jpg)
+
 4. **Worktree isolation** (via the Agent tool's `isolation: "worktree"` flag) gives each concurrent agent a full, isolated checkout. No file-conflict races between agents working on overlapping areas of the codebase.
 5. **Bugfix loop** — if any stage fails, a Bugfix Agent classifies the failure as `CODE_BUG` / `TEST_BUG` / `ENV_ISSUE`, files a GitHub issue, auto-fixes, and retries (max 2 attempts). Failed stories are marked `FAILED`; their dependents become `BLOCKED` in subsequent cohorts.
 6. **E2E gate** at epic boundaries runs Playwright tests — blocking, warning, or off per flag.
