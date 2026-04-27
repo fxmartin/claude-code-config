@@ -11,16 +11,16 @@ The harness ships as **two mirror plugins** — `autonomous-sdlc` for Claude Cod
 ## What this harness achieves
 
 ```
- idea ─▶ /project-init ─▶ git repo + GitHub remote + labels + CLAUDE.md + PROJECT-SEED.md
+ idea ─▶ /autonomous-sdlc:project-init ─▶ git repo + GitHub remote + labels + CLAUDE.md + PROJECT-SEED.md
          │
          ▼
-     /brainstorm ─▶ REQUIREMENTS.md  (seed-aware: skips what /project-init already answered)
+     /autonomous-sdlc:brainstorm ─▶ REQUIREMENTS.md  (seed-aware: skips what /autonomous-sdlc:project-init already answered)
          │
          ▼
-     /generate-epics ─▶ STORIES.md + epic-NN-*.md + NFRs
+     /autonomous-sdlc:generate-epics ─▶ STORIES.md + epic-NN-*.md + NFRs
          │
          ▼
-     /build-stories (parallel, autonomous)
+     /autonomous-sdlc:build-stories (parallel, autonomous)
          │  ├─ Discovery agent → dependency cohorts
          │  ├─ Build agents   (×5, worktree-isolated, TDD)
          │  ├─ Coverage gate  (×5, enforces 90%+)
@@ -40,11 +40,11 @@ Every phase emits structured events to a cmux sidebar pill + progress bar + ledg
 
 ## The workflow, in five phases
 
-### Phase 0 — Bootstrap (`/project-init`)
+### Phase 0 — Bootstrap (`/autonomous-sdlc:project-init`)
 
 A lightweight bootstrapper for a brand-new repo. Turns an empty directory into a project the rest of the pipeline can consume — no more, no less.
 
-Pre-flight checks gate the run: empty directory (dotfiles allowed), `gh` authenticated, no existing `.git/`. Then a **5-question interactive discovery** (objective, tech stack, architecture style, repo visibility, catch-all) — deliberately narrow. Database, testing, CI/CD, and deployment questions are **not** asked here; those belong to `/brainstorm`.
+Pre-flight checks gate the run: empty directory (dotfiles allowed), `gh` authenticated, no existing `.git/`. Then a **5-question interactive discovery** (objective, tech stack, architecture style, repo visibility, catch-all) — deliberately narrow. Database, testing, CI/CD, and deployment questions are **not** asked here; those belong to `/autonomous-sdlc:brainstorm`.
 
 Output:
 
@@ -52,16 +52,16 @@ Output:
 - GitHub remote created via `gh repo create` (public or private per your answer)
 - **26 standard labels** applied (bug, enhancement, priority:*, epic:*, etc.) plus any project-specific ones
 - `.gitignore` tailored to the detected tech stack
-- **`CLAUDE.md`** — lightweight scaffold with placeholders for sections `/brainstorm` will fill in later (testing strategy, CI/CD, DB, deployment)
-- **`PROJECT-SEED.md`** — structured handoff file that `/brainstorm` detects and reads to skip redundant questions
+- **`CLAUDE.md`** — lightweight scaffold with placeholders for sections `/autonomous-sdlc:brainstorm` will fill in later (testing strategy, CI/CD, DB, deployment)
+- **`PROJECT-SEED.md`** — structured handoff file that `/autonomous-sdlc:brainstorm` detects and reads to skip redundant questions
 
-The skill closes by suggesting `/brainstorm` as the next step. If you already have a repo, skip Phase 0 — `/brainstorm` runs fine without a seed, just asks the full 8-question set from scratch.
+The skill closes by suggesting `/autonomous-sdlc:brainstorm` as the next step. If you already have a repo, skip Phase 0 — `/autonomous-sdlc:brainstorm` runs fine without a seed, just asks the full 8-question set from scratch.
 
-### Phase 1 — Discovery (`/brainstorm`)
+### Phase 1 — Discovery (`/autonomous-sdlc:brainstorm`)
 
-A Senior PM persona conducts a structured 8-question interview covering problem space, personas, success metrics, capabilities, scope boundaries, technical constraints, priority, and acceptance criteria. Output: `REQUIREMENTS.md`. If `PROJECT-SEED.md` exists (from `/project-init`), the interview skips questions already answered (objective, stack, architecture) and drills deeper into product/market fit — requirements, user problems, competitive landscape, success metrics. After the interview, `CLAUDE.md` is updated with any newly determined sections (testing, CI/CD, database, deployment).
+A Senior PM persona conducts a structured 8-question interview covering problem space, personas, success metrics, capabilities, scope boundaries, technical constraints, priority, and acceptance criteria. Output: `REQUIREMENTS.md`. If `PROJECT-SEED.md` exists (from `/autonomous-sdlc:project-init`), the interview skips questions already answered (objective, stack, architecture) and drills deeper into product/market fit — requirements, user problems, competitive landscape, success metrics. After the interview, `CLAUDE.md` is updated with any newly determined sections (testing, CI/CD, database, deployment).
 
-### Phase 2 — Planning (`/generate-epics`, `/create-epic`)
+### Phase 2 — Planning (`/autonomous-sdlc:generate-epics`, `/autonomous-sdlc:create-epic`)
 
 Transforms `REQUIREMENTS.md` into a modular AGILE structure:
 
@@ -69,7 +69,7 @@ Transforms `REQUIREMENTS.md` into a modular AGILE structure:
 - `docs/stories/epic-NN-<name>.md` — INVEST-compliant user stories in `{Epic}.{Feature}-{NNN}` format
 - `docs/stories/non-functional-requirements.md` — perf, security, reliability targets
 
-`/create-epic` lets you add more epics interactively without redoing discovery.
+`/autonomous-sdlc:create-epic` lets you add more epics interactively without redoing discovery.
 
 ### Phase 3 — Build
 
@@ -77,11 +77,11 @@ Two paths depending on how much control you want:
 
 | Mode | Command | When to use |
 |------|---------|-------------|
-| **Controlled** | `/resume-build-agents <story-id\|epic\|next>` | One story at a time, visible agent selection, manual PR decisions |
-| **Autonomous** | `/build-stories [all\|resume\|epic-NN] [--sequential]` | Full batch — parses the story graph, schedules cohorts, runs until done |
-| **Issue-driven** | `/fix-issue <N\|url\|next\|all>` | 11-phase pipeline: investigate → build → coverage → review → E2E → merge → summary, with auto-classified bugfix retries |
+| **Controlled** | `/autonomous-sdlc:resume-build-agents <story-id\|epic\|next>` | One story at a time, visible agent selection, manual PR decisions |
+| **Autonomous** | `/autonomous-sdlc:build-stories [all\|resume\|epic-NN] [--sequential]` | Full batch — parses the story graph, schedules cohorts, runs until done |
+| **Issue-driven** | `/autonomous-sdlc:fix-issue <N\|url\|next\|all>` | 11-phase pipeline: investigate → build → coverage → review → E2E → merge → summary, with auto-classified bugfix retries |
 
-#### The autonomous path: how `/build-stories` actually runs
+#### The autonomous path: how `/autonomous-sdlc:build-stories` actually runs
 
 The skill is a **thin dispatcher** — argument parsing, control flow, and structured-result parsing only. All heavy lifting is delegated to sub-agents, which preserves the orchestrator's context across 20+ story builds.
 
@@ -127,7 +127,7 @@ The full workflow is documented end-to-end in [`WORKFLOW-v2.md`](WORKFLOW-v2.md)
 
 ## Why it works
 
-- **Thin-dispatcher orchestrators** — skills like `/build-stories` and `/fix-issue` carry only control flow; heavy I/O and reasoning are delegated to sub-agents so the orchestrator's context window stays lean across tens of stories.
+- **Thin-dispatcher orchestrators** — skills like `/autonomous-sdlc:build-stories` and `/autonomous-sdlc:fix-issue` carry only control flow; heavy I/O and reasoning are delegated to sub-agents so the orchestrator's context window stays lean across tens of stories.
 - **Specialist agents per story type** — the Build stage picks the right agent from the roster (`backend-typescript-architect`, `python-backend-engineer`, `ui-engineer`, `bash-zsh-macos-engineer`, `podman-container-architect`, `qa-engineer`) based on the story's tech stack.
 - **Mandatory senior-code-reviewer** — every PR flows through an architecture/security review before merge. Not a nice-to-have, not optional.
 - **TDD-first** — tests are written before implementation; the coverage gate fails the story if the final suite doesn't hit the threshold (default 90%).
