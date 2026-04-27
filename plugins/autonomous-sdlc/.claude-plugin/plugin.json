@@ -1,0 +1,20 @@
+{
+  "name": "autonomous-sdlc",
+  "version": "0.1.0",
+  "description": "Claude-native SDLC workflows: project bootstrap, requirements discovery, epic/story planning, issue handling, and orchestrated build. Mirror of the Codex autonomous-sdlc plugin.",
+  "author": {
+    "name": "FX Martin",
+    "url": "https://github.com/fxmartin"
+  },
+  "homepage": "https://github.com/fxmartin/claude-code-config",
+  "repository": "https://github.com/fxmartin/claude-code-config",
+  "license": "MIT",
+  "keywords": [
+    "sdlc",
+    "stories",
+    "automation",
+    "github",
+    "planning",
+    "build"
+  ]
+}

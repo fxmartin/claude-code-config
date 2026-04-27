@@ -1,0 +1,21 @@
+{
+  "name": "fx-claude-config",
+  "owner": {
+    "name": "FX Martin"
+  },
+  "metadata": {
+    "description": "FX's personal Claude Code marketplace — bundles SDLC plugin and shared workflows.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "autonomous-sdlc",
+      "description": "Plan, review, and execute SDLC workflows in Claude Code: project bootstrap, requirements discovery, epic/story planning, issue handling, and orchestrated build.",
+      "version": "0.1.0",
+      "author": {
+        "name": "FX Martin"
+      },
+      "source": "./plugins/autonomous-sdlc"
+    }
+  ]
+}

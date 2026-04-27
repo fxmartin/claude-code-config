@@ -119,6 +119,7 @@ if $UNINSTALL; then
   remove_symlink "$CLAUDE_DIR/docs"                     "$SCRIPT_DIR/docs"
   remove_symlink "$CLAUDE_DIR/skills"                   "$SCRIPT_DIR/skills"
   remove_symlink "$CLAUDE_DIR/hooks"                    "$SCRIPT_DIR/hooks"
+  remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
   echo "Done. MCP config (~/.claude.json) was not modified."
   exit 0
 fi
@@ -152,6 +153,10 @@ create_symlink "$SCRIPT_DIR/reference-docs"            "$CLAUDE_DIR/reference-do
 create_symlink "$SCRIPT_DIR/docs"                     "$CLAUDE_DIR/docs"
 create_symlink "$SCRIPT_DIR/skills"                    "$CLAUDE_DIR/skills"
 create_symlink "$SCRIPT_DIR/hooks"                    "$CLAUDE_DIR/hooks"
+
+# Local marketplace (exposes the autonomous-sdlc plugin under /autonomous-sdlc:*)
+run mkdir -p "$CLAUDE_DIR/plugins/marketplaces"
+create_symlink "$SCRIPT_DIR" "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config"
 
 # ─── CLI Tools (Yazi + utilities) ────────────────────────────────────
 if $SKIP_TOOLS; then
