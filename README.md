@@ -259,21 +259,40 @@ Consumed at `config/claude-code-config/`. The Nix activation script handles syml
 
 ### Claude Code plugin install
 
-`./install.sh` symlinks `~/.claude/plugins/marketplaces/fx-claude-config/` → this repo, exposing `.claude-plugin/marketplace.json` as a local marketplace. After that runs once, register and install the plugin from inside any Claude Code session:
+Two paths — pick one.
+
+#### Option A — Install directly from GitHub (recommended for users)
+
+No local clone needed. Inside any Claude Code session:
+
+```text
+/plugin marketplace add fxmartin/claude-code-config
+/plugin install autonomous-sdlc@fx-claude-config
+```
+
+Claude Code clones the repo into `~/.claude/plugins/marketplaces/fx-claude-config/`, reads `.claude-plugin/marketplace.json`, and installs the `autonomous-sdlc` plugin from `./plugins/autonomous-sdlc`. Pull updates later with:
+
+```text
+/plugin marketplace update fx-claude-config
+```
+
+#### Option B — Local clone + symlink (dev workflow)
+
+Use this if you're authoring or iterating on the plugin's skills — edits to `plugins/autonomous-sdlc/skills/<name>/SKILL.md` land live in Claude Code without re-installing. `./install.sh` symlinks `~/.claude/plugins/marketplaces/fx-claude-config/` → this checkout. After it runs once:
 
 ```text
 /plugin marketplace add fx-claude-config
 /plugin install autonomous-sdlc@fx-claude-config
 ```
 
-Verify the install:
+#### Verify either path
 
 ```bash
 jq '.plugins | keys' ~/.claude/plugins/installed_plugins.json
 # expect: includes "autonomous-sdlc@fx-claude-config"
 ```
 
-A new Claude Code session will then surface the plugin's 8 skills under `/autonomous-sdlc:` autocomplete.
+A new Claude Code session then surfaces the plugin's 8 skills under `/autonomous-sdlc:` autocomplete.
 
 ### Codex plugin install
 
