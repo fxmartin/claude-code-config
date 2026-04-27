@@ -4,7 +4,7 @@ A complete, opinionated Claude Code configuration: agents, skills, slash command
 
 This is the harness behind a multi-agent AGILE pipeline that runs on [cmux](https://www.cmux.dev/) (native macOS terminal for AI development) with full real-time visibility, parallel worktree execution, and automatic bug triage.
 
-The repo now also ships a **Codex plugin** at `plugins/autonomous-sdlc/` so the same SDLC workflows are available as Codex-native skills outside Claude Code.
+The harness ships as **two mirror plugins** — `autonomous-sdlc` for Claude Code (in this repo at `plugins/autonomous-sdlc/`) and `autonomous-sdlc` for Codex (in the sibling [`nix-install`](https://github.com/fxmartin/nix-install) repo). Same plugin name, same pipeline shape, same skill IDs — so the SDLC workflow is portable across both runtimes. On Claude Code skills are invoked as `/autonomous-sdlc:<name>`; on Codex as `Use autonomous-sdlc <name>`.
 
 ---
 
@@ -177,8 +177,9 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | Path | Description | Count |
 |------|-------------|-------|
 | `CLAUDE.md` | Global instructions loaded into every Claude Code session | 1 |
-| `plugins/autonomous-sdlc/` | Codex plugin manifest, hooks, and SDLC skills mirrored from this harness | 1 plugin |
-| `skills/` | Model-invocable skills (brainstorm, build-stories, fix-issue, generate-epics, create-epic, resume-build-agents, project-init, generators, and more) | 16 |
+| `.claude-plugin/marketplace.json` | Local Claude Code marketplace manifest (registers the `autonomous-sdlc` plugin under the `fx-claude-config` marketplace) | 1 |
+| `plugins/autonomous-sdlc/` | **Claude Code plugin** — SDLC skills bundled as `/autonomous-sdlc:<name>` (mirror of the Codex `autonomous-sdlc` plugin in `nix-install`) | 1 plugin / 8 skills |
+| `skills/` | Loose user-level Claude skills not part of the SDLC plugin (generators, e2e, claude-docs, telegram, demo) | 9 |
 | `commands/` | Namespaced slash commands (`dev/`, `devops/`, `issues/`, `project/`, `quality/`, `research/`) | 17 |
 | `agents/` | Specialist agent definitions (flat) | 12 |
 | `hooks/` | cmux lifecycle hooks, Telegram bridge, worktree bootstrap, PR-merge docs hook | 8 scripts |
@@ -191,24 +192,29 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `mcp/config.template.json` | MCP server template (env-var substituted at install) | — |
 | `install.sh` | Portable symlink installer (`--skip-mcp`, `--skip-tools`, `--dry-run`, `--uninstall`) | — |
 
-### Codex plugin skills
+### Mirror plugins — `autonomous-sdlc` on both runtimes
 
-The bundled `plugins/autonomous-sdlc/` package exposes these Codex skills:
+The same plugin name ships on both platforms with overlapping but not identical skill sets. The shared core covers the user-facing SDLC chain (`project-init → brainstorm → generate-epics → create-epic → create-story → build-stories`); each side adds runtime-specific extras.
 
-- `brainstorm`
-- `build-stories`
-- `check-releases`
-- `coverage`
-- `create-epic`
-- `create-issue`
-- `create-project-summary-stats`
-- `fix-issue`
-- `generate-epics`
-- `plan-release-update`
-- `project-init`
-- `project-review`
-- `resume-build-agents`
-- `roast`
+**Claude Code plugin** — `plugins/autonomous-sdlc/` in this repo (8 skills):
+
+| Skill | Invocation |
+|---|---|
+| `project-init` | `/autonomous-sdlc:project-init [name]` |
+| `brainstorm` | `/autonomous-sdlc:brainstorm [idea]` |
+| `generate-epics` | `/autonomous-sdlc:generate-epics` |
+| `create-epic` | `/autonomous-sdlc:create-epic <NN> [topic]` |
+| `create-story` | `/autonomous-sdlc:create-story <NN> <description>` |
+| `build-stories` | `/autonomous-sdlc:build-stories [story-id\|all]` |
+| `fix-issue` | `/autonomous-sdlc:fix-issue [issue\|all\|next]` |
+| `resume-build-agents` | `/autonomous-sdlc:resume-build-agents` |
+
+**Codex plugin** — `plugins/autonomous-sdlc/` in the sibling [`nix-install`](https://github.com/fxmartin/nix-install) repo (15 skills):
+
+- All 8 Claude skills above (same names, same purpose)
+- Plus 7 Codex-only utilities: `check-releases`, `coverage`, `create-issue`, `create-project-summary-stats`, `plan-release-update`, `project-review`, `roast`
+
+The 7 Codex extras live as namespaced **commands** on the Claude side (`/devops:check-releases`, `/quality:roast`, etc.) under `commands/` rather than inside the plugin — so they're available everywhere, just at a different invocation path.
 
 ### Agent roster
 
@@ -251,15 +257,27 @@ The installer symlinks from `~/.claude/` to this repo for `CLAUDE.md`, `agents/`
 
 Consumed at `config/claude-code-config/`. The Nix activation script handles symlinks and MCP config generation — run the installer with `--skip-mcp`.
 
-### Codex plugin install
+### Claude Code plugin install
 
-This repo also contains a local Codex plugin:
+`./install.sh` symlinks `~/.claude/plugins/marketplaces/fx-claude-config/` → this repo, exposing `.claude-plugin/marketplace.json` as a local marketplace. After that runs once, register and install the plugin from inside any Claude Code session:
 
 ```text
-plugins/autonomous-sdlc/
+/plugin marketplace add fx-claude-config
+/plugin install autonomous-sdlc@fx-claude-config
 ```
 
-For a home-level Codex install, register the local marketplace rooted at your home directory:
+Verify the install:
+
+```bash
+jq '.plugins | keys' ~/.claude/plugins/installed_plugins.json
+# expect: includes "autonomous-sdlc@fx-claude-config"
+```
+
+A new Claude Code session will then surface the plugin's 8 skills under `/autonomous-sdlc:` autocomplete.
+
+### Codex plugin install
+
+The Codex mirror lives in the sibling [`nix-install`](https://github.com/fxmartin/nix-install) repo at `plugins/autonomous-sdlc/`. For a home-level Codex install, register the local marketplace rooted at your home directory:
 
 ```bash
 codex plugin marketplace add "$HOME"
@@ -277,7 +295,7 @@ and resolves:
 ./plugins/autonomous-sdlc -> ~/plugins/autonomous-sdlc
 ```
 
-If `~/plugins/autonomous-sdlc` is symlinked to this repo's plugin directory, Codex sessions will pick up future skill changes from this repo after a restart. If automatic install is not honored by the current Codex build, install the plugin once from `/plugins` inside Codex and keep using the shared plugin path on disk.
+If `~/plugins/autonomous-sdlc` is symlinked to the `nix-install` repo's plugin directory, Codex sessions will pick up future skill changes after a restart. If automatic install is not honored by the current Codex build, install the plugin once from `/plugins` inside Codex and keep using the shared plugin path on disk.
 
 ---
 
