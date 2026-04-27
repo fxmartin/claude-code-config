@@ -92,6 +92,11 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
   - `gh api repos/{owner}/{repo}/...` for anything not covered by subcommands
 - The `gh` CLI is pre-authenticated and available in all dev shells
 
+## Release Version Alignment
+- Before creating or deploying a release tag, align the package release number with the GitHub tag: `nyx/package.json` version `X.Y.Z` must match Git tag `vX.Y.Z`.
+- When bumping the package version, update the lockfile too, for example with `npm version X.Y.Z --no-git-tag-version` from `nyx/`, then create the matching `vX.Y.Z` tag after committing.
+- Do not deploy a tag whose `nyx/package.json` version disagrees with the tag name.
+
 ## Reference Materials
 - **CLAUDE.md guide**: `docs/claude-md-guide.md` — structure, guardrails, maintenance, and how this file itself is organized
 - **Python**: `docs/python-best-practices.md`
