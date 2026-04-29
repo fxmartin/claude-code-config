@@ -6,6 +6,8 @@ This is the harness behind a multi-agent AGILE pipeline that runs on [cmux](http
 
 The harness ships as **two mirror plugins** — `autonomous-sdlc` for Claude Code (in this repo at `plugins/autonomous-sdlc/`) and `autonomous-sdlc` for Codex (in the sibling [`nix-install`](https://github.com/fxmartin/nix-install) repo). Same plugin name, same pipeline shape, same skill IDs — so the SDLC workflow is portable across both runtimes. On Claude Code the plugin's skills surface as bare slash-commands (`/brainstorm`, `/create-story`, etc.) labelled `(autonomous-sdlc)` in the autocomplete; on Codex they're invoked as `Use autonomous-sdlc <name>`.
 
+We also use the Codex mirror as an automated adversarial review layer for Claude Code work. Claude Code remains the primary builder in this harness; Codex runs the same `autonomous-sdlc` plugin from the sibling repo to inspect Claude-produced changes, file high-signal issues, and challenge implementation quality from an independent runtime before work is considered done.
+
 ---
 
 ## What this harness achieves
@@ -121,6 +123,8 @@ After build, the harness can audit itself:
 | `/create-user-documentation` | Production-ready end-user docs |
 | `/update-progress` · `/sync-progress` | Reconcile story status across files |
 
+For adversarial review of Claude Code output, run the Codex mirror against the same repository after Claude finishes a build or fix. The preferred path is the Codex `autonomous-sdlc` plugin's review-oriented skills (`project-review`, `roast`, `coverage`, or `create-issue`) so findings come back as actionable issues rather than vague commentary.
+
 The full workflow is documented end-to-end in [`WORKFLOW-v2.md`](WORKFLOW-v2.md).
 
 ---
@@ -213,6 +217,7 @@ The same plugin name ships on both platforms with overlapping but not identical 
 
 - All 8 Claude skills above (same names, same purpose)
 - Plus 7 Codex-only utilities: `check-releases`, `coverage`, `create-issue`, `create-project-summary-stats`, `plan-release-update`, `project-review`, `roast`
+- Used as the adversarial review counterpart for Claude Code work: Codex can run `project-review`, `roast`, `coverage`, and `create-issue` against Claude-produced changes to catch bugs, missing tests, brittle assumptions, and integration regressions before merge.
 
 The 7 Codex extras live as namespaced **commands** on the Claude side (`/devops:check-releases`, `/quality:roast`, etc.) under `commands/` rather than inside the plugin — so they're available everywhere, just at a different invocation path.
 
