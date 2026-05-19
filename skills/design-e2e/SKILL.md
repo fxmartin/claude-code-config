@@ -43,7 +43,7 @@ Read `${CLAUDE_SKILL_DIR}/generation-rules.md` for detailed test design methodol
 
 ### Phase 2: Design Test Cases (AGENT)
 
-Launch a `qa-expert` agent with:
+Launch a `qa-engineer` agent with:
 - The extracted acceptance criteria
 - The test design rules from `${CLAUDE_SKILL_DIR}/generation-rules.md`
 - Existing test inventory (if any)
@@ -61,7 +61,7 @@ The agent returns: test plan summary and generated `.spec.ts` file contents.
 
 ### Phase 4: Execute Tests (AGENT — skip if `--design-only`)
 
-Launch a `qa-expert` agent to:
+Launch a `qa-engineer` agent to:
 1. Use Playwright MCP to explore the app UI and validate selectors
 2. Run the generated tests: `npx playwright test <spec-file>`
 3. Capture results and return test output with pass/fail status per test

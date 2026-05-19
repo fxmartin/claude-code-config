@@ -317,7 +317,7 @@ Skip if `--skip-coverage`. For each successfully built story, launch coverage ag
 
 ```
 Agent(
-  subagent_type="qa-expert",
+  subagent_type="qa-engineer",
   model="sonnet",
   isolation="worktree",
   prompt="""
@@ -484,7 +484,7 @@ Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Step 
 bash -c '~/.claude/hooks/cmux-bridge.sh status current "[ID] Coverage" --icon flask --color "#5856D6"'
 ```
 
-Launch a `qa-expert` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
+Launch a `qa-engineer` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
 - `{{STORY_ID}}` → current story ID
 - `{{STORY_TITLE}}` → current story title
 - `{{EPIC_NAME}}` → current epic name
@@ -655,7 +655,7 @@ bash -c '~/.claude/hooks/cmux-bridge.sh log info "E2E gate: epic [EPIC_ID] -- al
 Read `${CLAUDE_SKILL_DIR}/e2e-gate.md` for the full logic, then launch:
 
 ```
-Agent(subagent_type="qa-expert", model="sonnet", prompt="""
+Agent(subagent_type="qa-engineer", model="sonnet", prompt="""
 Epic [EPIC_ID]: [EPIC_NAME] — all stories built and merged.
 
 [Include full prompt from e2e-gate.md with substitutions]

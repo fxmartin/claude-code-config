@@ -141,14 +141,14 @@ Launch an agent with `subagent_type` set to `AGENT_TYPE` (detected in Phase 1) a
 **If `--skip-coverage`**: Extract `PR_NUMBER` and `PR_URL` from the agent result. Skip Phase 5.
 **If coverage enabled** (default): Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Phase 5.
 
-## Phase 5: Coverage Gate (DISPATCHED — qa-expert, sonnet) — skip if `--skip-coverage`
+## Phase 5: Coverage Gate (DISPATCHED — qa-engineer, sonnet) — skip if `--skip-coverage`
 
 ```bash
 bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Coverage check" --icon hammer --color "#FF9500"'
 bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.45 --label "Phase 5: Coverage"'
 ```
 
-Launch a `qa-expert` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
+Launch a `qa-engineer` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
 - `{{BRANCH_NAME}}` → branch name from build agent result
@@ -180,14 +180,14 @@ Extract `APPROVAL_STATUS`, `REVIEW_SUMMARY`, and `FIXES_APPLIED` from the agent 
 
 If `APPROVAL_STATUS: CHANGES_NEEDED` persists after the review agent's fixes, proceed to Phase 8 (bugfix loop).
 
-## Phase 7: E2E Gate (DISPATCHED — qa-expert, sonnet) — skip unless `--e2e-gate=block|warn`
+## Phase 7: E2E Gate (DISPATCHED — qa-engineer, sonnet) — skip unless `--e2e-gate=block|warn`
 
 ```bash
 bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "E2E testing" --icon hammer --color "#FF9500"'
 bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.73 --label "Phase 7: E2E"'
 ```
 
-Launch a `qa-expert` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/e2e-gate-prompt.md`, substituting:
+Launch a `qa-engineer` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/e2e-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
 - `{{PR_NUMBER}}` → PR number
@@ -400,7 +400,7 @@ Skip if `--skip-coverage`. For each successfully built issue, launch coverage ag
 
 ```
 Agent(
-  subagent_type="qa-expert",
+  subagent_type="qa-engineer",
   model="sonnet",
   isolation="worktree",
   prompt="""

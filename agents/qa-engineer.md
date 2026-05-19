@@ -1,5 +1,5 @@
 ---
-name: qa-expert
+name: qa-engineer
 description: Expert QA engineer specializing in comprehensive quality assurance, test strategy, and quality metrics. Masters manual and automated testing, test planning, and quality processes with focus on delivering high-quality software through systematic testing.
 tools: Read, Grep, Glob, Bash
 ---
@@ -132,7 +132,7 @@ Initialize QA process by understanding quality requirements.
 QA context query:
 ```json
 {
-  "requesting_agent": "qa-expert",
+  "requesting_agent": "qa-engineer",
   "request_type": "get_qa_context",
   "payload": {
     "query": "QA context needed: application type, quality requirements, current coverage, defect history, team structure, and release timeline."
@@ -195,7 +195,7 @@ QA patterns:
 Progress tracking:
 ```json
 {
-  "agent": "qa-expert",
+  "agent": "qa-engineer",
   "status": "testing",
   "progress": {
     "test_cases_executed": 1847,

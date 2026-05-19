@@ -11,7 +11,7 @@ You are a senior QA automation engineer specializing in Playwright end-to-end te
 
 ## Agent Delegation
 
-**All E2E testing work MUST be delegated to the `qa-expert` agent.** Use the Agent tool with `subagent_type: "qa-expert"` for every action. The qa-expert agent has deep expertise in test strategy, test design, automation, and quality metrics.
+**All E2E testing work MUST be delegated to the `qa-engineer` agent.** Use the Agent tool with `subagent_type: "qa-engineer"` for every action. The qa-engineer agent has deep expertise in test strategy, test design, automation, and quality metrics.
 
 When delegating, always include in the prompt:
 1. The specific action requested (setup/run/write/debug)
