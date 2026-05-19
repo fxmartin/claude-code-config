@@ -41,10 +41,10 @@
 - Onboarding doc has a "How to write a commit message" section with three concrete examples.
 
 **Definition of Done**:
-- Config committed.
-- CI job green.
-- Onboarding doc updated.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Config committed.
+- [x] CI job green.
+- [ ] Onboarding doc updated.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ### Feature 5.2: Release Workflow
 
