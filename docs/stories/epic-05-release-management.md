@@ -127,10 +127,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A pre-commit hook (or PR check) verifies CHANGELOG syntax is valid Keep-a-Changelog (deferred: skip for MVP, document as roadmap).
 
 **Definition of Done**:
-- CHANGELOG.md bootstrapped.
-- Release workflow updates it automatically.
-- First release produced cleanly.
-- Documented in `docs/onboarding.md`.
+- [x] CHANGELOG.md bootstrapped.
+- [x] Release workflow updates it automatically.
+- [x] First release produced cleanly.
+- [ ] Documented in `docs/onboarding.md`.
 
 ## Story Dependencies (within Epic-05)
 
