@@ -1,5 +1,7 @@
 # Epic 1: Stabilize Foundation
 
+> **Status: COMPLETE** — all 5 stories merged 2026-05-19 (PRs #14, #15, #16, #17, #18)
+
 ## Epic Overview
 
 **Epic ID**: Epic-01

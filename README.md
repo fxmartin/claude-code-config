@@ -186,7 +186,8 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `skills/` | Loose user-level Claude skills not part of the SDLC plugin (generators, e2e, claude-docs, telegram, demo) | 9 |
 | `commands/` | Namespaced slash commands (`dev/`, `devops/`, `issues/`, `project/`, `quality/`, `research/`) | 17 |
 | `agents/` | Specialist agent definitions (flat) | 12 |
-| `hooks/` | cmux lifecycle hooks, Telegram bridge, worktree bootstrap, PR-merge docs hook | 8 scripts |
+| `hooks/` | cmux lifecycle hooks, Telegram bridge, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper | 9 scripts |
+| `tests/` | bats test suite for hooks (cmux-bridge, sweep-orphan-worktrees) + verification scripts | 4 bats + 3 scripts |
 | `templates/` | Shared scaffolding used by generator skills | 3 |
 | `reference-docs/` | Language/tooling references loaded via `@` imports | 3 |
 | `docs/` | User-facing docs (cmux integration, CLAUDE.md guide, Python/container/DB/testing best practices, generators) | — |

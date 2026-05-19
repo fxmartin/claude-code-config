@@ -27,17 +27,17 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 
 ## Epic Overview
 
-| Epic ID | Epic Name | Track | Story Count | Total Points | Priority |
-|---------|-----------|-------|-------------|--------------|----------|
-| Epic-01 | Stabilize Foundation | MVP-blocking | 5 | 13 | P0 |
-| Epic-02 | Self-CI for the Framework | MVP-blocking | 3 | 8 | P0 |
-| Epic-03 | Cross-Platform Installer (macOS + Windows/WSL2) | MVP | 4 | 13 | P0 |
-| Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 |
-| Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 |
-| Epic-06 | Public Release Readiness | MVP | 4 | 11 | P1 |
-| Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 |
-| Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 |
-| Epic-09 | Security Baked into Quality Gates | Roadmap | 3 | 10 | P2 |
+| Epic ID | Epic Name | Track | Story Count | Total Points | Priority | Status |
+|---------|-----------|-------|-------------|--------------|----------|--------|
+| Epic-01 | Stabilize Foundation | MVP-blocking | 5 | 13 | P0 | **COMPLETE** |
+| Epic-02 | Self-CI for the Framework | MVP-blocking | 3 | 8 | P0 | |
+| Epic-03 | Cross-Platform Installer (macOS + Windows/WSL2) | MVP | 4 | 13 | P0 | |
+| Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | |
+| Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | |
+| Epic-06 | Public Release Readiness | MVP | 4 | 11 | P1 | |
+| Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | |
+| Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | |
+| Epic-09 | Security Baked into Quality Gates | Roadmap | 3 | 10 | P2 | |
 
 ## Epic Navigation
 
