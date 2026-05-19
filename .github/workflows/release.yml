@@ -10,9 +10,11 @@ name: Release
 # --- Why this cannot infinite-loop -----------------------------------------
 # The workflow itself pushes a `chore(release): vX.Y.Z` commit to `main`, which
 # is another `push` to `main`. Two independent guards stop a second run:
-#   1. The `guard` job skips when the head commit subject starts with
-#      `chore(release):` or contains `[skip release]`. The release job depends
-#      on `guard`, so a bot commit short-circuits before any work.
+#   1. The `guard` job skips when the head commit SUBJECT (first line only)
+#      starts with `chore(release):` or contains the skip-release token. The
+#      release job depends on `guard`, so a bot commit short-circuits before
+#      any work. Matching the subject — not the whole message — means a PR
+#      body that merely documents the token cannot false-trip the guard.
 #   2. Defence in depth: even if guard 1 were bypassed, `compute-release.sh`
 #      would see only the `chore(release):` commit since the new tag, classify
 #      it as `BUMP=none`, and exit 0 without tagging.
@@ -43,28 +45,19 @@ jobs:
     outputs:
       proceed: ${{ steps.decide.outputs.proceed }}
     steps:
+      - name: Checkout (guard script only)
+        uses: actions/checkout@v4
+
       - name: Decide whether to run
         id: decide
         env:
           # The head commit message of the push that triggered this run.
           HEAD_MSG: ${{ github.event.head_commit.message }}
         run: |
-          proceed=true
-          # Skip the workflow's own bump commit (recursion guard 1).
-          case "${HEAD_MSG}" in
-            "chore(release):"*)
-              echo "Head commit is a release bump — skipping to avoid recursion."
-              proceed=false
-              ;;
-          esac
-          # Manual escape hatch for docs-only / workflow-tweak emergency pushes.
-          case "${HEAD_MSG}" in
-            *"[skip release]"*)
-              echo "Head commit requests [skip release] — skipping."
-              proceed=false
-              ;;
-          esac
-          echo "proceed=${proceed}" >> "${GITHUB_OUTPUT}"
+          # The decision (subject-only matching) lives in a bats-tested helper
+          # so the loop/skip logic cannot silently regress.
+          printf '%s' "${HEAD_MSG}" \
+            | ./scripts/release-guard.sh >> "${GITHUB_OUTPUT}"
 
   release:
     name: Compute, tag and publish
