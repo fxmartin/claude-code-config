@@ -70,3 +70,25 @@ jobs:
 
       - name: Validate agent registry
         run: ./scripts/validate-agent-registry.sh
+
+  behavior-tests:
+    name: Behavior tests (bats)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up bats-core
+        uses: bats-core/bats-action@3.0.1
+        with:
+          support-install: false
+          assert-install: false
+          detik-install: false
+          file-install: false
+
+      - name: Run bats suites
+        run: |
+          bats --version
+          jq --version
+          bats tests/cmux-bridge.bats tests/install-dry-run.bats
