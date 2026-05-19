@@ -79,11 +79,11 @@
 - `concurrency` group prevents parallel releases racing.
 
 **Definition of Done**:
-- Workflow committed.
-- A test commit on a feature branch followed by merge to `main` produces a new tag and release.
-- `plugin.json` and `marketplace.json` versions match the new tag.
-- CHANGELOG entry created.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Workflow committed.
+- [x] A test commit on a feature branch followed by merge to `main` produces a new tag and release.
+- [x] `plugin.json` and `marketplace.json` versions match the new tag.
+- [x] CHANGELOG entry created.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ### Feature 5.3: CHANGELOG Maintenance
 
