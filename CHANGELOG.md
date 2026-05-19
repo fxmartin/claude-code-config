@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v1.4.0] - 2026-05-19
+
+### Added
+
+- feat: github actions release workflow (#5.2-001) (#23)
+- feat: conventional commits + commitlint on PRs (#5.1-001) (#22)
+- feat(self-ci): bats test suite for cmux-bridge.sh and install.sh --dry-run (#2.1-002) (#20)
+- feat: Agent-registry validator (#2.1-003) (#21)
+- feat: GitHub Actions workflow for static checks (#2.1-001) (#19)
+- feat: Fix .env source path and worktree leak (#1.3-002) (#17)
+- feat: Fix Telegram JSON escaping in cmux-bridge.sh (#1.3-001) (#18)
+- feat(foundation): resolve WORKFLOW.md and workflow-diagram.png dangling references (#1.2-001) (#16)
+- feat: Reconcile qa-expert to qa-engineer across all skills (#1.1-001) (#14)
+- feat: Reconcile slash-command naming in CLAUDE.md (#1.1-002) (#15)
+- feat(stories): seed MVP and roadmap epics for sharing the framework
+
+
 ### Added
 
 - Automatic release pipeline: a new `.github/workflows/release.yml` that, on
