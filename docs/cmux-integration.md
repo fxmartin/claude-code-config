@@ -52,10 +52,23 @@ Automatic lifecycle tracking that fires for ALL skills and agents without per-sk
 | `cmux-session-start.sh` | `SessionStart` | Logs "Claude session started", sets "Ready" status pill (blue) |
 | `cmux-agent-start.sh` | `SubagentStart` | Shows "Running: {agent_type}" status pill (blue), logs agent start |
 | `cmux-agent-stop.sh` | `SubagentStop` | Clears agent pill, logs completion, sends desktop notification with result excerpt (first 200 chars) |
-| `cmux-stop.sh` | `Stop` | Clears all progress/status, sends "Claude Done" notification |
+| `cmux-stop.sh` | `Stop` | Clears all progress/status, sends "Claude Done" notification, prunes completed worktrees |
 | `cmux-permission.sh` | `Notification` (matcher: `permission_prompt`) | Sets red "Permission Needed" pill, sends urgent desktop notification |
 
 All hooks receive JSON on stdin from Claude Code with context like `agent_type`, `last_assistant_message`, and `notification_type`. All run asynchronously (never block Claude).
+
+### Worktree Cleanup
+
+Parallel `/build-stories` runs isolate each agent in a git worktree under `.claude/worktrees/agent-*`. Without cleanup these accumulate (~150 MB per run). Two mechanisms keep disk usage bounded:
+
+- **`cmux-stop.sh`** — at session end, removes any `.claude/worktrees/agent-*` whose branch is fully merged into `main` (`git worktree remove --force`), then delegates stale-orphan cleanup to the sweeper. Also exposes `cmux-stop.sh prune-worktrees [repo-root]` for manual runs.
+- **`sweep-orphan-worktrees.sh`** — removes any `agent-*` worktree directory older than 6 hours. It is **safe to run mid-build**: a directory still registered with `git worktree list --porcelain` is never removed, regardless of age. Permission errors on a single orphan are skipped, never fatal.
+
+Both are silent and non-blocking — a cleanup failure never breaks session end. After a full parallel build, `du -sh .claude/worktrees/` stays under 50 MB.
+
+### `.env` Resolution
+
+`cmux-bridge.sh` sources Telegram credentials from `.env` at the repo root, resolved relative to the script's own directory (`$(dirname "${BASH_SOURCE[0]}")/../.env`). This matches where `install.sh` writes `.env` and works correctly even when the bridge is invoked through the `~/.claude/hooks` symlink.
 
 ### Hook Configuration in `settings.json`
 
@@ -143,6 +156,7 @@ No direct Telegram `curl` blocks remain in any skill except the dedicated `/tele
 | `hooks/cmux-agent-stop.sh` | ~10 | SubagentStop lifecycle hook |
 | `hooks/cmux-stop.sh` | ~8 | Stop lifecycle hook |
 | `hooks/cmux-permission.sh` | ~6 | Permission prompt notification hook |
+| `hooks/sweep-orphan-worktrees.sh` | ~55 | Removes stale (>6h) orphan agent worktrees, mid-build safe |
 
 ### Modified
 
