@@ -62,6 +62,19 @@ while IFS= read -r cmd; do
   fi
 done < <(grep -oE '`/[a-z][a-z0-9-]*`' "$CLAUDE_MD" | tr -d '`' | sort -u)
 
+# Definition of Done: CHANGELOG.md must reference this story (#1.1-002) under
+# the "Fixed" section, confirming the change was documented per the DoD.
+CHANGELOG="$REPO_ROOT/CHANGELOG.md"
+if [ ! -f "$CHANGELOG" ]; then
+  echo "FAIL: CHANGELOG.md does not exist"
+  fail=1
+elif grep -qF "#1.1-002" "$CHANGELOG"; then
+  echo "PASS: CHANGELOG.md documents story #1.1-002"
+else
+  echo "FAIL: CHANGELOG.md missing #1.1-002 entry — DoD requires changelog update"
+  fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "VERIFICATION FAILED"
   exit 1
