@@ -90,10 +90,10 @@
 - Documentation in `docs/onboarding.md` explains how to add a new agent (file under `agents/`) so it is discoverable to the validator.
 
 **Definition of Done**:
-- Script committed and executable.
-- CI job green on `main` after Epic-01 fixes are in.
-- Onboarding doc updated.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Script committed and executable.
+- [x] CI job green on `main` after Epic-01 fixes are in.
+- [ ] Onboarding doc updated.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ## Story Dependencies (within Epic-02)
 
