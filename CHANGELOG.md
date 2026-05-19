@@ -123,5 +123,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial public release of the Claude Code configuration framework: agents,
   skills, commands, hooks, the cmux integration, and the install script.
-</content>
-</invoke>
