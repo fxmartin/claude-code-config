@@ -53,3 +53,25 @@ skip_token() { printf '[%s]' 'skip release'; }
     [ "${status}" -eq 0 ]
     [[ "${output}" == *"proceed=true"* ]]
 }
+
+@test "plain fix subject proceeds" {
+    # fix: is the other common release-triggering type — must not be guarded
+    run "${GUARD}" <<<'fix: correct off-by-one in version parser'
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"proceed=true"* ]]
+}
+
+@test "empty commit message defaults to proceed=true" {
+    # An empty message has no subject to match — safe default is to release
+    run "${GUARD}" <<<''
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"proceed=true"* ]]
+}
+
+@test "CRLF line endings do not defeat subject-only guards" {
+    # GitHub event payloads may use CRLF; the guard must still correctly skip
+    # a chore(release): subject even when lines end with \r\n.
+    run bash -c "printf 'chore(release): v9.9.9\r\nbody line' | ${GUARD}"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"proceed=false"* ]]
+}
