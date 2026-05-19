@@ -64,3 +64,18 @@ EOF
         bash "$INSTALL_DIR/hooks/cmux-bridge.sh" telegram "Test" "Body"
     [ "$status" -eq 0 ]
 }
+
+@test "bridge resolves .env correctly when invoked via a symlink" {
+    _stage_install "symlink-token-456"
+    # Simulate the installed symlink: ~/.claude/hooks -> .../repo/hooks
+    LINK_DIR="$FAKE_HOME/.claude/hooks"
+    mkdir -p "$FAKE_HOME/.claude"
+    ln -s "$INSTALL_DIR/hooks" "$LINK_DIR"
+    run env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID -u CMUX_SOCKET_PATH \
+        HOME="$FAKE_HOME" CMUX_BRIDGE_DRYRUN=1 \
+        bash "$LINK_DIR/cmux-bridge.sh" telegram "Test" "Body"
+    [ "$status" -eq 0 ]
+    # BASH_SOURCE[0] resolves through the symlink so ../.env still points at
+    # $INSTALL_DIR/.env, not $LINK_DIR/../.env which would be ~/.claude/.env.
+    [[ "$output" == *"symlink-token-456"* ]]
+}

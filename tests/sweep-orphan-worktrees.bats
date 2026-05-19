@@ -72,3 +72,16 @@ _age_dir() {
     # Sweeper must not abort the run on a single failed removal.
     [ "$status" -eq 0 ]
 }
+
+@test "no-git-repo: sweeper exits 0 when passed a plain directory" {
+    # REPO_ROOT is not a git repo — sweeper must degrade silently.
+    plain_dir="$(mktemp -d)"
+    mkdir -p "$plain_dir/.claude/worktrees"
+    orphan="$plain_dir/.claude/worktrees/agent-norepo"
+    mkdir -p "$orphan"
+    # Age it so it would be swept if the git guard were absent.
+    touch -t "$(date -v-7H +%Y%m%d%H%M 2>/dev/null || date -d '7 hours ago' +%Y%m%d%H%M)" "$orphan"
+    run bash "$SWEEP" "$plain_dir"
+    rm -rf "$plain_dir"
+    [ "$status" -eq 0 ]
+}

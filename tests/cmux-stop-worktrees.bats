@@ -43,3 +43,30 @@ teardown() {
     [ "$status" -eq 0 ]
     [ -d "$wt" ]
 }
+
+@test "detached-HEAD worktree is skipped, not removed" {
+    wt="$REPO/.claude/worktrees/agent-detached"
+    git -C "$REPO" worktree add -q -b feat/detach "$wt" >/dev/null
+    echo change > "$wt/seed"
+    git -C "$wt" commit -q -am change
+    # Detach HEAD so symbolic-ref returns nothing
+    git -C "$wt" checkout -q --detach >/dev/null
+    git -C "$REPO" merge -q feat/detach
+    run bash "$REPO_ROOT/hooks/cmux-stop.sh" prune-worktrees "$REPO"
+    [ "$status" -eq 0 ]
+    # Detached HEAD: _prune_worktrees skips the branch-check, directory survives.
+    [ -d "$wt" ]
+}
+
+@test "non-agent worktree pattern is never removed" {
+    # A worktree outside the agent-* naming convention must never be swept.
+    wt="$REPO/.claude/worktrees/shared-tools"
+    git -C "$REPO" worktree add -q -b feat/shared "$wt" >/dev/null
+    echo change > "$wt/seed"
+    git -C "$wt" commit -q -am change
+    git -C "$REPO" merge -q feat/shared
+    run bash "$REPO_ROOT/hooks/cmux-stop.sh" prune-worktrees "$REPO"
+    [ "$status" -eq 0 ]
+    # Pattern guard `*/.claude/worktrees/agent-*` excludes this directory.
+    [ -d "$wt" ]
+}
