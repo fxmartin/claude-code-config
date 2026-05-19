@@ -104,10 +104,10 @@
 - The shell-level `> /dev/null 2>&1 || true` on the `curl` call is replaced with non-blocking error logging: failures append a single line to `~/.claude/logs/cmux-bridge.log` (created lazily) without blocking the caller.
 
 **Definition of Done**:
-- Code committed.
-- A `bats` test in `tests/cmux-bridge.bats` verifies the function emits valid JSON when fed adversarial inputs from a fixture (`tests/fixtures/adversarial-strings.txt`).
-- Manual smoke test: send a notification with body `Test * _broken_ \backslash "quotes" and a 🚨 emoji` and confirm it arrives readable on Telegram.
-- Change noted in `CHANGELOG.md` under "Fixed".
+- [x] Code committed.
+- [x] A `bats` test in `tests/cmux-bridge.bats` verifies the function emits valid JSON when fed adversarial inputs from a fixture (`tests/fixtures/adversarial-strings.txt`).
+- [x] Manual smoke test: send a notification with body `Test * _broken_ \backslash "quotes" and a 🚨 emoji` and confirm it arrives readable on Telegram.
+- [x] Change noted in `CHANGELOG.md` under "Fixed".
 
 ##### Story 1.3-002: Fix `.env` source path and worktree leak
 **User Story**: As FX, I want `cmux-bridge.sh` to find the actual `.env` file the installer writes, and I want completed worktrees to be torn down automatically, so that long parallel runs do not silently drop Telegram alerts and do not leave 150 MB of orphan checkouts on disk per run.
