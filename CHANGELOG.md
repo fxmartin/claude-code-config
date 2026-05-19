@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Conventional Commits enforcement: a `.commitlintrc.json` extending
+  `@commitlint/config-conventional` that restricts types to `feat`, `fix`,
+  `chore`, `docs`, `refactor`, `test`, `ci`, `perf`, `build`, `revert`, makes
+  scope optional but lower-case, and enforces a lower-case subject start, no
+  trailing period, and a 72-character header cap. A new `commit-format` CI job
+  in `.github/workflows/ci.yml` runs `commitlint --from origin/main --to HEAD`
+  on every pull request and fails the PR on any non-conforming commit; existing
+  history on `main` is exempt. A "Commit Format" section in `CLAUDE.md`
+  documents how to write a commit message with three concrete examples.
+  Folding the same guidance into `docs/onboarding.md` is deferred until Epic-06
+  creates that file. (#5.1-001)
 - Behavior test suites under `tests/`: `cmux-bridge.bats` extended with
   `notify` JSON-validity cases (normal and adversarial input) and
   graceful-degradation exit checks for the `log`, `status`, `progress`,
