@@ -1,5 +1,7 @@
 # Epic 5: Automatic Release Management
 
+> **Status: COMPLETE** — all 3 stories merged 2026-05-19 (PRs #22, #23, #24)
+
 ## Epic Overview
 
 **Epic ID**: Epic-05

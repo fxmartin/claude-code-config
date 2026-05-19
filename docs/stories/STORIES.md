@@ -33,7 +33,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic-02 | Self-CI for the Framework | MVP-blocking | 3 | 8 | P0 | **COMPLETE** |
 | Epic-03 | Cross-Platform Installer (macOS + Windows/WSL2) | MVP | 4 | 13 | P0 | |
 | Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | |
-| Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | |
+| Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | **COMPLETE** |
 | Epic-06 | Public Release Readiness | MVP | 4 | 11 | P1 | |
 | Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | |
 | Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | |

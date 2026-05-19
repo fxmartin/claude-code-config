@@ -1,6 +1,8 @@
 # claude-code-config
 
 [![CI](https://github.com/fxmartin/claude-code-config/actions/workflows/ci.yml/badge.svg)](https://github.com/fxmartin/claude-code-config/actions/workflows/ci.yml)
+[![Release](https://github.com/fxmartin/claude-code-config/actions/workflows/release.yml/badge.svg)](https://github.com/fxmartin/claude-code-config/actions/workflows/release.yml)
+[![GitHub release](https://img.shields.io/github/v/release/fxmartin/claude-code-config)](https://github.com/fxmartin/claude-code-config/releases/latest)
 
 A complete, opinionated Claude Code configuration: agents, skills, slash commands, MCP servers, hooks, and observability — engineered to take an idea from **one-line concept to merged PR without a human in the loop**.
 
@@ -189,7 +191,7 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `commands/` | Namespaced slash commands (`dev/`, `devops/`, `issues/`, `project/`, `quality/`, `research/`) | 17 |
 | `agents/` | Specialist agent definitions (flat) | 12 |
 | `hooks/` | cmux lifecycle hooks, Telegram bridge, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper | 9 scripts |
-| `scripts/` | Standalone validation scripts run by CI (`validate-agent-registry.sh`) | 1 |
+| `scripts/` | Standalone scripts run by CI (`validate-agent-registry.sh`) and the release workflow (`compute-release.sh`, `release-guard.sh`) | 3 |
 | `tests/` | bats test suite for hooks and install smoke tests (cmux-bridge, install dry-run, agent-registry, sweep-orphan-worktrees) | 6 bats |
 | `templates/` | Shared scaffolding used by generator skills | 3 |
 | `reference-docs/` | Language/tooling references loaded via `@` imports | 3 |
@@ -374,6 +376,14 @@ See [`docs/generators.md`](docs/generators.md).
 - [`docs/cmux-integration.md`](docs/cmux-integration.md) — full cmux integration architecture and event schema
 - [`docs/generators.md`](docs/generators.md) — generator skills documentation
 - [`docs/python-best-practices.md`](docs/python-best-practices.md) · [`docs/testing-best-practices.md`](docs/testing-best-practices.md) · [`docs/container-best-practices.md`](docs/container-best-practices.md) · [`docs/database-best-practices.md`](docs/database-best-practices.md)
+
+---
+
+## Contributing
+
+This repo enforces [Conventional Commits](https://www.conventionalcommits.org/). A `commit-format` CI job runs `commitlint` against every PR and will fail if any commit in the range violates the rules. Allowed types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `ci`, `perf`, `build`, `revert`. Subject must start lowercase, no trailing period, max 72 chars.
+
+Every push to `main` that contains a `feat:` or `fix:` commit (or better) triggers the release workflow: it bumps semver, creates a `vX.Y.Z` tag, updates `plugin.json` and `marketplace.json`, appends a CHANGELOG entry, and opens a GitHub Release with auto-generated notes. `chore:`/`docs:`-only pushes produce no release.
 
 ---
 
