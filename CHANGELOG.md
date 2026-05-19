@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Automatic release pipeline: a new `.github/workflows/release.yml` that, on
+  every push to `main`, computes the next semantic version from the
+  Conventional Commits since the last tag, aligns the `version` fields of
+  `plugins/autonomous-sdlc/.claude-plugin/plugin.json` and
+  `.claude-plugin/marketplace.json`, prepends a CHANGELOG section, commits the
+  bump as `chore(release): vX.Y.Z`, tags it `vX.Y.Z`, and publishes a GitHub
+  Release with auto-generated notes. Bump rules: `BREAKING CHANGE:`/`!` →
+  MAJOR, `feat` → MINOR, `fix`/`perf`/`refactor` → PATCH, and a
+  chore/docs-only push is a clean no-op. The semver maths lives in a
+  shellcheck-clean, bats-tested helper `scripts/compute-release.sh`. The
+  workflow is non-recursive (a `guard` job skips its own `chore(release):`
+  bump commit and `[skip release]` pushes) and idempotent (it no-ops if the
+  computed tag already exists). (#5.2-001)
 - Conventional Commits enforcement: a `.commitlintrc.json` extending
   `@commitlint/config-conventional` that restricts types to `feat`, `fix`,
   `chore`, `docs`, `refactor`, `test`, `ci`, `perf`, `build`, `revert`, makes
