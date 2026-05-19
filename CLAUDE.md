@@ -52,7 +52,7 @@ For multi-step tasks, state a brief plan with explicit verification per step:
 
 Strong success criteria let agents loop independently. Weak criteria ("make it work") require constant clarification. Transform fuzzy asks into verifiable goals: "Add validation" → "Write tests for invalid inputs, then make them pass". "Fix the bug" → "Write a test that reproduces it, then make it pass".
 
-**Agents** (defined in `agents/*.md`): backend-typescript-architect, python-backend-engineer, ui-engineer, podman-container-architect, bash-zsh-macos-engineer, senior-code-reviewer, qa-expert.
+**Agents** (defined in `agents/*.md`): backend-typescript-architect, python-backend-engineer, ui-engineer, podman-container-architect, bash-zsh-macos-engineer, senior-code-reviewer, qa-engineer.
 
 **Key skills**: `/brainstorm`, `/generate-epics`, `/resume-build-agents`, `/create-issue`, `/coverage`, `/create-project-summary-stats`.
 

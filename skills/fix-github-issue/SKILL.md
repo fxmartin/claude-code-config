@@ -163,7 +163,7 @@ Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Phase
 
 ## Phase 6: Coverage Gate (skip if `--skip-coverage`)
 
-Launch a `qa-expert` agent with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
+Launch a `qa-engineer` agent with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` -> current issue number
 - `{{ISSUE_TITLE}}` -> current issue title
 - `{{BRANCH_NAME}}` -> branch name from build agent result
@@ -190,7 +190,7 @@ If `APPROVAL_STATUS: CHANGES_NEEDED` persists after the review agent's fixes, pr
 
 ## Phase 8: E2E Gate (skip unless `--e2e-gate=block|warn`)
 
-Launch a `qa-expert` agent with the prompt from `${CLAUDE_SKILL_DIR}/e2e-gate-prompt.md`, substituting:
+Launch a `qa-engineer` agent with the prompt from `${CLAUDE_SKILL_DIR}/e2e-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` -> current issue number
 - `{{ISSUE_TITLE}}` -> current issue title
 - `{{PR_NUMBER}}` -> PR number

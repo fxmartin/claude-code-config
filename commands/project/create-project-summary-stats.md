@@ -5,7 +5,7 @@ Generate a complete project retrospective report by launching these analysis age
 1. **Code metrics agent** (`general-purpose`): Run `cloc .` for line counts, count files by type, calculate code-to-test ratio
 2. **GitHub activity agent** (`general-purpose`): Use `gh` CLI for repo stats, PR metrics, issue tracking, contributor analysis
 3. **Dependency health agent** (`general-purpose`): List all dependencies, check for outdated packages, identify security vulnerabilities
-4. **Test coverage agent** (`qa-expert`): Run test coverage analysis, count test files, assess test quality
+4. **Test coverage agent** (`qa-engineer`): Run test coverage analysis, count test files, assess test quality
 
 Merge all agent results into a unified report.
 

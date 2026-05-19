@@ -10,10 +10,10 @@ After completing a story, determine if this was the last story for its epic in t
 
 ## E2E Test Generation & Validation Loop
 
-At each epic boundary, launch the `qa-expert` agent:
+At each epic boundary, launch the `qa-engineer` agent:
 
 ```
-Agent(subagent_type="qa-expert", prompt="""
+Agent(subagent_type="qa-engineer", prompt="""
 Epic [EPIC_ID]: [EPIC_NAME] — all stories built and merged.
 
 ## Your Task
