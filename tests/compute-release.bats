@@ -130,3 +130,37 @@ commits() {
     run "${BUMPER}" </dev/null
     [ "${status}" -eq 2 ]
 }
+
+@test "BREAKING-CHANGE hyphenated footer bumps MAJOR" {
+    run "${BUMPER}" v1.3.0 <<<"$(commits $'fix: adjust thing\n\nBREAKING-CHANGE: old flag removed')"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"BUMP=major"* ]]
+    [[ "${output}" == *"VERSION=v2.0.0"* ]]
+}
+
+@test "mixed fix+feat+BREAKING CHANGE — MAJOR wins over all" {
+    run "${BUMPER}" v1.3.0 <<<"$(commits 'fix: patch thing' 'feat: add thing' $'chore: admin\n\nBREAKING CHANGE: api changed')"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"BUMP=major"* ]]
+    [[ "${output}" == *"VERSION=v2.0.0"* ]]
+}
+
+@test "from v0.0.0 a fix produces v0.0.1" {
+    run "${BUMPER}" v0.0.0 <<<"$(commits 'fix: first patch')"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"BUMP=patch"* ]]
+    [[ "${output}" == *"VERSION=v0.0.1"* ]]
+}
+
+@test "minor increment rolls over double-digit patch — v1.9.9 + feat yields v1.10.0" {
+    run "${BUMPER}" v1.9.9 <<<"$(commits 'feat: new thing')"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"BUMP=minor"* ]]
+    [[ "${output}" == *"VERSION=v1.10.0"* ]]
+}
+
+@test "revert commit is treated as no-op" {
+    run "${BUMPER}" v1.3.0 <<<"$(commits 'revert: undo last change')"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"BUMP=none"* ]]
+}
