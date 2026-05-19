@@ -54,7 +54,7 @@ Strong success criteria let agents loop independently. Weak criteria ("make it w
 
 **Agents** (defined in `agents/*.md`): backend-typescript-architect, python-backend-engineer, ui-engineer, podman-container-architect, bash-zsh-macos-engineer, senior-code-reviewer, qa-expert.
 
-**Key skills**: `/brainstorm`, `/generate-epics`, `/resume-build-agents`, `/issues:create-issue`, `/quality:coverage`, `/project:create-project-summary-stats`.
+**Key skills**: `/brainstorm`, `/generate-epics`, `/resume-build-agents`, `/create-issue`, `/coverage`, `/create-project-summary-stats`.
 
 **Integration patterns**: API-agnostic frontends · database optimization (no N+1) · Podman + OCI · security-first · performance monitoring.
 
