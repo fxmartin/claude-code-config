@@ -1,6 +1,6 @@
 #!/bin/bash
 # Hook: Notification (permission_prompt) — Alert dev that permission is needed
-INPUT=$(cat)
+cat > /dev/null
 
 BRIDGE="$HOME/.claude/hooks/cmux-bridge.sh"
 "$BRIDGE" status claude "Permission Needed" --icon sparkle --color "#FF3B30"
