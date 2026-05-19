@@ -23,9 +23,20 @@ _send_telegram() {
     local REPO
     REPO=$(_repo_tag)
     local TAGGED_TITLE="[${REPO}] ${TITLE}"
-    # shellcheck source=/dev/null
-    source ~/.claude/config/.env 2>/dev/null || true
+    # Source .env from the repo root relative to this script's own directory
+    # ($SCRIPT_DIR/.env), which is exactly where install.sh writes it.
+    # ${BASH_SOURCE[0]} resolves correctly even when invoked via the
+    # ~/.claude/hooks symlink. Falls back silently when no .env exists.
+    local BRIDGE_DIR
+    BRIDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # shellcheck disable=SC1091
+    [ -f "$BRIDGE_DIR/../.env" ] && source "$BRIDGE_DIR/../.env" 2>/dev/null || true
     if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+        if [ -n "${CMUX_BRIDGE_DRYRUN:-}" ]; then
+            # Test hook: report the resolved token without hitting the network.
+            echo "[dry-run] telegram token=${TELEGRAM_BOT_TOKEN} chat=${TELEGRAM_CHAT_ID}"
+            return 0
+        fi
         # Build the payload with jq so quotes, backslashes, newlines, markdown
         # characters and emoji are escaped correctly. No string interpolation
         # of payload fields. parse_mode is omitted: plain text for MVP.
