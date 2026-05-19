@@ -40,7 +40,7 @@
 
 ## Workflow & Agents
 
-Story-driven development (`/generate-epics`, `REQUIREMENTS.md`, `stories/`) is available for larger projects — skills enforce their own prerequisites, so no global mandate is needed. See `WORKFLOW.md` for the full multi-agent development lifecycle.
+Story-driven development (`/generate-epics`, `REQUIREMENTS.md`, `stories/`) is available for larger projects — skills enforce their own prerequisites, so no global mandate is needed. See `WORKFLOW-v2.md` for the full multi-agent development lifecycle.
 
 ### Verifiable goals
 For multi-step tasks, state a brief plan with explicit verification per step:
@@ -104,7 +104,7 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 - **Containers**: `docs/container-best-practices.md`
 - **Testing & TDD**: `docs/testing-best-practices.md`
 - **Source Control**: `@~/.claude/reference-docs/source-control.md`
-- **Full Workflow**: `WORKFLOW.md` and `WORKFLOW-v2.md`
+- **Full Workflow**: `WORKFLOW-v2.md`
 
 ---
 *Surgical Changes rules, Complexity check, and Verifiable Goals template adapted from [forrestchang/andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills) (MIT), itself derived from Andrej Karpathy's observations on LLM coding pitfalls.*

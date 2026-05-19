@@ -291,7 +291,7 @@ A table mapping legacy tools (`find`, `grep`, `cat`, `cd`) to modern replacement
 - **Containers**: `docs/container-best-practices.md`
 - **Testing & TDD**: `docs/testing-best-practices.md`
 - **Source Control**: `@~/.claude/reference-docs/source-control.md`
-- **Full Workflow**: `WORKFLOW.md` and `WORKFLOW-v2.md`
+- **Full Workflow**: `WORKFLOW-v2.md`
 ```
 
 Five pointers, one `@` import. The `@` imports Source Control eagerly into the prompt — because commit/branch/PR conventions apply in every session. The other four are lazy pointers — Claude knows they exist and reads them only when relevant (writing Python code, designing a DB schema, etc.).
@@ -618,7 +618,7 @@ Six months from now, when a new teammate joins or you spin up a new project, thi
 
 - This repo's [`CLAUDE.md`](../CLAUDE.md) — the file this guide dissects
 - [`docs/cmux-integration.md`](cmux-integration.md) — example of a deep-dive that CLAUDE.md links to rather than inlines
-- [`WORKFLOW.md`](../WORKFLOW.md), [`WORKFLOW-v2.md`](../WORKFLOW-v2.md) — the multi-agent workflow CLAUDE.md orients Claude toward
+- [`WORKFLOW-v2.md`](../WORKFLOW-v2.md) — the multi-agent workflow CLAUDE.md orients Claude toward
 - [forrestchang/andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills) — upstream for three of this file's rules
 - Anthropic's [Claude Code documentation](https://docs.claude.com/en/docs/claude-code) — authoritative reference for CLAUDE.md loading behavior and harness mechanics
 
