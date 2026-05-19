@@ -40,10 +40,10 @@
 - Status check `static-checks` is required for merging to `main` (branch protection rule documented in `docs/onboarding.md`).
 
 **Definition of Done**:
-- Workflow committed.
-- Workflow passes on `main` after Epic-01 fixes are in.
-- Branch protection rule documented in onboarding doc.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Workflow committed.
+- [x] Workflow passes on `main` after Epic-01 fixes are in.
+- [ ] Branch protection rule documented in onboarding doc.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ##### Story 2.1-002: Bats test suite for `cmux-bridge.sh` and `install.sh --dry-run`
 **User Story**: As FX, I want behavior tests for the two scripts most likely to break for LTM colleagues so that I catch regressions before they hit a teammate's machine.
