@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+# Static checks are read-only: drop the default token to least privilege.
+permissions:
+  contents: read
+
 jobs:
   static-checks:
     name: Static checks
