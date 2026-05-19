@@ -23,11 +23,28 @@ _send_telegram() {
     local REPO
     REPO=$(_repo_tag)
     local TAGGED_TITLE="[${REPO}] ${TITLE}"
+    # shellcheck source=/dev/null
     source ~/.claude/config/.env 2>/dev/null || true
     if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        # Build the payload with jq so quotes, backslashes, newlines, markdown
+        # characters and emoji are escaped correctly. No string interpolation
+        # of payload fields. parse_mode is omitted: plain text for MVP.
+        local PAYLOAD
+        PAYLOAD=$(jq -n \
+            --arg chat "$TELEGRAM_CHAT_ID" \
+            --arg text "${TAGGED_TITLE}
+${BODY}" \
+            '{chat_id: $chat, text: $text}')
+        # Non-blocking error logging: a failed send appends one line to the
+        # bridge log instead of being swallowed, and never blocks the caller.
+        if ! curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${TAGGED_TITLE}\n${BODY}\", \"parse_mode\": \"Markdown\"}" > /dev/null 2>&1 || true
+            -d "$PAYLOAD" > /dev/null 2>&1; then
+            local LOG=~/.claude/logs/cmux-bridge.log
+            mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+            printf '%s telegram send failed: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$TAGGED_TITLE" \
+                >> "$LOG" 2>/dev/null || true
+        fi
     fi
 }
 
