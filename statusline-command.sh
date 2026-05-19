@@ -37,4 +37,31 @@ else
   branch_seg=""
 fi
 
-printf '%s%s | %s%s' "$cwd_display" "$branch_seg" "$model" "$ctx_seg"
+# Build rate-limit segment (Claude.ai subscription only — absent for API users)
+five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
+week_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
+
+if [ -n "$five_pct" ] || [ -n "$week_pct" ]; then
+  rl_label=""
+  if [ -n "$five_pct" ]; then
+    five_int=$(printf '%.0f' "$five_pct")
+    if [ "$five_int" -ge 80 ] 2>/dev/null; then
+      rl_label="⚠️  rl: ${five_int}%"
+    else
+      rl_label="rl: ${five_int}%"
+    fi
+  fi
+  if [ -n "$week_pct" ]; then
+    week_int=$(printf '%.0f' "$week_pct")
+    if [ -n "$rl_label" ]; then
+      rl_label="${rl_label}/7d:${week_int}%"
+    else
+      rl_label="rl: 7d:${week_int}%"
+    fi
+  fi
+  rl_seg=" | ${rl_label}"
+else
+  rl_seg=""
+fi
+
+printf '%s%s | %s%s%s' "$cwd_display" "$branch_seg" "$model" "$ctx_seg" "$rl_seg"
