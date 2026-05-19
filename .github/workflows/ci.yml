@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Shellcheck (severity floor: warning)"
+        run: |
+          shellcheck --version
+          shellcheck --severity=warning \
+            hooks/*.sh \
+            install.sh \
+            statusline-command.sh
+
+      - name: Validate JSON (jq -e .)
+        run: |
+          jq --version
+          fail=0
+          for f in \
+            .claude-plugin/*.json \
+            plugins/*/.claude-plugin/*.json \
+            mcp/*.json \
+            settings.json
+          do
+            [ -e "$f" ] || continue
+            if jq -e . "$f" > /dev/null; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      - name: Markdown link check
+        run: |
+          npm install -g markdown-link-check@3
+          fail=0
+          while IFS= read -r f; do
+            if ! markdown-link-check -q -c .markdown-link-check.json "$f"; then
+              fail=1
+            fi
+          done < <(git ls-files '*.md')
+          exit "$fail"

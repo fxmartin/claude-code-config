@@ -9,7 +9,7 @@
 1. [Why CLAUDE.md matters — the essay](#part-i--why-claudemd-matters-the-essay)
 2. [How Claude Code discovers and loads it](#part-ii--how-claude-code-discovers-and-loads-it)
 3. [Anatomy of this repo's CLAUDE.md — the worked example](#part-iii--anatomy-of-this-repos-claudemd-the-worked-example)
-4. [Guardrails, defaults, focus — a taxonomy](#part-iv--guardrails-defaults-focus-a-taxonomy)
+4. [Guardrails, defaults, focus — a taxonomy](#part-iv--guardrails-defaults-focus--a-taxonomy)
 5. [Anti-patterns](#part-v--anti-patterns)
 6. [Maintenance loop](#part-vi--maintenance-loop)
 7. [Adapt for your project](#part-vii--adapt-for-your-project)

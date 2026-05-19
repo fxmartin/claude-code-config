@@ -6,7 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- GitHub Actions workflow `.github/workflows/ci.yml` with a `static-checks`
+  job: `shellcheck` (severity floor `warning`) on the project's shell scripts,
+  `jq -e .` validation of plugin/MCP/settings JSON, and `markdown-link-check`
+  on every tracked `*.md` file. Runs on `pull_request` and on `push` to
+  `main`. Includes a `.markdown-link-check.json` config that allows `mailto:`
+  links and allowlists known-transient hosts. Branch protection requiring the
+  `static-checks` status check is an admin action for FX; it will be
+  documented in `docs/onboarding.md` once Epic-06 creates that file. (#2.1-001)
+
 ### Fixed
+
+- Corrected a broken table-of-contents anchor in `docs/claude-md-guide.md`
+  ("Part IV") and consumed unused stdin in the `cmux-permission` hooks via
+  `cat > /dev/null` so the new `static-checks` CI job passes on `main`.
+  (#2.1-001)
 
 - Reconciled slash-command references in `CLAUDE.md` to the bare-name form used
   in `README.md` and `WORKFLOW-v2.md`: `/issues:create-issue` → `/create-issue`,
