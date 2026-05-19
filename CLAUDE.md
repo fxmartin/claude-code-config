@@ -97,13 +97,49 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 - When bumping the package version, update the lockfile too, for example with `npm version X.Y.Z --no-git-tag-version` from `nyx/`, then create the matching `vX.Y.Z` tag after committing.
 - Do not deploy a tag whose `nyx/package.json` version disagrees with the tag name.
 
+## Commit Format
+
+This repo enforces [Conventional Commits](https://www.conventionalcommits.org/) via
+commitlint (`.commitlintrc.json`). The `commit-format` CI job runs
+`commitlint --from origin/main --to HEAD` on every PR; a PR fails if any of its
+commits violate the rules. Existing history on `main` is exempt.
+
+**How to write a commit message:**
+- Header: `type(scope): subject` — `type` is required and lower-case, `scope` is
+  optional and lower-case, `subject` starts lower-case, has no trailing period,
+  and the whole header is at most 72 characters.
+- Allowed types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `ci`,
+  `perf`, `build`, `revert`. `feat` drives a MINOR bump, `fix` a PATCH; other
+  types do not trigger a release (see Epic-05 release workflow).
+- Body and footer are blank-line separated. A breaking change is flagged with a
+  `BREAKING CHANGE:` footer (or `!` after the type), which drives a MAJOR bump.
+
+Three concrete examples:
+
+```
+feat(release): conventional commits + commitlint on prs
+
+Adds a commit-format CI job so the release workflow has reliable
+semver signal.
+```
+
+```
+docs: document the commit format in the source-control reference
+```
+
+```
+fix(cmux)!: drop unused stdin in permission hooks
+
+BREAKING CHANGE: cmux-bridge no longer reads stdin for the log subcommand.
+```
+
 ## Reference Materials
 - **CLAUDE.md guide**: `docs/claude-md-guide.md` — structure, guardrails, maintenance, and how this file itself is organized
 - **Python**: `docs/python-best-practices.md`
 - **Database**: `docs/database-best-practices.md`
 - **Containers**: `docs/container-best-practices.md`
 - **Testing & TDD**: `docs/testing-best-practices.md`
-- **Source Control**: `@~/.claude/reference-docs/source-control.md`
+- **Source Control**: `@~/.claude/reference-docs/source-control.md` — see also the **Commit Format** section above
 - **Full Workflow**: `WORKFLOW-v2.md`
 
 ---

@@ -71,6 +71,25 @@ jobs:
       - name: Validate agent registry
         run: ./scripts/validate-agent-registry.sh
 
+  commit-format:
+    name: Commit format (commitlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Only PR commits are linted; existing history on main is exempt.
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lint PR commits
+        run: |
+          npm install --no-save \
+            @commitlint/cli@21 \
+            @commitlint/config-conventional@21
+          npx commitlint --from origin/main --to HEAD --verbose
+
   behavior-tests:
     name: Behavior tests (bats)
     runs-on: ubuntu-latest
