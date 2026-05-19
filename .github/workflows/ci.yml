@@ -23,6 +23,7 @@ jobs:
           shellcheck --version
           shellcheck --severity=warning \
             hooks/*.sh \
+            scripts/*.sh \
             test/*.sh \
             install.sh \
             statusline-command.sh
@@ -58,3 +59,14 @@ jobs:
             fi
           done < <(git ls-files '*.md')
           exit "$fail"
+
+  contract-checks:
+    name: Contract checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate agent registry
+        run: ./scripts/validate-agent-registry.sh
