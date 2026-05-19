@@ -44,3 +44,26 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/agent-registry"
     [ "${status}" -eq 0 ]
     [[ "${output}" == *"OK:"* ]]
 }
+
+@test "single-quoted subagent_type references resolve correctly" {
+    # Verifies the value-stripping logic handles single quotes identically to double quotes.
+    run "${VALIDATOR}" "${FIXTURES}/single-good"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"OK:"* ]]
+}
+
+@test "multiple unresolved refs are each reported with correct file and line" {
+    # multi-bad/skills/multi-bad.md has ghost-a on line 2 and ghost-b on line 4.
+    run "${VALIDATOR}" "${FIXTURES}/multi-bad"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"skills/multi-bad.md:2"* ]]
+    [[ "${output}" == *"skills/multi-bad.md:4"* ]]
+    [[ "${output}" == *"ghost-a"* ]]
+    [[ "${output}" == *"ghost-b"* ]]
+}
+
+@test "exits 2 with an error message when the agents/ directory is missing" {
+    run "${VALIDATOR}" "${FIXTURES}/no-agents-dir"
+    [ "${status}" -eq 2 ]
+    [[ "${output}" == *"error:"* ]]
+}
