@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Behavior test suites under `tests/`: `cmux-bridge.bats` extended with
+  `notify` JSON-validity cases (normal and adversarial input) and
+  graceful-degradation exit checks for the `log`, `status`, `progress`,
+  `clear` and tokenless `telegram` subcommands; and a new
+  `install-dry-run.bats` that runs `./install.sh --dry-run --skip-tools
+  --skip-mcp` against an isolated `HOME`, asserting exit 0, no symlinks
+  created (before/after snapshot), and a `[dry-run]` line for every target
+  file. A new `behavior-tests` CI job in `.github/workflows/ci.yml` runs both
+  suites via `bats-core/bats-action`. (#2.1-002)
 - GitHub Actions workflow `.github/workflows/ci.yml` with a `static-checks`
   job: `shellcheck` (severity floor `warning`) on the project's shell scripts,
   `jq -e .` validation of plugin/MCP/settings JSON, and `markdown-link-check`

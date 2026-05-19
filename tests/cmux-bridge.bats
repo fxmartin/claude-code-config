@@ -146,3 +146,84 @@ teardown() {
     [[ "$output" == *"cmux-path-title"* ]]
     [[ "$output" == *"cmux-path-body"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Story 2.1-002 AC: notify subcommand JSON validity
+#
+# When cmux is absent, `notify` falls back to the shared _send_telegram path
+# (desktop notifications need cmux, but Telegram pings still work). With the
+# curl stub in place we can assert the rendered payload is valid JSON.
+# ---------------------------------------------------------------------------
+
+@test "notify with normal input renders valid JSON" {
+    run bash "${BRIDGE}" notify "Build done" "All green"
+    [ "$status" -eq 0 ]
+    run jq -e . "${PAYLOAD_FILE}"
+    [ "$status" -eq 0 ]
+    run jq -r '.text' "${PAYLOAD_FILE}"
+    [[ "$output" == *"Build done"* ]]
+    [[ "$output" == *"All green"* ]]
+}
+
+@test "notify with adversarial input renders valid JSON" {
+    body="$(cat "${FIXTURE}")"
+    run bash "${BRIDGE}" notify "Adversarial * _title_ \"quote\"" "${body}"
+    [ "$status" -eq 0 ]
+    # Quotes, asterisks, backslashes, newlines and emoji must not break JSON.
+    run jq -e . "${PAYLOAD_FILE}"
+    [ "$status" -eq 0 ]
+    decoded="$(jq -r .text "${PAYLOAD_FILE}")"
+    [[ "$decoded" == *'double "quotes" inside'* ]]
+    [[ "$decoded" == *'🚨'* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Story 2.1-002 AC: telegram with no TELEGRAM_BOT_TOKEN exits 0
+#
+# The AC text mentions a log line; the script (hooks/cmux-bridge.sh) only
+# appends to ~/.claude/logs/cmux-bridge.log on an actual curl *send failure*
+# when a token IS present — with no token it stays silent by design. This
+# test asserts the observable, real behaviour: graceful exit 0 and no send.
+# ---------------------------------------------------------------------------
+
+@test "telegram with no TELEGRAM_BOT_TOKEN exits 0 and sends nothing" {
+    local FAKE_HOME="${STUB_DIR}/fakehome"
+    mkdir -p "${FAKE_HOME}"
+    unset TELEGRAM_BOT_TOKEN
+    unset TELEGRAM_CHAT_ID
+    rm -f "${PAYLOAD_FILE}"
+    run env HOME="${FAKE_HOME}" bash "${BRIDGE}" telegram "no-token" "body"
+    [ "$status" -eq 0 ]
+    # No token => _send_telegram never reaches curl => no payload written.
+    [ ! -f "${PAYLOAD_FILE}" ]
+}
+
+# ---------------------------------------------------------------------------
+# Story 2.1-002 AC: log/status/progress/clear exit 0 when cmux is absent
+#
+# CMUX_SOCKET_PATH is unset (see setup) and no `cmux` binary is on PATH, so
+# every cmux-only subcommand must hit the graceful-degradation `exit 0`.
+# ---------------------------------------------------------------------------
+
+@test "log subcommand exits 0 when cmux is absent" {
+    run bash "${BRIDGE}" log info "a message" --source test
+    [ "$status" -eq 0 ]
+}
+
+@test "status subcommand exits 0 when cmux is absent" {
+    run bash "${BRIDGE}" status claude "working" --icon hammer
+    [ "$status" -eq 0 ]
+}
+
+@test "progress subcommand exits 0 when cmux is absent" {
+    run bash "${BRIDGE}" progress 42 --label "halfway"
+    [ "$status" -eq 0 ]
+}
+
+@test "clear subcommand exits 0 when cmux is absent" {
+    run bash "${BRIDGE}" clear claude
+    [ "$status" -eq 0 ]
+    # Also the no-key form (clears progress).
+    run bash "${BRIDGE}" clear
+    [ "$status" -eq 0 ]
+}
