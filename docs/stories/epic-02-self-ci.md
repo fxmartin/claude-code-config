@@ -1,5 +1,7 @@
 # Epic 2: Self-CI for the Framework
 
+> **Status: COMPLETE** — all 3 stories merged 2026-05-19 (PRs #19, #21, #20)
+
 ## Epic Overview
 
 **Epic ID**: Epic-02

@@ -30,7 +30,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic ID | Epic Name | Track | Story Count | Total Points | Priority | Status |
 |---------|-----------|-------|-------------|--------------|----------|--------|
 | Epic-01 | Stabilize Foundation | MVP-blocking | 5 | 13 | P0 | **COMPLETE** |
-| Epic-02 | Self-CI for the Framework | MVP-blocking | 3 | 8 | P0 | |
+| Epic-02 | Self-CI for the Framework | MVP-blocking | 3 | 8 | P0 | **COMPLETE** |
 | Epic-03 | Cross-Platform Installer (macOS + Windows/WSL2) | MVP | 4 | 13 | P0 | |
 | Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | |
 | Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | |

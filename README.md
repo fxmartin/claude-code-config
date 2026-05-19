@@ -1,5 +1,7 @@
 # claude-code-config
 
+[![CI](https://github.com/fxmartin/claude-code-config/actions/workflows/ci.yml/badge.svg)](https://github.com/fxmartin/claude-code-config/actions/workflows/ci.yml)
+
 A complete, opinionated Claude Code configuration: agents, skills, slash commands, MCP servers, hooks, and observability — engineered to take an idea from **one-line concept to merged PR without a human in the loop**.
 
 This is the harness behind a multi-agent AGILE pipeline that runs on [cmux](https://www.cmux.dev/) (native macOS terminal for AI development) with full real-time visibility, parallel worktree execution, and automatic bug triage.
@@ -187,7 +189,8 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `commands/` | Namespaced slash commands (`dev/`, `devops/`, `issues/`, `project/`, `quality/`, `research/`) | 17 |
 | `agents/` | Specialist agent definitions (flat) | 12 |
 | `hooks/` | cmux lifecycle hooks, Telegram bridge, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper | 9 scripts |
-| `tests/` | bats test suite for hooks (cmux-bridge, sweep-orphan-worktrees) + verification scripts | 4 bats + 3 scripts |
+| `scripts/` | Standalone validation scripts run by CI (`validate-agent-registry.sh`) | 1 |
+| `tests/` | bats test suite for hooks and install smoke tests (cmux-bridge, install dry-run, agent-registry, sweep-orphan-worktrees) | 6 bats |
 | `templates/` | Shared scaffolding used by generator skills | 3 |
 | `reference-docs/` | Language/tooling references loaded via `@` imports | 3 |
 | `docs/` | User-facing docs (cmux integration, CLAUDE.md guide, Python/container/DB/testing best practices, generators) | — |
