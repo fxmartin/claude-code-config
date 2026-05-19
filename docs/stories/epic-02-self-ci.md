@@ -66,10 +66,10 @@
 - New CI job `behavior-tests` runs both bats suites. Job completes in under 30 seconds.
 
 **Definition of Done**:
-- Both bats files committed.
-- Fixtures committed under `tests/fixtures/`.
-- CI job green on `main`.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Both bats files committed.
+- [x] Fixtures committed under `tests/fixtures/`.
+- [x] CI job green on `main`.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ##### Story 2.1-003: Agent-registry validator
 **User Story**: As FX, I want CI to fail on any PR that references a `subagent_type` for an agent file that does not exist so that the `qa-expert` class of bug cannot recur.
