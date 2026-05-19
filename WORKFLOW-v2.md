@@ -6,7 +6,7 @@ This document describes the end-to-end workflow for taking an idea from concept 
 
 ## Workflow Diagram
 
-![Workflow Diagram](workflow-diagram.png)
+![Workflow Diagram](workflow-diagrams/01-workflow.png)
 
 <details>
 <summary>Mermaid source (click to expand)</summary>
