@@ -18,6 +18,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Branch protection requiring the
   `static-checks` status check is an admin action for FX; it will be
   documented in `docs/onboarding.md` once Epic-06 creates that file. (#2.1-001)
+- Agent-registry validator `scripts/validate-agent-registry.sh` plus a
+  `contract-checks` CI job that runs it. The validator greps every `*.md`
+  under `plugins/`, `skills/`, and `commands/` for `subagent_type=`
+  references and resolves each against the file basenames in `agents/`,
+  allowlisting built-in Claude Code subagent types (`general-purpose`,
+  `Plan`, `Explore`) and skipping bracketed placeholders (e.g.
+  `[story.agent_type]`). It exits non-zero listing every unresolved
+  reference with its file and line, so the `qa-expert` class of bug cannot
+  recur. The `static-checks` shellcheck glob now also covers `scripts/*.sh`.
+  Documenting how to add a new agent so it is discoverable to the validator
+  is deferred to `docs/onboarding.md` (an Epic-06 deliverable). (#2.1-003)
 
 ### Fixed
 
