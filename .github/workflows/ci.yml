@@ -19,6 +19,7 @@ jobs:
           shellcheck --version
           shellcheck --severity=warning \
             hooks/*.sh \
+            test/*.sh \
             install.sh \
             statusline-command.sh
 
@@ -30,7 +31,8 @@ jobs:
             .claude-plugin/*.json \
             plugins/*/.claude-plugin/*.json \
             mcp/*.json \
-            settings.json
+            settings.json \
+            keybindings.json
           do
             [ -e "$f" ] || continue
             if jq -e . "$f" > /dev/null; then
