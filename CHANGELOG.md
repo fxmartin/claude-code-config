@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.13.0] - 2026-05-20
+
+### Added
+
+- feat(installer): verify both plugin install paths end-to-end (#6.4-001) (#34)
+
+
 ### Added
 
 - Plugin install path verification (#6.4-001). New
