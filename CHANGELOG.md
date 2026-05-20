@@ -12,7 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - feat(installer): split install.sh into --core/--tools/--mcp/--shell/--all modes (#3.1-001) (#26)
-
+- SQLite ledger schema and migration tooling (Epic-04 foundation): a new
+  `state/schema.sql` documents the canonical ledger shape (`runs`, `stories`,
+  `stages`, `events`, `_migrations`), the first migration lives at
+  `state/migrations/001-init.sql`, and `scripts/sdlc-state.sh` provides
+  `init` / `migrate` / `show` / `prune --older-than` / `backup` subcommands
+  over `sqlite3`. WAL journal mode is enabled at init. The DB path is
+  configurable via `--db` (default `.sdlc-state.db`); the file is
+  `.gitignore`d alongside its WAL companions. A bats suite
+  (`tests/sdlc-state.bats`, 22 tests) covers fresh-DB init, idempotent
+  re-migrate, schema introspection, composite primary keys, show, prune
+  (with IN_PROGRESS run protection), and backup. Stories 4.2-001, 4.2-002,
+  and 4.3-001 will build write helpers, a markdown renderer, and a resume
+  subcommand on top of this. (#4.1-001)
 
 ### Changed
 
