@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.8.0] - 2026-05-20
+
+### Added
+
+- feat(installer): wsl2 detection and platform-aware behavior (#3.1-002) (#27)
+
+
 ### Added
 
 - WSL2 detection and platform-aware behavior in installer (#3.1-002)
