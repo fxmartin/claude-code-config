@@ -45,10 +45,11 @@
 | `--shell` | `~/.zshrc` | nothing | appends `dev()` and `y()` shell functions if absent |
 
 **Definition of Done**:
-- All four modes work independently and in combination.
-- Dry-run output matches actual run output exactly (verified by Epic-02 bats test).
-- README "What this script does" table is committed.
-- Change noted in `CHANGELOG.md` under "Changed" with backward-compat note.
+- [x] All four modes work independently and in combination.
+- [x] Dry-run output matches actual run output exactly (verified by Epic-02 bats test).
+- [x] README "What this script does" table is committed.
+- [x] Change noted in `CHANGELOG.md` under "Changed" with backward-compat note.
+- [x] All DoD criteria satisfied (merged via PR #26)
 
 ##### Story 3.1-002: WSL2 detection and platform-aware behavior
 **User Story**: As an LTM colleague on Windows, I want the installer to detect WSL2 and behave correctly without me having to pass a `--platform` flag.
