@@ -255,6 +255,8 @@ The roster is split into two scopes (Story 6.2-001). **SDLC plugin agents** live
 
 ## Install
 
+> **First time here?** Read [docs/onboarding.md](docs/onboarding.md) — a 15-minute walkthrough from blank machine to first autonomous build, written for the LTM colleague pilot.
+
 ### Portable (any macOS / Linux)
 
 ```bash
