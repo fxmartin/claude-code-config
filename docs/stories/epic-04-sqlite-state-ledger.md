@@ -42,9 +42,9 @@
 - WAL mode enabled (`PRAGMA journal_mode=WAL`) for concurrent reads during writes.
 
 **Definition of Done**:
-- Schema and migration tooling committed.
-- A bats test in `tests/sdlc-state.bats` covers: init on empty DB, migrate apply, idempotent re-run, schema introspection.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Schema and migration tooling committed (PR #25).
+- [x] A bats test in `tests/sdlc-state.bats` covers: init on empty DB, migrate apply, idempotent re-run, schema introspection (22 tests: 11 success-path in sdlc-state.bats, 11 error-path in sdlc-state-errors.bats).
+- [x] Change noted in `CHANGELOG.md` under "Added" (v1.6.0).
 
 ### Feature 4.2: Write Path
 
