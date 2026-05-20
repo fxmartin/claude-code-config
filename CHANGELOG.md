@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- LTM colleague onboarding guide (#6.1-001). New `docs/onboarding.md` walks a
+  new colleague from "I heard about this" to "I just ran `/build-stories` on a
+  fresh project" in under 15 minutes. Sections cover prerequisites, both
+  install paths (marketplace + `install.sh --core`/`--tools`/`--mcp`/`--shell`
+  /`--all`), a first-run smoke test, the full `/brainstorm → /generate-epics
+  → /create-epic → /create-story → /build-stories` walkthrough with expected
+  events on success and failure modes on failure, optional cmux and Telegram
+  integrations (both opt-in; cmux is macOS-only), Conventional Commits
+  conventions, the SQLite state ledger and `/build-stories resume`, getting
+  help, known limitations, and a "Tested with" footer dated 2026-05-20.
+  README links to it from the top of the Install section. New
+  `tests/onboarding-doc.bats` pins the cross-references. Colleague review
+  remains pending until the Story 6.3-001 pilot kicks off.
+
 ## [v1.13.1] - 2026-05-20
 
 ### Changed
