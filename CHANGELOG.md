@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.9.0] - 2026-05-20
+
+### Added
+
+- feat(state): orchestrator and agents write to the ledger (#4.2-001) (#28)
+
+
 ### Added
 
 - Orchestrator and build-stories agents now write run/story/stage/event
