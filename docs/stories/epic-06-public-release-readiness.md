@@ -118,10 +118,15 @@
 - MVP is shipped only if ≥ 4 of 5 say "yes" or "yes-after-fixes."
 
 **Definition of Done**:
-- Pilot completed.
-- Feedback doc committed.
-- Issues filed.
-- Decision recorded: ship MVP, ship with caveats, or defer.
+- [x] Pilot kit committed.
+- [x] README link added.
+- [x] CHANGELOG entry.
+- [ ] Pilot completed.
+- [ ] Feedback doc committed.
+- [ ] Issues filed.
+- [ ] Decision recorded: ship MVP, ship with caveats, or defer.
+
+**Live pilot run pending** — kit shipped via PR #36 on 2026-05-20. FX schedules the actual pilot with 5 LTM colleagues; remaining DoD bullets stay unchecked until pilot completes and decision-record.md is filled in.
 
 ### Feature 6.4: Marketplace Install Verification
 
