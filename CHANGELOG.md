@@ -12,10 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - feat(installer): verify both plugin install paths end-to-end (#6.4-001) (#34)
-
-
-### Added
-
 - Plugin install path verification (#6.4-001). New
   `scripts/verify-plugin-install.sh` validates the `/plugin marketplace add
   fxmartin/claude-code-config` path B structurally: marketplace manifest is
@@ -28,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parts CI cannot reach (real `/plugin install` inside a Claude Code session
   on macOS and WSL2).
 
+### Changed
+
+- Separated personal config from the autonomous-sdlc plugin (#6.2-001).
+  The four personal-helper agents — `crypto-coin-analyzer`,
+  `crypto-market-agent`, `executive-summary-generator`, and
+  `professional-profile-researcher` — moved from `agents/` to
+  `agents/personal/`. The plugin-scope agents stay directly under
+  `agents/` so an LTM colleague installing `autonomous-sdlc` sees only
+  SDLC-relevant agents in their roster. The agent-registry validator
+  (`scripts/validate-agent-registry.sh`) now walks `agents/`
+  recursively so references in either location continue to resolve;
+  every existing `subagent_type=` call still validates. The README
+  agent roster splits into two tables (SDLC plugin agents vs Personal
+  extras) so the boundary is documented for both colleagues and the
+  forthcoming `docs/onboarding.md` (Story 6.1-001).
 ## [v1.12.0] - 2026-05-20
 
 ### Added

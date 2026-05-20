@@ -229,6 +229,10 @@ The 7 Codex extras live as namespaced **commands** on the Claude side (`/devops:
 
 ### Agent roster
 
+The roster is split into two scopes (Story 6.2-001). **SDLC plugin agents** live directly under `agents/` and are the public surface used by the `autonomous-sdlc` plugin's workflows. **Personal extras** live under `agents/personal/` — they ship with `--core` install (the `agents/` directory is symlinked as a unit) but are not part of the plugin's documented surface and can be ignored by LTM colleagues who only want the SDLC workflows.
+
+#### SDLC plugin agents
+
 | Agent | Specialization |
 |-------|---------------|
 | `backend-typescript-architect` | Bun runtime, advanced TypeScript, microservices |
@@ -239,6 +243,11 @@ The 7 Codex extras live as namespaced **commands** on the Claude side (`/devops:
 | `qa-engineer` | Test strategy, quality metrics, defect management |
 | `senior-code-reviewer` | Architecture validation, security audits, best practices |
 | `meta-agent` | Generates new agent definitions |
+
+#### Personal extras
+
+| Agent | Specialization |
+|-------|---------------|
 | `crypto-coin-analyzer`, `crypto-market-agent` | Crypto market/ticker analysis |
 | `executive-summary-generator`, `professional-profile-researcher` | Research workflows |
 
