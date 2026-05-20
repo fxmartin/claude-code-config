@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.6.0] - 2026-05-20
+
 ### Added
 
+- feat(installer): split install.sh into --core/--tools/--mcp/--shell/--all modes (#3.1-001) (#26)
 - SQLite ledger schema and migration tooling (Epic-04 foundation): a new
   `state/schema.sql` documents the canonical ledger shape (`runs`, `stories`,
   `stages`, `events`, `_migrations`), the first migration lives at
@@ -22,6 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (with IN_PROGRESS run protection), and backup. Stories 4.2-001, 4.2-002,
   and 4.3-001 will build write helpers, a markdown renderer, and a resume
   subcommand on top of this. (#4.1-001)
+
+### Changed
+
+- `install.sh` is now a thin dispatcher over per-mode modules in `install/`.
+  New flags `--core`, `--tools`, `--mcp`, `--shell`, and `--all` let you opt
+  into exactly the parts of the framework you want. The default when no mode
+  flag is passed is `--core` (symlinks only), a conservative, additive
+  default. Every mode is idempotent and `--dry-run` now exactly previews the
+  actions that the real run would perform — the dry-run drift around
+  "Created ~/.claude" reported by Codex is fixed (`mkdir -p` now goes through
+  the same `run` guard as everything else). `--mcp` normalises its JSON
+  output through `jq` so a second run is byte-identical to the first.
+  Backward-compatible: `--skip-mcp` (≡ `--core --tools --shell`) and
+  `--skip-tools` (≡ `--core --mcp --shell`) still work but now emit a
+  deprecation warning pointing at the new modes; both will be removed in the
+  next MAJOR release. (#3.1-001)
 
 ## [v1.5.0] - 2026-05-19
 
