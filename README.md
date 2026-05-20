@@ -291,8 +291,11 @@ The installer auto-detects WSL2 (via `/proc/version`) and switches package
 manager + shellrc accordingly: `--tools` prefers `apt` (override with
 `--prefer-brew`), `--mcp` validates `BROWSER_PATH` against the `/mnt/c/`
 mount, and `--shell` appends to `~/.bashrc` when zsh is not the default
-(installing a `dev()` stub since cmux is macOS-only). A full step-by-step
-"fresh Windows 11 → framework installed" guide lands as Story 3.2-001.
+(installing a `dev()` stub since cmux is macOS-only).
+
+### Windows
+
+See [docs/install-windows.md](docs/install-windows.md) for the WSL2-based install guide.
 
 ### As a submodule (Nix-managed machines)
 
