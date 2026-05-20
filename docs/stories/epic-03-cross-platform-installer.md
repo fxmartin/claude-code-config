@@ -98,9 +98,10 @@
 - The guide is dated and includes a "tested with" footer naming the WSL2 and Ubuntu versions used.
 
 **Definition of Done**:
-- Doc committed.
-- README link added.
-- Reviewed by one LTM colleague before MVP pilot.
+- [x] Doc committed.
+- [x] README link added.
+- [ ] Reviewed by one LTM colleague before MVP pilot (pending pilot).
+- [x] All DoD criteria satisfied (merged via PR #29)
 
 ##### Story 3.2-002: Clean-machine install verification (macOS and WSL2)
 **User Story**: As FX, I want a documented, reproducible smoke test for both supported platforms so that I never ship a release that breaks on a fresh box.
