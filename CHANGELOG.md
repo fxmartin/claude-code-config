@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Windows install guide (WSL2-based) (#3.2-001)
+- Markdown view generator: regenerate .build-progress.md from SQLite ledger (#4.2-002)
 
 ## [v1.9.0] - 2026-05-20
 
