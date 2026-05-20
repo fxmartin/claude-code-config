@@ -4,7 +4,9 @@
 #
 # Greps every `*.md` under plugins/, skills/, commands/ for `subagent_type=`
 # references and resolves each referenced agent name against the basenames of
-# files in agents/. Built-in Claude Code subagent types are allowlisted.
+# files in agents/ (including subdirectories such as agents/personal/, added
+# by Story 6.2-001 to separate personal helpers from the plugin scope).
+# Built-in Claude Code subagent types are allowlisted.
 #
 # A reference whose name is a bracketed placeholder (e.g. [story.agent_type],
 # [AGENT_TYPE]) is a variable, not a literal agent name — it is skipped.
@@ -53,10 +55,12 @@ is_builtin() {
 }
 
 # --- Collect known agent basenames (without .md suffix) -------------------
+# Walks agents/ recursively so personal helpers under agents/personal/ are
+# still resolvable targets for subagent_type= references.
 known_agents=()
 while IFS= read -r agent_file; do
   known_agents+=("$(basename "${agent_file}" .md)")
-done < <(find "${repo_root}/agents" -maxdepth 1 -type f -name '*.md' | sort)
+done < <(find "${repo_root}/agents" -type f -name '*.md' | sort)
 
 is_known_agent() {
   local name="$1"
