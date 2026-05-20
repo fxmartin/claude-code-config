@@ -90,10 +90,10 @@
 - A bats test verifies: render → edit markdown → re-render → markdown matches SQLite, edits lost.
 
 **Definition of Done**:
-- Renderer committed.
-- Skill calls it.
-- Bats test passes.
-- Change noted in `CHANGELOG.md` under "Changed".
+- [x] Renderer committed.
+- [x] Skill calls it.
+- [x] Bats test passes.
+- [x] Change noted in `CHANGELOG.md` under "Added" (merged via PR #31)
 
 ### Feature 4.3: Recovery
 
