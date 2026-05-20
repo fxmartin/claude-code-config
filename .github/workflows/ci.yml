@@ -111,4 +111,23 @@ jobs:
         run: |
           bats --version
           jq --version
-          bats tests/cmux-bridge.bats tests/install-dry-run.bats
+          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats
+
+  smoke-test:
+    name: Smoke test (clean-machine install)
+    # Story 3.2-002: end-to-end --core happy path on both supported platforms.
+    # Matrix covers macOS (the primary target) and Ubuntu (stand-in for WSL2 —
+    # GitHub does not provide WSL2 runners, but the codepath is identical
+    # except for platform detection, which has its own bats coverage).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run smoke test
+        run: bash scripts/smoke-test.sh
