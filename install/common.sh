@@ -102,3 +102,36 @@ remove_symlink() {
     info "Removed symlink: $name"
   fi
 }
+
+# detect_platform(): prints one of Darwin | WSL2 | Linux | <uname-fallback>.
+#
+# Strategy:
+#   - macOS (Darwin) is decided by `uname -s` alone — /proc/version does not
+#     exist there and any attempt to read it would be wasted IO.
+#   - On Linux, we look at /proc/version (or the path in _PROC_VERSION_PATH
+#     for tests) for a case-insensitive "microsoft" substring. WSL1 and WSL2
+#     both match — for the framework's purposes they are treated as WSL2,
+#     since WSL1 is end-of-life on Windows 11 and the modal installer only
+#     officially supports WSL2.
+#   - Anything else falls through to the raw `uname -s` value so unfamiliar
+#     platforms surface with a readable label in the banner.
+detect_platform() {
+  local proc_version="${_PROC_VERSION_PATH:-/proc/version}"
+  local uname_s
+  uname_s="$(uname -s)"
+  case "$uname_s" in
+    Darwin)
+      echo "Darwin"
+      ;;
+    Linux)
+      if [ -r "$proc_version" ] && grep -qi 'microsoft' "$proc_version"; then
+        echo "WSL2"
+      else
+        echo "Linux"
+      fi
+      ;;
+    *)
+      echo "$uname_s"
+      ;;
+  esac
+}

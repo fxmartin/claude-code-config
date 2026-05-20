@@ -1,34 +1,57 @@
 #!/usr/bin/env bash
-# ABOUTME: --shell mode — append the dev() and y() helper functions to ~/.zshrc.
+# ABOUTME: --shell mode — append dev() and y() helper functions to the shellrc.
 # ABOUTME: Idempotent: skips append if the function header is already present.
 #
-# Sourced by install.sh after common.sh. Expects HOME, DRY_RUN.
+# Sourced by install.sh after common.sh. Expects HOME, DRY_RUN, PLATFORM.
 #
-# Platform branching (zsh vs bash, WSL2 specifics) is Story 3.1-002 — this
-# module only writes to ~/.zshrc today.
+# Target file selection:
+#   - macOS or Linux with $SHELL ending in /zsh → ~/.zshrc.
+#   - WSL2 with non-zsh shell → ~/.bashrc.
+#   - Anything else falls back to ~/.zshrc (existing behaviour).
+#
+# dev() on WSL2 is a stub that prints "cmux is macOS-only; this command is a
+# no-op on WSL2" so the user can keep the same muscle memory across machines
+# without launching a broken cmux invocation.
 
 install_shell_run() {
   echo ""
-  echo "[shell] Adding helper functions to ~/.zshrc..."
 
-  local zshrc="$HOME/.zshrc"
+  local rcfile
+  rcfile="$(install_shell_target_rc)"
+  echo "[shell] Adding helper functions to $rcfile..."
 
-  install_shell_append_dev "$zshrc"
-  install_shell_append_y   "$zshrc"
+  install_shell_append_dev "$rcfile"
+  install_shell_append_y   "$rcfile"
 }
 
-# Append the dev() cmux workspace launcher if absent.
+# Pick the shellrc to append to based on PLATFORM and $SHELL. Returns an
+# absolute path. On WSL2 with a non-zsh default shell, this is ~/.bashrc;
+# everywhere else (including WSL2 with zsh) it remains ~/.zshrc to match the
+# pre-3.1-002 default.
+install_shell_target_rc() {
+  if [ "${PLATFORM:-}" = "WSL2" ] && [[ "${SHELL:-}" != */zsh ]]; then
+    echo "$HOME/.bashrc"
+  else
+    echo "$HOME/.zshrc"
+  fi
+}
+
+# Append the dev() cmux workspace launcher (or its WSL2 stub) if absent.
 install_shell_append_dev() {
-  local zshrc="$1"
-  if grep -q 'function dev()' "$zshrc" 2>/dev/null; then
-    info "dev() function already in ~/.zshrc — skipping"
+  local rcfile="$1"
+  if grep -q 'function dev()' "$rcfile" 2>/dev/null; then
+    info "dev() function already in $(basename "$rcfile") — skipping"
+    return
+  fi
+  if [ "${PLATFORM:-}" = "WSL2" ]; then
+    install_shell_append_dev_stub "$rcfile"
     return
   fi
   if [ "${DRY_RUN:-false}" = "true" ]; then
-    echo "  [dry-run] append dev() function to $zshrc"
+    echo "  [dry-run] append dev() function to $rcfile"
     return
   fi
-  cat >> "$zshrc" << 'ZSH'
+  cat >> "$rcfile" << 'ZSH'
 
 # cmux dev workspace — opens 3 workspaces: claude/shell | terminal | yazi
 function dev() {
@@ -72,21 +95,41 @@ function dev() {
   [ -n "$ws1_ref" ] && cmux focus --workspace "$ws1_ref"
 }
 ZSH
-  info "Added dev() function to ~/.zshrc"
+  info "Added dev() function to $(basename "$rcfile")"
+}
+
+# WSL2 stub for dev() — cmux is macOS-only, so the helper here just prints a
+# clear message instead of trying (and failing) to spawn cmux workspaces.
+install_shell_append_dev_stub() {
+  local rcfile="$1"
+  if [ "${DRY_RUN:-false}" = "true" ]; then
+    echo "  [dry-run] append dev() WSL2 stub to $rcfile"
+    return
+  fi
+  cat >> "$rcfile" << 'BASH'
+
+# WSL2 stub — cmux is macOS-only, so this command is a clear no-op rather
+# than a confusing "cmux: command not found" the first time a user types it.
+function dev() {
+  echo "cmux is macOS-only; this command is a no-op on WSL2"
+  return 0
+}
+BASH
+  info "Added dev() WSL2 stub to $(basename "$rcfile")"
 }
 
 # Append the y() yazi wrapper if absent.
 install_shell_append_y() {
-  local zshrc="$1"
-  if grep -q 'function y()' "$zshrc" 2>/dev/null; then
-    info "y() function already in ~/.zshrc — skipping"
+  local rcfile="$1"
+  if grep -q 'function y()' "$rcfile" 2>/dev/null; then
+    info "y() function already in $(basename "$rcfile") — skipping"
     return
   fi
   if [ "${DRY_RUN:-false}" = "true" ]; then
-    echo "  [dry-run] append y() function to $zshrc"
+    echo "  [dry-run] append y() function to $rcfile"
     return
   fi
-  cat >> "$zshrc" << 'ZSH'
+  cat >> "$rcfile" << 'ZSH'
 
 # Yazi file manager — cd to last browsed directory on exit
 function y() {
@@ -98,5 +141,5 @@ function y() {
   rm -f -- "$tmp"
 }
 ZSH
-  info "Added y() function to ~/.zshrc"
+  info "Added y() function to $(basename "$rcfile")"
 }
