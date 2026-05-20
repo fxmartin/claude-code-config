@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Clean-machine install smoke test (#3.2-002): `scripts/smoke-test.sh`
+  exercises `install.sh --core` end-to-end (dry-run → install → idempotent
+  re-run → uninstall) inside an isolated `$HOME`. A new CI matrix job runs
+  it on both `macos-latest` and `ubuntu-latest` to catch regressions before
+  release. The accompanying `docs/smoke-test.md` documents the four manual
+  smoke tests CI cannot cover (`--tools` against real Homebrew/apt, `--mcp`
+  with a real `BROWSER_PATH`, full `/build-stories` on a sample project,
+  full WSL2 walkthrough) — these are run before every release tag.
+
 ## [v1.9.0] - 2026-05-20
 
 ### Added
