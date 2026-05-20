@@ -42,3 +42,39 @@ REPO_ROOT="${BATS_TEST_DIRNAME}/.."
     # The "Optional integrations" section must exist as a header.
     grep -qE "^#+ .*[Oo]ptional integrations" "$doc"
 }
+
+@test "docs/onboarding.md references /build-stories and /build-stories resume" {
+    local doc="$REPO_ROOT/docs/onboarding.md"
+    # /build-stories skill must appear
+    grep -qF "/build-stories" "$doc"
+    # The resume sub-command (Story 4.3-001) must be explicit
+    grep -qF "/build-stories resume" "$doc"
+}
+
+@test "docs/onboarding.md has a Prerequisites section enumerating Claude Code, gh CLI, git" {
+    local doc="$REPO_ROOT/docs/onboarding.md"
+    # Section header
+    grep -qE "^#+ .*[Pp]rerequisites" "$doc"
+    # Three load-bearing prerequisites
+    grep -qF "Claude Code" "$doc"
+    grep -qE "gh.*(CLI|cli)" "$doc"
+    grep -qE "^| \`git\`|git.*(configured|config)" "$doc"
+}
+
+@test "docs/onboarding.md explicitly states cmux is macOS-only" {
+    local doc="$REPO_ROOT/docs/onboarding.md"
+    # Must clearly label cmux as macOS-only so a Windows/WSL2 colleague
+    # does not think it is a hard requirement.
+    grep -qiE "cmux.*(macOS.only|macOS-only)" "$doc"
+}
+
+@test "docs/onboarding.md lists Telegram as opt-in with a setup pointer" {
+    local doc="$REPO_ROOT/docs/onboarding.md"
+    # Telegram must be under the Optional integrations section (not required)
+    grep -qE "^#+ .*[Oo]ptional integrations" "$doc"
+    # Must reference the env-var names so a colleague knows where to look
+    grep -qF "TELEGRAM_BOT_TOKEN" "$doc"
+    grep -qF "TELEGRAM_CHAT_ID" "$doc"
+    # Must reference .env so the colleague knows where to put the creds
+    grep -qF ".env" "$doc"
+}
