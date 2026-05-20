@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ABOUTME: Portable install script for claude-code-config
-# ABOUTME: Creates symlinks from ~/.claude/ to this repo. Works on macOS and Linux.
+# ABOUTME: Modal installer for claude-code-config (--core / --tools / --mcp / --shell / --all).
+# ABOUTME: Dispatcher only; per-mode logic lives in install/<mode>.sh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,374 +8,121 @@ CLAUDE_DIR="$HOME/.claude"
 CLAUDE_JSON="$HOME/.claude.json"
 BACKUP_DIR="$CLAUDE_DIR/backups/install-$(date +%Y%m%d-%H%M%S)"
 
-# Colors (if terminal supports them)
-if [ -t 1 ]; then
-  GREEN='\033[0;32m'
-  YELLOW='\033[0;33m'
-  RED='\033[0;31m'
-  NC='\033[0m'
-else
-  GREEN='' YELLOW='' RED='' NC=''
-fi
+# Default flags. The mode flags are off-by-default; if the caller passes none,
+# the dispatcher selects --core (conservative additive default).
+DRY_RUN=false
+UNINSTALL=false
+MODE_CORE=false
+MODE_TOOLS=false
+MODE_MCP=false
+MODE_SHELL=false
 
-info()  { echo -e "${GREEN}✓${NC} $*"; }
-warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
-error() { echo -e "${RED}✗${NC} $*" >&2; }
+# Legacy compat: --skip-mcp / --skip-tools (default-on opt-out). These will
+# be removed in the next MAJOR release.
+LEGACY_SKIP_MCP=false
+LEGACY_SKIP_TOOLS=false
 
 usage() {
-  echo "Usage: $0 [--uninstall] [--dry-run] [--skip-mcp] [--skip-tools]"
-  echo ""
-  echo "Options:"
-  echo "  --uninstall    Remove symlinks created by this script"
-  echo "  --dry-run      Show what would be done without making changes"
-  echo "  --skip-mcp     Skip MCP config generation (useful on Nix-managed machines)"
-  echo "  --skip-tools   Skip CLI tools installation (yazi, bat, fd, etc.)"
-  echo "  --help         Show this help"
+  cat <<'USAGE'
+Usage: install.sh [MODE...] [--dry-run] [--uninstall] [--help]
+
+Modes (additive, combine freely):
+  --core       Symlink config into ~/.claude (default if no mode flag is given).
+  --tools      Install CLI utilities (yazi, bat, fd, rg, fzf, zoxide, jq, …).
+  --mcp        Merge mcp/config.template.json into ~/.claude.json.
+  --shell      Append dev() and y() helper functions to ~/.zshrc.
+  --all        Shortcut for --core --tools --mcp --shell.
+
+Options:
+  --dry-run    Preview every action without making changes.
+  --uninstall  Remove symlinks created by --core. Does not touch tools, MCP, or shellrc.
+  --help       Show this help.
+
+Backward-compatible (deprecated, removed in next MAJOR):
+  --skip-mcp    Equivalent to --core --tools --shell.
+  --skip-tools  Equivalent to --core --mcp --shell.
+USAGE
   exit 0
 }
 
-# Parse arguments
-UNINSTALL=false
-DRY_RUN=false
-SKIP_MCP=false
-SKIP_TOOLS=false
+# ─── Argument parsing ────────────────────────────────────────────────
 for arg in "$@"; do
   case "$arg" in
-    --uninstall)   UNINSTALL=true ;;
+    --core)        MODE_CORE=true ;;
+    --tools)       MODE_TOOLS=true ;;
+    --mcp)         MODE_MCP=true ;;
+    --shell)       MODE_SHELL=true ;;
+    --all)         MODE_CORE=true; MODE_TOOLS=true; MODE_MCP=true; MODE_SHELL=true ;;
     --dry-run)     DRY_RUN=true ;;
-    --skip-mcp)    SKIP_MCP=true ;;
-    --skip-tools)  SKIP_TOOLS=true ;;
-    --help)        usage ;;
-    *)             error "Unknown option: $arg"; usage ;;
+    --uninstall)   UNINSTALL=true ;;
+    --skip-mcp)    LEGACY_SKIP_MCP=true ;;
+    --skip-tools)  LEGACY_SKIP_TOOLS=true ;;
+    --help|-h)     usage ;;
+    *)
+      echo "✗ Unknown option: $arg" >&2
+      exit 1
+      ;;
   esac
 done
 
-run() {
-  if $DRY_RUN; then
-    echo "  [dry-run] $*"
-  else
-    "$@"
-  fi
-}
+# ─── Mode resolution ─────────────────────────────────────────────────
+# Translate legacy flags first (so they compose with explicit modes).
+if $LEGACY_SKIP_MCP; then
+  echo "⚠ --skip-mcp is DEPRECATED — equivalent to --core --tools --shell. Will be removed in the next MAJOR release." >&2
+  MODE_CORE=true; MODE_TOOLS=true; MODE_SHELL=true
+fi
+if $LEGACY_SKIP_TOOLS; then
+  echo "⚠ --skip-tools is DEPRECATED — equivalent to --core --mcp --shell. Will be removed in the next MAJOR release." >&2
+  MODE_CORE=true; MODE_MCP=true; MODE_SHELL=true
+fi
 
-backup_if_exists() {
-  local target="$1"
-  if [ -e "$target" ] && [ ! -L "$target" ]; then
-    run mkdir -p "$BACKUP_DIR"
-    run mv "$target" "$BACKUP_DIR/$(basename "$target")"
-    warn "Backed up $(basename "$target") to $BACKUP_DIR/"
-  fi
-}
+# If no mode was selected, default to --core (conservative).
+if ! $MODE_CORE && ! $MODE_TOOLS && ! $MODE_MCP && ! $MODE_SHELL && ! $UNINSTALL; then
+  MODE_CORE=true
+fi
 
-create_symlink() {
-  local src="$1"
-  local dst="$2"
-  local name
-  name="$(basename "$dst")"
+# Export everything the modules need before sourcing.
+export SCRIPT_DIR CLAUDE_DIR CLAUDE_JSON BACKUP_DIR DRY_RUN
 
-  # Skip if already pointing to the right place
-  if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
-    info "$name already linked"
-    return
-  fi
+# ─── Load modules ────────────────────────────────────────────────────
+# shellcheck source=install/common.sh
+source "$SCRIPT_DIR/install/common.sh"
+# shellcheck source=install/core.sh
+source "$SCRIPT_DIR/install/core.sh"
+# shellcheck source=install/tools.sh
+source "$SCRIPT_DIR/install/tools.sh"
+# shellcheck source=install/mcp.sh
+source "$SCRIPT_DIR/install/mcp.sh"
+# shellcheck source=install/shell.sh
+source "$SCRIPT_DIR/install/shell.sh"
 
-  backup_if_exists "$dst"
+# ─── Platform detection (used by --tools today; expanded in 3.1-002) ─
+case "$(uname -s)" in
+  Darwin) PLATFORM="macOS" ;;
+  Linux)  PLATFORM="Linux" ;;
+  *)      PLATFORM="$(uname -s)" ;;
+esac
+export PLATFORM
 
-  # Remove existing symlink pointing elsewhere
-  if [ -L "$dst" ]; then
-    run rm "$dst"
-  fi
-
-  if [ -d "$src" ]; then
-    run ln -sfn "$src" "$dst"
-  else
-    run ln -sf "$src" "$dst"
-  fi
-  info "Linked $name → $src"
-}
-
-remove_symlink() {
-  local dst="$1"
-  local src="$2"
-  local name
-  name="$(basename "$dst")"
-
-  if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
-    run rm "$dst"
-    info "Removed symlink: $name"
-  fi
-}
-
-# ─── Uninstall ────────────────────────────────────────────────────────
+# ─── Uninstall short-circuits everything else ────────────────────────
 if $UNINSTALL; then
   echo "Removing claude-code-config symlinks..."
-  remove_symlink "$CLAUDE_DIR/CLAUDE.md"               "$SCRIPT_DIR/CLAUDE.md"
-  remove_symlink "$CLAUDE_DIR/agents"                   "$SCRIPT_DIR/agents"
-  remove_symlink "$CLAUDE_DIR/commands"                 "$SCRIPT_DIR/commands"
-  remove_symlink "$CLAUDE_DIR/settings.json"            "$SCRIPT_DIR/settings.json"
-  remove_symlink "$CLAUDE_DIR/statusline-command.sh"    "$SCRIPT_DIR/statusline-command.sh"
-  remove_symlink "$CLAUDE_DIR/keybindings.json"         "$SCRIPT_DIR/keybindings.json"
-  remove_symlink "$CLAUDE_DIR/reference-docs"            "$SCRIPT_DIR/reference-docs"
-  remove_symlink "$CLAUDE_DIR/docs"                     "$SCRIPT_DIR/docs"
-  remove_symlink "$CLAUDE_DIR/skills"                   "$SCRIPT_DIR/skills"
-  remove_symlink "$CLAUDE_DIR/hooks"                    "$SCRIPT_DIR/hooks"
-  remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
+  install_core_uninstall
   echo "Done. MCP config (~/.claude.json) was not modified."
   exit 0
 fi
 
-# ─── Install ──────────────────────────────────────────────────────────
+# ─── Banner ──────────────────────────────────────────────────────────
 echo "Installing claude-code-config from: $SCRIPT_DIR"
-echo ""
-
-# Detect platform
-case "$(uname -s)" in
-  Darwin) PLATFORM="macOS" ;;
-  Linux)  PLATFORM="Linux" ;;
-  *)      PLATFORM="$(uname -s)"; warn "Untested platform: $PLATFORM" ;;
-esac
 info "Platform: $PLATFORM"
+echo "Modes selected:$( $MODE_CORE  && echo ' core'  )$( $MODE_TOOLS && echo ' tools' )$( $MODE_MCP   && echo ' mcp'   )$( $MODE_SHELL && echo ' shell' )"
+$DRY_RUN && echo "(dry-run — no changes will be made)"
 
-# Create ~/.claude if missing
-if [ ! -d "$CLAUDE_DIR" ]; then
-  run mkdir -p "$CLAUDE_DIR"
-  info "Created $CLAUDE_DIR"
-fi
-
-# Create symlinks for all config files/dirs
-create_symlink "$SCRIPT_DIR/CLAUDE.md"               "$CLAUDE_DIR/CLAUDE.md"
-create_symlink "$SCRIPT_DIR/agents"                   "$CLAUDE_DIR/agents"
-create_symlink "$SCRIPT_DIR/commands"                 "$CLAUDE_DIR/commands"
-create_symlink "$SCRIPT_DIR/settings.json"            "$CLAUDE_DIR/settings.json"
-create_symlink "$SCRIPT_DIR/statusline-command.sh"    "$CLAUDE_DIR/statusline-command.sh"
-create_symlink "$SCRIPT_DIR/keybindings.json"         "$CLAUDE_DIR/keybindings.json"
-create_symlink "$SCRIPT_DIR/reference-docs"            "$CLAUDE_DIR/reference-docs"
-create_symlink "$SCRIPT_DIR/docs"                     "$CLAUDE_DIR/docs"
-create_symlink "$SCRIPT_DIR/skills"                    "$CLAUDE_DIR/skills"
-create_symlink "$SCRIPT_DIR/hooks"                    "$CLAUDE_DIR/hooks"
-
-# Local marketplace (exposes the autonomous-sdlc plugin under /autonomous-sdlc:*)
-run mkdir -p "$CLAUDE_DIR/plugins/marketplaces"
-create_symlink "$SCRIPT_DIR" "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config"
-
-# ─── CLI Tools (Yazi + utilities) ────────────────────────────────────
-if $SKIP_TOOLS; then
-  warn "Skipping CLI tools (--skip-tools)"
-elif [ "$PLATFORM" != "macOS" ]; then
-  warn "CLI tools install is macOS-only (brew). Skipping on $PLATFORM."
-else
-  echo ""
-  echo "Installing CLI tools (yazi file manager & utilities)..."
-
-  BREW_PACKAGES=(
-    yazi        # Terminal file manager
-    bat         # Syntax-highlighted file viewer
-    fd          # Fast find alternative
-    ripgrep     # Fast grep alternative
-    fzf         # Fuzzy finder
-    zoxide      # Smarter cd with frecency
-    ffmpeg      # Media preview support
-    imagemagick # Image preview/conversion
-    poppler     # PDF preview
-    sevenzip    # Archive preview
-    jq          # JSON processing
-  )
-  BREW_CASKS=(
-    font-symbols-only-nerd-font  # File icons in yazi
-  )
-
-  if command -v brew &>/dev/null; then
-    run brew install "${BREW_PACKAGES[@]}"
-    run brew install --cask "${BREW_CASKS[@]}"
-    info "CLI tools installed"
-  else
-    warn "Homebrew not found — skipping CLI tools. Install from https://brew.sh"
-  fi
-
-  # Install yazi plugins
-  if command -v ya &>/dev/null; then
-    echo ""
-    echo "Installing yazi plugins..."
-    run ya pkg add yazi-rs/plugins:full-border
-    run ya pkg add yazi-rs/plugins:git
-    info "Yazi plugins installed"
-  fi
-
-  # Configure yazi
-  YAZI_DIR="$HOME/.config/yazi"
-  run mkdir -p "$YAZI_DIR"
-
-  if [ ! -f "$YAZI_DIR/yazi.toml" ] || $DRY_RUN; then
-    if ! $DRY_RUN; then
-      cat > "$YAZI_DIR/yazi.toml" << 'TOML'
-[mgr]
-ratio = [1, 2, 5]
-sort_by = "natural"
-sort_sensitive = false
-sort_reverse = false
-sort_dir_first = true
-show_hidden = true
-show_symlink = true
-
-[preview]
-max_width = 1000
-max_height = 1000
-
-[opener]
-edit = [
-  { run = '$EDITOR %s', block = true, for = "unix" },
-]
-
-[plugin]
-TOML
-    fi
-    info "Created yazi.toml"
-  else
-    info "yazi.toml already exists — skipping"
-  fi
-
-  if [ ! -f "$YAZI_DIR/init.lua" ] || $DRY_RUN; then
-    if ! $DRY_RUN; then
-      cat > "$YAZI_DIR/init.lua" << 'LUA'
--- full-border plugin
-require("full-border"):setup()
-
--- git plugin
-require("git"):setup()
-LUA
-    fi
-    info "Created init.lua"
-  else
-    info "init.lua already exists — skipping"
-  fi
-
-  # Add dev() shell function to .zshrc if not present
-  if ! grep -q 'function dev()' "$HOME/.zshrc" 2>/dev/null; then
-    if ! $DRY_RUN; then
-      cat >> "$HOME/.zshrc" << 'ZSH'
-
-# cmux dev workspace — opens 3 workspaces: claude/shell | terminal | yazi
-function dev() {
-  local dir="${1:-.}"
-  dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo "Invalid directory: $1"; return 1; }
-  local is_repo=false
-  git -C "$dir" rev-parse --is-inside-work-tree &>/dev/null && is_repo=true
-
-  # Workspace 1 — claude code (if repo) or plain terminal
-  local ws1_out
-  ws1_out="$(cmux new-workspace --cwd "$dir" 2>&1)" || { echo "Failed to open cmux workspace"; return 1; }
-  local ws1_ref
-  ws1_ref="$(echo "$ws1_out" | grep -oE 'workspace:[0-9]+')"
-  if $is_repo; then
-    sleep 0.3
-    cmux send --workspace "$ws1_ref" "claude\n"
-  fi
-
-  # Workspace 2 — pure terminal, renamed "terminal"
-  sleep 0.3
-  local ws2_out
-  ws2_out="$(cmux new-workspace --cwd "$dir" 2>&1)"
-  local ws2_ref
-  ws2_ref="$(echo "$ws2_out" | grep -oE 'workspace:[0-9]+')"
-  if [ -n "$ws2_ref" ]; then
-    cmux rename-workspace "$ws2_ref" "terminal"
-  fi
-
-  # Workspace 3 — yazi file manager
-  sleep 0.3
-  local ws3_out
-  ws3_out="$(cmux new-workspace --cwd "$dir" 2>&1)"
-  local ws3_ref
-  ws3_ref="$(echo "$ws3_out" | grep -oE 'workspace:[0-9]+')"
-  if [ -n "$ws3_ref" ]; then
-    cmux send --workspace "$ws3_ref" "yazi\n"
-  fi
-
-  # Focus back on workspace 1
-  sleep 0.3
-  [ -n "$ws1_ref" ] && cmux focus --workspace "$ws1_ref"
-}
-ZSH
-    fi
-    info "Added dev() function to ~/.zshrc"
-  else
-    info "dev() function already in ~/.zshrc — skipping"
-  fi
-
-  # Add y() shell function to .zshrc if not present
-  if ! grep -q 'function y()' "$HOME/.zshrc" 2>/dev/null; then
-    if ! $DRY_RUN; then
-      cat >> "$HOME/.zshrc" << 'ZSH'
-
-# Yazi file manager — cd to last browsed directory on exit
-function y() {
-  local tmp="$(mktemp -t "yazi-cwd.XXXXXX")" cwd
-  yazi "$@" --cwd-file="$tmp"
-  if cwd="$(command cat -- "$tmp")" && [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
-    builtin cd -- "$cwd"
-  fi
-  rm -f -- "$tmp"
-}
-ZSH
-    fi
-    info "Added y() function to ~/.zshrc"
-  else
-    info "y() function already in ~/.zshrc — skipping"
-  fi
-fi
-
-# ─── MCP Configuration ───────────────────────────────────────────────
-if $SKIP_MCP; then
-  warn "Skipping MCP config (--skip-mcp)"
-else
-  echo ""
-  echo "Configuring MCP servers..."
-
-  # Load .env if it exists
-  if [ -f "$SCRIPT_DIR/.env" ]; then
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/.env"
-    info "Loaded .env"
-  fi
-
-  # Check required env vars
-  if [ -z "${BROWSER_PATH:-}" ]; then
-    warn "BROWSER_PATH not set. Create .env from .env.example or export BROWSER_PATH"
-    warn "MCP config will have empty browser path"
-    BROWSER_PATH=""
-  fi
-
-  # Process template: substitute env vars
-  TEMPLATE="$SCRIPT_DIR/mcp/config.template.json"
-  if [ -f "$TEMPLATE" ]; then
-    MCP_CONFIG=$(sed "s|\\\$BROWSER_PATH|$BROWSER_PATH|g" "$TEMPLATE")
-
-    if [ -f "$CLAUDE_JSON" ]; then
-      # Merge mcpServers into existing ~/.claude.json
-      if command -v jq &>/dev/null; then
-        MERGED=$(jq -s '
-          .[0] as $existing |
-          .[1].mcpServers as $newServers |
-          $existing * {mcpServers: (($existing.mcpServers // {}) * $newServers)}
-        ' "$CLAUDE_JSON" <(echo "$MCP_CONFIG"))
-        if ! $DRY_RUN; then
-          echo "$MERGED" > "$CLAUDE_JSON"
-        fi
-        info "Merged MCP servers into $CLAUDE_JSON"
-      else
-        warn "jq not found — cannot merge MCP config. Install jq or use --skip-mcp"
-      fi
-    else
-      # Create new config
-      if ! $DRY_RUN; then
-        echo "$MCP_CONFIG" > "$CLAUDE_JSON"
-      fi
-      info "Created $CLAUDE_JSON with MCP servers"
-    fi
-  else
-    warn "MCP template not found: $TEMPLATE"
-  fi
-fi
+# ─── Dispatch ────────────────────────────────────────────────────────
+$MODE_CORE  && install_core_run
+$MODE_TOOLS && install_tools_run
+$MODE_MCP   && install_mcp_run
+$MODE_SHELL && install_shell_run
 
 echo ""
 info "Installation complete!"

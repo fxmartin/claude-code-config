@@ -200,7 +200,7 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `statusline-command.sh` | Statusline renderer | — |
 | `keybindings.json` | Keybindings override | — |
 | `mcp/config.template.json` | MCP server template (env-var substituted at install) | — |
-| `install.sh` | Portable symlink installer (`--skip-mcp`, `--skip-tools`, `--dry-run`, `--uninstall`) | — |
+| `install.sh` + `install/` | Modal installer (`--core`, `--tools`, `--mcp`, `--shell`, `--all`, `--dry-run`, `--uninstall`). Dispatcher in `install.sh`, per-mode logic in `install/{core,tools,mcp,shell}.sh`. | 1 + 5 |
 
 ### Mirror plugins — `autonomous-sdlc` on both runtimes
 
@@ -252,17 +252,38 @@ The 7 Codex extras live as namespaced **commands** on the Claude side (`/devops:
 git clone git@github.com:fxmartin/claude-code-config.git
 cd claude-code-config
 cp .env.example .env          # Machine-specific values (e.g., BROWSER_PATH)
-./install.sh
+./install.sh --core           # Default: just the symlinks; opt in to the rest.
 ```
 
-The installer symlinks from `~/.claude/` to this repo for `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `reference-docs/`, `docs/`, `settings.json`, `statusline-command.sh`, `keybindings.json`, and `hooks/`. Optionally installs CLI tools (`yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `jq`, `ffmpeg`, `imagemagick`, `poppler`, etc.) used across the skills.
+The installer is now **modal** — pick one or more of `--core`, `--tools`, `--mcp`, `--shell`, or use `--all` to run every mode. The default when no mode flag is passed is `--core` (conservative, additive).
 
 ```bash
-./install.sh --skip-mcp       # Skip MCP config (Nix handles it on Nix boxes)
-./install.sh --skip-tools     # Skip CLI tools
-./install.sh --dry-run        # Preview
-./install.sh --uninstall      # Remove symlinks
+./install.sh --core              # Symlink config into ~/.claude (default)
+./install.sh --core --mcp        # Combine modes — order does not matter
+./install.sh --all               # core + tools + mcp + shell
+./install.sh --all --dry-run     # Preview every action across every mode
+./install.sh --uninstall         # Remove core symlinks (other modes are untouched)
 ```
+
+#### What this script does to your machine
+
+Each mode is **opt-in**, **idempotent**, and supports `--dry-run` for an exact preview of every action before any change lands.
+
+| Mode | Touches | Files added | Files modified |
+|------|---------|-------------|----------------|
+| `--core` | `~/.claude/` | symlinks for `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `settings.json`, `statusline-command.sh`, `keybindings.json`, `reference-docs/`, `docs/`, `plugins/marketplaces/fx-claude-config` | none |
+| `--tools` | `/opt/homebrew/` (macOS) or `/usr/local/` (WSL2 via apt or brew, lands in Story 3.1-002) | `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip`, `jq`, optional Nerd Font | `~/.config/yazi/yazi.toml`, `~/.config/yazi/init.lua` (created if absent) |
+| `--mcp` | `~/.claude.json` | merges `mcp/config.template.json` into existing JSON via `jq` | only the `mcpServers` key |
+| `--shell` | `~/.zshrc` | nothing | appends `dev()` and `y()` shell functions if absent |
+
+##### Deprecated flags (still supported, removed in next MAJOR)
+
+| Old flag | New equivalent |
+|----------|----------------|
+| `./install.sh --skip-mcp` | `./install.sh --core --tools --shell` |
+| `./install.sh --skip-tools` | `./install.sh --core --mcp --shell` |
+
+Both legacy flags emit a deprecation warning pointing at the new modes.
 
 ### As a submodule (Nix-managed machines)
 
