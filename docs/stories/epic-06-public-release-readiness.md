@@ -83,11 +83,13 @@
 - Onboarding doc mentions the personal extras in a single line: "the install also ships personal helper agents (crypto, profile research, executive summary); they do not appear in the SDLC workflow and can be ignored."
 
 **Definition of Done**:
-- Files moved.
-- Registry validator updated.
-- README split.
-- Onboarding doc updated.
-- Change noted in `CHANGELOG.md` under "Changed".
+- [x] Files moved.
+- [x] Registry validator updated.
+- [x] README split.
+- [x] Onboarding doc updated.
+- [x] Change noted in `CHANGELOG.md` under "Changed".
+
+**Completed**: PR #33, merged 2026-05-20 at 17:51:14 UTC.
 
 ### Feature 6.3: Pilot
 
