@@ -81,7 +81,23 @@ Read `{{CLAUDE_SKILL_DIR}}/batch-progress.md` for the progress file format.
 3. Within that story's **Definition of Done** block, change ALL `- [ ]` to `- [x]`
 4. Save the file
 
-## Step 5: Commit Updates
+## Step 5: Regenerate the Markdown View from SQLite
+
+The `.build-progress.md` file is a read-model over the SQLite ledger
+(Story 4.2-002). After the merge has updated story status in SQLite via the
+hook calls below, regenerate the markdown so it reflects the ledger truth.
+The regenerate degrades silently when no ledger is configured (e.g. legacy
+environments), so this is safe to invoke unconditionally.
+
+```bash
+~/.claude/hooks/sdlc-state-emit.sh render --out "{{PROGRESS_FILE}}" || true
+```
+
+This is the single per-merge write point for `.build-progress.md`. Hand
+edits to the file are not necessary — Step 3 above is preserved only as a
+fallback for environments where the SQLite ledger is unavailable.
+
+## Step 6: Commit Updates
 
 ```bash
 git add "{{EPIC_FILE}}" "{{PROGRESS_FILE}}"
