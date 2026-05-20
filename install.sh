@@ -60,7 +60,7 @@ for arg in "$@"; do
     --help|-h)     usage ;;
     *)
       echo "✗ Unknown option: $arg" >&2
-      usage
+      exit 1
       ;;
   esac
 done

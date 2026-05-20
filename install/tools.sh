@@ -63,8 +63,8 @@ install_tools_run() {
       echo "  [dry-run] ya pkg add yazi-rs/plugins:full-border"
       echo "  [dry-run] ya pkg add yazi-rs/plugins:git"
     elif command -v ya &>/dev/null; then
-      run ya pkg add yazi-rs/plugins:full-border
-      run ya pkg add yazi-rs/plugins:git
+      run ya pkg add yazi-rs/plugins:full-border || run ya pkg upgrade yazi-rs/plugins:full-border
+      run ya pkg add yazi-rs/plugins:git || run ya pkg upgrade yazi-rs/plugins:git
       info "Yazi plugins installed"
     fi
   fi
