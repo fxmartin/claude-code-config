@@ -11,6 +11,8 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 
 You are a **thin dispatcher** orchestrator. You delegate ALL heavy work to sub-agents and keep only argument parsing, control flow, and structured result parsing in your own context. This preserves your context window across 20+ story builds.
 
+> **SQLite ledger (Epic-04, Story 4.2-001)** — alongside every `cmux-bridge log` call, also write to the durable ledger via `~/.claude/hooks/sdlc-state-emit.sh`. The orchestrator initialises the ledger and exports `SDLC_RUN_ID`; sub-agents inherit it and emit stage transitions. The markdown progress file (`.build-progress.md`) is still updated for human readability — story 4.2-002 will switch the markdown to a SELECT-only view. For now, BOTH write paths must run on every transition. The emit hook is silent (exit 0) when no ledger is configured, so legacy environments are not broken.
+
 ## Sidebar Notification Architecture
 
 Use exactly **2 status pill keys** throughout the entire run. Never create per-story keyed pills.
@@ -74,6 +76,22 @@ echo "build-stories" > /tmp/.claude-skill-active
 
 **Important:** This file MUST be removed on every exit path (finish, abort, preflight failure, discovery failure). See Phase 7 and error paths below.
 
+### Initialise SQLite Ledger (Story 4.2-001)
+
+Create the durable ledger row for this run BEFORE the first sub-agent dispatch so every subsequent stage emission has a valid `SDLC_RUN_ID` to attach to:
+
+```bash
+# Initialise the ledger DB if it does not yet exist (idempotent).
+~/.claude/hooks/sdlc-state-emit.sh init >/dev/null 2>&1 || \
+  scripts/sdlc-state.sh init >/dev/null
+
+# Create the run row; capture the ID and export it for child agents.
+export SDLC_RUN_ID="$(~/.claude/hooks/sdlc-state-emit.sh run-create "${SCOPE:-all}" "${MODE:-parallel}")"
+~/.claude/hooks/sdlc-state-emit.sh event-log "${SDLC_RUN_ID}" "" info build-stories "run started: scope=${SCOPE:-all} mode=${MODE:-parallel}"
+```
+
+`SDLC_RUN_ID` is inherited by every dispatched sub-agent (Agent tool calls preserve env). Sub-agents append stage/event rows via the same hook. If the hook exits silently (no DB), the orchestrator continues — the markdown progress file is still updated.
+
 ### Pre-Flight Health Check (skip if `--skip-preflight`)
 
 ```bash
@@ -132,6 +150,7 @@ The agent returns: a display table, blocked/completed lists, and a `QUEUE_JSON:`
 On success:
 ```bash
 bash -c '~/.claude/hooks/cmux-bridge.sh log info "Discovered [N] stories across [M] epics" --source build-stories'
+~/.claude/hooks/sdlc-state-emit.sh event-log "${SDLC_RUN_ID:-}" "" info build-stories "discovery complete: [N] stories across [M] epics"
 ```
 
 On error:
@@ -149,6 +168,19 @@ Extract the `QUEUE_JSON:` line from the discovery agent result. Parse it into an
 
 If the agent returned `DISCOVERY_ERROR:` — print the error and STOP.
 If the agent returned `RESUME_WARNING:` — print warning, ask user to confirm or use `resume`.
+
+### Persist queue to ledger (Story 4.2-001)
+
+For each parsed story, write a `stories` row so resume (4.3-001) can rebuild the queue from SQLite alone:
+
+```bash
+# For each story in the parsed queue:
+~/.claude/hooks/sdlc-state-emit.sh story-upsert \
+  "${SDLC_RUN_ID}" "${STORY_ID}" "${EPIC_ID}" "${TITLE}" \
+  "${PRIORITY}" "${POINTS}" "${AGENT_TYPE}" "" "" TODO
+```
+
+The markdown progress file is still initialised below — both views coexist until 4.2-002 lands.
 
 ### Queue Truncation (`--limit=N`)
 
@@ -291,18 +323,27 @@ Agent(
   Return BRANCH_NAME: feature/[ID] and BUILD_STATUS: SUCCESS when done.
   If failed, return BUILD_STATUS: FAILED with error details.
 
-  ## Sidebar Ledger
+  ## Sidebar Ledger + SQLite Ledger
   After each milestone, emit a structured log entry so the cmux sidebar shows parallel-agent progress. Only emit if $CMUX_SOCKET_PATH is set (same guard as the orchestrator preamble).
 
   bash -c '~/.claude/hooks/cmux-bridge.sh log info "BUILD_STARTED [ID]: [TITLE]" --source story-[ID]'
+  # SQLite ledger (Story 4.2-001): mark the build stage IN_PROGRESS. SDLC_RUN_ID is inherited from the orchestrator.
+  ~/.claude/hooks/sdlc-state-emit.sh stage-start "${SDLC_RUN_ID:-}" "[ID]" build 1
+
   # After git checkout -b succeeds:
   bash -c '~/.claude/hooks/cmux-bridge.sh log info "BRANCH_CREATED [ID]: feature/[ID]" --source story-[ID]'
+  ~/.claude/hooks/sdlc-state-emit.sh story-upsert "${SDLC_RUN_ID:-}" "[ID]" "[EPIC_ID]" "[TITLE]" "[PRIORITY]" "[POINTS]" "[AGENT_TYPE]" "feature/[ID]" "" IN_PROGRESS
+
   # After all quality gates pass:
   bash -c '~/.claude/hooks/cmux-bridge.sh log success "TESTS_GREEN [ID]: all gates passed" --source story-[ID]'
   # After git push succeeds:
   bash -c '~/.claude/hooks/cmux-bridge.sh log success "BRANCH_PUSHED [ID]: feature/[ID] pushed" --source story-[ID]'
+  ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "[ID]" build 1 DONE "" ""
+
   # On failure:
   bash -c '~/.claude/hooks/cmux-bridge.sh log error "BUILD_FAILED [ID]: [error summary]" --source story-[ID]'
+  ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "[ID]" build 1 FAILED "build-error" ""
+  ~/.claude/hooks/sdlc-state-emit.sh event-log "${SDLC_RUN_ID:-}" "[ID]" error story-[ID] "build failed: [error summary]"
   """
 )
 ```
@@ -327,10 +368,12 @@ Agent(
     git checkout {{BRANCH_NAME}}
   Then proceed with coverage analysis.
 
-  ## Sidebar Ledger
+  ## Sidebar Ledger + SQLite Ledger
   Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set.
 
   bash -c '~/.claude/hooks/cmux-bridge.sh log info "COVERAGE_STARTED {{STORY_ID}}: {{STORY_TITLE}}" --source story-{{STORY_ID}}'
+  ~/.claude/hooks/sdlc-state-emit.sh stage-start "${SDLC_RUN_ID:-}" "{{STORY_ID}}" coverage 1
+
   # After running the test suite:
   bash -c '~/.claude/hooks/cmux-bridge.sh log info "COVERAGE_MEASURED {{STORY_ID}}: [PCT]% current" --source story-{{STORY_ID}}'
   # After adding gap-filling tests:
@@ -339,8 +382,10 @@ Agent(
   bash -c '~/.claude/hooks/cmux-bridge.sh log info "SECURITY_SCANNED {{STORY_ID}}: [CLEAN|WARN|BLOCK|SKIPPED]" --source story-{{STORY_ID}}'
   # After gh pr create:
   bash -c '~/.claude/hooks/cmux-bridge.sh log success "PR_CREATED {{STORY_ID}}: PR #[PR_NUMBER]" --source story-{{STORY_ID}}'
+  ~/.claude/hooks/sdlc-state-emit.sh story-upsert "${SDLC_RUN_ID:-}" "{{STORY_ID}}" "" "{{STORY_TITLE}}" "" "" "" "{{BRANCH_NAME}}" "[PR_NUMBER]" IN_PROGRESS
   # Final status:
   bash -c '~/.claude/hooks/cmux-bridge.sh log success "COVERAGE_DONE {{STORY_ID}}: [PASS|WARN] [PCT]%" --source story-{{STORY_ID}}'
+  ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "{{STORY_ID}}" coverage 1 DONE "" ""
   """
 )
 ```
@@ -366,16 +411,20 @@ Agent(
   5. When satisfied: gh pr review [PR_NUMBER] --approve
   Return APPROVAL_STATUS: APPROVED or APPROVAL_STATUS: CHANGES_NEEDED
 
-  ## Sidebar Ledger
+  ## Sidebar Ledger + SQLite Ledger
   Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set.
 
   bash -c '~/.claude/hooks/cmux-bridge.sh log info "REVIEW_STARTED [ID]: [TITLE]" --source story-[ID]'
+  ~/.claude/hooks/sdlc-state-emit.sh stage-start "${SDLC_RUN_ID:-}" "[ID]" review 1
+
   # If changes are needed and applied:
   bash -c '~/.claude/hooks/cmux-bridge.sh log warning "CHANGES_REQUESTED [ID]: fixes applied, re-reviewing" --source story-[ID]'
   # After gh pr review --approve:
   bash -c '~/.claude/hooks/cmux-bridge.sh log success "APPROVED [ID]: PR #[PR_NUMBER] approved" --source story-[ID]'
+  ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "[ID]" review 1 DONE "" ""
   # If CHANGES_NEEDED persists:
   bash -c '~/.claude/hooks/cmux-bridge.sh log error "REVIEW_FAILED [ID]: changes still needed" --source story-[ID]'
+  ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "[ID]" review 1 FAILED "review-blocked" ""
   """
 )
 ```
@@ -518,16 +567,20 @@ Review the PR for story [ID]: [TITLE]
 
 Return APPROVAL_STATUS: APPROVED or APPROVAL_STATUS: CHANGES_NEEDED
 
-## Sidebar Ledger
+## Sidebar Ledger + SQLite Ledger
 Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set.
 
 bash -c '~/.claude/hooks/cmux-bridge.sh log info "REVIEW_STARTED [ID]: [TITLE]" --source story-[ID]'
+~/.claude/hooks/sdlc-state-emit.sh stage-start "${SDLC_RUN_ID:-}" "[ID]" review 1
+
 # If changes are needed and applied:
 bash -c '~/.claude/hooks/cmux-bridge.sh log warning "CHANGES_REQUESTED [ID]: fixes applied, re-reviewing" --source story-[ID]'
 # After gh pr review --approve:
 bash -c '~/.claude/hooks/cmux-bridge.sh log success "APPROVED [ID]: PR #[PR_NUMBER] approved" --source story-[ID]'
+~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "[ID]" review 1 DONE "" ""
 # If CHANGES_NEEDED persists:
 bash -c '~/.claude/hooks/cmux-bridge.sh log error "REVIEW_FAILED [ID]: changes still needed" --source story-[ID]'
+~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "[ID]" review 1 FAILED "review-blocked" ""
 """)
 ```
 
@@ -637,6 +690,9 @@ bash -c '~/.claude/hooks/cmux-bridge.sh telegram "Build Stories: First Failure" 
   bash -c '~/.claude/hooks/cmux-bridge.sh log error "Build aborted by user at story [N]/[TOTAL]" --source build-stories'
   bash -c '~/.claude/hooks/cmux-bridge.sh notify "Build Stories Aborted" "Stopped at [N]/[TOTAL]\nCompleted: [C], Failed: [F]"'
   bash -c '~/.claude/hooks/cmux-bridge.sh telegram "Build Stories Aborted" "Stopped at story [N]/[TOTAL]\nCompleted: [C], Failed: [F]"'
+  # Close the ledger run as ABORTED (Story 4.2-001).
+  ~/.claude/hooks/sdlc-state-emit.sh event-log "${SDLC_RUN_ID}" "" error build-stories "aborted by user at story [N]/[TOTAL]"
+  ~/.claude/hooks/sdlc-state-emit.sh run-update-status "${SDLC_RUN_ID}" ABORTED
   rm -f /tmp/.claude-skill-active
   ```
   Skip to Phase 6 for summary.
@@ -670,6 +726,10 @@ Handle result per `--e2e-gate` mode:
 ```bash
 bash -c '~/.claude/hooks/cmux-bridge.sh log success "E2E gate: epic [EPIC_ID] PASSED" --source build-stories'
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "E2E Gate Passed" "Epic [EPIC_ID]: [EPIC_NAME]"'
+# SQLite ledger (Story 4.2-001): the schema has no dedicated e2e_gate table,
+# so gate results are written into `events` with source=e2e-gate so the
+# resume + summary flows can find them by SELECT ... WHERE source='e2e-gate'.
+~/.claude/hooks/sdlc-state-emit.sh event-log "${SDLC_RUN_ID:-}" "" success e2e-gate "E2E_PASS epic [EPIC_ID]: [EPIC_NAME]"
 ```
 
 **E2E FAIL:**
@@ -677,6 +737,7 @@ bash -c '~/.claude/hooks/cmux-bridge.sh notify "E2E Gate Passed" "Epic [EPIC_ID]
 bash -c '~/.claude/hooks/cmux-bridge.sh log error "E2E gate: epic [EPIC_ID] FAILED" --source build-stories'
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "E2E Gate FAILED" "Epic [EPIC_ID]: [EPIC_NAME]"'
 bash -c '~/.claude/hooks/cmux-bridge.sh telegram "E2E Gate Failed" "Epic [EPIC_ID]: [EPIC_NAME]\nMode: [block|warn]"'
+~/.claude/hooks/sdlc-state-emit.sh event-log "${SDLC_RUN_ID:-}" "" error e2e-gate "E2E_FAIL epic [EPIC_ID]: [EPIC_NAME] mode=[block|warn]"
 ```
 
 - `block` + FAIL: if `--auto` treat as `warn`, otherwise ask user
@@ -737,6 +798,10 @@ bash -c '~/.claude/hooks/cmux-bridge.sh progress 1.0 --label "Done: [COMPLETED]/
 bash -c '~/.claude/hooks/cmux-bridge.sh log success "Build finished: [COMPLETED] done, [FAILED] failed, [SKIPPED] skipped, [DURATION]" --source build-stories'
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nDone: [COMPLETED]/[TOTAL]\nFailed: [FAILED]\nDuration: [DURATION]"'
 bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Build Stories Finished" "Scope: [SCOPE]\nDone: [COMPLETED]/[TOTAL]\nFailed: [FAILED]\nDuration: [DURATION]"'
+# Close out the ledger run (Story 4.2-001). Terminal status — DONE if every
+# story completed, FAILED if any did, ABORTED on user abort.
+~/.claude/hooks/sdlc-state-emit.sh event-log "${SDLC_RUN_ID}" "" success build-stories "run finished: [COMPLETED] done, [FAILED] failed"
+~/.claude/hooks/sdlc-state-emit.sh run-update-status "${SDLC_RUN_ID}" "${RUN_TERMINAL_STATUS:-DONE}"
 rm -f /tmp/.claude-skill-active
 ```
 
