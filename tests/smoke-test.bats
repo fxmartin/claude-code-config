@@ -85,3 +85,84 @@ _run_smoke() {
     [ "$status" -ne 0 ]
     rm -rf "${empty_root}"
 }
+
+# ── Gap coverage tests (Story 3.2-002 QA gate) ──────────────────────────────
+#
+# These four tests cover behaviours that the original 7 tests leave unexercised:
+#   G1. install.sh is present but exits non-zero → smoke-test exits non-zero
+#       with a diagnostic on stderr and the SMOKE_TEST summary line on stdout.
+#   G2. The SMOKE_TEST summary line format is stable/grep-parseable even when
+#       phases fail (not only on a clean run).
+#   G3. No temp dir leaks when the smoke-test exits 1 (trap cleanup fires on
+#       any exit, including failure).
+#   G4. The script never writes to the caller's real $HOME, even when
+#       SMOKE_HOME_OVERRIDE is absent — the only writer is the mktemp home.
+
+# Helper: create a minimal fake repo root whose install.sh always exits $1.
+_make_stub_root() {
+    local exit_code="${1:-1}"
+    local stub_root
+    stub_root="$(mktemp -d)"
+    printf '#!/usr/bin/env bash\necho "stub output"\nexit %s\n' "$exit_code" \
+        > "${stub_root}/install.sh"
+    chmod +x "${stub_root}/install.sh"
+    echo "$stub_root"
+}
+
+@test "G1: smoke-test exits non-zero when install.sh is present but fails" {
+    stub_root="$(_make_stub_root 1)"
+    run env SMOKE_SCRIPT_ROOT_OVERRIDE="${stub_root}" SMOKE_HOME_OVERRIDE="${SMOKE_HOME}" \
+        bash "${SMOKE}"
+    rm -rf "${stub_root}"
+    [ "$status" -ne 0 ]
+}
+
+@test "G2: SMOKE_TEST summary line is present and grep-parseable even on failure" {
+    stub_root="$(_make_stub_root 1)"
+    # Merge stderr into stdout so bats captures both streams in $output.
+    run env SMOKE_SCRIPT_ROOT_OVERRIDE="${stub_root}" SMOKE_HOME_OVERRIDE="${SMOKE_HOME}" \
+        bash "${SMOKE}" 2>&1
+    rm -rf "${stub_root}"
+    # Exit must be non-zero (phases failed) but the summary line must be emitted.
+    [ "$status" -ne 0 ]
+    # The exact format CI greps for: SMOKE_TEST: <n>/<n> passed
+    echo "${output}" | grep -qE '^SMOKE_TEST: [0-9]+/[0-9]+ passed$'
+}
+
+@test "G3: smoke-test cleans up its mktemp home even when phases fail" {
+    stub_root="$(_make_stub_root 1)"
+    # Count smoke-claude-* dirs in TMPDIR before the run. We cannot observe
+    # the temp dir that the script creates (it is gone by the time run returns),
+    # so we assert the count is the same after the run as it was before.
+    tmpdir="${TMPDIR:-/tmp}"
+    before_count=$(ls "$tmpdir" 2>/dev/null | { grep -c "smoke-claude-" || true; })
+    run env SMOKE_SCRIPT_ROOT_OVERRIDE="${stub_root}" bash "${SMOKE}" 2>&1
+    after_count=$(ls "$tmpdir" 2>/dev/null | { grep -c "smoke-claude-" || true; })
+    rm -rf "${stub_root}"
+    [ "$after_count" -eq "$before_count" ]
+}
+
+@test "G4: smoke-test does not write to the caller's real HOME when SMOKE_HOME_OVERRIDE is absent" {
+    # Record the mtime of $HOME/.claude (or note its absence) before the run.
+    real_claude="${HOME}/.claude"
+    if [ -d "${real_claude}" ]; then
+        # stat flags differ between macOS (-f %m) and Linux (-c %Y).
+        before_mtime=$(stat -f "%m" "${real_claude}" 2>/dev/null \
+                       || stat -c "%Y" "${real_claude}" 2>/dev/null)
+    else
+        before_mtime="absent"
+    fi
+
+    # Run without SMOKE_HOME_OVERRIDE — the script must create its own mktemp.
+    run bash "${SMOKE}"
+    [ "$status" -eq 0 ]
+
+    if [ -d "${real_claude}" ]; then
+        after_mtime=$(stat -f "%m" "${real_claude}" 2>/dev/null \
+                      || stat -c "%Y" "${real_claude}" 2>/dev/null)
+    else
+        after_mtime="absent"
+    fi
+
+    [ "${before_mtime}" = "${after_mtime}" ]
+}
