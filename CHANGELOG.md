@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Plugin install path verification (#6.4-001). New
+  `scripts/verify-plugin-install.sh` validates the `/plugin marketplace add
+  fxmartin/claude-code-config` path B structurally: marketplace manifest is
+  valid JSON, every declared plugin resolves to a real directory with a
+  valid `plugin.json`, and every `skills/<name>/SKILL.md` frontmatter `name:`
+  matches its directory. Wired into `.github/workflows/ci.yml` static-checks
+  alongside the existing path-A `scripts/smoke-test.sh`. New bats suite
+  `tests/plugin-install-paths.bats` pins the contract. `docs/smoke-test.md`
+  grows a "Two install paths" section listing the exact manual steps for the
+  parts CI cannot reach (real `/plugin install` inside a Claude Code session
+  on macOS and WSL2).
+
 ## [v1.12.0] - 2026-05-20
 
 ### Added

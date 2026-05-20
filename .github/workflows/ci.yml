@@ -50,6 +50,13 @@ jobs:
           done
           exit "$fail"
 
+      - name: Verify plugin marketplace structure (Story 6.4-001 path B)
+        # Structural check that the `/plugin marketplace add fxmartin/...`
+        # path resolves cleanly: marketplace manifest valid, plugin manifest
+        # valid, every declared skill has a matching SKILL.md frontmatter.
+        # Companion to the smoke-test job (path A: install.sh --core).
+        run: bash scripts/verify-plugin-install.sh
+
       - name: Markdown link check
         run: |
           npm install -g markdown-link-check@3
@@ -111,7 +118,7 @@ jobs:
         run: |
           bats --version
           jq --version
-          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats
+          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats
 
   smoke-test:
     name: Smoke test (clean-machine install)

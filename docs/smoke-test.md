@@ -1,14 +1,77 @@
 # Smoke Test — Clean-Machine Install Verification
 
-**Story:** [3.2-002](stories/epic-03-cross-platform-installer.md#story-32-002-clean-machine-install-verification-macos-and-wsl2)
+**Stories:** [3.2-002](stories/epic-03-cross-platform-installer.md#story-32-002-clean-machine-install-verification-macos-and-wsl2),
+[6.4-001](stories/epic-06-public-release-readiness.md#story-64-001-verify-both-plugin-install-paths-end-to-end)
 **Audience:** FX (release captain) and any LTM colleague verifying a fresh box.
 
 This document describes the two layers of smoke testing for `install.sh`:
 
-1. **Automated** — `scripts/smoke-test.sh`, runs in GitHub Actions on
-   `macos-latest` and `ubuntu-latest` every PR and on every push to `main`.
+1. **Automated** — `scripts/smoke-test.sh` (path A) and
+   `scripts/verify-plugin-install.sh` (path B), both run in GitHub Actions on
+   every PR and on every push to `main`.
 2. **Manual** — the parts CI cannot cover (real Homebrew, real `BROWSER_PATH`,
-   real `/build-stories` end-to-end). Run before every release tag (Epic-05).
+   real `/build-stories` end-to-end, real `/plugin marketplace add` inside a
+   Claude Code session). Run before every release tag (Epic-05).
+
+---
+
+## Two install paths (Story 6.4-001)
+
+The README advertises **two ways** to install the framework. Both must work on
+a fresh box, both are exercised by CI, and the manual checklist below catches
+the parts CI cannot reach.
+
+| Path | What the user runs | What it produces |
+|------|--------------------|------------------|
+| **A. local clone + `install.sh`** | `git clone …` then `./install.sh --core` | Symlinks under `~/.claude/`, including `~/.claude/plugins/marketplaces/fx-claude-config → <repo>`. The local marketplace exposes the `autonomous-sdlc` plugin to Claude Code. |
+| **B. GitHub-direct marketplace** | `/plugin marketplace add fxmartin/claude-code-config` then `/plugin install autonomous-sdlc@fx-claude-config` inside a running Claude Code session | Claude Code clones the repo, reads `.claude-plugin/marketplace.json`, then resolves the `autonomous-sdlc` plugin at `plugins/autonomous-sdlc/`. The eight SDLC skills become available. |
+
+### Automated coverage for each path
+
+| Path | Script | What it asserts |
+|------|--------|-----------------|
+| A | `scripts/smoke-test.sh` | `install.sh --core` dry-run, install, idempotent re-run, uninstall — all inside an isolated `$HOME`. Verifies the marketplace symlink is created and removed. |
+| B | `scripts/verify-plugin-install.sh` | `.claude-plugin/marketplace.json` is valid JSON, declares the `autonomous-sdlc` plugin, the plugin manifest is valid JSON with `name`/`version`/`description`, every `skills/<name>/SKILL.md` exists and its frontmatter `name:` matches the directory. Does NOT invoke Claude Code — structural validation only. |
+
+Both run in CI (`.github/workflows/ci.yml`). Both can be invoked locally:
+
+```bash
+bash scripts/smoke-test.sh             # path A end-to-end
+bash scripts/verify-plugin-install.sh  # path B structural check
+```
+
+The path-B script prints a `VERIFY_PLUGIN: <pass>/<total> passed` summary that
+CI greps for and `tests/plugin-install-paths.bats` asserts on.
+
+### Manual path-B verification (pre-release checklist)
+
+CI cannot drive a real Claude Code session. Before each release tag, FX runs
+the path-B install on a clean machine and confirms the skills resolve:
+
+1. **macOS (clean user)**:
+   - Open Claude Code in any throwaway repo.
+   - Run `/plugin marketplace add fxmartin/claude-code-config`.
+   - Run `/plugin install autonomous-sdlc@fx-claude-config`.
+   - Restart Claude Code (or `/plugin reload` if available).
+   - In the slash menu, confirm `/brainstorm`, `/generate-epics`,
+     `/build-stories`, `/create-epic`, `/create-story`, `/fix-issue`,
+     `/project-init`, `/resume-build-agents` all show up.
+   - Invoke `/brainstorm` and confirm it runs the interview flow.
+2. **WSL2 (Ubuntu 22.04, clean user)**:
+   - Same sequence. cmux is unavailable on WSL2; the skills must still load
+     and the `cmux-bridge.sh` graceful-degradation path should keep them
+     usable (no fatal errors when a skill emits a cmux sidebar event).
+
+**Pass criteria:** all eight skills surface in the slash menu on both
+platforms; `/brainstorm` reaches at least the first interview question
+without erroring.
+
+### What verify-plugin-install.sh does NOT cover
+
+- It does not run Claude Code. There is no headless `/plugin install`.
+- It does not check that GitHub serves the repo over HTTPS (handled by GitHub).
+- It does not verify the plugin works in a Codex session — that path is the
+  autonomous-sdlc Codex plugin under a separate repo and is out of scope.
 
 ---
 
@@ -191,7 +254,9 @@ Record results in the release draft or the PR that bumps the version.
 
 ## Reference
 
-- Script: [`scripts/smoke-test.sh`](../scripts/smoke-test.sh)
-- Tests: [`tests/smoke-test.bats`](../tests/smoke-test.bats)
-- CI job: `.github/workflows/ci.yml` → `smoke-test`
-- Story: [`docs/stories/epic-03-cross-platform-installer.md`](stories/epic-03-cross-platform-installer.md)
+- Path A script: [`scripts/smoke-test.sh`](../scripts/smoke-test.sh)
+- Path A tests: [`tests/smoke-test.bats`](../tests/smoke-test.bats)
+- Path B script: [`scripts/verify-plugin-install.sh`](../scripts/verify-plugin-install.sh)
+- Path B tests: [`tests/plugin-install-paths.bats`](../tests/plugin-install-paths.bats)
+- CI jobs: `.github/workflows/ci.yml` → `smoke-test`, `static-checks`
+- Stories: [`epic-03`](stories/epic-03-cross-platform-installer.md), [`epic-06`](stories/epic-06-public-release-readiness.md)
