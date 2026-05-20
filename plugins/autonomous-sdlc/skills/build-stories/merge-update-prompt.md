@@ -11,6 +11,32 @@ You are a merge-and-update agent. You merge an approved PR, update the progress 
 - **Progress File**: `{{PROGRESS_FILE}}`
 - **Skill Directory**: `{{CLAUDE_SKILL_DIR}}`
 
+## Resume-Aware Branch and PR Reuse (Story 4.3-001)
+
+When the orchestrator dispatches you during a `scope=resume` run, the
+ledger's `resume-plan` output already populated `{{PR_NUMBER}}` and the
+branch metadata from the prior attempt. Do NOT create a new branch and do
+NOT call `gh pr create` — the existing PR is the merge target.
+
+Before Step 0, check whether the referenced PR + branch are still alive:
+
+```bash
+# Verify the PR is open and points at the expected branch.
+PR_STATE=$(gh pr view "{{PR_NUMBER}}" --json state,headRefName 2>/dev/null || true)
+if [ -z "${PR_STATE}" ]; then
+    # The ledger has a PR number but the PR is gone (closed, deleted,
+    # or repository-renamed). The orchestrator must classify this as a
+    # FAILED stage and re-dispatch the build agent.
+    echo "MERGE_STATUS: PR_MISSING"
+    echo "DETAIL: PR #{{PR_NUMBER}} not found — branch may need recreation"
+    exit 1
+fi
+```
+
+If the PR exists and the branch is still on the remote, proceed to Step 0
+unchanged. Branch and PR are preserved verbatim across the resume — the
+metadata in the ledger is the source of truth.
+
 ## Step 0: Rebase Branch onto Latest Main (parallel mode safety)
 
 Before merging, ensure the PR branch is up-to-date with main. This is critical in parallel mode where earlier stories in the same cohort may have already merged, changing the main baseline.
@@ -115,6 +141,7 @@ Output exactly one of these status lines:
 - `MERGE_STATUS: REBASE_CONFLICT` — branch could not be rebased onto updated main (parallel mode baseline drift)
 - `MERGE_STATUS: CONFLICT` — PR could not merge due to conflicts
 - `MERGE_STATUS: FAILED` — PR merge failed for another reason (include error details on next line)
+- `MERGE_STATUS: PR_MISSING` — resume-time check found the referenced PR is gone; orchestrator must re-dispatch the build agent for this story
 
 On success, also output:
 ```

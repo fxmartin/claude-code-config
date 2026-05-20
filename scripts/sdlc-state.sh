@@ -30,6 +30,12 @@
 #   sdlc-state.sh [--db <path>] stage-finish <run_id> <story_id> <stage_name> <attempt> <status> <failure_category> <output_path>
 #   sdlc-state.sh [--db <path>] event-log <run_id> <story_id> <level> <source> <message>
 #
+# Resume path (Story 4.3-001 — the orchestrator calls these when
+# `/build-stories resume` is re-invoked):
+#   sdlc-state.sh [--db <path>] latest-incomplete-run                              # prints the most-recent IN_PROGRESS run_id (or empty)
+#   sdlc-state.sh [--db <path>] mark-stages-stale <run_id> <story_id> <stage_name> # atomically flip prior non-DONE stages to STALE
+#   sdlc-state.sh [--db <path>] resume-plan <run_id>                               # emit a JSON queue of stories to resume
+#
 # Default DB path: `.sdlc-state.db` in the current directory. Tests override
 # with `--db <tmpfile>` so the real ledger is never touched.
 #
@@ -78,6 +84,11 @@ Write-path subcommands (Story 4.2-001):
   stage-finish <run_id> <story_id> <stage_name> <attempt> <status>
                <failure_category> <output_path>                        UPDATE the stages row to a terminal status.
   event-log <run_id> <story_id> <level> <source> <message>             Append an events row.
+
+Resume-path subcommands (Story 4.3-001):
+  latest-incomplete-run                                                Print the most-recent IN_PROGRESS run_id (or empty).
+  mark-stages-stale <run_id> <story_id> <stage_name>                   Atomically flip prior non-DONE stages to STALE.
+  resume-plan <run_id>                                                 Emit a JSON queue of stories to resume.
 
 Default --db path: .sdlc-state.db in the current directory.
 
@@ -662,6 +673,198 @@ render_subcommand() {
     mv "${tmp_path}" "${out_path}"
 }
 
+# --- Resume helpers (Story 4.3-001) ---------------------------------------
+#
+# Resume reads the ledger and produces a JSON queue that the orchestrator
+# feeds into Phase 5 of build-stories. The contract intentionally mirrors
+# the shape of `QUEUE_JSON:` emitted by the discovery agent so the
+# orchestrator's queue parser stays generic — the only new field is
+# `resume_from`, the stage the agent should re-enter for IN_PROGRESS
+# stories. Stories whose status is DONE are filtered out entirely (the
+# orchestrator never needs to see them).
+#
+# All renderable values pass through `json_escape` so embedded quotes,
+# backslashes, and control characters cannot corrupt the envelope.
+
+# Escape a value for safe embedding inside a JSON string literal.
+# Implements the minimal RFC 8259 escapes: backslash, double-quote,
+# newline, carriage return, tab. The output does NOT include surrounding
+# quotes — the caller wraps the result.
+json_escape() {
+    local v="${1-}"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//$'\n'/\\n}"
+    v="${v//$'\r'/\\r}"
+    v="${v//$'\t'/\\t}"
+    printf '%s' "${v}"
+}
+
+# Print the resume_from stage for a story by inspecting its stages rows.
+# Selection rule (matches the resume contract in story 4.3-001):
+#   * If any IN_PROGRESS stage row exists, return that stage_name (the
+#     orchestrator was killed mid-stage).
+#   * Else if any FAILED stage row exists, return the most-recently-failed
+#     stage_name (the stage that broke the run before the kill).
+#   * Else if any STALE row exists — meaning a prior resume already
+#     marked the failed attempt stale — return the most-recently-stale
+#     stage_name so a second resume picks up where the first left off.
+#   * Else fall back to the most recent stage row REGARDLESS of status
+#     (covers DONE-then-killed and partial DONE chains), ordered by the
+#     pipeline sequence so a story with only a DONE build resumes from
+#     coverage, not build.
+#   * Else return "build" — the natural entry point for a story that
+#     has no recorded stage attempts yet.
+story_resume_stage() {
+    local rid="$1" sid="$2"
+    local found
+
+    # Pipeline order — used both to break ties and to step forward past
+    # DONE stages. Keep this in sync with the stage_name vocabulary in
+    # the build-stories orchestrator (Phase 5).
+    local stage_rank
+    stage_rank="CASE stage_name
+                    WHEN 'build'    THEN 1
+                    WHEN 'coverage' THEN 2
+                    WHEN 'review'   THEN 3
+                    WHEN 'merge'    THEN 4
+                    WHEN 'e2e'      THEN 5
+                    ELSE 99
+                END"
+
+    for target_status in IN_PROGRESS FAILED STALE; do
+        found=$(sqlite3 "${DB_PATH}" "PRAGMA query_only=1;
+            SELECT stage_name FROM stages
+             WHERE run_id     = $(sql_quote "${rid}")
+               AND story_id   = $(sql_quote "${sid}")
+               AND status     = $(sql_quote "${target_status}")
+             ORDER BY ${stage_rank} DESC, attempt DESC
+             LIMIT 1;")
+        if [ -n "${found}" ]; then
+            printf '%s' "${found}"
+            return
+        fi
+    done
+
+    # Nothing in-flight / failed / stale — step past any DONE stages and
+    # resume at the next pipeline stage. A story with build=DONE and no
+    # other rows resumes at 'coverage', not 'build'.
+    local last_done
+    last_done=$(sqlite3 "${DB_PATH}" "PRAGMA query_only=1;
+        SELECT stage_name FROM stages
+         WHERE run_id     = $(sql_quote "${rid}")
+           AND story_id   = $(sql_quote "${sid}")
+           AND status     = 'DONE'
+         ORDER BY ${stage_rank} DESC
+         LIMIT 1;")
+    case "${last_done}" in
+        build)    printf 'coverage' ;;
+        coverage) printf 'review' ;;
+        review)   printf 'merge' ;;
+        merge)    printf 'e2e' ;;
+        e2e)      printf 'done' ;;
+        *)        printf 'build' ;;
+    esac
+}
+
+# Re-evaluate a BLOCKED story's dependencies. If every story listed in a
+# `source='dependency'` event for the BLOCKED story is now DONE, return
+# the string "PENDING"; otherwise return "BLOCKED".
+#
+# The event message format is `<story_id>|<depends_on>` (one edge per
+# event), matching the convention used by the discovery agent when it
+# records cross-story dependencies. Multiple edges = multiple events.
+story_reevaluate_blocked() {
+    local rid="$1" sid="$2"
+    # Pull every distinct dependency target for this story.
+    local deps
+    deps=$(sqlite3 "${DB_PATH}" "PRAGMA query_only=1;
+        SELECT DISTINCT
+            SUBSTR(message, INSTR(message, '|') + 1)
+          FROM events
+         WHERE run_id   = $(sql_quote "${rid}")
+           AND story_id = $(sql_quote "${sid}")
+           AND source   = 'dependency';")
+    if [ -z "${deps}" ]; then
+        # No recorded edges → cannot prove un-blocked. Stay BLOCKED.
+        printf 'BLOCKED'
+        return
+    fi
+    local dep
+    while IFS= read -r dep; do
+        [ -z "${dep}" ] && continue
+        local dep_status
+        dep_status=$(sqlite3 "${DB_PATH}" "PRAGMA query_only=1;
+            SELECT COALESCE(status, '') FROM stories
+             WHERE run_id   = $(sql_quote "${rid}")
+               AND story_id = $(sql_quote "${dep}");")
+        if [ "${dep_status}" != "DONE" ]; then
+            printf 'BLOCKED'
+            return
+        fi
+    done <<< "${deps}"
+    printf 'PENDING'
+}
+
+# Emit a single JSON object for one resumable story. Fields:
+#   id, title, epic_id, priority, points, agent_type,
+#   branch, pr_number, status, resume_from
+# Integer fields (points, pr_number) round-trip as JSON numbers when
+# numeric, and as null when empty/non-numeric.
+emit_resume_story_json() {
+    local rid="$1" sid="$2" status="$3"
+    local row
+    row=$(sqlite3 -separator "${SDLC_FIELD_SEP}" "${DB_PATH}" "PRAGMA query_only=1;
+        SELECT COALESCE(title, ''),
+               COALESCE(epic_id, ''),
+               COALESCE(priority, ''),
+               COALESCE(CAST(points AS TEXT), ''),
+               COALESCE(agent_type, ''),
+               COALESCE(branch, ''),
+               COALESCE(CAST(pr_number AS TEXT), '')
+          FROM stories
+         WHERE run_id   = $(sql_quote "${rid}")
+           AND story_id = $(sql_quote "${sid}");")
+    local title epic_id priority points agent_type branch pr_number
+    IFS=$'\x1f' read -r title epic_id priority points agent_type branch pr_number <<< "${row}"
+
+    local points_json pr_json branch_json resume_from
+    if [[ "${points}" =~ ^[0-9]+$ ]]; then
+        points_json="${points}"
+    else
+        points_json="null"
+    fi
+    if [[ "${pr_number}" =~ ^[0-9]+$ ]]; then
+        pr_json="${pr_number}"
+    else
+        pr_json="null"
+    fi
+    if [ -z "${branch}" ]; then
+        branch_json="null"
+    else
+        branch_json="\"$(json_escape "${branch}")\""
+    fi
+    # resume_from only makes sense for IN_PROGRESS stories. PENDING and
+    # BLOCKED stories have no in-flight stage to re-enter.
+    if [ "${status}" = "IN_PROGRESS" ]; then
+        resume_from="\"$(json_escape "$(story_resume_stage "${rid}" "${sid}")")\""
+    else
+        resume_from="null"
+    fi
+
+    printf '{"id":"%s","title":"%s","epic_id":"%s","priority":"%s","points":%s,"agent_type":"%s","branch":%s,"pr_number":%s,"status":"%s","resume_from":%s}' \
+        "$(json_escape "${sid}")" \
+        "$(json_escape "${title}")" \
+        "$(json_escape "${epic_id}")" \
+        "$(json_escape "${priority}")" \
+        "${points_json}" \
+        "$(json_escape "${agent_type}")" \
+        "${branch_json}" \
+        "${pr_json}" \
+        "$(json_escape "${status}")" \
+        "${resume_from}"
+}
+
 # --- Subcommand dispatch --------------------------------------------------
 
 case "${SUBCOMMAND}" in
@@ -943,6 +1146,140 @@ SQL
 
     render|render-all)
         render_subcommand "$@"
+        ;;
+
+    # --- Resume path (Story 4.3-001) -------------------------------------
+    #
+    # `latest-incomplete-run` is a read-only SELECT for the orchestrator
+    # to decide whether `scope=resume` has anything to pick up. We sort
+    # IN_PROGRESS runs by started_at DESC, id DESC and return the first —
+    # so the newest interrupted run wins on a tie. Empty output is the
+    # explicit "nothing to resume" signal (exit code stays 0).
+    #
+    # `mark-stages-stale` flips every non-DONE stage row for a given
+    # (run, story, stage_name) to STALE. We must NOT touch DONE rows —
+    # they record completed work that must survive the resume. The whole
+    # UPDATE runs inside an implicit single statement so it is atomic.
+    #
+    # `resume-plan` walks the stories table for a run and emits one JSON
+    # entry per story that needs work. DONE stories are filtered. BLOCKED
+    # stories are re-evaluated against their `events.source='dependency'`
+    # edges and may flip to PENDING. The envelope is prefixed with
+    # `QUEUE_JSON:` to match the discovery agent's contract.
+
+    latest-incomplete-run)
+        if [ ! -f "${DB_PATH}" ]; then
+            # No ledger file → no resumable run. Stay quiet, exit 0.
+            exit 0
+        fi
+        sqlite3 "${DB_PATH}" "PRAGMA query_only=1;
+            SELECT id FROM runs
+             WHERE status = 'IN_PROGRESS'
+             ORDER BY started_at DESC, id DESC
+             LIMIT 1;"
+        ;;
+
+    mark-stages-stale)
+        # Usage: mark-stages-stale <run_id> <story_id> <stage_name>
+        # Atomic transition: all matching rows whose status != 'DONE' flip
+        # to 'STALE' in a single UPDATE. A subsequent stage-start can then
+        # safely append a new attempt without violating the
+        # (run_id, story_id, stage_name, attempt) PK.
+        if [ $# -lt 3 ]; then
+            err "mark-stages-stale requires <run_id> <story_id> <stage_name>"
+            exit 1
+        fi
+        run_id="$1"; story_id="$2"; stage_name="$3"
+        db_exec "UPDATE stages
+                    SET status = 'STALE'
+                  WHERE run_id     = $(sql_quote "${run_id}")
+                    AND story_id   = $(sql_quote "${story_id}")
+                    AND stage_name = $(sql_quote "${stage_name}")
+                    AND status    != 'DONE';"
+        ;;
+
+    resume-plan)
+        # Usage: resume-plan <run_id>
+        # Reads stories.status, applies the resume state machine, and
+        # emits a `QUEUE_JSON:`-prefixed envelope. Returns exit 1 if the
+        # run does not exist or has reached a terminal status.
+        if [ $# -lt 1 ]; then
+            err "resume-plan requires <run_id>"
+            exit 1
+        fi
+        run_id="$1"
+        # Confirm the run exists. Unknown run is exit 1 — not 0+empty —
+        # so the orchestrator can surface a clear error.
+        run_row=$(sqlite3 -separator "${SDLC_FIELD_SEP}" "${DB_PATH}" "PRAGMA query_only=1;
+            SELECT COALESCE(status, ''), COALESCE(scope, ''), COALESCE(mode, '')
+              FROM runs WHERE id = $(sql_quote "${run_id}");")
+        if [ -z "${run_row}" ]; then
+            err "resume-plan: run not found: ${run_id}"
+            exit 1
+        fi
+        IFS=$'\x1f' read -r run_status run_scope run_mode <<< "${run_row}"
+        # Don't bother planning a resume for a terminal run.
+        case "${run_status}" in
+            DONE|FAILED|ABORTED)
+                err "resume-plan: most recent run is already ${run_status}; use scope=all or epic-NN for a fresh run"
+                exit 1
+                ;;
+        esac
+
+        # Stream the story_id + status pairs in deterministic order so the
+        # JSON envelope is reproducible across invocations.
+        stories_rows=$(sqlite3 -separator "${SDLC_FIELD_SEP}" "${DB_PATH}" "PRAGMA query_only=1;
+            SELECT story_id, COALESCE(status, '')
+              FROM stories
+             WHERE run_id = $(sql_quote "${run_id}")
+             ORDER BY epic_id, story_id;")
+
+        # Build the JSON array body in memory so we can join with commas.
+        json_entries=""
+        if [ -n "${stories_rows}" ]; then
+            while IFS=$'\x1f' read -r sid sstatus; do
+                [ -z "${sid}" ] && continue
+                case "${sstatus}" in
+                    DONE)
+                        # Skip — completed work survives resume.
+                        continue
+                        ;;
+                    BLOCKED)
+                        # Re-evaluate: if every recorded dependency is now
+                        # DONE, the story flips to PENDING for this plan.
+                        # If no edges are recorded, stay BLOCKED.
+                        effective=$(story_reevaluate_blocked "${run_id}" "${sid}")
+                        ;;
+                    IN_PROGRESS|PENDING|FAILED|SKIPPED)
+                        # IN_PROGRESS: re-enter at last in-flight / failed
+                        #   stage (preserving branch + PR).
+                        # PENDING / FAILED / SKIPPED: surfaced as-is — the
+                        #   orchestrator's --auto path decides what to do
+                        #   with FAILED and SKIPPED entries.
+                        effective="${sstatus}"
+                        ;;
+                    *)
+                        # Unknown status — pass through so a future
+                        # extension does not silently drop work.
+                        effective="${sstatus}"
+                        ;;
+                esac
+                entry=$(emit_resume_story_json "${run_id}" "${sid}" "${effective}")
+                if [ -z "${json_entries}" ]; then
+                    json_entries="${entry}"
+                else
+                    json_entries="${json_entries},${entry}"
+                fi
+            done <<< "${stories_rows}"
+        fi
+
+        # The envelope mirrors the discovery agent's QUEUE_JSON: contract
+        # so the orchestrator's queue parser stays generic. RESUME_META
+        # carries the run identifier + scope + mode so the orchestrator
+        # can echo them back into its phase logs.
+        printf 'RESUME_META: run_id=%s scope=%s mode=%s\n' \
+            "${run_id}" "${run_scope}" "${run_mode}"
+        printf 'QUEUE_JSON:[%s]\n' "${json_entries}"
         ;;
 
     *)

@@ -47,15 +47,63 @@ Read `{{CLAUDE_SKILL_DIR}}/dependency-resolver.md` for the full algorithm.
 
 ## Step 3: Resume Logic (if scope is `resume`)
 
-Read `{{CLAUDE_SKILL_DIR}}/batch-progress.md` for progress file format and resume rules.
+**As of Story 4.3-001, the SQLite ledger is the source of truth for resume.**
+The legacy progress-file path is preserved as a fallback for environments
+without a configured ledger.
+
+### Step 3a: Ledger-driven resume (preferred path)
+
+1. Ask the ledger which run is resumable:
+
+   ```bash
+   RESUME_RUN_ID="$(~/.claude/hooks/sdlc-state-emit.sh latest-incomplete-run)"
+   ```
+
+2. If `RESUME_RUN_ID` is empty → output `DISCOVERY_ERROR: No resumable run found in ledger` and STOP.
+
+3. Otherwise, ask the ledger for the resume plan:
+
+   ```bash
+   ~/.claude/hooks/sdlc-state-emit.sh resume-plan "${RESUME_RUN_ID}"
+   ```
+
+   The output is two lines:
+
+   ```
+   RESUME_META: run_id=<id> scope=<scope> mode=<mode>
+   QUEUE_JSON:[{"id":"...","status":"...","resume_from":"...","branch":"...","pr_number":...},...]
+   ```
+
+   `resume-plan` already applies the resume state machine:
+   - status `DONE` → filtered out (not in the queue)
+   - status `IN_PROGRESS` → included with `resume_from` set to the stage to re-enter (branch and PR are preserved verbatim)
+   - status `PENDING` → included with `resume_from=null` (start at build)
+   - status `BLOCKED` → re-evaluated against `events.source='dependency'` edges; flips to `PENDING` when every recorded dependency is `DONE`, otherwise stays `BLOCKED`
+   - status `FAILED` / `SKIPPED` → surfaced as-is so the orchestrator's `--auto` path can decide
+
+4. Emit `QUEUE_JSON:` verbatim into your output (Step 4 below). Also echo
+   `RESUME_META:` so the orchestrator can correlate the resumed run.
+
+5. If `resume-plan` exits non-zero with `most recent run is already DONE/FAILED/ABORTED`,
+   output `DISCOVERY_ERROR: most recent run completed; use scope=all or epic-NN for a fresh run` and STOP.
+
+### Step 3b: Fallback (markdown progress file)
+
+Used only when the ledger is unavailable (`latest-incomplete-run` exits 0
+with empty output AND the hook script is missing or non-executable). Read
+`{{CLAUDE_SKILL_DIR}}/batch-progress.md` for the legacy progress-file
+format, then:
 
 1. Load progress file at `{{PROGRESS_FILE}}`
 2. If file doesn't exist → output `DISCOVERY_ERROR: No previous build session found`
 3. Apply resume logic: skip DONE, restart IN_PROGRESS, handle FAILED per batch-progress rules
 4. Re-evaluate SKIPPED/BLOCKED stories against current dependency state
 
-If scope is NOT `resume` but progress file exists:
-- Include a warning line: `RESUME_WARNING: Previous build session found at {{PROGRESS_FILE}}`
+### Cross-scope warning
+
+If scope is NOT `resume` but the ledger reports an IN_PROGRESS run (or a
+progress file exists), include a warning line:
+`RESUME_WARNING: Previous build session found (run_id=<id> or {{PROGRESS_FILE}})`
 
 ## Output Contract
 
@@ -112,6 +160,14 @@ QUEUE_JSON:[{"id":"01.1-001","title":"Setup","epic_id":"01","epic_name":"Foundat
 ```
 
 Each entry MUST include: `id`, `title`, `epic_id`, `epic_name`, `epic_file`, `priority`, `points`, `agent_type`, `dependencies` (array of story ID strings).
+
+When the queue comes from `resume-plan` (Step 3a), each entry additionally
+carries `branch`, `pr_number`, `status`, and `resume_from`. The orchestrator
+uses `branch`/`pr_number` to reuse the existing PR (no new branch is created
+for in-flight stories) and `resume_from` to re-enter the pipeline at the
+correct stage. `epic_name` and `epic_file` may be empty for ledger-sourced
+entries — the orchestrator falls back to a fresh epic-file scan when these
+are missing.
 
 ### Totals
 
