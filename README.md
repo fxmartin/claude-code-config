@@ -110,7 +110,7 @@ The skill is a **thin dispatcher** — argument parsing, control flow, and struc
 6. **E2E gate** at epic boundaries runs Playwright tests — blocking, warning, or off per flag.
 7. **Summary agent** emits the run's metrics and a merged-PR manifest.
 
-Progress is persisted in `docs/stories/.build-progress.md` (`DONE` / `IN_PROGRESS` / `FAILED` / `SKIPPED` / `PENDING`), so any run is resumable.
+Progress is persisted in a **SQLite state ledger** (`sdlc_state.db`) with a human-readable markdown view generated on demand. Legacy `docs/stories/.build-progress.md` is kept as a fallback view. Status values: `DONE` / `IN_PROGRESS` / `FAILED` / `SKIPPED` / `PENDING`. Any run is resumable from the last completed stage.
 
 ### Phase 4 — Quality & Intelligence
 

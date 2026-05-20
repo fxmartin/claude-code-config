@@ -31,8 +31,8 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 |---------|-----------|-------|-------------|--------------|----------|--------|
 | Epic-01 | Stabilize Foundation | MVP-blocking | 5 | 13 | P0 | **COMPLETE** |
 | Epic-02 | Self-CI for the Framework | MVP-blocking | 3 | 8 | P0 | **COMPLETE** |
-| Epic-03 | Cross-Platform Installer (macOS + Windows/WSL2) | MVP | 4 | 13 | P0 | |
-| Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | |
+| Epic-03 | Cross-Platform Installer (macOS + Windows/WSL2) | MVP | 4 | 13 | P0 | **COMPLETE** |
+| Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | **COMPLETE** |
 | Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | **COMPLETE** |
 | Epic-06 | Public Release Readiness | MVP | 4 | 11 | P1 | |
 | Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | |
@@ -73,6 +73,10 @@ The MVP is shippable when ALL of the following hold:
 | Durability (must) | Epic-04 | 18 |
 | Release ops (must) | Epic-05 | 8 |
 | **Total MVP** | **6 epics, 23 stories** | **71** |
+
+### MVP Status
+
+5 of 6 MVP epics are **COMPLETE** (Epic-01, Epic-02, Epic-03, Epic-04, Epic-05). Only **Epic-06 (Public Release Readiness)** remains before the MVP is shippable.
 
 ### Out of MVP Scope
 
