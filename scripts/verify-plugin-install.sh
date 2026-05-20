@@ -22,7 +22,10 @@
 #      a. Has a `source` path that resolves to a real directory in the repo.
 #      b. Contains `.claude-plugin/plugin.json` (valid JSON, name+version+description).
 #      c. Contains a non-empty `skills/` directory.
-#      d. Every `skills/<name>/SKILL.md` declares `name: <dir>` in frontmatter.
+#      d. Every skill subdirectory contains a SKILL.md (not silently skipped).
+#      e. Every `skills/<name>/SKILL.md` declares `name: <dir>` in frontmatter.
+#   4. Every literal `subagent_type=` reference in plugin SKILL.md files resolves
+#      to a file under `agents/` in the repo root OR is a known built-in type.
 #
 # Output contract: prints per-check lines and the summary
 #     VERIFY_PLUGIN: <pass>/<total> passed
@@ -116,7 +119,7 @@ fi
 if jq -e . "$MARKETPLACE_JSON" >/dev/null 2>&1; then
   record "marketplace manifest is valid JSON" pass
 else
-  record "marketplace manifest is valid JSON" fail "jq parse failed"
+  record "marketplace manifest is valid JSON" fail "jq parse failed: $MARKETPLACE_JSON"
   echo ""
   echo "VERIFY_PLUGIN: ${PASSED}/${TOTAL} passed"
   exit 1
@@ -134,7 +137,7 @@ plugin_count="$(jq -r '.plugins | length' "$MARKETPLACE_JSON" 2>/dev/null || ech
 if [ "$plugin_count" -gt 0 ] 2>/dev/null; then
   record "marketplace declares at least one plugin (count=$plugin_count)" pass
 else
-  record "marketplace declares at least one plugin" fail "plugins[] empty or missing"
+  record "marketplace declares at least one plugin" fail "plugins[] empty or missing — no plugins declared"
   echo ""
   echo "VERIFY_PLUGIN: ${PASSED}/${TOTAL} passed"
   exit 1
@@ -146,6 +149,9 @@ echo "[phase 2] per-plugin validation"
 
 # Pull the plugin list as a TSV (name<TAB>source) to avoid jq subshell churn.
 plugins_tsv="$(jq -r '.plugins[] | [.name, .source] | @tsv' "$MARKETPLACE_JSON")"
+
+# Accumulate plugin skill dirs for phase 3.
+all_skill_dirs=()
 
 while IFS=$'\t' read -r plugin_name plugin_source; do
   [ -z "$plugin_name" ] && continue
@@ -198,13 +204,26 @@ while IFS=$'\t' read -r plugin_name plugin_source; do
   fi
   record "[$plugin_name] skills/ directory exists" pass
 
-  # Count skill subdirectories that contain a SKILL.md.
+  # Count skill subdirectories that contain a SKILL.md, and flag dirs missing one.
   skill_count=0
+  missing_skill_md=""
   for skill_path in "$skills_dir"/*/; do
     [ -d "$skill_path" ] || continue
-    [ -f "$skill_path/SKILL.md" ] || continue
-    skill_count=$((skill_count + 1))
+    if [ -f "$skill_path/SKILL.md" ]; then
+      skill_count=$((skill_count + 1))
+      all_skill_dirs+=("$skill_path")
+    else
+      missing_skill_md="${missing_skill_md} $(basename "$skill_path")"
+    fi
   done
+
+  if [ -n "$missing_skill_md" ]; then
+    record "[$plugin_name] every skill dir contains a SKILL.md" fail \
+           "no SKILL.md in:${missing_skill_md}"
+  else
+    record "[$plugin_name] every skill dir contains a SKILL.md" pass
+  fi
+
   if [ "$skill_count" -gt 0 ]; then
     record "[$plugin_name] has $skill_count skill(s) with SKILL.md" pass
   else
@@ -212,7 +231,7 @@ while IFS=$'\t' read -r plugin_name plugin_source; do
     continue
   fi
 
-  # 2d. Each SKILL.md must declare `name: <dir>` in frontmatter.
+  # 2e. Each SKILL.md must declare `name: <dir>` in frontmatter.
   bad_frontmatter=""
   for skill_path in "$skills_dir"/*/; do
     [ -d "$skill_path" ] || continue
@@ -244,6 +263,93 @@ while IFS=$'\t' read -r plugin_name plugin_source; do
 done <<EOF
 $plugins_tsv
 EOF
+
+# ─── Phase 3: agent-reference resolution ─────────────────────────────────────
+echo ""
+echo "[phase 3] agent-reference resolution"
+
+# Built-in Claude Code subagent types — no agents/ file expected for these.
+BUILTIN_AGENT_TYPES=(
+  "general-purpose"
+  "Plan"
+  "Explore"
+)
+
+is_builtin_agent() {
+  local name="$1"
+  local builtin
+  for builtin in "${BUILTIN_AGENT_TYPES[@]}"; do
+    [ "$name" = "$builtin" ] && return 0
+  done
+  return 1
+}
+
+agents_dir="$REPO_ROOT/agents"
+if [ ! -d "$agents_dir" ]; then
+  record "agents/ directory present in repo root" fail \
+         "agent-ref checking skipped — $agents_dir not found"
+else
+  record "agents/ directory present in repo root" pass
+
+  # Collect known agent names (basename without .md).
+  known_agents=()
+  while IFS= read -r f; do
+    known_agents+=("$(basename "$f" .md)")
+  done < <(find "$agents_dir" -maxdepth 1 -type f -name '*.md' | sort)
+
+  is_known_agent() {
+    local name="$1"
+    local a
+    for a in "${known_agents[@]}"; do
+      [ "$name" = "$a" ] && return 0
+    done
+    return 1
+  }
+
+  unresolved_refs=()
+  for skill_path in "${all_skill_dirs[@]}"; do
+    skill_md="$skill_path/SKILL.md"
+    [ -f "$skill_md" ] || continue
+
+    line_no=0
+    while IFS= read -r line; do
+      line_no=$((line_no + 1))
+      case "$line" in
+        *subagent_type=*) ;;
+        *) continue ;;
+      esac
+
+      # Extract each subagent_type= value on the line.
+      while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        value="${ref#*subagent_type=}"
+        value="${value#\"}"
+        value="${value#\'}"
+        value="${value%\"}"
+        value="${value%\'}"
+
+        # Bracketed placeholders are variables (e.g. [AGENT_TYPE]) — skip.
+        case "$value" in
+          \[*) continue ;;
+        esac
+        [ -n "$value" ] || continue
+
+        is_builtin_agent "$value" && continue
+        if ! is_known_agent "$value"; then
+          rel="$(basename "$skill_path")/SKILL.md:${line_no}"
+          unresolved_refs+=("${rel}: subagent_type='${value}'")
+        fi
+      done < <(grep -oE 'subagent_type=("[^"]*"|'"'"'[^'"'"']*'"'"'|\[[^]]*\]|[A-Za-z0-9_.-]+)' <<<"$line" 2>/dev/null || true)
+    done < "$skill_md"
+  done
+
+  if [ "${#unresolved_refs[@]}" -eq 0 ]; then
+    record "all plugin skill subagent_type references resolve" pass
+  else
+    detail="unresolved: ${unresolved_refs[*]}"
+    record "all plugin skill subagent_type references resolve" fail "$detail"
+  fi
+fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""

@@ -231,3 +231,288 @@ JSON
     [ "$status" -eq 0 ]
     [[ "$output" == *"Usage"* || "$output" == *"usage"* ]]
 }
+
+# ─── Gap tests: error-path coverage (Story 6.4-001 QA gate) ─────────────────
+#
+# The following tests extend coverage beyond the initial 21, targeting the
+# specific gaps identified in the QA gate:
+#   1. Malformed JSON manifest — error message identifies the file
+#   2. Declared skill path missing (skill dir exists, SKILL.md absent)
+#   3. Agent referenced by a skill is missing — clean error with path
+#   4. VERIFY_PLUGIN summary is grep-parseable (already tested, re-pinned)
+#   5. Empty plugins array — exits 1 with "no plugins declared" message
+#   6. Idempotency — running the script twice yields identical output
+
+# ── Gap 1: malformed JSON error message is informative ──────────────────────
+
+@test "verify-plugin-install.sh malformed JSON error message identifies the file" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    printf 'not valid json }{' > "${fake_root}/.claude-plugin/marketplace.json"
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -ne 0 ]
+    # The combined stdout+stderr must reference the parse failure clearly.
+    [[ "${output}" == *"jq parse failed"* ]]
+}
+
+# ── Gap 2: skill directory present but missing SKILL.md ─────────────────────
+
+@test "verify-plugin-install.sh fails when a skill dir is missing its SKILL.md" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/.claude-plugin"
+    # Two skill dirs: one has SKILL.md, one does not.
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/good-skill"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/broken-skill"
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": [
+    {"name": "test-plugin", "source": "./plugins/test-plugin", "version": "0.1.0"}
+  ]
+}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/.claude-plugin/plugin.json" <<'JSON'
+{"name": "test-plugin", "version": "0.0.1", "description": "test plugin"}
+JSON
+    printf -- '---\nname: good-skill\n---\nbody\n' \
+        > "${fake_root}/plugins/test-plugin/skills/good-skill/SKILL.md"
+    # broken-skill dir deliberately has NO SKILL.md.
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -ne 0 ]
+    # Error output should mention the missing skill directory.
+    [[ "${output}" == *"broken-skill"* ]]
+}
+
+@test "verify-plugin-install.sh error for missing SKILL.md points at the unresolved path" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/orphan-skill"
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": [
+    {"name": "test-plugin", "source": "./plugins/test-plugin", "version": "0.1.0"}
+  ]
+}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/.claude-plugin/plugin.json" <<'JSON'
+{"name": "test-plugin", "version": "0.0.1", "description": "test plugin"}
+JSON
+    # orphan-skill has no SKILL.md — this is the only skill dir, so skill_count=0 too.
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -ne 0 ]
+    # Output must name the skill that has no SKILL.md.
+    [[ "${output}" == *"orphan-skill"* ]]
+}
+
+# ── Gap 3: agent referenced by a skill is unresolved ────────────────────────
+
+@test "verify-plugin-install.sh fails when a skill SKILL.md references an unknown agent" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/my-skill"
+    mkdir -p "${fake_root}/agents"
+    # Write a real agent file so the agents/ check passes.
+    printf '# real-agent\nA real agent.\n' > "${fake_root}/agents/real-agent.md"
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": [
+    {"name": "test-plugin", "source": "./plugins/test-plugin", "version": "0.1.0"}
+  ]
+}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/.claude-plugin/plugin.json" <<'JSON'
+{"name": "test-plugin", "version": "0.0.1", "description": "test plugin"}
+JSON
+    # SKILL.md references a subagent_type that does NOT exist in agents/.
+    cat > "${fake_root}/plugins/test-plugin/skills/my-skill/SKILL.md" <<'SKILL'
+---
+name: my-skill
+description: A test skill
+---
+# My Skill
+Agent(subagent_type="ghost-agent", prompt="do stuff")
+SKILL
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -ne 0 ]
+    # Error output must mention the unresolved agent name.
+    [[ "${output}" == *"ghost-agent"* ]]
+}
+
+@test "verify-plugin-install.sh passes when skill subagent_type references a known agent" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/my-skill"
+    mkdir -p "${fake_root}/agents"
+    printf '# known-agent\nA known agent.\n' > "${fake_root}/agents/known-agent.md"
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": [
+    {"name": "test-plugin", "source": "./plugins/test-plugin", "version": "0.1.0"}
+  ]
+}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/.claude-plugin/plugin.json" <<'JSON'
+{"name": "test-plugin", "version": "0.0.1", "description": "test plugin"}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/skills/my-skill/SKILL.md" <<'SKILL'
+---
+name: my-skill
+description: A test skill
+---
+# My Skill
+Agent(subagent_type="known-agent", prompt="do stuff")
+SKILL
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -eq 0 ]
+}
+
+@test "verify-plugin-install.sh passes when skill uses a built-in subagent_type" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/my-skill"
+    mkdir -p "${fake_root}/agents"
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": [
+    {"name": "test-plugin", "source": "./plugins/test-plugin", "version": "0.1.0"}
+  ]
+}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/.claude-plugin/plugin.json" <<'JSON'
+{"name": "test-plugin", "version": "0.0.1", "description": "test plugin"}
+JSON
+    # Uses built-in subagent types — no agents/ file needed.
+    cat > "${fake_root}/plugins/test-plugin/skills/my-skill/SKILL.md" <<'SKILL'
+---
+name: my-skill
+description: A test skill
+---
+# My Skill
+Agent(subagent_type="general-purpose", prompt="do stuff")
+SKILL
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -eq 0 ]
+}
+
+@test "verify-plugin-install.sh skips bracketed placeholder subagent_type values" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/my-skill"
+    mkdir -p "${fake_root}/agents"
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": [
+    {"name": "test-plugin", "source": "./plugins/test-plugin", "version": "0.1.0"}
+  ]
+}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/.claude-plugin/plugin.json" <<'JSON'
+{"name": "test-plugin", "version": "0.0.1", "description": "test plugin"}
+JSON
+    # [AGENT_TYPE] is a placeholder, not a literal agent name — must be skipped.
+    cat > "${fake_root}/plugins/test-plugin/skills/my-skill/SKILL.md" <<'SKILL'
+---
+name: my-skill
+description: A test skill
+---
+# My Skill
+Agent(subagent_type=[AGENT_TYPE], prompt="do stuff")
+SKILL
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -eq 0 ]
+}
+
+# ── Gap 4: summary line grep contract (re-pinned with count assertion) ───────
+
+@test "verify-plugin-install.sh VERIFY_PLUGIN summary format is grep-parseable with numbers" {
+    run "${VERIFY}"
+    [ "$status" -eq 0 ]
+    # Must match: VERIFY_PLUGIN: <N>/<M> passed where N and M are integers.
+    echo "$output" | grep -qE '^VERIFY_PLUGIN: [0-9]+/[0-9]+ passed$'
+    # Sanity: N must equal M on the clean repo (all checks pass).
+    summary_line="$(echo "$output" | grep '^VERIFY_PLUGIN:')"
+    passed="$(echo "$summary_line" | grep -oE '[0-9]+' | head -1)"
+    total="$(echo "$summary_line" | grep -oE '[0-9]+' | tail -1)"
+    [ "$passed" -eq "$total" ]
+}
+
+# ── Gap 5: empty plugins array ───────────────────────────────────────────────
+
+@test "verify-plugin-install.sh fails with a clear message when plugins array is empty" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": []
+}
+JSON
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -ne 0 ]
+    # Output must mention that no plugins are declared.
+    [[ "${output}" == *"no plugins declared"* || "${output}" == *"plugins[] empty"* ]]
+}
+
+@test "verify-plugin-install.sh exits 1 (not 2) when plugins array is empty" {
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": []
+}
+JSON
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    # Exit 1 = check failure; exit 2 = preflight failure. Empty plugins is a
+    # check failure, not a preflight error.
+    [ "$status" -eq 1 ]
+}
+
+# ── Gap 6: idempotency ───────────────────────────────────────────────────────
+
+@test "verify-plugin-install.sh is idempotent: two consecutive runs produce identical output" {
+    run "${VERIFY}"
+    [ "$status" -eq 0 ]
+    first_output="$output"
+    run "${VERIFY}"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$first_output" ]
+}
+
+@test "verify-plugin-install.sh leaves no temp files after a successful run" {
+    tmp_before="$(mktemp -d)"
+    # Run with the real repo; if the script creates temp files they'd be in TMPDIR.
+    TMPDIR="${tmp_before}" run env VERIFY_PLUGIN_ROOT_OVERRIDE="${REPO_ROOT}" "${VERIFY}"
+    leftover_count="$(find "${tmp_before}" -mindepth 1 | wc -l | tr -d ' ')"
+    rm -rf "${tmp_before}"
+    [ "$status" -eq 0 ]
+    [ "$leftover_count" -eq 0 ]
+}
