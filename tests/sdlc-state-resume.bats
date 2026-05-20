@@ -304,3 +304,158 @@ _set_started_at() {
     # Story C (PENDING) must be present.
     [[ "${output}" == *"4.3-C"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Gap tests added by QA coverage gate (Story 4.3-001)
+# ---------------------------------------------------------------------------
+
+# Gap: resume-plan on a run that has zero stories should exit 0 with an
+# empty queue — not an error. The QUEUE_JSON envelope must still be emitted
+# so downstream parsers do not break on missing output.
+@test "resume-plan on a run with zero stories exits 0 and emits an empty queue" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    # No story-upsert calls — the stories table has zero rows for this run.
+    run "${SDLC_STATE}" --db "${DB}" resume-plan "${rid}"
+    [ "${status}" -eq 0 ]
+    # QUEUE_JSON envelope must be present (even if empty).
+    [[ "${output}" == *"QUEUE_JSON:"* ]]
+    # The array must be empty: QUEUE_JSON:[]
+    [[ "${output}" == *"QUEUE_JSON:[]"* ]]
+}
+
+# Gap: resume-plan for a run whose stories are ALL DONE should output a
+# QUEUE_JSON with an empty array — "run complete, nothing to resume".
+@test "resume-plan where all stories are DONE emits an empty queue" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-X1 04 "Done 1" P1 3 bash feature/4.3-X1 10 DONE
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-X2 04 "Done 2" P1 3 bash feature/4.3-X2 11 DONE
+
+    run "${SDLC_STATE}" --db "${DB}" resume-plan "${rid}"
+    [ "${status}" -eq 0 ]
+    # Both DONE stories must be absent from the queue.
+    [[ "${output}" != *"4.3-X1"* ]]
+    [[ "${output}" != *"4.3-X2"* ]]
+    # Empty array envelope.
+    [[ "${output}" == *"QUEUE_JSON:[]"* ]]
+}
+
+# Gap: mark-stages-stale called for a story_id that has no stage rows must
+# be a no-op — not an error. The UPDATE affects zero rows which is fine.
+@test "mark-stages-stale on a story with no stage rows is a no-op" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-NOSTAGE 04 "No stages" P1 3 bash "" "" PENDING
+    # There are no stage rows for 4.3-NOSTAGE — mark-stages-stale must succeed.
+    run "${SDLC_STATE}" --db "${DB}" mark-stages-stale "${rid}" 4.3-NOSTAGE coverage
+    [ "${status}" -eq 0 ]
+    # Confirm no stage rows were created as a side-effect.
+    local count
+    count=$(sqlite3 "${DB}" "SELECT COUNT(*) FROM stages
+                                WHERE run_id='${rid}' AND story_id='4.3-NOSTAGE';")
+    [ "${count}" = "0" ]
+}
+
+# Gap: transitive dependency chain — A depends on B which depends on C.
+# When both B and C are DONE, A must flip from BLOCKED to PENDING.
+@test "resume-plan promotes BLOCKED to PENDING for a transitive dependency chain" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    # C is DONE, B depends on C and is DONE, A depends on B and is BLOCKED.
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-TC 04 "Chain C" P1 3 bash feature/4.3-TC 20 DONE
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-TB 04 "Chain B" P1 3 bash feature/4.3-TB 21 DONE
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-TA 04 "Chain A" P1 3 bash "" "" BLOCKED
+    # Record the dependency edges: A->B and B->C.
+    # (B->C is also recorded so story_reevaluate_blocked for B would work,
+    # but B is already DONE so only A's edge matters for this test.)
+    "${SDLC_STATE}" --db "${DB}" event-log "${rid}" 4.3-TA info dependency "4.3-TA|4.3-TB"
+
+    run "${SDLC_STATE}" --db "${DB}" resume-plan "${rid}"
+    [ "${status}" -eq 0 ]
+    # A must appear as PENDING — its only recorded dep (B) is DONE.
+    [[ "${output}" == *"4.3-TA"* ]]
+    [[ "${output}" == *"PENDING"* ]]
+    # C and B are DONE — they must not appear in the queue.
+    [[ "${output}" != *"4.3-TC"* ]]
+    [[ "${output}" != *"4.3-TB"* ]]
+}
+
+# Gap: BLOCKED story stays BLOCKED when at least one dependency is FAILED.
+@test "resume-plan keeps BLOCKED when a dependency is FAILED" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-FDEP 04 "Failed dep" P1 3 bash "" "" FAILED
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-FBLK 04 "Still blocked" P1 3 bash "" "" BLOCKED
+    "${SDLC_STATE}" --db "${DB}" event-log "${rid}" 4.3-FBLK info dependency "4.3-FBLK|4.3-FDEP"
+
+    run "${SDLC_STATE}" --db "${DB}" resume-plan "${rid}"
+    [ "${status}" -eq 0 ]
+    # FBLK must remain BLOCKED — its dep is FAILED, not DONE.
+    [[ "${output}" == *"4.3-FBLK"* ]]
+    [[ "${output}" == *"BLOCKED"* ]]
+    # FAILED story itself must appear in the queue (surfaced as-is).
+    [[ "${output}" == *"4.3-FDEP"* ]]
+    [[ "${output}" == *"FAILED"* ]]
+}
+
+# Gap: BLOCKED story stays BLOCKED when a dependency is SKIPPED (not DONE).
+@test "resume-plan keeps BLOCKED when a dependency is SKIPPED" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-SDEP 04 "Skipped dep" P1 3 bash "" "" SKIPPED
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-SBLK 04 "Still blocked" P1 3 bash "" "" BLOCKED
+    "${SDLC_STATE}" --db "${DB}" event-log "${rid}" 4.3-SBLK info dependency "4.3-SBLK|4.3-SDEP"
+
+    run "${SDLC_STATE}" --db "${DB}" resume-plan "${rid}"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"4.3-SBLK"* ]]
+    [[ "${output}" == *"BLOCKED"* ]]
+}
+
+# Gap: BLOCKED story stays BLOCKED when its dependency is itself BLOCKED.
+@test "resume-plan keeps BLOCKED when a dependency is also BLOCKED" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-BDEP 04 "Blocked dep" P1 3 bash "" "" BLOCKED
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${rid}" 4.3-BBLK 04 "Outer blocked" P1 3 bash "" "" BLOCKED
+    "${SDLC_STATE}" --db "${DB}" event-log "${rid}" 4.3-BBLK info dependency "4.3-BBLK|4.3-BDEP"
+
+    run "${SDLC_STATE}" --db "${DB}" resume-plan "${rid}"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"4.3-BBLK"* ]]
+    [[ "${output}" == *"BLOCKED"* ]]
+}
+
+# Gap: FAILED run refuses resume-plan (mirrors DONE check — all terminal
+# statuses should be rejected, not just DONE).
+@test "resume-plan refuses to plan a FAILED run" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" run-update-status "${rid}" FAILED
+    run "${SDLC_STATE}" --db "${DB}" resume-plan "${rid}"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"FAILED"* ]] || [[ "${output}" == *"completed"* ]]
+}
+
+# Gap: ABORTED run refuses resume-plan.
+@test "resume-plan refuses to plan an ABORTED run" {
+    local rid
+    rid=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" run-update-status "${rid}" ABORTED
+    run "${SDLC_STATE}" --db "${DB}" resume-plan "${rid}"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"ABORTED"* ]] || [[ "${output}" == *"completed"* ]]
+}
