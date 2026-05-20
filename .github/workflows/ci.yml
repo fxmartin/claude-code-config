@@ -26,6 +26,7 @@ jobs:
             scripts/*.sh \
             test/*.sh \
             install.sh \
+            install/*.sh \
             statusline-command.sh
 
       - name: Validate JSON (jq -e .)

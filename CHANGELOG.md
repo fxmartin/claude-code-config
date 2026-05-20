@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `install.sh` is now a thin dispatcher over per-mode modules in `install/`.
+  New flags `--core`, `--tools`, `--mcp`, `--shell`, and `--all` let you opt
+  into exactly the parts of the framework you want. The default when no mode
+  flag is passed is `--core` (symlinks only), a conservative, additive
+  default. Every mode is idempotent and `--dry-run` now exactly previews the
+  actions that the real run would perform — the dry-run drift around
+  "Created ~/.claude" reported by Codex is fixed (`mkdir -p` now goes through
+  the same `run` guard as everything else). `--mcp` normalises its JSON
+  output through `jq` so a second run is byte-identical to the first.
+  Backward-compatible: `--skip-mcp` (≡ `--core --tools --shell`) and
+  `--skip-tools` (≡ `--core --mcp --shell`) still work but now emit a
+  deprecation warning pointing at the new modes; both will be removed in the
+  next MAJOR release. (#3.1-001)
+
 ## [v1.5.0] - 2026-05-19
 
 ### Added
