@@ -21,6 +21,24 @@ install_mcp_run() {
     BROWSER_PATH=""
   fi
 
+  # WSL2-specific BROWSER_PATH validation. From inside WSL2 the user can point
+  # the Playwright MCP server at either a WSL-side Chromium (`/usr/bin/...`)
+  # or a Windows-side browser via the /mnt/c/ DrvFs mount. A bare Windows
+  # path like `C:\…` is unreachable from inside the WSL2 filesystem and will
+  # silently fail at runtime, so we flag it loudly here.
+  if [ "${PLATFORM:-}" = "WSL2" ] && [ -n "$BROWSER_PATH" ]; then
+    case "$BROWSER_PATH" in
+      /mnt/c/*|/mnt/[a-zA-Z]/*)
+        warn "BROWSER_PATH points at a Windows-side browser ($BROWSER_PATH)."
+        warn "This works on WSL2 but the browser will run on the Windows host."
+        ;;
+      [a-zA-Z]:\\*|[a-zA-Z]:/*)
+        warn "BROWSER_PATH=$BROWSER_PATH looks like a raw Windows path and is unreachable from WSL2."
+        warn "Use the /mnt/<drive>/... form (e.g. /mnt/c/Program Files/...) or a WSL-side path."
+        ;;
+    esac
+  fi
+
   local template="$SCRIPT_DIR/mcp/config.template.json"
   if [ ! -f "$template" ]; then
     warn "MCP template not found: $template"

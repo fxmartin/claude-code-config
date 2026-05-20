@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- WSL2 detection and platform-aware behavior in installer (#3.1-002)
+
 ## [v1.7.0] - 2026-05-20
 
 ### Added

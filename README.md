@@ -272,9 +272,9 @@ Each mode is **opt-in**, **idempotent**, and supports `--dry-run` for an exact p
 | Mode | Touches | Files added | Files modified |
 |------|---------|-------------|----------------|
 | `--core` | `~/.claude/` | symlinks for `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `settings.json`, `statusline-command.sh`, `keybindings.json`, `reference-docs/`, `docs/`, `plugins/marketplaces/fx-claude-config` | none |
-| `--tools` | `/opt/homebrew/` (macOS) or `/usr/local/` (WSL2 via apt or brew, lands in Story 3.1-002) | `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip`, `jq`, optional Nerd Font | `~/.config/yazi/yazi.toml`, `~/.config/yazi/init.lua` (created if absent) |
+| `--tools` | `/opt/homebrew/` (macOS) or apt (WSL2; `--prefer-brew` opts back into brew) | `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip`, `jq`, optional Nerd Font; on WSL2 `yazi` falls back to `cargo install --locked yazi-fm` | `~/.config/yazi/yazi.toml`, `~/.config/yazi/init.lua` (created if absent) |
 | `--mcp` | `~/.claude.json` | merges `mcp/config.template.json` into existing JSON via `jq` | only the `mcpServers` key |
-| `--shell` | `~/.zshrc` | nothing | appends `dev()` and `y()` shell functions if absent |
+| `--shell` | `~/.zshrc` (macOS / zsh) or `~/.bashrc` (WSL2 with non-zsh default) | nothing | appends `dev()` and `y()` shell functions if absent; on WSL2 `dev()` is a stub that prints `"cmux is macOS-only; this command is a no-op on WSL2"` |
 
 ##### Deprecated flags (still supported, removed in next MAJOR)
 
@@ -284,6 +284,15 @@ Each mode is **opt-in**, **idempotent**, and supports `--dry-run` for an exact p
 | `./install.sh --skip-tools` | `./install.sh --core --mcp --shell` |
 
 Both legacy flags emit a deprecation warning pointing at the new modes.
+
+#### Windows install via WSL2
+
+The installer auto-detects WSL2 (via `/proc/version`) and switches package
+manager + shellrc accordingly: `--tools` prefers `apt` (override with
+`--prefer-brew`), `--mcp` validates `BROWSER_PATH` against the `/mnt/c/`
+mount, and `--shell` appends to `~/.bashrc` when zsh is not the default
+(installing a `dev()` stub since cmux is macOS-only). A full step-by-step
+"fresh Windows 11 → framework installed" guide lands as Story 3.2-001.
 
 ### As a submodule (Nix-managed machines)
 

@@ -16,6 +16,7 @@ MODE_CORE=false
 MODE_TOOLS=false
 MODE_MCP=false
 MODE_SHELL=false
+PREFER_BREW=false
 
 # Legacy compat: --skip-mcp / --skip-tools (default-on opt-out). These will
 # be removed in the next MAJOR release.
@@ -34,9 +35,10 @@ Modes (additive, combine freely):
   --all        Shortcut for --core --tools --mcp --shell.
 
 Options:
-  --dry-run    Preview every action without making changes.
-  --uninstall  Remove symlinks created by --core. Does not touch tools, MCP, or shellrc.
-  --help       Show this help.
+  --dry-run     Preview every action without making changes.
+  --uninstall   Remove symlinks created by --core. Does not touch tools, MCP, or shellrc.
+  --prefer-brew On WSL2, use Homebrew for --tools even when apt is available.
+  --help        Show this help.
 
 Backward-compatible (deprecated, removed in next MAJOR):
   --skip-mcp    Equivalent to --core --tools --shell.
@@ -55,6 +57,7 @@ for arg in "$@"; do
     --all)         MODE_CORE=true; MODE_TOOLS=true; MODE_MCP=true; MODE_SHELL=true ;;
     --dry-run)     DRY_RUN=true ;;
     --uninstall)   UNINSTALL=true ;;
+    --prefer-brew) PREFER_BREW=true ;;
     --skip-mcp)    LEGACY_SKIP_MCP=true ;;
     --skip-tools)  LEGACY_SKIP_TOOLS=true ;;
     --help|-h)     usage ;;
@@ -82,7 +85,7 @@ if ! $MODE_CORE && ! $MODE_TOOLS && ! $MODE_MCP && ! $MODE_SHELL && ! $UNINSTALL
 fi
 
 # Export everything the modules need before sourcing.
-export SCRIPT_DIR CLAUDE_DIR CLAUDE_JSON BACKUP_DIR DRY_RUN
+export SCRIPT_DIR CLAUDE_DIR CLAUDE_JSON BACKUP_DIR DRY_RUN PREFER_BREW
 
 # ─── Load modules ────────────────────────────────────────────────────
 # shellcheck source=install/common.sh
@@ -96,12 +99,14 @@ source "$SCRIPT_DIR/install/mcp.sh"
 # shellcheck source=install/shell.sh
 source "$SCRIPT_DIR/install/shell.sh"
 
-# ─── Platform detection (used by --tools today; expanded in 3.1-002) ─
-case "$(uname -s)" in
-  Darwin) PLATFORM="macOS" ;;
-  Linux)  PLATFORM="Linux" ;;
-  *)      PLATFORM="$(uname -s)" ;;
-esac
+# ─── Platform detection (Story 3.1-002) ──────────────────────────────
+# detect_platform() lives in common.sh so mode scripts can stub it out in
+# tests. The dispatcher sets PLATFORM exactly once; mode scripts branch on it.
+# "macOS" is the canonical label used by --tools; detect_platform returns
+# "Darwin" so we translate it once here to keep the existing tools.sh case
+# arm ("macOS") working without churn.
+PLATFORM="$(detect_platform)"
+[ "$PLATFORM" = "Darwin" ] && PLATFORM="macOS"
 export PLATFORM
 
 # ─── Uninstall short-circuits everything else ────────────────────────
