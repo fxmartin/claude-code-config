@@ -34,7 +34,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic-03 | Cross-Platform Installer (macOS + Windows/WSL2) | MVP | 4 | 13 | P0 | **COMPLETE** |
 | Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | **COMPLETE** |
 | Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | **COMPLETE** |
-| Epic-06 | Public Release Readiness | MVP | 4 | 11 | P1 | |
+| Epic-06 | Public Release Readiness | MVP | 4 | 11 | P1 | **COMPLETE**[^1] |
 | Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | |
 | Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | |
 | Epic-09 | Security Baked into Quality Gates | Roadmap | 3 | 10 | P2 | |
@@ -76,7 +76,9 @@ The MVP is shippable when ALL of the following hold:
 
 ### MVP Status
 
-5 of 6 MVP epics are **COMPLETE** (Epic-01, Epic-02, Epic-03, Epic-04, Epic-05). Only **Epic-06 (Public Release Readiness)** remains before the MVP is shippable.
+**6 of 6 MVP epics are COMPLETE.** All 23 MVP stories have landed. The framework is feature-complete and shippable to the five LTM colleagues. The live pilot run (distributing the pilot kit and collecting feedback via `docs/pilot-kit/`) is the one pending organizational action — it has not run yet and is FX's to schedule.[^1]
+
+[^1]: Epic-06 code-complete as of the batch build (PRs #33, #34, #35, #36 merged). The five-colleague pilot run itself is a pending organizational action — it has not occurred yet.
 
 ### Out of MVP Scope
 
