@@ -2,3 +2,10 @@
 .DS_Store
 *.backup
 .claude/worktrees/
+
+# Epic-04: SQLite ledger (truth source for build-stories runs).
+# The DB and its WAL companions are machine-local and never committed.
+.sdlc-state.db
+.sdlc-state.db-journal
+.sdlc-state.db-wal
+.sdlc-state.db-shm
