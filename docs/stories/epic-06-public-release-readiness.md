@@ -46,10 +46,11 @@
 - One LTM colleague reviews the doc before the pilot and confirms it answers their questions.
 
 **Definition of Done**:
-- Doc committed.
-- README link added.
-- One colleague review captured (as a PR comment or follow-up issue).
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Doc committed.
+- [x] README link added.
+- [ ] One colleague review captured (pending pilot).
+- [x] Change noted in `CHANGELOG.md` under "Added".
+- [x] Doc + README link + CHANGELOG entry committed (merged via PR #35).
 
 ### Feature 6.2: Scope Cleanup
 
