@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.10.0] - 2026-05-20
+
+### Added
+
+- feat(installer): clean-machine install smoke test (macos + ubuntu) (#3.2-002) (#30)
+
+
 ### Added
 
 - Clean-machine install smoke test (#3.2-002): `scripts/smoke-test.sh`
