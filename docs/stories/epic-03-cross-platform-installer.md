@@ -121,10 +121,11 @@
 - The macOS and WSL2 manual smoke tests are run before every release tag (Epic-05).
 
 **Definition of Done**:
-- Script committed and integrated into CI (Epic-02).
-- Doc committed.
-- One macOS and one WSL2 manual run completed and dated.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Script committed and integrated into CI (Epic-02).
+- [x] Doc committed.
+- [x] One macOS and one WSL2 manual run completed and dated.
+- [x] Change noted in `CHANGELOG.md` under "Added".
+- [x] All DoD criteria satisfied (merged via PR #30)
 
 ## Story Dependencies (within Epic-03)
 
