@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.12.0] - 2026-05-20
+
+### Added
+
+- feat(state): resume run from ledger state (#4.3-001) (#32)
+
+
 ### Added
 
 - Resume build-stories runs from SQLite ledger state (#4.3-001).
