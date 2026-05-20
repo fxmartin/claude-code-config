@@ -7,17 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Orchestrator and build-stories agents now write run/story/stage/event
+  records to the SQLite ledger (#4.2-001). `scripts/sdlc-state.sh` grows a
+  write-path API (`run-create`, `run-update-status`, `story-upsert`,
+  `stage-start`, `stage-finish`, `event-log`) with single-quote-doubled
+  TEXT parameters and integer coercion for numeric IDs — no raw user input
+  reaches SQL. A new `hooks/sdlc-state-emit.sh` wrapper is the single
+  ingress for agents: it resolves the ledger DB from `$SDLC_STATE_DB`
+  (set by the orchestrator) or the repo-root `.sdlc-state.db`, and
+  silently no-ops when no ledger is configured so legacy environments
+  are not broken. The `build-stories` skill, the parallel/sequential
+  build prompts, the coverage-gate prompt, the review prompt, the
+  merge-update prompt, and the E2E-gate path all emit ledger updates
+  alongside their existing `cmux-bridge log` calls. The markdown
+  progress file (`.build-progress.md`) remains the human-readable view;
+  story 4.2-002 will switch it to a SELECT-only renderer over this
+  ledger.
+
 ## [v1.8.0] - 2026-05-20
 
 ### Added
 
-- feat(installer): wsl2 detection and platform-aware behavior (#3.1-002) (#27)
-
-
-### Added
-
 - WSL2 detection and platform-aware behavior in installer (#3.1-002)
-
 ## [v1.7.0] - 2026-05-20
 
 ### Added
