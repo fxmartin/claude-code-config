@@ -162,12 +162,67 @@ rm -f /tmp/.claude-skill-active
 ```
 Print the error and STOP. No Telegram — discovery failures are config issues, user is at keyboard.
 
-## Phase 3: Parse Queue (DIRECT)
+## Phase 3: Parse Queue (DIRECT) — including Resume
 
 Extract the `QUEUE_JSON:` line from the discovery agent result. Parse it into an in-memory list of story records. Each record has: `id`, `title`, `epic_id`, `epic_name`, `epic_file`, `priority`, `points`, `agent_type`, `dependencies`.
 
 If the agent returned `DISCOVERY_ERROR:` — print the error and STOP.
 If the agent returned `RESUME_WARNING:` — print warning, ask user to confirm or use `resume`.
+
+### Resume Logic (cutover to SQLite ledger — Story 4.3-001)
+
+When `scope=resume`, the ledger is the source of truth (the markdown
+progress file is regenerated FROM the ledger by Story 4.2-002 and is no
+longer authoritative for resume decisions).
+
+Pre-resume sanity check (orchestrator):
+
+```bash
+# Ambiguity guard: if two IN_PROGRESS runs share the same started_at,
+# bail out instead of silently picking one. The user can pass --run-id
+# (a future flag) to disambiguate.
+AMBIG=$(sqlite3 .sdlc-state.db "
+    SELECT COUNT(*) FROM (
+        SELECT started_at FROM runs
+         WHERE status='IN_PROGRESS'
+         GROUP BY started_at
+        HAVING COUNT(*) > 1
+    );" 2>/dev/null || echo 0)
+if [ "${AMBIG}" -gt 0 ]; then
+    echo "ABORT: ambiguous resume state, please specify --run-id"
+    rm -f /tmp/.claude-skill-active
+    exit 1
+fi
+```
+
+The discovery agent now drives resume via `~/.claude/hooks/sdlc-state-emit.sh
+latest-incomplete-run` and `resume-plan <run-id>` (see Step 3 in
+`discovery-agent-prompt.md`). The resulting `QUEUE_JSON:` entries carry:
+
+- `status` — `IN_PROGRESS`, `PENDING`, `BLOCKED`, `FAILED`, `SKIPPED`
+- `resume_from` — the stage name to re-enter (`build`, `coverage`, `review`, `merge`, or `e2e`); `null` for fresh PENDING work
+- `branch` — preserved from the prior attempt (do NOT recreate)
+- `pr_number` — preserved from the prior attempt (the merge agent reuses this)
+
+For each story in the parsed queue:
+
+- `status=DONE` → already filtered by `resume-plan`; never appears
+- `status=IN_PROGRESS` → call `mark-stages-stale <run> <story> <resume_from>` BEFORE re-dispatching the agent, then start the next attempt at `resume_from` with `attempt = previous_attempt + 1`
+- `status=PENDING` → run normally (Phase 5)
+- `status=BLOCKED` → keep BLOCKED (dependencies still open)
+- `status=FAILED` → in `--auto` mode, mark `SKIPPED` and continue; otherwise prompt user (retry / skip / abort)
+- `status=SKIPPED` → leave skipped (do not retry)
+
+The `RESUME_META:` line emitted by `resume-plan` carries the previous run's
+`run_id`, `scope`, and `mode` — export `SDLC_RUN_ID=<resumed-id>` so the
+existing event/stage rows accumulate under the same run instead of creating
+a new one.
+
+Skip-flag persistence: the run-level `events` table carries any
+`--skip-coverage`/`--skip-e2e` flags emitted at run start (source=
+`build-stories`, message starts with `flags:`). On resume, the orchestrator
+must re-read these and pass them as-is so stages skipped intentionally on
+the prior attempt stay skipped.
 
 ### Persist queue to ledger (Story 4.2-001)
 

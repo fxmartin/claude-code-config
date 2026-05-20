@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Resume build-stories runs from SQLite ledger state (#4.3-001).
+  `scripts/sdlc-state.sh` grows three resume subcommands —
+  `latest-incomplete-run`, `mark-stages-stale <run> <story> <stage>`,
+  and `resume-plan <run>` — that let `/build-stories resume` rebuild
+  the in-flight queue directly from SQLite. Branch names and PR numbers
+  are preserved verbatim across the resume so the merge agent reuses the
+  existing PR instead of creating a new one. `resume-plan` skips DONE
+  stories, re-evaluates BLOCKED stories against the recorded dependency
+  events (a BLOCKED story flips to PENDING once every dependency is DONE),
+  surfaces FAILED / SKIPPED entries as-is for the orchestrator's
+  `--auto` path, and emits a JSON envelope compatible with the discovery
+  agent's `QUEUE_JSON:` contract. The discovery-agent prompt now drives
+  Phase 3 resume through the ledger; the markdown progress file is the
+  fallback path only when no ledger is configured. The merge-update
+  prompt gained a resume-aware preflight that checks the PR still exists
+  and exits `MERGE_STATUS: PR_MISSING` if the PR has been closed or
+  deleted since the prior attempt.
+
 ## [v1.11.0] - 2026-05-20
 
 ### Added
