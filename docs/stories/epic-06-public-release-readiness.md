@@ -139,10 +139,10 @@
 - Any README inaccuracies surfaced by the verification are fixed in this story.
 
 **Definition of Done**:
-- Both paths verified.
-- README corrected if needed.
-- Smoke-test doc extended.
-- Change noted in `CHANGELOG.md` under "Fixed" or "Changed" as appropriate.
+- [x] Both paths verified.
+- [x] README corrected if needed.
+- [x] Smoke-test doc extended.
+- [x] Change noted in `CHANGELOG.md` under "Fixed" or "Changed" as appropriate.
 
 ## Story Dependencies (within Epic-06)
 
