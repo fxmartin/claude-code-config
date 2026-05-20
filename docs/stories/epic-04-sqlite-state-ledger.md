@@ -70,10 +70,10 @@
 - A single environment variable `SDLC_RUN_ID` is exported by the orchestrator and inherited by all sub-agents.
 
 **Definition of Done**:
-- Skill updated with ledger emit calls.
-- Helper script `~/.claude/hooks/sdlc-state-emit.sh` committed.
-- Bats test verifies a simulated 3-story 4-stage run produces the expected row counts.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Skill updated with ledger emit calls.
+- [x] Helper script `~/.claude/hooks/sdlc-state-emit.sh` committed.
+- [x] Bats test verifies a simulated 3-story 4-stage run produces the expected row counts.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ##### Story 4.2-002: Markdown view generator
 **User Story**: As FX, I want `.build-progress.md` to stay human-readable but no longer be the truth source so that I can still glance at progress in a text editor without breaking resume behavior.
