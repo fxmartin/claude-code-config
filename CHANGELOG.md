@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.6.0] - 2026-05-20
+
+### Added
+
+- feat(installer): split install.sh into --core/--tools/--mcp/--shell/--all modes (#3.1-001) (#26)
+
+
 ### Changed
 
 - `install.sh` is now a thin dispatcher over per-mode modules in `install/`.
