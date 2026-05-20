@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pilot kit for the five-LTM-colleague smoke test (#6.3-001). New
+  `docs/pilot-kit/` houses four colleague-facing artifacts plus an
+  environment-capture helper: `README.md` (one-page "what's expected of you"
+  brief — onboarding read, one `/build-stories` run, one feedback form),
+  `feedback-template.md` (blank structured form covering install time,
+  blockers, what worked / didn't, 1–5 recommendation score, project
+  details), `pilot-tracker.md` (FX's per-colleague ledger with platform /
+  install path / gate dates / verdict / issue count columns), and
+  `decision-record.md` (post-pilot pass/fail checklist tied to the epic-06
+  acceptance criteria, must-fix vs deferred lists, and a three-option
+  go/no-go decision block — all fields blank until the pilot actually
+  runs). New `scripts/pilot-helper.sh` prints a paste-ready markdown
+  Environment block (OS, architecture, shell, Claude Code / `gh` / `git`
+  versions, install path) for the feedback form, with
+  `PILOT_HELPER_NONINTERACTIVE=1` for CI / scripted use. README links to
+  the pilot kit from the top of the Install section. New
+  `tests/pilot-kit.bats` (7 assertions) pins the kit's structure and the
+  helper's output contract. The actual five-colleague pilot remains
+  pending — this delivers the kit, not the results.
 - LTM colleague onboarding guide (#6.1-001). New `docs/onboarding.md` walks a
   new colleague from "I heard about this" to "I just ran `/build-stories` on a
   fresh project" in under 15 minutes. Sections cover prerequisites, both

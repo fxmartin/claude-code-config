@@ -256,6 +256,8 @@ The roster is split into two scopes (Story 6.2-001). **SDLC plugin agents** live
 ## Install
 
 > **First time here?** Read [docs/onboarding.md](docs/onboarding.md) — a 15-minute walkthrough from blank machine to first autonomous build, written for the LTM colleague pilot.
+>
+> **Piloting the framework?** Start at [docs/pilot-kit/README.md](docs/pilot-kit/README.md) — the five-colleague smoke-test kit (Story 6.3-001): what's expected of a pilot, the feedback form, and the environment-capture helper.
 
 ### Portable (any macOS / Linux)
 
