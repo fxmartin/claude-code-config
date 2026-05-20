@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.13.1] - 2026-05-20
+
+### Changed
+
+- refactor(plugin): separate personal config from autonomous-sdlc plugin (#6.2-001) (#33)
+
+
 ## [v1.13.0] - 2026-05-20
 
 ### Added
