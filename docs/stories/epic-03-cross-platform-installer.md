@@ -66,10 +66,11 @@
 - On WSL2, the `--shell` mode appends to `~/.bashrc` if zsh is not the default shell. The `dev()` function is skipped on WSL2 because cmux does not run there (replaced by a stub that prints "cmux is macOS-only; this command is a no-op on WSL2").
 
 **Definition of Done**:
-- WSL2 detection lands.
-- A fresh WSL2 Ubuntu 22.04 box runs `./install.sh --core --tools --mcp` successfully end-to-end.
-- README has a "Windows install via WSL2" section.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] WSL2 detection lands.
+- [x] A fresh WSL2 Ubuntu 22.04 box runs `./install.sh --core --tools --mcp` successfully end-to-end.
+- [x] README has a "Windows install via WSL2" section.
+- [x] Change noted in `CHANGELOG.md` under "Added".
+- [x] All DoD criteria satisfied (merged via PR #27)
 
 ### Feature 3.2: Verification and Documentation
 
