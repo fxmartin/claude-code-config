@@ -309,3 +309,276 @@ setup() {
     [ -f "${dest}" ]
     grep -q "| 4.2-EMIT | Via emit | DONE" "${dest}"
 }
+
+# ---------------------------------------------------------------------------
+# Malformed DB (wrong magic bytes): render exits non-zero with a clear error.
+# The renderer must never hang or silently succeed on a corrupt database.
+# ---------------------------------------------------------------------------
+
+@test "render with wrong magic bytes exits non-zero with a clear error" {
+    local bad_db="${BATS_TEST_TMPDIR}/wrong-magic.db"
+    printf 'NOTASQLITEFILE\n' > "${bad_db}"
+
+    run "${SDLC_STATE}" --db "${bad_db}" render
+    # sqlite3 returns non-zero when the file is not a valid database.
+    [ "${status}" -ne 0 ]
+    # The combined output+stderr must mention the corruption.
+    [[ "${output}" == *"not a database"* ]] || [[ "${output}" == *"malformed"* ]] || \
+        [[ "${output}" == *"Error"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Truncated DB (valid magic bytes, truncated body): same contract as above.
+# ---------------------------------------------------------------------------
+
+@test "render with a truncated DB exits non-zero with a clear error" {
+    # Build a valid DB in the setup tmpdir, then truncate a copy of it.
+    local truncated_db="${BATS_TEST_TMPDIR}/truncated.db"
+    # Copy only the first 100 bytes of a valid (but schema-less) sqlite DB.
+    dd if="${DB}" bs=1 count=100 of="${truncated_db}" 2>/dev/null
+
+    run "${SDLC_STATE}" --db "${truncated_db}" render
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"malformed"* ]] || [[ "${output}" == *"not a database"* ]] || \
+        [[ "${output}" == *"Error"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Unwritable --out path: render exits non-zero and the original file is intact.
+# The atomic write (tmp + rename) must never truncate the destination before
+# it is ready to move the tmp into place.
+# ---------------------------------------------------------------------------
+
+@test "render --out to unwritable directory exits non-zero and leaves original intact" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${run_id}" 4.2-WRITE 04 "Write test" P1 3 bash feature/4.2-WRITE 1 DONE
+
+    # Create a read-only directory and a known original file inside it.
+    local ro_dir="${BATS_TEST_TMPDIR}/readonly"
+    mkdir -p "${ro_dir}"
+    local dest="${ro_dir}/progress.md"
+    printf 'ORIGINAL\n' > "${dest}"
+    chmod a-w "${ro_dir}"
+
+    run "${SDLC_STATE}" --db "${DB}" render --out "${dest}"
+    local rc="${status}"
+
+    # Restore permissions so BATS cleanup can remove the dir.
+    chmod 755 "${ro_dir}"
+
+    # Must fail.
+    [ "${rc}" -ne 0 ]
+    # Original content must still be intact.
+    grep -q "^ORIGINAL$" "${dest}"
+}
+
+# ---------------------------------------------------------------------------
+# Large ledger: hundreds of stories complete in a reasonable time (<30 s)
+# and produce deterministic output on repeated calls.
+# ---------------------------------------------------------------------------
+
+@test "render with a large ledger completes in under 30 seconds and is deterministic" {
+    # Insert 5 runs x 40 stories = 200 stories across multiple epics.
+    local r run_id s
+    for r in 01 02 03 04 05; do
+        run_id=$("${SDLC_STATE}" --db "${DB}" run-create "epic-${r}" parallel)
+        for s in $(seq 1 40); do
+            "${SDLC_STATE}" --db "${DB}" story-upsert \
+                "${run_id}" "${r}-$(printf '%03d' "${s}")" "${r}" \
+                "Story ${r}-$(printf '%03d' "${s}")" P1 3 bash \
+                "feature/${r}-${s}" "${s}" DONE >/dev/null
+        done
+        "${SDLC_STATE}" --db "${DB}" run-update-status "${run_id}" DONE >/dev/null
+    done
+
+    # Time the render; bash `time` goes to stderr so capture wall time via date.
+    local t0 t1
+    t0=$(date +%s)
+    "${SDLC_STATE}" --db "${DB}" render > "${BATS_TEST_TMPDIR}/large-1.md"
+    t1=$(date +%s)
+    local elapsed=$(( t1 - t0 ))
+    [ "${elapsed}" -lt 30 ]
+
+    # Determinism: second call must be byte-identical.
+    "${SDLC_STATE}" --db "${DB}" render > "${BATS_TEST_TMPDIR}/large-2.md"
+    diff "${BATS_TEST_TMPDIR}/large-1.md" "${BATS_TEST_TMPDIR}/large-2.md"
+}
+
+# ---------------------------------------------------------------------------
+# NULL optional columns: pr_number NULL renders as "—", never literal "NULL".
+# Tests COALESCE behaviour end-to-end through the renderer.
+# ---------------------------------------------------------------------------
+
+@test "render with NULL optional columns never emits literal NULL in output" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    # Insert directly via sqlite3 so we can force NULL on pr_number and branch.
+    sqlite3 "${DB}" \
+        "INSERT INTO stories(run_id, story_id, epic_id, title, status, branch, pr_number)
+         VALUES ('${run_id}', '4.2-NULLPR', '04', 'PR is null', 'IN_PROGRESS', NULL, NULL);"
+
+    run "${SDLC_STATE}" --db "${DB}" render
+    [ "${status}" -eq 0 ]
+    # The word NULL must not appear in any table cell.
+    [[ "${output}" != *"| NULL |"* ]]
+    [[ "${output}" != *"| NULL"$'\n'* ]]
+    # The null-pr row must still appear in the output.
+    [[ "${output}" == *"4.2-NULLPR"* ]]
+    # And the dash placeholder must be used.
+    [[ "${output}" == *"— |"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Backtick in titles: backticks are valid markdown inline code markers; they
+# must pass through to the cell without being stripped or doubled.
+# ---------------------------------------------------------------------------
+
+@test "render preserves backtick characters in story titles" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    sqlite3 "${DB}" \
+        "INSERT INTO stories(run_id, story_id, epic_id, title, status, branch)
+         VALUES ('${run_id}', '4.2-BTICK', '04', 'Use \`cmd\` here', 'DONE', 'feature/test');"
+
+    run "${SDLC_STATE}" --db "${DB}" render
+    [ "${status}" -eq 0 ]
+    # Backtick-enclosed text must appear in the output (not stripped).
+    [[ "${output}" == *'`cmd`'* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Multi-line titles: a newline inside a title value must collapse to a space
+# so the markdown table stays on a single row.
+# ---------------------------------------------------------------------------
+
+@test "render collapses newlines in titles so the table row stays on one line" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    sqlite3 "${DB}" \
+        "INSERT INTO stories(run_id, story_id, epic_id, title, status, branch)
+         VALUES ('${run_id}', '4.2-NL', '04', 'Line1'||char(10)||'Line2', 'DONE', 'feature/test');"
+
+    run "${SDLC_STATE}" --db "${DB}" render
+    [ "${status}" -eq 0 ]
+    # The output must contain both words on the same line (joined by a space).
+    [[ "${output}" == *"Line1 Line2"* ]]
+    # And must NOT have "Line2" appearing as a standalone partial table row.
+    # A partial row would look like "| Line2 | DONE |" — check it's absent.
+    [[ "${output}" != *"| Line2 | DONE"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# render-all when historical snapshot is missing: degrades gracefully,
+# emitting a valid document with no Historical section (not an error).
+# ---------------------------------------------------------------------------
+
+@test "render-all degrades gracefully when historical snapshot is absent" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${run_id}" 4.2-RA 04 "render-all no-hist" P1 3 bash feature/4.2-RA 1 DONE
+
+    # Temporarily hide the historical snapshot from the repo root.
+    local hist_path="${BATS_TEST_DIRNAME}/../docs/stories/.build-progress.historical.md"
+    local hist_backup="${BATS_TEST_TMPDIR}/historical.md.bak"
+    if [ -f "${hist_path}" ]; then
+        mv "${hist_path}" "${hist_backup}"
+    fi
+
+    run "${SDLC_STATE}" --db "${DB}" render-all
+    local rc="${status}"
+
+    # Restore unconditionally so the teardown is always clean.
+    if [ -f "${hist_backup}" ]; then
+        mv "${hist_backup}" "${hist_path}"
+    fi
+
+    [ "${rc}" -eq 0 ]
+    # Must still produce the main heading and E2E Gate section.
+    [[ "${output}" == *"# Build Progress"* ]]
+    [[ "${output}" == *"## E2E Gate"* ]]
+    # Must NOT have the Historical heading because the file was absent.
+    [[ "${output}" != *"## Historical (pre-ledger)"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# render-all when historical snapshot exists but is empty: still produces
+# a structurally valid document (Historical section present but empty body).
+# ---------------------------------------------------------------------------
+
+@test "render-all with an empty historical snapshot produces valid output" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${run_id}" 4.2-RAE 04 "render-all empty-hist" P1 3 bash feature/4.2-RAE 1 DONE
+
+    # Temporarily replace the historical snapshot with an empty file.
+    local hist_path="${BATS_TEST_DIRNAME}/../docs/stories/.build-progress.historical.md"
+    local hist_backup="${BATS_TEST_TMPDIR}/historical.md.bak"
+    if [ -f "${hist_path}" ]; then
+        cp "${hist_path}" "${hist_backup}"
+        : > "${hist_path}"   # truncate to empty
+    else
+        touch "${hist_path}"
+    fi
+
+    run "${SDLC_STATE}" --db "${DB}" render-all
+    local rc="${status}"
+
+    # Restore unconditionally.
+    if [ -f "${hist_backup}" ]; then
+        mv "${hist_backup}" "${hist_path}"
+    else
+        rm -f "${hist_path}"
+    fi
+
+    [ "${rc}" -eq 0 ]
+    [[ "${output}" == *"# Build Progress"* ]]
+    [[ "${output}" == *"## Historical (pre-ledger)"* ]]
+    [[ "${output}" == *"## E2E Gate"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Atomicity under SIGKILL: killing the render mid-write must leave the
+# destination file either in its original state or fully replaced —
+# never a partial render. The .tmp side-file may be left behind (that is an
+# acceptable artefact of SIGKILL) but the primary destination must be intact.
+# ---------------------------------------------------------------------------
+
+@test "SIGKILL during render --out leaves destination intact (never partial)" {
+    # Populate a moderately-sized ledger so the render takes a little time.
+    local run_id s
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    for s in $(seq 1 30); do
+        "${SDLC_STATE}" --db "${DB}" story-upsert \
+            "${run_id}" "4.2-K$(printf '%02d' "${s}")" 04 \
+            "Kill story $(printf '%02d' "${s}")" P1 3 bash \
+            "feature/k${s}" "${s}" DONE >/dev/null
+    done
+    "${SDLC_STATE}" --db "${DB}" run-update-status "${run_id}" DONE >/dev/null
+
+    local dest="${BATS_TEST_TMPDIR}/atomic.md"
+    local original_content="ORIGINAL_ATOMIC_CONTENT"
+    printf '%s\n' "${original_content}" > "${dest}"
+
+    # Launch render in the background and immediately kill it.
+    "${SDLC_STATE}" --db "${DB}" render --out "${dest}" &
+    local bg_pid=$!
+    # Give it the briefest head-start so the .tmp open has likely occurred.
+    sleep 0.05
+    kill -9 "${bg_pid}" 2>/dev/null
+    wait "${bg_pid}" 2>/dev/null || true
+
+    # The destination must contain EITHER the original content (render was
+    # killed before mv completed) OR the full new render (mv was atomic and
+    # already committed). It must NEVER be empty or partially written.
+    local dest_content
+    dest_content=$(cat "${dest}")
+    # Must not be empty.
+    [ -n "${dest_content}" ]
+    # Must be either the original marker or a valid render (starts with "# Build Progress").
+    [[ "${dest_content}" == "${original_content}" ]] || \
+        [[ "${dest_content}" == *"# Build Progress"* ]]
+}

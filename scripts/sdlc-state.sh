@@ -486,10 +486,10 @@ render_run_block() {
         local rows
         rows=$(db_select "
             SELECT
-                s.story_id,
-                COALESCE(s.title, ''),
+                REPLACE(REPLACE(s.story_id, char(10), ' '), char(13), ''),
+                REPLACE(REPLACE(COALESCE(s.title, ''), char(10), ' '), char(13), ''),
                 COALESCE(s.status, ''),
-                COALESCE(s.branch, ''),
+                REPLACE(REPLACE(COALESCE(s.branch, ''), char(10), ' '), char(13), ''),
                 COALESCE(CAST(s.pr_number AS TEXT), ''),
                 COALESCE((SELECT MIN(started_at)
                             FROM stages
