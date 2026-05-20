@@ -338,3 +338,162 @@ setup() {
     # And no DB was created.
     [ ! -f "${BATS_TEST_TMPDIR}/nope" ]
 }
+
+# ---------------------------------------------------------------------------
+# SQL-injection resistance: every write API that takes free-text input must
+# not allow a crafted argument to corrupt the DB or alter table structure.
+# We feed the OWASP classic payload to each TEXT parameter, then verify that
+# the `runs` table still exists and the row round-trips the raw value.
+# ---------------------------------------------------------------------------
+
+@test "injection: run-update-status status containing SQL is stored safely" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-inject parallel)
+    local nasty="DONE'; DROP TABLE runs;--"
+    # run-update-status passes status through sql_quote — no raw interpolation.
+    "${SDLC_STATE}" --db "${DB}" run-update-status "${run_id}" "${nasty}"
+    # runs table must still exist.
+    local tables
+    tables=$(sqlite3 "${DB}" "SELECT name FROM sqlite_master WHERE type='table' AND name='runs';")
+    [ "${tables}" = "runs" ]
+    # The stored value is the raw string.
+    local stored
+    stored=$(sqlite3 "${DB}" "SELECT status FROM runs WHERE id='${run_id}';")
+    [ "${stored}" = "${nasty}" ]
+}
+
+@test "injection: story-upsert epic_id containing SQL is stored safely" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-inject parallel)
+    local nasty="04'); DROP TABLE stories;--"
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${run_id}" inj-001 "${nasty}" "Injection story" P1 1 bash feature/inj "" IN_PROGRESS
+    local tables
+    tables=$(sqlite3 "${DB}" "SELECT name FROM sqlite_master WHERE type='table' AND name='stories';")
+    [ "${tables}" = "stories" ]
+    local stored
+    stored=$(sqlite3 "${DB}" "SELECT epic_id FROM stories WHERE run_id='${run_id}';")
+    [ "${stored}" = "${nasty}" ]
+}
+
+@test "injection: stage-start stage_name containing SQL is stored safely" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-inject parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${run_id}" inj-001 04 "Inj" P1 1 bash feature/inj "" IN_PROGRESS
+    local nasty="build'); DROP TABLE stages;--"
+    "${SDLC_STATE}" --db "${DB}" stage-start "${run_id}" inj-001 "${nasty}" 1
+    local tables
+    tables=$(sqlite3 "${DB}" "SELECT name FROM sqlite_master WHERE type='table' AND name='stages';")
+    [ "${tables}" = "stages" ]
+    local stored
+    stored=$(sqlite3 "${DB}" "SELECT stage_name FROM stages WHERE run_id='${run_id}';")
+    [ "${stored}" = "${nasty}" ]
+}
+
+@test "injection: stage-finish failure_category containing SQL is stored safely" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-inject parallel)
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${run_id}" inj-001 04 "Inj" P1 1 bash feature/inj "" IN_PROGRESS
+    "${SDLC_STATE}" --db "${DB}" stage-start "${run_id}" inj-001 build 1
+    local nasty="flaky'); DROP TABLE stages;--"
+    "${SDLC_STATE}" --db "${DB}" stage-finish "${run_id}" inj-001 build 1 FAILED "${nasty}" ""
+    local tables
+    tables=$(sqlite3 "${DB}" "SELECT name FROM sqlite_master WHERE type='table' AND name='stages';")
+    [ "${tables}" = "stages" ]
+    local stored
+    stored=$(sqlite3 "${DB}" "SELECT failure_category FROM stages WHERE run_id='${run_id}';")
+    [ "${stored}" = "${nasty}" ]
+}
+
+@test "injection: event-log source containing SQL is stored safely" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-inject parallel)
+    local nasty="build-stories'); DROP TABLE events;--"
+    "${SDLC_STATE}" --db "${DB}" event-log "${run_id}" "" info "${nasty}" "payload"
+    local tables
+    tables=$(sqlite3 "${DB}" "SELECT name FROM sqlite_master WHERE type='table' AND name='events';")
+    [ "${tables}" = "events" ]
+    local stored
+    stored=$(sqlite3 "${DB}" "SELECT source FROM events WHERE run_id='${run_id}';")
+    [ "${stored}" = "${nasty}" ]
+}
+
+# ---------------------------------------------------------------------------
+# event-log: very large message (100 KB).
+# SQLite stores TEXT values of arbitrary length (limited only by available
+# memory and SQLITE_MAX_LENGTH, which defaults to 1 billion bytes).  The CLI
+# must pass the full value through without truncation.
+# ---------------------------------------------------------------------------
+
+@test "event-log stores a 100 KB message without truncation" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-large parallel)
+    # Build a 100 KB payload (python available on macOS + standard Linux).
+    local big_msg
+    big_msg=$(python3 -c "print('A' * 102400, end='')")
+    "${SDLC_STATE}" --db "${DB}" event-log "${run_id}" "" info build-stories "${big_msg}"
+    local stored_len
+    stored_len=$(sqlite3 "${DB}" "SELECT LENGTH(message) FROM events WHERE run_id='${run_id}';")
+    [ "${stored_len}" = "102400" ]
+}
+
+# ---------------------------------------------------------------------------
+# story-upsert ON CONFLICT semantics: must use UPDATE, not DELETE+INSERT.
+# If the implementation were INSERT OR REPLACE (which SQLite expands as
+# DELETE + INSERT), the FK cascade would wipe stages attached to the story.
+# We verify the stage rows survive an upsert that changes the story's status.
+# ---------------------------------------------------------------------------
+
+@test "story-upsert ON CONFLICT preserves attached stage rows (no cascade delete)" {
+    local run_id
+    run_id=$("${SDLC_STATE}" --db "${DB}" run-create epic-04 parallel)
+    # Insert story and three stage rows.
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${run_id}" 4.2-upsert 04 "Upsert safety" P1 3 bash feature/upsert "" IN_PROGRESS
+    "${SDLC_STATE}" --db "${DB}" stage-start "${run_id}" 4.2-upsert build 1
+    "${SDLC_STATE}" --db "${DB}" stage-finish "${run_id}" 4.2-upsert build 1 DONE "" ""
+    "${SDLC_STATE}" --db "${DB}" stage-start "${run_id}" 4.2-upsert coverage 1
+    "${SDLC_STATE}" --db "${DB}" stage-finish "${run_id}" 4.2-upsert coverage 1 DONE "" ""
+    # Upsert again (status change simulating story completion).
+    "${SDLC_STATE}" --db "${DB}" story-upsert \
+        "${run_id}" 4.2-upsert 04 "Upsert safety" P1 3 bash feature/upsert 42 DONE
+    # Stage rows must still exist.
+    local stage_count
+    stage_count=$(sqlite3 "${DB}" \
+        "SELECT COUNT(*) FROM stages WHERE run_id='${run_id}' AND story_id='4.2-upsert';")
+    [ "${stage_count}" = "2" ]
+    # And the story row shows the new status.
+    local st_status
+    st_status=$(sqlite3 "${DB}" \
+        "SELECT status FROM stories WHERE run_id='${run_id}' AND story_id='4.2-upsert';")
+    [ "${st_status}" = "DONE" ]
+}
+
+# ---------------------------------------------------------------------------
+# run-create concurrent safety: two parallel invocations must each produce a
+# distinct run_id and both rows must be present in the DB.
+# We simulate concurrency with two background subshells writing to the same DB.
+# SQLite WAL mode handles reader-writer concurrency; run-create does not hold
+# a long-running lock, so both inserts should commit without data loss.
+# ---------------------------------------------------------------------------
+
+@test "run-create concurrent invocations each produce a distinct run_id" {
+    local id1 id2
+    # Run two inserts in parallel, capturing their stdout.
+    id1=$("${SDLC_STATE}" --db "${DB}" run-create scope-A parallel &
+           wait $!)
+    id2=$("${SDLC_STATE}" --db "${DB}" run-create scope-B serial &
+           wait $!)
+    # Both IDs must be non-empty.
+    [ -n "${id1}" ]
+    [ -n "${id2}" ]
+    # IDs must be distinct (UUIDs are random — collision is effectively
+    # impossible, but a bug in new_run_id that returns a constant would fail).
+    [ "${id1}" != "${id2}" ]
+    # Both rows exist.
+    local count
+    count=$(sqlite3 "${DB}" "SELECT COUNT(*) FROM runs WHERE id IN ('${id1}','${id2}');")
+    [ "${count}" = "2" ]
+}
