@@ -119,11 +119,12 @@
 - A bats test simulates a kill at Stage 2 of a 3-story run, verifies that resume picks up exactly at Stage 2 of the killed story.
 
 **Definition of Done**:
-- Resume logic committed.
-- Bats test passes.
-- Manual test: kill a real run mid-Stage-2, resume, confirm correct pickup.
-- Documentation in `docs/cmux-integration.md` and the skill's preamble.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Resume logic committed (PR #32).
+- [x] Bats test passes.
+- [x] Manual test: kill a real run mid-Stage-2, resume, confirm correct pickup.
+- [x] Documentation in `docs/cmux-integration.md` and the skill's preamble.
+- [x] Change noted in `CHANGELOG.md` under "Added".
+- [x] All DoD criteria satisfied (merged via PR #32)
 
 ## Story Dependencies (within Epic-04)
 
