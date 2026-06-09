@@ -1,0 +1,3 @@
+[submodule "skills/model-shelf"]
+	path = skills/model-shelf
+	url = https://github.com/alexziskind1/model-shelf.git

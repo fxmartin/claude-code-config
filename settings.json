@@ -125,6 +125,9 @@
   "voiceEnabled": true,
   "skipAutoPermissionPrompt": true,
   "permissions": {
-    "defaultMode": "auto"
+    "defaultMode": "auto",
+    "allow": [
+      "Bash(model-shelf:*)"
+    ]
   }
 }
