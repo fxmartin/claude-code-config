@@ -1,6 +1,6 @@
 # Pilot Decision Record
 
-**Story:** [6.3-001](../stories/epic-06-public-release-readiness.md#story-63-001-five-colleague-pilot-smoke-test)
+**Story:** [9.3-001](../stories/epic-09-security-quality-gates.md#story-93-001-five-colleague-live-pilot) *(moved from epic-06 story 6.3-001 on 2026-06-11)*
 **Owner:** FX (fills in post-pilot — this is intentionally a blank form right now).
 **Source artifacts:** five returned [`feedback-template.md`](feedback-template.md) forms, the [`pilot-tracker.md`](pilot-tracker.md) ledger, the `pilot-feedback`-labelled GitHub issues, and the install transcripts.
 **See also:** [`README.md`](README.md), [`docs/onboarding.md`](../onboarding.md)
@@ -21,10 +21,11 @@ verdicts, no optimistic assumptions.
 
 ---
 
-## 2. Pass / fail acceptance criteria (epic-06)
+## 2. Pass / fail acceptance criteria (story 9.3-001)
 
-Source of truth: `docs/stories/epic-06-public-release-readiness.md` story
-6.3-001 acceptance criteria. Tick only after explicit verification — do NOT
+Source of truth: the acceptance criteria written in
+`docs/stories/epic-06-public-release-readiness.md` story 6.3-001, inherited
+verbatim by epic-09 story 9.3-001. Tick only after explicit verification — do NOT
 pre-tick.
 
 - [ ] Five LTM colleagues identified (at least one on Windows/WSL2, at least

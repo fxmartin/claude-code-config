@@ -14,7 +14,7 @@
 
 ## Epic Scope
 
-**Total Stories**: 4 | **Total Points**: 11 | **MVP Stories**: 4
+**Total Stories**: 4 | **Total Points**: 9 *(was 11; 2 points moved to Epic-09 with the live pilot)* | **MVP Stories**: 4
 
 ## Features in This Epic
 
@@ -96,10 +96,10 @@
 
 #### Stories
 
-##### Story 6.3-001: Five-colleague pilot smoke test
+##### Story 6.3-001: Five-colleague pilot smoke test (kit only — live pilot moved)
 **User Story**: As FX, I want five LTM colleagues to install and run the framework on their own machines, file issues for anything that breaks, and confirm they would use it for their own projects.
 **Priority**: P1
-**Points**: 3
+**Points**: 1 *(re-pointed from 3 on 2026-06-11: the live pilot run moved with 2 points to [Epic-09 Story 9.3-001](./epic-09-security-quality-gates.md#story-93-001-five-colleague-live-pilot); this story now covers only the pilot kit, which shipped)*
 **Stack hint**: organizational, no code
 **Dependencies**: all other Epic-06 stories complete, all of Epic-01 to Epic-05 merged.
 **Affected files**: new `docs/pilot-feedback.md` (running log), GitHub issues filed.
@@ -121,12 +121,9 @@
 - [x] Pilot kit committed.
 - [x] README link added.
 - [x] CHANGELOG entry.
-- [ ] Pilot completed.
-- [ ] Feedback doc committed.
-- [ ] Issues filed.
-- [ ] Decision recorded: ship MVP, ship with caveats, or defer.
+- [x] Live-pilot bullets (pilot completed, feedback doc, issues filed, decision recorded) moved to [Epic-09 Story 9.3-001](./epic-09-security-quality-gates.md#story-93-001-five-colleague-live-pilot).
 
-**Live pilot run pending** — kit shipped via PR #36 on 2026-05-20. FX schedules the actual pilot with 5 LTM colleagues; remaining DoD bullets stay unchecked until pilot completes and decision-record.md is filled in.
+**Live pilot relocated** — kit shipped via PR #36 on 2026-05-20. Resequenced on 2026-06-11: the live pilot run no longer gates MVP and instead closes the roadmap as the final story of Epic-09. The acceptance criteria above describe the full pilot and are inherited verbatim by 9.3-001.
 
 ### Feature 6.4: Marketplace Install Verification
 
@@ -176,8 +173,8 @@ flowchart TD
 
 Epic-06 is complete when all 4 stories meet their Definition of Done and the following hold:
 
-- Five colleagues have completed the pilot.
-- ≥ 4 of 5 verdicts are "yes" or "yes-after-fixes."
+- ~~Five colleagues have completed the pilot.~~ *(moved to Epic-09 Story 9.3-001 on 2026-06-11)*
+- ~~≥ 4 of 5 verdicts are "yes" or "yes-after-fixes."~~ *(moved to Epic-09 Story 9.3-001 on 2026-06-11)*
 - `docs/onboarding.md` exists and is reviewed.
 - Personal agents are clearly separated.
 - Both plugin install paths verified on macOS and WSL2.

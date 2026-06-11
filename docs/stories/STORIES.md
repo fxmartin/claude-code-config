@@ -34,10 +34,10 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic-03 | Cross-Platform Installer (macOS + Windows/WSL2) | MVP | 4 | 13 | P0 | **COMPLETE** |
 | Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | **COMPLETE** |
 | Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | **COMPLETE** |
-| Epic-06 | Public Release Readiness | MVP | 4 | 11 | P1 | **COMPLETE**[^1] |
+| Epic-06 | Public Release Readiness | MVP | 4 | 9 | P1 | **COMPLETE**[^1] |
 | Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | |
 | Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | |
-| Epic-09 | Security Baked into Quality Gates | Roadmap | 3 | 10 | P2 | |
+| Epic-09 | Security Baked into Quality Gates + Live Pilot | Roadmap | 4 | 12 | P2 | |
 
 ## Epic Navigation
 
@@ -49,7 +49,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 - **[Epic-06: Public Release Readiness](./epic-06-public-release-readiness.md)** - CHANGELOG bootstrap, onboarding doc, five-user pilot smoke test, scope cleanup (separate personal agents from plugin).
 - **[Epic-07: External Controller and Typed Contracts](./epic-07-external-controller.md)** *(Roadmap)*: Python or TypeScript CLI that owns the state machine; skills become workers with typed JSON-schema I/O contracts.
 - **[Epic-08: Adversarial Gate and High-Risk Approval](./epic-08-adversarial-gate.md)** *(Roadmap)*: Vendor-agnostic adversarial reviewer slot; mandatory human approval for changes touching auth, payments, migrations, infrastructure, secrets.
-- **[Epic-09: Security Baked into Quality Gates](./epic-09-security-quality-gates.md)** *(Roadmap)*: SAST plus dependency plus secrets scanning embedded into the coverage stage so security is a gate, not a follow-up.
+- **[Epic-09: Security Baked into Quality Gates](./epic-09-security-quality-gates.md)** *(Roadmap)*: SAST plus dependency plus secrets scanning embedded into the coverage stage so security is a gate, not a follow-up. Closes with the five-colleague live pilot (9.3-001, moved from Epic-06 on 2026-06-11) — the roadmap capstone that validates the finished platform.
 
 ## MVP Summary
 
@@ -69,16 +69,16 @@ The MVP is shippable when ALL of the following hold:
 | Track | Epics in MVP | Points |
 |-------|--------------|--------|
 | Foundation (must) | Epic-01, Epic-02 | 21 |
-| Distribution (must) | Epic-03, Epic-06 | 24 |
+| Distribution (must) | Epic-03, Epic-06 | 22 |
 | Durability (must) | Epic-04 | 18 |
 | Release ops (must) | Epic-05 | 8 |
-| **Total MVP** | **6 epics, 23 stories** | **71** |
+| **Total MVP** | **6 epics, 23 stories** | **69** |
 
 ### MVP Status
 
-**6 of 6 MVP epics are COMPLETE.** All 23 MVP stories have landed. The framework is feature-complete and shippable to the five LTM colleagues. The live pilot run (distributing the pilot kit and collecting feedback via `docs/pilot-kit/`) is the one pending organizational action — it has not run yet and is FX's to schedule.[^1]
+**6 of 6 MVP epics are COMPLETE.** All 23 MVP stories have landed. The framework is feature-complete and shippable to the five LTM colleagues.[^1]
 
-[^1]: Epic-06 code-complete as of the batch build (PRs #33, #34, #35, #36 merged). The five-colleague pilot run itself is a pending organizational action — it has not occurred yet.
+[^1]: Epic-06 code-complete as of the batch build (PRs #33, #34, #35, #36 merged). The five-colleague live pilot originally gated this epic; on 2026-06-11 it was resequenced to the end of the roadmap as [Epic-09 Story 9.3-001](./epic-09-security-quality-gates.md#story-93-001-five-colleague-live-pilot), so it validates the finished platform (Epics 07–09) rather than the bare MVP. The MVP install/run criteria below remain verified by that pilot when it runs.
 
 ### Out of MVP Scope
 
@@ -91,10 +91,10 @@ The MVP is shippable when ALL of the following hold:
 ## Project Metrics
 
 - **Total Epics**: 9
-- **Total Stories**: 33
+- **Total Stories**: 34 *(the live pilot split out of 6.3-001 into 9.3-001 on 2026-06-11)*
 - **Total Story Points**: 120
-- **MVP Stories**: 23 (71 pts)
-- **Roadmap Stories**: 10 (49 pts)
+- **MVP Stories**: 23 (69 pts)
+- **Roadmap Stories**: 11 (51 pts)
 
 ## Story Dependencies
 
@@ -126,9 +126,9 @@ flowchart TD
 
 ### Critical Path
 
-`Epic-01 → Epic-02 → Epic-05 → Epic-06`
+`Epic-01 → Epic-02 → Epic-05 → Epic-06 → Epic-07 → Epic-08 / Epic-09 → live pilot (9.3-001)`
 
-Foundation fixes unblock CI. CI unblocks reliable release tagging. Release tagging unblocks the 5-colleague pilot. Epic-03 (cross-platform installer) and Epic-04 (SQLite state) run in parallel to the critical path and converge at Epic-06.
+Foundation fixes unblock CI. CI unblocks reliable release tagging. Release tagging unblocks public release readiness. Epic-03 (cross-platform installer) and Epic-04 (SQLite state) run in parallel to the critical path and converge at Epic-06. The five-colleague live pilot closes the roadmap as the final story of Epic-09 (resequenced 2026-06-11; it previously gated Epic-06).
 
 ### Recommended Sequencing
 
@@ -137,7 +137,7 @@ Foundation fixes unblock CI. CI unblocks reliable release tagging. Release taggi
 | Sprint 1 | Foundation | Epic-01 in full, Epic-02 stories 2.1-001 and 2.1-002 |
 | Sprint 2 | CI + Cross-platform | Epic-02 finish, Epic-03 in full |
 | Sprint 3 | State + Release | Epic-04, Epic-05 |
-| Sprint 4 | Public release | Epic-06, pilot run with five colleagues |
-| Sprint 5+ | Roadmap | Epic-07, Epic-08, Epic-09 |
+| Sprint 4 | Public release | Epic-06 |
+| Sprint 5+ | Roadmap | Epic-07, Epic-08, Epic-09 — closing with the five-colleague live pilot (9.3-001) |
 
-The roadmap epics are not committed to a sprint. They get scheduled after the LTM pilot returns feedback.
+The roadmap epics are not committed to a sprint. The five-colleague live pilot runs last (Epic-09 Story 9.3-001, resequenced 2026-06-11) and validates the finished platform.

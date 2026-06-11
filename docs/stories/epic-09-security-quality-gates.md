@@ -14,7 +14,7 @@
 
 ## Epic Scope
 
-**Total Stories**: 3 | **Total Points**: 10 | **MVP Stories**: 0 (all roadmap)
+**Total Stories**: 4 | **Total Points**: 12 *(includes the five-colleague live pilot, moved here from Epic-06 with 2 points on 2026-06-11)* | **MVP Stories**: 0 (all roadmap)
 
 ## Features in This Epic
 
@@ -100,6 +100,26 @@
 - Documentation in `docs/security-gates.md` explains how to handle a real find.
 - Change noted in `CHANGELOG.md` under "Added".
 
+### Feature 9.3: MVP Live Pilot (Roadmap Capstone)
+
+#### Stories
+
+##### Story 9.3-001: Five-colleague live pilot
+**User Story**: As FX, I want five LTM colleagues to install and run the framework on their own machines, file issues for anything that breaks, and confirm they would use it for their own projects.
+**Priority**: P2
+**Points**: 2
+**Stack hint**: organizational, no code
+**Dependencies**: pilot kit shipped ([Epic-06 Story 6.3-001](./epic-06-public-release-readiness.md#story-63-001-five-colleague-pilot-smoke-test-kit-only--live-pilot-moved), done); all code stories of Epic-07, Epic-08, and Epic-09 complete — the pilot is the last story of the roadmap and validates the finished platform, not the bare MVP.
+**Affected files**: `docs/pilot-kit/` (forms filled in), new `docs/pilot-feedback.md`, GitHub issues filed.
+
+> Moved here from Epic-06 on 2026-06-11. The full acceptance criteria (five colleagues, <15-minute installs, end-to-end `/brainstorm → /generate-epics → /build-stories` runs, issues filed, feedback summary, ≥4/5 "yes" or "yes-after-fixes" verdict) are inherited verbatim from the original story and remain the source of truth; the pilot kit under `docs/pilot-kit/` is the working material.
+
+**Definition of Done**:
+- [ ] Pilot completed with five colleagues.
+- [ ] Feedback doc (`docs/pilot-feedback.md`) committed.
+- [ ] Issues filed for every failure or friction point.
+- [ ] Decision recorded in `docs/pilot-kit/decision-record.md`: ship, ship with caveats, or defer.
+
 ## Story Dependencies (within Epic-09)
 
 ```mermaid
@@ -107,10 +127,13 @@ flowchart TD
     S1[9.1-001 Semgrep SAST]
     S2[9.1-002 osv-scanner deps]
     S3[9.2-001 gitleaks secrets]
+    S4[9.3-001 Five-colleague live pilot]
     S1 --> S2
+    S2 --> S4
+    S3 --> S4
 ```
 
-Story 9.2-001 is independent of the others and can ship first if Epic-02 is the only prerequisite.
+Story 9.2-001 is independent of the scan stories and can ship first if Epic-02 is the only prerequisite. Story 9.3-001 (the live pilot) runs last — after every code story across Epic-07, Epic-08, and Epic-09.
 
 ## Design Notes
 
@@ -133,10 +156,11 @@ Story 9.2-001 is independent of the others and can ship first if Epic-02 is the 
 
 ## Epic Acceptance
 
-Epic-09 is complete when all 3 stories meet their Definition of Done and the following hold:
+Epic-09 is complete when all 4 stories meet their Definition of Done and the following hold:
 
 - A test PR with a deliberate SQL-injection pattern triggers a `BLOCK` from the SAST scanner.
 - A test PR with a known-vulnerable lockfile entry triggers a `BLOCK` from the dependency scanner.
 - A test PR with a deliberate API-key string triggers a block from gitleaks before any other CI job runs.
 - The bugfix agent successfully remediates the SAST and dependency cases in a sample run.
 - Documentation in `docs/security-gates.md` is complete.
+- The five-colleague live pilot (9.3-001) has run against the finished platform: ≥ 4 of 5 verdicts are "yes" or "yes-after-fixes", feedback is summarized in `docs/pilot-feedback.md`, and the go/no-go decision is recorded.

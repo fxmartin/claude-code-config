@@ -1,6 +1,6 @@
 # Pilot Kit — Five-Colleague Smoke Test
 
-**Story:** [6.3-001](../stories/epic-06-public-release-readiness.md#story-63-001-five-colleague-pilot-smoke-test)
+**Story:** [9.3-001](../stories/epic-09-security-quality-gates.md#story-93-001-five-colleague-live-pilot) *(moved from epic-06 story 6.3-001 on 2026-06-11)*
 **Audience:** the five LTM colleagues piloting the `autonomous-sdlc` plugin.
 **Time budget:** ~45 minutes total — 15 install + reading, ~25 first autonomous build, 5 to fill in the feedback form.
 
@@ -91,14 +91,14 @@ section of the feedback form.
 FX collects the five forms and fills in
 [`decision-record.md`](decision-record.md):
 
-- the pass/fail checklist (epic-06 acceptance: ≥ 4 of 5 say "yes" or
+- the pass/fail checklist (story 9.3-001 acceptance: ≥ 4 of 5 say "yes" or
   "yes-after-fixes");
 - the must-fix-before-public-release list;
 - the deferred list (good ideas, not blockers);
 - the go/no-go on opening the repo to the world.
 
 Every `pilot-feedback` issue you filed is triaged — fixes that block public
-release become Epic-06 follow-ups, the rest go to a Post-MVP epic.
+release become roadmap follow-ups, the rest go to a Post-MVP epic.
 
 ---
 
