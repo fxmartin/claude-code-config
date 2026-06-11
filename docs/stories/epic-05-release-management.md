@@ -45,7 +45,7 @@
 **Definition of Done**:
 - [x] Config committed.
 - [x] CI job green.
-- [ ] Onboarding doc updated.
+- [x] Onboarding doc updated.
 - [x] Change noted in `CHANGELOG.md` under "Added".
 
 ### Feature 5.2: Release Workflow
@@ -132,7 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [x] CHANGELOG.md bootstrapped.
 - [x] Release workflow updates it automatically.
 - [x] First release produced cleanly.
-- [ ] Documented in `docs/onboarding.md`.
+- [x] Documented in `docs/onboarding.md`.
 
 ## Story Dependencies (within Epic-05)
 

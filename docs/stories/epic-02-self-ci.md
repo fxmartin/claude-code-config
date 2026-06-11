@@ -44,7 +44,7 @@
 **Definition of Done**:
 - [x] Workflow committed.
 - [x] Workflow passes on `main` after Epic-01 fixes are in.
-- [ ] Branch protection rule documented in onboarding doc.
+- [x] Branch protection rule documented in onboarding doc.
 - [x] Change noted in `CHANGELOG.md` under "Added".
 
 ##### Story 2.1-002: Bats test suite for `cmux-bridge.sh` and `install.sh --dry-run`
@@ -94,7 +94,7 @@
 **Definition of Done**:
 - [x] Script committed and executable.
 - [x] CI job green on `main` after Epic-01 fixes are in.
-- [ ] Onboarding doc updated.
+- [x] Onboarding doc updated.
 - [x] Change noted in `CHANGELOG.md` under "Added".
 
 ## Story Dependencies (within Epic-02)
