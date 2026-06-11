@@ -33,7 +33,7 @@ allowed-tools: Read, Write, Glob, Grep, Bash
 | `disable-model-invocation` | bool | `false` | If `true`, only user can invoke (not auto-triggered) |
 | `argument-hint` | string | — | Shown in help text (e.g., `"[url]"`, `"<file-path>"`) |
 | `allowed-tools` | string | all | Comma-separated list of allowed tools |
-| `model` | string | default | Override model (e.g., `claude-sonnet-4-5-20250514`) |
+| `model` | string | default | Override model (e.g., `claude-sonnet-4-6`) |
 | `context` | string | — | `"fork"` to run in forked context (no interactive Q&A) |
 | `agent` | object | — | Agent configuration for delegation |
 | `hooks` | object | — | Pre/post execution hooks |

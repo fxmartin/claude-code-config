@@ -17,7 +17,7 @@ Commands can optionally include YAML frontmatter:
 ```yaml
 ---
 allowed-tools: Read, Grep, Glob, Bash    # Restrict available tools
-model: claude-sonnet-4-5-20250514        # Override default model
+model: claude-sonnet-4-6                 # Override default model
 ---
 ```
 
