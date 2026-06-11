@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.13.2] - 2026-06-11
+
+### Changed
+
+- refactor(tests): fold test/ shell checkers into tests/
+
+### Fixed
+
+- fix(install): initialize git submodules during --core install
+- fix(templates): use a valid model id in frontmatter examples
+
+
 ### Added
 
 - Pilot kit for the five-LTM-colleague smoke test (#6.3-001). New
