@@ -309,6 +309,33 @@ The autonomous build agents generate commit messages in this format automaticall
 
 ---
 
+## Contributing changes to the framework
+
+### Branch protection on `main`
+
+`main` is protected by a repository ruleset — **direct pushes are rejected for everyone, including the maintainer**. Day-to-day this means: branch, commit, `gh pr create`, wait for green, merge.
+
+- Every change lands through a **pull request**. No approval count is enforced, so a maintainer can self-merge once CI is green.
+- These CI checks are **required** before a PR can merge: `Static checks`, `Contract checks`, `Commit format (commitlint)`, `Behavior tests (bats)`, and both `Smoke test (clean-machine install)` matrix legs (macOS + Ubuntu).
+- Force-pushes to and deletion of `main` are blocked.
+- The one direct-push exception is the **release pipeline**: it pushes its `chore(release): vX.Y.Z` bump commit and tag using a deploy key, which the ruleset lists as a bypass actor. (Personal GitHub repos cannot grant the Actions app a ruleset bypass, hence the deploy key.)
+
+### CHANGELOG maintenance
+
+`CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and is **maintained by the release workflow, not by hand**. On every push to `main` that contains `feat`, `fix`, `perf`, or `refactor` commits, the workflow computes the next semver from the commit types, prepends a dated section under `## [Unreleased]` (feat → Added, fix → Fixed, perf/refactor → Changed), commits it as `chore(release): vX.Y.Z`, tags, and publishes a GitHub Release with the same notes.
+
+Hand-edit only the `[Unreleased]` section, and only for context a commit subject cannot carry (e.g. multi-commit features that deserve one narrative entry). Never rewrite already-released sections — the git tag is the release authority.
+
+### Adding a new agent
+
+Subagent definitions are markdown files under `agents/` (personal helpers live in `agents/personal/`). To add one:
+
+1. Create `agents/<agent-name>.md` with YAML frontmatter (`name`, `description`, optional `tools`, `model`, `color`) followed by the agent's system prompt. Copy an existing file such as `agents/qa-engineer.md` as a starting point.
+2. The **file basename** (without `.md`) is the agent's identity: any skill or command that references `subagent_type=<agent-name>` resolves against the basenames of files in `agents/` (subdirectories included). Built-in Claude Code types (`general-purpose`, `Plan`, `Explore`, …) are allowlisted and need no file.
+3. Before pushing, run `scripts/validate-agent-registry.sh` — it greps every `*.md` under `plugins/`, `skills/`, and `commands/` for `subagent_type=` references and fails listing any that do not resolve. The same check runs in CI as the required `Contract checks` job, so an unresolved reference blocks the merge.
+
+---
+
 ## State and resume
 
 Progress is persisted in a **SQLite state ledger** at `.sdlc-state.db` in the repo root. Status values are `DONE` / `IN_PROGRESS` / `FAILED` / `SKIPPED` / `PENDING`, recorded per story per stage. You do not need to operate the ledger yourself — the pipeline reads and writes it.
