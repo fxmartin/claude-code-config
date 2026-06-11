@@ -28,7 +28,7 @@ jobs:
           shellcheck --severity=warning \
             hooks/*.sh \
             scripts/*.sh \
-            test/*.sh \
+            tests/*.sh \
             install.sh \
             install/*.sh \
             statusline-command.sh
