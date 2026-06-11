@@ -8,6 +8,18 @@ install_core_run() {
   echo ""
   echo "[core] Symlinking config into ${CLAUDE_DIR}..."
 
+  # Git submodules (skills/model-shelf) ship empty on a plain clone, which
+  # would leave the symlinked skill as a dead directory. Idempotent: a
+  # no-op when the submodule is already initialized. Skipped with a warning
+  # for tarball downloads (no .git) or when git is unavailable.
+  if [ -f "$SCRIPT_DIR/.gitmodules" ]; then
+    if [ -e "$SCRIPT_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+      run git -C "$SCRIPT_DIR" submodule update --init
+    else
+      warn "Cannot initialize git submodules (no .git or git missing) — submodule-backed skills will be empty"
+    fi
+  fi
+
   ensure_dir "$CLAUDE_DIR"
 
   create_symlink "$SCRIPT_DIR/CLAUDE.md"               "$CLAUDE_DIR/CLAUDE.md"

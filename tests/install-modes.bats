@@ -66,6 +66,14 @@ _run_install() {
     [ "$ln_lines" -eq 11 ]
 }
 
+@test "--core --dry-run previews git submodule init" {
+    _run_install --core --dry-run
+    [ "$status" -eq 0 ]
+    # skills/model-shelf is a git submodule; a plain clone leaves it empty,
+    # so --core must initialize submodules or the symlinked skill is dead.
+    [[ "$output" == *"[dry-run] git -C"*"submodule update --init"* ]]
+}
+
 @test "--core creates the symlink set and exits 0" {
     _run_install --core
     [ "$status" -eq 0 ]
