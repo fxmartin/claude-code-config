@@ -1,6 +1,6 @@
 # Pilot Feedback — `<your name>`
 
-**Story:** [6.3-001](../stories/epic-06-public-release-readiness.md#story-63-001-five-colleague-pilot-smoke-test)
+**Story:** [9.3-001](../stories/epic-09-security-quality-gates.md#story-93-001-five-colleague-live-pilot) *(moved from epic-06 story 6.3-001 on 2026-06-11)*
 **See:** [`README.md`](README.md) (what's being asked) · [`docs/onboarding.md`](../onboarding.md) (the walkthrough you followed)
 
 Copy this file, fill in every section, send it back to FX (PR against this
