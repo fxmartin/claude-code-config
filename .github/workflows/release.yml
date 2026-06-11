@@ -74,6 +74,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Push the bump commit and tag as the release deploy key: personal
+          # repos cannot grant the Actions app a ruleset bypass, so the deploy
+          # key is the bypass actor that gets past the main-branch PR ruleset.
+          # Deploy-key pushes retrigger this workflow (unlike GITHUB_TOKEN);
+          # the guard job's chore(release) check is what stops the loop.
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
       - name: Determine last tag
         id: lasttag
