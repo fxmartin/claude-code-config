@@ -70,11 +70,11 @@
 - A test harness `controller/tests/test_schemas.py` covers: valid response passes, missing required field fails with field name, extra field is allowed (forward-compat).
 
 **Definition of Done**:
-- All five schemas committed.
-- Agent prompts updated.
-- Test harness green.
-- Documentation in `agents/contracts.md`.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] All five schemas committed.
+- [x] Agent prompts updated.
+- [x] Test harness green.
+- [x] Documentation in `agents/contracts.md`.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ### Feature 7.3: Port Orchestration to Controller
 
