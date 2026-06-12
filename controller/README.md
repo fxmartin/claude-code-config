@@ -56,7 +56,7 @@ sdlc validate build agent-response.txt   # file, or pipe via stdin
 cat resp.txt | sdlc validate coverage
 ```
 
-See [`agents/contracts.md`](../agents/contracts.md) for the full contract.
+See [`docs/contracts.md`](../docs/contracts.md) for the full contract.
 
 ## Development
 

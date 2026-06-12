@@ -55,7 +55,7 @@
 **Points**: 8
 **Stack hint**: JSON schema, Pydantic (or zod for TS)
 **Dependencies**: Story 7.1-001.
-**Affected files**: new `controller/schemas/`, every `*-agent-prompt.md` updated to require structured output, possibly new `agents/contracts.md` documentation.
+**Affected files**: new `controller/schemas/`, every `*-agent-prompt.md` updated to require structured output, possibly new `docs/contracts.md` documentation.
 
 **Acceptance Criteria**:
 - A schema exists for each agent type used by the orchestrator:
@@ -73,7 +73,7 @@
 - [x] All five schemas committed.
 - [x] Agent prompts updated.
 - [x] Test harness green.
-- [x] Documentation in `agents/contracts.md`.
+- [x] Documentation in `docs/contracts.md`.
 - [x] Change noted in `CHANGELOG.md` under "Added".
 
 ### Feature 7.3: Port Orchestration to Controller

@@ -30,7 +30,9 @@ with these markers:
 
 ## Schemas
 
-Schemas live in [`controller/schemas/`](../controller/schemas/) in
+Schemas live in
+[`controller/src/sdlc/schemas/`](../controller/src/sdlc/schemas/) (bundled
+inside the `sdlc` package so they ship in the installed wheel) in
 [JSON Schema draft 2020-12](https://json-schema.org/draft/2020-12/) format.
 
 | Agent type | Schema file | Required fields |
