@@ -129,10 +129,10 @@
 - Both consumer repos document the sync workflow in their READMEs.
 
 **Definition of Done**:
-- ADR committed.
-- Sync mechanism live in both repos.
-- A test sync (bump a skill in source, propagate to both consumers) verified.
-- Change noted in `CHANGELOG.md` under "Changed".
+- [x] ADR committed.
+- [x] Sync mechanism live in both repos.
+- [x] A test sync (bump a skill in source, propagate to both consumers) verified.
+- [x] Change noted in `CHANGELOG.md` under "Changed".
 
 ## Story Dependencies (within Epic-07)
 
