@@ -112,6 +112,42 @@ The skill is a **thin dispatcher** — argument parsing, control flow, and struc
 
 Progress is persisted in a **SQLite state ledger** (`sdlc_state.db`) with a human-readable markdown view generated on demand. Legacy `docs/stories/.build-progress.md` is kept as a fallback view. Status values: `DONE` / `IN_PROGRESS` / `FAILED` / `SKIPPED` / `PENDING`. Any run is resumable from the last completed stage.
 
+### The `sdlc` controller (Epic-07)
+
+The `build-stories` skill is now a **thin wrapper** — all orchestration logic lives in a deterministic Python CLI (`sdlc`) rather than in an LLM interpreting a markdown playbook. The controller owns the state machine, validates every agent return against a JSON-schema contract, and surfaces malformed responses as actionable errors before the next stage runs.
+
+#### Install
+
+```bash
+# From the repo root — bootstraps uv if needed, then installs the CLI:
+./scripts/install-controller.sh
+
+# Or directly if you already have uv:
+cd controller && uv tool install .
+```
+
+#### Key subcommands
+
+| Command | Purpose |
+|---------|---------|
+| `sdlc build [scope] [--dry-run] [--auto] [--skip-coverage] [--limit=N]` | Run the full build-stories orchestration |
+| `sdlc resume` | Resume an interrupted build from the ledger state |
+| `sdlc status` | Show current run status and stage progress |
+| `sdlc state` | Inspect the persisted state machine for a run |
+| `sdlc validate <agent-type> <file>` | Validate an agent response against its JSON schema |
+| `sdlc rollback` | Roll a run back to a prior ledger checkpoint |
+| `sdlc sync-check <src> <dst>` | Verify shared-skills parity between repos |
+
+`sdlc build` accepts the same arguments as `/build-stories` — the skill simply shells out to it. Migration is invisible to end users.
+
+#### Agent I/O contracts
+
+Every agent the orchestrator dispatches must return a JSON object fenced with `<<<RESULT_JSON>>>` ... `<<<END_RESULT>>>` markers matching one of five published schemas (build, coverage, review, merge, bugfix). A response that fails schema validation is treated as a build failure and routed to the bugfix loop — it never silently propagates bad data downstream. Full schema reference: [`docs/contracts.md`](docs/contracts.md).
+
+See [`docs/controller-architecture.md`](docs/controller-architecture.md) for the module map, state-machine diagram, and retry semantics. The runtime decision is recorded in [`docs/adr/001-controller-runtime.md`](docs/adr/001-controller-runtime.md) (Python + uv + Typer + Pydantic).
+
+---
+
 ### Phase 4 — Quality & Intelligence
 
 After build, the harness can audit itself:
@@ -186,16 +222,18 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 |------|-------------|-------|
 | `CLAUDE.md` | Global instructions loaded into every Claude Code session | 1 |
 | `.claude-plugin/marketplace.json` | Local Claude Code marketplace manifest (registers the `autonomous-sdlc` plugin under the `fx-claude-config` marketplace) | 1 |
+| `controller/` | **`sdlc` CLI** — Python controller that owns the build-stories state machine (Epic-07). Install via `./scripts/install-controller.sh`. See [`controller/README.md`](controller/README.md). | 1 package |
+| `shared-skills/` | Single source of truth for the 7 skills shared between the Claude Code and Codex plugins (`check-releases`, `coverage`, `create-issue`, etc.) — consumed as a git submodule by the `nix-install` Codex mirror | 7 skills |
 | `plugins/autonomous-sdlc/` | **Claude Code plugin** — SDLC skills surfaced as bare slash-commands labelled `(autonomous-sdlc)` (mirror of the Codex `autonomous-sdlc` plugin in `nix-install`) | 1 plugin / 8 skills |
 | `skills/` | Loose user-level Claude skills not part of the SDLC plugin (generators, e2e, claude-docs, telegram, demo) | 9 |
 | `commands/` | Namespaced slash commands (`dev/`, `devops/`, `issues/`, `project/`, `quality/`, `research/`) | 17 |
 | `agents/` | Specialist agent definitions (flat) | 12 |
 | `hooks/` | cmux lifecycle hooks, Telegram bridge, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper | 9 scripts |
-| `scripts/` | Standalone scripts run by CI (`validate-agent-registry.sh`) and the release workflow (`compute-release.sh`, `release-guard.sh`) | 3 |
+| `scripts/` | Standalone scripts run by CI (`validate-agent-registry.sh`), the release workflow (`compute-release.sh`, `release-guard.sh`), and controller bootstrap (`install-controller.sh`) + shared-skills sync (`sync-shared-skills.sh`) | 5 |
 | `tests/` | bats test suite for hooks and install smoke tests (cmux-bridge, install dry-run, agent-registry, sweep-orphan-worktrees) | 6 bats |
 | `templates/` | Shared scaffolding used by generator skills | 3 |
 | `reference-docs/` | Language/tooling references loaded via `@` imports | 3 |
-| `docs/` | User-facing docs (cmux integration, CLAUDE.md guide, Python/container/DB/testing best practices, generators) | — |
+| `docs/` | User-facing docs (cmux integration, CLAUDE.md guide, Python/container/DB/testing best practices, generators, controller architecture, ADRs, contracts) | — |
 | `settings.json` | Hooks config, statusline, enabled plugins, marketplaces | — |
 | `statusline-command.sh` | Statusline renderer | — |
 | `keybindings.json` | Keybindings override | — |
@@ -441,6 +479,9 @@ See [`docs/generators.md`](docs/generators.md).
 - [`docs/claude-md-guide.md`](docs/claude-md-guide.md) — deep dive on CLAUDE.md structure, guardrails, and maintenance
 - [`docs/cmux-integration.md`](docs/cmux-integration.md) — full cmux integration architecture and event schema
 - [`docs/generators.md`](docs/generators.md) — generator skills documentation
+- [`docs/controller-architecture.md`](docs/controller-architecture.md) — `sdlc` controller module map, state-machine, and retry semantics (Epic-07)
+- [`docs/contracts.md`](docs/contracts.md) — agent I/O JSON-schema contracts reference
+- [`docs/adr/001-controller-runtime.md`](docs/adr/001-controller-runtime.md) · [`docs/adr/002-codex-mirror-sync.md`](docs/adr/002-codex-mirror-sync.md) — architecture decision records
 - [`docs/python-best-practices.md`](docs/python-best-practices.md) · [`docs/testing-best-practices.md`](docs/testing-best-practices.md) · [`docs/container-best-practices.md`](docs/container-best-practices.md) · [`docs/database-best-practices.md`](docs/database-best-practices.md)
 
 ---
