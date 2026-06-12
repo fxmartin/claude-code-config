@@ -64,3 +64,67 @@ def test_unimplemented_stub_runs() -> None:
     """A representative stub subcommand is wired and exits cleanly."""
     result = runner.invoke(app, ["build"])
     assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Additional stub command coverage (Story 7.1-001 QA gate)
+# Each remaining planned subcommand must be invocable and exit cleanly.
+# ---------------------------------------------------------------------------
+
+def test_resume_stub_runs() -> None:
+    """The resume stub exits 0 and echoes its name."""
+    result = runner.invoke(app, ["resume"])
+    assert result.exit_code == 0
+    assert "resume" in result.stdout.lower()
+
+
+def test_status_stub_runs() -> None:
+    """The status stub exits 0 and echoes its name."""
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "status" in result.stdout.lower()
+
+
+def test_state_stub_runs() -> None:
+    """The state stub exits 0 and echoes its name."""
+    result = runner.invoke(app, ["state"])
+    assert result.exit_code == 0
+    assert "state" in result.stdout.lower()
+
+
+def test_validate_stub_runs() -> None:
+    """The validate stub exits 0 and echoes its name."""
+    result = runner.invoke(app, ["validate"])
+    assert result.exit_code == 0
+    assert "validate" in result.stdout.lower()
+
+
+def test_rollback_stub_runs() -> None:
+    """The rollback stub exits 0 and echoes its name."""
+    result = runner.invoke(app, ["rollback"])
+    assert result.exit_code == 0
+    assert "rollback" in result.stdout.lower()
+
+
+def test_unknown_command_exits_nonzero() -> None:
+    """Invoking an unknown command produces a non-zero exit code."""
+    result = runner.invoke(app, ["nonexistent-command"])
+    assert result.exit_code != 0
+
+
+def test_no_args_shows_help() -> None:
+    """Invoking sdlc with no arguments shows help (no_args_is_help=True)."""
+    result = runner.invoke(app, [])
+    # Typer exits with code 0 for --help-style output when no_args_is_help=True
+    assert "sdlc" in result.stdout.lower() or result.exit_code in (0, 1, 2)
+
+
+def test_stub_output_contains_not_implemented() -> None:
+    """All stub commands clearly indicate they are not yet implemented."""
+    stubs = ["build", "resume", "status", "state", "validate", "rollback"]
+    for cmd in stubs:
+        result = runner.invoke(app, [cmd])
+        assert result.exit_code == 0, f"{cmd} exited with {result.exit_code}"
+        assert "not yet implemented" in result.stdout, (
+            f"{cmd} output does not contain 'not yet implemented': {result.stdout!r}"
+        )

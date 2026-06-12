@@ -32,3 +32,8 @@ packages = ["src/sdlc"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest-cov>=7.1.0",
+]
