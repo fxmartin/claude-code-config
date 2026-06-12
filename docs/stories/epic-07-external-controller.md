@@ -40,10 +40,10 @@
 - A new top-level `scripts/install-controller.sh` wraps `uv tool install` for users who do not have uv yet (it bootstraps uv first).
 
 **Definition of Done**:
-- ADR committed.
-- CLI scaffold installable.
-- Smoke test in CI installs the CLI and runs `sdlc --version`.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] ADR committed.
+- [x] CLI scaffold installable.
+- [x] Smoke test in CI installs the CLI and runs `sdlc --version`.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ### Feature 7.2: Typed I/O Contracts
 
