@@ -86,3 +86,25 @@ Users still type `/build-stories` in Claude Code. The skill shells out to
 `sdlc build $ARGUMENTS` (falling back to `uv run sdlc` from the `controller/`
 checkout when the tool is not installed). The migration is invisible to end
 users; the worker agent prompts in the skill directory are unchanged.
+
+## Known divergences from the legacy skill
+
+The port preserves the skill's argument surface and end state, but a few of the
+skill's behaviours are intentionally not (yet) reproduced. They are listed here
+so the fidelity claim is honest:
+
+- **Sequential execution only.** The controller walks cohorts and stories in a
+  single thread regardless of `--sequential`. The skill's parallel
+  batch-per-stage worktree scheduling (up to five concurrent agents, sequential
+  merge stage) is deferred. The flag is accepted for compatibility; it is a
+  no-op until parallel dispatch lands.
+- **`--auto` is inert.** The controller is always non-interactive (it never
+  prompts), so it already behaves as the skill did under `--auto` for the
+  no-prompt aspect. It does **not** reclassify a FAILED story's dependents as
+  SKIPPED — they are marked BLOCKED. The flag is accepted for compatibility.
+- **No cmux sidebar emission from the controller.** Per-stage observability is
+  written to the ledger `events` table and surfaced via the markdown render
+  hook; the controller does not call `cmux-bridge.sh` directly. The skill
+  wrapper still owns any cmux interaction (unchanged contract).
+- **`current_stage` is not written.** The column exists in the schema for the
+  resume story (4.3-001); the build state machine does not populate it yet.

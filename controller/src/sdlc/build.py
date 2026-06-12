@@ -7,9 +7,10 @@ import os
 import sqlite3
 import subprocess
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Protocol
+from typing import Callable, Iterable, Iterator, Protocol
 
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.contracts import ContractError
@@ -164,10 +165,18 @@ class Ledger:
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         self.db_path = Path(db_path)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # Commit-or-rollback like sqlite3's own context manager, then *close* the
+        # connection so a long run does not leak a file handle per write (the
+        # bare ``with sqlite3.connect(...)`` form commits but never closes).
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def init(self) -> None:
         """Create the ledger schema if absent (idempotent)."""
