@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fix(controller): bundle the agent JSON schemas inside the `sdlc` package
+  (`controller/src/sdlc/schemas/`) and resolve them via `importlib.resources`,
+  so `sdlc validate` works under `uv tool install` (the schemas previously lived
+  outside the package and broke once the source tree was gone — Epic-07 E2E
+  defect). Added a packaging regression test and a CI `sdlc validate` round-trip
+  after install (#44).
+- fix(agents): move `agents/contracts.md` to `docs/contracts.md`; the file is
+  I/O contract documentation, not an agent definition, and its presence under
+  `agents/` broke the "agents/ root contains exactly 8 plugin agents" invariant
+  (#44).
+
 ## [v1.17.0] - 2026-06-12
 
 ### Added
@@ -79,7 +92,7 @@ Codex mirror artifact: bump the `shared-skills` submodule to this tag and run `g
   validation errors as actionable messages that name the offending field. The
   `sdlc validate <agent-type> [file]` command exposes this on the CLI (reads a
   file or stdin). Build-stories agent prompts updated to require the result
-  block. New `agents/contracts.md` documents the contract; test harness
+  block. New `docs/contracts.md` documents the contract; test harness
   `controller/tests/test_schemas.py` covers valid-passes, missing-required-fails
   -with-field-name, and extra-field-allowed (forward-compat).
 

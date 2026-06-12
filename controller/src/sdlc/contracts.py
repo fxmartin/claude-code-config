@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from pathlib import Path
+from importlib import resources
+from importlib.resources.abc import Traversable
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -17,8 +18,13 @@ from jsonschema.exceptions import best_match
 RESULT_START_MARKER = "<<<RESULT_JSON>>>"
 RESULT_END_MARKER = "<<<END_RESULT>>>"
 
-# Directory holding the published JSON-schema files (sibling of `src/`).
-SCHEMA_DIR = Path(__file__).resolve().parents[2] / "schemas"
+# The published JSON-schema files ship *inside* the `sdlc` package (under
+# `sdlc/schemas/`) so they are bundled into the wheel. Resolving them via
+# importlib.resources keeps `sdlc validate` working under `uv tool install`,
+# where the source tree is gone and only the installed package remains.
+# (A `parents[N] / "schemas"` path is fine in a git checkout but raises
+# FileNotFoundError for an installed wheel — that was the Epic-07 E2E defect.)
+SCHEMA_DIR: Traversable = resources.files(__package__) / "schemas"
 
 # Agent type -> schema filename. Keys are the names the orchestrator dispatches.
 AGENT_SCHEMAS: dict[str, str] = {
@@ -46,8 +52,13 @@ class SchemaValidationError(ContractError):
     """
 
 
-def schema_path(agent_type: str) -> Path:
-    """Return the schema file path for an agent type, or raise ``KeyError``."""
+def schema_path(agent_type: str) -> Traversable:
+    """Return the schema resource for an agent type, or raise ``KeyError``.
+
+    Returns an ``importlib.abc.Traversable`` (a real ``Path`` for a regular
+    wheel install) so callers can ``.read_text()`` it regardless of whether the
+    package is unpacked on disk or imported from a zip.
+    """
     if agent_type not in AGENT_SCHEMAS:
         valid = ", ".join(sorted(AGENT_SCHEMAS))
         raise KeyError(f"unknown agent type {agent_type!r}; expected one of: {valid}")
@@ -57,8 +68,8 @@ def schema_path(agent_type: str) -> Path:
 @lru_cache(maxsize=None)
 def load_schema(agent_type: str) -> dict[str, Any]:
     """Load and cache the JSON schema for an agent type."""
-    path = schema_path(agent_type)
-    return json.loads(path.read_text(encoding="utf-8"))
+    resource = schema_path(agent_type)
+    return json.loads(resource.read_text(encoding="utf-8"))
 
 
 def parse_result_block(response: str) -> dict[str, Any]:

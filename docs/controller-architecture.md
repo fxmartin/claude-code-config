@@ -55,7 +55,8 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
 ## Why schema validation is the safety boundary
 
 Every agent returns a `<<<RESULT_JSON>>> … <<<END_RESULT>>>` block. The
-controller parses and validates it against `controller/schemas/`. A missing or
+controller parses and validates it against the schemas bundled in the `sdlc`
+package (`controller/src/sdlc/schemas/`). A missing or
 malformed block raises a `ContractError`, which the state machine treats
 exactly like a build failure — the next stage never runs on garbage. This is
 the deterministic-control-flow guarantee Epic-07 was created for.

@@ -29,10 +29,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sdlc"]
+# Explicitly bundle the JSON schemas as package data so `sdlc validate` keeps
+# working under `uv tool install`, where the source tree is gone (Epic-07 E2E
+# fix). importlib.resources resolves them as `sdlc/schemas/*.schema.json`.
+artifacts = ["src/sdlc/schemas/*.schema.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "slow: end-to-end tests that build a wheel and spin up a venv",
+]
 
 [dependency-groups]
 dev = [

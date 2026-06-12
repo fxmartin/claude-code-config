@@ -154,6 +154,21 @@ jobs:
           echo "expected=$expected actual=$actual"
           test "$expected" = "$actual"
 
+      - name: Verify sdlc validate round-trip from an arbitrary cwd
+        # Epic-07 E2E regression guard: the JSON schemas must ship inside the
+        # installed wheel so `sdlc validate` works once the source tree is gone.
+        # Run from a tmp dir (no `controller/schemas/` sibling) so a path-based
+        # schema lookup would FileNotFoundError here.
+        run: |
+          cd "$(mktemp -d)"
+          printf '<<<RESULT_JSON>>>\n{"branch_name":"x","build_status":"SUCCESS","commit_sha":"abc123"}\n<<<END_RESULT>>>\n' \
+            | sdlc validate build
+          # An invalid block must exit non-zero.
+          if printf '<<<RESULT_JSON>>>\n{}\n<<<END_RESULT>>>\n' | sdlc validate build; then
+            echo "expected non-zero exit for invalid block" >&2
+            exit 1
+          fi
+
       - name: Run controller test suite
         run: |
           cd controller

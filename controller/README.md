@@ -48,7 +48,8 @@ in the behavior.
 
 Each agent the orchestrator dispatches returns a JSON object fenced with
 `<<<RESULT_JSON>>>` ... `<<<END_RESULT>>>` markers. The schemas live in
-[`schemas/`](schemas/) (JSON Schema draft 2020-12). `validate` parses the block
+[`src/sdlc/schemas/`](src/sdlc/schemas/) (JSON Schema draft 2020-12), bundled in
+the package so they ship in the installed wheel. `validate` parses the block
 and validates it, surfacing the offending field on failure:
 
 ```bash
@@ -56,7 +57,7 @@ sdlc validate build agent-response.txt   # file, or pipe via stdin
 cat resp.txt | sdlc validate coverage
 ```
 
-See [`agents/contracts.md`](../agents/contracts.md) for the full contract.
+See [`docs/contracts.md`](../docs/contracts.md) for the full contract.
 
 ## Development
 
