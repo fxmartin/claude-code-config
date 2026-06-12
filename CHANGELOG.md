@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Ported the `build-stories` orchestration out of the Claude skill into the
+  external `sdlc` controller (Epic-07, Story 7.3-001). The controller now owns
+  the deterministic state machine — preflight, story discovery from the
+  markdown epics, dependency-cohort scheduling, the build → coverage → review →
+  merge pipeline, and a bounded bugfix loop — in Python (`controller/src/sdlc/`:
+  `build.py`, `cohort.py`, `dispatch.py`, `discovery.py`, `ledger_view.py`).
+  Every agent is dispatched as a subprocess and its response is validated
+  against the 7.2-001 JSON-schema contracts *before* the next stage runs; a
+  malformed or schema-invalid response is treated as a build failure and routed
+  to the bugfix loop. Stage transitions are persisted to the Epic-04 SQLite
+  ledger after every step. `sdlc build [scope]` accepts the same flags the
+  skill did (`--dry-run`, `--auto`, `--skip-coverage`, `--limit=N`,
+  `--sequential`, `--coverage-threshold=N`, `--skip-preflight`).
+
+  **Migration note:** `build-stories/SKILL.md` is now a thin wrapper that shells
+  out to `sdlc build $ARGUMENTS` (falling back to `uv run sdlc` from the
+  `controller/` checkout when the tool is not installed). Users still invoke
+  `/build-stories` exactly as before — the change is invisible at the call site.
+  Architecture is documented in `docs/controller-architecture.md`.
+
 ## [v1.15.0] - 2026-06-12
 
 ### Added

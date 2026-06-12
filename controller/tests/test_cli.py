@@ -61,8 +61,12 @@ def test_init_stub_runs() -> None:
 
 
 def test_unimplemented_stub_runs() -> None:
-    """A representative stub subcommand is wired and exits cleanly."""
-    result = runner.invoke(app, ["build"])
+    """A representative stub subcommand is wired and exits cleanly.
+
+    `build` is now fully implemented (Story 7.3-001); `resume` remains a stub,
+    so it stands in as the representative unimplemented command here.
+    """
+    result = runner.invoke(app, ["resume"])
     assert result.exit_code == 0
 
 
@@ -120,7 +124,8 @@ def test_no_args_shows_help() -> None:
 
 def test_stub_output_contains_not_implemented() -> None:
     """All stub commands clearly indicate they are not yet implemented."""
-    stubs = ["build", "resume", "status", "state", "rollback"]
+    # `build` is implemented in Story 7.3-001 and is no longer a stub.
+    stubs = ["resume", "status", "state", "rollback"]
     for cmd in stubs:
         result = runner.invoke(app, [cmd])
         assert result.exit_code == 0, f"{cmd} exited with {result.exit_code}"
