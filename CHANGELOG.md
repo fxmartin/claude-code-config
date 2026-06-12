@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.16.0] - 2026-06-12
+
+### Added
+
+- feat(controller): port build-stories orchestration (#7.3-001) (#42)
+
+
 ### Changed
 
 - Ported the `build-stories` orchestration out of the Claude skill into the
