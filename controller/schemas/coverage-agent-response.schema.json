@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/coverage-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for coverage-agent responses (Story 7.2-001). ABOUTME: Draft 2020-12; extra fields allowed for forward-compat.",
+  "title": "CoverageAgentResponse",
+  "description": "Structured result returned by a coverage agent dispatched by the orchestrator.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "pr_number",
+    "pr_url",
+    "coverage_pct",
+    "tests_added",
+    "coverage_status",
+    "security_status"
+  ],
+  "properties": {
+    "pr_number": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Pull request number created by the coverage agent."
+    },
+    "pr_url": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 1,
+      "description": "URL of the pull request."
+    },
+    "coverage_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Measured test coverage percentage."
+    },
+    "tests_added": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of tests the agent added."
+    },
+    "coverage_status": {
+      "type": "string",
+      "enum": ["PASS", "WARN", "FAIL"],
+      "description": "Coverage gate outcome."
+    },
+    "security_status": {
+      "type": "string",
+      "enum": ["PASS", "WARN", "FAIL"],
+      "description": "Security scan outcome."
+    }
+  }
+}

@@ -149,6 +149,22 @@ MERGE_PR: #{{PR_NUMBER}}
 MERGE_STORY: {{STORY_ID}}
 ```
 
+### Machine-readable result block
+
+As the FINAL line of your response, emit a result block that conforms to
+`controller/schemas/merge-agent-response.schema.json`. Map the merge outcome
+into the schema's `MERGED | FAILED | SKIPPED` enum (SUCCESS → MERGED; CONFLICT
+/ REBASE_CONFLICT / FAILED → FAILED; PR_MISSING → SKIPPED). Use the squash-merge
+commit SHA and an ISO-8601 timestamp:
+
+```
+<<<RESULT_JSON>>>
+{"pr_number": {{PR_NUMBER}}, "merge_status": "MERGED", "merge_sha": "[SHA]", "merged_at": "[ISO-8601]"}
+<<<END_RESULT>>>
+```
+
+The controller validates this block against the schema before acting on it.
+
 ## Sidebar Ledger + SQLite Ledger
 Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set. The SQLite ledger emit lines (`sdlc-state-emit.sh`) run unconditionally — the hook degrades silently when no ledger DB is configured (Story 4.2-001).
 

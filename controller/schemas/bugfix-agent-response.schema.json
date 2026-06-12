@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/bugfix-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for bugfix-agent responses (Story 7.2-001). ABOUTME: Draft 2020-12; extra fields allowed for forward-compat.",
+  "title": "BugfixAgentResponse",
+  "description": "Structured result returned by a bugfix agent dispatched by the orchestrator.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "failure_category",
+    "fix_status",
+    "tests_passing",
+    "bugs_fixed",
+    "tests_fixed"
+  ],
+  "properties": {
+    "failure_category": {
+      "type": "string",
+      "enum": [
+        "CODE_BUG",
+        "TEST_BUG",
+        "ENV_ISSUE",
+        "BUILD_ERROR",
+        "TEST_FAILURE",
+        "SCHEMA_ERROR"
+      ],
+      "description": "Failure classification (bugfix-agent vocabulary CODE_BUG/TEST_BUG/ENV_ISSUE, plus orchestrator routing categories)."
+    },
+    "issue_number": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "GitHub issue the agent opened, when applicable."
+    },
+    "fix_status": {
+      "type": "string",
+      "enum": ["FIXED", "UNFIXED", "N/A"],
+      "description": "Whether the bugfix agent resolved the failure."
+    },
+    "tests_passing": {
+      "type": "boolean",
+      "description": "Whether the test suite is green after the fix."
+    },
+    "bugs_fixed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of distinct bugs the agent fixed."
+    },
+    "tests_fixed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of failing tests the agent made pass."
+    }
+  }
+}

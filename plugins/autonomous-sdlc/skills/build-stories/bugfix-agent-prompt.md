@@ -126,3 +126,15 @@ TESTS_FIXED: [count]
 DIAGNOSTIC_STEPS: [comma-separated list of checklist steps completed, e.g. reproduce,isolate,inspect]
 ISOLATED_TO: [file:function or file:line where the root cause was found, or UNKNOWN]
 ```
+
+As the FINAL line of your response, also emit a machine-readable result block
+that conforms to `controller/schemas/bugfix-agent-response.schema.json`:
+
+```
+<<<RESULT_JSON>>>
+{"failure_category": "CODE_BUG", "fix_status": "FIXED", "tests_passing": true, "bugs_fixed": 1, "tests_fixed": 2}
+<<<END_RESULT>>>
+```
+
+Include the optional "issue_number" (integer) when you opened a GitHub issue.
+The controller validates this block against the schema before acting on it.

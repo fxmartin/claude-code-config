@@ -44,6 +44,20 @@ Most subcommands are stubs at this scaffold stage (Story 7.1-001); they print a
 "not yet implemented" notice and exit cleanly. Subsequent Epic-07 stories fill
 in the behavior.
 
+## Agent I/O contracts (Story 7.2-001)
+
+Each agent the orchestrator dispatches returns a JSON object fenced with
+`<<<RESULT_JSON>>>` ... `<<<END_RESULT>>>` markers. The schemas live in
+[`schemas/`](schemas/) (JSON Schema draft 2020-12). `validate` parses the block
+and validates it, surfacing the offending field on failure:
+
+```bash
+sdlc validate build agent-response.txt   # file, or pipe via stdin
+cat resp.txt | sdlc validate coverage
+```
+
+See [`agents/contracts.md`](../agents/contracts.md) for the full contract.
+
 ## Development
 
 ```bash

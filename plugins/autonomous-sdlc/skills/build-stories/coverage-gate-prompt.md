@@ -141,3 +141,18 @@ SECURITY_STATUS: CLEAN | SECURITY_WARN | SECURITY_BLOCK | SKIPPED
   - `SECURITY_WARN`: Non-critical findings from any scanner (details in agent output)
   - `SECURITY_BLOCK`: `pip-audit` found critical/high severity CVEs — gate FAILED (include package names, CVE IDs, and fix versions in agent output)
   - `SKIPPED`: Security scan was disabled via `{{SECURITY_SCAN}}=off`
+
+### Machine-readable result block
+
+As the FINAL line of your response, also emit a result block that conforms to
+`controller/schemas/coverage-agent-response.schema.json`. Map the statuses into
+the schema's canonical `PASS | WARN | FAIL` enum (CLEAN → PASS, SECURITY_WARN →
+WARN, SECURITY_BLOCK → FAIL, SKIPPED → PASS):
+
+```
+<<<RESULT_JSON>>>
+{"pr_number": [number], "pr_url": "[url]", "coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "security_status": "PASS"}
+<<<END_RESULT>>>
+```
+
+The controller validates this block against the schema before acting on it.
