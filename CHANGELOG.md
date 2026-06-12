@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- External controller scaffold (Epic-07, Story 7.1-001). New `controller/`
+  Python package managed with uv, exposing the `sdlc` CLI with `--version`,
+  `--help`, an `init` stub, and stub subcommands for the full planned surface
+  (`build`, `resume`, `status`, `state`, `validate`, `rollback`). The runtime
+  decision (Python + uv + Typer + Pydantic) is recorded in
+  `docs/adr/001-controller-runtime.md`. Installable via `uv tool install .`
+  from `controller/`, or via the new `scripts/install-controller.sh` wrapper
+  which bootstraps uv first for users who do not have it. A new CI
+  `controller-smoke` job installs the CLI and asserts `sdlc --version` matches
+  `controller/pyproject.toml` on macOS and Ubuntu, and runs the controller
+  pytest suite (`controller/tests/test_cli.py`, 7 tests).
+
 ## [v1.13.2] - 2026-06-11
 
 ### Changed
