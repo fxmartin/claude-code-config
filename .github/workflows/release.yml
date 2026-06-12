@@ -182,6 +182,21 @@ jobs:
               echo "${fixed}" | awk '{ print "- " $0 }'
               echo
             fi
+
+            # Shared skills (ADR-002): this tag is the versioned artifact the
+            # Codex mirror (nix-install) pins to via git submodule. Flag the
+            # release explicitly when any `shared-skills/` file changed, so a
+            # consumer scanning release notes knows a submodule bump is worth it.
+            shared="$(git log "${last}..HEAD" --no-merges \
+              --pretty=format:'%s' -- shared-skills/ | sort -u || true)"
+            if [ -n "${shared}" ]; then
+              echo "### Shared skills"
+              echo
+              echo "Codex mirror artifact: bump the \`shared-skills\` submodule to this tag and run \`git submodule update --remote\` (see ADR-002)."
+              echo
+              echo "${shared}" | awk '{ print "- " $0 }'
+              echo
+            fi
           } > "${section}"
 
           echo "::group::New CHANGELOG section"

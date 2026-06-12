@@ -23,6 +23,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "state": "Inspect the persisted state machine for a run.",
     "validate": "Validate an agent response against its JSON schema.",
     "rollback": "Roll a run back to a prior ledger checkpoint.",
+    "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
 }
 
 app = typer.Typer(
@@ -170,6 +171,43 @@ def validate(
 def rollback() -> None:
     """Roll a run back to a prior checkpoint (stub)."""
     typer.echo("rollback: not yet implemented.")
+
+
+@app.command(name="sync-check", help=PLANNED_SUBCOMMANDS["sync-check"])
+def sync_check(
+    source_dir: Path = typer.Argument(
+        ...,
+        help="Source-of-truth shared-skills directory (this repo).",
+    ),
+    consumer_dir: Path = typer.Argument(
+        ...,
+        help="Consumer submodule checkout (e.g. the nix-install Codex mirror).",
+    ),
+) -> None:
+    """Verify a consumer's shared-skills submodule mirrors the source of truth.
+
+    Run this after ``git submodule update --remote`` in a consumer repo to
+    confirm the propagation landed byte-for-byte. Exits 0 when every shared
+    skill is in sync, 1 when any skill drifted or is missing/extra, and 2 when
+    a directory is missing entirely.
+    """
+    from sdlc.sync import SkillState, parity_report
+
+    try:
+        report = parity_report(source_dir, consumer_dir)
+    except FileNotFoundError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if report.in_sync:
+        typer.echo(f"shared skills in sync ({len(report.skills)} skills).")
+        raise typer.Exit(code=0)
+
+    for skill in report.skills:
+        if skill.state is not SkillState.IN_SYNC:
+            typer.echo(f"{skill.name}: {skill.state.value}")
+    typer.echo("shared skills drifted — run `git submodule update --remote`.")
+    raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
