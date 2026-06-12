@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -80,7 +79,9 @@ def test_all_five_schemas_present() -> None:
         "merge-agent-response.schema.json",
         "bugfix-agent-response.schema.json",
     }
-    present = {p.name for p in Path(SCHEMA_DIR).glob("*.schema.json")}
+    present = {
+        p.name for p in SCHEMA_DIR.iterdir() if p.name.endswith(".schema.json")
+    }
     assert expected.issubset(present)
 
 
@@ -272,7 +273,11 @@ def test_schema_is_valid_draft_2020_12() -> None:
     """Every schema in the schemas/ directory is a structurally valid draft 2020-12 schema."""
     from jsonschema import Draft202012Validator
 
-    for schema_file in sorted(Path(SCHEMA_DIR).glob("*.schema.json")):
+    schema_files = sorted(
+        (p for p in SCHEMA_DIR.iterdir() if p.name.endswith(".schema.json")),
+        key=lambda p: p.name,
+    )
+    for schema_file in schema_files:
         schema = json.loads(schema_file.read_text(encoding="utf-8"))
         # check_schema raises SchemaError when the meta-schema is violated.
         Draft202012Validator.check_schema(schema)

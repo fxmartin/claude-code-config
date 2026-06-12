@@ -436,7 +436,7 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         "4. Run all quality gates (tests, types, lint, security)\n"
         f"5. Commit: feat({story.epic_name}): {story.title} (#{story.id})\n"
         f"{push}\n\n"
-        "Emit the result block per controller/schemas/build-agent-response.schema.json."
+        "Emit the result block per controller/src/sdlc/schemas/build-agent-response.schema.json."
     )
 
 
@@ -445,7 +445,7 @@ def render_coverage_prompt(story: Story, opts: BuildOptions) -> str:
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
         "Fetch the branch, fill coverage gaps, push, open the PR, then emit the "
-        "result block per controller/schemas/coverage-agent-response.schema.json."
+        "result block per controller/src/sdlc/schemas/coverage-agent-response.schema.json."
     )
 
 
@@ -454,7 +454,7 @@ def render_review_prompt(story: Story, pr_number: int | None) -> str:
         f"Review the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
         "Check architecture, security, performance, coverage, code quality; "
         "approve when satisfied, then emit the result block per "
-        "controller/schemas/review-agent-response.schema.json."
+        "controller/src/sdlc/schemas/review-agent-response.schema.json."
     )
 
 
@@ -462,7 +462,7 @@ def render_merge_prompt(story: Story, pr_number: int | None) -> str:
     return (
         f"Merge the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
         "Rebase before merge to absorb baseline drift, then emit the result "
-        "block per controller/schemas/merge-agent-response.schema.json."
+        "block per controller/src/sdlc/schemas/merge-agent-response.schema.json."
     )
 
 
@@ -471,7 +471,7 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
         f"Bugfix story {story.id}: {story.title}. Stage '{failed_stage}' failed.\n"
         f"Failure: {failure}\n"
         "Classify (CODE_BUG/TEST_BUG/ENV_ISSUE), fix where possible, then emit "
-        "the result block per controller/schemas/bugfix-agent-response.schema.json."
+        "the result block per controller/src/sdlc/schemas/bugfix-agent-response.schema.json."
     )
 
 
