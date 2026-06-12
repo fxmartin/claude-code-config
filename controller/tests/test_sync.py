@@ -164,3 +164,106 @@ def test_real_shared_skills_dir_holds_the_seven_extras() -> None:
     shared = repo_root / "shared-skills"
     discovered = set(discover_shared_skills(shared))
     assert discovered == set(SHARED_SKILLS)
+
+
+# --- edge-case tests (gap analysis: Story 7.4-001 QA gate) -------------------
+
+
+def test_discover_empty_dir_returns_empty_dict(tmp_path: Path) -> None:
+    """An empty skills dir (no *.md) is valid — returns {} not an error."""
+    empty = tmp_path / "shared-skills"
+    empty.mkdir()
+    assert discover_shared_skills(empty) == {}
+
+
+def test_parity_both_empty_dirs_are_in_sync(tmp_path: Path) -> None:
+    """Two empty source/consumer dirs vacuously satisfy parity."""
+    src = tmp_path / "src"
+    consumer = tmp_path / "consumer"
+    src.mkdir()
+    consumer.mkdir()
+    report = parity_report(src, consumer)
+    assert report.in_sync is True
+    assert report.skills == ()
+
+
+def test_discover_ignores_nested_subdirectories(tmp_path: Path) -> None:
+    """*.md files in sub-directories are NOT picked up (glob is non-recursive)."""
+    src = tmp_path / "shared-skills"
+    src.mkdir()
+    _write(src / "top.md", "skill content")
+    nested_dir = src / "subdir"
+    nested_dir.mkdir()
+    _write(nested_dir / "nested.md", "nested — must be ignored")
+    result = discover_shared_skills(src)
+    assert "top" in result
+    assert "nested" not in result
+
+
+def test_crlf_vs_lf_are_treated_as_equal(tmp_path: Path) -> None:
+    """Python Path.read_text() applies universal-newlines normalization.
+
+    CRLF and LF variants of the same logical text compare equal via the sync
+    check — the comparison is text-level (after Python decoding), not raw bytes.
+    This is documented behaviour: skill files stored with different line endings
+    on different OSes do NOT cause false drift.
+    """
+    src = tmp_path / "src"
+    consumer = tmp_path / "consumer"
+    src.mkdir()
+    consumer.mkdir()
+    lf_body = "# Skill\n\nSome content\n"
+    crlf_body = "# Skill\r\n\r\nSome content\r\n"
+    _write(src / "roast.md", lf_body)
+    _write(consumer / "roast.md", crlf_body)
+    report = parity_report(src, consumer)
+    # Universal-newlines normalises both to LF on read → treated as IN_SYNC
+    assert report.in_sync is True
+    states = {s.name: s.state for s in report.skills}
+    assert states["roast"] is SkillState.IN_SYNC
+
+
+def test_parity_source_empty_consumer_has_extra(tmp_path: Path) -> None:
+    """Extra skills in consumer (source is empty) are all flagged as EXTRA_IN_CONSUMER."""
+    src = tmp_path / "src"
+    src.mkdir()
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write(consumer / "stale.md", "leftover skill")
+    report = parity_report(src, consumer)
+    assert report.in_sync is False
+    assert report.skills[0].state is SkillState.EXTRA_IN_CONSUMER
+    assert report.skills[0].name == "stale"
+
+
+def test_parity_consumer_empty_source_has_skills(tmp_path: Path) -> None:
+    """All source skills are MISSING_IN_CONSUMER when consumer dir is empty."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _write(src / "coverage.md", "cov skill")
+    _write(src / "roast.md", "roast skill")
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    report = parity_report(src, consumer)
+    assert report.in_sync is False
+    states = {s.name: s.state for s in report.skills}
+    assert all(v is SkillState.MISSING_IN_CONSUMER for v in states.values())
+
+
+def test_parity_mixed_states_in_one_report(tmp_path: Path) -> None:
+    """A single report can contain IN_SYNC, DRIFTED, MISSING, and EXTRA simultaneously."""
+    src = _seed_source(
+        tmp_path,
+        {"alpha": "same", "beta": "v2", "gamma": "only-in-src"},
+    )
+    consumer = _seed_consumer(
+        tmp_path,
+        {"alpha": "same", "beta": "v1", "delta": "only-in-consumer"},
+    )
+    report = parity_report(src, consumer)
+    states = {s.name: s.state for s in report.skills}
+    assert states["alpha"] is SkillState.IN_SYNC
+    assert states["beta"] is SkillState.DRIFTED
+    assert states["gamma"] is SkillState.MISSING_IN_CONSUMER
+    assert states["delta"] is SkillState.EXTRA_IN_CONSUMER
+    assert report.in_sync is False
