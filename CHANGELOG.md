@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.17.1] - 2026-06-12
+
+### Fixed
+
+- fix(controller): epic-07 e2e gate fixes (#44) (#45)
+
+
 ### Fixed
 
 - fix(controller): bundle the agent JSON schemas inside the `sdlc` package
