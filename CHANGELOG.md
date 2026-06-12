@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.14.0] - 2026-06-12
+
+### Added
+
+- feat(controller): choose runtime and scaffold the cli (#7.1-001) (#40)
+
+
 ### Added
 
 - External controller scaffold (Epic-07, Story 7.1-001). New `controller/`
