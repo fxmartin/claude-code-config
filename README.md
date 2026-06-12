@@ -225,7 +225,7 @@ The same plugin name ships on both platforms with overlapping but not identical 
 - Plus 7 Codex-only utilities: `check-releases`, `coverage`, `create-issue`, `create-project-summary-stats`, `plan-release-update`, `project-review`, `roast`
 - Used as the adversarial review counterpart for Claude Code work: Codex can run `project-review`, `roast`, `coverage`, and `create-issue` against Claude-produced changes to catch bugs, missing tests, brittle assumptions, and integration regressions before merge.
 
-The 7 Codex extras live in a single source of truth at `shared-skills/` in this repo — there is exactly one copy, so the Claude and Codex sides cannot drift (see [ADR-002](docs/adr/002-codex-mirror-sync.md)).
+The 7 Codex extras live in a single source of truth at `shared-skills/` in this repo — there is exactly one copy, so the Claude and Codex sides cannot drift (see [ADR-002](docs/adr/002-codex-mirror-sync.md)). On the Claude side, `install.sh --core` symlinks each one in as a bare top-level slash command (`/check-releases`, `/coverage`, `/create-issue`, `/create-project-summary-stats`, `/plan-release-update`, `/project-review`, `/roast`) — the symlinks keep the single copy, so there is still no duplication.
 
 #### Shared-skills sync workflow
 
