@@ -35,7 +35,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | **COMPLETE** |
 | Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | **COMPLETE** |
 | Epic-06 | Public Release Readiness | MVP | 4 | 9 | P1 | **COMPLETE**[^1] |
-| Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | |
+| Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | **COMPLETE** (PRs #40-#43; E2E_PASS after bugfix #45) |
 | Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | |
 | Epic-09 | Security Baked into Quality Gates + Live Pilot | Roadmap | 4 | 12 | P2 | |
 

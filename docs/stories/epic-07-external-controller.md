@@ -1,5 +1,7 @@
 # Epic 7: External Controller and Typed Contracts
 
+> **Status: COMPLETE** — all 4 stories merged 2026-06-12 (PRs #40, #41, #42, #43; E2E_PASS after bugfix #45)
+
 ## Epic Overview
 
 **Epic ID**: Epic-07
