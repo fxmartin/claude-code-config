@@ -262,3 +262,158 @@ def test_contract_errors_share_base() -> None:
     """ResultBlockError and SchemaValidationError are both ContractError."""
     assert issubclass(ResultBlockError, ContractError)
     assert issubclass(SchemaValidationError, ContractError)
+
+
+# ---------------------------------------------------------------------------
+# Edge cases required by QA gate (Story 7.2-001 coverage)
+# ---------------------------------------------------------------------------
+
+def test_schema_is_valid_draft_2020_12() -> None:
+    """Every schema in the schemas/ directory is a structurally valid draft 2020-12 schema."""
+    from jsonschema import Draft202012Validator
+
+    for schema_file in sorted(Path(SCHEMA_DIR).glob("*.schema.json")):
+        schema = json.loads(schema_file.read_text(encoding="utf-8"))
+        # check_schema raises SchemaError when the meta-schema is violated.
+        Draft202012Validator.check_schema(schema)
+
+
+def test_schema_path_returns_correct_path_for_known_type() -> None:
+    """schema_path resolves the expected filename for each known agent type."""
+    from sdlc.contracts import schema_path
+
+    for agent_type, filename in AGENT_SCHEMAS.items():
+        p = schema_path(agent_type)
+        assert p.name == filename
+        assert p.is_file(), f"Schema file missing: {p}"
+
+
+def test_schema_path_raises_keyerror_for_unknown_type() -> None:
+    """schema_path raises KeyError with an informative message for unknown types."""
+    from sdlc.contracts import schema_path
+
+    with pytest.raises(KeyError) as exc_info:
+        schema_path("phantom")
+    assert "phantom" in str(exc_info.value)
+    # The message must list the valid types so the caller knows what to use.
+    for valid in sorted(AGENT_SCHEMAS):
+        assert valid in str(exc_info.value)
+
+
+def test_parse_result_block_uses_first_block_when_multiple_present() -> None:
+    """When multiple marker blocks appear, only the first is extracted."""
+    first = {"branch_name": "first", "build_status": "SUCCESS", "commit_sha": "aaa"}
+    second = {"branch_name": "second", "build_status": "FAILED", "commit_sha": "bbb"}
+    text = (
+        f"{RESULT_START_MARKER}\n{json.dumps(first)}\n{RESULT_END_MARKER}\n"
+        f"Some inter-block prose.\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(second)}\n{RESULT_END_MARKER}\n"
+    )
+    result = parse_result_block(text)
+    assert result == first
+
+
+def test_parse_result_block_empty_string_raises_result_block_error() -> None:
+    """An empty string (e.g. empty stdin) raises ResultBlockError, not an unhandled exception."""
+    with pytest.raises(ResultBlockError) as exc_info:
+        parse_result_block("")
+    # Must mention the missing start marker, not produce a generic traceback.
+    assert RESULT_START_MARKER in str(exc_info.value)
+
+
+def test_parse_result_block_unicode_payload() -> None:
+    """Unicode content in the JSON block is parsed correctly."""
+    payload = {
+        "branch_name": "feature/unicode-中文-éà",
+        "build_status": "SUCCESS",
+        "commit_sha": "\U0001f680abc123",
+    }
+    text = f"{RESULT_START_MARKER}\n{json.dumps(payload, ensure_ascii=False)}\n{RESULT_END_MARKER}"
+    result = parse_result_block(text)
+    assert result["branch_name"] == payload["branch_name"]
+    assert result["commit_sha"] == payload["commit_sha"]
+
+
+def test_parse_result_block_unicode_surrounds_block() -> None:
+    """Unicode prose surrounding the marker block does not confuse the parser."""
+    payload = {"branch_name": "ok", "build_status": "SUCCESS", "commit_sha": "c0ff33"}
+    text = (
+        "中文文本éà\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(payload)}\n{RESULT_END_MARKER}\n"
+        "\U0001f44d done"
+    )
+    result = parse_result_block(text)
+    assert result == payload
+
+
+def test_validate_command_empty_stdin_exits_nonzero() -> None:
+    """`validate build` with empty stdin exits non-zero with a clear message."""
+    from typer.testing import CliRunner
+    from sdlc.cli import app
+
+    cli_runner = CliRunner()
+    result = cli_runner.invoke(app, ["validate", "build"], input="")
+    assert result.exit_code == 1
+    # Must name the missing marker so the caller knows what to fix.
+    assert "RESULT_JSON" in result.output
+
+
+def test_validate_command_unicode_valid_response() -> None:
+    """`validate build` correctly handles a unicode agent response."""
+    from typer.testing import CliRunner
+    from sdlc.cli import app
+
+    cli_runner = CliRunner()
+    payload = {
+        "branch_name": "feature/élève",
+        "build_status": "SUCCESS",
+        "commit_sha": "unicode1",
+    }
+    response = (
+        f"élève analyse\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(payload, ensure_ascii=False)}\n{RESULT_END_MARKER}\n"
+    )
+    result = cli_runner.invoke(app, ["validate", "build"], input=response)
+    assert result.exit_code == 0, result.output
+    # The CLI uses ensure_ascii=True so non-ASCII chars are \uXXXX-escaped.
+    # Parse the output as JSON to verify round-trip fidelity instead of string match.
+    parsed_output = json.loads(result.output)
+    assert parsed_output["branch_name"] == payload["branch_name"]
+
+
+def test_validate_command_multiple_blocks_uses_first() -> None:
+    """`validate build` with multiple marker blocks validates the first one."""
+    from typer.testing import CliRunner
+    from sdlc.cli import app
+
+    cli_runner = CliRunner()
+    first = {"branch_name": "feature/first", "build_status": "SUCCESS", "commit_sha": "aaa111"}
+    second = {"branch_name": "feature/second", "build_status": "FAILED", "commit_sha": "bbb222"}
+    response = (
+        f"{RESULT_START_MARKER}\n{json.dumps(first)}\n{RESULT_END_MARKER}\n"
+        f"Some output between blocks.\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(second)}\n{RESULT_END_MARKER}\n"
+    )
+    result = cli_runner.invoke(app, ["validate", "build"], input=response)
+    assert result.exit_code == 0, result.output
+    assert "feature/first" in result.output
+
+
+def test_validate_command_malformed_json_in_block() -> None:
+    """`validate build` with malformed JSON in the result block exits 1 with location info."""
+    from typer.testing import CliRunner
+    from sdlc.cli import app
+
+    cli_runner = CliRunner()
+    response = f"{RESULT_START_MARKER}\n{{not_json: true}}\n{RESULT_END_MARKER}\n"
+    result = cli_runner.invoke(app, ["validate", "build"], input=response)
+    assert result.exit_code == 1
+    # The error must include location (line/column) info from parse_result_block.
+    assert "line" in result.output.lower()
+
+
+def test_load_schema_is_cached() -> None:
+    """load_schema returns the same object on repeated calls (lru_cache active)."""
+    schema_a = load_schema("build")
+    schema_b = load_schema("build")
+    assert schema_a is schema_b
