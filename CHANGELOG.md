@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.15.0] - 2026-06-12
+
+### Added
+
+- feat(controller): define agent i/o json-schema contracts (#7.2-001) (#41)
+
+
 ### Added
 
 - Typed agent I/O JSON-schema contracts (Epic-07, Story 7.2-001). Five JSON
