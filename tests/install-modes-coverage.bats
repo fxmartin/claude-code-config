@@ -249,7 +249,7 @@ _run_install() {
     [ "$status" -eq 0 ]
     # Core dry-run lines present
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 11 ]
+    [ "$ln_lines" -eq 18 ]
     # Tools output present (brew or apt mention)
     [[ "$output" == *"brew"* || "$output" == *"apt"* || "$output" == *"Homebrew"* ]]
 }
@@ -258,6 +258,6 @@ _run_install() {
     _run_install --core --mcp --dry-run
     [ "$status" -eq 0 ]
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 11 ]
+    [ "$ln_lines" -eq 18 ]
     [[ "$output" == *"MCP"* || "$output" == *"mcp"* ]]
 }
