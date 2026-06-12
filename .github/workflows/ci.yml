@@ -126,6 +126,40 @@ jobs:
           jq --version
           bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats
 
+  controller-smoke:
+    name: Controller CLI smoke test (uv tool install)
+    # Story 7.1-001: install the sdlc controller CLI and verify `sdlc --version`
+    # matches the version declared in controller/pyproject.toml. Runs on macOS
+    # and Ubuntu (WSL2 stand-in) since the install path must work on both.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install controller CLI
+        run: bash scripts/install-controller.sh
+
+      - name: Verify sdlc --version matches pyproject
+        run: |
+          expected="$(uv run --no-project python -c 'import tomllib,pathlib;print(tomllib.loads(pathlib.Path("controller/pyproject.toml").read_text())["project"]["version"])')"
+          actual="$(sdlc --version)"
+          echo "expected=$expected actual=$actual"
+          test "$expected" = "$actual"
+
+      - name: Run controller test suite
+        run: |
+          cd controller
+          uv sync --extra dev
+          uv run pytest -q
+
   smoke-test:
     name: Smoke test (clean-machine install)
     # Story 3.2-002: end-to-end --core happy path on both supported platforms.

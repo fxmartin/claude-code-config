@@ -1,0 +1,8 @@
+# ABOUTME: Ignores local Python build/venv artifacts for the controller package.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
