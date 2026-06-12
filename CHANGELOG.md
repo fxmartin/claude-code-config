@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.17.0] - 2026-06-12
+
+### Added
+
+- feat(controller): codex mirror sync mechanism (#7.4-001) (#43)
+
+### Shared skills
+
+Codex mirror artifact: bump the `shared-skills` submodule to this tag and run `git submodule update --remote` (see ADR-002).
+
+- feat(controller): codex mirror sync mechanism (#7.4-001) (#43)
+
+
 ### Changed
 
 - Established the Codex mirror sync mechanism (Epic-07, Story 7.4-001). The seven
