@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/build-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for build-agent responses (Story 7.2-001). ABOUTME: Draft 2020-12; extra fields allowed for forward-compat.",
+  "title": "BuildAgentResponse",
+  "description": "Structured result returned by a build agent dispatched by the orchestrator.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["branch_name", "build_status", "commit_sha"],
+  "properties": {
+    "branch_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Feature branch the agent worked on, e.g. feature/7.2-001."
+    },
+    "build_status": {
+      "type": "string",
+      "enum": ["SUCCESS", "FAILED"],
+      "description": "Whether the build stage succeeded."
+    },
+    "commit_sha": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SHA of the commit the agent produced."
+    },
+    "pr_number": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Pull request number, when the agent created one."
+    },
+    "error_summary": {
+      "type": "string",
+      "description": "Human-readable failure summary when build_status is FAILED."
+    }
+  }
+}

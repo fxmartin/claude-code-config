@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/merge-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for merge-agent responses (Story 7.2-001). ABOUTME: Draft 2020-12; extra fields allowed for forward-compat.",
+  "title": "MergeAgentResponse",
+  "description": "Structured result returned by a merge agent dispatched by the orchestrator.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["pr_number", "merge_status", "merge_sha", "merged_at"],
+  "properties": {
+    "pr_number": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Pull request number that was merged."
+    },
+    "merge_status": {
+      "type": "string",
+      "enum": ["MERGED", "FAILED", "SKIPPED"],
+      "description": "Outcome of the merge attempt."
+    },
+    "merge_sha": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SHA of the resulting merge commit."
+    },
+    "merged_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of when the merge landed."
+    }
+  }
+}

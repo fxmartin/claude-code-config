@@ -378,6 +378,17 @@ Agent(
   Return BRANCH_NAME: feature/[ID] and BUILD_STATUS: SUCCESS when done.
   If failed, return BUILD_STATUS: FAILED with error details.
 
+  As the FINAL line of your response, emit a machine-readable result block that
+  conforms to `controller/schemas/build-agent-response.schema.json`:
+
+  <<<RESULT_JSON>>>
+  {"branch_name": "feature/[ID]", "build_status": "SUCCESS", "commit_sha": "[SHA]"}
+  <<<END_RESULT>>>
+
+  (Set "build_status" to "FAILED" and add "error_summary" on failure. Optional
+  "pr_number" when a PR was created.) The controller validates this block; a
+  missing or malformed block is treated as a build failure.
+
   ## Sidebar Ledger + SQLite Ledger
   After each milestone, emit a structured log entry so the cmux sidebar shows parallel-agent progress. Only emit if $CMUX_SOCKET_PATH is set (same guard as the orchestrator preamble).
 
@@ -466,6 +477,16 @@ Agent(
   5. When satisfied: gh pr review [PR_NUMBER] --approve
   Return APPROVAL_STATUS: APPROVED or APPROVAL_STATUS: CHANGES_NEEDED
 
+  As the FINAL line of your response, emit a machine-readable result block that
+  conforms to `controller/schemas/review-agent-response.schema.json`:
+
+  <<<RESULT_JSON>>>
+  {"pr_number": [PR_NUMBER], "approval_status": "APPROVED", "change_count": 0, "final_status": "APPROVED"}
+  <<<END_RESULT>>>
+
+  (Use "CHANGES_NEEDED"/"REJECTED" when the PR is not approved; "change_count"
+  is the number of changes you requested or applied.)
+
   ## Sidebar Ledger + SQLite Ledger
   Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set.
 
@@ -550,6 +571,14 @@ Before starting development, update the progress file at [PROGRESS_FILE]:
    gh pr create --title "feat: [Story Title] (#[ID])" --body "[summary, testing, Implements Story [ID]]"
 
 Return PR_NUMBER: [number] and PR_URL: [url] when done.
+
+As the FINAL line of your response, emit a machine-readable result block that
+conforms to `controller/schemas/build-agent-response.schema.json` (this
+skip-coverage build agent creates the PR, so include "pr_number"):
+
+<<<RESULT_JSON>>>
+{"branch_name": "feature/[ID]", "build_status": "SUCCESS", "commit_sha": "[SHA]", "pr_number": [PR_NUMBER]}
+<<<END_RESULT>>>
 ```
 
 Extract `PR_NUMBER` from the agent result. Skip Step 5a2.
@@ -576,6 +605,15 @@ Before starting development, update the progress file at [PROGRESS_FILE]:
 6. DO NOT push or create a PR — the coverage agent handles that next.
 
 Return BRANCH_NAME: feature/[ID] and BUILD_STATUS: SUCCESS when done.
+
+As the FINAL line of your response, emit a machine-readable result block that
+conforms to `controller/schemas/build-agent-response.schema.json`:
+
+<<<RESULT_JSON>>>
+{"branch_name": "feature/[ID]", "build_status": "SUCCESS", "commit_sha": "[SHA]"}
+<<<END_RESULT>>>
+
+(Set "build_status" to "FAILED" and add "error_summary" on failure.)
 ```
 
 > **Note:** In parallel mode (default), the build agent prompt differs — see Phase 5 Parallel Worktree Mode above. The parallel build agent always pushes the branch so that the coverage agent (in a separate worktree) can access it.

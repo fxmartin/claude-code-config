@@ -1,0 +1,419 @@
+# ABOUTME: Test harness for agent I/O JSON-schema contracts (Story 7.2-001).
+# ABOUTME: Covers valid pass, missing-required failure with field name, extra-field allowed.
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from sdlc.contracts import (
+    AGENT_SCHEMAS,
+    RESULT_END_MARKER,
+    RESULT_START_MARKER,
+    SCHEMA_DIR,
+    ContractError,
+    ResultBlockError,
+    SchemaValidationError,
+    load_schema,
+    parse_and_validate,
+    parse_result_block,
+    validate_response,
+)
+
+# A valid response object for each agent type, matching the published schema.
+VALID_RESPONSES: dict[str, dict] = {
+    "build": {
+        "branch_name": "feature/7.2-001",
+        "build_status": "SUCCESS",
+        "commit_sha": "abc123def456",
+    },
+    "coverage": {
+        "pr_number": 42,
+        "pr_url": "https://github.com/fxmartin/repo/pull/42",
+        "coverage_pct": 93.5,
+        "tests_added": 7,
+        "coverage_status": "PASS",
+        "security_status": "PASS",
+    },
+    "review": {
+        "pr_number": 42,
+        "approval_status": "APPROVED",
+        "change_count": 0,
+        "final_status": "APPROVED",
+    },
+    "merge": {
+        "pr_number": 42,
+        "merge_status": "MERGED",
+        "merge_sha": "deadbeef",
+        "merged_at": "2026-06-12T10:30:00Z",
+    },
+    "bugfix": {
+        "failure_category": "TEST_FAILURE",
+        "fix_status": "FIXED",
+        "tests_passing": True,
+        "bugs_fixed": 1,
+        "tests_fixed": 3,
+    },
+}
+
+ALL_AGENT_TYPES = sorted(AGENT_SCHEMAS)
+
+
+def _wrap(payload: dict) -> str:
+    """Wrap a payload in the result-marker block as an agent would."""
+    body = json.dumps(payload)
+    return f"Some prose.\n{RESULT_START_MARKER}\n{body}\n{RESULT_END_MARKER}\nTrailer."
+
+
+# ---------------------------------------------------------------------------
+# Schema files exist, are draft 2020-12, and are valid JSON
+# ---------------------------------------------------------------------------
+
+def test_all_five_schemas_present() -> None:
+    """Exactly the five agent schemas named in the AC are published."""
+    expected = {
+        "build-agent-response.schema.json",
+        "coverage-agent-response.schema.json",
+        "review-agent-response.schema.json",
+        "merge-agent-response.schema.json",
+        "bugfix-agent-response.schema.json",
+    }
+    present = {p.name for p in Path(SCHEMA_DIR).glob("*.schema.json")}
+    assert expected.issubset(present)
+
+
+@pytest.mark.parametrize("agent_type", ALL_AGENT_TYPES)
+def test_schema_declares_draft_2020_12(agent_type: str) -> None:
+    """Every schema declares the draft 2020-12 dialect."""
+    schema = load_schema(agent_type)
+    assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+
+
+@pytest.mark.parametrize("agent_type", ALL_AGENT_TYPES)
+def test_schema_allows_extra_properties(agent_type: str) -> None:
+    """Schemas opt into forward-compat by allowing additional properties."""
+    schema = load_schema(agent_type)
+    assert schema.get("additionalProperties", True) is True
+
+
+# ---------------------------------------------------------------------------
+# AC: valid response passes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("agent_type", ALL_AGENT_TYPES)
+def test_valid_response_passes(agent_type: str) -> None:
+    """A well-formed response validates and is returned unchanged."""
+    data = VALID_RESPONSES[agent_type]
+    assert validate_response(agent_type, data) == data
+
+
+@pytest.mark.parametrize("agent_type", ALL_AGENT_TYPES)
+def test_valid_response_passes_through_marker_block(agent_type: str) -> None:
+    """parse_and_validate handles the full marker-wrapped agent response."""
+    response = _wrap(VALID_RESPONSES[agent_type])
+    assert parse_and_validate(agent_type, response) == VALID_RESPONSES[agent_type]
+
+
+# ---------------------------------------------------------------------------
+# AC: missing required field fails with the field name in the message
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("agent_type", ALL_AGENT_TYPES)
+def test_missing_required_field_fails_with_field_name(agent_type: str) -> None:
+    """Dropping a required field raises a SchemaValidationError naming it."""
+    data = dict(VALID_RESPONSES[agent_type])
+    schema = load_schema(agent_type)
+    dropped = schema["required"][0]
+    del data[dropped]
+
+    with pytest.raises(SchemaValidationError) as exc_info:
+        validate_response(agent_type, data)
+    message = str(exc_info.value)
+    assert dropped in message, f"field name {dropped!r} not in error: {message!r}"
+    assert "validation failed" != message.lower()
+
+
+def test_missing_field_error_is_actionable_not_generic() -> None:
+    """The error message is actionable, not a bare 'validation failed'."""
+    data = dict(VALID_RESPONSES["build"])
+    del data["branch_name"]
+    with pytest.raises(SchemaValidationError) as exc_info:
+        validate_response("build", data)
+    message = str(exc_info.value)
+    assert "branch_name" in message
+    assert "build" in message
+    assert "missing" in message.lower()
+
+
+# ---------------------------------------------------------------------------
+# AC: extra field is allowed (forward-compat)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("agent_type", ALL_AGENT_TYPES)
+def test_extra_field_is_allowed(agent_type: str) -> None:
+    """An unknown extra field does not break validation (forward-compat)."""
+    data = dict(VALID_RESPONSES[agent_type])
+    data["a_future_field_we_dont_know_yet"] = {"nested": [1, 2, 3]}
+    assert validate_response(agent_type, data) == data
+
+
+# ---------------------------------------------------------------------------
+# Optional fields and type enforcement
+# ---------------------------------------------------------------------------
+
+def test_build_optional_fields_accepted() -> None:
+    """Optional build fields (pr_number, error_summary) validate when present."""
+    data = dict(VALID_RESPONSES["build"])
+    data["build_status"] = "FAILED"
+    data["error_summary"] = "tests failed in module x"
+    data["pr_number"] = 7
+    assert validate_response("build", data) == data
+
+
+def test_bugfix_optional_issue_number_accepted() -> None:
+    """The optional bugfix issue_number validates when present."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["issue_number"] = 314
+    assert validate_response("bugfix", data) == data
+
+
+def test_wrong_type_fails_with_location() -> None:
+    """A field with the wrong type fails and the message names the field."""
+    data = dict(VALID_RESPONSES["coverage"])
+    data["pr_number"] = "not-an-int"
+    with pytest.raises(SchemaValidationError) as exc_info:
+        validate_response("coverage", data)
+    assert "pr_number" in str(exc_info.value)
+
+
+def test_enum_violation_fails() -> None:
+    """A value outside an enum is rejected."""
+    data = dict(VALID_RESPONSES["build"])
+    data["build_status"] = "MAYBE"
+    with pytest.raises(SchemaValidationError):
+        validate_response("build", data)
+
+
+def test_unknown_agent_type_raises_keyerror() -> None:
+    """Validating against an unknown agent type raises KeyError."""
+    with pytest.raises(KeyError):
+        validate_response("nonexistent", {"x": 1})
+
+
+# ---------------------------------------------------------------------------
+# Result-marker block parsing
+# ---------------------------------------------------------------------------
+
+def test_parse_result_block_extracts_object() -> None:
+    """parse_result_block pulls the JSON object out of the marker block."""
+    payload = {"branch_name": "feature/x", "build_status": "SUCCESS"}
+    parsed = parse_result_block(_wrap(payload))
+    assert parsed == payload
+
+
+def test_parse_result_block_missing_start_marker() -> None:
+    """A response with no start marker raises an actionable ResultBlockError."""
+    with pytest.raises(ResultBlockError) as exc_info:
+        parse_result_block("no markers here at all")
+    assert RESULT_START_MARKER in str(exc_info.value)
+
+
+def test_parse_result_block_missing_end_marker() -> None:
+    """A start marker without a matching end marker is reported."""
+    text = f"{RESULT_START_MARKER}\n{{}}"
+    with pytest.raises(ResultBlockError) as exc_info:
+        parse_result_block(text)
+    assert RESULT_END_MARKER in str(exc_info.value)
+
+
+def test_parse_result_block_empty_block() -> None:
+    """An empty marker block raises an actionable error."""
+    text = f"{RESULT_START_MARKER}\n\n{RESULT_END_MARKER}"
+    with pytest.raises(ResultBlockError):
+        parse_result_block(text)
+
+
+def test_parse_result_block_invalid_json_reports_location() -> None:
+    """Malformed JSON in the block surfaces line/column, not just 'failed'."""
+    text = f"{RESULT_START_MARKER}\n{{not json}}\n{RESULT_END_MARKER}"
+    with pytest.raises(ResultBlockError) as exc_info:
+        parse_result_block(text)
+    message = str(exc_info.value)
+    assert "line" in message.lower()
+
+
+def test_parse_result_block_non_object_rejected() -> None:
+    """A JSON array (not an object) in the block is rejected."""
+    text = f"{RESULT_START_MARKER}\n[1, 2, 3]\n{RESULT_END_MARKER}"
+    with pytest.raises(ResultBlockError):
+        parse_result_block(text)
+
+
+def test_parse_and_validate_propagates_schema_error() -> None:
+    """parse_and_validate raises SchemaValidationError on a bad payload."""
+    bad = {"build_status": "SUCCESS"}  # missing branch_name, commit_sha
+    with pytest.raises(SchemaValidationError):
+        parse_and_validate("build", _wrap(bad))
+
+
+def test_contract_errors_share_base() -> None:
+    """ResultBlockError and SchemaValidationError are both ContractError."""
+    assert issubclass(ResultBlockError, ContractError)
+    assert issubclass(SchemaValidationError, ContractError)
+
+
+# ---------------------------------------------------------------------------
+# Edge cases required by QA gate (Story 7.2-001 coverage)
+# ---------------------------------------------------------------------------
+
+def test_schema_is_valid_draft_2020_12() -> None:
+    """Every schema in the schemas/ directory is a structurally valid draft 2020-12 schema."""
+    from jsonschema import Draft202012Validator
+
+    for schema_file in sorted(Path(SCHEMA_DIR).glob("*.schema.json")):
+        schema = json.loads(schema_file.read_text(encoding="utf-8"))
+        # check_schema raises SchemaError when the meta-schema is violated.
+        Draft202012Validator.check_schema(schema)
+
+
+def test_schema_path_returns_correct_path_for_known_type() -> None:
+    """schema_path resolves the expected filename for each known agent type."""
+    from sdlc.contracts import schema_path
+
+    for agent_type, filename in AGENT_SCHEMAS.items():
+        p = schema_path(agent_type)
+        assert p.name == filename
+        assert p.is_file(), f"Schema file missing: {p}"
+
+
+def test_schema_path_raises_keyerror_for_unknown_type() -> None:
+    """schema_path raises KeyError with an informative message for unknown types."""
+    from sdlc.contracts import schema_path
+
+    with pytest.raises(KeyError) as exc_info:
+        schema_path("phantom")
+    assert "phantom" in str(exc_info.value)
+    # The message must list the valid types so the caller knows what to use.
+    for valid in sorted(AGENT_SCHEMAS):
+        assert valid in str(exc_info.value)
+
+
+def test_parse_result_block_uses_first_block_when_multiple_present() -> None:
+    """When multiple marker blocks appear, only the first is extracted."""
+    first = {"branch_name": "first", "build_status": "SUCCESS", "commit_sha": "aaa"}
+    second = {"branch_name": "second", "build_status": "FAILED", "commit_sha": "bbb"}
+    text = (
+        f"{RESULT_START_MARKER}\n{json.dumps(first)}\n{RESULT_END_MARKER}\n"
+        f"Some inter-block prose.\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(second)}\n{RESULT_END_MARKER}\n"
+    )
+    result = parse_result_block(text)
+    assert result == first
+
+
+def test_parse_result_block_empty_string_raises_result_block_error() -> None:
+    """An empty string (e.g. empty stdin) raises ResultBlockError, not an unhandled exception."""
+    with pytest.raises(ResultBlockError) as exc_info:
+        parse_result_block("")
+    # Must mention the missing start marker, not produce a generic traceback.
+    assert RESULT_START_MARKER in str(exc_info.value)
+
+
+def test_parse_result_block_unicode_payload() -> None:
+    """Unicode content in the JSON block is parsed correctly."""
+    payload = {
+        "branch_name": "feature/unicode-中文-éà",
+        "build_status": "SUCCESS",
+        "commit_sha": "\U0001f680abc123",
+    }
+    text = f"{RESULT_START_MARKER}\n{json.dumps(payload, ensure_ascii=False)}\n{RESULT_END_MARKER}"
+    result = parse_result_block(text)
+    assert result["branch_name"] == payload["branch_name"]
+    assert result["commit_sha"] == payload["commit_sha"]
+
+
+def test_parse_result_block_unicode_surrounds_block() -> None:
+    """Unicode prose surrounding the marker block does not confuse the parser."""
+    payload = {"branch_name": "ok", "build_status": "SUCCESS", "commit_sha": "c0ff33"}
+    text = (
+        "中文文本éà\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(payload)}\n{RESULT_END_MARKER}\n"
+        "\U0001f44d done"
+    )
+    result = parse_result_block(text)
+    assert result == payload
+
+
+def test_validate_command_empty_stdin_exits_nonzero() -> None:
+    """`validate build` with empty stdin exits non-zero with a clear message."""
+    from typer.testing import CliRunner
+    from sdlc.cli import app
+
+    cli_runner = CliRunner()
+    result = cli_runner.invoke(app, ["validate", "build"], input="")
+    assert result.exit_code == 1
+    # Must name the missing marker so the caller knows what to fix.
+    assert "RESULT_JSON" in result.output
+
+
+def test_validate_command_unicode_valid_response() -> None:
+    """`validate build` correctly handles a unicode agent response."""
+    from typer.testing import CliRunner
+    from sdlc.cli import app
+
+    cli_runner = CliRunner()
+    payload = {
+        "branch_name": "feature/élève",
+        "build_status": "SUCCESS",
+        "commit_sha": "unicode1",
+    }
+    response = (
+        f"élève analyse\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(payload, ensure_ascii=False)}\n{RESULT_END_MARKER}\n"
+    )
+    result = cli_runner.invoke(app, ["validate", "build"], input=response)
+    assert result.exit_code == 0, result.output
+    # The CLI uses ensure_ascii=True so non-ASCII chars are \uXXXX-escaped.
+    # Parse the output as JSON to verify round-trip fidelity instead of string match.
+    parsed_output = json.loads(result.output)
+    assert parsed_output["branch_name"] == payload["branch_name"]
+
+
+def test_validate_command_multiple_blocks_uses_first() -> None:
+    """`validate build` with multiple marker blocks validates the first one."""
+    from typer.testing import CliRunner
+    from sdlc.cli import app
+
+    cli_runner = CliRunner()
+    first = {"branch_name": "feature/first", "build_status": "SUCCESS", "commit_sha": "aaa111"}
+    second = {"branch_name": "feature/second", "build_status": "FAILED", "commit_sha": "bbb222"}
+    response = (
+        f"{RESULT_START_MARKER}\n{json.dumps(first)}\n{RESULT_END_MARKER}\n"
+        f"Some output between blocks.\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(second)}\n{RESULT_END_MARKER}\n"
+    )
+    result = cli_runner.invoke(app, ["validate", "build"], input=response)
+    assert result.exit_code == 0, result.output
+    assert "feature/first" in result.output
+
+
+def test_validate_command_malformed_json_in_block() -> None:
+    """`validate build` with malformed JSON in the result block exits 1 with location info."""
+    from typer.testing import CliRunner
+    from sdlc.cli import app
+
+    cli_runner = CliRunner()
+    response = f"{RESULT_START_MARKER}\n{{not_json: true}}\n{RESULT_END_MARKER}\n"
+    result = cli_runner.invoke(app, ["validate", "build"], input=response)
+    assert result.exit_code == 1
+    # The error must include location (line/column) info from parse_result_block.
+    assert "line" in result.output.lower()
+
+
+def test_load_schema_is_cached() -> None:
+    """load_schema returns the same object on repeated calls (lru_cache active)."""
+    schema_a = load_schema("build")
+    schema_b = load_schema("build")
+    assert schema_a is schema_b

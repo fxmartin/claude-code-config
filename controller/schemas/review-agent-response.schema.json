@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/review-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for review-agent responses (Story 7.2-001). ABOUTME: Draft 2020-12; extra fields allowed for forward-compat.",
+  "title": "ReviewAgentResponse",
+  "description": "Structured result returned by a review agent dispatched by the orchestrator.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["pr_number", "approval_status", "change_count", "final_status"],
+  "properties": {
+    "pr_number": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Pull request number under review."
+    },
+    "approval_status": {
+      "type": "string",
+      "enum": ["APPROVED", "CHANGES_NEEDED"],
+      "description": "Reviewer verdict on the pull request."
+    },
+    "change_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of changes the reviewer requested or applied."
+    },
+    "final_status": {
+      "type": "string",
+      "enum": ["APPROVED", "REJECTED"],
+      "description": "Terminal state of the review stage."
+    }
+  }
+}

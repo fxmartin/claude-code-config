@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Typed agent I/O JSON-schema contracts (Epic-07, Story 7.2-001). Five JSON
+  Schema draft 2020-12 schemas in `controller/schemas/` for the `build`,
+  `coverage`, `review`, `merge`, and `bugfix` agent responses. Agents now emit
+  their structured result as the final line of their response, fenced with
+  `<<<RESULT_JSON>>>` ... `<<<END_RESULT>>>` markers. A new `sdlc.contracts`
+  module parses the marker block and validates it (`jsonschema`), surfacing
+  validation errors as actionable messages that name the offending field. The
+  `sdlc validate <agent-type> [file]` command exposes this on the CLI (reads a
+  file or stdin). Build-stories agent prompts updated to require the result
+  block. New `agents/contracts.md` documents the contract; test harness
+  `controller/tests/test_schemas.py` covers valid-passes, missing-required-fails
+  -with-field-name, and extra-field-allowed (forward-compat).
+
 ## [v1.14.0] - 2026-06-12
 
 ### Added

@@ -1,5 +1,5 @@
-# ABOUTME: Behavior tests for the sdlc CLI scaffold (Story 7.1-001).
-# ABOUTME: Covers --version, --help subcommand listing, and the init stub.
+# ABOUTME: Behavior tests for the sdlc CLI scaffold (Story 7.1-001) and validate (7.2-001).
+# ABOUTME: Covers --version, --help, the init stub, and the validate command.
 
 from __future__ import annotations
 
@@ -92,11 +92,10 @@ def test_state_stub_runs() -> None:
     assert "state" in result.stdout.lower()
 
 
-def test_validate_stub_runs() -> None:
-    """The validate stub exits 0 and echoes its name."""
+def test_validate_requires_agent_type() -> None:
+    """`validate` now requires an agent-type argument (Story 7.2-001)."""
     result = runner.invoke(app, ["validate"])
-    assert result.exit_code == 0
-    assert "validate" in result.stdout.lower()
+    assert result.exit_code != 0
 
 
 def test_rollback_stub_runs() -> None:
@@ -121,10 +120,64 @@ def test_no_args_shows_help() -> None:
 
 def test_stub_output_contains_not_implemented() -> None:
     """All stub commands clearly indicate they are not yet implemented."""
-    stubs = ["build", "resume", "status", "state", "validate", "rollback"]
+    stubs = ["build", "resume", "status", "state", "rollback"]
     for cmd in stubs:
         result = runner.invoke(app, [cmd])
         assert result.exit_code == 0, f"{cmd} exited with {result.exit_code}"
         assert "not yet implemented" in result.stdout, (
             f"{cmd} output does not contain 'not yet implemented': {result.stdout!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# `sdlc validate` command (Story 7.2-001)
+# ---------------------------------------------------------------------------
+
+_VALID_BUILD_RESPONSE = (
+    "Build done.\n"
+    "<<<RESULT_JSON>>>\n"
+    '{"branch_name": "feature/7.2-001", "build_status": "SUCCESS", '
+    '"commit_sha": "abc123"}\n'
+    "<<<END_RESULT>>>\n"
+)
+
+
+def test_validate_accepts_valid_response_via_stdin() -> None:
+    """`validate build` reads stdin and exits 0 on a valid response."""
+    result = runner.invoke(app, ["validate", "build"], input=_VALID_BUILD_RESPONSE)
+    assert result.exit_code == 0, result.stdout
+    assert "feature/7.2-001" in result.stdout
+
+
+def test_validate_accepts_valid_response_via_file(tmp_path) -> None:
+    """`validate build <file>` reads a file and exits 0 on a valid response."""
+    response = tmp_path / "resp.txt"
+    response.write_text(_VALID_BUILD_RESPONSE, encoding="utf-8")
+    result = runner.invoke(app, ["validate", "build", str(response)])
+    assert result.exit_code == 0, result.stdout
+
+
+def test_validate_rejects_missing_field_with_actionable_error() -> None:
+    """A missing required field exits non-zero and names the field on stderr."""
+    bad = (
+        "<<<RESULT_JSON>>>\n"
+        '{"build_status": "SUCCESS", "commit_sha": "abc123"}\n'
+        "<<<END_RESULT>>>\n"
+    )
+    result = runner.invoke(app, ["validate", "build"], input=bad)
+    assert result.exit_code == 1
+    assert "branch_name" in result.output
+
+
+def test_validate_rejects_missing_marker_block() -> None:
+    """A response with no marker block exits non-zero with a clear message."""
+    result = runner.invoke(app, ["validate", "build"], input="no markers")
+    assert result.exit_code == 1
+    assert "RESULT_JSON" in result.output
+
+
+def test_validate_rejects_unknown_agent_type() -> None:
+    """An unknown agent type exits with code 2 and lists valid types."""
+    result = runner.invoke(app, ["validate", "frobnicate"], input="{}")
+    assert result.exit_code == 2
+    assert "unknown agent type" in result.output

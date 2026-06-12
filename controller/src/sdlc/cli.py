@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
+
 import typer
 
 from sdlc import __version__
+from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
 
 # The full set of planned subcommands with one-line descriptions. `--help`
 # renders these even while the bodies are stubs, so the surface area is visible
@@ -78,9 +83,43 @@ def state() -> None:
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["validate"])
-def validate() -> None:
-    """Validate an agent response against its schema (stub, see Story 7.2-001)."""
-    typer.echo("validate: not yet implemented.")
+def validate(
+    agent_type: str = typer.Argument(
+        ...,
+        help=f"Agent type to validate. One of: {', '.join(sorted(AGENT_SCHEMAS))}.",
+    ),
+    response_file: Path | None = typer.Argument(
+        None,
+        help="File containing the agent response. Reads stdin when omitted.",
+    ),
+) -> None:
+    """Validate an agent response against its JSON-schema contract.
+
+    Reads the agent's free-form response (from a file or stdin), extracts the
+    fenced result block, validates it against the schema for ``agent_type``,
+    and prints the validated JSON. Validation failures exit non-zero with an
+    actionable message naming the offending field.
+    """
+    if agent_type not in AGENT_SCHEMAS:
+        valid = ", ".join(sorted(AGENT_SCHEMAS))
+        typer.echo(
+            f"error: unknown agent type {agent_type!r}; expected one of: {valid}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    if response_file is not None:
+        response = response_file.read_text(encoding="utf-8")
+    else:
+        response = sys.stdin.read()
+
+    try:
+        data = parse_and_validate(agent_type, response)
+    except ContractError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(data, indent=2, sort_keys=True))
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["rollback"])

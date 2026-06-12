@@ -12,6 +12,7 @@ authors = [{ name = "FX", email = "mail@fxmartin.me" }]
 dependencies = [
     "typer>=0.12",
     "pydantic>=2.7",
+    "jsonschema>=4.21",
 ]
 
 [project.scripts]
