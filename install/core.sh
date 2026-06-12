@@ -33,6 +33,18 @@ install_core_run() {
   create_symlink "$SCRIPT_DIR/skills"                  "$CLAUDE_DIR/skills"
   create_symlink "$SCRIPT_DIR/hooks"                   "$CLAUDE_DIR/hooks"
 
+  # Shared skills (ADR-002) are the single source of truth synced to the Codex
+  # mirror; they are NOT duplicated under commands/. Symlink each one in as a
+  # bare top-level slash command (e.g. /coverage, /roast, /create-issue) so the
+  # commands CLAUDE.md advertises keep resolving — one copy, no duplication.
+  ensure_dir "$CLAUDE_DIR/commands"
+  for shared_skill in "$SCRIPT_DIR"/shared-skills/*.md; do
+    [ -e "$shared_skill" ] || continue
+    skill_name="$(basename "$shared_skill")"
+    [ "$skill_name" = "README.md" ] && continue
+    create_symlink "$shared_skill" "$CLAUDE_DIR/commands/$skill_name"
+  done
+
   # Local marketplace — exposes the autonomous-sdlc plugin to Claude Code.
   ensure_dir "$CLAUDE_DIR/plugins/marketplaces"
   create_symlink "$SCRIPT_DIR" "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config"
@@ -50,5 +62,11 @@ install_core_uninstall() {
   remove_symlink "$CLAUDE_DIR/docs"                    "$SCRIPT_DIR/docs"
   remove_symlink "$CLAUDE_DIR/skills"                  "$SCRIPT_DIR/skills"
   remove_symlink "$CLAUDE_DIR/hooks"                   "$SCRIPT_DIR/hooks"
+  for shared_skill in "$SCRIPT_DIR"/shared-skills/*.md; do
+    [ -e "$shared_skill" ] || continue
+    skill_name="$(basename "$shared_skill")"
+    [ "$skill_name" = "README.md" ] && continue
+    remove_symlink "$CLAUDE_DIR/commands/$skill_name" "$shared_skill"
+  done
   remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
 }

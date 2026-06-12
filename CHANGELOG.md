@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Established the Codex mirror sync mechanism (Epic-07, Story 7.4-001). The seven
+  shared skills (`check-releases`, `coverage`, `create-issue`,
+  `create-project-summary-stats`, `plan-release-update`, `project-review`,
+  `roast`) now live in a single source of truth at `shared-skills/`; their
+  duplicate copies under `commands/` are removed. The `nix-install` Codex mirror
+  consumes them as a git submodule (ADR-002), updating with
+  `git submodule update --remote` and verifying parity via `sdlc sync-check`
+  (`scripts/sync-shared-skills.sh`). Each release tag is the versioned shared-skills
+  artifact.
+
 ## [v1.16.0] - 2026-06-12
 
 ### Added

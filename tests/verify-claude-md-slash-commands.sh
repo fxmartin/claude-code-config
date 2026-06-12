@@ -35,6 +35,11 @@ resolves() {
   if find "$REPO_ROOT/commands" -type f -name "$name.md" | grep -q .; then return 0; fi
   if [ -f "$REPO_ROOT/plugins/autonomous-sdlc/skills/$name/SKILL.md" ]; then return 0; fi
   if [ -f "$REPO_ROOT/skills/$name/SKILL.md" ]; then return 0; fi
+  # Shared skills (ADR-002) live in a single source of truth under
+  # shared-skills/ and are NOT duplicated under commands/. The installer
+  # symlinks each one in as a bare top-level command, so a bare reference
+  # like /coverage resolves here.
+  if [ -f "$REPO_ROOT/shared-skills/$name.md" ]; then return 0; fi
   return 1
 }
 

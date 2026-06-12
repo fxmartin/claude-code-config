@@ -29,7 +29,9 @@ Plus `fix-issue` for triaging GitHub issues and `resume-build-agents` for resumi
 
 ## Codex symmetry
 
-This plugin name and prefix match the Codex `autonomous-sdlc` plugin (`~/Documents/nix-install/plugins/autonomous-sdlc/`). The Claude side ships 8 of the 15 Codex skills — the user-facing SDLC chain. The remaining Codex skills (`check-releases`, `coverage`, `create-issue`, `create-project-summary-stats`, `plan-release-update`, `project-review`, `roast`) live as namespaced commands on the Claude side (`/devops:check-releases`, `/quality:coverage`, etc.) and are not duplicated here.
+This plugin name and prefix match the Codex `autonomous-sdlc` plugin (`~/Documents/nix-install/plugins/autonomous-sdlc/`). The Claude side ships 8 of the 15 Codex skills — the user-facing SDLC chain. The remaining 7 skills (`check-releases`, `coverage`, `create-issue`, `create-project-summary-stats`, `plan-release-update`, `project-review`, `roast`) live in a single source of truth at `shared-skills/` in this repo and are **not duplicated** — the Codex mirror consumes them as a git submodule, so the two runtimes cannot drift (see [ADR-002](../../docs/adr/002-codex-mirror-sync.md)).
+
+**Sync workflow.** A consumer pulls the latest shared skills with `git submodule update --remote`, then verifies byte-for-byte parity with `sdlc sync-check <source>/shared-skills <consumer>/shared-skills` (wrapped by `scripts/sync-shared-skills.sh`). Each release tag of this repo is the versioned shared-skills artifact a consumer pins to.
 
 ## Installation
 

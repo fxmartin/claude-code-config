@@ -61,9 +61,9 @@ _run_install() {
     do
         [[ "$output" == *"[dry-run]"*"${target}"* ]]
     done
-    # 11 ln -s lines expected (10 config items + 1 marketplace)
+    # 18 ln -s lines expected (10 config items + 1 marketplace + 7 shared skills)
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 11 ]
+    [ "$ln_lines" -eq 18 ]
 }
 
 @test "--core --dry-run previews git submodule init" {
@@ -212,7 +212,7 @@ _run_install() {
     _run_install --all --dry-run
     [ "$status" -eq 0 ]
     all_ln="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$all_ln" -eq 11 ]
+    [ "$all_ln" -eq 18 ]
 }
 
 # ─── Backward-compat flags ───────────────────────────────────────────
@@ -230,12 +230,12 @@ _run_install() {
     _run_install --core --tools --shell --dry-run
     [ "$status" -eq 0 ]
     out_new="$output"
-    # Both should perform the same number of ln operations (11 core)
+    # Both should perform the same number of ln operations (18 core)
     # and neither should attempt the MCP jq merge.
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 11 ]
-    [ "$new_ln" -eq 11 ]
+    [ "$legacy_ln" -eq 18 ]
+    [ "$new_ln" -eq 18 ]
     # Neither should mention writing to ~/.claude.json
     [[ "$out_legacy" != *"Merged MCP"* ]]
     [[ "$out_new" != *"Merged MCP"* ]]
@@ -256,8 +256,8 @@ _run_install() {
     out_new="$output"
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 11 ]
-    [ "$new_ln" -eq 11 ]
+    [ "$legacy_ln" -eq 18 ]
+    [ "$new_ln" -eq 18 ]
 }
 
 # ─── --uninstall ─────────────────────────────────────────────────────

@@ -225,7 +225,27 @@ The same plugin name ships on both platforms with overlapping but not identical 
 - Plus 7 Codex-only utilities: `check-releases`, `coverage`, `create-issue`, `create-project-summary-stats`, `plan-release-update`, `project-review`, `roast`
 - Used as the adversarial review counterpart for Claude Code work: Codex can run `project-review`, `roast`, `coverage`, and `create-issue` against Claude-produced changes to catch bugs, missing tests, brittle assumptions, and integration regressions before merge.
 
-The 7 Codex extras live as namespaced **commands** on the Claude side (`/devops:check-releases`, `/quality:roast`, etc.) under `commands/` rather than inside the plugin — so they're available everywhere, just at a different invocation path.
+The 7 Codex extras live in a single source of truth at `shared-skills/` in this repo — there is exactly one copy, so the Claude and Codex sides cannot drift (see [ADR-002](docs/adr/002-codex-mirror-sync.md)). On the Claude side, `install.sh --core` symlinks each one in as a bare top-level slash command (`/check-releases`, `/coverage`, `/create-issue`, `/create-project-summary-stats`, `/plan-release-update`, `/project-review`, `/roast`) — the symlinks keep the single copy, so there is still no duplication.
+
+#### Shared-skills sync workflow
+
+`claude-code-config` (this repo) is the source of truth; the `nix-install` Codex mirror consumes `shared-skills/` as a git submodule.
+
+- **Edit** a shared skill here, in `shared-skills/`. Commit and release as usual — each `vX.Y.Z` tag is the versioned shared-skills artifact a consumer pins to.
+- **Pull** the latest into a consumer repo with one command:
+
+  ```bash
+  git submodule update --remote          # or: ./scripts/sync-shared-skills.sh update
+  ```
+
+- **Verify** byte-for-byte parity after pulling:
+
+  ```bash
+  sdlc sync-check <source>/shared-skills <consumer>/shared-skills
+  # or: ./scripts/sync-shared-skills.sh verify <source>/shared-skills <consumer>/shared-skills
+  ```
+
+  Exits 0 in sync, 1 on drift (naming the offending skill), 2 if a directory is missing.
 
 ### Agent roster
 
