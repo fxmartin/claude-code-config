@@ -1,0 +1,21 @@
+# ABOUTME: High-risk file glob patterns that block merge until a human approves.
+# ABOUTME: Story 8.2-001 — consumed by sdlc.risk_gate and .github/workflows/risk-gate.yml.
+#
+# Any changed file matching one of these gitignore-style globs flags the PR as
+# `risk:high`. Globs follow the convention: `**` crosses path separators, `*`
+# matches within a single path segment. Per-repo additions go in a consumer
+# repo's `.sdlc-risk-config.yaml` (additive, never replacing this baseline).
+high_risk_patterns:
+  - "**/auth/**"
+  - "**/authentication/**"
+  - "**/payments/**"
+  - "**/billing/**"
+  - "**/migrations/**"
+  - "**/.github/workflows/**"
+  - "Dockerfile*"
+  - "**/*.tf"
+  - "**/*.tfvars"
+  - "**/secrets/**"
+  - "**/*.sh"  # destructive shell scripts; can be narrowed
+  - "**/iam/**"
+  - "**/policies/**"

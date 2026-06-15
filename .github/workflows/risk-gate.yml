@@ -1,0 +1,155 @@
+name: Risk Gate
+
+# High-risk file approval gate (Epic-08 Story 8.2-001).
+#
+# Any PR that touches a high-risk path (auth, payments, migrations, infra,
+# secrets, destructive shell, ...) is flagged `risk:high` and the `risk-gate`
+# check fails until a member of the `risk-approver` GitHub team approves. The
+# merge agent (controller side) refuses to merge a `risk:high` PR without that
+# human approval and never uses `gh pr merge --admin` to bypass it.
+#
+# Re-runs on review submission so an approval flips the check from red to green
+# without a new push.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+# Needs to label + comment on the PR; contents:read to diff the change set.
+permissions:
+  contents: read
+  pull-requests: write
+
+# A new push or review supersedes an in-flight gate evaluation for the same PR.
+concurrency:
+  group: risk-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  RISK_LABEL: "risk:high"
+  RISK_TEAM: "risk-approver"
+
+jobs:
+  risk-gate:
+    name: High-risk file approval gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect high-risk changed files
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Compare the PR head against the merge-base with the target branch.
+          git fetch --no-tags origin "${BASE_SHA}" "${HEAD_SHA}" 2>/dev/null || true
+          matches="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" \
+            | bash scripts/risk-gate-detect.sh || true)"
+
+          if [ -n "${matches}" ]; then
+            echo "high_risk=true" >> "${GITHUB_OUTPUT}"
+            {
+              echo "matched<<EOF"
+              echo "${matches}"
+              echo "EOF"
+            } >> "${GITHUB_OUTPUT}"
+            echo "High-risk files detected:"
+            echo "${matches}"
+          else
+            echo "high_risk=false" >> "${GITHUB_OUTPUT}"
+            echo "No high-risk files in this change set."
+          fi
+
+      - name: Label, comment, and require human approval
+        if: steps.detect.outputs.high_risk == 'true'
+        uses: actions/github-script@v7
+        env:
+          MATCHED: ${{ steps.detect.outputs.matched }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const riskLabel = process.env.RISK_LABEL;
+            const riskTeam = process.env.RISK_TEAM;
+            const matched = process.env.MATCHED || "";
+
+            // 1. Add the risk:high label (idempotent).
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: pr.number, labels: [riskLabel],
+            });
+
+            // 2. Post (once) a comment listing matched files + required reviewers.
+            const fileLines = matched.split("\n").filter(Boolean)
+              .map((l) => "- `" + l.replace(/\t/, "` ← matched `") + "`")
+              .join("\n");
+            const marker = "<!-- risk-gate-comment -->";
+            const body = [
+              marker,
+              "## :lock: High-risk change detected",
+              "",
+              "This PR touches high-risk paths and is blocked at merge until a",
+              "human on the **`" + riskTeam + "`** team approves it. The merge",
+              "agent will not bypass this gate (`--admin` is not used).",
+              "",
+              "**Matched files:**",
+              fileLines,
+              "",
+              "**Required reviewers:** a member of the `" + riskTeam + "` team.",
+            ].join("\n");
+
+            const comments = await github.rest.issues.listComments({
+              owner, repo, issue_number: pr.number, per_page: 100,
+            });
+            const existing = comments.data.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number, body,
+              });
+            }
+
+            // 3. Check for an approving review from a risk-approver member.
+            const reviews = await github.rest.pulls.listReviews({
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            // Keep only the latest review state per author.
+            const latest = new Map();
+            for (const r of reviews.data) {
+              if (r.user && r.user.login) latest.set(r.user.login, r.state);
+            }
+
+            let approvedByApprover = false;
+            for (const [login, state] of latest) {
+              if (state !== "APPROVED") continue;
+              try {
+                const membership = await github.rest.teams.getMembershipForUserInOrg({
+                  org: owner, team_slug: riskTeam, username: login,
+                });
+                if (membership.data.state === "active") {
+                  approvedByApprover = true;
+                  break;
+                }
+              } catch (err) {
+                // Not a team member (404) — keep scanning other approvers.
+                if (err.status !== 404) throw err;
+              }
+            }
+
+            if (!approvedByApprover) {
+              core.setFailed(
+                "Risk gate: a `" + riskTeam + "` team member must approve this " +
+                "high-risk PR before it can merge."
+              );
+            } else {
+              core.info("Risk gate: approved by a " + riskTeam + " team member.");
+            }

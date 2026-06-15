@@ -1,0 +1,15 @@
+README.md
+docs/guide.md
+src/app/main.py
+src/auth/login.py
+services/billing/invoice.py
+db/migrations/0001_init.sql
+.github/workflows/ci.yml
+Dockerfile
+Dockerfile.prod
+infra/network.tf
+infra/prod.tfvars
+config/secrets/keys.json
+scripts/deploy.sh
+platform/iam/role.json
+platform/policies/access.json

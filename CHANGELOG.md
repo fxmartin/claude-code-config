@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- feat(risk-gate): high-risk file pattern detection and human-approval block
+  (#8.2-001). A new `risk-gate` GitHub workflow flags any PR touching high-risk
+  paths (auth, payments, migrations, infra, secrets, destructive shell) with the
+  `risk:high` label, comments the matched files, and fails until a
+  `risk-approver` team member approves. Detection logic ships as
+  `scripts/risk-gate-detect.sh` and `controller/src/sdlc/risk_gate.py`, driven by
+  `controller/config/high-risk-patterns.yaml` with additive per-repo overrides
+  via `.sdlc-risk-config.yaml`. The merge agent refuses to merge a `risk:high` PR
+  without human approval and never bypasses with `gh pr merge --admin`. Documented
+  in `docs/high-risk-gate.md`.
+
 ## [v1.17.1] - 2026-06-12
 
 ### Fixed

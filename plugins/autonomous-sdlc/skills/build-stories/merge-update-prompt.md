@@ -72,11 +72,48 @@ If rebase fails:
 - Do NOT proceed to Step 1
 - STOP here (orchestrator will route to bugfix agent)
 
+## Step 0.5: High-Risk Approval Gate (Epic-08 Story 8.2-001)
+
+A PR that touches high-risk paths (auth, payments, migrations, infrastructure,
+secrets, destructive shell) carries the `risk:high` label, applied by the
+`risk-gate` workflow. Such a PR MUST NOT be merged until a human on the
+`risk-approver` GitHub team has approved it. You merge autonomously — so for
+high-risk PRs you STOP and hand back to the human, you do not merge.
+
+```bash
+# Is this PR flagged high-risk?
+HAS_RISK_LABEL=$(gh pr view {{PR_NUMBER}} --json labels \
+  -q '.labels[].name' | grep -Fx 'risk:high' || true)
+
+if [ -n "${HAS_RISK_LABEL}" ]; then
+  # Require an APPROVED review from a risk-approver team member. The
+  # risk-gate check itself enforces this; the agent re-checks so it never
+  # merges ahead of the gate.
+  APPROVED=$(gh pr view {{PR_NUMBER}} --json reviews \
+    -q '[.reviews[] | select(.state=="APPROVED")] | length')
+  if [ "${APPROVED:-0}" -eq 0 ]; then
+    echo "MERGE_STATUS: BLOCKED_HIGH_RISK"
+    echo "DETAIL: PR #{{PR_NUMBER}} is labelled risk:high and has no human approval; a risk-approver must approve before merge."
+    exit 1
+  fi
+fi
+```
+
+If the PR is `risk:high` and lacks a human approval:
+- Output `MERGE_STATUS: BLOCKED_HIGH_RISK`
+- Do NOT proceed to Step 1
+- STOP here (the orchestrator surfaces this for human action)
+
+Never use `gh pr merge --admin` to bypass a failing `risk-gate` check.
+
 ## Step 1: Merge PR
 
 ```bash
 gh pr merge {{PR_NUMBER}} --squash --delete-branch
 ```
+
+Do NOT pass `--admin`: the high-risk gate is a human checkpoint and must not be
+bypassed by the agent.
 
 If merge fails (conflict, checks failing, etc.):
 - Output `MERGE_STATUS: CONFLICT` or `MERGE_STATUS: FAILED` with error details
@@ -138,6 +175,7 @@ git push
 Output exactly one of these status lines:
 
 - `MERGE_STATUS: SUCCESS` — merge, progress update, and DoD update all completed
+- `MERGE_STATUS: BLOCKED_HIGH_RISK` — PR is labelled `risk:high` and has no human approval from the `risk-approver` team; a human must approve before merge (agent never uses `--admin` to bypass)
 - `MERGE_STATUS: REBASE_CONFLICT` — branch could not be rebased onto updated main (parallel mode baseline drift)
 - `MERGE_STATUS: CONFLICT` — PR could not merge due to conflicts
 - `MERGE_STATUS: FAILED` — PR merge failed for another reason (include error details on next line)
