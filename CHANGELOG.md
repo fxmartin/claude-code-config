@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.19.0] - 2026-06-15
+
+### Added
+
+- feat: high-risk file pattern detection and approval block (#8.2-001) (#52)
+
+
 ### Added
 
 - feat(risk-gate): high-risk file pattern detection and human-approval block
