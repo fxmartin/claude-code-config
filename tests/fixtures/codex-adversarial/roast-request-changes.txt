@@ -1,0 +1,30 @@
+Running roast review over PR #7...
+
+Findings ordered by severity. One error-level correctness issue and one
+warning. None are outright blockers, but they should be fixed before merge.
+
+```json
+{
+  "reviewer_name": "codex",
+  "verdict": "request_changes",
+  "summary": "One correctness bug and one missing-validation warning. Address both before merge; neither is a hard blocker.",
+  "findings": [
+    {
+      "severity": "error",
+      "category": "correctness",
+      "file": "src/sdlc/adversarial.py",
+      "line": 256,
+      "message": "Tie-break falls through to leaders[0] without a deterministic order; sort the leaders first."
+    },
+    {
+      "severity": "warn",
+      "category": "validation",
+      "file": "scripts/codex-adversarial-review.sh",
+      "line": null,
+      "message": "PR number is not validated as an integer before being passed to gh."
+    }
+  ]
+}
+```
+
+Review complete.

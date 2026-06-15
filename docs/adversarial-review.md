@@ -95,6 +95,58 @@ stub that always approves, point a reviewer's `command` at the stub and disable
 the rest — no orchestrator code changes. Users without a given reviewer
 installed simply leave it `enabled: false`.
 
+## Codex reference implementation
+
+The first concrete plug-in is the Codex reviewer (Story 8.1-002). It ships as a
+wrapper script, `scripts/codex-adversarial-review.sh`, registered as the `codex`
+command in `adversarial-reviewers.yaml`. The same script is distributed with the
+Codex `autonomous-sdlc` plugin (`nix-install`) so it is on `PATH` wherever Codex
+runs.
+
+```
+codex-adversarial-review.sh --pr-number <N> [--reviewer-skill roast|project-review]
+```
+
+What it does:
+
+1. Fetches the PR diff with `gh pr diff <N>`.
+2. Runs a Codex review skill via `codex exec` — `roast` by default, or
+   `project-review` (choose per repo with `--reviewer-skill`, or set
+   `CODEX_ADV_REVIEW_SKILL`). The skill is instructed to end its output with a
+   single fenced ` ```json ` block in the slot's response shape.
+3. Extracts that block, forces `reviewer_name` to `codex`, records which skill
+   ran in an extra `reviewer_skill` field (the schema allows extra fields), and
+   prints the normalised JSON to stdout.
+
+The output validates against
+`controller/src/sdlc/schemas/adversarial-reviewer-response.schema.json`, so the
+controller's `parse_reviewer_response()` accepts it unchanged. If the transcript
+contains no parseable JSON or an out-of-range verdict, the wrapper exits
+non-zero and prints nothing — it fails closed rather than waving a PR through.
+
+The wrapper never shells out during tests: setting `CODEX_ADV_RAW_OUTPUT` to a
+captured transcript file makes it parse that instead of calling `gh`/`codex`,
+which is how the `tests/codex-adversarial-review.bats` suite and the controller
+`test_codex_adversarial_review.py` schema-validity test run hermetically in CI.
+
+### Disabling the Codex reviewer
+
+`codex` is `enabled: true` by default. If you do not have Codex installed, set
+`enabled: false` for the `codex` entry in `adversarial-reviewers.yaml`:
+
+```yaml
+reviewers:
+  codex:
+    command: "codex-adversarial-review.sh --pr-number {pr_number}"
+    timeout_sec: 300
+    enabled: false   # <- turn off when Codex is not available
+    allowed_verdicts: ["approve", "request_changes", "block"]
+```
+
+With every reviewer disabled the slot is inert and `/build-stories` behaves as it
+did before the gate existed — the Codex reviewer is mandatory only when it is
+configured and enabled, so users without Codex see no behavior change.
+
 ## Consensus rules
 
 The active rule lives in the config (`consensus:`), not in code, so changing it

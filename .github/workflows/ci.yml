@@ -124,7 +124,7 @@ jobs:
         run: |
           bats --version
           jq --version
-          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/risk-gate.bats
+          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/risk-gate.bats tests/codex-adversarial-review.bats
 
   controller-smoke:
     name: Controller CLI smoke test (uv tool install)

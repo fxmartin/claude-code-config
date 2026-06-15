@@ -1,0 +1,23 @@
+Running project-review over PR #9...
+
+A critical security finding makes this a hard block. The diff disables TLS
+verification on an outbound call to a payments provider.
+
+```json
+{
+  "reviewer_name": "codex",
+  "verdict": "block",
+  "summary": "Critical security regression: TLS verification disabled on a payments call. Must not merge.",
+  "findings": [
+    {
+      "severity": "critical",
+      "category": "security",
+      "file": "services/billing/client.py",
+      "line": 88,
+      "message": "verify=False on the payments HTTP client disables TLS certificate validation; remove it."
+    }
+  ]
+}
+```
+
+Review complete.
