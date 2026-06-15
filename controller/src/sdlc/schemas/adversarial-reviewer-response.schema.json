@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/adversarial-reviewer-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for adversarial-reviewer responses (Story 8.1-001). ABOUTME: Draft 2020-12; vendor-agnostic verdict shape; extra fields allowed for forward-compat.",
+  "title": "AdversarialReviewerResponse",
+  "description": "Structured verdict returned by any adversarial reviewer (Codex, Gemini, SAST, ...) plugged into the reviewer slot.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["reviewer_name", "verdict", "summary", "findings"],
+  "properties": {
+    "reviewer_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Name of the reviewer that produced this verdict; matches a key in adversarial-reviewers.yaml."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "request_changes", "block"],
+      "description": "Reviewer verdict on the pull request."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Human-readable one-paragraph summary of the review."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Zero or more structured findings supporting the verdict.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["severity", "category", "file", "line", "message"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["info", "warn", "error", "critical"],
+            "description": "Severity of the finding."
+          },
+          "category": {
+            "type": "string",
+            "description": "Free-form category, e.g. 'security', 'correctness', 'style'."
+          },
+          "file": {
+            "type": "string",
+            "description": "Path of the file the finding refers to."
+          },
+          "line": {
+            "type": ["integer", "null"],
+            "description": "Line number, or null when the finding is file-level."
+          },
+          "message": {
+            "type": "string",
+            "description": "Description of the finding."
+          }
+        }
+      }
+    }
+  }
+}
