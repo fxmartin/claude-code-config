@@ -1,0 +1,5 @@
+README.md
+docs/guide.md
+src/app/main.py
+src/app/utils.py
+tests/test_app.py
