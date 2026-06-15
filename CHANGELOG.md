@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.20.0] - 2026-06-15
+
+### Added
+
+- feat(commands): add workflow helper commands (#49)
+
+
 ## [v1.19.0] - 2026-06-15
 
 ### Added
