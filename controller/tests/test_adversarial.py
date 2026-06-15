@@ -11,9 +11,11 @@ import pytest
 from sdlc.adversarial import (
     REVIEWER_SCHEMA,
     AdversarialContractError,
+    AdversarialError,
     ReviewContext,
     ReviewerConfig,
     ReviewRequest,
+    _default_invoke,
     apply_consensus,
     build_command,
     dispatch_adversarial_review,
@@ -307,3 +309,165 @@ def test_dispatch_passes_timeout_to_invoke(tmp_path: Path) -> None:
     )
     assert seen["alpha"] == 30
     assert seen["beta"] == 30
+
+
+# ---------------------------------------------------------------------------
+# to_dict helpers (lines 66, 88) — used by dispatch serialisation
+# ---------------------------------------------------------------------------
+
+
+def test_review_context_to_dict() -> None:
+    ctx = ReviewContext(tests_pass=True, coverage_pct=87.5, review_approved=False)
+    d = ctx.to_dict()
+    assert d == {"tests_pass": True, "coverage_pct": 87.5, "review_approved": False}
+
+
+def test_review_request_to_dict_nests_context() -> None:
+    ctx = ReviewContext(tests_pass=False, coverage_pct=55.0, review_approved=False)
+    req = ReviewRequest(
+        pr_number=99,
+        pr_url="https://github.com/org/repo/pull/99",
+        story_id="8.1-001",
+        diff="@@ -1,1 +1,2 @@",
+        context=ctx,
+    )
+    d = req.to_dict()
+    assert d["pr_number"] == 99
+    assert d["story_id"] == "8.1-001"
+    assert d["context"] == ctx.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Config loading error paths (lines 121, 125-126, 132, 137)
+# ---------------------------------------------------------------------------
+
+
+def test_config_non_dict_yaml_raises(tmp_path: Path) -> None:
+    """YAML that is a list (not a mapping) must raise AdversarialError."""
+    cfg = tmp_path / "reviewers.yaml"
+    cfg.write_text("- item1\n- item2\n", encoding="utf-8")
+    with pytest.raises(AdversarialError, match="must be a mapping"):
+        load_reviewers_config(cfg)
+
+
+def test_config_unknown_consensus_raises(tmp_path: Path) -> None:
+    """An unrecognised consensus rule must raise AdversarialError naming the rule."""
+    cfg = tmp_path / "reviewers.yaml"
+    cfg.write_text("consensus: made_up_rule\nreviewers: {}\n", encoding="utf-8")
+    with pytest.raises(AdversarialError, match="made_up_rule"):
+        load_reviewers_config(cfg)
+
+
+def test_config_reviewers_not_a_mapping_raises(tmp_path: Path) -> None:
+    """When 'reviewers' is a list rather than a mapping, raise AdversarialError."""
+    cfg = tmp_path / "reviewers.yaml"
+    cfg.write_text("reviewers:\n  - not_a_mapping\n", encoding="utf-8")
+    with pytest.raises(AdversarialError, match="'reviewers' must be a mapping"):
+        load_reviewers_config(cfg)
+
+
+def test_config_reviewer_missing_command_raises(tmp_path: Path) -> None:
+    """A reviewer entry that omits 'command' must raise AdversarialError."""
+    cfg = tmp_path / "reviewers.yaml"
+    cfg.write_text(
+        "reviewers:\n  broken:\n    timeout_sec: 60\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AdversarialError, match="'broken'.*command"):
+        load_reviewers_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# parse_reviewer_response — JSON non-object (line 190)
+# ---------------------------------------------------------------------------
+
+
+def test_json_array_is_rejected() -> None:
+    """A JSON array is not a reviewer object and must raise AdversarialContractError."""
+    with pytest.raises(AdversarialContractError, match="JSON object"):
+        parse_reviewer_response('["approve"]')
+
+
+def test_json_number_is_rejected() -> None:
+    """A bare JSON number is not a reviewer object."""
+    with pytest.raises(AdversarialContractError, match="JSON object"):
+        parse_reviewer_response("42")
+
+
+# ---------------------------------------------------------------------------
+# _default_invoke error paths (lines 280-295)
+# ---------------------------------------------------------------------------
+
+
+def test_default_invoke_timeout_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When subprocess.run times out, AdversarialError must be raised."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["false"], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(AdversarialError, match="timed out"):
+        _default_invoke("false", 1)
+
+
+def test_default_invoke_file_not_found_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the command binary is missing, AdversarialError must be raised."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        raise FileNotFoundError("No such file")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(AdversarialError, match="could not launch reviewer"):
+        _default_invoke("nonexistent_cmd", 30)
+
+
+def test_default_invoke_os_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OSError (permission denied etc.) must surface as AdversarialError."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        raise OSError("Permission denied")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(AdversarialError, match="could not launch reviewer"):
+        _default_invoke("restricted_cmd", 30)
+
+
+def test_default_invoke_nonzero_exit_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-zero reviewer exit code must raise AdversarialError with the exit code."""
+    import subprocess
+
+    fake_result = subprocess.CompletedProcess(
+        args=["fail_cmd"],
+        returncode=2,
+        stdout="",
+        stderr="something went wrong",
+    )
+
+    def fake_run(*args, **kwargs):
+        return fake_result
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(AdversarialError, match="exited 2"):
+        _default_invoke("fail_cmd", 30)
+
+
+def test_default_invoke_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Happy path: zero-exit command returns its stdout."""
+    import subprocess
+
+    fake_result = subprocess.CompletedProcess(
+        args=["ok_cmd"],
+        returncode=0,
+        stdout='{"reviewer_name":"x","verdict":"approve","summary":"ok","findings":[]}',
+        stderr="",
+    )
+
+    def fake_run(*args, **kwargs):
+        return fake_result
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    output = _default_invoke("ok_cmd", 30)
+    assert "approve" in output
