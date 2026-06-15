@@ -110,3 +110,129 @@ def test_wrapper_fails_closed_on_unparseable_transcript(tmp_path: Path) -> None:
     assert "no reviewer JSON" in result.stderr
     with pytest.raises(AdversarialContractError):
         parse_reviewer_response(result.stdout or "")
+
+
+def test_wrapper_rejects_non_integer_pr_number() -> None:
+    """--pr-number must be a positive integer; letters cause exit 2."""
+    import os
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--pr-number", "abc"],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    assert result.returncode == 2
+    assert "positive integer" in result.stderr
+
+
+def test_wrapper_rejects_unknown_skill() -> None:
+    """--reviewer-skill with an unrecognised name must exit 2."""
+    import os
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--pr-number", "1", "--reviewer-skill", "nope"],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    assert result.returncode == 2
+    assert "reviewer-skill" in result.stderr
+
+
+def test_wrapper_fails_closed_on_bad_json_in_block(tmp_path: Path) -> None:
+    """A json-fenced block with invalid JSON content -> non-zero exit."""
+    import os
+
+    bad = tmp_path / "bad-json.txt"
+    bad.write_text("```json\nnot real json\n```\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--pr-number", "1"],
+        capture_output=True,
+        text=True,
+        env={
+            "CODEX_ADV_RAW_OUTPUT": str(bad),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        },
+    )
+    assert result.returncode != 0
+    assert "JSON object" in result.stderr
+
+
+def test_wrapper_fails_closed_on_out_of_range_verdict(tmp_path: Path) -> None:
+    """A verdict value outside the allowed set -> non-zero exit."""
+    import os
+
+    bad_verdict = tmp_path / "bad-verdict.txt"
+    bad_verdict.write_text(
+        '```json\n{"reviewer_name":"codex","verdict":"bogus","summary":"x","findings":[]}\n```\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--pr-number", "1"],
+        capture_output=True,
+        text=True,
+        env={
+            "CODEX_ADV_RAW_OUTPUT": str(bad_verdict),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        },
+    )
+    assert result.returncode != 0
+    assert "verdict" in result.stderr
+
+
+def test_wrapper_honours_codex_adv_review_skill_env() -> None:
+    """CODEX_ADV_REVIEW_SKILL env var is used as the default skill."""
+    import os
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--pr-number", "42"],
+        capture_output=True,
+        text=True,
+        env={
+            "CODEX_ADV_RAW_OUTPUT": str(FIXTURES / "roast-approve.txt"),
+            "CODEX_ADV_REVIEW_SKILL": "project-review",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    parsed = parse_reviewer_response(result.stdout)
+    assert parsed["reviewer_skill"] == "project-review"
+
+
+def test_wrapper_accepts_equals_sign_pr_number_syntax() -> None:
+    """--pr-number=N (equals-sign) syntax is accepted."""
+    import os
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--pr-number=42"],
+        capture_output=True,
+        text=True,
+        env={
+            "CODEX_ADV_RAW_OUTPUT": str(FIXTURES / "roast-approve.txt"),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    parsed = parse_reviewer_response(result.stdout)
+    assert parsed["verdict"] == "approve"
+
+
+def test_wrapper_accepts_equals_sign_reviewer_skill_syntax() -> None:
+    """--reviewer-skill=S (equals-sign) syntax is accepted."""
+    import os
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--pr-number", "9", "--reviewer-skill=project-review"],
+        capture_output=True,
+        text=True,
+        env={
+            "CODEX_ADV_RAW_OUTPUT": str(FIXTURES / "roast-block.txt"),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    parsed = parse_reviewer_response(result.stdout)
+    assert parsed["reviewer_skill"] == "project-review"

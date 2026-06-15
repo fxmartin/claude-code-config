@@ -67,3 +67,67 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/codex-adversarial"
     [ "${status}" -ne 0 ]
     [[ "${output}" == *"no reviewer JSON"* ]]
 }
+
+@test "--help prints usage and exits 0" {
+    run bash "${WRAPPER}" --help
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"--pr-number"* ]]
+}
+
+@test "rejects a non-integer pr-number" {
+    run bash "${WRAPPER}" --pr-number abc
+    [ "${status}" -eq 2 ]
+    [[ "${output}" == *"positive integer"* ]]
+}
+
+@test "rejects an unknown argument" {
+    run bash "${WRAPPER}" --pr-number 1 --unknown-arg
+    [ "${status}" -eq 2 ]
+    [[ "${output}" == *"unknown argument"* ]]
+}
+
+@test "fails closed when CODEX_ADV_RAW_OUTPUT path does not exist" {
+    CODEX_ADV_RAW_OUTPUT="/tmp/nonexistent-fixture-$$.txt" \
+        run bash "${WRAPPER}" --pr-number 1
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"not found"* ]]
+}
+
+@test "fails closed when the json block is not a valid json object" {
+    printf '```json\nnot real json\n```\n' > "${BATS_TMPDIR}/bad-json.txt"
+    CODEX_ADV_RAW_OUTPUT="${BATS_TMPDIR}/bad-json.txt" \
+        run bash "${WRAPPER}" --pr-number 1
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"JSON object"* ]]
+}
+
+@test "fails closed when the verdict is out of range" {
+    printf '```json\n{"reviewer_name":"codex","verdict":"bogus","summary":"x","findings":[]}\n```\n' \
+        > "${BATS_TMPDIR}/bad-verdict.txt"
+    CODEX_ADV_RAW_OUTPUT="${BATS_TMPDIR}/bad-verdict.txt" \
+        run bash "${WRAPPER}" --pr-number 1
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"verdict"* ]]
+}
+
+@test "CODEX_ADV_REVIEW_SKILL env var sets the default skill" {
+    CODEX_ADV_RAW_OUTPUT="${FIXTURES}/roast-approve.txt" \
+    CODEX_ADV_REVIEW_SKILL="project-review" \
+        run bash "${WRAPPER}" --pr-number 42
+    [ "${status}" -eq 0 ]
+    [ "$(echo "${output}" | jq -r .reviewer_skill)" = "project-review" ]
+}
+
+@test "accepts --pr-number=N equals-sign syntax" {
+    CODEX_ADV_RAW_OUTPUT="${FIXTURES}/roast-approve.txt" \
+        run bash "${WRAPPER}" --pr-number=42
+    [ "${status}" -eq 0 ]
+    [ "$(echo "${output}" | jq -r .verdict)" = "approve" ]
+}
+
+@test "accepts --reviewer-skill=S equals-sign syntax" {
+    CODEX_ADV_RAW_OUTPUT="${FIXTURES}/roast-block.txt" \
+        run bash "${WRAPPER}" --pr-number 9 --reviewer-skill=project-review
+    [ "${status}" -eq 0 ]
+    [ "$(echo "${output}" | jq -r .reviewer_skill)" = "project-review" ]
+}
