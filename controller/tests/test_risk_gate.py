@@ -116,3 +116,46 @@ class TestMatchHighRisk:
         )
         result = match_high_risk(["app/special/thing.py"], override_path=override)
         assert "app/special/thing.py" in result
+
+
+class TestGlobEdgeCases:
+    """Cover the ? wildcard and the mid-pattern **/ trailing-slash branch."""
+
+    def test_question_mark_matches_single_non_separator_char(self) -> None:
+        # Lines 70-71: the `?` branch in _glob_to_regex.
+        assert matches_pattern("Dockerfile.1", "Dockerfile.?")
+
+    def test_question_mark_does_not_match_multiple_chars(self) -> None:
+        assert not matches_pattern("Dockerfile.12", "Dockerfile.?")
+
+    def test_question_mark_does_not_match_separator(self) -> None:
+        assert not matches_pattern("Dockerfile/1", "Dockerfile.?")
+
+    def test_mid_pattern_double_star_slash_consumed(self) -> None:
+        # Line 64: ** in a non-prefix position followed immediately by /
+        # (e.g. foo/**/*.py — the / after ** is consumed so *. follows cleanly).
+        assert matches_pattern("foo/bar/baz.py", "foo/**/*.py")
+        assert matches_pattern("foo/baz.py", "foo/**/*.py")
+
+    def test_mid_pattern_double_star_does_not_cross_prefix_boundary(self) -> None:
+        # The pattern without a leading **/ prefix only matches paths starting
+        # with the literal prefix segment.
+        assert not matches_pattern("bar/baz.py", "foo/**/*.py")
+
+
+class TestReadPatternsMissingKey:
+    """Cover both branches of the 'not isinstance(data, dict) or key missing' guard."""
+
+    def test_yaml_not_a_dict_raises(self, tmp_path: Path) -> None:
+        # Line 95 branch: YAML parses to a non-dict (bare scalar).
+        bad = tmp_path / "not-dict.yaml"
+        bad.write_text("just a string\n", encoding="utf-8")
+        with pytest.raises(RiskGateError, match="must define a top-level"):
+            load_patterns(config_path=bad)
+
+    def test_dict_missing_key_raises(self, tmp_path: Path) -> None:
+        # Line 95 branch: YAML is a dict but lacks the high_risk_patterns key.
+        bad = tmp_path / "wrong-key.yaml"
+        bad.write_text("other_key:\n  - foo\n", encoding="utf-8")
+        with pytest.raises(RiskGateError, match="must define a top-level"):
+            load_patterns(config_path=bad)
