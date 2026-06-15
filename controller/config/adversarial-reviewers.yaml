@@ -1,0 +1,28 @@
+# ABOUTME: Registry of adversarial reviewers for the vendor-agnostic review slot.
+# ABOUTME: Story 8.1-001 — name, command, timeout, allowed verdicts, plus consensus rule.
+#
+# The controller reads this file, invokes each enabled reviewer in parallel,
+# collects their verdicts, and applies the consensus rule below. Swapping the
+# reviewer runtime (Codex -> Gemini -> a stub) is a config change here, not a
+# code change in the orchestrator.
+#
+# Command templates may use {pr_number}, {pr_url}, and {story_id} placeholders;
+# the controller substitutes them before invoking the reviewer.
+
+# Consensus rule applied across all enabled reviewers' verdicts.
+#   any_block_majority (default): any `block` blocks; otherwise majority wins,
+#                                 ties fall back to `request_changes`.
+#   unanimous_approve:            every reviewer must `approve`, else block.
+consensus: any_block_majority
+
+reviewers:
+  codex:
+    command: "codex review-pr --pr-number {pr_number} --output json"
+    timeout_sec: 300
+    enabled: true
+    allowed_verdicts: ["approve", "request_changes", "block"]
+  gemini:
+    command: "gemini-review --pr {pr_url} --format json"
+    timeout_sec: 300
+    enabled: false
+    allowed_verdicts: ["approve", "request_changes", "block"]
