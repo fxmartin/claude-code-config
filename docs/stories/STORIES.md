@@ -35,9 +35,10 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic-04 | Durable State with SQLite | MVP | 4 | 18 | P1 | **COMPLETE** |
 | Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | **COMPLETE** |
 | Epic-06 | Public Release Readiness | MVP | 4 | 9 | P1 | **COMPLETE**[^1] |
-| Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | **COMPLETE** (PRs #40-#43; E2E_PASS after bugfix #45) |
+| Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | **COMPLETE** (PRs #40-#43; E2E_PASS after bugfix #45) — `sdlc build`/`validate`/`sync-check` implemented; `init`/`resume`/`status`/`state`/`rollback` ship as [stubs](./epic-07-external-controller.md#deferred--stubbed-subcommands) |
 | Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | |
 | Epic-09 | Security Baked into Quality Gates + Live Pilot | Roadmap | 4 | 12 | P2 | |
+| Epic-10 | Controller Hardening (resume, observability, rollback) | Roadmap | 2 | 13 | P2 | **PLANNED** |
 
 ## Epic Navigation
 
@@ -50,6 +51,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 - **[Epic-07: External Controller and Typed Contracts](./epic-07-external-controller.md)** *(Roadmap)*: Python or TypeScript CLI that owns the state machine; skills become workers with typed JSON-schema I/O contracts.
 - **[Epic-08: Adversarial Gate and High-Risk Approval](./epic-08-adversarial-gate.md)** *(Roadmap)*: Vendor-agnostic adversarial reviewer slot; mandatory human approval for changes touching auth, payments, migrations, infrastructure, secrets.
 - **[Epic-09: Security Baked into Quality Gates](./epic-09-security-quality-gates.md)** *(Roadmap)*: SAST plus dependency plus secrets scanning embedded into the coverage stage so security is a gate, not a follow-up. Closes with the five-colleague live pilot (9.3-001, moved from Epic-06 on 2026-06-11) — the roadmap capstone that validates the finished platform.
+- **[Epic-10: Controller Hardening](./epic-10-controller-hardening.md)** *(Roadmap)*: Implement the `sdlc` CLI verbs Epic-07 shipped as stubs — `resume` (controller-native crash recovery), `status`/`state` (observability), `rollback` (checkpoint unwind) — and retire or implement the redundant `init`. Created 2026-06-15.
 
 ## MVP Summary
 
@@ -90,11 +92,11 @@ The MVP is shippable when ALL of the following hold:
 
 ## Project Metrics
 
-- **Total Epics**: 9
-- **Total Stories**: 34 *(the live pilot split out of 6.3-001 into 9.3-001 on 2026-06-11)*
-- **Total Story Points**: 120
+- **Total Epics**: 10
+- **Total Stories**: 36 *(the live pilot split out of 6.3-001 into 9.3-001 on 2026-06-11; Epic-10 added 2 controller-hardening stories on 2026-06-15)*
+- **Total Story Points**: 133
 - **MVP Stories**: 23 (69 pts)
-- **Roadmap Stories**: 11 (51 pts)
+- **Roadmap Stories**: 13 (64 pts)
 
 ## Story Dependencies
 
@@ -111,6 +113,7 @@ flowchart TD
     E07[Epic-07: External Controller]
     E08[Epic-08: Adversarial Gate]
     E09[Epic-09: Security Gates]
+    E10[Epic-10: Controller Hardening]
 
     E01 --> E02
     E01 --> E03
@@ -122,6 +125,7 @@ flowchart TD
     E04 --> E07
     E07 --> E08
     E07 --> E09
+    E07 --> E10
 ```
 
 ### Critical Path
