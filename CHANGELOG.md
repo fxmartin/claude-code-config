@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.18.0] - 2026-06-15
+
+### Added
+
+- feat: define adversarial reviewer slot interface (#8.1-001) (#51)
+
+
 ### Added
 
 - feat(controller): define the vendor-agnostic adversarial reviewer slot
