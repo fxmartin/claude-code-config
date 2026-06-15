@@ -52,11 +52,11 @@ reviewers:
 - A test harness simulates two reviewers returning different verdicts and asserts the consensus rule.
 
 **Definition of Done**:
-- Interface and schema committed.
-- Config format documented.
-- Test harness green.
-- Documentation in `docs/adversarial-review.md`.
-- Change noted in `CHANGELOG.md` under "Added".
+- [x] Interface and schema committed.
+- [x] Config format documented.
+- [x] Test harness green.
+- [x] Documentation in `docs/adversarial-review.md`.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ##### Story 8.1-002: Codex reference implementation of the slot
 **User Story**: As FX, I want the Codex `autonomous-sdlc` plugin (in `nix-install`) to expose the `roast` and `project-review` skills via the adversarial reviewer slot contract so that today's Codex setup becomes the first concrete plug-in.
