@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- feat(controller): define the vendor-agnostic adversarial reviewer slot
+  interface (#8.1-001). Adds the input/output dataclasses and a draft 2020-12
+  JSON schema (`controller/src/sdlc/schemas/adversarial-reviewer-response.schema.json`),
+  a reviewer registry config (`controller/config/adversarial-reviewers.yaml`),
+  and `dispatch_adversarial_review` which runs each enabled reviewer in parallel
+  and applies a configurable consensus rule (default: any `block` blocks,
+  otherwise majority wins). Documented in `docs/adversarial-review.md`.
+
 ## [v1.17.1] - 2026-06-12
 
 ### Fixed
