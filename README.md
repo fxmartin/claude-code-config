@@ -385,6 +385,12 @@ No local clone needed. Inside any Claude Code session:
 /plugin install autonomous-sdlc@fx-claude-config
 ```
 
+If the first command errors with `Marketplace file not found at .../fxmartin-claude-code-config/.claude-plugin/marketplace.json`, your machine likely has no GitHub SSH key trusted by `known_hosts` — Claude Code clones via SSH for the `owner/repo` shorthand and surfaces the missing-file error instead of the underlying `Host key verification failed`. Retry with the full HTTPS URL:
+
+```text
+/plugin marketplace add https://github.com/fxmartin/claude-code-config.git
+```
+
 Claude Code clones the repo into `~/.claude/plugins/marketplaces/fx-claude-config/`, reads `.claude-plugin/marketplace.json`, and installs the `autonomous-sdlc` plugin from `./plugins/autonomous-sdlc`. Pull updates later with:
 
 ```text
