@@ -1,0 +1,36 @@
+# .semgrepignore — paths the SAST gate skips (Story 9.1-001).
+#
+# Keep this lean: the goal is to avoid noise from code the team did not write
+# or test fixtures that are deliberately "wrong", not to hide real findings in
+# production source. Per-repo additions go here; per-finding suppressions (with
+# a mandatory reason) go in .sast-config.yaml instead.
+
+# --- Dependencies and build artifacts (not our code) ---
+node_modules/
+.venv/
+venv/
+__pycache__/
+dist/
+build/
+*.egg-info/
+target/
+vendor/
+
+# --- Generated / minified files ---
+*.min.js
+*.min.css
+*.lock
+*.generated.*
+**/migrations/**
+
+# --- Version control / tooling ---
+.git/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Test fixtures (deliberately malformed or insecure on purpose) ---
+# These exist to exercise tooling; scanning them produces expected "findings".
+tests/fixtures/
+**/fixtures/
+**/testdata/

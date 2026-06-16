@@ -186,3 +186,54 @@ def test_validate_rejects_unknown_agent_type() -> None:
     result = runner.invoke(app, ["validate", "frobnicate"], input="{}")
     assert result.exit_code == 2
     assert "unknown agent type" in result.output
+
+
+# ---------------------------------------------------------------------------
+# sast subcommand (Story 9.1-001)
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def _semgrep_report(severity: str, check_id: str = "rules.example") -> str:
+    return _json.dumps(
+        {
+            "results": [
+                {
+                    "check_id": check_id,
+                    "path": "src/app.py",
+                    "start": {"line": 7},
+                    "end": {"line": 7},
+                    "extra": {"severity": severity, "message": "x"},
+                }
+            ],
+            "errors": [],
+        }
+    )
+
+
+def test_sast_clean_exits_zero() -> None:
+    result = runner.invoke(app, ["sast"], input=_json.dumps({"results": []}))
+    assert result.exit_code == 0
+    assert "SAST_STATUS: CLEAN" in result.output
+
+
+def test_sast_warn_exits_zero() -> None:
+    result = runner.invoke(app, ["sast"], input=_semgrep_report("WARNING"))
+    assert result.exit_code == 0
+    assert "SAST_STATUS: WARN" in result.output
+
+
+def test_sast_block_exits_one() -> None:
+    result = runner.invoke(
+        app, ["sast"], input=_semgrep_report("ERROR", "python.lang.security.sqli")
+    )
+    assert result.exit_code == 1
+    assert "SAST_STATUS: BLOCK" in result.output
+    assert "python.lang.security.sqli" in result.output
+
+
+def test_sast_bad_report_exits_two() -> None:
+    result = runner.invoke(app, ["sast"], input="{not json")
+    assert result.exit_code == 2
+    assert "not valid JSON" in result.output
