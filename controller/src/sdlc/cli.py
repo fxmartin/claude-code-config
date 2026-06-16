@@ -24,6 +24,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "validate": "Validate an agent response against its JSON schema.",
     "rollback": "Roll a run back to a prior ledger checkpoint.",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
+    "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
 }
 
 app = typer.Typer(
@@ -171,6 +172,51 @@ def validate(
 def rollback() -> None:
     """Roll a run back to a prior checkpoint (stub)."""
     typer.echo("rollback: not yet implemented.")
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["sast"])
+def sast(
+    report_file: Path | None = typer.Argument(
+        None,
+        help="semgrep --json report. Reads stdin when omitted.",
+    ),
+    config_file: Path = typer.Option(
+        Path(".sast-config.yaml"),
+        "--config",
+        help="Per-repo SAST overrides (suppressions, extra rulesets).",
+    ),
+) -> None:
+    """Classify a semgrep report into a SAST gate verdict.
+
+    Reads a semgrep ``--json`` report (from a file or stdin), applies any
+    per-repo suppressions from ``.sast-config.yaml``, and prints the verdict as
+    ``SAST_STATUS: CLEAN | WARN | BLOCK`` followed by one line per gating
+    finding. Exits 0 for CLEAN/WARN and 1 for BLOCK so a shell gate can branch
+    on the exit code.
+    """
+    from sdlc.security_scan import (
+        SastConfigError,
+        SastReportError,
+        classify_report,
+        load_sast_config,
+    )
+
+    report = report_file.read_text(encoding="utf-8") if report_file else sys.stdin.read()
+
+    try:
+        config = load_sast_config(config_file)
+        result = classify_report(report, config=config)
+    except (SastReportError, SastConfigError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(f"SAST_STATUS: {result.status}")
+    for finding in result.findings:
+        typer.echo(f"  [{finding.severity}] {finding.location()} {finding.check_id}")
+    for finding in result.suppressed:
+        typer.echo(f"  [suppressed] {finding.location()} {finding.check_id}")
+
+    raise typer.Exit(code=1 if result.status == "BLOCK" else 0)
 
 
 @app.command(name="sync-check", help=PLANNED_SUBCOMMANDS["sync-check"])

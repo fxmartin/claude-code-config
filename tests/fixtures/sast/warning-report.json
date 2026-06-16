@@ -1,0 +1,16 @@
+{
+  "version": "1.0.0",
+  "results": [
+    {
+      "check_id": "python.lang.best-practice.unspecified-open-encoding",
+      "path": "src/app.py",
+      "start": { "line": 3, "col": 1 },
+      "end": { "line": 3, "col": 20 },
+      "extra": {
+        "severity": "WARNING",
+        "message": "Missing encoding when opening a file."
+      }
+    }
+  ],
+  "errors": []
+}
