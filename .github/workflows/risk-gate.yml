@@ -13,7 +13,7 @@ name: Risk Gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   pull_request_review:
     types: [submitted, dismissed]
 
@@ -30,6 +30,10 @@ concurrency:
 env:
   RISK_LABEL: "risk:high"
   RISK_TEAM: "risk-approver"
+  # Approval label for single-maintainer / personal (non-org) repos, where
+  # there is no team to check and a PR author cannot review their own PR. A
+  # maintainer (write+ access) applying this label satisfies the gate.
+  RISK_APPROVED_LABEL: "risk-approved"
 
 jobs:
   risk-gate:
@@ -78,6 +82,7 @@ jobs:
             const { owner, repo } = context.repo;
             const riskLabel = process.env.RISK_LABEL;
             const riskTeam = process.env.RISK_TEAM;
+            const approvedLabel = process.env.RISK_APPROVED_LABEL;
             const matched = process.env.MATCHED || "";
 
             // 1. Add the risk:high label (idempotent).
@@ -95,13 +100,16 @@ jobs:
               "## :lock: High-risk change detected",
               "",
               "This PR touches high-risk paths and is blocked at merge until a",
-              "human on the **`" + riskTeam + "`** team approves it. The merge",
-              "agent will not bypass this gate (`--admin` is not used).",
+              "human approves it. Either path satisfies the gate:",
+              "",
+              "- a member of the **`" + riskTeam + "`** team submits an approving review, or",
+              "- a maintainer (write access) adds the **`" + approvedLabel + "`** label",
+              "  (the approval path for single-maintainer / non-org repos).",
+              "",
+              "The merge agent will not bypass this gate (`--admin` is not used).",
               "",
               "**Matched files:**",
               fileLines,
-              "",
-              "**Required reviewers:** a member of the `" + riskTeam + "` team.",
             ].join("\n");
 
             const comments = await github.rest.issues.listComments({
@@ -118,7 +126,7 @@ jobs:
               });
             }
 
-            // 3. Check for an approving review from a risk-approver member.
+            // 3a. Approving review from a risk-approver team member (org repos).
             const reviews = await github.rest.pulls.listReviews({
               owner, repo, pull_number: pr.number, per_page: 100,
             });
@@ -128,7 +136,7 @@ jobs:
               if (r.user && r.user.login) latest.set(r.user.login, r.state);
             }
 
-            let approvedByApprover = false;
+            let approvedByTeam = false;
             for (const [login, state] of latest) {
               if (state !== "APPROVED") continue;
               try {
@@ -136,20 +144,69 @@ jobs:
                   org: owner, team_slug: riskTeam, username: login,
                 });
                 if (membership.data.state === "active") {
-                  approvedByApprover = true;
+                  approvedByTeam = true;
                   break;
                 }
               } catch (err) {
-                // Not a team member (404) — keep scanning other approvers.
+                // Not a team member (404), or owner is a user account with no
+                // teams (404) — keep scanning other approvers.
                 if (err.status !== 404) throw err;
               }
             }
 
-            if (!approvedByApprover) {
+            // 3b. `risk-approved` label applied by a maintainer (write+ access).
+            // This is the approval path for single-maintainer / personal repos,
+            // where there is no org team and a PR author cannot approve their
+            // own PR. Verifying the labeller's permission stops a drive-by
+            // contributor from self-approving by slapping the label on.
+            let approvedByLabel = false;
+            const prNow = await github.rest.pulls.get({
+              owner, repo, pull_number: pr.number,
+            });
+            const hasApprovedLabel = (prNow.data.labels || [])
+              .some((l) => l.name === approvedLabel);
+            if (hasApprovedLabel) {
+              const events = await github.paginate(github.rest.issues.listEvents, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              const labellers = events
+                .filter((e) => e.event === "labeled"
+                  && e.label && e.label.name === approvedLabel)
+                .map((e) => e.actor && e.actor.login)
+                .filter(Boolean);
+              for (const login of labellers) {
+                // The repo owner (personal repos) is always a maintainer.
+                if (login === owner) {
+                  approvedByLabel = true;
+                  break;
+                }
+                try {
+                  const perm = await github.rest.repos.getCollaboratorPermissionLevel({
+                    owner, repo, username: login,
+                  });
+                  // permission is one of: admin | write | read | none.
+                  if (perm.data.permission === "admin"
+                    || perm.data.permission === "write") {
+                    approvedByLabel = true;
+                    break;
+                  }
+                } catch (err) {
+                  // Token may lack scope to read collaborator permission (403)
+                  // or the user is not a collaborator (404). Either way this
+                  // labeller does not count — keep scanning.
+                  if (err.status !== 403 && err.status !== 404) throw err;
+                }
+              }
+            }
+
+            if (!approvedByTeam && !approvedByLabel) {
               core.setFailed(
-                "Risk gate: a `" + riskTeam + "` team member must approve this " +
-                "high-risk PR before it can merge."
+                "Risk gate: this high-risk PR needs human approval — either an " +
+                "approving review from a `" + riskTeam + "` team member, or the " +
+                "`" + approvedLabel + "` label added by a maintainer."
               );
-            } else {
+            } else if (approvedByTeam) {
               core.info("Risk gate: approved by a " + riskTeam + " team member.");
+            } else {
+              core.info("Risk gate: approved via the " + approvedLabel + " label.");
             }

@@ -3,10 +3,17 @@
 The high-risk gate is a human-in-the-loop checkpoint (Epic-08, Story 8.2-001).
 Any pull request that touches a high-risk path — auth, payments, migrations,
 infrastructure, secrets, or destructive shell — is blocked at merge until a
-human on the `risk-approver` GitHub team approves it, regardless of how green
-the rest of the pipeline is. The gate is the safety valve that lets the rest of
-the autonomous loop run aggressively without risking an unintended
-`DROP TABLE users` at 3 am.
+human approves it, regardless of how green the rest of the pipeline is. The gate
+is the safety valve that lets the rest of the autonomous loop run aggressively
+without risking an unintended `DROP TABLE users` at 3 am.
+
+Approval is satisfied by **either** of two paths:
+
+- an approving review from a member of the `risk-approver` GitHub team (the path
+  for organisation repos); or
+- the `risk-approved` label added by a maintainer with write access (the path
+  for single-maintainer / personal repos, where there is no org team to check
+  and a PR author cannot approve their own PR).
 
 ## How it works
 
@@ -17,11 +24,14 @@ the autonomous loop run aggressively without risking an unintended
 2. **Flagging.** If any file matches, the workflow:
    - adds the `risk:high` label to the PR;
    - posts (and keeps updated) a comment listing the matched files, the pattern
-     each one hit, and the required reviewers; and
-   - **fails the `risk-gate` check** until a `risk-approver` team member submits
-     an approving review.
-3. **Approval.** When a `risk-approver` member approves, the workflow re-runs on
-   the review event and the check turns green.
+     each one hit, and the two approval paths; and
+   - **fails the `risk-gate` check** until the PR is approved by one of those
+     paths.
+3. **Approval.** Either a `risk-approver` team member approves the PR, or a
+   maintainer (write+ access) adds the `risk-approved` label. The workflow
+   re-runs on the review or label event and the check turns green. The label
+   path verifies the labeller's repo permission, so a drive-by contributor
+   cannot self-approve by applying the label.
 4. **Merge.** The merge agent (`build-stories` merge prompt) refuses to merge a
    `risk:high` PR that has no human approval and **never** uses
    `gh pr merge --admin` to bypass the gate.
