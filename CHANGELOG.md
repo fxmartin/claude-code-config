@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- feat(security): gitleaks secrets scan on every pr (#9.2-001)
+
 ## [v1.21.0] - 2026-06-16
 
 ### Added

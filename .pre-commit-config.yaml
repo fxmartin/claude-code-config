@@ -1,0 +1,17 @@
+# Opt-in local secrets gate (Story 9.2-001).
+#
+# Runs the same gitleaks scan locally that the `secrets-scan` CI job runs, so a
+# credential is caught at commit time rather than on the PR. This file is
+# OPT-IN: it only takes effect after `pre-commit install` (see docs/onboarding.md
+# and docs/security-gates.md). FX's machines already run a Home Manager-managed
+# gitleaks pre-commit hook; this config gives colleagues without that setup the
+# same protection through the standard pre-commit framework.
+#
+# Both call sites share .gitleaks.toml, so allowlist tuning applies everywhere.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        name: gitleaks (secret detection)
+        args: ["protect", "--staged", "--redact", "--config", ".gitleaks.toml"]

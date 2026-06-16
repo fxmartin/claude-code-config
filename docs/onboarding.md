@@ -258,6 +258,23 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in your `.env`, and the harness 
 
 Failures are gated to one-per-run so your phone does not buzz 47 times during a bad run. Telegram is platform-agnostic — works identically on macOS and WSL2.
 
+### Secrets pre-commit hook (recommended)
+
+CI already blocks any PR that introduces a credential, API key, or token — the
+`secrets-scan` job runs [gitleaks](https://github.com/gitleaks/gitleaks) first,
+before the build (Story 9.2-001). To catch a leak *before* you push, opt in to
+the local pre-commit hook that runs the same scan against your staged changes:
+
+```bash
+pipx install pre-commit   # or: brew install pre-commit / uv tool install pre-commit
+pre-commit install        # registers the hook from .pre-commit-config.yaml
+```
+
+Both the hook and CI share [`.gitleaks.toml`](../.gitleaks.toml), so the
+allowlist stays consistent. If a scan ever fires, do **not** just delete the
+line — rotate the secret and scrub it from history. The full runbook is in
+[`docs/security-gates.md`](security-gates.md).
+
 ---
 
 ## Commit conventions

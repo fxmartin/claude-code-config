@@ -1,0 +1,49 @@
+# ABOUTME: gitleaks configuration for the secrets-scan CI gate and pre-commit hook.
+# ABOUTME: Story 9.2-001 — extends the default ruleset, allowlists known-safe paths.
+#
+# This config is auto-discovered by gitleaks when run from the repo root, so it
+# governs three call sites:
+#   1. The `secrets-scan` CI job (`gitleaks detect --no-banner --redact`).
+#   2. The Home Manager pre-commit hook (`gitleaks protect --staged --redact`).
+#   3. The opt-in `.pre-commit-config.yaml` hook.
+#
+# It does NOT govern tests/gitleaks-secrets.bats: that test runs gitleaks with
+# the stock default ruleset against tests/fixtures/leaked-key.txt to prove the
+# scanner catches a planted credential. Keeping the planted secret out of this
+# allowlist would block every commit to this repo, so the fixture path is
+# exempted here while the bats test verifies detection independently.
+
+# `extend.useDefault = true` layers the rules below on top of gitleaks' built-in
+# ruleset (AWS, GitHub, Slack, Stripe, generic high-entropy, ...). We add no
+# custom rules — the defaults are the detection surface; we only tune the
+# allowlist for known-safe patterns.
+title = "claude-code-config secrets policy"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-safe patterns: example/sample configs and test fixtures."
+
+# Allowlist by path. Example/sample env files and documentation snippets carry
+# placeholder values, not live secrets. The deliberate test fixture is exempted
+# here so the planted secret never blocks a commit or the CI gate; the bats
+# test scans it with the default config to confirm detection still works.
+paths = [
+  '''(^|/)\.env\.example$''',
+  '''(^|/)\.env\.sample$''',
+  '''(^|/)tests/fixtures/leaked-key\.txt$''',
+  # The bats test embeds the fixture token verbatim to assert it is redacted
+  # out of gitleaks output. Exempt the test file for the same reason as the
+  # fixture; tests/gitleaks-secrets.bats proves detection with the default config.
+  '''(^|/)tests/gitleaks-secrets\.bats$''',
+]
+
+# Allowlist obvious placeholder tokens so README/onboarding examples that show
+# the *shape* of a credential (e.g. `ghp_xxxx...`, `<your-token-here>`) do not
+# trip the gate. These match only synthetic placeholder text, never live keys.
+regexes = [
+  '''(?i)example[_-]?key''',
+  '''(?i)your[_-]?(api[_-]?)?(key|token|secret)[_-]?here''',
+  '''x{8,}''',
+]
