@@ -205,3 +205,43 @@ def test_command_appends_per_repo_extra_rulesets(tmp_path: Path) -> None:
 def test_command_scans_target_path() -> None:
     cmd = build_semgrep_command(report_path="/tmp/report.json", target="src/")
     assert cmd[-1] == "src/"
+
+
+def test_suppress_entry_not_a_dict_is_rejected(tmp_path: Path) -> None:
+    """Line 74: suppress entries that are plain scalars (not dicts) must be rejected."""
+    config = tmp_path / ".sast-config.yaml"
+    config.write_text("suppress:\n  - python.lang.security.sqli\n", encoding="utf-8")
+    with pytest.raises(SastConfigError, match="'id'"):
+        load_sast_config(config)
+
+
+def test_suppress_entry_dict_missing_id_is_rejected(tmp_path: Path) -> None:
+    """Line 74 (alt): a dict suppress entry without an 'id' key must be rejected."""
+    config = tmp_path / ".sast-config.yaml"
+    config.write_text(
+        "suppress:\n  - reason: some reason but no id field\n", encoding="utf-8"
+    )
+    with pytest.raises(SastConfigError, match="'id'"):
+        load_sast_config(config)
+
+
+def test_rulesets_not_a_list_is_rejected(tmp_path: Path) -> None:
+    """Line 85: 'rulesets' must be a list; a string value must be rejected."""
+    config = tmp_path / ".sast-config.yaml"
+    config.write_text("rulesets: p/python\n", encoding="utf-8")
+    with pytest.raises(SastConfigError, match="list"):
+        load_sast_config(config)
+
+
+# ---------------------------------------------------------------------------
+# SastFinding helper methods
+# ---------------------------------------------------------------------------
+
+
+def test_finding_location_formats_path_and_line() -> None:
+    """Line 136: SastFinding.location() returns 'path:line' string."""
+    result = classify_report(
+        _report([_finding(severity="ERROR", path="src/app.py", line=42)])
+    )
+    assert len(result.findings) == 1
+    assert result.findings[0].location() == "src/app.py:42"
