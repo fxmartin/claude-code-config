@@ -1,0 +1,16 @@
+{
+  "version": "1.0.0",
+  "results": [
+    {
+      "check_id": "python.lang.security.audit.formatted-sql-query.formatted-sql-query",
+      "path": "tests/fixtures/sql-injection.py",
+      "start": { "line": 14, "col": 13 },
+      "end": { "line": 14, "col": 62 },
+      "extra": {
+        "severity": "ERROR",
+        "message": "Detected possible formatted SQL query. Use parameterized queries instead."
+      }
+    }
+  ],
+  "errors": []
+}

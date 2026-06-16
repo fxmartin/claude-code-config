@@ -99,17 +99,51 @@ fi
 
 # Node.js projects (non-blocking)
 npm audit --production 2>/dev/null || true
-
-# Semgrep (non-blocking)
-semgrep --config auto $CHANGED_FILES 2>/dev/null || true
 ```
 
 **Security scan behavior:**
-- `bandit`, `npm audit`, `semgrep`: **Non-blocking** — findings reported as `SECURITY_WARN`
+- `bandit`, `npm audit`: **Non-blocking** — findings reported as `SECURITY_WARN`
 - `pip-audit` with **critical/high** CVEs: **Blocking** — report as `SECURITY_BLOCK` and fail the gate. The story cannot proceed until vulnerable dependencies are updated.
 - `pip-audit` with **medium/low** findings: **Non-blocking** — reported as `SECURITY_WARN`
 
 If `pip-audit` blocks, include the vulnerable packages and available fix versions in the agent output so the bugfix agent can resolve them.
+
+### Step 7c: SAST scan with semgrep (Story 9.1-001 — skip if `{{SECURITY_SCAN}}` is `off`)
+
+Run a Static Application Security Testing scan over the repo *after* coverage is
+measured. This catches obvious security antipatterns (SQL injection, weak
+crypto, unsafe deserialization) that coverage cannot. The repo ships a
+`scripts/sast-scan.sh` wrapper that runs semgrep with the OWASP rulesets and
+classifies the JSON report into a `CLEAN | WARN | BLOCK` verdict:
+
+```bash
+# semgrep must be installed (uv tool install semgrep, brew install semgrep, or pipx).
+if command -v semgrep >/dev/null 2>&1; then
+  # The wrapper runs:
+  #   semgrep --config=p/default --config=p/owasp-top-ten --json --output=$REPORT .
+  # then classifies the report via `sdlc sast` (ERROR -> BLOCK, WARNING -> WARN).
+  # It honors .semgrepignore and per-repo .sast-config.yaml suppressions.
+  SAST_OUTPUT="$(bash scripts/sast-scan.sh . || true)"
+  echo "$SAST_OUTPUT"
+  SAST_STATUS="$(echo "$SAST_OUTPUT" | sed -nE 's/^SAST_STATUS: (CLEAN|WARN|BLOCK)$/\1/p' | head -1)"
+else
+  SAST_STATUS="SKIPPED"   # semgrep not installed; report SKIPPED, do not block
+fi
+```
+
+**SAST scan behavior:**
+- `CLEAN`: no findings at `error` or above — gate passes.
+- `WARN`: one or more `warning`-severity findings — gate passes, findings reported.
+- `BLOCK`: one or more `error`-severity findings — **gate FAILED**. The
+  orchestrator routes a `BLOCK` to the bugfix loop (Step 5d in `build-stories`),
+  the same path as a `SECURITY_BLOCK`. Include each finding's rule ID, file, and
+  line in the agent output so the bugfix agent can remediate.
+- `SKIPPED`: semgrep is not installed, or `{{SECURITY_SCAN}}` is `off`.
+
+A consumer repo may ship `.sast-config.yaml` to add rulesets or suppress
+findings by rule ID (each suppression requires a mandatory `reason`). The
+`.semgrepignore` file excludes test fixtures and generated code from scanning.
+See `docs/security-gates.md` for the full contract.
 
 ## Coverage Analysis Approach
 
@@ -132,6 +166,7 @@ PR_NUMBER: [number]
 PR_URL: [url]
 COVERAGE_STATUS: PASS | WARN
 SECURITY_STATUS: CLEAN | SECURITY_WARN | SECURITY_BLOCK | SKIPPED
+SAST_STATUS: CLEAN | WARN | BLOCK | SKIPPED
 ```
 
 - `PASS`: New code has ≥{{COVERAGE_THRESHOLD}}% coverage
@@ -141,17 +176,23 @@ SECURITY_STATUS: CLEAN | SECURITY_WARN | SECURITY_BLOCK | SKIPPED
   - `SECURITY_WARN`: Non-critical findings from any scanner (details in agent output)
   - `SECURITY_BLOCK`: `pip-audit` found critical/high severity CVEs — gate FAILED (include package names, CVE IDs, and fix versions in agent output)
   - `SKIPPED`: Security scan was disabled via `{{SECURITY_SCAN}}=off`
+- `SAST_STATUS` (semgrep, Story 9.1-001):
+  - `CLEAN`: No SAST findings at `error` or above (or only `info`)
+  - `WARN`: One or more `warning`-severity findings — gate passes
+  - `BLOCK`: One or more `error`-severity findings — gate FAILED; routed to the bugfix loop (include rule IDs, files, and lines in agent output)
+  - `SKIPPED`: semgrep not installed, or security scan disabled via `{{SECURITY_SCAN}}=off`
 
 ### Machine-readable result block
 
 As the FINAL line of your response, also emit a result block that conforms to
 `controller/schemas/coverage-agent-response.schema.json`. Map the statuses into
 the schema's canonical `PASS | WARN | FAIL` enum (CLEAN → PASS, SECURITY_WARN →
-WARN, SECURITY_BLOCK → FAIL, SKIPPED → PASS):
+WARN, SECURITY_BLOCK → FAIL, SKIPPED → PASS). The SAST verdict maps the same way
+(CLEAN → PASS, WARN → WARN, BLOCK → FAIL, SKIPPED → PASS):
 
 ```
 <<<RESULT_JSON>>>
-{"pr_number": [number], "pr_url": "[url]", "coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "security_status": "PASS"}
+{"pr_number": [number], "pr_url": "[url]", "coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "security_status": "PASS", "sast_status": "PASS"}
 <<<END_RESULT>>>
 ```
 
