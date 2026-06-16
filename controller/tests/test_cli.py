@@ -237,3 +237,61 @@ def test_sast_bad_report_exits_two() -> None:
     result = runner.invoke(app, ["sast"], input="{not json")
     assert result.exit_code == 2
     assert "not valid JSON" in result.output
+
+
+# ---------------------------------------------------------------------------
+# depscan subcommand (Story 9.1-002)
+# ---------------------------------------------------------------------------
+
+
+def _osv_report(severity: str, osv_id: str = "OSV-2024-0001") -> str:
+    return _json.dumps(
+        {
+            "results": [
+                {
+                    "source": {"path": "uv.lock", "type": "lockfile"},
+                    "packages": [
+                        {
+                            "package": {
+                                "name": "requests",
+                                "version": "2.0.0",
+                                "ecosystem": "PyPI",
+                            },
+                            "vulnerabilities": [
+                                {
+                                    "id": osv_id,
+                                    "summary": "x",
+                                    "database_specific": {"severity": severity},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+
+def test_depscan_clean_exits_zero() -> None:
+    result = runner.invoke(app, ["depscan"], input=_json.dumps({"results": []}))
+    assert result.exit_code == 0
+    assert "DEP_SCAN_STATUS: CLEAN" in result.output
+
+
+def test_depscan_warn_exits_zero() -> None:
+    result = runner.invoke(app, ["depscan"], input=_osv_report("LOW"))
+    assert result.exit_code == 0
+    assert "DEP_SCAN_STATUS: WARN" in result.output
+
+
+def test_depscan_block_exits_one() -> None:
+    result = runner.invoke(app, ["depscan"], input=_osv_report("CRITICAL", "OSV-CRIT"))
+    assert result.exit_code == 1
+    assert "DEP_SCAN_STATUS: BLOCK" in result.output
+    assert "OSV-CRIT" in result.output
+
+
+def test_depscan_bad_report_exits_two() -> None:
+    result = runner.invoke(app, ["depscan"], input="{not json")
+    assert result.exit_code == 2
+    assert "not valid JSON" in result.output

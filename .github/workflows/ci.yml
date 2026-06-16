@@ -152,15 +152,16 @@ jobs:
           file-install: false
 
       - name: Install uv
-        # tests/sast-scan.bats drives the controller's `sdlc sast` classifier
-        # via `uv run`, so uv must be on PATH for the bats job.
+        # tests/sast-scan.bats and tests/osv-scan.bats drive the controller's
+        # `sdlc sast` / `sdlc depscan` classifiers via `uv run`, so uv must be
+        # on PATH for the bats job.
         uses: astral-sh/setup-uv@v5
 
       - name: Run bats suites
         run: |
           bats --version
           jq --version
-          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/risk-gate.bats tests/codex-adversarial-review.bats tests/sast-scan.bats tests/gitleaks-secrets.bats
+          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/risk-gate.bats tests/codex-adversarial-review.bats tests/sast-scan.bats tests/osv-scan.bats tests/gitleaks-secrets.bats
 
   controller-smoke:
     name: Controller CLI smoke test (uv tool install)

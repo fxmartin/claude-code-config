@@ -51,6 +51,11 @@
       "type": "string",
       "enum": ["PASS", "WARN", "FAIL"],
       "description": "SAST (semgrep) scan outcome (Story 9.1-001). CLEAN->PASS, WARN->WARN, BLOCK->FAIL. Optional for backward compatibility."
+    },
+    "dep_scan_status": {
+      "type": "string",
+      "enum": ["PASS", "WARN", "FAIL"],
+      "description": "Dependency (osv-scanner) scan outcome (Story 9.1-002). CLEAN->PASS, WARN->WARN, BLOCK->FAIL. Optional for backward compatibility."
     }
   }
 }
