@@ -76,9 +76,11 @@ If rebase fails:
 
 A PR that touches high-risk paths (auth, payments, migrations, infrastructure,
 secrets, destructive shell) carries the `risk:high` label, applied by the
-`risk-gate` workflow. Such a PR MUST NOT be merged until a human on the
-`risk-approver` GitHub team has approved it. You merge autonomously — so for
-high-risk PRs you STOP and hand back to the human, you do not merge.
+`risk-gate` workflow. Such a PR MUST NOT be merged until a human has approved
+it via one of two paths: an approving review from a `risk-approver` GitHub team
+member (org repos), or the `risk-approved` label added by a maintainer (the
+path for single-maintainer / non-org repos). You merge autonomously — so for
+an unapproved high-risk PR you STOP and hand back to the human, you do not merge.
 
 ```bash
 # Is this PR flagged high-risk?
@@ -86,14 +88,15 @@ HAS_RISK_LABEL=$(gh pr view {{PR_NUMBER}} --json labels \
   -q '.labels[].name' | grep -Fx 'risk:high' || true)
 
 if [ -n "${HAS_RISK_LABEL}" ]; then
-  # Require an APPROVED review from a risk-approver team member. The
-  # risk-gate check itself enforces this; the agent re-checks so it never
-  # merges ahead of the gate.
+  # Accept either approval path. The risk-gate check enforces the same logic;
+  # the agent re-checks so it never merges ahead of the gate.
   APPROVED=$(gh pr view {{PR_NUMBER}} --json reviews \
     -q '[.reviews[] | select(.state=="APPROVED")] | length')
-  if [ "${APPROVED:-0}" -eq 0 ]; then
+  HAS_APPROVED_LABEL=$(gh pr view {{PR_NUMBER}} --json labels \
+    -q '.labels[].name' | grep -Fx 'risk-approved' || true)
+  if [ "${APPROVED:-0}" -eq 0 ] && [ -z "${HAS_APPROVED_LABEL}" ]; then
     echo "MERGE_STATUS: BLOCKED_HIGH_RISK"
-    echo "DETAIL: PR #{{PR_NUMBER}} is labelled risk:high and has no human approval; a risk-approver must approve before merge."
+    echo "DETAIL: PR #{{PR_NUMBER}} is labelled risk:high and has no human approval; a risk-approver must approve, or a maintainer must add the risk-approved label, before merge."
     exit 1
   fi
 fi
@@ -175,7 +178,7 @@ git push
 Output exactly one of these status lines:
 
 - `MERGE_STATUS: SUCCESS` — merge, progress update, and DoD update all completed
-- `MERGE_STATUS: BLOCKED_HIGH_RISK` — PR is labelled `risk:high` and has no human approval from the `risk-approver` team; a human must approve before merge (agent never uses `--admin` to bypass)
+- `MERGE_STATUS: BLOCKED_HIGH_RISK` — PR is labelled `risk:high` and has no human approval (a `risk-approver` review or the `risk-approved` label from a maintainer); a human must approve before merge (agent never uses `--admin` to bypass)
 - `MERGE_STATUS: REBASE_CONFLICT` — branch could not be rebased onto updated main (parallel mode baseline drift)
 - `MERGE_STATUS: CONFLICT` — PR could not merge due to conflicts
 - `MERGE_STATUS: FAILED` — PR merge failed for another reason (include error details on next line)
