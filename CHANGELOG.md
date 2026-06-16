@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- feat(adversarial): codex reference implementation of the reviewer slot
+  (#8.1-002). A new `scripts/codex-adversarial-review.sh` wrapper is the first
+  concrete plug-in for the Story 8.1-001 reviewer slot: it fetches a PR via
+  `gh`, runs a Codex review skill (`roast` or `project-review`) through
+  `codex exec`, and emits JSON that validates against the
+  `adversarial-reviewer-response` schema, so the controller's
+  `parse_reviewer_response()` accepts it unchanged. The `codex` reviewer is
+  registered and enabled by default in
+  `controller/config/adversarial-reviewers.yaml`; users without Codex set
+  `enabled: false` for no behavior change. Covered by
+  `tests/codex-adversarial-review.bats` and
+  `controller/tests/test_codex_adversarial_review.py` (both hermetic via a
+  captured-transcript seam). Documented in `docs/adversarial-review.md`.
 - feat(risk-gate): high-risk file pattern detection and human-approval block
   (#8.2-001). A new `risk-gate` GitHub workflow flags any PR touching high-risk
   paths (auth, payments, migrations, infra, secrets, destructive shell) with the

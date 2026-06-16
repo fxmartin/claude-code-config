@@ -16,8 +16,12 @@
 consensus: any_block_majority
 
 reviewers:
+  # Codex reference implementation of the slot (Story 8.1-002). The wrapper
+  # fetches the PR via `gh`, runs a Codex review skill (roast/project-review),
+  # and emits this schema's JSON. Enabled by default for FX's environment;
+  # users without Codex set `enabled: false` (see docs/adversarial-review.md).
   codex:
-    command: "codex review-pr --pr-number {pr_number} --output json"
+    command: "codex-adversarial-review.sh --pr-number {pr_number}"
     timeout_sec: 300
     enabled: true
     allowed_verdicts: ["approve", "request_changes", "block"]
