@@ -305,3 +305,57 @@ def test_finding_coordinate_formats_package_and_version() -> None:
         _report([_package(name="flask", version="2.1.0", vulns=[_vuln(severity="HIGH")])])
     )
     assert result.findings[0].coordinate() == "flask@2.1.0"
+
+
+# ---------------------------------------------------------------------------
+# _cvss_score edge cases (defensive parsing paths)
+# ---------------------------------------------------------------------------
+
+
+def test_cvss_score_ignores_non_dict_severity_entry() -> None:
+    """Non-dict entries in severity[] must be skipped (line 175 branch)."""
+    vuln = {
+        "id": "OSV-CVSS-STR",
+        "summary": "cvss-string-entry",
+        "severity": ["not-a-dict", {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+    }
+    result = classify_osv_report(_report([_package(vulns=[vuln])]))
+    # The non-dict entry is skipped; the second entry is a high-impact vector → BLOCK.
+    assert result.status == "BLOCK"
+
+
+def test_cvss_score_ignores_entry_with_missing_score_key() -> None:
+    """Severity dicts with no 'score' key must be skipped (line 178-179 branch)."""
+    vuln = {
+        "id": "OSV-CVSS-NOSCORE",
+        "summary": "no-score-key",
+        "severity": [{"type": "CVSS_V3"}],  # no "score" key
+    }
+    result = classify_osv_report(_report([_package(vulns=[vuln])]))
+    # No score available: falls through to WARN (unknown label, no usable CVSS).
+    assert result.status == "WARN"
+
+
+def test_cvss_score_parses_bare_numeric_score() -> None:
+    """A bare numeric string score (e.g. '7.5') must be parsed as a float (line 183-184)."""
+    vuln = {
+        "id": "OSV-CVSS-NUMERIC",
+        "summary": "numeric-score",
+        "severity": [{"type": "CVSS_V3", "score": "7.5"}],
+        # No database_specific.severity label — falls back entirely to CVSS score.
+    }
+    result = classify_osv_report(_report([_package(vulns=[vuln])]))
+    # 7.5 >= _CVSS_BLOCK_THRESHOLD (7.0) → BLOCK.
+    assert result.status == "BLOCK"
+
+
+def test_cvss_score_low_numeric_does_not_block() -> None:
+    """A low bare numeric score (e.g. '3.5') must not trigger BLOCK."""
+    vuln = {
+        "id": "OSV-CVSS-LOW",
+        "summary": "low-numeric-score",
+        "severity": [{"type": "CVSS_V3", "score": "3.5"}],
+    }
+    result = classify_osv_report(_report([_package(vulns=[vuln])]))
+    # 3.5 < 7.0 → not blocking; unknown label with low CVSS → WARN.
+    assert result.status == "WARN"

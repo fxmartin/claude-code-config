@@ -295,3 +295,44 @@ def test_depscan_bad_report_exits_two() -> None:
     result = runner.invoke(app, ["depscan"], input="{not json")
     assert result.exit_code == 2
     assert "not valid JSON" in result.output
+
+
+def test_depscan_suppressed_finding_is_printed(tmp_path) -> None:
+    """Suppressed findings must appear as [suppressed] lines in the output (cli.py:267)."""
+    suppressions = tmp_path / ".dep-scan-suppressions.yaml"
+    suppressions.write_text(
+        "suppress:\n"
+        "  - id: OSV-2024-0001\n"
+        "    reason: not reachable from our call paths\n"
+        "    expires: 2999-01-01\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        ["depscan", "--suppressions", str(suppressions)],
+        input=_osv_report("HIGH"),
+    )
+    assert result.exit_code == 0
+    assert "DEP_SCAN_STATUS: CLEAN" in result.output
+    assert "[suppressed]" in result.output
+    assert "OSV-2024-0001" in result.output
+
+
+def test_sast_suppressed_finding_is_printed(tmp_path) -> None:
+    """Suppressed SAST findings must appear as [suppressed] lines in the output (cli.py:218)."""
+    config = tmp_path / ".sast-config.yaml"
+    config.write_text(
+        "suppress:\n"
+        "  - id: rules.example\n"
+        "    reason: false positive in test harness\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        ["sast", "--config", str(config)],
+        input=_semgrep_report("ERROR", "rules.example"),
+    )
+    assert result.exit_code == 0
+    assert "SAST_STATUS: CLEAN" in result.output
+    assert "[suppressed]" in result.output
+    assert "rules.example" in result.output
