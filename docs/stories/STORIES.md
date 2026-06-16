@@ -36,7 +36,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic-05 | Automatic Release Management | MVP | 3 | 8 | P1 | **COMPLETE** |
 | Epic-06 | Public Release Readiness | MVP | 4 | 9 | P1 | **COMPLETE**[^1] |
 | Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | **COMPLETE** (PRs #40-#43; E2E_PASS after bugfix #45) — `sdlc build`/`validate`/`sync-check` implemented; `init`/`resume`/`status`/`state`/`rollback` ship as [stubs](./epic-07-external-controller.md#deferred--stubbed-subcommands) |
-| Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | |
+| Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | **COMPLETE** (PRs #51, #52, #54) — adversarial slot + Codex reference impl + high-risk approval gate; gate approval fixed for solo/non-org repos via the `risk-approved` maintainer label ([#56](https://github.com/fxmartin/claude-code-config/pull/56)) |
 | Epic-09 | Security Baked into Quality Gates + Live Pilot | Roadmap | 4 | 12 | P2 | |
 | Epic-10 | Controller Hardening (resume, observability, rollback) | Roadmap | 2 | 13 | P2 | **PLANNED** |
 
