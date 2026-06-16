@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.21.0] - 2026-06-16
+
+### Added
+
+- feat: codex reference implementation of adversarial slot (#8.1-002) (#54)
+
+
 ## [v1.20.1] - 2026-06-16
 
 ### Fixed
