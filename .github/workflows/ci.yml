@@ -10,6 +10,34 @@ permissions:
   contents: read
 
 jobs:
+  # Story 9.2-001: secrets must be caught before any build/test job runs so a
+  # leaked credential is never echoed into later job logs. This job runs the
+  # gitleaks CLI directly (`detect --no-banner --redact`) against the repo;
+  # the build-like jobs (behavior-tests, controller-smoke, smoke-test) gate on
+  # it via `needs: secrets-scan` to fail fast. The same .gitleaks.toml drives
+  # the local pre-commit hook, so CI and local scans stay in lockstep.
+  secrets-scan:
+    name: Secret detection (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so detect scans every commit on the branch, not just
+          # the tip — a secret introduced and "reverted" earlier still counts.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          version="8.30.1"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz"
+          curl -fsSL "$url" | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Run gitleaks (redacted, fail on any finding)
+        run: gitleaks detect --no-banner --redact --config .gitleaks.toml
+
   static-checks:
     name: Static checks
     runs-on: ubuntu-latest
@@ -106,6 +134,9 @@ jobs:
     name: Behavior tests (bats)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Gate on the secrets scan so a leaked credential fails the build before any
+    # test job runs and risks echoing the secret (Story 9.2-001).
+    needs: secrets-scan
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -129,7 +160,7 @@ jobs:
         run: |
           bats --version
           jq --version
-          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/risk-gate.bats tests/codex-adversarial-review.bats tests/sast-scan.bats
+          bats tests/cmux-bridge.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/risk-gate.bats tests/codex-adversarial-review.bats tests/sast-scan.bats tests/gitleaks-secrets.bats
 
   controller-smoke:
     name: Controller CLI smoke test (uv tool install)
@@ -142,6 +173,8 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
+    # Fail fast on leaked secrets before standing up the controller (9.2-001).
+    needs: secrets-scan
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -192,6 +225,8 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
+    # Fail fast on leaked secrets before the clean-machine install (9.2-001).
+    needs: secrets-scan
     steps:
       - name: Checkout
         uses: actions/checkout@v4

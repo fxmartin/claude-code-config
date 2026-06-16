@@ -1,0 +1,11 @@
+# ABOUTME: Deliberate test secret fixture for the gitleaks bats test (Story 9.2-001).
+# ABOUTME: NOT a real credential — a synthetic token that gitleaks must flag.
+#
+# This file exists so tests/gitleaks-secrets.bats can prove the secrets scanner
+# catches a planted credential. The token below is fabricated and grants access
+# to nothing. The fixture is path-allowlisted in .gitleaks.toml so it never
+# blocks a commit or the CI gate; the bats test scans it with the stock default
+# ruleset (no allowlist) to confirm detection works. Do not put a real secret
+# here, and do not move it under an allowlisted example path.
+
+github_pat = ghp_012345678901234567890123456789abcdef
