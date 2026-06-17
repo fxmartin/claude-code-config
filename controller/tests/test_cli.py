@@ -237,3 +237,102 @@ def test_sast_bad_report_exits_two() -> None:
     result = runner.invoke(app, ["sast"], input="{not json")
     assert result.exit_code == 2
     assert "not valid JSON" in result.output
+
+
+# ---------------------------------------------------------------------------
+# depscan subcommand (Story 9.1-002)
+# ---------------------------------------------------------------------------
+
+
+def _osv_report(severity: str, osv_id: str = "OSV-2024-0001") -> str:
+    return _json.dumps(
+        {
+            "results": [
+                {
+                    "source": {"path": "uv.lock", "type": "lockfile"},
+                    "packages": [
+                        {
+                            "package": {
+                                "name": "requests",
+                                "version": "2.0.0",
+                                "ecosystem": "PyPI",
+                            },
+                            "vulnerabilities": [
+                                {
+                                    "id": osv_id,
+                                    "summary": "x",
+                                    "database_specific": {"severity": severity},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+
+def test_depscan_clean_exits_zero() -> None:
+    result = runner.invoke(app, ["depscan"], input=_json.dumps({"results": []}))
+    assert result.exit_code == 0
+    assert "DEP_SCAN_STATUS: CLEAN" in result.output
+
+
+def test_depscan_warn_exits_zero() -> None:
+    result = runner.invoke(app, ["depscan"], input=_osv_report("LOW"))
+    assert result.exit_code == 0
+    assert "DEP_SCAN_STATUS: WARN" in result.output
+
+
+def test_depscan_block_exits_one() -> None:
+    result = runner.invoke(app, ["depscan"], input=_osv_report("CRITICAL", "OSV-CRIT"))
+    assert result.exit_code == 1
+    assert "DEP_SCAN_STATUS: BLOCK" in result.output
+    assert "OSV-CRIT" in result.output
+
+
+def test_depscan_bad_report_exits_two() -> None:
+    result = runner.invoke(app, ["depscan"], input="{not json")
+    assert result.exit_code == 2
+    assert "not valid JSON" in result.output
+
+
+def test_depscan_suppressed_finding_is_printed(tmp_path) -> None:
+    """Suppressed findings must appear as [suppressed] lines in the output (cli.py:267)."""
+    suppressions = tmp_path / ".dep-scan-suppressions.yaml"
+    suppressions.write_text(
+        "suppress:\n"
+        "  - id: OSV-2024-0001\n"
+        "    reason: not reachable from our call paths\n"
+        "    expires: 2999-01-01\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        ["depscan", "--suppressions", str(suppressions)],
+        input=_osv_report("HIGH"),
+    )
+    assert result.exit_code == 0
+    assert "DEP_SCAN_STATUS: CLEAN" in result.output
+    assert "[suppressed]" in result.output
+    assert "OSV-2024-0001" in result.output
+
+
+def test_sast_suppressed_finding_is_printed(tmp_path) -> None:
+    """Suppressed SAST findings must appear as [suppressed] lines in the output (cli.py:218)."""
+    config = tmp_path / ".sast-config.yaml"
+    config.write_text(
+        "suppress:\n"
+        "  - id: rules.example\n"
+        "    reason: false positive in test harness\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        ["sast", "--config", str(config)],
+        input=_semgrep_report("ERROR", "rules.example"),
+    )
+    assert result.exit_code == 0
+    assert "SAST_STATUS: CLEAN" in result.output
+    assert "[suppressed]" in result.output
+    assert "rules.example" in result.output

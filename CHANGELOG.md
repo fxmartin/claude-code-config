@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- feat(security): dependency scan with osv-scanner (#9.1-002)
 - feat(security): gitleaks secrets scan on every pr (#9.2-001)
 
 ## [v1.22.0] - 2026-06-16

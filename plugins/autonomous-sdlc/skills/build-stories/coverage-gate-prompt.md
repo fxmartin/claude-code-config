@@ -145,6 +145,47 @@ findings by rule ID (each suppression requires a mandatory `reason`). The
 `.semgrepignore` file excludes test fixtures and generated code from scanning.
 See `docs/security-gates.md` for the full contract.
 
+### Step 7d: Dependency scan with osv-scanner (Story 9.1-002 — skip if `{{SECURITY_SCAN}}` is `off`)
+
+Check the project's dependency tree against the OSV vulnerability database
+*after* coverage is measured. This blocks PRs that introduce known-vulnerable
+libraries — something coverage and SAST cannot catch. The repo ships a
+`scripts/osv-scan.sh` wrapper that auto-detects lockfiles (`package-lock.json`,
+`uv.lock`, `poetry.lock`, `go.sum`, `Cargo.lock`, …) and classifies the JSON
+report into a `CLEAN | WARN | BLOCK` verdict:
+
+```bash
+# osv-scanner must be installed (brew install osv-scanner, go install, or the
+# release binary). The wrapper runs:
+#   osv-scanner --lockfile=auto --format=json --output=$REPORT .
+# then classifies the report via `sdlc depscan`
+#   (HIGH/CRITICAL -> BLOCK, LOW/MODERATE -> WARN).
+# It honors per-repo .dep-scan-suppressions.yaml (OSV IDs with mandatory
+# reason + expiry; an expired suppression fails the gate).
+if command -v osv-scanner >/dev/null 2>&1; then
+  DEP_SCAN_OUTPUT="$(bash scripts/osv-scan.sh . || true)"
+  echo "$DEP_SCAN_OUTPUT"
+  DEP_SCAN_STATUS="$(echo "$DEP_SCAN_OUTPUT" | sed -nE 's/^DEP_SCAN_STATUS: (CLEAN|WARN|BLOCK)$/\1/p' | head -1)"
+else
+  DEP_SCAN_STATUS="SKIPPED"   # osv-scanner not installed; report SKIPPED, do not block
+fi
+```
+
+**Dependency scan behavior:**
+- `CLEAN`: no vulnerabilities in the dependency tree — gate passes.
+- `WARN`: one or more low/moderate-severity findings — gate passes, findings reported.
+- `BLOCK`: one or more high/critical-severity findings — **gate FAILED**. The
+  orchestrator routes a `BLOCK` to the bugfix loop (Step 5d in `build-stories`),
+  the same path as a `SAST_STATUS: BLOCK`. Include each finding's OSV ID,
+  package, and version in the agent output so the bugfix agent can bump the
+  vulnerable dependency.
+- `SKIPPED`: osv-scanner is not installed, or `{{SECURITY_SCAN}}` is `off`.
+
+A consumer repo may ship `.dep-scan-suppressions.yaml` to suppress a finding by
+OSV ID; each suppression requires a mandatory `reason` and an `expires` date,
+and an expired suppression fails the gate. See `docs/security-gates.md` for the
+full contract.
+
 ## Coverage Analysis Approach
 
 - Focus coverage analysis on **files changed by this story only** (not the entire codebase)
@@ -167,6 +208,7 @@ PR_URL: [url]
 COVERAGE_STATUS: PASS | WARN
 SECURITY_STATUS: CLEAN | SECURITY_WARN | SECURITY_BLOCK | SKIPPED
 SAST_STATUS: CLEAN | WARN | BLOCK | SKIPPED
+DEP_SCAN_STATUS: CLEAN | WARN | BLOCK | SKIPPED
 ```
 
 - `PASS`: New code has ≥{{COVERAGE_THRESHOLD}}% coverage
@@ -181,18 +223,24 @@ SAST_STATUS: CLEAN | WARN | BLOCK | SKIPPED
   - `WARN`: One or more `warning`-severity findings — gate passes
   - `BLOCK`: One or more `error`-severity findings — gate FAILED; routed to the bugfix loop (include rule IDs, files, and lines in agent output)
   - `SKIPPED`: semgrep not installed, or security scan disabled via `{{SECURITY_SCAN}}=off`
+- `DEP_SCAN_STATUS` (osv-scanner, Story 9.1-002):
+  - `CLEAN`: No known-vulnerable dependencies
+  - `WARN`: One or more low/moderate-severity findings — gate passes
+  - `BLOCK`: One or more high/critical-severity findings — gate FAILED; routed to the bugfix loop (include OSV IDs, packages, and versions in agent output)
+  - `SKIPPED`: osv-scanner not installed, or security scan disabled via `{{SECURITY_SCAN}}=off`
 
 ### Machine-readable result block
 
 As the FINAL line of your response, also emit a result block that conforms to
 `controller/schemas/coverage-agent-response.schema.json`. Map the statuses into
 the schema's canonical `PASS | WARN | FAIL` enum (CLEAN → PASS, SECURITY_WARN →
-WARN, SECURITY_BLOCK → FAIL, SKIPPED → PASS). The SAST verdict maps the same way
-(CLEAN → PASS, WARN → WARN, BLOCK → FAIL, SKIPPED → PASS):
+WARN, SECURITY_BLOCK → FAIL, SKIPPED → PASS). The SAST and dependency-scan
+verdicts map the same way (CLEAN → PASS, WARN → WARN, BLOCK → FAIL, SKIPPED →
+PASS):
 
 ```
 <<<RESULT_JSON>>>
-{"pr_number": [number], "pr_url": "[url]", "coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "security_status": "PASS", "sast_status": "PASS"}
+{"pr_number": [number], "pr_url": "[url]", "coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "security_status": "PASS", "sast_status": "PASS", "dep_scan_status": "PASS"}
 <<<END_RESULT>>>
 ```
 

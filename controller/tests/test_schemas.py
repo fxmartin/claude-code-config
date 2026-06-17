@@ -180,6 +180,21 @@ def test_bugfix_optional_issue_number_accepted() -> None:
     assert validate_response("bugfix", data) == data
 
 
+def test_coverage_optional_dep_scan_status_accepted() -> None:
+    """The optional dep_scan_status (Story 9.1-002) validates when present."""
+    data = dict(VALID_RESPONSES["coverage"])
+    data["dep_scan_status"] = "FAIL"
+    assert validate_response("coverage", data) == data
+
+
+def test_coverage_dep_scan_status_enum_violation_fails() -> None:
+    """A dep_scan_status outside the PASS|WARN|FAIL enum is rejected."""
+    data = dict(VALID_RESPONSES["coverage"])
+    data["dep_scan_status"] = "BLOCK"
+    with pytest.raises(SchemaValidationError):
+        validate_response("coverage", data)
+
+
 def test_wrong_type_fails_with_location() -> None:
     """A field with the wrong type fails and the message names the field."""
     data = dict(VALID_RESPONSES["coverage"])

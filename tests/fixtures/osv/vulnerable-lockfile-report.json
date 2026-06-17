@@ -1,0 +1,28 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "tests/fixtures/osv/uv.lock",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "requests",
+            "version": "2.19.0",
+            "ecosystem": "PyPI"
+          },
+          "vulnerabilities": [
+            {
+              "id": "GHSA-9wx4-h78v-vm56",
+              "summary": "Unintended leak of Proxy-Authorization header in requests",
+              "database_specific": {
+                "severity": "HIGH"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

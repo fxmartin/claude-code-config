@@ -110,6 +110,42 @@ Based on the debugging checklist findings, classify:
 2. If not fixable by agent: report the issue clearly in the output
 3. No GitHub issue needed for environment issues
 
+### Step 2b: Dependency-vulnerability remediation (DEP_SCAN_STATUS: BLOCK)
+
+When `{{FAILED_STEP}}` is the coverage gate and `{{FAILURE_OUTPUT}}` reports a
+`DEP_SCAN_STATUS: BLOCK` from osv-scanner, the root cause is a known-vulnerable
+dependency, not a logic bug. The failure output lists each gating finding's OSV
+ID, package, and version. Remediate one dependency at a time:
+
+1. **Identify the fixed version.** Look up the OSV ID (e.g. on
+   <https://osv.dev>) or read the advisory in the scan output to find the
+   lowest non-vulnerable release of the named package.
+2. **Bump exactly that one dependency** in the lockfile, preferring the minimal
+   safe upgrade so the blast radius stays small:
+   - Python (uv): `uv lock --upgrade-package <name>` (or pin `<name>>=<fixed>` in
+     `pyproject.toml`, then `uv lock`).
+   - Node: `npm install <name>@<fixed>` (or `npm audit fix` for a single dep).
+   - Go / Rust: `go get <module>@<fixed>` / `cargo update -p <name> --precise <fixed>`.
+3. **Run the test suite** to confirm the bump did not break anything. If it did,
+   fix the breakage or fall back to the next compatible version.
+4. **Confirm the vulnerability is gone:** re-run `bash scripts/osv-scan.sh .`
+   (or the gate) and verify the OSV ID no longer appears and the verdict is
+   `CLEAN` or `WARN`.
+5. **If no fixed version exists** and the finding is genuinely not reachable,
+   add a `.dep-scan-suppressions.yaml` entry with a mandatory `reason` and a
+   near-term `expires` date (so the deferral is revisited), and note it in the
+   output. Never suppress a reachable high/critical finding to make the gate
+   pass.
+6. **Commit the bump:**
+   ```bash
+   git add -A
+   git commit -m "fix({{EPIC_NAME}}): bump <name> to <fixed> for <OSV-ID>
+
+   Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+   ```
+
+Treat each remediated dependency as a fixed bug for the output counts.
+
 ## Output Contract
 
 Return these exact lines at the end of your response:

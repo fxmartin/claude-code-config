@@ -25,6 +25,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "rollback": "Roll a run back to a prior ledger checkpoint.",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
     "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
+    "depscan": "Classify an osv-scanner report into a CLEAN | WARN | BLOCK gate verdict.",
 }
 
 app = typer.Typer(
@@ -215,6 +216,55 @@ def sast(
         typer.echo(f"  [{finding.severity}] {finding.location()} {finding.check_id}")
     for finding in result.suppressed:
         typer.echo(f"  [suppressed] {finding.location()} {finding.check_id}")
+
+    raise typer.Exit(code=1 if result.status == "BLOCK" else 0)
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["depscan"])
+def depscan(
+    report_file: Path | None = typer.Argument(
+        None,
+        help="osv-scanner --format=json report. Reads stdin when omitted.",
+    ),
+    suppressions_file: Path = typer.Option(
+        Path(".dep-scan-suppressions.yaml"),
+        "--suppressions",
+        help="Per-repo OSV-ID suppressions (each needs a reason and an expiry).",
+    ),
+) -> None:
+    """Classify an osv-scanner report into a dependency-scan gate verdict.
+
+    Reads an osv-scanner ``--format=json`` report (from a file or stdin),
+    applies any per-repo suppressions from ``.dep-scan-suppressions.yaml``, and
+    prints the verdict as ``DEP_SCAN_STATUS: CLEAN | WARN | BLOCK`` followed by
+    one line per gating finding. Exits 0 for CLEAN/WARN and 1 for BLOCK so a
+    shell gate can branch on the exit code. A malformed report or an expired
+    suppression exits 2.
+    """
+    from sdlc.dependency_scan import (
+        DepScanConfigError,
+        DepScanReportError,
+        classify_osv_report,
+        load_dep_scan_suppressions,
+    )
+
+    report = report_file.read_text(encoding="utf-8") if report_file else sys.stdin.read()
+
+    try:
+        suppressions = load_dep_scan_suppressions(suppressions_file)
+        result = classify_osv_report(report, suppressions=suppressions)
+    except (DepScanReportError, DepScanConfigError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(f"DEP_SCAN_STATUS: {result.status}")
+    for finding in result.findings:
+        typer.echo(
+            f"  [{finding.severity}] {finding.coordinate()} "
+            f"({finding.ecosystem}) {finding.osv_id}"
+        )
+    for finding in result.suppressed:
+        typer.echo(f"  [suppressed] {finding.coordinate()} {finding.osv_id}")
 
     raise typer.Exit(code=1 if result.status == "BLOCK" else 0)
 

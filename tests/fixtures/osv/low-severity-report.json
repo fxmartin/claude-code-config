@@ -1,0 +1,28 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "tests/fixtures/osv/uv.lock",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "example-pkg",
+            "version": "1.0.0",
+            "ecosystem": "PyPI"
+          },
+          "vulnerabilities": [
+            {
+              "id": "OSV-2024-9999",
+              "summary": "A minor informational advisory",
+              "database_specific": {
+                "severity": "LOW"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
