@@ -218,7 +218,7 @@ def test_bugfix_loop_exhaustion_marks_story_failed(tmp_path) -> None:
         def set_story_pr(self, *a, **k): pass
 
     opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
-    outcome = _run_story(story, opts, _SilentLedger(), "run-id", dispatch)  # type: ignore[arg-type]
+    outcome = _run_story(story, opts, _SilentLedger(), "run-id", dispatch, tmp_path / "logs")  # type: ignore[arg-type]
 
     # After MAX_BUGFIX_ATTEMPTS the guard fires and the story is FAILED.
     assert outcome == "FAILED"

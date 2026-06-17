@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import subprocess
+import sys
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -101,6 +102,7 @@ _BOOL_FLAGS = {
     "--skip-coverage": "skip_coverage",
     "--sequential": "sequential",
     "--skip-preflight": "skip_preflight",
+    "--rebuild": "rebuild",
 }
 
 
@@ -120,6 +122,8 @@ class BuildOptions:
     sequential: bool = False
     coverage_threshold: int = 90
     skip_preflight: bool = False
+    rebuild: bool = False
+    preflight_timeout: int = 600
 
 
 def parse_build_args(args: Iterable[str]) -> BuildOptions:
@@ -127,9 +131,10 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
 
     Accepts the exact flags the skill documents:
     ``[scope] [--dry-run] [--auto] [--skip-coverage] [--limit=N]
-    [--sequential] [--coverage-threshold=N] [--skip-preflight]``. A bare
-    positional token is the scope (default ``all``). Unknown flags raise
-    :class:`ValueError` so a typo never silently changes behaviour.
+    [--sequential] [--coverage-threshold=N] [--skip-preflight] [--rebuild]
+    [--preflight-timeout=SEC]``. ``scope`` is ``all``, ``epic-NN``, an epic
+    name, or a single story id ``X.Y-NNN`` (default ``all``). Unknown flags
+    raise :class:`ValueError` so a typo never silently changes behaviour.
     """
     opts = BuildOptions()
     scope_set = False
@@ -140,6 +145,8 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
             opts.limit = int(arg.split("=", 1)[1])
         elif arg.startswith("--coverage-threshold="):
             opts.coverage_threshold = int(arg.split("=", 1)[1])
+        elif arg.startswith("--preflight-timeout="):
+            opts.preflight_timeout = int(arg.split("=", 1)[1])
         elif arg.startswith("--"):
             raise ValueError(f"unknown flag: {arg}")
         elif not scope_set:
@@ -338,6 +345,189 @@ class Ledger:
                 (run_id or None, story_id or None, level, source or None, message),
             )
 
+    # --- Read-only queries -------------------------------------------------
+    # These power `sdlc status`. They open the ledger read-only with a
+    # busy timeout so a poll issued *while the controller is writing* waits out
+    # the brief writer lock instead of erroring. A missing DB file is reported
+    # as "no run yet" (None / empty), never an exception — the status command
+    # and the polling skill treat absence as "not started".
+
+    @contextmanager
+    def _connect_ro(self) -> Iterator[sqlite3.Connection]:
+        """Open a read-only connection to the ledger (caller guarantees it exists)."""
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout = 2000;")
+            yield conn
+        finally:
+            conn.close()
+
+    def latest_run_id(self) -> str | None:
+        """The most recently started run id, or None when there is no run / no DB."""
+        if not self.db_path.exists():
+            return None
+        with self._connect_ro() as conn:
+            row = conn.execute(
+                "SELECT id FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        return row["id"] if row else None
+
+    def run_row(self, run_id: str) -> dict | None:
+        """The `runs` row for ``run_id`` as a dict, or None when absent."""
+        if not self.db_path.exists():
+            return None
+        with self._connect_ro() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def story_rows(self, run_id: str) -> list[dict]:
+        """Per-story progress for ``run_id``, newest-stage first.
+
+        ``current_stage`` / ``stage_status`` are derived from the ``stages``
+        table (the controller never populates ``stories.current_stage``): the
+        latest stage attempt by start time wins.
+        """
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.story_id, s.title, s.priority, s.status, s.pr_number,
+                    (SELECT st.stage_name FROM stages st
+                       WHERE st.run_id = s.run_id AND st.story_id = s.story_id
+                       ORDER BY st.started_at DESC, st.rowid DESC LIMIT 1) AS current_stage,
+                    (SELECT st.status FROM stages st
+                       WHERE st.run_id = s.run_id AND st.story_id = s.story_id
+                       ORDER BY st.started_at DESC, st.rowid DESC LIMIT 1) AS stage_status
+                FROM stories s
+                WHERE s.run_id = ?
+                ORDER BY s.rowid
+                """,
+                (run_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def recent_events(self, run_id: str, limit: int = 10) -> list[dict]:
+        """The last ``limit`` audit events for ``run_id``, oldest-first."""
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                "SELECT ts, level, source, story_id, message FROM events "
+                "WHERE run_id = ? ORDER BY id DESC LIMIT ?",
+                (run_id, limit),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def list_runs(self, limit: int = 50) -> list[dict]:
+        """The most recent ``limit`` runs (newest first) for the runs browser.
+
+        Each entry is ``{id, scope, mode, status, started_at, finished_at,
+        total, done, failed}``. The ``total/done/failed`` tallies are computed
+        live from the per-story rows (a single grouped query), so an in-progress
+        run shows accurate counts — the run row's stored ``completed/failed`` are
+        0 until close-out. Capped at ``limit`` to keep the list bounded.
+        """
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            runs = conn.execute(
+                "SELECT id, scope, mode, status, started_at, finished_at, "
+                "total_stories FROM runs ORDER BY started_at DESC, rowid DESC "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+            grouped = conn.execute(
+                "SELECT run_id, status, COUNT(*) AS n FROM stories GROUP BY run_id, status"
+            ).fetchall()
+
+        counts: dict[str, dict[str, int]] = {}
+        for g in grouped:
+            counts.setdefault(g["run_id"], {})[g["status"]] = g["n"]
+
+        out: list[dict] = []
+        for r in runs:
+            by_status = counts.get(r["id"], {})
+            total = r["total_stories"] or sum(by_status.values())
+            out.append(
+                {
+                    "id": r["id"],
+                    "scope": r["scope"],
+                    "mode": r["mode"],
+                    "status": r["status"],
+                    "started_at": r["started_at"],
+                    "finished_at": r["finished_at"],
+                    "total": total,
+                    "done": by_status.get("DONE", 0),
+                    "failed": by_status.get("FAILED", 0),
+                }
+            )
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Progress snapshot — shared by `status --json` and the dashboard
+# ---------------------------------------------------------------------------
+
+_EMPTY_COUNTS = {
+    "total": 0, "done": 0, "failed": 0, "blocked": 0,
+    "in_progress": 0, "skipped": 0, "todo": 0,
+}
+
+
+def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
+    """A read-only progress snapshot of ``run_id`` (default: the latest run).
+
+    Returns the stable shape consumed by both ``sdlc status --json`` and
+    the local dashboard: ``{db, run|None, counts, stories, events}``. Counts are
+    derived from the per-story rows (not the run row's end-of-run tallies, which
+    are 0 mid-run). When there is no run, ``run`` is None and counts are zero.
+    """
+    rid = run_id or ledger.latest_run_id()
+    payload: dict = {
+        "db": str(ledger.db_path),
+        "run": None,
+        "counts": dict(_EMPTY_COUNTS),
+        "stories": [],
+        "events": [],
+    }
+    if rid is None:
+        return payload
+
+    run_row = ledger.run_row(rid)
+    if run_row is None:
+        # An explicit run id that doesn't exist → report "no run", not a hollow one.
+        return payload
+
+    stories = ledger.story_rows(rid)
+    events = ledger.recent_events(rid, limit=10)
+
+    def _count(value: str) -> int:
+        return sum(1 for s in stories if s.get("status") == value)
+
+    payload["run"] = {
+        "id": rid,
+        "scope": run_row.get("scope"),
+        "mode": run_row.get("mode"),
+        "status": run_row.get("status"),
+        "started_at": run_row.get("started_at"),
+        "finished_at": run_row.get("finished_at"),
+    }
+    payload["counts"] = {
+        "total": run_row.get("total_stories") or len(stories),
+        "done": _count("DONE"),
+        "failed": _count("FAILED"),
+        "blocked": _count("BLOCKED"),
+        "in_progress": _count("IN_PROGRESS"),
+        "skipped": _count("SKIPPED"),
+        "todo": _count("TODO"),
+    }
+    payload["stories"] = stories
+    payload["events"] = events
+    return payload
+
 
 # ---------------------------------------------------------------------------
 # Dispatcher protocol + result
@@ -376,36 +566,70 @@ class BuildResult:
 # ---------------------------------------------------------------------------
 
 def detect_test_command(root: Path) -> list[str] | None:
-    """Detect the project's test command, mirroring the skill's preference order.
+    """Detect the project's preflight command, preferring its real quality gate.
 
-    package.json (npm test) → pyproject.toml (uv run pytest) → Makefile (make
-    test) → bats (bats test/). Returns ``None`` when no test harness is found.
+    Order: the project's own gate first — ``scripts/quality-gate.sh`` or a
+    ``gate`` Makefile target — because that is what the repo actually runs in CI
+    and pre-push (e.g. ROSETTA's gate runs ``pytest -n 4``). Only if no gate
+    exists do we fall back to a generic suite: ``package.json`` (npm test) →
+    ``pyproject.toml`` (``uv run pytest``, with ``-n auto`` when pytest-xdist is
+    present so it isn't a slow serial run) → ``Makefile`` (make test) → bats.
+    Returns ``None`` when nothing is found.
     """
+    gate = root / "scripts" / "quality-gate.sh"
+    if gate.is_file():
+        return ["bash", str(gate)]
+    makefile = root / "Makefile"
+    makefile_text = makefile.read_text(encoding="utf-8") if makefile.is_file() else ""
+    if "gate:" in makefile_text:
+        return ["make", "gate"]
+
     if (root / "package.json").is_file():
         return ["npm", "test"]
     if (root / "pyproject.toml").is_file():
-        return ["uv", "run", "pytest"]
-    makefile = root / "Makefile"
-    if makefile.is_file() and "test:" in makefile.read_text(encoding="utf-8"):
+        cmd = ["uv", "run", "pytest"]
+        if _has_pytest_xdist(root):
+            cmd += ["-n", "auto"]
+        return cmd
+    if "test:" in makefile_text:
         return ["make", "test"]
     if (root / "test").is_dir():
         return ["bats", "test/"]
     return None
 
 
-def default_preflight(root: Path | None = None) -> bool:
-    """Run the detected test command and return True when it is green.
+def _has_pytest_xdist(root: Path) -> bool:
+    """True when pytest-xdist appears in the project's deps/lock (enables -n auto)."""
+    for name in ("pyproject.toml", "uv.lock", "requirements.txt"):
+        path = root / name
+        if path.is_file() and "pytest-xdist" in path.read_text(encoding="utf-8"):
+            return True
+    return False
 
-    This is the real preflight: it shells out to the test command. ``run_build``
-    accepts a ``preflight`` callable so tests inject a deterministic stub instead
-    of executing a suite.
+
+def default_preflight(root: Path | None = None, timeout: int = 600) -> bool:
+    """Run the detected preflight command and return True when it is green.
+
+    Streams the command's output (no capture) so the user sees progress instead
+    of a silent hang, and bounds it with ``timeout`` seconds — on expiry it
+    prints a clear message and fails (use ``--skip-preflight`` to bypass).
+    ``run_build`` accepts a ``preflight`` callable so tests inject a stub.
     """
     root = root or Path.cwd()
     cmd = detect_test_command(root)
     if cmd is None:
         # No suite to run — treat as a pass rather than blocking the build.
         return True
-    completed = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+    print(f"preflight: {' '.join(cmd)} (timeout {timeout}s)", file=sys.stderr)
+    try:
+        completed = subprocess.run(cmd, cwd=root, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(
+            f"PRE_FLIGHT_TIMEOUT: '{' '.join(cmd)}' exceeded {timeout}s — aborting. "
+            "Raise --preflight-timeout=N or bypass with --skip-preflight.",
+            file=sys.stderr,
+        )
+        return False
     return completed.returncode == 0
 
 
@@ -483,6 +707,37 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
 _STAGES = ("build", "coverage", "review", "merge")
 
 
+def _ensure_repo_ignores(db_path: Path) -> None:
+    """Keep the ledger files out of the target repo's ``git status`` (R9).
+
+    Adds ``.sdlc-state.db*`` (covering the DB, its ``-shm``/``-wal`` sidecars, and
+    the ``.sdlc-state.db.logs`` transcript dir) to the repo's
+    ``.git/info/exclude`` — a *local* ignore that never modifies a tracked file,
+    so the controller never dirties the repo it is building in. Best-effort:
+    silently does nothing when there is no enclosing git repo.
+    """
+    pattern = ".sdlc-state.db*"
+    try:
+        start = Path(db_path).resolve().parent
+        git_dir = next(
+            (d / ".git" for d in (start, *start.parents) if (d / ".git").is_dir()),
+            None,
+        )
+        if git_dir is None:
+            return
+        exclude = git_dir / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if pattern in existing.split():
+            return
+        with exclude.open("a", encoding="utf-8") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")
+            fh.write(f"# sdlc ledger (auto-added)\n{pattern}\n")
+    except OSError:
+        pass
+
+
 def run_build(
     opts: BuildOptions,
     *,
@@ -506,45 +761,62 @@ def run_build(
     hook that regenerates the markdown progress view from the ledger.
     """
     dispatch = dispatcher or dispatch_agent
-    check_preflight = preflight or (lambda: default_preflight())
+    check_preflight = preflight or (lambda: default_preflight(timeout=opts.preflight_timeout))
 
-    # --- Phase 1: Preflight --------------------------------------------------
+    # --- Partition: shipped (Done) stories are skipped unless --rebuild ------
+    if opts.rebuild:
+        buildable, done_skips = queue, []
+    else:
+        buildable = [s for s in queue if not s.done]
+        done_skips = [s for s in queue if s.done]
+
+    # --- Limit truncation (applies to the buildable set) ---------------------
+    if opts.limit:
+        buildable = truncate_queue(buildable, opts.limit)
+
+    # --- Dry run: report the buildable plan, dispatch nothing ----------------
+    # A dry run is plan-only — it must not run the (possibly slow/failing)
+    # preflight gate, so this returns before Phase 1.
+    if opts.dry_run:
+        return BuildResult(dry_run=True, planned=len(buildable))
+
+    # --- Phase 1: Preflight (real runs only) ---------------------------------
     if not opts.skip_preflight:
         if not check_preflight():
             return BuildResult(preflight_failed=True)
 
-    # --- Limit truncation ----------------------------------------------------
-    if opts.limit:
-        queue = truncate_queue(queue, opts.limit)
-
-    # --- Dry run: report the plan, dispatch nothing --------------------------
-    if opts.dry_run:
-        return BuildResult(dry_run=True, planned=len(queue))
-
     # --- Ledger bootstrap ----------------------------------------------------
     ledger.init()
+    _ensure_repo_ignores(ledger.db_path)  # keep ledger files out of git status (R9)
     mode = "serial" if opts.sequential else "parallel"
     run_id = ledger.run_create(opts.scope, mode)
-    ledger.set_total(run_id, len(queue))
+    ledger.set_total(run_id, len(buildable))
+    # Per-run transcript dir (next to the ledger; covered by the R9 ignore).
+    logs_dir = Path(f"{ledger.db_path}.logs") / run_id
     ledger.event_log(
         run_id, "", "info", "controller", f"run started: scope={opts.scope} mode={mode}"
     )
-    for story in queue:
+    # Record shipped stories as SKIPPED for the audit trail. They are NOT part of
+    # the build and deliberately stay out of the cohort `status` map below, so a
+    # buildable story that depends on a shipped one is treated as satisfied, not
+    # blocked (R2/R4).
+    for story in done_skips:
         ledger.story_upsert(
-            run_id,
-            story.id,
-            story.epic_id,
-            story.title,
-            story.priority,
-            story.points,
-            story.agent_type,
-            "",
-            None,
-            "TODO",
+            run_id, story.id, story.epic_id, story.title, story.priority,
+            story.points, story.agent_type, "", None, "SKIPPED",
+        )
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            "skipped: story already Done in epic (use --rebuild to force)",
+        )
+    for story in buildable:
+        ledger.story_upsert(
+            run_id, story.id, story.epic_id, story.title, story.priority,
+            story.points, story.agent_type, "", None, "TODO",
         )
 
-    cohorts = compute_cohorts(queue)
-    status: dict[str, str] = {s.id: "TODO" for s in queue}
+    cohorts = compute_cohorts(buildable)
+    status: dict[str, str] = {s.id: "TODO" for s in buildable}
 
     # --- Phase 2: cohort-by-cohort execution ---------------------------------
     for cohort in cohorts:
@@ -567,15 +839,16 @@ def run_build(
                 )
                 continue
 
-            outcome = _run_story(story, opts, ledger, run_id, dispatch)
+            outcome = _run_story(story, opts, ledger, run_id, dispatch, logs_dir)
             status[story.id] = outcome
             ledger.set_story_status(run_id, story.id, outcome)
 
     # --- Phase 3: close out --------------------------------------------------
     completed = sum(1 for v in status.values() if v == "DONE")
     failed = sum(1 for v in status.values() if v == "FAILED")
-    skipped = sum(1 for v in status.values() if v == "SKIPPED")
     blocked = sum(1 for v in status.values() if v == "BLOCKED")
+    # Shipped stories were skipped before the loop; fold them into the tally.
+    skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
 
     run_terminal = "DONE" if (failed == 0 and blocked == 0) else "FAILED"
     ledger.run_update_counts(run_id, completed, failed)
@@ -584,21 +857,26 @@ def run_build(
         "",
         "success" if run_terminal == "DONE" else "error",
         "controller",
-        f"run finished: {completed} done, {failed} failed, {blocked} blocked",
+        f"run finished: {completed} done, {failed} failed, {blocked} blocked, "
+        f"{skipped} skipped",
     )
     ledger.run_update_status(run_id, run_terminal)
 
     if render_view is not None:
         render_view(run_id)
 
+    # The returned per-story map includes the shipped skips for visibility,
+    # even though they were kept out of the cohort `status` used for blocking.
+    story_status = {s.id: "SKIPPED" for s in done_skips}
+    story_status.update(status)
     return BuildResult(
         completed=completed,
         failed=failed,
         skipped=skipped,
         blocked=blocked,
-        planned=len(queue),
+        planned=len(buildable),
         run_id=run_id,
-        story_status=status,
+        story_status=story_status,
     )
 
 
@@ -608,12 +886,15 @@ def _run_story(
     ledger: Ledger,
     run_id: str,
     dispatch: Dispatcher,
+    logs_dir: Path,
 ) -> str:
     """Drive one story through build → coverage → review → merge.
 
     Returns the terminal story status: ``DONE`` or ``FAILED``. A stage failure
     (agent FAILED status, dispatch error, or schema-invalid output) enters the
-    bounded bugfix loop; the stage is retried after a successful fix.
+    bounded bugfix loop; the stage is retried after a successful fix. Each
+    dispatch's transcript is persisted under ``logs_dir`` and its path recorded
+    on the stage row (R8).
     """
     pr_number: int | None = None
     stages = [s for s in _STAGES if not (s == "coverage" and opts.skip_coverage)]
@@ -623,11 +904,14 @@ def _run_story(
         attempt = 1
         while True:
             ledger.stage_start(run_id, story.id, stage, attempt)
+            tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             ok, result, failure = _dispatch_stage(
-                stage, story, opts, pr_number, dispatch
+                stage, story, opts, pr_number, dispatch, tpath
             )
             if ok:
-                ledger.stage_finish(run_id, story.id, stage, attempt, "DONE")
+                ledger.stage_finish(
+                    run_id, story.id, stage, attempt, "DONE", output_path=str(tpath)
+                )
                 pr_number = _extract_pr(result, pr_number)
                 if pr_number is not None:
                     ledger.set_story_pr(run_id, story.id, pr_number)
@@ -635,7 +919,7 @@ def _run_story(
 
             # Stage failed: record it, then attempt a bounded bugfix.
             ledger.stage_finish(
-                run_id, story.id, stage, attempt, "FAILED", f"{stage}-error"
+                run_id, story.id, stage, attempt, "FAILED", f"{stage}-error", str(tpath)
             )
             ledger.event_log(
                 run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
@@ -644,7 +928,8 @@ def _run_story(
                 return "FAILED"
 
             bugfix_attempts += 1
-            if not _run_bugfix(story, stage, failure, ledger, run_id, dispatch):
+            bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_attempts}.log"
+            if not _run_bugfix(story, stage, failure, ledger, run_id, dispatch, bpath):
                 return "FAILED"
             # Bugfix succeeded — retry the same stage as a new attempt.
             attempt += 1
@@ -658,6 +943,7 @@ def _dispatch_stage(
     opts: BuildOptions,
     pr_number: int | None,
     dispatch: Dispatcher,
+    transcript_path: Path | None = None,
 ) -> tuple[bool, AgentResult | None, str]:
     """Dispatch one stage's agent and classify the outcome.
 
@@ -667,7 +953,7 @@ def _dispatch_stage(
     """
     prompt = _render_stage_prompt(stage, story, opts, pr_number)
     try:
-        result = dispatch(stage, prompt, story=story)
+        result = dispatch(stage, prompt, story=story, transcript_path=transcript_path)
     except ContractError as exc:
         # Malformed / schema-invalid agent output is a build failure.
         return False, None, f"contract violation: {exc}"
@@ -724,6 +1010,7 @@ def _run_bugfix(
     ledger: Ledger,
     run_id: str,
     dispatch: Dispatcher,
+    transcript_path: Path | None = None,
 ) -> bool:
     """Dispatch the bugfix agent. Returns True when the fix is confirmed.
 
@@ -732,11 +1019,14 @@ def _run_bugfix(
     or contract error during bugfix is itself a failure (no fix).
     """
     ledger.stage_start(run_id, story.id, "bugfix", 1)
+    out = str(transcript_path) if transcript_path is not None else ""
     prompt = render_bugfix_prompt(story, failed_stage, failure)
     try:
-        result = dispatch("bugfix", prompt, story=story)
+        result = dispatch("bugfix", prompt, story=story, transcript_path=transcript_path)
     except (ContractError, AgentDispatchError) as exc:
-        ledger.stage_finish(run_id, story.id, "bugfix", 1, "FAILED", "bugfix-error")
+        ledger.stage_finish(
+            run_id, story.id, "bugfix", 1, "FAILED", "bugfix-error", out
+        )
         ledger.event_log(
             run_id, story.id, "error", "controller", f"bugfix dispatch failed: {exc}"
         )
@@ -751,6 +1041,7 @@ def _run_bugfix(
         1,
         "DONE" if fixed else "FAILED",
         str(data.get("failure_category", "")),
+        out,
     )
     ledger.event_log(
         run_id,

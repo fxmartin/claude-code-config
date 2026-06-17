@@ -3,7 +3,7 @@ name: build-stories
 description: Batch build all incomplete stories across epics — thin wrapper that shells out to the external `sdlc` controller, which owns the deterministic state machine.
 user-invocable: true
 disable-model-invocation: true
-argument-hint: "[all|resume|epic-NN|epic-name] [--dry-run] [--auto] [--skip-coverage] [--limit=N] [--sequential] [--coverage-threshold=N] [--skip-preflight]"
+argument-hint: "[all|resume|epic-NN|epic-name|story-id] [--dry-run] [--auto] [--skip-coverage] [--rebuild] [--limit=N] [--sequential] [--coverage-threshold=N] [--skip-preflight] [--preflight-timeout=N]"
 allowed-tools: Bash
 ---
 
