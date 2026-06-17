@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.24.0] - 2026-06-17
+
+### Added
+
+- feat: dependency scan with osv-scanner (#9.1-002) (#60)
+
+
 ## [v1.23.0] - 2026-06-16
 
 ### Added
