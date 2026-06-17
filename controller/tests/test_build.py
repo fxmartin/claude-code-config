@@ -12,6 +12,8 @@ from sdlc.build import (
     BuildOptions,
     BuildResult,
     Ledger,
+    default_preflight,
+    detect_test_command,
     parse_build_args,
     run_build,
 )
@@ -498,3 +500,172 @@ def test_regression_end_state_matches_expected(tmp_path) -> None:
     runs = conn.execute("SELECT COUNT(*), MAX(status) FROM runs").fetchone()
     assert runs[0] == 1
     assert runs[1] == "DONE"
+
+
+# ---------------------------------------------------------------------------
+# R4: done-skip + --rebuild
+# ---------------------------------------------------------------------------
+
+def _story(sid: str, *, deps=None, done=False) -> Story:
+    return Story(
+        sid, f"Story {sid}", sid.split(".", 1)[0].zfill(2), "x",
+        "epic-x.md", "P1", 1, "py", deps or [], done,
+    )
+
+
+def test_run_build_skips_done_stories(tmp_path) -> None:
+    """A story the epic marks Done is recorded SKIPPED with an event, not built."""
+    db = tmp_path / "l.db"
+    disp = FakeDispatcher()
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=[_story("99.1-001", done=True), _story("99.1-002", done=False)],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.skipped == 1
+    assert result.completed == 1
+    assert result.story_status["99.1-001"] == "SKIPPED"
+    # The done story was never dispatched.
+    assert all(sid != "99.1-001" for _, sid in disp.calls)
+    # A skip event is recorded for the audit trail.
+    conn = _open(db)
+    events = conn.execute(
+        "SELECT message FROM events WHERE story_id = '99.1-001'"
+    ).fetchall()
+    assert any("skipped" in row[0].lower() for row in events)
+
+
+def test_rebuild_forces_done_stories(tmp_path) -> None:
+    """`--rebuild` rebuilds stories that are marked Done."""
+    db = tmp_path / "l.db"
+    disp = FakeDispatcher()
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True, rebuild=True
+    )
+    result = run_build(
+        opts,
+        queue=[_story("99.1-001", done=True), _story("99.1-002", done=False)],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.skipped == 0
+    assert result.completed == 2
+
+
+# ---------------------------------------------------------------------------
+# R6: preflight detection + timeout/streaming
+# ---------------------------------------------------------------------------
+
+def test_parse_rebuild_and_preflight_timeout() -> None:
+    opts = parse_build_args(["--rebuild", "--preflight-timeout=120"])
+    assert opts.rebuild is True
+    assert opts.preflight_timeout == 120
+
+
+def test_detect_prefers_quality_gate_script(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    cmd = detect_test_command(tmp_path)
+    assert cmd[0] == "bash" and cmd[1].endswith("scripts/quality-gate.sh")
+
+
+def test_detect_prefers_make_gate(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "Makefile").write_text("gate:\n\techo hi\n", encoding="utf-8")
+    assert detect_test_command(tmp_path) == ["make", "gate"]
+
+
+def test_detect_pytest_adds_xdist_when_present(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["pytest-xdist>=3"]\n', encoding="utf-8"
+    )
+    assert detect_test_command(tmp_path) == ["uv", "run", "pytest", "-n", "auto"]
+
+
+def test_detect_pytest_serial_without_xdist(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    assert detect_test_command(tmp_path) == ["uv", "run", "pytest"]
+
+
+def test_default_preflight_no_suite_passes(tmp_path) -> None:
+    assert default_preflight(root=tmp_path, timeout=5) is True
+
+
+def test_default_preflight_nonzero_fails(tmp_path) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text(
+        "#!/usr/bin/env bash\nexit 1\n", encoding="utf-8"
+    )
+    assert default_preflight(root=tmp_path, timeout=10) is False
+
+
+def test_default_preflight_times_out(tmp_path, capsys) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text(
+        "#!/usr/bin/env bash\nsleep 5\n", encoding="utf-8"
+    )
+    assert default_preflight(root=tmp_path, timeout=1) is False
+    assert "PRE_FLIGHT_TIMEOUT" in capsys.readouterr().err
+
+
+def test_dry_run_skips_preflight(tmp_path) -> None:
+    """A dry run is plan-only — it must not run the preflight gate."""
+    def _boom() -> bool:
+        raise AssertionError("preflight must not run during a dry run")
+
+    result = run_build(
+        BuildOptions(scope="epic-99", dry_run=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=FakeDispatcher(),
+        preflight=_boom,
+    )
+    assert result.dry_run is True
+    assert result.preflight_failed is False
+
+
+# ---------------------------------------------------------------------------
+# R8: transcript output_path is recorded on every stage row
+# ---------------------------------------------------------------------------
+
+def test_run_build_records_transcript_output_paths(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    paths = [r[0] for r in conn.execute("SELECT output_path FROM stages").fetchall()]
+    assert paths and all(p for p in paths)        # every stage attempt has a path
+    assert all(".sdlc-state.db.logs" in p or ".logs" in p for p in paths)
+
+
+# ---------------------------------------------------------------------------
+# R9: ledger files are kept out of git status via .git/info/exclude
+# ---------------------------------------------------------------------------
+
+def test_ensure_repo_ignores_adds_pattern(tmp_path) -> None:
+    from sdlc.build import _ensure_repo_ignores
+
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+    db = tmp_path / ".sdlc-state.db"
+    _ensure_repo_ignores(db)
+    exclude = tmp_path / ".git" / "info" / "exclude"
+    assert ".sdlc-state.db*" in exclude.read_text(encoding="utf-8")
+    _ensure_repo_ignores(db)  # idempotent
+    assert exclude.read_text(encoding="utf-8").count(".sdlc-state.db*") == 1
+
+
+def test_ensure_repo_ignores_no_git_is_noop(tmp_path) -> None:
+    from sdlc.build import _ensure_repo_ignores
+
+    _ensure_repo_ignores(tmp_path / ".sdlc-state.db")  # no .git anywhere → no crash
+    assert not (tmp_path / ".git").exists()

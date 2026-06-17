@@ -11,10 +11,19 @@ from sdlc.cohort import Story
 # `##### Story 7.3-001: Port build-stories ...`
 _STORY_HEADER = re.compile(r"^#{2,6}\s*Story\s+([0-9]+\.[0-9]+-[0-9]+):\s*(.+?)\s*$")
 _PRIORITY = re.compile(r"^\*\*Priority\*\*:\s*(\S+)")
-_POINTS = re.compile(r"^\*\*Points\*\*:\s*([0-9]+)")
+# Accept both `**Points**:` and the `**Story Points**:` form epics actually use.
+_POINTS = re.compile(r"^\*\*(?:Story\s+)?Points\*\*:\s*([0-9]+)")
 _DEPENDENCIES = re.compile(r"^\*\*Dependencies\*\*:\s*(.+?)\s*$")
 # Pull every `X.Y-NNN` story id mentioned in a Dependencies line.
 _DEP_ID = re.compile(r"[0-9]+\.[0-9]+-[0-9]+")
+# A story is shipped when its **Status**: line starts "Done", or when its
+# Definition-of-Done checklist exists and every box is checked.
+_STATUS = re.compile(r"^\*\*Status\*\*:\s*(.+?)\s*$")
+_DOD_BOX = re.compile(r"^\s*-\s*\[([ xX])\]")
+# A bare scope that names exactly one story, e.g. `34.5-003`.
+_STORY_ID_SCOPE = re.compile(r"^[0-9]+\.[0-9]+-[0-9]+$")
+# The numeric epic id embedded in an `epic-34-*.md` / `epic-07-*.md` filename.
+_EPIC_FILE_NUM = re.compile(r"^epic-0*([0-9]+)")
 
 _STORY_DIR_CANDIDATES = ("docs/stories", "stories")
 
@@ -51,6 +60,14 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
 
     current: dict | None = None
 
+    def _is_done(c: dict) -> bool:
+        """Shipped when Status starts 'Done', or DoD has boxes and all are checked."""
+        status = c.get("status", "")
+        if status.strip().lower().startswith("done"):
+            return True
+        boxes_total = c.get("dod_total", 0)
+        return boxes_total > 0 and c.get("dod_checked", 0) == boxes_total
+
     def _flush() -> None:
         if current is None:
             return
@@ -66,6 +83,7 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
                 points=current.get("points", 0),
                 agent_type=current.get("agent_type", "general-purpose"),
                 dependencies=current.get("dependencies", []),
+                done=_is_done(current),
             )
         )
 
@@ -77,7 +95,13 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
             continue
         if current is None:
             continue
-        if m := _PRIORITY.match(line):
+        if box := _DOD_BOX.match(line):
+            current["dod_total"] = current.get("dod_total", 0) + 1
+            if box.group(1) != " ":
+                current["dod_checked"] = current.get("dod_checked", 0) + 1
+        elif m := _STATUS.match(line):
+            current.setdefault("status", m.group(1))  # first Status line wins
+        elif m := _PRIORITY.match(line):
             current["priority"] = m.group(1)
         elif m := _POINTS.match(line):
             current["points"] = int(m.group(1))
@@ -101,9 +125,10 @@ def _story_dir(root: Path) -> Path | None:
 def discover_queue(scope: str, root: Path | None = None) -> list[Story]:
     """Build the story queue for ``scope`` from the markdown epic files.
 
-    ``scope`` accepts ``all`` (every epic), ``epic-NN`` (one epic by number), or
-    a bare epic name. Returns an empty queue when nothing matches — the caller
-    decides whether that is an error.
+    ``scope`` accepts ``all`` (every epic), ``epic-NN`` (one epic by number), a
+    bare epic name, or a single story id ``X.Y-NNN`` (resolved to its epic by the
+    leading major number, returning only that story). Returns an empty queue when
+    nothing matches — the caller decides whether that is an error.
     """
     root = root or Path.cwd()
     story_dir = _story_dir(root)
@@ -111,6 +136,19 @@ def discover_queue(scope: str, root: Path | None = None) -> list[Story]:
         return []
 
     epic_files = sorted(story_dir.glob("epic-*.md"))
+
+    # Single-story scope: find the epic by major number and return just that story.
+    if _STORY_ID_SCOPE.match(scope.strip()):
+        target = scope.strip()
+        major = int(target.split(".", 1)[0])
+        for epic in epic_files:
+            m = _EPIC_FILE_NUM.match(epic.stem.lower())
+            if m and int(m.group(1)) == major:
+                for story in parse_epic_file(epic):
+                    if story.id == target:
+                        return [story]
+        return []
+
     selected: list[Path] = []
     scope_l = scope.lower()
     for epic in epic_files:
