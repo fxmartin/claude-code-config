@@ -177,6 +177,7 @@ _PAGE = """<!doctype html>
   .IN_PROGRESS { background: #e4ecfd; color: var(--blue); }
   .FAILED { background: #fbe3e8; color: var(--red); }
   .BLOCKED { background: #fdeede; color: var(--peach); }
+  .NEEDS_ATTENTION { background: #fdeede; color: var(--peach); }
   .SKIPPED { background: var(--surface); color: var(--sub); }
   .TODO { background: var(--crust); color: var(--overlay); }
   .events { margin-top: 16px; }
@@ -208,7 +209,7 @@ _PAGE = """<!doctype html>
     </div>
   </div>
 <script>
-const ORDER = ["DONE","IN_PROGRESS","FAILED","BLOCKED","SKIPPED","TODO"];
+const ORDER = ["DONE","IN_PROGRESS","FAILED","BLOCKED","NEEDS_ATTENTION","SKIPPED","TODO"];
 let sel = null;  // null = Live (latest)
 function esc(s){return String(s==null?"":s).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));}
 function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(s)+"</span>";}
