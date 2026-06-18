@@ -815,3 +815,76 @@ def test_prompts_show_verbatim_result_wrapper() -> None:
         assert RESULT_START_MARKER in p
         assert RESULT_END_MARKER in p
         assert "no markdown code fences" in p
+
+
+# ---------------------------------------------------------------------------
+# bugfix stage rows must use distinct attempt numbers (no UNIQUE collision)
+# ---------------------------------------------------------------------------
+
+class _FlakyDispatcher:
+    """Fails named stages on their first dispatch, succeeds after; bugfix fixes."""
+
+    def __init__(self, fail_first: set[str]) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.seen: dict[str, int] = {}
+        self.fail_first = set(fail_first)
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.dispatch import AgentResult
+
+        self.calls.append((agent_type, getattr(story, "id", "")))
+        n = self.seen.get(agent_type, 0)
+        self.seen[agent_type] = n + 1
+        payload = dict(_default_payload(agent_type, story))
+        if agent_type in self.fail_first and n == 0:
+            if agent_type == "build":
+                payload["build_status"] = "FAILED"
+            elif agent_type == "coverage":
+                payload["coverage_status"] = "FAIL"
+        return AgentResult(agent_type=agent_type, data=payload, raw="")
+
+
+def test_repeated_bugfix_same_stage_no_unique_collision(tmp_path) -> None:
+    """Two bugfix rounds on one stage get distinct attempts (was a UNIQUE crash)."""
+    disp = FakeDispatcher(
+        overrides={
+            ("build", "99.1-001"): {
+                "branch_name": "feature/99.1-001",
+                "build_status": "FAILED",
+                "commit_sha": "x",
+                "error_summary": "boom",
+            }
+        }
+    )
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.failed == 1  # build never passes → FAILED, but no crash
+    rows = _open(db).execute(
+        "SELECT attempt FROM stages WHERE stage_name='bugfix' ORDER BY attempt"
+    ).fetchall()
+    assert [r[0] for r in rows] == [1, 2]
+
+
+def test_bugfix_across_stages_uses_distinct_attempts(tmp_path) -> None:
+    """A bugfix in two different stages gets distinct attempts (cross-stage collision)."""
+    disp = _FlakyDispatcher(fail_first={"build", "coverage"})
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.completed == 1
+    assert result.story_status["99.1-001"] == "DONE"
+    rows = _open(db).execute(
+        "SELECT attempt FROM stages WHERE stage_name='bugfix' ORDER BY attempt"
+    ).fetchall()
+    assert [r[0] for r in rows] == [1, 2]

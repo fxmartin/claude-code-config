@@ -980,6 +980,11 @@ def _run_story(
     """
     pr_number: int | None = None
     stages = [s for s in _STAGES if not (s == "coverage" and opts.skip_coverage)]
+    # Monotonic across the whole story: the "bugfix" stage rows share one
+    # (run_id, story_id, stage_name) key, so every bugfix dispatch — across both
+    # retries of one stage and across different stages — needs a distinct attempt
+    # number, or the second insert hits the stages UNIQUE constraint.
+    bugfix_seq = 0
 
     for stage in stages:
         bugfix_attempts = 0
@@ -1025,8 +1030,11 @@ def _run_story(
                 return "FAILED"
 
             bugfix_attempts += 1
-            bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_attempts}.log"
-            if not _run_bugfix(story, stage, failure, ledger, run_id, dispatch, bpath):
+            bugfix_seq += 1
+            bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
+            if not _run_bugfix(
+                story, stage, failure, ledger, run_id, dispatch, bpath, bugfix_seq
+            ):
                 return "FAILED"
             # Bugfix succeeded — retry the same stage as a new attempt.
             attempt += 1
@@ -1112,21 +1120,25 @@ def _run_bugfix(
     run_id: str,
     dispatch: Dispatcher,
     transcript_path: Path | None = None,
+    attempt: int = 1,
 ) -> bool:
     """Dispatch the bugfix agent. Returns True when the fix is confirmed.
 
     A bugfix is "confirmed" only when ``fix_status == FIXED`` and
     ``tests_passing`` is true — exactly the skill's Step 5d2 gate. Any dispatch
-    or contract error during bugfix is itself a failure (no fix).
+    or contract error during bugfix is itself a failure (no fix). ``attempt`` is
+    a story-level monotonic sequence so each bugfix row is unique (the "bugfix"
+    stage recurs across retries and stages and would otherwise collide on the
+    stages UNIQUE key).
     """
-    ledger.stage_start(run_id, story.id, "bugfix", 1)
+    ledger.stage_start(run_id, story.id, "bugfix", attempt)
     out = str(transcript_path) if transcript_path is not None else ""
     prompt = render_bugfix_prompt(story, failed_stage, failure)
     try:
         result = dispatch("bugfix", prompt, story=story, transcript_path=transcript_path)
     except (ContractError, AgentDispatchError) as exc:
         ledger.stage_finish(
-            run_id, story.id, "bugfix", 1, "FAILED", "bugfix-error", out
+            run_id, story.id, "bugfix", attempt, "FAILED", "bugfix-error", out
         )
         ledger.event_log(
             run_id, story.id, "error", "controller", f"bugfix dispatch failed: {exc}"
@@ -1139,7 +1151,7 @@ def _run_bugfix(
         run_id,
         story.id,
         "bugfix",
-        1,
+        attempt,
         "DONE" if fixed else "FAILED",
         str(data.get("failure_category", "")),
         out,
