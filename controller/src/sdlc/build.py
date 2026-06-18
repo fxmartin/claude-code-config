@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
 
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
-from sdlc.contracts import ContractError
+from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER, ContractError
 from sdlc.dispatch import AgentDispatchError, AgentResult, dispatch_agent
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -92,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_status     ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_run_ts   ON events(run_id, ts);
 """
 
-_TERMINAL_RUN_STATES = {"DONE", "FAILED", "ABORTED"}
+_TERMINAL_RUN_STATES = {"DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION"}
 
 # Boolean flags the build subcommand accepts. Kept identical to the skill's
 # argument-hint so `sdlc build $ARGUMENTS` is a drop-in for `/build-stories`.
@@ -473,7 +473,7 @@ class Ledger:
 
 _EMPTY_COUNTS = {
     "total": 0, "done": 0, "failed": 0, "blocked": 0,
-    "in_progress": 0, "skipped": 0, "todo": 0,
+    "in_progress": 0, "skipped": 0, "todo": 0, "needs_attention": 0,
 }
 
 
@@ -523,6 +523,7 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "in_progress": _count("IN_PROGRESS"),
         "skipped": _count("SKIPPED"),
         "todo": _count("TODO"),
+        "needs_attention": _count("NEEDS_ATTENTION"),
     }
     payload["stories"] = stories
     payload["events"] = events
@@ -554,6 +555,7 @@ class BuildResult:
     failed: int = 0
     skipped: int = 0
     blocked: int = 0
+    needs_attention: int = 0
     planned: int = 0
     dry_run: bool = False
     preflight_failed: bool = False
@@ -637,6 +639,25 @@ def default_preflight(root: Path | None = None, timeout: int = 600) -> bool:
 # Prompt rendering (kept terse — the agent reads the epic file itself)
 # ---------------------------------------------------------------------------
 
+def _result_wrapper(schema_filename: str) -> str:
+    """The exact result-block wrapper every agent must emit (R10).
+
+    Shown verbatim so the agent uses the sentinel markers rather than a markdown
+    ```json fence. The controller now tolerates fences as a fallback, but the
+    sentinels are unambiguous — this instruction reduces the drift at the source.
+    """
+    return (
+        "End your reply with EXACTLY this wrapper — the literal marker lines, "
+        "no markdown code fences (do not wrap it in ```json), and nothing after "
+        "the closing marker:\n"
+        + RESULT_START_MARKER
+        + "\n{ ...the JSON object per controller/src/sdlc/schemas/"
+        + schema_filename
+        + " ... }\n"
+        + RESULT_END_MARKER
+    )
+
+
 def render_build_prompt(story: Story, opts: BuildOptions) -> str:
     """Render the build-agent instructions for one story.
 
@@ -660,7 +681,7 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         "4. Run all quality gates (tests, types, lint, security)\n"
         f"5. Commit: feat({story.epic_name}): {story.title} (#{story.id})\n"
         f"{push}\n\n"
-        "Emit the result block per controller/src/sdlc/schemas/build-agent-response.schema.json."
+        + _result_wrapper("build-agent-response.schema.json")
     )
 
 
@@ -669,7 +690,8 @@ def render_coverage_prompt(story: Story, opts: BuildOptions) -> str:
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
         "Fetch the branch, fill coverage gaps, push, open the PR, then emit the "
-        "result block per controller/src/sdlc/schemas/coverage-agent-response.schema.json."
+        "result block.\n"
+        + _result_wrapper("coverage-agent-response.schema.json")
     )
 
 
@@ -677,16 +699,16 @@ def render_review_prompt(story: Story, pr_number: int | None) -> str:
     return (
         f"Review the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
         "Check architecture, security, performance, coverage, code quality; "
-        "approve when satisfied, then emit the result block per "
-        "controller/src/sdlc/schemas/review-agent-response.schema.json."
+        "approve when satisfied, then emit the result block.\n"
+        + _result_wrapper("review-agent-response.schema.json")
     )
 
 
 def render_merge_prompt(story: Story, pr_number: int | None) -> str:
     return (
         f"Merge the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
-        "Rebase before merge to absorb baseline drift, then emit the result "
-        "block per controller/src/sdlc/schemas/merge-agent-response.schema.json."
+        "Rebase before merge to absorb baseline drift, then emit the result block.\n"
+        + _result_wrapper("merge-agent-response.schema.json")
     )
 
 
@@ -695,7 +717,8 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
         f"Bugfix story {story.id}: {story.title}. Stage '{failed_stage}' failed.\n"
         f"Failure: {failure}\n"
         "Classify (CODE_BUG/TEST_BUG/ENV_ISSUE), fix where possible, then emit "
-        "the result block per controller/src/sdlc/schemas/bugfix-agent-response.schema.json."
+        "the result block.\n"
+        + _result_wrapper("bugfix-agent-response.schema.json")
     )
 
 
@@ -736,6 +759,52 @@ def _ensure_repo_ignores(db_path: Path) -> None:
             fh.write(f"# sdlc ledger (auto-added)\n{pattern}\n")
     except OSError:
         pass
+
+
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a git command in ``root``, capturing output (10s ceiling)."""
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def _base_ref(root: Path) -> str | None:
+    """The branch to diff a story branch against: origin/HEAD → main → master."""
+    head = _git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    if head.returncode == 0 and head.stdout.strip():
+        # e.g. "refs/remotes/origin/main" → "origin/main"
+        return head.stdout.strip().removeprefix("refs/remotes/")
+    for candidate in ("main", "master"):
+        if _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}").returncode == 0:
+            return candidate
+    return None
+
+
+def story_commit_exists(story_id: str, root: Path | None = None) -> bool:
+    """Best-effort: True when ``feature/<story_id>`` holds a commit beyond the base.
+
+    Lets the controller detect that an agent already committed the story even when
+    its result block was unparseable, so the work is never discarded (R10).
+    Returns False — never raises — when git is absent, there is no repo, or the
+    branch does not exist (mirrors ``_ensure_repo_ignores`` defensiveness).
+    """
+    root = root or Path.cwd()
+    branch = f"feature/{story_id}"
+    try:
+        if _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode != 0:
+            return False
+        base = _base_ref(root)
+        if base is None:
+            # No base to diff against, but the branch exists — treat as committed.
+            return True
+        out = _git(root, "rev-list", "--count", f"{base}..{branch}")
+        count = out.stdout.strip()
+        return out.returncode == 0 and count.isdigit() and int(count) > 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def run_build(
@@ -847,18 +916,27 @@ def run_build(
     completed = sum(1 for v in status.values() if v == "DONE")
     failed = sum(1 for v in status.values() if v == "FAILED")
     blocked = sum(1 for v in status.values() if v == "BLOCKED")
+    # Stories whose work was committed but whose result was unparseable (R10):
+    # not a clean success, but deliberately not a destructive FAILED.
+    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
     # Shipped stories were skipped before the loop; fold them into the tally.
     skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
 
-    run_terminal = "DONE" if (failed == 0 and blocked == 0) else "FAILED"
+    if failed or blocked:
+        run_terminal = "FAILED"
+    elif needs_attention:
+        run_terminal = "NEEDS_ATTENTION"
+    else:
+        run_terminal = "DONE"
+    run_level = {"DONE": "success", "NEEDS_ATTENTION": "warn"}.get(run_terminal, "error")
     ledger.run_update_counts(run_id, completed, failed)
     ledger.event_log(
         run_id,
         "",
-        "success" if run_terminal == "DONE" else "error",
+        run_level,
         "controller",
         f"run finished: {completed} done, {failed} failed, {blocked} blocked, "
-        f"{skipped} skipped",
+        f"{needs_attention} need attention, {skipped} skipped",
     )
     ledger.run_update_status(run_id, run_terminal)
 
@@ -874,6 +952,7 @@ def run_build(
         failed=failed,
         skipped=skipped,
         blocked=blocked,
+        needs_attention=needs_attention,
         planned=len(buildable),
         run_id=run_id,
         story_status=story_status,
@@ -890,9 +969,12 @@ def _run_story(
 ) -> str:
     """Drive one story through build → coverage → review → merge.
 
-    Returns the terminal story status: ``DONE`` or ``FAILED``. A stage failure
-    (agent FAILED status, dispatch error, or schema-invalid output) enters the
-    bounded bugfix loop; the stage is retried after a successful fix. Each
+    Returns the terminal story status: ``DONE``, ``FAILED``, or
+    ``NEEDS_ATTENTION``. A stage failure (agent FAILED status, dispatch error, or
+    schema-invalid output) enters the bounded bugfix loop; the stage is retried
+    after a successful fix. If a result is *unparseable* (contract error) but the
+    agent already committed the story branch, the work is preserved as
+    ``NEEDS_ATTENTION`` instead of being discarded and rebuilt (R10). Each
     dispatch's transcript is persisted under ``logs_dir`` and its path recorded
     on the stage row (R8).
     """
@@ -905,7 +987,7 @@ def _run_story(
         while True:
             ledger.stage_start(run_id, story.id, stage, attempt)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
-            ok, result, failure = _dispatch_stage(
+            ok, result, failure, kind = _dispatch_stage(
                 stage, story, opts, pr_number, dispatch, tpath
             )
             if ok:
@@ -924,6 +1006,21 @@ def _run_story(
             ledger.event_log(
                 run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
             )
+
+            # R10: never discard committed work. If the result was unparseable
+            # (contract error) but the agent already committed the story branch,
+            # preserve it for manual push/MR rather than bugfixing from scratch.
+            if kind == "contract" and story_commit_exists(story.id):
+                ledger.event_log(
+                    run_id,
+                    story.id,
+                    "warn",
+                    "controller",
+                    f"work committed on feature/{story.id} but result block "
+                    "unparseable — preserved for manual push/MR (no bugfix re-run)",
+                )
+                return "NEEDS_ATTENTION"
+
             if bugfix_attempts >= MAX_BUGFIX_ATTEMPTS:
                 return "FAILED"
 
@@ -944,25 +1041,29 @@ def _dispatch_stage(
     pr_number: int | None,
     dispatch: Dispatcher,
     transcript_path: Path | None = None,
-) -> tuple[bool, AgentResult | None, str]:
+) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one stage's agent and classify the outcome.
 
-    Returns ``(ok, result, failure_summary)``. ``ok`` is False on a dispatch
-    error, a schema-invalid response (caught here, never passed downstream), or
-    an agent that reported a non-success status for its stage.
+    Returns ``(ok, result, failure_summary, kind)``. ``ok`` is False on a
+    dispatch error, a schema-invalid response (caught here, never passed
+    downstream), or an agent that reported a non-success status for its stage.
+    ``kind`` names the failure cause — ``"contract"`` / ``"dispatch"`` /
+    ``"reported"`` (empty on success) — so the caller can treat an unparseable
+    result that nonetheless committed work as recoverable rather than discard it
+    (R10).
     """
     prompt = _render_stage_prompt(stage, story, opts, pr_number)
     try:
         result = dispatch(stage, prompt, story=story, transcript_path=transcript_path)
     except ContractError as exc:
         # Malformed / schema-invalid agent output is a build failure.
-        return False, None, f"contract violation: {exc}"
+        return False, None, f"contract violation: {exc}", "contract"
     except AgentDispatchError as exc:
-        return False, None, f"dispatch error: {exc}"
+        return False, None, f"dispatch error: {exc}", "dispatch"
 
     if not _stage_succeeded(stage, result.data):
-        return False, result, _stage_failure_summary(stage, result.data)
-    return True, result, ""
+        return False, result, _stage_failure_summary(stage, result.data), "reported"
+    return True, result, "", ""
 
 
 def _render_stage_prompt(

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -669,3 +670,148 @@ def test_ensure_repo_ignores_no_git_is_noop(tmp_path) -> None:
 
     _ensure_repo_ignores(tmp_path / ".sdlc-state.db")  # no .git anywhere → no crash
     assert not (tmp_path / ".git").exists()
+
+
+# ---------------------------------------------------------------------------
+# R10: tolerant result parsing + never discard committed work
+# ---------------------------------------------------------------------------
+
+class _FencedDispatcher:
+    """Mimics dispatch_agent: runs the REAL parser on a ```json-fenced stdout.
+
+    Proves the controller no longer fails a stage just because the agent wrapped
+    its result in a markdown fence instead of the sentinel markers (R10).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.contracts import parse_and_validate
+        from sdlc.dispatch import AgentResult
+
+        self.calls.append((agent_type, getattr(story, "id", "")))
+        payload = _default_payload(agent_type, story)
+        stdout = f"work done\n```json\n{json.dumps(payload)}\n```\n"  # no sentinels
+        data = parse_and_validate(agent_type, stdout)
+        return AgentResult(agent_type=agent_type, data=data, raw=stdout)
+
+
+class _RaisingDispatcher:
+    """Raises a contract error for one agent_type; canned defaults otherwise.
+
+    ``bugfix_fixed=False`` makes the bugfix agent report an unresolved fix, so a
+    failing story exits after a single bugfix round (avoids an unrelated latent
+    bug where a *second* bugfix round re-inserts the ``bugfix`` stage at the same
+    attempt number).
+    """
+
+    def __init__(self, raise_on: str = "build", bugfix_fixed: bool = True) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.raise_on = raise_on
+        self.bugfix_fixed = bugfix_fixed
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.contracts import ResultBlockError
+        from sdlc.dispatch import AgentResult
+
+        self.calls.append((agent_type, getattr(story, "id", "")))
+        if agent_type == self.raise_on:
+            raise ResultBlockError("missing <<<RESULT_JSON>>> marker")
+        payload = _default_payload(agent_type, story)
+        if agent_type == "bugfix" and not self.bugfix_fixed:
+            payload = dict(payload, fix_status="FIXED", tests_passing=False)
+        return AgentResult(agent_type=agent_type, data=payload, raw="")
+
+
+def test_fenced_agent_output_builds_successfully(tmp_path) -> None:
+    """An agent that wraps its result in ```json (no sentinels) is not a failure."""
+    disp = _FencedDispatcher()
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.completed == 1
+    assert result.failed == 0
+    assert result.story_status["99.1-001"] == "DONE"
+
+
+def test_contract_error_with_commit_marks_needs_attention(tmp_path, monkeypatch) -> None:
+    """Unparseable result + an existing story commit ⇒ NEEDS_ATTENTION, no bugfix."""
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
+    disp = _RaisingDispatcher(raise_on="build")
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.needs_attention == 1
+    assert result.failed == 0
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+    # The committed work is preserved — no bugfix re-run from scratch.
+    assert all(agent != "bugfix" for agent, _ in disp.calls)
+    # A recoverable event names the situation for the operator.
+    conn = _open(db)
+    msgs = [
+        r[0]
+        for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("unparseable" in m for m in msgs)
+
+
+def test_contract_error_without_commit_still_fails(tmp_path, monkeypatch) -> None:
+    """No story commit ⇒ unchanged behavior: bugfix loop then FAILED."""
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    disp = _RaisingDispatcher(raise_on="build", bugfix_fixed=False)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.needs_attention == 0
+    assert result.failed == 1
+    assert result.story_status["99.1-001"] == "FAILED"
+    assert any(agent == "bugfix" for agent, _ in disp.calls)
+
+
+def test_story_commit_exists_no_git_is_false(tmp_path) -> None:
+    """The git probe never raises and returns False outside a git repo."""
+    from sdlc.build import story_commit_exists
+
+    assert story_commit_exists("99.1-001", root=tmp_path) is False
+
+
+def test_prompts_show_verbatim_result_wrapper() -> None:
+    """Every rendered prompt shows the exact sentinel wrapper and forbids fences."""
+    from sdlc.build import (
+        render_bugfix_prompt,
+        render_build_prompt,
+        render_coverage_prompt,
+        render_merge_prompt,
+        render_review_prompt,
+    )
+    from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
+
+    story = _story("99.1-001")
+    opts = BuildOptions()
+    prompts = [
+        render_build_prompt(story, opts),
+        render_coverage_prompt(story, opts),
+        render_review_prompt(story, 7),
+        render_merge_prompt(story, 7),
+        render_bugfix_prompt(story, "build", "boom"),
+    ]
+    for p in prompts:
+        assert RESULT_START_MARKER in p
+        assert RESULT_END_MARKER in p
+        assert "no markdown code fences" in p

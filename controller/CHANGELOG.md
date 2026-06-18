@@ -5,6 +5,31 @@ All notable changes to `sdlc-controller`. Format follows
 versioning. History before 1.14.0 lives in the git log and the Epic-07/08
 stories.
 
+## [1.14.1] — 2026-06-18
+
+Stops the controller from discarding completed, committed work when an agent's
+result block drifts from the required format (R10). A real run fully implemented
+and committed a story but emitted its result in a markdown ```json fence instead
+of the `<<<RESULT_JSON>>> … <<<END_RESULT>>>` sentinels — the strict parser
+rejected it, the run was marked FAILED, and coverage/push/PR never ran.
+
+### Changed
+- **Tolerant result parsing** — when the sentinel markers are absent, the parser
+  falls back to the last ```json (or bare) fenced block, then the last balanced
+  top-level JSON object. `parse_and_validate` picks the first *schema-valid*
+  candidate, so an example/decoy object in the prose is skipped. A present but
+  malformed sentinel block still raises its precise, actionable error.
+- **Stronger prompts** — every rendered agent prompt now shows the exact result
+  wrapper verbatim and states that markdown code fences are not accepted (belt
+  and braces on top of the tolerant parser).
+
+### Added
+- **`NEEDS_ATTENTION` story status** — if a result is unparseable but the agent
+  already committed the `feature/<story>` branch, the work is preserved (branch
+  kept, a clear event logged, no bugfix-from-scratch, run not marked a clean
+  success) instead of being thrown away. Surfaced in `status`/dashboard and the
+  build summary; a non-clean run exits non-zero.
+
 ## [1.14.0] — 2026-06-17
 
 Brings the controller fixes and the local dashboard developed in the

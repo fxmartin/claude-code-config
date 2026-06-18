@@ -141,9 +141,11 @@ def build(ctx: typer.Context) -> None:
 
     typer.echo(
         f"build finished: {result.completed} done, {result.failed} failed, "
-        f"{result.blocked} blocked, {result.skipped} skipped."
+        f"{result.blocked} blocked, {result.needs_attention} need attention, "
+        f"{result.skipped} skipped."
     )
-    raise typer.Exit(code=0 if result.failed == 0 and result.blocked == 0 else 1)
+    clean = result.failed == 0 and result.blocked == 0 and result.needs_attention == 0
+    raise typer.Exit(code=0 if clean else 1)
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["resume"])
