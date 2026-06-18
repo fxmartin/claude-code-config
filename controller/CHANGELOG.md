@@ -5,6 +5,16 @@ All notable changes to `sdlc-controller`. Format follows
 versioning. History before 1.14.0 lives in the git log and the Epic-07/08
 stories.
 
+## [1.14.2] — 2026-06-18
+
+### Fixed
+- **Bugfix stage rows now use distinct attempt numbers.** `_run_bugfix` always
+  inserted the `bugfix` stage at `attempt=1`, so a second bugfix dispatch for a
+  story — a retry of the same stage, or a bugfix in a later stage — hit the
+  `stages` UNIQUE constraint and crashed the whole run. A story-level monotonic
+  sequence now numbers each bugfix row, so a story can exhaust its bounded
+  bugfix budget (or bugfix across stages) without aborting.
+
 ## [1.14.1] — 2026-06-18
 
 Stops the controller from discarding completed, committed work when an agent's
