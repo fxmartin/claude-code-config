@@ -73,6 +73,18 @@ def test_root_serves_html(tmp_path: Path) -> None:
     assert "sdlc build" in text and "/api/status" in text
 
 
+def test_brand_bar_shows_version(tmp_path: Path) -> None:
+    """The served page renders the controller version in the brand bar."""
+    from sdlc import __version__
+
+    db = tmp_path / ".sdlc-state.db"
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/")
+    text = body.decode("utf-8")
+    assert f"v{__version__}" in text         # version rendered next to the app name
+    assert "__SDLC_VERSION__" not in text    # placeholder fully substituted
+
+
 def test_unknown_path_404(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     _seed(db)

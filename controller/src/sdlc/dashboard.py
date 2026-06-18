@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -21,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from sdlc import __version__
 from sdlc.build import Ledger, status_snapshot
 
 # scp-like remote: git@host:owner/sub/repo.git
@@ -153,6 +155,7 @@ _PAGE = """<!doctype html>
             border-bottom: 1px solid var(--surface); }
   .brand { font-weight: 700; font-size: 15px; letter-spacing: .02em; }
   .brand .tld { color: var(--blue); }
+  .brand .ver { color: var(--sub); font-weight: 500; font-size: 12px; margin-left: 4px; }
   .wrap { display: flex; min-height: 100vh; }
   .side { width: 264px; flex: none; background: var(--mantle);
           border-right: 1px solid var(--surface); padding: 16px; overflow: auto; }
@@ -194,7 +197,7 @@ _PAGE = """<!doctype html>
 </head>
 <body>
   <header class="topbar">
-    <span class="brand">Autonomous <span class="tld">SDLC</span></span>
+    <span class="brand">Autonomous <span class="tld">SDLC</span><span class="ver">__SDLC_VERSION__</span></span>
     <span id="repo" class="muted"></span>
   </header>
   <div class="wrap">
@@ -323,7 +326,10 @@ class _Handler(BaseHTTPRequestHandler):
         path = parts.path
         ledger = Ledger(self.server.db_path)
         if path == "/":
-            self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            # Inject the controller version into the brand bar (constant per
+            # process; escaped though it comes from trusted package metadata).
+            page = _PAGE.replace("__SDLC_VERSION__", html.escape(f"v{__version__}"))
+            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         elif path in ("/api/status", "/status.json"):
             run = parse_qs(parts.query).get("run", [None])[0] or self.server.run_id
             snap = status_snapshot(ledger, run)
