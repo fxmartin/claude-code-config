@@ -5,6 +5,14 @@ All notable changes to `sdlc-controller`. Format follows
 versioning. History before 1.14.0 lives in the git log and the Epic-07/08
 stories.
 
+## [1.15.0] — 2026-06-18
+
+### Added
+- The dashboard **brand bar shows the controller version** (e.g. `Autonomous
+  SDLC v1.15.0`) next to the app name. It is injected server-side from the
+  package metadata when `/` is served (a per-process constant, so it renders
+  immediately without a client round-trip).
+
 ## [1.14.2] — 2026-06-18
 
 ### Fixed
