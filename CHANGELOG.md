@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.25.0] - 2026-06-19
+
+### Added
+
+- feat(controller): dashboard, status, tolerant parsing, version badge (#66)
+
+
 ## [v1.24.0] - 2026-06-17
 
 ### Added
