@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from sdlc.build import (
     BuildOptions,
     BuildResult,
     Ledger,
+    default_preflight,
+    detect_test_command,
     parse_build_args,
     run_build,
 )
@@ -498,3 +501,390 @@ def test_regression_end_state_matches_expected(tmp_path) -> None:
     runs = conn.execute("SELECT COUNT(*), MAX(status) FROM runs").fetchone()
     assert runs[0] == 1
     assert runs[1] == "DONE"
+
+
+# ---------------------------------------------------------------------------
+# R4: done-skip + --rebuild
+# ---------------------------------------------------------------------------
+
+def _story(sid: str, *, deps=None, done=False) -> Story:
+    return Story(
+        sid, f"Story {sid}", sid.split(".", 1)[0].zfill(2), "x",
+        "epic-x.md", "P1", 1, "py", deps or [], done,
+    )
+
+
+def test_run_build_skips_done_stories(tmp_path) -> None:
+    """A story the epic marks Done is recorded SKIPPED with an event, not built."""
+    db = tmp_path / "l.db"
+    disp = FakeDispatcher()
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=[_story("99.1-001", done=True), _story("99.1-002", done=False)],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.skipped == 1
+    assert result.completed == 1
+    assert result.story_status["99.1-001"] == "SKIPPED"
+    # The done story was never dispatched.
+    assert all(sid != "99.1-001" for _, sid in disp.calls)
+    # A skip event is recorded for the audit trail.
+    conn = _open(db)
+    events = conn.execute(
+        "SELECT message FROM events WHERE story_id = '99.1-001'"
+    ).fetchall()
+    assert any("skipped" in row[0].lower() for row in events)
+
+
+def test_rebuild_forces_done_stories(tmp_path) -> None:
+    """`--rebuild` rebuilds stories that are marked Done."""
+    db = tmp_path / "l.db"
+    disp = FakeDispatcher()
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True, rebuild=True
+    )
+    result = run_build(
+        opts,
+        queue=[_story("99.1-001", done=True), _story("99.1-002", done=False)],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.skipped == 0
+    assert result.completed == 2
+
+
+# ---------------------------------------------------------------------------
+# R6: preflight detection + timeout/streaming
+# ---------------------------------------------------------------------------
+
+def test_parse_rebuild_and_preflight_timeout() -> None:
+    opts = parse_build_args(["--rebuild", "--preflight-timeout=120"])
+    assert opts.rebuild is True
+    assert opts.preflight_timeout == 120
+
+
+def test_detect_prefers_quality_gate_script(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    cmd = detect_test_command(tmp_path)
+    assert cmd[0] == "bash" and cmd[1].endswith("scripts/quality-gate.sh")
+
+
+def test_detect_prefers_make_gate(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "Makefile").write_text("gate:\n\techo hi\n", encoding="utf-8")
+    assert detect_test_command(tmp_path) == ["make", "gate"]
+
+
+def test_detect_pytest_adds_xdist_when_present(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["pytest-xdist>=3"]\n', encoding="utf-8"
+    )
+    assert detect_test_command(tmp_path) == ["uv", "run", "pytest", "-n", "auto"]
+
+
+def test_detect_pytest_serial_without_xdist(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    assert detect_test_command(tmp_path) == ["uv", "run", "pytest"]
+
+
+def test_default_preflight_no_suite_passes(tmp_path) -> None:
+    assert default_preflight(root=tmp_path, timeout=5) is True
+
+
+def test_default_preflight_nonzero_fails(tmp_path) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text(
+        "#!/usr/bin/env bash\nexit 1\n", encoding="utf-8"
+    )
+    assert default_preflight(root=tmp_path, timeout=10) is False
+
+
+def test_default_preflight_times_out(tmp_path, capsys) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text(
+        "#!/usr/bin/env bash\nsleep 5\n", encoding="utf-8"
+    )
+    assert default_preflight(root=tmp_path, timeout=1) is False
+    assert "PRE_FLIGHT_TIMEOUT" in capsys.readouterr().err
+
+
+def test_dry_run_skips_preflight(tmp_path) -> None:
+    """A dry run is plan-only — it must not run the preflight gate."""
+    def _boom() -> bool:
+        raise AssertionError("preflight must not run during a dry run")
+
+    result = run_build(
+        BuildOptions(scope="epic-99", dry_run=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=FakeDispatcher(),
+        preflight=_boom,
+    )
+    assert result.dry_run is True
+    assert result.preflight_failed is False
+
+
+# ---------------------------------------------------------------------------
+# R8: transcript output_path is recorded on every stage row
+# ---------------------------------------------------------------------------
+
+def test_run_build_records_transcript_output_paths(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    paths = [r[0] for r in conn.execute("SELECT output_path FROM stages").fetchall()]
+    assert paths and all(p for p in paths)        # every stage attempt has a path
+    assert all(".sdlc-state.db.logs" in p or ".logs" in p for p in paths)
+
+
+# ---------------------------------------------------------------------------
+# R9: ledger files are kept out of git status via .git/info/exclude
+# ---------------------------------------------------------------------------
+
+def test_ensure_repo_ignores_adds_pattern(tmp_path) -> None:
+    from sdlc.build import _ensure_repo_ignores
+
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+    db = tmp_path / ".sdlc-state.db"
+    _ensure_repo_ignores(db)
+    exclude = tmp_path / ".git" / "info" / "exclude"
+    assert ".sdlc-state.db*" in exclude.read_text(encoding="utf-8")
+    _ensure_repo_ignores(db)  # idempotent
+    assert exclude.read_text(encoding="utf-8").count(".sdlc-state.db*") == 1
+
+
+def test_ensure_repo_ignores_no_git_is_noop(tmp_path) -> None:
+    from sdlc.build import _ensure_repo_ignores
+
+    _ensure_repo_ignores(tmp_path / ".sdlc-state.db")  # no .git anywhere → no crash
+    assert not (tmp_path / ".git").exists()
+
+
+# ---------------------------------------------------------------------------
+# R10: tolerant result parsing + never discard committed work
+# ---------------------------------------------------------------------------
+
+class _FencedDispatcher:
+    """Mimics dispatch_agent: runs the REAL parser on a ```json-fenced stdout.
+
+    Proves the controller no longer fails a stage just because the agent wrapped
+    its result in a markdown fence instead of the sentinel markers (R10).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.contracts import parse_and_validate
+        from sdlc.dispatch import AgentResult
+
+        self.calls.append((agent_type, getattr(story, "id", "")))
+        payload = _default_payload(agent_type, story)
+        stdout = f"work done\n```json\n{json.dumps(payload)}\n```\n"  # no sentinels
+        data = parse_and_validate(agent_type, stdout)
+        return AgentResult(agent_type=agent_type, data=data, raw=stdout)
+
+
+class _RaisingDispatcher:
+    """Raises a contract error for one agent_type; canned defaults otherwise.
+
+    ``bugfix_fixed=False`` makes the bugfix agent report an unresolved fix, so a
+    failing story exits after a single bugfix round (avoids an unrelated latent
+    bug where a *second* bugfix round re-inserts the ``bugfix`` stage at the same
+    attempt number).
+    """
+
+    def __init__(self, raise_on: str = "build", bugfix_fixed: bool = True) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.raise_on = raise_on
+        self.bugfix_fixed = bugfix_fixed
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.contracts import ResultBlockError
+        from sdlc.dispatch import AgentResult
+
+        self.calls.append((agent_type, getattr(story, "id", "")))
+        if agent_type == self.raise_on:
+            raise ResultBlockError("missing <<<RESULT_JSON>>> marker")
+        payload = _default_payload(agent_type, story)
+        if agent_type == "bugfix" and not self.bugfix_fixed:
+            payload = dict(payload, fix_status="FIXED", tests_passing=False)
+        return AgentResult(agent_type=agent_type, data=payload, raw="")
+
+
+def test_fenced_agent_output_builds_successfully(tmp_path) -> None:
+    """An agent that wraps its result in ```json (no sentinels) is not a failure."""
+    disp = _FencedDispatcher()
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.completed == 1
+    assert result.failed == 0
+    assert result.story_status["99.1-001"] == "DONE"
+
+
+def test_contract_error_with_commit_marks_needs_attention(tmp_path, monkeypatch) -> None:
+    """Unparseable result + an existing story commit ⇒ NEEDS_ATTENTION, no bugfix."""
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
+    disp = _RaisingDispatcher(raise_on="build")
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.needs_attention == 1
+    assert result.failed == 0
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+    # The committed work is preserved — no bugfix re-run from scratch.
+    assert all(agent != "bugfix" for agent, _ in disp.calls)
+    # A recoverable event names the situation for the operator.
+    conn = _open(db)
+    msgs = [
+        r[0]
+        for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("unparseable" in m for m in msgs)
+
+
+def test_contract_error_without_commit_still_fails(tmp_path, monkeypatch) -> None:
+    """No story commit ⇒ unchanged behavior: bugfix loop then FAILED."""
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    disp = _RaisingDispatcher(raise_on="build", bugfix_fixed=False)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.needs_attention == 0
+    assert result.failed == 1
+    assert result.story_status["99.1-001"] == "FAILED"
+    assert any(agent == "bugfix" for agent, _ in disp.calls)
+
+
+def test_story_commit_exists_no_git_is_false(tmp_path) -> None:
+    """The git probe never raises and returns False outside a git repo."""
+    from sdlc.build import story_commit_exists
+
+    assert story_commit_exists("99.1-001", root=tmp_path) is False
+
+
+def test_prompts_show_verbatim_result_wrapper() -> None:
+    """Every rendered prompt shows the exact sentinel wrapper and forbids fences."""
+    from sdlc.build import (
+        render_bugfix_prompt,
+        render_build_prompt,
+        render_coverage_prompt,
+        render_merge_prompt,
+        render_review_prompt,
+    )
+    from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
+
+    story = _story("99.1-001")
+    opts = BuildOptions()
+    prompts = [
+        render_build_prompt(story, opts),
+        render_coverage_prompt(story, opts),
+        render_review_prompt(story, 7),
+        render_merge_prompt(story, 7),
+        render_bugfix_prompt(story, "build", "boom"),
+    ]
+    for p in prompts:
+        assert RESULT_START_MARKER in p
+        assert RESULT_END_MARKER in p
+        assert "no markdown code fences" in p
+
+
+# ---------------------------------------------------------------------------
+# bugfix stage rows must use distinct attempt numbers (no UNIQUE collision)
+# ---------------------------------------------------------------------------
+
+class _FlakyDispatcher:
+    """Fails named stages on their first dispatch, succeeds after; bugfix fixes."""
+
+    def __init__(self, fail_first: set[str]) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.seen: dict[str, int] = {}
+        self.fail_first = set(fail_first)
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.dispatch import AgentResult
+
+        self.calls.append((agent_type, getattr(story, "id", "")))
+        n = self.seen.get(agent_type, 0)
+        self.seen[agent_type] = n + 1
+        payload = dict(_default_payload(agent_type, story))
+        if agent_type in self.fail_first and n == 0:
+            if agent_type == "build":
+                payload["build_status"] = "FAILED"
+            elif agent_type == "coverage":
+                payload["coverage_status"] = "FAIL"
+        return AgentResult(agent_type=agent_type, data=payload, raw="")
+
+
+def test_repeated_bugfix_same_stage_no_unique_collision(tmp_path) -> None:
+    """Two bugfix rounds on one stage get distinct attempts (was a UNIQUE crash)."""
+    disp = FakeDispatcher(
+        overrides={
+            ("build", "99.1-001"): {
+                "branch_name": "feature/99.1-001",
+                "build_status": "FAILED",
+                "commit_sha": "x",
+                "error_summary": "boom",
+            }
+        }
+    )
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.failed == 1  # build never passes → FAILED, but no crash
+    rows = _open(db).execute(
+        "SELECT attempt FROM stages WHERE stage_name='bugfix' ORDER BY attempt"
+    ).fetchall()
+    assert [r[0] for r in rows] == [1, 2]
+
+
+def test_bugfix_across_stages_uses_distinct_attempts(tmp_path) -> None:
+    """A bugfix in two different stages gets distinct attempts (cross-stage collision)."""
+    disp = _FlakyDispatcher(fail_first={"build", "coverage"})
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.completed == 1
+    assert result.story_status["99.1-001"] == "DONE"
+    rows = _open(db).execute(
+        "SELECT attempt FROM stages WHERE stage_name='bugfix' ORDER BY attempt"
+    ).fetchall()
+    assert [r[0] for r in rows] == [1, 2]

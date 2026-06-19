@@ -59,10 +59,62 @@ def test_build_limit_truncates_in_dry_run(tmp_path, monkeypatch) -> None:
     assert "1 stories" in result.output
 
 
-def test_build_unknown_scope_dry_run_is_empty(tmp_path, monkeypatch) -> None:
-    """An unmatched scope yields an empty plan rather than an error."""
+def test_build_unmatched_scope_errors(tmp_path, monkeypatch) -> None:
+    """R3: an unmatched non-`all` scope is an error (exit 2), not a hollow success."""
     _make_project(tmp_path)
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["build", "epic-77", "--dry-run"])
+    assert result.exit_code == 2, result.output
+    assert "matched no stories" in result.output.lower()
+
+
+def test_build_unmatched_story_scope_errors(tmp_path, monkeypatch) -> None:
+    """R3: a story id that resolves to no story exits 2."""
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "99.9-999", "--dry-run"])
+    assert result.exit_code == 2, result.output
+
+
+def test_build_all_empty_still_exits_zero(tmp_path, monkeypatch) -> None:
+    """R3 leaves `all` alone — an empty `all` run is a benign 0-story success."""
+    (tmp_path / "docs" / "stories").mkdir(parents=True)  # no epic files
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "all", "--dry-run"])
     assert result.exit_code == 0, result.output
-    assert "0 stories" in result.output
+
+
+def test_build_single_story_scope_dry_run(tmp_path, monkeypatch) -> None:
+    """R2: a story-id scope plans exactly that one story."""
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "99.1-002", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "1 stories" in result.output
+
+
+def test_build_help_lists_flags_and_scopes() -> None:
+    """R1: build's help epilog documents every flag and scope form.
+
+    Asserts against ``_BUILD_EPILOG`` — the text wired into the command via
+    ``@app.command(epilog=...)`` — rather than the rendered ``--help`` output,
+    which Rich reflows differently per terminal width/environment (it renders
+    fine locally but collapses on CI runners). This keeps the R1 guarantee
+    deterministic while still confirming ``build --help`` runs cleanly.
+    """
+    from sdlc.cli import _BUILD_EPILOG
+
+    assert runner.invoke(app, ["build", "--help"]).exit_code == 0
+    for flag in (
+        "--dry-run",
+        "--auto",
+        "--skip-coverage",
+        "--skip-preflight",
+        "--rebuild",
+        "--sequential",
+        "--limit",
+        "--coverage-threshold",
+        "--preflight-timeout",
+    ):
+        assert flag in _BUILD_EPILOG, f"{flag} missing from build epilog"
+    assert "epic-NN" in _BUILD_EPILOG and "X.Y-NNN" in _BUILD_EPILOG

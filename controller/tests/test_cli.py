@@ -82,11 +82,11 @@ def test_resume_stub_runs() -> None:
     assert "resume" in result.stdout.lower()
 
 
-def test_status_stub_runs() -> None:
-    """The status stub exits 0 and echoes its name."""
-    result = runner.invoke(app, ["status"])
+def test_status_no_run_exits_zero(tmp_path) -> None:
+    """`status` is implemented (not a stub); with no ledger it exits 0 cleanly."""
+    result = runner.invoke(app, ["status", "--db", str(tmp_path / ".sdlc-state.db")])
     assert result.exit_code == 0
-    assert "status" in result.stdout.lower()
+    assert "no build run found" in result.stdout.lower()
 
 
 def test_state_stub_runs() -> None:
@@ -124,8 +124,8 @@ def test_no_args_shows_help() -> None:
 
 def test_stub_output_contains_not_implemented() -> None:
     """All stub commands clearly indicate they are not yet implemented."""
-    # `build` is implemented in Story 7.3-001 and is no longer a stub.
-    stubs = ["resume", "status", "state", "rollback"]
+    # `build` (Story 7.3-001) and `status` are implemented and no longer stubs.
+    stubs = ["resume", "state", "rollback"]
     for cmd in stubs:
         result = runner.invoke(app, [cmd])
         assert result.exit_code == 0, f"{cmd} exited with {result.exit_code}"

@@ -281,6 +281,89 @@ def test_contract_errors_share_base() -> None:
 
 
 # ---------------------------------------------------------------------------
+# R10: tolerant parsing when the sentinel markers are absent (format drift)
+# ---------------------------------------------------------------------------
+
+_BUILD_OK = {
+    "branch_name": "feature/34.5-003",
+    "build_status": "SUCCESS",
+    "commit_sha": "e807982f",
+}
+
+
+def test_fallback_parses_json_fence_when_no_markers() -> None:
+    """A ```json fenced object (no sentinels) is recovered (the R10 incident)."""
+    body = json.dumps(_BUILD_OK)
+    response = f"All done. Here is the result:\n```json\n{body}\n```\n"
+    assert parse_result_block(response) == _BUILD_OK
+    assert parse_and_validate("build", response) == _BUILD_OK
+
+
+def test_fallback_parses_language_less_fence() -> None:
+    """A bare ``` fence (no language tag) is also recovered."""
+    response = f"```\n{json.dumps(_BUILD_OK)}\n```"
+    assert parse_result_block(response) == _BUILD_OK
+
+
+def test_fallback_parses_bare_object_in_prose() -> None:
+    """A bare balanced JSON object embedded in prose is recovered."""
+    response = f"Result below.\n{json.dumps(_BUILD_OK)}\nThanks!"
+    assert parse_result_block(response) == _BUILD_OK
+
+
+def test_fallback_last_fence_wins() -> None:
+    """When several fenced objects appear, the last one is the result."""
+    decoy = json.dumps({"build_status": "FAILED"})
+    real = json.dumps(_BUILD_OK)
+    response = f"```json\n{decoy}\n```\nthen finally\n```json\n{real}\n```"
+    assert parse_result_block(response) == _BUILD_OK
+
+
+def test_fallback_skips_schema_invalid_candidate() -> None:
+    """parse_and_validate picks the first schema-valid fallback, skipping a decoy.
+
+    The last block is an example wrapper missing required fields; the real,
+    schema-valid result is earlier — it must still be selected.
+    """
+    real = json.dumps(_BUILD_OK)
+    example = json.dumps({"note": "put your result here"})
+    response = f"```json\n{real}\n```\nexample format:\n```json\n{example}\n```"
+    assert parse_and_validate("build", response) == _BUILD_OK
+
+
+def test_fallback_brace_scanner_ignores_braces_in_strings() -> None:
+    """The bare-object scanner is string-aware (braces inside strings don't count)."""
+    payload = dict(_BUILD_OK, commit_sha="ab{c}d")  # braces inside a JSON string value
+    response = f"noise {json.dumps(payload)} more noise"
+    assert parse_result_block(response) == payload
+
+
+def test_sentinel_preferred_over_fence() -> None:
+    """When both a sentinel block and a fence are present, the sentinel wins."""
+    fence_obj = dict(_BUILD_OK, branch_name="feature/from-fence")
+    sentinel_obj = dict(_BUILD_OK, branch_name="feature/from-sentinel")
+    response = (
+        f"```json\n{json.dumps(fence_obj)}\n```\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(sentinel_obj)}\n{RESULT_END_MARKER}"
+    )
+    assert parse_result_block(response)["branch_name"] == "feature/from-sentinel"
+
+
+def test_no_markers_no_json_still_raises() -> None:
+    """Truly marker-less, fence-less, JSON-less output is still a ResultBlockError."""
+    with pytest.raises(ResultBlockError) as exc_info:
+        parse_result_block("the build failed and I gave up, sorry")
+    assert RESULT_START_MARKER in str(exc_info.value)
+
+
+def test_array_fence_is_not_accepted() -> None:
+    """A fenced JSON array (not an object) is not a valid result candidate."""
+    response = "```json\n[1, 2, 3]\n```"
+    with pytest.raises(ResultBlockError):
+        parse_result_block(response)
+
+
+# ---------------------------------------------------------------------------
 # Edge cases required by QA gate (Story 7.2-001 coverage)
 # ---------------------------------------------------------------------------
 

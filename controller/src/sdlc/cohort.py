@@ -23,6 +23,10 @@ class Story:
     points: int
     agent_type: str
     dependencies: list[str] = field(default_factory=list)
+    # True when the epic marks the story shipped (Status: Done, or all DoD boxes
+    # checked). The build skips these by default so an epic-scoped run never
+    # re-opens merged work — see run_build's done-skip and `--rebuild`.
+    done: bool = False
 
 
 def compute_cohorts(queue: list[Story]) -> list[list[Story]]:
