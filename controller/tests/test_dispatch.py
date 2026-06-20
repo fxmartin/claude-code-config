@@ -325,8 +325,12 @@ class _FakePopen:
         self._returncode = returncode
         self._wait_exc = wait_exc
         self.killed = False
+        self.wait_delay = 0.0  # seconds wait() lingers, to provoke timer races
 
     def wait(self, timeout=None):  # noqa: ANN001 - mirror subprocess API
+        if self.wait_delay:
+            # Block long enough for a short-timeout watchdog to fire mid-reap.
+            threading.Event().wait(self.wait_delay)
         if self._wait_exc is not None:
             raise self._wait_exc
         return self._returncode
@@ -469,6 +473,19 @@ def test_streaming_dispatch_timeout_raises(monkeypatch) -> None:
         # A tiny timeout makes the watchdog fire promptly; no real agent stalls.
         dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, timeout=0.2)
     assert fake.killed  # the hung child is killed
+
+
+def test_streaming_dispatch_late_watchdog_does_not_false_timeout(monkeypatch) -> None:
+    """A watchdog firing after the stream is fully read must not flag a timeout."""
+    fake = _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+    # wait() lingers so the (tiny-timeout) watchdog fires while we are reaping,
+    # i.e. after the read loop already drained stdout — the race the lock guards.
+    fake.wait_delay = 0.3
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, timeout=0.05)
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert result.cost_usd == 0.42  # the valid result is kept, not discarded
+    assert not fake.killed  # a completed child is never killed by the watchdog
 
 
 def test_streaming_dispatch_falls_back_when_no_result_event(monkeypatch) -> None:

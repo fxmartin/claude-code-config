@@ -135,6 +135,11 @@ def _parse_stream_line(line: str) -> dict[str, Any] | None:
 # agent surfaces as a typed failure instead of blocking the run forever.
 DEFAULT_TIMEOUT_S = 3600
 
+# Grace period to reap a streamed child after stdout reaches EOF. The process
+# has closed stdout, so it should exit within milliseconds; this only bounds the
+# pathological case of a child that lingers after EOF so a reap cannot hang.
+_POST_STREAM_WAIT_S = 30
+
 
 class AgentDispatchError(Exception):
     """The agent subprocess could not be run to completion.
@@ -323,11 +328,23 @@ def _dispatch_streaming(
     # has no equivalent here unless we enforce it ourselves. A timer kills the
     # child at the deadline; the kill closes stdout, the loop ends, and the run
     # surfaces as a typed ``AgentDispatchError`` instead of hanging the build.
+    #
+    # ``read_done`` + ``state_lock`` close a race: once the read loop has drained
+    # stdout on its own, a watchdog that fires microseconds later (e.g. a child
+    # that completed right at the deadline) must NOT flag a timeout and discard a
+    # valid result. The watchdog only acts while the read is still outstanding,
+    # and the loop only claims success while no timeout has fired — the lock makes
+    # exactly one of the two win, so a completed child is never a false timeout.
     timed_out = threading.Event()
+    read_done = threading.Event()
+    state_lock = threading.Lock()
 
     def _on_timeout() -> None:
-        timed_out.set()
-        proc.kill()
+        with state_lock:
+            if read_done.is_set():
+                return  # stdout already fully read; the child finished in time
+            timed_out.set()
+        proc.kill()  # unblock the still-outstanding stdout read
 
     watchdog = threading.Timer(timeout, _on_timeout)
     watchdog.daemon = True
@@ -356,18 +373,34 @@ def _dispatch_streaming(
                 event = _parse_stream_line(line)
                 if event is not None and event.get("type") == "result":
                     result_event = event
-        returncode = proc.wait()
+        # Claim completion: if the watchdog hasn't already fired, mark the read
+        # done so a later firing is a no-op. If it *has* fired, the kill is what
+        # ended the read — honour the timeout.
+        with state_lock:
+            if not timed_out.is_set():
+                read_done.set()
+        if timed_out.is_set():
+            try:
+                proc.wait(timeout=_POST_STREAM_WAIT_S)
+            except subprocess.TimeoutExpired:
+                pass
+            watchdog.cancel()
+            drainer.join(timeout=1)
+            transcript.append(f"\n--- TIMEOUT after {timeout}s ---\n")
+            transcript.close()
+            raise AgentDispatchError(
+                f"{agent_type} agent timed out after {timeout}s"
+            )
+        # stdout hit EOF, so the child is exiting; bound the reap so a process
+        # that closes stdout but lingers cannot hang the run (the watchdog is a
+        # no-op now that read_done is set).
+        try:
+            returncode = proc.wait(timeout=_POST_STREAM_WAIT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            returncode = proc.wait()
     finally:
         watchdog.cancel()
-
-    drainer.join(timeout=1)
-
-    if timed_out.is_set():
-        transcript.append(f"\n--- TIMEOUT after {timeout}s ---\n")
-        transcript.close()
-        raise AgentDispatchError(
-            f"{agent_type} agent timed out after {timeout}s"
-        )
 
     drainer.join(timeout=1)
     stderr = "".join(stderr_chunks)
