@@ -10,7 +10,12 @@ from typer.testing import CliRunner
 
 from sdlc.cli import app
 
-from test_resume import _make_project, _seed_complete, _seed_interrupted
+from test_resume import (
+    _make_project,
+    _seed_all_stages_done_unfinalised,
+    _seed_complete,
+    _seed_interrupted,
+)
 
 runner = CliRunner()
 
@@ -45,6 +50,13 @@ def test_state_json(tmp_path: Path) -> None:
     assert result.exit_code == 0
     rows = json.loads(result.stdout)
     assert any(r["story_id"] == "99.1-002" and r["stage_name"] == "review" for r in rows)
+
+
+def test_state_json_no_run(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    result = runner.invoke(app, ["state", "--db", str(db), "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == []  # empty array, not the human message
 
 
 def test_state_is_not_a_stub(tmp_path: Path) -> None:
@@ -105,6 +117,19 @@ def test_resume_command_nothing_to_resume(tmp_path: Path, monkeypatch) -> None:
     result = runner.invoke(app, ["resume", "epic-99", "--db", str(db)])
     assert result.exit_code == 0, result.output
     assert "nothing to resume" in result.output.lower()
+
+
+def test_resume_command_run_with_no_incomplete_stories(tmp_path: Path, monkeypatch) -> None:
+    """A resumable run whose stories are all (unfinalised but) complete reports
+    the run id and exits 0 — distinct from the no-run-at-all message."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    rid = _seed_all_stages_done_unfinalised(db)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["resume", "epic-99", "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    assert "nothing to resume" in result.output.lower()
+    assert rid[:8] in result.output  # names the specific run, not "no incomplete run"
 
 
 def test_resume_is_not_a_stub(tmp_path: Path) -> None:
