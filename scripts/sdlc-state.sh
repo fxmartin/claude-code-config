@@ -638,42 +638,46 @@ render_document() {
     printf '%s\n' "${SDLC_MANAGED_END}"
 }
 
-# True when <file> already contains a well-formed managed region. The region
-# is anchored on the LAST BEGIN marker and the first END marker after it, so a
-# region exists exactly when the last BEGIN precedes the last END. Anchoring on
-# the *last* BEGIN (not the first) is what keeps re-renders idempotent: the
-# non-destructive append fallback can leave a stray half-marker in the
-# preserved content (e.g. a file that arrived with a BEGIN but no END), and a
-# first-marker rule would later mis-pair that orphan with the real region's END
-# and clobber everything between them. Malformed / partial marker sets (no
-# BEGIN, no END, or every END before every BEGIN) return false so the caller
-# falls back to non-destructive append. grep is guarded so `set -o pipefail`
-# does not abort on a no-match.
+# Locate the first well-formed managed region — a BEGIN marker line that is
+# closed by an END marker line with no other BEGIN in between (a *matched
+# pair*). Echoes "<begin_ln> <end_ln>" (1-based) or nothing when no such pair
+# exists. Matching the closing pair — rather than the first/last marker of each
+# kind — is what makes re-renders idempotent regardless of orphan half-markers
+# the non-destructive append fallback may leave around the real region:
+#   * a BEGIN before the region (no close yet) is superseded by the real BEGIN
+#   * a trailing BEGIN after the region is never reached (we exit on first close)
+#   * an END before any BEGIN is ignored
+# awk has no default-print rule here, so it only ever emits the coordinate line.
+find_managed_region() {
+    awk '
+        index($0, "BEGIN SDLC LEDGER") { b = NR; next }
+        index($0, "END SDLC LEDGER") && b { print b, NR; exit }
+    ' "$1" 2>/dev/null || true
+}
+
+# True when <file> contains a well-formed managed region (see
+# find_managed_region). Malformed / partial marker sets (no BEGIN, no END, or
+# markers that never form a closed pair) return false so the caller falls back
+# to non-destructive append.
 has_managed_region() {
-    local f="$1" begin_ln end_ln
-    begin_ln=$(grep -n -F "${SDLC_MANAGED_BEGIN}" "${f}" 2>/dev/null | tail -1 | cut -d: -f1 || true)
-    end_ln=$(grep -n -F "${SDLC_MANAGED_END}" "${f}" 2>/dev/null | tail -1 | cut -d: -f1 || true)
-    [ -n "${begin_ln}" ] && [ -n "${end_ln}" ] && [ "${begin_ln}" -lt "${end_ln}" ]
+    [ -n "$(find_managed_region "$1")" ]
 }
 
 # Splice freshly-rendered managed content into an existing file that already
-# carries a managed region. The region starts at the LAST BEGIN marker and ends
-# at the first END marker after it (see has_managed_region for why the *last*
-# BEGIN). Everything before that BEGIN — including any orphan half-markers left
-# by an earlier append — and everything after the matching END is preserved
-# verbatim; the old managed body (markers included) is replaced by
-# <managed_file> (which carries its own BEGIN/END markers). Emits the merged
-# document to stdout.
+# carries a managed region. The region is the matched BEGIN..END pair found by
+# find_managed_region; exactly those lines are replaced by <managed_file>
+# (which carries its own BEGIN/END markers). Everything else — content before
+# the region and any orphan half-markers or hand-maintained history after it —
+# is preserved verbatim. Emits the merged document to stdout.
 splice_managed_region() {
-    local existing="$1" managed_file="$2" begin_ln
-    begin_ln=$(grep -n -F "${SDLC_MANAGED_BEGIN}" "${existing}" 2>/dev/null | tail -1 | cut -d: -f1 || true)
-    awk -v mfile="${managed_file}" -v begin_ln="${begin_ln}" '
+    local existing="$1" managed_file="$2" region begin_ln end_ln
+    region="$(find_managed_region "${existing}")"
+    begin_ln="${region% *}"
+    end_ln="${region#* }"
+    awk -v mfile="${managed_file}" -v begin_ln="${begin_ln}" -v end_ln="${end_ln}" '
         BEGIN { while ((getline line < mfile) > 0) managed = managed line "\n" }
-        NR == begin_ln {   # last BEGIN marker = region start
-            printf "%s", managed; state = 1; next
-        }
-        state == 1 && index($0, "END SDLC LEDGER") { state = 2; next }
-        state == 1 { next }   # drop the stale managed body
+        NR == begin_ln { printf "%s", managed; next }   # emit the fresh region
+        NR > begin_ln && NR <= end_ln { next }          # drop the stale body + END
         { print }
     ' "${existing}"
 }
