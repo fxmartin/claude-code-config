@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 
 import pytest
 
@@ -432,15 +433,41 @@ def test_streaming_dispatch_nonzero_exit_raises(monkeypatch) -> None:
         dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
 
 
+class _BlockingStdout:
+    """A stdout that blocks on read until the process is ``kill()``-ed (EOF then).
+
+    Models a stalled agent that stops emitting yet never closes stdout — the
+    case the watchdog must rescue, since iterating such a stream blocks forever.
+    """
+
+    def __init__(self) -> None:
+        self.released = threading.Event()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.released.wait(timeout=5)  # unblocked by _FakePopen.kill()
+        raise StopIteration
+
+
 def test_streaming_dispatch_timeout_raises(monkeypatch) -> None:
-    """A wait() timeout on the streamed subprocess surfaces as AgentDispatchError."""
-    fake = _FakePopen(
-        [_stream_result_event(_wrap(_VALID_BUILD))],
-        wait_exc=subprocess.TimeoutExpired(_STREAM_CMD, 1),
-    )
+    """A stalled stream is killed by the watchdog and surfaces as AgentDispatchError."""
+    blocking = _BlockingStdout()
+    fake = _FakePopen([])
+    fake.stdout = blocking
+
+    original_kill = fake.kill
+
+    def kill_and_release() -> None:
+        original_kill()
+        blocking.released.set()  # the kill closes stdout → loop ends
+
+    fake.kill = kill_and_release  # type: ignore[method-assign]
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
     with pytest.raises(AgentDispatchError, match="timed out"):
-        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, timeout=1)
+        # A tiny timeout makes the watchdog fire promptly; no real agent stalls.
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, timeout=0.2)
     assert fake.killed  # the hung child is killed
 
 
