@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.29.0] - 2026-06-20
+
+### Added
+
+- feat(realtime-observability): stream agent output with transcript tee
+
+### Fixed
+
+- fix(realtime-observability): prevent watchdog false-timeout race
+- fix(realtime-observability): enforce wall-clock timeout on streamed run
+
+
 ## [v1.28.0] - 2026-06-20
 
 ### Added
