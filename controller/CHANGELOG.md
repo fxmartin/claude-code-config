@@ -5,6 +5,39 @@ All notable changes to `sdlc-controller`. Format follows
 versioning. History before 1.14.0 lives in the git log and the Epic-07/08
 stories.
 
+## [1.16.0] — 2026-06-20
+
+Replicates the richer dashboard developed in the GitLab-native fork: the full
+per-story pipeline, run configuration, and per-run/per-stage token & cost.
+
+### Added
+- **Per-stage pipeline on the dashboard** — each story now shows `build · QA ·
+  review · merge` cells (PENDING when not started, SKIPPED when the coverage gate
+  is off) plus a `🔧×N` bugfix-retry marker, instead of just the latest stage. New
+  `Ledger.stage_breakdown()`; `status_snapshot` attaches per-story `stages` +
+  `bugfix_attempts`.
+- **Run configuration header** — preflight / QA-gate / mode / rebuild / limit,
+  persisted as a `config` event at run start (`Ledger.run_config()`; filtered out
+  of the human event log).
+- **`/log` endpoint** — failed stages link to their persisted transcript (R8); the
+  server only serves files resolving inside the run's `<ledger>.logs` root (no path
+  traversal).
+- **Per-run and per-stage token & cost** — the default agent command now requests
+  `--output-format json`, and dispatch unwraps Claude Code's result envelope to
+  capture `usage`, `total_cost_usd`, and `session_id`. These are recorded per stage
+  attempt and surfaced on the dashboard (run-header totals, a per-story column,
+  per-stage tooltips) and in the runs sidebar. A custom `SDLC_AGENT_CMD` that omits
+  the flag still works — dispatch falls back to plain-text parsing and records no
+  usage.
+
+### Changed
+- The `stages` table gains `session_id, input_tokens, output_tokens,
+  cache_read_tokens, cache_creation_tokens, cost_usd`. A new idempotent migration
+  (`Ledger.init()` → `_apply_migrations`) adds these columns to a pre-existing
+  ledger via `ALTER TABLE`, recorded in `_migrations`. Read APIs
+  (`list_runs`/`stage_breakdown`/`status_snapshot`) tolerate an un-migrated ledger
+  (read-only viewers never migrate) — runs/stages without usage render as "—".
+
 ## [1.15.0] — 2026-06-18
 
 ### Added

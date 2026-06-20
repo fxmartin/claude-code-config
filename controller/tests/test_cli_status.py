@@ -150,3 +150,44 @@ def test_status_snapshot_seeded(tmp_path: Path) -> None:
     by_id = {s["story_id"]: s for s in snap["stories"]}
     assert by_id["34.5-003"]["pr_number"] == 42
     assert snap["events"]
+
+
+# --- per-stage breakdown + run config --------------------------------------
+
+
+def test_run_config_roundtrip_and_event_filter(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("all", "parallel")
+    ledger.event_log(run_id, "", "info", "controller", "run started")
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"preflight": "skipped", "skip_coverage": True}))
+
+    assert ledger.run_config(run_id) == {"preflight": "skipped", "skip_coverage": True}
+    # The config marker must not leak into the human event log.
+    assert all(e.get("source") != "config" for e in ledger.recent_events(run_id))
+
+
+def test_stage_breakdown_groups_attempts(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed(db)
+    bd = Ledger(db).stage_breakdown(run_id)
+    assert [s["name"] for s in bd["34.5-003"]] == ["build", "coverage"]
+    assert bd["34.6-001"][0]["name"] == "build"
+
+
+def test_snapshot_stage_breakdown_and_config(tmp_path: Path) -> None:
+    from sdlc.build import status_snapshot
+
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    run_id = _seed(db)
+    ledger.event_log(run_id, "", "info", "config", json.dumps(
+        {"preflight": "skipped", "skip_coverage": True, "coverage_threshold": 90}
+    ))
+    snap = status_snapshot(ledger)
+    assert snap["run"]["config"]["preflight"] == "skipped"
+    by_id = {s["story_id"]: s for s in snap["stories"]}
+    # With skip_coverage set, an unrun coverage stage shows SKIPPED, not PENDING.
+    cov = next(st for st in by_id["34.6-001"]["stages"] if st["name"] == "coverage")
+    assert cov["status"] == "SKIPPED"

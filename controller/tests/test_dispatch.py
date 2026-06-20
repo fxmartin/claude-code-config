@@ -172,3 +172,106 @@ def test_dispatch_writes_transcript_on_contract_failure(monkeypatch, tmp_path) -
     with pytest.raises(ResultBlockError):
         dispatch_agent("build", "prompt", agent_cmd=["fake"], transcript_path=tpath)
     assert "garbage, no markers" in tpath.read_text(encoding="utf-8")
+
+
+# --- Token/cost: --output-format json envelope ----------------------------
+
+
+def _envelope(result_text: str, *, is_error: bool = False, cost: float = 0.42,
+              usage: dict | None = None, session_id: str = "sess-123") -> str:
+    """A claude -p --output-format json result envelope, as a JSON string."""
+    return json.dumps({
+        "type": "result",
+        "subtype": "error_max_turns" if is_error else "success",
+        "is_error": is_error,
+        "result": result_text,
+        "session_id": session_id,
+        "total_cost_usd": cost,
+        "num_turns": 3,
+        "duration_ms": 1234,
+        "usage": usage if usage is not None else {
+            "input_tokens": 100, "output_tokens": 20,
+            "cache_creation_input_tokens": 300, "cache_read_input_tokens": 4000,
+        },
+    })
+
+
+def test_dispatch_unwraps_json_envelope_and_captures_usage(monkeypatch) -> None:
+    """An --output-format json envelope is unwrapped; usage/cost/session captured."""
+    out = _envelope(_wrap(_VALID_BUILD))
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _FakeCompleted(out))
+    result = dispatch_agent("build", "prompt", agent_cmd=["fake"])
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert result.session_id == "sess-123"
+    assert result.cost_usd == 0.42
+    assert result.usage["output_tokens"] == 20
+    assert result.usage["cache_read_input_tokens"] == 4000
+    # raw is the readable agent text, not the JSON wrapper.
+    assert RESULT_END_MARKER in result.raw
+
+
+def test_dispatch_envelope_with_fenced_result_recovers(monkeypatch) -> None:
+    """R10 tolerant parsing still applies to the envelope's `result` text."""
+    fenced = "I built and committed it.\n```json\n" + json.dumps(_VALID_BUILD) + "\n```\n"
+    out = _envelope(fenced)
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _FakeCompleted(out))
+    result = dispatch_agent("build", "prompt", agent_cmd=["fake"])
+    assert result.data["build_status"] == "SUCCESS"
+    assert result.cost_usd == 0.42
+
+
+def test_dispatch_envelope_is_error_raises(monkeypatch) -> None:
+    """An envelope with is_error=true surfaces as AgentDispatchError."""
+    out = _envelope("hit the turn limit", is_error=True)
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _FakeCompleted(out))
+    with pytest.raises(AgentDispatchError, match="reported an error"):
+        dispatch_agent("build", "prompt", agent_cmd=["fake"])
+
+
+def test_dispatch_envelope_writes_readable_transcript(monkeypatch, tmp_path) -> None:
+    """The persisted transcript is the agent text (+stderr), not the JSON envelope."""
+    out = _envelope(_wrap(_VALID_BUILD))
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(out, stderr="a warning")
+    )
+    tpath = tmp_path / "build-1.log"
+    dispatch_agent("build", "prompt", agent_cmd=["fake"], transcript_path=tpath)
+    body = tpath.read_text(encoding="utf-8")
+    assert RESULT_START_MARKER in body
+    assert '"type": "result"' not in body  # the envelope wrapper is gone
+    assert "a warning" in body              # stderr is appended
+
+
+def test_dispatch_malformed_json_envelope_falls_back(monkeypatch) -> None:
+    """Output starting with '{' but not valid JSON falls back to raw parsing."""
+    out = "{oops not json\n" + _wrap(_VALID_BUILD)
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _FakeCompleted(out))
+    result = dispatch_agent("build", "prompt", agent_cmd=["fake"])
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert result.usage is None  # not recognized as an envelope
+
+
+def test_dispatch_non_result_json_is_not_treated_as_envelope(monkeypatch) -> None:
+    """A valid JSON object that isn't a result envelope is not unwrapped."""
+    out = json.dumps({"type": "system", "subtype": "init"})
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _FakeCompleted(out))
+    # Falls through to raw parsing → the dict fails schema validation (no build fields).
+    with pytest.raises(SchemaValidationError):
+        dispatch_agent("build", "prompt", agent_cmd=["fake"])
+
+
+def test_dispatch_plain_text_fallback_has_no_usage(monkeypatch) -> None:
+    """Non-envelope (plain text) output still parses, with usage None (back-compat)."""
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_BUILD))
+    )
+    result = dispatch_agent("build", "prompt", agent_cmd=["fake"])
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert result.usage is None and result.cost_usd is None and result.session_id is None
+
+
+def test_default_agent_cmd_requests_json_output() -> None:
+    """The default command asks for the JSON envelope so usage is captured."""
+    assert "--output-format" in DEFAULT_AGENT_CMD
+    i = DEFAULT_AGENT_CMD.index("--output-format")
+    assert DEFAULT_AGENT_CMD[i + 1] == "json"
