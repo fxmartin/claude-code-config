@@ -93,8 +93,15 @@ def compute_resume_plan(
         else:
             start_attempt = 1
 
-        bugfix_attempts = [a["attempt"] for a in attempts if a["name"] == "bugfix"]
-        bugfix_seq = max(bugfix_attempts) if bugfix_attempts else 0
+        # The "bugfix" and "reask" stages share the monotonic ``bugfix_seq``
+        # counter for their attempt number (Story 12.1-001). A re-ask that
+        # *succeeded* leaves a "reask" row but no "bugfix" row, so reconstructing
+        # the counter from "bugfix" rows alone would reuse an existing attempt and
+        # collide on the stages PRIMARY KEY — resume must continue past both.
+        recovery_attempts = [
+            a["attempt"] for a in attempts if a["name"] in ("bugfix", "reask")
+        ]
+        bugfix_seq = max(recovery_attempts) if recovery_attempts else 0
 
         plan[sid] = StoryResumeState(
             story_id=sid,

@@ -106,6 +106,39 @@ def test_compute_resume_plan_identifies_next_stage(tmp_path: Path) -> None:
     assert interrupted.pr_number == 100  # PR number preserved
 
 
+def test_resume_bugfix_seq_continues_past_reask_rows(tmp_path: Path) -> None:
+    """A prior envelope re-ask must advance the resumed monotonic seq (12.1-001).
+
+    The 'reask' and 'bugfix' stages share the ``bugfix_seq`` counter for their
+    attempt number. A re-ask that *succeeded* leaves a 'reask' row but no
+    'bugfix' row; if resume reconstructs ``bugfix_seq`` from 'bugfix' rows only,
+    the next re-ask reuses an existing attempt and hits the stages PRIMARY KEY.
+    Resume must continue past the highest of both.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"skip_coverage": True}))
+    ledger.story_upsert(
+        run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    # Build recovered via an envelope re-ask (reask seq=1, no bugfix row), then
+    # the run crashed mid-review.
+    ledger.stage_start(run_id, "99.1-001", "build", 1)
+    ledger.stage_finish(run_id, "99.1-001", "build", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-001", "reask", 1)
+    ledger.stage_finish(run_id, "99.1-001", "reask", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-001", "review", 1)  # left IN_PROGRESS
+    ledger.set_story_status(run_id, "99.1-001", "IN_PROGRESS")
+
+    plan = compute_resume_plan(ledger, run_id, skip_coverage=True)
+    # The resumed seq must be at least the existing reask attempt so the next
+    # recovery row cannot collide on (run_id, story_id, 'reask', seq).
+    assert plan["99.1-001"].bugfix_seq >= 1
+
+
 def test_latest_resumable_run_finds_in_progress(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     run_id = _seed_interrupted(db)
@@ -353,8 +386,9 @@ def test_resume_marks_needs_attention_when_committed_but_unparseable(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Resuming a stage whose agent emits an unparseable result, while a story
-    commit already exists, preserves the work as NEEDS_ATTENTION (no bugfix) and
-    closes the run out NEEDS_ATTENTION."""
+    commit already exists, attempts bounded recovery (envelope re-ask + bugfix)
+    and — once exhausted — preserves the work as NEEDS_ATTENTION (R10), closing
+    the run out NEEDS_ATTENTION (Story 12.1-001)."""
     _make_project(tmp_path)
     monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
     db = tmp_path / ".sdlc-state.db"
@@ -366,8 +400,9 @@ def test_resume_marks_needs_attention_when_committed_but_unparseable(
     assert result.failed == 0
     assert result.blocked == 0
     assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
-    # The committed work is preserved — no bugfix re-run from scratch.
-    assert all(agent != "bugfix" for agent, _ in disp.calls)
+    # Recovery is attempted before parking, but the committed work is never
+    # discarded — it ends NEEDS_ATTENTION, not FAILED (R10).
+    assert any(agent == "bugfix" for agent, _ in disp.calls)
 
     ledger = Ledger(db)
     assert ledger.run_row(ledger.latest_run_id())["status"] == "NEEDS_ATTENTION"
