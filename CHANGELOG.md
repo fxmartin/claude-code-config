@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.28.0] - 2026-06-20
+
+### Added
+
+- feat(controller): rollback verb and remove init stub (#10.2-001) (#71)
+
+
 ### Added
 
 - feat(controller-hardening): implement rollback and resolve the init stub (#10.2-001)
