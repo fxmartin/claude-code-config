@@ -1797,3 +1797,319 @@ def test_inflight_story_marked_in_progress_during_dispatch(tmp_path) -> None:
     assert story["status"] == "IN_PROGRESS"          # in-flight, not TODO
     assert snap["counts"]["in_progress"] == 1        # count is accurate mid-run
     assert story["activity"]["message"] == "editing cli.py"  # renders activity
+
+
+# ---------------------------------------------------------------------------
+# Commit-message commitlint enforcement (Story 12.2-002)
+# ---------------------------------------------------------------------------
+
+# A minimal ruleset standing in for the repo's .commitlintrc.json.
+_COMMITLINT_RULES = {
+    "rules": {
+        "type-enum": [2, "always", ["feat", "fix", "chore", "docs", "test"]],
+        "type-empty": [2, "never"],
+        "subject-empty": [2, "never"],
+        "subject-case": [2, "always", "lower-case"],
+        "subject-full-stop": [2, "never", "."],
+        "header-max-length": [2, "always", 72],
+    }
+}
+
+# A header that breaks subject-case (capital) and subject-full-stop.
+_BAD_COMMIT = "feat(controller): Add the thing."
+_GOOD_COMMIT = "feat(controller): add the thing"
+
+
+class _CommitLintDispatcher:
+    """An agent whose freshly-authored commit is amended on a commit-lint re-ask.
+
+    Tracks ``compliant`` head state so the monkeypatched ``_commit_message`` knows
+    which header to return. Each commit-authoring **stage** dispatch leaves a
+    fresh (non-compliant) commit; a commit-lint **re-ask** (recognised by the
+    sentinel word its prompt carries) amends it compliant — unless
+    ``fix_on_reask=False``, which keeps it broken to exercise the bounded
+    exhaustion path. Modelling per-commit state (rather than a single latch) lets
+    the build *and* coverage commits each be linted independently.
+    """
+
+    def __init__(self, fix_on_reask: bool = True, start_compliant: bool = False) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.fix_on_reask = fix_on_reask
+        self.compliant = start_compliant
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.dispatch import AgentResult
+
+        is_lint = "commitlint" in prompt
+        self.calls.append(
+            (agent_type, getattr(story, "id", ""), "commitlint" if is_lint else "stage")
+        )
+        if is_lint:
+            self.compliant = self.fix_on_reask  # re-ask amends iff allowed
+        elif agent_type in ("build", "coverage", "bugfix"):
+            self.compliant = False  # a new commit-authoring stage → fresh commit
+        return AgentResult(
+            agent_type=agent_type, data=_default_payload(agent_type, story), raw=""
+        )
+
+
+def _patch_commitlint(monkeypatch, disp, config, *, good=_GOOD_COMMIT, bad=_BAD_COMMIT):
+    monkeypatch.setattr("sdlc.build.load_commitlint_config", lambda root: config)
+    monkeypatch.setattr(
+        "sdlc.build._commit_message",
+        lambda ref, root=None: good if disp.compliant else bad,
+    )
+
+
+def test_noncompliant_commit_triggers_reask_and_recovers(tmp_path, monkeypatch) -> None:
+    """A commitlint-violating build commit is amended via a bounded re-ask (AC1)."""
+    disp = _CommitLintDispatcher(fix_on_reask=True)
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES)
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "DONE"
+    # A commit-lint re-ask was dispatched against the build agent.
+    assert any(kind == "commitlint" for _, _, kind in disp.calls)
+    # It is recorded as a 'commitlint' stage row and a compliance event (AC1).
+    conn = _open(db)
+    stages = [
+        r[0] for r in conn.execute(
+            "SELECT stage_name FROM stages WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert "commitlint" in stages
+    msgs = [
+        r[0] for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("violates commitlint" in m for m in msgs)
+    assert any("commitlint-compliant" in m for m in msgs)
+
+
+def test_no_commitlint_config_is_a_noop(tmp_path, monkeypatch) -> None:
+    """With no commitlint config the controller invents no rules (AC2)."""
+    disp = _CommitLintDispatcher()
+    monkeypatch.setattr("sdlc.build.load_commitlint_config", lambda root: None)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "DONE"
+    assert all(kind != "commitlint" for _, _, kind in disp.calls)
+
+
+def test_compliant_commit_has_no_reask(tmp_path, monkeypatch) -> None:
+    """A compliant build commit changes nothing — no re-ask (AC3)."""
+    disp = _CommitLintDispatcher()
+    # _commit_message always returns a compliant header regardless of `amended`.
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES, bad=_GOOD_COMMIT)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "DONE"
+    assert all(kind != "commitlint" for _, _, kind in disp.calls)
+
+
+def test_exhausted_commit_lint_parks_needs_attention(tmp_path, monkeypatch) -> None:
+    """An unfixable message is bounded, then parked — never advanced to a PR."""
+    from sdlc.build import MAX_COMMITLINT_REASK
+
+    disp = _CommitLintDispatcher(fix_on_reask=False)  # re-ask never amends
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES)
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    # The story is parked, not advanced: a non-compliant header must not reach a PR.
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+    # The pipeline stopped at the build gate — review/merge never ran (work preserved).
+    advanced = {agent for agent, _, _ in disp.calls}
+    assert "review" not in advanced and "merge" not in advanced
+    # The re-ask was bounded by MAX_COMMITLINT_REASK.
+    lint_calls = [c for c in disp.calls if c[2] == "commitlint"]
+    assert len(lint_calls) == MAX_COMMITLINT_REASK
+    msgs = [
+        r[0] for r in _open(db).execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("still violates commitlint" in m for m in msgs)
+
+
+def test_commit_lint_park_blocks_dependents(tmp_path, monkeypatch) -> None:
+    """A dependent of a commit-lint-parked story is BLOCKED, not built on unmerged work."""
+    disp = _CommitLintDispatcher(fix_on_reask=False)  # parks 99.1-001 NEEDS_ATTENTION
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES)
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001"), _story("99.1-002", deps=["99.1-001"])],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+    # The dependent is blocked: its dependency's work is committed but unmerged.
+    assert result.story_status["99.1-002"] == "BLOCKED"
+    # The dependent was never dispatched (no build attempt against unmerged work).
+    assert all(sid != "99.1-002" for _, sid, _ in disp.calls)
+
+
+def test_bugfix_stage_commit_is_also_linted(tmp_path, monkeypatch) -> None:
+    """The bugfix agent's commit is linted too — not only pipeline stages (AC1)."""
+    state = {"build_attempts": 0}
+
+    class _BuildThenBugfix:
+        """Build fails once → bugfix fixes it → both author lintable commits."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.compliant = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            from sdlc.dispatch import AgentResult
+
+            is_lint = "commitlint" in prompt
+            self.calls.append((agent_type, "commitlint" if is_lint else "stage"))
+            if is_lint:
+                self.compliant = True
+                return AgentResult(agent_type, _default_payload(agent_type, story), "")
+            self.compliant = False  # any stage dispatch leaves a fresh commit
+            if agent_type == "build":
+                state["build_attempts"] += 1
+                if state["build_attempts"] == 1:
+                    return AgentResult(
+                        "build",
+                        {
+                            "branch_name": "feature/99.1-001",
+                            "build_status": "FAILED",
+                            "commit_sha": "0",
+                            "error_summary": "boom",
+                        },
+                        "",
+                    )
+            return AgentResult(agent_type, _default_payload(agent_type, story), "")
+
+    disp = _BuildThenBugfix()
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True, auto=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "DONE"
+    # The bugfix agent ran and its commit was linted (a 'bugfix' commit-lint re-ask).
+    assert ("bugfix", "stage") in disp.calls
+    assert ("bugfix", "commitlint") in disp.calls
+
+
+def test_envelope_recovered_commit_is_linted(tmp_path, monkeypatch) -> None:
+    """An envelope-recovered build commit is still commitlint-checked (AC1).
+
+    A stage that drops its result envelope is recovered by the 12.1-001
+    envelope-only re-ask; that path must not smuggle a non-compliant header
+    past the commit-lint gate to the PR.
+    """
+    class _EnvelopeThenLint:
+        """Build omits its envelope, recovers on the envelope re-ask, then its
+        (non-compliant) commit is linted and amended on a commit-lint re-ask."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.compliant = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            from sdlc.contracts import ResultBlockError
+            from sdlc.dispatch import AgentResult
+
+            is_lint = "commitlint" in prompt
+            is_env_reask = _REASK_SENTINEL in prompt
+            kind = "commitlint" if is_lint else ("envelope" if is_env_reask else "stage")
+            self.calls.append((agent_type, kind))
+            if is_lint:
+                self.compliant = True
+                return AgentResult(agent_type, _default_payload(agent_type, story), "")
+            # The first plain build dispatch drops its envelope (ContractError).
+            if agent_type == "build" and not is_env_reask:
+                raise ResultBlockError("missing <<<RESULT_JSON>>> marker")
+            self.compliant = False  # recovered commit is non-compliant
+            return AgentResult(agent_type, _default_payload(agent_type, story), "")
+
+    disp = _EnvelopeThenLint()
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "DONE"
+    # The envelope re-ask recovered the stage, and its commit was still linted.
+    assert ("build", "envelope") in disp.calls
+    assert ("build", "commitlint") in disp.calls
+
+
+def test_commit_lint_reask_prompt_is_amend_only() -> None:
+    """The re-ask prompt asks only to amend the message, not change code."""
+    from sdlc.build import render_commit_lint_reask_prompt
+    from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
+
+    prompt = render_commit_lint_reask_prompt(
+        "build", _story("99.1-001"), _BAD_COMMIT,
+        ["subject-case: ...", "subject-full-stop: ..."],
+    )
+    assert "commit --amend" in prompt
+    assert "Do NOT change any code" in prompt
+    assert "subject-case" in prompt and "subject-full-stop" in prompt
+    assert RESULT_START_MARKER in prompt and RESULT_END_MARKER in prompt
+
+
+def test_commit_lint_reask_prompt_uses_stage_schema() -> None:
+    """The re-ask validates against the re-asked stage's own schema."""
+    from sdlc.build import render_commit_lint_reask_prompt
+
+    cov = render_commit_lint_reask_prompt("coverage", _story("99.1-001"), _BAD_COMMIT, ["x"])
+    assert "coverage-agent-response.schema.json" in cov
+    assert "'coverage'" in cov
+    bug = render_commit_lint_reask_prompt("bugfix", _story("99.1-001"), _BAD_COMMIT, ["x"])
+    assert "bugfix-agent-response.schema.json" in bug
+
+
+def test_coverage_stage_commit_is_also_linted(tmp_path, monkeypatch) -> None:
+    """Commit-lint covers the coverage agent's commit, not just build (AC1)."""
+    disp = _CommitLintDispatcher(fix_on_reask=True)
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES)
+    db = tmp_path / "l.db"
+    result = run_build(
+        # Coverage stage runs (not skipped) so its commit is linted too.
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "DONE"
+    # The commit-lint re-ask was dispatched against both build and coverage.
+    lint_agents = {agent for agent, _, kind in disp.calls if kind == "commitlint"}
+    assert {"build", "coverage"} <= lint_agents
