@@ -19,6 +19,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "build": "Run the full build-stories orchestration for a scope.",
     "resume": "Resume an interrupted build from the ledger state.",
     "status": "Show the current run status and stage progress.",
+    "runs": "List every known run from the host-level registry.",
     "state": "Inspect the persisted state machine for a run.",
     "validate": "Validate an agent response against its JSON schema.",
     "rollback": "Roll a run back to a prior ledger checkpoint.",
@@ -100,6 +101,7 @@ def build(ctx: typer.Context) -> None:
     from sdlc.build import parse_build_args, run_build
     from sdlc.discovery import discover_queue
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
+    from sdlc.registry import Registry
 
     try:
         opts = parse_build_args(ctx.args)
@@ -126,6 +128,7 @@ def build(ctx: typer.Context) -> None:
         queue=queue,
         ledger=ledger,
         render_view=make_render_view(ledger.db_path),
+        registry=Registry(),
     )
 
     if result.preflight_failed:
@@ -262,6 +265,53 @@ def status(
                 f"  {e.get('ts', '')}  {str(e.get('level', '')):<8}"
                 f"{str(e.get('source') or ''):<11} {e.get('message', '')}"
             )
+    raise typer.Exit(code=0)
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["runs"])
+def runs(
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the registry view as a JSON array."
+    ),
+    prune: bool = typer.Option(
+        False, "--prune", help="Remove crashed (dead-pid) entries before listing."
+    ),
+) -> None:
+    """List every known run across repos from the host-level registry.
+
+    The registry is a discovery cache written by each ``sdlc build`` (default
+    ``~/.sdlc/registry.json``, XDG-aware). A run whose process has died without a
+    clean finish surfaces as ``DEAD`` rather than lingering as in-progress;
+    ``--prune`` drops those entries. Each repo's own ledger stays authoritative
+    for run detail. Exits 0 even when empty — no runs means "nothing started".
+    """
+    from sdlc.registry import Registry
+
+    registry = Registry()
+    if prune:
+        removed = registry.prune()
+        if not as_json:
+            typer.echo(f"pruned {removed} dead run(s).")
+
+    rows = registry.view()
+    if as_json:
+        typer.echo(json.dumps(rows, default=str))
+        raise typer.Exit(code=0)
+
+    if not rows:
+        typer.echo("no runs registered.")
+        raise typer.Exit(code=0)
+
+    typer.echo(f"{'RUN':<14}{'SCOPE':<14}{'STATE':<14}{'PROGRESS':<10}REPO")
+    for r in rows:
+        run_disp = str(r.get("run_id", "?"))[:12]
+        total = r.get("total")
+        completed = r.get("completed")
+        progress = f"{completed}/{total}" if total is not None else "-"
+        typer.echo(
+            f"{run_disp:<14}{str(r.get('scope', '?')):<14}"
+            f"{str(r.get('state', '?')):<14}{progress:<10}{r.get('repo', '?')}"
+        )
     raise typer.Exit(code=0)
 
 

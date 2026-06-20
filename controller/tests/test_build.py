@@ -293,6 +293,49 @@ def test_run_build_skip_coverage_omits_coverage_stage(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Registry integration (Story 11.2-001)
+# ---------------------------------------------------------------------------
+
+def test_run_build_registers_and_marks_finished(tmp_path) -> None:
+    from sdlc.registry import Registry
+
+    db = tmp_path / "ledger.db"
+    registry = Registry(tmp_path / "registry.json")
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+        registry=registry,
+    )
+    records = registry.records()
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.scope == "epic-99"
+    assert rec.db == str(db.resolve())
+    assert rec.total == 3
+    # Clean close-out: terminal status + finished_at stamped, counts reconciled.
+    assert rec.status == "DONE"
+    assert rec.finished_at
+    assert rec.completed == 3
+
+
+def test_run_build_without_registry_is_unaffected(tmp_path) -> None:
+    # The default path: existing callers pass no registry and nothing breaks.
+    db = tmp_path / "ledger.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    assert result.completed == 3
+
+
+# ---------------------------------------------------------------------------
 # Failure routing: malformed/failed agent output → bugfix loop
 # ---------------------------------------------------------------------------
 
