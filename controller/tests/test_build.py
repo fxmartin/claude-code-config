@@ -1262,6 +1262,13 @@ def test_latest_progress_tolerates_unmigrated_db(tmp_path) -> None:
     assert Ledger(db).latest_progress("r1") == {}
 
 
+def test_latest_progress_returns_empty_when_db_absent(tmp_path) -> None:
+    """No ledger file yet (status polled before the run wrote it) → {}, not a crash."""
+    db = tmp_path / "never-created.db"
+    assert not db.exists()
+    assert Ledger(db).latest_progress("r1") == {}
+
+
 class _StreamingDispatcher:
     """A fake dispatcher that replays stream events into ``on_progress``.
 
