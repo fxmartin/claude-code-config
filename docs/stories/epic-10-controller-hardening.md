@@ -1,6 +1,6 @@
 # Epic 10: Controller Hardening — Resume, Observability, Rollback
 
-> **Status: PLANNED** — created 2026-06-15 to complete the `sdlc` CLI verbs that Epic-07 shipped as scaffolded stubs (see [Epic-07 Deferred — stubbed subcommands](./epic-07-external-controller.md#deferred--stubbed-subcommands)).
+> **Status: COMPLETE** (2026-06-20) — both stories merged: 10.1-001 `resume`/`status`/`state` + web `dashboard` (#66, #67, #70) and 10.2-001 `rollback` + `init` removal (#71). No `sdlc` verb prints "not yet implemented" anymore. Created 2026-06-15 to complete the CLI verbs Epic-07 shipped as scaffolded stubs (see [Epic-07 Deferred — stubbed subcommands](./epic-07-external-controller.md#deferred--stubbed-subcommands)).
 
 ## Epic Overview
 
@@ -43,10 +43,10 @@
 - Behaviour parity check: the controller `resume` reaches the same end state as the legacy `sdlc-state.sh` resume path for a small sample run.
 
 **Definition of Done**:
-- [ ] `resume`, `status`, `state` implemented (no remaining "not yet implemented" output for these three).
-- [ ] pytest coverage for interrupted-run resume and status reporting, green on macOS and WSL2.
-- [ ] `docs/controller-architecture.md` updated; the Epic-07 stub table updated to mark these three implemented.
-- [ ] Change noted in `CHANGELOG.md` under "Added".
+- [x] `resume`, `status`, `state` implemented (no remaining "not yet implemented" output for these three).
+- [x] pytest coverage for interrupted-run resume and status reporting, green on macOS and WSL2.
+- [x] `docs/controller-architecture.md` updated; the Epic-07 stub table updated to mark these three implemented.
+- [x] Change noted in `CHANGELOG.md` under "Added".
 
 ### Feature 10.2: Rollback and Stub Cleanup
 
