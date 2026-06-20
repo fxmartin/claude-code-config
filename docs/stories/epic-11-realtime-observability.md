@@ -33,7 +33,7 @@ debuggable in flight; multi-run support makes parallel batches manageable from o
 
 ## Epic Scope
 
-**Total Stories**: 7 | **Total Points**: 27 | **MVP Stories**: 0 (roadmap — Should Have)
+**Total Stories**: 8 | **Total Points**: 30 | **MVP Stories**: 0 (roadmap — Should Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -282,6 +282,46 @@ mode) — degrade to stage-level.
 **Dependencies**: 11.1-002, 11.2-003
 **Risk Level**: Medium
 
+##### Story 11.2-005: Display run and per-story durations on the dashboard
+**User Story**: As FX, I want the dashboard to show how long each run took and how long each
+story took (with a total), so that I can spot slow stories/stages and compare runs at a glance.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a finished run **When** I view it (overview row and detail) **Then** the dashboard
+  shows the run's **total duration** (`finished_at − started_at`) in a human-readable form
+  (e.g. `4m 12s`, `1h 03m`).
+- **Given** an in-progress run **When** I view it **Then** the run shows its **elapsed**
+  duration ticking from `started_at` to now (updating via the 11.2-003 transport; a static
+  computed elapsed is acceptable when the transport is absent).
+- **Given** a run's stories **When** I view the per-run detail **Then** each story row shows its
+  own duration, derived from that story's stage rows (earliest stage `started_at` → latest stage
+  `finished_at`), and an in-flight story shows elapsed-so-far.
+- **Given** a story or stage with missing/null timestamps **When** duration is computed **Then**
+  the cell degrades gracefully (e.g. `—`) and never renders `NaN` or a negative value.
+- **Given** the durations are shown **When** they are computed **Then** they come from the
+  ledger timestamps already persisted (`runs.started_at/finished_at`, `stages.started_at/finished_at`) —
+  no new schema is required.
+
+**Technical Notes**: Surfaced in `controller/src/sdlc/dashboard.py` (run overview + per-run
+detail) and the `/api/status` / `/api/runs` payloads. Story duration could be the wall-clock
+span (first stage start → last stage finish) or the sum of stage durations; the span is
+recommended (it reflects real elapsed time including gaps) — capture the choice in the PR.
+Formatting helper should be shared so overview and detail render identically. Live ticking for
+in-progress runs rides on the 11.2-003 transport; without it, show the elapsed value computed
+at page load.
+
+**Definition of Done**:
+- [ ] Run total duration shown for finished and in-progress runs (elapsed for the latter)
+- [ ] Per-story duration shown in the detail view, derived from stage timestamps
+- [ ] Graceful handling of missing/null timestamps (no NaN/negative)
+- [ ] Durations exposed in the dashboard API payload; shared human-readable formatter
+- [ ] Tests for the duration computation + formatting (incl. in-progress and missing-timestamp cases)
+
+**Dependencies**: None (reads existing ledger timestamps; the existing dashboard from #66/#67). Live ticking pairs with 11.2-003.
+**Risk Level**: Low
+
 ## Story Dependencies (within Epic-11)
 
 ```
@@ -291,9 +331,12 @@ mode) — degrade to stage-level.
 11.2-003 (SSE transport) ──────────────────────────────┘
 ```
 
-- **Cohort 1** (no deps): 11.1-001, 11.2-001, 11.2-003
+- **Cohort 1** (no deps): 11.1-001, 11.2-001, 11.2-003, 11.2-005
 - **Cohort 2**: 11.1-002, 11.1-003 (need 11.1-001); 11.2-002 (needs 11.2-001)
 - **Cohort 3**: 11.2-004 (needs 11.1-002 + 11.2-003)
+
+(11.2-005 reads existing ledger timestamps and can land independently; its live-ticking
+refinement pairs with 11.2-003 but is not blocked by it.)
 
 ## Epic Complete When
 
