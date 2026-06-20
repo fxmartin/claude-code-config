@@ -117,15 +117,20 @@ def test_dispatch_raises_on_timeout(monkeypatch) -> None:
 
 
 def test_dispatch_uses_default_agent_cmd(monkeypatch) -> None:
-    """When no agent_cmd is given a sensible default (claude CLI) is used."""
+    """When no agent_cmd is given a sensible default (claude CLI) is used.
+
+    The default is a streaming command (11.1-001), so it launches via Popen;
+    the streaming coverage lives in ``test_default_streaming_dispatch_uses_default_cmd``.
+    """
     seen = {}
 
     def fake_run(cmd, **kwargs):
         seen["cmd"] = cmd
         return _FakeCompleted(_wrap(_VALID_BUILD))
 
+    # A non-streaming explicit command still exercises the captured run() path.
     monkeypatch.setattr(subprocess, "run", fake_run)
-    dispatch_agent("build", "prompt")
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
     assert seen["cmd"][0]  # a non-empty executable name
 
 
@@ -270,8 +275,208 @@ def test_dispatch_plain_text_fallback_has_no_usage(monkeypatch) -> None:
     assert result.usage is None and result.cost_usd is None and result.session_id is None
 
 
-def test_default_agent_cmd_requests_json_output() -> None:
-    """The default command asks for the JSON envelope so usage is captured."""
+def test_default_agent_cmd_requests_stream_json_output() -> None:
+    """The default command streams (stream-json + --verbose) so a stage is live (11.1-001)."""
     assert "--output-format" in DEFAULT_AGENT_CMD
     i = DEFAULT_AGENT_CMD.index("--output-format")
-    assert DEFAULT_AGENT_CMD[i + 1] == "json"
+    assert DEFAULT_AGENT_CMD[i + 1] == "stream-json"
+    # `claude -p` requires --verbose to actually emit the line-delimited stream.
+    assert "--verbose" in DEFAULT_AGENT_CMD
+
+
+# --- 11.1-001: streaming dispatch with a live transcript tee ---------------
+
+
+class _FakeStdin:
+    def __init__(self) -> None:
+        self.written = ""
+        self.closed = False
+
+    def write(self, data: str) -> None:
+        self.written += data
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeStderr:
+    def __init__(self, data: str = "") -> None:
+        self._data = data
+
+    def read(self) -> str:
+        return self._data
+
+
+class _FakePopen:
+    """A minimal stand-in for ``subprocess.Popen`` over a stream-json agent."""
+
+    def __init__(
+        self,
+        stdout_lines,
+        *,
+        returncode: int = 0,
+        stderr: str = "",
+        wait_exc: Exception | None = None,
+    ) -> None:
+        self.stdin = _FakeStdin()
+        self.stdout = iter(stdout_lines)
+        self.stderr = _FakeStderr(stderr)
+        self._returncode = returncode
+        self._wait_exc = wait_exc
+        self.killed = False
+
+    def wait(self, timeout=None):  # noqa: ANN001 - mirror subprocess API
+        if self._wait_exc is not None:
+            raise self._wait_exc
+        return self._returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def poll(self):
+        return self._returncode
+
+
+def _stream_result_event(result_text: str, *, is_error: bool = False,
+                         cost: float = 0.42, usage: dict | None = None,
+                         session_id: str = "sess-123") -> str:
+    """A terminal stream-json `result` event line (same shape as the json envelope)."""
+    return _envelope(result_text, is_error=is_error, cost=cost,
+                     usage=usage, session_id=session_id) + "\n"
+
+
+_STREAM_PREAMBLE = [
+    json.dumps({"type": "system", "subtype": "init", "session_id": "sess-123"}) + "\n",
+    json.dumps({"type": "assistant", "message": {"content": "working"}}) + "\n",
+    json.dumps({"type": "user", "message": {"content": "tool result"}}) + "\n",
+]
+
+_STREAM_CMD = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+
+
+def test_streaming_dispatch_extracts_result_and_usage(monkeypatch) -> None:
+    """A stream-json command is consumed line-by-line; the terminal result is used."""
+    lines = list(_STREAM_PREAMBLE) + [_stream_result_event(_wrap(_VALID_BUILD))]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert result.session_id == "sess-123"
+    assert result.cost_usd == 0.42
+    assert result.usage["output_tokens"] == 20
+    assert RESULT_END_MARKER in result.raw
+
+
+def test_streaming_dispatch_passes_prompt_on_stdin(monkeypatch) -> None:
+    """The prompt is written to the streamed subprocess's stdin and closed."""
+    fake = _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    dispatch_agent("build", "PROMPT-MARKER-XYZ", agent_cmd=_STREAM_CMD)
+    assert "PROMPT-MARKER-XYZ" in fake.stdin.written
+    assert fake.stdin.closed
+
+
+def test_streaming_dispatch_tees_stream_to_transcript(monkeypatch, tmp_path) -> None:
+    """Every stream line lands verbatim in the transcript (the live tail -f view)."""
+    lines = list(_STREAM_PREAMBLE) + [_stream_result_event(_wrap(_VALID_BUILD))]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    tpath = tmp_path / "build-1.log"
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, transcript_path=tpath)
+    body = tpath.read_text(encoding="utf-8")
+    # The raw stream is preserved (system/assistant/result lines), not rewritten.
+    assert '"type": "system"' in body
+    assert '"type": "result"' in body
+    assert RESULT_START_MARKER in body
+
+
+def test_streaming_dispatch_tee_is_incremental(monkeypatch, tmp_path) -> None:
+    """Lines are flushed as they arrive: line N is on disk before line N+1 is read."""
+    tpath = tmp_path / "build-1.log"
+    first = json.dumps({"type": "system", "subtype": "init"}) + "\n"
+    second = _stream_result_event(_wrap(_VALID_BUILD))
+
+    def gen():
+        yield first
+        # By the time the second line is requested, the first must already be
+        # flushed to disk — otherwise `tail -f` would lag a whole stage.
+        assert first in tpath.read_text(encoding="utf-8")
+        yield second
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(gen()))
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, transcript_path=tpath)
+
+
+def test_streaming_dispatch_validation_parity_on_bad_schema(monkeypatch) -> None:
+    """A schema-invalid result in the stream raises exactly like the captured path."""
+    bad = {"build_status": "SUCCESS", "commit_sha": "abc"}  # no branch_name
+    lines = [_stream_result_event(_wrap(bad))]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    with pytest.raises(SchemaValidationError):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+
+
+def test_streaming_dispatch_is_error_result_raises(monkeypatch) -> None:
+    """A terminal result event with is_error=true surfaces as AgentDispatchError."""
+    lines = list(_STREAM_PREAMBLE) + [_stream_result_event("hit limit", is_error=True)]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    with pytest.raises(AgentDispatchError, match="reported an error"):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+
+
+def test_streaming_dispatch_nonzero_exit_raises(monkeypatch) -> None:
+    """A non-zero exit from a streamed agent raises AgentDispatchError."""
+    monkeypatch.setattr(
+        subprocess, "Popen",
+        lambda *a, **kw: _FakePopen([], returncode=1, stderr="boom"),
+    )
+    with pytest.raises(AgentDispatchError, match="boom"):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+
+
+def test_streaming_dispatch_timeout_raises(monkeypatch) -> None:
+    """A wait() timeout on the streamed subprocess surfaces as AgentDispatchError."""
+    fake = _FakePopen(
+        [_stream_result_event(_wrap(_VALID_BUILD))],
+        wait_exc=subprocess.TimeoutExpired(_STREAM_CMD, 1),
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    with pytest.raises(AgentDispatchError, match="timed out"):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, timeout=1)
+    assert fake.killed  # the hung child is killed
+
+
+def test_streaming_dispatch_falls_back_when_no_result_event(monkeypatch) -> None:
+    """A streaming cmd whose output carries no result event degrades to captured parsing."""
+    # No line is a `type==result` event; the wrapped block arrives as plain text.
+    lines = ["agent prose\n", f"{RESULT_START_MARKER}\n",
+             json.dumps(_VALID_BUILD) + "\n", f"{RESULT_END_MARKER}\n"]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert result.usage is None  # no envelope → no usage, but the run still succeeds
+
+
+def test_non_streaming_cmd_uses_captured_run_not_popen(monkeypatch) -> None:
+    """A non-stream-json SDLC_AGENT_CMD keeps the captured subprocess.run path."""
+    def boom(*a, **kw):
+        raise AssertionError("Popen must not be used for a non-streaming command")
+
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_BUILD))
+    )
+    result = dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert result.data["branch_name"] == "feature/7.3-001"
+
+
+def test_default_streaming_dispatch_uses_default_cmd(monkeypatch) -> None:
+    """With no agent_cmd the default (streaming) command launches via Popen."""
+    seen = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    dispatch_agent("build", "prompt")
+    assert seen["cmd"][0]  # a non-empty executable name
+    assert "stream-json" in seen["cmd"]
