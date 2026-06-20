@@ -99,6 +99,58 @@ def test_records_tolerates_corrupt_file(tmp_path):
     assert reg.records() == []
 
 
+def test_records_skips_malformed_rows(tmp_path):
+    """A partial/junk row must not crash discovery — only it is dropped."""
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"run_id": "partial"},  # missing required fields
+                "not-a-dict",  # wrong element type
+                123,  # wrong element type
+                _record("good").to_dict(),  # valid
+            ]
+        ),
+        encoding="utf-8",
+    )
+    reg = Registry(path)
+    assert [r.run_id for r in reg.records()] == ["good"]
+    # view() walks the same path and must also survive.
+    assert [r["run_id"] for r in reg.view()] == ["good"]
+
+
+def test_register_survives_existing_malformed_rows(tmp_path):
+    """A pre-existing junk cache must not crash a new registration (build path)."""
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json.dumps([{"run_id": "partial"}, "junk", _record("keep").to_dict()]),
+        encoding="utf-8",
+    )
+    reg = Registry(path)
+    reg.register(_record("new"))
+    # The non-dict 'junk' is dropped by the read; the partial dict is preserved
+    # (writers don't parse it) but discovery skips it.
+    ids = {r.run_id for r in reg.records()}
+    assert ids == {"keep", "new"}
+
+
+def test_derive_state_handles_non_int_pid():
+    rec = _record("run-1", pid="not-a-pid")  # type: ignore[arg-type]
+    assert derive_state(rec) == "DEAD"
+
+
+def test_prune_drops_malformed_rows(tmp_path):
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json.dumps([{"run_id": "partial"}, _record("alive", pid=os.getpid()).to_dict()]),
+        encoding="utf-8",
+    )
+    reg = Registry(path)
+    removed = reg.prune()
+    assert removed == 1  # the partial row
+    assert {r.run_id for r in reg.records()} == {"alive"}
+
+
 # --- mark_finished ----------------------------------------------------------
 
 

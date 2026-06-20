@@ -70,13 +70,20 @@ class RunRecord:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
-def pid_alive(pid: int) -> bool:
+def pid_alive(pid: object) -> bool:
     """True when ``pid`` names a live process.
 
     ``os.kill(pid, 0)`` is the canonical liveness probe: it sends no signal but
     raises ``ProcessLookupError`` when the pid is gone. A ``PermissionError``
     means the process exists but is owned by another user — still alive.
     """
+    # A malformed pid (None, list, unparseable string, …) names no live process.
+    if not isinstance(pid, (int, str)):
+        return False
+    try:
+        pid = int(pid)
+    except ValueError:
+        return False
     if pid <= 0:
         return False
     try:
@@ -135,9 +142,14 @@ class Registry:
     def _read_raw(self) -> list[dict]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
             return []
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        # Keep only dict rows: a non-dict element (string/number/null) would
+        # crash the upsert/finish writers' ``row.get(...)`` — a junk cache must
+        # never break a build or discovery.
+        return [row for row in data if isinstance(row, dict)]
 
     def _write_raw(self, rows: list[dict]) -> None:
         # Atomic replace: write a sibling temp file, fsync, then rename over the
@@ -201,7 +213,14 @@ class Registry:
             nonlocal removed
             kept: list[dict] = []
             for row in rows:
-                state = derive_state(RunRecord.from_dict(row))
+                try:
+                    rec = RunRecord.from_dict(row)
+                except (TypeError, ValueError):
+                    # An unparseable row (missing required keys, bad types) is
+                    # junk that could never render — drop it on prune.
+                    removed += 1
+                    continue
+                state = derive_state(rec)
                 drop = state == "DEAD" or (include_finished and row.get("finished_at"))
                 if drop:
                     removed += 1
@@ -215,8 +234,19 @@ class Registry:
     # --- readers ------------------------------------------------------------
 
     def records(self) -> list[RunRecord]:
-        """Every registry entry as a :class:`RunRecord` (empty if absent/corrupt)."""
-        return [RunRecord.from_dict(r) for r in self._read_raw()]
+        """Every parseable registry entry as a :class:`RunRecord`.
+
+        Empty when the file is absent/corrupt; individual rows that fail to
+        parse (missing required keys, wrong types) are skipped rather than
+        crashing discovery — the registry is a best-effort cache.
+        """
+        records: list[RunRecord] = []
+        for row in self._read_raw():
+            try:
+                records.append(RunRecord.from_dict(row))
+            except (TypeError, ValueError):
+                continue
+        return records
 
     def view(self) -> list[dict]:
         """Records as dicts annotated with the derived effective ``state``."""
