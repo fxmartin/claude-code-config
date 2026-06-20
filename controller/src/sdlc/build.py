@@ -17,6 +17,7 @@ from typing import Callable, Iterable, Iterator, Protocol
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER, ContractError
 from sdlc.dispatch import AgentDispatchError, AgentResult, dispatch_agent
+from sdlc.registry import Registry, RunRecord
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
 # "max 2 bugfix iterations" rule (Step 5d2) so behaviour matches the playbook.
@@ -1121,6 +1122,38 @@ def story_commit_exists(story_id: str, root: Path | None = None) -> bool:
         return False
 
 
+def _registry_register(
+    registry: Registry, run_id: str, scope: str, db_path: Path, total: int
+) -> None:
+    """Register a starting run; swallow any cache IO error (never fails a build)."""
+    try:
+        registry.register(
+            RunRecord(
+                run_id=run_id,
+                repo=str(Path.cwd().resolve()),
+                db=str(Path(db_path).resolve()),
+                scope=scope,
+                pid=os.getpid(),
+                status="IN_PROGRESS",
+                started_at="",  # registry stamps the start time
+                total=total,
+                completed=0,
+            )
+        )
+    except OSError:
+        pass
+
+
+def _registry_finish(
+    registry: Registry, run_id: str, status: str, completed: int
+) -> None:
+    """Stamp a run terminal in the registry; swallow any cache IO error."""
+    try:
+        registry.mark_finished(run_id, status, completed=completed)
+    except OSError:
+        pass
+
+
 def run_build(
     opts: BuildOptions,
     *,
@@ -1129,6 +1162,7 @@ def run_build(
     dispatcher: Dispatcher | None = None,
     preflight: Callable[[], bool] | None = None,
     render_view: Callable[[str], None] | None = None,
+    registry: "Registry | None" = None,
 ) -> BuildResult:
     """Run the build-stories orchestration deterministically.
 
@@ -1174,6 +1208,11 @@ def run_build(
     mode = "serial" if opts.sequential else "parallel"
     run_id = ledger.run_create(opts.scope, mode)
     ledger.set_total(run_id, len(buildable))
+    # Announce the run in the host-level registry so a single dashboard can
+    # discover it across repos (Story 11.2-001). Best-effort: a registry IO
+    # failure must never fail an otherwise-good build.
+    if registry is not None:
+        _registry_register(registry, run_id, opts.scope, ledger.db_path, len(buildable))
     # Per-run transcript dir (next to the ledger; covered by the R9 ignore).
     logs_dir = Path(f"{ledger.db_path}.logs") / run_id
     ledger.event_log(
@@ -1266,6 +1305,8 @@ def run_build(
         f"{needs_attention} need attention, {skipped} skipped",
     )
     ledger.run_update_status(run_id, run_terminal)
+    if registry is not None:
+        _registry_finish(registry, run_id, run_terminal, completed)
 
     if render_view is not None:
         render_view(run_id)

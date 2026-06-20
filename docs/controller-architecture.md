@@ -23,6 +23,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/resume.py` | Crash-resume: derives each story's resume point from the ledger and re-enters the loop (Story 10.1-001). |
 | `sdlc/status.py` | Read-side `state` helpers — a greppable state-machine dump (Story 10.1-001). |
 | `sdlc/rollback.py` | Returns a run to a prior checkpoint by resetting the later stories (Story 10.2-001). |
+| `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 
 ## The state machine
 
@@ -118,6 +119,33 @@ which mirrors cohort order), so any completed story is a natural **checkpoint**
   when a to-be-reset story has an already-merged PR (a `merge` stage marked
   DONE). A merged PR is committed work the ledger cannot unwind — revert it in
   git instead. Rolling back to the latest story is a benign no-op.
+
+## The run registry (cross-repo discovery)
+
+The per-repo ledger (`.sdlc-state.db`) is authoritative for a single run's
+detail, but it can only be found if you already know its path. To let **one**
+dashboard watch builds running in several repos at once, each `sdlc build`
+announces itself in a host-level **registry** (`sdlc/registry.py`).
+
+- **Location.** `default_registry_path()` resolves `SDLC_REGISTRY_PATH` (explicit
+  override, used by tests) → `XDG_STATE_HOME/sdlc/registry.json` →
+  `~/.sdlc/registry.json`. It is a single JSON array of run entries.
+- **Lifecycle.** `run_build` calls `Registry.register` right after `run_create`
+  (entry: `run_id`, absolute `repo`, ledger `db`, `scope`, `pid`, `status`,
+  `started_at`, `total`, `completed`) and `Registry.mark_finished` at clean
+  close-out (stamps the terminal `status`, `finished_at`, reconciled `completed`).
+  Both calls are best-effort — a registry IO error never fails a build.
+- **Concurrency + atomicity.** Two builds may register at once, so every
+  read-modify-write runs under an exclusive `flock` on a sidecar `.lock` file and
+  commits via an atomic `os.replace` of a temp file. A missing or corrupt file
+  degrades to an empty list — a damaged cache must never break discovery.
+- **Stale/dead detection.** The registry is a cache, not truth: a crashed build
+  leaves an `IN_PROGRESS` entry whose `finished_at` is never stamped.
+  `derive_state` reports such an entry as `DEAD` when its `pid` is no longer alive
+  (`os.kill(pid, 0)`), so it does not linger as in-progress forever.
+  `Registry.prune` drops `DEAD` entries (and, optionally, finished ones).
+- **`sdlc runs`** lists the registry view (repo, scope, derived state, progress);
+  `--json` emits it for tooling and `--prune` clears crashed entries first.
 
 ## There is no `init` verb
 
