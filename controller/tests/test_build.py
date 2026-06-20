@@ -1157,6 +1157,130 @@ def test_run_build_records_usage_on_stage_rows(tmp_path) -> None:
     assert rows == (100, 20, 4000, 300, 0.05, "sess-build")
 
 
+# ---------------------------------------------------------------------------
+# Live running token/cost accrual per story+stage (Story 11.1-003)
+# ---------------------------------------------------------------------------
+
+def _assistant_usage(session_id: str | None = None, **usage: int) -> dict:
+    event: dict = {"type": "assistant", "message": {"content": [], "usage": usage}}
+    if session_id is not None:
+        event["session_id"] = session_id
+    return event
+
+
+def _stage_usage_row(ledger: Ledger, run_id: str, story_id: str, stage: str, attempt: int = 1):
+    breakdown = ledger.stage_breakdown(run_id)
+    for row in breakdown.get(story_id, []):
+        if row["name"] == stage and row["attempt"] == attempt:
+            return row
+    raise AssertionError(f"no {stage} attempt {attempt} for {story_id}")
+
+
+def test_progress_sink_accrues_running_usage_mid_stage(tmp_path) -> None:
+    """The sink writes a running token total to the stage row as events arrive."""
+    from sdlc.build import _make_progress_sink
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "s1", "build", 1)
+
+    sink = _make_progress_sink(ledger, run_id, "s1", "build", 1)
+    sink(_assistant_usage(session_id="sess-1", input_tokens=100, output_tokens=20))
+    # Visible mid-stage, before the stage finishes.
+    row = _stage_usage_row(ledger, run_id, "s1", "build")
+    assert row["input_tokens"] == 100
+    assert row["output_tokens"] == 20
+    assert row["session_id"] == "sess-1"
+
+    # A second turn accrues on top of the first (running total grows).
+    sink(_assistant_usage(input_tokens=150, output_tokens=30))
+    row = _stage_usage_row(ledger, run_id, "s1", "build")
+    assert row["input_tokens"] == 250
+    assert row["output_tokens"] == 50
+
+
+def test_progress_sink_without_usage_leaves_columns_null(tmp_path) -> None:
+    """A streamed agent that carries no usage leaves the row NULL (renders '—')."""
+    from sdlc.build import _make_progress_sink
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "s1", "build", 1)
+
+    sink = _make_progress_sink(ledger, run_id, "s1", "build", 1)
+    sink({"type": "system", "subtype": "init"})
+    sink({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}})
+
+    row = _stage_usage_row(ledger, run_id, "s1", "build")
+    assert row["tokens"] is None
+    assert row["cost_usd"] is None
+
+
+def test_final_usage_reconciles_over_live_accrual(tmp_path) -> None:
+    """On stage completion the authoritative total overwrites the accrued figure."""
+    from sdlc.build import _make_progress_sink, _record_stage_usage
+    from sdlc.dispatch import AgentResult
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "s1", "build", 1)
+
+    # Live accrual records a partial running figure.
+    sink = _make_progress_sink(ledger, run_id, "s1", "build", 1)
+    sink(_assistant_usage(input_tokens=100, output_tokens=20))
+    sink(_assistant_usage(input_tokens=150, output_tokens=30))
+
+    # Stage completes: the final result envelope carries the authoritative total.
+    result = AgentResult(
+        agent_type="build",
+        data={},
+        raw="",
+        usage={
+            "input_tokens": 260,
+            "output_tokens": 55,
+            "cache_read_input_tokens": 4000,
+            "cache_creation_input_tokens": 300,
+        },
+        cost_usd=0.09,
+        session_id="sess-final",
+    )
+    _record_stage_usage(ledger, run_id, "s1", "build", 1, result)
+
+    row = _stage_usage_row(ledger, run_id, "s1", "build")
+    # Final value wins — not the sum of live (250/50) and final (260/55).
+    assert row["input_tokens"] == 260
+    assert row["output_tokens"] == 55
+    assert row["cache_read_tokens"] == 4000
+    assert row["cost_usd"] == 0.09
+    assert row["session_id"] == "sess-final"
+
+
+def test_live_accrual_surfaces_in_status_snapshot(tmp_path) -> None:
+    """Per-run + per-story usage breakdown reflects live accrual before completion."""
+    from sdlc.build import _make_progress_sink, status_snapshot
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "s1", "build", 1)
+
+    sink = _make_progress_sink(ledger, run_id, "s1", "build", 1)
+    sink(_assistant_usage(input_tokens=100, output_tokens=20))
+
+    snap = status_snapshot(ledger, run_id)
+    story = next(s for s in snap["stories"] if s["story_id"] == "s1")
+    assert story["tokens"] == 120
+    assert snap["run"]["usage"]["total_tokens"] == 120
+
+
 def test_read_api_tolerates_unmigrated_db(tmp_path) -> None:
     """list_runs/status_snapshot read a pre-token ledger without crashing.
 
