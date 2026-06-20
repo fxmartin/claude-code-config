@@ -22,6 +22,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/ledger_view.py` | DB-path resolution + markdown render hook. |
 | `sdlc/resume.py` | Crash-resume: derives each story's resume point from the ledger and re-enters the loop (Story 10.1-001). |
 | `sdlc/status.py` | Read-side `state` helpers — a greppable state-machine dump (Story 10.1-001). |
+| `sdlc/rollback.py` | Returns a run to a prior checkpoint by resetting the later stories (Story 10.2-001). |
 
 ## The state machine
 
@@ -98,6 +99,33 @@ ledger alone is enough to recover an interrupted run — no separate journal.
 - **`sdlc state`** (`sdlc/status.py` + `Ledger.state_rows`) dumps every stage
   row (story id, stage, status, attempt, PR, branch) in a stable, greppable
   format for debugging.
+
+## Rollback
+
+A run's stories are scheduled in a stable order (the ledger's insertion order,
+which mirrors cohort order), so any completed story is a natural **checkpoint**
+— no separate checkpoint table is needed.
+
+- **`sdlc rollback [run] --to <story_id>`** (`sdlc/rollback.py`) returns a run to
+  the checkpoint named by `--to`: that story and every story scheduled *before*
+  it are kept untouched, while every story scheduled *after* it is reset to a
+  fresh unbuilt state via `Ledger.reset_story` (stage rows deleted, PR/branch
+  cleared, status `TODO`). The run is reopened to `IN_PROGRESS`, so the next
+  `sdlc resume`/`sdlc build` rebuilds **only** the reset stories — the checkpoint
+  is never rebuilt.
+- **Guard rails.** `run_rollback` raises `RollbackError` (CLI exit 2) and mutates
+  nothing when there is no run, when the checkpoint is not a story in the run, or
+  when a to-be-reset story has an already-merged PR (a `merge` stage marked
+  DONE). A merged PR is committed work the ledger cannot unwind — revert it in
+  git instead. Rolling back to the latest story is a benign no-op.
+
+## There is no `init` verb
+
+Epic-07 scaffolded an `init` stub, but `build` already creates the SQLite ledger
+on first use (`Ledger.init()` runs inside `run_build` before any story is
+dispatched), so a separate workspace-scaffold command had no distinct purpose.
+Story 10.2-001 resolved it by **removal** rather than inventing a job for it; see
+the addendum in `docs/adr/001-controller-runtime.md`.
 
 ## The dispatch seam
 
