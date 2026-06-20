@@ -147,6 +147,40 @@ announces itself in a host-level **registry** (`sdlc/registry.py`).
 - **`sdlc runs`** lists the registry view (repo, scope, derived state, progress);
   `--json` emits it for tooling and `--prune` clears crashed entries first.
 
+## Live dashboard transport (Story 11.2-003)
+
+The dashboard updates itself — no manual reload — over a **Server-Sent Events**
+stream (`/api/stream`) served by the same stdlib `http.server`, so the
+dependency footprint stays at zero web frameworks.
+
+- **Change detection.** `Ledger.change_token()` returns an opaque digest that
+  moves whenever any **dashboard-visible** field does. `MAX(events.id)` alone is
+  insufficient: the dashboard also renders per-stage status/usage and per-story
+  status/PR, which are set by in-place `UPDATE`s (`stage_finish`,
+  `stage_set_usage`, `set_story_status`, `set_story_pr`) that write no event row
+  — and the ledger runs in **WAL** mode, so the file mtime is no proxy and
+  SQLite's `PRAGMA data_version` is meaningless across the fresh read-only
+  connections we poll with. So the token is a `blake2b` digest over the mutable
+  fields of `runs`/`stories`/`stages` plus the event high-water mark (row counts
+  are tens per run, so it stays cheap to poll sub-second). `_change_token(server)`
+  wraps it: single-`--db` mode returns the one ledger's token; registry-discovery
+  mode digests every run's `id`/derived-state/token so the stream also fires when
+  a run appears, finishes, or changes across repos. An unreachable ledger
+  contributes `"0"` rather than breaking the stream.
+- **The stream.** `_serve_stream` polls the token on a short interval
+  (`_SSE_POLL_INTERVAL`, ~1 s ⇒ under the 2 s latency target) and pushes an SSE
+  `change` event carrying the new token only when it moves; otherwise it emits a
+  bare `: heartbeat` comment every `_SSE_HEARTBEAT_INTERVAL` to keep the
+  connection (and any proxy) alive. Idle ⇒ no `change` traffic, negligible CPU.
+  Each connection runs in its own `ThreadingHTTPServer` thread, so multiple
+  browser tabs each get an independent stream; the loop exits the moment a write
+  fails (client gone).
+- **Client.** The page subscribes with `EventSource` and, on each pushed
+  `change`, refetches `/api/runs` + `/api/status` — the same idempotent whole-
+  snapshot render it always did. `EventSource` reconnects on its own, and because
+  the render replaces (never appends) DOM, a dropped-and-resumed connection never
+  duplicates rows. Browsers without `EventSource` fall back to gentle polling.
+
 ## There is no `init` verb
 
 Epic-07 scaffolded an `init` stub, but `build` already creates the SQLite ledger

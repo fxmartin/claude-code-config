@@ -117,6 +117,49 @@ def _registry_runs_view(registry: Registry) -> list[dict]:
     return rows
 
 
+# --- live transport: change detection (Story 11.2-003) ---------------------
+# The SSE endpoint pushes a delta only when the ledger actually moves. We avoid
+# diffing rows by collapsing all activity into a cheap token; when it changes,
+# the client refetches the snapshot it already knows how to render (idempotent),
+# which keeps the transport simple and free of duplicate-row bugs on reconnect.
+
+
+def _change_token(server) -> str:
+    """A cheap token of ledger activity used by the SSE stream to detect change.
+
+    Single-db mode: the ledger's max event id (as a string). Registry-discovery
+    mode: a digest of every run's id, derived status, and its own ledger's max
+    event id — so the stream also fires when a run is added/removed or changes
+    state across repos. An unreachable ledger contributes 0 rather than breaking
+    the stream (the registry is best-effort). Returns ``"0"`` when there is no
+    source yet, so an idle dashboard simply stays quiet.
+    """
+    registry = getattr(server, "registry", None)
+    if registry is not None:
+        parts: list[str] = []
+        for rec in registry.records():
+            try:
+                tok = Ledger(rec.db).change_token()
+            except (OSError, sqlite3.Error):
+                tok = "0"
+            parts.append(f"{rec.run_id}:{derive_state(rec)}:{tok}")
+        return "|".join(parts)
+    db_path = getattr(server, "db_path", None)
+    if db_path is None:
+        return "0"
+    try:
+        return Ledger(db_path).change_token()
+    except (OSError, sqlite3.Error):
+        return "0"
+
+
+# Live transport tuning (overridable per-server, mostly for tests). The poll
+# interval bounds time-to-push (~1s ⇒ well under the 2s target); the heartbeat
+# keeps the connection (and any intermediary) alive while idle without traffic.
+_SSE_POLL_INTERVAL = 1.0
+_SSE_HEARTBEAT_INTERVAL = 15.0
+
+
 # --- lifecycle: stop/restart -----------------------------------------------
 # A dashboard is detached when launched in the background, so we record its PID
 # (keyed by host:port) and provide --stop/--restart. lsof is a fallback so we
@@ -388,7 +431,21 @@ document.getElementById("runs").addEventListener("click", e => {
   sel = el.dataset.run || null;  // "" → Live
   tick();
 });
-tick(); setInterval(tick, 2500);
+
+// Live transport: subscribe to the server's SSE stream and refetch on each
+// pushed "change". EventSource reconnects on its own, and tick() re-renders the
+// whole snapshot, so a dropped connection resumes without duplicated rows. If
+// EventSource is unavailable, fall back to gentle polling.
+function connectStream(){
+  if(!("EventSource" in window)){ setInterval(tick, 2500); return; }
+  const es = new EventSource("/api/stream");
+  es.addEventListener("change", tick);
+  es.addEventListener("error", () => {
+    document.getElementById("updated").textContent = "reconnecting…";
+  });
+}
+tick();          // immediate first paint
+connectStream(); // then live updates (the stream's initial change repaints too)
 </script>
 </body>
 </html>"""
@@ -439,6 +496,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(_registry_runs_view(self.server.registry))
             else:
                 self._json(Ledger(self.server.db_path).list_runs())
+        elif path == "/api/stream":
+            self._serve_stream()
         elif path == "/log":
             self._serve_log(query.get("path", [""])[0], run)
         elif path == "/favicon.ico":
@@ -483,6 +542,63 @@ class _Handler(BaseHTTPRequestHandler):
         snap["pr_base"] = project_url
         snap["project"] = {"name": _project_name(project_url, Path(rec.db)), "url": project_url}
         return snap
+
+    # --- live auto-refresh transport (Story 11.2-003) ----------------------
+
+    def _sse_write(self, text: str) -> bool:
+        """Write one SSE chunk; return False once the client has gone away."""
+        try:
+            self.wfile.write(text.encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
+
+    def _serve_stream(self) -> None:
+        """Server-Sent Events: push a ``change`` event when the ledger advances.
+
+        Polls the cheap change token (:func:`_change_token`) on a short interval
+        and emits an SSE ``change`` event carrying the new token whenever it
+        moves; the browser then refetches ``/api/runs`` + ``/api/status`` (the
+        same idempotent render it already does), so a reconnect never duplicates
+        rows. When idle it emits only a heartbeat comment, keeping CPU and
+        traffic negligible. Runs in the handler's own thread
+        (``ThreadingHTTPServer``), so multiple browser tabs each get an
+        independent stream; the loop exits as soon as the client disconnects.
+        """
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            # Defeat proxy/response buffering so events arrive as they are sent.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+        poll = getattr(self.server, "sse_poll_interval", _SSE_POLL_INTERVAL)
+        heartbeat = getattr(self.server, "sse_heartbeat_interval", _SSE_HEARTBEAT_INTERVAL)
+        # Tell the browser's EventSource how soon to retry if the stream drops.
+        if not self._sse_write(f"retry: {max(1, int(poll * 1000))}\n\n"):
+            return
+
+        last_token: str | None = None
+        idle = 0.0
+        while not getattr(self.server, "_sse_stop", False):
+            token = _change_token(self.server)
+            if token != last_token:
+                last_token = token
+                if not self._sse_write(f"event: change\ndata: {token}\n\n"):
+                    return
+                idle = 0.0
+            else:
+                idle += poll
+                if idle >= heartbeat:
+                    if not self._sse_write(": heartbeat\n\n"):
+                        return
+                    idle = 0.0
+            time.sleep(poll)
 
     def _serve_log(self, requested: str, run_id: str | None = None) -> None:
         """Serve a transcript file, but only one resolving inside the logs root.

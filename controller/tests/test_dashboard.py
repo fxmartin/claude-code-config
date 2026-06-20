@@ -31,8 +31,12 @@ def _seed(db_path: Path) -> str:
 
 
 @contextmanager
-def _running(db_path: Path):
+def _running(db_path: Path, *, sse_poll: float | None = None, sse_heartbeat: float | None = None):
     server = make_server(db_path, host="127.0.0.1", port=0)
+    if sse_poll is not None:
+        server.sse_poll_interval = sse_poll  # type: ignore[attr-defined]
+    if sse_heartbeat is not None:
+        server.sse_heartbeat_interval = sse_heartbeat  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
@@ -468,3 +472,160 @@ def test_log_endpoint_registry_mode_resolves_selected_run(tmp_path: Path) -> Non
             raise AssertionError("expected 404 when the run id is omitted")
         except urllib.error.HTTPError as exc:
             assert exc.code == 404
+
+
+# --- live auto-refresh transport / SSE (Story 11.2-003) --------------------
+
+
+def test_change_token_advances_on_event(tmp_path: Path) -> None:
+    """Ledger.change_token is "0" for a missing ledger and moves with events."""
+    db = tmp_path / ".sdlc-state.db"
+    assert Ledger(db).change_token() == "0"  # no DB yet
+    run_id = _seed(db)  # _seed logs one "run started" event
+    first = Ledger(db).change_token()
+    assert first != "0"
+    Ledger(db).event_log(run_id, "", "info", "controller", "something happened")
+    assert Ledger(db).change_token() != first  # changes on new activity
+
+
+def test_change_token_advances_on_non_event_write(tmp_path: Path) -> None:
+    """In-place writes the dashboard renders but that emit no event still move
+    the token — otherwise the SSE stream would miss stage/story/PR/usage updates."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed(db)
+    ledger = Ledger(db)
+    base = ledger.change_token()
+
+    # A stage transition (no event row) must change the token.
+    ledger.stage_finish(run_id, "34.5-003", "build", 1, "DONE")
+    after_stage = ledger.change_token()
+    assert after_stage != base
+
+    # A per-stage usage update (no event row) must change it again.
+    ledger.stage_set_usage(
+        run_id, "34.5-003", "build", 1, session_id="s", input_tokens=10,
+        output_tokens=20, cache_read_tokens=0, cache_creation_tokens=0, cost_usd=0.01,
+    )
+    after_usage = ledger.change_token()
+    assert after_usage != after_stage
+
+    # A story status/PR change (no event row) must change it again.
+    ledger.set_story_status(run_id, "34.5-003", "DONE")
+    ledger.set_story_pr(run_id, "34.5-003", 99)
+    assert ledger.change_token() != after_usage
+
+
+def test_change_token_helper_single_db(tmp_path: Path) -> None:
+    """_change_token reflects the ledger's max event id in single-db mode."""
+    from sdlc.dashboard import _change_token
+
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed(db)
+    server = make_server(db, host="127.0.0.1", port=0)
+    try:
+        before = _change_token(server)
+        Ledger(db).event_log(run_id, "", "info", "controller", "tick")
+        after = _change_token(server)
+        assert before != after  # token moves when the ledger changes
+    finally:
+        server.server_close()
+
+
+def test_change_token_helper_registry(tmp_path: Path) -> None:
+    """In registry mode the token covers every run's ledger (cross-repo)."""
+    from sdlc.dashboard import _change_token
+
+    registry, run_a, _run_b, repo_a, _repo_b = _two_repo_registry(tmp_path)
+    server = make_server(db_path=None, host="127.0.0.1", port=0, registry=registry)
+    try:
+        before = _change_token(server)
+        # Advance run_a's own ledger; the combined token must change.
+        Ledger(Path(repo_a) / ".sdlc-state.db").event_log(
+            run_a, "", "info", "controller", "tick"
+        )
+        after = _change_token(server)
+        assert before != after
+    finally:
+        server.server_close()
+
+
+def _read_sse_records(resp, *, want_changes: int = 0, want_text: str = "", deadline: float = 4.0):
+    """Read an open SSE response, returning (change_tokens, raw_text).
+
+    Stops once ``want_changes`` change-event ``data:`` tokens are collected and
+    (when given) ``want_text`` appears in the raw stream, or the deadline
+    elapses. Only ``change`` events carry ``data:`` lines (heartbeats are bare
+    comment lines), so counting ``data:`` lines counts change pushes.
+    """
+    import socket
+    import time as _t
+
+    end = _t.monotonic() + deadline
+    raw = ""
+    tokens: list[str] = []
+    while _t.monotonic() < end:
+        if len(tokens) >= want_changes and (not want_text or want_text in raw):
+            break
+        try:
+            line = resp.readline()
+        except (TimeoutError, socket.timeout, OSError):
+            break  # idle past the socket timeout — return what we have
+        if not line:
+            break
+        s = line.decode("utf-8", "replace")
+        raw += s
+        if s.startswith("data:"):
+            tokens.append(s[len("data:"):].strip())
+    return tokens, raw
+
+
+def test_stream_content_type_and_initial_change(tmp_path: Path) -> None:
+    """/api/stream is an event-stream that pushes an initial change on connect."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db, sse_poll=0.05, sse_heartbeat=5.0) as base:
+        resp = urllib.request.urlopen(base + "/api/stream", timeout=3.0)  # noqa: S310
+        try:
+            ctype = resp.headers.get("Content-Type", "")
+            tokens, raw = _read_sse_records(resp, want_changes=1, deadline=3.0)
+        finally:
+            resp.close()
+    assert "text/event-stream" in ctype
+    assert "retry:" in raw          # client reconnect hint
+    assert len(tokens) >= 1         # an initial change so the page renders at once
+
+
+def test_stream_pushes_change_on_new_event(tmp_path: Path) -> None:
+    """A ledger write produces a fresh change token over the open stream."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed(db)
+    with _running(db, sse_poll=0.05, sse_heartbeat=5.0) as base:
+        resp = urllib.request.urlopen(base + "/api/stream", timeout=3.0)  # noqa: S310
+        try:
+            first, _raw = _read_sse_records(resp, want_changes=1, deadline=3.0)
+            Ledger(db).event_log(run_id, "", "info", "controller", "new activity")
+            nxt, _raw2 = _read_sse_records(resp, want_changes=1, deadline=3.0)
+        finally:
+            resp.close()
+    assert first and nxt          # an initial push, then one for the new write
+    assert nxt[0] != first[0]     # token advanced after the write
+
+
+def test_stream_heartbeat_when_idle(tmp_path: Path) -> None:
+    """With no ledger changes the stream stays quiet but emits heartbeats."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db, sse_poll=0.05, sse_heartbeat=0.1) as base:
+        resp = urllib.request.urlopen(base + "/api/stream", timeout=3.0)  # noqa: S310
+        try:
+            _tokens, raw = _read_sse_records(resp, want_changes=1, want_text=": heartbeat", deadline=3.0)
+        finally:
+            resp.close()
+    assert ": heartbeat" in raw  # idle keep-alive comment (ignored by EventSource)
+
+
+def test_page_uses_eventsource_transport() -> None:
+    from sdlc.dashboard import _PAGE
+
+    assert "EventSource" in _PAGE     # server push, not just polling
+    assert "/api/stream" in _PAGE     # the SSE endpoint the client subscribes to
