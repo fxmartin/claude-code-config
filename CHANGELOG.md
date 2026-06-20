@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.32.0] - 2026-06-20
+
+### Added
+
+- feat(realtime-observability): track running token usage (#11.1-003)
+
+### Fixed
+
+- fix(realtime-observability): don't write zero-token rows (#11.1-003)
+
+
 ## [v1.31.0] - 2026-06-20
 
 ### Added
