@@ -208,6 +208,37 @@ def test_pid_alive_self_and_dead():
     assert pid_alive(0) is False
 
 
+def test_pid_alive_rejects_non_int_str_types():
+    """A pid that is neither int nor str (None, list, …) names no live process."""
+    assert pid_alive(None) is False
+    assert pid_alive([os.getpid()]) is False
+    assert pid_alive({"pid": 1}) is False
+
+
+def test_pid_alive_unparseable_string_is_dead():
+    """A string that is not a valid integer is treated as dead, not a crash."""
+    assert pid_alive("not-a-pid") is False
+
+
+def test_pid_alive_permission_error_means_alive(monkeypatch):
+    """A pid owned by another user raises PermissionError from kill — still alive."""
+
+    def _kill(_pid, _sig):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(os, "kill", _kill)
+    assert pid_alive(1) is True
+
+
+def test_records_empty_when_top_level_is_not_a_list(tmp_path):
+    """Valid JSON whose top level is an object (not an array) degrades to empty."""
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps({"run_id": "lonely"}), encoding="utf-8")
+    reg = Registry(path)
+    assert reg.records() == []
+    assert reg.view() == []
+
+
 # --- prune ------------------------------------------------------------------
 
 

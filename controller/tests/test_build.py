@@ -322,6 +322,44 @@ def test_run_build_registers_and_marks_finished(tmp_path) -> None:
     assert rec.completed == 3
 
 
+def test_registry_helpers_swallow_io_errors(tmp_path) -> None:
+    """A registry whose IO raises OSError must never fail a build (best-effort)."""
+    from sdlc.build import _registry_finish, _registry_register
+
+    class _BrokenRegistry:
+        def register(self, record):
+            raise OSError("disk full")
+
+        def mark_finished(self, run_id, status, *, completed=None):
+            raise PermissionError("read-only filesystem")  # subclass of OSError
+
+    broken = _BrokenRegistry()
+    # Neither helper may propagate the OSError; both are no-ops on failure.
+    _registry_register(broken, "run-1", "epic-99", tmp_path / "l.db", 3)
+    _registry_finish(broken, "run-1", "DONE", 3)
+
+
+def test_run_build_survives_registry_io_failure(tmp_path) -> None:
+    """An end-to-end build with a failing registry still completes cleanly."""
+    class _BrokenRegistry:
+        def register(self, record):
+            raise OSError("disk full")
+
+        def mark_finished(self, run_id, status, *, completed=None):
+            raise OSError("disk full")
+
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+        registry=_BrokenRegistry(),
+    )
+    assert result.completed == 3
+    assert result.failed == 0
+
+
 def test_run_build_without_registry_is_unaffected(tmp_path) -> None:
     # The default path: existing callers pass no registry and nothing breaks.
     db = tmp_path / "ledger.db"
