@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.30.0] - 2026-06-20
+
+### Added
+
+- feat(realtime-observability): central run registry (#11.2-001)
+
+### Fixed
+
+- fix(realtime-observability): harden registry vs bad rows (#11.2-001)
+
+
 ## [v1.29.0] - 2026-06-20
 
 ### Added
