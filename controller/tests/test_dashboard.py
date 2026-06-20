@@ -690,3 +690,307 @@ def test_api_status_activity_null_without_progress(tmp_path: Path) -> None:
         _s, _c, body = _get(base + "/api/status")
     for story in json.loads(body)["stories"]:
         assert story["activity"] is None
+
+
+# --- project-url / project-name resolution ---------------------------------
+
+
+def test_git_project_url_resolves_origin(tmp_path: Path) -> None:
+    """A real repo with an ``origin`` remote resolves to its forge web base."""
+    import subprocess
+
+    from sdlc.dashboard import git_project_url
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         "git@github.com:owner/repo.git"],
+        check=True,
+    )
+    assert git_project_url(tmp_path) == "https://github.com/owner/repo"
+
+
+def test_git_project_url_handles_missing_git(monkeypatch) -> None:
+    """When git is absent / errors, git_project_url returns None (plain-text PRs)."""
+    import sdlc.dashboard as dash
+
+    def _raise(*_a, **_k):
+        raise OSError("git not found")
+
+    monkeypatch.setattr(dash.subprocess, "run", _raise)
+    assert dash.git_project_url("/nope") is None
+
+
+def test_project_name_from_url() -> None:
+    """``owner/repo`` is taken from the URL when one is known."""
+    from sdlc.dashboard import _project_name
+
+    assert _project_name("https://github.com/owner/repo", Path("/x/.sdlc-state.db")) == "owner/repo"
+
+
+# --- registry fallback / change-token branches -----------------------------
+
+
+def test_registry_runs_view_keeps_cached_counts_on_error(monkeypatch, tmp_path: Path) -> None:
+    """An unreachable per-run ledger falls back to the registry's cached counts."""
+    import os
+    import sqlite3
+
+    import sdlc.dashboard as dash
+    from sdlc.registry import Registry, RunRecord
+
+    def _raise(self):
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(dash.Ledger, "list_runs", _raise)
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord("rid", str(tmp_path), str(tmp_path / ".sdlc-state.db"), "epic-x",
+                  os.getpid(), "IN_PROGRESS", "2026-01-01T00:00:00+00:00", total=7, completed=3)
+    )
+    rows = dash._registry_runs_view(registry)
+    assert rows[0]["done"] == 3 and rows[0]["total"] == 7
+
+
+def test_change_token_no_source_returns_zero() -> None:
+    """Neither a registry nor a db_path → an idle dashboard stays quiet."""
+    from types import SimpleNamespace
+
+    from sdlc.dashboard import _change_token
+
+    assert _change_token(SimpleNamespace(registry=None, db_path=None)) == "0"
+
+
+def test_change_token_single_db_unreadable_returns_zero(monkeypatch, tmp_path: Path) -> None:
+    """A raising ledger in single-db mode degrades the token to ``"0"``."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    import sdlc.dashboard as dash
+
+    def _raise(self):
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(dash.Ledger, "change_token", _raise)
+    srv = SimpleNamespace(registry=None, db_path=tmp_path / ".sdlc-state.db")
+    assert dash._change_token(srv) == "0"
+
+
+def test_change_token_registry_unreadable_contributes_zero(monkeypatch, tmp_path: Path) -> None:
+    """A raising per-run ledger contributes ``0`` rather than breaking the stream."""
+    import os
+    import sqlite3
+    from types import SimpleNamespace
+
+    import sdlc.dashboard as dash
+    from sdlc.registry import Registry, RunRecord
+
+    def _raise(self):
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(dash.Ledger, "change_token", _raise)
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord("rid", str(tmp_path), str(tmp_path / ".sdlc-state.db"), "epic-x",
+                  os.getpid(), "IN_PROGRESS", "2026-01-01T00:00:00+00:00", total=1, completed=0)
+    )
+    srv = SimpleNamespace(registry=registry, db_path=None)
+    tok = dash._change_token(srv)
+    assert tok.startswith("rid:") and tok.endswith(":0")
+
+
+# --- lifecycle helpers: lsof, stop_dashboard error paths -------------------
+
+
+def test_pids_on_port_handles_missing_lsof(monkeypatch) -> None:
+    """No lsof → an empty PID list rather than an exception."""
+    import sdlc.dashboard as dash
+
+    def _raise(*_a, **_k):
+        raise OSError("no lsof")
+
+    monkeypatch.setattr(dash.subprocess, "run", _raise)
+    assert dash._pids_on_port(12345) == []
+
+
+def test_stop_dashboard_ignores_unreadable_pidfile(monkeypatch) -> None:
+    """A garbage PID file is ignored (ValueError swallowed)."""
+    import sdlc.dashboard as dash
+
+    monkeypatch.setattr(dash, "_pids_on_port", lambda port: [])
+    host, port = "127.0.0.1", 8801
+    pf = dash._pidfile(host, port)
+    pf.write_text("not-a-pid")
+    try:
+        assert dash.stop_dashboard(host, port) == 0
+    finally:
+        pf.unlink(missing_ok=True)
+
+
+def test_stop_dashboard_handles_dead_pid(monkeypatch) -> None:
+    """Signalling a PID that no longer exists is swallowed (not counted)."""
+    import sdlc.dashboard as dash
+
+    monkeypatch.setattr(dash, "_pids_on_port", lambda port: [])
+
+    def _kill(_pid, _sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(dash.os, "kill", _kill)
+    host, port = "127.0.0.1", 8802
+    pf = dash._pidfile(host, port)
+    pf.write_text("2147483646")
+    try:
+        assert dash.stop_dashboard(host, port) == 0
+    finally:
+        pf.unlink(missing_ok=True)
+
+
+def test_stop_dashboard_waits_for_port_to_free(monkeypatch) -> None:
+    """stop_dashboard polls until the port frees, sleeping between checks."""
+    import sdlc.dashboard as dash
+
+    calls = {"n": 0}
+
+    def _in_use(_host, _port):
+        calls["n"] += 1
+        return calls["n"] == 1  # busy on the first probe, free thereafter
+
+    monkeypatch.setattr(dash, "_port_in_use", _in_use)
+    monkeypatch.setattr(dash, "_pids_on_port", lambda port: [])
+    monkeypatch.setattr(dash.time, "sleep", lambda _s: None)
+    host, port = "127.0.0.1", 8803
+    dash._pidfile(host, port).unlink(missing_ok=True)
+    assert dash.stop_dashboard(host, port) == 0
+    assert calls["n"] >= 2  # looped at least once, exercising the wait
+
+
+# --- favicon + log-root-None branch ----------------------------------------
+
+
+def test_favicon_returns_no_content(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db) as base:
+        status, _ctype, body = _get(base + "/favicon.ico")
+    assert status == 204 and body == b""
+
+
+def test_log_endpoint_404_when_no_run_resolvable(tmp_path: Path) -> None:
+    """In discovery mode with no runs, /log has no logs root → 404."""
+    from sdlc.registry import Registry
+
+    registry = Registry(tmp_path / "registry.json")  # empty
+    with _running_registry(registry) as base:
+        try:
+            _get(base + "/log?path=/whatever")
+            raise AssertionError("expected 404")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+
+
+# --- serve() lifecycle -----------------------------------------------------
+
+
+def test_serve_runs_until_interrupt(tmp_path: Path, monkeypatch) -> None:
+    """serve() writes a PID file, opens the browser, and cleans up on Ctrl-C."""
+    from http.server import ThreadingHTTPServer
+
+    import sdlc.dashboard as dash
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    opened: list[str] = []
+    monkeypatch.setattr(dash.webbrowser, "open", lambda url: opened.append(url))
+
+    def _interrupt(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ThreadingHTTPServer, "serve_forever", _interrupt)
+
+    dash.serve(db, host="127.0.0.1", port=0, open_browser=True)
+
+    assert opened  # browser was opened
+    assert not dash._pidfile("127.0.0.1", 0).exists()  # PID file cleaned up
+
+
+def test_serve_skips_signal_off_main_thread(tmp_path: Path, monkeypatch) -> None:
+    """Off the main thread, signal registration is skipped without error."""
+    from http.server import ThreadingHTTPServer
+
+    import sdlc.dashboard as dash
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+
+    def _interrupt(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ThreadingHTTPServer, "serve_forever", _interrupt)
+    errors: list[BaseException] = []
+
+    def _run():
+        try:
+            dash.serve(db, host="127.0.0.1", port=0, open_browser=False)
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not errors  # ValueError from signal.signal off-main-thread is swallowed
+
+
+# --- SSE write-failure paths (client disconnects mid-stream) ----------------
+
+
+class _FailingWFile:
+    """A wfile whose writes succeed until ``fail_after`` calls, then break."""
+
+    def __init__(self, fail_after: int) -> None:
+        self.n = 0
+        self.fail_after = fail_after
+
+    def write(self, _b) -> None:
+        self.n += 1
+        if self.n > self.fail_after:
+            raise BrokenPipeError("client gone")
+
+    def flush(self) -> None:
+        pass
+
+
+def _stream_handler(fail_after: int):
+    """A bare _Handler wired to a failing wfile, ready to call _serve_stream."""
+    from types import SimpleNamespace
+
+    from sdlc.dashboard import _Handler
+
+    h = _Handler.__new__(_Handler)
+    h.wfile = _FailingWFile(fail_after)
+    h.requestline = "GET /api/stream HTTP/1.1"
+    h.request_version = "HTTP/1.1"
+    h.server = SimpleNamespace(
+        registry=None, db_path=None, sse_poll_interval=0.01,
+        sse_heartbeat_interval=0.05, _sse_stop=False,
+    )
+    return h
+
+
+def test_serve_stream_returns_when_headers_fail() -> None:
+    """A client that drops before headers flush ends the stream cleanly."""
+    h = _stream_handler(fail_after=0)  # the header flush is the first write → fails
+    h._serve_stream()  # must return, not raise
+
+
+def test_serve_stream_returns_when_retry_hint_fails() -> None:
+    """A drop right after headers (on the retry hint) ends the stream cleanly."""
+    h = _stream_handler(fail_after=1)  # headers ok, retry-hint write fails
+    h._serve_stream()
+
+
+def test_serve_stream_returns_when_change_push_fails() -> None:
+    """A drop on the first change push ends the stream cleanly."""
+    h = _stream_handler(fail_after=2)  # headers + retry ok, change push fails
+    h._serve_stream()
