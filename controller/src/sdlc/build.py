@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
@@ -756,7 +757,9 @@ class Ledger:
         """The most recent ``limit`` runs (newest first) for the runs browser.
 
         Each entry is ``{id, scope, mode, status, started_at, finished_at,
-        total, done, failed, total_tokens, total_cost_usd}``. The
+        duration_seconds, total, done, failed, total_tokens, total_cost_usd}``.
+        ``duration_seconds`` is the run's total span (elapsed-so-far while
+        in-progress), or None when the start is missing (renders "—"). The
         ``total/done/failed`` tallies are computed live from the per-story rows
         (a single grouped query), so an in-progress run shows accurate counts —
         the run row's stored ``completed/failed`` are 0 until close-out.
@@ -808,6 +811,9 @@ class Ledger:
                     "status": r["status"],
                     "started_at": r["started_at"],
                     "finished_at": r["finished_at"],
+                    "duration_seconds": _duration_seconds(
+                        r["started_at"], r["finished_at"]
+                    ),
                     "total": total,
                     "done": by_status.get("DONE", 0),
                     "failed": by_status.get("FAILED", 0),
@@ -831,6 +837,72 @@ _EMPTY_COUNTS = {
 _TOKEN_FIELDS = (
     "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
 )
+
+
+# --- durations (Story 11.2-005) --------------------------------------------
+# Durations are derived from the ledger timestamps already persisted (no new
+# schema). The dashboard renders these with a shared human-readable formatter;
+# in-progress spans use a "now" anchor so the value reads as elapsed-so-far.
+
+
+def _parse_ts(value) -> datetime | None:
+    """Parse a ledger timestamp into an aware UTC datetime, or None.
+
+    Tolerates the SQLite ``CURRENT_TIMESTAMP`` shape (``"YYYY-MM-DD HH:MM:SS"``,
+    space-separated) and ISO-8601 (``"…T…"``); both are UTC. A naive value is
+    assumed UTC. Returns None for null/empty/garbage so callers degrade to "—".
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def _duration_seconds(started_at, finished_at, now: datetime | None = None) -> int | None:
+    """Whole-second span from ``started_at`` to ``finished_at`` (or ``now``).
+
+    Returns None when the start is missing/unparseable (renders "—"), uses
+    ``now`` (default: current UTC time) as the end for an in-progress span
+    (``finished_at`` null), and degrades a negative span (clock skew / bad
+    data) to None so the dashboard never shows a negative duration.
+    """
+    start = _parse_ts(started_at)
+    if start is None:
+        return None
+    end = _parse_ts(finished_at) if finished_at else (now or datetime.now(timezone.utc))
+    if end is None:
+        return None
+    secs = (end - start).total_seconds()
+    return int(secs) if secs >= 0 else None
+
+
+def _story_duration_seconds(stage_attempts: list[dict], now: datetime | None = None) -> int | None:
+    """Wall-clock span of a story: earliest stage start → latest stage finish.
+
+    The span (not the sum of stage durations) reflects real elapsed time
+    including gaps between stages. An in-flight story (any started stage with no
+    ``finished_at``) shows elapsed-so-far against ``now``. Returns None when no
+    stage has started yet (renders "—").
+    """
+    starts = [_parse_ts(a.get("started_at")) for a in stage_attempts]
+    starts = [s for s in starts if s is not None]
+    if not starts:
+        return None
+    earliest = min(starts)
+    in_flight = any(a.get("started_at") and not a.get("finished_at") for a in stage_attempts)
+    if in_flight:
+        end = now or datetime.now(timezone.utc)
+    else:
+        ends = [_parse_ts(a.get("finished_at")) for a in stage_attempts]
+        ends = [e for e in ends if e is not None]
+        if not ends:
+            return None
+        end = max(ends)
+    secs = (end - earliest).total_seconds()
+    return int(secs) if secs >= 0 else None
 
 
 def _sum_tokens(row: dict) -> int | None:
@@ -903,6 +975,9 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
     config = ledger.run_config(rid)
     breakdown = ledger.stage_breakdown(rid)
     activity = ledger.latest_progress(rid)
+    # One "now" anchor so the run's elapsed and every in-flight story's
+    # elapsed-so-far are measured against the same instant in this snapshot.
+    now = datetime.now(timezone.utc)
 
     def _count(value: str) -> int:
         return sum(1 for s in stories if s.get("status") == value)
@@ -940,6 +1015,10 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         # for the story, or None for runs with no streamed progress (captured
         # fallback / older runs) so consumers degrade to the stage name.
         s["activity"] = activity.get(s["story_id"])
+        # Per-story wall-clock duration (Story 11.2-005): earliest stage start →
+        # latest stage finish, elapsed-so-far while in flight. From the same
+        # attempts above, before PENDING/SKIPPED placeholders were appended.
+        s["duration_seconds"] = _story_duration_seconds(attempts, now=now)
 
     # Run-level usage rollup across every stage attempt of every story.
     run_usage = _aggregate_run_usage(breakdown)
@@ -951,6 +1030,9 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "status": run_row.get("status"),
         "started_at": run_row.get("started_at"),
         "finished_at": run_row.get("finished_at"),
+        "duration_seconds": _duration_seconds(
+            run_row.get("started_at"), run_row.get("finished_at"), now=now
+        ),
         "config": config,
         "usage": run_usage,
     }
