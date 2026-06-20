@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.31.0] - 2026-06-20
+
+### Added
+
+- feat(realtime-observability): emit sub-stage progress events (#11.1-002)
+
+
 ## [v1.30.0] - 2026-06-20
 
 ### Added
