@@ -40,6 +40,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic-09 | Security Baked into Quality Gates + Live Pilot | Roadmap | 4 | 12 | P2 | **CODE-COMPLETE** (3/4) — SAST (#58), gitleaks (#59), osv-scanner (#60) merged, E2E_PASS; [9.3-001 live pilot](./epic-09-security-quality-gates.md#story-93-001-five-colleague-live-pilot) BLOCKED pending human pilot |
 | Epic-10 | Controller Hardening (resume, observability, rollback) | Roadmap | 2 | 13 | P2 | **IN PROGRESS** — `status` + a web `dashboard` shipped (#66, #67); `resume`/`state` (rest of 10.1-001) and `rollback`/`init` (10.2-001) remain stubs |
 | Epic-11 | Realtime Progress & Multi-Run Observability | Roadmap | 7 | 27 | P2 | **PLANNED** — stream agent activity + sub-stage events into the ledger; one auto-refreshing dashboard for multiple runs across repos via a central registry |
+| Epic-12 | Controller Robustness & Failure Recovery | Roadmap | 4 | 13 | P2 | **PLANNED** ([#72](https://github.com/fxmartin/claude-code-config/issues/72)) — recover malformed result envelopes before parking, guard preflight against recursive hangs, non-destructive progress renderer, commit-message linting at commit time |
 
 ## Epic Navigation
 
@@ -54,6 +55,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 - **[Epic-09: Security Baked into Quality Gates](./epic-09-security-quality-gates.md)** *(Roadmap)*: SAST plus dependency plus secrets scanning embedded into the coverage stage so security is a gate, not a follow-up. Closes with the five-colleague live pilot (9.3-001, moved from Epic-06 on 2026-06-11) — the roadmap capstone that validates the finished platform.
 - **[Epic-10: Controller Hardening](./epic-10-controller-hardening.md)** *(Roadmap)*: Implement the `sdlc` CLI verbs Epic-07 shipped as stubs — `resume` (controller-native crash recovery), `status`/`state` (observability), `rollback` (checkpoint unwind) — and retire or implement the redundant `init`. Created 2026-06-15.
 - **[Epic-11: Realtime Progress & Multi-Run Observability](./epic-11-realtime-observability.md)** *(Roadmap)*: Stream agent stdout and emit fine-grained sub-stage events + running token/cost into the ledger (no more "captured output, invisible until stage completes"); a central run registry lets one auto-refreshing dashboard display every active run across repos. Created 2026-06-20.
+- **[Epic-12: Controller Robustness & Failure Recovery](./epic-12-controller-robustness.md)** *(Roadmap)*: Make the controller resilient when a run goes sideways — recover a missing/malformed result envelope before parking work `NEEDS_ATTENTION`, guard preflight against recursive self-invocation hangs, keep the `.build-progress.md` renderer from clobbering non-ledger history, and lint agent commit messages at commit time. From issue #72 (epic-10 run post-mortem). Created 2026-06-20.
 
 ## MVP Summary
 
@@ -94,11 +96,11 @@ The MVP is shippable when ALL of the following hold:
 
 ## Project Metrics
 
-- **Total Epics**: 11
-- **Total Stories**: 43 *(the live pilot split out of 6.3-001 into 9.3-001 on 2026-06-11; Epic-10 added 2 controller-hardening stories on 2026-06-15; Epic-11 added 7 realtime/multi-run stories on 2026-06-20)*
-- **Total Story Points**: 160
+- **Total Epics**: 12
+- **Total Stories**: 47 *(the live pilot split out of 6.3-001 into 9.3-001 on 2026-06-11; Epic-10 added 2 controller-hardening stories on 2026-06-15; Epic-11 added 7 realtime/multi-run stories on 2026-06-20; Epic-12 added 4 controller-robustness stories on 2026-06-20 from issue #72)*
+- **Total Story Points**: 173
 - **MVP Stories**: 23 (69 pts)
-- **Roadmap Stories**: 20 (91 pts)
+- **Roadmap Stories**: 24 (104 pts)
 
 ## Story Dependencies
 
