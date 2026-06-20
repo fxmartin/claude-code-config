@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.26.0] - 2026-06-20
+
+### Added
+
+- feat(dashboard): per-stage pipeline, run config, and token/cost (#67)
+
+
 ## [v1.25.0] - 2026-06-19
 
 ### Added
