@@ -125,6 +125,95 @@ def map_stream_event(event: dict[str, Any]) -> list[ProgressEvent]:
     return []
 
 
+# Map Claude stream-json usage keys to the ledger's stage column names. The
+# stream and the `--output-format json` envelope share these key names, so the
+# live accrual lands in the exact columns the final reconciliation overwrites.
+_USAGE_KEY_MAP = {
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "cache_read_input_tokens": "cache_read_tokens",
+    "cache_creation_input_tokens": "cache_creation_tokens",
+}
+
+
+def usage_of(event: Any) -> dict[str, int] | None:
+    """Extract a token-usage mapping from a stream-json event, or None (11.1-003).
+
+    Reads ``message.usage`` (assistant turns), falling back to a top-level
+    ``usage`` (the terminal ``result`` event), and renames Claude's keys to the
+    ledger's stage column names. Only integer components are kept; an event with
+    no usage block (system / tool_use / text) returns None so the caller accrues
+    nothing. Defensive by design, mirroring the rest of the stream parsing.
+    """
+    if not isinstance(event, dict):
+        return None
+    message = event.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        usage = event.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    mapped = {
+        col: usage[src]
+        for src, col in _USAGE_KEY_MAP.items()
+        if isinstance(usage.get(src), int)
+    }
+    return mapped or None
+
+
+@dataclass
+class RunningUsage:
+    """Accrued token totals (+ the captured session id) for one stage attempt."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    session_id: str | None = None
+
+
+class UsageAccumulator:
+    """Accrue running token totals from a stream of stream-json events (11.1-003).
+
+    Sums each assistant turn's ``message.usage`` so a mid-stage query shows tokens
+    building up *during* a run, not only at the end. The terminal ``result`` event
+    is deliberately ignored: dispatch hands its authoritative totals to the final
+    reconciliation (``Ledger.stage_set_usage``), which overwrites the accrued
+    figure — final value wins, with no double counting. Cost is not carried per
+    turn in stream-json, so it accrues only at reconciliation (still a strict
+    improvement over today's run-level-only total).
+    """
+
+    def __init__(self) -> None:
+        self.totals = RunningUsage()
+
+    def observe(self, event: Any) -> bool:
+        """Fold one event's usage into the running totals.
+
+        Returns True when the totals (or session id) changed and the caller should
+        persist them; False for an event with no usage, so no redundant write is
+        issued. ``result`` events are skipped so the live figure never includes the
+        authoritative total that reconciliation will set.
+        """
+        if not isinstance(event, dict) or event.get("type") == "result":
+            return False
+        changed = False
+        session_id = event.get("session_id")
+        if (
+            isinstance(session_id, str)
+            and session_id
+            and session_id != self.totals.session_id
+        ):
+            self.totals.session_id = session_id
+            changed = True
+        usage = usage_of(event)
+        if usage:
+            for col, value in usage.items():
+                setattr(self.totals, col, getattr(self.totals, col) + value)
+            changed = True
+        return changed
+
+
 class ProgressCoalescer:
     """Rate-limit + de-dupe mapped events so the ledger is never flooded.
 

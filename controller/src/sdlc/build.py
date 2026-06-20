@@ -18,7 +18,7 @@ from typing import Callable, Iterable, Iterator, Protocol
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER, ContractError
 from sdlc.dispatch import AgentDispatchError, AgentResult, dispatch_agent
-from sdlc.progress import ProgressCoalescer, map_stream_event
+from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
 from sdlc.registry import Registry, RunRecord
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -1460,7 +1460,7 @@ def _run_story(
         while True:
             ledger.stage_start(run_id, story.id, stage, attempt)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
-            sink = _make_progress_sink(ledger, run_id, story.id, stage)
+            sink = _make_progress_sink(ledger, run_id, story.id, stage, attempt)
             ok, result, failure, kind = _dispatch_stage(
                 stage, story, opts, pr_number, dispatch, tpath, on_progress=sink
             )
@@ -1515,7 +1515,7 @@ def _run_story(
 
 
 def _make_progress_sink(
-    ledger: Ledger, run_id: str, story_id: str, stage: str
+    ledger: Ledger, run_id: str, story_id: str, stage: str, attempt: int = 1
 ):
     """A best-effort sink that maps stream events → coalesced ledger progress rows.
 
@@ -1526,14 +1526,34 @@ def _make_progress_sink(
     survivors to the ledger. Coalescing keeps ledger writes infrequent so the
     agent stream is never materially blocked; dispatch already isolates any
     exception raised here so progress recording can never fail the run.
+
+    It also accrues running token usage (Story 11.1-003): each usage-bearing
+    event folds into a :class:`~sdlc.progress.UsageAccumulator`, and the new
+    running total is written to this stage attempt's row, so a mid-stage query
+    sees spend building up. The stage's terminal :func:`_record_stage_usage`
+    later overwrites this with the authoritative envelope figure — final value
+    wins, no double counting (both write the same columns via
+    :meth:`Ledger.stage_set_usage`).
     """
     coalescer = ProgressCoalescer()
+    usage = UsageAccumulator()
 
     def sink(event: dict) -> None:
         now = time.monotonic()
         for pe in map_stream_event(event):
             if coalescer.admit(pe, now):
                 ledger.progress_log(run_id, story_id, stage, pe.kind, pe.message)
+        if usage.observe(event):
+            t = usage.totals
+            ledger.stage_set_usage(
+                run_id, story_id, stage, attempt,
+                session_id=t.session_id,
+                input_tokens=t.input_tokens,
+                output_tokens=t.output_tokens,
+                cache_read_tokens=t.cache_read_tokens,
+                cache_creation_tokens=t.cache_creation_tokens,
+                cost_usd=None,
+            )
 
     return sink
 
@@ -1663,7 +1683,7 @@ def _run_bugfix(
     ledger.stage_start(run_id, story.id, "bugfix", attempt)
     out = str(transcript_path) if transcript_path is not None else ""
     prompt = render_bugfix_prompt(story, failed_stage, failure)
-    sink = _make_progress_sink(ledger, run_id, story.id, "bugfix")
+    sink = _make_progress_sink(ledger, run_id, story.id, "bugfix", attempt)
     try:
         result = dispatch(
             "bugfix", prompt, story=story, transcript_path=transcript_path,

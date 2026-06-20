@@ -198,6 +198,20 @@ malformed stream never fails the run on its own. The streaming path keeps the
 verbatim stream in the transcript (it is the live view); the captured envelope
 path still rewrites the transcript to the readable agent text.
 
+On the streaming path the same per-stage progress sink also accrues **running
+token usage** (Story 11.1-003): a `UsageAccumulator` sums each assistant turn's
+`message.usage`, and the running total is written to that stage attempt's row
+(`stages.input_tokens` etc.) via `Ledger.stage_set_usage` as events arrive — so
+a query mid-stage (`sdlc status`, the dashboard) sees spend building up rather
+than only the end-of-stage total. The terminal `result` event is excluded from
+the accumulator; when the stage finishes, `_record_stage_usage` overwrites the
+row with the envelope's authoritative `usage`/`total_cost_usd` — **final value
+wins, no double counting**, because both writes target the same columns. Cost is
+not carried per turn in `stream-json`, so it lands only at this reconciliation
+(still a strict improvement over the previous run-level-only total). The per-run
+and per-story/stage breakdowns surface through the existing query path
+(`stage_breakdown`, `_aggregate_run_usage`, `status_snapshot`) with no new schema.
+
 ## Backward compatibility
 
 Users still type `/build-stories` in Claude Code. The skill shells out to

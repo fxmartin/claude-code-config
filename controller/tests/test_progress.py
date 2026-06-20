@@ -11,7 +11,9 @@ from sdlc.progress import (
     TOOL_USE,
     ProgressCoalescer,
     ProgressEvent,
+    UsageAccumulator,
     map_stream_event,
+    usage_of,
 )
 
 
@@ -147,3 +149,78 @@ def test_window_resets_after_one_second() -> None:
     assert c.admit(ProgressEvent(TOOL_USE, "c"), now=0.5) is False  # still in window
     # New window opens at >= 1.0s → admits again.
     assert c.admit(ProgressEvent(TOOL_USE, "d"), now=1.0) is True
+
+
+# --- running token usage (Story 11.1-003) ---------------------------------
+
+
+def _assistant_usage(**usage: int) -> dict:
+    return {"type": "assistant", "message": {"content": [], "usage": usage}}
+
+
+def test_usage_of_maps_assistant_usage_to_ledger_columns() -> None:
+    event = _assistant_usage(
+        input_tokens=100,
+        output_tokens=20,
+        cache_read_input_tokens=4000,
+        cache_creation_input_tokens=300,
+    )
+    assert usage_of(event) == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 4000,
+        "cache_creation_tokens": 300,
+    }
+
+
+def test_usage_of_reads_top_level_usage_too() -> None:
+    # The terminal `result` event carries usage at the top level, not under message.
+    event = {"type": "result", "usage": {"input_tokens": 5, "output_tokens": 7}}
+    assert usage_of(event) == {"input_tokens": 5, "output_tokens": 7}
+
+
+def test_usage_of_ignores_non_int_and_missing_usage() -> None:
+    assert usage_of({"type": "system"}) is None
+    assert usage_of({"type": "assistant", "message": {"content": []}}) is None
+    assert usage_of({"type": "assistant", "message": {"usage": {"input_tokens": "x"}}}) is None
+    assert usage_of("not a dict") is None  # type: ignore[arg-type]
+
+
+def test_accumulator_sums_usage_across_turns() -> None:
+    acc = UsageAccumulator()
+    assert acc.observe(_assistant_usage(input_tokens=100, output_tokens=20)) is True
+    assert acc.observe(_assistant_usage(input_tokens=150, output_tokens=30)) is True
+    assert acc.totals.input_tokens == 250
+    assert acc.totals.output_tokens == 50
+
+
+def test_accumulator_ignores_result_event() -> None:
+    # The result event's authoritative total is reconciled by the final path —
+    # accruing it here would double-count, so observe() must skip it.
+    acc = UsageAccumulator()
+    acc.observe(_assistant_usage(output_tokens=20))
+    changed = acc.observe({"type": "result", "usage": {"output_tokens": 999}})
+    assert changed is False
+    assert acc.totals.output_tokens == 20
+
+
+def test_accumulator_reports_no_change_without_usage() -> None:
+    acc = UsageAccumulator()
+    assert acc.observe({"type": "system", "subtype": "init"}) is False
+    assert acc.observe({"type": "assistant", "message": {"content": []}}) is False
+
+
+def test_accumulator_captures_session_id() -> None:
+    acc = UsageAccumulator()
+    changed = acc.observe({"type": "assistant", "session_id": "sess-1", "message": {"content": []}})
+    assert changed is True
+    assert acc.totals.session_id == "sess-1"
+    # A repeated session id is not a fresh change on its own.
+    assert acc.observe({"type": "assistant", "session_id": "sess-1", "message": {"content": []}}) is False
+
+
+def test_accumulator_tolerates_malformed_events() -> None:
+    acc = UsageAccumulator()
+    assert acc.observe({}) is False
+    assert acc.observe("nope") is False  # type: ignore[arg-type]
+    assert acc.totals.input_tokens == 0
