@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.33.0] - 2026-06-20
+
+### Added
+
+- feat(realtime-observability): live per-run detail view (#11.2-004)
+- feat(realtime-observability): live auto-refresh transport (#11.2-003)
+- feat(realtime-observability): multi-run dashboard overview (#11.2-002)
+
+
 ## [v1.32.0] - 2026-06-20
 
 ### Added
