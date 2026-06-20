@@ -210,13 +210,15 @@ def test_accumulator_reports_no_change_without_usage() -> None:
     assert acc.observe({"type": "assistant", "message": {"content": []}}) is False
 
 
-def test_accumulator_captures_session_id() -> None:
+def test_accumulator_captures_session_id_without_writing_zero_row() -> None:
     acc = UsageAccumulator()
-    changed = acc.observe({"type": "assistant", "session_id": "sess-1", "message": {"content": []}})
-    assert changed is True
-    assert acc.totals.session_id == "sess-1"
-    # A repeated session id is not a fresh change on its own.
+    # A session-id-only event captures the id but must NOT signal a write — there
+    # is no usage yet, so persisting now would be a misleading all-zero row.
     assert acc.observe({"type": "assistant", "session_id": "sess-1", "message": {"content": []}}) is False
+    assert acc.totals.session_id == "sess-1"
+    # When usage finally arrives, the captured session id rides along with it.
+    assert acc.observe(_assistant_usage(output_tokens=10)) is True
+    assert acc.totals.session_id == "sess-1"
 
 
 def test_accumulator_tolerates_malformed_events() -> None:

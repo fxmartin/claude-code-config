@@ -188,16 +188,18 @@ class UsageAccumulator:
         self.totals = RunningUsage()
 
     def observe(self, event: Any) -> bool:
-        """Fold one event's usage into the running totals.
+        """Fold one event's token usage into the running totals.
 
-        Returns True when the totals (or session id) changed and the caller should
-        persist them; False for an event with no usage, so no redundant write is
-        issued. ``result`` events are skipped so the live figure never includes the
-        authoritative total that reconciliation will set.
+        Returns True only when actual token usage was folded in and the caller
+        should persist the new running total; False otherwise, so no row is
+        written before any usage exists (a session-id-only event would otherwise
+        write an all-zero row that renders as a misleading "0 tokens" instead of
+        "—"). A ``session_id`` is still captured internally so the *first*
+        usage-bearing write carries it. ``result`` events are skipped so the live
+        figure never includes the authoritative total reconciliation will set.
         """
         if not isinstance(event, dict) or event.get("type") == "result":
             return False
-        changed = False
         session_id = event.get("session_id")
         if (
             isinstance(session_id, str)
@@ -205,13 +207,12 @@ class UsageAccumulator:
             and session_id != self.totals.session_id
         ):
             self.totals.session_id = session_id
-            changed = True
         usage = usage_of(event)
-        if usage:
-            for col, value in usage.items():
-                setattr(self.totals, col, getattr(self.totals, col) + value)
-            changed = True
-        return changed
+        if not usage:
+            return False
+        for col, value in usage.items():
+            setattr(self.totals, col, getattr(self.totals, col) + value)
+        return True
 
 
 class ProgressCoalescer:

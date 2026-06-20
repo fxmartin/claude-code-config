@@ -1212,12 +1212,15 @@ def test_progress_sink_without_usage_leaves_columns_null(tmp_path) -> None:
     ledger.stage_start(run_id, "s1", "build", 1)
 
     sink = _make_progress_sink(ledger, run_id, "s1", "build", 1)
-    sink({"type": "system", "subtype": "init"})
+    # A real `system` init event carries a session_id but no usage — it must not
+    # write an all-zero token row (regression: would render "0" instead of "—").
+    sink({"type": "system", "subtype": "init", "session_id": "sess-1"})
     sink({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}})
 
     row = _stage_usage_row(ledger, run_id, "s1", "build")
     assert row["tokens"] is None
     assert row["cost_usd"] is None
+    assert row["session_id"] is None
 
 
 def test_final_usage_reconciles_over_live_accrual(tmp_path) -> None:
