@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -704,6 +705,52 @@ class Ledger:
             d["tokens"] = _sum_tokens(d)
             out.setdefault(d.pop("story_id"), []).append(d)
         return out
+
+    def change_token(self) -> str:
+        """An opaque token that changes whenever a dashboard-visible field does.
+
+        Used by the live SSE transport (Story 11.2-003) to decide when to push a
+        delta. ``MAX(events.id)`` alone is not enough: the dashboard also renders
+        per-stage status/usage and per-story status/PR, and those are written by
+        in-place ``UPDATE``\\ s (``stage_finish``, ``stage_set_usage``,
+        ``set_story_status``, ``set_story_pr``) that emit no event row — and the
+        ledger runs in WAL mode, so the file's mtime is no proxy either. So we
+        digest every mutable field the dashboard shows across ``runs``/
+        ``stories``/``stages`` plus the event high-water mark. Returns ``"0"``
+        for a missing/unreadable ledger. The row counts here are small (tens of
+        rows per run), so this stays cheap enough to poll sub-second.
+        """
+        if not self.db_path.exists():
+            return "0"
+        try:
+            with self._connect_ro() as conn:
+                ev = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+                runs = conn.execute(
+                    "SELECT id, status, total_stories, completed, failed, "
+                    "started_at, finished_at FROM runs ORDER BY id"
+                ).fetchall()
+                stories = conn.execute(
+                    "SELECT run_id, story_id, status, pr_number, current_stage "
+                    "FROM stories ORDER BY run_id, story_id"
+                ).fetchall()
+                stages = conn.execute(
+                    "SELECT run_id, story_id, stage_name, attempt, status, "
+                    "failure_category, output_path, session_id, input_tokens, "
+                    "output_tokens, cache_read_tokens, cache_creation_tokens, "
+                    "cost_usd, started_at, finished_at FROM stages "
+                    "ORDER BY run_id, story_id, stage_name, attempt"
+                ).fetchall()
+        except sqlite3.Error:
+            return "0"
+        # Rows come back as ``sqlite3.Row`` (set on the read-only connection),
+        # whose ``repr`` embeds the object's memory address and so differs every
+        # call — digest the plain tuple values instead, which depend only on the
+        # data, so an unchanged ledger yields a stable token.
+        payload = (ev, [tuple(r) for r in runs], [tuple(r) for r in stories],
+                   [tuple(r) for r in stages])
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(repr(payload).encode("utf-8"))
+        return digest.hexdigest()
 
     def list_runs(self, limit: int = 50) -> list[dict]:
         """The most recent ``limit`` runs (newest first) for the runs browser.

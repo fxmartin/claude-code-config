@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -23,7 +24,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from sdlc import __version__
-from sdlc.build import Ledger, status_snapshot
+from sdlc.build import _EMPTY_COUNTS, Ledger, status_snapshot
+from sdlc.registry import Registry, RunRecord, derive_state
 
 # scp-like remote: git@host:owner/sub/repo.git
 _SCP_REMOTE = re.compile(r"^[\w.-]+@([\w.-]+):(.+?)(?:\.git)?/?$")
@@ -72,6 +74,90 @@ def _project_name(project_url: str | None, db_path: Path) -> str:
     if project_url:
         return "/".join(project_url.rstrip("/").split("/")[-2:])
     return db_path.resolve().parent.name
+
+
+# --- multi-run registry discovery (Story 11.2-002) -------------------------
+# In discovery mode the dashboard has no single ledger: it reads the host-level
+# registry to find every `sdlc build` across repos, and resolves each run's own
+# ledger on demand. The per-repo ledger stays authoritative for run detail.
+
+
+def _registry_runs_view(registry: Registry) -> list[dict]:
+    """Normalize the host-level registry into the runs-browser row shape.
+
+    Each row carries the cross-repo discovery fields (``repo``, ``scope``) plus
+    the derived effective ``status`` and live ``done``/``total`` read from that
+    run's own ledger when reachable — falling back to the registry's cached
+    counts when a ledger is missing/corrupt (the registry is best-effort).
+    Newest run first.
+    """
+    rows: list[dict] = []
+    for rec in registry.records():
+        done, total = rec.completed, rec.total
+        try:
+            for r in Ledger(rec.db).list_runs():
+                if r["id"] == rec.run_id:
+                    done, total = r["done"], r["total"]
+                    break
+        except (OSError, sqlite3.Error):
+            pass  # unreachable ledger → keep the registry's cached counts
+        rows.append(
+            {
+                "id": rec.run_id,
+                "repo": rec.repo,
+                "scope": rec.scope,
+                "status": derive_state(rec),
+                "started_at": rec.started_at,
+                "finished_at": rec.finished_at,
+                "done": done,
+                "total": total,
+            }
+        )
+    rows.sort(key=lambda r: (r["started_at"] or ""), reverse=True)
+    return rows
+
+
+# --- live transport: change detection (Story 11.2-003) ---------------------
+# The SSE endpoint pushes a delta only when the ledger actually moves. We avoid
+# diffing rows by collapsing all activity into a cheap token; when it changes,
+# the client refetches the snapshot it already knows how to render (idempotent),
+# which keeps the transport simple and free of duplicate-row bugs on reconnect.
+
+
+def _change_token(server) -> str:
+    """A cheap token of ledger activity used by the SSE stream to detect change.
+
+    Single-db mode: the ledger's max event id (as a string). Registry-discovery
+    mode: a digest of every run's id, derived status, and its own ledger's max
+    event id — so the stream also fires when a run is added/removed or changes
+    state across repos. An unreachable ledger contributes 0 rather than breaking
+    the stream (the registry is best-effort). Returns ``"0"`` when there is no
+    source yet, so an idle dashboard simply stays quiet.
+    """
+    registry = getattr(server, "registry", None)
+    if registry is not None:
+        parts: list[str] = []
+        for rec in registry.records():
+            try:
+                tok = Ledger(rec.db).change_token()
+            except (OSError, sqlite3.Error):
+                tok = "0"
+            parts.append(f"{rec.run_id}:{derive_state(rec)}:{tok}")
+        return "|".join(parts)
+    db_path = getattr(server, "db_path", None)
+    if db_path is None:
+        return "0"
+    try:
+        return Ledger(db_path).change_token()
+    except (OSError, sqlite3.Error):
+        return "0"
+
+
+# Live transport tuning (overridable per-server, mostly for tests). The poll
+# interval bounds time-to-push (~1s ⇒ well under the 2s target); the heartbeat
+# keeps the connection (and any intermediary) alive while idle without traffic.
+_SSE_POLL_INTERVAL = 1.0
+_SSE_HEARTBEAT_INTERVAL = 15.0
 
 
 # --- lifecycle: stop/restart -----------------------------------------------
@@ -184,6 +270,8 @@ _PAGE = """<!doctype html>
   .SKIPPED { background: var(--surface); color: var(--sub); }
   .TODO { background: var(--crust); color: var(--overlay); }
   .PENDING { background: var(--crust); color: var(--overlay); }
+  .substage > td { border-bottom: 1px solid var(--surface); padding-top: 0; color: var(--sub); }
+  .substage .kind { color: var(--blue); margin-right: 4px; }
   .events { margin-top: 16px; }
   .events div { padding: 2px 0; border-bottom: 1px solid var(--crust); font-size: 13px; }
   .lvl-error { color: var(--red); } .lvl-warn { color: var(--peach); } .lvl-success { color: var(--green); }
@@ -228,9 +316,30 @@ function stageCell(st){
   let title = (st.attempt?("attempt "+st.attempt):"") + (st.failure_category?(" · "+esc(st.failure_category)):"");
   if(st.tokens!=null) title += " · "+humanTokens(st.tokens)+" tok"+(st.cost_usd!=null?(" · "+usd(st.cost_usd)):"");
   const inner = title ? "<span title='"+esc(title)+"'>"+badge(st.status)+"</span>" : badge(st.status);
+  // Carry the selected run so registry mode confines /log to that run's logs
+  // root (a non-newest run's transcript lives under its own <db>.logs).
+  const runQ = sel ? "&run=" + encodeURIComponent(sel) : "";
   return st.output_path
-    ? "<td><a href='/log?path="+encodeURIComponent(st.output_path)+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
+    ? "<td><a href='/log?path="+encodeURIComponent(st.output_path)+runQ+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
     : "<td>"+inner+"</td>";
+}
+
+// Live sub-stage activity (Story 11.2-004): the latest progress milestone the
+// agent emitted for a story (11.1-002), shown as a second row under the story.
+// A small glyph hints the kind; absent activity (older runs / captured-mode
+// fallback) returns "" so the detail view degrades to the stage-level pipeline.
+const KIND_GLYPH = {agent_started:"▸", tool_use:"⚙", file_changed:"✎", test_run:"✓", message:"💬"};
+function activityRow(s){
+  const a = s.activity;
+  if(!a) return "";  // no streamed sub-stage data → stay stage-level
+  const glyph = KIND_GLYPH[a.kind] || "▸";
+  const stage = a.stage ? "<code>"+esc(a.stage)+"</code> " : "";
+  // Span every column but the leading story cell so the activity reads as a
+  // continuation of its story row. Update the colspan if columns change.
+  return "<tr class='substage'><td></td>"
+    + "<td colspan='7' class='small'><span class='kind'>"+glyph+"</span>"
+    + stage + esc(a.message)
+    + (a.ts ? " <span class='muted'>"+esc(a.ts)+"</span>" : "") + "</td></tr>";
 }
 
 async function tick(){
@@ -256,8 +365,12 @@ function renderRuns(runs){
       + (r.failed ? " &middot; " + esc(r.failed) + " failed" : "")
       + (r.total_tokens!=null ? " &middot; " + humanTokens(r.total_tokens) + " tok" : "")
       + (r.total_cost_usd!=null ? " &middot; " + usd(r.total_cost_usd) : "");
+    const repo = r.repo
+      ? "<div class='muted small'>📁 " + esc(String(r.repo).split(/[\\\\/]/).pop()) + "</div>"
+      : "";
     return "<div class='run "+(sel===r.id?"active":"")+"' data-run='"+esc(r.id)+"'>"
       + badge(r.status) + " <code>" + esc(r.id.slice(0,8)) + "</code>"
+      + repo
       + "<div class='muted small'>" + sub + "</div>"
       + "<div class='muted small'>" + esc(r.started_at||"") + "</div></div>";
   }).join("");
@@ -321,7 +434,8 @@ function renderMain(d){
     + "<td>"+badge(s.status)+bug+"</td>"
     + stageCells
     + "<td>"+pr+"</td>"
-    + "<td class='muted small'>"+tok+"</td></tr>";
+    + "<td class='muted small'>"+tok+"</td></tr>"
+    + activityRow(s);
   }).join("");
   document.getElementById("stories").innerHTML = rows
     ? "<table><tr><th>story</th><th>status</th><th>build</th><th>QA</th>"
@@ -338,7 +452,21 @@ document.getElementById("runs").addEventListener("click", e => {
   sel = el.dataset.run || null;  // "" → Live
   tick();
 });
-tick(); setInterval(tick, 2500);
+
+// Live transport: subscribe to the server's SSE stream and refetch on each
+// pushed "change". EventSource reconnects on its own, and tick() re-renders the
+// whole snapshot, so a dropped connection resumes without duplicated rows. If
+// EventSource is unavailable, fall back to gentle polling.
+function connectStream(){
+  if(!("EventSource" in window)){ setInterval(tick, 2500); return; }
+  const es = new EventSource("/api/stream");
+  es.addEventListener("change", tick);
+  es.addEventListener("error", () => {
+    document.getElementById("updated").textContent = "reconnecting…";
+  });
+}
+tick();          // immediate first paint
+connectStream(); // then live updates (the stream's initial change repaints too)
 </script>
 </body>
 </html>"""
@@ -366,30 +494,147 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parts = urlsplit(self.path)
         path = parts.path
-        ledger = Ledger(self.server.db_path)
+        query = parse_qs(parts.query)
+        run = query.get("run", [None])[0] or self.server.run_id
         if path == "/":
             # Inject the controller version into the brand bar (constant per
             # process; escaped though it comes from trusted package metadata).
             page = _PAGE.replace("__SDLC_VERSION__", html.escape(f"v{__version__}"))
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         elif path in ("/api/status", "/status.json"):
-            run = parse_qs(parts.query).get("run", [None])[0] or self.server.run_id
-            snap = status_snapshot(ledger, run)
-            snap["pr_base"] = self.server.project_url
-            snap["project"] = {"name": self.server.project_name, "url": self.server.project_url}
-            self._json(snap)
+            if self.server.registry is not None:
+                self._json(self._registry_status(run))
+            else:
+                snap = status_snapshot(Ledger(self.server.db_path), run)
+                snap["pr_base"] = self.server.project_url
+                snap["project"] = {
+                    "name": self.server.project_name,
+                    "url": self.server.project_url,
+                }
+                self._json(snap)
         elif path == "/api/runs":
-            self._json(ledger.list_runs())
+            if self.server.registry is not None:
+                self._json(_registry_runs_view(self.server.registry))
+            else:
+                self._json(Ledger(self.server.db_path).list_runs())
+        elif path == "/api/stream":
+            self._serve_stream()
         elif path == "/log":
-            self._serve_log(parse_qs(parts.query).get("path", [""])[0])
+            self._serve_log(query.get("path", [""])[0], run)
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
-    def _serve_log(self, requested: str) -> None:
-        """Serve a transcript file, but only one resolving inside the logs root."""
-        root = self.server.logs_root
+    # --- registry-discovery mode helpers -----------------------------------
+
+    def _resolve_run(self, run_id: str | None) -> RunRecord | None:
+        """The registry record for ``run_id``, or the newest run when unset.
+
+        Returns None when the id is unknown or the registry is empty — the
+        caller then renders "no run" rather than a hollow snapshot.
+        """
+        records = self.server.registry.records()
+        if run_id:
+            return next((r for r in records if r.run_id == run_id), None)
+        if not records:
+            return None
+        return max(records, key=lambda r: (r.started_at or ""))
+
+    def _registry_status(self, run_id: str | None) -> dict:
+        """Status snapshot resolved through the registry to the run's own ledger.
+
+        Per-run isolation: each run reads its registered ``db`` path, so two
+        runs in two repos never bleed into one another's detail view.
+        """
+        rec = self._resolve_run(run_id)
+        if rec is None:
+            return {
+                "db": None,
+                "run": None,
+                "counts": dict(_EMPTY_COUNTS),
+                "stories": [],
+                "events": [],
+                "pr_base": None,
+                "project": {"name": None, "url": None},
+            }
+        snap = status_snapshot(Ledger(rec.db), rec.run_id)
+        project_url = git_project_url(Path(rec.db).parent)
+        snap["pr_base"] = project_url
+        snap["project"] = {"name": _project_name(project_url, Path(rec.db)), "url": project_url}
+        return snap
+
+    # --- live auto-refresh transport (Story 11.2-003) ----------------------
+
+    def _sse_write(self, text: str) -> bool:
+        """Write one SSE chunk; return False once the client has gone away."""
+        try:
+            self.wfile.write(text.encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
+
+    def _serve_stream(self) -> None:
+        """Server-Sent Events: push a ``change`` event when the ledger advances.
+
+        Polls the cheap change token (:func:`_change_token`) on a short interval
+        and emits an SSE ``change`` event carrying the new token whenever it
+        moves; the browser then refetches ``/api/runs`` + ``/api/status`` (the
+        same idempotent render it already does), so a reconnect never duplicates
+        rows. When idle it emits only a heartbeat comment, keeping CPU and
+        traffic negligible. Runs in the handler's own thread
+        (``ThreadingHTTPServer``), so multiple browser tabs each get an
+        independent stream; the loop exits as soon as the client disconnects.
+        """
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            # Defeat proxy/response buffering so events arrive as they are sent.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+        poll = getattr(self.server, "sse_poll_interval", _SSE_POLL_INTERVAL)
+        heartbeat = getattr(self.server, "sse_heartbeat_interval", _SSE_HEARTBEAT_INTERVAL)
+        # Tell the browser's EventSource how soon to retry if the stream drops.
+        if not self._sse_write(f"retry: {max(1, int(poll * 1000))}\n\n"):
+            return
+
+        last_token: str | None = None
+        idle = 0.0
+        while not getattr(self.server, "_sse_stop", False):
+            token = _change_token(self.server)
+            if token != last_token:
+                last_token = token
+                if not self._sse_write(f"event: change\ndata: {token}\n\n"):
+                    return
+                idle = 0.0
+            else:
+                idle += poll
+                if idle >= heartbeat:
+                    if not self._sse_write(": heartbeat\n\n"):
+                        return
+                    idle = 0.0
+            time.sleep(poll)
+
+    def _serve_log(self, requested: str, run_id: str | None = None) -> None:
+        """Serve a transcript file, but only one resolving inside the logs root.
+
+        In registry-discovery mode the logs root is the selected run's own
+        ``<db>.logs`` directory, keeping the path confinement per-run.
+        """
+        if self.server.registry is not None:
+            rec = self._resolve_run(run_id)
+            root = Path(f"{rec.db}.logs").resolve() if rec is not None else None
+        else:
+            root = self.server.logs_root
+        if root is None:
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
         try:
             target = Path(requested).resolve()
             target.relative_to(root)  # raises ValueError if outside the root
@@ -401,16 +646,32 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(
-    db_path: str | Path,
+    db_path: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8787,
     run_id: str | None = None,
+    registry: Registry | None = None,
 ) -> ThreadingHTTPServer:
-    """Build (but do not start) the dashboard server bound to ``host:port``."""
+    """Build (but do not start) the dashboard server bound to ``host:port``.
+
+    With a ``db_path`` the server runs in single-repo mode (the historical
+    behaviour): one ledger, one runs browser. Without one it runs in
+    registry-discovery mode — it reads the host-level registry to list every
+    run across repos and resolves each run's own ledger on demand.
+    """
     server = ThreadingHTTPServer((host, port), _Handler)
+    server.run_id = run_id  # type: ignore[attr-defined]
+    if db_path is None:
+        # Registry-discovery mode: no single ledger; project/logs resolve per run.
+        server.registry = registry if registry is not None else Registry()  # type: ignore[attr-defined]
+        server.db_path = None  # type: ignore[attr-defined]
+        server.project_url = None  # type: ignore[attr-defined]
+        server.project_name = None  # type: ignore[attr-defined]
+        server.logs_root = None  # type: ignore[attr-defined]
+        return server
+    server.registry = None  # type: ignore[attr-defined]
     db_path = Path(db_path)
     server.db_path = db_path  # type: ignore[attr-defined]
-    server.run_id = run_id  # type: ignore[attr-defined]
     # Resolve the project's GitHub web base + a repo label once (from the repo
     # holding the ledger): used for PR links and the header. None when not a git repo.
     server.project_url = git_project_url(db_path.parent)  # type: ignore[attr-defined]
@@ -422,14 +683,19 @@ def make_server(
 
 
 def serve(
-    db_path: str | Path,
+    db_path: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8787,
     run_id: str | None = None,
     open_browser: bool = False,
+    registry: Registry | None = None,
 ) -> None:
-    """Run the dashboard until interrupted. Prints the URL; optionally opens it."""
-    server = make_server(db_path, host, port, run_id)
+    """Run the dashboard until interrupted. Prints the URL; optionally opens it.
+
+    With no ``db_path`` it serves in registry-discovery mode, listing runs from
+    the host-level registry across repos.
+    """
+    server = make_server(db_path, host, port, run_id, registry)
     url = f"http://{host}:{port}"
     pf = _pidfile(host, port)
     pf.write_text(str(os.getpid()))
@@ -444,7 +710,8 @@ def serve(
     except ValueError:
         pass  # not the main thread (e.g. under test) — skip
 
-    print(f"sdlc dashboard → {url}  (ledger: {db_path}; Ctrl-C to stop)")
+    source = f"ledger: {db_path}" if db_path is not None else "registry discovery"
+    print(f"sdlc dashboard → {url}  ({source}; Ctrl-C to stop)")
     if open_browser:
         webbrowser.open(url)
     try:
