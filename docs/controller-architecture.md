@@ -49,11 +49,25 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    merge` (coverage is skipped under `--skip-coverage`). Each stage dispatches
    an agent and the response is validated against its schema *before* the next
    stage runs.
-5. **Bugfix loop** — a stage failure (agent FAILED status, dispatch error, or
-   **schema-invalid output**) routes to the bugfix agent. A fix is confirmed
-   only when `fix_status == FIXED` and `tests_passing` is true; the stage is
-   then retried. Bounded to `MAX_BUGFIX_ATTEMPTS` (2) per story.
-6. **Dependency blocking** — if a dependency ends FAILED/BLOCKED/SKIPPED, the
+5. **Envelope re-ask** — a stage that exits cleanly but omits or malforms its
+   `<<<RESULT_JSON>>>` block (a `ContractError`) usually means the agent did good
+   work and failed only to wrap it. Before any heavier recovery, the controller
+   issues a bounded **envelope-only re-ask** (`render_envelope_reask_prompt` →
+   `_reask_envelope`): it re-prompts the *same* stage agent to inspect the branch
+   it already built and emit just the result block — explicitly **not** to redo
+   the work or create new commits (R10). On a schema-valid, success-reporting
+   reply the stage is marked DONE and the run proceeds exactly as if the agent
+   had emitted the block the first time. The attempt is recorded as a `reask`
+   stage row and logged to the ledger `events` (Story 12.1-001).
+6. **Bugfix loop** — a stage failure (agent FAILED status, dispatch error, or
+   **schema-invalid output**), or an envelope re-ask that still fails, routes to
+   the bugfix agent. A fix is confirmed only when `fix_status == FIXED` and
+   `tests_passing` is true; the stage is then retried. Bounded to
+   `MAX_BUGFIX_ATTEMPTS` (2) per story. Only once this bounded recovery is
+   exhausted is the story parked: `NEEDS_ATTENTION` when committed work exists on
+   `feature/<story>` (preserved for manual push/MR, R10), otherwise `FAILED`
+   (`_exhausted_status`).
+7. **Dependency blocking** — if a dependency ends FAILED/BLOCKED/SKIPPED, the
    dependent story is marked BLOCKED and never dispatched.
 
 ## Why schema validation is the safety boundary
@@ -61,9 +75,12 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
 Every agent returns a `<<<RESULT_JSON>>> … <<<END_RESULT>>>` block. The
 controller parses and validates it against the schemas bundled in the `sdlc`
 package (`controller/src/sdlc/schemas/`). A missing or
-malformed block raises a `ContractError`, which the state machine treats
-exactly like a build failure — the next stage never runs on garbage. This is
-the deterministic-control-flow guarantee Epic-07 was created for.
+malformed block raises a `ContractError` — the next stage never runs on garbage.
+This is the deterministic-control-flow guarantee Epic-07 was created for. Rather
+than dead-end such a stage, the state machine first attempts the bounded
+envelope re-ask described above (step 5) and then the bugfix loop, so a single
+malformed agent message recovers automatically in the common case instead of
+stranding otherwise-good work for manual rescue (Story 12.1-001).
 
 ## The ledger
 

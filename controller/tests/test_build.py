@@ -837,8 +837,13 @@ def test_fenced_agent_output_builds_successfully(tmp_path) -> None:
     assert result.story_status["99.1-001"] == "DONE"
 
 
-def test_contract_error_with_commit_marks_needs_attention(tmp_path, monkeypatch) -> None:
-    """Unparseable result + an existing story commit ⇒ NEEDS_ATTENTION, no bugfix."""
+def test_contract_error_with_commit_recovers_then_parks(tmp_path, monkeypatch) -> None:
+    """Unparseable result + a story commit: re-ask + bugfix are tried, then parked.
+
+    Story 12.1-001 changes the old straight-to-NEEDS_ATTENTION behaviour: an
+    envelope re-ask and the bounded bugfix path run first; only when both are
+    exhausted is committed work parked NEEDS_ATTENTION (R10 preserved).
+    """
     monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
     disp = _RaisingDispatcher(raise_on="build")
     db = tmp_path / "l.db"
@@ -852,9 +857,9 @@ def test_contract_error_with_commit_marks_needs_attention(tmp_path, monkeypatch)
     assert result.needs_attention == 1
     assert result.failed == 0
     assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
-    # The committed work is preserved — no bugfix re-run from scratch.
-    assert all(agent != "bugfix" for agent, _ in disp.calls)
-    # A recoverable event names the situation for the operator.
+    # Recovery was attempted before parking: both an envelope re-ask and the
+    # bounded bugfix path ran (AC1, AC2).
+    assert any(agent == "bugfix" for agent, _ in disp.calls)
     conn = _open(db)
     msgs = [
         r[0]
@@ -862,7 +867,9 @@ def test_contract_error_with_commit_marks_needs_attention(tmp_path, monkeypatch)
             "SELECT message FROM events WHERE story_id='99.1-001'"
         ).fetchall()
     ]
-    assert any("unparseable" in m for m in msgs)
+    # Each recovery attempt is recorded (AC3) and the operator sees the situation.
+    assert any("envelope" in m for m in msgs)
+    assert any("committed" in m for m in msgs)
 
 
 def test_contract_error_without_commit_still_fails(tmp_path, monkeypatch) -> None:
@@ -880,6 +887,155 @@ def test_contract_error_without_commit_still_fails(tmp_path, monkeypatch) -> Non
     assert result.failed == 1
     assert result.story_status["99.1-001"] == "FAILED"
     assert any(agent == "bugfix" for agent, _ in disp.calls)
+
+
+# ---------------------------------------------------------------------------
+# Story 12.1-001 — recover a missing/malformed result envelope before parking
+# ---------------------------------------------------------------------------
+
+# The verbatim phrase the envelope re-ask prompt carries, used by the test
+# dispatcher to tell a re-ask apart from the original stage dispatch.
+_REASK_SENTINEL = "envelope-only re-ask"
+
+
+class _EnvelopeReaskDispatcher:
+    """An agent that omits the result envelope on the real stage but emits a
+    valid one when re-asked for the envelope only (Story 12.1-001 AC1/AC4).
+
+    The original stage dispatch raises ``ResultBlockError`` (missing envelope);
+    the envelope-only re-ask — recognised by the sentinel phrase its prompt
+    carries — returns a schema-valid, success-reporting result, so the stage is
+    recovered without ever entering the bugfix path. ``reask_succeeds=False``
+    makes the re-ask fail too, so recovery falls through to the bugfix path.
+    """
+
+    def __init__(
+        self,
+        stage: str = "build",
+        reask_succeeds: bool = True,
+        recover_after_bugfix: bool = False,
+    ) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.stage = stage
+        self.reask_succeeds = reask_succeeds
+        self.recover_after_bugfix = recover_after_bugfix
+        self._bugfixed = False
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.contracts import ResultBlockError
+        from sdlc.dispatch import AgentResult
+
+        is_reask = _REASK_SENTINEL in prompt
+        self.calls.append(
+            (agent_type, getattr(story, "id", ""), "reask" if is_reask else "stage")
+        )
+        if agent_type == "bugfix":
+            self._bugfixed = True
+        if agent_type == self.stage and not is_reask:
+            # The stage stays broken until a bugfix has run (when enabled).
+            if not (self.recover_after_bugfix and self._bugfixed):
+                raise ResultBlockError("missing <<<RESULT_JSON>>> marker")
+        if agent_type == self.stage and is_reask and not self.reask_succeeds:
+            raise ResultBlockError("re-ask still missing <<<RESULT_JSON>>> marker")
+        return AgentResult(
+            agent_type=agent_type, data=_default_payload(agent_type, story), raw=""
+        )
+
+
+def test_missing_envelope_recovered_by_reask(tmp_path) -> None:
+    """A stage that omits its envelope is recovered by a re-ask — no bugfix (AC1/AC4)."""
+    disp = _EnvelopeReaskDispatcher(stage="build", reask_succeeds=True)
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.completed == 1
+    assert result.failed == 0
+    assert result.needs_attention == 0
+    assert result.story_status["99.1-001"] == "DONE"
+    # The envelope re-ask ran; the heavier bugfix path was never needed (AC1).
+    assert any(kind == "reask" for _, _, kind in disp.calls)
+    assert all(agent != "bugfix" for agent, _, _ in disp.calls)
+    # The recovery attempt is recorded in the ledger events (AC3).
+    conn = _open(db)
+    msgs = [
+        r[0]
+        for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("re-ask" in m for m in msgs)
+
+
+def test_reask_failure_falls_through_to_bugfix(tmp_path, monkeypatch) -> None:
+    """When the re-ask fails too, recovery routes through the bugfix path (AC2)."""
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    disp = _EnvelopeReaskDispatcher(
+        stage="build", reask_succeeds=False, recover_after_bugfix=True
+    )
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    # The re-ask is tried first; when it fails, the bounded bugfix path runs and
+    # the retried stage then succeeds → the story completes, not stranded (AC2).
+    assert any(kind == "reask" for _, _, kind in disp.calls)
+    assert any(agent == "bugfix" for agent, _, _ in disp.calls)
+    # The re-ask precedes the bugfix for the same failure (cheaper attempt first).
+    kinds = [(agent, kind) for agent, _, kind in disp.calls]
+    assert kinds.index(("build", "reask")) < kinds.index(("bugfix", "stage"))
+    assert result.story_status["99.1-001"] == "DONE"
+
+
+def test_envelope_recovery_records_each_attempt(tmp_path, monkeypatch) -> None:
+    """Every recovery attempt (re-ask + bugfix) is logged to the ledger (AC3)."""
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    disp = _EnvelopeReaskDispatcher(stage="build", reask_succeeds=False)
+    db = tmp_path / "l.db"
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    # A 'reask' stage attempt row exists and an event names the re-ask.
+    stages = [
+        r[0]
+        for r in conn.execute(
+            "SELECT stage_name FROM stages WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert "reask" in stages
+    msgs = [
+        r[0]
+        for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("re-ask" in m for m in msgs)
+
+
+def test_envelope_reask_prompt_is_envelope_only() -> None:
+    """The re-ask prompt asks only for the result block — not a rebuild (AC1)."""
+    from sdlc.build import render_envelope_reask_prompt
+    from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
+
+    story = _story("99.1-001")
+    prompt = render_envelope_reask_prompt("build", story, BuildOptions(), None)
+    assert _REASK_SENTINEL in prompt
+    assert RESULT_START_MARKER in prompt
+    assert RESULT_END_MARKER in prompt
+    # It must steer the agent away from redoing the work / new commits.
+    assert "build-agent-response.schema.json" in prompt
 
 
 def test_story_commit_exists_no_git_is_false(tmp_path) -> None:

@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
 
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
-from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER, ContractError
+from sdlc.contracts import (
+    AGENT_SCHEMAS,
+    RESULT_END_MARKER,
+    RESULT_START_MARKER,
+    ContractError,
+)
 from sdlc.dispatch import AgentDispatchError, AgentResult, dispatch_agent
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
 from sdlc.registry import Registry, RunRecord
@@ -1243,6 +1248,32 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
     )
 
 
+def render_envelope_reask_prompt(
+    stage: str, story: Story, opts: BuildOptions, pr_number: int | None
+) -> str:
+    """Re-prompt the ``stage`` agent to emit ONLY its result block (Story 12.1-001).
+
+    A missing/malformed result envelope usually means the agent finished the work
+    but failed only to wrap it in the ``<<<RESULT_JSON>>>`` markers. This is a
+    cheap, bounded **envelope-only re-ask**: it tells the agent the work is
+    already done and asks it to inspect the current branch state and report the
+    result block — explicitly NOT to redo the work or create new commits, so
+    committed work is preserved (R10). It validates against the same stage schema
+    as the original dispatch.
+    """
+    schema = AGENT_SCHEMAS[stage]
+    pr_hint = f" (PR #{pr_number})" if pr_number is not None else ""
+    return (
+        f"You already completed the '{stage}' stage for story {story.id}: "
+        f"{story.title}{pr_hint}, but your previous reply omitted or malformed "
+        f"its {RESULT_START_MARKER} result block. This is an envelope-only re-ask.\n"
+        "Do NOT redo the work or create new commits. Inspect the current state of "
+        f"branch feature/{story.id} (git log/status, the open PR if any) and report "
+        "what you already did as the result block below.\n"
+        + _result_wrapper(schema)
+    )
+
+
 # ---------------------------------------------------------------------------
 # The state machine
 # ---------------------------------------------------------------------------
@@ -1613,22 +1644,37 @@ def _run_story(
                 run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
             )
 
-            # R10: never discard committed work. If the result was unparseable
-            # (contract error) but the agent already committed the story branch,
-            # preserve it for manual push/MR rather than bugfixing from scratch.
-            if kind == "contract" and story_commit_exists(story.id):
-                ledger.event_log(
-                    run_id,
-                    story.id,
-                    "warn",
-                    "controller",
-                    f"work committed on feature/{story.id} but result block "
-                    "unparseable — preserved for manual push/MR (no bugfix re-run)",
+            # Story 12.1-001: a missing/malformed result envelope (contract
+            # error) usually means the agent did good work but failed only to
+            # emit the result block. Before any heavier recovery, issue a cheap,
+            # bounded envelope-only re-ask (AC1). On success the stage is treated
+            # as DONE and the run proceeds exactly as if the agent had emitted the
+            # block the first time (AC4); committed work is never discarded (R10).
+            if kind == "contract":
+                bugfix_seq += 1
+                rpath = logs_dir / f"{story.id}-reask-{stage}-{bugfix_seq}.log"
+                ok_r, result_r = _reask_envelope(
+                    stage, story, opts, pr_number, ledger, run_id, dispatch,
+                    rpath, bugfix_seq,
                 )
-                return "NEEDS_ATTENTION"
+                if ok_r:
+                    ledger.stage_finish(
+                        run_id, story.id, stage, attempt, "DONE",
+                        output_path=str(rpath),
+                    )
+                    _record_stage_usage(
+                        ledger, run_id, story.id, stage, attempt, result_r
+                    )
+                    pr_number = _extract_pr(result_r, pr_number)
+                    if pr_number is not None:
+                        ledger.set_story_pr(run_id, story.id, pr_number)
+                    break
 
             if bugfix_attempts >= MAX_BUGFIX_ATTEMPTS:
-                return "FAILED"
+                # Recovery exhausted (AC2). R10: never discard committed work —
+                # if the agent already committed the story branch, park it for
+                # manual push/MR rather than reporting an outright failure.
+                return _exhausted_status(kind, story.id, ledger, run_id)
 
             bugfix_attempts += 1
             bugfix_seq += 1
@@ -1636,11 +1682,32 @@ def _run_story(
             if not _run_bugfix(
                 story, stage, failure, ledger, run_id, dispatch, bpath, bugfix_seq
             ):
-                return "FAILED"
+                return _exhausted_status(kind, story.id, ledger, run_id)
             # Bugfix succeeded — retry the same stage as a new attempt.
             attempt += 1
 
     return "DONE"
+
+
+def _exhausted_status(
+    kind: str, story_id: str, ledger: Ledger, run_id: str
+) -> str:
+    """Terminal status once bounded recovery is exhausted (Story 12.1-001 AC2).
+
+    R10: a contract failure (missing/malformed envelope) whose agent already
+    committed the story branch is parked ``NEEDS_ATTENTION`` for manual push/MR
+    — committed work is never discarded. Any other exhausted failure (or an
+    uncommitted contract failure) is an outright ``FAILED``, unchanged from
+    before. The parking decision is recorded in the ledger events.
+    """
+    if kind == "contract" and story_commit_exists(story_id):
+        ledger.event_log(
+            run_id, story_id, "warn", "controller",
+            f"recovery exhausted but work committed on feature/{story_id} — "
+            "preserved for manual push/MR (no further re-run)",
+        )
+        return "NEEDS_ATTENTION"
+    return "FAILED"
 
 
 def _make_progress_sink(
@@ -1788,6 +1855,70 @@ def _extract_pr(result: AgentResult | None, current: int | None) -> int | None:
         return current
     pr = result.data.get("pr_number")
     return pr if isinstance(pr, int) else current
+
+
+def _reask_envelope(
+    stage: str,
+    story: Story,
+    opts: BuildOptions,
+    pr_number: int | None,
+    ledger: Ledger,
+    run_id: str,
+    dispatch: Dispatcher,
+    transcript_path: Path | None,
+    seq: int,
+) -> tuple[bool, AgentResult | None]:
+    """Bounded envelope-only re-ask after a missing/malformed result block (12.1-001).
+
+    The agent likely did good ``stage`` work but failed only to emit a valid
+    ``<<<RESULT_JSON>>>`` block. Before any heavier recovery, re-prompt the same
+    stage agent to emit just the result block for the work it already did. This
+    is cheaper than a full stage re-run and never discards committed work (R10).
+
+    Returns ``(ok, result)``. ``ok`` is True only when the re-ask yields a
+    schema-valid response that reports success for ``stage`` — then the caller
+    treats the stage as DONE and proceeds (AC4). A dispatch/contract error or a
+    non-success status is a failed recovery (``ok=False``), not fatal: the caller
+    falls through to the bugfix path (AC2). The attempt is recorded as a
+    ``reask`` stage row and logged to the ledger events (AC3).
+    """
+    ledger.stage_start(run_id, story.id, "reask", seq)
+    out = str(transcript_path) if transcript_path is not None else ""
+    ledger.event_log(
+        run_id, story.id, "warn", "controller",
+        f"{stage} result envelope missing/malformed — issuing envelope-only re-ask",
+    )
+    prompt = render_envelope_reask_prompt(stage, story, opts, pr_number)
+    sink = _make_progress_sink(ledger, run_id, story.id, "reask", seq)
+    try:
+        result = dispatch(
+            stage, prompt, story=story, transcript_path=transcript_path,
+            on_progress=sink,
+        )
+    except (ContractError, AgentDispatchError) as exc:
+        ledger.stage_finish(run_id, story.id, "reask", seq, "FAILED", "reask-error", out)
+        ledger.event_log(
+            run_id, story.id, "error", "controller", f"envelope re-ask failed: {exc}"
+        )
+        return False, None
+
+    if not _stage_succeeded(stage, result.data):
+        ledger.stage_finish(
+            run_id, story.id, "reask", seq, "FAILED", "reask-reported", out
+        )
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"envelope re-ask returned a non-success {stage} status",
+        )
+        return False, result
+
+    ledger.stage_finish(run_id, story.id, "reask", seq, "DONE", output_path=out)
+    _record_stage_usage(ledger, run_id, story.id, "reask", seq, result)
+    ledger.event_log(
+        run_id, story.id, "success", "controller",
+        f"envelope re-ask recovered the {stage} result block",
+    )
+    return True, result
 
 
 def _run_bugfix(
