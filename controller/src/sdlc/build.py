@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
 
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
+from sdlc.commitlint import lint_commit_message, load_commitlint_config
 from sdlc.contracts import (
     AGENT_SCHEMAS,
     RESULT_END_MARKER,
@@ -31,6 +32,11 @@ from sdlc.registry import Registry, RunRecord
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
 # "max 2 bugfix iterations" rule (Step 5d2) so behaviour matches the playbook.
 MAX_BUGFIX_ATTEMPTS = 2
+
+# Maximum commit-message re-asks after a commitlint violation (Story 12.2-002).
+# Bounded like the bugfix loop: try to get a compliant header before the work
+# reaches a PR, but never spin forever over a cosmetic message issue.
+MAX_COMMITLINT_REASK = 2
 
 # Canonical ledger DDL. Kept in sync with state/schema.sql (Epic-04). Embedded
 # here so the controller can create a ledger even when installed standalone via
@@ -1274,6 +1280,37 @@ def render_envelope_reask_prompt(
     )
 
 
+def render_commit_lint_reask_prompt(
+    stage: str, story: Story, message: str, violations: list[str]
+) -> str:
+    """Re-prompt the ``stage`` agent to amend a commitlint-violating commit (12.2-002).
+
+    The agent already committed compliant *code*; only the commit *message*
+    breaks the repo's commitlint rules and would fail the commit-format CI job at
+    PR time. This asks it to ``git commit --amend`` the HEAD commit on the story
+    branch into a compliant header — explicitly NOT to change code or add new
+    commits, so the work is preserved (R10) — then re-emit the ``stage`` result
+    block with the amended ``commit_sha``. Used for any commit-authoring stage
+    (build / coverage / bugfix), so the result block is validated against that
+    stage's own schema.
+    """
+    bullets = "\n".join(f"  - {v}" for v in violations)
+    return (
+        f"The commit you authored on branch feature/{story.id} for the '{stage}' "
+        f"stage of story {story.id}: {story.title} violates the repo's commitlint "
+        "rules and will fail the commit-format CI job at PR time.\n\n"
+        f"Current commit message:\n{message}\n\n"
+        f"Violations:\n{bullets}\n\n"
+        "Amend ONLY the commit message to be commitlint-compliant: "
+        "`git commit --amend` the HEAD commit on the story branch into a "
+        "conventional header (`type(scope): subject`) with a lower-case subject, "
+        "a header of at most 72 characters, and an allowed type. Do NOT change any "
+        f"code or create new commits. Then re-emit the '{stage}' result block with "
+        "the amended commit_sha.\n"
+        + _result_wrapper(AGENT_SCHEMAS[stage])
+    )
+
+
 # ---------------------------------------------------------------------------
 # The state machine
 # ---------------------------------------------------------------------------
@@ -1357,6 +1394,24 @@ def story_commit_exists(story_id: str, root: Path | None = None) -> bool:
         return out.returncode == 0 and count.isdigit() and int(count) > 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def _commit_message(ref: str, root: Path | None = None) -> str | None:
+    """The full commit message of ``ref``'s tip, or ``None`` if unreadable.
+
+    Used to lint an agent-authored commit against commitlint (Story 12.2-002).
+    Returns ``None`` — never raises — when git is absent, there is no repo, or the
+    ref does not exist, so a commit-lint check degrades to a no-op exactly like
+    :func:`story_commit_exists`.
+    """
+    root = root or Path.cwd()
+    try:
+        out = _git(root, "log", "-1", "--format=%B", ref)
+        if out.returncode != 0:
+            return None
+        return out.stdout.rstrip("\n")
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _registry_register(
@@ -1493,11 +1548,15 @@ def run_build(
     # --- Phase 2: cohort-by-cohort execution ---------------------------------
     for cohort in cohorts:
         for story in cohort:
-            # A story whose dependency failed cannot proceed.
+            # A story whose dependency did not cleanly finish cannot proceed.
+            # NEEDS_ATTENTION counts as not-done: the dependency's work is
+            # committed but unmerged (parked for manual push/MR or a
+            # commit-message fix), so a dependent built on top of it would race
+            # incomplete work — block it like any other non-DONE dependency.
             blocked_by = [
                 dep
                 for dep in story.dependencies
-                if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED"}
+                if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED", "NEEDS_ATTENTION"}
             ]
             if blocked_by:
                 status[story.id] = "BLOCKED"
@@ -1632,6 +1691,20 @@ def _run_story(
                 pr_number = _extract_pr(result, pr_number)
                 if pr_number is not None:
                     ledger.set_story_pr(run_id, story.id, pr_number)
+                # Story 12.2-002: lint the commit a commit-authoring stage just
+                # produced against commitlint before it can reach a PR; bounded
+                # amend re-ask on violation, no-op when there is no config /
+                # nothing to lint. Build and coverage both author commits on the
+                # story branch; review/merge do not. If the message is still
+                # non-compliant after the bounded re-asks, park the story rather
+                # than advance a known-non-compliant commit to review/merge/PR
+                # (work preserved on the branch, R10).
+                if stage in ("build", "coverage"):
+                    bugfix_seq, lint_ok = _lint_stage_commit(
+                        stage, story, ledger, run_id, dispatch, logs_dir, bugfix_seq
+                    )
+                    if not lint_ok:
+                        return "NEEDS_ATTENTION"
                 break
 
             # Stage failed: record it, then attempt a bounded bugfix.
@@ -1668,6 +1741,17 @@ def _run_story(
                     pr_number = _extract_pr(result_r, pr_number)
                     if pr_number is not None:
                         ledger.set_story_pr(run_id, story.id, pr_number)
+                    # Story 12.2-002: an envelope-recovered stage committed work
+                    # just like a first-pass success — lint its commit too, or
+                    # an envelope-only failure would smuggle a non-compliant
+                    # header straight to the PR. Park on exhausted re-asks (R10).
+                    if stage in ("build", "coverage"):
+                        bugfix_seq, lint_ok = _lint_stage_commit(
+                            stage, story, ledger, run_id, dispatch, logs_dir,
+                            bugfix_seq,
+                        )
+                        if not lint_ok:
+                            return "NEEDS_ATTENTION"
                     break
 
             if bugfix_attempts >= MAX_BUGFIX_ATTEMPTS:
@@ -1683,6 +1767,13 @@ def _run_story(
                 story, stage, failure, ledger, run_id, dispatch, bpath, bugfix_seq
             ):
                 return _exhausted_status(kind, story.id, ledger, run_id)
+            # Story 12.2-002: the bugfix agent authors a commit too — lint its
+            # message and amend early. This is best-effort (no park): the stage
+            # is about to be retried, and that retry's own success-time lint is
+            # the terminal gate that parks a still-non-compliant commit.
+            bugfix_seq, _ = _lint_stage_commit(
+                "bugfix", story, ledger, run_id, dispatch, logs_dir, bugfix_seq
+            )
             # Bugfix succeeded — retry the same stage as a new attempt.
             attempt += 1
 
@@ -1919,6 +2010,97 @@ def _reask_envelope(
         f"envelope re-ask recovered the {stage} result block",
     )
     return True, result
+
+
+def _lint_stage_commit(
+    stage: str,
+    story: Story,
+    ledger: Ledger,
+    run_id: str,
+    dispatch: Dispatcher,
+    logs_dir: Path,
+    seq: int,
+) -> tuple[int, bool]:
+    """Lint a stage's commit against commitlint and re-ask on violation (12.2-002).
+
+    After any commit-authoring stage (build / coverage / bugfix) succeeds,
+    validate the HEAD commit message of ``feature/<story_id>`` against the repo's
+    commitlint rules. When the message violates them, issue a bounded
+    message-only re-ask (``git commit --amend`` by the *same* ``stage`` agent) so
+    a non-compliant header never reaches a PR and fails the commit-format CI job.
+    Graceful no-op when the repo has no commitlint config, the commit can't be
+    read, or the message is already compliant — then there is no behaviour
+    change.
+
+    Returns ``(seq, compliant)``. ``seq`` is the (possibly advanced) attempt
+    counter so the caller keeps stage rows unique. ``compliant`` is False only
+    when the message still violates commitlint after the bounded re-asks are
+    exhausted — the caller then **parks the story** rather than advancing a
+    known-non-compliant commit to a PR (the epic's "zero commitlint failures
+    reach a PR" guarantee). Committed work is never discarded (R10); the no-op
+    cases all report ``True``.
+    """
+    root = Path.cwd()
+    config = load_commitlint_config(root)
+    if config is None:
+        return seq, True  # No config → invent no rules (AC2).
+    ref = f"feature/{story.id}"
+    message = _commit_message(ref, root)
+    if message is None:
+        return seq, True  # Unreadable commit → degrade to a no-op.
+    violations = lint_commit_message(message, config)
+    if not violations:
+        return seq, True  # Compliant → no behaviour change (AC3).
+
+    attempt = 0
+    while violations and attempt < MAX_COMMITLINT_REASK:
+        attempt += 1
+        seq += 1
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"{stage} commit message violates commitlint "
+            f"({'; '.join(violations)}) — re-asking the {stage} agent to amend",
+        )
+        cpath = logs_dir / f"{story.id}-commitlint-{seq}.log"
+        ledger.stage_start(run_id, story.id, "commitlint", seq)
+        prompt = render_commit_lint_reask_prompt(stage, story, message, violations)
+        sink = _make_progress_sink(ledger, run_id, story.id, "commitlint", seq)
+        try:
+            result = dispatch(
+                stage, prompt, story=story, transcript_path=cpath, on_progress=sink,
+            )
+        except (ContractError, AgentDispatchError) as exc:
+            ledger.stage_finish(
+                run_id, story.id, "commitlint", seq, "FAILED",
+                "commitlint-error", str(cpath),
+            )
+            ledger.event_log(
+                run_id, story.id, "error", "controller",
+                f"commit-lint re-ask dispatch failed: {exc}",
+            )
+            break
+        _record_stage_usage(ledger, run_id, story.id, "commitlint", seq, result)
+        ledger.stage_finish(
+            run_id, story.id, "commitlint", seq, "DONE", output_path=str(cpath)
+        )
+        message = _commit_message(ref, root)
+        if message is None:
+            break
+        violations = lint_commit_message(message, config)
+
+    if violations:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"{stage} commit message still violates commitlint after {attempt} "
+            f"re-ask(s) ({'; '.join(violations)}) — parking for manual fix so a "
+            "non-compliant header never reaches the PR (work preserved)",
+        )
+        return seq, False
+    ledger.event_log(
+        run_id, story.id, "success", "controller",
+        f"{stage} commit message is now commitlint-compliant",
+    )
+    return seq, True
 
 
 def _run_bugfix(

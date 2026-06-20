@@ -67,8 +67,32 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    exhausted is the story parked: `NEEDS_ATTENTION` when committed work exists on
    `feature/<story>` (preserved for manual push/MR, R10), otherwise `FAILED`
    (`_exhausted_status`).
-7. **Dependency blocking** — if a dependency ends FAILED/BLOCKED/SKIPPED, the
-   dependent story is marked BLOCKED and never dispatched.
+7. **Commit-message lint** — after any **commit-authoring** stage succeeds
+   (build, coverage, a confirmed bugfix, and an *envelope-recovered* build/
+   coverage stage), the controller lints the HEAD commit of `feature/<story>`
+   against the repo's commitlint rules
+   (`load_commitlint_config` → `lint_commit_message`) so a non-compliant header
+   never reaches a PR and fails the `commit-format` CI job. On a violation it
+   issues a bounded **message-only re-ask** (`render_commit_lint_reask_prompt` →
+   `_lint_stage_commit`): the *same* stage agent `git commit --amend`s the header
+   into a compliant form — explicitly **not** changing code or adding commits
+   (R10) — bounded to `MAX_COMMITLINT_REASK` (2), with the re-ask validated
+   against that stage's own schema. It is a graceful no-op when the repo has no
+   commitlint config, the commit can't be read, or the message is already
+   compliant. If the message is **still** non-compliant once the bounded re-asks
+   are exhausted, the story is parked `NEEDS_ATTENTION` (the build/coverage
+   success gate) rather than advancing a known-non-compliant commit to
+   review/merge/PR — committed work is preserved on the branch (R10), upholding
+   the epic's "zero commitlint failures reach a PR" guarantee. (The mid-loop
+   lint of a *bugfix* commit is best-effort and does not park: that stage is
+   about to be retried, and the retry's own success-time lint is the terminal
+   gate.) Each attempt is a `commitlint` stage row, logged to the ledger
+   `events` (Story 12.2-002).
+8. **Dependency blocking** — if a dependency ends FAILED/BLOCKED/SKIPPED/
+   NEEDS_ATTENTION, the dependent story is marked BLOCKED and never dispatched.
+   NEEDS_ATTENTION counts as not-done: the dependency's work is committed but
+   unmerged (parked for manual push/MR or a commit-message fix), so a dependent
+   built on top of it would race incomplete work.
 
 ## Why schema validation is the safety boundary
 
