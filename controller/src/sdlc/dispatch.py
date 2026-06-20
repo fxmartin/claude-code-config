@@ -317,15 +317,38 @@ def _dispatch_streaming(
     drainer = threading.Thread(target=_drain_stderr, daemon=True)
     drainer.start()
 
+    # Watchdog: reading stdout line-by-line blocks, so a stalled agent (one that
+    # stops emitting but never closes stdout) would hang the read loop forever —
+    # the captured path's wall-clock guarantee (``subprocess.run(timeout=…)``)
+    # has no equivalent here unless we enforce it ourselves. A timer kills the
+    # child at the deadline; the kill closes stdout, the loop ends, and the run
+    # surfaces as a typed ``AgentDispatchError`` instead of hanging the build.
+    timed_out = threading.Event()
+
+    def _on_timeout() -> None:
+        timed_out.set()
+        proc.kill()
+
+    watchdog = threading.Timer(timeout, _on_timeout)
+    watchdog.daemon = True
+    watchdog.start()
+
     transcript = _StreamTranscript(transcript_path)
     raw_lines: list[str] = []
     result_event: dict[str, Any] | None = None
     try:
         if proc.stdin is not None:
+            # A killed child (watchdog) breaks the stdin pipe; tolerate that so
+            # the timeout surfaces below rather than as a raw BrokenPipeError.
             try:
                 proc.stdin.write(prompt)
+            except OSError:
+                pass
             finally:
-                proc.stdin.close()
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
         if proc.stdout is not None:
             for line in proc.stdout:
                 transcript.append(line)
@@ -333,19 +356,18 @@ def _dispatch_streaming(
                 event = _parse_stream_line(line)
                 if event is not None and event.get("type") == "result":
                     result_event = event
-        returncode = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        drainer.join(timeout=1)
+        returncode = proc.wait()
+    finally:
+        watchdog.cancel()
+
+    drainer.join(timeout=1)
+
+    if timed_out.is_set():
         transcript.append(f"\n--- TIMEOUT after {timeout}s ---\n")
         transcript.close()
         raise AgentDispatchError(
             f"{agent_type} agent timed out after {timeout}s"
-        ) from exc
+        )
 
     drainer.join(timeout=1)
     stderr = "".join(stderr_chunks)

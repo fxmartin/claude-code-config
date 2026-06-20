@@ -148,7 +148,11 @@ and flushed to the per-stage transcript
 (`.sdlc-state.db.logs/<run>/<story>-<stage>-<attempt>.log`) as it arrives, so
 `tail -f` on that file shows live activity within ~1 s instead of only when the
 stage finishes. stderr is drained on a background thread to avoid a pipe-buffer
-deadlock.
+deadlock. Because reading stdout line-by-line blocks, a watchdog timer enforces
+the wall-clock `timeout` the captured path got for free from
+`subprocess.run(timeout=…)`: a stalled agent is killed at the deadline, which
+closes stdout, ends the read loop, and surfaces as an `AgentDispatchError`
+instead of hanging the build.
 
 The terminal `result` event in the stream has the **same shape** as the old
 `--output-format json` envelope, so the controller captures it during the loop
