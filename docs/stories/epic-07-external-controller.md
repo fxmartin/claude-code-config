@@ -184,19 +184,19 @@ Epic-07 close they still print "not yet implemented":
 | `build` | ✅ Implemented | The path `/build-stories` shells out to. |
 | `validate` | ✅ Implemented | Schema validation of an agent response. |
 | `sync-check` | ✅ Implemented | Codex mirror submodule sync check (7.4-001). |
-| `init` | ⬜ Stub | Workspace/ledger scaffold. |
-| `resume` | ⬜ Stub | Crash-resume from ledger — see caveat below. |
-| `status` | ⬜ Stub | Show current run status. |
-| `state` | ⬜ Stub | Inspect the persisted state machine. |
-| `rollback` | ⬜ Stub | Roll a run back to a prior checkpoint. |
+| `init` | ⬜ Stub | Workspace/ledger scaffold — resolved in Story 10.2-001. |
+| `resume` | ✅ Implemented | Crash-resume from the ledger (Story 10.1-001). |
+| `status` | ✅ Implemented | Show current run status (read from the ledger). |
+| `state` | ✅ Implemented | Inspect the persisted state machine (Story 10.1-001). |
+| `rollback` | ⬜ Stub | Roll a run back to a prior checkpoint — Story 10.2-001. |
 
-**Resume caveat.** Story 7.3-001's acceptance criteria describe `build` reading
-"the SQLite ledger if a prior run is being resumed," and the build-stories skill
-repeats this. The dedicated `sdlc resume` verb is **not** wired up. The
-crash-resume capability that exists today lives in the Epic-04 bash tooling
-(`sdlc-state.sh`), not in the controller CLI. Implementing `resume`/`status` in
-the controller is tracked as follow-up work, not part of Epic-07's delivered
-scope.
+**Resume caveat (resolved by Epic-10).** Story 7.3-001's acceptance criteria
+describe `build` reading "the SQLite ledger if a prior run is being resumed," and
+the build-stories skill repeats this. At the Epic-07 close the dedicated
+`sdlc resume` verb was **not** wired up — crash-resume lived only in the Epic-04
+bash tooling (`sdlc-state.sh`). Story 10.1-001 closes this: `sdlc resume`,
+`sdlc status`, and `sdlc state` are now controller-native and read the ledger
+directly. Only `init` and `rollback` remain stubs, resolved in Story 10.2-001.
 
 ## Out-of-Scope for Epic-07
 

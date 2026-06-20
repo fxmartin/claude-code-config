@@ -150,9 +150,52 @@ def build(ctx: typer.Context) -> None:
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["resume"])
-def resume() -> None:
-    """Resume an interrupted build (stub)."""
-    typer.echo("resume: not yet implemented.")
+def resume(
+    scope: str = typer.Argument(
+        "all",
+        help="Scope of the run to resume: all, epic-NN, an epic name, or X.Y-NNN.",
+    ),
+    run: str | None = typer.Option(
+        None, "--run", help="Resume a specific run id (default: the latest incomplete run)."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+) -> None:
+    """Resume an interrupted build from the SQLite ledger.
+
+    Finds the most recent incomplete run for ``scope`` (a run still marked
+    IN_PROGRESS because it never reached a clean close-out), recomputes the
+    remaining queue from the markdown epics, and re-enters the 4-stage loop at
+    the exact stage each story was interrupted in — branch, PR number, and
+    attempt count preserved. Completed stories are not rebuilt. A run with no
+    incomplete stories is a no-op that reports "nothing to resume" and exits 0.
+    """
+    from sdlc.ledger_view import Ledger, default_db_path, make_render_view
+    from sdlc.resume import run_resume
+
+    db_path = db or default_db_path()
+    ledger = Ledger(db_path)
+    result = run_resume(
+        scope, ledger=ledger, run_id=run, render_view=make_render_view(db_path)
+    )
+
+    if result.nothing_to_resume:
+        if result.run_id is None:
+            typer.echo(f"nothing to resume: no incomplete run for scope '{scope}'.")
+        else:
+            typer.echo(
+                f"nothing to resume: run {result.run_id[:8]} has no incomplete stories."
+            )
+        raise typer.Exit(code=0)
+
+    typer.echo(
+        f"resume finished: {result.completed} done, {result.failed} failed, "
+        f"{result.blocked} blocked, {result.needs_attention} need attention "
+        f"({result.resumed} resumed)."
+    )
+    clean = result.failed == 0 and result.blocked == 0 and result.needs_attention == 0
+    raise typer.Exit(code=0 if clean else 1)
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["status"])
@@ -200,7 +243,7 @@ def status(
     typer.echo(
         f"run {run_id[:8]}  {snap['run'].get('status', '?')}  "
         f"{counts['done']}/{counts['total']} done, {counts['failed']} failed, "
-        f"{counts['blocked']} blocked  "
+        f"{counts['blocked']} blocked, {counts['in_progress']} in progress  "
         f"(scope={snap['run'].get('scope', '?')}, {snap['run'].get('mode', '?')})"
     )
     if stories:
@@ -282,9 +325,48 @@ def dashboard(
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["state"])
-def state() -> None:
-    """Inspect the persisted state machine (stub)."""
-    typer.echo("state: not yet implemented.")
+def state(
+    run: str | None = typer.Option(
+        None, "--run", help="Run id to dump (default: the most recent run)."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the stage rows as a JSON array."
+    ),
+) -> None:
+    """Dump the persisted state-machine rows for a run, for debugging.
+
+    Reads the ledger **read-only** and prints one line per stage attempt
+    (story id, stage, status, attempt, PR, branch) in a stable, greppable
+    format. With ``--json`` it emits the same rows as an array. When there is no
+    run it says so and exits 0.
+    """
+    from sdlc.build import Ledger
+    from sdlc.ledger_view import default_db_path
+    from sdlc.status import format_state, state_report
+
+    db_path = db or default_db_path()
+    ledger = Ledger(db_path)
+    rid = run or ledger.latest_run_id()
+
+    if rid is None:
+        if as_json:
+            typer.echo(json.dumps([]))
+        else:
+            typer.echo(f"no build run found in ledger: {db_path}")
+        raise typer.Exit(code=0)
+
+    rows = state_report(ledger, rid)
+    if as_json:
+        typer.echo(json.dumps(rows, default=str))
+        raise typer.Exit(code=0)
+
+    typer.echo(f"state for run {rid[:8]} ({len(rows)} stage rows)")
+    for line in format_state(rows):
+        typer.echo(line)
+    raise typer.Exit(code=0)
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["validate"])

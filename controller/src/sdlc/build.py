@@ -459,6 +459,54 @@ class Ledger:
             ).fetchone()
         return row["id"] if row else None
 
+    def latest_resumable_run(self, scope: str | None = None) -> str | None:
+        """The most recent IN_PROGRESS run id (optionally for ``scope``), or None.
+
+        A clean build close-out stamps a terminal status, so a run still marked
+        ``IN_PROGRESS`` is one that was interrupted before finishing — exactly
+        what ``sdlc resume`` recovers. ``scope`` ``None``/``all`` matches any
+        scope; a specific scope (``epic-99``, a story id) filters to that run.
+        """
+        if not self.db_path.exists():
+            return None
+        with self._connect_ro() as conn:
+            if scope and scope.lower() != "all":
+                row = conn.execute(
+                    "SELECT id FROM runs WHERE status = 'IN_PROGRESS' AND scope = ? "
+                    "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    (scope,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id FROM runs WHERE status = 'IN_PROGRESS' "
+                    "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+                ).fetchone()
+        return row["id"] if row else None
+
+    def state_rows(self, run_id: str) -> list[dict]:
+        """Every persisted stage-machine row for ``run_id`` for `sdlc state`.
+
+        Each row is ``{story_id, stage_name, status, attempt, branch,
+        pr_number}`` in a stable, chronological order (by story, then start
+        time) — a greppable dump of the state machine for debugging.
+        """
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                """
+                SELECT st.story_id, st.stage_name, st.status, st.attempt,
+                       s.branch, s.pr_number
+                FROM stages st
+                JOIN stories s
+                  ON st.run_id = s.run_id AND st.story_id = s.story_id
+                WHERE st.run_id = ?
+                ORDER BY st.story_id, st.started_at, st.rowid
+                """,
+                (run_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def run_row(self, run_id: str) -> dict | None:
         """The `runs` row for ``run_id`` as a dict, or None when absent."""
         if not self.db_path.exists():
@@ -1223,6 +1271,11 @@ def _run_story(
     run_id: str,
     dispatch: Dispatcher,
     logs_dir: Path,
+    *,
+    done_stages: frozenset[str] = frozenset(),
+    start_attempt: int = 1,
+    pr_number: int | None = None,
+    bugfix_seq: int = 0,
 ) -> str:
     """Drive one story through build → coverage → review → merge.
 
@@ -1234,18 +1287,27 @@ def _run_story(
     ``NEEDS_ATTENTION`` instead of being discarded and rebuilt (R10). Each
     dispatch's transcript is persisted under ``logs_dir`` and its path recorded
     on the stage row (R8).
+
+    Resume parameters (Story 10.1-001) let the controller re-enter mid-story
+    without rebuilding completed work: ``done_stages`` are pipeline stages with a
+    recorded DONE attempt and are skipped; ``start_attempt`` is the attempt
+    number for the first stage actually run (continuing past a crashed attempt);
+    ``pr_number`` / ``bugfix_seq`` carry forward the run's prior PR and bugfix
+    sequence. The defaults reproduce a fresh full build exactly.
     """
-    pr_number: int | None = None
     stages = [s for s in _STAGES if not (s == "coverage" and opts.skip_coverage)]
+    # Already-completed stages are skipped on resume; a fresh build skips none.
+    pending = [s for s in stages if s not in done_stages]
     # Monotonic across the whole story: the "bugfix" stage rows share one
     # (run_id, story_id, stage_name) key, so every bugfix dispatch — across both
     # retries of one stage and across different stages — needs a distinct attempt
     # number, or the second insert hits the stages UNIQUE constraint.
-    bugfix_seq = 0
 
-    for stage in stages:
+    for idx, stage in enumerate(pending):
         bugfix_attempts = 0
-        attempt = 1
+        # Only the first resumed stage continues a prior attempt count; later
+        # stages start fresh at attempt 1.
+        attempt = start_attempt if idx == 0 else 1
         while True:
             ledger.stage_start(run_id, story.id, stage, attempt)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
