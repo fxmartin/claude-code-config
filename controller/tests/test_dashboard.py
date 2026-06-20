@@ -629,3 +629,64 @@ def test_page_uses_eventsource_transport() -> None:
 
     assert "EventSource" in _PAGE     # server push, not just polling
     assert "/api/stream" in _PAGE     # the SSE endpoint the client subscribes to
+
+
+# --- live per-run detail: sub-stage activity (Story 11.2-004) ---------------
+
+
+def test_page_renders_substage_activity() -> None:
+    """The detail view binds each story's latest sub-stage activity (11.1-002)."""
+    from sdlc.dashboard import _PAGE
+
+    # The render reads the per-story `activity` the snapshot attaches and emits a
+    # dedicated sub-stage row helper that the story rows append.
+    assert "s.activity" in _PAGE
+    assert "activityRow" in _PAGE
+    assert "substage" in _PAGE  # styled sub-stage row class
+
+
+def test_page_substage_render_degrades_without_data() -> None:
+    """Older runs / captured-mode fallback carry no activity → no sub-stage row."""
+    from sdlc.dashboard import _PAGE
+
+    # A guard that returns empty when activity is absent keeps the detail view
+    # stage-level for runs that never streamed sub-stage events.
+    assert 'if(!a) return ""' in _PAGE
+
+
+def _seed_substage(db_path: Path) -> str:
+    """Seed a run whose in-flight story has a latest sub-stage progress event."""
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("11.2-004", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(
+        run_id, "s1", "epic-11", "Detail story", "Should", 3,
+        "backend", "feature/s1", None, "IN_PROGRESS",
+    )
+    ledger.stage_start(run_id, "s1", "build", 1)
+    ledger.progress_log(run_id, "s1", "build", "file_changed", "editing cli.py")
+    return run_id
+
+
+def test_api_status_surfaces_substage_activity(tmp_path: Path) -> None:
+    """The dashboard /api/status payload carries the per-story sub-stage activity
+    the detail view renders live, with stage/kind/message."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_substage(db)
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/status")
+    story = next(s for s in json.loads(body)["stories"] if s["story_id"] == "s1")
+    assert story["activity"]["stage"] == "build"
+    assert story["activity"]["kind"] == "file_changed"
+    assert story["activity"]["message"] == "editing cli.py"
+
+
+def test_api_status_activity_null_without_progress(tmp_path: Path) -> None:
+    """A run with no streamed progress yields activity=None so the view degrades."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)  # no progress_log events
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/status")
+    for story in json.loads(body)["stories"]:
+        assert story["activity"] is None

@@ -270,6 +270,8 @@ _PAGE = """<!doctype html>
   .SKIPPED { background: var(--surface); color: var(--sub); }
   .TODO { background: var(--crust); color: var(--overlay); }
   .PENDING { background: var(--crust); color: var(--overlay); }
+  .substage > td { border-bottom: 1px solid var(--surface); padding-top: 0; color: var(--sub); }
+  .substage .kind { color: var(--blue); margin-right: 4px; }
   .events { margin-top: 16px; }
   .events div { padding: 2px 0; border-bottom: 1px solid var(--crust); font-size: 13px; }
   .lvl-error { color: var(--red); } .lvl-warn { color: var(--peach); } .lvl-success { color: var(--green); }
@@ -320,6 +322,24 @@ function stageCell(st){
   return st.output_path
     ? "<td><a href='/log?path="+encodeURIComponent(st.output_path)+runQ+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
     : "<td>"+inner+"</td>";
+}
+
+// Live sub-stage activity (Story 11.2-004): the latest progress milestone the
+// agent emitted for a story (11.1-002), shown as a second row under the story.
+// A small glyph hints the kind; absent activity (older runs / captured-mode
+// fallback) returns "" so the detail view degrades to the stage-level pipeline.
+const KIND_GLYPH = {agent_started:"▸", tool_use:"⚙", file_changed:"✎", test_run:"✓", message:"💬"};
+function activityRow(s){
+  const a = s.activity;
+  if(!a) return "";  // no streamed sub-stage data → stay stage-level
+  const glyph = KIND_GLYPH[a.kind] || "▸";
+  const stage = a.stage ? "<code>"+esc(a.stage)+"</code> " : "";
+  // Span every column but the leading story cell so the activity reads as a
+  // continuation of its story row. Update the colspan if columns change.
+  return "<tr class='substage'><td></td>"
+    + "<td colspan='7' class='small'><span class='kind'>"+glyph+"</span>"
+    + stage + esc(a.message)
+    + (a.ts ? " <span class='muted'>"+esc(a.ts)+"</span>" : "") + "</td></tr>";
 }
 
 async function tick(){
@@ -414,7 +434,8 @@ function renderMain(d){
     + "<td>"+badge(s.status)+bug+"</td>"
     + stageCells
     + "<td>"+pr+"</td>"
-    + "<td class='muted small'>"+tok+"</td></tr>";
+    + "<td class='muted small'>"+tok+"</td></tr>"
+    + activityRow(s);
   }).join("");
   document.getElementById("stories").innerHTML = rows
     ? "<table><tr><th>story</th><th>status</th><th>build</th><th>QA</th>"
