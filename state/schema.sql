@@ -77,9 +77,11 @@ CREATE TABLE IF NOT EXISTS events (
     run_id      TEXT,
     story_id    TEXT,
     ts          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    level       TEXT NOT NULL,                  -- 'info' | 'warn' | 'error' | 'success' | 'debug'.
+    level       TEXT NOT NULL,                  -- 'info' | 'warn' | 'error' | 'success' | 'debug' | 'progress'.
     source      TEXT,                           -- which agent or hook emitted it.
-    message     TEXT NOT NULL
+    message     TEXT NOT NULL,
+    stage       TEXT,                           -- sub-stage progress: pipeline stage (Story 11.1-002).
+    kind        TEXT                            -- sub-stage progress: agent_started|tool_use|file_changed|test_run|message.
 );
 
 -- _migrations: bookkeeping for the migration runner. `version` is the integer

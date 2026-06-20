@@ -526,6 +526,49 @@ def test_default_streaming_dispatch_uses_default_cmd(monkeypatch) -> None:
     assert "stream-json" in seen["cmd"]
 
 
+# --- 11.1-002: on_progress callback receives each stream event --------------
+
+
+def test_streaming_dispatch_invokes_on_progress_per_event(monkeypatch) -> None:
+    """Every parsed stream event is handed to the on_progress callback in order."""
+    init = json.dumps({"type": "system", "subtype": "init"}) + "\n"
+    asst = json.dumps(
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "cli.py"}}
+        ]}}
+    ) + "\n"
+    lines = [init, asst, _stream_result_event(_wrap(_VALID_BUILD))]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+
+    seen: list[dict] = []
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, on_progress=seen.append)
+
+    types = [e.get("type") for e in seen]
+    assert "system" in types and "assistant" in types and "result" in types
+
+
+def test_on_progress_failure_never_breaks_the_run(monkeypatch) -> None:
+    """A throwing on_progress callback is isolated — the dispatch still succeeds."""
+    lines = list(_STREAM_PREAMBLE) + [_stream_result_event(_wrap(_VALID_BUILD))]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+
+    def boom(_event: dict) -> None:
+        raise RuntimeError("sink exploded")
+
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, on_progress=boom)
+    assert result.data["branch_name"] == "feature/7.3-001"  # run unaffected
+
+
+def test_captured_path_ignores_on_progress(monkeypatch) -> None:
+    """A non-streaming command never emits progress events (graceful degradation)."""
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_BUILD))
+    )
+    seen: list[dict] = []
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], on_progress=seen.append)
+    assert seen == []
+
+
 # --- 11.1-001: best-effort error handling (transcript I/O, launch, reap) ----
 
 

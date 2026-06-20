@@ -89,6 +89,25 @@ def test_status_no_run_exits_zero(tmp_path) -> None:
     assert "no build run found" in result.stdout.lower()
 
 
+def test_status_renders_substage_activity_for_in_progress_story(tmp_path) -> None:
+    """An IN_PROGRESS story with a streamed progress event shows the `↳` line (11.1-002)."""
+    from sdlc.build import Ledger
+
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-11", "build")
+    ledger.story_upsert(
+        run_id, "11.1-002", "epic-11", "progress events", "high", 3,
+        "python-backend-engineer", "feature/11.1-002", None, "IN_PROGRESS",
+    )
+    ledger.progress_log(run_id, "11.1-002", "build", "file_changed", "editing cli.py")
+
+    result = runner.invoke(app, ["status", "--db", str(db)])
+    assert result.exit_code == 0
+    assert "↳ build: editing cli.py" in result.stdout
+
+
 def test_state_stub_runs() -> None:
     """The state stub exits 0 and echoes its name."""
     result = runner.invoke(app, ["state"])

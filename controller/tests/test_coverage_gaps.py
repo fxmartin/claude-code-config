@@ -216,6 +216,7 @@ def test_bugfix_loop_exhaustion_marks_story_failed(tmp_path) -> None:
         def stage_finish(self, *a, **k): pass
         def event_log(self, *a, **k): pass
         def set_story_pr(self, *a, **k): pass
+        def set_story_status(self, *a, **k): pass
 
     opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
     outcome = _run_story(story, opts, _SilentLedger(), "run-id", dispatch, tmp_path / "logs")  # type: ignore[arg-type]

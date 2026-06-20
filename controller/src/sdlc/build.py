@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from typing import Callable, Iterable, Iterator, Protocol
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER, ContractError
 from sdlc.dispatch import AgentDispatchError, AgentResult, dispatch_agent
+from sdlc.progress import ProgressCoalescer, map_stream_event
 from sdlc.registry import Registry, RunRecord
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -85,7 +87,9 @@ CREATE TABLE IF NOT EXISTS events (
     ts          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     level       TEXT NOT NULL,
     source      TEXT,
-    message     TEXT NOT NULL
+    message     TEXT NOT NULL,
+    stage       TEXT,
+    kind        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -120,6 +124,19 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
             ("cache_read_tokens", "INTEGER"),
             ("cache_creation_tokens", "INTEGER"),
             ("cost_usd", "REAL"),
+        ],
+    ),
+    # Migration 2 adds the sub-stage progress columns (Story 11.1-002) to a
+    # pre-existing ledger. Additive and back-compatible: old event rows keep
+    # NULL stage/kind and are unaffected; only the new `progress`-level rows
+    # populate them. A fresh DB created from the up-to-date DDL is a no-op.
+    (
+        2,
+        "event progress columns",
+        "events",
+        [
+            ("stage", "TEXT"),
+            ("kind", "TEXT"),
         ],
     ),
 ]
@@ -454,6 +471,24 @@ class Ledger:
                 (run_id or None, story_id or None, level, source or None, message),
             )
 
+    def progress_log(
+        self, run_id: str, story_id: str, stage: str, kind: str, message: str
+    ) -> None:
+        """Append a fine-grained sub-stage progress event (Story 11.1-002).
+
+        Recorded at ``level = 'progress'`` / ``source = 'agent'`` with the
+        sub-stage ``stage`` and a fixed ``kind`` (see :mod:`sdlc.progress`), so
+        the dashboard and ``sdlc status`` can show what an agent is doing
+        mid-stage. Kept out of the human ``recent_events`` audit list (which
+        filters progress rows) so a high-volume stream never floods it.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO events(run_id, story_id, level, source, message, "
+                "stage, kind) VALUES (?, ?, 'progress', 'agent', ?, ?, ?)",
+                (run_id or None, story_id or None, message, stage or None, kind or None),
+            )
+
     # --- Read-only queries -------------------------------------------------
     # These power `sdlc status`. They open the ledger read-only with a
     # busy timeout so a poll issued *while the controller is writing* waits out
@@ -569,19 +604,56 @@ class Ledger:
     def recent_events(self, run_id: str, limit: int = 10) -> list[dict]:
         """The last ``limit`` human audit events for ``run_id``, oldest-first.
 
-        The internal ``config`` marker event (run options) is excluded so it
-        never clutters the human-facing event log.
+        The internal ``config`` marker event (run options) and the high-volume
+        ``progress`` sub-stage events (Story 11.1-002, surfaced separately via
+        :meth:`latest_progress`) are excluded so neither clutters or floods the
+        human-facing event log.
         """
         if not self.db_path.exists():
             return []
         with self._connect_ro() as conn:
             rows = conn.execute(
                 "SELECT ts, level, source, story_id, message FROM events "
-                "WHERE run_id = ? AND (source IS NULL OR source != 'config') "
+                "WHERE run_id = ? AND level != 'progress' "
+                "AND (source IS NULL OR source != 'config') "
                 "ORDER BY id DESC LIMIT ?",
                 (run_id, limit),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def latest_progress(self, run_id: str) -> dict[str, dict]:
+        """The most recent sub-stage progress event per story for ``run_id``.
+
+        Returns ``{story_id: {stage, kind, message, ts}}`` — the single newest
+        ``progress`` event for each story, which is what ``sdlc status`` and the
+        dashboard render as current sub-stage activity. Empty when the run has no
+        progress events (older runs / captured-mode fallback). The grouped
+        ``MAX(id)`` makes SQLite return the bare columns from the latest row.
+        """
+        if not self.db_path.exists():
+            return {}
+        with self._connect_ro() as conn:
+            # Tolerate a ledger created before the progress columns existed
+            # (read-only viewers never migrate): no stage/kind column means no
+            # progress events were ever recorded, so report none.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+            if "stage" not in cols or "kind" not in cols:
+                return {}
+            rows = conn.execute(
+                "SELECT story_id, stage, kind, message, ts, MAX(id) AS id "
+                "FROM events WHERE run_id = ? AND level = 'progress' "
+                "AND story_id IS NOT NULL GROUP BY story_id",
+                (run_id,),
+            ).fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            out[r["story_id"]] = {
+                "stage": r["stage"],
+                "kind": r["kind"],
+                "message": r["message"],
+                "ts": r["ts"],
+            }
+        return out
 
     def run_config(self, run_id: str) -> dict:
         """The run's options, recorded as a ``config`` event at start (or {})."""
@@ -783,6 +855,7 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
     events = ledger.recent_events(rid, limit=10)
     config = ledger.run_config(rid)
     breakdown = ledger.stage_breakdown(rid)
+    activity = ledger.latest_progress(rid)
 
     def _count(value: str) -> int:
         return sum(1 for s in stories if s.get("status") == value)
@@ -816,6 +889,10 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         s["cost_usd"] = (
             sum(c or 0 for c in story_cost) if any(c is not None for c in story_cost) else None
         )
+        # Current sub-stage activity (Story 11.1-002): the latest progress event
+        # for the story, or None for runs with no streamed progress (captured
+        # fallback / older runs) so consumers degrade to the stage name.
+        s["activity"] = activity.get(s["story_id"])
 
     # Run-level usage rollup across every stage attempt of every story.
     run_usage = _aggregate_run_usage(breakdown)
@@ -1361,6 +1438,15 @@ def _run_story(
     stages = [s for s in _STAGES if not (s == "coverage" and opts.skip_coverage)]
     # Already-completed stages are skipped on resume; a fresh build skips none.
     pending = [s for s in stages if s not in done_stages]
+    # Mark the story IN_PROGRESS the moment real work starts (Story 11.1-002):
+    # without this a story goes straight TODO → terminal, so `sdlc status` /
+    # the dashboard never see an in-flight window and never render its live
+    # sub-stage activity (and the in_progress count stays 0 mid-run). The
+    # terminal status is stamped by the caller once the story finishes; resume
+    # is unaffected since it keys off stage rows, not this status, and treats
+    # IN_PROGRESS as resumable.
+    if pending:
+        ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
     # Monotonic across the whole story: the "bugfix" stage rows share one
     # (run_id, story_id, stage_name) key, so every bugfix dispatch — across both
     # retries of one stage and across different stages — needs a distinct attempt
@@ -1374,8 +1460,9 @@ def _run_story(
         while True:
             ledger.stage_start(run_id, story.id, stage, attempt)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
+            sink = _make_progress_sink(ledger, run_id, story.id, stage)
             ok, result, failure, kind = _dispatch_stage(
-                stage, story, opts, pr_number, dispatch, tpath
+                stage, story, opts, pr_number, dispatch, tpath, on_progress=sink
             )
             if ok:
                 ledger.stage_finish(
@@ -1427,6 +1514,30 @@ def _run_story(
     return "DONE"
 
 
+def _make_progress_sink(
+    ledger: Ledger, run_id: str, story_id: str, stage: str
+):
+    """A best-effort sink that maps stream events → coalesced ledger progress rows.
+
+    Returned callable is handed to ``dispatch_agent(on_progress=…)`` (Story
+    11.1-002). It maps each stream-json event to zero or more
+    :class:`~sdlc.progress.ProgressEvent`, rate-limits/de-dupes them through a
+    per-stage :class:`~sdlc.progress.ProgressCoalescer`, and appends the
+    survivors to the ledger. Coalescing keeps ledger writes infrequent so the
+    agent stream is never materially blocked; dispatch already isolates any
+    exception raised here so progress recording can never fail the run.
+    """
+    coalescer = ProgressCoalescer()
+
+    def sink(event: dict) -> None:
+        now = time.monotonic()
+        for pe in map_stream_event(event):
+            if coalescer.admit(pe, now):
+                ledger.progress_log(run_id, story_id, stage, pe.kind, pe.message)
+
+    return sink
+
+
 def _dispatch_stage(
     stage: str,
     story: Story,
@@ -1434,6 +1545,7 @@ def _dispatch_stage(
     pr_number: int | None,
     dispatch: Dispatcher,
     transcript_path: Path | None = None,
+    on_progress=None,
 ) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one stage's agent and classify the outcome.
 
@@ -1443,11 +1555,15 @@ def _dispatch_stage(
     ``kind`` names the failure cause — ``"contract"`` / ``"dispatch"`` /
     ``"reported"`` (empty on success) — so the caller can treat an unparseable
     result that nonetheless committed work as recoverable rather than discard it
-    (R10).
+    (R10). ``on_progress`` (Story 11.1-002) is forwarded to the dispatcher so the
+    streamed stage emits sub-stage progress to the ledger.
     """
     prompt = _render_stage_prompt(stage, story, opts, pr_number)
     try:
-        result = dispatch(stage, prompt, story=story, transcript_path=transcript_path)
+        result = dispatch(
+            stage, prompt, story=story, transcript_path=transcript_path,
+            on_progress=on_progress,
+        )
     except ContractError as exc:
         # Malformed / schema-invalid agent output is a build failure.
         return False, None, f"contract violation: {exc}", "contract"
@@ -1547,8 +1663,12 @@ def _run_bugfix(
     ledger.stage_start(run_id, story.id, "bugfix", attempt)
     out = str(transcript_path) if transcript_path is not None else ""
     prompt = render_bugfix_prompt(story, failed_stage, failure)
+    sink = _make_progress_sink(ledger, run_id, story.id, "bugfix")
     try:
-        result = dispatch("bugfix", prompt, story=story, transcript_path=transcript_path)
+        result = dispatch(
+            "bugfix", prompt, story=story, transcript_path=transcript_path,
+            on_progress=sink,
+        )
     except (ContractError, AgentDispatchError) as exc:
         ledger.stage_finish(
             run_id, story.id, "bugfix", attempt, "FAILED", "bugfix-error", out
