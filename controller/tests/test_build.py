@@ -1038,6 +1038,73 @@ def test_envelope_reask_prompt_is_envelope_only() -> None:
     assert "build-agent-response.schema.json" in prompt
 
 
+class _ReaskNonSuccessDispatcher:
+    """Stage omits its envelope; the re-ask returns a schema-valid response that
+    nonetheless reports a *non-success* status (Story 12.1-001 AC2).
+
+    This exercises the ``_reask_envelope`` branch where the re-ask yields a valid
+    result but ``_stage_succeeded`` is False — recovery is not satisfied and must
+    fall through to the bugfix path, which then recovers the stage.
+    """
+
+    def __init__(self, stage: str = "build") -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.stage = stage
+        self._bugfixed = False
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.contracts import ResultBlockError
+        from sdlc.dispatch import AgentResult
+
+        is_reask = _REASK_SENTINEL in prompt
+        self.calls.append((agent_type, "reask" if is_reask else "stage"))
+        if agent_type == "bugfix":
+            self._bugfixed = True
+        if agent_type == self.stage and not is_reask and not self._bugfixed:
+            raise ResultBlockError("missing <<<RESULT_JSON>>> marker")
+        payload = dict(_default_payload(agent_type, story))
+        if agent_type == self.stage and is_reask:
+            # Valid envelope, but it reports the stage did NOT succeed.
+            payload["build_status"] = "FAILED"
+        return AgentResult(agent_type=agent_type, data=payload, raw="")
+
+
+def test_reask_non_success_status_falls_through_to_bugfix(tmp_path, monkeypatch) -> None:
+    """A re-ask that reports a non-success status is a failed recovery (AC2)."""
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    disp = _ReaskNonSuccessDispatcher(stage="build")
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    # Re-ask ran and returned a result, but its non-success status routed recovery
+    # through the bugfix path; the retried stage then completes the story (AC2).
+    assert any(kind == "reask" for _, kind in disp.calls)
+    assert any(agent == "bugfix" for agent, _ in disp.calls)
+    assert result.story_status["99.1-001"] == "DONE"
+    # The non-success re-ask is logged distinctly from a dispatch error (AC3).
+    conn = _open(db)
+    msgs = [
+        r[0]
+        for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("non-success" in m for m in msgs)
+
+
+def test_envelope_reask_prompt_includes_pr_hint() -> None:
+    """When a PR is already known, the re-ask names it so the agent reports it."""
+    from sdlc.build import render_envelope_reask_prompt
+
+    prompt = render_envelope_reask_prompt("build", _story("99.1-001"), BuildOptions(), 4242)
+    assert "PR #4242" in prompt
+
+
 def test_story_commit_exists_no_git_is_false(tmp_path) -> None:
     """The git probe never raises and returns False outside a git repo."""
     from sdlc.build import story_commit_exists
