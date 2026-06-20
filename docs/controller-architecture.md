@@ -137,6 +137,35 @@ CI**. Infrastructure failures (non-zero exit, timeout, missing executable)
 surface as `AgentDispatchError`; contract failures surface as the
 `ContractError` subclasses from `sdlc.contracts`.
 
+### Streaming vs captured dispatch (Story 11.1-001)
+
+The default command is `claude -p --output-format stream-json --verbose
+--dangerously-skip-permissions`. When the resolved command requests
+`stream-json`, `dispatch_agent` takes the **streaming** path
+(`_dispatch_streaming`): it launches the agent with `subprocess.Popen`, writes
+the prompt to stdin, and reads stdout **line by line**. Each line is appended
+and flushed to the per-stage transcript
+(`.sdlc-state.db.logs/<run>/<story>-<stage>-<attempt>.log`) as it arrives, so
+`tail -f` on that file shows live activity within ~1 s instead of only when the
+stage finishes. stderr is drained on a background thread to avoid a pipe-buffer
+deadlock.
+
+The terminal `result` event in the stream has the **same shape** as the old
+`--output-format json` envelope, so the controller captures it during the loop
+and hands it to a shared `_interpret` step: `<<<RESULT_JSON>>>` extraction,
+`usage`/`total_cost_usd`/`session_id` capture, and schema validation are
+byte-for-byte identical to the captured path. Unknown / non-JSON stream lines
+are teed to the transcript but ignored for control flow.
+
+Any command **without** `stream-json` (a custom `SDLC_AGENT_CMD`, or an older
+agent) takes the **captured** path (`_dispatch_captured`, the original
+`subprocess.run` with `capture_output=True`). A streamed run whose terminal
+`result` event never arrives degrades gracefully: `_interpret` falls back to
+parsing the accumulated stdout exactly as the captured path would, so a
+malformed stream never fails the run on its own. The streaming path keeps the
+verbatim stream in the transcript (it is the live view); the captured envelope
+path still rewrites the transcript to the readable agent text.
+
 ## Backward compatibility
 
 Users still type `/build-stories` in Claude Code. The skill shells out to

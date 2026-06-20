@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,15 +24,24 @@ from sdlc.contracts import parse_and_validate
 # Tests always pass an explicit ``agent_cmd`` and monkeypatch ``subprocess.run``
 # so this default is never executed in CI.
 #
-# ``--output-format json`` makes the agent emit a result *envelope* on stdout —
-# a single JSON object carrying the authoritative ``usage`` (token counts),
+# ``--output-format stream-json --verbose`` makes the agent emit one JSON object
+# per line as it works (system/assistant/tool_use/tool_result), terminated by a
+# single ``result`` event carrying the authoritative ``usage`` (token counts),
 # ``total_cost_usd`` and ``session_id`` alongside the agent's text in ``result``.
-# The controller unwraps it to feed the result-block parser and to record
-# per-stage token/cost usage on the ledger. A custom ``SDLC_AGENT_CMD`` that
-# omits the flag (or a non-claude agent) simply emits plain text — dispatch
-# falls back to parsing stdout directly and records no usage.
+# Streaming lets the controller tee live activity to the per-stage transcript
+# (so ``tail -f`` shows progress) instead of waiting for the stage to finish
+# (Story 11.1-001). The terminal ``result`` event has the same shape as the old
+# ``--output-format json`` envelope, so usage extraction and schema validation
+# are byte-for-byte identical. ``--verbose`` is required for ``claude -p`` to
+# actually emit the line-delimited stream.
+#
+# A custom ``SDLC_AGENT_CMD`` that omits ``stream-json`` (or a non-claude agent)
+# is dispatched via the captured-output path instead — dispatch consumes its
+# whole stdout at once, unwraps a ``--output-format json`` envelope when present,
+# and otherwise parses plain text and records no usage (graceful degradation).
 DEFAULT_AGENT_CMD: list[str] = [
-    "claude", "-p", "--output-format", "json", "--dangerously-skip-permissions",
+    "claude", "-p", "--output-format", "stream-json", "--verbose",
+    "--dangerously-skip-permissions",
 ]
 
 
@@ -58,6 +68,67 @@ def _write_transcript(path: Path | None, stdout: str, stderr: str = "") -> None:
         path.write_text(body, encoding="utf-8")
     except OSError:
         pass
+
+
+class _StreamTranscript:
+    """Tee stream-json lines to the per-stage transcript as they arrive (R8, 11.1-001).
+
+    Opens the transcript once and appends each line with a flush, so ``tail -f``
+    on the file shows live agent activity within ~1 s instead of only on stage
+    completion. Entirely best-effort: any I/O error is swallowed so a transcript
+    problem never fails the run.
+    """
+
+    def __init__(self, path: Path | None) -> None:
+        self._fh = None
+        if path is None:
+            return
+        try:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = path.open("w", encoding="utf-8")
+        except OSError:
+            self._fh = None
+
+    def append(self, text: str) -> None:
+        if self._fh is None:
+            return
+        try:
+            self._fh.write(text)
+            self._fh.flush()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+        self._fh = None
+
+
+def _is_streaming_cmd(cmd: list[str]) -> bool:
+    """True when the command requests Claude's line-delimited ``stream-json`` output."""
+    return "stream-json" in cmd
+
+
+def _parse_stream_line(line: str) -> dict[str, Any] | None:
+    """Parse one stream-json line into an event dict, or None when it isn't JSON.
+
+    Unknown / non-JSON lines (blank lines, diagnostics interleaved by a custom
+    agent) return None — they are still teed to the transcript but ignored for
+    control flow, per the defensive-parsing note in the story.
+    """
+    text = line.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
 
 # A generous default ceiling. A single story build can legitimately run for
 # many minutes; the controller (not the agent) owns this timeout so a hung
@@ -140,7 +211,29 @@ def dispatch_agent(
     key its canned responses on the story without changing this signature.
     """
     cmd = resolve_agent_cmd(agent_cmd)
+    if _is_streaming_cmd(cmd):
+        return _dispatch_streaming(
+            agent_type, prompt, cmd, timeout=timeout, transcript_path=transcript_path
+        )
+    return _dispatch_captured(
+        agent_type, prompt, cmd, timeout=timeout, transcript_path=transcript_path
+    )
 
+
+def _dispatch_captured(
+    agent_type: str,
+    prompt: str,
+    cmd: list[str],
+    *,
+    timeout: int,
+    transcript_path: Path | None,
+) -> AgentResult:
+    """Buffered dispatch: run the agent and read all of stdout at once.
+
+    Used for a non-streaming ``SDLC_AGENT_CMD`` (no ``stream-json``) and as the
+    long-standing fallback. Unwraps a ``--output-format json`` envelope when one
+    is present; otherwise treats stdout as the raw agent response.
+    """
     try:
         completed = subprocess.run(
             cmd,
@@ -164,13 +257,140 @@ def dispatch_agent(
     # or a missing/invalid result block leaves the agent's output on disk (R8).
     _write_transcript(transcript_path, completed.stdout, completed.stderr)
 
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()
+    return _interpret(
+        agent_type,
+        completed.stdout,
+        completed.stderr,
+        completed.returncode,
+        transcript_path,
+        envelope=None,
+        streaming=False,
+    )
+
+
+def _dispatch_streaming(
+    agent_type: str,
+    prompt: str,
+    cmd: list[str],
+    *,
+    timeout: int,
+    transcript_path: Path | None,
+) -> AgentResult:
+    """Streamed dispatch: consume stdout line-by-line, teeing each to the transcript.
+
+    Reads the agent's ``stream-json`` output incrementally so the per-stage
+    transcript reflects live activity (Story 11.1-001). The terminal ``result``
+    event is captured and handed to the same interpretation logic the captured
+    path uses, so usage extraction and schema validation are identical. If no
+    ``result`` event arrives (the stream wasn't well-formed), interpretation
+    falls back to parsing the accumulated stdout — graceful degradation rather
+    than failing the run.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        _write_transcript(transcript_path, "", f"could not launch {cmd[0]!r}: {exc}")
         raise AgentDispatchError(
-            f"{agent_type} agent exited {completed.returncode}: {detail}"
+            f"could not launch {agent_type} agent ({cmd[0]!r}): {exc}"
+        ) from exc
+
+    # Drain stderr on a background thread so a chatty agent cannot deadlock by
+    # filling the stderr pipe buffer while we are blocked reading stdout.
+    stderr_chunks: list[str] = []
+
+    def _drain_stderr() -> None:
+        if proc.stderr is None:
+            return
+        try:
+            chunk = proc.stderr.read()
+            if chunk:
+                stderr_chunks.append(chunk)
+        except (OSError, ValueError):
+            pass
+
+    drainer = threading.Thread(target=_drain_stderr, daemon=True)
+    drainer.start()
+
+    transcript = _StreamTranscript(transcript_path)
+    raw_lines: list[str] = []
+    result_event: dict[str, Any] | None = None
+    try:
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write(prompt)
+            finally:
+                proc.stdin.close()
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                transcript.append(line)
+                raw_lines.append(line)
+                event = _parse_stream_line(line)
+                if event is not None and event.get("type") == "result":
+                    result_event = event
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        drainer.join(timeout=1)
+        transcript.append(f"\n--- TIMEOUT after {timeout}s ---\n")
+        transcript.close()
+        raise AgentDispatchError(
+            f"{agent_type} agent timed out after {timeout}s"
+        ) from exc
+
+    drainer.join(timeout=1)
+    stderr = "".join(stderr_chunks)
+    if stderr:
+        transcript.append("\n--- stderr ---\n" + stderr)
+    transcript.close()
+    raw_stdout = "".join(raw_lines)
+
+    return _interpret(
+        agent_type,
+        raw_stdout,
+        stderr,
+        returncode,
+        transcript_path,
+        envelope=result_event,
+        streaming=True,
+    )
+
+
+def _interpret(
+    agent_type: str,
+    stdout: str,
+    stderr: str,
+    returncode: int,
+    transcript_path: Path | None,
+    *,
+    envelope: dict[str, Any] | None,
+    streaming: bool,
+) -> AgentResult:
+    """Shared post-collection logic for both the captured and streamed paths.
+
+    ``envelope`` is the terminal ``result`` event (streaming) or None; when None
+    it is derived from ``stdout`` (captured path, or a streamed run whose result
+    event never arrived — the graceful fallback). ``streaming`` suppresses the
+    transcript rewrite so the live stream is preserved verbatim for ``tail -f``.
+    """
+    if returncode != 0:
+        detail = (stderr or stdout or "").strip()
+        raise AgentDispatchError(
+            f"{agent_type} agent exited {returncode}: {detail}"
         )
 
-    envelope = _parse_envelope(completed.stdout)
+    if envelope is None:
+        envelope = _parse_envelope(stdout)
+
     if envelope is not None:
         if envelope.get("is_error"):
             detail = (
@@ -184,16 +404,18 @@ def dispatch_agent(
         raw_cost = envelope.get("total_cost_usd")
         cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
         session_id = envelope.get("session_id")
-        # The raw envelope is already on disk (R8 persist above); rewrite the
-        # transcript with the readable agent text so the dashboard /log view
-        # shows the response, not the JSON wrapper.
-        _write_transcript(transcript_path, agent_text, completed.stderr)
+        # Captured path: the raw envelope is already on disk (R8 persist), so
+        # rewrite the transcript with the readable agent text. Streaming path:
+        # leave the verbatim stream in place — that is the live tail -f view.
+        if not streaming:
+            _write_transcript(transcript_path, agent_text, stderr)
         data = parse_and_validate(agent_type, agent_text)
         return AgentResult(
             agent_type=agent_type, data=data, raw=agent_text,
             usage=usage, cost_usd=cost, session_id=session_id,
         )
 
-    # Fallback: plain-text agent output (custom SDLC_AGENT_CMD / older claude).
-    data = parse_and_validate(agent_type, completed.stdout)
-    return AgentResult(agent_type=agent_type, data=data, raw=completed.stdout)
+    # Fallback: plain-text agent output (custom SDLC_AGENT_CMD / older claude, or
+    # a streamed run that produced no result event).
+    data = parse_and_validate(agent_type, stdout)
+    return AgentResult(agent_type=agent_type, data=data, raw=stdout)
