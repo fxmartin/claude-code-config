@@ -1,4 +1,10 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(model-shelf:*)"
+    ],
+    "defaultMode": "auto"
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -122,12 +128,6 @@
     }
   },
   "agentPushNotifEnabled": true,
-  "voiceEnabled": true,
   "skipAutoPermissionPrompt": true,
-  "permissions": {
-    "defaultMode": "auto",
-    "allow": [
-      "Bash(model-shelf:*)"
-    ]
-  }
+  "voiceEnabled": true
 }
