@@ -1,5 +1,5 @@
 # ABOUTME: Typer entry point for the `sdlc` controller CLI (Story 7.1-001).
-# ABOUTME: Ships --version, --help, an init stub, and stubs for every subcommand.
+# ABOUTME: Ships --version, --help, and every build/resume/observability verb.
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
 # renders these even while the bodies are stubs, so the surface area is visible
 # from day one. Keep the keys in sync with the Epic-07 success metrics.
 PLANNED_SUBCOMMANDS: dict[str, str] = {
-    "init": "Scaffold a controller workspace and SQLite ledger.",
     "build": "Run the full build-stories orchestration for a scope.",
     "resume": "Resume an interrupted build from the ledger state.",
     "status": "Show the current run status and stage progress.",
@@ -55,10 +54,10 @@ def main(
     """sdlc — deterministic controller for autonomous SDLC runs."""
 
 
-@app.command(help=PLANNED_SUBCOMMANDS["init"])
-def init() -> None:
-    """Scaffold a controller workspace (stub)."""
-    typer.echo("init: not yet implemented (Story 7.1-001 scaffold).")
+# Note: there is no `init` verb. Epic-07 scaffolded one as a stub, but `build`
+# already creates the SQLite ledger on first use (`Ledger.init()` runs inside
+# `run_build`), so a separate workspace-scaffold command had no distinct job.
+# Story 10.2-001 resolved it by removal — see docs/adr/001-controller-runtime.md.
 
 
 _BUILD_EPILOG = """\
@@ -410,9 +409,56 @@ def validate(
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["rollback"])
-def rollback() -> None:
-    """Roll a run back to a prior checkpoint (stub)."""
-    typer.echo("rollback: not yet implemented.")
+def rollback(
+    run: str | None = typer.Argument(
+        None, help="Run id to roll back (default: the most recent run)."
+    ),
+    to: str = typer.Option(
+        ...,
+        "--to",
+        help="Checkpoint story id to roll back to (kept; later stories reset).",
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+) -> None:
+    """Roll a run back to a prior ledger checkpoint.
+
+    ``--to <story_id>`` names the checkpoint to return to: that story and every
+    story scheduled before it are kept untouched, while every story scheduled
+    *after* it is reset to a fresh unbuilt state (stage history deleted, PR and
+    branch cleared, status TODO). The run is reopened so the next ``sdlc
+    resume``/``sdlc build`` rebuilds only the reset stories.
+
+    Refuses (non-zero exit) when the checkpoint does not exist or when the
+    rollback would discard a story whose PR has already merged — a merged PR is
+    committed work the ledger cannot unwind. Rolling back to the latest story is
+    a benign no-op.
+    """
+    from sdlc.ledger_view import Ledger, default_db_path
+    from sdlc.rollback import RollbackError, run_rollback
+
+    db_path = db or default_db_path()
+    try:
+        result = run_rollback(Ledger(db_path), run, to)
+    except RollbackError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if not result.reset_stories:
+        typer.echo(
+            f"nothing to roll back: '{to}' is already the latest checkpoint in "
+            f"run {result.run_id[:8]}."
+        )
+        raise typer.Exit(code=0)
+
+    typer.echo(
+        f"rolled run {result.run_id[:8]} back to '{result.checkpoint}': "
+        f"reset {len(result.reset_stories)} story(ies) "
+        f"({', '.join(result.reset_stories)}) — "
+        f"run `sdlc resume` to rebuild them."
+    )
+    raise typer.Exit(code=0)
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["sast"])

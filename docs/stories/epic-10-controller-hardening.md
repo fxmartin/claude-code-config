@@ -68,10 +68,10 @@
 - The Epic-07 stub table is updated to reflect the final state of all eight verbs.
 
 **Definition of Done**:
-- [ ] `rollback` implemented with guard rails; `init` resolved (implemented or removed).
-- [ ] pytest coverage for rollback and its guard rails, green on macOS and WSL2.
-- [ ] Epic-07 stub table and `docs/controller-architecture.md` updated.
-- [ ] Change noted in `CHANGELOG.md` under "Added" (rollback) and "Changed"/"Removed" (init, as applicable).
+- [x] `rollback` implemented with guard rails; `init` resolved (removed as redundant with `build`'s auto-create).
+- [x] pytest coverage for rollback and its guard rails, green on macOS and WSL2.
+- [x] Epic-07 stub table and `docs/controller-architecture.md` updated; `init` removal recorded as an ADR-001 addendum.
+- [x] Change noted in `CHANGELOG.md` under "Added" (rollback) and "Removed" (init).
 
 ## Story Dependencies (within Epic-10)
 

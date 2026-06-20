@@ -1,5 +1,5 @@
 # ABOUTME: Behavior tests for the sdlc CLI scaffold (Story 7.1-001) and validate (7.2-001).
-# ABOUTME: Covers --version, --help, the init stub, and the validate command.
+# ABOUTME: Covers --version, --help, the resolved verbs, and the validate command.
 
 from __future__ import annotations
 
@@ -41,9 +41,14 @@ def test_help_lists_all_planned_subcommands() -> None:
 
 
 def test_planned_subcommands_cover_success_metrics() -> None:
-    """The planned set matches the subcommands named in the Epic-07 metrics."""
-    expected = {"build", "resume", "status", "state", "validate", "rollback", "init"}
+    """The planned set matches the subcommands named in the Epic-07 metrics.
+
+    ``init`` was resolved by removal in Story 10.2-001 (``build`` already creates
+    the ledger), so it is no longer a planned subcommand.
+    """
+    expected = {"build", "resume", "status", "state", "validate", "rollback"}
     assert expected.issubset(set(PLANNED_SUBCOMMANDS))
+    assert "init" not in PLANNED_SUBCOMMANDS
 
 
 def test_each_subcommand_has_one_line_description() -> None:
@@ -53,19 +58,14 @@ def test_each_subcommand_has_one_line_description() -> None:
         assert "\n" not in summary, f"{name} description must be one line"
 
 
-def test_init_stub_runs() -> None:
-    """The init stub is invocable and exits cleanly while unimplemented."""
+def test_init_command_removed() -> None:
+    """`init` was resolved by removal (Story 10.2-001) — invoking it errors."""
     result = runner.invoke(app, ["init"])
-    assert result.exit_code == 0
-    assert "init" in result.stdout.lower()
+    assert result.exit_code != 0  # no such command
 
 
-def test_unimplemented_stub_runs() -> None:
-    """A representative stub subcommand is wired and exits cleanly.
-
-    `build` is now fully implemented (Story 7.3-001); `resume` remains a stub,
-    so it stands in as the representative unimplemented command here.
-    """
+def test_resume_command_runs() -> None:
+    """`resume` is implemented (Story 10.1-001); with no run it exits 0 cleanly."""
     result = runner.invoke(app, ["resume"])
     assert result.exit_code == 0
 
@@ -102,11 +102,10 @@ def test_validate_requires_agent_type() -> None:
     assert result.exit_code != 0
 
 
-def test_rollback_stub_runs() -> None:
-    """The rollback stub exits 0 and echoes its name."""
+def test_rollback_requires_checkpoint() -> None:
+    """`rollback` is implemented (Story 10.2-001) and requires `--to`."""
     result = runner.invoke(app, ["rollback"])
-    assert result.exit_code == 0
-    assert "rollback" in result.stdout.lower()
+    assert result.exit_code != 0  # missing required --to option
 
 
 def test_unknown_command_exits_nonzero() -> None:
@@ -122,19 +121,24 @@ def test_no_args_shows_help() -> None:
     assert "sdlc" in result.stdout.lower() or result.exit_code in (0, 1, 2)
 
 
-def test_stub_output_contains_not_implemented() -> None:
-    """The remaining stub commands clearly indicate they are not yet implemented.
+def test_no_subcommand_prints_not_yet_implemented() -> None:
+    """Epic-10 acceptance: no controller verb is a dead-end stub anymore.
 
-    `build`/`validate`/`status` (Epic-07) and `resume`/`state` (Story 10.1-001)
-    are implemented and no longer stubs. `init` and `rollback` are resolved in
-    Story 10.2-001 and stay stubs until then.
+    Every planned subcommand is invoked with no/minimal args; none may emit the
+    old "not yet implemented" stub text (they may legitimately error on missing
+    args, but never as an unimplemented stub).
     """
-    stubs = ["init", "rollback"]
-    for cmd in stubs:
-        result = runner.invoke(app, [cmd])
-        assert result.exit_code == 0, f"{cmd} exited with {result.exit_code}"
-        assert "not yet implemented" in result.stdout, (
-            f"{cmd} output does not contain 'not yet implemented': {result.stdout!r}"
+    # `build` is excluded: invoking it bare runs the real orchestration
+    # (preflight → `subprocess.run` of the project test command), which would
+    # recurse into pytest and hang. It was never a stub, so the stub check does
+    # not apply to it; the remaining verbs error on missing args or report empty
+    # state quickly.
+    for name in PLANNED_SUBCOMMANDS:
+        if name == "build":
+            continue
+        result = runner.invoke(app, [name])
+        assert "not yet implemented" not in result.stdout, (
+            f"{name} still prints the stub text: {result.stdout!r}"
         )
 
 

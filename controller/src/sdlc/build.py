@@ -420,6 +420,28 @@ class Ledger:
                 ),
             )
 
+    def reset_story(self, run_id: str, story_id: str) -> None:
+        """Roll a story back to a fresh, unbuilt state (Story 10.2-001).
+
+        Deletes every stage attempt for the story and clears its branch, PR, and
+        current stage, then sets its status to TODO so the next ``resume``/
+        ``build`` rebuilds it from the first pipeline stage. The story row itself
+        is preserved (title/epic/priority stay) so the queue is unaffected. Used
+        only by ``sdlc rollback``, which guards merged stories before calling
+        this.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM stages WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            )
+            conn.execute(
+                "UPDATE stories SET status = 'TODO', pr_number = NULL, "
+                "branch = NULL, current_stage = NULL "
+                "WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            )
+
     def event_log(
         self, run_id: str, story_id: str, level: str, source: str, message: str
     ) -> None:

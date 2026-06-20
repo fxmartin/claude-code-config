@@ -1,6 +1,6 @@
 # Epic 7: External Controller and Typed Contracts
 
-> **Status: COMPLETE** — all 4 stories merged 2026-06-12 (PRs #40, #41, #42, #43; E2E_PASS after bugfix #45). The CLI ships `build` and `validate` fully implemented (plus `sync-check`); `init`, `resume`, `status`, `state`, and `rollback` remain scaffolded stubs — see [Deferred — stubbed subcommands](#deferred--stubbed-subcommands).
+> **Status: COMPLETE** — all 4 stories merged 2026-06-12 (PRs #40, #41, #42, #43; E2E_PASS after bugfix #45). At the Epic-07 close the CLI shipped `build` and `validate` fully implemented (plus `sync-check`), with `init`, `resume`, `status`, `state`, and `rollback` as scaffolded stubs. **Epic-10 finished the surface:** `resume`/`status`/`state`/`rollback` are now implemented and `init` was removed — see [Deferred — stubbed subcommands](#deferred--stubbed-subcommands) for the final state.
 
 ## Epic Overview
 
@@ -184,11 +184,11 @@ Epic-07 close they still print "not yet implemented":
 | `build` | ✅ Implemented | The path `/build-stories` shells out to. |
 | `validate` | ✅ Implemented | Schema validation of an agent response. |
 | `sync-check` | ✅ Implemented | Codex mirror submodule sync check (7.4-001). |
-| `init` | ⬜ Stub | Workspace/ledger scaffold — resolved in Story 10.2-001. |
+| `init` | ❌ Removed | Redundant with `build`'s auto-create — removed in Story 10.2-001. |
 | `resume` | ✅ Implemented | Crash-resume from the ledger (Story 10.1-001). |
 | `status` | ✅ Implemented | Show current run status (read from the ledger). |
 | `state` | ✅ Implemented | Inspect the persisted state machine (Story 10.1-001). |
-| `rollback` | ⬜ Stub | Roll a run back to a prior checkpoint — Story 10.2-001. |
+| `rollback` | ✅ Implemented | Roll a run back to a prior checkpoint (Story 10.2-001). |
 
 **Resume caveat (resolved by Epic-10).** Story 7.3-001's acceptance criteria
 describe `build` reading "the SQLite ledger if a prior run is being resumed," and
@@ -196,7 +196,10 @@ the build-stories skill repeats this. At the Epic-07 close the dedicated
 `sdlc resume` verb was **not** wired up — crash-resume lived only in the Epic-04
 bash tooling (`sdlc-state.sh`). Story 10.1-001 closes this: `sdlc resume`,
 `sdlc status`, and `sdlc state` are now controller-native and read the ledger
-directly. Only `init` and `rollback` remain stubs, resolved in Story 10.2-001.
+directly. Story 10.2-001 then resolved the last two: `sdlc rollback` is
+implemented (checkpoint rollback with merged-PR guard rails) and `init` was
+removed as redundant with `build`'s auto-create. No controller verb prints "not
+yet implemented" any longer.
 
 ## Out-of-Scope for Epic-07
 

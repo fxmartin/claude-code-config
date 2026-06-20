@@ -72,7 +72,25 @@ exposes a single console-script entry point: `sdlc`.
   an extra native dependency. Rejected on install-footprint and language-fit
   grounds, not on technical capability.
 
+## Addendum (2026-06-20, Epic-10 / Story 10.2-001): the `init` verb was removed
+
+Story 7.1-001 scaffolded an `init` subcommand alongside the other stubs, on the
+assumption the controller might need an explicit "create the workspace/ledger"
+step. It never gained one. `build` (and, transitively, `resume`) create the
+SQLite ledger on first use — `run_build` calls `Ledger.init()`, which runs the
+schema DDL and migrations idempotently before any story is dispatched. A
+separate `init` verb would either duplicate that or do nothing, so it was a dead
+end that printed "not yet implemented."
+
+Story 10.2-001 resolved it by **removal** rather than inventing a purpose: the
+command and its `PLANNED_SUBCOMMANDS` entry are gone, and `sdlc --help` no longer
+lists it. This keeps the CLI surface honest — every listed verb does real work.
+If a future need for explicit scaffolding appears (e.g. seeding per-repo config
+files), it can be reintroduced with a documented job; until then, the absence is
+the correct state.
+
 ## References
 
 - `docs/stories/epic-07-external-controller.md` (Story 7.1-001, Design Notes)
+- `docs/stories/epic-10-controller-hardening.md` (Story 10.2-001)
 - `docs/python-best-practices.md`
