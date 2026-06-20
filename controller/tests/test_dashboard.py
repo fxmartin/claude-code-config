@@ -108,6 +108,32 @@ def test_api_status_no_run(tmp_path: Path) -> None:
     assert json.loads(body)["run"] is None
 
 
+def test_api_payloads_carry_durations(tmp_path: Path) -> None:
+    """Both /api/status and /api/runs expose duration_seconds (Story 11.2-005)."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)  # one IN_PROGRESS story with a started build stage, one DONE story
+    with _running(db) as base:
+        _s, _c, status_body = _get(base + "/api/status")
+        _s2, _c2, runs_body = _get(base + "/api/runs")
+    snap = json.loads(status_body)
+    assert "duration_seconds" in snap["run"]
+    assert snap["run"]["duration_seconds"] >= 0  # in-progress run → elapsed-so-far
+    assert all("duration_seconds" in s for s in snap["stories"])
+    runs = json.loads(runs_body)
+    assert all("duration_seconds" in r for r in runs)
+
+
+def test_page_includes_duration_formatter_and_column(tmp_path: Path) -> None:
+    """The served page ships the shared formatter and a per-story duration header."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/")
+    text = body.decode("utf-8")
+    assert "function humanDuration" in text   # shared formatter present
+    assert "<th>duration</th>" in text         # per-story duration column header
+
+
 # --- clickable PR links ----------------------------------------------------
 
 

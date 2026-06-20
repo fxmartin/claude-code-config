@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from sdlc import __version__
-from sdlc.build import _EMPTY_COUNTS, Ledger, status_snapshot
+from sdlc.build import _EMPTY_COUNTS, Ledger, _duration_seconds, status_snapshot
 from sdlc.registry import Registry, RunRecord, derive_state
 
 # scp-like remote: git@host:owner/sub/repo.git
@@ -109,6 +109,7 @@ def _registry_runs_view(registry: Registry) -> list[dict]:
                 "status": derive_state(rec),
                 "started_at": rec.started_at,
                 "finished_at": rec.finished_at,
+                "duration_seconds": _duration_seconds(rec.started_at, rec.finished_at),
                 "done": done,
                 "total": total,
             }
@@ -303,6 +304,10 @@ _PAGE = """<!doctype html>
 <script>
 const ORDER = ["DONE","IN_PROGRESS","FAILED","BLOCKED","NEEDS_ATTENTION","SKIPPED","TODO"];
 let sel = null;  // null = Live (latest)
+// Live run-duration ticker (Story 11.2-005): when a run is in-progress, count
+// up locally from the server-computed elapsed (runtimeBase) captured at fetch
+// (runtimeAnchor). null disables the ticker (finished run / no timestamps).
+let runtimeBase = null, runtimeAnchor = null;
 function esc(s){return String(s==null?"":s).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));}
 function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(s)+"</span>";}
 function humanTokens(n){
@@ -312,6 +317,16 @@ function humanTokens(n){
   return String(n);
 }
 function usd(n){ return n==null ? "" : "$"+Number(n).toFixed(n<1?3:2); }
+// Shared duration formatter (Story 11.2-005): seconds → e.g. "4m 12s",
+// "1h 03m", "8s". Guards null/negative/NaN so a cell never shows a bad value.
+function humanDuration(s){
+  if(s==null || !isFinite(s) || s<0) return "—";
+  s = Math.floor(s);
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  if(h>0) return h+"h "+String(m).padStart(2,"0")+"m";
+  if(m>0) return m+"m "+String(sec).padStart(2,"0")+"s";
+  return sec+"s";
+}
 function stageCell(st){
   let title = (st.attempt?("attempt "+st.attempt):"") + (st.failure_category?(" · "+esc(st.failure_category)):"");
   if(st.tokens!=null) title += " · "+humanTokens(st.tokens)+" tok"+(st.cost_usd!=null?(" · "+usd(st.cost_usd)):"");
@@ -337,7 +352,7 @@ function activityRow(s){
   // Span every column but the leading story cell so the activity reads as a
   // continuation of its story row. Update the colspan if columns change.
   return "<tr class='substage'><td></td>"
-    + "<td colspan='7' class='small'><span class='kind'>"+glyph+"</span>"
+    + "<td colspan='8' class='small'><span class='kind'>"+glyph+"</span>"
     + stage + esc(a.message)
     + (a.ts ? " <span class='muted'>"+esc(a.ts)+"</span>" : "") + "</td></tr>";
 }
@@ -363,6 +378,7 @@ function renderRuns(runs){
   html += (runs||[]).map(r => {
     const sub = esc(r.scope) + " &middot; " + esc(r.done) + "/" + esc(r.total)
       + (r.failed ? " &middot; " + esc(r.failed) + " failed" : "")
+      + (r.duration_seconds!=null ? " &middot; " + humanDuration(r.duration_seconds) : "")
       + (r.total_tokens!=null ? " &middot; " + humanTokens(r.total_tokens) + " tok" : "")
       + (r.total_cost_usd!=null ? " &middot; " + usd(r.total_cost_usd) : "");
     const repo = r.repo
@@ -406,9 +422,24 @@ function renderMain(d){
       + " &middot; cache "+humanTokens((u.cache_read||0)+(u.cache_creation||0))+")"
       + (u.cost_usd!=null ? " &middot; "+usd(u.cost_usd) : "") + "</div>"
     : "";
+  const running = run.status === "IN_PROGRESS";
+  // Run total duration (Story 11.2-005): "took" once finished, "elapsed" while
+  // running. The label carries an id so the ticker can refresh it in place
+  // (live ticking) without re-rendering the whole head between transport pushes.
+  const durLine = run.duration_seconds!=null
+    ? " &middot; "+(running?"elapsed":"took")+" <span id='runtime'>"+esc(humanDuration(run.duration_seconds))+"</span>"
+    : "";
   document.getElementById("head").innerHTML =
     "run <code>"+esc(run.id.slice(0,8))+"</code> &middot; "+badge(run.status)
-    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode) + cfgline + usageLine;
+    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode) + durLine + cfgline + usageLine;
+  // Anchor the local ticker: while running, count up from the server-computed
+  // elapsed at fetch using the browser clock, so the value advances smoothly
+  // even when the ledger (and the SSE transport) is momentarily quiet.
+  if(running && run.duration_seconds!=null){
+    runtimeBase = run.duration_seconds; runtimeAnchor = Date.now();
+  } else {
+    runtimeBase = null; runtimeAnchor = null;
+  }
   const total = c.total||0, done = c.done||0;
   document.getElementById("bar").style.width = (total? Math.round(100*done/total):0) + "%";
   document.getElementById("chips").innerHTML = ORDER
@@ -434,12 +465,13 @@ function renderMain(d){
     + "<td>"+badge(s.status)+bug+"</td>"
     + stageCells
     + "<td>"+pr+"</td>"
-    + "<td class='muted small'>"+tok+"</td></tr>"
+    + "<td class='muted small'>"+tok+"</td>"
+    + "<td class='muted small'>"+humanDuration(s.duration_seconds)+"</td></tr>"
     + activityRow(s);
   }).join("");
   document.getElementById("stories").innerHTML = rows
     ? "<table><tr><th>story</th><th>status</th><th>build</th><th>QA</th>"
-      + "<th>review</th><th>merge</th><th>PR</th><th>tokens</th></tr>"+rows+"</table>"
+      + "<th>review</th><th>merge</th><th>PR</th><th>tokens</th><th>duration</th></tr>"+rows+"</table>"
     : "<p class='muted'>no stories yet…</p>";
   document.getElementById("events").innerHTML = (d.events||[]).slice().reverse().map(e =>
     "<div><span class='muted'>"+esc(e.ts)+"</span> <span class='lvl-"+esc(e.level)+"'>"+esc(e.level)+"</span> "+esc(e.message)+"</div>"
@@ -465,6 +497,15 @@ function connectStream(){
     document.getElementById("updated").textContent = "reconnecting…";
   });
 }
+// Advance the in-progress run's elapsed once a second between transport pushes.
+function tickRuntime(){
+  if(runtimeBase==null || runtimeAnchor==null) return;
+  const el = document.getElementById("runtime");
+  if(!el) return;
+  el.textContent = humanDuration(runtimeBase + (Date.now()-runtimeAnchor)/1000);
+}
+setInterval(tickRuntime, 1000);
+
 tick();          // immediate first paint
 connectStream(); // then live updates (the stream's initial change repaints too)
 </script>

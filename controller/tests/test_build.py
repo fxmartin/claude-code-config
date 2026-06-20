@@ -1138,6 +1138,71 @@ def test_status_snapshot_run_usage_and_per_story_totals(tmp_path) -> None:
     assert s["cost_usd"] is not None
 
 
+def test_status_snapshot_exposes_run_and_story_durations(tmp_path) -> None:
+    """Durations come from the persisted stage/run timestamps (Story 11.2-005)."""
+    import sqlite3
+
+    from sdlc.build import status_snapshot
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "DONE")
+    ledger.stage_start(run_id, "s1", "build", 1)
+    ledger.stage_finish(run_id, "s1", "build", 1, "DONE")
+    # Pin known timestamps so the computed span is deterministic.
+    with sqlite3.connect(tmp_path / "ledger.db") as conn:
+        conn.execute(
+            "UPDATE runs SET started_at='2026-06-20 11:00:00', "
+            "finished_at='2026-06-20 11:04:12' WHERE id=?",
+            (run_id,),
+        )
+        conn.execute(
+            "UPDATE stages SET started_at='2026-06-20 11:00:30', "
+            "finished_at='2026-06-20 11:03:30' WHERE run_id=? AND story_id='s1'",
+            (run_id,),
+        )
+
+    snap = status_snapshot(ledger, run_id)
+    assert snap["run"]["duration_seconds"] == 252  # 4m 12s
+    assert snap["stories"][0]["duration_seconds"] == 180  # 3m
+
+
+def test_status_snapshot_in_progress_story_duration_is_elapsed(tmp_path) -> None:
+    """An unfinished stage yields a positive, non-null elapsed-so-far span."""
+    from sdlc.build import status_snapshot
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "s1", "build", 1)  # started, not finished
+
+    snap = status_snapshot(ledger, run_id)
+    # In-progress run + in-flight story: both elapsed-so-far, never None/negative.
+    assert snap["run"]["duration_seconds"] is not None
+    assert snap["run"]["duration_seconds"] >= 0
+    assert snap["stories"][0]["duration_seconds"] is not None
+    assert snap["stories"][0]["duration_seconds"] >= 0
+
+
+def test_list_runs_exposes_duration_seconds(tmp_path) -> None:
+    """The runs-browser rows carry a duration for the overview (Story 11.2-005)."""
+    import sqlite3
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    with sqlite3.connect(tmp_path / "ledger.db") as conn:
+        conn.execute(
+            "UPDATE runs SET started_at='2026-06-20 11:00:00', "
+            "finished_at='2026-06-20 12:03:00' WHERE id=?",
+            (run_id,),
+        )
+    rows = ledger.list_runs()
+    assert rows[0]["duration_seconds"] == 3780  # 1h 03m
+
+
 def test_run_build_records_usage_on_stage_rows(tmp_path) -> None:
     import sqlite3
     db = tmp_path / "ledger.db"
