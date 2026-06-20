@@ -123,9 +123,13 @@ def test_no_args_shows_help() -> None:
 
 
 def test_stub_output_contains_not_implemented() -> None:
-    """All stub commands clearly indicate they are not yet implemented."""
-    # `build` (Story 7.3-001) and `status` are implemented and no longer stubs.
-    stubs = ["resume", "state", "rollback"]
+    """The remaining stub commands clearly indicate they are not yet implemented.
+
+    `build`/`validate`/`status` (Epic-07) and `resume`/`state` (Story 10.1-001)
+    are implemented and no longer stubs. `init` and `rollback` are resolved in
+    Story 10.2-001 and stay stubs until then.
+    """
+    stubs = ["init", "rollback"]
     for cmd in stubs:
         result = runner.invoke(app, [cmd])
         assert result.exit_code == 0, f"{cmd} exited with {result.exit_code}"

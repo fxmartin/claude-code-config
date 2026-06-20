@@ -5,6 +5,30 @@ All notable changes to `sdlc-controller`. Format follows
 versioning. History before 1.14.0 lives in the git log and the Epic-07/08
 stories.
 
+## [Unreleased]
+
+### Added
+- **Controller-native `resume`** (Story 10.1-001) — `sdlc resume [scope]` recovers
+  an interrupted build directly from the SQLite ledger. It finds the most recent
+  run still marked `IN_PROGRESS`, recomputes the remaining queue from the markdown
+  epics, and re-enters the 4-stage loop at the exact stage each story was
+  interrupted in (PR number and attempt count preserved); completed stories are
+  not rebuilt. A run with no incomplete stories is a no-op that reports "nothing to
+  resume" and exits 0. New `sdlc/resume.py` (`compute_resume_plan`, `run_resume`);
+  `_run_story` gains `done_stages` / `start_attempt` / `pr_number` / `bugfix_seq`
+  resume parameters whose defaults reproduce a fresh full build exactly. Crash
+  recovery no longer requires dropping to the Epic-04 bash `sdlc-state.sh`.
+- **`sdlc state`** (Story 10.1-001) — dumps the persisted state-machine rows for a
+  run (story id, stage, status, attempt, PR, branch) in a stable, greppable format
+  for debugging, or as a JSON array with `--json`. New `Ledger.state_rows()` and
+  `sdlc/status.py` (`state_report`, `format_state`).
+- **`Ledger.latest_resumable_run()`** — resolves the newest interrupted run,
+  optionally filtered by scope, that `resume` recovers.
+
+### Changed
+- `sdlc status` (human output) now also reports the in-progress story count
+  alongside done / failed / blocked.
+
 ## [1.16.0] — 2026-06-20
 
 Replicates the richer dashboard developed in the GitLab-native fork: the full

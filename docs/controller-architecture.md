@@ -20,6 +20,8 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
 | `sdlc/contracts.py` | JSON-schema parse + validation (Story 7.2-001). |
 | `sdlc/ledger_view.py` | DB-path resolution + markdown render hook. |
+| `sdlc/resume.py` | Crash-resume: derives each story's resume point from the ledger and re-enters the loop (Story 10.1-001). |
+| `sdlc/status.py` | Read-side `state` helpers — a greppable state-machine dump (Story 10.1-001). |
 
 ## The state machine
 
@@ -70,6 +72,32 @@ standalone `uv tool install` works with no repo checkout. The markdown
 read-model (`docs/stories/.build-progress.md`) is regenerated from the ledger
 via `sdlc-state.sh render` when that script is present (best-effort — a render
 failure never fails an otherwise-good build).
+
+## Resume, status, and state
+
+Because every stage transition is persisted **before** the next stage runs, the
+ledger alone is enough to recover an interrupted run — no separate journal.
+
+- **`sdlc resume [scope]`** (`sdlc/resume.py`) finds the most recent run still
+  marked `IN_PROGRESS` (a clean close-out stamps a terminal status, so a run
+  left `IN_PROGRESS` is by definition interrupted), recomputes the queue from
+  the markdown epics, and derives a per-story resume point with
+  `compute_resume_plan`: the pipeline stages that already have a DONE attempt
+  are skipped, the first stage still owed is re-entered, and the attempt counter
+  continues past any crashed attempt (so a half-written IN_PROGRESS row is never
+  overwritten). The PR number and bugfix sequence carry forward. `run_resume`
+  reuses `_run_story` (via its `done_stages` / `start_attempt` / `pr_number` /
+  `bugfix_seq` parameters), `compute_cohorts`, and the same dependency-blocking
+  and close-out logic as `run_build`, so a resumed run reaches the same end
+  state a full build would. Completed stories are never rebuilt; a run with no
+  incomplete stories is a no-op.
+- **`sdlc status`** reports the active/most-recent run from the ledger
+  (`status_snapshot`): scope, run id, per-story current stage, and aggregate
+  counts (done / failed / blocked / in-progress). It never reads
+  `.build-progress.md`.
+- **`sdlc state`** (`sdlc/status.py` + `Ledger.state_rows`) dumps every stage
+  row (story id, stage, status, attempt, PR, branch) in a stable, greppable
+  format for debugging.
 
 ## The dispatch seam
 
