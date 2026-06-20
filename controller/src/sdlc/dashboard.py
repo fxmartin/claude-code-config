@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -23,7 +24,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from sdlc import __version__
-from sdlc.build import Ledger, status_snapshot
+from sdlc.build import _EMPTY_COUNTS, Ledger, status_snapshot
+from sdlc.registry import Registry, RunRecord, derive_state
 
 # scp-like remote: git@host:owner/sub/repo.git
 _SCP_REMOTE = re.compile(r"^[\w.-]+@([\w.-]+):(.+?)(?:\.git)?/?$")
@@ -72,6 +74,47 @@ def _project_name(project_url: str | None, db_path: Path) -> str:
     if project_url:
         return "/".join(project_url.rstrip("/").split("/")[-2:])
     return db_path.resolve().parent.name
+
+
+# --- multi-run registry discovery (Story 11.2-002) -------------------------
+# In discovery mode the dashboard has no single ledger: it reads the host-level
+# registry to find every `sdlc build` across repos, and resolves each run's own
+# ledger on demand. The per-repo ledger stays authoritative for run detail.
+
+
+def _registry_runs_view(registry: Registry) -> list[dict]:
+    """Normalize the host-level registry into the runs-browser row shape.
+
+    Each row carries the cross-repo discovery fields (``repo``, ``scope``) plus
+    the derived effective ``status`` and live ``done``/``total`` read from that
+    run's own ledger when reachable — falling back to the registry's cached
+    counts when a ledger is missing/corrupt (the registry is best-effort).
+    Newest run first.
+    """
+    rows: list[dict] = []
+    for rec in registry.records():
+        done, total = rec.completed, rec.total
+        try:
+            for r in Ledger(rec.db).list_runs():
+                if r["id"] == rec.run_id:
+                    done, total = r["done"], r["total"]
+                    break
+        except (OSError, sqlite3.Error):
+            pass  # unreachable ledger → keep the registry's cached counts
+        rows.append(
+            {
+                "id": rec.run_id,
+                "repo": rec.repo,
+                "scope": rec.scope,
+                "status": derive_state(rec),
+                "started_at": rec.started_at,
+                "finished_at": rec.finished_at,
+                "done": done,
+                "total": total,
+            }
+        )
+    rows.sort(key=lambda r: (r["started_at"] or ""), reverse=True)
+    return rows
 
 
 # --- lifecycle: stop/restart -----------------------------------------------
@@ -228,8 +271,11 @@ function stageCell(st){
   let title = (st.attempt?("attempt "+st.attempt):"") + (st.failure_category?(" · "+esc(st.failure_category)):"");
   if(st.tokens!=null) title += " · "+humanTokens(st.tokens)+" tok"+(st.cost_usd!=null?(" · "+usd(st.cost_usd)):"");
   const inner = title ? "<span title='"+esc(title)+"'>"+badge(st.status)+"</span>" : badge(st.status);
+  // Carry the selected run so registry mode confines /log to that run's logs
+  // root (a non-newest run's transcript lives under its own <db>.logs).
+  const runQ = sel ? "&run=" + encodeURIComponent(sel) : "";
   return st.output_path
-    ? "<td><a href='/log?path="+encodeURIComponent(st.output_path)+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
+    ? "<td><a href='/log?path="+encodeURIComponent(st.output_path)+runQ+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
     : "<td>"+inner+"</td>";
 }
 
@@ -256,8 +302,12 @@ function renderRuns(runs){
       + (r.failed ? " &middot; " + esc(r.failed) + " failed" : "")
       + (r.total_tokens!=null ? " &middot; " + humanTokens(r.total_tokens) + " tok" : "")
       + (r.total_cost_usd!=null ? " &middot; " + usd(r.total_cost_usd) : "");
+    const repo = r.repo
+      ? "<div class='muted small'>📁 " + esc(String(r.repo).split(/[\\\\/]/).pop()) + "</div>"
+      : "";
     return "<div class='run "+(sel===r.id?"active":"")+"' data-run='"+esc(r.id)+"'>"
       + badge(r.status) + " <code>" + esc(r.id.slice(0,8)) + "</code>"
+      + repo
       + "<div class='muted small'>" + sub + "</div>"
       + "<div class='muted small'>" + esc(r.started_at||"") + "</div></div>";
   }).join("");
@@ -366,30 +416,88 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parts = urlsplit(self.path)
         path = parts.path
-        ledger = Ledger(self.server.db_path)
+        query = parse_qs(parts.query)
+        run = query.get("run", [None])[0] or self.server.run_id
         if path == "/":
             # Inject the controller version into the brand bar (constant per
             # process; escaped though it comes from trusted package metadata).
             page = _PAGE.replace("__SDLC_VERSION__", html.escape(f"v{__version__}"))
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         elif path in ("/api/status", "/status.json"):
-            run = parse_qs(parts.query).get("run", [None])[0] or self.server.run_id
-            snap = status_snapshot(ledger, run)
-            snap["pr_base"] = self.server.project_url
-            snap["project"] = {"name": self.server.project_name, "url": self.server.project_url}
-            self._json(snap)
+            if self.server.registry is not None:
+                self._json(self._registry_status(run))
+            else:
+                snap = status_snapshot(Ledger(self.server.db_path), run)
+                snap["pr_base"] = self.server.project_url
+                snap["project"] = {
+                    "name": self.server.project_name,
+                    "url": self.server.project_url,
+                }
+                self._json(snap)
         elif path == "/api/runs":
-            self._json(ledger.list_runs())
+            if self.server.registry is not None:
+                self._json(_registry_runs_view(self.server.registry))
+            else:
+                self._json(Ledger(self.server.db_path).list_runs())
         elif path == "/log":
-            self._serve_log(parse_qs(parts.query).get("path", [""])[0])
+            self._serve_log(query.get("path", [""])[0], run)
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
-    def _serve_log(self, requested: str) -> None:
-        """Serve a transcript file, but only one resolving inside the logs root."""
-        root = self.server.logs_root
+    # --- registry-discovery mode helpers -----------------------------------
+
+    def _resolve_run(self, run_id: str | None) -> RunRecord | None:
+        """The registry record for ``run_id``, or the newest run when unset.
+
+        Returns None when the id is unknown or the registry is empty — the
+        caller then renders "no run" rather than a hollow snapshot.
+        """
+        records = self.server.registry.records()
+        if run_id:
+            return next((r for r in records if r.run_id == run_id), None)
+        if not records:
+            return None
+        return max(records, key=lambda r: (r.started_at or ""))
+
+    def _registry_status(self, run_id: str | None) -> dict:
+        """Status snapshot resolved through the registry to the run's own ledger.
+
+        Per-run isolation: each run reads its registered ``db`` path, so two
+        runs in two repos never bleed into one another's detail view.
+        """
+        rec = self._resolve_run(run_id)
+        if rec is None:
+            return {
+                "db": None,
+                "run": None,
+                "counts": dict(_EMPTY_COUNTS),
+                "stories": [],
+                "events": [],
+                "pr_base": None,
+                "project": {"name": None, "url": None},
+            }
+        snap = status_snapshot(Ledger(rec.db), rec.run_id)
+        project_url = git_project_url(Path(rec.db).parent)
+        snap["pr_base"] = project_url
+        snap["project"] = {"name": _project_name(project_url, Path(rec.db)), "url": project_url}
+        return snap
+
+    def _serve_log(self, requested: str, run_id: str | None = None) -> None:
+        """Serve a transcript file, but only one resolving inside the logs root.
+
+        In registry-discovery mode the logs root is the selected run's own
+        ``<db>.logs`` directory, keeping the path confinement per-run.
+        """
+        if self.server.registry is not None:
+            rec = self._resolve_run(run_id)
+            root = Path(f"{rec.db}.logs").resolve() if rec is not None else None
+        else:
+            root = self.server.logs_root
+        if root is None:
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
         try:
             target = Path(requested).resolve()
             target.relative_to(root)  # raises ValueError if outside the root
@@ -401,16 +509,32 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(
-    db_path: str | Path,
+    db_path: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8787,
     run_id: str | None = None,
+    registry: Registry | None = None,
 ) -> ThreadingHTTPServer:
-    """Build (but do not start) the dashboard server bound to ``host:port``."""
+    """Build (but do not start) the dashboard server bound to ``host:port``.
+
+    With a ``db_path`` the server runs in single-repo mode (the historical
+    behaviour): one ledger, one runs browser. Without one it runs in
+    registry-discovery mode — it reads the host-level registry to list every
+    run across repos and resolves each run's own ledger on demand.
+    """
     server = ThreadingHTTPServer((host, port), _Handler)
+    server.run_id = run_id  # type: ignore[attr-defined]
+    if db_path is None:
+        # Registry-discovery mode: no single ledger; project/logs resolve per run.
+        server.registry = registry if registry is not None else Registry()  # type: ignore[attr-defined]
+        server.db_path = None  # type: ignore[attr-defined]
+        server.project_url = None  # type: ignore[attr-defined]
+        server.project_name = None  # type: ignore[attr-defined]
+        server.logs_root = None  # type: ignore[attr-defined]
+        return server
+    server.registry = None  # type: ignore[attr-defined]
     db_path = Path(db_path)
     server.db_path = db_path  # type: ignore[attr-defined]
-    server.run_id = run_id  # type: ignore[attr-defined]
     # Resolve the project's GitHub web base + a repo label once (from the repo
     # holding the ledger): used for PR links and the header. None when not a git repo.
     server.project_url = git_project_url(db_path.parent)  # type: ignore[attr-defined]
@@ -422,14 +546,19 @@ def make_server(
 
 
 def serve(
-    db_path: str | Path,
+    db_path: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8787,
     run_id: str | None = None,
     open_browser: bool = False,
+    registry: Registry | None = None,
 ) -> None:
-    """Run the dashboard until interrupted. Prints the URL; optionally opens it."""
-    server = make_server(db_path, host, port, run_id)
+    """Run the dashboard until interrupted. Prints the URL; optionally opens it.
+
+    With no ``db_path`` it serves in registry-discovery mode, listing runs from
+    the host-level registry across repos.
+    """
+    server = make_server(db_path, host, port, run_id, registry)
     url = f"http://{host}:{port}"
     pf = _pidfile(host, port)
     pf.write_text(str(os.getpid()))
@@ -444,7 +573,8 @@ def serve(
     except ValueError:
         pass  # not the main thread (e.g. under test) — skip
 
-    print(f"sdlc dashboard → {url}  (ledger: {db_path}; Ctrl-C to stop)")
+    source = f"ledger: {db_path}" if db_path is not None else "registry discovery"
+    print(f"sdlc dashboard → {url}  ({source}; Ctrl-C to stop)")
     if open_browser:
         webbrowser.open(url)
     try:

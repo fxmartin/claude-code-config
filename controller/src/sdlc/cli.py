@@ -354,9 +354,11 @@ def dashboard(
 
     Use ``--stop`` to stop a (possibly backgrounded) dashboard on this port, or
     ``--restart`` to replace it — handy after upgrading the controller.
+
+    With no ``--db`` the dashboard discovers every run across repos from the
+    host-level registry; pass ``--db <path>`` for the single-repo view.
     """
     from sdlc.dashboard import serve, stop_dashboard
-    from sdlc.ledger_view import default_db_path
 
     if stop or restart:
         n = stop_dashboard(host, port)
@@ -368,9 +370,9 @@ def dashboard(
         if stop:
             raise typer.Exit(code=0)
 
-    db_path = db or default_db_path()
     try:
-        serve(db_path, host=host, port=port, run_id=run, open_browser=open_browser)
+        # db is None → registry-discovery mode (multi-run overview, Story 11.2-002).
+        serve(db, host=host, port=port, run_id=run, open_browser=open_browser)
     except OSError as exc:
         # Almost always "address already in use" — a dashboard is likely running.
         typer.echo(
