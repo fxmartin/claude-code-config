@@ -258,6 +258,15 @@ def status(
                 f"  {str(s.get('story_id', '?')):<14}"
                 f"{str(s.get('status', '?')):<13}{str(stage):<11}{pr_disp}"
             )
+            # Sub-stage activity for an in-flight story (Story 11.1-002): the
+            # latest progress milestone, e.g. "↳ build: editing cli.py". Absent
+            # for finished stories or runs without streamed progress.
+            activity = s.get("activity")
+            if s.get("status") == "IN_PROGRESS" and activity:
+                msg = activity.get("message") or activity.get("kind") or ""
+                act_stage = activity.get("stage") or stage
+                if msg:
+                    typer.echo(f"    ↳ {act_stage}: {msg}")
     if events:
         typer.echo("recent:")
         for e in events:

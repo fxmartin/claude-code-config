@@ -1181,3 +1181,197 @@ def test_read_api_tolerates_unmigrated_db(tmp_path) -> None:
     assert snap["run"]["usage"] is None
     assert snap["stories"][0]["tokens"] is None
     assert snap["stories"][0]["stages"][0]["tokens"] is None
+
+
+# ---------------------------------------------------------------------------
+# Story 11.1-002 — sub-stage progress events to the ledger
+# ---------------------------------------------------------------------------
+
+_EVENT_PROGRESS_COLS = {"stage", "kind"}
+
+
+def _event_columns(db: Path) -> set[str]:
+    import sqlite3
+    with sqlite3.connect(db) as conn:
+        return {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+
+
+def test_init_migrates_existing_db_adds_event_progress_columns(tmp_path) -> None:
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    assert not (_EVENT_PROGRESS_COLS & _event_columns(db))  # none present initially
+    Ledger(db).init()
+    assert _EVENT_PROGRESS_COLS <= _event_columns(db)
+
+
+def test_event_migration_preserves_existing_rows(tmp_path) -> None:
+    import sqlite3
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO events(run_id, story_id, level, source, message) "
+            "VALUES ('r1','s1','info','controller','hello')"
+        )
+    Ledger(db).init()
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT message, stage, kind FROM events").fetchone()
+    assert row[0] == "hello"   # pre-existing audit row intact
+    assert row[1] is None and row[2] is None  # new columns default NULL
+
+
+def test_progress_log_persists_kind_and_stage(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()  # events has no FK, so a bare progress row needs no run/story
+    ledger.progress_log("r1", "11.1-002", "build", "file_changed", "editing cli.py")
+    latest = ledger.latest_progress("r1")
+    assert latest["11.1-002"]["kind"] == "file_changed"
+    assert latest["11.1-002"]["stage"] == "build"
+    assert latest["11.1-002"]["message"] == "editing cli.py"
+
+
+def test_latest_progress_keeps_only_newest_per_story(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    ledger.progress_log("r1", "s1", "build", "agent_started", "agent started")
+    ledger.progress_log("r1", "s1", "build", "file_changed", "editing a.py")
+    ledger.progress_log("r1", "s2", "coverage", "test_run", "running tests")
+    latest = ledger.latest_progress("r1")
+    assert latest["s1"]["message"] == "editing a.py"   # newest for s1 wins
+    assert latest["s2"]["kind"] == "test_run"
+
+
+def test_progress_events_excluded_from_recent_events(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    ledger.event_log("r1", "s1", "info", "controller", "stage started")
+    ledger.progress_log("r1", "s1", "build", "tool_use", "$ git status")
+    recent = ledger.recent_events("r1")
+    messages = [e["message"] for e in recent]
+    assert "stage started" in messages
+    assert "$ git status" not in messages  # progress never floods the audit log
+
+
+def test_latest_progress_tolerates_unmigrated_db(tmp_path) -> None:
+    """A read-only viewer on a pre-11.1-002 ledger gets {}, not a crash."""
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    assert Ledger(db).latest_progress("r1") == {}
+
+
+class _StreamingDispatcher:
+    """A fake dispatcher that replays stream events into ``on_progress``.
+
+    Models the real streamed dispatch (Story 11.1-001/002): each canned event is
+    handed to the controller's progress sink before a successful AgentResult is
+    returned, so the wiring from dispatch → ledger progress rows is exercised
+    end-to-end without a real subprocess.
+    """
+
+    def __init__(self, events) -> None:
+        self.events = events
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.dispatch import AgentResult
+
+        sink = kwargs.get("on_progress")
+        if sink is not None:
+            for ev in self.events:
+                sink(ev)
+        return AgentResult(
+            agent_type=agent_type,
+            data=_default_payload(agent_type, story),
+            raw="",
+        )
+
+
+def test_streamed_stage_records_substage_activity(tmp_path) -> None:
+    """A build run with a streaming dispatcher lands sub-stage progress rows."""
+    db = tmp_path / "ledger.db"
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "src/cli.py"}}
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "uv run pytest"}}
+        ]}},
+    ]
+    opts = BuildOptions(scope="11.1-002", skip_coverage=True, skip_preflight=True)
+    run_build(
+        opts,
+        queue=[_story("11.1-002")],
+        ledger=Ledger(db),
+        dispatcher=_StreamingDispatcher(events),
+        preflight=lambda: True,
+    )
+    rid = Ledger(db).latest_run_id()
+    latest = Ledger(db).latest_progress(rid)
+    # The last streamed milestone for the story is the test run.
+    assert latest["11.1-002"]["kind"] == "test_run"
+
+
+def test_substage_activity_surfaces_in_status_snapshot(tmp_path) -> None:
+    """status_snapshot attaches the latest sub-stage activity to each story."""
+    from sdlc.build import status_snapshot
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    rid = ledger.run_create("11.1-002", "serial")
+    ledger.story_upsert(
+        rid, "s1", "epic-11", "Sub-stage story", "Should", 3,
+        "python-backend-engineer", "feature/s1", None, "IN_PROGRESS",
+    )
+    ledger.stage_start(rid, "s1", "build", 1)
+    ledger.progress_log(rid, "s1", "build", "file_changed", "editing cli.py")
+    snap = status_snapshot(ledger, rid)
+    story = next(s for s in snap["stories"] if s["story_id"] == "s1")
+    assert story["activity"]["message"] == "editing cli.py"
+
+
+def test_inflight_story_marked_in_progress_during_dispatch(tmp_path) -> None:
+    """A story is IN_PROGRESS (not TODO) while its stages run, so `sdlc status`
+    can show live sub-stage activity for it (Story 11.1-002).
+
+    Regression: previously a story went TODO → terminal with no IN_PROGRESS
+    window, so the status view never rendered activity for a real in-flight
+    build and `counts.in_progress` was always 0 mid-run.
+    """
+    from sdlc.build import status_snapshot
+    db = tmp_path / "ledger.db"
+    captured: dict = {}
+
+    class _Capturing:
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            from sdlc.dispatch import AgentResult
+            sink = kwargs.get("on_progress")
+            if sink is not None:
+                sink({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Edit", "input": {"file_path": "cli.py"}}
+                ]}})
+            if agent_type == "build":
+                # Observe the run state *while* the build stage is executing.
+                lg = Ledger(db)
+                rid = lg.latest_run_id()
+                captured["snap"] = status_snapshot(lg, rid)
+            return AgentResult(
+                agent_type=agent_type,
+                data=_default_payload(agent_type, story),
+                raw="",
+            )
+
+    run_build(
+        BuildOptions(scope="s1", skip_coverage=True, skip_preflight=True),
+        queue=[_story("s1")],
+        ledger=Ledger(db),
+        dispatcher=_Capturing(),
+        preflight=lambda: True,
+    )
+    snap = captured["snap"]
+    story = next(s for s in snap["stories"] if s["story_id"] == "s1")
+    assert story["status"] == "IN_PROGRESS"          # in-flight, not TODO
+    assert snap["counts"]["in_progress"] == 1        # count is accurate mid-run
+    assert story["activity"]["message"] == "editing cli.py"  # renders activity

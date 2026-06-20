@@ -10,9 +10,13 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sdlc.contracts import parse_and_validate
+
+# A sink that receives each parsed stream-json event as it arrives (Story
+# 11.1-002), used to emit fine-grained sub-stage progress to the ledger.
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 # Default command the controller shells out to. The prompt is delivered on
 # stdin. The agent runs **headless** (`-p`), where there is no human to approve
@@ -198,6 +202,7 @@ def dispatch_agent(
     agent_cmd: list[str] | None = None,
     timeout: int = DEFAULT_TIMEOUT_S,
     transcript_path: Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> AgentResult:
     """Dispatch one agent as a subprocess and validate its response.
 
@@ -214,11 +219,18 @@ def dispatch_agent(
 
     ``story`` is accepted (and ignored here) so a mock dispatcher in tests can
     key its canned responses on the story without changing this signature.
+
+    ``on_progress`` (Story 11.1-002) is called with each parsed stream-json event
+    as it arrives on the streaming path, so a caller can emit fine-grained
+    sub-stage progress to the ledger. It is never called on the captured path
+    (no streaming → no sub-stage milestones); failures inside the callback are
+    isolated so progress recording can never break the run.
     """
     cmd = resolve_agent_cmd(agent_cmd)
     if _is_streaming_cmd(cmd):
         return _dispatch_streaming(
-            agent_type, prompt, cmd, timeout=timeout, transcript_path=transcript_path
+            agent_type, prompt, cmd, timeout=timeout,
+            transcript_path=transcript_path, on_progress=on_progress,
         )
     return _dispatch_captured(
         agent_type, prompt, cmd, timeout=timeout, transcript_path=transcript_path
@@ -273,6 +285,21 @@ def _dispatch_captured(
     )
 
 
+def _emit_progress(on_progress: ProgressCallback | None, event: dict[str, Any]) -> None:
+    """Hand one parsed stream event to the progress callback, swallowing errors.
+
+    Progress recording is strictly best-effort (Story 11.1-002): a failing sink
+    (e.g. a transient ledger write error) must never abort the agent stream, so
+    any exception is contained here.
+    """
+    if on_progress is None:
+        return
+    try:
+        on_progress(event)
+    except Exception:  # noqa: BLE001 - progress is best-effort, never fatal
+        pass
+
+
 def _dispatch_streaming(
     agent_type: str,
     prompt: str,
@@ -280,6 +307,7 @@ def _dispatch_streaming(
     *,
     timeout: int,
     transcript_path: Path | None,
+    on_progress: ProgressCallback | None = None,
 ) -> AgentResult:
     """Streamed dispatch: consume stdout line-by-line, teeing each to the transcript.
 
@@ -371,8 +399,10 @@ def _dispatch_streaming(
                 transcript.append(line)
                 raw_lines.append(line)
                 event = _parse_stream_line(line)
-                if event is not None and event.get("type") == "result":
-                    result_event = event
+                if event is not None:
+                    _emit_progress(on_progress, event)
+                    if event.get("type") == "result":
+                        result_event = event
         # Claim completion: if the watchdog hasn't already fired, mark the read
         # done so a later firing is a no-op. If it *has* fired, the kill is what
         # ended the read — honour the timeout.
