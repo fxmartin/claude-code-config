@@ -524,3 +524,189 @@ def test_default_streaming_dispatch_uses_default_cmd(monkeypatch) -> None:
     dispatch_agent("build", "prompt")
     assert seen["cmd"][0]  # a non-empty executable name
     assert "stream-json" in seen["cmd"]
+
+
+# --- 11.1-001: best-effort error handling (transcript I/O, launch, reap) ----
+
+
+def test_parse_stream_line_invalid_json_returns_none() -> None:
+    """A line that opens like JSON but isn't parseable is ignored, not raised."""
+    from sdlc.dispatch import _parse_stream_line
+
+    assert _parse_stream_line("{not valid json") is None  # JSONDecodeError path
+    assert _parse_stream_line("plain diagnostic text") is None  # not a '{' line
+    assert _parse_stream_line("[1, 2, 3]") is None  # valid JSON, but not a dict
+
+
+def test_write_transcript_swallows_oserror(tmp_path) -> None:
+    """A transcript write that fails (here: target is a directory) never raises."""
+    from sdlc.dispatch import _write_transcript
+
+    # Writing text to an existing directory raises IsADirectoryError (an OSError),
+    # which the best-effort helper must swallow (R8).
+    _write_transcript(tmp_path, "body", "stderr")  # must not raise
+
+
+def test_stream_transcript_init_swallows_oserror(tmp_path) -> None:
+    """Opening the transcript for write can fail; the tee degrades to a no-op."""
+    from sdlc.dispatch import _StreamTranscript
+
+    t = _StreamTranscript(tmp_path)  # opening a directory for write raises → swallowed
+    assert t._fh is None
+    t.append("ignored")  # no-op, no raise (handle is None)
+    t.close()  # no-op, no raise (handle is None)
+
+
+class _BrokenFh:
+    """A file handle whose every operation raises OSError, to exercise the guards."""
+
+    def write(self, data: str) -> None:
+        raise OSError("write boom")
+
+    def flush(self) -> None:
+        raise OSError("flush boom")
+
+    def close(self) -> None:
+        raise OSError("close boom")
+
+
+def test_stream_transcript_append_and_close_swallow_oserror(tmp_path) -> None:
+    """A mid-stream write/flush/close failure is swallowed, never failing the run."""
+    from sdlc.dispatch import _StreamTranscript
+
+    t = _StreamTranscript(tmp_path / "ok.log")  # a valid open
+    t._fh = _BrokenFh()  # force subsequent I/O to fail
+    t.append("x")  # OSError on write/flush swallowed
+    t.close()  # OSError on close swallowed
+    assert t._fh is None  # close still clears the handle
+
+
+def test_captured_dispatch_launch_failure_raises(monkeypatch) -> None:
+    """A missing executable on the captured path surfaces as AgentDispatchError."""
+
+    def boom(*a, **kw):
+        raise FileNotFoundError("no such binary")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(AgentDispatchError, match="could not launch"):
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+
+
+def test_captured_dispatch_launch_failure_writes_transcript(monkeypatch, tmp_path) -> None:
+    """A launch failure on the captured path still records the reason on disk (R8)."""
+
+    def boom(*a, **kw):
+        raise FileNotFoundError("no such binary")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    tpath = tmp_path / "build-1.log"
+    with pytest.raises(AgentDispatchError):
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], transcript_path=tpath)
+    assert "could not launch" in tpath.read_text(encoding="utf-8")
+
+
+def test_streaming_dispatch_launch_failure_raises(monkeypatch, tmp_path) -> None:
+    """A missing executable on the streaming path surfaces as AgentDispatchError."""
+
+    def boom(*a, **kw):
+        raise FileNotFoundError("no such binary")
+
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    tpath = tmp_path / "build-1.log"
+    with pytest.raises(AgentDispatchError, match="could not launch"):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, transcript_path=tpath)
+    assert "could not launch" in tpath.read_text(encoding="utf-8")
+
+
+def test_streaming_dispatch_handles_missing_stderr(monkeypatch) -> None:
+    """A child with no stderr pipe (proc.stderr is None) drains cleanly."""
+    fake = _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+    fake.stderr = None  # the drain thread must short-circuit, not crash
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["branch_name"] == "feature/7.3-001"
+
+
+class _BrokenStderr:
+    """A stderr pipe whose read raises, to exercise the drain-thread guard."""
+
+    def read(self) -> str:
+        raise OSError("stderr read boom")
+
+
+def test_streaming_dispatch_stderr_read_error_is_swallowed(monkeypatch) -> None:
+    """A failure draining stderr never fails the run; the result still parses."""
+    fake = _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+    fake.stderr = _BrokenStderr()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["branch_name"] == "feature/7.3-001"
+
+
+class _BrokenStdin:
+    """A stdin pipe whose write and close raise, modelling a killed child's pipe."""
+
+    def __init__(self) -> None:
+        self.written = ""
+
+    def write(self, data: str) -> None:
+        raise BrokenPipeError("stdin write boom")
+
+    def close(self) -> None:
+        raise OSError("stdin close boom")
+
+
+def test_streaming_dispatch_stdin_errors_are_swallowed(monkeypatch) -> None:
+    """A broken stdin (write and close both raise) does not derail the run."""
+    fake = _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+    fake.stdin = _BrokenStdin()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["branch_name"] == "feature/7.3-001"
+
+
+def test_streaming_dispatch_timeout_reap_lingers(monkeypatch) -> None:
+    """When the killed child lingers past the reap window, the timeout still surfaces."""
+    blocking = _BlockingStdout()
+    # wait() raises TimeoutExpired so the post-kill reap in the timeout branch
+    # hits its `except TimeoutExpired: pass` guard rather than returning cleanly.
+    fake = _FakePopen([], wait_exc=subprocess.TimeoutExpired("cmd", 30))
+    fake.stdout = blocking
+
+    original_kill = fake.kill
+
+    def kill_and_release() -> None:
+        original_kill()
+        blocking.released.set()
+
+    fake.kill = kill_and_release  # type: ignore[method-assign]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    with pytest.raises(AgentDispatchError, match="timed out"):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, timeout=0.2)
+    assert fake.killed
+
+
+class _LingeringPopen(_FakePopen):
+    """A child that closes stdout but lingers: the bounded reap times out once,
+    then the unbounded reap after kill() returns the exit code.
+    """
+
+    def wait(self, timeout=None):  # noqa: ANN001 - mirror subprocess API
+        if timeout is not None:
+            raise subprocess.TimeoutExpired("cmd", timeout)
+        return self._returncode
+
+
+def test_streaming_dispatch_eof_reap_timeout_kills_child(monkeypatch) -> None:
+    """A child that closes stdout but won't exit is killed after the reap window."""
+    lines = [_stream_result_event(_wrap(_VALID_BUILD))]
+    fake_ref = {}
+
+    def make(*a, **kw):
+        fake_ref["p"] = _LingeringPopen(lines)
+        return fake_ref["p"]
+
+    monkeypatch.setattr(subprocess, "Popen", make)
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert fake_ref["p"].killed  # the lingering child was force-killed on reap timeout
