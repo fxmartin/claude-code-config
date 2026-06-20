@@ -759,6 +759,14 @@ EOF
     # A fresh, well-formed region was appended so future renders are idempotent.
     grep -q "12.2-BEG | Begin only | DONE" "${dest}"
     [ "$(grep -c 'END SDLC LEDGER' "${dest}")" -eq 1 ]
+
+    # Second render must be NON-DESTRUCTIVE and idempotent: the appended region
+    # leaves the original orphan BEGIN above it, so a first-marker splice rule
+    # would mis-pair that orphan with the new END and delete the dangling body.
+    cp "${dest}" "${BATS_TEST_TMPDIR}/begin-1.md"
+    "${SDLC_STATE}" --db "${DB}" render --out "${dest}"
+    diff "${BATS_TEST_TMPDIR}/begin-1.md" "${dest}"
+    grep -q "dangling partial body, never closed" "${dest}"
 }
 
 @test "render --out treats an END-only file as markerless and appends a region" {
@@ -786,6 +794,14 @@ EOF
     grep -q "1.1 | Pre-ledger story | DONE" "${dest}"
     grep -q "12.2-END | End only | DONE" "${dest}"
     [ "$(grep -c 'BEGIN SDLC LEDGER' "${dest}")" -eq 1 ]
+
+    # Second render must NOT append a duplicate region: the orphan END sits
+    # before the appended BEGIN, so detection must anchor on the last BEGIN /
+    # last END rather than fail and re-append on every run (unbounded growth).
+    cp "${dest}" "${BATS_TEST_TMPDIR}/end-1.md"
+    "${SDLC_STATE}" --db "${DB}" render --out "${dest}"
+    diff "${BATS_TEST_TMPDIR}/end-1.md" "${dest}"
+    [ "$(grep -c 'BEGIN SDLC LEDGER' "${dest}")" -eq 1 ]
 }
 
 @test "render --out treats END-before-BEGIN as markerless and appends a region" {
@@ -811,4 +827,11 @@ EOF
     # Malformed ordering -> append path: original kept, fresh region added.
     grep -q "inverted marker body" "${dest}"
     grep -q "12.2-ORD | Out of order | DONE" "${dest}"
+
+    # Second render is idempotent: the inverted orphan markers sit above the
+    # appended region and must not corrupt detection or get clobbered.
+    cp "${dest}" "${BATS_TEST_TMPDIR}/ord-1.md"
+    "${SDLC_STATE}" --db "${DB}" render --out "${dest}"
+    diff "${BATS_TEST_TMPDIR}/ord-1.md" "${dest}"
+    grep -q "inverted marker body" "${dest}"
 }
