@@ -638,30 +638,41 @@ render_document() {
     printf '%s\n' "${SDLC_MANAGED_END}"
 }
 
-# True when <file> already contains a well-formed managed region — a BEGIN
-# marker line that precedes an END marker line. Malformed / partial marker
-# sets return false so the caller falls back to non-destructive append.
-# grep is guarded so `set -o pipefail` does not abort on a no-match.
+# True when <file> already contains a well-formed managed region. The region
+# is anchored on the LAST BEGIN marker and the first END marker after it, so a
+# region exists exactly when the last BEGIN precedes the last END. Anchoring on
+# the *last* BEGIN (not the first) is what keeps re-renders idempotent: the
+# non-destructive append fallback can leave a stray half-marker in the
+# preserved content (e.g. a file that arrived with a BEGIN but no END), and a
+# first-marker rule would later mis-pair that orphan with the real region's END
+# and clobber everything between them. Malformed / partial marker sets (no
+# BEGIN, no END, or every END before every BEGIN) return false so the caller
+# falls back to non-destructive append. grep is guarded so `set -o pipefail`
+# does not abort on a no-match.
 has_managed_region() {
     local f="$1" begin_ln end_ln
-    begin_ln=$(grep -n -F "${SDLC_MANAGED_BEGIN}" "${f}" 2>/dev/null | head -1 | cut -d: -f1 || true)
-    end_ln=$(grep -n -F "${SDLC_MANAGED_END}" "${f}" 2>/dev/null | head -1 | cut -d: -f1 || true)
+    begin_ln=$(grep -n -F "${SDLC_MANAGED_BEGIN}" "${f}" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+    end_ln=$(grep -n -F "${SDLC_MANAGED_END}" "${f}" 2>/dev/null | tail -1 | cut -d: -f1 || true)
     [ -n "${begin_ln}" ] && [ -n "${end_ln}" ] && [ "${begin_ln}" -lt "${end_ln}" ]
 }
 
 # Splice freshly-rendered managed content into an existing file that already
-# carries a managed region. Everything before the first BEGIN marker and
-# everything after the first matching END marker is preserved verbatim; the
-# old managed body (markers included) is replaced by <managed_file> (which
-# carries its own BEGIN/END markers). Emits the merged document to stdout.
+# carries a managed region. The region starts at the LAST BEGIN marker and ends
+# at the first END marker after it (see has_managed_region for why the *last*
+# BEGIN). Everything before that BEGIN — including any orphan half-markers left
+# by an earlier append — and everything after the matching END is preserved
+# verbatim; the old managed body (markers included) is replaced by
+# <managed_file> (which carries its own BEGIN/END markers). Emits the merged
+# document to stdout.
 splice_managed_region() {
-    local existing="$1" managed_file="$2"
-    awk -v mfile="${managed_file}" '
+    local existing="$1" managed_file="$2" begin_ln
+    begin_ln=$(grep -n -F "${SDLC_MANAGED_BEGIN}" "${existing}" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+    awk -v mfile="${managed_file}" -v begin_ln="${begin_ln}" '
         BEGIN { while ((getline line < mfile) > 0) managed = managed line "\n" }
-        index($0, "BEGIN SDLC LEDGER") && state == 0 {
+        NR == begin_ln {   # last BEGIN marker = region start
             printf "%s", managed; state = 1; next
         }
-        index($0, "END SDLC LEDGER") && state == 1 { state = 2; next }
+        state == 1 && index($0, "END SDLC LEDGER") { state = 2; next }
         state == 1 { next }   # drop the stale managed body
         { print }
     ' "${existing}"
