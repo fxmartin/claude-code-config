@@ -1,9 +1,15 @@
 # Epic 11: Realtime Progress & Multi-Run Observability
 
-> **Status: PLANNED** — created 2026-06-20. Builds on Epic-07 (external controller),
-> Epic-04 (SQLite ledger), and Epic-10 (the `dashboard`/`status` verbs). Makes the
-> controller's progress observable *as it happens*, and lets one dashboard watch
-> several builds running in different repos at once.
+> **Status: IN PROGRESS (8/13 shipped)** — created 2026-06-20. The original 8 stories merged
+> (released through v1.34.0): 11.1-001 (#78), 11.1-002 (#80), 11.1-003 (#81), 11.2-001 (#79),
+> 11.2-004 (#82), 11.2-005 (#83); 11.2-002 and 11.2-003 were stranded `NEEDS_ATTENTION` by a
+> malformed result envelope, then recovered (committed work preserved — R10) and merged directly
+> (commits `fa49d61`, `b88d934`) — the exact failure mode Epic-12 12.1-001 will automate. **Still
+> planned:** the 5 follow-up dashboard stories added 2026-06-20 — 11.2-006 (GitHub repo-health),
+> 11.2-007 (wave/dep persistence), 11.2-008 (wave-column DAG), 11.2-009 (live story status),
+> 11.2-010 (transcript viewer). Builds on Epic-07 (external controller), Epic-04 (SQLite ledger),
+> and Epic-10 (the `dashboard`/`status` verbs). Makes the controller's progress observable *as it
+> happens*, and lets one dashboard watch several builds running in different repos at once.
 
 ## Epic Overview
 
