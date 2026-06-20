@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.34.0] - 2026-06-20
+
+### Added
+
+- feat(realtime-observability): show run/story durations (#11.2-005)
+
+
 ## [v1.33.0] - 2026-06-20
 
 ### Added
