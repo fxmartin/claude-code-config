@@ -38,7 +38,7 @@ The MVP target is shareability: five LTM colleagues can install the framework on
 | Epic-07 | External Controller and Typed Contracts | Roadmap | 4 | 26 | P2 | **COMPLETE** (PRs #40-#43; E2E_PASS after bugfix #45) — `sdlc build`/`validate`/`sync-check` implemented; `init`/`resume`/`status`/`state`/`rollback` ship as [stubs](./epic-07-external-controller.md#deferred--stubbed-subcommands) |
 | Epic-08 | Adversarial Gate and High-Risk Approval | Roadmap | 3 | 13 | P2 | **COMPLETE** (PRs #51, #52, #54) — adversarial slot + Codex reference impl + high-risk approval gate; gate approval fixed for solo/non-org repos via the `risk-approved` maintainer label ([#56](https://github.com/fxmartin/claude-code-config/pull/56)) |
 | Epic-09 | Security Baked into Quality Gates + Live Pilot | Roadmap | 4 | 12 | P2 | **CODE-COMPLETE** (3/4) — SAST (#58), gitleaks (#59), osv-scanner (#60) merged, E2E_PASS; [9.3-001 live pilot](./epic-09-security-quality-gates.md#story-93-001-five-colleague-live-pilot) BLOCKED pending human pilot |
-| Epic-10 | Controller Hardening (resume, observability, rollback) | Roadmap | 2 | 13 | P2 | **PLANNED** |
+| Epic-10 | Controller Hardening (resume, observability, rollback) | Roadmap | 2 | 13 | P2 | **IN PROGRESS** — `status` + a web `dashboard` shipped (#66, #67); `resume`/`state` (rest of 10.1-001) and `rollback`/`init` (10.2-001) remain stubs |
 
 ## Epic Navigation
 
