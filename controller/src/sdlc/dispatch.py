@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -21,7 +22,17 @@ from sdlc.contracts import parse_and_validate
 #   SDLC_AGENT_CMD="claude -p --permission-mode acceptEdits --allowedTools Edit,Write,Bash"
 # Tests always pass an explicit ``agent_cmd`` and monkeypatch ``subprocess.run``
 # so this default is never executed in CI.
-DEFAULT_AGENT_CMD: list[str] = ["claude", "-p", "--dangerously-skip-permissions"]
+#
+# ``--output-format json`` makes the agent emit a result *envelope* on stdout —
+# a single JSON object carrying the authoritative ``usage`` (token counts),
+# ``total_cost_usd`` and ``session_id`` alongside the agent's text in ``result``.
+# The controller unwraps it to feed the result-block parser and to record
+# per-stage token/cost usage on the ledger. A custom ``SDLC_AGENT_CMD`` that
+# omits the flag (or a non-claude agent) simply emits plain text — dispatch
+# falls back to parsing stdout directly and records no usage.
+DEFAULT_AGENT_CMD: list[str] = [
+    "claude", "-p", "--output-format", "json", "--dangerously-skip-permissions",
+]
 
 
 def resolve_agent_cmd(explicit: list[str] | None = None) -> list[str]:
@@ -67,13 +78,40 @@ class AgentResult:
     """A validated agent response.
 
     ``data`` has already passed JSON-schema validation for ``agent_type`` so
-    callers can read fields without re-checking. ``raw`` is the full agent
-    transcript, retained for ledger ``output_path`` logging and debugging.
+    callers can read fields without re-checking. ``raw`` is the agent's text
+    response, retained for ledger ``output_path`` logging and debugging.
+
+    ``usage`` / ``cost_usd`` / ``session_id`` come from the ``--output-format
+    json`` envelope and are None when the agent emitted plain text (a custom
+    ``SDLC_AGENT_CMD`` or older ``claude``).
     """
 
     agent_type: str
     data: dict[str, Any]
     raw: str
+    usage: dict[str, Any] | None = None
+    cost_usd: float | None = None
+    session_id: str | None = None
+
+
+def _parse_envelope(stdout: str) -> dict[str, Any] | None:
+    """Parse a ``claude -p --output-format json`` result envelope, or None.
+
+    Returns the envelope dict only when stdout is a single JSON object that
+    looks like Claude's result envelope (``type == "result"`` with a ``result``
+    field). Plain-text agent output, a non-claude agent, or malformed JSON
+    return None so the caller treats stdout as the raw agent response.
+    """
+    text = stdout.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        env = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(env, dict) and env.get("type") == "result" and "result" in env:
+        return env
+    return None
 
 
 def dispatch_agent(
@@ -132,5 +170,30 @@ def dispatch_agent(
             f"{agent_type} agent exited {completed.returncode}: {detail}"
         )
 
+    envelope = _parse_envelope(completed.stdout)
+    if envelope is not None:
+        if envelope.get("is_error"):
+            detail = (
+                envelope.get("result") or envelope.get("subtype") or "unknown error"
+            )
+            raise AgentDispatchError(
+                f"{agent_type} agent reported an error: {detail}"
+            )
+        agent_text = envelope.get("result") or ""
+        usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else None
+        raw_cost = envelope.get("total_cost_usd")
+        cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
+        session_id = envelope.get("session_id")
+        # The raw envelope is already on disk (R8 persist above); rewrite the
+        # transcript with the readable agent text so the dashboard /log view
+        # shows the response, not the JSON wrapper.
+        _write_transcript(transcript_path, agent_text, completed.stderr)
+        data = parse_and_validate(agent_type, agent_text)
+        return AgentResult(
+            agent_type=agent_type, data=data, raw=agent_text,
+            usage=usage, cost_usd=cost, session_id=session_id,
+        )
+
+    # Fallback: plain-text agent output (custom SDLC_AGENT_CMD / older claude).
     data = parse_and_validate(agent_type, completed.stdout)
     return AgentResult(agent_type=agent_type, data=data, raw=completed.stdout)

@@ -172,7 +172,24 @@ class FakeDispatcher:
                 payload = payload()
         else:
             payload = _default_payload(agent_type, story)
-        return AgentResult(agent_type=agent_type, data=payload, raw="")
+        # Attach a sample usage envelope so the orchestration exercises token
+        # recording (mirrors the real --output-format json dispatch).
+        return AgentResult(
+            agent_type=agent_type, data=payload, raw="",
+            usage=dict(_SAMPLE_USAGE), cost_usd=0.05,
+            session_id=f"sess-{agent_type}",
+        )
+
+
+# A representative usage envelope (the four token counts the agent emits).
+_SAMPLE_USAGE = {
+    "input_tokens": 100,
+    "output_tokens": 20,
+    "cache_read_input_tokens": 4000,
+    "cache_creation_input_tokens": 300,
+}
+# Sum of the four counts above → the per-stage token total the ledger stores.
+_SAMPLE_STAGE_TOKENS = 100 + 20 + 4000 + 300
 
 
 def _default_payload(agent_type, story):
@@ -888,3 +905,198 @@ def test_bugfix_across_stages_uses_distinct_attempts(tmp_path) -> None:
         "SELECT attempt FROM stages WHERE stage_name='bugfix' ORDER BY attempt"
     ).fetchall()
     assert [r[0] for r in rows] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Token/cost capture: schema migration, ledger write, read API, wiring
+# ---------------------------------------------------------------------------
+
+def _old_schema_db(db: Path) -> None:
+    """Create a pre-token-capture ledger: the full schema minus the six usage
+    columns on `stages` (mirrors a real ledger built before this feature)."""
+    import sqlite3
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE runs (id TEXT PRIMARY KEY, scope TEXT, started_at TIMESTAMP, "
+        "  finished_at TIMESTAMP, mode TEXT, total_stories INTEGER DEFAULT 0, "
+        "  completed INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, status TEXT NOT NULL);"
+        "CREATE TABLE stories (run_id TEXT, story_id TEXT, epic_id TEXT, title TEXT, "
+        "  priority TEXT, points INTEGER, agent_type TEXT, branch TEXT, "
+        "  pr_number INTEGER, current_stage TEXT, status TEXT NOT NULL, "
+        "  PRIMARY KEY(run_id, story_id));"
+        "CREATE TABLE stages (run_id TEXT, story_id TEXT, stage_name TEXT, "
+        "  attempt INTEGER DEFAULT 1, status TEXT NOT NULL, started_at TIMESTAMP, "
+        "  finished_at TIMESTAMP, failure_category TEXT, output_path TEXT, "
+        "  PRIMARY KEY(run_id, story_id, stage_name, attempt));"
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, "
+        "  story_id TEXT, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP, level TEXT NOT NULL, "
+        "  source TEXT, message TEXT NOT NULL);"
+        "CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+        "  applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _stage_columns(db: Path) -> set[str]:
+    import sqlite3
+    with sqlite3.connect(db) as conn:
+        return {r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()}
+
+
+_USAGE_COLS = {
+    "session_id", "input_tokens", "output_tokens",
+    "cache_read_tokens", "cache_creation_tokens", "cost_usd",
+}
+
+
+def test_init_migrates_existing_db_adds_usage_columns(tmp_path) -> None:
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    assert not (_USAGE_COLS & _stage_columns(db))  # none present initially
+    Ledger(db).init()
+    assert _USAGE_COLS <= _stage_columns(db)
+
+
+def test_init_migration_preserves_existing_rows(tmp_path) -> None:
+    import sqlite3
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO runs(id, status) VALUES ('r1','DONE')")
+        conn.execute("INSERT INTO stories(run_id, story_id, status) VALUES ('r1','s1','DONE')")
+        conn.execute(
+            "INSERT INTO stages(run_id, story_id, stage_name, attempt, status) "
+            "VALUES ('r1','s1','build',1,'DONE')"
+        )
+    Ledger(db).init()
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT status, input_tokens FROM stages WHERE run_id='r1'"
+        ).fetchone()
+    assert row[0] == "DONE"      # pre-existing data intact
+    assert row[1] is None        # new column defaults NULL
+
+
+def test_init_migration_is_idempotent(tmp_path) -> None:
+    import sqlite3
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    Ledger(db).init()
+    Ledger(db).init()  # second run must not raise (duplicate-column ALTER avoided)
+    with sqlite3.connect(db) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM _migrations WHERE version=1").fetchone()[0]
+    assert n == 1
+
+
+def test_stage_set_usage_persists_and_breakdown_exposes_tokens(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "TODO")
+    ledger.stage_start(run_id, "s1", "build", 1)
+    ledger.stage_finish(run_id, "s1", "build", 1, "DONE")
+    ledger.stage_set_usage(
+        run_id, "s1", "build", 1, session_id="sess-x",
+        input_tokens=100, output_tokens=20, cache_read_tokens=4000,
+        cache_creation_tokens=300, cost_usd=0.07,
+    )
+    breakdown = ledger.stage_breakdown(run_id)
+    build = breakdown["s1"][0]
+    assert build["tokens"] == 4420
+    assert build["cost_usd"] == 0.07
+    assert build["session_id"] == "sess-x"
+
+
+def test_list_runs_includes_token_and_cost_totals(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    runs = Ledger(db).list_runs()
+    assert runs and runs[0]["total_tokens"] is not None
+    assert runs[0]["total_tokens"] > 0
+    assert runs[0]["total_cost_usd"] > 0
+
+
+def test_list_runs_null_totals_when_no_usage(tmp_path) -> None:
+    """A run whose stages recorded no usage reports None totals (renders '—')."""
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "DONE")
+    ledger.stage_start(run_id, "s1", "build", 1)
+    ledger.stage_finish(run_id, "s1", "build", 1, "DONE")
+    runs = ledger.list_runs()
+    assert runs[0]["total_tokens"] is None
+    assert runs[0]["total_cost_usd"] is None
+
+
+def test_status_snapshot_run_usage_and_per_story_totals(tmp_path) -> None:
+    from sdlc.build import status_snapshot
+    db = tmp_path / "ledger.db"
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    snap = status_snapshot(Ledger(db))
+    usage = snap["run"]["usage"]
+    assert usage is not None
+    assert usage["total_tokens"] == usage["input"] + usage["output"] + usage["cache_read"] + usage["cache_creation"]
+    assert usage["cost_usd"] > 0
+    # Each story aggregates its stages (4 stages × sample tokens for a clean run).
+    s = snap["stories"][0]
+    assert s["tokens"] is not None and s["tokens"] > 0
+    assert s["cost_usd"] is not None
+
+
+def test_run_build_records_usage_on_stage_rows(tmp_path) -> None:
+    import sqlite3
+    db = tmp_path / "ledger.db"
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, "
+            "cache_creation_tokens, cost_usd, session_id FROM stages "
+            "WHERE story_id='s1-001' AND stage_name='build' AND attempt=1"
+        ).fetchone()
+    assert rows == (100, 20, 4000, 300, 0.05, "sess-build")
+
+
+def test_read_api_tolerates_unmigrated_db(tmp_path) -> None:
+    """list_runs/status_snapshot read a pre-token ledger without crashing.
+
+    The dashboard reads read-only and never migrates; an old DB (no usage
+    columns) must render with None totals, not raise 'no such column'.
+    """
+    import sqlite3
+    from sdlc.build import status_snapshot
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO runs(id, scope, status, mode) VALUES ('r1','s','DONE','serial')")
+        conn.execute("INSERT INTO stories(run_id, story_id, status) VALUES ('r1','s1','DONE')")
+        conn.execute(
+            "INSERT INTO stages(run_id, story_id, stage_name, attempt, status) "
+            "VALUES ('r1','s1','build',1,'DONE')"
+        )
+    ledger = Ledger(db)  # NOT init()'d — simulates a viewer on an old ledger
+    runs = ledger.list_runs()
+    assert runs[0]["total_tokens"] is None and runs[0]["total_cost_usd"] is None
+    snap = status_snapshot(ledger, "r1")
+    assert snap["run"]["usage"] is None
+    assert snap["stories"][0]["tokens"] is None
+    assert snap["stories"][0]["stages"][0]["tokens"] is None

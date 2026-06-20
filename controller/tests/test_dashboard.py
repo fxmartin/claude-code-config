@@ -257,3 +257,51 @@ def test_stop_dashboard_kills_recorded_pid() -> None:
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+# --- per-stage pipeline detail + /log endpoint -----------------------------
+
+
+def test_api_status_has_stage_breakdown(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)  # 34.5-003: build IN_PROGRESS, nothing past it
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/status")
+    by_id = {s["story_id"]: s for s in json.loads(body)["stories"]}
+    story = by_id["34.5-003"]
+    names = [st["name"] for st in story["stages"]]
+    assert names == ["build", "coverage", "review", "merge"]
+    by_name = {st["name"]: st["status"] for st in story["stages"]}
+    assert by_name["build"] == "IN_PROGRESS"
+    assert by_name["coverage"] == "PENDING"
+    assert by_name["review"] == "PENDING" and by_name["merge"] == "PENDING"
+    assert "bugfix_attempts" in story
+
+
+def test_log_endpoint_serves_within_root_and_confines(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    logs = tmp_path / ".sdlc-state.db.logs" / "run"
+    logs.mkdir(parents=True)
+    transcript = logs / "34.5-003-build-1.log"
+    transcript.write_text("AGENT TRANSCRIPT HERE", encoding="utf-8")
+    outside = tmp_path / "secret.txt"  # under tmp_path but NOT under the logs root
+    outside.write_text("do not serve", encoding="utf-8")
+
+    import urllib.parse
+
+    with _running(db) as base:
+        s1, _c, body = _get(base + "/log?path=" + urllib.parse.quote(str(transcript.resolve())))
+        assert s1 == 200 and b"AGENT TRANSCRIPT HERE" in body
+        try:
+            _get(base + "/log?path=" + urllib.parse.quote(str(outside.resolve())))
+            raise AssertionError("expected 404 for a path outside the logs root")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+
+
+def test_page_has_stage_columns() -> None:
+    from sdlc.dashboard import _PAGE
+
+    for header in ("build", "QA", "review", "merge"):
+        assert f"<th>{header}</th>" in _PAGE

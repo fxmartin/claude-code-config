@@ -60,11 +60,17 @@ sdlc dashboard --stop       # stop a (possibly backgrounded) dashboard
 ```
 
 The dashboard (Catppuccin Latte theme) auto-refreshes — run summary, progress
-bar, per-story stages, clickable PRs, recent events. A **left sidebar lists this
-repo's past runs** (the ledger is per-repo) so you can click any run to inspect
-it; "● Live" follows the newest. The **header names the GitHub project**
-(`owner/repo`, linked). Binds **localhost only** by default (`--host`/`--port`/
-`--run` to override). Runs until Ctrl-C.
+bar, clickable PRs, recent events. Each story shows its **full pipeline**
+(`build · QA · review · merge`, with PENDING/SKIPPED and a `🔧×N` bugfix marker);
+a failed stage links to its **transcript** via `/log`. The run header shows the
+**run config** (preflight / QA gate / mode) and **token & cost** totals, with a
+per-story token column and per-stage tooltips — captured from Claude Code's
+`--output-format json` envelope (override the agent command with `$SDLC_AGENT_CMD`;
+omitting the flag simply records no usage). A **left sidebar lists this repo's
+past runs** (the ledger is per-repo, with token/cost per run) so you can click any
+run to inspect it; "● Live" follows the newest. The **header names the GitHub
+project** (`owner/repo`, linked). Binds **localhost only** by default
+(`--host`/`--port`/`--run` to override). Runs until Ctrl-C.
 
 ## Agent I/O contracts (Story 7.2-001)
 

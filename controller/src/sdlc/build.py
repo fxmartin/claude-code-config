@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -66,6 +67,12 @@ CREATE TABLE IF NOT EXISTS stages (
     finished_at         TIMESTAMP,
     failure_category    TEXT,
     output_path         TEXT,
+    session_id          TEXT,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cache_read_tokens   INTEGER,
+    cache_creation_tokens INTEGER,
+    cost_usd            REAL,
     PRIMARY KEY (run_id, story_id, stage_name, attempt),
     FOREIGN KEY (run_id, story_id) REFERENCES stories(run_id, story_id) ON DELETE CASCADE
 );
@@ -93,6 +100,51 @@ CREATE INDEX IF NOT EXISTS idx_events_run_ts   ON events(run_id, ts);
 """
 
 _TERMINAL_RUN_STATES = {"DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION"}
+
+# Schema migrations applied by Ledger.init() after the base DDL. Each entry adds
+# missing columns to an existing ledger idempotently (guarded by PRAGMA
+# table_info, so a fresh DB created with the up-to-date DDL is a no-op) and is
+# recorded in the _migrations table so it runs at most once per DB. Migration 1
+# adds the per-stage token/cost columns to a pre-existing ledger without
+# touching its rows (old stages keep NULL usage and render as "—").
+_MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
+    (
+        1,
+        "stage usage columns",
+        "stages",
+        [
+            ("session_id", "TEXT"),
+            ("input_tokens", "INTEGER"),
+            ("output_tokens", "INTEGER"),
+            ("cache_read_tokens", "INTEGER"),
+            ("cache_creation_tokens", "INTEGER"),
+            ("cost_usd", "REAL"),
+        ],
+    ),
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Apply pending schema migrations on an open connection (idempotent).
+
+    Adds any missing columns via ``ALTER TABLE`` and records each applied
+    version in ``_migrations``. Identifiers come from the internal ``_MIGRATIONS``
+    table (never user input), so the f-string interpolation is safe — SQLite
+    cannot parametrise column/table names.
+    """
+    applied = {r[0] for r in conn.execute("SELECT version FROM _migrations").fetchall()}
+    for version, name, table, columns in _MIGRATIONS:
+        if version in applied:
+            continue
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col, col_type in columns:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations(version, name) VALUES (?, ?)",
+            (version, name),
+        )
+
 
 # Boolean flags the build subcommand accepts. Kept identical to the skill's
 # argument-hint so `sdlc build $ARGUMENTS` is a drop-in for `/build-stories`.
@@ -186,9 +238,10 @@ class Ledger:
             conn.close()
 
     def init(self) -> None:
-        """Create the ledger schema if absent (idempotent)."""
+        """Create the ledger schema if absent, then apply migrations (idempotent)."""
         with self._connect() as conn:
             conn.executescript(_SCHEMA_DDL)
+            _apply_migrations(conn)
 
     def run_create(self, scope: str, mode: str) -> str:
         """Insert a fresh run row and return its generated id."""
@@ -334,6 +387,39 @@ class Ledger:
                 ),
             )
 
+    def stage_set_usage(
+        self,
+        run_id: str,
+        story_id: str,
+        stage_name: str,
+        attempt: int,
+        *,
+        session_id: str | None,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        cache_read_tokens: int | None,
+        cache_creation_tokens: int | None,
+        cost_usd: float | None,
+    ) -> None:
+        """Record an agent's token/cost usage on a stage attempt row.
+
+        Called after a dispatch returns the ``--output-format json`` envelope.
+        Skipped by the caller when the agent emitted plain text and carried no
+        usage, so old rows keep NULL usage and render as "—".
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stages SET session_id = ?, input_tokens = ?, "
+                "output_tokens = ?, cache_read_tokens = ?, "
+                "cache_creation_tokens = ?, cost_usd = ? "
+                "WHERE run_id = ? AND story_id = ? AND stage_name = ? AND attempt = ?",
+                (
+                    session_id, input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, cost_usd,
+                    run_id, story_id, stage_name, attempt,
+                ),
+            )
+
     def event_log(
         self, run_id: str, story_id: str, level: str, source: str, message: str
     ) -> None:
@@ -410,25 +496,82 @@ class Ledger:
         return [dict(r) for r in rows]
 
     def recent_events(self, run_id: str, limit: int = 10) -> list[dict]:
-        """The last ``limit`` audit events for ``run_id``, oldest-first."""
+        """The last ``limit`` human audit events for ``run_id``, oldest-first.
+
+        The internal ``config`` marker event (run options) is excluded so it
+        never clutters the human-facing event log.
+        """
         if not self.db_path.exists():
             return []
         with self._connect_ro() as conn:
             rows = conn.execute(
                 "SELECT ts, level, source, story_id, message FROM events "
-                "WHERE run_id = ? ORDER BY id DESC LIMIT ?",
+                "WHERE run_id = ? AND (source IS NULL OR source != 'config') "
+                "ORDER BY id DESC LIMIT ?",
                 (run_id, limit),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def run_config(self, run_id: str) -> dict:
+        """The run's options, recorded as a ``config`` event at start (or {})."""
+        if not self.db_path.exists():
+            return {}
+        with self._connect_ro() as conn:
+            row = conn.execute(
+                "SELECT message FROM events WHERE run_id = ? AND source = 'config' "
+                "ORDER BY id DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return {}
+        try:
+            return json.loads(row["message"])
+        except (ValueError, TypeError):
+            return {}
+
+    def stage_breakdown(self, run_id: str) -> dict[str, list[dict]]:
+        """All stage attempts for ``run_id``, grouped by story id (chronological).
+
+        Each entry is ``{name, attempt, status, started_at, finished_at,
+        failure_category, output_path, session_id, input_tokens, output_tokens,
+        cache_read_tokens, cache_creation_tokens, cost_usd, tokens}`` where
+        ``tokens`` is the summed token count (None when no usage was recorded).
+        Powers the dashboard's per-stage view and its token tooltips.
+        """
+        if not self.db_path.exists():
+            return {}
+        with self._connect_ro() as conn:
+            # Tolerate a ledger created before token columns existed (read-only
+            # viewers never migrate): select usage columns only when present.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()}
+            usage_sel = (
+                ", session_id, input_tokens, output_tokens, cache_read_tokens, "
+                "cache_creation_tokens, cost_usd"
+                if "input_tokens" in cols else ""
+            )
+            rows = conn.execute(
+                "SELECT story_id, stage_name AS name, attempt, status, started_at, "
+                "finished_at, failure_category, output_path" + usage_sel +
+                " FROM stages WHERE run_id = ? ORDER BY story_id, started_at, rowid",
+                (run_id,),
+            ).fetchall()
+        out: dict[str, list[dict]] = {}
+        for r in rows:
+            d = dict(r)
+            d["tokens"] = _sum_tokens(d)
+            out.setdefault(d.pop("story_id"), []).append(d)
+        return out
 
     def list_runs(self, limit: int = 50) -> list[dict]:
         """The most recent ``limit`` runs (newest first) for the runs browser.
 
         Each entry is ``{id, scope, mode, status, started_at, finished_at,
-        total, done, failed}``. The ``total/done/failed`` tallies are computed
-        live from the per-story rows (a single grouped query), so an in-progress
-        run shows accurate counts — the run row's stored ``completed/failed`` are
-        0 until close-out. Capped at ``limit`` to keep the list bounded.
+        total, done, failed, total_tokens, total_cost_usd}``. The
+        ``total/done/failed`` tallies are computed live from the per-story rows
+        (a single grouped query), so an in-progress run shows accurate counts —
+        the run row's stored ``completed/failed`` are 0 until close-out.
+        ``total_tokens``/``total_cost_usd`` are None for runs with no recorded
+        usage (those predating token capture). Capped at ``limit``.
         """
         if not self.db_path.exists():
             return []
@@ -442,15 +585,31 @@ class Ledger:
             grouped = conn.execute(
                 "SELECT run_id, status, COUNT(*) AS n FROM stories GROUP BY run_id, status"
             ).fetchall()
+            # Token columns are absent on a ledger created before this feature;
+            # skip the rollup so a read-only viewer never hits "no such column".
+            stage_cols = {r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()}
+            usage = (
+                conn.execute(
+                    "SELECT run_id, "
+                    "SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)"
+                    "+COALESCE(cache_read_tokens,0)+COALESCE(cache_creation_tokens,0)) AS tok, "
+                    "SUM(COALESCE(cost_usd,0)) AS cost, "
+                    "COUNT(input_tokens) AS n_tok, COUNT(cost_usd) AS n_cost "
+                    "FROM stages GROUP BY run_id"
+                ).fetchall()
+                if "input_tokens" in stage_cols else []
+            )
 
         counts: dict[str, dict[str, int]] = {}
         for g in grouped:
             counts.setdefault(g["run_id"], {})[g["status"]] = g["n"]
+        usage_by_run = {u["run_id"]: u for u in usage}
 
         out: list[dict] = []
         for r in runs:
             by_status = counts.get(r["id"], {})
             total = r["total_stories"] or sum(by_status.values())
+            u = usage_by_run.get(r["id"])
             out.append(
                 {
                     "id": r["id"],
@@ -462,6 +621,8 @@ class Ledger:
                     "total": total,
                     "done": by_status.get("DONE", 0),
                     "failed": by_status.get("FAILED", 0),
+                    "total_tokens": (u["tok"] if u and u["n_tok"] else None),
+                    "total_cost_usd": (u["cost"] if u and u["n_cost"] else None),
                 }
             )
         return out
@@ -475,6 +636,52 @@ _EMPTY_COUNTS = {
     "total": 0, "done": 0, "failed": 0, "blocked": 0,
     "in_progress": 0, "skipped": 0, "todo": 0, "needs_attention": 0,
 }
+
+# The four per-stage token components recorded from the agent usage envelope.
+_TOKEN_FIELDS = (
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+)
+
+
+def _sum_tokens(row: dict) -> int | None:
+    """Total tokens across the four usage components, or None when none recorded.
+
+    None (not 0) signals "no usage data" so the dashboard renders "—" rather
+    than a misleading zero for runs/stages that predate token capture.
+    """
+    values = [row.get(k) for k in _TOKEN_FIELDS]
+    if all(v is None for v in values):
+        return None
+    return sum(v or 0 for v in values)
+
+
+def _aggregate_run_usage(breakdown: dict[str, list[dict]]) -> dict | None:
+    """Sum token/cost usage across every stage attempt of a run.
+
+    Returns ``{input, output, cache_read, cache_creation, total_tokens,
+    cost_usd}`` or None when no stage recorded any usage (a pre-capture run).
+    """
+    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+    key_map = {
+        "input": "input_tokens", "output": "output_tokens",
+        "cache_read": "cache_read_tokens", "cache_creation": "cache_creation_tokens",
+    }
+    cost = 0.0
+    seen = False
+    for attempts in breakdown.values():
+        for a in attempts:
+            for out_key, in_key in key_map.items():
+                v = a.get(in_key)
+                if v is not None:
+                    totals[out_key] += v
+                    seen = True
+            c = a.get("cost_usd")
+            if c is not None:
+                cost += c
+                seen = True
+    if not seen:
+        return None
+    return {**totals, "total_tokens": sum(totals.values()), "cost_usd": cost}
 
 
 def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
@@ -503,9 +710,44 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
 
     stories = ledger.story_rows(rid)
     events = ledger.recent_events(rid, limit=10)
+    config = ledger.run_config(rid)
+    breakdown = ledger.stage_breakdown(rid)
 
     def _count(value: str) -> int:
         return sum(1 for s in stories if s.get("status") == value)
+
+    # Attach the per-stage pipeline to each story: the latest attempt of each
+    # pipeline stage (build → coverage → review → merge), PENDING when not yet
+    # started, SKIPPED for coverage when this run skipped the coverage gate.
+    # Also fold in per-story token/cost totals across all of the story's attempts.
+    skip_coverage = bool(config.get("skip_coverage"))
+    for s in stories:
+        attempts = breakdown.get(s["story_id"], [])
+        latest: dict[str, dict] = {}
+        for a in attempts:  # chronological, so the last write wins per stage
+            latest[a["name"]] = a
+        pipeline = []
+        for name in _STAGES:
+            row = latest.get(name)
+            if row is not None:
+                pipeline.append(row)
+            elif name == "coverage" and skip_coverage:
+                pipeline.append({"name": name, "status": "SKIPPED"})
+            else:
+                pipeline.append({"name": name, "status": "PENDING"})
+        s["stages"] = pipeline
+        s["bugfix_attempts"] = sum(1 for a in attempts if a["name"] == "bugfix")
+        story_tok = [a.get("tokens") for a in attempts]
+        s["tokens"] = (
+            sum(t or 0 for t in story_tok) if any(t is not None for t in story_tok) else None
+        )
+        story_cost = [a.get("cost_usd") for a in attempts]
+        s["cost_usd"] = (
+            sum(c or 0 for c in story_cost) if any(c is not None for c in story_cost) else None
+        )
+
+    # Run-level usage rollup across every stage attempt of every story.
+    run_usage = _aggregate_run_usage(breakdown)
 
     payload["run"] = {
         "id": rid,
@@ -514,6 +756,8 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "status": run_row.get("status"),
         "started_at": run_row.get("started_at"),
         "finished_at": run_row.get("finished_at"),
+        "config": config,
+        "usage": run_usage,
     }
     payload["counts"] = {
         "total": run_row.get("total_stories") or len(stories),
@@ -865,6 +1109,19 @@ def run_build(
     ledger.event_log(
         run_id, "", "info", "controller", f"run started: scope={opts.scope} mode={mode}"
     )
+    # Persist the run's options as an immutable config marker (read back by the
+    # dashboard header). Kept as an event so no schema migration is needed.
+    ledger.event_log(
+        run_id, "", "info", "config",
+        json.dumps({
+            "preflight": "skipped" if opts.skip_preflight else "passed",
+            "skip_coverage": opts.skip_coverage,
+            "coverage_threshold": opts.coverage_threshold,
+            "mode": mode,
+            "rebuild": opts.rebuild,
+            "limit": opts.limit,
+        }),
+    )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of
     # the build and deliberately stay out of the cohort `status` map below, so a
     # buildable story that depends on a shipped one is treated as satisfied, not
@@ -999,6 +1256,7 @@ def _run_story(
                 ledger.stage_finish(
                     run_id, story.id, stage, attempt, "DONE", output_path=str(tpath)
                 )
+                _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
                 pr_number = _extract_pr(result, pr_number)
                 if pr_number is not None:
                     ledger.set_story_pr(run_id, story.id, pr_number)
@@ -1008,6 +1266,8 @@ def _run_story(
             ledger.stage_finish(
                 run_id, story.id, stage, attempt, "FAILED", f"{stage}-error", str(tpath)
             )
+            # A schema-valid-but-FAILED agent response still carries usage.
+            _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
             ledger.event_log(
                 run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
             )
@@ -1105,6 +1365,34 @@ def _stage_failure_summary(stage: str, data: dict) -> str:
     return f"{stage} reported non-success status"
 
 
+def _record_stage_usage(
+    ledger: Ledger,
+    run_id: str,
+    story_id: str,
+    stage: str,
+    attempt: int,
+    result: AgentResult | None,
+) -> None:
+    """Persist a stage's token/cost usage from its AgentResult (no-op if absent).
+
+    Maps the agent envelope's usage keys (``cache_read_input_tokens`` etc.) to
+    the ledger's column names. Skipped entirely when the agent emitted plain
+    text (custom ``SDLC_AGENT_CMD``) and carried no usage.
+    """
+    if result is None or (result.usage is None and result.cost_usd is None):
+        return
+    u = result.usage or {}
+    ledger.stage_set_usage(
+        run_id, story_id, stage, attempt,
+        session_id=result.session_id,
+        input_tokens=u.get("input_tokens"),
+        output_tokens=u.get("output_tokens"),
+        cache_read_tokens=u.get("cache_read_input_tokens"),
+        cache_creation_tokens=u.get("cache_creation_input_tokens"),
+        cost_usd=result.cost_usd,
+    )
+
+
 def _extract_pr(result: AgentResult | None, current: int | None) -> int | None:
     if result is None:
         return current
@@ -1156,6 +1444,7 @@ def _run_bugfix(
         str(data.get("failure_category", "")),
         out,
     )
+    _record_stage_usage(ledger, run_id, story.id, "bugfix", attempt, result)
     ledger.event_log(
         run_id,
         story.id,

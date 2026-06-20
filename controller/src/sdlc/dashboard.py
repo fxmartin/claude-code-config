@@ -183,6 +183,7 @@ _PAGE = """<!doctype html>
   .NEEDS_ATTENTION { background: #fdeede; color: var(--peach); }
   .SKIPPED { background: var(--surface); color: var(--sub); }
   .TODO { background: var(--crust); color: var(--overlay); }
+  .PENDING { background: var(--crust); color: var(--overlay); }
   .events { margin-top: 16px; }
   .events div { padding: 2px 0; border-bottom: 1px solid var(--crust); font-size: 13px; }
   .lvl-error { color: var(--red); } .lvl-warn { color: var(--peach); } .lvl-success { color: var(--green); }
@@ -216,6 +217,21 @@ const ORDER = ["DONE","IN_PROGRESS","FAILED","BLOCKED","NEEDS_ATTENTION","SKIPPE
 let sel = null;  // null = Live (latest)
 function esc(s){return String(s==null?"":s).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));}
 function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(s)+"</span>";}
+function humanTokens(n){
+  if(n==null) return "—";
+  if(n>=1e6) return (n/1e6).toFixed(n>=1e7?0:1)+"M";
+  if(n>=1e3) return (n/1e3).toFixed(n>=1e4?0:1)+"k";
+  return String(n);
+}
+function usd(n){ return n==null ? "" : "$"+Number(n).toFixed(n<1?3:2); }
+function stageCell(st){
+  let title = (st.attempt?("attempt "+st.attempt):"") + (st.failure_category?(" · "+esc(st.failure_category)):"");
+  if(st.tokens!=null) title += " · "+humanTokens(st.tokens)+" tok"+(st.cost_usd!=null?(" · "+usd(st.cost_usd)):"");
+  const inner = title ? "<span title='"+esc(title)+"'>"+badge(st.status)+"</span>" : badge(st.status);
+  return st.output_path
+    ? "<td><a href='/log?path="+encodeURIComponent(st.output_path)+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
+    : "<td>"+inner+"</td>";
+}
 
 async function tick(){
   try{
@@ -237,7 +253,9 @@ function renderRuns(runs){
     + "<b>● Live</b> <span class='muted small'>(latest)</span></div>";
   html += (runs||[]).map(r => {
     const sub = esc(r.scope) + " &middot; " + esc(r.done) + "/" + esc(r.total)
-      + (r.failed ? " &middot; " + esc(r.failed) + " failed" : "");
+      + (r.failed ? " &middot; " + esc(r.failed) + " failed" : "")
+      + (r.total_tokens!=null ? " &middot; " + humanTokens(r.total_tokens) + " tok" : "")
+      + (r.total_cost_usd!=null ? " &middot; " + usd(r.total_cost_usd) : "");
     return "<div class='run "+(sel===r.id?"active":"")+"' data-run='"+esc(r.id)+"'>"
       + badge(r.status) + " <code>" + esc(r.id.slice(0,8)) + "</code>"
       + "<div class='muted small'>" + sub + "</div>"
@@ -260,9 +278,24 @@ function renderMain(d){
     document.getElementById("events").innerHTML = "";
     return;
   }
+  const cfg = run.config || {};
+  let cfgline = "";
+  if(Object.keys(cfg).length){
+    const qa = cfg.skip_coverage ? "QA gate: off" : ("QA gate: on ("+esc(cfg.coverage_threshold)+"%)");
+    cfgline = "<div class='muted small'>preflight: "+esc(cfg.preflight||"?")+" &middot; "+qa
+      + (cfg.rebuild ? " &middot; rebuild" : "")
+      + (cfg.limit ? (" &middot; limit "+esc(cfg.limit)) : "") + "</div>";
+  }
+  const u = run.usage;
+  const usageLine = u
+    ? "<div class='muted small'>tokens "+humanTokens(u.total_tokens)
+      + " (in "+humanTokens(u.input)+" &middot; out "+humanTokens(u.output)
+      + " &middot; cache "+humanTokens((u.cache_read||0)+(u.cache_creation||0))+")"
+      + (u.cost_usd!=null ? " &middot; "+usd(u.cost_usd) : "") + "</div>"
+    : "";
   document.getElementById("head").innerHTML =
     "run <code>"+esc(run.id.slice(0,8))+"</code> &middot; "+badge(run.status)
-    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode);
+    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode) + cfgline + usageLine;
   const total = c.total||0, done = c.done||0;
   document.getElementById("bar").style.width = (total? Math.round(100*done/total):0) + "%";
   document.getElementById("chips").innerHTML = ORDER
@@ -277,13 +310,22 @@ function renderMain(d){
         ? "<a href='"+esc(prBase)+"/pull/"+esc(s.pr_number)+"' target='_blank' rel='noopener'>#"+esc(s.pr_number)+"</a>"
         : "#"+esc(s.pr_number);
     }
+    const stageCells = (s.stages||[]).map(stageCell).join("");
+    const bug = s.bugfix_attempts > 0
+      ? " <span class='badge BLOCKED' title='bugfix retries'>🔧×"+esc(s.bugfix_attempts)+"</span>"
+      : "";
+    const tok = s.tokens!=null
+      ? humanTokens(s.tokens)+(s.cost_usd!=null?(" "+usd(s.cost_usd)):"")
+      : "—";
     return "<tr><td><code>"+esc(s.story_id)+"</code></td>"
-    + "<td>"+badge(s.status)+"</td>"
-    + "<td>"+esc(s.current_stage||"-")+"</td>"
-    + "<td>"+pr+"</td></tr>";
+    + "<td>"+badge(s.status)+bug+"</td>"
+    + stageCells
+    + "<td>"+pr+"</td>"
+    + "<td class='muted small'>"+tok+"</td></tr>";
   }).join("");
   document.getElementById("stories").innerHTML = rows
-    ? "<table><tr><th>story</th><th>status</th><th>stage</th><th>PR</th></tr>"+rows+"</table>"
+    ? "<table><tr><th>story</th><th>status</th><th>build</th><th>QA</th>"
+      + "<th>review</th><th>merge</th><th>PR</th><th>tokens</th></tr>"+rows+"</table>"
     : "<p class='muted'>no stories yet…</p>";
   document.getElementById("events").innerHTML = (d.events||[]).slice().reverse().map(e =>
     "<div><span class='muted'>"+esc(e.ts)+"</span> <span class='lvl-"+esc(e.level)+"'>"+esc(e.level)+"</span> "+esc(e.message)+"</div>"
@@ -338,10 +380,24 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(snap)
         elif path == "/api/runs":
             self._json(ledger.list_runs())
+        elif path == "/log":
+            self._serve_log(parse_qs(parts.query).get("path", [""])[0])
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _serve_log(self, requested: str) -> None:
+        """Serve a transcript file, but only one resolving inside the logs root."""
+        root = self.server.logs_root
+        try:
+            target = Path(requested).resolve()
+            target.relative_to(root)  # raises ValueError if outside the root
+            body = target.read_bytes()
+        except (ValueError, OSError):
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
+        self._send(200, body, "text/plain; charset=utf-8")
 
 
 def make_server(
@@ -359,6 +415,9 @@ def make_server(
     # holding the ledger): used for PR links and the header. None when not a git repo.
     server.project_url = git_project_url(db_path.parent)  # type: ignore[attr-defined]
     server.project_name = _project_name(server.project_url, db_path)  # type: ignore[attr-defined]
+    # Transcript files live under "<db>.logs"; the /log endpoint will only serve
+    # files resolving inside this root (no path traversal).
+    server.logs_root = Path(f"{db_path}.logs").resolve()  # type: ignore[attr-defined]
     return server
 
 
