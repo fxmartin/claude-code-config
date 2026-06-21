@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.47.0] - 2026-06-21
+
+### Added
+
+- feat(cost-model-governance): pre-dispatch cost estimate (#14.1-002)
+
+
 ## [v1.46.0] - 2026-06-21
 
 ### Added
