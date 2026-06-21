@@ -69,6 +69,21 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
 2. **Discovery** — `discover_queue(scope)` parses `##### Story X.Y-NNN:` headers
    from `docs/stories/epic-*.md`, extracting priority, points, and intra-project
    dependencies.
+
+   **Dependencies-line convention (Story 12.5-001).** Edge extraction reads only
+   the *leading edge list* of a `**Dependencies**:` line — the run of bare
+   `X.Y-NNN` ids before the first parenthetical (`(`), `;`, em/en-dash, or
+   sentence-ending period (`_dependency_head`/`_parse_dependency_edges` in
+   `discovery.py`). Story ids that appear only in parenthetical or sentence prose
+   are **not** edges, and a line that leads with `None`/`N/A`/`TBD` resolves to
+   zero dependencies. This stops a benignly-worded rationale (e.g.
+   `12.3-001 (reconcile flips it once 12.3-004 lands)`) from minting a phantom
+   edge to `12.3-004` and crashing `compute_cohorts` with a false cycle. **Authoring
+   rule:** put real edges on the `**Dependencies**:` line as a leading
+   comma/whitespace ID list (or `None`); put rationale/sequencing notes either in
+   a trailing parenthetical/sentence or on a separate `**Sequencing**:` line — the
+   parser ignores ids there, but a genuine intended cycle still fails fast with the
+   story-named `compute_cohorts` error.
 3. **Cohort scheduling** — `compute_cohorts` groups stories whose dependencies
    are all satisfied (already merged or in an earlier cohort). A cycle is a hard
    `ValueError`, never an infinite loop.
