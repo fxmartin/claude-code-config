@@ -110,6 +110,70 @@ def test_fast_forward_landing_reclassifies_to_done(tmp_path: Path) -> None:
     assert _merge_done(db, run_id, "99.1-001") == 1
 
 
+# --- legitimate fast-forward landing (≥1 own commit) still fires (#111) ------
+
+
+def test_fast_forward_with_own_commit_still_lands(tmp_path: Path) -> None:
+    """The real is-ancestor positive (branch ahead by ≥1 then merged) survives."""
+    from sdlc.reconcile import _detect_landing
+
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-104", new=True)
+    sha = _commit(root, "ff2.py", "v = 1\n", "feat: ff2 (#99.1-104)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-104")
+    base = _git(root, "rev-parse", "HEAD").stdout.strip()
+
+    landing = _detect_landing("99.1-104", None, base, root)
+    assert landing is not None
+    assert landing[0] == "is-ancestor"
+    assert landing[1] == sha
+
+
+# --- empty stacked branch must NOT false-positive as a landing (#111) --------
+
+
+def test_empty_stacked_branch_does_not_falsely_land(tmp_path: Path) -> None:
+    """An empty story branch (0 commits ahead of base) must NOT report a landing.
+
+    ``git merge-base --is-ancestor <branch> <base>`` is trivially true for a
+    branch carrying none of its own work (e.g. a story cut stacked on a sibling
+    whose work later merged to main, while the story itself was never built).
+    Without a "ahead by ≥1 commit" floor, reconcile would mark a never-built
+    story DONE with no PR and no code (#111). It must return None instead.
+    """
+    from sdlc.reconcile import _detect_landing
+
+    root = _init_repo(tmp_path)
+    # A sibling's work lands on main.
+    _commit(root, "sibling.py", "s = 1\n", "feat: sibling landed (#99.1-100)")
+    # The story branch is cut from main and carries zero own commits — its tip
+    # is therefore (trivially) an ancestor of main.
+    _checkout(root, "feature/99.1-101", new=True)
+    _checkout(root, "main")
+
+    base = _git(root, "rev-parse", "HEAD").stdout.strip()
+    assert _detect_landing("99.1-101", None, base, root) is None
+
+
+def test_empty_stacked_branch_stays_parked_end_to_end(tmp_path: Path) -> None:
+    """End-to-end: a parked story with an empty branch is not flipped to DONE."""
+    root = _init_repo(tmp_path)
+    _commit(root, "sibling.py", "s = 1\n", "feat: sibling landed (#99.1-102)")
+    _checkout(root, "feature/99.1-103", new=True)
+    _checkout(root, "main")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-103", "FAILED", None)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert result.reclassified == []
+    assert _status(db, run_id, "99.1-103") == "FAILED"
+    assert result.run_status_after == "FAILED"
+    assert _merge_done(db, run_id, "99.1-103") == 0
+
+
 # --- patch-id equivalence (git cherry) — transitive/stacked landing ---------
 
 
