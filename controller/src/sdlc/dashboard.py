@@ -314,6 +314,11 @@ let sel = null;  // null = Live (latest)
 let runtimeBase = null, runtimeAnchor = null;
 function esc(s){return String(s==null?"":s).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));}
 function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(s)+"</span>";}
+function localTime(s){
+  if(!s) return "";
+  const d = new Date(String(s).replace(" ","T") + "Z");
+  return isNaN(d) ? String(s) : d.toLocaleString();
+}
 function humanTokens(n){
   if(n==null) return "—";
   if(n>=1e6) return (n/1e6).toFixed(n>=1e7?0:1)+"M";
@@ -392,7 +397,7 @@ function renderRuns(runs){
       + badge(r.status) + " <code>" + esc(r.id.slice(0,8)) + "</code>"
       + repo
       + "<div class='muted small'>" + sub + "</div>"
-      + "<div class='muted small'>" + esc(r.started_at||"") + "</div></div>";
+      + "<div class='muted small'>" + esc(localTime(r.started_at)) + "</div></div>";
   }).join("");
   document.getElementById("runs").innerHTML = html;
 }
@@ -478,7 +483,7 @@ function renderMain(d){
       + "<th>review</th><th>merge</th><th>PR</th><th>tokens</th><th>duration</th></tr>"+rows+"</table>"
     : "<p class='muted'>no stories yet…</p>";
   document.getElementById("events").innerHTML = (d.events||[]).slice().reverse().map(e =>
-    "<div><span class='muted'>"+esc(e.ts)+"</span> <span class='lvl-"+esc(e.level)+"'>"+esc(e.level)+"</span> "+esc(e.message)+"</div>"
+    "<div><span class='muted'>"+esc(localTime(e.ts))+"</span> <span class='lvl-"+esc(e.level)+"'>"+esc(e.level)+"</span> "+esc(e.message)+"</div>"
   ).join("");
 }
 
