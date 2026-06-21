@@ -321,7 +321,8 @@ grep-tag combination closes it. Persist via existing `Ledger.set_story_status`,
 - [ ] Tests: squash landing, fast-forward landing, transitive/stacked landing, PR-merged-but-branch-deleted, genuinely-unlanded (stays parked), offline no-op, idempotent re-run
 - [ ] Docs updated (`docs/controller-architecture.md` close-out / reconciliation section)
 
-**Dependencies**: None (shares `build.py` close-out with 12.3-004 and 12.4-001 — serialize)
+**Dependencies**: None
+**Sequencing**: shares `build.py` close-out with 12.3-004 / 12.4-001 — serialize (do not build concurrently)
 **Risk Level**: High
 
 ##### Story 12.3-002: Standalone `sdlc reconcile` command for after-the-fact recovery
