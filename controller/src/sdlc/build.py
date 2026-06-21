@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -322,6 +323,12 @@ class BuildOptions:
     # the controller warns; interactively (no ``--auto``) it gates the stage before
     # any spend, in ``--auto`` it proceeds.
     cost_estimate_threshold: int = 0
+    # Story 14.2-002: per-request thinking-token cap surfaced to dispatched agents
+    # as ``MAX_THINKING_TOKENS`` (bounds hidden extended-thinking cost on long
+    # runs). 0 = no cap → behaviour unchanged (the agent's default thinking
+    # budget). It is a per-run constant, bound onto the real dispatch seam in
+    # :func:`_resolve_dispatch`; auto-compaction stays at Claude Code's default.
+    thinking_cap: int = 0
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -721,6 +728,13 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
             # token/$ convenience parser — a $-threshold converts to the notional
             # API-equivalent token count, mirroring --budget. 0 = off.
             opts.cost_estimate_threshold, _ = _parse_budget_value(arg.split("=", 1)[1])
+        elif arg.startswith("--thinking-cap="):
+            # Story 14.2-002: cap per-request thinking tokens (MAX_THINKING_TOKENS).
+            # 0 = no cap (today's default thinking budget); negative is nonsense.
+            cap = int(arg.split("=", 1)[1])
+            if cap < 0:
+                raise ValueError(f"--thinking-cap must be non-negative: {arg}")
+            opts.thinking_cap = cap
         elif arg.startswith("--rate-limit-max-wait="):
             wait = int(arg.split("=", 1)[1])
             if wait < 0:
@@ -1726,6 +1740,32 @@ class Dispatcher(Protocol):
     ) -> AgentResult: ...
 
 
+def _resolve_dispatch(
+    dispatcher: "Dispatcher | None",
+    opts: BuildOptions,
+    default: Callable[..., AgentResult] = dispatch_agent,
+):
+    """The dispatch seam for a run, with the thinking-token cap bound (14.2-002).
+
+    Tests inject a fake ``dispatcher`` and own its signature, so the cap is bound
+    only onto the real default seam (``dispatcher is None``) — an injected fake is
+    returned untouched. With no cap configured the real seam is returned
+    unchanged, so the no-cap path is byte-for-byte today's. The cap is a per-run
+    constant, so binding it here once reaches every stage's dispatch
+    (build/coverage/review/merge/bugfix/reask) without threading it through each
+    call site.
+
+    ``default`` is the real dispatcher to fall back to; each caller passes its
+    *own* module-level ``dispatch_agent`` so a test that monkeypatches that
+    module's symbol (e.g. ``sdlc.resume.dispatch_agent``) still routes through its
+    fake.
+    """
+    dispatch = dispatcher or default
+    if dispatcher is None and opts.thinking_cap:
+        dispatch = functools.partial(dispatch, thinking_cap=opts.thinking_cap)
+    return dispatch
+
+
 @dataclass
 class BuildResult:
     """The terminal outcome of a build run."""
@@ -2245,7 +2285,7 @@ def run_build(
     defaults to running the detected test suite. ``render_view`` is an optional
     hook that regenerates the markdown progress view from the ledger.
     """
-    dispatch = dispatcher or dispatch_agent
+    dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
     check_preflight = preflight or (lambda: default_preflight(timeout=opts.preflight_timeout))
 
     # --- Partition: shipped (Done) stories are skipped unless --rebuild ------
@@ -2336,6 +2376,10 @@ def run_build(
             # without this the resume would default to interactive and wrongly gate
             # stages the original auto run would have proceeded through.
             "auto": opts.auto,
+            # Story 14.2-002: persist the thinking-token cap so a resume re-applies
+            # the same MAX_THINKING_TOKENS bound and the dashboard can show it.
+            # 0 keeps today's default thinking budget.
+            "thinking_cap": opts.thinking_cap,
         }),
     )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of

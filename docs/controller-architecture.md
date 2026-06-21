@@ -752,6 +752,43 @@ so it never inflates the level. This is a routing offset only — the bounded
 `MAX_BUGFIX_ATTEMPTS` budget is untouched, keeping its existing per-resume reset
 semantics.
 
+## Thinking-token cap and early-compaction config (Story 14.2-002)
+
+Extended thinking is a hidden per-request cost: every dispatched agent may spend
+thinking tokens the result envelope never surfaces as a stage knob. On a long
+overnight batch that cost compounds. `sdlc build --thinking-cap=<N>` bounds it.
+
+**How the cap is applied.** The cap is an *environment* knob, not a CLI flag.
+`dispatch.py` exports it as **`MAX_THINKING_TOKENS`** on a copy of the current
+environment (`_dispatch_env`), handed to both the streamed `Popen` and the
+captured `subprocess.run`. Because it rides the environment rather than the
+agent's argv, the same cap applies to the built-in default command *and* any
+`SDLC_AGENT_CMD` / explicit override — `claude -p` honours `MAX_THINKING_TOKENS`
+regardless of the rest of the command. With no cap (`--thinking-cap` unset or
+`0`) `_dispatch_env` returns `None`, the subprocess inherits the parent
+environment unchanged, and the agent keeps its default thinking budget — the
+no-cap path is byte-for-byte today's.
+
+**One bind, every stage.** The cap is a per-run constant, so it is bound once
+onto the real dispatch seam in `_resolve_dispatch` (a `functools.partial` over
+`dispatch_agent`) rather than threaded through each `dispatch(...)` call site.
+That single bind reaches every routed stage (build / coverage / review / merge /
+bugfix / reask). An *injected* dispatcher (the orchestration tests' fake) is
+returned untouched — it owns its own signature — so the cap is bound only on the
+real `dispatcher is None` path.
+
+**Recorded per run, re-applied on resume.** The cap is persisted in the run's
+`config` event (`thinking_cap`) so the dashboard can show it and `sdlc resume`
+re-applies the same bound (`_options_from_config` carries it; legacy runs without
+the field default to no cap).
+
+**Early compaction.** Auto-compaction is left at Claude Code's default (enabled,
+`autoCompactEnabled`): the controller never sets `DISABLE_AUTO_COMPACT`, so a long
+run keeps compacting context near the limit. There is no documented env var to
+lower the compaction *threshold*, so "early compaction" here means **honouring —
+not disabling — the built-in behaviour** while the thinking cap does the bounding
+of hidden per-request cost.
+
 ## Rate-limit / quota awareness with automatic resume (Story 14.1-003)
 
 On a Claude Max subscription the real overnight failure mode is not dollars (they

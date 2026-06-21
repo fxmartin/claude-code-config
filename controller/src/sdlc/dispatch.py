@@ -49,6 +49,36 @@ DEFAULT_AGENT_CMD: list[str] = [
     "--dangerously-skip-permissions",
 ]
 
+# Story 14.2-002: the Claude Code env var that caps per-request extended-thinking
+# tokens. Surfaced through dispatch so a long overnight run can bound the hidden
+# thinking cost of every dispatched agent. It is honoured by `claude -p`
+# regardless of the rest of the command, so it works for the built-in default and
+# any `SDLC_AGENT_CMD`/explicit override alike — the cap is an environment knob,
+# not a CLI flag, so it never has to be threaded into the (escape-hatch) argv.
+THINKING_CAP_ENV = "MAX_THINKING_TOKENS"
+
+
+def _dispatch_env(thinking_cap: int | None) -> dict[str, str] | None:
+    """The subprocess environment for a dispatch, or ``None`` to inherit the parent.
+
+    Story 14.2-002: when a thinking-token cap is configured, export it as
+    ``MAX_THINKING_TOKENS`` on top of a copy of the current environment so the
+    dispatched agent bounds its extended-thinking budget. Returns ``None`` when no
+    cap is set (``0`` / ``None``), so the subprocess inherits the parent
+    environment exactly as before — the no-cap path is byte-for-byte today's.
+
+    Auto-compaction is deliberately left at Claude Code's default (enabled,
+    ``autoCompactEnabled``): the controller never sets ``DISABLE_AUTO_COMPACT``,
+    so long runs keep compacting context near the limit. There is no documented
+    env var to lower the *threshold*, so "early compaction" here means honouring —
+    not disabling — the built-in behaviour while the thinking cap does the bounding.
+    """
+    if not thinking_cap or thinking_cap <= 0:
+        return None
+    env = dict(os.environ)
+    env[THINKING_CAP_ENV] = str(thinking_cap)
+    return env
+
 
 def resolve_agent_cmd(
     explicit: list[str] | None = None, *, model: str | None = None
@@ -231,6 +261,7 @@ def dispatch_agent(
     story: Any | None = None,
     agent_cmd: list[str] | None = None,
     model: str | None = None,
+    thinking_cap: int | None = None,
     timeout: int = DEFAULT_TIMEOUT_S,
     transcript_path: Path | None = None,
     on_progress: ProgressCallback | None = None,
@@ -258,13 +289,15 @@ def dispatch_agent(
     isolated so progress recording can never break the run.
     """
     cmd = resolve_agent_cmd(agent_cmd, model=model)
+    env = _dispatch_env(thinking_cap)
     if _is_streaming_cmd(cmd):
         return _dispatch_streaming(
             agent_type, prompt, cmd, timeout=timeout,
-            transcript_path=transcript_path, on_progress=on_progress,
+            transcript_path=transcript_path, on_progress=on_progress, env=env,
         )
     return _dispatch_captured(
-        agent_type, prompt, cmd, timeout=timeout, transcript_path=transcript_path
+        agent_type, prompt, cmd, timeout=timeout,
+        transcript_path=transcript_path, env=env,
     )
 
 
@@ -275,12 +308,15 @@ def _dispatch_captured(
     *,
     timeout: int,
     transcript_path: Path | None,
+    env: dict[str, str] | None = None,
 ) -> AgentResult:
     """Buffered dispatch: run the agent and read all of stdout at once.
 
     Used for a non-streaming ``SDLC_AGENT_CMD`` (no ``stream-json``) and as the
     long-standing fallback. Unwraps a ``--output-format json`` envelope when one
-    is present; otherwise treats stdout as the raw agent response.
+    is present; otherwise treats stdout as the raw agent response. ``env`` is the
+    subprocess environment (Story 14.2-002: carries a ``MAX_THINKING_TOKENS`` cap);
+    ``None`` means inherit the parent environment, so the no-cap path is unchanged.
     """
     try:
         completed = subprocess.run(
@@ -289,6 +325,7 @@ def _dispatch_captured(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         _write_transcript(transcript_path, "", f"TIMEOUT after {timeout}s")
@@ -339,6 +376,7 @@ def _dispatch_streaming(
     timeout: int,
     transcript_path: Path | None,
     on_progress: ProgressCallback | None = None,
+    env: dict[str, str] | None = None,
 ) -> AgentResult:
     """Streamed dispatch: consume stdout line-by-line, teeing each to the transcript.
 
@@ -348,7 +386,9 @@ def _dispatch_streaming(
     path uses, so usage extraction and schema validation are identical. If no
     ``result`` event arrives (the stream wasn't well-formed), interpretation
     falls back to parsing the accumulated stdout — graceful degradation rather
-    than failing the run.
+    than failing the run. ``env`` is the subprocess environment (Story 14.2-002:
+    a ``MAX_THINKING_TOKENS`` cap); ``None`` inherits the parent, so the no-cap
+    path is unchanged.
     """
     try:
         proc = subprocess.Popen(
@@ -357,6 +397,7 @@ def _dispatch_streaming(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
     except (FileNotFoundError, OSError) as exc:
         _write_transcript(transcript_path, "", f"could not launch {cmd[0]!r}: {exc}")
