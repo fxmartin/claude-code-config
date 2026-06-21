@@ -17,6 +17,7 @@ from sdlc.build import (
     _honor_parked_reset,
     _make_rate_limit_context,
     _reposition_head,
+    _resolve_dispatch,
     _run_story_rate_limited,
     _StoryRunOutcome,
     apply_budget_stop,
@@ -195,6 +196,10 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         # cost-gate posture — an auto run warns-and-proceeds rather than flipping
         # to interactive and wrongly gating stages it would have proceeded through.
         auto=bool(config.get("auto", False)),
+        # Story 14.2-002: carry the thinking-token cap so a resumed run re-applies
+        # the same MAX_THINKING_TOKENS bound. Defaults to 0 (no cap) for runs that
+        # predate this field — unchanged behaviour.
+        thinking_cap=int(config.get("thinking_cap", 0) or 0),
     )
 
 
@@ -228,8 +233,6 @@ def run_resume(
     When the accrual is already at/over the ceiling, the gate re-halts before
     dispatching anything.
     """
-    dispatch = dispatcher or dispatch_agent
-
     rid = run_id or ledger.latest_resumable_run(scope)
     if rid is None:
         return ResumeResult(run_id=None, nothing_to_resume=True)
@@ -259,6 +262,14 @@ def run_resume(
     # a story parked by the gate can proceed (0 disables it for this resume).
     if cost_threshold is not None:
         opts.cost_estimate_threshold = cost_threshold
+
+    # Story 14.2-002: bind the persisted thinking-token cap onto the real dispatch
+    # seam (no-op for an injected fake / no cap), so a resumed run re-applies the
+    # same MAX_THINKING_TOKENS bound the original build used. Resolved here, after
+    # opts is reconstructed, because the cap lives on opts. Pass resume's own
+    # ``dispatch_agent`` so a test that monkeypatches ``sdlc.resume.dispatch_agent``
+    # still routes through its fake.
+    dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
 
     # Recompute the queue from the markdown source so each story carries its
     # title/epic_file/dependencies (the ledger stores progress, not the spec).

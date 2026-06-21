@@ -104,6 +104,8 @@ Flags:
                             skeptic is always Opus
   --model-<stage>=MODEL     pin one stage's model, winning over the map (escape
                             hatch), e.g. --model-build=opus --model-merge=haiku
+  --thinking-cap=N          cap per-request thinking tokens (MAX_THINKING_TOKENS)
+                            on every dispatched agent; 0 = no cap (default)
 """
 
 

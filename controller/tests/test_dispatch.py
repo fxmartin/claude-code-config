@@ -849,3 +849,88 @@ def test_streaming_dispatch_eof_reap_timeout_kills_child(monkeypatch) -> None:
     result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
     assert result.data["branch_name"] == "feature/7.3-001"
     assert fake_ref["p"].killed  # the lingering child was force-killed on reap timeout
+
+
+# --- 14.2-002: thinking-token cap surfaced as MAX_THINKING_TOKENS ----------
+
+
+def test_thinking_cap_sets_env_on_captured_path(monkeypatch) -> None:
+    """A configured cap exports MAX_THINKING_TOKENS to the agent subprocess."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], thinking_cap=4096)
+    assert seen["env"] is not None
+    assert seen["env"]["MAX_THINKING_TOKENS"] == "4096"
+
+
+def test_no_thinking_cap_leaves_env_unchanged_on_captured_path(monkeypatch) -> None:
+    """No cap → env=None so the subprocess inherits the parent environment (unchanged)."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert seen["env"] is None
+
+
+def test_thinking_cap_zero_is_no_cap(monkeypatch) -> None:
+    """A zero / falsy cap is treated as no cap — env stays None (unchanged path)."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], thinking_cap=0)
+    assert seen["env"] is None
+
+
+def test_thinking_cap_env_preserves_parent_environment(monkeypatch) -> None:
+    """The cap is added *on top of* the inherited environment, not in place of it."""
+    monkeypatch.setenv("SDLC_SENTINEL_VAR", "keep-me")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], thinking_cap=2048)
+    assert seen["env"]["SDLC_SENTINEL_VAR"] == "keep-me"
+    assert seen["env"]["MAX_THINKING_TOKENS"] == "2048"
+
+
+def test_thinking_cap_sets_env_on_streaming_path(monkeypatch) -> None:
+    """The cap also reaches the streamed Popen subprocess (the default dispatch path)."""
+    seen = {}
+
+    def make(*a, **kw):
+        seen["env"] = kw.get("env")
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", make)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, thinking_cap=1024)
+    assert seen["env"] is not None
+    assert seen["env"]["MAX_THINKING_TOKENS"] == "1024"
+
+
+def test_no_thinking_cap_leaves_env_unchanged_on_streaming_path(monkeypatch) -> None:
+    """No cap on the streaming path → env=None (inherits parent), behaviour unchanged."""
+    seen = {}
+
+    def make(*a, **kw):
+        seen["env"] = kw.get("env")
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", make)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert seen["env"] is None
