@@ -73,6 +73,7 @@ Stop a single bad agent message or a self-inflicted hang from dead-ending a run.
 #### Stories
 
 ##### Story 12.1-001: Recover a missing or malformed result envelope before parking
+**Status**: Done (run `ced08c0f`, shipped via #88)
 **User Story**: As FX running an unattended build, I want the controller to attempt a bounded
 recovery when an agent completes work but omits or malforms the `<<<RESULT_JSON>>>` envelope,
 so that otherwise-good work is not stranded as `NEEDS_ATTENTION` and left for manual rescue.
@@ -110,6 +111,7 @@ loop. An envelope-only re-ask is cheaper than a full stage re-run — try it fir
 **Risk Level**: Medium
 
 ##### Story 12.1-002: Guard preflight and agent-added tests against recursive hangs
+**Status**: Done (run `ced08c0f`, shipped via #89)
 **User Story**: As FX, I want the controller's preflight (and agent-added tests) to be unable
 to recurse into the controller's own orchestration, so that a build cannot hang itself.
 **Priority**: Should Have
@@ -149,6 +151,7 @@ ledger schema it depends on.
 #### Stories
 
 ##### Story 12.2-001: Make the progress renderer non-destructive to non-ledger history
+**Status**: Done (run `ced08c0f`, shipped via #88)
 **User Story**: As FX, I want the `.build-progress.md` ledger renderer to preserve
 hand-maintained / pre-existing build history, so that a controller run does not clobber the
 logs of epics completed outside the SQLite ledger.
@@ -180,6 +183,7 @@ opt-in/non-destructive by default. Touches `scripts/sdlc-state.sh` (render) and 
 **Risk Level**: Low
 
 ##### Story 12.2-002: Lint agent commit messages against commitlint at commit time
+**Status**: Done (run `ced08c0f`, shipped via #87)
 **User Story**: As FX, I want the controller to validate agent-authored commit messages
 against the repo's commitlint rules at commit time, so that a non-compliant header never
 reaches a PR and fails the commit-format CI job.
@@ -211,6 +215,7 @@ the controller's commit step in `build.py` / the agent commit instructions.
 **Risk Level**: Low
 
 ##### Story 12.2-003: Auto-apply pending ledger migrations at controller launch
+**Status**: Done (run `ced08c0f`, shipped via #88)
 **User Story**: As FX launching the controller in a repo whose ledger predates a schema change,
 I want any pending migrations applied before a verb reads or writes the ledger, so that an
 out-of-date DB (e.g. one missing 11.2-007's `wave`/`dependencies` columns) never crashes
