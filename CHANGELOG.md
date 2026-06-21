@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.49.0] - 2026-06-21
+
+### Added
+
+- feat(cost-model-governance): thinking-token cap and early-compaction
+
+
 ## [v1.48.0] - 2026-06-21
 
 ### Added
