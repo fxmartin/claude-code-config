@@ -228,6 +228,15 @@ def test_parse_accepts_recovery_stage_overrides() -> None:
     assert opts.model_overrides == {"bugfix": "opus", "reask": "haiku"}
 
 
+def test_parse_per_stage_override_without_value_raises() -> None:
+    """`--model-build` with no `=value` is a typo, not a silent no-op — the parse
+    fails eagerly before the stage is ever validated."""
+    import pytest
+
+    with pytest.raises(ValueError, match="needs a value"):
+        parse_build_args(["--model-build"])
+
+
 # ---------------------------------------------------------------------------
 # Recovery stages (bugfix / reask) receive routed models
 # ---------------------------------------------------------------------------
@@ -294,3 +303,72 @@ def test_bugfix_override_wins_over_map(tmp_path, monkeypatch) -> None:
     )
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
     assert bugfix_models[0] == HAIKU
+
+
+# ---------------------------------------------------------------------------
+# _story_high_risk — best-effort risk signal (Story 14.2-001)
+# ---------------------------------------------------------------------------
+
+
+def _completed(stdout: str):
+    """A minimal stand-in for subprocess.run's CompletedProcess (only .stdout)."""
+    import types
+
+    return types.SimpleNamespace(stdout=stdout)
+
+
+def test_story_high_risk_off_short_circuits(monkeypatch) -> None:
+    """Routing off never shells out — the probe returns False before touching git."""
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("subprocess.run must not be called when routing is off")
+
+    monkeypatch.setattr(build_mod.subprocess, "run", _must_not_run)
+    for profile in ("", "off", "none", "  OFF  "):
+        opts = BuildOptions(model_profile=profile)
+        assert build_mod._story_high_risk(_story(), opts) is False
+
+
+def test_story_high_risk_true_when_changed_file_matches(monkeypatch) -> None:
+    monkeypatch.setattr(
+        build_mod.subprocess, "run",
+        lambda *a, **k: _completed("darwin/configuration.nix\n"),
+    )
+    monkeypatch.setattr(
+        "sdlc.risk_gate.match_high_risk",
+        lambda files, **k: {"darwin/configuration.nix": "darwin/**"},
+    )
+    opts = BuildOptions(model_profile="balanced")
+    assert build_mod._story_high_risk(_story(), opts) is True
+
+
+def test_story_high_risk_false_when_no_changed_files(monkeypatch) -> None:
+    """An empty diff (whitespace-only stdout) never consults the risk patterns."""
+
+    def _must_not_match(*args, **kwargs):
+        raise AssertionError("match_high_risk must not run with no changed files")
+
+    monkeypatch.setattr(build_mod.subprocess, "run", lambda *a, **k: _completed("\n  \n"))
+    monkeypatch.setattr("sdlc.risk_gate.match_high_risk", _must_not_match)
+    opts = BuildOptions(model_profile="balanced")
+    assert build_mod._story_high_risk(_story(), opts) is False
+
+
+def test_story_high_risk_false_when_no_pattern_matches(monkeypatch) -> None:
+    monkeypatch.setattr(
+        build_mod.subprocess, "run", lambda *a, **k: _completed("README.md\n")
+    )
+    monkeypatch.setattr("sdlc.risk_gate.match_high_risk", lambda files, **k: {})
+    opts = BuildOptions(model_profile="balanced")
+    assert build_mod._story_high_risk(_story(), opts) is False
+
+
+def test_story_high_risk_degrades_to_false_on_error(monkeypatch) -> None:
+    """Any git/import failure degrades to False so routing never fails a build."""
+
+    def _raise(*args, **kwargs):
+        raise OSError("git not found")
+
+    monkeypatch.setattr(build_mod.subprocess, "run", _raise)
+    opts = BuildOptions(model_profile="balanced")
+    assert build_mod._story_high_risk(_story(), opts) is False
