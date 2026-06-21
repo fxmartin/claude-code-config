@@ -29,8 +29,9 @@ from sdlc.contracts import (
     RESULT_START_MARKER,
     ContractError,
 )
-from sdlc.dispatch import AgentDispatchError, AgentResult, dispatch_agent
+from sdlc.dispatch import AgentDispatchError, AgentResult, RateLimitError, dispatch_agent
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
+from sdlc.rate_limit import RateLimitSignal, WindowQuota, seconds_until_reset, within_wait_cap
 from sdlc.registry import Registry, RunRecord
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -262,6 +263,17 @@ class BuildOptions:
     budget: int = 0
     budget_usd: float | None = None
     budget_policy: str = "pause"
+    # Story 14.1-003: Max rate-limit / quota awareness with automatic resume.
+    # ``rate_limit_max_wait_s`` is the in-process auto-wait cap (~one window): a
+    # reset within it is waited out and the same run auto-resumes; a reset beyond
+    # it durably parks for `sdlc resume`. ``window_budget`` (tokens; 0 = off, rely
+    # only on agent rate-limit signals) is a *configured* per-window token budget
+    # tracked from the 11.1-003 accrual; ``window_s`` is its rolling-window length
+    # and ``rate_limit_threshold`` (< 1.0) pauses *near* the limit, not only at it.
+    rate_limit_max_wait_s: int = 18000  # ~5h, one Max rolling window
+    window_budget: int = 0
+    window_s: int = 18000
+    rate_limit_threshold: float = 1.0
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -292,6 +304,281 @@ def _budget_exceeded(ledger: "Ledger", run_id: str, budget: int) -> bool:
     resumed run honour the same ceiling rather than continue unbounded.
     """
     return bool(budget) and ledger.run_usage_totals(run_id)["tokens"] >= budget
+
+
+# ---------------------------------------------------------------------------
+# Story 14.1-003: Max rate-limit / quota awareness with automatic resume
+# ---------------------------------------------------------------------------
+
+# Cadence of the countdown log emitted while waiting in-process for a rate-limit
+# window to reopen. ~5 min keeps the ledger/dashboard showing the run is alive
+# and how long is left, without spamming the event log on a multi-hour wait.
+RATE_LIMIT_POLL_S = 300
+
+
+@dataclass
+class _RateLimitContext:
+    """The injectable knobs the rate-limit wait/park path needs (Story 14.1-003).
+
+    ``window`` is the optional configured rolling-window token budget (None when
+    only reactive 429 signals gate). ``clock`` / ``sleep_fn`` are injected so the
+    in-process auto-wait is deterministic and instant under test (the per-agent
+    dispatch timeout bounds the agent subprocess, not this controller-side wait).
+    """
+
+    opts: BuildOptions
+    window: "WindowQuota | None"
+    clock: Callable[[], float]
+    sleep_fn: Callable[[float], None]
+
+
+@dataclass
+class _StoryRunOutcome:
+    """Result of driving one story through the rate-limit-aware runner.
+
+    ``status`` is the terminal story status on a normal finish (then
+    ``parked`` is False). When the window reset was beyond the auto-wait cap the
+    story is left for `sdlc resume`: ``parked`` is True, ``status`` is None, and
+    ``signal`` carries the pause cause. ``waited_s`` is the total time auto-waited
+    in-process across any within-cap pauses before this outcome.
+    """
+
+    status: str | None
+    parked: bool = False
+    signal: "RateLimitSignal | None" = None
+    waited_s: int = 0
+
+
+class _RateLimitPark(Exception):
+    """Internal signal: a rate-limit reset is beyond the auto-wait cap (14.1-003).
+
+    Raised from :func:`_run_story` (which owns the in-process auto-wait so the
+    in-story attempt/PR/bugfix state survives a within-cap pause) and caught by
+    :func:`_run_story_rate_limited`, which converts it to a ``parked`` outcome so
+    the caller durably parks the run RATE_LIMITED. ``waited_s`` is the time
+    already auto-waited in-process before giving up and parking.
+    """
+
+    def __init__(self, *, signal: "RateLimitSignal", waited_s: int) -> None:
+        super().__init__("rate-limit reset beyond auto-wait cap")
+        self.signal = signal
+        self.waited_s = waited_s
+
+
+def _make_rate_limit_context(
+    opts: BuildOptions,
+    *,
+    clock: Callable[[], float] | None,
+    sleep_fn: Callable[[float], None] | None,
+    baseline: int = 0,
+) -> _RateLimitContext:
+    """Build the rate-limit context, defaulting the clock/sleep to wall-clock.
+
+    ``baseline`` is the run's *already-accrued* tokens when the window opens — 0
+    for a fresh build (no spend yet), but the current accrual for a **resume**.
+    This is essential: the configured window budget measures usage *within* the
+    window as ``total - baseline``. If a resume of a durably-parked RATE_LIMITED
+    run started the window at baseline 0, the cumulative pre-park spend would
+    already exceed the budget and the run would re-park forever, making zero
+    forward progress. Seeding the baseline with the current accrual treats the
+    resume as a freshly-reopened window (the documented approximate heuristic), so
+    each resume can build at least up to another window-budget of work.
+    """
+    the_clock = clock or time.time
+    window: WindowQuota | None = None
+    if opts.window_budget > 0:
+        window = WindowQuota(
+            budget=opts.window_budget,
+            window_s=opts.window_s,
+            threshold=opts.rate_limit_threshold,
+            start=the_clock(),
+            baseline=baseline,
+        )
+    return _RateLimitContext(
+        opts=opts, window=window, clock=the_clock, sleep_fn=sleep_fn or time.sleep,
+    )
+
+
+def _rate_limit_wait(
+    ledger: "Ledger",
+    run_id: str,
+    signal: "RateLimitSignal",
+    wait_s: int,
+    *,
+    sleep_fn: Callable[[float], None],
+) -> int:
+    """Wait in-process for the window to reopen, logging a periodic countdown.
+
+    The run is flagged ``RATE_LIMITED`` for the duration so a concurrent `sdlc
+    status` / dashboard read shows the pause distinctly, then restored to
+    ``IN_PROGRESS`` before dispatch resumes. The loop is driven by the accumulated
+    sleep (not the wall clock) so an injected no-op ``sleep_fn`` terminates
+    deterministically under test. Returns the total seconds waited.
+    """
+    ledger.run_update_status(run_id, "RATE_LIMITED")
+    ledger.event_log(
+        run_id, "", "warn", "controller",
+        f"rate limit hit ({signal.source}) — waiting ~{wait_s}s in-process for the "
+        "window to reopen, then auto-resuming this run (no manual resume needed).",
+    )
+    waited = 0
+    while waited < wait_s:
+        chunk = min(RATE_LIMIT_POLL_S, wait_s - waited)
+        sleep_fn(chunk)
+        waited += chunk
+        remaining = wait_s - waited
+        if remaining > 0:
+            ledger.event_log(
+                run_id, "", "info", "controller",
+                f"rate-limit wait: ~{remaining}s until the window reopens.",
+            )
+    ledger.run_update_status(run_id, "IN_PROGRESS")
+    ledger.event_log(
+        run_id, "", "success", "controller",
+        "rate-limit window reopened — resuming dispatch.",
+    )
+    return waited
+
+
+def apply_rate_limit_park(
+    ledger: "Ledger",
+    run_id: str,
+    signal: "RateLimitSignal",
+    *,
+    now: float,
+    waited_s: int,
+    window_s: int,
+) -> float:
+    """Durably park a run whose window reset is beyond the auto-wait cap (14.1-003).
+
+    Records a distinct ``RATE_LIMITED`` run state — resumable (NOT terminal) and
+    deliberately NOT ``NEEDS_ATTENTION``: the run is waiting for *time*, not human
+    attention. The process does not hold indefinitely; `sdlc resume` (or a
+    scheduled wake) continues it once the window reopens. Committed work from
+    finished stories is untouched (R10). Returns the approximate reset epoch.
+
+    The reset epoch is resolved the same way :func:`seconds_until_reset` resolves
+    the wait: an explicit ``reset_at`` → a relative ``retry_after`` → else a full
+    ``window_s`` fallback. The fallback matters: a throttle that surfaced *no*
+    explicit reset (and so parked only because a full window exceeds the cap) must
+    still record a reset epoch, or the resume gate would have nothing to honour
+    and would dispatch early into the still-closed window.
+    """
+    reset_at = signal.reset_at
+    if reset_at is None and signal.retry_after_s is not None:
+        reset_at = now + signal.retry_after_s
+    if reset_at is None:
+        reset_at = now + window_s  # fallback: assume a full window must elapse
+    waited_note = f" after auto-waiting {waited_s}s" if waited_s else ""
+    ledger.event_log(
+        run_id, "", "warn", "controller",
+        f"rate limit hit ({signal.source}); reset is beyond the auto-wait cap"
+        f"{waited_note}; window reopens ~epoch {int(reset_at)} — parking run "
+        "RATE_LIMITED (waiting for time, not a failure); `sdlc resume` continues "
+        "it once the window reopens.",
+    )
+    # Persist the reset epoch into the run config so a resume *honours* it rather
+    # than dispatching early (which would blow the still-closed window). Merge it
+    # into the existing config event so no original key is lost; run_config reads
+    # the latest config event, so this becomes the effective config on resume.
+    cfg = ledger.run_config(run_id)
+    cfg["rate_limit_reset_at"] = float(reset_at)
+    ledger.event_log(run_id, "", "info", "config", json.dumps(cfg))
+    ledger.run_update_status(run_id, "RATE_LIMITED")
+    return reset_at
+
+
+def _honor_parked_reset(
+    ledger: "Ledger",
+    run_id: str,
+    opts: BuildOptions,
+    rl_ctx: _RateLimitContext,
+    reset_at: float | None,
+) -> _StoryRunOutcome | None:
+    """At resume, wait for — or re-park until — a persisted window-reset time.
+
+    Story 14.1-003: a durably-parked ``RATE_LIMITED`` run records the approximate
+    epoch its Max window reopens (``apply_rate_limit_park`` persists it in the run
+    config). Resuming *before* that epoch must not dispatch early — that would
+    spend into a still-closed window and blow the quota the original park was
+    protecting. So when ``now`` is before the reset, the controller waits
+    in-process (when the remaining time is within the auto-wait cap) or durably
+    re-parks (beyond it). Returns a parked :class:`_StoryRunOutcome` to re-park,
+    or ``None`` once the window has reopened (or no reset is pending) so the caller
+    proceeds with a fresh window. (The fresh-window baseline is seeded by
+    :func:`_make_rate_limit_context`, so progress is then unbounded by pre-park
+    spend.)
+    """
+    if reset_at is None:
+        return None
+    now = rl_ctx.clock()
+    if now >= reset_at:
+        return None  # the window has already reopened — proceed
+    signal = RateLimitSignal(source="window-reset", reset_at=float(reset_at))
+    wait_s = seconds_until_reset(signal, now=now, window_s=opts.window_s)
+    if not within_wait_cap(wait_s, opts.rate_limit_max_wait_s):
+        return _StoryRunOutcome(status=None, parked=True, signal=signal, waited_s=0)
+    _rate_limit_wait(ledger, run_id, signal, wait_s, sleep_fn=rl_ctx.sleep_fn)
+    if rl_ctx.window is not None:
+        rl_ctx.window.reopen(rl_ctx.clock(), ledger.run_usage_totals(run_id)["tokens"])
+    return None
+
+
+def _run_story_rate_limited(
+    ctx: _RateLimitContext,
+    story: Story,
+    ledger: "Ledger",
+    run_id: str,
+    dispatch: "Dispatcher",
+    logs_dir: Path,
+    **run_story_kwargs,
+) -> _StoryRunOutcome:
+    """Drive one story to a terminal status, absorbing Max rate-limit pauses.
+
+    Shared by :func:`run_build` and ``run_resume`` so both react identically.
+    Two signal sources are handled the same way — compute the window-reset time,
+    then wait in-process (reset within the cap → automatic resume) or return a
+    ``parked`` outcome (reset beyond the cap → durable `sdlc resume` handoff):
+
+    * proactive: a configured rolling-window token budget exhausted *before* the
+      story is dispatched (checked here);
+    * reactive: a :class:`~sdlc.dispatch.RateLimitError` raised mid-stage, which
+      :func:`_run_story` absorbs internally (so the in-story attempt/PR/bugfix
+      state survives the wait) and escalates as :class:`_RateLimitPark` only when
+      the reset is beyond the cap.
+
+    A throttle never enters the bugfix loop, so it can never burn a stage attempt.
+    """
+    opts = ctx.opts
+    waited_total = 0
+
+    # Proactive configured-window-budget gate (before any dispatch this story).
+    if ctx.window is not None:
+        while ctx.window.exhausted(ledger.run_usage_totals(run_id)["tokens"]):
+            signal = ctx.window.signal()
+            wait_s = seconds_until_reset(
+                signal, now=ctx.clock(), window_s=opts.window_s
+            )
+            if not within_wait_cap(wait_s, opts.rate_limit_max_wait_s):
+                return _StoryRunOutcome(
+                    status=None, parked=True, signal=signal, waited_s=waited_total,
+                )
+            waited_total += _rate_limit_wait(
+                ledger, run_id, signal, wait_s, sleep_fn=ctx.sleep_fn,
+            )
+            ctx.window.reopen(ctx.clock(), ledger.run_usage_totals(run_id)["tokens"])
+
+    try:
+        status = _run_story(
+            story, opts, ledger, run_id, dispatch, logs_dir,
+            rl_ctx=ctx, **run_story_kwargs,
+        )
+    except _RateLimitPark as park:
+        return _StoryRunOutcome(
+            status=None, parked=True, signal=park.signal,
+            waited_s=waited_total + park.waited_s,
+        )
+    return _StoryRunOutcome(status=status, waited_s=waited_total)
 
 
 def notional_cost_label(cost_usd: float | None) -> str:
@@ -361,6 +648,27 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
                     f"invalid --budget-policy: {policy} (expected pause|abort)"
                 )
             opts.budget_policy = policy
+        elif arg.startswith("--rate-limit-max-wait="):
+            wait = int(arg.split("=", 1)[1])
+            if wait < 0:
+                raise ValueError(f"--rate-limit-max-wait must be non-negative: {arg}")
+            opts.rate_limit_max_wait_s = wait
+        elif arg.startswith("--window-budget="):
+            # Reuse the token/$ convenience parser (Story 14.1-001) — a $-window
+            # budget converts to the notional API-equivalent token ceiling.
+            opts.window_budget, _ = _parse_budget_value(arg.split("=", 1)[1])
+        elif arg.startswith("--window="):
+            window = int(arg.split("=", 1)[1])
+            if window <= 0:
+                raise ValueError(f"--window must be positive: {arg}")
+            opts.window_s = window
+        elif arg.startswith("--rate-limit-threshold="):
+            threshold = float(arg.split("=", 1)[1])
+            if not 0 < threshold <= 1:
+                raise ValueError(
+                    f"--rate-limit-threshold must be in (0, 1]: {arg}"
+                )
+            opts.rate_limit_threshold = threshold
         elif arg.startswith("--"):
             raise ValueError(f"unknown flag: {arg}")
         elif not scope_set:
@@ -687,25 +995,29 @@ class Ledger:
         return row["id"] if row else None
 
     def latest_resumable_run(self, scope: str | None = None) -> str | None:
-        """The most recent IN_PROGRESS run id (optionally for ``scope``), or None.
+        """The most recent resumable run id (optionally for ``scope``), or None.
 
         A clean build close-out stamps a terminal status, so a run still marked
         ``IN_PROGRESS`` is one that was interrupted before finishing — exactly
-        what ``sdlc resume`` recovers. ``scope`` ``None``/``all`` matches any
-        scope; a specific scope (``epic-99``, a story id) filters to that run.
+        what ``sdlc resume`` recovers. Story 14.1-003 adds ``RATE_LIMITED``: a run
+        durably parked because the Max plan's window reset is beyond the auto-wait
+        cap is *also* resumable (it is waiting for time, not done), so `sdlc
+        resume` continues it once the window reopens. ``scope`` ``None``/``all``
+        matches any scope; a specific scope (``epic-99``, a story id) filters to
+        that run.
         """
         if not self.db_path.exists():
             return None
         with self._connect_ro() as conn:
             if scope and scope.lower() != "all":
                 row = conn.execute(
-                    "SELECT id FROM runs WHERE status = 'IN_PROGRESS' AND scope = ? "
-                    "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    "SELECT id FROM runs WHERE status IN ('IN_PROGRESS', 'RATE_LIMITED') "
+                    "AND scope = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
                     (scope,),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT id FROM runs WHERE status = 'IN_PROGRESS' "
+                    "SELECT id FROM runs WHERE status IN ('IN_PROGRESS', 'RATE_LIMITED') "
                     "ORDER BY started_at DESC, rowid DESC LIMIT 1"
                 ).fetchone()
         return row["id"] if row else None
@@ -1298,6 +1610,15 @@ class BuildResult:
     budget_policy: str = ""
     accrued_tokens: int = 0
     notional_cost_usd: float = 0.0
+    # Story 14.1-003: set when the run was durably parked because the Max plan's
+    # rate-limit / quota window reset is beyond the in-process auto-wait cap. The
+    # run is left RATE_LIMITED (resumable, not terminal); ``rate_limit_reset_at``
+    # is the approximate epoch the window reopens and ``rate_limit_waited_s`` is
+    # the total time auto-waited in-process before parking (0 if it parked
+    # immediately). ``rate_limited`` stays False on the auto-wait-and-resume path.
+    rate_limited: bool = False
+    rate_limit_reset_at: float | None = None
+    rate_limit_waited_s: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1758,6 +2079,8 @@ def run_build(
     preflight: Callable[[], bool] | None = None,
     render_view: Callable[[str], None] | None = None,
     registry: "Registry | None" = None,
+    clock: Callable[[], float] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> BuildResult:
     """Run the build-stories orchestration deterministically.
 
@@ -1841,6 +2164,12 @@ def run_build(
             # the accrual already in the ledger; `sdlc resume --budget` raises it.
             "budget": opts.budget,
             "budget_policy": opts.budget_policy,
+            # Story 14.1-003: persist the rate-limit knobs so a resume of a
+            # RATE_LIMITED run honours the same auto-wait cap and window budget.
+            "rate_limit_max_wait_s": opts.rate_limit_max_wait_s,
+            "window_budget": opts.window_budget,
+            "window_s": opts.window_s,
+            "rate_limit_threshold": opts.rate_limit_threshold,
         }),
     )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of
@@ -1872,9 +2201,21 @@ def run_build(
     # close-out below — pause leaves the run resumable, abort stamps it terminal.
     # The pre-dispatch position means a resume of an already-over run dispatches
     # nothing and re-parks until the budget is raised.
+    # Story 14.1-003: the rate-limit context owns the in-process auto-wait. A
+    # reactive 429 (RateLimitError) or a proactive configured-window-budget
+    # exhaustion pauses the run; within the auto-wait cap it waits and resumes the
+    # same run, beyond it durably parks RATE_LIMITED for `sdlc resume`.
+    # Seed the window baseline with any accrual already on the run (0 for a fresh
+    # build; non-zero only in the degenerate re-run case) so the window measures
+    # spend from now — see _make_rate_limit_context for why this matters on resume.
+    rl_ctx = _make_rate_limit_context(
+        opts, clock=clock, sleep_fn=sleep_fn,
+        baseline=ledger.run_usage_totals(run_id)["tokens"],
+    )
     budget_stopped = False
+    rate_limit_park: _StoryRunOutcome | None = None
     for cohort in cohorts:
-        if budget_stopped:
+        if budget_stopped or rate_limit_park is not None:
             break
         for story in cohort:
             if _budget_exceeded(ledger, run_id, opts.budget):
@@ -1903,7 +2244,18 @@ def run_build(
                 )
                 continue
 
-            outcome = _run_story(story, opts, ledger, run_id, dispatch, logs_dir)
+            sr = _run_story_rate_limited(
+                rl_ctx, story, ledger, run_id, dispatch, logs_dir
+            )
+            if sr.parked:
+                # Reset is beyond the auto-wait cap: leave the in-flight story
+                # RATE_LIMITED (resumable, distinct from NEEDS_ATTENTION) and hand
+                # off to the durable park close-out below.
+                status[story.id] = "RATE_LIMITED"
+                ledger.set_story_status(run_id, story.id, "RATE_LIMITED")
+                rate_limit_park = sr
+                break
+            outcome = sr.status or "FAILED"  # non-parked always carries a status
             status[story.id] = outcome
             ledger.set_story_status(run_id, story.id, outcome)
 
@@ -1915,6 +2267,15 @@ def run_build(
             # the close-out reconcile guard below. Best-effort, never fatal.
             if dispatcher is None:
                 _reposition_head(Path.cwd())
+
+    # Story 14.1-003: a rate-limit park (reset beyond the auto-wait cap) skips the
+    # terminal close-out in favour of a durable RATE_LIMITED handoff — resumable,
+    # never terminal, distinct from NEEDS_ATTENTION. Committed work is untouched.
+    if rate_limit_park is not None:
+        return _rate_limit_close_out(
+            opts, ledger, run_id, status, done_skips, buildable,
+            rate_limit_park, rl_ctx.clock(), render_view,
+        )
 
     # Story 14.1-001: a crossed budget ceiling skips the normal close-out (which
     # would stamp a terminal status and run reconcile network I/O) in favour of a
@@ -2049,6 +2410,59 @@ def _budget_close_out(
     )
 
 
+def _rate_limit_close_out(
+    opts: BuildOptions,
+    ledger: Ledger,
+    run_id: str,
+    status: dict[str, str],
+    done_skips: list[Story],
+    buildable: list[Story],
+    park: _StoryRunOutcome,
+    now: float,
+    render_view: Callable[[str], None] | None,
+) -> BuildResult:
+    """Close out a ``run_build`` run durably parked for rate limits (Story 14.1-003).
+
+    The run is left ``RATE_LIMITED`` (resumable, not terminal) so `sdlc resume`
+    continues it once the Max plan's window reopens. Finished stories keep their
+    committed work (R10); the unbuilt stories stay ``TODO`` and the in-flight one
+    is ``RATE_LIMITED``.
+    """
+    completed = sum(1 for v in status.values() if v == "DONE")
+    failed = sum(1 for v in status.values() if v == "FAILED")
+    blocked = sum(1 for v in status.values() if v == "BLOCKED")
+    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
+    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
+    skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
+    ledger.run_update_counts(run_id, completed, failed)
+
+    assert park.signal is not None  # a park always carries the pause cause
+    reset_at = apply_rate_limit_park(
+        ledger, run_id, park.signal, now=now, waited_s=park.waited_s,
+        window_s=opts.window_s,
+    )
+
+    if render_view is not None:
+        render_view(run_id)
+
+    story_status = {s.id: "SKIPPED" for s in done_skips}
+    story_status.update(status)
+    return BuildResult(
+        completed=completed,
+        failed=failed,
+        skipped=skipped,
+        blocked=blocked,
+        needs_attention=needs_attention,
+        awaiting_approval=awaiting_approval,
+        planned=len(buildable),
+        run_id=run_id,
+        story_status=story_status,
+        rate_limited=True,
+        rate_limit_reset_at=reset_at,
+        rate_limit_waited_s=park.waited_s,
+    )
+
+
 def _run_terminal(
     failed: int, blocked: int, needs_attention: int, awaiting_approval: int
 ) -> str:
@@ -2177,8 +2591,18 @@ def _run_story(
     start_attempt: int = 1,
     pr_number: int | None = None,
     bugfix_seq: int = 0,
+    rl_ctx: "_RateLimitContext | None" = None,
 ) -> str:
     """Drive one story through build → coverage → review → merge.
+
+    Story 14.1-003: when ``rl_ctx`` is provided, a :class:`RateLimitError` raised
+    by any stage/recovery dispatch is absorbed here as a recoverable, time-based
+    pause rather than a stage failure: within the auto-wait cap the controller
+    waits in-process and retries the *same* stage as a fresh attempt (the prior
+    attempt's IN_PROGRESS row stays as a crashed attempt, so the PR/bugfix state
+    and committed work are preserved); beyond the cap it raises
+    :class:`_RateLimitPark` so the caller durably parks the run. A throttle thus
+    never records a FAILED attempt nor enters the bugfix loop.
 
     Returns the terminal story status: ``DONE``, ``FAILED``,
     ``NEEDS_ATTENTION``, or ``AWAITING_APPROVAL``. A stage failure (agent FAILED
@@ -2216,6 +2640,7 @@ def _run_story(
     # retries of one stage and across different stages — needs a distinct attempt
     # number, or the second insert hits the stages UNIQUE constraint.
 
+    rl_waited = 0  # cumulative in-process auto-wait across reactive pauses (14.1-003)
     for idx, stage in enumerate(pending):
         bugfix_attempts = 0
         # Only the first resumed stage continues a prior attempt count; later
@@ -2225,119 +2650,143 @@ def _run_story(
             ledger.stage_start(run_id, story.id, stage, attempt)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             sink = _make_progress_sink(ledger, run_id, story.id, stage, attempt)
-            ok, result, failure, kind = _dispatch_stage(
-                stage, story, opts, pr_number, dispatch, tpath, on_progress=sink
-            )
-            if ok:
-                ledger.stage_finish(
-                    run_id, story.id, stage, attempt, "DONE", output_path=str(tpath)
+            try:
+                ok, result, failure, kind = _dispatch_stage(
+                    stage, story, opts, pr_number, dispatch, tpath, on_progress=sink
                 )
-                _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
-                pr_number = _extract_pr(result, pr_number)
-                if pr_number is not None:
-                    ledger.set_story_pr(run_id, story.id, pr_number)
-                # Story 12.2-002: lint the commit a commit-authoring stage just
-                # produced against commitlint before it can reach a PR; bounded
-                # amend re-ask on violation, no-op when there is no config /
-                # nothing to lint. Build and coverage both author commits on the
-                # story branch; review/merge do not. If the message is still
-                # non-compliant after the bounded re-asks, park the story rather
-                # than advance a known-non-compliant commit to review/merge/PR
-                # (work preserved on the branch, R10).
-                if stage in ("build", "coverage"):
-                    bugfix_seq, lint_ok = _lint_stage_commit(
-                        stage, story, opts, pr_number, ledger, run_id, dispatch,
-                        logs_dir, bugfix_seq,
-                    )
-                    if not lint_ok:
-                        return "NEEDS_ATTENTION"
-                break
-
-            # Stage failed: record it, then attempt a bounded bugfix.
-            ledger.stage_finish(
-                run_id, story.id, stage, attempt, "FAILED", f"{stage}-error", str(tpath)
-            )
-            # A schema-valid-but-FAILED agent response still carries usage.
-            _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
-            ledger.event_log(
-                run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
-            )
-
-            # Story 12.3-003: a merge blocked only by the high-risk human-approval
-            # gate is parked in a distinct AWAITING_APPROVAL terminal — *before*
-            # any recovery. The bugfix loop cannot self-approve and would only
-            # exhaust into FAILED, misreporting a run that is honestly
-            # awaiting-human. The committed work / open PR are preserved (R10):
-            # nothing is discarded or rebuilt. Reconciliation (12.3-001) flips it
-            # to DONE once FX approves and the PR merges.
-            if kind == "awaiting_approval":
-                ledger.event_log(
-                    run_id, story.id, "warn", "controller",
-                    f"merge blocked awaiting human approval (high-risk) — parking "
-                    f"AWAITING_APPROVAL; PR/branch on feature/{story.id} preserved",
-                )
-                return "AWAITING_APPROVAL"
-
-            # Story 12.1-001: a missing/malformed result envelope (contract
-            # error) usually means the agent did good work but failed only to
-            # emit the result block. Before any heavier recovery, issue a cheap,
-            # bounded envelope-only re-ask (AC1). On success the stage is treated
-            # as DONE and the run proceeds exactly as if the agent had emitted the
-            # block the first time (AC4); committed work is never discarded (R10).
-            if kind == "contract":
-                bugfix_seq += 1
-                rpath = logs_dir / f"{story.id}-reask-{stage}-{bugfix_seq}.log"
-                ok_r, result_r = _reask_envelope(
-                    stage, story, opts, pr_number, ledger, run_id, dispatch,
-                    rpath, bugfix_seq,
-                )
-                if ok_r:
+                if ok:
                     ledger.stage_finish(
-                        run_id, story.id, stage, attempt, "DONE",
-                        output_path=str(rpath),
+                        run_id, story.id, stage, attempt, "DONE", output_path=str(tpath)
                     )
-                    _record_stage_usage(
-                        ledger, run_id, story.id, stage, attempt, result_r
-                    )
-                    pr_number = _extract_pr(result_r, pr_number)
+                    _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
+                    pr_number = _extract_pr(result, pr_number)
                     if pr_number is not None:
                         ledger.set_story_pr(run_id, story.id, pr_number)
-                    # Story 12.2-002: an envelope-recovered stage committed work
-                    # just like a first-pass success — lint its commit too, or
-                    # an envelope-only failure would smuggle a non-compliant
-                    # header straight to the PR. Park on exhausted re-asks (R10).
+                    # Story 12.2-002: lint the commit a commit-authoring stage just
+                    # produced against commitlint before it can reach a PR; bounded
+                    # amend re-ask on violation, no-op when there is no config /
+                    # nothing to lint. Build and coverage both author commits on the
+                    # story branch; review/merge do not. If the message is still
+                    # non-compliant after the bounded re-asks, park the story rather
+                    # than advance a known-non-compliant commit to review/merge/PR
+                    # (work preserved on the branch, R10).
                     if stage in ("build", "coverage"):
                         bugfix_seq, lint_ok = _lint_stage_commit(
-                            stage, story, opts, pr_number, ledger, run_id,
-                            dispatch, logs_dir, bugfix_seq,
+                            stage, story, opts, pr_number, ledger, run_id, dispatch,
+                            logs_dir, bugfix_seq,
                         )
                         if not lint_ok:
                             return "NEEDS_ATTENTION"
                     break
 
-            if bugfix_attempts >= MAX_BUGFIX_ATTEMPTS:
-                # Recovery exhausted (AC2). R10: never discard committed work —
-                # if the agent already committed the story branch, park it for
-                # manual push/MR rather than reporting an outright failure.
-                return _exhausted_status(kind, story.id, ledger, run_id)
+                # Stage failed: record it, then attempt a bounded bugfix.
+                ledger.stage_finish(
+                    run_id, story.id, stage, attempt, "FAILED", f"{stage}-error", str(tpath)
+                )
+                # A schema-valid-but-FAILED agent response still carries usage.
+                _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
+                ledger.event_log(
+                    run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
+                )
 
-            bugfix_attempts += 1
-            bugfix_seq += 1
-            bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
-            if not _run_bugfix(
-                story, stage, failure, ledger, run_id, dispatch, bpath, bugfix_seq
-            ):
-                return _exhausted_status(kind, story.id, ledger, run_id)
-            # Story 12.2-002: the bugfix agent authors a commit too — lint its
-            # message and amend early. This is best-effort (no park): the stage
-            # is about to be retried, and that retry's own success-time lint is
-            # the terminal gate that parks a still-non-compliant commit.
-            bugfix_seq, _ = _lint_stage_commit(
-                "bugfix", story, opts, pr_number, ledger, run_id, dispatch,
-                logs_dir, bugfix_seq,
-            )
-            # Bugfix succeeded — retry the same stage as a new attempt.
-            attempt += 1
+                # Story 12.3-003: a merge blocked only by the high-risk human-approval
+                # gate is parked in a distinct AWAITING_APPROVAL terminal — *before*
+                # any recovery. The bugfix loop cannot self-approve and would only
+                # exhaust into FAILED, misreporting a run that is honestly
+                # awaiting-human. The committed work / open PR are preserved (R10):
+                # nothing is discarded or rebuilt. Reconciliation (12.3-001) flips it
+                # to DONE once FX approves and the PR merges.
+                if kind == "awaiting_approval":
+                    ledger.event_log(
+                        run_id, story.id, "warn", "controller",
+                        f"merge blocked awaiting human approval (high-risk) — parking "
+                        f"AWAITING_APPROVAL; PR/branch on feature/{story.id} preserved",
+                    )
+                    return "AWAITING_APPROVAL"
+
+                # Story 12.1-001: a missing/malformed result envelope (contract
+                # error) usually means the agent did good work but failed only to
+                # emit the result block. Before any heavier recovery, issue a cheap,
+                # bounded envelope-only re-ask (AC1). On success the stage is treated
+                # as DONE and the run proceeds exactly as if the agent had emitted the
+                # block the first time (AC4); committed work is never discarded (R10).
+                if kind == "contract":
+                    bugfix_seq += 1
+                    rpath = logs_dir / f"{story.id}-reask-{stage}-{bugfix_seq}.log"
+                    ok_r, result_r = _reask_envelope(
+                        stage, story, opts, pr_number, ledger, run_id, dispatch,
+                        rpath, bugfix_seq,
+                    )
+                    if ok_r:
+                        ledger.stage_finish(
+                            run_id, story.id, stage, attempt, "DONE",
+                            output_path=str(rpath),
+                        )
+                        _record_stage_usage(
+                            ledger, run_id, story.id, stage, attempt, result_r
+                        )
+                        pr_number = _extract_pr(result_r, pr_number)
+                        if pr_number is not None:
+                            ledger.set_story_pr(run_id, story.id, pr_number)
+                        # Story 12.2-002: an envelope-recovered stage committed work
+                        # just like a first-pass success — lint its commit too, or
+                        # an envelope-only failure would smuggle a non-compliant
+                        # header straight to the PR. Park on exhausted re-asks (R10).
+                        if stage in ("build", "coverage"):
+                            bugfix_seq, lint_ok = _lint_stage_commit(
+                                stage, story, opts, pr_number, ledger, run_id,
+                                dispatch, logs_dir, bugfix_seq,
+                            )
+                            if not lint_ok:
+                                return "NEEDS_ATTENTION"
+                        break
+
+                if bugfix_attempts >= MAX_BUGFIX_ATTEMPTS:
+                    # Recovery exhausted (AC2). R10: never discard committed work —
+                    # if the agent already committed the story branch, park it for
+                    # manual push/MR rather than reporting an outright failure.
+                    return _exhausted_status(kind, story.id, ledger, run_id)
+
+                bugfix_attempts += 1
+                bugfix_seq += 1
+                bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
+                if not _run_bugfix(
+                    story, stage, failure, ledger, run_id, dispatch, bpath, bugfix_seq
+                ):
+                    return _exhausted_status(kind, story.id, ledger, run_id)
+                # Story 12.2-002: the bugfix agent authors a commit too — lint its
+                # message and amend early. This is best-effort (no park): the stage
+                # is about to be retried, and that retry's own success-time lint is
+                # the terminal gate that parks a still-non-compliant commit.
+                bugfix_seq, _ = _lint_stage_commit(
+                    "bugfix", story, opts, pr_number, ledger, run_id, dispatch,
+                    logs_dir, bugfix_seq,
+                )
+                # Bugfix succeeded — retry the same stage as a new attempt.
+                attempt += 1
+            except RateLimitError as exc:
+                # Story 14.1-003: a Max rate-limit hit anywhere in this stage's
+                # dispatch/recovery is a recoverable, time-based pause — never a
+                # stage FAILED. The interrupted attempt's IN_PROGRESS row is left as
+                # a crashed attempt; we wait in-process (within the cap) and retry
+                # the same stage as a *fresh* attempt, or escalate _RateLimitPark
+                # (beyond the cap) so the caller durably parks the run.
+                if rl_ctx is None:
+                    raise
+                wait_s = seconds_until_reset(
+                    exc.signal, now=rl_ctx.clock(), window_s=rl_ctx.opts.window_s
+                )
+                if not within_wait_cap(wait_s, rl_ctx.opts.rate_limit_max_wait_s):
+                    raise _RateLimitPark(signal=exc.signal, waited_s=rl_waited) from exc
+                rl_waited += _rate_limit_wait(
+                    ledger, run_id, exc.signal, wait_s, sleep_fn=rl_ctx.sleep_fn
+                )
+                if rl_ctx.window is not None:
+                    rl_ctx.window.reopen(
+                        rl_ctx.clock(), ledger.run_usage_totals(run_id)["tokens"]
+                    )
+                attempt += 1
+                continue
 
     return "DONE"
 
@@ -2433,6 +2882,13 @@ def _dispatch_stage(
             stage, prompt, story=story, transcript_path=transcript_path,
             on_progress=on_progress,
         )
+    except RateLimitError:
+        # Story 14.1-003: a Max rate-limit hit is a recoverable, time-based pause,
+        # NOT a stage failure — let it propagate past the bugfix loop so a throttle
+        # never burns a bugfix attempt. The caller (run_build/run_resume) waits or
+        # durably parks. Re-raised before the AgentDispatchError catch below since
+        # RateLimitError subclasses it.
+        raise
     except ContractError as exc:
         # Malformed / schema-invalid agent output is a build failure.
         return False, None, f"contract violation: {exc}", "contract"
@@ -2590,6 +3046,11 @@ def _reask_envelope(
             stage, prompt, story=story, transcript_path=transcript_path,
             on_progress=sink,
         )
+    except RateLimitError:
+        # Story 14.1-003: a throttle during recovery is a pause, not a failed fix —
+        # propagate so the controller waits/parks. The reask row stays IN_PROGRESS
+        # (from stage_start), so resume re-enters cleanly.
+        raise
     except (ContractError, AgentDispatchError) as exc:
         ledger.stage_finish(run_id, story.id, "reask", seq, "FAILED", "reask-error", out)
         ledger.event_log(
@@ -2684,6 +3145,10 @@ def _lint_stage_commit(
             result = dispatch(
                 stage, prompt, story=story, transcript_path=cpath, on_progress=sink,
             )
+        except RateLimitError:
+            # Story 14.1-003: a throttle during the commit-lint amend is a pause,
+            # not a failed lint — propagate so the controller waits/parks.
+            raise
         except (ContractError, AgentDispatchError) as exc:
             # Story 12.2-004 AC4: a malformed re-ask envelope is recovered via
             # the shared envelope-only re-ask (12.1-001), not dead-ended. The
@@ -2767,6 +3232,11 @@ def _run_bugfix(
             "bugfix", prompt, story=story, transcript_path=transcript_path,
             on_progress=sink,
         )
+    except RateLimitError:
+        # Story 14.1-003: a throttle during the bugfix dispatch is a pause, not a
+        # failed fix — propagate so the controller waits/parks rather than burning
+        # the bugfix attempt. The bugfix row stays IN_PROGRESS for a clean resume.
+        raise
     except (ContractError, AgentDispatchError) as exc:
         ledger.stage_finish(
             run_id, story.id, "bugfix", attempt, "FAILED", "bugfix-error", out

@@ -269,6 +269,9 @@ _PAGE = """<!doctype html>
   .BLOCKED { background: #fdeede; color: var(--peach); }
   .NEEDS_ATTENTION { background: #fdeede; color: var(--peach); }
   .AWAITING_APPROVAL { background: #e9e7fd; color: var(--mauve); }
+  /* Story 14.1-003: a rate-limit pause is waiting for time, not human attention
+     — its own distinct (yellow) badge, never styled like NEEDS_ATTENTION. */
+  .RATE_LIMITED { background: #fdf6e3; color: #df8e1d; }
   .SKIPPED { background: var(--surface); color: var(--sub); }
   .TODO { background: var(--crust); color: var(--overlay); }
   .PENDING { background: var(--crust); color: var(--overlay); }
@@ -303,7 +306,7 @@ _PAGE = """<!doctype html>
     </div>
   </div>
 <script>
-const ORDER = ["DONE","IN_PROGRESS","FAILED","BLOCKED","NEEDS_ATTENTION","AWAITING_APPROVAL","SKIPPED","TODO"];
+const ORDER = ["DONE","IN_PROGRESS","RATE_LIMITED","FAILED","BLOCKED","NEEDS_ATTENTION","AWAITING_APPROVAL","SKIPPED","TODO"];
 let sel = null;  // null = Live (latest)
 // Live run-duration ticker (Story 11.2-005): when a run is in-progress, count
 // up locally from the server-computed elapsed (runtimeBase) captured at fetch

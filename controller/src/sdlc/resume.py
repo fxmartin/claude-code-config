@@ -13,9 +13,13 @@ from sdlc.build import (
     Dispatcher,
     Ledger,
     _budget_exceeded,
+    _honor_parked_reset,
+    _make_rate_limit_context,
     _reposition_head,
-    _run_story,
+    _run_story_rate_limited,
+    _StoryRunOutcome,
     apply_budget_stop,
+    apply_rate_limit_park,
     finalize_run,
 )
 from sdlc.cohort import Story, compute_cohorts
@@ -70,6 +74,11 @@ class ResumeResult:
     budget_policy: str = ""
     accrued_tokens: int = 0
     notional_cost_usd: float = 0.0
+    # Story 14.1-003: set when the resume re-hit the rate-limit window beyond the
+    # auto-wait cap and durably re-parked RATE_LIMITED (resumable again later).
+    rate_limited: bool = False
+    rate_limit_reset_at: float | None = None
+    rate_limit_waited_s: int = 0
 
 
 def _pipeline(skip_coverage: bool) -> list[str]:
@@ -147,6 +156,13 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         # --budget` overrides this in run_resume before the loop.
         budget=int(config.get("budget", 0) or 0),
         budget_policy=str(config.get("budget_policy") or "pause"),
+        # Story 14.1-003: carry the rate-limit knobs so a resumed RATE_LIMITED run
+        # honours the same auto-wait cap and configured window budget. Defaults
+        # match BuildOptions for runs that predate these fields.
+        rate_limit_max_wait_s=int(config.get("rate_limit_max_wait_s", 18000) or 18000),
+        window_budget=int(config.get("window_budget", 0) or 0),
+        window_s=int(config.get("window_s", 18000) or 18000),
+        rate_limit_threshold=float(config.get("rate_limit_threshold", 1.0) or 1.0),
     )
 
 
@@ -160,6 +176,8 @@ def run_resume(
     root: Path | None = None,
     budget: int | None = None,
     budget_policy: str | None = None,
+    clock: Callable[[], float] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> ResumeResult:
     """Resume the most recent interrupted run for ``scope`` from the ledger.
 
@@ -220,9 +238,26 @@ def run_resume(
     status: dict[str, str] = {s.id: plan[s.id].status for s in run_queue}
     resumed = 0
     budget_stopped = False
+    # Story 14.1-003: re-enforce the rate-limit auto-wait/park on resume too, so a
+    # RATE_LIMITED run that is resumed while the window is still closed waits or
+    # re-parks just like the original build did.
+    # Seed the window baseline with the accrual already on the run so the
+    # reopened window measures only post-resume spend — otherwise a durably-parked
+    # configured-window run would re-park forever (zero progress). See
+    # _make_rate_limit_context for the rationale.
+    rl_ctx = _make_rate_limit_context(
+        opts, clock=clock, sleep_fn=sleep_fn,
+        baseline=ledger.run_usage_totals(rid)["tokens"],
+    )
+    # Honour a persisted park reset time before dispatching anything: a run
+    # resumed *before* its window reopens must wait (within cap) or re-park,
+    # never dispatch early into a still-closed window.
+    rate_limit_park: _StoryRunOutcome | None = _honor_parked_reset(
+        ledger, rid, opts, rl_ctx, config.get("rate_limit_reset_at"),
+    )
 
     for cohort in cohorts:
-        if budget_stopped:
+        if budget_stopped or rate_limit_park is not None:
             break
         for story in cohort:
             st = plan[story.id]
@@ -270,13 +305,19 @@ def run_resume(
                 f"resume: re-entering at stage '{st.next_stage}' "
                 f"(attempt {st.start_attempt})",
             )
-            outcome = _run_story(
-                story, opts, ledger, rid, dispatch, logs_dir,
+            sr = _run_story_rate_limited(
+                rl_ctx, story, ledger, rid, dispatch, logs_dir,
                 done_stages=st.done_pipeline_stages,
                 start_attempt=st.start_attempt,
                 pr_number=st.pr_number,
                 bugfix_seq=st.bugfix_seq,
             )
+            if sr.parked:
+                status[story.id] = "RATE_LIMITED"
+                ledger.set_story_status(rid, story.id, "RATE_LIMITED")
+                rate_limit_park = sr
+                break
+            outcome = sr.status or "FAILED"
             status[story.id] = outcome
             ledger.set_story_status(rid, story.id, outcome)
             resumed += 1
@@ -287,6 +328,38 @@ def run_resume(
             # test's cwd); best-effort and never fatal.
             if dispatcher is None:
                 _reposition_head(root or Path.cwd())
+
+    # Story 14.1-003: the resume re-hit the rate-limit window beyond the auto-wait
+    # cap — durably re-park RATE_LIMITED (resumable again) without the terminal
+    # close-out, exactly like run_build.
+    if rate_limit_park is not None:
+        assert rate_limit_park.signal is not None
+        completed = sum(1 for v in status.values() if v == "DONE")
+        ledger.run_update_counts(rid, completed, sum(
+            1 for v in status.values() if v == "FAILED"
+        ))
+        reset_at = apply_rate_limit_park(
+            ledger, rid, rate_limit_park.signal,
+            now=rl_ctx.clock(), waited_s=rate_limit_park.waited_s,
+            window_s=opts.window_s,
+        )
+        if render_view is not None:
+            render_view(rid)
+        return ResumeResult(
+            run_id=rid,
+            resumed=resumed,
+            completed=completed,
+            failed=sum(1 for v in status.values() if v == "FAILED"),
+            blocked=sum(1 for v in status.values() if v == "BLOCKED"),
+            needs_attention=sum(1 for v in status.values() if v == "NEEDS_ATTENTION"),
+            awaiting_approval=sum(1 for v in status.values() if v == "AWAITING_APPROVAL"),
+            skipped=sum(1 for v in status.values() if v == "SKIPPED"),
+            nothing_to_resume=False,
+            story_status=dict(status),
+            rate_limited=True,
+            rate_limit_reset_at=reset_at,
+            rate_limit_waited_s=rate_limit_park.waited_s,
+        )
 
     # Story 14.1-001: the budget gate re-halted the resume — apply the same
     # policy-aware stop as run_build (pause leaves IN_PROGRESS/resumable, abort

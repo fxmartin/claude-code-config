@@ -19,6 +19,7 @@ from sdlc.dispatch import (
     DEFAULT_AGENT_CMD,
     AgentDispatchError,
     AgentResult,
+    RateLimitError,
     dispatch_agent,
     resolve_agent_cmd,
 )
@@ -115,6 +116,54 @@ def test_dispatch_raises_on_timeout(monkeypatch) -> None:
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(AgentDispatchError, match="timed out"):
         dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# Story 14.1-003: a rate-limit exit raises the distinct RateLimitError
+# ---------------------------------------------------------------------------
+
+def test_dispatch_rate_limit_exit_raises_rate_limit_error(monkeypatch) -> None:
+    # A non-zero exit whose stderr names a rate limit is a recoverable pause, not
+    # a generic dispatch failure — surfaced as RateLimitError carrying the signal.
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kw: _FakeCompleted(
+            "", returncode=1, stderr="API error 429: rate limit; Retry-After: 300"
+        ),
+    )
+    with pytest.raises(RateLimitError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert exc.value.signal.retry_after_s == 300
+    # It is still an AgentDispatchError subclass for graceful degradation.
+    assert isinstance(exc.value, AgentDispatchError)
+
+
+def test_dispatch_nonzero_exit_without_rate_limit_is_plain_error(monkeypatch) -> None:
+    # A non-rate-limit failure must NOT be misread as a throttle (AC7 degradation).
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kw: _FakeCompleted("", returncode=1, stderr="segfault"),
+    )
+    with pytest.raises(AgentDispatchError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert not isinstance(exc.value, RateLimitError)
+
+
+def test_dispatch_error_envelope_rate_limit_raises_rate_limit_error(monkeypatch) -> None:
+    # An is_error result envelope whose text names a rate limit is the same pause.
+    envelope = json.dumps({
+        "type": "result",
+        "result": "usage limit reached for this 5-hour window",
+        "is_error": True,
+        "subtype": "rate_limit_error",
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(RateLimitError):
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
 
 
 def test_dispatch_uses_default_agent_cmd(monkeypatch) -> None:

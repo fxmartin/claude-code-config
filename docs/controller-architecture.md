@@ -578,6 +578,76 @@ mistaken for actual spend (the dashboard, owned by Epic-11, renders the same
 label). With no `--budget` the path is byte-for-byte today's behaviour (the gate
 is skipped; `0` means "no ceiling", never "ceiling of zero").
 
+## Rate-limit / quota awareness with automatic resume (Story 14.1-003)
+
+On a Claude Max subscription the real overnight failure mode is not dollars (they
+are flat) but **finite quota**: a 5-hour rolling window and a weekly cap. Without
+handling, a limit hit surfaced as a non-zero `claude -p` exit → `AgentDispatchError`
+→ the bugfix loop re-dispatched (also throttled) → the story parked
+`NEEDS_ATTENTION`/`FAILED` and the night's run died. Story 14.1-003 replaces that
+with detect → pause → auto-wait-or-park → resume.
+
+**Detection.** `sdlc/rate_limit.py` (`detect_rate_limit`) scans the agent's
+stderr / error-envelope text for a throttle signal — a `429`, a `rate limit` /
+`rate_limit_error` / `usage limit reached`, or an explicit `Retry-After` / reset
+epoch. `dispatch.py` raises a distinct **`RateLimitError`** (a subclass of
+`AgentDispatchError`, so any older `except AgentDispatchError` still degrades
+gracefully) carrying a `RateLimitSignal`. When **no** signal is present the
+exit is the ordinary `AgentDispatchError` and behaviour is exactly today's (AC7).
+
+**A throttle is never a stage failure.** `_dispatch_stage` (and the reask /
+bugfix / commit-lint dispatch sites) re-raise `RateLimitError` *before* the
+generic `AgentDispatchError` handling, so a 429 never records a `FAILED` attempt
+nor burns a bugfix attempt. `_run_story` (given an `rl_ctx`) absorbs it: the
+interrupted attempt's `IN_PROGRESS` row is left as a crashed attempt and the
+*same* stage is retried as a fresh attempt — preserving the PR/bugfix state and
+any committed work (R10).
+
+**Auto-wait vs durable park.** The reset time is computed by `seconds_until_reset`
+(explicit `retry-after` → absolute reset epoch → else a full `--window`, the
+documented approximate heuristic). If it is within the configurable
+**`--rate-limit-max-wait`** cap (default ≈ one window, ~5h), the controller
+**waits in-process** (`_rate_limit_wait`, flagging the run `RATE_LIMITED` with a
+periodic countdown event) and **auto-resumes the same run** — no manual
+`sdlc resume`. The per-agent dispatch timeout is unaffected: it bounds the agent
+subprocess, not this controller-side wait. If the reset is **beyond** the cap
+(e.g. a weekly cap days away), the controller does not hold the process: it
+durably parks the run **`RATE_LIMITED`** and exits.
+
+**`RATE_LIMITED` is a distinct, resumable state** — deliberately *not*
+`NEEDS_ATTENTION` (the run waits for *time*, not human attention) and *not*
+terminal. `Ledger.latest_resumable_run` matches it alongside `IN_PROGRESS`, so
+`sdlc resume` (or a scheduled wake) continues it once the window reopens; an
+interrupted (machine sleep/crash) paused run resumes the same way from the
+committed ledger state. It renders with its own badge in `sdlc status` /
+the dashboard (Epic-11 11.2-009).
+
+**Resume honours the parked reset time.** The park persists the approximate
+reset epoch into the run config (`rate_limit_reset_at`), and `_honor_parked_reset`
+gates the resume on it *before* dispatching anything: a resume that arrives
+**before** the window reopens waits in-process (when the remaining time is within
+the cap) or durably re-parks (beyond it), so an early resume can never dispatch
+into a still-closed window and blow the quota. Once the reset has passed, the
+window is treated as freshly reopened — the `WindowQuota` baseline is seeded with
+the run's *current* accrual (not 0), so the resumed run makes forward progress
+rather than re-parking forever on pre-park spend.
+
+**Configured window budget (proactive).** When no live rate-limit header is
+available, a configured per-window token budget gates dispatch instead:
+`--window-budget=<N|$>` (tokens, or a `$` convenience converted via the same
+notional rate as 14.1-001) tracked over a `--window=<s>` rolling window via the
+11.1-003 accrual, pausing at `--rate-limit-threshold` (default `1.0`; `<1` pauses
+*near* the limit). `WindowQuota` measures usage from a baseline captured at the
+window's open; `_run_story_rate_limited` checks it *before* dispatching each story
+and waits/parks identically.
+
+All four knobs are persisted in the run's config event, so `run_resume`
+re-enforces the same cap and window budget (carried via `_options_from_config`);
+the wait/park is shared between `run_build` and `run_resume` (`_make_rate_limit_context`,
+`_run_story_rate_limited`, `apply_rate_limit_park`) so a resume reacts identically
+to a fresh build. The `clock` / `sleep_fn` are injectable so the in-process wait
+is deterministic and instant under test.
+
 ## Backward compatibility
 
 Users still type `/build-stories` in Claude Code. The skill shells out to
