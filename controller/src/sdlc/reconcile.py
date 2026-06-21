@@ -69,6 +69,26 @@ def _rev(root: Path, ref: str) -> str:
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
+def _branch_owns_story_commit(root: Path, branch: str, story_id: str) -> bool:
+    """Whether ``branch`` carries ≥1 commit tagged ``(#<story_id>)`` of its own.
+
+    An empty/stacked-base-only branch is trivially an ancestor of base but holds
+    none of the story's own work, so its tip's ``(#<story_id>)`` tag is absent
+    (the commit it points at belongs to a sibling). Requiring the branch to
+    carry a commit attributable to *this* story blocks that is-ancestor
+    false-positive (#111) across every merge style (ff / merge-commit / squash),
+    where ``base..branch`` count alone would be 0 once the work has landed.
+
+    Returns False — never raises — on a non-zero ``git log`` so a flaky result
+    degrades to "no own work" rather than a false landing.
+    """
+    out = _git(
+        root, "log", branch, "--fixed-strings", f"--grep=(#{story_id})",
+        "--format=%H", "-1",
+    )
+    return out.returncode == 0 and bool(out.stdout.strip())
+
+
 def _detect_landing(
     story_id: str, pr_number: int | None, base: str | None, root: Path
 ) -> tuple[str, str] | None:
@@ -78,7 +98,8 @@ def _detect_landing(
     detectors are deliberately complementary across merge styles:
 
     - ``is-ancestor`` — fast-forward / merge-commit landings (branch tip is an
-      ancestor of base).
+      ancestor of base *and* the branch owns a commit tagged for this story, so
+      an empty stacked branch cannot false-positive — #111).
     - ``git-cherry`` — patch-id equivalence (rebase / single-commit squash /
       transitive-stacked landings, where the tip sha differs but the patch is on
       base already).
@@ -98,7 +119,14 @@ def _detect_landing(
     )
 
     if branch_exists and base:
-        if _git(root, "merge-base", "--is-ancestor", branch, base).returncode == 0:
+        # An empty/stacked-base-only branch is trivially an ancestor of base but
+        # carries none of the story's own work — guard that false positive (#111)
+        # by requiring the branch to own a commit tagged for *this* story before
+        # trusting is-ancestor.
+        if (
+            _git(root, "merge-base", "--is-ancestor", branch, base).returncode == 0
+            and _branch_owns_story_commit(root, branch, story_id)
+        ):
             return "is-ancestor", _rev(root, branch)
         cherry = _git(root, "cherry", base, branch)
         if cherry.returncode == 0:
