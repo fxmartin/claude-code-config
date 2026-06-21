@@ -19,6 +19,7 @@ from sdlc.dispatch import (
     DEFAULT_AGENT_CMD,
     AgentDispatchError,
     AgentResult,
+    ContextOverflowError,
     RateLimitError,
     dispatch_agent,
     resolve_agent_cmd,
@@ -232,6 +233,118 @@ def test_dispatch_non_429_error_envelope_stays_plain_error(monkeypatch) -> None:
     with pytest.raises(AgentDispatchError) as exc:
         dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
     assert not isinstance(exc.value, RateLimitError)
+
+
+# ---------------------------------------------------------------------------
+# Issue #104: a context-window overflow envelope raises ContextOverflowError
+# ---------------------------------------------------------------------------
+
+_OVERFLOW_TEXT = "Prompt is too long · the request is ~1180341 tokens (limit 1000000)"
+
+
+def test_dispatch_context_overflow_envelope_raises_context_overflow_error(
+    monkeypatch,
+) -> None:
+    # Issue #104: an is_error envelope whose text reports a prompt-too-long /
+    # context-window overflow is a distinct, fail-fast failure (a fresh dispatch
+    # cannot shrink in-session context) — surfaced as ContextOverflowError.
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "result": _OVERFLOW_TEXT,
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(ContextOverflowError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    # Still an AgentDispatchError subclass so any except-AgentDispatchError
+    # path degrades gracefully.
+    assert isinstance(exc.value, AgentDispatchError)
+
+
+def test_dispatch_context_overflow_distinct_from_rate_limit(monkeypatch) -> None:
+    # Critical #109 non-shadowing guard: an overflow must NOT be misclassified as
+    # a recoverable rate-limit pause (which would wait/retry forever).
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "result": _OVERFLOW_TEXT,
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(ContextOverflowError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert not isinstance(exc.value, RateLimitError)
+
+
+def test_dispatch_non_overflow_error_envelope_stays_plain_error(monkeypatch) -> None:
+    # A generic error envelope must NOT be misread as a context overflow.
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "result": "unknown agent error",
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(AgentDispatchError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert not isinstance(exc.value, ContextOverflowError)
+
+
+@pytest.mark.parametrize(
+    "overflow_text",
+    [
+        _OVERFLOW_TEXT,
+        "context window exceeded",
+        "request is 1200000 tokens (limit 1000000)",
+        "the request is ~1,180,341 tokens (limit 1,000,000)",
+    ],
+)
+def test_dispatch_overflow_text_variations(monkeypatch, overflow_text) -> None:
+    # Issue #104: the matcher must accept the observed wording and its variants.
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "result": overflow_text,
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(ContextOverflowError):
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+
+
+@pytest.mark.parametrize(
+    "benign_text",
+    [
+        # "request is … tokens … limit" strung across separate sentences, or
+        # without an actual token count, must NOT read as a context overflow.
+        "I made the request. It used 5 tokens. The limit is fine.",
+        "request is processing tokens within limit",
+        "Your request is for API tokens but we hit the limit",
+        "The merge request is ready; tokens refreshed; limit reset",
+    ],
+)
+def test_dispatch_overflow_matcher_rejects_benign_token_prose(
+    monkeypatch, benign_text
+) -> None:
+    # Issue #104: the token-count matcher must not false-positive on benign
+    # error prose that merely mentions request/tokens/limit — such an error is
+    # a plain (potentially fixable) AgentDispatchError, not a fail-fast overflow.
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "result": benign_text,
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(AgentDispatchError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert not isinstance(exc.value, ContextOverflowError)
 
 
 def test_dispatch_uses_default_agent_cmd(monkeypatch) -> None:

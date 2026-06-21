@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -211,6 +212,43 @@ class RateLimitError(AgentDispatchError):
     def __init__(self, message: str, *, signal: RateLimitSignal) -> None:
         super().__init__(message)
         self.signal = signal
+
+
+class ContextOverflowError(AgentDispatchError):
+    """The agent failed because its prompt exceeded the model context window.
+
+    Issue #104: a dispatch can exit 0 yet emit an ``is_error`` envelope whose
+    text is e.g. ``"Prompt is too long · the request is ~1180341 tokens (limit
+    1000000)"``. That is neither a recoverable rate-limit pause nor a fixable
+    stage failure — a *fresh* dispatch cannot shrink the in-session context, so
+    the bugfix loop would only re-overflow. A subclass of
+    :class:`AgentDispatchError` (so ``except AgentDispatchError`` still
+    degrades gracefully), but the controller catches it *first* and fails the
+    stage fast with ``failure_category="context-overflow"``.
+    """
+
+
+# Issue #104: prompt-too-long / context-window overflow signatures. Matched
+# case-insensitively against the error-envelope ``result`` text. Kept distinct
+# from the rate-limit matcher and applied *after* it so the two never shadow.
+_CONTEXT_OVERFLOW_PATTERNS = (
+    re.compile(r"\bprompt is too long\b", re.IGNORECASE),
+    # Anchor on an actual token *count* before "limit", and stay within one
+    # clause (no sentence break), so benign error prose that merely strings
+    # together "request is … tokens … limit" across sentences cannot match.
+    re.compile(
+        r"\brequest is\b[^.!?\n]*?\d[\d,]*\s*tokens\b[^.!?\n]*\blimit\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bcontext.*(?:window|limit).*(?:exceeded|too long)\b", re.IGNORECASE
+    ),
+)
+
+
+def _is_context_overflow(text: str) -> bool:
+    """True when ``text`` reports a prompt-too-long / context-window overflow."""
+    return any(pattern.search(text) for pattern in _CONTEXT_OVERFLOW_PATTERNS)
 
 
 @dataclass(frozen=True)
@@ -580,6 +618,15 @@ def _interpret(
                 raise RateLimitError(
                     f"{agent_type} agent hit the rate limit: {detail}",
                     signal=signal,
+                )
+            # Issue #104: a prompt-too-long / context-window overflow. Checked
+            # AFTER the rate-limit detection so the two never shadow each other,
+            # and BEFORE the generic dispatch error so the controller can
+            # fail-fast instead of burning the bugfix loop on an unshrinkable
+            # in-session context.
+            if _is_context_overflow(str(detail)):
+                raise ContextOverflowError(
+                    f"{agent_type} agent exceeded context window: {detail}"
                 )
             raise AgentDispatchError(
                 f"{agent_type} agent reported an error: {detail}"

@@ -42,28 +42,18 @@ metadata in the ledger is the source of truth.
 Before merging, ensure the PR branch is up-to-date with main. This is critical in parallel mode where earlier stories in the same cohort may have already merged, changing the main baseline.
 
 ```bash
-# Attempt GitHub's built-in branch update (fast, no local checkout needed)
+# Attempt GitHub's built-in branch update (fast, no local checkout needed).
+# Do NOT fall back to a manual git fetch/checkout/rebase: reading the full
+# branch diff into context is the dominant context inflator (issue #104) and
+# can overflow the model window. If the server-side rebase fails, the branch
+# conflicts with main — emit REBASE_CONFLICT and STOP.
 gh pr update-branch {{PR_NUMBER}} --rebase 2>/dev/null
 UPDATE_EXIT=$?
 
-# If that fails (e.g., conflicts), rebase manually
 if [ $UPDATE_EXIT -ne 0 ]; then
-  git fetch origin main
-  git fetch origin feature/{{STORY_ID}}
-  git checkout feature/{{STORY_ID}}
-  git rebase origin/main
-
-  # If rebase fails with conflicts
-  if [ $? -ne 0 ]; then
-    git rebase --abort
-    # Output conflict status and STOP
-    echo "MERGE_STATUS: REBASE_CONFLICT"
-    echo "CONFLICT_DETAILS: Branch feature/{{STORY_ID}} conflicts with updated main after prior merges"
-    exit 1
-  fi
-
-  git push --force-with-lease origin feature/{{STORY_ID}}
-  git checkout main
+  echo "MERGE_STATUS: REBASE_CONFLICT"
+  echo "CONFLICT_DETAILS: Branch feature/{{STORY_ID}} conflicts with updated main after prior merges"
+  exit 1
 fi
 ```
 
@@ -129,7 +119,16 @@ If merge fails (conflict, checks failing, etc.):
 git checkout main && git pull
 ```
 
-## Step 3: Update Progress File
+## Step 3: Update Progress File (legacy fallback only)
+
+In a controller-dispatched run — a ledger is configured and `$SDLC_RUN_ID` is
+set — do NOT read or hand-edit `{{PROGRESS_FILE}}`. Skip this entire step.
+Step 5's `sdlc-state-emit.sh render` regenerates the file from SQLite and is
+the single per-merge write point; reading the progress file into context here
+needlessly inflates the prompt (issue #104).
+
+This step is preserved ONLY as the legacy fallback for environments with no
+ledger configured (`$SDLC_RUN_ID` unset). In that case:
 
 Read `{{CLAUDE_SKILL_DIR}}/batch-progress.md` for the progress file format.
 
