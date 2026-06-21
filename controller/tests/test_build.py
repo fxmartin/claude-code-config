@@ -2497,6 +2497,59 @@ def test_commit_lint_malformed_reask_envelope_is_recovered(tmp_path, monkeypatch
     assert any("routing through envelope recovery" in m for m in msgs)
 
 
+def test_commit_lint_recovered_envelope_then_unreadable_commit_parks(
+    tmp_path, monkeypatch
+) -> None:
+    """AC4: envelope recovery succeeds but the amended commit then reads back unreadable.
+
+    The recovery rescues the malformed re-ask reply, yet the post-amend
+    ``_commit_message`` read degrades to ``None`` (e.g. the branch ref vanished
+    mid-flight). The loop must break and the story park — never silently advance a
+    commit it could not re-lint — with work preserved (R10).
+    """
+    from sdlc.contracts import ContractError
+    from sdlc.dispatch import AgentResult
+
+    class _RecoverThenUnreadable:
+        """The amend's re-ask reply is malformed; recovery lands, then the commit is unreadable."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.recovered = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            kind = _kind_of(prompt)
+            self.calls.append((agent_type, kind))
+            if kind == "commitlint":
+                raise ContractError("missing required field 'branch_name'")
+            if kind == "envelope":
+                self.recovered = True  # the envelope-only recovery dispatch lands
+            return AgentResult(agent_type, _default_payload(agent_type, story), "")
+
+    disp = _RecoverThenUnreadable()
+    monkeypatch.setattr(
+        "sdlc.build.load_commitlint_config", lambda root: _COMMITLINT_RULES
+    )
+    # Non-compliant before recovery; unreadable once the recovery has run.
+    monkeypatch.setattr(
+        "sdlc.build._commit_message",
+        lambda ref, root=None: None if disp.recovered else _BAD_COMMIT,
+    )
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    # Recovery dispatched, but the unreadable post-amend commit breaks the loop → park.
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+    assert any(kind == "envelope" for _, kind in disp.calls)
+    advanced = {agent for agent, _ in disp.calls}
+    assert "review" not in advanced and "merge" not in advanced
+
+
 def test_commit_lint_reask_dispatch_error_parks(tmp_path, monkeypatch) -> None:
     """A re-ask whose envelope recovery also fails is bounded, then parks (12.2-004 AC4)."""
     from sdlc.dispatch import AgentDispatchError, AgentResult
