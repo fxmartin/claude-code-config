@@ -253,6 +253,71 @@ class BuildOptions:
     skip_preflight: bool = False
     rebuild: bool = False
     preflight_timeout: int = 600
+    # Story 14.1-001: per-run token budget gate. ``budget`` is the token ceiling
+    # (the governance primitive — 0 means no ceiling, today's behaviour). A
+    # ``$``-denominated budget is accepted as a convenience and converted to the
+    # notional API-equivalent token ceiling; the original dollars are kept in
+    # ``budget_usd`` only for the labelled-notional display. ``budget_policy`` is
+    # ``pause`` (NEEDS_ATTENTION-style resumable hold) or ``abort`` (terminal).
+    budget: int = 0
+    budget_usd: float | None = None
+    budget_policy: str = "pause"
+
+
+# Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
+# the token primitive the gate enforces. On a Claude Max subscription the dollar
+# figure is an API-list-price equivalent computed from token usage — never real
+# spend on the flat monthly fee — so this is a documented convenience constant,
+# not a billing fact. A blended ~$15/Mtok keeps the conversion easy to reason
+# about ($15 ⇒ 1M tokens) without pretending to be authoritative.
+NOTIONAL_USD_PER_MILLION_TOKENS = 15.0
+
+
+def usd_to_notional_tokens(usd: float) -> int:
+    """Convert a ``$``-budget into its notional API-equivalent token ceiling.
+
+    Story 14.1-001: the gate's primitive is tokens; a dollar budget is a
+    convenience. The rate is notional (see :data:`NOTIONAL_USD_PER_MILLION_TOKENS`),
+    so this is guidance for the ceiling, never a billing computation.
+    """
+    return int(round(usd / NOTIONAL_USD_PER_MILLION_TOKENS * 1_000_000))
+
+
+def notional_cost_label(cost_usd: float | None) -> str:
+    """Render a dollar figure with the mandated not-real-spend disclaimer.
+
+    Story 14.1-001: any ``$`` the controller surfaces is an API-list-price
+    equivalent derived from token usage, never actual spend on a flat-fee Max
+    subscription. Centralised so every surface (ledger events, status, dashboard)
+    reads identically and a reader can never mistake it for a real bill.
+    """
+    figure = "$—" if cost_usd is None else f"${cost_usd:.2f}"
+    return f"{figure} (API-equivalent, not billed on subscription)"
+
+
+def _parse_budget_value(raw: str) -> tuple[int, float | None]:
+    """Parse a ``--budget`` value into ``(token_ceiling, notional_usd_or_None)``.
+
+    A bare number is a token ceiling (the primary unit). A ``$``-prefixed or
+    ``usd``-suffixed value is a convenience dollar budget converted to the
+    notional API-equivalent token ceiling (Story 14.1-001). Thousands separators
+    (``,`` / ``_``) are tolerated. A negative value is rejected.
+    """
+    s = raw.strip()
+    is_dollars = s.startswith("$") or s.lower().endswith("usd")
+    num = s[1:] if s.startswith("$") else s
+    if num.lower().endswith("usd"):
+        num = num[:-3]
+    num = num.strip().replace(",", "").replace("_", "")
+    if is_dollars:
+        usd = float(num)
+        if usd < 0:
+            raise ValueError(f"--budget must be non-negative: {raw}")
+        return usd_to_notional_tokens(usd), usd
+    tokens = int(num)
+    if tokens < 0:
+        raise ValueError(f"--budget must be non-negative: {raw}")
+    return tokens, None
 
 
 def parse_build_args(args: Iterable[str]) -> BuildOptions:
@@ -276,6 +341,15 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
             opts.coverage_threshold = int(arg.split("=", 1)[1])
         elif arg.startswith("--preflight-timeout="):
             opts.preflight_timeout = int(arg.split("=", 1)[1])
+        elif arg.startswith("--budget="):
+            opts.budget, opts.budget_usd = _parse_budget_value(arg.split("=", 1)[1])
+        elif arg.startswith("--budget-policy="):
+            policy = arg.split("=", 1)[1]
+            if policy not in {"pause", "abort"}:
+                raise ValueError(
+                    f"invalid --budget-policy: {policy} (expected pause|abort)"
+                )
+            opts.budget_policy = policy
         elif arg.startswith("--"):
             raise ValueError(f"unknown flag: {arg}")
         elif not scope_set:
@@ -656,6 +730,38 @@ class Ledger:
         with self._connect_ro() as conn:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
+
+    def run_usage_totals(self, run_id: str) -> dict:
+        """Running token + notional-cost accrual for ``run_id`` (Story 14.1-001).
+
+        Sums the four per-stage token components and the notional ``cost_usd``
+        across every recorded stage attempt for the run — the live accrual the
+        budget gate reads between stories. Returns ``{"tokens": int,
+        "cost_usd": float}``; both are 0 when no usage has been recorded yet, the
+        ledger predates token capture, or the DB is absent, so the gate degrades
+        to "no spend seen" rather than crashing.
+        """
+        zero = {"tokens": 0, "cost_usd": 0.0}
+        if not self.db_path.exists():
+            return zero
+        with self._connect_ro() as conn:
+            stage_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()
+            }
+            if "input_tokens" not in stage_cols:
+                return zero
+            row = conn.execute(
+                "SELECT "
+                "SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)"
+                "+COALESCE(cache_read_tokens,0)+COALESCE(cache_creation_tokens,0)) AS tok, "
+                "SUM(COALESCE(cost_usd,0)) AS cost "
+                "FROM stages WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return {
+            "tokens": int(row["tok"] or 0),
+            "cost_usd": float(row["cost"] or 0.0),
+        }
 
     def story_rows(self, run_id: str) -> list[dict]:
         """Per-story progress for ``run_id``, newest-stage first.
@@ -1173,6 +1279,14 @@ class BuildResult:
     skipped_in_test: bool = False
     run_id: str | None = None
     story_status: dict[str, str] = field(default_factory=dict)
+    # Story 14.1-001: set when the per-run token budget gate halted dispatch.
+    # ``budget_policy`` is the honoured policy (``pause``/``abort``);
+    # ``accrued_tokens``/``notional_cost_usd`` are the accrual at the stop (the
+    # dollar figure is notional API-equivalent, never real subscription spend).
+    budget_stopped: bool = False
+    budget_policy: str = ""
+    accrued_tokens: int = 0
+    notional_cost_usd: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1736,7 +1850,14 @@ def run_build(
     status: dict[str, str] = {s.id: "TODO" for s in buildable}
 
     # --- Phase 2: cohort-by-cohort execution ---------------------------------
+    # Story 14.1-001: the budget gate is checked between stories (each story's
+    # in-flight stages are already finished or cleanly parked, so R10 holds). A
+    # crossed ceiling halts further dispatch and hands off to the policy-aware
+    # close-out below — pause leaves the run resumable, abort stamps it terminal.
+    budget_stopped = False
     for cohort in cohorts:
+        if budget_stopped:
+            break
         for story in cohort:
             # A story whose dependency did not cleanly finish cannot proceed.
             # NEEDS_ATTENTION counts as not-done: the dependency's work is
@@ -1774,6 +1895,25 @@ def run_build(
             if dispatcher is None:
                 _reposition_head(Path.cwd())
 
+            # --- Budget gate (Story 14.1-001) --------------------------------
+            # Stop dispatching once accrued tokens cross the ceiling. The check
+            # is between stories, so the just-finished story is preserved; the
+            # remaining unbuilt stories stay TODO in the ledger and are picked up
+            # by `sdlc resume` (pause) or left for a deliberate restart (abort).
+            if opts.budget and ledger.run_usage_totals(run_id)["tokens"] >= opts.budget:
+                budget_stopped = True
+                break
+
+    # Story 14.1-001: a crossed budget ceiling skips the normal close-out (which
+    # would stamp a terminal status and run reconcile network I/O) in favour of a
+    # policy-aware handoff: pause keeps the run IN_PROGRESS (resumable), abort
+    # stamps it ABORTED. Committed work from finished stories is untouched (R10).
+    if budget_stopped:
+        return _budget_close_out(
+            opts, ledger, run_id, status, done_skips, buildable,
+            registry, render_view,
+        )
+
     # --- Phase 3: close out via the shared finalize helper (12.3-004) --------
     # finalize_run runs reconciliation against origin/main (real runs only, hence
     # the dispatcher-None gate), recomputes the tally — folding in the shipped
@@ -1806,6 +1946,75 @@ def run_build(
         planned=len(buildable),
         run_id=run_id,
         story_status=story_status,
+    )
+
+
+def _budget_close_out(
+    opts: BuildOptions,
+    ledger: Ledger,
+    run_id: str,
+    status: dict[str, str],
+    done_skips: list[Story],
+    buildable: list[Story],
+    registry: "Registry | None",
+    render_view: Callable[[str], None] | None,
+) -> BuildResult:
+    """Close out a run halted by the budget gate (Story 14.1-001).
+
+    ``pause`` (the default) records a NEEDS_ATTENTION-style reason and leaves the
+    run ``IN_PROGRESS`` so :meth:`Ledger.latest_resumable_run` — and therefore
+    ``sdlc resume`` — picks it up once the budget is raised. ``abort`` records the
+    stop and stamps the run ``ABORTED`` (terminal). Either way, finished stories
+    keep their committed work (R10) and the unbuilt stories stay ``TODO``.
+    """
+    usage = ledger.run_usage_totals(run_id)
+    label = notional_cost_label(usage["cost_usd"])
+    completed = sum(1 for v in status.values() if v == "DONE")
+    failed = sum(1 for v in status.values() if v == "FAILED")
+    blocked = sum(1 for v in status.values() if v == "BLOCKED")
+    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
+    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
+    skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
+    ledger.run_update_counts(run_id, completed, failed)
+
+    reason = (
+        f"budget ceiling crossed: {usage['tokens']} ≥ {opts.budget} tokens "
+        f"(notional {label})"
+    )
+    if opts.budget_policy == "abort":
+        ledger.event_log(
+            run_id, "", "error", "controller",
+            f"{reason} — aborting run (policy=abort).",
+        )
+        ledger.run_update_status(run_id, "ABORTED")
+        if registry is not None:
+            _registry_finish(registry, run_id, "ABORTED", completed)
+    else:  # pause: leave the run IN_PROGRESS so it resumes like any interruption
+        ledger.event_log(
+            run_id, "", "warn", "controller",
+            f"{reason} — pausing run (policy=pause); raise --budget and "
+            "`sdlc resume` to continue.",
+        )
+
+    if render_view is not None:
+        render_view(run_id)
+
+    story_status = {s.id: "SKIPPED" for s in done_skips}
+    story_status.update(status)
+    return BuildResult(
+        completed=completed,
+        failed=failed,
+        skipped=skipped,
+        blocked=blocked,
+        needs_attention=needs_attention,
+        awaiting_approval=awaiting_approval,
+        planned=len(buildable),
+        run_id=run_id,
+        story_status=story_status,
+        budget_stopped=True,
+        budget_policy=opts.budget_policy,
+        accrued_tokens=usage["tokens"],
+        notional_cost_usd=usage["cost_usd"],
     )
 
 
