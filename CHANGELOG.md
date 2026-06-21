@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.44.0] - 2026-06-21
+
+### Added
+
+- feat(controller-robustness): share run-finalization helper (#12.3-004)
+
+
 ## [v1.43.0] - 2026-06-21
 
 ### Added
