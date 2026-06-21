@@ -6,8 +6,9 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import sdlc.reconcile as reconcile_mod
 from sdlc.build import Ledger
-from sdlc.reconcile import ReconcileResult, reconcile_run
+from sdlc.reconcile import ReconcileResult, _gh_pr_state, reconcile_run
 
 
 # --- git fixture helpers ----------------------------------------------------
@@ -277,3 +278,162 @@ def test_no_run_is_clean_noop(tmp_path: Path) -> None:
     result = reconcile_run(ledger, None, root=tmp_path, fetch=False)
     assert result.reclassified == []
     assert result.run_id == ""
+
+
+# --- _gh_pr_state: real body across gh outcomes -----------------------------
+
+
+class _FakeProc:
+    def __init__(self, returncode: int, stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_gh_pr_state_merged(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        reconcile_mod.subprocess, "run", lambda *a, **k: _FakeProc(0, "MERGED\n")
+    )
+    assert _gh_pr_state(200, tmp_path) == "MERGED"
+
+
+def test_gh_pr_state_nonzero_returns_none(tmp_path: Path, monkeypatch) -> None:
+    # gh present but the call fails (unauthenticated / unknown PR) → no signal.
+    monkeypatch.setattr(
+        reconcile_mod.subprocess, "run", lambda *a, **k: _FakeProc(1, "boom")
+    )
+    assert _gh_pr_state(201, tmp_path) is None
+
+
+def test_gh_pr_state_empty_stdout_returns_none(tmp_path: Path, monkeypatch) -> None:
+    # Exit 0 with blank state → `strip() or None` yields None, not "".
+    monkeypatch.setattr(
+        reconcile_mod.subprocess, "run", lambda *a, **k: _FakeProc(0, "  \n")
+    )
+    assert _gh_pr_state(202, tmp_path) is None
+
+
+def test_gh_pr_state_subprocess_error_returns_none(tmp_path: Path, monkeypatch) -> None:
+    # gh absent / spawn failure must degrade silently, never raise.
+    def _raise(*_a, **_k):
+        raise OSError("gh not found")
+
+    monkeypatch.setattr(reconcile_mod.subprocess, "run", _raise)
+    assert _gh_pr_state(203, tmp_path) is None
+
+
+# --- _ensure_merge_done: existing DONE merge is not duplicated --------------
+
+
+def test_existing_done_merge_not_duplicated(tmp_path: Path) -> None:
+    # A parked-but-already-has-a-DONE-merge story: reconciliation must flip it to
+    # DONE without recording a second merge row.
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-010", new=True)
+    _commit(root, "j.py", "j = 1\n", "feat: j (#99.1-010)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-010")
+
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(
+        run_id, "99.1-010", "99", "j", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    for stage in ("build", "review", "merge"):
+        ledger.stage_start(run_id, "99.1-010", stage, 1)
+        ledger.stage_finish(run_id, "99.1-010", stage, 1, "DONE")
+    ledger.set_story_pr(run_id, "99.1-010", 110)
+    ledger.set_story_status(run_id, "99.1-010", "FAILED")  # parked despite DONE merge
+    ledger.run_update_status(run_id, "FAILED")
+
+    result = reconcile_run(ledger, run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-010"]
+    assert _status(db, run_id, "99.1-010") == "DONE"
+    assert _merge_done(db, run_id, "99.1-010") == 1  # not duplicated
+
+
+# --- _ensure_merge_done: promote a non-DONE merge attempt -------------------
+
+
+def test_promotes_non_done_merge_attempt(tmp_path: Path) -> None:
+    # A parked story whose merge attempt exists but FAILED: reconciliation must
+    # promote that attempt to DONE rather than synthesize a new one.
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-011", new=True)
+    _commit(root, "k.py", "k = 1\n", "feat: k (#99.1-011)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-011")
+
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(
+        run_id, "99.1-011", "99", "k", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    for stage in ("build", "review"):
+        ledger.stage_start(run_id, "99.1-011", stage, 1)
+        ledger.stage_finish(run_id, "99.1-011", stage, 1, "DONE")
+    ledger.stage_start(run_id, "99.1-011", "merge", 1)
+    ledger.stage_finish(run_id, "99.1-011", "merge", 1, "FAILED")
+    ledger.set_story_pr(run_id, "99.1-011", 111)
+    ledger.set_story_status(run_id, "99.1-011", "FAILED")
+    ledger.run_update_status(run_id, "FAILED")
+
+    result = reconcile_run(ledger, run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-011"]
+    assert result.changed is True
+    assert _merge_done(db, run_id, "99.1-011") == 1  # FAILED attempt promoted
+
+
+# --- _compute_terminal: unlanded NEEDS_ATTENTION leaves run NEEDS_ATTENTION --
+
+
+def test_terminal_needs_attention_when_unlanded_remains(tmp_path: Path) -> None:
+    root = _init_repo(tmp_path)  # no feature branch → nothing landed
+    _checkout(root, "feature/99.1-012", new=True)
+    _commit(root, "wip.py", "w = 1\n", "feat: wip (#99.1-012)")
+    _checkout(root, "main")  # never merged
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-012", "NEEDS_ATTENTION", None)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert result.reclassified == []
+    assert result.run_status_after == "NEEDS_ATTENTION"
+    assert _status(db, run_id, "99.1-012") == "NEEDS_ATTENTION"
+
+
+# --- fetch raising (not just non-zero) degrades to a skip -------------------
+
+
+def test_fetch_exception_degrades_to_skip(tmp_path: Path, monkeypatch) -> None:
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-013", new=True)
+    _commit(root, "x.py", "x = 1\n", "feat: x (#99.1-013)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-013")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-013", "FAILED", 113)])
+
+    real_git = reconcile_mod._git
+
+    def _git_or_raise(root_, *args):
+        if args[:1] == ("fetch",):
+            raise OSError("git unavailable")
+        return real_git(root_, *args)
+
+    monkeypatch.setattr(reconcile_mod, "_git", _git_or_raise)
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=True)
+
+    assert result.skipped is True
+    assert result.reclassified == []
+    assert _status(db, run_id, "99.1-013") == "FAILED"

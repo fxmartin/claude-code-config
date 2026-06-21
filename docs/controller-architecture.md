@@ -23,6 +23,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/resume.py` | Crash-resume: derives each story's resume point from the ledger and re-enters the loop (Story 10.1-001). |
 | `sdlc/status.py` | Read-side `state` helpers — a greppable state-machine dump (Story 10.1-001). |
 | `sdlc/rollback.py` | Returns a run to a prior checkpoint by resetting the later stories (Story 10.2-001). |
+| `sdlc/reconcile.py` | Verifies parked stories against `origin/main` and recomputes the run terminal — shared by close-out and `sdlc reconcile` (Stories 12.3-001/12.3-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 
 ## The state machine
@@ -310,6 +311,27 @@ which mirrors cohort order), so any completed story is a natural **checkpoint**
   when a to-be-reset story has an already-merged PR (a `merge` stage marked
   DONE). A merged PR is committed work the ledger cannot unwind — revert it in
   git instead. Rolling back to the latest story is a benign no-op.
+
+## Reconcile (recovery verb)
+
+`sdlc reconcile` is the **manual** counterpart to the automatic close-out
+reconciliation — a recovery verb in the same family as `resume`/`rollback`, not
+new orchestration. Its job is to rescue a run that aborted (e.g. a 429) before
+its already-open PRs were merged by hand the next morning, so the ledger no
+longer shows FAILED days after the work actually shipped.
+
+- **`sdlc reconcile [run] [--db PATH]`** (`sdlc/cli.py`) runs `ledger.ensure_migrated()`
+  and then the shared `reconcile.reconcile_run` (see
+  [Reconciliation](#reconciliation-against-originmain)) — the identical algorithm
+  close-out runs — and prints a human summary of the reclassifications and the
+  run-status transition (e.g. `reconciled 3 story(ies) to DONE; run ced08c0f
+  FAILED → DONE`).
+- **Defaults to the latest run** (mirrors `rollback`) when no run id is passed.
+- **Idempotent.** A run with nothing to reconcile reports `nothing to reconcile`
+  and exits 0; offline / no-remote degrades to a clean skip notice.
+- **Clean absence.** No ledger / no runs reports cleanly and never materialises a
+  spurious empty ledger; only a genuinely-unknown *explicit* run id exits
+  non-zero (CLI exit 2).
 
 ## The run registry (cross-repo discovery)
 
