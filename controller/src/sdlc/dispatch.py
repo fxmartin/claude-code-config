@@ -233,7 +233,13 @@ class ContextOverflowError(AgentDispatchError):
 # from the rate-limit matcher and applied *after* it so the two never shadow.
 _CONTEXT_OVERFLOW_PATTERNS = (
     re.compile(r"\bprompt is too long\b", re.IGNORECASE),
-    re.compile(r"\brequest is .* tokens.*limit\b", re.IGNORECASE),
+    # Anchor on an actual token *count* before "limit", and stay within one
+    # clause (no sentence break), so benign error prose that merely strings
+    # together "request is … tokens … limit" across sentences cannot match.
+    re.compile(
+        r"\brequest is\b[^.!?\n]*?\d[\d,]*\s*tokens\b[^.!?\n]*\blimit\b",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"\bcontext.*(?:window|limit).*(?:exceeded|too long)\b", re.IGNORECASE
     ),
