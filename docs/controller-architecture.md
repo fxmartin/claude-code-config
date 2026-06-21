@@ -675,8 +675,9 @@ malformed one is a hard error.
 **Where the `--model` is applied.** Every dispatch this controller makes routes:
 the four pipeline stages via `_dispatch_stage`, plus the two recovery agents —
 the envelope-only re-ask (`_reask_envelope`, on the map's `reask` tier) and the
-bugfix agent (`_run_bugfix`, on the `bugfix` tier; per-attempt escalation arrives
-in 14.2-003). Each calls `_select_stage_model(stage, story, opts)` and threads
+bugfix agent (`_run_bugfix`, on the `bugfix` tier; per-attempt escalation on
+retry is layered on by Story 14.2-003 — see below). Each calls
+`_select_stage_model(stage, story, opts)` and threads
 the result into `dispatch_agent(model=…)`, which appends `--model <model>` to the
 **default** command only. `_ROUTABLE_STAGES` — the stages a `--model-<stage>`
 override is accepted for — is exactly this routed set (`build`, `coverage`,
@@ -707,6 +708,38 @@ the run's config event and rehydrated by `run_resume`, so a resumed run routes
 identically. The `<<<RESULT_JSON>>>`
 contract and schema validation are untouched — routing changes only *which model*
 runs a stage, never how its output is parsed.
+
+### Cheap-first dispatch with model escalation on retry (Story 14.2-003)
+
+Routing makes the *common* path cheap; cheap-first makes the *stuck* path strong
+without paying for it up front. A stage runs on its mapped (cheaper) tier on the
+first pass — the passing path, which is the common one. Only when a stage **fails
+into the bugfix loop** does it climb: each bugfix attempt escalates the model one
+tier up the ladder (`TIER_LADDER = (haiku, sonnet, opus)`), capped at the
+strongest tier, rather than retrying on the model that just failed. So Opus is
+paid for exactly when a stage is actually stuck — not on every build.
+
+`escalate_model(base, steps)` in `sdlc/model_routing.py` is the chooser: it bumps
+`base` up the ladder by `steps`, and is a deliberate no-op when `steps <= 0` (the
+cheap first pass), when `base is None` (routing off — no tier to climb), when
+`base` is already at the top tier (escalating Opus does nothing), or when `base`
+is a custom / pinned model id the ladder cannot reason about (returned verbatim,
+never silently rewritten). `_select_stage_model(…, escalation_steps=N)` applies it
+*after* the base map selection — and an explicit `--model-<stage>` pin is returned
+*before* it, so an operator's pin is never escalated.
+
+The escalation level is the **count of bugfix attempts already spent on this
+stage**, threaded through `_run_story`'s loop: `0` on the first dispatch, `+1` per
+retry. Both the retried stage (`_dispatch_stage(…, escalation_steps=bugfix_attempts)`)
+and the bugfix agent itself (`_run_bugfix(…, escalation_steps=bugfix_attempts)`)
+climb together. The existing `MAX_BUGFIX_ATTEMPTS` budget is unchanged, so a stage
+already mapped to Opus simply re-runs on Opus (escalation no-op) without extra
+attempts. The model chosen per attempt is recorded as a ledger event
+(`info`, `controller`, tagged `Story 14.2-003`) for both the retry dispatch and
+the bugfix agent, so the Epic-18 eval harness can measure cheap-first's
+success rate. Worked example on **Balanced** (`build` = Sonnet): first build on
+Sonnet fails → bugfix and the build retry both escalate to Opus. On **Quota-max**
+(`build` = Haiku) two failures walk the full ladder Haiku → Sonnet → Opus.
 
 ## Rate-limit / quota awareness with automatic resume (Story 14.1-003)
 

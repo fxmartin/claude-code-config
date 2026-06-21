@@ -14,6 +14,8 @@ from sdlc.model_routing import (
     QUALITY_FIRST,
     QUOTA_MAX,
     SONNET,
+    TIER_LADDER,
+    escalate_model,
     load_routing_config,
     routing_config,
     select_model,
@@ -256,3 +258,49 @@ def test_config_is_frozen() -> None:
 
 def test_select_model_with_none_config_is_routing_off() -> None:
     assert select_model("build", None, points=99, high_risk=True) is None
+
+
+# ---------------------------------------------------------------------------
+# escalate_model — cheap-first retry tier bump (Story 14.2-003)
+# ---------------------------------------------------------------------------
+
+
+def test_tier_ladder_is_cheap_to_strong() -> None:
+    assert TIER_LADDER == (HAIKU, SONNET, OPUS)
+
+
+def test_escalate_climbs_one_tier_per_step() -> None:
+    assert escalate_model(HAIKU, 1) == SONNET
+    assert escalate_model(HAIKU, 2) == OPUS
+    assert escalate_model(SONNET, 1) == OPUS
+
+
+def test_escalate_caps_at_top_tier() -> None:
+    # Beyond the strongest tier is a no-op — never overshoots Opus (AC1 cap).
+    assert escalate_model(HAIKU, 3) == OPUS
+    assert escalate_model(SONNET, 5) == OPUS
+
+
+def test_escalate_top_tier_is_a_no_op() -> None:
+    # AC3: escalating an already-Opus stage does nothing.
+    assert escalate_model(OPUS, 1) == OPUS
+    assert escalate_model(OPUS, 9) == OPUS
+
+
+def test_escalate_zero_or_negative_steps_is_unchanged() -> None:
+    # The cheap first-pass path passes steps=0 → no escalation (AC2).
+    assert escalate_model(SONNET, 0) == SONNET
+    assert escalate_model(HAIKU, -1) == HAIKU
+
+
+def test_escalate_none_base_stays_none() -> None:
+    # Routing off → no base model → escalation keeps the CLI default.
+    assert escalate_model(None, 1) is None
+    assert escalate_model(None, 0) is None
+
+
+def test_escalate_unknown_model_is_left_untouched() -> None:
+    # A custom / pinned model id the ladder cannot reason about is never
+    # silently rewritten — it is returned verbatim.
+    assert escalate_model("claude-opus-4-8", 1) == "claude-opus-4-8"
+    assert escalate_model("some-vendor-model", 2) == "some-vendor-model"
