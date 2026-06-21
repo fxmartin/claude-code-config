@@ -1318,7 +1318,12 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         f"Epic: {story.epic_name} (from {story.epic_file})\n"
         f"Priority: {story.priority}\n\n"
         "## Instructions\n"
-        f"1. Create branch: git checkout -b feature/{story.id}\n"
+        # Story 12.4-001: cut the branch from a freshly-fetched origin/main, not
+        # from whatever HEAD happens to be checked out. A base-less
+        # ``git checkout -b feature/<id>`` lets the branch stack on a previous
+        # story's leftover feature branch, so a later successful merge can
+        # transitively land the earlier (parked) story's commits on main.
+        f"1. Create branch: git fetch origin && git checkout -b feature/{story.id} origin/main\n"
         f"2. Read {story.epic_file} and find the full story section for {story.id}\n"
         "3. Follow TDD: write failing tests first, then implement\n"
         "4. Run all quality gates (tests, types, lint, security)\n"
@@ -1512,6 +1517,37 @@ def _base_ref(root: Path) -> str | None:
         if _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}").returncode == 0:
             return candidate
     return None
+
+
+def _reposition_head(root: Path) -> None:
+    """Return the working dir to the base branch between stories (Story 12.4-001).
+
+    The merge agent only returns HEAD to ``main`` on its success path; on a
+    parked/blocked/conflict path it leaves the shared working dir on the story's
+    ``feature/<id>`` branch. Repositioning HEAD onto the base before the next
+    story keeps that single working dir honest. The target is the **local**
+    branch (``main``/``master``) — :func:`_base_ref` yields the remote-tracking
+    ref ``origin/main`` when ``origin/HEAD`` is set, and checking that out would
+    leave a real run in *detached HEAD*; stripping the ``origin/`` prefix and
+    landing on the local branch keeps HEAD on a branch. Only if no matching local
+    branch exists does it fall back to the ref ``_base_ref`` returned. Best-effort
+    and non-fatal: it only ``checkout``s an existing ref — it **never** deletes a
+    feature branch or its commits (R10) — and swallows every git/OS error so it
+    can never fail an otherwise-good run.
+    """
+    try:
+        base = _base_ref(root)
+        if base is None:
+            return
+        # Prefer the local branch over the remote-tracking ref so HEAD lands on a
+        # branch rather than detached at ``origin/main``.
+        target = base.removeprefix("origin/")
+        local = _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{target}")
+        if local.returncode != 0:
+            target = base  # no local branch — fall back (rare; may detach)
+        _git(root, "checkout", target)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def story_commit_exists(story_id: str, root: Path | None = None) -> bool:
@@ -1728,6 +1764,15 @@ def run_build(
             outcome = _run_story(story, opts, ledger, run_id, dispatch, logs_dir)
             status[story.id] = outcome
             ledger.set_story_status(run_id, story.id, outcome)
+
+            # Story 12.4-001: reposition HEAD back to the base between stories so
+            # a parked/blocked story's feature branch (the merge agent only
+            # returns to main on its success path) is never the base the next
+            # story's branch stacks on. Real runs only — injected fakes operate
+            # on the test's cwd and must not touch the real repo, exactly like
+            # the close-out reconcile guard below. Best-effort, never fatal.
+            if dispatcher is None:
+                _reposition_head(Path.cwd())
 
     # --- Reconcile against origin/main before the close-out tally (12.3-001) -
     # A story whose PR genuinely merged may be parked in-memory (a 429, a manual

@@ -880,6 +880,11 @@ def test_run_build_applies_reconcile_reclassifications(tmp_path, monkeypatch) ->
         )
 
     monkeypatch.setattr("sdlc.reconcile.reconcile_run", fake_reconcile)
+    # Story 12.4-001: the real-run branch also repositions HEAD between stories
+    # via _reposition_head(Path.cwd()). This test runs in the real repo cwd (no
+    # chdir), so neutralize that git side effect exactly as reconcile is faked
+    # above — otherwise it would check out the base ref in the live checkout.
+    monkeypatch.setattr("sdlc.build._reposition_head", lambda root: None)
 
     # s1-003 depends on s1-001 (which succeeds) so it is not blocked by s1-002.
     opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True, auto=True)
@@ -2826,3 +2831,181 @@ def test_status_snapshot_counts_awaiting_approval(tmp_path) -> None:
     )
     snap = status_snapshot(Ledger(db), result.run_id)
     assert snap["counts"]["awaiting_approval"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Story 12.4-001: cut story branches from origin/main + reposition HEAD
+# ---------------------------------------------------------------------------
+
+
+def test_build_prompt_branches_from_origin_main() -> None:
+    """The build prompt cuts ``feature/<id>`` from a freshly-fetched ``origin/main``.
+
+    Story 12.4-001 AC1: a base-less ``git checkout -b feature/<id>`` lets the
+    branch stack on whatever HEAD happened to be; the prompt must fetch and cut
+    from the remote base instead.
+    """
+    from sdlc.build import render_build_prompt
+
+    story = _story("12.4-001")
+    prompt = render_build_prompt(story, BuildOptions())
+    assert f"git checkout -b feature/{story.id} origin/main" in prompt
+    assert "git fetch origin" in prompt
+    # The old base-less form must be gone (it is a prefix of the new one, so
+    # assert the new form is the only checkout instruction).
+    assert f"git checkout -b feature/{story.id}\n" not in prompt
+
+
+def test_reposition_head_checks_out_local_branch_not_detached(monkeypatch) -> None:
+    """``_reposition_head`` lands on the local branch, not detached origin/main (AC2).
+
+    ``_base_ref`` yields the remote-tracking ref ``origin/main``; checking that
+    out would detach HEAD. The helper strips ``origin/`` and checks out the local
+    ``main`` branch when it exists.
+    """
+    import subprocess
+
+    from sdlc.build import _reposition_head
+
+    calls: list[tuple[str, ...]] = []
+
+    def _fake_git(root, *args):
+        calls.append(args)
+        # The local-branch existence probe succeeds → land on the local branch.
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("sdlc.build._git", _fake_git)
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "origin/main")
+    _reposition_head(Path("/repo"))
+    assert ("checkout", "main") in calls  # local branch, not detached origin/main
+    assert ("checkout", "origin/main") not in calls
+    # R10: it only checks out — it never deletes a feature branch or its commits.
+    assert all("-D" not in a and a[:1] != ("branch",) for a in calls)
+
+
+def test_reposition_head_falls_back_when_no_local_branch(monkeypatch) -> None:
+    """No local branch ⇒ fall back to the ref ``_base_ref`` returned (non-fatal)."""
+    import subprocess
+
+    from sdlc.build import _reposition_head
+
+    calls: list[tuple[str, ...]] = []
+
+    def _fake_git(root, *args):
+        calls.append(args)
+        # The local-branch existence probe fails (no refs/heads/main).
+        rc = 1 if args[:1] == ("rev-parse",) else 0
+        return subprocess.CompletedProcess(args, rc, stdout="", stderr="")
+
+    monkeypatch.setattr("sdlc.build._git", _fake_git)
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "origin/main")
+    _reposition_head(Path("/repo"))
+    assert ("checkout", "origin/main") in calls  # fell back to the remote ref
+
+
+def test_reposition_head_no_base_is_noop(monkeypatch) -> None:
+    """No discoverable base ⇒ ``_reposition_head`` does nothing (never raises)."""
+    import subprocess
+
+    from sdlc.build import _reposition_head
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        "sdlc.build._git",
+        lambda root, *args: calls.append(args)
+        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: None)
+    _reposition_head(Path("/repo"))
+    assert calls == []  # no base → no checkout attempted
+
+
+def test_reposition_head_is_non_fatal(monkeypatch) -> None:
+    """A git/OS error during reposition is swallowed (best-effort, AC4/R10)."""
+    import subprocess
+
+    from sdlc.build import _reposition_head
+
+    def _boom(root, *args):
+        raise subprocess.SubprocessError("git vanished")
+
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "main")
+    monkeypatch.setattr("sdlc.build._git", _boom)
+    # Must not raise.
+    _reposition_head(Path("/repo"))
+
+
+def _git_run(cwd, *args):
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_branch_from_origin_main_prevents_transitive_landing(tmp_path) -> None:
+    """A failed story's commits never ride a later story's merge onto origin/main.
+
+    Story 12.4-001 AC3 + DoD regression: with branches cut from ``origin/main``
+    and HEAD repositioned between stories (via the real ``_reposition_head``), a
+    story that fails before merge does not appear on ``origin/main`` and a later
+    successful story does not transitively land it. The failed branch and its
+    commits are preserved (R10).
+    """
+    import subprocess
+
+    from sdlc.build import _reposition_head
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    work = tmp_path / "work"
+    subprocess.run(
+        ["git", "clone", str(origin), str(work)],
+        check=True, capture_output=True, text=True,
+    )
+    _git_run(work, "config", "user.email", "t@example.com")
+    _git_run(work, "config", "user.name", "Test")
+
+    (work / "README").write_text("base\n")
+    _git_run(work, "add", "-A")
+    _git_run(work, "commit", "-m", "chore: base")
+    _git_run(work, "push", "origin", "main")
+
+    # Story A fails before merge: branch from origin/main, commit, never merged.
+    _git_run(work, "fetch", "origin")
+    _git_run(work, "checkout", "-b", "feature/A", "origin/main")
+    (work / "a.txt").write_text("A\n")
+    _git_run(work, "add", "-A")
+    _git_run(work, "commit", "-m", "feat: a (#A)")
+
+    # Controller repositions HEAD off the leftover feature branch (the fix).
+    _reposition_head(work)
+    head = _git_run(work, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    # Lands on the local ``main`` branch — not detached at ``origin/main`` and
+    # not left on the story's feature branch.
+    assert head == "main"
+
+    # Story B succeeds: branch from a fresh origin/main, commit, merge, push.
+    _git_run(work, "fetch", "origin")
+    _git_run(work, "checkout", "-b", "feature/B", "origin/main")
+    (work / "b.txt").write_text("B\n")
+    _git_run(work, "add", "-A")
+    _git_run(work, "commit", "-m", "feat: b (#B)")
+    _git_run(work, "checkout", "main")
+    _git_run(work, "merge", "--no-ff", "feature/B", "-m", "merge: b")
+    _git_run(work, "push", "origin", "main")
+
+    landed = _git_run(work, "log", "origin/main", "--format=%s").stdout
+    assert "feat: b (#B)" in landed  # B's work shipped
+    assert "feat: a (#A)" not in landed  # A did NOT transitively land
+
+    # R10: A's branch and commit are preserved, not deleted.
+    assert (
+        _git_run(work, "rev-parse", "--verify", "feature/A").returncode == 0
+    )
