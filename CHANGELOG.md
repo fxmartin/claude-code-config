@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.39.0] - 2026-06-21
+
+### Added
+
+- feat(controller-robustness): generate compliant commit subjects (#12.2-004) (#96)
+
+
 ## [v1.38.0] - 2026-06-21
 
 ### Added
