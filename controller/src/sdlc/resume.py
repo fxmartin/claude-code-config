@@ -93,13 +93,17 @@ def compute_resume_plan(
         else:
             start_attempt = 1
 
-        # The "bugfix" and "reask" stages share the monotonic ``bugfix_seq``
-        # counter for their attempt number (Story 12.1-001). A re-ask that
-        # *succeeded* leaves a "reask" row but no "bugfix" row, so reconstructing
-        # the counter from "bugfix" rows alone would reuse an existing attempt and
-        # collide on the stages PRIMARY KEY — resume must continue past both.
+        # The "bugfix", "reask" and "commitlint" stages share the monotonic
+        # ``bugfix_seq`` counter for their attempt number (Stories 12.1-001,
+        # 12.2-002). A recovery stage that *succeeded* (e.g. a "reask" or a
+        # "commitlint" amend) leaves its own row but no "bugfix" row, so
+        # reconstructing the counter from a subset of these names would reuse an
+        # existing attempt and collide on the stages PRIMARY KEY — resume must
+        # continue past the highest of all three.
         recovery_attempts = [
-            a["attempt"] for a in attempts if a["name"] in ("bugfix", "reask")
+            a["attempt"]
+            for a in attempts
+            if a["name"] in ("bugfix", "reask", "commitlint")
         ]
         bugfix_seq = max(recovery_attempts) if recovery_attempts else 0
 

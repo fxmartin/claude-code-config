@@ -139,6 +139,41 @@ def test_resume_bugfix_seq_continues_past_reask_rows(tmp_path: Path) -> None:
     assert plan["99.1-001"].bugfix_seq >= 1
 
 
+def test_resume_bugfix_seq_continues_past_commitlint_rows(tmp_path: Path) -> None:
+    """A prior commitlint re-ask must advance the resumed monotonic seq (12.2-002).
+
+    The 'commitlint' stage shares the ``bugfix_seq`` counter with 'bugfix' and
+    'reask' (Story 12.2-002). A build commit that needed a commitlint amend
+    leaves a 'commitlint' row but no 'bugfix'/'reask' row; if resume rebuilds
+    ``bugfix_seq`` from those two names only, a later commit-authoring stage that
+    also needs a commitlint amend reuses attempt 1 and collides on the stages
+    PRIMARY KEY (run_id, story_id, 'commitlint', attempt). Resume must continue
+    past the highest commitlint attempt too.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"skip_coverage": False}))
+    ledger.story_upsert(
+        run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    # Build committed, then its message needed a commitlint amend (commitlint
+    # seq=1, no bugfix/reask row), then the run crashed mid-coverage.
+    ledger.stage_start(run_id, "99.1-001", "build", 1)
+    ledger.stage_finish(run_id, "99.1-001", "build", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-001", "commitlint", 1)
+    ledger.stage_finish(run_id, "99.1-001", "commitlint", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-001", "coverage", 1)  # left IN_PROGRESS
+    ledger.set_story_status(run_id, "99.1-001", "IN_PROGRESS")
+
+    plan = compute_resume_plan(ledger, run_id, skip_coverage=False)
+    # The resumed seq must be at least the existing commitlint attempt so the
+    # next commitlint row cannot collide on the stages PRIMARY KEY.
+    assert plan["99.1-001"].bugfix_seq >= 1
+
+
 def test_latest_resumable_run_finds_in_progress(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     run_id = _seed_interrupted(db)
