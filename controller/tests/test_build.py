@@ -3009,3 +3009,117 @@ def test_branch_from_origin_main_prevents_transitive_landing(tmp_path) -> None:
     assert (
         _git_run(work, "rev-parse", "--verify", "feature/A").returncode == 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #104: ContextOverflowError fail-fast — no bugfix loop, FAILED fast
+# ---------------------------------------------------------------------------
+
+
+class _ContextOverflowDispatcher:
+    """Raises ContextOverflowError for a specific stage; canned defaults otherwise.
+
+    Models the agent whose merge (or build) dispatch returns an is_error
+    envelope reporting a prompt-too-long / context-window overflow. Tracks
+    every call so the test can assert no bugfix was dispatched.
+    """
+
+    def __init__(self, overflow_on: str = "build") -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.overflow_on = overflow_on
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.dispatch import AgentResult, ContextOverflowError
+
+        self.calls.append((agent_type, getattr(story, "id", "")))
+        if agent_type == self.overflow_on:
+            raise ContextOverflowError(
+                f"{agent_type} agent exceeded context window: "
+                "Prompt is too long · the request is ~1180341 tokens (limit 1000000)"
+            )
+        payload = _default_payload(agent_type, story)
+        return AgentResult(agent_type=agent_type, data=payload, raw="")
+
+
+def test_context_overflow_on_build_fails_fast_without_bugfix(tmp_path) -> None:
+    """Issue #104: ContextOverflowError on the build stage fails the story FAILED
+    immediately with failure_category='context-overflow', and no bugfix is ever
+    dispatched (the bugfix loop would only re-overflow).
+    """
+    db = tmp_path / "l.db"
+    disp = _ContextOverflowDispatcher(overflow_on="build")
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    # Story must be FAILED — not NEEDS_ATTENTION and not still in-progress.
+    assert result.failed == 1
+    assert result.completed == 0
+    assert result.story_status["99.1-001"] == "FAILED"
+
+    # The bugfix agent must NEVER have been called — re-dispatching into an
+    # overflowed context would only re-overflow.
+    dispatched_types = [a for a, _ in disp.calls]
+    assert "bugfix" not in dispatched_types, (
+        f"bugfix was dispatched despite context overflow; calls={disp.calls}"
+    )
+
+    # The stage row must record failure_category='context-overflow' so the
+    # dashboard and sdlc status can surface the root cause distinctly.
+    conn = _open(db)
+    row = conn.execute(
+        "SELECT status, failure_category FROM stages "
+        "WHERE story_id='99.1-001' AND stage_name='build' ORDER BY attempt DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None, "no build stage row found"
+    assert row[0] == "FAILED"
+    assert row[1] == "context-overflow", (
+        f"expected failure_category='context-overflow', got {row[1]!r}"
+    )
+
+
+def test_context_overflow_on_merge_fails_fast_without_bugfix(tmp_path) -> None:
+    """Issue #104: ContextOverflowError on the merge stage also fails fast.
+
+    The merge stage is the dominant real-world overflow site (#104) — the
+    merge prompt ingested the full progress file. Ensure the fail-fast guard
+    fires on any stage, not just build.
+    """
+    db = tmp_path / "l.db"
+    disp = _ContextOverflowDispatcher(overflow_on="merge")
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.failed == 1
+    assert result.story_status["99.1-001"] == "FAILED"
+
+    dispatched_types = [a for a, _ in disp.calls]
+    assert "bugfix" not in dispatched_types, (
+        f"bugfix was dispatched despite context overflow on merge; calls={disp.calls}"
+    )
+
+    conn = _open(db)
+    row = conn.execute(
+        "SELECT status, failure_category FROM stages "
+        "WHERE story_id='99.1-001' AND stage_name='merge' ORDER BY attempt DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None, "no merge stage row found"
+    assert row[0] == "FAILED"
+    assert row[1] == "context-overflow"
+
+
+def test_context_overflow_is_subclass_of_agent_dispatch_error() -> None:
+    """Issue #104: ContextOverflowError is still an AgentDispatchError for
+    graceful degradation in any caller that only catches the base class.
+    """
+    from sdlc.dispatch import AgentDispatchError, ContextOverflowError
+
+    exc = ContextOverflowError("too long")
+    assert isinstance(exc, AgentDispatchError)
