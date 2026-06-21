@@ -96,6 +96,34 @@ def test_ensure_migrated_applies_pending_columns(tmp_path: Path) -> None:
     assert _EVENT_COLS <= _columns(db, "events")
 
 
+def test_ensure_migrated_ledger_predating_migrations_table(tmp_path: Path) -> None:
+    # A ledger built *before* the migration framework shipped has neither the
+    # token/progress columns nor the bookkeeping `_migrations` table — and that
+    # is precisely the ledger Migration 1 targets. ensure_migrated must create
+    # the table on the fly rather than crash with "no such table: _migrations".
+    db = tmp_path / "ancient.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE runs (id TEXT PRIMARY KEY, scope TEXT, started_at TIMESTAMP, "
+        "  finished_at TIMESTAMP, mode TEXT, total_stories INTEGER DEFAULT 0, "
+        "  completed INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, status TEXT NOT NULL);"
+        "CREATE TABLE stages (run_id TEXT, story_id TEXT, stage_name TEXT, "
+        "  attempt INTEGER DEFAULT 1, status TEXT NOT NULL, "
+        "  PRIMARY KEY(run_id, story_id, stage_name, attempt));"
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, "
+        "  story_id TEXT, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP, level TEXT NOT NULL, "
+        "  source TEXT, message TEXT NOT NULL);"
+    )
+    conn.commit()
+    conn.close()
+
+    Ledger(db).ensure_migrated()  # must not raise
+
+    assert _USAGE_COLS <= _columns(db, "stages")
+    assert _EVENT_COLS <= _columns(db, "events")
+    assert _versions(db) == [1, 2]
+
+
 def test_ensure_migrated_no_db_is_noop_and_creates_nothing(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     Ledger(db).ensure_migrated()  # must not raise

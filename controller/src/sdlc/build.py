@@ -162,7 +162,18 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     version in ``_migrations``. Identifiers come from the internal ``_MIGRATIONS``
     table (never user input), so the f-string interpolation is safe — SQLite
     cannot parametrise column/table names.
+
+    The bookkeeping ``_migrations`` table is created on the fly if missing:
+    ``init`` already creates it via the base DDL, but ``ensure_migrated`` runs
+    against a pre-existing ledger that may predate the migration framework
+    entirely (exactly the ledger Migration 1 targets), so this function cannot
+    assume the table exists.
     """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _migrations ("
+        "version INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+        "applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
     applied = {r[0] for r in conn.execute("SELECT version FROM _migrations").fetchall()}
     for version, name, table, columns in _MIGRATIONS:
         if version in applied:
