@@ -39,7 +39,7 @@ debuggable in flight; multi-run support makes parallel batches manageable from o
 
 ## Epic Scope
 
-**Total Stories**: 13 | **Total Points**: 47 | **MVP Stories**: 0 (roadmap — Should Have)
+**Total Stories**: 14 | **Total Points**: 49 | **MVP Stories**: 0 (roadmap — Should Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -328,55 +328,71 @@ at page load.
 **Dependencies**: None (reads existing ledger timestamps; the existing dashboard from #66/#67). Live ticking pairs with 11.2-003.
 **Risk Level**: Low
 
-##### Story 11.2-006: Top-bar GitHub repo health (issues, PRs, CI status)
-**User Story**: As FX watching a build, I want a menu bar at the top of the dashboard showing the
-current run's repo GitHub health — open/closed issue counts, open/closed PR counts, and the live
-CI workflow status — so that I can see the repo's external state next to the run without leaving
-the dashboard or opening GitHub.
+##### Story 11.2-006: GitHub repo health on the multi-run dashboard (issues, PRs, CI status)
+**User Story**: As FX watching builds across several repos, I want each repo's GitHub health —
+open/closed issues, open/closed PRs, and CI status — shown on the dashboard so that I can see
+every run's external state at a glance and drill into one without leaving the dashboard or opening
+GitHub.
 **Priority**: Should Have
 **Story Points**: 3
 
-**Acceptance Criteria**:
-- **Given** a run is selected (or its detail is open) **When** its repo is resolved from the
-  registry (11.2-001) **Then** a persistent top menu bar shows that repo's GitHub health: open
-  issue count, closed issue count, open PR count, closed (merged + closed) PR count, and the
-  latest CI workflow status — and on the multi-run overview (no run selected) the bar shows the
-  repo the dashboard is launched from.
-- **Given** the CI workflow status **When** it is fetched **Then** it reflects the conclusion of
-  the most recent workflow run on the repo's default branch (`success` / `failure` /
-  `in_progress` / `cancelled`) with a clear visual state, kept current ("real time") by the same
-  refresh cadence.
-- **Given** the dashboard is open **When** ~60 s elapses **Then** the GitHub panel refreshes from
-  a backend-cached fetch without a full page reload, and switching to a different run updates the
-  bar to that run's repo.
-- **Given** multiple runs across different repos **When** each is selected **Then** the stats are
-  per-repo with no cross-repo bleed, and fetched results are cached per-repo (TTL ~60 s) so the
-  GitHub API rate limit is respected regardless of how many tabs/runs are open.
-- **Given** `gh` is unavailable, unauthenticated, rate-limited, or the repo has no GitHub remote
-  **When** the bar renders **Then** it degrades gracefully to a muted "GitHub unavailable" state,
-  never blocks the ledger-driven dashboard, and never throws.
+> **Design note (revised 2026-06-21)**: written for the now-deployed **multi-run** dashboard
+> (registry discovery shipped in 11.2-001/11.2-002, v1.34.0). Placement is **per-repo badge on
+> each overview row + a full panel in the selected run's detail view** — not a single top bar.
+> The earlier "no run selected → show the launched-from repo" notion is dropped: in registry mode
+> there is no single launch repo.
 
-**Technical Notes**: New backend helper (e.g. `controller/src/sdlc/github_stats.py`, or a section
-of `dashboard.py`) that derives the repo slug from the registry repo path's git remote and reads
-counts via the GitHub API (`gh api` / search for issue + PR open/closed counts; `gh run list`
-or `actions/runs` for the latest default-branch run). Results are cached with a short TTL (~60 s)
-keyed by repo and fetched **off the request path** so a slow or failing GitHub call never blocks
-the dashboard. New endpoint (e.g. `/api/github?run=<id>`) resolves the repo via the registry;
-the front end renders a compact top bar that re-queries on the existing refresh tick. Reuse the
-project's `gh` CLI convention; auth comes from the ambient `gh` session. **Open question /
-deferred**: PR-branch-specific CI status (the checks for the SDLC run's own PR) is out of scope
-here — default-branch latest run only; revisit if per-PR CI proves more useful than repo health.
+**Acceptance Criteria**:
+- **Given** the multi-run overview lists runs across repos **When** each run row renders **Then**
+  it shows a **compact** GitHub badge for that run's repo — open-issue count, open-PR count, and
+  the latest default-branch CI conclusion as a clear visual state (✓ success / ✗ failure / ◷
+  in-progress) — keyed off the registry `repo` path.
+- **Given** several runs share one repo **When** the overview renders **Then** their GitHub stats
+  come from a **single per-repo fetch** (deduped by repo), not one fetch per run.
+- **Given** a run is selected **When** its detail view opens **Then** it shows the **full** GitHub
+  panel for that run's repo: issues open/closed, PRs open/closed (merged + closed), and the latest
+  default-branch CI status with its branch and age.
+- **Given** the CI status **When** it is fetched **Then** it reflects the conclusion of the most
+  recent workflow run on the repo's **default branch** (`success` / `failure` / `in_progress` /
+  `cancelled`).
+- **Given** the dashboard is open **When** ~60 s elapses **Then** the GitHub data refreshes from a
+  backend-cached fetch without a full page reload; the existing ~2.5 s client poll reads the cache
+  and never itself drives `gh`.
+- **Given** multiple runs across different repos **When** they render **Then** stats are per-repo
+  with no cross-repo bleed, resolved via the registry, and cached **per repo** (TTL ~60 s) so
+  GitHub's rate limit is respected regardless of how many runs/tabs are open.
+- **Given** `gh` is unavailable, unauthenticated, rate-limited, or the repo has no GitHub remote
+  **When** the badge/panel renders **Then** it degrades gracefully to a muted "GitHub unavailable"
+  state, never blocks the ledger-driven dashboard, and never throws.
+
+**Technical Notes**: New backend helper `controller/src/sdlc/github_stats.py` that derives the
+`owner/repo` slug from a run's repo path git remote — reuse `git_project_url()` and the
+`_SCP_REMOTE`/`_URL_REMOTE` regexes already in `dashboard.py` — and reads counts via the GitHub
+API (`gh api`/search for issue + PR open/closed counts; `gh run list` or `actions/runs` for the
+latest default-branch run). Results cached with a short TTL (~60 s) **keyed by repo slug** and
+fetched **off the request path** (serve cached, refresh when stale) so a slow/failing call never
+blocks the dashboard and N runs in one repo cost one fetch. Wiring: enrich `_registry_runs_view`
+with a compact per-row `github` summary (deduped per repo) for the **overview rows**; add a
+`/api/github?run=<id>` route in `do_GET` (resolve the repo via `_resolve_run` → `RunRecord.repo`;
+single-`--db` mode resolves from the ledger's parent dir) for the **detail panel**; render in
+`renderRuns()` (row badge) and `renderMain()` (full panel). Note: `gh` consumes **GitHub's** rate
+limit, not the Claude Max window. **Deferred**: PR-branch-specific CI (the SDLC run's own PR's
+checks) — default-branch latest run only; revisit if per-PR CI proves more useful.
 
 **Definition of Done**:
-- [ ] Backend GitHub-stats fetch with per-repo TTL cache, off the request path
-- [ ] Repo slug resolved from the registry repo path's git remote
-- [ ] Top menu bar renders issue/PR counts + latest default-branch CI status, contextual to the selected run
-- [ ] ~60 s refresh without full reload; updates when the selected run/repo changes
+- [ ] `github_stats.py` fetch with per-repo-slug TTL cache (~60 s), off the request path; graceful "unavailable" sentinel
+- [ ] Repo slug derived from the run's git remote (reusing `git_project_url`/remote regexes)
+- [ ] Overview rows show a compact per-repo badge (issues / PRs / CI), deduped per repo
+- [ ] Selected run's detail view shows the full GitHub panel
+- [ ] ~60 s server-side refresh; client poll reads cache, never drives `gh`; no full reload
+- [ ] Per-repo isolation via the registry (no cross-repo bleed); single-`--db` fallback works
 - [ ] Graceful degradation when `gh` is absent/unauthenticated/rate-limited or no GitHub remote
-- [ ] Tests for slug resolution, count/CI parsing, caching/TTL, and the unavailable fallback (no live `gh` dependency)
+- [ ] Tests for slug resolution, count/CI parsing, caching/TTL, dedup, and the unavailable fallback (no live `gh` dependency)
+- [ ] Story doc + `docs/controller-architecture.md` dashboard section updated
 
-**Dependencies**: 11.2-001 (repo path from the registry), 11.2-002 (run selection → repo). The
-~60 s poll is independent of the 11.2-003 SSE transport.
+**Dependencies**: 11.2-001 (registry `repo` path) and 11.2-002 (multi-run overview) — **both
+shipped (v1.34.0), so this is unblocked**. The ~60 s poll is independent of the 11.2-003 SSE
+transport.
 **Risk Level**: Medium
 
 ##### Story 11.2-007: Persist story dependencies and wave (cohort) index to the ledger
@@ -547,6 +563,46 @@ acceptable for a localhost tool; dovetails with Epic-13 sanitization.
 **Dependencies**: None (builds on the existing `/log` endpoint + `stages.output_path`; pairs with 11.2-004 and 11.1-001)
 **Risk Level**: Low
 
+##### Story 11.2-011: Stable-height live regions (no screen jump on update)
+**User Story**: As FX watching a live build, I want the auto-updating regions to keep a stable
+height so that the page doesn't jump and reflow every time their content changes from one line to
+two or three.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** a live-updating region whose content can render on **1, 2, or 3 lines** (the run
+  summary `#head`, the per-story sub-stage `activityRow`, and the `#updated` line) **When** its
+  content changes on a refresh / SSE tick **Then** the region's height stays stable (it reserves
+  space for its maximum line count) so elements below it do **not** move and the page does not
+  reflow.
+- **Given** the viewer has scrolled while watching a run **When** updates arrive **Then** the
+  scroll position is preserved — content does not shift under the cursor and the view does not
+  jump to the top.
+- **Given** content that would exceed the reserved lines **When** it renders **Then** it is
+  clamped/ellipsized (or scrolls within the fixed-height box) rather than growing the layout.
+- **Given** a region currently shows 1 line **When** it later shows 3 (and vice-versa) **Then**
+  there is no visible reflow of surrounding elements.
+
+**Technical Notes**: Pure front-end/CSS in the embedded dashboard HTML — **no backend change**.
+The variable-height live regions are in `controller/src/sdlc/dashboard.py`: `#head` (run summary,
+~line 432), the per-story `activityRow(s)` sub-stage line (~lines 347–352), and `#updated`
+(~lines 296/369), all re-rendered each tick by `renderMain()` / the 11.2-003 SSE handler. Reserve
+a stable height (e.g. `min-height` sized to the 3-line max, or a fixed-height container with
+`overflow`/line-clamp) on those containers so a full `innerHTML` swap never changes their box
+height. Pairs with 11.2-003 (auto-refresh transport) and 11.2-004 (live detail) which drive the
+updates; this story only stabilises their layout.
+
+**Definition of Done**:
+- [ ] Live regions reserve stable height; content toggling 1↔2↔3 lines causes no reflow of elements below
+- [ ] Scroll position preserved across updates (no jump-to-top, no shift under the cursor)
+- [ ] Overflow beyond the reserved lines is clamped/scrolled, not grown
+- [ ] Verified on a live (or simulated) run; test toggles 1/2/3-line content and asserts stable container height
+- [ ] No backend change; dashboard section of `docs/controller-architecture.md` noted if relevant
+
+**Dependencies**: None (stabilises the regions produced by 11.2-003 and 11.2-004)
+**Risk Level**: Low
+
 ## Story Dependencies (within Epic-11)
 
 ```
@@ -556,7 +612,7 @@ acceptable for a localhost tool; dovetails with Epic-13 sanitization.
 11.2-003 (SSE transport) ──────────────────────────────┘
 ```
 
-- **Cohort 1** (no deps): 11.1-001, 11.2-001, 11.2-003, 11.2-005, 11.2-007, 11.2-009, 11.2-010
+- **Cohort 1** (no deps): 11.1-001, 11.2-001, 11.2-003, 11.2-005, 11.2-007, 11.2-009, 11.2-010, 11.2-011
 - **Cohort 2**: 11.1-002, 11.1-003 (need 11.1-001); 11.2-002 (needs 11.2-001)
 - **Cohort 3**: 11.2-004 (needs 11.1-002 + 11.2-003); 11.2-006 (needs 11.2-001 + 11.2-002); 11.2-008 (needs 11.2-007)
 
