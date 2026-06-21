@@ -2113,3 +2113,148 @@ def test_coverage_stage_commit_is_also_linted(tmp_path, monkeypatch) -> None:
     # The commit-lint re-ask was dispatched against both build and coverage.
     lint_agents = {agent for agent, _, kind in disp.calls if kind == "commitlint"}
     assert {"build", "coverage"} <= lint_agents
+
+
+def test_commit_message_reads_branch_head(monkeypatch) -> None:
+    """``_commit_message`` returns the tip message, trimming the trailing newline."""
+    import subprocess
+
+    from sdlc.build import _commit_message
+
+    def _fake_git(root, *args):
+        assert args[:2] == ("log", "-1")
+        return subprocess.CompletedProcess(args, 0, stdout="feat: x\n\nbody\n", stderr="")
+
+    monkeypatch.setattr("sdlc.build._git", _fake_git)
+    assert _commit_message("feature/99.1-001", Path("/repo")) == "feat: x\n\nbody"
+
+
+def test_commit_message_none_on_git_failure(monkeypatch) -> None:
+    """A non-zero git exit makes ``_commit_message`` degrade to ``None``."""
+    import subprocess
+
+    from sdlc.build import _commit_message
+
+    monkeypatch.setattr(
+        "sdlc.build._git",
+        lambda root, *args: subprocess.CompletedProcess(args, 128, stdout="", stderr="no ref"),
+    )
+    assert _commit_message("feature/missing") is None
+
+
+def test_commit_message_none_on_git_error(monkeypatch) -> None:
+    """``_commit_message`` swallows OS/subprocess errors and returns ``None``."""
+    import subprocess
+
+    from sdlc.build import _commit_message
+
+    def _boom(root, *args):
+        raise subprocess.SubprocessError("git vanished")
+
+    monkeypatch.setattr("sdlc.build._git", _boom)
+    assert _commit_message("feature/99.1-001") is None
+
+
+def test_unreadable_commit_skips_lint(tmp_path, monkeypatch) -> None:
+    """An unreadable commit message degrades the lint gate to a no-op (R10)."""
+    disp = _CommitLintDispatcher()
+    monkeypatch.setattr("sdlc.build.load_commitlint_config", lambda root: _COMMITLINT_RULES)
+    # The HEAD message can never be read → lint is skipped, build still completes.
+    monkeypatch.setattr("sdlc.build._commit_message", lambda ref, root=None: None)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "DONE"
+    assert all(kind != "commitlint" for _, _, kind in disp.calls)
+
+
+def test_commit_lint_reask_dispatch_error_parks(tmp_path, monkeypatch) -> None:
+    """A failed commit-lint re-ask dispatch is bounded, then parks (work preserved)."""
+    from sdlc.dispatch import AgentDispatchError, AgentResult
+
+    class _ReaskRaises:
+        """Build leaves a non-compliant commit; the commit-lint re-ask blows up."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.compliant = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            is_lint = "commitlint" in prompt
+            self.calls.append((agent_type, "commitlint" if is_lint else "stage"))
+            if is_lint:
+                raise AgentDispatchError("agent crashed during amend")
+            self.compliant = False
+            return AgentResult(agent_type, _default_payload(agent_type, story), "")
+
+    disp = _ReaskRaises()
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES)
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    # The dispatch error breaks the loop; the story is parked, never advanced.
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+    advanced = {agent for agent, _ in disp.calls}
+    assert "review" not in advanced and "merge" not in advanced
+    # Exactly one commit-lint attempt was made before the error aborted the loop.
+    assert sum(1 for _, kind in disp.calls if kind == "commitlint") == 1
+    msgs = [
+        r[0] for r in _open(db).execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("commit-lint re-ask dispatch failed" in m for m in msgs)
+    # The failed re-ask is recorded as a FAILED 'commitlint' stage row.
+    stage_statuses = _open(db).execute(
+        "SELECT status FROM stages WHERE story_id='99.1-001' AND stage_name='commitlint'"
+    ).fetchall()
+    assert any(s[0] == "FAILED" for s in stage_statuses)
+
+
+def test_commit_lint_unreadable_after_reask_parks(tmp_path, monkeypatch) -> None:
+    """If HEAD becomes unreadable after a re-ask, the loop bails out and parks."""
+    from sdlc.dispatch import AgentResult
+
+    class _ReaskThenUnreadable:
+        """Build leaves a bad commit; after the re-ask dispatch HEAD reads as None."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.reasked = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            is_lint = "commitlint" in prompt
+            self.calls.append((agent_type, "commitlint" if is_lint else "stage"))
+            if is_lint:
+                self.reasked = True
+            return AgentResult(agent_type, _default_payload(agent_type, story), "")
+
+    disp = _ReaskThenUnreadable()
+    monkeypatch.setattr("sdlc.build.load_commitlint_config", lambda root: _COMMITLINT_RULES)
+    # Non-compliant before the re-ask; unreadable (None) once a re-ask has run.
+    monkeypatch.setattr(
+        "sdlc.build._commit_message",
+        lambda ref, root=None: None if disp.reasked else _BAD_COMMIT,
+    )
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    # One re-ask ran, HEAD then read as None → the loop broke and the story parked.
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+    assert sum(1 for _, kind in disp.calls if kind == "commitlint") == 1
+    advanced = {agent for agent, _ in disp.calls}
+    assert "review" not in advanced and "merge" not in advanced
