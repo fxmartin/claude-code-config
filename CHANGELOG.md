@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.46.0] - 2026-06-21
+
+### Added
+
+- feat(cost-model-governance): per-task model routing (#14.2-001)
+
+### Fixed
+
+- fix(cost-model-governance): route bugfix/reask stages (#14.2-001)
+- fix(cost-model-governance): resume-deterministic routing (#14.2-001)
+
+
 ## [v1.45.0] - 2026-06-21
 
 ### Added
