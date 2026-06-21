@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.49.1] - 2026-06-21
+
+### Fixed
+
+- fix(controller-robustness): detect 429 session-limit (#109) (#115)
+
+
 ## [v1.49.0] - 2026-06-21
 
 ### Added
