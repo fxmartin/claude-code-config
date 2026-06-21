@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.37.0] - 2026-06-21
+
+### Added
+
+- feat(controller-robustness): guard preflight recursion hangs (#12.1-002)
+
+
 ## [v1.36.0] - 2026-06-21
 
 ### Added
