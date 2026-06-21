@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from sdlc.contracts import parse_and_validate
+from sdlc.rate_limit import RateLimitSignal, detect_rate_limit
 
 # A sink that receives each parsed stream-json event as it arrives (Story
 # 11.1-002), used to emit fine-grained sub-stage progress to the ledger.
@@ -151,6 +152,22 @@ class AgentDispatchError(Exception):
     Distinct from a contract error: this is an infrastructure failure (non-zero
     exit, timeout, missing executable), not a malformed-but-received response.
     """
+
+
+class RateLimitError(AgentDispatchError):
+    """The agent failed because the Max plan's rate-limit / quota was exhausted.
+
+    Story 14.1-003: a subclass of :class:`AgentDispatchError` so any existing
+    ``except AgentDispatchError`` still degrades gracefully, but the controller's
+    stage dispatch catches it *first* and treats it as a recoverable, time-based
+    pause (wait-and-resume / durable park) rather than a stage ``FAILED`` that
+    would burn a bugfix attempt. ``signal`` carries the detected backoff / reset
+    hint so the controller can compute the window-reset time.
+    """
+
+    def __init__(self, message: str, *, signal: RateLimitSignal) -> None:
+        super().__init__(message)
+        self.signal = signal
 
 
 @dataclass(frozen=True)
@@ -469,6 +486,16 @@ def _interpret(
     """
     if returncode != 0:
         detail = (stderr or stdout or "").strip()
+        # Story 14.1-003: a non-zero exit caused by the Max plan's rate limit is a
+        # recoverable, time-based pause — not a generic dispatch failure. Surface
+        # it as a distinct RateLimitError so the controller waits/parks instead of
+        # burning a bugfix attempt. Absent a rate-limit signal, behaviour is today's.
+        signal = detect_rate_limit(detail)
+        if signal is not None:
+            raise RateLimitError(
+                f"{agent_type} agent hit the rate limit (exit {returncode}): {detail}",
+                signal=signal,
+            )
         raise AgentDispatchError(
             f"{agent_type} agent exited {returncode}: {detail}"
         )
@@ -481,6 +508,14 @@ def _interpret(
             detail = (
                 envelope.get("result") or envelope.get("subtype") or "unknown error"
             )
+            # Story 14.1-003: an error envelope whose subtype/text names a rate
+            # limit is the same recoverable pause as a non-zero exit.
+            signal = detect_rate_limit(str(detail))
+            if signal is not None:
+                raise RateLimitError(
+                    f"{agent_type} agent hit the rate limit: {detail}",
+                    signal=signal,
+                )
             raise AgentDispatchError(
                 f"{agent_type} agent reported an error: {detail}"
             )

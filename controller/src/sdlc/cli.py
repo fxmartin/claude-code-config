@@ -85,6 +85,15 @@ Flags:
                             converted to a notional API-equivalent token ceiling
   --budget-policy=POLICY    on crossing the ceiling: pause (resumable, default)
                             or abort (terminal stop)
+  --rate-limit-max-wait=SEC in-process auto-wait cap for a Max rate-limit pause
+                            (default 18000 ≈ 5h); a reset within it auto-resumes
+                            the same run, beyond it parks RATE_LIMITED for resume
+  --window-budget=N         configured per-window token budget (a $-value
+                            converts to a notional ceiling); 0 = rely only on
+                            live rate-limit signals (default)
+  --window=SEC              rolling rate-limit window length (default 18000 ≈ 5h)
+  --rate-limit-threshold=F  pause at this fraction of the window budget
+                            (default 1.0; <1 pauses near the limit)
 """
 
 
@@ -184,16 +193,31 @@ def build(ctx: typer.Context) -> None:
             f"(ceiling {opts.budget}); "
             f"{notional_cost_label(result.notional_cost_usd)} — {tail}"
         )
+    # Story 14.1-003: a rate-limit park (reset beyond the auto-wait cap) leaves
+    # the run RATE_LIMITED (resumable). Report it as a time-based pause, not a
+    # failure, so a wrapper knows `sdlc resume` will continue it once the window
+    # reopens. (Within-cap auto-waits never reach here — they resume in-process.)
+    if result.rate_limited:
+        waited = (
+            f" (auto-waited {result.rate_limit_waited_s}s first)"
+            if result.rate_limit_waited_s
+            else ""
+        )
+        typer.echo(
+            f"rate limit reached{waited} — run parked RATE_LIMITED; `sdlc resume` "
+            "continues it once the Max plan's window reopens."
+        )
     # An AWAITING_APPROVAL run is honestly not a failure (Story 12.3-003), but it
     # still needs FX to act, so it is not "clean" — exit non-zero like
     # NEEDS_ATTENTION so a wrapping script never reads it as fully done. A
-    # budget-stopped run is likewise not fully done.
+    # budget-stopped or rate-limited run is likewise not fully done.
     clean = (
         result.failed == 0
         and result.blocked == 0
         and result.needs_attention == 0
         and result.awaiting_approval == 0
         and not result.budget_stopped
+        and not result.rate_limited
     )
     raise typer.Exit(code=0 if clean else 1)
 
@@ -285,12 +309,19 @@ def resume(
             f"budget ceiling crossed: {result.accrued_tokens} tokens accrued; "
             f"{notional_cost_label(result.notional_cost_usd)} — {tail}"
         )
+    # Story 14.1-003: a resume that re-hit the window beyond the cap re-parks.
+    if result.rate_limited:
+        typer.echo(
+            "rate limit still in effect — run re-parked RATE_LIMITED; `sdlc resume` "
+            "again once the Max plan's window reopens."
+        )
     clean = (
         result.failed == 0
         and result.blocked == 0
         and result.needs_attention == 0
         and result.awaiting_approval == 0
         and not result.budget_stopped
+        and not result.rate_limited
     )
     raise typer.Exit(code=0 if clean else 1)
 
