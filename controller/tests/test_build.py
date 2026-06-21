@@ -23,6 +23,7 @@ from sdlc.build import (
     run_build,
 )
 from sdlc.cohort import Story
+from sdlc.commitlint import lint_commit_message
 
 
 # ---------------------------------------------------------------------------
@@ -2373,21 +2374,144 @@ def test_unreadable_commit_skips_lint(tmp_path, monkeypatch) -> None:
     assert all(kind != "commitlint" for _, _, kind in disp.calls)
 
 
-def test_commit_lint_reask_dispatch_error_parks(tmp_path, monkeypatch) -> None:
-    """A failed commit-lint re-ask dispatch is bounded, then parks (work preserved)."""
-    from sdlc.dispatch import AgentDispatchError, AgentResult
+def _kind_of(prompt: str) -> str:
+    """Classify a dispatched prompt for the commit-lint fixtures (12.2-004)."""
+    if "envelope-only re-ask" in prompt:
+        return "envelope"
+    if "commitlint" in prompt:
+        return "commitlint"
+    return "stage"
 
-    class _ReaskRaises:
-        """Build leaves a non-compliant commit; the commit-lint re-ask blows up."""
+
+def test_build_prompt_commit_subject_is_compliant_by_construction() -> None:
+    """The build prompt supplies a compliant header, not the raw title (12.2-004 AC1/AC2)."""
+    from sdlc.build import render_build_prompt
+
+    # A long, Title-Case title that would blow header-max-length + subject-case.
+    long_title = (
+        "Reconcile Story Status Against Origin Main And Recompute The Run Terminal"
+    )
+    story = Story(
+        "12.3-001", long_title, "12", "controller-robustness",
+        "docs/stories/epic-12.md", "Must", 8, "py", [], False,
+    )
+    prompt = render_build_prompt(story, BuildOptions())
+    header = next(
+        line.strip()
+        for line in prompt.splitlines()
+        if line.strip().startswith("feat(controller-robustness):")
+    )
+    # The constructed header passes commitlint by construction — no re-ask needed.
+    assert lint_commit_message(header, _COMMITLINT_RULES) == []
+    # The (#id) tag reconciliation keys off is preserved.
+    assert header.endswith("(#12.3-001)")
+    # The raw Title-Case title is never used verbatim as the commit subject.
+    assert f"feat(controller-robustness): {long_title}" not in prompt
+
+
+def test_coverage_prompt_commit_subject_is_compliant_by_construction() -> None:
+    """The coverage agent commits too — its supplied header is compliant (12.2-004 AC1)."""
+    from sdlc.build import render_coverage_prompt
+
+    long_title = (
+        "Reconcile Story Status Against Origin Main And Recompute The Run Terminal"
+    )
+    story = Story(
+        "12.3-001", long_title, "12", "controller-robustness",
+        "docs/stories/epic-12.md", "Must", 8, "py", [], False,
+    )
+    prompt = render_coverage_prompt(story, BuildOptions())
+    header = next(
+        line.strip()
+        for line in prompt.splitlines()
+        if line.strip().startswith("test(controller-robustness):")
+    )
+    assert lint_commit_message(header, _COMMITLINT_RULES) == []
+    assert header.endswith("(#12.3-001)")
+
+
+def test_bugfix_prompt_commit_subject_is_compliant_by_construction() -> None:
+    """The bugfix agent commits its fix — its supplied header is compliant (12.2-004 AC1)."""
+    from sdlc.build import render_bugfix_prompt
+
+    long_title = (
+        "Reconcile Story Status Against Origin Main And Recompute The Run Terminal"
+    )
+    story = Story(
+        "12.3-001", long_title, "12", "controller-robustness",
+        "docs/stories/epic-12.md", "Must", 8, "py", [], False,
+    )
+    prompt = render_bugfix_prompt(story, "build", "boom")
+    header = next(
+        line.strip()
+        for line in prompt.splitlines()
+        if line.strip().startswith("fix(controller-robustness):")
+    )
+    assert lint_commit_message(header, _COMMITLINT_RULES) == []
+    assert header.endswith("(#12.3-001)")
+
+
+def test_commit_lint_malformed_reask_envelope_is_recovered(tmp_path, monkeypatch) -> None:
+    """AC4: a malformed commit-lint re-ask reply routes through envelope recovery, not a park."""
+    from sdlc.contracts import ContractError
+    from sdlc.dispatch import AgentResult
+
+    class _AmendThenMalformed:
+        """The amend lands but the re-ask reply omits its envelope; recovery rescues it."""
 
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
             self.compliant = False
 
         def __call__(self, agent_type, prompt, story=None, **kwargs):
-            is_lint = "commitlint" in prompt
-            self.calls.append((agent_type, "commitlint" if is_lint else "stage"))
-            if is_lint:
+            kind = _kind_of(prompt)
+            self.calls.append((agent_type, kind))
+            if kind == "commitlint":
+                # The amend itself lands (commit becomes compliant) but the reply
+                # omits the result envelope — exactly the run 7df64f19 failure.
+                self.compliant = True
+                raise ContractError("missing required field 'branch_name'")
+            if kind == "stage" and agent_type in ("build", "coverage", "bugfix"):
+                self.compliant = False  # a fresh commit-authoring stage
+            return AgentResult(agent_type, _default_payload(agent_type, story), "")
+
+    disp = _AmendThenMalformed()
+    _patch_commitlint(monkeypatch, disp, _COMMITLINT_RULES)
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_coverage=True, skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    # Recovered, not parked: the story completes.
+    assert result.story_status["99.1-001"] == "DONE"
+    # The malformed re-ask was routed through the envelope-only recovery path.
+    assert any(kind == "envelope" for _, kind in disp.calls)
+    msgs = [
+        r[0] for r in _open(db).execute(
+            "SELECT message FROM events WHERE story_id='99.1-001'"
+        ).fetchall()
+    ]
+    assert any("routing through envelope recovery" in m for m in msgs)
+
+
+def test_commit_lint_reask_dispatch_error_parks(tmp_path, monkeypatch) -> None:
+    """A re-ask whose envelope recovery also fails is bounded, then parks (12.2-004 AC4)."""
+    from sdlc.dispatch import AgentDispatchError, AgentResult
+
+    class _ReaskRaises:
+        """Both the commit-lint re-ask and its envelope recovery blow up."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.compliant = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            kind = _kind_of(prompt)
+            self.calls.append((agent_type, kind))
+            if kind in ("commitlint", "envelope"):
                 raise AgentDispatchError("agent crashed during amend")
             self.compliant = False
             return AgentResult(agent_type, _default_payload(agent_type, story), "")
@@ -2402,19 +2526,19 @@ def test_commit_lint_reask_dispatch_error_parks(tmp_path, monkeypatch) -> None:
         dispatcher=disp,
         preflight=lambda: True,
     )
-    # The dispatch error breaks the loop; the story is parked, never advanced.
+    # Recovery also failed; the story is parked, never advanced (work preserved).
     assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
     advanced = {agent for agent, _ in disp.calls}
     assert "review" not in advanced and "merge" not in advanced
-    # Exactly one commit-lint attempt was made before the error aborted the loop.
-    assert sum(1 for _, kind in disp.calls if kind == "commitlint") == 1
+    # The malformed re-ask was routed through envelope recovery before parking.
+    assert any(kind == "envelope" for _, kind in disp.calls)
     msgs = [
         r[0] for r in _open(db).execute(
             "SELECT message FROM events WHERE story_id='99.1-001'"
         ).fetchall()
     ]
-    assert any("commit-lint re-ask dispatch failed" in m for m in msgs)
-    # The failed re-ask is recorded as a FAILED 'commitlint' stage row.
+    assert any("routing through envelope recovery" in m for m in msgs)
+    # The unrecovered re-ask is recorded as a FAILED 'commitlint' stage row.
     stage_statuses = _open(db).execute(
         "SELECT status FROM stages WHERE story_id='99.1-001' AND stage_name='commitlint'"
     ).fetchall()

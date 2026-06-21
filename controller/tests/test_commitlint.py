@@ -144,3 +144,103 @@ def test_unknown_rule_is_ignored() -> None:
 
 def test_empty_rules_passes() -> None:
     assert lint_commit_message("Feat: WHATEVER.", {"rules": {}}) == []
+
+
+# ---------------------------------------------------------------------------
+# Compliant-by-construction subjects (Story 12.2-004)
+# ---------------------------------------------------------------------------
+
+from sdlc.commitlint import (  # noqa: E402
+    build_commit_header,
+    compliant_subject,
+    header_max_length,
+)
+
+
+def test_header_max_length_honours_config() -> None:
+    assert header_max_length(_RULES) == 72
+    assert header_max_length({"rules": {"header-max-length": [2, "always", 50]}}) == 50
+
+
+def test_header_max_length_defaults_to_72_without_config() -> None:
+    # No config, or a disabled rule, falls back to the conventional default so a
+    # subject can still be made compliant by construction.
+    assert header_max_length(None) == 72
+    assert header_max_length({"rules": {"header-max-length": [0, "always", 50]}}) == 72
+
+
+def test_compliant_subject_lowercases_a_title_case_title() -> None:
+    out = compliant_subject("Generate Compliant Commit Subjects", _RULES)
+    assert out == "generate compliant commit subjects"
+
+
+def test_compliant_subject_strips_trailing_period() -> None:
+    assert compliant_subject("add the thing.", _RULES) == "add the thing"
+    assert compliant_subject("add the thing...", _RULES) == "add the thing"
+
+
+def test_compliant_subject_is_idempotent_on_compliant_input() -> None:
+    # An already-compliant subject is returned unchanged (AC5).
+    good = "add coverage gap detection"
+    assert compliant_subject(good, _RULES) == good
+    assert compliant_subject(compliant_subject(good, _RULES), _RULES) == good
+
+
+def test_compliant_subject_trims_to_budget_on_word_boundary() -> None:
+    prefix = "feat(controller-robustness): "
+    trailer = " (#12.2-004)"
+    out = compliant_subject(
+        "Generate Commitlint Compliant Commit Subjects By Construction",
+        _RULES,
+        header_prefix=prefix,
+        trailer=trailer,
+    )
+    # Fits the remaining budget, never splits a word, and stays lower-case.
+    assert len(prefix) + len(out) + len(trailer) <= 72
+    assert out == out.lower()
+    assert not out.endswith(" ")
+    assert " " not in "Generate"  # sanity: words preserved whole
+    assert out.split() == [w for w in out.split()]  # no partial trailing token
+
+
+def test_build_commit_header_is_compliant_for_long_title_case_title() -> None:
+    # The Feature-12.3 style long Title-Case title used as a real fixture.
+    header = build_commit_header(
+        ctype="feat",
+        scope="controller-robustness",
+        subject="Reconcile Story Status Against Origin Main And Recompute Run Terminal",
+        trailer=" (#12.3-001)",
+        config=_RULES,
+    )
+    # The constructed header passes commitlint by construction (AC1/AC2).
+    assert lint_commit_message(header, _RULES) == []
+    # The (#id) trailer reconciliation keys off is always preserved intact.
+    assert header.endswith(" (#12.3-001)")
+    # The raw Title-Case title is never used verbatim as the subject.
+    assert "Reconcile Story Status" not in header
+
+
+def test_build_commit_header_idempotent_on_compliant_subject() -> None:
+    header = build_commit_header(
+        ctype="feat",
+        scope="controller",
+        subject="add the thing",
+        trailer=" (#1.1-001)",
+        config=_RULES,
+    )
+    assert header == "feat(controller): add the thing (#1.1-001)"
+    assert lint_commit_message(header, _RULES) == []
+
+
+def test_build_commit_header_without_config_uses_conventional_defaults() -> None:
+    # Compliant by construction even when no repo config is loaded at render time.
+    header = build_commit_header(
+        ctype="feat",
+        scope="controller-robustness",
+        subject="Generate Compliant Commit Subjects",
+        trailer=" (#12.2-004)",
+        config=None,
+    )
+    assert lint_commit_message(header, _RULES) == []
+    assert len(header) <= 72
+    assert header.endswith(" (#12.2-004)")

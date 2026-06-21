@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
 
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
-from sdlc.commitlint import lint_commit_message, load_commitlint_config
+from sdlc.commitlint import (
+    build_commit_header,
+    lint_commit_message,
+    load_commitlint_config,
+)
 from sdlc.contracts import (
     AGENT_SCHEMAS,
     RESULT_END_MARKER,
@@ -1291,6 +1295,17 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         if opts.skip_coverage
         else "6. Commit locally; the coverage agent pushes and opens the PR."
     )
+    # Story 12.2-004: derive a commitlint-compliant subject by construction
+    # rather than asking the agent to transcribe the (often long, Title-Case)
+    # story title verbatim — which fails ``header-max-length``/``subject-case``
+    # and forces a re-ask. The ``(#id)`` tag reconciliation keys off is always
+    # preserved, and the subject is trimmed to the header budget.
+    commit_header = build_commit_header(
+        ctype="feat",
+        scope=story.epic_name,
+        subject=story.title,
+        trailer=f" (#{story.id})",
+    )
     return (
         f"You are building story {story.id}: {story.title}\n"
         f"Epic: {story.epic_name} (from {story.epic_file})\n"
@@ -1300,18 +1315,30 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         f"2. Read {story.epic_file} and find the full story section for {story.id}\n"
         "3. Follow TDD: write failing tests first, then implement\n"
         "4. Run all quality gates (tests, types, lint, security)\n"
-        f"5. Commit: feat({story.epic_name}): {story.title} (#{story.id})\n"
+        "5. Commit with this exact, conventional-commit-compliant message — do "
+        f"not alter it:\n   {commit_header}\n"
         f"{push}\n\n"
         + _result_wrapper("build-agent-response.schema.json")
     )
 
 
 def render_coverage_prompt(story: Story, opts: BuildOptions) -> str:
+    # Story 12.2-004: the coverage agent authors a commit too (it is linted via
+    # the build/coverage success gate), so supply a commitlint-compliant header
+    # by construction rather than letting it improvise a non-compliant one.
+    commit_header = build_commit_header(
+        ctype="test",
+        scope=story.epic_name,
+        subject=story.title,
+        trailer=f" (#{story.id})",
+    )
     return (
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
-        "Fetch the branch, fill coverage gaps, push, open the PR, then emit the "
-        "result block.\n"
+        "Fetch the branch, fill coverage gaps, then commit with this exact, "
+        "conventional-commit-compliant message — do not alter it:\n"
+        f"   {commit_header}\n"
+        "Push, open the PR, then emit the result block.\n"
         + _result_wrapper("coverage-agent-response.schema.json")
     )
 
@@ -1334,11 +1361,21 @@ def render_merge_prompt(story: Story, pr_number: int | None) -> str:
 
 
 def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
+    # Story 12.2-004: the bugfix agent commits its fix (linted mid-loop), so give
+    # it a commitlint-compliant header by construction too.
+    commit_header = build_commit_header(
+        ctype="fix",
+        scope=story.epic_name,
+        subject=story.title,
+        trailer=f" (#{story.id})",
+    )
     return (
         f"Bugfix story {story.id}: {story.title}. Stage '{failed_stage}' failed.\n"
         f"Failure: {failure}\n"
-        "Classify (CODE_BUG/TEST_BUG/ENV_ISSUE), fix where possible, then emit "
-        "the result block.\n"
+        "Classify (CODE_BUG/TEST_BUG/ENV_ISSUE), fix where possible. If you "
+        "commit the fix, use this exact, conventional-commit-compliant message "
+        f"— do not alter it:\n   {commit_header}\n"
+        "Then emit the result block.\n"
         + _result_wrapper("bugfix-agent-response.schema.json")
     )
 
@@ -1819,7 +1856,8 @@ def _run_story(
                 # (work preserved on the branch, R10).
                 if stage in ("build", "coverage"):
                     bugfix_seq, lint_ok = _lint_stage_commit(
-                        stage, story, ledger, run_id, dispatch, logs_dir, bugfix_seq
+                        stage, story, opts, pr_number, ledger, run_id, dispatch,
+                        logs_dir, bugfix_seq,
                     )
                     if not lint_ok:
                         return "NEEDS_ATTENTION"
@@ -1865,8 +1903,8 @@ def _run_story(
                     # header straight to the PR. Park on exhausted re-asks (R10).
                     if stage in ("build", "coverage"):
                         bugfix_seq, lint_ok = _lint_stage_commit(
-                            stage, story, ledger, run_id, dispatch, logs_dir,
-                            bugfix_seq,
+                            stage, story, opts, pr_number, ledger, run_id,
+                            dispatch, logs_dir, bugfix_seq,
                         )
                         if not lint_ok:
                             return "NEEDS_ATTENTION"
@@ -1890,7 +1928,8 @@ def _run_story(
             # is about to be retried, and that retry's own success-time lint is
             # the terminal gate that parks a still-non-compliant commit.
             bugfix_seq, _ = _lint_stage_commit(
-                "bugfix", story, ledger, run_id, dispatch, logs_dir, bugfix_seq
+                "bugfix", story, opts, pr_number, ledger, run_id, dispatch,
+                logs_dir, bugfix_seq,
             )
             # Bugfix succeeded — retry the same stage as a new attempt.
             attempt += 1
@@ -2133,6 +2172,8 @@ def _reask_envelope(
 def _lint_stage_commit(
     stage: str,
     story: Story,
+    opts: BuildOptions,
+    pr_number: int | None,
     ledger: Ledger,
     run_id: str,
     dispatch: Dispatcher,
@@ -2149,6 +2190,14 @@ def _lint_stage_commit(
     Graceful no-op when the repo has no commitlint config, the commit can't be
     read, or the message is already compliant — then there is no behaviour
     change.
+
+    Story 12.2-004 (AC4): a re-ask whose response is malformed (a missing/garbled
+    result envelope, e.g. the missing ``branch_name`` of run ``7df64f19``) must
+    not dead-end the story. Such a contract error is routed through the same
+    envelope-only recovery other stages use (:func:`_reask_envelope`, 12.1-001):
+    the amend itself almost always landed, so the recovered envelope lets the
+    re-lint see the now-compliant message instead of parking on a transport-level
+    failure.
 
     Returns ``(seq, compliant)``. ``seq`` is the (possibly advanced) attempt
     counter so the caller keeps stage rows unique. ``compliant`` is False only
@@ -2174,32 +2223,54 @@ def _lint_stage_commit(
     while violations and attempt < MAX_COMMITLINT_REASK:
         attempt += 1
         seq += 1
+        lint_seq = seq
         ledger.event_log(
             run_id, story.id, "warn", "controller",
             f"{stage} commit message violates commitlint "
             f"({'; '.join(violations)}) — re-asking the {stage} agent to amend",
         )
-        cpath = logs_dir / f"{story.id}-commitlint-{seq}.log"
-        ledger.stage_start(run_id, story.id, "commitlint", seq)
+        cpath = logs_dir / f"{story.id}-commitlint-{lint_seq}.log"
+        ledger.stage_start(run_id, story.id, "commitlint", lint_seq)
         prompt = render_commit_lint_reask_prompt(stage, story, message, violations)
-        sink = _make_progress_sink(ledger, run_id, story.id, "commitlint", seq)
+        sink = _make_progress_sink(ledger, run_id, story.id, "commitlint", lint_seq)
         try:
             result = dispatch(
                 stage, prompt, story=story, transcript_path=cpath, on_progress=sink,
             )
         except (ContractError, AgentDispatchError) as exc:
-            ledger.stage_finish(
-                run_id, story.id, "commitlint", seq, "FAILED",
-                "commitlint-error", str(cpath),
-            )
+            # Story 12.2-004 AC4: a malformed re-ask envelope is recovered via
+            # the shared envelope-only re-ask (12.1-001), not dead-ended. The
+            # amend usually landed; the recovered envelope lets us re-read and
+            # re-lint the now-compliant commit on the next iteration.
             ledger.event_log(
-                run_id, story.id, "error", "controller",
-                f"commit-lint re-ask dispatch failed: {exc}",
+                run_id, story.id, "warn", "controller",
+                f"commit-lint re-ask response malformed ({exc}) — routing "
+                "through envelope recovery (12.2-004)",
             )
-            break
-        _record_stage_usage(ledger, run_id, story.id, "commitlint", seq, result)
+            seq += 1
+            rpath = logs_dir / f"{story.id}-reask-commitlint-{seq}.log"
+            ok_r, _ = _reask_envelope(
+                stage, story, opts, pr_number, ledger, run_id, dispatch,
+                rpath, seq,
+            )
+            if not ok_r:
+                ledger.stage_finish(
+                    run_id, story.id, "commitlint", lint_seq, "FAILED",
+                    "commitlint-error", str(cpath),
+                )
+                break
+            ledger.stage_finish(
+                run_id, story.id, "commitlint", lint_seq, "DONE",
+                output_path=str(cpath),
+            )
+            message = _commit_message(ref, root)
+            if message is None:
+                break
+            violations = lint_commit_message(message, config)
+            continue
+        _record_stage_usage(ledger, run_id, story.id, "commitlint", lint_seq, result)
         ledger.stage_finish(
-            run_id, story.id, "commitlint", seq, "DONE", output_path=str(cpath)
+            run_id, story.id, "commitlint", lint_seq, "DONE", output_path=str(cpath)
         )
         message = _commit_message(ref, root)
         if message is None:

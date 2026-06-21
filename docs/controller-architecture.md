@@ -114,6 +114,28 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    about to be retried, and the retry's own success-time lint is the terminal
    gate.) Each attempt is a `commitlint` stage row, logged to the ledger
    `events` (Story 12.2-002).
+
+   **Compliant by construction (Story 12.2-004).** The lint above is the
+   backstop, not the first line of defence. The build prompt no longer asks the
+   agent to transcribe the (often long, Title-Case) story title as the commit
+   subject — which routinely blew `header-max-length`/`subject-case` and made the
+   run depend on the re-ask succeeding. Instead every commit-authoring prompt
+   (`render_build_prompt` → `feat`, `render_coverage_prompt` → `test`,
+   `render_bugfix_prompt` → `fix`) supplies an already-compliant header built by
+   `build_commit_header`
+   (`commitlint.compliant_subject`): the subject is lower-cased, stripped of a
+   trailing period, and trimmed on a word boundary to the `header-max-length`
+   budget left after the fixed `type(scope): ` prefix and the `(#<id>)` tag (which
+   reconciliation keys off and is always preserved intact). An already-compliant
+   subject is left unchanged (idempotent), so the common case passes the gate on
+   the first attempt with **no** re-ask dispatched. When a commit-format re-ask
+   *is* still needed and its reply omits or malforms the result envelope (e.g. the
+   missing `branch_name` of run `7df64f19`), `_lint_stage_commit` routes that
+   contract error through the same **envelope-only recovery** as other stages
+   (`_reask_envelope`, step 5) rather than dead-ending the story into
+   `NEEDS_ATTENTION` — the amend itself usually landed, so the recovered envelope
+   lets the re-lint see the now-compliant message. Only when that recovery *also*
+   fails is the story parked.
 8. **Dependency blocking** — if a dependency ends FAILED/BLOCKED/SKIPPED/
    NEEDS_ATTENTION, the dependent story is marked BLOCKED and never dispatched.
    NEEDS_ATTENTION counts as not-done: the dependency's work is committed but

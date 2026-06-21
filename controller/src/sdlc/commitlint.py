@@ -22,6 +22,11 @@ _CONFIG_FILENAMES = (
     ".commitlintrc",
 )
 
+# The conventional-commit header budget, used when no enforced
+# ``header-max-length`` rule is loaded so a subject can be made compliant by
+# construction even without a repo config (Story 12.2-004).
+_DEFAULT_HEADER_MAX = 72
+
 
 def load_commitlint_config(root: Path) -> dict | None:
     """Return the repo's commitlint config dict, or ``None`` when none exists.
@@ -108,3 +113,90 @@ def lint_commit_message(message: str, config: dict) -> list[str]:
         violations.append("body-leading-blank: leave a blank line after the header")
 
     return violations
+
+
+def header_max_length(config: dict | None) -> int:
+    """Return the enforced ``header-max-length`` limit, or the conventional 72.
+
+    Honours an error-level (``2``) ``header-max-length`` rule's integer limit;
+    otherwise — no config, a disabled/warn rule, or a malformed spec — falls back
+    to :data:`_DEFAULT_HEADER_MAX` so a subject can be trimmed to a sane budget by
+    construction (Story 12.2-004).
+    """
+    rules = (config or {}).get("rules") or {}
+    spec = rules.get("header-max-length")
+    if isinstance(spec, list) and spec and spec[0] == 2 and len(spec) > 2:
+        limit = spec[2]
+        if isinstance(limit, int) and limit > 0:
+            return limit
+    return _DEFAULT_HEADER_MAX
+
+
+def _strip_full_stop(subject: str) -> str:
+    """Drop trailing whitespace then any trailing period(s) (``subject-full-stop``)."""
+    s = subject.rstrip()
+    while s.endswith("."):
+        s = s[:-1].rstrip()
+    return s
+
+
+def _trim_to_budget(subject: str, budget: int) -> str:
+    """Trim ``subject`` to at most ``budget`` chars, preferring a word boundary.
+
+    A non-positive budget (a pathologically long prefix/trailer) leaves the
+    subject untouched — the commit-time lint re-ask remains the backstop rather
+    than the controller emitting an empty subject.
+    """
+    if budget <= 0 or len(subject) <= budget:
+        return subject
+    cut = subject[:budget].rstrip()
+    space = cut.rfind(" ")
+    if space >= 1:
+        cut = cut[:space].rstrip()
+    return cut
+
+
+def compliant_subject(
+    subject: str,
+    config: dict | None = None,
+    *,
+    header_prefix: str = "",
+    trailer: str = "",
+) -> str:
+    """Normalize ``subject`` so ``header_prefix + subject + trailer`` is compliant.
+
+    Applies the deterministic transforms the controller can guarantee by
+    construction (Story 12.2-004): lower-case the subject — which satisfies a
+    ``subject-case`` of ``lower-case`` and, being neither sentence/start/pascal/
+    upper case, the conventional default too — strip a trailing period
+    (``subject-full-stop``), and trim to the ``header-max-length`` budget left
+    after the fixed ``header_prefix`` (e.g. ``feat(scope): ``) and ``trailer``
+    (e.g. the ``(#id)`` tag reconciliation keys off, always preserved intact).
+    Idempotent: an already-compliant subject is returned unchanged.
+    """
+    s = _strip_full_stop(subject.strip()).lower()
+    budget = header_max_length(config) - len(header_prefix) - len(trailer)
+    s = _trim_to_budget(s, budget)
+    # Trimming on a word boundary can re-expose a trailing period.
+    return _strip_full_stop(s)
+
+
+def build_commit_header(
+    *,
+    ctype: str,
+    scope: str | None,
+    subject: str,
+    trailer: str = "",
+    config: dict | None = None,
+) -> str:
+    """Construct a commitlint-compliant commit header from its parts.
+
+    Builds ``type(scope): subject<trailer>`` where ``subject`` is normalized by
+    :func:`compliant_subject` to fit the header-length budget after the fixed
+    ``type(scope): `` prefix and the ``trailer``. Used so an agent commit is
+    compliant by construction rather than by transcribing a long, Title-Case
+    story title verbatim (Story 12.2-004).
+    """
+    prefix = f"{ctype}({scope}): " if scope else f"{ctype}: "
+    body = compliant_subject(subject, config, header_prefix=prefix, trailer=trailer)
+    return f"{prefix}{body}{trailer}"
