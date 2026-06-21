@@ -21,6 +21,15 @@ stage instead of being retried; (2) `default_preflight` can recurse into the pro
 command and hang; (3) the ledger renderer can clobber hand-maintained `.build-progress.md`
 history; (4) agent-authored commits can violate commitlint and only fail at PR time.
 
+A second post-mortem — the epic-11 run `877df2ab` and epic-12 run `ced08c0f`, both of which
+finished marked **FAILED** while every story's work had actually merged to `main` and each
+required **manual ledger reconciliation by hand** — exposed two further failure modes addressed
+by Features 12.3/12.4: (5) run terminal status is a blind in-memory tally of self-reported agent
+statuses that never verifies what landed on `origin/main` (and a merge blocked only by the
+high-risk human gate is mistaken for a failure); and (6) branch-stacking — story branches are
+cut base-less from whatever HEAD is checked out, so a parked story's commits ride a later story's
+merge onto `main` transitively, leaving the ledger out of sync with reality.
+
 **Business Value**: FX runs long unattended autonomous batches (increasingly several in
 parallel). The value of autonomy collapses if a single malformed agent message — or a
 self-inflicted hang — strands a night's work and demands a manual archaeology session the
@@ -34,10 +43,14 @@ next morning. Robustness is what makes "fire-and-forget overnight" actually safe
   controller's own orchestration; a runaway stage is bounded by a timeout.
 - The ledger renderer **never destroys** pre-existing/non-ledger `.build-progress.md` history.
 - **Zero** commitlint failures reach a PR from agent-authored commits.
+- A run whose work merged to `origin/main` **reports DONE without manual intervention** — the
+  number of by-hand ledger reconciliations drops to zero.
+- A high-risk-gated merge is reported as `AWAITING_APPROVAL`, **never** FAILED, and a
+  parked/failed story **never** lands transitively on `main`.
 
 ## Epic Scope
 
-**Total Stories**: 5 | **Total Points**: 16 | **MVP Stories**: 0 (roadmap — primary defect is Must Have)
+**Total Stories**: 10 | **Total Points**: 40 | **MVP Stories**: 0 (roadmap — primary defect is Must Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -244,6 +257,249 @@ add a new `sdlc migrate` verb — apply automatically at launch.
 11.2-007's `wave`/`dependencies` migration safe on pre-existing ledgers.
 **Risk Level**: Medium
 
+### Feature 12.3: Honest Run-Terminal Status
+
+A run's terminal status must reflect what actually landed on `origin/main`, not an in-memory
+tally of self-reported agent statuses. A run whose work shipped — even after a 429 abort or via
+a stacked transitive merge — must report SUCCESS; a merge blocked only by the high-risk human
+gate must report a distinct "awaiting human" state, not FAILED. (Post-mortem of the epic-11 run
+`877df2ab` and epic-12 run `ced08c0f`, both of which finished FAILED while their work was fully
+merged to `main`, and both of which required manual ledger reconciliation by hand.)
+
+#### Stories
+
+##### Story 12.3-001: Reconcile per-story status against `origin/main` before computing run terminal
+**User Story**: As FX running unattended builds, I want the controller to verify against
+`origin/main` whether each story's work actually landed before it computes the run's terminal
+status, so that a run whose PRs genuinely merged reports DONE instead of FAILED/NEEDS_ATTENTION
+from a stale in-memory tally.
+**Priority**: Must Have
+**Story Points**: 8
+
+**Acceptance Criteria**:
+- **Given** a story parked `NEEDS_ATTENTION`/`FAILED`/`BLOCKED`/`AWAITING_APPROVAL` whose
+  `feature/<id>` work is provably present on `origin/main` **When** close-out reconciliation runs
+  **Then** that story is reclassified `DONE`, its `merge` stage row is recorded/updated to `DONE`,
+  and an audit event (`source="reconcile"`) names the winning signal and merge SHA.
+- **Given** reconciliation needs the latest remote state **When** it starts **Then** it runs
+  `git fetch origin` first, and a fetch failure (offline / no remote) degrades to a no-op skip —
+  reconciliation never raises and never fails an otherwise-good run.
+- **Given** landing detection across merge styles **When** it evaluates a story **Then** it treats
+  the story as landed if **any** of: `git merge-base --is-ancestor feature/<id> origin/main`;
+  `git cherry origin/main feature/<id>` reports nothing left to apply (patch-id equivalence —
+  squash/rebase-resilient, catches transitive/stacked landings); `gh pr view <pr_number> --json
+  state` is `MERGED`; or `origin/main` contains a commit whose message matches the mandated
+  `(#<story_id>)` tag.
+- **Given** a story already `DONE`/`SKIPPED` **When** reconciliation runs **Then** it is left
+  untouched (no redundant work, no duplicate merge row).
+- **Given** reconciliation finishes **When** the run terminal is computed **Then** it is computed
+  from the reconciled per-story statuses, so a run whose every story landed reports `DONE`.
+- **Given** reconciliation is re-run on an already-reconciled run **When** it executes **Then** it
+  is idempotent — no status flips, no duplicate stage rows, only a "nothing to reconcile" event.
+
+**Technical Notes**: New module `controller/src/sdlc/reconcile.py` exposing
+`reconcile_run(ledger, run_id, root=None, fetch=True) -> ReconcileResult`. Reuse `_base_ref`,
+`_git`, and the branch-existence guard pattern from `story_commit_exists` in `build.py`. Note
+`story_commit_exists` only counts commits *ahead of* base (`rev-list --count base..branch`) and so
+cannot detect already-landed work — that is the gap; the `--is-ancestor`/`git cherry`/`gh pr view`/
+grep-tag combination closes it. Persist via existing `Ledger.set_story_status`,
+`stage_start`/`stage_finish` (to synthesize the `merge` DONE row that `rollback._story_merged` and
+`compute_resume_plan` key off), and `Ledger.event_log`. No new schema column. Wire the call in
+`run_build` after the cohort loop and **before** the close-out tally.
+
+**Definition of Done**:
+- [ ] Combines `--is-ancestor` + `git cherry` patch-id + `gh pr view` state + `(#<id>)` tag-in-`origin/main`; any one ⇒ landed
+- [ ] `git fetch` first; offline/no-remote degrades to no-op; never raises, never fails the run
+- [ ] Reclassifies parked stories to `DONE`, synthesizes/updates the `merge` DONE row, logs an audit event with winning signal + SHA
+- [ ] Run terminal recomputed from reconciled statuses at close-out
+- [ ] Idempotent on re-run; already-`DONE`/`SKIPPED` stories untouched
+- [ ] Tests: squash landing, fast-forward landing, transitive/stacked landing, PR-merged-but-branch-deleted, genuinely-unlanded (stays parked), offline no-op, idempotent re-run
+- [ ] Docs updated (`docs/controller-architecture.md` close-out / reconciliation section)
+
+**Dependencies**: None (shares `build.py` close-out with 12.3-004 and 12.4-001 — serialize)
+**Risk Level**: High
+
+##### Story 12.3-002: Standalone `sdlc reconcile` command for after-the-fact recovery
+**User Story**: As FX whose overnight run aborted (e.g. a 429) before its already-open PRs were
+merged by hand the next morning, I want a `sdlc reconcile` command that re-checks the run against
+`origin/main` and corrects the ledger, so that a run which truly shipped no longer shows FAILED
+days later.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a finished or interrupted run **When** I invoke `sdlc reconcile [run] [--db PATH]`
+  **Then** it runs the same `reconcile_run` algorithm as close-out (12.3-001), reclassifies any
+  stories whose work landed, recomputes and re-stamps the run terminal, and prints a human summary
+  (e.g. "reclassified 3 story(ies) to DONE; run ced08c0f FAILED → DONE").
+- **Given** no run id is passed **When** `sdlc reconcile` runs **Then** it targets the most recent
+  run (mirrors `rollback`'s default), and `ensure_migrated()` runs first so a stale ledger does not
+  crash with "no such column".
+- **Given** a run where nothing changed **When** I reconcile **Then** it reports "nothing to
+  reconcile" and exits 0 (idempotent, safe to re-run).
+- **Given** no ledger / no such run **When** I reconcile **Then** it reports cleanly (non-zero only
+  on a genuinely unknown explicit run id), never creating a spurious empty DB.
+
+**Technical Notes**: Add a `reconcile` Typer command in `controller/src/sdlc/cli.py` modeled on
+`rollback`: construct `Ledger(db or default_db_path())`, `ledger.ensure_migrated()`, then call the
+shared `reconcile_run` from 12.3-001 and print `ReconcileResult`. Per this epic's "no new CLI
+verbs" non-goal: this is a **recovery verb** in the same spirit as the existing `resume`/`rollback`
+recovery surface (the manual counterpart to the automatic close-out reconciliation), not new
+orchestration — call that out so it does not read as scope creep.
+
+**Definition of Done**:
+- [ ] `sdlc reconcile [run] [--db]` calls the shared `reconcile_run`, defaults to latest run, migrates first
+- [ ] Human summary of reclassifications + run-status transition; idempotent "nothing to reconcile"
+- [ ] No-DB / unknown-run handled cleanly; no spurious ledger created
+- [ ] Tests: 429-aborted-then-merged fixture reconciles FAILED → DONE; idempotent re-run; default-to-latest
+- [ ] Docs: recovery-verbs reference notes `reconcile` alongside `resume`/`rollback`
+
+**Dependencies**: 12.3-001 (reuses `reconcile_run`)
+**Risk Level**: Medium
+
+##### Story 12.3-003: High-risk-blocked merge becomes a distinct `AWAITING_APPROVAL` state
+**User Story**: As FX, I want a merge blocked only by the high-risk human-approval gate to be
+parked in a distinct `AWAITING_APPROVAL` state that does not burn the bugfix loop and does not
+mark the run FAILED, so that a run waiting on my approval is reported honestly as awaiting-human
+rather than as a failure.
+**Priority**: Must Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** the merge agent returns `BLOCKED_HIGH_RISK` (PR carries `risk:high` from
+  `risk_gate.py`/`.github/workflows/risk-gate.yml`, no `risk-approved` label or `risk-approver`
+  review) **When** the controller classifies the merge outcome **Then** it recognizes "blocked
+  awaiting human approval" as a distinct outcome — **not** a generic stage failure — and does
+  **not** enter the bugfix loop (which cannot self-approve and would only exhaust into FAILED).
+- **Given** a story whose merge is high-risk-blocked **When** `_run_story` returns **Then** it
+  returns `AWAITING_APPROVAL`, the story row is set `AWAITING_APPROVAL`, and the committed work /
+  open PR is preserved (R10).
+- **Given** a run whose only non-DONE stories are `AWAITING_APPROVAL` **When** close-out computes
+  the run terminal **Then** the run is `AWAITING_APPROVAL` (a non-FAILED, non-DONE bucket), never
+  `FAILED`; dependency-blocking follows the existing `NEEDS_ATTENTION` rule.
+- **Given** the human later approves and the PR merges **When** `sdlc reconcile` (12.3-002) or a
+  subsequent close-out runs **Then** the `AWAITING_APPROVAL` story reconciles to `DONE` and the run
+  terminal is recomputed.
+- **Given** epic-14 14.1-003's `PAUSED`/`RATE_LIMITED` **When** these states coexist **Then**
+  `AWAITING_APPROVAL` is orthogonal (waiting for a *person* vs. waiting for *time*); neither is
+  FAILED, and reconciliation never reclassifies a `PAUSED` run as FAILED.
+
+**Technical Notes**: The merge schema enum is only `MERGED|FAILED|SKIPPED`
+(`merge-agent-response.schema.json`) and the agent maps `BLOCKED_HIGH_RISK → FAILED` today, so the
+signal is lost before the controller sees it. Two coordinated changes: (1) surface the block —
+prefer an **additive** `block_reason` field / text-line detection in `_dispatch_stage` /
+`_stage_failure_summary` returning a new `kind="awaiting_approval"`, over re-enumerating the schema
+(per the epic's "don't redefine the result contract" non-goal); (2) in `_run_story`, short-circuit
+that kind to `return "AWAITING_APPROVAL"` **before** the `MAX_BUGFIX_ATTEMPTS` path, bypassing
+`_run_bugfix`. Add `AWAITING_APPROVAL` to `_TERMINAL_RUN_STATES` and the finalize logic; ensure
+status-snapshot counts, `list_runs`, and the dashboard tolerate the new string.
+
+**Definition of Done**:
+- [ ] `BLOCKED_HIGH_RISK` recognized as a distinct outcome, not a generic stage failure
+- [ ] No bugfix-loop entry for a high-risk block; story returns `AWAITING_APPROVAL`; work/PR preserved (R10)
+- [ ] Run terminal supports `AWAITING_APPROVAL` (non-FAILED); added to `_TERMINAL_RUN_STATES` and finalize logic
+- [ ] Composes with epic-14 `PAUSED`/`RATE_LIMITED` (no FAILED reclassification of paused runs); reconcile flips approved-and-merged back to DONE
+- [ ] Status/dashboard render the new state
+- [ ] Tests: high-risk block → AWAITING_APPROVAL (no bugfix dispatch); run terminal not FAILED; reconcile-after-approval → DONE
+- [ ] Docs: failure-handling + states reference
+
+**Dependencies**: 12.3-001 (reconcile flips it to DONE after approval). Coordinates run-state
+vocabulary with epic-14 14.1-003 — reference, do not duplicate.
+**Risk Level**: High
+
+##### Story 12.3-004: Single shared run-finalization helper (dedupe build.py + resume.py)
+**User Story**: As a maintainer, I want the run-terminal computation and close-out to live in one
+place so that the reconciliation step and the new `AWAITING_APPROVAL` state cannot drift between
+the `build` and `resume` code paths.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** the close-out logic duplicated in `build.py` and `resume.py` **When** this story lands
+  **Then** both call a single `finalize_run(ledger, run_id, status_map, ...)` helper that computes
+  the terminal (including `AWAITING_APPROVAL`), recomputes counts, logs the finish event, and
+  stamps `run_update_status` — so the two paths can never diverge again.
+- **Given** the shared helper **When** it runs **Then** it invokes reconciliation (12.3-001) at one
+  defined point so both `build` and `resume` reconcile identically, and the existing
+  `BuildResult`/`ResumeResult` shapes are unchanged.
+- **Given** existing behavior **When** no stories landed unexpectedly **Then** terminal outcomes for
+  already-passing runs are unchanged (pure refactor for the DONE/FAILED cases).
+
+**Technical Notes**: Factor the identical close-out blocks (`build.py` terminal computation +
+counts/event/status/registry; the mirror in `resume.py`) into one helper, likely in `build.py`
+beside `_exhausted_status` or in the new `reconcile.py`. Keep `_registry_finish` callable from the
+build path only (resume has no registry arg today) — parameterize it. This is the backward-compat
+safety story: it removes the duplicated-finalization hazard.
+
+**Definition of Done**:
+- [ ] One `finalize_run` helper used by both `run_build` and `run_resume`
+- [ ] Reconcile + `AWAITING_APPROVAL` handled once, no divergence
+- [ ] Existing `BuildResult`/`ResumeResult` fields and DONE/FAILED outcomes unchanged for passing runs
+- [ ] Tests assert build and resume produce identical terminals for the same final story map
+- [ ] Docs note the single finalize point
+
+**Dependencies**: 12.3-001, 12.3-003 (the new semantics it consolidates). Serialize with 12.3-001 (both touch `build.py` close-out).
+**Risk Level**: Medium
+
+### Feature 12.4: Branch Isolation
+
+Fixing reconciliation makes the ledger *eventually* honest; fixing branch-stacking makes it
+*immediately* honest, so a genuinely-incomplete story FAILS instead of silently riding a later
+story's merge onto `main`.
+
+#### Stories
+
+##### Story 12.4-001: Cut every story branch from `origin/main` and reposition HEAD between stories
+**User Story**: As FX, I want each story's `feature/<id>` branch to be cut from a fresh
+`origin/main` and the working directory returned to `main` between stories, so that a parked/failed
+story's commits never stack under the next story and transitively ship to `main` unnoticed —
+making each story's outcome isolated and honest.
+**Priority**: Must Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** the build prompt instructs branch creation **When** it renders **Then** it cuts from
+  the remote base — `git fetch origin && git checkout -b feature/<id> origin/main` — instead of the
+  current base-less `git checkout -b feature/{id}`, so a branch never stacks on whatever HEAD
+  happened to be.
+- **Given** a story finishes (DONE, FAILED, NEEDS_ATTENTION, AWAITING_APPROVAL) and the agent left
+  the working dir on a feature branch (the merge agent only returns to `main` on its success path)
+  **When** the controller moves to the next story/cohort **Then** the controller repositions HEAD to
+  `main`/`origin/main` (the run and resume loops do this today — they currently never touch HEAD).
+- **Given** a story that genuinely did not complete **When** the run finishes **Then** its work is
+  **not** present on `origin/main` (no transitive landing), so reconciliation (12.3-001) correctly
+  leaves it parked and the run honestly reflects the incomplete story — explicitly accept this
+  tension: branch-from-main means real failures now FAIL rather than silently ship, and
+  reconciliation is what still rescues work that *truly* landed.
+- **Given** committed-but-unmerged work on a parked feature branch **When** HEAD is repositioned
+  **Then** that branch and its commits are preserved (R10) — repositioning never deletes a feature
+  branch or its commits.
+- **Given** the shared-working-dir model (dispatch has no `cwd`/worktree today) **When** this ships
+  **Then** it works without worktrees; full per-story worktree isolation is deferred to epic-17
+  17.2-001/17.2-002 and referenced, not duplicated here.
+
+**Technical Notes**: Edit `render_build_prompt` in `build.py` to `git fetch origin` +
+`git checkout -b feature/{story.id} origin/main`. Add a controller-side HEAD reposition (a
+`_git(root, "checkout", base)` using `_base_ref`/`_git`) between stories in the `run_build` cohort
+loop and the `run_resume` loop, best-effort and non-fatal. Root cause recap: agents share one
+working dir (no `cwd` in `dispatch.py`); the merge agent exits on the feature branch for
+parked/blocked/conflict paths, so the next story's base-less `git checkout -b` stacks on the
+leftover branch and a later successful merge transitively lands the earlier parked commits — which
+the ledger never reconciled (the gap 12.3-001 also covers).
+
+**Definition of Done**:
+- [ ] Build prompt cuts `feature/<id>` from `origin/main` after a fetch
+- [ ] Controller repositions HEAD to `main` between stories/cohorts in both `run_build` and `run_resume`
+- [ ] Parked/failed feature branches and their commits preserved (R10); no branch deletion
+- [ ] Regression test: a story that fails before merge does not appear on `origin/main`; a later successful story does not transitively land it
+- [ ] References epic-17 17.2-001/002 for worktree isolation as the follow-on
+- [ ] Docs: branch-model / source-control reference updated
+
+**Dependencies**: None to ship; pairs with 12.3-001 (reconcile preserves truly-landed work once
+stacking is fixed). Shares `build.py` with 12.3-001/12.3-004 — serialize. Forward-references
+epic-17 17.2-001/002.
+**Risk Level**: High
+
 ## Story Dependencies (within Epic-12)
 
 ```
@@ -252,11 +508,20 @@ add a new `sdlc migrate` verb — apply automatically at launch.
 12.2-001 (renderer integrity)   independent
 12.2-002 (commit-msg lint)      independent
 12.2-003 (auto-migrate at launch) independent
+
+12.3-001 (reconcile core) ──┬─ 12.3-002 (sdlc reconcile verb)   reuses reconcile_run
+                            ├─ 12.3-003 (AWAITING_APPROVAL)      reconcile flips to DONE post-approval
+                            └─ 12.3-004 (shared finalize)        consolidates 001+003 close-out
+12.4-001 (branch-from-main) ── pairs with 12.3-001; independent to ship
 ```
 
 - **Cohort 1** (no cross-deps): 12.1-001, 12.2-001, 12.2-002, 12.2-003 can run concurrently;
   12.1-002 shares files with 12.1-001, so serialize those two (or run 12.1-002 after 12.1-001).
   (12.2-003 also touches `build.py`/CLI entry points — serialize with 12.1-001/12.1-002 if run together.)
+- **Feature 12.3/12.4**: 12.3-001 has no deps; 12.3-002/003/004 depend on it. 12.3-001, 12.3-004,
+  and 12.4-001 all touch `build.py` close-out / run loop — **serialize them** (do not build
+  concurrently). 12.3-003 coordinates run-state vocabulary with **epic-14 14.1-003**
+  (`PAUSED`/`RATE_LIMITED`); 12.4-001 forward-references **epic-17 17.2-001/002** (worktree isolation).
 
 ## Epic Complete When
 
@@ -267,4 +532,12 @@ add a new `sdlc migrate` verb — apply automatically at launch.
   `build`/`dashboard`, and runaway tests are timeout-bounded.
 - The progress renderer preserves non-ledger history and re-renders idempotently.
 - Agent-authored commits are commitlint-compliant before they reach a PR.
+- A run whose work actually landed on `origin/main` reports DONE — automatically at close-out and
+  via `sdlc reconcile` after the fact — instead of FAILED requiring manual ledger reconciliation.
+- A merge blocked only by the high-risk human gate reports `AWAITING_APPROVAL`, not FAILED, and
+  never burns the bugfix loop; it reconciles to DONE once approved and merged.
+- Story branches are cut from `origin/main` and HEAD is repositioned between stories, so a
+  parked/failed story never transitively lands on `main` — failures are isolated and honest.
+- The build and resume paths share one run-finalization helper, so terminal-status logic cannot
+  drift between them.
 - Source issue [#72](https://github.com/fxmartin/claude-code-config/issues/72) can be closed.
