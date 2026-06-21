@@ -1675,6 +1675,23 @@ def run_build(
             status[story.id] = outcome
             ledger.set_story_status(run_id, story.id, outcome)
 
+    # --- Reconcile against origin/main before the close-out tally (12.3-001) -
+    # A story whose PR genuinely merged may be parked in-memory (a 429, a manual
+    # merge, a transitive landing). Reconciliation verifies each parked story
+    # against origin/main and flips the truly-landed ones to DONE so the run
+    # terminal reflects reality. Only on real runs (it does network/git I/O);
+    # injected fakes — the controller's own orchestration tests — skip it, exactly
+    # like the recursion guard above. It never raises and never fails a good run.
+    if dispatcher is None:
+        try:
+            from sdlc.reconcile import reconcile_run
+
+            recon = reconcile_run(ledger, run_id, root=Path.cwd(), fetch=True)
+            for item in recon.reclassified:
+                status[item["story_id"]] = "DONE"
+        except Exception:  # belt-and-suspenders: never fail an otherwise-good run
+            pass
+
     # --- Phase 3: close out --------------------------------------------------
     completed = sum(1 for v in status.values() if v == "DONE")
     failed = sum(1 for v in status.values() if v == "FAILED")
