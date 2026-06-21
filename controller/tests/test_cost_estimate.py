@@ -10,9 +10,12 @@ import pytest
 from sdlc.build import (
     BuildOptions,
     Ledger,
+    _reconcile_estimate,
+    _result_total_tokens,
     parse_build_args,
     run_build,
 )
+from sdlc.dispatch import AgentResult
 from sdlc.cost_estimate import (
     DEFAULT_STAGE_FACTOR,
     DEFAULT_STAGE_FACTORS,
@@ -450,3 +453,130 @@ def test_resumed_auto_build_does_not_trip_interactive_gate(tmp_path: Path) -> No
     ledger = Ledger(db)
     statuses = {r["story_id"]: r["status"] for r in ledger.story_rows(result.run_id)}
     assert all(v == "DONE" for v in statuses.values()), statuses
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation guards: no-op when there is no estimate / no agent usage
+# ---------------------------------------------------------------------------
+
+def test_result_total_tokens_none_when_usage_all_none() -> None:
+    # A usage envelope present but with every token component absent (e.g. a
+    # plain-text custom agent that still attached an empty usage dict) reads as
+    # None — reconciliation is skipped, not compared against a misleading zero.
+    result = AgentResult(agent_type="build", data={}, raw="", usage={})
+    assert _result_total_tokens(result) is None
+
+
+def test_result_total_tokens_sums_present_components() -> None:
+    result = AgentResult(
+        agent_type="build", data={}, raw="",
+        usage={"input_tokens": 10, "output_tokens": 5,
+               "cache_read_input_tokens": None, "cache_creation_input_tokens": 2},
+    )
+    assert _result_total_tokens(result) == 17
+
+
+def test_reconcile_estimate_noop_without_estimate() -> None:
+    # No estimate → return immediately, never touching the ledger (so passing
+    # None for the ledger is safe and proves the early-out is taken).
+    _reconcile_estimate(None, "run-x", "s1-001", "build", None, None)
+
+
+# ---------------------------------------------------------------------------
+# Cost-gate close-out renders the run view when one is wired (build + resume)
+# ---------------------------------------------------------------------------
+
+def test_cost_gate_close_out_renders_view(tmp_path: Path) -> None:
+    # When a render_view is supplied, the interactive cost-gate close-out renders
+    # the paused run so the terminal reflects the IN_PROGRESS state at the halt.
+    from sdlc.discovery import discover_queue
+
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-66-sample.md").write_text(_GATE_EPIC, encoding="utf-8")
+    db = tmp_path / ".sdlc-state.db"
+    queue = discover_queue("epic-66", tmp_path)
+    opts = BuildOptions(
+        scope="epic-66", skip_preflight=True, sequential=True, auto=False,
+        cost_estimate_threshold=1,
+    )
+    seen: list[str] = []
+    result = run_build(
+        opts, queue=queue, ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), preflight=lambda: True,
+        render_view=seen.append,
+    )
+    assert result.cost_gated is True
+    assert result.run_id in seen
+
+
+def test_resume_cost_gate_renders_view(tmp_path: Path) -> None:
+    # The resume cost-gate close-out renders the run view too when re-gated.
+    from sdlc.resume import run_resume
+
+    db, result = _build_cost_gated(tmp_path)
+    seen: list[str] = []
+    resumed = run_resume(
+        "epic-66", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        render_view=seen.append,
+    )
+    assert resumed.cost_gated is True
+    assert result.run_id in seen
+
+
+# ---------------------------------------------------------------------------
+# CLI surfacing: cost-gate report + --cost-threshold parse error
+# ---------------------------------------------------------------------------
+
+def test_cli_build_reports_cost_gate(tmp_path: Path, monkeypatch) -> None:
+    # A cost-gated build is not "clean": the CLI reports the pause and exits 1 so
+    # a wrapping script knows to raise --cost-threshold and resume.
+    from typer.testing import CliRunner
+
+    import sdlc.build as build_mod
+    from sdlc.build import BuildResult
+    from sdlc.cli import app
+
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-66-sample.md").write_text(_GATE_EPIC, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    def _fake_run_build(opts, **kwargs):
+        return BuildResult(completed=0, run_id="run-x", cost_gated=True)
+
+    monkeypatch.setattr(build_mod, "run_build", _fake_run_build)
+    result = CliRunner().invoke(app, ["build", "epic-66", "--cost-threshold=1"])
+    assert result.exit_code == 1, result.output
+    assert "cost gate reached" in result.output
+
+
+def test_cli_resume_invalid_cost_threshold_errors(tmp_path: Path, monkeypatch) -> None:
+    # A malformed --cost-threshold is rejected with exit 2 before any resume work.
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["resume", "epic-66", "--cost-threshold=-1"])
+    assert result.exit_code == 2, result.output
+    assert "error:" in result.output
+
+
+def test_cli_resume_reports_cost_gate(tmp_path: Path, monkeypatch) -> None:
+    # An un-raised resume re-trips the gate; the CLI reports it and exits 1.
+    from typer.testing import CliRunner
+
+    import sdlc.resume as resume_mod
+    from sdlc.cli import app
+    from sdlc.resume import ResumeResult
+
+    monkeypatch.chdir(tmp_path)
+
+    def _fake_run_resume(scope, **kwargs):
+        return ResumeResult(run_id="run-x", cost_gated=True)
+
+    monkeypatch.setattr(resume_mod, "run_resume", _fake_run_resume)
+    result = CliRunner().invoke(app, ["resume", "epic-66"])
+    assert result.exit_code == 1, result.output
+    assert "cost gate still in effect" in result.output
