@@ -322,6 +322,7 @@ merged to `main`, and both of which required manual ledger reconciliation by han
 #### Stories
 
 ##### Story 12.3-001: Reconcile story status against origin/main
+**Status**: Done (run `7df64f19`; reconcile core shipped as `73fdaf2` via PR #93)
 **User Story**: As FX running unattended builds, I want the controller to verify against
 `origin/main` whether each story's work actually landed before it computes the run's terminal
 status, so that a run whose PRs genuinely merged reports DONE instead of FAILED/NEEDS_ATTENTION
