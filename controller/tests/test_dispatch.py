@@ -166,6 +166,74 @@ def test_dispatch_error_envelope_rate_limit_raises_rate_limit_error(monkeypatch)
         dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
 
 
+def test_dispatch_structured_429_envelope_raises_rate_limit_error(monkeypatch) -> None:
+    # Issue #109: the CLI rejects a dispatch with a *successful* exit but an error
+    # envelope carrying structured 429 fields. This must be recognised as a
+    # recoverable rate-limit pause, not a generic build error.
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "api_error_status": 429,
+        "error": "rate_limit",
+        "result": "You've hit your session limit · resets 8:20pm (Europe/Luxembourg)",
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(RateLimitError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert isinstance(exc.value, AgentDispatchError)
+
+
+def test_dispatch_error_field_rate_limit_without_status_raises(monkeypatch) -> None:
+    # Issue #109: ``error == "rate_limit"`` alone (no api_error_status) is a throttle.
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "error": "rate_limit",
+        "result": "throttled",
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(RateLimitError):
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+
+
+def test_dispatch_structured_429_unparseable_reset_no_crash(monkeypatch) -> None:
+    # Issue #109: a structured 429 whose result text has no parseable reset must
+    # still raise RateLimitError with reset_at=None (the wait uses the window).
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "api_error_status": 429,
+        "result": "rejected, try later",
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(RateLimitError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert exc.value.signal.reset_at is None
+
+
+def test_dispatch_non_429_error_envelope_stays_plain_error(monkeypatch) -> None:
+    # Issue #109 regression guard: a non-rate-limit error envelope must NOT be
+    # misclassified as a throttle.
+    envelope = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "subtype": "error_max_turns",
+        "result": "hit the turn limit",
+    })
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(envelope)
+    )
+    with pytest.raises(AgentDispatchError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert not isinstance(exc.value, RateLimitError)
+
+
 def test_dispatch_uses_default_agent_cmd(monkeypatch) -> None:
     """When no agent_cmd is given a sensible default (claude CLI) is used.
 

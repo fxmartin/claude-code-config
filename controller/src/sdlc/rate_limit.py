@@ -26,6 +26,10 @@ _RATE_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\busage limit reached\b", re.I),
     re.compile(r"\bquota (?:exceeded|exhausted|reached)\b", re.I),
     re.compile(r"\btoo many requests\b", re.I),
+    # Issue #109: the claude CLI's 5-hour session cap wording ("You've hit your
+    # session limit · resets 8:20pm"). No explicit retry-after → "usage-limit".
+    re.compile(r"\bsession limit\b", re.I),
+    re.compile(r"\bhit your .*\blimit\b", re.I),
 )
 
 # Explicit backoff hint the API surfaces a few ways: an HTTP ``Retry-After: 120``
@@ -35,9 +39,11 @@ _RATE_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
 _RETRY_AFTER = re.compile(r"retry[\s_-]?after['\"]?\s*[:=]\s*['\"]?(\d+)", re.I)
 
 # Some surfaces carry an absolute window-reset epoch (e.g. the
-# ``anthropic-ratelimit-*-reset`` family). When present it is preferred over a
-# relative retry-after because it survives clock skew between dispatch and wait.
-_RESET_AT = re.compile(r"(?:ratelimit[\w-]*reset|reset[\s_-]?at)['\"]?\s*[:=]\s*['\"]?(\d+)", re.I)
+# ``anthropic-ratelimit-*-reset`` family, or the CLI's camelCase ``resetsAt``
+# from a rate_limit_event stream line — issue #109). When present it is preferred
+# over a relative retry-after because it survives clock skew between dispatch and
+# wait. The optional ``s`` matches both ``reset_at`` and ``resetsAt``.
+_RESET_AT = re.compile(r"(?:ratelimit[\w-]*reset|reset(?:s)?[\s_-]?at)['\"]?\s*[:=]\s*['\"]?(\d+)", re.I)
 
 
 @dataclass(frozen=True)

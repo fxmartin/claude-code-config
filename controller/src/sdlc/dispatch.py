@@ -565,7 +565,17 @@ def _interpret(
             )
             # Story 14.1-003: an error envelope whose subtype/text names a rate
             # limit is the same recoverable pause as a non-zero exit.
+            # Issue #109: the CLI rejects a dispatch with a *successful* exit but
+            # an error envelope carrying structured 429 fields
+            # (``api_error_status``/``error``). Treat that as a definitive
+            # rate-limit signal even when the human ``result`` text is not
+            # recognised, preferring a structured reset epoch when surfaced.
             signal = detect_rate_limit(str(detail))
+            if signal is None and (
+                envelope.get("api_error_status") == 429
+                or envelope.get("error") == "rate_limit"
+            ):
+                signal = RateLimitSignal(source="usage-limit")
             if signal is not None:
                 raise RateLimitError(
                     f"{agent_type} agent hit the rate limit: {detail}",

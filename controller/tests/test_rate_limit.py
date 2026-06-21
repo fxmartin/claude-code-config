@@ -54,6 +54,24 @@ def test_detect_reset_at_epoch() -> None:
     assert sig.reset_at == 1700000000.0
 
 
+def test_detect_session_limit_phrase() -> None:
+    # Issue #109: the CLI wording for the 5-hour session cap was not matched, so
+    # a 429 fell through to a generic dispatch error → false story FAILED.
+    sig = detect_rate_limit(
+        "You've hit your session limit · resets 8:20pm (Europe/Luxembourg)"
+    )
+    assert sig is not None
+    assert sig.source == "usage-limit"
+
+
+def test_detect_reset_at_camelcase_resets_at() -> None:
+    # Issue #109: the rate_limit_event stream line carries the camelCase
+    # ``resetsAt`` epoch key, which the original ``reset[_-]?at`` regex missed.
+    sig = detect_rate_limit("rate_limit_info resetsAt:1782066000")
+    assert sig is not None
+    assert sig.reset_at == 1782066000.0
+
+
 # ---------------------------------------------------------------------------
 # seconds_until_reset — prefer retry-after, then reset_at, else full window
 # ---------------------------------------------------------------------------
