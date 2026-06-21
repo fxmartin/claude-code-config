@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.43.0] - 2026-06-21
+
+### Added
+
+- feat(controller-robustness): parse intended dependency edges (#12.5-001)
+
+
 ## [v1.42.0] - 2026-06-21
 
 ### Added
