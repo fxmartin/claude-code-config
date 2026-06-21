@@ -18,7 +18,13 @@ from sdlc.build import (
 )
 from sdlc.resume import run_resume
 
+from typer.testing import CliRunner
+
+from sdlc.cli import app
+
 from test_build import FakeDispatcher, _SAMPLE_STAGE_TOKENS, _sample_queue
+
+runner = CliRunner()
 
 # Each story runs build+coverage+review+merge under the fake dispatcher, so a
 # fully-built story accrues four sample stages' worth of tokens.
@@ -295,3 +301,172 @@ def test_resume_with_raised_budget_completes_run(tmp_path: Path) -> None:
     statuses = {r["story_id"]: r["status"] for r in ledger.story_rows(result.run_id)}
     assert all(v == "DONE" for v in statuses.values()), statuses
     assert ledger.run_row(result.run_id)["status"] == "DONE"
+
+
+def test_resume_budget_policy_override_aborts_paused_run(tmp_path: Path) -> None:
+    # An explicit --budget-policy=abort on resume overrides the persisted policy:
+    # the un-raised resume re-trips the ceiling and now stamps the run terminal
+    # instead of re-pausing it.
+    db, result = _build_paused(tmp_path)
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        budget_policy="abort",
+    )
+    assert resumed.budget_stopped is True
+    assert resumed.budget_policy == "abort"
+    ledger = Ledger(db)
+    # Abort is terminal — the run is no longer resumable.
+    assert ledger.run_row(result.run_id)["status"] == "ABORTED"
+    assert ledger.latest_resumable_run("epic-88") is None
+
+
+def test_resume_repause_invokes_render_view(tmp_path: Path) -> None:
+    # The budget-stop close-out on resume regenerates the progress view.
+    db, result = _build_paused(tmp_path)
+    rendered: list[str] = []
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        render_view=rendered.append,
+    )
+    assert resumed.budget_stopped is True
+    assert rendered == [result.run_id]
+
+
+# ---------------------------------------------------------------------------
+# Multi-cohort dependency chain — the budget stop must skip remaining cohorts
+# ---------------------------------------------------------------------------
+
+_CHAINED_EPIC = """# Epic 77
+
+##### Story 77.1-001: One
+**Priority**: P1
+**Points**: 1
+**Dependencies**: None.
+
+##### Story 77.1-002: Two
+**Priority**: P1
+**Points**: 1
+**Dependencies**: Story 77.1-001.
+
+##### Story 77.1-003: Three
+**Priority**: P1
+**Points**: 1
+**Dependencies**: Story 77.1-002.
+"""
+
+
+def _build_paused_chained(tmp_path: Path):
+    """Build the dependency-chained epic-77 so it pauses after the first cohort."""
+    from sdlc.discovery import discover_queue
+
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-77-sample.md").write_text(_CHAINED_EPIC, encoding="utf-8")
+    db = tmp_path / ".sdlc-state.db"
+    queue = discover_queue("epic-77", tmp_path)
+    assert len(queue) == 3
+    opts = BuildOptions(scope="epic-77", skip_preflight=True, budget=10_000)
+    result = run_build(
+        opts, queue=queue, ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), preflight=lambda: True,
+    )
+    assert result.budget_stopped is True
+    assert result.completed == 1
+    return db, result
+
+
+def test_resume_repause_skips_remaining_cohorts(tmp_path: Path) -> None:
+    # With a dependency chain the queue splits into three serial cohorts. A
+    # re-paused resume trips the ceiling in the second cohort and must break out
+    # of the cohort loop entirely rather than fall through to the third.
+    db, result = _build_paused_chained(tmp_path)
+    dispatcher = FakeDispatcher()
+    resumed = run_resume(
+        "epic-77", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path
+    )
+    assert resumed.budget_stopped is True
+    assert resumed.resumed == 0  # nothing dispatched — over the ceiling
+    assert dispatcher.calls == []
+    ledger = Ledger(db)
+    statuses = {r["story_id"]: r["status"] for r in ledger.story_rows(result.run_id)}
+    # Only the first cohort's story is DONE; the rest stay TODO (never dispatched).
+    assert statuses["77.1-001"] == "DONE"
+    assert statuses["77.1-002"] == "TODO"
+    assert statuses["77.1-003"] == "TODO"
+
+
+# ---------------------------------------------------------------------------
+# run_build close-out: registry + render_view side-effects on a budget stop
+# ---------------------------------------------------------------------------
+
+def test_budget_abort_marks_registry_finished(tmp_path: Path) -> None:
+    # An abort-policy budget stop reconciles the registry record to ABORTED so
+    # the multi-run overview never shows the halted run as still live.
+    from sdlc.registry import Registry
+
+    db = tmp_path / "ledger.db"
+    registry = Registry(tmp_path / "registry.json")
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True,
+        budget=10_000, budget_policy="abort",
+    )
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), preflight=lambda: True,
+        registry=registry,
+    )
+    assert result.budget_stopped is True
+    records = registry.records()
+    assert len(records) == 1
+    assert records[0].status == "ABORTED"
+    assert records[0].finished_at
+
+
+def test_budget_close_out_invokes_render_view(tmp_path: Path) -> None:
+    # The run_build budget close-out regenerates the markdown progress view.
+    db = tmp_path / "ledger.db"
+    rendered: list[str] = []
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True, budget=10_000,
+    )
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), preflight=lambda: True,
+        render_view=rendered.append,
+    )
+    assert result.budget_stopped is True
+    assert rendered == [result.run_id]
+
+
+# ---------------------------------------------------------------------------
+# CLI surface: `sdlc resume --budget / --budget-policy`
+# ---------------------------------------------------------------------------
+
+def test_cli_resume_rejects_malformed_budget(tmp_path: Path, monkeypatch) -> None:
+    # A non-numeric --budget is a usage error (exit 2) with an actionable message.
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["resume", "epic-88", "--budget=notanumber"])
+    assert result.exit_code == 2
+    assert "error" in result.output.lower()
+
+
+def test_cli_resume_rejects_invalid_budget_policy(tmp_path: Path, monkeypatch) -> None:
+    # An unknown --budget-policy is a usage error (exit 2) before any work runs.
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["resume", "epic-88", "--budget-policy=halt"]
+    )
+    assert result.exit_code == 2
+    assert "pause|abort" in result.output
+
+
+def test_cli_resume_reports_budget_stop(tmp_path: Path, monkeypatch) -> None:
+    # End-to-end CLI: a budget-paused run re-pauses on `sdlc resume` (the ceiling
+    # trips pre-dispatch so no real agent runs), prints the notional-$ summary,
+    # and exits non-zero because the run did not finish cleanly.
+    db, _result = _build_paused(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["resume", "epic-88", "--db", str(db)])
+    assert result.exit_code == 1
+    assert "budget ceiling crossed" in result.output
+    assert "not billed on subscription" in result.output
