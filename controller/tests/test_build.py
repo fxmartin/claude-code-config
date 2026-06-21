@@ -824,6 +824,95 @@ def test_run_build_with_fakes_ignores_sentinel(tmp_path, monkeypatch) -> None:
     assert result.completed == 3
 
 
+# ---------------------------------------------------------------------------
+# Close-out reconciliation wiring (Story 12.3-001)
+# ---------------------------------------------------------------------------
+
+
+def test_run_build_applies_reconcile_reclassifications(tmp_path, monkeypatch) -> None:
+    """A real run flips a parked-but-landed story to DONE via reconciliation.
+
+    The story's build keeps failing (parked FAILED), but reconciliation (faked
+    here — it does real git I/O in production) finds its work landed on
+    origin/main and reclassifies it. The close-out tally must then read DONE, so
+    the run terminal is DONE rather than FAILED.
+    """
+    db = tmp_path / "ledger.db"
+
+    failing = FakeDispatcher(
+        overrides={
+            ("build", "s1-002"): {
+                "branch_name": "feature/s1-002",
+                "build_status": "FAILED",
+                "commit_sha": "0",
+                "error_summary": "nope",
+            },
+            ("bugfix", "s1-002"): {
+                "failure_category": "CODE_BUG",
+                "fix_status": "UNFIXED",
+                "tests_passing": False,
+                "bugs_fixed": 0,
+                "tests_fixed": 0,
+            },
+        }
+    )
+    # dispatcher is None → the real-run reconcile branch fires; route dispatch
+    # through the fake so no subprocess agents spawn.
+    monkeypatch.setattr("sdlc.build.dispatch_agent", failing)
+
+    from sdlc.reconcile import ReconcileResult
+
+    calls: list[tuple] = []
+
+    def fake_reconcile(ledger, run_id, root=None, fetch=True):
+        calls.append((run_id, fetch))
+        ledger.set_story_status(run_id, "s1-002", "DONE")
+        return ReconcileResult(
+            run_id=run_id,
+            reclassified=[
+                {"story_id": "s1-002", "from_status": "FAILED",
+                 "signal": "is-ancestor", "sha": "cafef00d"}
+            ],
+            run_status_before="FAILED",
+            run_status_after="DONE",
+            fetched=True,
+        )
+
+    monkeypatch.setattr("sdlc.reconcile.reconcile_run", fake_reconcile)
+
+    # s1-003 depends on s1-001 (which succeeds) so it is not blocked by s1-002.
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=None,
+        preflight=lambda: True,
+    )
+
+    assert calls and calls[0][1] is True  # reconcile ran with fetch=True
+    assert result.failed == 0
+    assert result.story_status["s1-002"] == "DONE"
+    run_status = _open(db).execute("SELECT status FROM runs").fetchone()[0]
+    assert run_status == "DONE"
+
+
+def test_run_build_skips_reconcile_under_injected_dispatcher(tmp_path, monkeypatch) -> None:
+    """Injected fakes (orchestration tests) must not trigger reconcile's git I/O."""
+    def _boom(*_a, **_k):
+        raise AssertionError("reconcile must not run when a dispatcher is injected")
+
+    monkeypatch.setattr("sdlc.reconcile.reconcile_run", _boom)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    assert result.completed == 3
+
+
 def test_dry_run_skips_preflight(tmp_path) -> None:
     """A dry run is plan-only — it must not run the preflight gate."""
     def _boom() -> bool:

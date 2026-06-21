@@ -50,7 +50,7 @@ next morning. Robustness is what makes "fire-and-forget overnight" actually safe
 
 ## Epic Scope
 
-**Total Stories**: 10 | **Total Points**: 40 | **MVP Stories**: 0 (roadmap — primary defect is Must Have)
+**Total Stories**: 12 | **Total Points**: 46 | **MVP Stories**: 0 (roadmap — primary defect is Must Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -262,6 +262,54 @@ add a new `sdlc migrate` verb — apply automatically at launch.
 11.2-007's `wave`/`dependencies` migration safe on pre-existing ledgers.
 **Risk Level**: Medium
 
+##### Story 12.2-004: Generate compliant commit subjects
+**User Story**: As FX, I want the controller to ensure every agent commit subject is
+commitlint-compliant by construction — not dependent on an agent transcribing a long, Title-Case
+story title — so that autonomous runs do not stall on commit-format re-asks and a malformed
+re-ask cannot park otherwise-good work `NEEDS_ATTENTION`.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a build/coverage/bugfix agent prepares a commit **When** the controller commits it
+  **Then** the subject is commitlint-compliant by construction (header ≤ 72 incl. the
+  `type(scope):` prefix, lower-case subject, no trailing period) — the controller normalizes the
+  proposed subject (lower-case the initial letter, trim to the length budget, strip a trailing
+  period) rather than relying on the agent transcribing the story title verbatim.
+- **Given** a story whose title is long or Title-Case (e.g. the Feature 12.3/12.4 titles)
+  **When** its commit is created **Then** the resulting subject still passes commitlint (the raw
+  title is never used as the subject).
+- **Given** the common case **When** a build runs **Then** the commit passes the gate on the
+  first attempt and no re-ask is dispatched (compliant by construction, not by retry).
+- **Given** a commit-format re-ask is still needed **When** it is dispatched **Then** it routes
+  through the same envelope-recovery path as other stages (12.1-001), so a malformed re-ask
+  response (e.g. missing `branch_name`, as in run `7df64f19`) is recovered/retried rather than
+  dead-ending the story into `NEEDS_ATTENTION`.
+- **Given** an agent already emits a compliant subject **When** normalization runs **Then** it is
+  left unchanged (no regression; idempotent).
+
+**Technical Notes**: Story 12.2-002 added commitlint-at-commit with a bounded re-ask
+(`controller/src/sdlc/commitlint.py`, `build.py`). The remaining gap: build agents derive the
+subject from the story title (`render_build_prompt`), which is frequently > 72 chars and
+Title-Case, so commitlint rejects it and the run depends on the re-ask succeeding — and the
+re-ask can itself fail on a malformed envelope (run `7df64f19`: "commit-lint re-ask dispatch
+failed: ... missing required field 'branch_name'"). Fix at the source: have the controller
+normalize/derive a compliant subject before committing (and/or have the build prompt supply the
+`type(scope):` prefix and mandate a short imperative lower-case subject), and route the
+commit-format re-ask through `_reask`/envelope recovery (12.1-001) so a bad re-ask response is
+recovered. References 12.2-002 (extends it) and 12.1-001 (envelope recovery).
+
+**Definition of Done**:
+- [ ] Commit subjects compliant by construction (length, case, no trailing period); raw story title never used as the subject
+- [ ] Common case passes the gate first time (no re-ask needed)
+- [ ] Commit-format re-ask routes through envelope recovery; a malformed re-ask response is recovered, not parked
+- [ ] Already-compliant subjects unchanged (idempotent)
+- [ ] Tests: long/Title-Case title → compliant subject; malformed re-ask envelope → recovered; idempotent on compliant input
+- [ ] Docs updated (commit-format reference + failure-handling section)
+
+**Dependencies**: 12.2-002
+**Risk Level**: Medium
+
 ### Feature 12.3: Honest Run-Terminal Status
 
 A run's terminal status must reflect what actually landed on `origin/main`, not an in-memory
@@ -273,7 +321,7 @@ merged to `main`, and both of which required manual ledger reconciliation by han
 
 #### Stories
 
-##### Story 12.3-001: Reconcile per-story status against `origin/main` before computing run terminal
+##### Story 12.3-001: Reconcile story status against origin/main
 **User Story**: As FX running unattended builds, I want the controller to verify against
 `origin/main` whether each story's work actually landed before it computes the run's terminal
 status, so that a run whose PRs genuinely merged reports DONE instead of FAILED/NEEDS_ATTENTION
@@ -325,7 +373,7 @@ grep-tag combination closes it. Persist via existing `Ledger.set_story_status`,
 **Sequencing**: shares `build.py` close-out with 12.3-004 / 12.4-001 — serialize (do not build concurrently)
 **Risk Level**: High
 
-##### Story 12.3-002: Standalone `sdlc reconcile` command for after-the-fact recovery
+##### Story 12.3-002: Add the sdlc reconcile recovery verb
 **User Story**: As FX whose overnight run aborted (e.g. a 429) before its already-open PRs were
 merged by hand the next morning, I want a `sdlc reconcile` command that re-checks the run against
 `origin/main` and corrects the ledger, so that a run which truly shipped no longer shows FAILED
@@ -363,7 +411,7 @@ orchestration — call that out so it does not read as scope creep.
 **Dependencies**: 12.3-001 (reuses `reconcile_run`)
 **Risk Level**: Medium
 
-##### Story 12.3-003: High-risk-blocked merge becomes a distinct `AWAITING_APPROVAL` state
+##### Story 12.3-003: Add the AWAITING_APPROVAL merge state
 **User Story**: As FX, I want a merge blocked only by the high-risk human-approval gate to be
 parked in a distinct `AWAITING_APPROVAL` state that does not burn the bugfix loop and does not
 mark the run FAILED, so that a run waiting on my approval is reported honestly as awaiting-human
@@ -413,7 +461,7 @@ status-snapshot counts, `list_runs`, and the dashboard tolerate the new string.
 vocabulary with epic-14 14.1-003 — reference, do not duplicate.
 **Risk Level**: High
 
-##### Story 12.3-004: Single shared run-finalization helper (dedupe build.py + resume.py)
+##### Story 12.3-004: Share one run-finalization helper
 **User Story**: As a maintainer, I want the run-terminal computation and close-out to live in one
 place so that the reconciliation step and the new `AWAITING_APPROVAL` state cannot drift between
 the `build` and `resume` code paths.
@@ -455,7 +503,7 @@ story's merge onto `main`.
 
 #### Stories
 
-##### Story 12.4-001: Cut every story branch from `origin/main` and reposition HEAD between stories
+##### Story 12.4-001: Cut story branches from origin/main
 **User Story**: As FX, I want each story's `feature/<id>` branch to be cut from a fresh
 `origin/main` and the working directory returned to `main` between stories, so that a parked/failed
 story's commits never stack under the next story and transitively ship to `main` unnoticed —
@@ -506,6 +554,64 @@ stacking is fixed). Shares `build.py` with 12.3-001/12.3-004 — serialize. Forw
 epic-17 17.2-001/002.
 **Risk Level**: High
 
+### Feature 12.5: Discovery & Scheduling Robustness
+
+Protect the controller's *input* path — parsing epic markdown into the build
+queue — so a benignly-worded story file cannot crash scheduling.
+
+#### Stories
+
+##### Story 12.5-001: Parse only intended dependency edges
+**User Story**: As FX authoring epic stories, I want discovery to read only the intended
+dependency edges from a story's `**Dependencies**:` line, so that story IDs mentioned in
+explanatory prose are not parsed as edges and cannot create a phantom dependency cycle that
+crashes cohort scheduling and aborts the build.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a `**Dependencies**:` line that lists real edge IDs followed by parenthetical or
+  sentence prose mentioning other story IDs (e.g. `**Dependencies**: 12.3-001 (reconcile flips
+  it once 12.3-004 lands)`) **When** discovery parses it **Then** only the leading edge id(s)
+  are extracted (`12.3-001`), and IDs inside the prose (`12.3-004`) are ignored.
+- **Given** a line beginning with `None` followed by prose containing IDs (e.g.
+  `None (shares build.py with 12.3-004 and 12.4-001)`) **When** parsed **Then** the story has
+  zero dependencies — no prose IDs become edges.
+- **Given** the existing terse Dependencies lines across every current epic file **When** parsed
+  **Then** each story's resolved edge set is unchanged (regression-locked by a fixture test that
+  parses all `docs/stories/epic-*.md`).
+- **Given** the verbose Dependencies lines that crashed `sdlc build epic-12` (the 12.3/12.4
+  stories, used as real fixtures) **When** parsed and scheduled **Then** `compute_cohorts`
+  resolves with no phantom cycle.
+- **Given** a Dependencies line whose *intended* edges genuinely form a cycle or reference an
+  out-of-queue story **When** `compute_cohorts` runs **Then** the controller still fails fast
+  with the existing clear, story-named error — the parser fix must not mask real cycles.
+
+**Technical Notes**: Root cause in `controller/src/sdlc/discovery.py`: `_DEPENDENCIES`
+(`^\*\*Dependencies\*\*:\s*(.+?)\s*$`) captures the whole line and `_DEP_ID.findall(...)`
+extracts every `X.Y-NNN` anywhere on it (regexes ~lines 16-18; used ~lines 108-111). Constrain
+edge extraction to the intended list — e.g. only scan the segment before the first `(` or
+sentence delimiter, treat a leading `none`/`n/a`/`tbd` as empty, and accept only a leading
+comma/whitespace-separated run of bare IDs. Keep it permissive enough not to regress today's
+terse lines. Add unit tests using the actual verbose 12.3-001 / 12.4-001 prose as fixtures, plus
+a guard test that parses every `docs/stories/epic-*.md` and asserts no story resolves an edge to
+an ID that only appears in prose. Document the convention in the story-authoring reference
+("Dependencies line = leading ID list or `None`; put rationale on a separate `Sequencing` line").
+This is the root-cause fix for the symptom hot-patched in PR #92 (which only terse-ified the one
+offending 12.3-001 line). Keep/strengthen the `cohort.py` cycle error message (it already names
+members) — but the parser is the root cause.
+
+**Definition of Done**:
+- [ ] Edge extraction limited to the intended leading ID list; prose IDs ignored; leading `None` → no deps
+- [ ] Terse Dependencies lines across all existing epics parse to unchanged edge sets (regression test)
+- [ ] The verbose 12.3/12.4 lines parse and schedule without a phantom cycle (fixture test)
+- [ ] Genuine cycles / out-of-queue edges still fail fast with the story-named error
+- [ ] Tests in the controller suite (90% gate); discovery parser branches covered
+- [ ] Story-authoring convention documented (Dependencies line vs Sequencing note)
+
+**Dependencies**: None
+**Risk Level**: Low
+
 ## Story Dependencies (within Epic-12)
 
 ```
@@ -514,11 +620,14 @@ epic-17 17.2-001/002.
 12.2-001 (renderer integrity)   independent
 12.2-002 (commit-msg lint)      independent
 12.2-003 (auto-migrate at launch) independent
+12.2-004 (compliant commit subjects) extends 12.2-002 (shipped) — independent to build
 
 12.3-001 (reconcile core) ──┬─ 12.3-002 (sdlc reconcile verb)   reuses reconcile_run
                             ├─ 12.3-003 (AWAITING_APPROVAL)      reconcile flips to DONE post-approval
                             └─ 12.3-004 (shared finalize)        consolidates 001+003 close-out
 12.4-001 (branch-from-main) ── pairs with 12.3-001; independent to ship
+
+12.5-001 (dependency-line parser) ── independent, no deps
 ```
 
 - **Cohort 1** (no cross-deps): 12.1-001, 12.2-001, 12.2-002, 12.2-003 can run concurrently;
@@ -546,4 +655,7 @@ epic-17 17.2-001/002.
   parked/failed story never transitively lands on `main` — failures are isolated and honest.
 - The build and resume paths share one run-finalization helper, so terminal-status logic cannot
   drift between them.
+- A story's `**Dependencies**:` line cannot create a phantom cycle from prose-mentioned IDs —
+  discovery parses only the intended edges, so a benignly-worded story file never crashes
+  cohort scheduling.
 - Source issue [#72](https://github.com/fxmartin/claude-code-config/issues/72) can be closed.

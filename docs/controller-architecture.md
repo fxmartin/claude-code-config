@@ -119,6 +119,48 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    NEEDS_ATTENTION counts as not-done: the dependency's work is committed but
    unmerged (parked for manual push/MR or a commit-message fix), so a dependent
    built on top of it would race incomplete work.
+9. **Close-out reconciliation** — after the cohort loop and **before** the
+   terminal tally, `run_build` (real runs only — injected fakes skip it, like the
+   recursion guard) calls `reconcile.reconcile_run` to re-check every parked
+   story against the remote. The in-memory tally can lag reality: a PR that
+   merged after a 429, by hand the next morning, or transitively as part of a
+   stacked PR leaves a story parked even though its work shipped. Reconciliation
+   verifies the truth on `origin/main` and corrects the ledger so the run
+   terminal reports DONE instead of a stale FAILED/NEEDS_ATTENTION. See
+   [Reconciliation](#reconciliation-against-originmain) below.
+
+## Reconciliation against origin/main
+
+`reconcile.reconcile_run(ledger, run_id, root=None, fetch=True)` reconciles a
+run's parked stories against the remote and recomputes its terminal. It is the
+shared engine behind both automatic close-out (above) and the manual recovery
+verb (`sdlc reconcile`, Story 12.3-002 — the counterpart to `resume`/`rollback`).
+
+- **Scope.** Only stories parked `NEEDS_ATTENTION`/`FAILED`/`BLOCKED`/
+  `AWAITING_APPROVAL` are candidates; already-`DONE`/`SKIPPED` stories are left
+  untouched (no redundant work, no duplicate `merge` row). When no story is
+  parkable, it is a no-op and never touches the network.
+- **Fetch first, degrade offline.** It runs `git fetch origin` before inspecting
+  refs. A fetch failure (offline / no remote) degrades to a **no-op skip** — it
+  never raises and never fails an otherwise-good run, because stale local refs
+  can't be trusted to reflect what landed.
+- **Landing detection** treats a story as landed if **any** signal fires
+  (complementary across merge styles, closing the gap that `story_commit_exists`
+  — which only counts commits *ahead of* base — cannot):
+  - `git merge-base --is-ancestor feature/<id> origin/main` (fast-forward /
+    merge-commit landings);
+  - `git cherry origin/main feature/<id>` reports nothing left to apply
+    (patch-id equivalence — rebase / single-commit squash / transitive-stacked);
+  - `gh pr view <pr> --json state` is `MERGED` (PR merged, branch deleted);
+  - `origin/main` carries a commit whose message holds the mandated
+    `(#<story_id>)` tag (multi-commit squash, where patch-id no longer matches).
+- **Effect.** A landed story is set `DONE`, a DONE `merge` stage row is
+  recorded/updated (the signal `rollback._story_merged` and `compute_resume_plan`
+  key off), and a `source="reconcile"` audit event names the winning signal and
+  merge SHA. The run terminal is then recomputed from the reconciled per-story
+  statuses.
+- **Idempotent.** A re-run over an already-reconciled run produces no status
+  flips and no duplicate rows — only a "nothing to reconcile" event.
 
 ## Why schema validation is the safety boundary
 
