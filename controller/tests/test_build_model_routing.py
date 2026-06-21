@@ -211,3 +211,86 @@ def test_parse_routing_off_is_default() -> None:
     opts = parse_build_args(["epic-14"])
     assert opts.model_profile == ""
     assert opts.model_overrides == {}
+
+
+def test_parse_rejects_overrides_for_unrouted_stages() -> None:
+    """discovery / adversarial are dispatched outside this pipeline — overriding
+    their model here would be a silent no-op, so the parse rejects it."""
+    import pytest
+
+    for stage in ("discovery", "adversarial"):
+        with pytest.raises(ValueError, match="unknown stage"):
+            parse_build_args([f"--model-{stage}=opus"])
+
+
+def test_parse_accepts_recovery_stage_overrides() -> None:
+    opts = parse_build_args(["--model-bugfix=opus", "--model-reask=haiku"])
+    assert opts.model_overrides == {"bugfix": "opus", "reask": "haiku"}
+
+
+# ---------------------------------------------------------------------------
+# Recovery stages (bugfix / reask) receive routed models
+# ---------------------------------------------------------------------------
+
+
+class _BugfixRecordingDispatcher:
+    """Fails build once, then records the model of every dispatched agent.
+
+    Records each call as (agent_type, model) so the bugfix agent's routed model
+    can be asserted distinctly from the build agent's.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+        self._build_seen = 0
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        self.calls.append((agent_type, kwargs.get("model")))
+        if agent_type == "build":
+            self._build_seen += 1
+            if self._build_seen == 1:
+                return AgentResult(
+                    agent_type="build",
+                    data={"branch_name": "feature/x", "build_status": "FAILED",
+                          "error_summary": "boom"},
+                    raw="",
+                )
+        if agent_type == "bugfix":
+            return AgentResult(
+                agent_type="bugfix",
+                data={"failure_category": "TEST_BUG", "fix_status": "FIXED",
+                      "tests_passing": True, "bugs_fixed": 1, "tests_fixed": 0},
+                raw="",
+            )
+        return AgentResult(agent_type=agent_type, data=_PAYLOADS[agent_type], raw="")
+
+
+def test_bugfix_stage_receives_routed_model(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    disp = _BugfixRecordingDispatcher()
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced",
+    )
+    run_build(
+        opts, queue=[_story(points=1)], ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=disp, preflight=lambda: True,
+    )
+    bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
+    assert bugfix_models, "bugfix agent was never dispatched"
+    assert bugfix_models[0] == SONNET  # balanced 'bugfix' tier, not the CLI default
+
+
+def test_bugfix_override_wins_over_map(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    disp = _BugfixRecordingDispatcher()
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced", model_overrides={"bugfix": "haiku"},
+    )
+    run_build(
+        opts, queue=[_story(points=1)], ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=disp, preflight=lambda: True,
+    )
+    bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
+    assert bugfix_models[0] == HAIKU

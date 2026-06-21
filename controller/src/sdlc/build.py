@@ -2798,7 +2798,8 @@ def _run_story(
                 bugfix_seq += 1
                 bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
                 if not _run_bugfix(
-                    story, stage, failure, ledger, run_id, dispatch, bpath, bugfix_seq
+                    story, stage, failure, opts, ledger, run_id, dispatch,
+                    bpath, bugfix_seq,
                 ):
                     return _exhausted_status(kind, story.id, ledger, run_id)
                 # Story 12.2-002: the bugfix agent authors a commit too — lint its
@@ -2903,13 +2904,17 @@ def _make_progress_sink(
     return sink
 
 
-# Story 14.2-001: stages whose model the routing map may set. The four pipeline
-# stages plus the bugfix/reask recovery agents and the out-of-pipeline discovery
-# and adversarial slots — the names `select_model` keys off. A `--model-<stage>`
-# override is accepted only for these.
+# Story 14.2-001: the stages this controller actually dispatches and therefore
+# routes — the four pipeline stages plus the bugfix/reask recovery agents (all
+# go through the dispatch seam and receive a routed `--model`). A
+# `--model-<stage>` CLI override is accepted only for these, so an override for a
+# stage routing can't honour is a hard error rather than a silent no-op.
+# `discovery` and `adversarial` are dispatched outside this pipeline (the
+# discovery agent and the standalone adversarial-reviewer slot), so they are
+# deliberately excluded here even though the profile map still defines their
+# tiers for `select_model` / the adversarial Opus pin.
 _ROUTABLE_STAGES = frozenset(
-    {"discovery", "build", "coverage", "review", "adversarial", "merge",
-     "bugfix", "reask"}
+    {"build", "coverage", "review", "merge", "bugfix", "reask"}
 )
 
 # Story 14.2-001: stages whose changed-files risk signal is *stable* at the
@@ -3178,10 +3183,14 @@ def _reask_envelope(
     )
     prompt = render_envelope_reask_prompt(stage, story, opts, pr_number)
     sink = _make_progress_sink(ledger, run_id, story.id, "reask", seq)
+    # Story 14.2-001: the envelope-only re-ask is cheap reformatting work, so it
+    # routes on the map's `reask` tier (its own override beats it) rather than the
+    # stage's — and never the unconfigured CLI default under an active profile.
+    model = _select_stage_model("reask", story, opts)
     try:
         result = dispatch(
-            stage, prompt, story=story, transcript_path=transcript_path,
-            on_progress=sink,
+            stage, prompt, story=story, model=model,
+            transcript_path=transcript_path, on_progress=sink,
         )
     except RateLimitError:
         # Story 14.1-003: a throttle during recovery is a pause, not a failed fix —
@@ -3345,6 +3354,7 @@ def _run_bugfix(
     story: Story,
     failed_stage: str,
     failure: str,
+    opts: BuildOptions,
     ledger: Ledger,
     run_id: str,
     dispatch: Dispatcher,
@@ -3364,10 +3374,14 @@ def _run_bugfix(
     out = str(transcript_path) if transcript_path is not None else ""
     prompt = render_bugfix_prompt(story, failed_stage, failure)
     sink = _make_progress_sink(ledger, run_id, story.id, "bugfix", attempt)
+    # Story 14.2-001: route the bugfix agent on the map's `bugfix` tier (its own
+    # override beats it) instead of the unconfigured CLI default. Per-attempt
+    # model escalation on retry is layered on later (Story 14.2-003).
+    model = _select_stage_model("bugfix", story, opts)
     try:
         result = dispatch(
-            "bugfix", prompt, story=story, transcript_path=transcript_path,
-            on_progress=sink,
+            "bugfix", prompt, story=story, model=model,
+            transcript_path=transcript_path, on_progress=sink,
         )
     except RateLimitError:
         # Story 14.1-003: a throttle during the bugfix dispatch is a pause, not a

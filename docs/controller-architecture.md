@@ -606,10 +606,18 @@ points threshold, or escalation model — mirroring `risk_gate.py`'s
 `.sdlc-risk-config.yaml` convention. A missing file is a silent no-op; a
 malformed one is a hard error.
 
-**Where the `--model` is applied.** `_dispatch_stage` calls
-`_select_stage_model(stage, story, opts)` and threads the result into
-`dispatch_agent(model=…)`, which appends `--model <model>` to the **default**
-command only. Precedence, highest first:
+**Where the `--model` is applied.** Every dispatch this controller makes routes:
+the four pipeline stages via `_dispatch_stage`, plus the two recovery agents —
+the envelope-only re-ask (`_reask_envelope`, on the map's `reask` tier) and the
+bugfix agent (`_run_bugfix`, on the `bugfix` tier; per-attempt escalation arrives
+in 14.2-003). Each calls `_select_stage_model(stage, story, opts)` and threads
+the result into `dispatch_agent(model=…)`, which appends `--model <model>` to the
+**default** command only. `_ROUTABLE_STAGES` — the stages a `--model-<stage>`
+override is accepted for — is exactly this routed set (`build`, `coverage`,
+`review`, `merge`, `bugfix`, `reask`); `discovery` and `adversarial` are
+dispatched outside this pipeline, so an override for them is a hard error rather
+than a silent no-op (the profile map still defines their tiers for `select_model`
+and the adversarial Opus pin). Precedence, highest first:
 
 1. an explicit per-stage `--model-<stage>=<model>` flag (the escape hatch);
 2. a `SDLC_AGENT_CMD` override — the custom command owns its own model, so the
