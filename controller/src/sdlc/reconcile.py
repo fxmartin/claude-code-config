@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sdlc.build import Ledger, _base_ref, _git
+from sdlc.build import _STAGES, Ledger, _base_ref, _git
 
 __all__ = ["ReconcileResult", "reconcile_run"]
 
@@ -61,6 +61,49 @@ def _gh_pr_state(pr_number: int, root: Path) -> str | None:
     if out.returncode != 0:
         return None
     return out.stdout.strip() or None
+
+
+def _gh_pr_for_landing(story_id: str, sha: str, root: Path) -> int | None:
+    """The merged PR behind a detected landing, or None.
+
+    Resolves the PR best-effort for landings where no ``pr_number`` was on file
+    (the is-ancestor / git-cherry / commit-tag detectors). It first searches the
+    story's own ``feature/<story_id>`` head ref — which is anchored to *this*
+    story and so cannot attach a sibling's PR — and only falls back to the
+    landing ``sha`` if that yields nothing. The sha fallback matters because some
+    signals (git-cherry / gh-pr-merged) hand us the *base tip* sha, whose
+    associated PR may belong to a sibling story; trying the head ref first keeps
+    that fallback from misattributing. Isolated so tests can monkeypatch it.
+
+    Best-effort and offline-safe: returns None — never raises — when ``gh`` is
+    absent, unauthenticated, offline, or no PR matches, so PR backfill simply
+    does not happen and the caller leaves ``pr_number`` as-is.
+    """
+    branch = f"feature/{story_id}"
+    searches = [f"head:{branch}"] + ([sha] if sha else [])
+    for query in searches:
+        try:
+            out = subprocess.run(
+                [
+                    "gh", "pr", "list", "--state", "merged", "--search", query,
+                    "--json", "number", "-q", ".[0].number", "--limit", "1",
+                ],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            continue
+        text = out.stdout.strip()
+        if text:
+            try:
+                return int(text)
+            except ValueError:
+                continue
+    return None
 
 
 def _rev(root: Path, ref: str) -> str:
@@ -175,6 +218,39 @@ def _ensure_merge_done(
         )
 
 
+def _ensure_stages_done(
+    ledger: Ledger, run_id: str, story_id: str, attempts: list[dict]
+) -> None:
+    """Terminalize the non-merge pipeline stages of a reconciled-DONE story.
+
+    A story that landed but parked may never have recorded a terminal attempt for
+    its intermediate ``build`` / ``coverage`` / ``review`` stages, so the
+    dashboard renders them ``PENDING`` forever on an otherwise-``DONE`` story
+    (#105). For each such stage lacking a DONE attempt we promote the latest
+    non-DONE attempt, or synthesize a fresh one marked ``output_path="reconcile"``
+    — mirroring :func:`_ensure_merge_done`. ``merge`` is left to that helper.
+
+    Idempotent: a stage that already has a DONE attempt is skipped (no duplicate
+    row), so a re-run over an already-reconciled story is a no-op.
+    """
+    for stage in _STAGES:
+        if stage == "merge":
+            continue
+        stage_attempts = [a for a in attempts if a.get("name") == stage]
+        if any(a.get("status") == "DONE" for a in stage_attempts):
+            continue
+        if stage_attempts:
+            attempt = max(int(a.get("attempt", 1)) for a in stage_attempts)
+            ledger.stage_finish(
+                run_id, story_id, stage, attempt, "DONE", output_path="reconcile"
+            )
+        else:
+            ledger.stage_start(run_id, story_id, stage, 1)
+            ledger.stage_finish(
+                run_id, story_id, stage, 1, "DONE", output_path="reconcile"
+            )
+
+
 def _compute_terminal(statuses: dict[str, str]) -> str:
     """The run terminal implied by per-story statuses (mirrors run_build).
 
@@ -263,7 +339,16 @@ def reconcile_run(
             continue
         signal, sha = landing
         ledger.set_story_status(rid, sid, "DONE")
-        _ensure_merge_done(ledger, rid, sid, breakdown.get(sid, []))
+        # Backfill the PR best-effort: keep an already-recorded number, else
+        # resolve the merged PR behind the landing via gh. A failed/empty lookup
+        # leaves pr_number as-is and never crashes (reconcile's contract).
+        if r.get("pr_number") is None:
+            pr = _gh_pr_for_landing(sid, sha, root)
+            if pr is not None:
+                ledger.set_story_pr(rid, sid, pr)
+        story_attempts = breakdown.get(sid, [])
+        _ensure_merge_done(ledger, rid, sid, story_attempts)
+        _ensure_stages_done(ledger, rid, sid, story_attempts)
         ledger.event_log(
             rid, sid, "info", "reconcile",
             f"reconciled {r.get('status')} → DONE via {signal}: "

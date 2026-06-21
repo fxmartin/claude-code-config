@@ -86,6 +86,17 @@ def _merge_done(db_path: Path, run_id: str, story_id: str) -> int:
     return sum(1 for a in rows if a["name"] == "merge" and a["status"] == "DONE")
 
 
+def _stage_done(db_path: Path, run_id: str, story_id: str, stage: str) -> int:
+    rows = Ledger(db_path).stage_breakdown(run_id).get(story_id, [])
+    return sum(1 for a in rows if a["name"] == stage and a["status"] == "DONE")
+
+
+def _pr_number(db_path: Path, run_id: str, story_id: str) -> int | None:
+    return {r["story_id"]: r["pr_number"] for r in Ledger(db_path).story_rows(run_id)}[
+        story_id
+    ]
+
+
 # --- fast-forward / merge-commit landing (is-ancestor) ----------------------
 
 
@@ -563,3 +574,283 @@ def test_compute_terminal_awaiting_approval_precedence() -> None:
     )
     # A failed story still dominates.
     assert _compute_terminal({"a": "AWAITING_APPROVAL", "b": "FAILED"}) == "FAILED"
+
+
+# --- #105: ledger left cosmetically incomplete after recovery ---------------
+
+
+def test_reconcile_terminalizes_intermediate_stages(tmp_path: Path) -> None:
+    """A landed-but-parked story has its build/coverage/review stages DONE.
+
+    The seed records DONE build+review but never coverage and never merge.
+    After reconcile flips the story to DONE, every non-merge pipeline stage must
+    carry a DONE attempt (the dashboard otherwise renders coverage as PENDING on
+    an otherwise-DONE story — #105).
+    """
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-030", new=True)
+    _commit(root, "s.py", "s = 1\n", "feat: s (#99.1-030)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-030")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-030", "FAILED", 130)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-030"]
+    assert _status(db, run_id, "99.1-030") == "DONE"
+    # coverage was never recorded by the seed → reconcile must synthesize a DONE.
+    assert _stage_done(db, run_id, "99.1-030", "coverage") == 1
+    # build / review were already DONE — still DONE, not duplicated.
+    assert _stage_done(db, run_id, "99.1-030", "build") == 1
+    assert _stage_done(db, run_id, "99.1-030", "review") == 1
+    assert _merge_done(db, run_id, "99.1-030") == 1
+    # The synthesized coverage row is marked with the reconcile output_path.
+    rows = Ledger(db).stage_breakdown(run_id)["99.1-030"]
+    cov = [a for a in rows if a["name"] == "coverage"]
+    assert cov and cov[0]["output_path"] == "reconcile"
+
+
+def test_reconcile_backfills_pr_via_gh_when_absent(tmp_path: Path, monkeypatch) -> None:
+    """A landing detected via is-ancestor (no PR on file) backfills the PR via gh.
+
+    The seed parks the story with pr_number=None. reconcile must resolve the PR
+    behind the landing sha through gh and persist it on the story row (#105).
+    """
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-031", new=True)
+    _commit(root, "t.py", "t = 1\n", "feat: t (#99.1-031)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-031")
+
+    monkeypatch.setattr(
+        "sdlc.reconcile._gh_pr_for_landing",
+        lambda story_id, sha, root: 131,
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-031", "FAILED", None)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-031"]
+    assert _pr_number(db, run_id, "99.1-031") == 131
+
+
+def test_reconcile_keeps_existing_pr_number(tmp_path: Path, monkeypatch) -> None:
+    """A story already carrying a PR keeps it; no gh lookup is needed."""
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-032", new=True)
+    _commit(root, "u.py", "u = 1\n", "feat: u (#99.1-032)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-032")
+
+    # If gh were consulted it would return a different number; assert it is not.
+    monkeypatch.setattr(
+        "sdlc.reconcile._gh_pr_for_landing",
+        lambda story_id, sha, root: 999,
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-032", "FAILED", 132)])
+
+    reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert _pr_number(db, run_id, "99.1-032") == 132
+
+
+def test_reconcile_pr_backfill_offline_safe(tmp_path: Path, monkeypatch) -> None:
+    """gh lookup failing (offline / gh absent) leaves pr_number null, no crash.
+
+    The story still reconciles to DONE and its stages are still terminalized —
+    PR backfill is strictly best-effort (#105).
+    """
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-033", new=True)
+    _commit(root, "v.py", "v = 1\n", "feat: v (#99.1-033)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-033")
+
+    monkeypatch.setattr(
+        "sdlc.reconcile._gh_pr_for_landing",
+        lambda story_id, sha, root: None,
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-033", "FAILED", None)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-033"]
+    assert _pr_number(db, run_id, "99.1-033") is None
+    assert _status(db, run_id, "99.1-033") == "DONE"
+    assert _stage_done(db, run_id, "99.1-033", "coverage") == 1
+
+
+def test_reconcile_stage_terminalization_idempotent(tmp_path: Path) -> None:
+    """Re-running reconcile adds no duplicate stage rows and does not re-flip."""
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-034", new=True)
+    _commit(root, "w.py", "w = 1\n", "feat: w (#99.1-034)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-034")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-034", "FAILED", 134)])
+
+    first = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+    assert len(first.reclassified) == 1
+    assert _stage_done(db, run_id, "99.1-034", "coverage") == 1
+
+    second = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+    assert second.reclassified == []
+    # Exactly one DONE coverage attempt after the re-run — no duplication.
+    assert _stage_done(db, run_id, "99.1-034", "coverage") == 1
+    assert _stage_done(db, run_id, "99.1-034", "build") == 1
+    assert _merge_done(db, run_id, "99.1-034") == 1
+
+
+def test_unlanded_story_stages_not_terminalized(tmp_path: Path, monkeypatch) -> None:
+    """A non-landed parked story is untouched: no PR backfill, no stage DONE.
+
+    Guards the #111 contract — an unlanded story must stay parked, and the #105
+    terminalization must never fire on it (no coverage DONE synthesized).
+    """
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-035", new=True)
+    _commit(root, "wip.py", "z = 3\n", "feat: wip (#99.1-035)")
+    _checkout(root, "main")  # never merged
+    monkeypatch.setattr("sdlc.reconcile._gh_pr_state", lambda pr_number, root: None)
+    monkeypatch.setattr(
+        "sdlc.reconcile._gh_pr_for_landing", lambda story_id, sha, root: 935
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-035", "FAILED", None)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert result.reclassified == []
+    assert _status(db, run_id, "99.1-035") == "FAILED"
+    assert _pr_number(db, run_id, "99.1-035") is None  # no backfill on a non-landing
+    assert _stage_done(db, run_id, "99.1-035", "coverage") == 0
+
+
+# --- _gh_pr_for_landing: direct unit coverage of error paths ----------------
+
+
+def test_gh_pr_for_landing_subprocess_error_returns_none(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """OSError/SubprocessError in gh call returns None without raising (lines 92-93)."""
+    from sdlc.reconcile import _gh_pr_for_landing
+
+    def _raise(*_a, **_k):
+        raise OSError("gh not found")
+
+    monkeypatch.setattr(reconcile_mod.subprocess, "run", _raise)
+    assert _gh_pr_for_landing("99.1-040", "abc1234", tmp_path) is None
+
+
+def test_gh_pr_for_landing_nonzero_continues_to_head_ref(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """First query returns non-zero; the second succeeds — PR resolved (lines 94-95)."""
+    from sdlc.reconcile import _gh_pr_for_landing
+
+    call_count = [0]
+
+    def _fake_run(*_a, **_k):
+        call_count[0] += 1
+        # First call (head: ref query) → fail; second call (sha fallback) → success.
+        if call_count[0] == 1:
+            return _FakeProc(1, "")
+        return _FakeProc(0, "142\n")
+
+    monkeypatch.setattr(reconcile_mod.subprocess, "run", _fake_run)
+    result = _gh_pr_for_landing("99.1-041", "deadbeef", tmp_path)
+    assert result == 142
+    assert call_count[0] == 2
+
+
+def test_gh_pr_for_landing_prefers_head_ref_over_sha(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The story-anchored head: ref is tried first, shadowing the sha fallback.
+
+    Guards against attaching a sibling's PR: a git-cherry / gh-pr-merged landing
+    hands us the *base tip* sha, whose associated PR may belong to another story.
+    The head: ref query resolves this story's own PR first, so the sha fallback
+    (which here would return a sibling's 777) is never consulted.
+    """
+    from sdlc.reconcile import _gh_pr_for_landing
+
+    seen_queries: list[str] = []
+
+    def _fake_run(cmd, *_a, **_k):
+        query = cmd[cmd.index("--search") + 1]
+        seen_queries.append(query)
+        if query.startswith("head:"):
+            return _FakeProc(0, "555\n")
+        return _FakeProc(0, "777\n")  # sibling PR behind the base-tip sha
+
+    monkeypatch.setattr(reconcile_mod.subprocess, "run", _fake_run)
+    result = _gh_pr_for_landing("99.1-044", "basetipsha", tmp_path)
+    assert result == 555
+    assert seen_queries == ["head:feature/99.1-044"]  # sha never queried
+
+
+def test_gh_pr_for_landing_invalid_number_continues_and_returns_none(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Non-integer stdout on all queries triggers ValueError continue → None (lines 98-101)."""
+    from sdlc.reconcile import _gh_pr_for_landing
+
+    monkeypatch.setattr(
+        reconcile_mod.subprocess, "run", lambda *_a, **_k: _FakeProc(0, "not-a-number\n")
+    )
+    assert _gh_pr_for_landing("99.1-042", "abc1234", tmp_path) is None
+
+
+# --- _ensure_stages_done: promote a non-DONE existing attempt ---------------
+
+
+def test_ensure_stages_done_promotes_non_done_attempt(tmp_path: Path) -> None:
+    """A stage with an existing FAILED attempt is promoted to DONE (lines 239-240).
+
+    Seeds build=FAILED (no DONE) and coverage/review absent.  After reconcile
+    the build attempt must be promoted (not synthesized fresh) — confirming the
+    ``if stage_attempts:`` branch in ``_ensure_stages_done`` fires.
+    """
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-043", new=True)
+    _commit(root, "promote.py", "p = 1\n", "feat: promote (#99.1-043)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-043")
+
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(
+        run_id, "99.1-043", "99", "promote", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    # Record a FAILED build attempt — exists but not DONE → _ensure_stages_done
+    # must promote it rather than synthesize a fresh one (lines 239-240).
+    ledger.stage_start(run_id, "99.1-043", "build", 1)
+    ledger.stage_finish(run_id, "99.1-043", "build", 1, "FAILED")
+    ledger.set_story_status(run_id, "99.1-043", "FAILED")
+    ledger.run_update_status(run_id, "FAILED")
+
+    result = reconcile_run(ledger, run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-043"]
+    assert _status(db, run_id, "99.1-043") == "DONE"
+    # build: FAILED attempt was promoted to DONE — exactly one DONE row.
+    assert _stage_done(db, run_id, "99.1-043", "build") == 1
+    # coverage / review had no prior attempts → synthesized fresh.
+    assert _stage_done(db, run_id, "99.1-043", "coverage") == 1
+    assert _stage_done(db, run_id, "99.1-043", "review") == 1
+    assert _merge_done(db, run_id, "99.1-043") == 1
