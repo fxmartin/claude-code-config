@@ -578,6 +578,72 @@ mistaken for actual spend (the dashboard, owned by Epic-11, renders the same
 label). With no `--budget` the path is byte-for-byte today's behaviour (the gate
 is skipped; `0` means "no ceiling", never "ceiling of zero").
 
+## Pre-dispatch cost estimate and warning (Story 14.1-002)
+
+Before each stage is dispatched the controller computes a lightweight **usage
+estimate**, records it on the stage row, and surfaces it — so an operator sees
+roughly what a stage will spend *before* it runs, and can gate expensive work.
+This is guidance only; the authoritative figure remains the post-stage
+`--output-format` usage envelope reconciled at completion.
+
+The estimator lives in `sdlc/cost_estimate.py`. `estimate_stage(stage, prompt,
+*, historical_tokens)` returns a `StageEstimate` (prompt tokens, projected total
+tokens, notional `$`, and a `calibrated` flag):
+
+- **Heuristic.** Prompt tokens are `len(prompt) // ~4` chars; the projected total
+  is `prompt_tokens × stage_factor`, where the per-stage factor (`build` 12×,
+  `merge` 3×, …) reflects how much a stage amplifies its prompt into output +
+  tool round-trips. The projection is floored at the prompt's own tokens.
+- **Calibration.** When the ledger already holds recorded usage for that stage,
+  `Ledger.historical_stage_tokens(stage)` (the average of past DONE attempts that
+  recorded usage) overrides the crude factor — the estimate self-improves as the
+  ledger fills, and the event is tagged `[calibrated from history]`.
+- **Notional `$`.** Tokens convert to dollars at the same notional rate as the
+  budget gate and render through `notional_cost_label`, so the `$` is never
+  mistaken for real spend on the subscription.
+
+`_estimate_stage_cost` (in `build.py`, called from `_run_story` before
+`_dispatch_stage`) renders the prompt, estimates, writes the estimate to the
+stage row via `Ledger.stage_set_estimate`, and logs a `pre-dispatch estimate`
+event. It is **best-effort**: any failure degrades to `None` and the stage
+dispatches exactly as today.
+
+**Threshold gate.** `sdlc build --cost-threshold=<N>` sets a per-stage token
+ceiling for the *estimate* (a `$` value is accepted and converted, like
+`--budget`). When an estimate crosses it (`_over_cost_threshold`):
+
+- in `--auto` the controller **warns and proceeds** (the warning names the
+  estimate, the threshold, and the notional `$`);
+- **interactively** (no `--auto`) it **gates before any spend** — the stage row
+  is finished `SKIPPED` with category `cost-gate`, the gated story is parked
+  `NEEDS_ATTENTION`, and no agent is dispatched (R10: no work started, nothing
+  discarded).
+
+A threshold of `0` (the default) means "no gate": the estimate is still computed
+and recorded, but never warns or gates — behaviour is otherwise unchanged.
+
+**Resumable, not a silent bypass.** The interactive gate pauses the *run*
+resumably — mirroring the budget pause, it raises an internal `_CostGatePause`
+that the cohort loop turns into a `cost_gated` close-out which leaves the run
+`IN_PROGRESS` (never a terminal status `latest_resumable_run` couldn't surface).
+The threshold is **persisted in the run config**, so `sdlc resume`
+**re-enforces** the same gate rather than rebuilding options with `threshold=0`
+and silently dispatching the stage the original run gated. To continue a gated
+story, raise or clear the gate on resume: `sdlc resume <scope> --cost-threshold=0`
+(disable) or `--cost-threshold=<higher>`. The persisted threshold + the SKIPPED
+(not DONE) gated-stage row mean the resumed run re-attempts exactly that stage.
+`--auto` is persisted alongside the threshold too, so a resumed auto run keeps
+its **warn-and-proceed** posture and never flips to interactive and wrongly gates
+a stage the original auto run would have run straight through.
+
+**Estimate-vs-actual reconciliation.** On a stage's successful completion,
+`_reconcile_estimate` compares the recorded estimate against the authoritative
+token total from the agent envelope and logs an `estimate reconciled: est ~X vs
+actual Y tokens (±Z%)` event. The persisted reconciliation is the
+`estimated_tokens`/`estimated_cost_usd` columns sitting alongside the actual
+usage columns on the same stage row (ledger Migration 3), which is also what
+feeds the next run's historical calibration.
+
 ## Per-task model routing (Story 14.2-001)
 
 Not every stage needs Opus. `sdlc build --model-routing=<profile>` dispatches

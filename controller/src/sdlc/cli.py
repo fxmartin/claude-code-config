@@ -94,6 +94,10 @@ Flags:
   --window=SEC              rolling rate-limit window length (default 18000 ≈ 5h)
   --rate-limit-threshold=F  pause at this fraction of the window budget
                             (default 1.0; <1 pauses near the limit)
+  --cost-threshold=N        per-stage pre-dispatch estimate ceiling; over it,
+                            --auto warns and proceeds, interactive gates the
+                            stage before spend. A $-value converts to a notional
+                            token ceiling; 0 = estimate only, no gate (default)
   --model-routing=PROFILE   per-stage model map: balanced | quality-first |
                             quota-max | off (default off = CLI default for all
                             stages). Balanced cuts quota burn; the adversarial
@@ -213,10 +217,17 @@ def build(ctx: typer.Context) -> None:
             f"rate limit reached{waited} — run parked RATE_LIMITED; `sdlc resume` "
             "continues it once the Max plan's window reopens."
         )
+    # Story 14.1-002: the interactive cost gate paused the run (resumable). Report
+    # it so a wrapper knows to raise --cost-threshold and resume.
+    if result.cost_gated:
+        typer.echo(
+            "cost gate reached — run paused IN_PROGRESS; raise --cost-threshold "
+            "and `sdlc resume` to continue the gated stage."
+        )
     # An AWAITING_APPROVAL run is honestly not a failure (Story 12.3-003), but it
     # still needs FX to act, so it is not "clean" — exit non-zero like
     # NEEDS_ATTENTION so a wrapping script never reads it as fully done. A
-    # budget-stopped or rate-limited run is likewise not fully done.
+    # budget-stopped, rate-limited, or cost-gated run is likewise not fully done.
     clean = (
         result.failed == 0
         and result.blocked == 0
@@ -224,6 +235,7 @@ def build(ctx: typer.Context) -> None:
         and result.awaiting_approval == 0
         and not result.budget_stopped
         and not result.rate_limited
+        and not result.cost_gated
     )
     raise typer.Exit(code=0 if clean else 1)
 
@@ -247,6 +259,12 @@ def resume(
     ),
     budget_policy: str | None = typer.Option(
         None, "--budget-policy", help="Override the budget policy: pause or abort.",
+    ),
+    cost_threshold: str | None = typer.Option(
+        None, "--cost-threshold",
+        help="Raise/override the per-stage cost-estimate gate (a $-value converts "
+        "to a notional token ceiling; 0 disables it). Pass this to continue a "
+        "story the gate parked.",
     ),
 ) -> None:
     """Resume an interrupted build from the SQLite ledger.
@@ -279,6 +297,13 @@ def resume(
             err=True,
         )
         raise typer.Exit(code=2)
+    cost_threshold_tokens: int | None = None
+    if cost_threshold is not None:
+        try:
+            cost_threshold_tokens, _ = _parse_budget_value(cost_threshold)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
 
     db_path = db or default_db_path()
     ledger = Ledger(db_path)
@@ -287,6 +312,7 @@ def resume(
     result = run_resume(
         scope, ledger=ledger, run_id=run, render_view=make_render_view(db_path),
         budget=budget_tokens, budget_policy=budget_policy,
+        cost_threshold=cost_threshold_tokens,
     )
 
     if result.nothing_to_resume:
@@ -321,6 +347,12 @@ def resume(
             "rate limit still in effect — run re-parked RATE_LIMITED; `sdlc resume` "
             "again once the Max plan's window reopens."
         )
+    # Story 14.1-002: an un-raised resume re-trips the cost gate (still IN_PROGRESS).
+    if result.cost_gated:
+        typer.echo(
+            "cost gate still in effect — run left IN_PROGRESS; raise "
+            "--cost-threshold further and `sdlc resume` to continue."
+        )
     clean = (
         result.failed == 0
         and result.blocked == 0
@@ -328,6 +360,7 @@ def resume(
         and result.awaiting_approval == 0
         and not result.budget_stopped
         and not result.rate_limited
+        and not result.cost_gated
     )
     raise typer.Exit(code=0 if clean else 1)
 
