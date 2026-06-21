@@ -76,6 +76,29 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    merge` (coverage is skipped under `--skip-coverage`). Each stage dispatches
    an agent and the response is validated against its schema *before* the next
    stage runs.
+
+   **Branch isolation (Story 12.4-001).** The build prompt
+   (`render_build_prompt`) cuts the story branch from a freshly-fetched remote
+   base — `git fetch origin && git checkout -b feature/<id> origin/main` — not
+   the base-less `git checkout -b feature/<id>`. Agents share one working dir
+   (`dispatch.py` has no per-call `cwd`/worktree yet — full worktree isolation is
+   deferred to epic-17 17.2-001/17.2-002), and the merge agent only returns HEAD
+   to `main` on its **success** path; on a parked/blocked/conflict path it leaves
+   the working dir on the story's feature branch. A base-less checkout would then
+   stack the next story on that leftover branch, so a later successful merge would
+   transitively land the earlier (parked) story's commits on `main` — leaving the
+   ledger out of sync with reality. To close the gap on both ends, `run_build` and
+   `run_resume` call `_reposition_head(root)` between stories (real runs only —
+   injected fakes skip it, like the close-out reconcile guard): it lands HEAD on
+   the **local** base branch (`main`/`master`) — stripping the `origin/` prefix
+   `_base_ref` yields so the working dir ends on a branch, not detached at
+   `origin/main` — regardless of where the merge agent left it. Repositioning is
+   best-effort and **never** deletes a
+   feature branch or its commits (R10): committed-but-unmerged work on a parked
+   branch is preserved. The deliberate tension this accepts: branch-from-`main`
+   means a genuinely-incomplete story now FAILS honestly instead of silently
+   shipping, and close-out reconciliation (step 9) is what still rescues work that
+   *truly* landed.
 5. **Envelope re-ask** — a stage that exits cleanly but omits or malforms its
    `<<<RESULT_JSON>>>` block (a `ContractError`) usually means the agent did good
    work and failed only to wrap it. Before any heavier recovery, the controller

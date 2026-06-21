@@ -12,6 +12,7 @@ from sdlc.build import (
     BuildOptions,
     Dispatcher,
     Ledger,
+    _reposition_head,
     _run_story,
     _run_terminal,
 )
@@ -240,6 +241,13 @@ def run_resume(
             status[story.id] = outcome
             ledger.set_story_status(rid, story.id, outcome)
             resumed += 1
+
+            # Story 12.4-001: reposition HEAD back to the base between stories so
+            # a parked story's leftover feature branch is never the base the next
+            # story stacks on. Real runs only (injected fakes operate on the
+            # test's cwd); best-effort and never fatal.
+            if dispatcher is None:
+                _reposition_head(root or Path.cwd())
 
     # --- close out (mirrors run_build phase 3) -------------------------------
     completed = sum(1 for v in status.values() if v == "DONE")
