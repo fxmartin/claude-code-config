@@ -2837,6 +2837,7 @@ def _run_story(
     *,
     done_stages: frozenset[str] = frozenset(),
     start_attempt: int = 1,
+    start_escalation: int = 0,
     pr_number: int | None = None,
     bugfix_seq: int = 0,
     rl_ctx: "_RateLimitContext | None" = None,
@@ -2869,7 +2870,11 @@ def _run_story(
     recorded DONE attempt and are skipped; ``start_attempt`` is the attempt
     number for the first stage actually run (continuing past a crashed attempt);
     ``pr_number`` / ``bugfix_seq`` carry forward the run's prior PR and bugfix
-    sequence. The defaults reproduce a fresh full build exactly.
+    sequence. ``start_escalation`` (Story 14.2-003) carries the cheap-first model
+    escalation level the first resumed stage had reached — the count of its prior
+    FAILED attempts — so a stage that had climbed to a stronger tier before an
+    interruption resumes on that tier rather than dropping back to its cheap base.
+    The defaults reproduce a fresh full build exactly.
     """
     stages = [s for s in _STAGES if not (s == "coverage" and opts.skip_coverage)]
     # Already-completed stages are skipped on resume; a fresh build skips none.
@@ -2894,6 +2899,14 @@ def _run_story(
         # Only the first resumed stage continues a prior attempt count; later
         # stages start fresh at attempt 1.
         attempt = start_attempt if idx == 0 else 1
+        # Story 14.2-003: the cheap-first escalation level for this stage is its
+        # prior FAILED-attempt count (carried only into the first resumed stage,
+        # 0 on a fresh run) plus any bugfix attempts spent in *this* process. So a
+        # stage that had already climbed a tier before an interruption resumes on
+        # that tier, while later stages and fresh runs start cheap. This is a
+        # display/routing offset only — the bounded bugfix budget (``bugfix_attempts``)
+        # is unchanged, preserving its existing per-resume reset semantics.
+        stage_escalation_base = start_escalation if idx == 0 else 0
         while True:
             ledger.stage_start(run_id, story.id, stage, attempt)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
@@ -2935,24 +2948,27 @@ def _run_story(
                         story_id=story.id, stage=stage, estimate=estimate
                     )
             # Story 14.2-003: the cheap-first escalation level for this dispatch is
-            # the count of bugfix attempts already spent on this stage — 0 on the
-            # first (cheap) pass, +1 per retry. A passing first attempt therefore
-            # never escalates (the common path stays cheap); only a stage that
-            # failed into the bugfix loop is retried one tier stronger.
-            if bugfix_attempts > 0:
+            # the bugfix attempts already spent on this stage — 0 on the first
+            # (cheap) pass, +1 per retry — plus any tier already reached before a
+            # resume (``stage_escalation_base``). A passing first attempt on a
+            # fresh run therefore never escalates (the common path stays cheap);
+            # only a stage that failed into the bugfix loop (or resumed mid-climb)
+            # is retried one tier stronger.
+            escalation_steps = stage_escalation_base + bugfix_attempts
+            if escalation_steps > 0:
                 esc_model = _select_stage_model(
-                    stage, story, opts, escalation_steps=bugfix_attempts
+                    stage, story, opts, escalation_steps=escalation_steps
                 )
                 ledger.event_log(
                     run_id, story.id, "info", "controller",
                     f"{stage} retry (attempt {attempt}) escalated to "
-                    f"model={esc_model or 'cli-default'} after {bugfix_attempts} "
-                    "bugfix attempt(s) (Story 14.2-003 cheap-first)",
+                    f"model={esc_model or 'cli-default'} after {escalation_steps} "
+                    "failed attempt(s) (Story 14.2-003 cheap-first)",
                 )
             try:
                 ok, result, failure, kind = _dispatch_stage(
                     stage, story, opts, pr_number, dispatch, tpath,
-                    on_progress=sink, escalation_steps=bugfix_attempts,
+                    on_progress=sink, escalation_steps=escalation_steps,
                 )
                 if ok:
                     ledger.stage_finish(
@@ -3057,7 +3073,8 @@ def _run_story(
                 bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
                 if not _run_bugfix(
                     story, stage, failure, opts, ledger, run_id, dispatch,
-                    bpath, bugfix_seq, escalation_steps=bugfix_attempts,
+                    bpath, bugfix_seq,
+                    escalation_steps=stage_escalation_base + bugfix_attempts,
                 ):
                     return _exhausted_status(kind, story.id, ledger, run_id)
                 # Story 12.2-002: the bugfix agent authors a commit too — lint its

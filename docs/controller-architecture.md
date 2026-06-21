@@ -741,6 +741,17 @@ success rate. Worked example on **Balanced** (`build` = Sonnet): first build on
 Sonnet fails → bugfix and the build retry both escalate to Opus. On **Quota-max**
 (`build` = Haiku) two failures walk the full ladder Haiku → Sonnet → Opus.
 
+The climb survives a resume. The escalation level is `start_escalation +
+bugfix_attempts`, where `start_escalation` is the resumed stage's prior
+FAILED-attempt count reconstructed from the ledger (`compute_resume_plan`). So a
+stage that had already climbed to a stronger tier before an interruption resumes
+on that tier rather than dropping back to its cheap base — mirroring the
+resume-determinism guarantee routing established in 14.2-001. Only **FAILED**
+attempts count: a crashed or rate-limited `IN_PROGRESS` attempt never escalated,
+so it never inflates the level. This is a routing offset only — the bounded
+`MAX_BUGFIX_ATTEMPTS` budget is untouched, keeping its existing per-resume reset
+semantics.
+
 ## Rate-limit / quota awareness with automatic resume (Story 14.1-003)
 
 On a Claude Max subscription the real overnight failure mode is not dollars (they
