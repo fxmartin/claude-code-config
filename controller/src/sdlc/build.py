@@ -162,7 +162,18 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     version in ``_migrations``. Identifiers come from the internal ``_MIGRATIONS``
     table (never user input), so the f-string interpolation is safe — SQLite
     cannot parametrise column/table names.
+
+    The bookkeeping ``_migrations`` table is created on the fly if missing:
+    ``init`` already creates it via the base DDL, but ``ensure_migrated`` runs
+    against a pre-existing ledger that may predate the migration framework
+    entirely (exactly the ledger Migration 1 targets), so this function cannot
+    assume the table exists.
     """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _migrations ("
+        "version INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+        "applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
     applied = {r[0] for r in conn.execute("SELECT version FROM _migrations").fetchall()}
     for version, name, table, columns in _MIGRATIONS:
         if version in applied:
@@ -272,6 +283,31 @@ class Ledger:
         """Create the ledger schema if absent, then apply migrations (idempotent)."""
         with self._connect() as conn:
             conn.executescript(_SCHEMA_DDL)
+            _apply_migrations(conn)
+
+    def ensure_migrated(self) -> None:
+        """Bring a *pre-existing* ledger up to the current schema (idempotent).
+
+        Unlike :meth:`init`, this never creates the schema: when the DB file is
+        absent it is a no-op, so a read/recovery verb launched against a
+        never-built repo does not leave behind a spurious empty ledger. When the
+        DB exists it opens a *writable* connection (a read-only connection cannot
+        ``ALTER TABLE``) and runs :func:`_apply_migrations`, so a verb that then
+        reads via :meth:`_connect_ro` can no longer crash with "no such column"
+        against a stale schema (e.g. a ledger predating a later migration).
+
+        Concurrent launches are safe. A busy timeout makes a second controller
+        wait out the brief writer lock, and ``BEGIN IMMEDIATE`` takes that lock
+        *before* the version check so the loser cannot slip an ``ALTER`` in
+        between our read of ``_migrations`` and our own ``ALTER`` (which would
+        otherwise raise "duplicate column name"); the version guard then makes
+        its pass a no-op.
+        """
+        if not self.db_path.exists():
+            return
+        with self._connect() as conn:
+            conn.execute("PRAGMA busy_timeout = 2000;")
+            conn.execute("BEGIN IMMEDIATE;")
             _apply_migrations(conn)
 
     def run_create(self, scope: str, mode: str) -> str:

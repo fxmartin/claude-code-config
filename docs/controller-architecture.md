@@ -116,6 +116,41 @@ read-model (`docs/stories/.build-progress.md`) is regenerated from the ledger
 via `sdlc-state.sh render` when that script is present (best-effort — a render
 failure never fails an otherwise-good build).
 
+### Schema migrations (auto-applied at launch)
+
+The schema evolves additively: each `_MIGRATIONS` entry in `build.py` adds
+missing columns to an existing ledger via `ALTER TABLE`, guarded by
+`PRAGMA table_info` so a fresh DB built from the current DDL is a no-op, and
+records its version in the `_migrations` table so it runs at most once per DB
+(`_apply_migrations`). A fresh `build` gets this for free — `Ledger.init()`
+runs the DDL then `_apply_migrations`.
+
+The read/recovery verbs, however, open the ledger **read-only** (`_connect_ro`),
+and a read-only connection cannot `ALTER TABLE`. So a ledger that predates a
+migration (e.g. one missing the columns a later entry adds) would otherwise
+crash `status`/`state`/`dashboard`/`resume`/`rollback` with a "no such column"
+error. `Ledger.ensure_migrated()` (Story 12.2-003) closes that gap: every verb
+calls it at launch, **before** any read or write. It is idempotent and:
+
+- **No-op when the DB does not exist** — a read verb against a never-built repo
+  reports "no run" and does **not** materialise a spurious empty ledger; migrate
+  only an already-present DB.
+- **Uses a writable connection up front** — it opens the writable path to run
+  `_apply_migrations`; subsequent reads still take the read-only path.
+- **Concurrent-launch safe** — a SQLite busy timeout makes a second controller
+  wait out the brief writer lock, and `BEGIN IMMEDIATE` takes that lock *before*
+  the version check so two launchers cannot both `ALTER` the same column; the
+  `_migrations` version guard then makes the loser's pass a no-op.
+
+The dashboard covers both modes: single-`--db` mode migrates the one ledger, and
+registry-discovery mode (`sdlc dashboard` with no `--db`) migrates *every*
+discovered run's own ledger up front (`_migrate_registry_ledgers`), best-effort
+— a missing/corrupt ledger is skipped rather than failing startup, since the
+read paths already tolerate an unreachable ledger.
+
+Per Epic-12's non-goals there is no `sdlc migrate` verb — migrations apply
+automatically at launch.
+
 The render is **non-destructive** (Story 12.2-001). The auto-generated document
 is fenced between a managed-region marker pair:
 

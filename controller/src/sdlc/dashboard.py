@@ -686,6 +686,26 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, body, "text/plain; charset=utf-8")
 
 
+def _migrate_registry_ledgers(registry: Registry) -> None:
+    """Apply pending migrations to every discovered run's ledger (best-effort).
+
+    Each registry record points at its own per-run ledger; the dashboard reads
+    them read-only, so a ledger predating a migration would crash a request with
+    "no such column". Migrate each up front. A missing/corrupt/unreachable ledger
+    is skipped (the registry is best-effort) — and ``ensure_migrated`` is itself a
+    no-op when the DB file is absent, so no record materialises a spurious DB.
+    """
+    seen: set[str] = set()
+    for rec in registry.records():
+        if rec.db in seen:
+            continue
+        seen.add(rec.db)
+        try:
+            Ledger(rec.db).ensure_migrated()
+        except (OSError, sqlite3.Error):
+            pass  # unreachable/corrupt ledger → leave it; reads already tolerate this
+
+
 def make_server(
     db_path: str | Path | None = None,
     host: str = "127.0.0.1",
@@ -704,7 +724,13 @@ def make_server(
     server.run_id = run_id  # type: ignore[attr-defined]
     if db_path is None:
         # Registry-discovery mode: no single ledger; project/logs resolve per run.
-        server.registry = registry if registry is not None else Registry()  # type: ignore[attr-defined]
+        reg = registry if registry is not None else Registry()
+        # Migrate every discovered run's own ledger up front, before the server
+        # reads any of them read-only (_registry_runs_view / _registry_status /
+        # _change_token) — a stale per-run DB would otherwise crash a request
+        # with "no such column", exactly as a single --db ledger would.
+        _migrate_registry_ledgers(reg)
+        server.registry = reg  # type: ignore[attr-defined]
         server.db_path = None  # type: ignore[attr-defined]
         server.project_url = None  # type: ignore[attr-defined]
         server.project_name = None  # type: ignore[attr-defined]
@@ -712,6 +738,10 @@ def make_server(
         return server
     server.registry = None  # type: ignore[attr-defined]
     db_path = Path(db_path)
+    # Apply any pending migrations on a pre-existing ledger before the dashboard
+    # starts serving read-only snapshots, so a stale DB never crashes a request
+    # with "no such column". No-op when the DB does not yet exist.
+    Ledger(db_path).ensure_migrated()
     server.db_path = db_path  # type: ignore[attr-defined]
     # Resolve the project's GitHub web base + a repo label once (from the repo
     # holding the ledger): used for PR links and the header. None when not a git repo.
