@@ -464,3 +464,62 @@ def test_resume_high_risk_merge_block_parks_awaiting_approval(tmp_path: Path) ->
     assert result.failed == 0
     assert not any(a == "bugfix" for a, _ in dispatcher.calls)
     assert Ledger(db).run_row(rid)["status"] == "AWAITING_APPROVAL"
+
+
+def test_resume_real_run_repositions_head_after_each_story(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """On a real run (``dispatcher=None``), resume repositions HEAD between
+    stories (Story 12.4-001) so a parked story's leftover ``feature/<id>`` branch
+    is never the base the next story stacks on.
+
+    ``dispatcher=None`` selects the module-level ``dispatch_agent``; route it
+    through a fake so no subprocess agents spawn, and spy on ``_reposition_head``
+    (neutralizing its git side effect on the live checkout) to prove the
+    real-run branch fires exactly for the story that genuinely resumed.
+    """
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_interrupted(db)  # only 99.1-002 resumes (at review); 99.1-001 is DONE
+
+    monkeypatch.setattr("sdlc.resume.dispatch_agent", FakeDispatcher())
+
+    reposition_calls: list[Path] = []
+    monkeypatch.setattr(
+        "sdlc.resume._reposition_head",
+        lambda root: reposition_calls.append(root),
+    )
+
+    result = run_resume("epic-99", ledger=Ledger(db), dispatcher=None, root=tmp_path)
+
+    assert result.completed == 2
+    assert result.failed == 0
+    assert result.resumed == 1  # only 99.1-002 was re-run
+    # HEAD repositioned once — for the single story that actually resumed. The
+    # already-DONE 99.1-001 closes out via the early ``continue`` and never
+    # reaches the reposition call.
+    assert reposition_calls == [tmp_path]
+
+
+def test_resume_injected_dispatcher_never_repositions_head(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With an injected dispatcher (the controller's own orchestration tests),
+    resume must NOT touch the real checkout — ``_reposition_head`` is guarded
+    behind ``dispatcher is None`` (Story 12.4-001)."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_interrupted(db)
+
+    reposition_calls: list[Path] = []
+    monkeypatch.setattr(
+        "sdlc.resume._reposition_head",
+        lambda root: reposition_calls.append(root),
+    )
+
+    result = run_resume(
+        "epic-99", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path
+    )
+
+    assert result.resumed == 1
+    assert reposition_calls == []  # injected fake → no git side effect
