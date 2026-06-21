@@ -29,6 +29,7 @@ from sdlc.contracts import (
     RESULT_START_MARKER,
     ContractError,
 )
+from sdlc.cost_estimate import StageEstimate, estimate_stage
 from sdlc.dispatch import AgentDispatchError, AgentResult, RateLimitError, dispatch_agent
 from sdlc.model_routing import (
     ModelRoutingConfig,
@@ -130,6 +131,8 @@ CREATE TABLE IF NOT EXISTS stages (
     cache_read_tokens   INTEGER,
     cache_creation_tokens INTEGER,
     cost_usd            REAL,
+    estimated_tokens    INTEGER,
+    estimated_cost_usd  REAL,
     PRIMARY KEY (run_id, story_id, stage_name, attempt),
     FOREIGN KEY (run_id, story_id) REFERENCES stories(run_id, story_id) ON DELETE CASCADE
 );
@@ -193,6 +196,19 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
         [
             ("stage", "TEXT"),
             ("kind", "TEXT"),
+        ],
+    ),
+    # Migration 3 adds the pre-dispatch estimate columns (Story 14.1-002) to a
+    # pre-existing ledger. Additive and back-compatible: old stage rows keep NULL
+    # estimates and render as "—"; only stages dispatched after this story
+    # populate them. A fresh DB created from the up-to-date DDL is a no-op.
+    (
+        3,
+        "stage estimate columns",
+        "stages",
+        [
+            ("estimated_tokens", "INTEGER"),
+            ("estimated_cost_usd", "REAL"),
         ],
     ),
 ]
@@ -297,6 +313,14 @@ class BuildOptions:
     model_profile: str = ""
     model_overrides: dict[str, str] = field(default_factory=dict)
     _model_config: object = field(default=_UNRESOLVED, repr=False, compare=False)
+    # Story 14.1-002: pre-dispatch cost-estimate gate. ``cost_estimate_threshold``
+    # is a per-stage token ceiling for the *estimate* (0 = off → estimate is still
+    # computed and recorded, but never warns or gates). A ``$``-denominated value
+    # is accepted as a convenience and converted to the notional API-equivalent
+    # token count, mirroring ``--budget``. When an estimate crosses the threshold
+    # the controller warns; interactively (no ``--auto``) it gates the stage before
+    # any spend, in ``--auto`` it proceeds.
+    cost_estimate_threshold: int = 0
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -386,6 +410,26 @@ class _RateLimitPark(Exception):
         super().__init__("rate-limit reset beyond auto-wait cap")
         self.signal = signal
         self.waited_s = waited_s
+
+
+class _CostGatePause(Exception):
+    """Internal signal: the interactive pre-dispatch cost gate halted a stage (14.1-002).
+
+    Raised from :func:`_run_story` when an over-threshold estimate must gate a
+    stage in interactive mode. It propagates *past* :func:`_run_story_rate_limited`
+    (which catches only :class:`_RateLimitPark`) up to the cohort loop in
+    ``run_build`` / ``run_resume``, which pauses the run **resumably** — leaving it
+    IN_PROGRESS like a budget pause rather than stamping a NEEDS_ATTENTION terminal
+    that :meth:`Ledger.latest_resumable_run` would never surface. Carrying the
+    gated stage + estimate lets the close-out write an actionable reason. Raising
+    ``--cost-threshold`` on ``sdlc resume`` lets the gated stage proceed.
+    """
+
+    def __init__(self, *, story_id: str, stage: str, estimate: StageEstimate) -> None:
+        super().__init__(f"cost gate halted {stage} for {story_id}")
+        self.story_id = story_id
+        self.stage = stage
+        self.estimate = estimate
 
 
 def _make_rate_limit_context(
@@ -671,6 +715,11 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
                     f"invalid --budget-policy: {policy} (expected pause|abort)"
                 )
             opts.budget_policy = policy
+        elif arg.startswith("--cost-threshold="):
+            # Story 14.1-002: per-stage pre-dispatch estimate ceiling. Reuse the
+            # token/$ convenience parser — a $-threshold converts to the notional
+            # API-equivalent token count, mirroring --budget. 0 = off.
+            opts.cost_estimate_threshold, _ = _parse_budget_value(arg.split("=", 1)[1])
         elif arg.startswith("--rate-limit-max-wait="):
             wait = int(arg.split("=", 1)[1])
             if wait < 0:
@@ -956,6 +1005,59 @@ class Ledger:
                     run_id, story_id, stage_name, attempt,
                 ),
             )
+
+    def stage_set_estimate(
+        self,
+        run_id: str,
+        story_id: str,
+        stage_name: str,
+        attempt: int,
+        *,
+        estimated_tokens: int | None,
+        estimated_cost_usd: float | None,
+    ) -> None:
+        """Record a stage attempt's pre-dispatch estimate (Story 14.1-002).
+
+        Written *before* the agent runs so the estimate is visible alongside the
+        actual usage the terminal :meth:`stage_set_usage` later records on the
+        same row — the two columns together are the persisted estimate-vs-actual
+        reconciliation. Best-effort estimation skips this when it cannot run, so
+        old/un-estimated rows keep NULL and render as "—".
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stages SET estimated_tokens = ?, estimated_cost_usd = ? "
+                "WHERE run_id = ? AND story_id = ? AND stage_name = ? AND attempt = ?",
+                (
+                    estimated_tokens, estimated_cost_usd,
+                    run_id, story_id, stage_name, attempt,
+                ),
+            )
+
+    def historical_stage_tokens(self, stage_name: str) -> float | None:
+        """Average recorded total tokens for ``stage_name`` across DONE attempts.
+
+        Story 14.1-002: calibrates the pre-dispatch estimate against the per-stage
+        usage already in the ledger. Averages the four token components over every
+        DONE attempt of this stage *that recorded usage* (rows with all-NULL token
+        columns are excluded so un-instrumented stages do not drag the mean toward
+        zero). Returns None when no calibration data exists, so the caller falls
+        back to the crude heuristic.
+        """
+        with self._connect_ro() as conn:
+            row = conn.execute(
+                "SELECT AVG("
+                "  COALESCE(input_tokens,0) + COALESCE(output_tokens,0) + "
+                "  COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)"
+                ") AS avg_tokens "
+                "FROM stages WHERE stage_name = ? AND status = 'DONE' AND ("
+                "  input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR "
+                "  cache_read_tokens IS NOT NULL OR cache_creation_tokens IS NOT NULL)",
+                (stage_name,),
+            ).fetchone()
+        if row is None or row["avg_tokens"] is None:
+            return None
+        return float(row["avg_tokens"])
 
     def reset_story(self, run_id: str, story_id: str) -> None:
         """Roll a story back to a fresh, unbuilt state (Story 10.2-001).
@@ -1661,6 +1763,11 @@ class BuildResult:
     rate_limited: bool = False
     rate_limit_reset_at: float | None = None
     rate_limit_waited_s: int = 0
+    # Story 14.1-002: set when the interactive pre-dispatch cost gate paused the
+    # run (an estimate crossed ``--cost-threshold`` and ``--auto`` was off). The
+    # run is left IN_PROGRESS (resumable, not terminal); raise ``--cost-threshold``
+    # on ``sdlc resume`` to continue the gated stage.
+    cost_gated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -2217,6 +2324,17 @@ def run_build(
             # which map a run used. "" / off keeps today's CLI-default behaviour.
             "model_profile": opts.model_profile,
             "model_overrides": opts.model_overrides,
+            # Story 14.1-002: persist the per-stage cost-estimate threshold so a
+            # resume **re-enforces** the same gate. Without this a resumed run
+            # would rebuild opts with threshold=0 and silently dispatch a stage
+            # the original run gated. `sdlc resume --cost-threshold` raises/clears
+            # it to let a gated story proceed.
+            "cost_estimate_threshold": opts.cost_estimate_threshold,
+            # Story 14.1-002: persist `--auto` so a resumed run keeps the same
+            # cost-gate posture. An auto run warns-and-proceeds over the threshold;
+            # without this the resume would default to interactive and wrongly gate
+            # stages the original auto run would have proceeded through.
+            "auto": opts.auto,
         }),
     )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of
@@ -2261,8 +2379,9 @@ def run_build(
     )
     budget_stopped = False
     rate_limit_park: _StoryRunOutcome | None = None
+    cost_gated: _CostGatePause | None = None
     for cohort in cohorts:
-        if budget_stopped or rate_limit_park is not None:
+        if budget_stopped or rate_limit_park is not None or cost_gated is not None:
             break
         for story in cohort:
             if _budget_exceeded(ledger, run_id, opts.budget):
@@ -2291,9 +2410,17 @@ def run_build(
                 )
                 continue
 
-            sr = _run_story_rate_limited(
-                rl_ctx, story, ledger, run_id, dispatch, logs_dir
-            )
+            try:
+                sr = _run_story_rate_limited(
+                    rl_ctx, story, ledger, run_id, dispatch, logs_dir
+                )
+            except _CostGatePause as gate:
+                # Story 14.1-002: the interactive cost gate halted a stage. Park
+                # the story NEEDS_ATTENTION but leave the run resumable below.
+                status[story.id] = "NEEDS_ATTENTION"
+                ledger.set_story_status(run_id, story.id, "NEEDS_ATTENTION")
+                cost_gated = gate
+                break
             if sr.parked:
                 # Reset is beyond the auto-wait cap: leave the in-flight story
                 # RATE_LIMITED (resumable, distinct from NEEDS_ATTENTION) and hand
@@ -2332,6 +2459,15 @@ def run_build(
         return _budget_close_out(
             opts, ledger, run_id, status, done_skips, buildable,
             registry, render_view,
+        )
+
+    # Story 14.1-002: the interactive cost gate paused the run. Like a budget
+    # pause, leave it IN_PROGRESS (resumable) instead of stamping a terminal —
+    # `sdlc resume --cost-threshold` raises the gate to continue.
+    if cost_gated is not None:
+        return _cost_gate_close_out(
+            opts, ledger, run_id, status, done_skips, buildable,
+            cost_gated, render_view,
         )
 
     # --- Phase 3: close out via the shared finalize helper (12.3-004) --------
@@ -2454,6 +2590,70 @@ def _budget_close_out(
         budget_policy=opts.budget_policy,
         accrued_tokens=usage["tokens"],
         notional_cost_usd=usage["cost_usd"],
+    )
+
+
+def apply_cost_gate_pause(
+    ledger: "Ledger", run_id: str, threshold: int, gate: "_CostGatePause"
+) -> None:
+    """Record an interactive cost-gate pause and leave the run resumable (14.1-002).
+
+    Shared by :func:`run_build` and ``run_resume`` so both halt identically. The
+    run is deliberately left ``IN_PROGRESS`` (never stamped terminal) so
+    :meth:`Ledger.latest_resumable_run` — and therefore ``sdlc resume`` — picks it
+    up; raising ``--cost-threshold`` on resume lets the gated stage proceed.
+    Finished stories keep their committed work (R10).
+    """
+    est = gate.estimate
+    ledger.event_log(
+        run_id, "", "warn", "controller",
+        f"cost gate paused run: {gate.stage} for {gate.story_id} estimated "
+        f"~{est.estimated_tokens} tokens "
+        f"({notional_cost_label(est.estimated_cost_usd)}) ≥ "
+        f"--cost-threshold={threshold} — run left IN_PROGRESS; raise "
+        "--cost-threshold and `sdlc resume` to continue.",
+    )
+
+
+def _cost_gate_close_out(
+    opts: BuildOptions,
+    ledger: Ledger,
+    run_id: str,
+    status: dict[str, str],
+    done_skips: list[Story],
+    buildable: list[Story],
+    gate: "_CostGatePause",
+    render_view: Callable[[str], None] | None,
+) -> BuildResult:
+    """Close out a ``run_build`` run paused by the interactive cost gate (14.1-002)."""
+    completed = sum(1 for v in status.values() if v == "DONE")
+    failed = sum(1 for v in status.values() if v == "FAILED")
+    blocked = sum(1 for v in status.values() if v == "BLOCKED")
+    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
+    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
+    skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
+    ledger.run_update_counts(run_id, completed, failed)
+
+    # Leave the run IN_PROGRESS (resumable) — deliberately skip finalize_run, which
+    # would stamp a terminal status `latest_resumable_run` could never surface.
+    apply_cost_gate_pause(ledger, run_id, opts.cost_estimate_threshold, gate)
+
+    if render_view is not None:
+        render_view(run_id)
+
+    story_status = {s.id: "SKIPPED" for s in done_skips}
+    story_status.update(status)
+    return BuildResult(
+        completed=completed,
+        failed=failed,
+        skipped=skipped,
+        blocked=blocked,
+        needs_attention=needs_attention,
+        awaiting_approval=awaiting_approval,
+        planned=len(buildable),
+        run_id=run_id,
+        story_status=story_status,
+        cost_gated=True,
     )
 
 
@@ -2697,6 +2897,42 @@ def _run_story(
             ledger.stage_start(run_id, story.id, stage, attempt)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             sink = _make_progress_sink(ledger, run_id, story.id, stage, attempt)
+            # Story 14.1-002: estimate this stage's usage before dispatch, record
+            # it on the row, and (when a threshold is configured) warn — gating
+            # the stage before any spend in interactive mode.
+            estimate = _estimate_stage_cost(
+                stage, story, opts, pr_number, ledger, run_id, attempt
+            )
+            if estimate is not None and _over_cost_threshold(estimate, opts):
+                gated = not opts.auto
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    f"{stage} estimate ~{estimate.estimated_tokens} tokens exceeds "
+                    f"--cost-threshold={opts.cost_estimate_threshold} "
+                    f"({notional_cost_label(estimate.estimated_cost_usd)}) — "
+                    + (
+                        "gating before dispatch; raise --cost-threshold or pass "
+                        "--auto to proceed"
+                        if gated
+                        else "proceeding (--auto)"
+                    ),
+                )
+                if gated:
+                    ledger.stage_finish(
+                        run_id, story.id, stage, attempt, "SKIPPED",
+                        "cost-gate", str(tpath),
+                    )
+                    ledger.event_log(
+                        run_id, story.id, "warn", "controller",
+                        f"{stage} gated pre-dispatch: no agent dispatched, run "
+                        "paused for review (R10: no work started, nothing discarded)",
+                    )
+                    # Pause the *run* resumably (IN_PROGRESS), not a terminal park:
+                    # propagate to the cohort loop so `sdlc resume --cost-threshold`
+                    # can raise the gate and continue the gated stage.
+                    raise _CostGatePause(
+                        story_id=story.id, stage=stage, estimate=estimate
+                    )
             try:
                 ok, result, failure, kind = _dispatch_stage(
                     stage, story, opts, pr_number, dispatch, tpath, on_progress=sink
@@ -2706,6 +2942,11 @@ def _run_story(
                         run_id, story.id, stage, attempt, "DONE", output_path=str(tpath)
                     )
                     _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
+                    # Story 14.1-002: reconcile the pre-dispatch estimate against
+                    # the authoritative usage now known, for future calibration.
+                    _reconcile_estimate(
+                        ledger, run_id, story.id, stage, estimate, result
+                    )
                     pr_number = _extract_pr(result, pr_number)
                     if pr_number is not None:
                         ledger.set_story_pr(run_id, story.id, pr_number)
@@ -3140,6 +3381,112 @@ def _record_stage_usage(
         cache_read_tokens=u.get("cache_read_input_tokens"),
         cache_creation_tokens=u.get("cache_creation_input_tokens"),
         cost_usd=result.cost_usd,
+    )
+
+
+# Map of the agent envelope's usage keys (Story 14.1-002 reconciliation reads the
+# same keys _record_stage_usage maps to the ledger columns).
+_RESULT_USAGE_KEYS = (
+    "input_tokens", "output_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens",
+)
+
+
+def _result_total_tokens(result: AgentResult | None) -> int | None:
+    """Sum the four token components of an AgentResult's usage envelope, or None.
+
+    None (not 0) means the agent carried no usage (plain-text custom agent), so
+    reconciliation is skipped rather than comparing against a misleading zero.
+    """
+    if result is None or result.usage is None:
+        return None
+    vals = [result.usage.get(k) for k in _RESULT_USAGE_KEYS]
+    if all(v is None for v in vals):
+        return None
+    return sum(int(v or 0) for v in vals)
+
+
+def _estimate_stage_cost(
+    stage: str,
+    story: Story,
+    opts: BuildOptions,
+    pr_number: int | None,
+    ledger: Ledger,
+    run_id: str,
+    attempt: int,
+) -> StageEstimate | None:
+    """Estimate + record a stage's usage before dispatch (Story 14.1-002).
+
+    Renders the same prompt the dispatcher will send, estimates its total usage
+    (calibrating against the ledger's historical per-stage average when present),
+    records the estimate on the stage row, and logs a notional-$ info event.
+    Entirely best-effort: any failure (render/DB error) degrades to None so a
+    bad estimate never breaks a build — the stage dispatches exactly as today.
+    """
+    try:
+        prompt = _render_stage_prompt(stage, story, opts, pr_number)
+        historical = ledger.historical_stage_tokens(stage)
+        est = estimate_stage(stage, prompt, historical_tokens=historical)
+        ledger.stage_set_estimate(
+            run_id, story.id, stage, attempt,
+            estimated_tokens=est.estimated_tokens,
+            estimated_cost_usd=est.estimated_cost_usd,
+        )
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            f"{stage} pre-dispatch estimate: ~{est.estimated_tokens} tokens "
+            f"({notional_cost_label(est.estimated_cost_usd)})"
+            + (" [calibrated from history]" if est.calibrated else ""),
+        )
+        return est
+    except Exception:  # noqa: BLE001 - estimation is best-effort, never fatal
+        return None
+
+
+def _over_cost_threshold(
+    estimate: StageEstimate | None, opts: BuildOptions
+) -> bool:
+    """Whether a stage estimate crosses the configured per-stage threshold.
+
+    A threshold of 0 (the default) means "no gate" — the estimate is still
+    computed and recorded, but never warns or gates (behaviour unchanged).
+    """
+    return (
+        estimate is not None
+        and opts.cost_estimate_threshold > 0
+        and estimate.estimated_tokens >= opts.cost_estimate_threshold
+    )
+
+
+def _reconcile_estimate(
+    ledger: Ledger,
+    run_id: str,
+    story_id: str,
+    stage: str,
+    estimate: StageEstimate | None,
+    result: AgentResult | None,
+) -> None:
+    """Log estimate-vs-actual once the authoritative usage is known (14.1-002).
+
+    The persisted reconciliation is the estimate + actual columns on the same
+    stage row (written by :meth:`Ledger.stage_set_estimate` /
+    :meth:`Ledger.stage_set_usage`); this surfaces the delta as a calibration
+    event. No-op when there is no estimate or the agent carried no usage.
+    """
+    if estimate is None:
+        return
+    actual = _result_total_tokens(result)
+    if actual is None:
+        return
+    pct = (
+        (actual - estimate.estimated_tokens) / estimate.estimated_tokens * 100.0
+        if estimate.estimated_tokens
+        else 0.0
+    )
+    ledger.event_log(
+        run_id, story_id, "info", "controller",
+        f"{stage} estimate reconciled: est ~{estimate.estimated_tokens} vs "
+        f"actual {actual} tokens ({pct:+.0f}%)",
     )
 
 

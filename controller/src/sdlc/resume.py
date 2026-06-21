@@ -13,12 +13,14 @@ from sdlc.build import (
     Dispatcher,
     Ledger,
     _budget_exceeded,
+    _CostGatePause,
     _honor_parked_reset,
     _make_rate_limit_context,
     _reposition_head,
     _run_story_rate_limited,
     _StoryRunOutcome,
     apply_budget_stop,
+    apply_cost_gate_pause,
     apply_rate_limit_park,
     finalize_run,
 )
@@ -79,6 +81,9 @@ class ResumeResult:
     rate_limited: bool = False
     rate_limit_reset_at: float | None = None
     rate_limit_waited_s: int = 0
+    # Story 14.1-002: set when the interactive cost gate re-halted the resume. The
+    # run is left IN_PROGRESS (resumable); raise --cost-threshold to continue.
+    cost_gated: bool = False
 
 
 def _pipeline(skip_coverage: bool) -> list[str]:
@@ -167,6 +172,14 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         # run dispatches each stage on the same model the original run chose.
         model_profile=str(config.get("model_profile") or ""),
         model_overrides=dict(config.get("model_overrides") or {}),
+        # Story 14.1-002: carry the per-stage cost-estimate threshold so a resume
+        # re-enforces the same gate rather than silently dispatching a stage the
+        # original run gated. `sdlc resume --cost-threshold` overrides it.
+        cost_estimate_threshold=int(config.get("cost_estimate_threshold", 0) or 0),
+        # Story 14.1-002: carry `--auto` so a resumed run keeps the original
+        # cost-gate posture — an auto run warns-and-proceeds rather than flipping
+        # to interactive and wrongly gating stages it would have proceeded through.
+        auto=bool(config.get("auto", False)),
     )
 
 
@@ -180,6 +193,7 @@ def run_resume(
     root: Path | None = None,
     budget: int | None = None,
     budget_policy: str | None = None,
+    cost_threshold: int | None = None,
     clock: Callable[[], float] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
 ) -> ResumeResult:
@@ -226,6 +240,10 @@ def run_resume(
         opts.budget = budget
     if budget_policy is not None:
         opts.budget_policy = budget_policy
+    # Story 14.1-002: --cost-threshold raises/clears the persisted estimate gate so
+    # a story parked by the gate can proceed (0 disables it for this resume).
+    if cost_threshold is not None:
+        opts.cost_estimate_threshold = cost_threshold
 
     # Recompute the queue from the markdown source so each story carries its
     # title/epic_file/dependencies (the ledger stores progress, not the spec).
@@ -259,9 +277,10 @@ def run_resume(
     rate_limit_park: _StoryRunOutcome | None = _honor_parked_reset(
         ledger, rid, opts, rl_ctx, config.get("rate_limit_reset_at"),
     )
+    cost_gated: _CostGatePause | None = None
 
     for cohort in cohorts:
-        if budget_stopped or rate_limit_park is not None:
+        if budget_stopped or rate_limit_park is not None or cost_gated is not None:
             break
         for story in cohort:
             st = plan[story.id]
@@ -309,13 +328,20 @@ def run_resume(
                 f"resume: re-entering at stage '{st.next_stage}' "
                 f"(attempt {st.start_attempt})",
             )
-            sr = _run_story_rate_limited(
-                rl_ctx, story, ledger, rid, dispatch, logs_dir,
-                done_stages=st.done_pipeline_stages,
-                start_attempt=st.start_attempt,
-                pr_number=st.pr_number,
-                bugfix_seq=st.bugfix_seq,
-            )
+            try:
+                sr = _run_story_rate_limited(
+                    rl_ctx, story, ledger, rid, dispatch, logs_dir,
+                    done_stages=st.done_pipeline_stages,
+                    start_attempt=st.start_attempt,
+                    pr_number=st.pr_number,
+                    bugfix_seq=st.bugfix_seq,
+                )
+            except _CostGatePause as gate:
+                # Story 14.1-002: the cost gate re-halted this stage on resume.
+                status[story.id] = "NEEDS_ATTENTION"
+                ledger.set_story_status(rid, story.id, "NEEDS_ATTENTION")
+                cost_gated = gate
+                break
             if sr.parked:
                 status[story.id] = "RATE_LIMITED"
                 ledger.set_story_status(rid, story.id, "RATE_LIMITED")
@@ -391,6 +417,30 @@ def run_resume(
             budget_policy=opts.budget_policy,
             accrued_tokens=usage["tokens"],
             notional_cost_usd=usage["cost_usd"],
+        )
+
+    # Story 14.1-002: the interactive cost gate re-halted the resume — leave the
+    # run IN_PROGRESS (resumable) just like run_build, never a terminal close-out.
+    if cost_gated is not None:
+        completed = sum(1 for v in status.values() if v == "DONE")
+        ledger.run_update_counts(rid, completed, sum(
+            1 for v in status.values() if v == "FAILED"
+        ))
+        apply_cost_gate_pause(ledger, rid, opts.cost_estimate_threshold, cost_gated)
+        if render_view is not None:
+            render_view(rid)
+        return ResumeResult(
+            run_id=rid,
+            resumed=resumed,
+            completed=completed,
+            failed=sum(1 for v in status.values() if v == "FAILED"),
+            blocked=sum(1 for v in status.values() if v == "BLOCKED"),
+            needs_attention=sum(1 for v in status.values() if v == "NEEDS_ATTENTION"),
+            awaiting_approval=sum(1 for v in status.values() if v == "AWAITING_APPROVAL"),
+            skipped=sum(1 for v in status.values() if v == "SKIPPED"),
+            nothing_to_resume=False,
+            story_status=dict(status),
+            cost_gated=True,
         )
 
     # --- close out via the shared finalize helper (12.3-004) -----------------
