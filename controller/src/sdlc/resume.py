@@ -12,8 +12,10 @@ from sdlc.build import (
     BuildOptions,
     Dispatcher,
     Ledger,
+    _budget_exceeded,
     _reposition_head,
     _run_story,
+    apply_budget_stop,
     finalize_run,
 )
 from sdlc.cohort import Story, compute_cohorts
@@ -61,6 +63,13 @@ class ResumeResult:
     skipped: int = 0
     nothing_to_resume: bool = False
     story_status: dict[str, str] = field(default_factory=dict)
+    # Story 14.1-001: a resumed run honours the same budget ceiling (carried in
+    # the ledger config, raised via `sdlc resume --budget`). Set when the gate
+    # re-halted dispatch so the caller can report it like a fresh build.
+    budget_stopped: bool = False
+    budget_policy: str = ""
+    accrued_tokens: int = 0
+    notional_cost_usd: float = 0.0
 
 
 def _pipeline(skip_coverage: bool) -> list[str]:
@@ -133,6 +142,11 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         skip_coverage=bool(config.get("skip_coverage")),
         coverage_threshold=int(config.get("coverage_threshold", 90)),
         sequential=(run_row.get("mode") == "serial"),
+        # Story 14.1-001: carry the original token budget so a resume re-enforces
+        # the same ceiling rather than continuing unbounded. `sdlc resume
+        # --budget` overrides this in run_resume before the loop.
+        budget=int(config.get("budget", 0) or 0),
+        budget_policy=str(config.get("budget_policy") or "pause"),
     )
 
 
@@ -144,6 +158,8 @@ def run_resume(
     run_id: str | None = None,
     render_view: Callable[[str], None] | None = None,
     root: Path | None = None,
+    budget: int | None = None,
+    budget_policy: str | None = None,
 ) -> ResumeResult:
     """Resume the most recent interrupted run for ``scope`` from the ledger.
 
@@ -153,6 +169,13 @@ def run_resume(
     never rebuilt. A run with no incomplete stories is a no-op
     (``nothing_to_resume``). Mirrors :func:`run_build`'s cohort ordering,
     dependency blocking, and close-out so the end state matches a full build.
+
+    Story 14.1-001: the run's original token budget is carried in the ledger
+    config and **re-enforced** here, so a budget-paused run does not resume
+    unbounded. ``budget`` (and optionally ``budget_policy``) raises/overrides it —
+    that is how a paused run is continued ("resumable once the budget is raised").
+    When the accrual is already at/over the ceiling, the gate re-halts before
+    dispatching anything.
     """
     dispatch = dispatcher or dispatch_agent
 
@@ -175,6 +198,12 @@ def run_resume(
         return ResumeResult(run_id=rid, nothing_to_resume=True)
 
     opts = _options_from_config(scope, run_row, config)
+    # A caller-supplied --budget raises (or overrides) the persisted ceiling; an
+    # explicit --budget-policy likewise. Absent overrides keep the original.
+    if budget is not None:
+        opts.budget = budget
+    if budget_policy is not None:
+        opts.budget_policy = budget_policy
 
     # Recompute the queue from the markdown source so each story carries its
     # title/epic_file/dependencies (the ledger stores progress, not the spec).
@@ -190,8 +219,11 @@ def run_resume(
     cohorts = compute_cohorts(run_queue)
     status: dict[str, str] = {s.id: plan[s.id].status for s in run_queue}
     resumed = 0
+    budget_stopped = False
 
     for cohort in cohorts:
+        if budget_stopped:
+            break
         for story in cohort:
             st = plan[story.id]
 
@@ -226,6 +258,13 @@ def run_resume(
                 )
                 continue
 
+            # Story 14.1-001: re-enforce the budget ceiling before dispatching.
+            # The accrual carried in the ledger already counts the pre-pause
+            # spend, so an un-raised resume stops here and re-parks immediately.
+            if _budget_exceeded(ledger, rid, opts.budget):
+                budget_stopped = True
+                break
+
             ledger.event_log(
                 rid, story.id, "info", "controller",
                 f"resume: re-entering at stage '{st.next_stage}' "
@@ -248,6 +287,34 @@ def run_resume(
             # test's cwd); best-effort and never fatal.
             if dispatcher is None:
                 _reposition_head(root or Path.cwd())
+
+    # Story 14.1-001: the budget gate re-halted the resume — apply the same
+    # policy-aware stop as run_build (pause leaves IN_PROGRESS/resumable, abort
+    # stamps ABORTED) and return without the normal terminal close-out.
+    if budget_stopped:
+        completed = sum(1 for v in status.values() if v == "DONE")
+        ledger.run_update_counts(rid, completed, sum(
+            1 for v in status.values() if v == "FAILED"
+        ))
+        usage = apply_budget_stop(ledger, rid, opts.budget, opts.budget_policy, completed)
+        if render_view is not None:
+            render_view(rid)
+        return ResumeResult(
+            run_id=rid,
+            resumed=resumed,
+            completed=completed,
+            failed=sum(1 for v in status.values() if v == "FAILED"),
+            blocked=sum(1 for v in status.values() if v == "BLOCKED"),
+            needs_attention=sum(1 for v in status.values() if v == "NEEDS_ATTENTION"),
+            awaiting_approval=sum(1 for v in status.values() if v == "AWAITING_APPROVAL"),
+            skipped=sum(1 for v in status.values() if v == "SKIPPED"),
+            nothing_to_resume=False,
+            story_status=dict(status),
+            budget_stopped=True,
+            budget_policy=opts.budget_policy,
+            accrued_tokens=usage["tokens"],
+            notional_cost_usd=usage["cost_usd"],
+        )
 
     # --- close out via the shared finalize helper (12.3-004) -----------------
     # The identical close-out is shared with `run_build`: finalize_run reconciles

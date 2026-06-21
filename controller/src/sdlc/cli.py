@@ -210,6 +210,14 @@ def resume(
     db: Path | None = typer.Option(
         None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
     ),
+    budget: str | None = typer.Option(
+        None, "--budget",
+        help="Raise/override the run's token budget (a $-value converts to a "
+        "notional API-equivalent ceiling). Required to continue a budget-paused run.",
+    ),
+    budget_policy: str | None = typer.Option(
+        None, "--budget-policy", help="Override the budget policy: pause or abort.",
+    ),
 ) -> None:
     """Resume an interrupted build from the SQLite ledger.
 
@@ -219,16 +227,36 @@ def resume(
     the exact stage each story was interrupted in — branch, PR number, and
     attempt count preserved. Completed stories are not rebuilt. A run with no
     incomplete stories is a no-op that reports "nothing to resume" and exits 0.
+
+    Story 14.1-001: a budget-paused run carries its token ceiling, so resuming
+    without raising it re-pauses immediately. Pass ``--budget`` to raise it and
+    continue.
     """
+    from sdlc.build import _parse_budget_value
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
     from sdlc.resume import run_resume
+
+    budget_tokens: int | None = None
+    if budget is not None:
+        try:
+            budget_tokens, _ = _parse_budget_value(budget)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+    if budget_policy is not None and budget_policy not in {"pause", "abort"}:
+        typer.echo(
+            f"error: invalid --budget-policy: {budget_policy} (expected pause|abort)",
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
     db_path = db or default_db_path()
     ledger = Ledger(db_path)
     # Migrate a pre-existing (possibly stale) ledger before resume reads it.
     ledger.ensure_migrated()
     result = run_resume(
-        scope, ledger=ledger, run_id=run, render_view=make_render_view(db_path)
+        scope, ledger=ledger, run_id=run, render_view=make_render_view(db_path),
+        budget=budget_tokens, budget_policy=budget_policy,
     )
 
     if result.nothing_to_resume:
@@ -245,11 +273,24 @@ def resume(
         f"{result.blocked} blocked, {result.needs_attention} need attention, "
         f"{result.awaiting_approval} awaiting approval ({result.resumed} resumed)."
     )
+    if result.budget_stopped:
+        from sdlc.build import notional_cost_label
+
+        tail = (
+            "run paused — raise --budget further and `sdlc resume` to continue."
+            if result.budget_policy == "pause"
+            else "run aborted."
+        )
+        typer.echo(
+            f"budget ceiling crossed: {result.accrued_tokens} tokens accrued; "
+            f"{notional_cost_label(result.notional_cost_usd)} — {tail}"
+        )
     clean = (
         result.failed == 0
         and result.blocked == 0
         and result.needs_attention == 0
         and result.awaiting_approval == 0
+        and not result.budget_stopped
     )
     raise typer.Exit(code=0 if clean else 1)
 

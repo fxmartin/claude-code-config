@@ -283,6 +283,17 @@ def usd_to_notional_tokens(usd: float) -> int:
     return int(round(usd / NOTIONAL_USD_PER_MILLION_TOKENS * 1_000_000))
 
 
+def _budget_exceeded(ledger: "Ledger", run_id: str, budget: int) -> bool:
+    """Whether the run's accrued tokens have reached the budget ceiling.
+
+    Story 14.1-001: a ``budget`` of 0 means "no ceiling" (never gates). The
+    accrual is the live total the ledger exposes, so this reflects every stage
+    recorded so far — including those from before a pause, which is what makes a
+    resumed run honour the same ceiling rather than continue unbounded.
+    """
+    return bool(budget) and ledger.run_usage_totals(run_id)["tokens"] >= budget
+
+
 def notional_cost_label(cost_usd: float | None) -> str:
     """Render a dollar figure with the mandated not-real-spend disclaimer.
 
@@ -1825,6 +1836,11 @@ def run_build(
             "mode": mode,
             "rebuild": opts.rebuild,
             "limit": opts.limit,
+            # Story 14.1-001: persist the budget so a resume re-enforces the same
+            # ceiling (a paused run must not continue unbounded). Carried through
+            # the accrual already in the ledger; `sdlc resume --budget` raises it.
+            "budget": opts.budget,
+            "budget_policy": opts.budget_policy,
         }),
     )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of
@@ -1850,15 +1866,20 @@ def run_build(
     status: dict[str, str] = {s.id: "TODO" for s in buildable}
 
     # --- Phase 2: cohort-by-cohort execution ---------------------------------
-    # Story 14.1-001: the budget gate is checked between stories (each story's
-    # in-flight stages are already finished or cleanly parked, so R10 holds). A
+    # Story 14.1-001: the budget gate is checked *before* dispatching each story
+    # (the prior story's stages are already finished/committed, so R10 holds). A
     # crossed ceiling halts further dispatch and hands off to the policy-aware
     # close-out below — pause leaves the run resumable, abort stamps it terminal.
+    # The pre-dispatch position means a resume of an already-over run dispatches
+    # nothing and re-parks until the budget is raised.
     budget_stopped = False
     for cohort in cohorts:
         if budget_stopped:
             break
         for story in cohort:
+            if _budget_exceeded(ledger, run_id, opts.budget):
+                budget_stopped = True
+                break
             # A story whose dependency did not cleanly finish cannot proceed.
             # NEEDS_ATTENTION counts as not-done: the dependency's work is
             # committed but unmerged (parked for manual push/MR or a
@@ -1894,15 +1915,6 @@ def run_build(
             # the close-out reconcile guard below. Best-effort, never fatal.
             if dispatcher is None:
                 _reposition_head(Path.cwd())
-
-            # --- Budget gate (Story 14.1-001) --------------------------------
-            # Stop dispatching once accrued tokens cross the ceiling. The check
-            # is between stories, so the just-finished story is preserved; the
-            # remaining unbuilt stories stay TODO in the ledger and are picked up
-            # by `sdlc resume` (pause) or left for a deliberate restart (abort).
-            if opts.budget and ledger.run_usage_totals(run_id)["tokens"] >= opts.budget:
-                budget_stopped = True
-                break
 
     # Story 14.1-001: a crossed budget ceiling skips the normal close-out (which
     # would stamp a terminal status and run reconcile network I/O) in favour of a
@@ -1949,39 +1961,32 @@ def run_build(
     )
 
 
-def _budget_close_out(
-    opts: BuildOptions,
-    ledger: Ledger,
+def apply_budget_stop(
+    ledger: "Ledger",
     run_id: str,
-    status: dict[str, str],
-    done_skips: list[Story],
-    buildable: list[Story],
-    registry: "Registry | None",
-    render_view: Callable[[str], None] | None,
-) -> BuildResult:
-    """Close out a run halted by the budget gate (Story 14.1-001).
+    budget: int,
+    budget_policy: str,
+    completed: int,
+    *,
+    registry: "Registry | None" = None,
+) -> dict:
+    """Record a budget-gate stop and apply the policy (Story 14.1-001).
 
+    Shared by :func:`run_build` and ``run_resume`` so both halt identically.
     ``pause`` (the default) records a NEEDS_ATTENTION-style reason and leaves the
     run ``IN_PROGRESS`` so :meth:`Ledger.latest_resumable_run` — and therefore
     ``sdlc resume`` — picks it up once the budget is raised. ``abort`` records the
-    stop and stamps the run ``ABORTED`` (terminal). Either way, finished stories
-    keep their committed work (R10) and the unbuilt stories stay ``TODO``.
+    stop and stamps the run ``ABORTED`` (terminal). Returns the accrual usage
+    dict so the caller can surface it on its result type. Finished stories keep
+    their committed work (R10); the unbuilt stories stay ``TODO``.
     """
     usage = ledger.run_usage_totals(run_id)
     label = notional_cost_label(usage["cost_usd"])
-    completed = sum(1 for v in status.values() if v == "DONE")
-    failed = sum(1 for v in status.values() if v == "FAILED")
-    blocked = sum(1 for v in status.values() if v == "BLOCKED")
-    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
-    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
-    skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
-    ledger.run_update_counts(run_id, completed, failed)
-
     reason = (
-        f"budget ceiling crossed: {usage['tokens']} ≥ {opts.budget} tokens "
+        f"budget ceiling crossed: {usage['tokens']} ≥ {budget} tokens "
         f"(notional {label})"
     )
-    if opts.budget_policy == "abort":
+    if budget_policy == "abort":
         ledger.event_log(
             run_id, "", "error", "controller",
             f"{reason} — aborting run (policy=abort).",
@@ -1995,6 +2000,32 @@ def _budget_close_out(
             f"{reason} — pausing run (policy=pause); raise --budget and "
             "`sdlc resume` to continue.",
         )
+    return usage
+
+
+def _budget_close_out(
+    opts: BuildOptions,
+    ledger: Ledger,
+    run_id: str,
+    status: dict[str, str],
+    done_skips: list[Story],
+    buildable: list[Story],
+    registry: "Registry | None",
+    render_view: Callable[[str], None] | None,
+) -> BuildResult:
+    """Close out a ``run_build`` run halted by the budget gate (Story 14.1-001)."""
+    completed = sum(1 for v in status.values() if v == "DONE")
+    failed = sum(1 for v in status.values() if v == "FAILED")
+    blocked = sum(1 for v in status.values() if v == "BLOCKED")
+    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
+    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
+    skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
+    ledger.run_update_counts(run_id, completed, failed)
+
+    usage = apply_budget_stop(
+        ledger, run_id, opts.budget, opts.budget_policy, completed,
+        registry=registry,
+    )
 
     if render_view is not None:
         render_view(run_id)

@@ -557,11 +557,19 @@ accrued tokens cross the ceiling, `_budget_close_out` applies the
 
 - **`pause`** (default): records a NEEDS_ATTENTION-style reason and leaves the
   run `IN_PROGRESS`, so `Ledger.latest_resumable_run` — and therefore
-  `sdlc resume` — picks it up unchanged once the budget is raised. It reuses the
-  Epic-10 resume machinery; `run_resume` does not re-apply the budget, so a
-  resumed run continues the remaining stories to completion.
+  `sdlc resume` — picks it up once the budget is raised.
 - **`abort`**: records the reason and stamps the run `ABORTED` (terminal); not
   auto-resumable.
+
+The budget (and policy) is persisted in the run's config event, and `run_resume`
+**re-enforces** it: the same pre-dispatch `_budget_exceeded` check runs in the
+resume loop, and because the accrual carried in the ledger already counts the
+pre-pause spend, resuming a paused run *without* raising the ceiling re-pauses
+immediately (dispatching nothing) rather than continuing unbounded.
+`sdlc resume --budget=<N>` raises the ceiling so the run can finish — that is
+what "resumable once the budget is raised" means. The pause/abort close-out is
+shared between `run_build` and `run_resume` via `apply_budget_stop`, so a resume
+halts identically to a fresh build.
 
 Either way the reason logged to the ledger — and the `sdlc build` summary line —
 renders any dollar figure through `notional_cost_label`, e.g.

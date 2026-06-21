@@ -133,7 +133,7 @@ def _run(db, *, budget=0, policy="pause", dispatcher=None):
         scope="epic-99", skip_preflight=True, sequential=True,
         budget=budget, budget_policy=policy,
     )
-    return opts, run_build(
+    return run_build(
         opts,
         queue=_sample_queue(),
         ledger=Ledger(db),
@@ -144,7 +144,7 @@ def _run(db, *, budget=0, policy="pause", dispatcher=None):
 
 def test_no_budget_path_is_unchanged(tmp_path: Path) -> None:
     db = tmp_path / "ledger.db"
-    _opts, result = _run(db, budget=0)
+    result = _run(db, budget=0)
     assert result.completed == 3
     assert result.budget_stopped is False
     assert Ledger(db).run_row(result.run_id)["status"] == "DONE"
@@ -154,7 +154,7 @@ def test_budget_pause_stops_dispatching_after_ceiling(tmp_path: Path) -> None:
     db = tmp_path / "ledger.db"
     dispatcher = FakeDispatcher()
     # Trip the gate after the first story's stages accrue.
-    _opts, result = _run(db, budget=10_000, dispatcher=dispatcher)
+    result = _run(db, budget=10_000, dispatcher=dispatcher)
 
     assert result.budget_stopped is True
     assert result.budget_policy == "pause"
@@ -169,7 +169,7 @@ def test_budget_pause_stops_dispatching_after_ceiling(tmp_path: Path) -> None:
 
 def test_budget_pause_leaves_run_resumable(tmp_path: Path) -> None:
     db = tmp_path / "ledger.db"
-    _opts, result = _run(db, budget=10_000)
+    result = _run(db, budget=10_000)
     ledger = Ledger(db)
     # A paused run is NOT stamped terminal — it stays IN_PROGRESS so resume picks it up.
     assert ledger.run_row(result.run_id)["status"] == "IN_PROGRESS"
@@ -178,7 +178,7 @@ def test_budget_pause_leaves_run_resumable(tmp_path: Path) -> None:
 
 def test_budget_pause_logs_notional_reason(tmp_path: Path) -> None:
     db = tmp_path / "ledger.db"
-    _opts, result = _run(db, budget=10_000)
+    result = _run(db, budget=10_000)
     ledger = Ledger(db)
     with ledger._connect_ro() as conn:  # noqa: SLF001 — test reads the audit trail
         msgs = [
@@ -194,7 +194,7 @@ def test_budget_pause_logs_notional_reason(tmp_path: Path) -> None:
 
 def test_budget_abort_marks_run_terminal(tmp_path: Path) -> None:
     db = tmp_path / "ledger.db"
-    _opts, result = _run(db, budget=10_000, policy="abort")
+    result = _run(db, budget=10_000, policy="abort")
     assert result.budget_stopped is True
     assert result.budget_policy == "abort"
     ledger = Ledger(db)
@@ -206,7 +206,7 @@ def test_budget_abort_marks_run_terminal(tmp_path: Path) -> None:
 def test_budget_at_zero_never_gates_even_after_spend(tmp_path: Path) -> None:
     # Belt-and-suspenders: 0 is "no ceiling", never "ceiling of zero".
     db = tmp_path / "ledger.db"
-    _opts, result = _run(db, budget=0)
+    result = _run(db, budget=0)
     assert result.budget_stopped is False
     assert result.completed == 3
 
@@ -241,14 +241,14 @@ def _make_project(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_budget_pause_then_resume_completes_run(tmp_path: Path) -> None:
+def _build_paused(tmp_path: Path):
+    """Build epic-88 with a tiny budget so it pauses after the first story."""
     from sdlc.discovery import discover_queue
 
     _make_project(tmp_path)
     db = tmp_path / ".sdlc-state.db"
     queue = discover_queue("epic-88", tmp_path)
     assert len(queue) == 3
-
     opts = BuildOptions(
         scope="epic-88", skip_preflight=True, sequential=True, budget=10_000,
     )
@@ -258,12 +258,39 @@ def test_budget_pause_then_resume_completes_run(tmp_path: Path) -> None:
     )
     assert result.budget_stopped is True
     assert result.completed == 1
+    return db, result
 
-    # Raise the budget (here: drop it) and resume — the same run finishes cleanly.
+
+def test_resume_without_raising_budget_repauses(tmp_path: Path) -> None:
+    # The bug guard: a budget-paused run must NOT resume unbounded. With the
+    # ceiling carried in the ledger config, an un-raised resume re-pauses
+    # immediately and dispatches nothing further.
+    db, result = _build_paused(tmp_path)
+    dispatcher = FakeDispatcher()
     resumed = run_resume(
-        "epic-88", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path
     )
     assert resumed.run_id == result.run_id
+    assert resumed.budget_stopped is True
+    assert resumed.resumed == 0  # nothing dispatched — already over the ceiling
+    assert dispatcher.calls == []
+    ledger = Ledger(db)
+    # Still resumable (pause is not terminal); only the first story is DONE.
+    assert ledger.run_row(result.run_id)["status"] == "IN_PROGRESS"
+    statuses = {r["story_id"]: r["status"] for r in ledger.story_rows(result.run_id)}
+    assert sum(1 for v in statuses.values() if v == "DONE") == 1
+
+
+def test_resume_with_raised_budget_completes_run(tmp_path: Path) -> None:
+    # "Resumable once the budget is raised": a generous --budget lets the same
+    # run finish cleanly.
+    db, result = _build_paused(tmp_path)
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        budget=10_000_000,
+    )
+    assert resumed.run_id == result.run_id
+    assert resumed.budget_stopped is False
     ledger = Ledger(db)
     statuses = {r["story_id"]: r["status"] for r in ledger.story_rows(result.run_id)}
     assert all(v == "DONE" for v in statuses.values()), statuses
