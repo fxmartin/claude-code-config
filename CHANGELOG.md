@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.49.2] - 2026-06-21
+
+### Fixed
+
+- fix(controller-robustness): reject empty branch in reconcile (#111) (#116)
+
+
 ## [v1.49.1] - 2026-06-21
 
 ### Fixed
