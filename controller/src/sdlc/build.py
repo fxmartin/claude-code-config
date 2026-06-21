@@ -31,7 +31,13 @@ from sdlc.contracts import (
     ContractError,
 )
 from sdlc.cost_estimate import StageEstimate, estimate_stage
-from sdlc.dispatch import AgentDispatchError, AgentResult, RateLimitError, dispatch_agent
+from sdlc.dispatch import (
+    AgentDispatchError,
+    AgentResult,
+    ContextOverflowError,
+    RateLimitError,
+    dispatch_agent,
+)
 from sdlc.model_routing import (
     ModelRoutingConfig,
     OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
@@ -3131,6 +3137,23 @@ def _run_story(
                 )
                 # Bugfix succeeded — retry the same stage as a new attempt.
                 attempt += 1
+            except ContextOverflowError as exc:
+                # Issue #104: the agent's prompt exceeded the model context
+                # window. A fresh dispatch cannot shrink the in-session context,
+                # so the bugfix loop would only re-overflow — fail the stage fast
+                # with a distinct failure_category="context-overflow". Prompt
+                # reductions (merge-update-prompt.md) prevent recurrence; any
+                # committed work on the branch is preserved (R10).
+                ledger.stage_finish(
+                    run_id, story.id, stage, attempt, "FAILED",
+                    "context-overflow", str(tpath),
+                )
+                ledger.event_log(
+                    run_id, story.id, "error", "controller",
+                    f"{stage} failed: context window exceeded — failing fast "
+                    f"(no bugfix loop): {exc}",
+                )
+                return "FAILED"
             except RateLimitError as exc:
                 # Story 14.1-003: a Max rate-limit hit anywhere in this stage's
                 # dispatch/recovery is a recoverable, time-based pause — never a
@@ -3362,6 +3385,12 @@ def _dispatch_stage(
         # never burns a bugfix attempt. The caller (run_build/run_resume) waits or
         # durably parks. Re-raised before the AgentDispatchError catch below since
         # RateLimitError subclasses it.
+        raise
+    except ContextOverflowError:
+        # Issue #104: a context-window overflow is unshrinkable in-session — let
+        # it propagate past the generic AgentDispatchError catch so _run_story
+        # fails the stage fast instead of re-overflowing through the bugfix loop.
+        # Re-raised before the AgentDispatchError catch since it subclasses it.
         raise
     except ContractError as exc:
         # Malformed / schema-invalid agent output is a build failure.
