@@ -39,6 +39,32 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
 1. **Preflight** — `default_preflight` shells out to the detected test command
    (`uv run pytest`, `npm test`, `make test`, or `bats test/`). A red suite
    aborts the run before any agent is dispatched (skip with `--skip-preflight`).
+   The whole command is bounded by `--preflight-timeout` (default 600s), and when
+   the project ships `pytest-timeout` the detected pytest command also gets a
+   per-test bound (`--timeout=60 --timeout-method=thread`, `PER_TEST_TIMEOUT`) so
+   a single hanging agent-added test fails fast instead of stalling the suite
+   until the whole-command timeout (Story 12.1-002).
+
+   **Recursion guard (`SDLC_IN_TEST` sentinel).** `default_preflight` runs the
+   test command with `SDLC_IN_TEST=1` exported into the *child* environment only
+   (the parent env is untouched). The guard then blocks **only the side-effecting
+   real path**, never unit coverage (AC3):
+   - `run_build` short-circuits (returns `BuildResult(skipped_in_test=True)`,
+     reported by the verb as an exit-0 note) when `in_test_sentinel()` is true
+     **and** it is a real run — i.e. no fake `dispatcher`/`preflight` was injected
+     (`dispatcher is None and preflight is None`). Tests that inject a
+     `FakeDispatcher`/stub preflight are deliberately exercising orchestration and
+     run unblocked, even when the sentinel is set (the controller's own preflight
+     case). Dry-run returns before the guard.
+   - The `dashboard` verb short-circuits before `serve()` (after `--stop`/
+     `--restart`, which only kill a server) so it never binds a socket under the
+     sentinel.
+
+   The net effect: a project test that invokes `sdlc build`/`sdlc dashboard` bare
+   cannot recurse into real orchestration (pytest-within-pytest) or bind a server
+   and hang the parent run, while the controller's own dry-run, arg/scope-error,
+   stubbed-`run_build`, and fake-dispatcher tests all still pass with the sentinel
+   set (Story 12.1-002).
 2. **Discovery** — `discover_queue(scope)` parses `##### Story X.Y-NNN:` headers
    from `docs/stories/epic-*.md`, extracting priority, points, and intra-project
    dependencies.

@@ -135,6 +135,18 @@ def build(ctx: typer.Context) -> None:
         registry=Registry(),
     )
 
+    if result.skipped_in_test:
+        # Story 12.1-002: the recursion guard fired (SDLC_IN_TEST set) — a project
+        # test invoked `sdlc build` bare during preflight. Report and exit cleanly
+        # so the parent suite does not recurse into pytest-within-pytest.
+        from sdlc.build import IN_TEST_ENV_VAR
+
+        typer.echo(
+            f"{IN_TEST_ENV_VAR} is set — skipping real build orchestration "
+            "(recursion guard, Story 12.1-002)."
+        )
+        raise typer.Exit(code=0)
+
     if result.preflight_failed:
         typer.echo(
             "PRE_FLIGHT_FAILURE: test suite is red on main — fix before building.",
@@ -369,6 +381,7 @@ def dashboard(
     With no ``--db`` the dashboard discovers every run across repos from the
     host-level registry; pass ``--db <path>`` for the single-repo view.
     """
+    from sdlc.build import in_test_sentinel
     from sdlc.dashboard import serve, stop_dashboard
 
     if stop or restart:
@@ -380,6 +393,20 @@ def dashboard(
         )
         if stop:
             raise typer.Exit(code=0)
+
+    # Story 12.1-002: never bind a server when running inside another build's
+    # preflight test suite (sentinel set) — a project test that invokes `sdlc
+    # dashboard` bare would otherwise block the run on a socket. Placed after the
+    # --stop/--restart handling (which only kills a server, never binds one) so
+    # that legitimate coverage of those paths still runs under the sentinel (AC3).
+    if in_test_sentinel():
+        from sdlc.build import IN_TEST_ENV_VAR
+
+        typer.echo(
+            f"{IN_TEST_ENV_VAR} is set — skipping dashboard server "
+            "(recursion guard, Story 12.1-002)."
+        )
+        raise typer.Exit(code=0)
 
     try:
         # db is None → registry-discovery mode (multi-run overview, Story 11.2-002).
