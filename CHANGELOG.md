@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.36.0] - 2026-06-21
+
+### Added
+
+- feat(controller-robustness): auto-migrate ledger at launch (#12.2-003)
+
+### Fixed
+
+- fix(controller-robustness): add missing _migrations table (#12.2-003)
+
+
 ## [v1.35.0] - 2026-06-21
 
 ### Added
