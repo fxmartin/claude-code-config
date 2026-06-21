@@ -552,3 +552,126 @@ def test_cli_build_all_done_exits_0(tmp_path, monkeypatch) -> None:
     result = runner.invoke(app, ["build", "epic-99", "--skip-preflight"])
     assert result.exit_code == 0
     assert "done" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# build.py — _run_story envelope-recovery branch (Story 14.2-003 touched this
+# function). A contract-error stage that is recovered by the envelope-only
+# re-ask (12.1-001) must still extract any PR number from the recovered result
+# and persist it (line ~3051), exactly as a first-pass success would.
+# ---------------------------------------------------------------------------
+
+def test_envelope_recovered_stage_persists_pr_number(tmp_path) -> None:
+    """A coverage stage recovered via envelope re-ask records its PR number.
+
+    The first ``coverage`` dispatch raises a ContractError (missing/garbled
+    result block); the bounded envelope-only re-ask then returns a schema-valid
+    coverage payload carrying ``pr_number``. The recovered PR must be persisted
+    on the story row just as a normal success would persist it.
+    """
+    from sdlc.contracts import ContractError
+
+    db = tmp_path / "ledger.db"
+    state = {"n": 0}
+
+    def coverage_contract_then_ok():
+        state["n"] += 1
+        if state["n"] == 1:
+            return ContractError("coverage result envelope missing")
+        return {
+            "pr_number": 4242,
+            "pr_url": "https://example/pull/4242",
+            "coverage_pct": 96.0,
+            "tests_added": 2,
+            "coverage_status": "PASS",
+            "security_status": "PASS",
+        }
+
+    dispatcher = FakeDispatcher(
+        overrides={("coverage", "s1-001"): coverage_contract_then_ok}
+    )
+    # Spy on every set_story_pr call so we can prove the *recovered* PR number was
+    # persisted by the envelope-recovery branch (line ~3051) specifically — the
+    # final stored value alone can't, since the later merge stage overwrites it
+    # with its own PR number and would mask a regression in that branch.
+    ledger = Ledger(db)
+    pr_persisted: list[int] = []
+    _orig_set_story_pr = ledger.set_story_pr
+
+    def _spy_set_story_pr(run_id, story_id, pr_number):
+        pr_persisted.append(pr_number)
+        return _orig_set_story_pr(run_id, story_id, pr_number)
+
+    ledger.set_story_pr = _spy_set_story_pr  # type: ignore[method-assign]
+
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=[_story("s1-001")],
+        ledger=ledger,
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    # Coverage was dispatched twice: the contract failure, then the re-ask.
+    assert sum(1 for a, sid in dispatcher.calls if a == "coverage") == 2
+    assert result.completed >= 1
+    # The envelope re-ask actually recovered the coverage stage...
+    conn = _open_db(db)
+    events = [
+        r[0]
+        for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='s1-001'"
+        ).fetchall()
+    ]
+    assert any("envelope re-ask recovered the coverage result" in m for m in events)
+    # ...and its recovered PR number (not merge's) was extracted and persisted by
+    # the recovery branch. This fails if line ~3051's set_story_pr is removed.
+    assert 4242 in pr_persisted
+
+
+# ---------------------------------------------------------------------------
+# build.py — _run_story envelope-recovery branch: an envelope-recovered
+# build/coverage stage whose commit still fails commitlint after the bounded
+# re-asks must park the story NEEDS_ATTENTION (line ~3062), never advance a
+# non-compliant header to a PR. (Function touched by Story 14.2-003.)
+# ---------------------------------------------------------------------------
+
+def test_envelope_recovered_stage_parks_on_lint_failure(tmp_path, monkeypatch) -> None:
+    """Recovered stage with a still-non-compliant commit parks NEEDS_ATTENTION."""
+    from sdlc.contracts import ContractError
+    import sdlc.build as build_mod
+    from sdlc.build import _run_story
+
+    # The envelope-recovered build stage's commit fails commitlint even after the
+    # bounded re-asks: force the shared lint helper to report non-compliant.
+    monkeypatch.setattr(build_mod, "_lint_stage_commit", lambda *a, **k: (0, False))
+
+    state = {"n": 0}
+
+    def build_contract_then_ok():
+        state["n"] += 1
+        if state["n"] == 1:
+            return ContractError("build result envelope missing")
+        return {
+            "branch_name": "feature/s1-001",
+            "build_status": "SUCCESS",
+            "commit_sha": "abc123",
+        }
+
+    dispatcher = FakeDispatcher(
+        overrides={("build", "s1-001"): build_contract_then_ok}
+    )
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(
+        run_id, "s1-001", "epic-99", "sample", "Story s1-001", 2, "py", "", None, "TODO"
+    )
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    outcome = _run_story(
+        _story("s1-001"), opts, ledger, run_id, dispatcher, tmp_path / "logs"
+    )
+    assert outcome == "NEEDS_ATTENTION"
+    # The build stage went through the envelope re-ask before parking.
+    assert sum(1 for a, sid in dispatcher.calls if a == "build") == 2
