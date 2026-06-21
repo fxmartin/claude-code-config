@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
+from sdlc.cohort import compute_cohorts
 from sdlc.discovery import discover_queue, parse_epic_file
 
 _SAMPLE_EPIC = """# Epic 99: Sample
@@ -24,7 +29,6 @@ More body.
 
 
 def _write_epic(tmp_path) -> "Path":  # type: ignore[name-defined]
-    from pathlib import Path
 
     stories = tmp_path / "docs" / "stories"
     stories.mkdir(parents=True)
@@ -105,7 +109,6 @@ _EPIC_34_LIKE = """# Epic 34: User Management
 
 
 def _write_epic34(tmp_path):
-    from pathlib import Path
 
     stories = tmp_path / "docs" / "stories"
     stories.mkdir(parents=True)
@@ -156,3 +159,148 @@ def test_discover_queue_single_story_zero_padded_epic(tmp_path, monkeypatch) -> 
     )
     monkeypatch.chdir(tmp_path)
     assert [s.id for s in discover_queue("7.3-001")] == ["7.3-001"]
+
+
+# --- 12.5-001: parse only intended dependency edges -------------------------
+
+
+def _deps_for(content: str, self_id: str = "99.9-999") -> list[str]:
+    """Parse a single `**Dependencies**:` value via parse_epic_file."""
+    epic = (
+        "# Epic 99: Deps\n\n"
+        f"##### Story {self_id}: Probe\n"
+        "**Priority**: P1\n"
+        "**Story Points**: 1\n"
+        f"**Dependencies**: {content}\n"
+    )
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "epic-99-deps.md"
+        path.write_text(epic, encoding="utf-8")
+        stories = parse_epic_file(path)
+    assert [s.id for s in stories] == [self_id]
+    return stories[0].dependencies
+
+
+def test_leading_id_then_parenthetical_prose_ignored() -> None:
+    """AC1: only the leading edge id is read; ids in prose are ignored."""
+    # The verbose 12.3-003 line that motivated this story.
+    assert _deps_for("12.3-001 (reconcile flips it once 12.3-004 lands)") == [
+        "12.3-001"
+    ]
+
+
+def test_leading_none_with_prose_ids_yields_no_deps() -> None:
+    """AC2: a leading `None` followed by prose ids resolves to zero edges."""
+    assert _deps_for("None (shares build.py with 12.3-004 and 12.4-001)") == []
+    # The real 12.4-001 line: `None to ship; ...` before any id.
+    assert (
+        _deps_for("None to ship; pairs with 12.3-001 (reconcile preserves work)")
+        == []
+    )
+
+
+def test_multiple_leading_edges_with_annotations_all_kept() -> None:
+    """Real 11.2-005 line: two real edges, each annotated, then trailing prose."""
+    assert _deps_for(
+        "11.2-001 (repo path from the registry), 11.2-002 (run selection). The"
+    ) == ["11.2-001", "11.2-002"]
+
+
+def test_terse_connective_lists_unchanged() -> None:
+    """Terse `Stories A and B.` and comma lists keep every leading edge."""
+    assert _deps_for("Stories 3.1-001 and 3.1-002.") == ["3.1-001", "3.1-002"]
+    assert _deps_for("11.1-002, 11.2-003") == ["11.1-002", "11.2-003"]
+    assert _deps_for("Story 99.1-001.", self_id="99.1-002") == ["99.1-001"]
+
+
+def test_ids_only_inside_parens_are_not_edges() -> None:
+    """Real epic-10 line: ids appear only inside a parenthetical → no edges."""
+    assert (
+        _deps_for("Epic-07 (Stories 7.1-001, 7.3-001) and Epic-04 (ledger schema).")
+        == []
+    )
+
+
+def test_independent_of_prose_ids_are_not_edges() -> None:
+    """`Independent of Stories 9.1-001 and 9.1-002.` are not dependencies."""
+    assert (
+        _deps_for("Epic-02 (CI workflow). Independent of Stories 9.1-001 and 9.1-002.")
+        == []
+    )
+
+
+def test_none_marker_variants_yield_no_deps() -> None:
+    assert _deps_for("None") == []
+    assert _deps_for("none") == []
+    assert _deps_for("none (independent of other epics).") == []
+    assert _deps_for("N/A") == []
+    assert _deps_for("TBD — to be decided once 14.1-001 lands") == []
+
+
+def _epic_files() -> list[Path]:
+    here = Path(__file__).resolve()
+    # controller/tests/test_discovery.py -> repo root is two parents up.
+    stories_dir = here.parents[2] / "docs" / "stories"
+    return sorted(stories_dir.glob("epic-*.md"))
+
+
+def test_all_epics_schedule_without_phantom_cycle() -> None:
+    """AC4: every shipped epic file parses and schedules with no phantom cycle."""
+    epics = _epic_files()
+    assert epics, "no epic story files found"
+    for epic in epics:
+        stories = parse_epic_file(epic)
+        # compute_cohorts must not raise a phantom cycle from prose-mentioned ids.
+        compute_cohorts(stories)
+
+
+def test_no_resolved_edge_appears_only_in_prose() -> None:
+    """AC3 guard: across all epics, every resolved edge id appears in the leading
+    head of its Dependencies line — never only in parenthetical/sentence prose.
+    """
+    import re
+
+    from sdlc.discovery import _dependency_head
+
+    header = re.compile(r"^#{2,6}\s*Story\s+([0-9]+\.[0-9]+-[0-9]+):")
+    dep_line = re.compile(r"^\*\*Dependencies\*\*:\s*(.+?)\s*$")
+    dep_id = re.compile(r"[0-9]+\.[0-9]+-[0-9]+")
+
+    # Map each story id to the set of ids in the *leading head* of its
+    # Dependencies line; a resolved edge outside that set would be prose-only.
+    checked = 0
+    for epic in _epic_files():
+        current: str | None = None
+        heads: dict[str, set[str]] = {}
+        for line in epic.read_text(encoding="utf-8").splitlines():
+            if h := header.match(line):
+                current = h.group(1)
+                continue
+            if current and (m := dep_line.match(line)):
+                heads[current] = set(dep_id.findall(_dependency_head(m.group(1))))
+                current = None
+        for story in parse_epic_file(epic):
+            allowed = heads.get(story.id, set())
+            prose_only = set(story.dependencies) - allowed
+            assert not prose_only, f"{epic.name} {story.id}: prose-only {prose_only}"
+            checked += 1
+    assert checked > 0
+
+
+def test_genuine_cycle_still_fails_fast() -> None:
+    """AC5: a real intended cycle still raises the story-named cohort error."""
+    epic = (
+        "# Epic 99: Cycle\n\n"
+        "##### Story 99.1-001: A\n**Story Points**: 1\n**Dependencies**: 99.1-002\n\n"
+        "##### Story 99.1-002: B\n**Story Points**: 1\n**Dependencies**: 99.1-001\n"
+    )
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "epic-99-cycle.md"
+        path.write_text(epic, encoding="utf-8")
+        stories = parse_epic_file(path)
+    with pytest.raises(ValueError, match="99.1-001"):
+        compute_cohorts(stories)
