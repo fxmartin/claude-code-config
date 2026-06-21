@@ -293,6 +293,25 @@ def test_resume_while_still_limited_reparks(tmp_path: Path) -> None:
     assert ledger.latest_resumable_run("epic-88") == result.run_id
 
 
+def test_resume_repark_renders_view(tmp_path: Path) -> None:
+    # A resume that re-parks RATE_LIMITED renders the live view exactly once for
+    # its own run before returning (parity with run_build's park close-out).
+    db, result = _build_parked(tmp_path)
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", "88.1-001"),
+        signal=RateLimitSignal(source="usage-limit", reset_at=999_999.0),
+        times=99,
+    )
+    rendered: list[str] = []
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        sleep_fn=_Sleeps(), clock=lambda: 0.0,
+        render_view=rendered.append,
+    )
+    assert resumed.rate_limited is True
+    assert rendered == [result.run_id]
+
+
 # ---------------------------------------------------------------------------
 # AC: configured rolling-window token budget (proactive gate)
 # ---------------------------------------------------------------------------
