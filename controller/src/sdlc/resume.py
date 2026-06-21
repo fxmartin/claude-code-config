@@ -43,7 +43,9 @@ class StoryResumeState:
     story's pipeline is complete), ``start_attempt`` continues the attempt count
     past any crashed/failed attempt of that stage, and ``pr_number`` /
     ``bugfix_seq`` carry forward so review/merge and the bugfix loop resume
-    intact.
+    intact. ``start_escalation`` (Story 14.2-003) is ``next_stage``'s prior
+    FAILED-attempt count, so cheap-first model escalation resumes on the tier the
+    stage had already climbed to rather than dropping back to its cheap base.
     """
 
     story_id: str
@@ -51,6 +53,7 @@ class StoryResumeState:
     done_pipeline_stages: frozenset[str]
     next_stage: str | None
     start_attempt: int
+    start_escalation: int
     pr_number: int | None
     bugfix_seq: int
 
@@ -116,8 +119,19 @@ def compute_resume_plan(
         if next_stage is not None:
             stage_attempts = [a["attempt"] for a in attempts if a["name"] == next_stage]
             start_attempt = (max(stage_attempts) + 1) if stage_attempts else 1
+            # Story 14.2-003: each prior FAILED attempt of the resumed stage
+            # represents one cheap-first tier bump already made, so resume routes
+            # on the tier the stage had climbed to. Only FAILED attempts count —
+            # a crashed/rate-limited IN_PROGRESS attempt never escalated, so it
+            # must not inflate the level.
+            start_escalation = sum(
+                1
+                for a in attempts
+                if a["name"] == next_stage and a["status"] == "FAILED"
+            )
         else:
             start_attempt = 1
+            start_escalation = 0
 
         # The "bugfix", "reask" and "commitlint" stages share the monotonic
         # ``bugfix_seq`` counter for their attempt number (Stories 12.1-001,
@@ -139,6 +153,7 @@ def compute_resume_plan(
             done_pipeline_stages=done_pipeline,
             next_stage=next_stage,
             start_attempt=start_attempt,
+            start_escalation=start_escalation,
             pr_number=row.get("pr_number"),
             bugfix_seq=bugfix_seq,
         )
@@ -333,6 +348,7 @@ def run_resume(
                     rl_ctx, story, ledger, rid, dispatch, logs_dir,
                     done_stages=st.done_pipeline_stages,
                     start_attempt=st.start_attempt,
+                    start_escalation=st.start_escalation,
                     pr_number=st.pr_number,
                     bugfix_seq=st.bugfix_seq,
                 )

@@ -427,6 +427,32 @@ def test_explicit_override_is_not_escalated_on_retry(tmp_path, monkeypatch) -> N
     assert build_models == [HAIKU, HAIKU]  # pin held, not escalated
 
 
+def test_resumed_stage_routes_on_escalated_tier(tmp_path, monkeypatch) -> None:
+    # A stage that had climbed to a stronger tier before an interruption must
+    # resume on that tier, not drop back to its cheap base. _run_story carries
+    # the prior FAILED-attempt count via start_escalation (Story 14.2-003).
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="quota-max",  # build base = Haiku
+    )
+    disp = _FailNTimesDispatcher("build", 0)  # build passes on the resumed dispatch
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-14", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(
+        run_id, "14.2-001", "epic-14", "t", "Should", 1, "python", "", None, "TODO"
+    )
+    build_mod._run_story(
+        _story(points=1), opts, ledger, run_id, disp, tmp_path,
+        start_attempt=3, start_escalation=2,  # build had failed twice already
+    )
+    build_models = [m for (a, m) in disp.calls if a == "build"]
+    # Haiku base + 2 prior tier bumps → Opus on the very first resumed dispatch.
+    assert build_models[0] == OPUS
+
+
 def test_escalation_is_recorded_in_ledger_events(tmp_path, monkeypatch) -> None:
     # AC4: the model used per attempt is recorded so the eval harness can see
     # cheap-first's success rate.

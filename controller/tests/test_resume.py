@@ -174,6 +174,46 @@ def test_resume_bugfix_seq_continues_past_commitlint_rows(tmp_path: Path) -> Non
     assert plan["99.1-001"].bugfix_seq >= 1
 
 
+def test_resume_escalation_reflects_prior_failed_attempts(tmp_path: Path) -> None:
+    """Cheap-first escalation resumes on the tier the stage had climbed to (14.2-003).
+
+    A stage that failed twice before a crash had escalated two tiers; resume must
+    reconstruct that level from its FAILED-attempt count so it does not drop back
+    to the cheap base. A crashed (IN_PROGRESS) attempt never escalated, so it must
+    not be counted.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"skip_coverage": True}))
+    ledger.story_upsert(
+        run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    # build failed twice (two cheap-first tier bumps), then crashed mid third try.
+    ledger.stage_start(run_id, "99.1-001", "build", 1)
+    ledger.stage_finish(run_id, "99.1-001", "build", 1, "FAILED")
+    ledger.stage_start(run_id, "99.1-001", "build", 2)
+    ledger.stage_finish(run_id, "99.1-001", "build", 2, "FAILED")
+    ledger.stage_start(run_id, "99.1-001", "build", 3)  # left IN_PROGRESS (crashed)
+    ledger.set_story_status(run_id, "99.1-001", "IN_PROGRESS")
+
+    plan = compute_resume_plan(ledger, run_id, skip_coverage=True)
+    st = plan["99.1-001"]
+    assert st.next_stage == "build"
+    assert st.start_attempt == 4  # past the crashed attempt 3
+    assert st.start_escalation == 2  # two FAILED attempts → two prior tier bumps
+
+
+def test_resume_escalation_zero_when_stage_never_failed(tmp_path: Path) -> None:
+    """A stage interrupted on its first (never-failed) attempt resumes cheap."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_interrupted(db)  # 99.1-002 crashed mid-review on attempt 1, no FAILED rows
+    plan = compute_resume_plan(Ledger(db), Ledger(db).latest_run_id(), skip_coverage=True)
+    assert plan["99.1-002"].start_escalation == 0
+
+
 def test_latest_resumable_run_finds_in_progress(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     run_id = _seed_interrupted(db)
