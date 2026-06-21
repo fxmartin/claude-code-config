@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.41.0] - 2026-06-21
+
+### Added
+
+- feat(controller-robustness): add awaiting_approval run state (#12.3-003)
+
+
 ## [v1.40.0] - 2026-06-21
 
 ### Added
