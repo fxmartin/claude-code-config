@@ -23,6 +23,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "state": "Inspect the persisted state machine for a run.",
     "validate": "Validate an agent response against its JSON schema.",
     "rollback": "Roll a run back to a prior ledger checkpoint.",
+    "reconcile": "Re-check a run against origin/main and correct the ledger.",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
     "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
     "depscan": "Classify an osv-scanner report into a CLEAN | WARN | BLOCK gate verdict.",
@@ -561,6 +562,72 @@ def rollback(
         f"reset {len(result.reset_stories)} story(ies) "
         f"({', '.join(result.reset_stories)}) — "
         f"run `sdlc resume` to rebuild them."
+    )
+    raise typer.Exit(code=0)
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["reconcile"])
+def reconcile(
+    run: str | None = typer.Argument(
+        None, help="Run id to reconcile (default: the most recent run)."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+) -> None:
+    """Re-check a run against ``origin/main`` and correct a stale ledger.
+
+    The manual counterpart to the automatic close-out reconciliation (Story
+    12.3-001): when an unattended run aborted (e.g. a 429) before its already-open
+    PRs were merged by hand the next morning, this re-runs the same
+    ``reconcile_run`` algorithm, reclassifies any story whose work provably landed
+    on ``origin/main`` to ``DONE``, recomputes and re-stamps the run terminal, and
+    prints a human summary. It is a *recovery* verb in the same spirit as
+    ``resume``/``rollback`` — not new orchestration.
+
+    Defaults to the most recent run (mirrors ``rollback``). A run where nothing
+    changed reports "nothing to reconcile" and exits 0 (idempotent, safe to
+    re-run). With no ledger / no run it reports cleanly and exits 0; only a
+    genuinely unknown *explicit* run id exits non-zero. Never creates a spurious
+    empty ledger.
+    """
+    from sdlc.ledger_view import Ledger, default_db_path
+    from sdlc.reconcile import reconcile_run
+
+    db_path = db or default_db_path()
+    ledger = Ledger(db_path)
+    # Migrate a pre-existing (possibly stale) ledger before any read/write so a
+    # ledger predating a schema change does not crash with "no such column".
+    ledger.ensure_migrated()
+
+    # Resolve the target up front so we can distinguish "no runs at all" (clean
+    # exit 0) from "unknown explicit run id" (error exit 2) — and so we never
+    # create a spurious empty ledger for a never-built repo.
+    target = run or ledger.latest_run_id()
+    if target is None:
+        typer.echo(f"no build run found in ledger: {db_path}")
+        raise typer.Exit(code=0)
+    if ledger.run_row(target) is None:
+        typer.echo(f"error: no such run: {target}", err=True)
+        raise typer.Exit(code=2)
+
+    result = reconcile_run(ledger, target)
+
+    if result.skipped:
+        typer.echo(
+            f"reconciliation skipped for run {result.run_id[:8]}: "
+            "git fetch failed (offline / no remote)."
+        )
+        raise typer.Exit(code=0)
+
+    if not result.reclassified:
+        typer.echo(f"nothing to reconcile: run {result.run_id[:8]} is already in sync.")
+        raise typer.Exit(code=0)
+
+    ids = ", ".join(r["story_id"] for r in result.reclassified)
+    typer.echo(
+        f"reconciled {len(result.reclassified)} story(ies) to DONE ({ids}); "
+        f"run {result.run_id[:8]} {result.run_status_before} → {result.run_status_after}"
     )
     raise typer.Exit(code=0)
 

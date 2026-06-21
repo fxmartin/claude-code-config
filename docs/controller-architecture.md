@@ -23,6 +23,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/resume.py` | Crash-resume: derives each story's resume point from the ledger and re-enters the loop (Story 10.1-001). |
 | `sdlc/status.py` | Read-side `state` helpers — a greppable state-machine dump (Story 10.1-001). |
 | `sdlc/rollback.py` | Returns a run to a prior checkpoint by resetting the later stories (Story 10.2-001). |
+| `sdlc/reconcile.py` | Re-checks parked stories against `origin/main` and recomputes the run terminal — the engine behind close-out and the `sdlc reconcile` verb (Stories 12.3-001/12.3-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 
 ## The state machine
@@ -183,6 +184,26 @@ verb (`sdlc reconcile`, Story 12.3-002 — the counterpart to `resume`/`rollback
   statuses.
 - **Idempotent.** A re-run over an already-reconciled run produces no status
   flips and no duplicate rows — only a "nothing to reconcile" event.
+
+### The `sdlc reconcile` recovery verb
+
+`sdlc reconcile [run] [--db PATH]` (Story 12.3-002) is the **manual** counterpart
+to the automatic close-out reconciliation — for when an unattended run aborted
+(e.g. a 429) before its already-open PRs were merged by hand the next morning, so
+the ledger still shows `FAILED` days later. It is a recovery verb in the same
+spirit as `resume`/`rollback`, **not** new orchestration: it just calls the shared
+`reconcile_run` and prints a human summary.
+
+- **Defaults to the most recent run** when no id is passed (mirrors `rollback`),
+  and runs `ensure_migrated()` first so a stale ledger never crashes with
+  "no such column".
+- **Human summary** of the reclassifications and the run-status transition, e.g.
+  `reconciled 3 story(ies) to DONE (…); run ced08c0f FAILED → DONE`. When nothing
+  changed it prints `nothing to reconcile` and exits 0 (idempotent, safe to
+  re-run).
+- **No-DB / unknown run.** With no ledger or no run it reports cleanly and exits 0
+  without materialising a spurious empty ledger; only a genuinely **unknown
+  explicit run id** exits non-zero.
 
 ## Why schema validation is the safety boundary
 
