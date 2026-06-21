@@ -45,6 +45,21 @@ def _repo_with_origin(tmp_path: Path) -> Path:
     return root
 
 
+def _repo_no_origin(tmp_path: Path) -> Path:
+    """A repo on ``main`` with NO ``origin`` remote, so ``git fetch origin`` fails."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "core.hooksPath", str(tmp_path / "no-hooks"))
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.name", "Test")
+    (root / "README.md").write_text("base\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-q", "-m", "chore: base")
+    _git(root, "branch", "-M", "main")
+    return root
+
+
 def _land_story(root: Path, story_id: str) -> None:
     """Cut ``feature/<id>``, commit, fast-forward into main, and push to origin."""
     _git(root, "checkout", "-q", "-b", f"feature/{story_id}")
@@ -156,6 +171,24 @@ def test_reconcile_unknown_run_exits_nonzero(tmp_path: Path) -> None:
     result = runner.invoke(app, ["reconcile", "does-not-exist", "--db", str(db)])
     assert result.exit_code != 0
     assert "does-not-exist" in result.output
+
+
+# --- offline fetch degrades to a clean "skipped" no-op (exit 0) -------------
+
+
+def test_reconcile_offline_fetch_is_skipped(tmp_path: Path, monkeypatch) -> None:
+    root = _repo_no_origin(tmp_path)  # no origin remote → `git fetch origin` fails
+    db = root / ".sdlc-state.db"
+    run_id = _seed_failed_run(db, "99.1-004")  # a parked story exists to reconcile
+    monkeypatch.chdir(root)
+
+    result = runner.invoke(app, ["reconcile", run_id, "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert "skipped" in result.output.lower()
+    assert "fetch failed" in result.output.lower()
+    # A skip leaves the parked story exactly as it was — no spurious flip.
+    assert _status(db, run_id, "99.1-004") == "FAILED"
 
 
 # --- not a stub -------------------------------------------------------------
