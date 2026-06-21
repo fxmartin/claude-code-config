@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.35.0] - 2026-06-21
+
+### Added
+
+- feat(controller-robustness): lint agent commit messages (#12.2-002)
+- feat(controller-robustness): make renderer non-destructive (#12.2-001)
+- feat(controller-robustness): recover malformed envelope (#12.1-001)
+
+### Fixed
+
+- fix(controller-robustness): include commitlint rows in resume seq
+- fix(controller-robustness): splice first matched marker pair (#12.2-001)
+- fix(controller-robustness): keep render idempotent (#12.2-001)
+
+
 ## [v1.34.0] - 2026-06-20
 
 ### Added
