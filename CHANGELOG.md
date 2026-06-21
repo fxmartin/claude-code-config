@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.45.0] - 2026-06-21
+
+### Added
+
+- feat(cost-model-governance): per-run token budget gate (#14.1-001)
+
+### Changed
+
+- refactor(controller-robustness): normalize discovery format (#12.5-001)
+
+### Fixed
+
+- fix(cost-model-governance): re-enforce budget on resume (#14.1-001)
+
+
 ## [v1.44.0] - 2026-06-21
 
 ### Added
