@@ -166,9 +166,7 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
         elif m := _POINTS.match(line):
             current["points"] = int(m.group(1))
         elif m := _DEPENDENCIES.match(line):
-            current["dependencies"] = _parse_dependency_edges(
-                m.group(1), current["id"]
-            )
+            current["dependencies"] = _parse_dependency_edges(m.group(1), current["id"])
 
     _flush()
     return stories

@@ -127,8 +127,8 @@ def test_story_points_alias_is_parsed(tmp_path) -> None:
 def test_done_detection(tmp_path) -> None:
     """R4: Status 'Done' OR all-checked DoD → done; otherwise not done."""
     by_id = {s.id: s for s in parse_epic_file(_write_epic34(tmp_path))}
-    assert by_id["34.1-001"].done is True   # Status: Done wins despite an unchecked box
-    assert by_id["34.2-001"].done is True   # all DoD boxes checked
+    assert by_id["34.1-001"].done is True  # Status: Done wins despite an unchecked box
+    assert by_id["34.2-001"].done is True  # all DoD boxes checked
     assert by_id["34.5-003"].done is False  # a box is unchecked, Status: Not Started
 
 
@@ -196,8 +196,7 @@ def test_leading_none_with_prose_ids_yields_no_deps() -> None:
     assert _deps_for("None (shares build.py with 12.3-004 and 12.4-001)") == []
     # The real 12.4-001 line: `None to ship; ...` before any id.
     assert (
-        _deps_for("None to ship; pairs with 12.3-001 (reconcile preserves work)")
-        == []
+        _deps_for("None to ship; pairs with 12.3-001 (reconcile preserves work)") == []
     )
 
 
