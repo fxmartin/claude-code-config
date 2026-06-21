@@ -50,14 +50,27 @@ DEFAULT_AGENT_CMD: list[str] = [
 ]
 
 
-def resolve_agent_cmd(explicit: list[str] | None = None) -> list[str]:
-    """The command to launch the agent: explicit arg → ``$SDLC_AGENT_CMD`` → default."""
+def resolve_agent_cmd(
+    explicit: list[str] | None = None, *, model: str | None = None
+) -> list[str]:
+    """The command to launch the agent: explicit arg → ``$SDLC_AGENT_CMD`` → default.
+
+    Story 14.2-001: ``model`` is the per-stage model the routing map selected. It
+    decorates **only** the built-in default command (``--model <model>``); an
+    explicit ``agent_cmd`` or a ``$SDLC_AGENT_CMD`` override is the escape hatch
+    and owns its own model selection, so the routed model is deliberately ignored
+    there (precedence: explicit/env > map). With no ``model`` the default command
+    is byte-for-byte today's, so routing-off behaviour is unchanged.
+    """
     if explicit is not None:
         return list(explicit)
     env = os.environ.get("SDLC_AGENT_CMD")
     if env:
         return shlex.split(env)
-    return list(DEFAULT_AGENT_CMD)
+    cmd = list(DEFAULT_AGENT_CMD)
+    if model:
+        cmd += ["--model", model]
+    return cmd
 
 
 def _write_transcript(path: Path | None, stdout: str, stderr: str = "") -> None:
@@ -217,6 +230,7 @@ def dispatch_agent(
     *,
     story: Any | None = None,
     agent_cmd: list[str] | None = None,
+    model: str | None = None,
     timeout: int = DEFAULT_TIMEOUT_S,
     transcript_path: Path | None = None,
     on_progress: ProgressCallback | None = None,
@@ -243,7 +257,7 @@ def dispatch_agent(
     (no streaming → no sub-stage milestones); failures inside the callback are
     isolated so progress recording can never break the run.
     """
-    cmd = resolve_agent_cmd(agent_cmd)
+    cmd = resolve_agent_cmd(agent_cmd, model=model)
     if _is_streaming_cmd(cmd):
         return _dispatch_streaming(
             agent_type, prompt, cmd, timeout=timeout,
