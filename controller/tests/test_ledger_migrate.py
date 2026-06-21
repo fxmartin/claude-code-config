@@ -275,3 +275,59 @@ def test_migrate_registry_ledgers_skips_unreachable(tmp_path: Path) -> None:
 
     assert _USAGE_COLS <= _columns(good_db, "stages")  # reachable one migrated
     assert not missing_db.exists()  # unreachable one not materialised
+
+
+def test_migrate_registry_ledgers_dedupes_shared_db(tmp_path: Path) -> None:
+    """Two registry records pointing at the *same* ledger migrate it once: the
+    second record is skipped by the ``seen`` guard, not migrated twice."""
+    import os
+
+    from sdlc.dashboard import _migrate_registry_ledgers
+    from sdlc.registry import Registry, RunRecord
+
+    shared_db = tmp_path / ".sdlc-state.db"
+    _old_schema_db(shared_db)
+
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord("r1", str(tmp_path), str(shared_db), "epic-aaa", os.getpid(),
+                  "IN_PROGRESS", "2026-01-01T00:00:00+00:00", total=1, completed=0)
+    )
+    registry.register(
+        RunRecord("r2", str(tmp_path), str(shared_db), "epic-bbb", os.getpid(),
+                  "DONE", "2026-01-02T00:00:00+00:00", total=1, completed=1)
+    )
+
+    _migrate_registry_ledgers(registry)  # must not raise on the duplicate db
+
+    assert _USAGE_COLS <= _columns(shared_db, "stages")  # migrated exactly once
+    assert _versions(shared_db) == [1, 2]  # no double-apply via the dupe record
+
+
+def test_migrate_registry_ledgers_skips_corrupt_existing_db(tmp_path: Path) -> None:
+    """An *existing but corrupt* ledger raises ``sqlite3.Error`` from
+    ``ensure_migrated`` — the best-effort loop swallows it and keeps going,
+    still migrating the reachable, valid ledger."""
+    import os
+
+    from sdlc.dashboard import _migrate_registry_ledgers
+    from sdlc.registry import Registry, RunRecord
+
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_bytes(b"this is not a sqlite database")  # exists, but unreadable
+    good_db = tmp_path / "good.db"
+    _old_schema_db(good_db)
+
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord("r1", str(tmp_path), str(corrupt_db), "epic-aaa", os.getpid(),
+                  "IN_PROGRESS", "2026-01-01T00:00:00+00:00", total=1, completed=0)
+    )
+    registry.register(
+        RunRecord("r2", str(tmp_path), str(good_db), "epic-bbb", os.getpid(),
+                  "DONE", "2026-01-02T00:00:00+00:00", total=1, completed=1)
+    )
+
+    _migrate_registry_ledgers(registry)  # corrupt db must not abort the loop
+
+    assert _USAGE_COLS <= _columns(good_db, "stages")  # the valid ledger migrated
