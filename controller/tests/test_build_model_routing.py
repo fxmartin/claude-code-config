@@ -287,7 +287,10 @@ def test_bugfix_stage_receives_routed_model(tmp_path, monkeypatch) -> None:
     )
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
     assert bugfix_models, "bugfix agent was never dispatched"
-    assert bugfix_models[0] == SONNET  # balanced 'bugfix' tier, not the CLI default
+    # Balanced's `bugfix` tier is Sonnet, but Story 14.2-003 escalates the first
+    # bugfix attempt one tier (Sonnet → Opus) — a routed model, not the CLI
+    # default. Full escalation behaviour is covered below.
+    assert bugfix_models[0] == OPUS
 
 
 def test_bugfix_override_wins_over_map(tmp_path, monkeypatch) -> None:
@@ -303,6 +306,151 @@ def test_bugfix_override_wins_over_map(tmp_path, monkeypatch) -> None:
     )
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
     assert bugfix_models[0] == HAIKU
+
+
+# ---------------------------------------------------------------------------
+# Cheap-first dispatch with model escalation on retry (Story 14.2-003)
+# ---------------------------------------------------------------------------
+
+
+class _FailNTimesDispatcher:
+    """Fails ``target`` ``fails`` times (then succeeds); bugfix returns FIXED.
+
+    Records every dispatch as (agent_type, model) so per-attempt escalation can
+    be asserted across both the retried stage and the bugfix agent.
+    """
+
+    def __init__(self, target: str = "build", fails: int = 1) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+        self._target = target
+        self._fails = fails
+        self._seen = 0
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        self.calls.append((agent_type, kwargs.get("model")))
+        if agent_type == self._target:
+            self._seen += 1
+            if self._seen <= self._fails:
+                return AgentResult(
+                    agent_type=self._target,
+                    data={"branch_name": "feature/x", "build_status": "FAILED",
+                          "error_summary": "boom"},
+                    raw="",
+                )
+        if agent_type == "bugfix":
+            return AgentResult(
+                agent_type="bugfix",
+                data={"failure_category": "TEST_BUG", "fix_status": "FIXED",
+                      "tests_passing": True, "bugs_fixed": 1, "tests_fixed": 0},
+                raw="",
+            )
+        return AgentResult(agent_type=agent_type, data=_PAYLOADS[agent_type], raw="")
+
+
+def _run_disp(opts, story, disp, tmp_path):
+    run_build(
+        opts, queue=[story], ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=disp, preflight=lambda: True,
+    )
+    return disp
+
+
+def test_bugfix_retry_escalates_build_one_tier(tmp_path, monkeypatch) -> None:
+    # Balanced build is Sonnet; a single failure escalates the retry + the bugfix
+    # agent one tier to Opus (AC1), rather than re-running on the model that failed.
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced",
+    )
+    disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 1), tmp_path)
+    build_models = [m for (a, m) in disp.calls if a == "build"]
+    bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
+    assert build_models == [SONNET, OPUS]  # cheap first pass, escalated retry
+    assert bugfix_models == [OPUS]
+
+
+def test_escalation_climbs_haiku_sonnet_opus(tmp_path, monkeypatch) -> None:
+    # Quota-max build is Haiku; two failures climb the full ladder one tier per
+    # attempt: Haiku → Sonnet → Opus (AC1 example), capped at the top.
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="quota-max",
+    )
+    disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 2), tmp_path)
+    build_models = [m for (a, m) in disp.calls if a == "build"]
+    bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
+    assert build_models == [HAIKU, SONNET, OPUS]
+    assert bugfix_models == [SONNET, OPUS]
+
+
+def test_top_tier_stage_escalation_is_a_noop(tmp_path, monkeypatch) -> None:
+    # Quality-first build is already Opus; escalation is a no-op (AC3) and the
+    # bounded bugfix budget is unchanged — every dispatch stays on Opus.
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="quality-first",
+    )
+    disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 1), tmp_path)
+    build_models = [m for (a, m) in disp.calls if a == "build"]
+    bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
+    assert build_models == [OPUS, OPUS]
+    assert bugfix_models == [OPUS]
+
+
+def test_first_pass_success_does_not_escalate(tmp_path, monkeypatch) -> None:
+    # AC2: a stage that passes first time stays on its cheap tier — no bugfix, no
+    # escalation. This is where the quota saving comes from.
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced",
+    )
+    disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 0), tmp_path)
+    build_models = [m for (a, m) in disp.calls if a == "build"]
+    assert build_models == [SONNET]  # one cheap dispatch, no escalation
+    assert not [m for (a, m) in disp.calls if a == "bugfix"]
+
+
+def test_explicit_override_is_not_escalated_on_retry(tmp_path, monkeypatch) -> None:
+    # An explicit --model-<stage> pin is an operator choice; cheap-first never
+    # overrides it, so build stays on the pinned model across the retry too.
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced", model_overrides={"build": HAIKU},
+    )
+    disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 1), tmp_path)
+    build_models = [m for (a, m) in disp.calls if a == "build"]
+    assert build_models == [HAIKU, HAIKU]  # pin held, not escalated
+
+
+def test_escalation_is_recorded_in_ledger_events(tmp_path, monkeypatch) -> None:
+    # AC4: the model used per attempt is recorded so the eval harness can see
+    # cheap-first's success rate.
+    import sqlite3
+
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced",
+    )
+    run_build(
+        opts, queue=[_story(points=1)], ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=_FailNTimesDispatcher("build", 1), preflight=lambda: True,
+    )
+    conn = sqlite3.connect(tmp_path / "ledger.db")
+    msgs = [
+        r[0]
+        for r in conn.execute(
+            "SELECT message FROM events WHERE message LIKE '%14.2-003%'"
+        ).fetchall()
+    ]
+    conn.close()
+    assert any("bugfix attempt" in m and "model=opus" in m for m in msgs)
+    assert any("retry" in m and "escalated" in m and "model=opus" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------

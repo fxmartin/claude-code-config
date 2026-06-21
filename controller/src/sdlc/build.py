@@ -34,6 +34,7 @@ from sdlc.dispatch import AgentDispatchError, AgentResult, RateLimitError, dispa
 from sdlc.model_routing import (
     ModelRoutingConfig,
     OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
+    escalate_model,
     load_routing_config,
     routing_config,
     select_model,
@@ -2933,9 +2934,25 @@ def _run_story(
                     raise _CostGatePause(
                         story_id=story.id, stage=stage, estimate=estimate
                     )
+            # Story 14.2-003: the cheap-first escalation level for this dispatch is
+            # the count of bugfix attempts already spent on this stage — 0 on the
+            # first (cheap) pass, +1 per retry. A passing first attempt therefore
+            # never escalates (the common path stays cheap); only a stage that
+            # failed into the bugfix loop is retried one tier stronger.
+            if bugfix_attempts > 0:
+                esc_model = _select_stage_model(
+                    stage, story, opts, escalation_steps=bugfix_attempts
+                )
+                ledger.event_log(
+                    run_id, story.id, "info", "controller",
+                    f"{stage} retry (attempt {attempt}) escalated to "
+                    f"model={esc_model or 'cli-default'} after {bugfix_attempts} "
+                    "bugfix attempt(s) (Story 14.2-003 cheap-first)",
+                )
             try:
                 ok, result, failure, kind = _dispatch_stage(
-                    stage, story, opts, pr_number, dispatch, tpath, on_progress=sink
+                    stage, story, opts, pr_number, dispatch, tpath,
+                    on_progress=sink, escalation_steps=bugfix_attempts,
                 )
                 if ok:
                     ledger.stage_finish(
@@ -3040,7 +3057,7 @@ def _run_story(
                 bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
                 if not _run_bugfix(
                     story, stage, failure, opts, ledger, run_id, dispatch,
-                    bpath, bugfix_seq,
+                    bpath, bugfix_seq, escalation_steps=bugfix_attempts,
                 ):
                     return _exhausted_status(kind, story.id, ledger, run_id)
                 # Story 12.2-002: the bugfix agent authors a commit too — lint its
@@ -3216,14 +3233,24 @@ def _story_high_risk(story: Story, opts: BuildOptions) -> bool:
         return False
 
 
-def _select_stage_model(stage: str, story: Story, opts: BuildOptions) -> str | None:
+def _select_stage_model(
+    stage: str, story: Story, opts: BuildOptions, *, escalation_steps: int = 0
+) -> str | None:
     """Pick the model for ``stage`` (Story 14.2-001), or None for the CLI default.
 
-    Precedence: an explicit ``--model-<stage>`` override wins over the map; then
-    the routing profile's :func:`select_model` (with the story's points and a
-    best-effort high-risk signal driving build/review escalation); else None when
-    routing is off — in which case the dispatcher adds no ``--model`` and
-    behaviour is unchanged from today.
+    Precedence: an explicit ``--model-<stage>`` override wins over the map (and is
+    an operator pin — never escalated); then the routing profile's
+    :func:`select_model` (with the story's points and a best-effort high-risk
+    signal driving build/review escalation); else None when routing is off — in
+    which case the dispatcher adds no ``--model`` and behaviour is unchanged from
+    today.
+
+    ``escalation_steps`` (Story 14.2-003) bumps the mapped tier up the ladder by
+    that many steps, capped at the strongest tier — the cheap-first retry lever.
+    It defaults to 0 (the common passing path), so the first dispatch of every
+    stage runs on its cheap mapped tier; only a bugfix retry passes a positive
+    count. An explicit override and the routing-off path both ignore it, so an
+    operator pin and today's behaviour are never silently escalated.
     """
     override = opts.model_overrides.get(stage)
     if override:
@@ -3235,7 +3262,8 @@ def _select_stage_model(stage: str, story: Story, opts: BuildOptions) -> str | N
     # decision time (review), so a resume routes identically to the original run;
     # build escalates on points alone. See _RISK_AWARE_STAGES.
     high_risk = _story_high_risk(story, opts) if stage in _RISK_AWARE_STAGES else False
-    return select_model(stage, config, points=story.points, high_risk=high_risk)
+    base = select_model(stage, config, points=story.points, high_risk=high_risk)
+    return escalate_model(base, escalation_steps)
 
 
 def _dispatch_stage(
@@ -3246,6 +3274,8 @@ def _dispatch_stage(
     dispatch: Dispatcher,
     transcript_path: Path | None = None,
     on_progress=None,
+    *,
+    escalation_steps: int = 0,
 ) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one stage's agent and classify the outcome.
 
@@ -3259,7 +3289,7 @@ def _dispatch_stage(
     streamed stage emits sub-stage progress to the ledger.
     """
     prompt = _render_stage_prompt(stage, story, opts, pr_number)
-    model = _select_stage_model(stage, story, opts)
+    model = _select_stage_model(stage, story, opts, escalation_steps=escalation_steps)
     try:
         result = dispatch(
             stage, prompt, story=story, model=model,
@@ -3707,6 +3737,8 @@ def _run_bugfix(
     dispatch: Dispatcher,
     transcript_path: Path | None = None,
     attempt: int = 1,
+    *,
+    escalation_steps: int = 0,
 ) -> bool:
     """Dispatch the bugfix agent. Returns True when the fix is confirmed.
 
@@ -3722,9 +3754,19 @@ def _run_bugfix(
     prompt = render_bugfix_prompt(story, failed_stage, failure)
     sink = _make_progress_sink(ledger, run_id, story.id, "bugfix", attempt)
     # Story 14.2-001: route the bugfix agent on the map's `bugfix` tier (its own
-    # override beats it) instead of the unconfigured CLI default. Per-attempt
-    # model escalation on retry is layered on later (Story 14.2-003).
-    model = _select_stage_model("bugfix", story, opts)
+    # override beats it) instead of the unconfigured CLI default.
+    # Story 14.2-003: ``escalation_steps`` bumps that tier one rung per bugfix
+    # attempt (capped at the strongest tier), so a stuck stage's recovery climbs
+    # toward Opus rather than re-running on the model that just failed. Record the
+    # chosen model per attempt so the eval harness (Epic-18) can see cheap-first's
+    # success rate.
+    model = _select_stage_model("bugfix", story, opts, escalation_steps=escalation_steps)
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"bugfix attempt {attempt} for {failed_stage} on "
+        f"model={model or 'cli-default'} (escalation +{escalation_steps}, "
+        "Story 14.2-003 cheap-first)",
+    )
     try:
         result = dispatch(
             "bugfix", prompt, story=story, model=model,

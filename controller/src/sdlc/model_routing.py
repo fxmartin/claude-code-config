@@ -18,6 +18,11 @@ HAIKU = "haiku"
 SONNET = "sonnet"
 OPUS = "opus"
 
+# The tier ladder, cheapest → strongest. Cheap-first retry escalation
+# (Story 14.2-003) walks up this and caps at the top tier, so a stuck stage
+# climbs Haiku→Sonnet→Opus instead of retrying on the model that just failed.
+TIER_LADDER: tuple[str, ...] = (HAIKU, SONNET, OPUS)
+
 # The single top-level key a per-repo override file uses.
 ROUTING_KEY = "model_routing"
 
@@ -162,6 +167,34 @@ def select_model(
     ):
         return config.escalation_model
     return base
+
+
+def escalate_model(base: str | None, steps: int) -> str | None:
+    """Bump ``base`` up the tier ladder by ``steps``, capped at the strongest tier.
+
+    The cheap-first lever (Story 14.2-003): a stage that fails into the bugfix
+    loop is retried one tier stronger per attempt, rather than re-running on the
+    model that just failed — so Opus is paid for only when a stage is actually
+    stuck, not on the common passing path.
+
+    Returns ``base`` unchanged when:
+
+    * ``steps <= 0`` — the first-pass / cheap path (no escalation, AC2);
+    * ``base is None`` — routing is off, so the CLI default stands and there is
+      no tier to climb;
+    * ``base`` is not a known ladder tier — a custom / pinned model id the router
+      cannot reason about is never silently rewritten.
+
+    At or above the top tier the bump is a no-op (AC3: escalating an already-Opus
+    stage does nothing).
+    """
+    if base is None or steps <= 0:
+        return base
+    try:
+        idx = TIER_LADDER.index(base)
+    except ValueError:
+        return base
+    return TIER_LADDER[min(idx + steps, len(TIER_LADDER) - 1)]
 
 
 def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
