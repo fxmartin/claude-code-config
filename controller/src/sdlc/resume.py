@@ -14,7 +14,7 @@ from sdlc.build import (
     Ledger,
     _reposition_head,
     _run_story,
-    _run_terminal,
+    finalize_run,
 )
 from sdlc.cohort import Story, compute_cohorts
 from sdlc.discovery import discover_queue
@@ -249,40 +249,32 @@ def run_resume(
             if dispatcher is None:
                 _reposition_head(root or Path.cwd())
 
-    # --- close out (mirrors run_build phase 3) -------------------------------
-    completed = sum(1 for v in status.values() if v == "DONE")
-    failed = sum(1 for v in status.values() if v == "FAILED")
-    blocked = sum(1 for v in status.values() if v == "BLOCKED")
-    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
-    # Story 12.3-003: stories parked awaiting FX's high-risk merge approval.
-    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
-    skipped = sum(1 for v in status.values() if v == "SKIPPED")
-
-    run_terminal = _run_terminal(failed, blocked, needs_attention, awaiting_approval)
-    run_level = {
-        "DONE": "success", "NEEDS_ATTENTION": "warn", "AWAITING_APPROVAL": "warn",
-    }.get(run_terminal, "error")
-    ledger.run_update_counts(rid, completed, failed)
-    ledger.event_log(
-        rid, "", run_level, "controller",
-        f"resume finished: {completed} done, {failed} failed, {blocked} blocked, "
-        f"{needs_attention} need attention, {awaiting_approval} awaiting approval, "
-        f"{skipped} skipped ({resumed} resumed)",
+    # --- close out via the shared finalize helper (12.3-004) -----------------
+    # The identical close-out is shared with `run_build`: finalize_run reconciles
+    # against origin/main (real runs only — the dispatcher-None gate that also
+    # guards the per-story HEAD reposition above), recomputes the tally, logs the
+    # finish event, and stamps the run terminal, so build and resume can never
+    # diverge on the terminal or the new AWAITING_APPROVAL state.
+    outcome = finalize_run(
+        ledger,
+        rid,
+        status,
+        reconcile=dispatcher is None,
+        root=root,
+        finish_label="resume finished",
+        finish_suffix=f" ({resumed} resumed)",
+        render_view=render_view,
     )
-    ledger.run_update_status(rid, run_terminal)
-
-    if render_view is not None:
-        render_view(rid)
 
     return ResumeResult(
         run_id=rid,
         resumed=resumed,
-        completed=completed,
-        failed=failed,
-        blocked=blocked,
-        needs_attention=needs_attention,
-        awaiting_approval=awaiting_approval,
-        skipped=skipped,
+        completed=outcome.completed,
+        failed=outcome.failed,
+        blocked=outcome.blocked,
+        needs_attention=outcome.needs_attention,
+        awaiting_approval=outcome.awaiting_approval,
+        skipped=outcome.skipped,
         nothing_to_resume=False,
         story_status=dict(status),
     )

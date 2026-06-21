@@ -202,17 +202,24 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    FX's high-risk approval), so a dependent built on top of it would race
    incomplete work.
 9. **Close-out reconciliation** — after the cohort loop and **before** the
-   terminal tally, `run_build` (real runs only — injected fakes skip it, like the
-   recursion guard) calls `reconcile.reconcile_run` to re-check every parked
-   story against the remote. The in-memory tally can lag reality: a PR that
-   merged after a 429, by hand the next morning, or transitively as part of a
-   stacked PR leaves a story parked even though its work shipped. Reconciliation
-   verifies the truth on `origin/main` and corrects the ledger so the run
-   terminal reports DONE instead of a stale FAILED/NEEDS_ATTENTION. See
+   terminal tally, the shared `finalize_run` helper (real runs only — injected
+   fakes skip it, like the recursion guard) calls `reconcile.reconcile_run` to
+   re-check every parked story against the remote. The in-memory tally can lag
+   reality: a PR that merged after a 429, by hand the next morning, or
+   transitively as part of a stacked PR leaves a story parked even though its
+   work shipped. Reconciliation verifies the truth on `origin/main` and corrects
+   the ledger so the run terminal reports DONE instead of a stale
+   FAILED/NEEDS_ATTENTION. See
    [Reconciliation](#reconciliation-against-originmain) below.
-10. **Run terminal** — the close-out tally maps per-story outcomes to one run
-    terminal via the shared `_run_terminal` helper (used by both `run_build` and
-    `run_resume`): any `FAILED`/`BLOCKED` story ⇒ `FAILED`; else any
+10. **Run terminal** — the **one** shared `finalize_run` helper (Story 12.3-004,
+    in `build.py`) is the single close-out point for both `run_build` and
+    `run_resume`: it runs reconciliation (step 9) at one defined point, recomputes
+    the counts, logs the finish event, stamps the run terminal via the shared
+    `_run_terminal` helper, and finishes the host registry (build path only —
+    parameterized). Because both paths route through it, the terminal computation
+    and the `AWAITING_APPROVAL` handling can never drift between `build` and
+    `resume`. `_run_terminal` maps per-story outcomes to one run terminal: any
+    `FAILED`/`BLOCKED` story ⇒ `FAILED`; else any
     `NEEDS_ATTENTION` ⇒ `NEEDS_ATTENTION` (the more-urgent "work is stuck" signal
     wins so a mix never hides it); else any `AWAITING_APPROVAL` ⇒
     `AWAITING_APPROVAL` (Story 12.3-003 — a non-FAILED, non-DONE bucket); else
