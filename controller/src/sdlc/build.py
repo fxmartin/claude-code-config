@@ -274,6 +274,31 @@ class Ledger:
             conn.executescript(_SCHEMA_DDL)
             _apply_migrations(conn)
 
+    def ensure_migrated(self) -> None:
+        """Bring a *pre-existing* ledger up to the current schema (idempotent).
+
+        Unlike :meth:`init`, this never creates the schema: when the DB file is
+        absent it is a no-op, so a read/recovery verb launched against a
+        never-built repo does not leave behind a spurious empty ledger. When the
+        DB exists it opens a *writable* connection (a read-only connection cannot
+        ``ALTER TABLE``) and runs :func:`_apply_migrations`, so a verb that then
+        reads via :meth:`_connect_ro` can no longer crash with "no such column"
+        against a stale schema (e.g. a ledger predating a later migration).
+
+        Concurrent launches are safe. A busy timeout makes a second controller
+        wait out the brief writer lock, and ``BEGIN IMMEDIATE`` takes that lock
+        *before* the version check so the loser cannot slip an ``ALTER`` in
+        between our read of ``_migrations`` and our own ``ALTER`` (which would
+        otherwise raise "duplicate column name"); the version guard then makes
+        its pass a no-op.
+        """
+        if not self.db_path.exists():
+            return
+        with self._connect() as conn:
+            conn.execute("PRAGMA busy_timeout = 2000;")
+            conn.execute("BEGIN IMMEDIATE;")
+            _apply_migrations(conn)
+
     def run_create(self, scope: str, mode: str) -> str:
         """Insert a fresh run row and return its generated id."""
         run_id = str(uuid.uuid4())

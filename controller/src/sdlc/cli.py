@@ -123,6 +123,10 @@ def build(ctx: typer.Context) -> None:
         raise typer.Exit(code=2)
 
     ledger = Ledger(default_db_path())
+    # Bring a pre-existing ledger up to the current schema before the build
+    # reads or writes it (run_build's init() also migrates, but a stale DB must
+    # be safe the moment any code touches it). No-op when no DB exists yet.
+    ledger.ensure_migrated()
     result = run_build(
         opts,
         queue=queue,
@@ -178,6 +182,8 @@ def resume(
 
     db_path = db or default_db_path()
     ledger = Ledger(db_path)
+    # Migrate a pre-existing (possibly stale) ledger before resume reads it.
+    ledger.ensure_migrated()
     result = run_resume(
         scope, ledger=ledger, run_id=run, render_view=make_render_view(db_path)
     )
@@ -224,7 +230,12 @@ def status(
     from sdlc.ledger_view import default_db_path
 
     db_path = db or default_db_path()
-    snap = status_snapshot(Ledger(db_path), run)
+    ledger = Ledger(db_path)
+    # Apply any pending migrations (writable connection) before the read-only
+    # snapshot, so a stale ledger never crashes the query with "no such column".
+    # No-op when the DB does not exist — absence stays "not started".
+    ledger.ensure_migrated()
+    snap = status_snapshot(ledger, run)
 
     if snap["run"] is None:
         if as_json:
@@ -409,6 +420,8 @@ def state(
 
     db_path = db or default_db_path()
     ledger = Ledger(db_path)
+    # Migrate a pre-existing (possibly stale) ledger before the read-only dump.
+    ledger.ensure_migrated()
     rid = run or ledger.latest_run_id()
 
     if rid is None:
@@ -500,8 +513,11 @@ def rollback(
     from sdlc.rollback import RollbackError, run_rollback
 
     db_path = db or default_db_path()
+    ledger = Ledger(db_path)
+    # Migrate a pre-existing (possibly stale) ledger before rollback reads/writes.
+    ledger.ensure_migrated()
     try:
-        result = run_rollback(Ledger(db_path), run, to)
+        result = run_rollback(ledger, run, to)
     except RollbackError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
