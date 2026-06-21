@@ -768,6 +768,26 @@ def test_detect_pytest_no_timeout_without_plugin(tmp_path) -> None:
     assert not any(c.startswith("--timeout") for c in cmd)
 
 
+def test_detect_pytest_timeout_detected_from_uv_lock(tmp_path) -> None:
+    """The plugin scan also covers uv.lock, not just pyproject.toml (Story 12.1-002)."""
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "uv.lock").write_text(
+        'name = "pytest-timeout"\nversion = "2.3.1"\n', encoding="utf-8"
+    )
+    cmd = detect_test_command(tmp_path)
+    assert f"--timeout={PER_TEST_TIMEOUT}" in cmd
+    assert "--timeout-method=thread" in cmd
+
+
+def test_detect_pytest_timeout_detected_from_requirements(tmp_path) -> None:
+    """requirements.txt is the third dep source the plugin scan reads (Story 12.1-002)."""
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("pytest-timeout>=2\n", encoding="utf-8")
+    cmd = detect_test_command(tmp_path)
+    assert f"--timeout={PER_TEST_TIMEOUT}" in cmd
+    assert "--timeout-method=thread" in cmd
+
+
 def test_run_build_short_circuits_under_sentinel_with_real_defaults(
     tmp_path, monkeypatch
 ) -> None:
