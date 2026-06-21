@@ -578,6 +578,56 @@ mistaken for actual spend (the dashboard, owned by Epic-11, renders the same
 label). With no `--budget` the path is byte-for-byte today's behaviour (the gate
 is skipped; `0` means "no ceiling", never "ceiling of zero").
 
+## Per-task model routing (Story 14.2-001)
+
+Not every stage needs Opus. `sdlc build --model-routing=<profile>` dispatches
+each pipeline stage on a model matched to its cognitive load, cutting quota burn
+where quality is not at stake while pinning the strong tier where it is. The map
+lives in `sdlc/model_routing.py` as a frozen `ModelRoutingConfig` (per-stage map
++ escalation policy), and `select_model(stage, config, *, points, high_risk)` is
+the single chooser.
+
+The shipped default profile is **Balanced**:
+
+| Stage | Default | Escalates to Opus when… |
+|---|---|---|
+| `discovery` | Haiku | — (structured extraction) |
+| `build` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold (8) |
+| `coverage` | Sonnet | — (tests need correctness) |
+| `review` | Sonnet | high-risk |
+| `adversarial` | **Opus** | **pinned — never downgraded, in any profile** |
+| `merge` | Haiku | — (mechanical) |
+
+Two documented alternatives ship alongside it: **Quality-first** (Opus
+everywhere) and **Quota-max** (cheapest everywhere, with the adversarial skeptic
+still pinned to Opus and a higher escalation bar). A per-repo
+`.sdlc-model-routing.yaml` additively overrides the chosen profile's stage map,
+points threshold, or escalation model — mirroring `risk_gate.py`'s
+`.sdlc-risk-config.yaml` convention. A missing file is a silent no-op; a
+malformed one is a hard error.
+
+**Where the `--model` is applied.** `_dispatch_stage` calls
+`_select_stage_model(stage, story, opts)` and threads the result into
+`dispatch_agent(model=…)`, which appends `--model <model>` to the **default**
+command only. Precedence, highest first:
+
+1. an explicit per-stage `--model-<stage>=<model>` flag (the escape hatch);
+2. a `SDLC_AGENT_CMD` override — the custom command owns its own model, so the
+   routed model never decorates it (`resolve_agent_cmd` returns it untouched);
+3. the routing profile's `select_model`;
+4. routing off (`--model-routing` unset / `off`) → **no `--model`**, so the CLI
+   default (Opus today) stands and behaviour is byte-for-byte unchanged.
+
+The high-risk signal for build/review escalation is best-effort: the story
+branch's changed files matched against the Epic-08 risk-gate patterns
+(`_story_high_risk`), degrading to `False` (so the points threshold drives
+escalation) before a branch exists or on any git error. The resolved config is
+memoized on `opts` so the override file is read at most once per run. The profile
+and per-stage overrides are persisted in the run's config event and rehydrated by
+`run_resume`, so a resumed run routes identically. The `<<<RESULT_JSON>>>`
+contract and schema validation are untouched — routing changes only *which model*
+runs a stage, never how its output is parsed.
+
 ## Rate-limit / quota awareness with automatic resume (Story 14.1-003)
 
 On a Claude Max subscription the real overnight failure mode is not dollars (they

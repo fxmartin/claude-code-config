@@ -94,6 +94,12 @@ Flags:
   --window=SEC              rolling rate-limit window length (default 18000 ≈ 5h)
   --rate-limit-threshold=F  pause at this fraction of the window budget
                             (default 1.0; <1 pauses near the limit)
+  --model-routing=PROFILE   per-stage model map: balanced | quality-first |
+                            quota-max | off (default off = CLI default for all
+                            stages). Balanced cuts quota burn; the adversarial
+                            skeptic is always Opus
+  --model-<stage>=MODEL     pin one stage's model, winning over the map (escape
+                            hatch), e.g. --model-build=opus --model-merge=haiku
 """
 
 

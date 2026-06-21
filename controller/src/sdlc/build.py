@@ -30,6 +30,13 @@ from sdlc.contracts import (
     ContractError,
 )
 from sdlc.dispatch import AgentDispatchError, AgentResult, RateLimitError, dispatch_agent
+from sdlc.model_routing import (
+    ModelRoutingConfig,
+    OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
+    load_routing_config,
+    routing_config,
+    select_model,
+)
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
 from sdlc.rate_limit import RateLimitSignal, WindowQuota, seconds_until_reset, within_wait_cap
 from sdlc.registry import Registry, RunRecord
@@ -240,6 +247,12 @@ _BOOL_FLAGS = {
 # Options + argument parsing
 # ---------------------------------------------------------------------------
 
+# Sentinel distinguishing "model-routing config not yet resolved" from a
+# resolved value of None (routing off). Stored on BuildOptions._model_config so
+# the per-repo override file is read at most once per run, not once per stage.
+_UNRESOLVED: object = object()
+
+
 @dataclass
 class BuildOptions:
     """Parsed `sdlc build` arguments — the same surface the skill exposes."""
@@ -274,6 +287,16 @@ class BuildOptions:
     window_budget: int = 0
     window_s: int = 18000
     rate_limit_threshold: float = 1.0
+    # Story 14.2-001: per-task model routing. ``model_profile`` selects the
+    # per-stage model map — "" / "off" keeps today's behaviour (no ``--model``,
+    # CLI default = Opus for every stage); "balanced" is the shipped default map,
+    # with "quality-first" / "quota-max" as documented alternatives.
+    # ``model_overrides`` maps a stage to an explicit model that *wins* over the
+    # map (the per-stage escape hatch). ``_model_config`` memoizes the resolved
+    # config (profile + per-repo override) so it is read at most once per run.
+    model_profile: str = ""
+    model_overrides: dict[str, str] = field(default_factory=dict)
+    _model_config: object = field(default=_UNRESOLVED, repr=False, compare=False)
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -669,6 +692,25 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
                     f"--rate-limit-threshold must be in (0, 1]: {arg}"
                 )
             opts.rate_limit_threshold = threshold
+        elif arg.startswith("--model-routing="):
+            # Story 14.2-001: select the per-stage model map ("" / off = today's
+            # CLI-default behaviour). Validated eagerly so a typo'd profile fails
+            # the parse rather than silently disabling routing.
+            opts.model_profile = arg.split("=", 1)[1]
+            routing_config(opts.model_profile)  # raises on an unknown profile
+        elif arg.startswith("--model-"):
+            # Story 14.2-001: an explicit per-stage model override that wins over
+            # the map (escape hatch), e.g. `--model-build=opus`. Restricted to the
+            # known pipeline stages so a typo is a hard error, not a silent no-op.
+            stage, _, model = arg[len("--model-"):].partition("=")
+            if not model:
+                raise ValueError(f"--model-<stage> needs a value: {arg}")
+            if stage not in _ROUTABLE_STAGES:
+                raise ValueError(
+                    f"unknown stage in {arg}: {stage} "
+                    f"(expected one of {sorted(_ROUTABLE_STAGES)})"
+                )
+            opts.model_overrides[stage] = model
         elif arg.startswith("--"):
             raise ValueError(f"unknown flag: {arg}")
         elif not scope_set:
@@ -2170,6 +2212,11 @@ def run_build(
             "window_budget": opts.window_budget,
             "window_s": opts.window_s,
             "rate_limit_threshold": opts.rate_limit_threshold,
+            # Story 14.2-001: persist the model-routing profile + per-stage
+            # overrides so a resume routes identically and the dashboard can show
+            # which map a run used. "" / off keeps today's CLI-default behaviour.
+            "model_profile": opts.model_profile,
+            "model_overrides": opts.model_overrides,
         }),
     )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of
@@ -2856,6 +2903,81 @@ def _make_progress_sink(
     return sink
 
 
+# Story 14.2-001: stages whose model the routing map may set. The four pipeline
+# stages plus the bugfix/reask recovery agents and the out-of-pipeline discovery
+# and adversarial slots — the names `select_model` keys off. A `--model-<stage>`
+# override is accepted only for these.
+_ROUTABLE_STAGES = frozenset(
+    {"discovery", "build", "coverage", "review", "adversarial", "merge",
+     "bugfix", "reask"}
+)
+
+
+def _routing_config_for(opts: BuildOptions) -> ModelRoutingConfig | None:
+    """Resolve (and memoize) the run's model-routing config (Story 14.2-001).
+
+    Returns None when routing is off. The per-repo override file
+    (``.sdlc-model-routing.yaml`` at the working tree root) is read at most once
+    per run — the result is cached on ``opts._model_config`` — so per-stage
+    selection stays cheap. A run with no profile never touches disk.
+    """
+    cached = opts._model_config
+    if cached is not _UNRESOLVED:
+        return cached  # type: ignore[return-value]
+    config = load_routing_config(
+        opts.model_profile, override_path=Path(MODEL_ROUTING_OVERRIDE_FILENAME)
+    )
+    opts._model_config = config
+    return config
+
+
+def _story_high_risk(story: Story, opts: BuildOptions) -> bool:
+    """Best-effort: does this story touch a high-risk path (Epic-08 risk_gate)?
+
+    Used only to escalate the build/review model to Opus (Story 14.2-001). The
+    signal is the changed files on the story branch matched against the risk-gate
+    patterns; before the branch exists (a fresh build's first stage) there is no
+    diff, so this is False and the points threshold drives escalation instead.
+    Entirely best-effort — any git/import error degrades to False so routing
+    never fails a build, and a no-op when routing is off.
+    """
+    if opts.model_profile.strip().lower() in {"", "off", "none"}:
+        return False
+    try:
+        from sdlc.risk_gate import match_high_risk
+
+        changed = subprocess.run(
+            ["git", "diff", "--name-only", f"origin/main...feature/{story.id}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        files = [ln for ln in changed.stdout.splitlines() if ln.strip()]
+        if not files:
+            return False
+        return bool(match_high_risk(files))
+    except Exception:  # noqa: BLE001 - risk detection is strictly best-effort
+        return False
+
+
+def _select_stage_model(stage: str, story: Story, opts: BuildOptions) -> str | None:
+    """Pick the model for ``stage`` (Story 14.2-001), or None for the CLI default.
+
+    Precedence: an explicit ``--model-<stage>`` override wins over the map; then
+    the routing profile's :func:`select_model` (with the story's points and a
+    best-effort high-risk signal driving build/review escalation); else None when
+    routing is off — in which case the dispatcher adds no ``--model`` and
+    behaviour is unchanged from today.
+    """
+    override = opts.model_overrides.get(stage)
+    if override:
+        return override
+    config = _routing_config_for(opts)
+    if config is None:
+        return None
+    return select_model(
+        stage, config, points=story.points, high_risk=_story_high_risk(story, opts)
+    )
+
+
 def _dispatch_stage(
     stage: str,
     story: Story,
@@ -2877,10 +2999,11 @@ def _dispatch_stage(
     streamed stage emits sub-stage progress to the ledger.
     """
     prompt = _render_stage_prompt(stage, story, opts, pr_number)
+    model = _select_stage_model(stage, story, opts)
     try:
         result = dispatch(
-            stage, prompt, story=story, transcript_path=transcript_path,
-            on_progress=on_progress,
+            stage, prompt, story=story, model=model,
+            transcript_path=transcript_path, on_progress=on_progress,
         )
     except RateLimitError:
         # Story 14.1-003: a Max rate-limit hit is a recoverable, time-based pause,

@@ -163,6 +163,10 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         window_budget=int(config.get("window_budget", 0) or 0),
         window_s=int(config.get("window_s", 18000) or 18000),
         rate_limit_threshold=float(config.get("rate_limit_threshold", 1.0) or 1.0),
+        # Story 14.2-001: carry the model-routing profile + overrides so a resumed
+        # run dispatches each stage on the same model the original run chose.
+        model_profile=str(config.get("model_profile") or ""),
+        model_overrides=dict(config.get("model_overrides") or {}),
     )
 
 
