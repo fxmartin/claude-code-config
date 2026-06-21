@@ -170,6 +170,32 @@ def test_build_help_lists_flags_and_scopes() -> None:
         "--limit",
         "--coverage-threshold",
         "--preflight-timeout",
+        "--budget",
+        "--budget-policy",
     ):
         assert flag in _BUILD_EPILOG, f"{flag} missing from build epilog"
     assert "epic-NN" in _BUILD_EPILOG and "X.Y-NNN" in _BUILD_EPILOG
+
+
+def test_build_reports_budget_stop_with_notional_label(tmp_path, monkeypatch) -> None:
+    """Story 14.1-001: a budget-gated stop prints the labelled-notional $ and
+    exits non-zero (a paused run is not fully done)."""
+    import sdlc.build as build_mod
+    from sdlc.build import BuildResult
+
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def _fake_run_build(opts, **kwargs):
+        return BuildResult(
+            completed=1, run_id="run-x", budget_stopped=True,
+            budget_policy="pause", accrued_tokens=12345, notional_cost_usd=0.62,
+        )
+
+    monkeypatch.setattr(build_mod, "run_build", _fake_run_build)
+    result = runner.invoke(app, ["build", "epic-99", "--budget=10000"])
+
+    assert result.exit_code == 1, result.output  # paused ≠ clean
+    assert "budget ceiling crossed" in result.output
+    assert "12345 tokens accrued" in result.output
+    assert "not billed on subscription" in result.output

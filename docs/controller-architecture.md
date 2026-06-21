@@ -535,6 +535,41 @@ not carried per turn in `stream-json`, so it lands only at this reconciliation
 and per-story/stage breakdowns surface through the existing query path
 (`stage_breakdown`, `_aggregate_run_usage`, `status_snapshot`) with no new schema.
 
+## Per-run token budget gate (Story 14.1-001)
+
+`sdlc build --budget=<N>` sets a **token** ceiling the controller respects
+between stories. Tokens — not dollars — are the governance primitive: on a
+Claude Max subscription the `total_cost_usd` the agent envelope reports is an
+**API-list-price equivalent** computed from usage, never real spend on the flat
+monthly fee. A `$`-denominated budget (`--budget=$5`, `--budget=30usd`) is
+accepted as a convenience and converted to a notional token ceiling via
+`usd_to_notional_tokens` (rate `NOTIONAL_USD_PER_MILLION_TOKENS`, a documented
+≈$15/Mtok constant — guidance, not a billing fact); the original dollars are
+kept only for display.
+
+The gate reads the live accrual from `Ledger.run_usage_totals(run_id)` — the
+same per-stage token columns the 11.1-003 streaming path writes — and is checked
+in the `run_build` cohort loop **after each story finishes**, never mid-stage.
+Because the just-finished story's stages are already committed and the unbuilt
+stories are still `TODO`, no committed work is ever discarded (R10 holds). When
+accrued tokens cross the ceiling, `_budget_close_out` applies the
+`--budget-policy`:
+
+- **`pause`** (default): records a NEEDS_ATTENTION-style reason and leaves the
+  run `IN_PROGRESS`, so `Ledger.latest_resumable_run` — and therefore
+  `sdlc resume` — picks it up unchanged once the budget is raised. It reuses the
+  Epic-10 resume machinery; `run_resume` does not re-apply the budget, so a
+  resumed run continues the remaining stories to completion.
+- **`abort`**: records the reason and stamps the run `ABORTED` (terminal); not
+  auto-resumable.
+
+Either way the reason logged to the ledger — and the `sdlc build` summary line —
+renders any dollar figure through `notional_cost_label`, e.g.
+`$0.62 (API-equivalent, not billed on subscription)`, so the `$` is never
+mistaken for actual spend (the dashboard, owned by Epic-11, renders the same
+label). With no `--budget` the path is byte-for-byte today's behaviour (the gate
+is skipped; `0` means "no ceiling", never "ceiling of zero").
+
 ## Backward compatibility
 
 Users still type `/build-stories` in Claude Code. The skill shells out to

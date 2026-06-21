@@ -81,6 +81,10 @@ Flags:
   --limit=N                 build at most N stories
   --coverage-threshold=N    required new-code coverage % (default 90)
   --preflight-timeout=SEC   abort the preflight gate after SEC seconds (default 600)
+  --budget=N                token ceiling for the run; a $-value (e.g. $5) is
+                            converted to a notional API-equivalent token ceiling
+  --budget-policy=POLICY    on crossing the ceiling: pause (resumable, default)
+                            or abort (terminal stop)
 """
 
 
@@ -164,14 +168,32 @@ def build(ctx: typer.Context) -> None:
         f"{result.blocked} blocked, {result.needs_attention} need attention, "
         f"{result.awaiting_approval} awaiting approval, {result.skipped} skipped."
     )
+    # Story 14.1-001: a budget-gated stop is reported with the labelled-notional
+    # dollar figure so the $ is never mistaken for real subscription spend. Pause
+    # leaves the run resumable; abort is a terminal stop.
+    if result.budget_stopped:
+        from sdlc.build import notional_cost_label
+
+        tail = (
+            "run paused — raise --budget and `sdlc resume` to continue."
+            if result.budget_policy == "pause"
+            else "run aborted."
+        )
+        typer.echo(
+            f"budget ceiling crossed: {result.accrued_tokens} tokens accrued "
+            f"(ceiling {opts.budget}); "
+            f"{notional_cost_label(result.notional_cost_usd)} — {tail}"
+        )
     # An AWAITING_APPROVAL run is honestly not a failure (Story 12.3-003), but it
     # still needs FX to act, so it is not "clean" — exit non-zero like
-    # NEEDS_ATTENTION so a wrapping script never reads it as fully done.
+    # NEEDS_ATTENTION so a wrapping script never reads it as fully done. A
+    # budget-stopped run is likewise not fully done.
     clean = (
         result.failed == 0
         and result.blocked == 0
         and result.needs_attention == 0
         and result.awaiting_approval == 0
+        and not result.budget_stopped
     )
     raise typer.Exit(code=0 if clean else 1)
 
