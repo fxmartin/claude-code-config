@@ -309,6 +309,7 @@ let sel = null;  // null = Live (latest)
 // (runtimeAnchor). null disables the ticker (finished run / no timestamps).
 let runtimeBase = null, runtimeAnchor = null;
 function esc(s){return String(s==null?"":s).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));}
+function localTime(s){if(!s) return "";const d=new Date(s.replace(" ","T")+"Z");return isNaN(d)?s:d.toLocaleString();}
 function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(s)+"</span>";}
 function humanTokens(n){
   if(n==null) return "—";
@@ -354,7 +355,7 @@ function activityRow(s){
   return "<tr class='substage'><td></td>"
     + "<td colspan='8' class='small'><span class='kind'>"+glyph+"</span>"
     + stage + esc(a.message)
-    + (a.ts ? " <span class='muted'>"+esc(a.ts)+"</span>" : "") + "</td></tr>";
+    + (a.ts ? " <span class='muted'>"+localTime(a.ts)+"</span>" : "") + "</td></tr>";
 }
 
 async function tick(){
@@ -388,7 +389,7 @@ function renderRuns(runs){
       + badge(r.status) + " <code>" + esc(r.id.slice(0,8)) + "</code>"
       + repo
       + "<div class='muted small'>" + sub + "</div>"
-      + "<div class='muted small'>" + esc(r.started_at||"") + "</div></div>";
+      + "<div class='muted small'>" + localTime(r.started_at) + "</div></div>";
   }).join("");
   document.getElementById("runs").innerHTML = html;
 }
