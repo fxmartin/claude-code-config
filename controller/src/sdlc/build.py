@@ -1774,69 +1774,35 @@ def run_build(
             if dispatcher is None:
                 _reposition_head(Path.cwd())
 
-    # --- Reconcile against origin/main before the close-out tally (12.3-001) -
-    # A story whose PR genuinely merged may be parked in-memory (a 429, a manual
-    # merge, a transitive landing). Reconciliation verifies each parked story
-    # against origin/main and flips the truly-landed ones to DONE so the run
-    # terminal reflects reality. Only on real runs (it does network/git I/O);
-    # injected fakes — the controller's own orchestration tests — skip it, exactly
-    # like the recursion guard above. It never raises and never fails a good run.
-    if dispatcher is None:
-        try:
-            from sdlc.reconcile import reconcile_run
-
-            recon = reconcile_run(ledger, run_id, root=Path.cwd(), fetch=True)
-            for item in recon.reclassified:
-                status[item["story_id"]] = "DONE"
-        except Exception:  # belt-and-suspenders: never fail an otherwise-good run
-            pass
-
-    # --- Phase 3: close out --------------------------------------------------
-    completed = sum(1 for v in status.values() if v == "DONE")
-    failed = sum(1 for v in status.values() if v == "FAILED")
-    blocked = sum(1 for v in status.values() if v == "BLOCKED")
-    # Stories whose work was committed but whose result was unparseable (R10):
-    # not a clean success, but deliberately not a destructive FAILED.
-    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
-    # Story 12.3-003: stories parked awaiting FX's high-risk merge approval — a
-    # non-FAILED, non-DONE bucket. Orthogonal to NEEDS_ATTENTION (waiting on a
-    # person vs. needing manual push/fix).
-    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
-    # Shipped stories were skipped before the loop; fold them into the tally.
-    skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
-
-    run_terminal = _run_terminal(failed, blocked, needs_attention, awaiting_approval)
-    run_level = {
-        "DONE": "success", "NEEDS_ATTENTION": "warn", "AWAITING_APPROVAL": "warn",
-    }.get(run_terminal, "error")
-    ledger.run_update_counts(run_id, completed, failed)
-    ledger.event_log(
+    # --- Phase 3: close out via the shared finalize helper (12.3-004) --------
+    # finalize_run runs reconciliation against origin/main (real runs only, hence
+    # the dispatcher-None gate), recomputes the tally — folding in the shipped
+    # `done_skips` skipped before the loop — logs the finish event, stamps the run
+    # terminal, and finishes the registry. The identical close-out is shared with
+    # `run_resume` so the two paths can never diverge.
+    outcome = finalize_run(
+        ledger,
         run_id,
-        "",
-        run_level,
-        "controller",
-        f"run finished: {completed} done, {failed} failed, {blocked} blocked, "
-        f"{needs_attention} need attention, {awaiting_approval} awaiting approval, "
-        f"{skipped} skipped",
+        status,
+        reconcile=dispatcher is None,
+        root=Path.cwd(),
+        registry=registry,
+        extra_skipped=len(done_skips),
+        finish_label="run finished",
+        render_view=render_view,
     )
-    ledger.run_update_status(run_id, run_terminal)
-    if registry is not None:
-        _registry_finish(registry, run_id, run_terminal, completed)
-
-    if render_view is not None:
-        render_view(run_id)
 
     # The returned per-story map includes the shipped skips for visibility,
     # even though they were kept out of the cohort `status` used for blocking.
     story_status = {s.id: "SKIPPED" for s in done_skips}
     story_status.update(status)
     return BuildResult(
-        completed=completed,
-        failed=failed,
-        skipped=skipped,
-        blocked=blocked,
-        needs_attention=needs_attention,
-        awaiting_approval=awaiting_approval,
+        completed=outcome.completed,
+        failed=outcome.failed,
+        skipped=outcome.skipped,
+        blocked=outcome.blocked,
+        needs_attention=outcome.needs_attention,
+        awaiting_approval=outcome.awaiting_approval,
         planned=len(buildable),
         run_id=run_id,
         story_status=story_status,
@@ -1863,6 +1829,100 @@ def _run_terminal(
     if awaiting_approval:
         return "AWAITING_APPROVAL"
     return "DONE"
+
+
+@dataclass
+class FinalizeOutcome:
+    """The per-status tally and run terminal computed by :func:`finalize_run`."""
+
+    run_terminal: str
+    completed: int
+    failed: int
+    blocked: int
+    needs_attention: int
+    awaiting_approval: int
+    skipped: int
+
+
+def finalize_run(
+    ledger: Ledger,
+    run_id: str,
+    status: dict[str, str],
+    *,
+    reconcile: bool = False,
+    root: Path | None = None,
+    registry: "Registry | None" = None,
+    extra_skipped: int = 0,
+    finish_label: str = "run finished",
+    finish_suffix: str = "",
+    render_view: Callable[[str], None] | None = None,
+) -> FinalizeOutcome:
+    """The single close-out shared by ``run_build`` and ``run_resume`` (12.3-004).
+
+    Computing the run terminal (including ``AWAITING_APPROVAL``), recomputing the
+    counts, logging the finish event, stamping ``run_update_status`` and the
+    optional registry, and — at one defined point — running reconciliation, all
+    live here so the ``build`` and ``resume`` paths can never drift apart again.
+
+    ``status`` is mutated in place: any story reconciliation flips to ``DONE`` is
+    reflected for the caller's returned per-story map. ``reconcile`` gates the
+    real-run-only reconciliation pass (callers pass ``dispatcher is None``);
+    ``extra_skipped`` folds in shipped skips counted outside ``status`` (build's
+    pre-loop ``done_skips``); ``finish_label``/``finish_suffix`` shape the event
+    text; ``registry`` is stamped only on the build path that owns one.
+    """
+    # --- Reconcile parked stories against origin/main (single shared point) ---
+    # Only on real runs (it does network/git I/O); injected fakes — the
+    # controller's own orchestration tests — skip it. It never raises and never
+    # fails an otherwise-good run.
+    if reconcile:
+        try:
+            from sdlc.reconcile import reconcile_run
+
+            recon = reconcile_run(ledger, run_id, root=root or Path.cwd(), fetch=True)
+            for item in recon.reclassified:
+                status[item["story_id"]] = "DONE"
+        except Exception:  # belt-and-suspenders: never fail an otherwise-good run
+            pass
+
+    # --- Tally the final per-story outcomes ----------------------------------
+    completed = sum(1 for v in status.values() if v == "DONE")
+    failed = sum(1 for v in status.values() if v == "FAILED")
+    blocked = sum(1 for v in status.values() if v == "BLOCKED")
+    needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
+    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
+    skipped = extra_skipped + sum(1 for v in status.values() if v == "SKIPPED")
+
+    run_terminal = _run_terminal(failed, blocked, needs_attention, awaiting_approval)
+    run_level = {
+        "DONE": "success", "NEEDS_ATTENTION": "warn", "AWAITING_APPROVAL": "warn",
+    }.get(run_terminal, "error")
+    ledger.run_update_counts(run_id, completed, failed)
+    ledger.event_log(
+        run_id,
+        "",
+        run_level,
+        "controller",
+        f"{finish_label}: {completed} done, {failed} failed, {blocked} blocked, "
+        f"{needs_attention} need attention, {awaiting_approval} awaiting approval, "
+        f"{skipped} skipped{finish_suffix}",
+    )
+    ledger.run_update_status(run_id, run_terminal)
+    if registry is not None:
+        _registry_finish(registry, run_id, run_terminal, completed)
+
+    if render_view is not None:
+        render_view(run_id)
+
+    return FinalizeOutcome(
+        run_terminal=run_terminal,
+        completed=completed,
+        failed=failed,
+        blocked=blocked,
+        needs_attention=needs_attention,
+        awaiting_approval=awaiting_approval,
+        skipped=skipped,
+    )
 
 
 def _run_story(

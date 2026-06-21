@@ -8,6 +8,17 @@ stories.
 ## [Unreleased]
 
 ### Added
+- **Shared `finalize_run` close-out** (Story 12.3-004) — the run-terminal
+  computation and close-out now live in one helper (`build.finalize_run`) called
+  by both `run_build` and `run_resume`, so the reconciliation step and the
+  `AWAITING_APPROVAL` state can never drift between the build and resume code
+  paths. It runs reconciliation (12.3-001) at one defined point, recomputes the
+  counts (folding in build's pre-loop shipped skips via `extra_skipped`), logs the
+  finish event, stamps the run terminal, and finishes the host registry
+  (build-only, parameterized). `resume` now reconciles identically to `build` on
+  real runs. The `BuildResult`/`ResumeResult` shapes and the DONE/FAILED outcomes
+  for already-passing runs are unchanged (a pure refactor for those cases).
+
 - **`AWAITING_APPROVAL` merge state** (Story 12.3-003) — a merge blocked *only* by
   the high-risk human-approval gate (`risk:high` with no `risk-approved` label /
   `risk-approver` review) is now parked in a distinct `AWAITING_APPROVAL` terminal
