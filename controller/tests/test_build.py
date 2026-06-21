@@ -2636,3 +2636,193 @@ def test_commit_lint_unreadable_after_reask_parks(tmp_path, monkeypatch) -> None
     assert sum(1 for _, kind in disp.calls if kind == "commitlint") == 1
     advanced = {agent for agent, _ in disp.calls}
     assert "review" not in advanced and "merge" not in advanced
+
+
+# ---------------------------------------------------------------------------
+# AWAITING_APPROVAL: a high-risk merge block is parked, not failed (12.3-003)
+# ---------------------------------------------------------------------------
+
+def _high_risk_merge_block(reason: str = "BLOCKED_HIGH_RISK") -> dict:
+    """A schema-valid merge response that surfaces a high-risk approval block.
+
+    The merge schema enum is only MERGED|FAILED|SKIPPED, so the block is
+    surfaced *additively* via a ``block_reason`` field (extra properties are
+    allowed). The merge did not land, so ``merge_status`` is FAILED and the
+    SHA / timestamp are empty — which the schema permits for a non-MERGED
+    outcome (Story 12.3-003).
+    """
+    return {
+        "pr_number": 100,
+        "merge_status": "FAILED",
+        "merge_sha": "",
+        "merged_at": "",
+        "block_reason": reason,
+    }
+
+
+def test_high_risk_block_passes_real_merge_schema_validation() -> None:
+    """The block response a real merge agent emits must pass schema validation.
+
+    Regression for the gap where ``merge_sha``'s unconditional ``minLength: 1``
+    rejected every non-merged response — which would route the block to the
+    contract-error path and never reach the awaiting-approval short-circuit.
+    """
+    from sdlc.contracts import SchemaValidationError, validate_response
+
+    # A high-risk block (empty SHA/timestamp) validates.
+    assert validate_response("merge", _high_risk_merge_block()) == _high_risk_merge_block()
+    # A real merge is held to the stricter contract — a non-empty SHA *and* a
+    # non-empty timestamp are still required when merge_status == MERGED.
+    with pytest.raises(SchemaValidationError):
+        validate_response("merge", {
+            "pr_number": 100, "merge_status": "MERGED",
+            "merge_sha": "", "merged_at": "2026-06-21T00:00:00Z",
+        })
+    with pytest.raises(SchemaValidationError):
+        validate_response("merge", {
+            "pr_number": 100, "merge_status": "MERGED",
+            "merge_sha": "cafef00d", "merged_at": "",
+        })
+    # The canonical successful merge still passes.
+    good = {
+        "pr_number": 100, "merge_status": "MERGED",
+        "merge_sha": "cafef00d", "merged_at": "2026-06-21T00:00:00Z",
+    }
+    assert validate_response("merge", good) == good
+
+
+def test_high_risk_block_detected_as_awaiting_approval() -> None:
+    from sdlc.build import _merge_awaiting_approval
+
+    # block_reason field — the primary, additive signal.
+    assert _merge_awaiting_approval("merge", _high_risk_merge_block()) is True
+    # Case-insensitive.
+    assert _merge_awaiting_approval("merge", _high_risk_merge_block("blocked_high_risk")) is True
+    # Free-text fallback when the reason rides in error_summary instead.
+    assert _merge_awaiting_approval(
+        "merge", {"merge_status": "FAILED", "error_summary": "PR is BLOCKED_HIGH_RISK, no risk-approved label"}
+    ) is True
+    # A plain merge failure is NOT awaiting approval.
+    assert _merge_awaiting_approval("merge", {"merge_status": "FAILED"}) is False
+    # Only the merge stage can be awaiting approval.
+    assert _merge_awaiting_approval("build", _high_risk_merge_block()) is False
+
+
+def test_high_risk_merge_block_parks_awaiting_approval_no_bugfix(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    # Two independent stories whose merges are high-risk-blocked; the bugfix loop
+    # must NOT run (it cannot self-approve) and each is parked AWAITING_APPROVAL.
+    dispatcher = FakeDispatcher(
+        overrides={
+            ("merge", "s1-001"): _high_risk_merge_block(),
+            ("merge", "s1-002"): _high_risk_merge_block(),
+        }
+    )
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(
+        opts,
+        queue=_sample_queue()[:2],
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    # No bugfix agent was ever dispatched — the block short-circuits before it.
+    assert not any(a == "bugfix" for a, _ in dispatcher.calls)
+    # Stories are parked AWAITING_APPROVAL, and the run is NOT failed.
+    assert result.failed == 0
+    assert result.story_status["s1-001"] == "AWAITING_APPROVAL"
+    conn = _open(db)
+    run_status = conn.execute("SELECT status FROM runs").fetchone()[0]
+    assert run_status == "AWAITING_APPROVAL"
+
+
+def test_awaiting_approval_run_terminal_not_failed(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    # A single-story run whose only outcome is awaiting approval.
+    dispatcher = FakeDispatcher(
+        overrides={("merge", "s1-001"): _high_risk_merge_block()}
+    )
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(
+        opts,
+        queue=[_sample_queue()[0]],
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert result.failed == 0
+    assert result.awaiting_approval == 1
+    conn = _open(db)
+    assert conn.execute("SELECT status FROM runs").fetchone()[0] == "AWAITING_APPROVAL"
+
+
+def test_awaiting_approval_blocks_dependents_like_needs_attention(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    # s1-001 is high-risk-blocked; s1-003 depends on it → s1-003 is BLOCKED
+    # (an unmerged dependency cannot be safely built upon).
+    dispatcher = FakeDispatcher(
+        overrides={("merge", "s1-001"): _high_risk_merge_block()}
+    )
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert result.story_status["s1-001"] == "AWAITING_APPROVAL"
+    assert result.story_status["s1-003"] == "BLOCKED"
+
+
+def test_needs_attention_takes_precedence_over_awaiting_approval(
+    tmp_path, monkeypatch
+) -> None:
+    db = tmp_path / "ledger.db"
+    from sdlc.contracts import SchemaValidationError
+
+    def raise_schema_error():
+        raise SchemaValidationError("build-agent response is missing 'branch_name'")
+
+    # s1-002's build is unparseable but its work is committed → parked
+    # NEEDS_ATTENTION (R10). s1-001 awaits approval. A mixed run reports the
+    # more-urgent NEEDS_ATTENTION (never hides stuck work), and never FAILED.
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
+    dispatcher = FakeDispatcher(
+        overrides={
+            ("merge", "s1-001"): _high_risk_merge_block(),
+            ("build", "s1-002"): raise_schema_error,
+        }
+    )
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True, auto=True)
+    # Two independent stories only (s1-003 depends on s1-001 and would BLOCK).
+    result = run_build(
+        opts,
+        queue=_sample_queue()[:2],
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert result.story_status["s1-001"] == "AWAITING_APPROVAL"
+    assert result.story_status["s1-002"] == "NEEDS_ATTENTION"
+    conn = _open(db)
+    assert conn.execute("SELECT status FROM runs").fetchone()[0] == "NEEDS_ATTENTION"
+
+
+def test_status_snapshot_counts_awaiting_approval(tmp_path) -> None:
+    from sdlc.build import status_snapshot
+
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher(
+        overrides={("merge", "s1-001"): _high_risk_merge_block()}
+    )
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(
+        opts,
+        queue=[_sample_queue()[0]],
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    snap = status_snapshot(Ledger(db), result.run_id)
+    assert snap["counts"]["awaiting_approval"] == 1

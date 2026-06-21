@@ -441,3 +441,26 @@ def test_resume_marks_needs_attention_when_committed_but_unparseable(
 
     ledger = Ledger(db)
     assert ledger.run_row(ledger.latest_run_id())["status"] == "NEEDS_ATTENTION"
+
+
+def test_resume_high_risk_merge_block_parks_awaiting_approval(tmp_path: Path) -> None:
+    """Resuming into a high-risk-blocked merge parks AWAITING_APPROVAL (12.3-003).
+
+    The run terminal is AWAITING_APPROVAL — never FAILED — and no bugfix agent
+    is dispatched (the block cannot be self-approved).
+    """
+    from test_build import _high_risk_merge_block
+
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    rid = _seed_single_interrupted_at_review(db)
+    dispatcher = FakeDispatcher(
+        overrides={("merge", "99.1-001"): _high_risk_merge_block()}
+    )
+    result = run_resume("epic-99", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    assert result.story_status["99.1-001"] == "AWAITING_APPROVAL"
+    assert result.awaiting_approval == 1
+    assert result.failed == 0
+    assert not any(a == "bugfix" for a, _ in dispatcher.calls)
+    assert Ledger(db).run_row(rid)["status"] == "AWAITING_APPROVAL"

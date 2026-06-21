@@ -437,3 +437,65 @@ def test_fetch_exception_degrades_to_skip(tmp_path: Path, monkeypatch) -> None:
     assert result.skipped is True
     assert result.reclassified == []
     assert _status(db, run_id, "99.1-013") == "FAILED"
+
+
+# --- AWAITING_APPROVAL: approve-then-merge → DONE; un-landed stays awaiting ---
+# (Story 12.3-003)
+
+
+def test_awaiting_approval_landed_reconciles_to_done(tmp_path: Path) -> None:
+    """A high-risk-blocked story FX later approves and merges reconciles to DONE."""
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-020", new=True)
+    _commit(root, "approved.py", "z = 3\n", "feat: approved (#99.1-020)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-020")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-020", "AWAITING_APPROVAL", 120)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-020"]
+    assert _status(db, run_id, "99.1-020") == "DONE"
+    assert _merge_done(db, run_id, "99.1-020") == 1
+    # All stories now DONE → the run terminal recomputes to DONE.
+    assert result.run_status_after == "DONE"
+
+
+def test_awaiting_approval_unlanded_keeps_awaiting_terminal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A standalone reconcile over a not-yet-approved run keeps AWAITING_APPROVAL.
+
+    Reconciliation must never downgrade the honest awaiting-human signal to
+    NEEDS_ATTENTION (and never to FAILED) just because the PR has not merged yet.
+    """
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-021", new=True)
+    _commit(root, "pending.py", "p = 4\n", "feat: pending (#99.1-021)")
+    _checkout(root, "main")  # work is NOT on main
+    monkeypatch.setattr("sdlc.reconcile._gh_pr_state", lambda pr_number, root: None)
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-021", "AWAITING_APPROVAL", 121)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert result.reclassified == []
+    assert _status(db, run_id, "99.1-021") == "AWAITING_APPROVAL"
+    assert result.run_status_after == "AWAITING_APPROVAL"
+
+
+def test_compute_terminal_awaiting_approval_precedence() -> None:
+    from sdlc.reconcile import _compute_terminal
+
+    # Pure awaiting → AWAITING_APPROVAL.
+    assert _compute_terminal({"a": "DONE", "b": "AWAITING_APPROVAL"}) == "AWAITING_APPROVAL"
+    # Mixed awaiting + needs-attention → NEEDS_ATTENTION (stuck work wins).
+    assert (
+        _compute_terminal({"a": "AWAITING_APPROVAL", "b": "NEEDS_ATTENTION"})
+        == "NEEDS_ATTENTION"
+    )
+    # A failed story still dominates.
+    assert _compute_terminal({"a": "AWAITING_APPROVAL", "b": "FAILED"}) == "FAILED"
