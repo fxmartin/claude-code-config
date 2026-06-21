@@ -592,9 +592,9 @@ The shipped default profile is **Balanced**:
 | Stage | Default | Escalates to Opus when… |
 |---|---|---|
 | `discovery` | Haiku | — (structured extraction) |
-| `build` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold (8) |
+| `build` | Sonnet | points ≥ threshold (8) — see the resume-determinism note below |
 | `coverage` | Sonnet | — (tests need correctness) |
-| `review` | Sonnet | high-risk |
+| `review` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold |
 | `adversarial` | **Opus** | **pinned — never downgraded, in any profile** |
 | `merge` | Haiku | — (mechanical) |
 
@@ -618,13 +618,19 @@ command only. Precedence, highest first:
 4. routing off (`--model-routing` unset / `off`) → **no `--model`**, so the CLI
    default (Opus today) stands and behaviour is byte-for-byte unchanged.
 
-The high-risk signal for build/review escalation is best-effort: the story
-branch's changed files matched against the Epic-08 risk-gate patterns
-(`_story_high_risk`), degrading to `False` (so the points threshold drives
-escalation) before a branch exists or on any git error. The resolved config is
-memoized on `opts` so the override file is read at most once per run. The profile
-and per-stage overrides are persisted in the run's config event and rehydrated by
-`run_resume`, so a resumed run routes identically. The `<<<RESULT_JSON>>>`
+The high-risk signal (`_story_high_risk`) matches the story branch's changed
+files against the Epic-08 risk-gate patterns, best-effort (any git/import error
+→ `False`). It is consulted **only for `review`** (`_RISK_AWARE_STAGES`), where
+the branch is already pushed so the same diff — and the same verdict — is seen on
+the original run and on a resume. `build` deliberately ignores it and escalates
+on **points** alone: build's branch does not exist when its model is chosen on a
+fresh run, so a live-git lookup would return `False` on first build but `True` on
+a resume (branch now present), silently changing the routed model across the
+resume. Routing build off points (a spec-derived, resume-stable signal) keeps it
+deterministic. The resolved config is memoized on `opts` so the override file is
+read at most once per run. The profile and per-stage overrides are persisted in
+the run's config event and rehydrated by `run_resume`, so a resumed run routes
+identically. The `<<<RESULT_JSON>>>`
 contract and schema validation are untouched — routing changes only *which model*
 runs a stage, never how its output is parsed.
 

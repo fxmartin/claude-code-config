@@ -2912,6 +2912,17 @@ _ROUTABLE_STAGES = frozenset(
      "bugfix", "reask"}
 )
 
+# Story 14.2-001: stages whose changed-files risk signal is *stable* at the
+# moment their model is chosen — the story branch is already pushed, so the same
+# diff (and therefore the same risk verdict) is seen on the original run and on a
+# resume. `build` is deliberately excluded: its branch does not yet exist when
+# its model is chosen on a fresh run, so a live-git lookup would return False on
+# first build but True on resume (the branch now exists), silently changing the
+# routed model between the two. `build` therefore escalates on **points** only —
+# a spec-derived signal identical across build and resume — keeping routing
+# deterministic. `review` escalation still uses the risk signal (stable there).
+_RISK_AWARE_STAGES = frozenset({"review"})
+
 
 def _routing_config_for(opts: BuildOptions) -> ModelRoutingConfig | None:
     """Resolve (and memoize) the run's model-routing config (Story 14.2-001).
@@ -2934,12 +2945,13 @@ def _routing_config_for(opts: BuildOptions) -> ModelRoutingConfig | None:
 def _story_high_risk(story: Story, opts: BuildOptions) -> bool:
     """Best-effort: does this story touch a high-risk path (Epic-08 risk_gate)?
 
-    Used only to escalate the build/review model to Opus (Story 14.2-001). The
-    signal is the changed files on the story branch matched against the risk-gate
-    patterns; before the branch exists (a fresh build's first stage) there is no
-    diff, so this is False and the points threshold drives escalation instead.
-    Entirely best-effort — any git/import error degrades to False so routing
-    never fails a build, and a no-op when routing is off.
+    Used to escalate the **review** model to Opus (Story 14.2-001). The signal is
+    the changed files on the story branch matched against the risk-gate patterns.
+    It is consulted only for stages where the branch is already pushed (see
+    ``_RISK_AWARE_STAGES``), so the same verdict is reached on the original run
+    and on a resume — routing never silently changes across a resume. Entirely
+    best-effort: any git/import error degrades to False so routing never fails a
+    build, and it is a no-op when routing is off.
     """
     if opts.model_profile.strip().lower() in {"", "off", "none"}:
         return False
@@ -2973,9 +2985,11 @@ def _select_stage_model(stage: str, story: Story, opts: BuildOptions) -> str | N
     config = _routing_config_for(opts)
     if config is None:
         return None
-    return select_model(
-        stage, config, points=story.points, high_risk=_story_high_risk(story, opts)
-    )
+    # The file-based risk signal is consulted only where the diff is stable at
+    # decision time (review), so a resume routes identically to the original run;
+    # build escalates on points alone. See _RISK_AWARE_STAGES.
+    high_risk = _story_high_risk(story, opts) if stage in _RISK_AWARE_STAGES else False
+    return select_model(stage, config, points=story.points, high_risk=high_risk)
 
 
 def _dispatch_stage(

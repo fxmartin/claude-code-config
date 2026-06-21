@@ -102,15 +102,37 @@ def test_large_story_escalates_build_and_review_to_opus(tmp_path, monkeypatch) -
     assert disp.models["merge"] == HAIKU
 
 
-def test_high_risk_story_escalates_build_and_review_to_opus(tmp_path, monkeypatch) -> None:
+def test_high_risk_story_escalates_review_to_opus(tmp_path, monkeypatch) -> None:
+    # The file-based risk signal is consulted only for review (its diff is stable
+    # at decision time); build escalates on points alone, so a small high-risk
+    # story keeps build on Sonnet but escalates review to Opus.
     monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: True)
     opts = BuildOptions(
         scope="epic-14", skip_preflight=True, sequential=True,
         model_profile="balanced",
     )
     disp = _run(opts, _story(points=1), tmp_path)
-    assert disp.models["build"] == OPUS
     assert disp.models["review"] == OPUS
+    assert disp.models["build"] == SONNET  # build escalates on points, not live risk
+
+
+def test_build_model_is_deterministic_regardless_of_branch_risk(
+    tmp_path, monkeypatch
+) -> None:
+    """Resume safety: build's model never depends on the live-git risk signal.
+
+    _story_high_risk reads live git state (the branch exists on resume but not on
+    a fresh build's build stage). Routing build off it would flip Sonnet→Opus
+    across a resume. Build must ignore it, so even a True risk verdict leaves a
+    small story's build on Sonnet.
+    """
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: True)
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced",
+    )
+    disp = _run(opts, _story(points=1), tmp_path)
+    assert disp.models["build"] == SONNET
 
 
 # ---------------------------------------------------------------------------
