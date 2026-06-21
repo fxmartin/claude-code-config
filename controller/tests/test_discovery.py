@@ -304,3 +304,24 @@ def test_genuine_cycle_still_fails_fast() -> None:
         stories = parse_epic_file(path)
     with pytest.raises(ValueError, match="99.1-001"):
         compute_cohorts(stories)
+
+
+def test_parenthetical_only_dependencies_yield_no_edges() -> None:
+    """An empty leading head (value is wholly parenthetical) resolves to zero edges."""
+    assert _deps_for("(see 12.3-001 for the rationale)") == []
+    # A leading prose delimiter also empties the head.
+    assert _deps_for("; deferred, pairs with 12.3-001") == []
+
+
+def test_discover_queue_scopes_by_bare_epic_name(tmp_path, monkeypatch) -> None:
+    """A bare scope substring matches the epic filename stem."""
+    _write_epic(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    queue = discover_queue("sample")
+    assert {s.id for s in queue} == {"99.1-001", "99.1-002"}
+
+
+def test_discover_queue_without_story_dir_returns_empty(tmp_path, monkeypatch) -> None:
+    """No docs/stories or stories directory under root → empty queue, no error."""
+    monkeypatch.chdir(tmp_path)
+    assert discover_queue("all") == []
