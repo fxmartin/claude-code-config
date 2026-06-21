@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.48.0] - 2026-06-21
+
+### Added
+
+- feat(cost-model-governance): cheap-first dispatch with retry escalation
+
+### Fixed
+
+- fix(cost-model-governance): preserve cheap-first escalation on resume
+
+
 ## [v1.47.0] - 2026-06-21
 
 ### Added
