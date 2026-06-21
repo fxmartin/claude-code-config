@@ -33,6 +33,35 @@ from sdlc.registry import Registry, RunRecord
 # "max 2 bugfix iterations" rule (Step 5d2) so behaviour matches the playbook.
 MAX_BUGFIX_ATTEMPTS = 2
 
+# Story 12.1-002: recursion-guard sentinel. The controller exports this in the
+# environment of any test suite it runs during preflight; the `build`/`dashboard`
+# verbs short-circuit when they see it, so a project test that invokes the
+# controller's own verbs bare cannot recurse into real orchestration
+# (pytest-within-pytest) or bind a server — which would hang the parent build.
+# The controller's own unit tests never set it, so legitimate CLI coverage runs
+# unchanged.
+IN_TEST_ENV_VAR = "SDLC_IN_TEST"
+
+# Per-test timeout (seconds) added to the detected pytest command when the
+# project ships pytest-timeout, so a single hanging test fails fast instead of
+# stalling the whole suite until the (much larger) preflight timeout. Best-effort
+# and graceful: applied only when the plugin is present, like `-n auto` for xdist.
+PER_TEST_TIMEOUT = 60
+
+
+def in_test_sentinel() -> bool:
+    """True when the in-test sentinel env var is set to a truthy value.
+
+    Truthy values: ``1``/``true``/``yes``/``on`` (case-insensitive). Anything
+    else — including unset, empty, ``0``, ``false`` — is False.
+    """
+    return os.environ.get(IN_TEST_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 # Maximum commit-message re-asks after a commitlint violation (Story 12.2-002).
 # Bounded like the bugfix loop: try to get a compliant header before the work
 # reaches a PR, but never spin forever over a cosmetic message issue.
@@ -1127,6 +1156,10 @@ class BuildResult:
     planned: int = 0
     dry_run: bool = False
     preflight_failed: bool = False
+    # Story 12.1-002: set when a real run was short-circuited by the recursion
+    # guard (the SDLC_IN_TEST sentinel was set), so the caller can report it and
+    # exit cleanly instead of launching preflight/orchestration.
+    skipped_in_test: bool = False
     run_id: str | None = None
     story_status: dict[str, str] = field(default_factory=dict)
 
@@ -1160,6 +1193,12 @@ def detect_test_command(root: Path) -> list[str] | None:
         cmd = ["uv", "run", "pytest"]
         if _has_pytest_xdist(root):
             cmd += ["-n", "auto"]
+        if _has_pytest_timeout(root):
+            # Bound each test so a hanging agent-added test fails fast with a
+            # clear pytest-timeout message rather than stalling until preflight's
+            # whole-suite timeout (Story 12.1-002). thread method works without
+            # signals so it is safe under xdist workers.
+            cmd += [f"--timeout={PER_TEST_TIMEOUT}", "--timeout-method=thread"]
         return cmd
     if "test:" in makefile_text:
         return ["make", "test"]
@@ -1173,6 +1212,15 @@ def _has_pytest_xdist(root: Path) -> bool:
     for name in ("pyproject.toml", "uv.lock", "requirements.txt"):
         path = root / name
         if path.is_file() and "pytest-xdist" in path.read_text(encoding="utf-8"):
+            return True
+    return False
+
+
+def _has_pytest_timeout(root: Path) -> bool:
+    """True when pytest-timeout appears in the project's deps/lock (Story 12.1-002)."""
+    for name in ("pyproject.toml", "uv.lock", "requirements.txt"):
+        path = root / name
+        if path.is_file() and "pytest-timeout" in path.read_text(encoding="utf-8"):
             return True
     return False
 
@@ -1191,8 +1239,13 @@ def default_preflight(root: Path | None = None, timeout: int = 600) -> bool:
         # No suite to run — treat as a pass rather than blocking the build.
         return True
     print(f"preflight: {' '.join(cmd)} (timeout {timeout}s)", file=sys.stderr)
+    # Export the recursion-guard sentinel into the child only (a copy of the
+    # parent env), so a project test that invokes the controller's `build`/
+    # `dashboard` verbs short-circuits instead of recursing into orchestration
+    # (Story 12.1-002). The parent process env is left untouched.
+    env = {**os.environ, IN_TEST_ENV_VAR: "1"}
     try:
-        completed = subprocess.run(cmd, cwd=root, timeout=timeout)
+        completed = subprocess.run(cmd, cwd=root, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         print(
             f"PRE_FLIGHT_TIMEOUT: '{' '.join(cmd)}' exceeded {timeout}s — aborting. "
@@ -1524,6 +1577,18 @@ def run_build(
     # preflight gate, so this returns before Phase 1.
     if opts.dry_run:
         return BuildResult(dry_run=True, planned=len(buildable))
+
+    # --- Recursion guard (Story 12.1-002) ------------------------------------
+    # When we are running inside another build's preflight test suite (the
+    # SDLC_IN_TEST sentinel is set) AND this is a *real* run using the default
+    # dispatcher and preflight (no injected fakes), short-circuit before the real
+    # preflight subprocess: otherwise a project test that invoked `sdlc build`
+    # bare would recurse into pytest-within-pytest and hang the parent run. Tests
+    # that inject a fake dispatcher/preflight are exercising orchestration
+    # deliberately, so they are never blocked — this guards only the side-effecting
+    # real path, not unit coverage (AC3).
+    if dispatcher is None and preflight is None and in_test_sentinel():
+        return BuildResult(skipped_in_test=True, planned=len(buildable))
 
     # --- Phase 1: Preflight (real runs only) ---------------------------------
     if not opts.skip_preflight:

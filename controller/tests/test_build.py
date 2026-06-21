@@ -4,17 +4,21 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from sdlc.build import (
+    IN_TEST_ENV_VAR,
+    PER_TEST_TIMEOUT,
     BuildOptions,
     BuildResult,
     Ledger,
     default_preflight,
     detect_test_command,
+    in_test_sentinel,
     parse_build_args,
     run_build,
 )
@@ -710,6 +714,94 @@ def test_default_preflight_times_out(tmp_path, capsys) -> None:
     )
     assert default_preflight(root=tmp_path, timeout=1) is False
     assert "PRE_FLIGHT_TIMEOUT" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Story 12.1-002: recursion guard (sentinel) + per-test timeout
+# ---------------------------------------------------------------------------
+
+def test_in_test_sentinel_reads_env(monkeypatch) -> None:
+    monkeypatch.delenv(IN_TEST_ENV_VAR, raising=False)
+    assert in_test_sentinel() is False
+    for truthy in ("1", "true", "YES", "on"):
+        monkeypatch.setenv(IN_TEST_ENV_VAR, truthy)
+        assert in_test_sentinel() is True
+    for falsy in ("", "0", "false", "no"):
+        monkeypatch.setenv(IN_TEST_ENV_VAR, falsy)
+        assert in_test_sentinel() is False
+
+
+def test_default_preflight_sets_in_test_sentinel(tmp_path) -> None:
+    """The preflight subprocess must see SDLC_IN_TEST so a project test that
+    invokes the controller's own verbs short-circuits instead of recursing."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text(
+        f'#!/usr/bin/env bash\ntest -n "${IN_TEST_ENV_VAR}"\n', encoding="utf-8"
+    )
+    # Ensure the parent does NOT already export it, proving preflight injects it.
+    assert default_preflight(root=tmp_path, timeout=10) is True
+
+
+def test_default_preflight_does_not_leak_sentinel(tmp_path, monkeypatch) -> None:
+    """Setting the sentinel for the child must not mutate the parent's env."""
+    monkeypatch.delenv(IN_TEST_ENV_VAR, raising=False)
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text(
+        "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+    )
+    default_preflight(root=tmp_path, timeout=10)
+    assert IN_TEST_ENV_VAR not in os.environ
+
+
+def test_detect_pytest_adds_timeout_when_present(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["pytest-timeout>=2"]\n', encoding="utf-8"
+    )
+    cmd = detect_test_command(tmp_path)
+    assert f"--timeout={PER_TEST_TIMEOUT}" in cmd
+    assert "--timeout-method=thread" in cmd
+
+
+def test_detect_pytest_no_timeout_without_plugin(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    cmd = detect_test_command(tmp_path)
+    assert not any(c.startswith("--timeout") for c in cmd)
+
+
+def test_run_build_short_circuits_under_sentinel_with_real_defaults(
+    tmp_path, monkeypatch
+) -> None:
+    """A real run (no injected dispatcher/preflight) under the sentinel must
+    short-circuit before any side effect — neither preflight nor dispatch runs."""
+    monkeypatch.setenv(IN_TEST_ENV_VAR, "1")
+
+    def _boom() -> bool:
+        raise AssertionError("preflight must not run under the sentinel")
+
+    # No dispatcher and no preflight injected → real defaults → guard fires.
+    result = run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(tmp_path / "l.db"),
+    )
+    assert result.skipped_in_test is True
+    assert result.completed == 0
+
+
+def test_run_build_with_fakes_ignores_sentinel(tmp_path, monkeypatch) -> None:
+    """AC3: a run that injects a fake dispatcher/preflight is exercising
+    orchestration deliberately — the guard must NOT block it, even when the
+    sentinel is set (the case during the controller's own preflight)."""
+    monkeypatch.setenv(IN_TEST_ENV_VAR, "1")
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    assert result.skipped_in_test is False
+    assert result.completed == 3
 
 
 def test_dry_run_skips_preflight(tmp_path) -> None:

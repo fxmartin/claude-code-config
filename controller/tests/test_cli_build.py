@@ -93,6 +93,61 @@ def test_build_single_story_scope_dry_run(tmp_path, monkeypatch) -> None:
     assert "1 stories" in result.output
 
 
+def test_build_short_circuits_under_test_sentinel(tmp_path, monkeypatch) -> None:
+    """Story 12.1-002: with SDLC_IN_TEST set, a bare `sdlc build` must NOT run
+    real orchestration — it exits 0 with a clear note and dispatches no agent.
+
+    This is the regression guard: a project test that invokes `sdlc build` bare
+    during the controller's preflight no longer hangs the suite. We boobytrap the
+    real preflight and dispatch so a regression fails fast instead of recursing
+    into pytest-within-pytest or spawning a real agent.
+    """
+    from sdlc.build import IN_TEST_ENV_VAR
+    import sdlc.build as build_mod
+
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(IN_TEST_ENV_VAR, "1")
+
+    def _boom(*args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("real preflight/dispatch must not run under the sentinel")
+
+    monkeypatch.setattr(build_mod, "dispatch_agent", _boom)
+    monkeypatch.setattr(build_mod, "default_preflight", _boom)
+
+    result = runner.invoke(app, ["build", "epic-99"])
+    assert result.exit_code == 0, result.output
+    assert IN_TEST_ENV_VAR in result.output
+
+
+def test_build_dry_run_still_works_under_sentinel(tmp_path, monkeypatch) -> None:
+    """AC3: the guard blocks only real orchestration. A dry-run plan does not
+    recurse, so it must still run (and report the plan) even with the sentinel
+    set — which is exactly the case during the controller's own preflight."""
+    from sdlc.build import IN_TEST_ENV_VAR
+
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(IN_TEST_ENV_VAR, "1")
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "dry run" in result.output.lower()
+    assert "2 stories" in result.output
+
+
+def test_build_scope_error_still_works_under_sentinel(tmp_path, monkeypatch) -> None:
+    """AC3: arg/scope validation runs before the guard, so a bad scope still
+    errors with exit 2 under the sentinel rather than being swallowed."""
+    from sdlc.build import IN_TEST_ENV_VAR
+
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(IN_TEST_ENV_VAR, "1")
+    result = runner.invoke(app, ["build", "epic-77", "--dry-run"])
+    assert result.exit_code == 2, result.output
+    assert "matched no stories" in result.output
+
+
 def test_build_help_lists_flags_and_scopes() -> None:
     """R1: build's help epilog documents every flag and scope form.
 

@@ -127,6 +127,40 @@ def test_rollback_requires_checkpoint() -> None:
     assert result.exit_code != 0  # missing required --to option
 
 
+def test_dashboard_short_circuits_under_test_sentinel(monkeypatch) -> None:
+    """Story 12.1-002: with SDLC_IN_TEST set, `sdlc dashboard` must NOT bind a
+    server — a project test that invokes it bare under preflight would otherwise
+    block the run on a socket. It exits 0 with a clear note instead."""
+    from sdlc.build import IN_TEST_ENV_VAR
+    import sdlc.dashboard as dash_mod
+
+    monkeypatch.setenv(IN_TEST_ENV_VAR, "1")
+
+    def _boom(*args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("serve must not run under the test sentinel")
+
+    monkeypatch.setattr(dash_mod, "serve", _boom)
+
+    result = runner.invoke(app, ["dashboard"])
+    assert result.exit_code == 0, result.output
+    assert IN_TEST_ENV_VAR in result.output
+
+
+def test_dashboard_stop_still_works_under_sentinel(monkeypatch) -> None:
+    """AC3: --stop only kills a server (never binds one), so it must still run
+    under the sentinel rather than hitting the serve() short-circuit."""
+    from sdlc.build import IN_TEST_ENV_VAR
+    import sdlc.dashboard as dash_mod
+
+    monkeypatch.setenv(IN_TEST_ENV_VAR, "1")
+    monkeypatch.setattr(dash_mod, "stop_dashboard", lambda host, port: 0)
+
+    result = runner.invoke(app, ["dashboard", "--stop"])
+    assert result.exit_code == 0, result.output
+    assert "no dashboard running" in result.output
+    assert IN_TEST_ENV_VAR not in result.output
+
+
 def test_unknown_command_exits_nonzero() -> None:
     """Invoking an unknown command produces a non-zero exit code."""
     result = runner.invoke(app, ["nonexistent-command"])
