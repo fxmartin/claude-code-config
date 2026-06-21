@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.40.0] - 2026-06-21
+
+### Added
+
+- feat(controller-robustness): add sdlc reconcile verb (#12.3-002)
+
+
 ## [v1.39.0] - 2026-06-21
 
 ### Added
