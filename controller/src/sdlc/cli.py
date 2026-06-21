@@ -162,9 +162,17 @@ def build(ctx: typer.Context) -> None:
     typer.echo(
         f"build finished: {result.completed} done, {result.failed} failed, "
         f"{result.blocked} blocked, {result.needs_attention} need attention, "
-        f"{result.skipped} skipped."
+        f"{result.awaiting_approval} awaiting approval, {result.skipped} skipped."
     )
-    clean = result.failed == 0 and result.blocked == 0 and result.needs_attention == 0
+    # An AWAITING_APPROVAL run is honestly not a failure (Story 12.3-003), but it
+    # still needs FX to act, so it is not "clean" — exit non-zero like
+    # NEEDS_ATTENTION so a wrapping script never reads it as fully done.
+    clean = (
+        result.failed == 0
+        and result.blocked == 0
+        and result.needs_attention == 0
+        and result.awaiting_approval == 0
+    )
     raise typer.Exit(code=0 if clean else 1)
 
 
@@ -212,10 +220,15 @@ def resume(
 
     typer.echo(
         f"resume finished: {result.completed} done, {result.failed} failed, "
-        f"{result.blocked} blocked, {result.needs_attention} need attention "
-        f"({result.resumed} resumed)."
+        f"{result.blocked} blocked, {result.needs_attention} need attention, "
+        f"{result.awaiting_approval} awaiting approval ({result.resumed} resumed)."
     )
-    clean = result.failed == 0 and result.blocked == 0 and result.needs_attention == 0
+    clean = (
+        result.failed == 0
+        and result.blocked == 0
+        and result.needs_attention == 0
+        and result.awaiting_approval == 0
+    )
     raise typer.Exit(code=0 if clean else 1)
 
 

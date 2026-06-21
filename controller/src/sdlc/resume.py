@@ -13,6 +13,7 @@ from sdlc.build import (
     Dispatcher,
     Ledger,
     _run_story,
+    _run_terminal,
 )
 from sdlc.cohort import Story, compute_cohorts
 from sdlc.discovery import discover_queue
@@ -55,6 +56,7 @@ class ResumeResult:
     failed: int = 0
     blocked: int = 0
     needs_attention: int = 0
+    awaiting_approval: int = 0
     skipped: int = 0
     nothing_to_resume: bool = False
     story_status: dict[str, str] = field(default_factory=dict)
@@ -212,7 +214,7 @@ def run_resume(
             blocked_by = [
                 dep
                 for dep in story.dependencies
-                if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED"}
+                if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED", "AWAITING_APPROVAL"}
             ]
             if blocked_by:
                 status[story.id] = "BLOCKED"
@@ -244,20 +246,20 @@ def run_resume(
     failed = sum(1 for v in status.values() if v == "FAILED")
     blocked = sum(1 for v in status.values() if v == "BLOCKED")
     needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
+    # Story 12.3-003: stories parked awaiting FX's high-risk merge approval.
+    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
     skipped = sum(1 for v in status.values() if v == "SKIPPED")
 
-    if failed or blocked:
-        run_terminal = "FAILED"
-    elif needs_attention:
-        run_terminal = "NEEDS_ATTENTION"
-    else:
-        run_terminal = "DONE"
-    run_level = {"DONE": "success", "NEEDS_ATTENTION": "warn"}.get(run_terminal, "error")
+    run_terminal = _run_terminal(failed, blocked, needs_attention, awaiting_approval)
+    run_level = {
+        "DONE": "success", "NEEDS_ATTENTION": "warn", "AWAITING_APPROVAL": "warn",
+    }.get(run_terminal, "error")
     ledger.run_update_counts(rid, completed, failed)
     ledger.event_log(
         rid, "", run_level, "controller",
         f"resume finished: {completed} done, {failed} failed, {blocked} blocked, "
-        f"{needs_attention} need attention, {skipped} skipped ({resumed} resumed)",
+        f"{needs_attention} need attention, {awaiting_approval} awaiting approval, "
+        f"{skipped} skipped ({resumed} resumed)",
     )
     ledger.run_update_status(rid, run_terminal)
 
@@ -271,6 +273,7 @@ def run_resume(
         failed=failed,
         blocked=blocked,
         needs_attention=needs_attention,
+        awaiting_approval=awaiting_approval,
         skipped=skipped,
         nothing_to_resume=False,
         story_status=dict(status),

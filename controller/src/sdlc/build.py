@@ -150,7 +150,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_status     ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_run_ts   ON events(run_id, ts);
 """
 
-_TERMINAL_RUN_STATES = {"DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION"}
+_TERMINAL_RUN_STATES = {
+    "DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION", "AWAITING_APPROVAL",
+}
 
 # Schema migrations applied by Ledger.init() after the base DDL. Each entry adds
 # missing columns to an existing ledger idempotently (guarded by PRAGMA
@@ -911,6 +913,7 @@ class Ledger:
 _EMPTY_COUNTS = {
     "total": 0, "done": 0, "failed": 0, "blocked": 0,
     "in_progress": 0, "skipped": 0, "todo": 0, "needs_attention": 0,
+    "awaiting_approval": 0,
 }
 
 # The four per-stage token components recorded from the agent usage envelope.
@@ -1125,6 +1128,7 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "skipped": _count("SKIPPED"),
         "todo": _count("TODO"),
         "needs_attention": _count("NEEDS_ATTENTION"),
+        "awaiting_approval": _count("AWAITING_APPROVAL"),
     }
     payload["stories"] = stories
     payload["events"] = events
@@ -1157,6 +1161,9 @@ class BuildResult:
     skipped: int = 0
     blocked: int = 0
     needs_attention: int = 0
+    # Story 12.3-003: stories parked waiting on FX's high-risk merge approval —
+    # a non-FAILED, non-DONE bucket distinct from NEEDS_ATTENTION.
+    awaiting_approval: int = 0
     planned: int = 0
     dry_run: bool = False
     preflight_failed: bool = False
@@ -1356,6 +1363,15 @@ def render_merge_prompt(story: Story, pr_number: int | None) -> str:
     return (
         f"Merge the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
         "Rebase before merge to absorb baseline drift, then emit the result block.\n"
+        # Story 12.3-003: surface a high-risk human-approval block additively so
+        # the controller parks AWAITING_APPROVAL instead of entering the bugfix
+        # loop (which cannot self-approve). The instruction below is part of the
+        # agent-facing prompt string, not a comment.
+        "If the PR is blocked only by the high-risk approval gate (it carries "
+        "the `risk:high` label with no `risk-approved` label and no "
+        "`risk-approver` review), do NOT force-merge or override the gate: "
+        'report merge_status="FAILED" and set the extra field "block_reason" to '
+        '"BLOCKED_HIGH_RISK" so the run is parked awaiting human approval.\n'
         + _result_wrapper("merge-agent-response.schema.json")
     )
 
@@ -1694,7 +1710,8 @@ def run_build(
             blocked_by = [
                 dep
                 for dep in story.dependencies
-                if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED", "NEEDS_ATTENTION"}
+                if status.get(dep)
+                in {"FAILED", "BLOCKED", "SKIPPED", "NEEDS_ATTENTION", "AWAITING_APPROVAL"}
             ]
             if blocked_by:
                 status[story.id] = "BLOCKED"
@@ -1736,16 +1753,17 @@ def run_build(
     # Stories whose work was committed but whose result was unparseable (R10):
     # not a clean success, but deliberately not a destructive FAILED.
     needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
+    # Story 12.3-003: stories parked awaiting FX's high-risk merge approval — a
+    # non-FAILED, non-DONE bucket. Orthogonal to NEEDS_ATTENTION (waiting on a
+    # person vs. needing manual push/fix).
+    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
     # Shipped stories were skipped before the loop; fold them into the tally.
     skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
 
-    if failed or blocked:
-        run_terminal = "FAILED"
-    elif needs_attention:
-        run_terminal = "NEEDS_ATTENTION"
-    else:
-        run_terminal = "DONE"
-    run_level = {"DONE": "success", "NEEDS_ATTENTION": "warn"}.get(run_terminal, "error")
+    run_terminal = _run_terminal(failed, blocked, needs_attention, awaiting_approval)
+    run_level = {
+        "DONE": "success", "NEEDS_ATTENTION": "warn", "AWAITING_APPROVAL": "warn",
+    }.get(run_terminal, "error")
     ledger.run_update_counts(run_id, completed, failed)
     ledger.event_log(
         run_id,
@@ -1753,7 +1771,8 @@ def run_build(
         run_level,
         "controller",
         f"run finished: {completed} done, {failed} failed, {blocked} blocked, "
-        f"{needs_attention} need attention, {skipped} skipped",
+        f"{needs_attention} need attention, {awaiting_approval} awaiting approval, "
+        f"{skipped} skipped",
     )
     ledger.run_update_status(run_id, run_terminal)
     if registry is not None:
@@ -1772,10 +1791,33 @@ def run_build(
         skipped=skipped,
         blocked=blocked,
         needs_attention=needs_attention,
+        awaiting_approval=awaiting_approval,
         planned=len(buildable),
         run_id=run_id,
         story_status=story_status,
     )
+
+
+def _run_terminal(
+    failed: int, blocked: int, needs_attention: int, awaiting_approval: int
+) -> str:
+    """The run terminal implied by the per-story outcome counts (Story 12.3-003).
+
+    Precedence: a ``FAILED``/``BLOCKED`` story makes the run ``FAILED``;
+    otherwise a leftover ``NEEDS_ATTENTION`` (the more-urgent "work is stuck,
+    push/fix it" signal) wins over ``AWAITING_APPROVAL`` so a mixed run never
+    hides stuck work behind the approval state; a run whose only non-DONE
+    stories are ``AWAITING_APPROVAL`` is reported ``AWAITING_APPROVAL`` (never
+    ``FAILED``); an all-DONE/SKIPPED run is ``DONE``. Shared by ``run_build`` and
+    ``run_resume`` close-out.
+    """
+    if failed or blocked:
+        return "FAILED"
+    if needs_attention:
+        return "NEEDS_ATTENTION"
+    if awaiting_approval:
+        return "AWAITING_APPROVAL"
+    return "DONE"
 
 
 def _run_story(
@@ -1793,10 +1835,13 @@ def _run_story(
 ) -> str:
     """Drive one story through build → coverage → review → merge.
 
-    Returns the terminal story status: ``DONE``, ``FAILED``, or
-    ``NEEDS_ATTENTION``. A stage failure (agent FAILED status, dispatch error, or
-    schema-invalid output) enters the bounded bugfix loop; the stage is retried
-    after a successful fix. If a result is *unparseable* (contract error) but the
+    Returns the terminal story status: ``DONE``, ``FAILED``,
+    ``NEEDS_ATTENTION``, or ``AWAITING_APPROVAL``. A stage failure (agent FAILED
+    status, dispatch error, or schema-invalid output) enters the bounded bugfix
+    loop; the stage is retried after a successful fix. A merge blocked only by
+    the high-risk human-approval gate short-circuits to ``AWAITING_APPROVAL``
+    *before* the bugfix loop (Story 12.3-003) — it cannot self-approve. If a
+    result is *unparseable* (contract error) but the
     agent already committed the story branch, the work is preserved as
     ``NEEDS_ATTENTION`` instead of being discarded and rebuilt (R10). Each
     dispatch's transcript is persisted under ``logs_dir`` and its path recorded
@@ -1872,6 +1917,21 @@ def _run_story(
             ledger.event_log(
                 run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
             )
+
+            # Story 12.3-003: a merge blocked only by the high-risk human-approval
+            # gate is parked in a distinct AWAITING_APPROVAL terminal — *before*
+            # any recovery. The bugfix loop cannot self-approve and would only
+            # exhaust into FAILED, misreporting a run that is honestly
+            # awaiting-human. The committed work / open PR are preserved (R10):
+            # nothing is discarded or rebuilt. Reconciliation (12.3-001) flips it
+            # to DONE once FX approves and the PR merges.
+            if kind == "awaiting_approval":
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    f"merge blocked awaiting human approval (high-risk) — parking "
+                    f"AWAITING_APPROVAL; PR/branch on feature/{story.id} preserved",
+                )
+                return "AWAITING_APPROVAL"
 
             # Story 12.1-001: a missing/malformed result envelope (contract
             # error) usually means the agent did good work but failed only to
@@ -2035,7 +2095,17 @@ def _dispatch_stage(
         return False, None, f"dispatch error: {exc}", "dispatch"
 
     if not _stage_succeeded(stage, result.data):
-        return False, result, _stage_failure_summary(stage, result.data), "reported"
+        # Story 12.3-003: a merge blocked only by the high-risk human-approval
+        # gate is not a generic stage failure — it is a run waiting on FX. Tag
+        # it ``awaiting_approval`` so the caller short-circuits before the bugfix
+        # loop (which cannot self-approve) and parks it as a distinct,
+        # non-FAILED terminal rather than exhausting into FAILED.
+        kind = (
+            "awaiting_approval"
+            if _merge_awaiting_approval(stage, result.data)
+            else "reported"
+        )
+        return False, result, _stage_failure_summary(stage, result.data), kind
     return True, result, "", ""
 
 
@@ -2067,7 +2137,39 @@ def _stage_succeeded(stage: str, data: dict) -> bool:
 def _stage_failure_summary(stage: str, data: dict) -> str:
     if stage == "build":
         return data.get("error_summary", "build reported FAILED")
+    if stage == "merge" and _merge_awaiting_approval(stage, data):
+        return "merge blocked awaiting human approval (high-risk gate)"
     return f"{stage} reported non-success status"
+
+
+# Markers a merge agent uses to signal a high-risk human-approval block. The
+# merge schema enum is only MERGED|FAILED|SKIPPED (re-enumerating it is a
+# non-goal), so the block is surfaced *additively* — a ``block_reason`` field
+# (extra properties are allowed) and/or the marker named in free text.
+_AWAITING_APPROVAL_MARKERS = ("BLOCKED_HIGH_RISK", "AWAITING_APPROVAL")
+# Free-text fields a merge agent might name the block in when it omits the
+# explicit ``block_reason`` field.
+_BLOCK_TEXT_FIELDS = ("block_reason", "error_summary", "detail", "summary", "notes")
+
+
+def _merge_awaiting_approval(stage: str, data: dict) -> bool:
+    """True when a non-success merge response is a high-risk approval block (12.3-003).
+
+    A PR carrying ``risk:high`` (from ``risk_gate.py`` /
+    ``.github/workflows/risk-gate.yml``) with no ``risk-approved`` label or
+    ``risk-approver`` review is blocked pending FX's manual approval, not a
+    fixable failure. Only the ``merge`` stage can be awaiting approval. The
+    primary signal is an additive ``block_reason`` field equal to a known marker
+    (case-insensitive); a free-text fallback recognizes the marker embedded in
+    other reason fields, so the signal survives even when the agent narrates it.
+    """
+    if stage != "merge":
+        return False
+    reason = str(data.get("block_reason", "")).strip().upper()
+    if reason in _AWAITING_APPROVAL_MARKERS:
+        return True
+    haystack = " ".join(str(data.get(k, "")) for k in _BLOCK_TEXT_FIELDS).upper()
+    return any(marker in haystack for marker in _AWAITING_APPROVAL_MARKERS)
 
 
 def _record_stage_usage(

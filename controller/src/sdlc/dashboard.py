@@ -233,7 +233,7 @@ _PAGE = """<!doctype html>
   :root { color-scheme: light;
     --base:#eff1f5; --mantle:#e6e9ef; --crust:#dce0e8; --text:#4c4f69; --sub:#6c6f85;
     --surface:#ccd0da; --overlay:#9ca0b0; --blue:#1e66f5; --green:#40a02b; --red:#d20f39;
-    --peach:#fe640b; }
+    --peach:#fe640b; --mauve:#8839ef; }
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
          background: var(--base); color: var(--text); }
@@ -268,6 +268,7 @@ _PAGE = """<!doctype html>
   .FAILED { background: #fbe3e8; color: var(--red); }
   .BLOCKED { background: #fdeede; color: var(--peach); }
   .NEEDS_ATTENTION { background: #fdeede; color: var(--peach); }
+  .AWAITING_APPROVAL { background: #e9e7fd; color: var(--mauve); }
   .SKIPPED { background: var(--surface); color: var(--sub); }
   .TODO { background: var(--crust); color: var(--overlay); }
   .PENDING { background: var(--crust); color: var(--overlay); }
@@ -302,7 +303,7 @@ _PAGE = """<!doctype html>
     </div>
   </div>
 <script>
-const ORDER = ["DONE","IN_PROGRESS","FAILED","BLOCKED","NEEDS_ATTENTION","SKIPPED","TODO"];
+const ORDER = ["DONE","IN_PROGRESS","FAILED","BLOCKED","NEEDS_ATTENTION","AWAITING_APPROVAL","SKIPPED","TODO"];
 let sel = null;  // null = Live (latest)
 // Live run-duration ticker (Story 11.2-005): when a run is in-progress, count
 // up locally from the server-computed elapsed (runtimeBase) captured at fetch

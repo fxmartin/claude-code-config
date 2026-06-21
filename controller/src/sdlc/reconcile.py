@@ -150,14 +150,20 @@ def _ensure_merge_done(
 def _compute_terminal(statuses: dict[str, str]) -> str:
     """The run terminal implied by per-story statuses (mirrors run_build).
 
-    A failed/blocked story makes the run FAILED; any other not-yet-done leftover
-    (NEEDS_ATTENTION / AWAITING_APPROVAL / IN_PROGRESS) makes it NEEDS_ATTENTION;
-    only an all-DONE/SKIPPED run is DONE.
+    A failed/blocked story makes the run FAILED; a run whose only not-yet-done
+    leftovers are ``AWAITING_APPROVAL`` stays ``AWAITING_APPROVAL`` so a standalone
+    ``sdlc reconcile`` over a not-yet-approved run never downgrades the honest
+    awaiting-human signal (Story 12.3-003); any other not-yet-done leftover
+    (NEEDS_ATTENTION / IN_PROGRESS, or a mix) makes it NEEDS_ATTENTION; only an
+    all-DONE/SKIPPED run is DONE.
     """
     vals = list(statuses.values())
     if any(v in {"FAILED", "BLOCKED"} for v in vals):
         return "FAILED"
-    if any(v not in {"DONE", "SKIPPED"} for v in vals):
+    leftover = [v for v in vals if v not in {"DONE", "SKIPPED"}]
+    if leftover and all(v == "AWAITING_APPROVAL" for v in leftover):
+        return "AWAITING_APPROVAL"
+    if leftover:
         return "NEEDS_ATTENTION"
     return "DONE"
 

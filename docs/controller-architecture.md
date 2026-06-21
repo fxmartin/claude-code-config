@@ -94,6 +94,26 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    exhausted is the story parked: `NEEDS_ATTENTION` when committed work exists on
    `feature/<story>` (preserved for manual push/MR, R10), otherwise `FAILED`
    (`_exhausted_status`).
+
+   **Awaiting human approval (Story 12.3-003).** A merge blocked *only* by the
+   high-risk human-approval gate — a PR carrying `risk:high` (from `risk_gate.py`
+   / `.github/workflows/risk-gate.yml`) with no `risk-approved` label or
+   `risk-approver` review — is **not** a fixable failure: the bugfix loop cannot
+   self-approve and would only exhaust into `FAILED`, misreporting a run that is
+   honestly awaiting FX. The merge `merge_status` enum stays `MERGED|FAILED|SKIPPED`
+   (re-enumerating it is a non-goal); the block is surfaced **additively** — the
+   merge agent sets a documented `block_reason` field (extra properties are
+   allowed) and/or names the marker in free text, which `_merge_awaiting_approval`
+   recognizes and `_dispatch_stage` tags `kind="awaiting_approval"`. The schema's
+   `merge_sha`/`merged_at` are required to be non-empty only when
+   `merge_status == MERGED` (`if/then`), so a real blocked response — which has no
+   SHA — passes validation and reaches this classification instead of being
+   rejected as a contract error first. `_run_story`
+   short-circuits that kind to `AWAITING_APPROVAL` **before** the bugfix loop,
+   preserving the committed work and open PR (R10). Reconciliation
+   (`reconcile_run`) flips the story to `DONE` once FX approves and the PR
+   merges. `AWAITING_APPROVAL` is orthogonal to epic-14's `PAUSED`/`RATE_LIMITED`
+   (waiting on a *person* vs. waiting on *time*); none of these is `FAILED`.
 7. **Commit-message lint** — after any **commit-authoring** stage succeeds
    (build, coverage, a confirmed bugfix, and an *envelope-recovered* build/
    coverage stage), the controller lints the HEAD commit of `feature/<story>`
@@ -138,10 +158,11 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    lets the re-lint see the now-compliant message. Only when that recovery *also*
    fails is the story parked.
 8. **Dependency blocking** — if a dependency ends FAILED/BLOCKED/SKIPPED/
-   NEEDS_ATTENTION, the dependent story is marked BLOCKED and never dispatched.
-   NEEDS_ATTENTION counts as not-done: the dependency's work is committed but
-   unmerged (parked for manual push/MR or a commit-message fix), so a dependent
-   built on top of it would race incomplete work.
+   NEEDS_ATTENTION/AWAITING_APPROVAL, the dependent story is marked BLOCKED and
+   never dispatched. These all count as not-done: the dependency's work is
+   committed but unmerged (parked for manual push/MR, a commit-message fix, or
+   FX's high-risk approval), so a dependent built on top of it would race
+   incomplete work.
 9. **Close-out reconciliation** — after the cohort loop and **before** the
    terminal tally, `run_build` (real runs only — injected fakes skip it, like the
    recursion guard) calls `reconcile.reconcile_run` to re-check every parked
@@ -151,6 +172,16 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    verifies the truth on `origin/main` and corrects the ledger so the run
    terminal reports DONE instead of a stale FAILED/NEEDS_ATTENTION. See
    [Reconciliation](#reconciliation-against-originmain) below.
+10. **Run terminal** — the close-out tally maps per-story outcomes to one run
+    terminal via the shared `_run_terminal` helper (used by both `run_build` and
+    `run_resume`): any `FAILED`/`BLOCKED` story ⇒ `FAILED`; else any
+    `NEEDS_ATTENTION` ⇒ `NEEDS_ATTENTION` (the more-urgent "work is stuck" signal
+    wins so a mix never hides it); else any `AWAITING_APPROVAL` ⇒
+    `AWAITING_APPROVAL` (Story 12.3-003 — a non-FAILED, non-DONE bucket); else
+    `DONE`. The CLI reports an `AWAITING_APPROVAL` run honestly (not a failure)
+    but exits non-zero, since FX must still act. `reconcile._compute_terminal`
+    mirrors this so a standalone `sdlc reconcile` over a not-yet-approved run
+    keeps the `AWAITING_APPROVAL` signal rather than downgrading it.
 
 ## Reconciliation against origin/main
 

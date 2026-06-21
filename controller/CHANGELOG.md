@@ -8,6 +8,26 @@ stories.
 ## [Unreleased]
 
 ### Added
+- **`AWAITING_APPROVAL` merge state** (Story 12.3-003) — a merge blocked *only* by
+  the high-risk human-approval gate (`risk:high` with no `risk-approved` label /
+  `risk-approver` review) is now parked in a distinct `AWAITING_APPROVAL` terminal
+  instead of burning the bugfix loop and reporting `FAILED`. The merge schema
+  `merge_status` enum is unchanged (`MERGED|FAILED|SKIPPED`); the block is surfaced
+  additively via a documented `block_reason` field / free-text marker that
+  `_merge_awaiting_approval` detects, `_dispatch_stage` tags
+  `kind="awaiting_approval"`, and `_run_story` short-circuits before the bugfix
+  loop — committed work and the open PR are preserved (R10). The schema no longer
+  demands a non-empty `merge_sha`/`merged_at` for a *non-merged* outcome (that
+  constraint is now conditional on `merge_status == MERGED` via `if/then`), so a
+  real merge agent's blocked response validates and reaches the controller instead
+  of being rejected as a contract error before this path runs. The run terminal gains a non-FAILED `AWAITING_APPROVAL` bucket
+  (shared `_run_terminal` for `run_build`/`run_resume`; mirrored in
+  `reconcile._compute_terminal`), and reconciliation flips the story to `DONE`
+  once FX approves and the PR merges. Status snapshot counts, the dashboard, and
+  the CLI summary render the new state; an `AWAITING_APPROVAL` run exits non-zero
+  (FX must act) without being a failure. Orthogonal to epic-14
+  `PAUSED`/`RATE_LIMITED`.
+
 - **Controller-native `resume`** (Story 10.1-001) — `sdlc resume [scope]` recovers
   an interrupted build directly from the SQLite ledger. It finds the most recent
   run still marked `IN_PROGRESS`, recomputes the remaining queue from the markdown
