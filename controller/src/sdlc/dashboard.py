@@ -321,6 +321,25 @@ function humanTokens(n){
   return String(n);
 }
 function usd(n){ return n==null ? "" : "$"+Number(n).toFixed(n<1?3:2); }
+// Render a UTC ledger timestamp in the viewer's local timezone (Issue #77).
+// Ledger timestamps arrive in two UTC shapes: SQLite CURRENT_TIMESTAMP
+// ("YYYY-MM-DD HH:MM:SS", space-separated, no zone suffix) and registry
+// ISO-8601 ("…T…+00:00"). new Date() parses a bare space/T string as *local*,
+// not UTC, so we must pin the zone: swap the space for "T" and append "Z" when
+// the string carries no explicit offset. Strings that already have an offset
+// (the registry shape) are passed through untouched. Non-parseable input is
+// shown verbatim. Stored/emitted timestamps stay UTC; only display adapts.
+function fmtLocal(iso){
+  if(!iso) return "";
+  let s = String(iso);
+  // Has an explicit zone (Z or ±HH:MM)? Trust it; otherwise treat as UTC.
+  if(!/[zZ]$|[+-]\\d{2}:?\\d{2}$/.test(s)){
+    s = s.replace(" ", "T") + "Z";
+  }
+  const d = new Date(s);
+  if(isNaN(d)) return String(iso);
+  return d.toLocaleString();
+}
 // Shared duration formatter (Story 11.2-005): seconds → e.g. "4m 12s",
 // "1h 03m", "8s". Guards null/negative/NaN so a cell never shows a bad value.
 function humanDuration(s){
@@ -358,7 +377,7 @@ function activityRow(s){
   return "<tr class='substage'><td></td>"
     + "<td colspan='8' class='small'><span class='kind'>"+glyph+"</span>"
     + stage + esc(a.message)
-    + (a.ts ? " <span class='muted'>"+esc(a.ts)+"</span>" : "") + "</td></tr>";
+    + (a.ts ? " <span class='muted' title='"+esc(a.ts)+"'>"+esc(fmtLocal(a.ts))+"</span>" : "") + "</td></tr>";
 }
 
 async function tick(){
@@ -392,7 +411,7 @@ function renderRuns(runs){
       + badge(r.status) + " <code>" + esc(r.id.slice(0,8)) + "</code>"
       + repo
       + "<div class='muted small'>" + sub + "</div>"
-      + "<div class='muted small'>" + esc(r.started_at||"") + "</div></div>";
+      + "<div class='muted small' title='" + esc(r.started_at||"") + "'>" + esc(fmtLocal(r.started_at||"")) + "</div></div>";
   }).join("");
   document.getElementById("runs").innerHTML = html;
 }
@@ -478,7 +497,7 @@ function renderMain(d){
       + "<th>review</th><th>merge</th><th>PR</th><th>tokens</th><th>duration</th></tr>"+rows+"</table>"
     : "<p class='muted'>no stories yet…</p>";
   document.getElementById("events").innerHTML = (d.events||[]).slice().reverse().map(e =>
-    "<div><span class='muted'>"+esc(e.ts)+"</span> <span class='lvl-"+esc(e.level)+"'>"+esc(e.level)+"</span> "+esc(e.message)+"</div>"
+    "<div><span class='muted' title='"+esc(e.ts)+"'>"+esc(fmtLocal(e.ts))+"</span> <span class='lvl-"+esc(e.level)+"'>"+esc(e.level)+"</span> "+esc(e.message)+"</div>"
   ).join("");
 }
 
