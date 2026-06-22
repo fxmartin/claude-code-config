@@ -7,7 +7,13 @@ import subprocess
 from pathlib import Path
 
 from sdlc.build import Ledger
-from sdlc.reconcile import ReconcileResult, reconcile_run
+from sdlc.reconcile import (
+    ReconcileResult,
+    _compute_terminal,
+    _ensure_merge_done,
+    _gh_pr_state,
+    reconcile_run,
+)
 
 
 # --- git fixture helpers ----------------------------------------------------
@@ -277,3 +283,114 @@ def test_no_run_is_clean_noop(tmp_path: Path) -> None:
     result = reconcile_run(ledger, None, root=tmp_path, fetch=False)
     assert result.reclassified == []
     assert result.run_id == ""
+
+
+# --- ReconcileResult.changed -------------------------------------------------
+
+
+def test_changed_property_reflects_flips_and_terminal() -> None:
+    # A reclassification alone makes it changed.
+    assert ReconcileResult(run_id="r", reclassified=[{"story_id": "x"}]).changed is True
+    # A run-terminal transition alone makes it changed.
+    assert ReconcileResult(
+        run_id="r", run_status_before="FAILED", run_status_after="DONE"
+    ).changed is True
+    # No flips and a stable terminal is a genuine no-op.
+    assert ReconcileResult(
+        run_id="r", run_status_before="FAILED", run_status_after="FAILED"
+    ).changed is False
+
+
+# --- _gh_pr_state isolation --------------------------------------------------
+
+
+def test_gh_pr_state_returns_state_on_success(tmp_path: Path, monkeypatch) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="MERGED\n", stderr="")
+
+    monkeypatch.setattr("sdlc.reconcile.subprocess.run", fake_run)
+    assert _gh_pr_state(42, tmp_path) == "MERGED"
+
+
+def test_gh_pr_state_none_on_nonzero_exit(tmp_path: Path, monkeypatch) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="no PR")
+
+    monkeypatch.setattr("sdlc.reconcile.subprocess.run", fake_run)
+    assert _gh_pr_state(42, tmp_path) is None
+
+
+def test_gh_pr_state_none_when_gh_absent(tmp_path: Path, monkeypatch) -> None:
+    def fake_run(*args, **kwargs):
+        raise OSError("gh not found")
+
+    monkeypatch.setattr("sdlc.reconcile.subprocess.run", fake_run)
+    assert _gh_pr_state(42, tmp_path) is None
+
+
+# --- _ensure_merge_done branches --------------------------------------------
+
+
+def test_ensure_merge_done_noop_when_already_done(tmp_path: Path) -> None:
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "99.2-001", "99", "x", "P1", 1, "g", "", None, "TODO")
+    ledger.stage_start(run_id, "99.2-001", "merge", 1)
+    ledger.stage_finish(run_id, "99.2-001", "merge", 1, "DONE")
+
+    attempts = ledger.stage_breakdown(run_id)["99.2-001"]
+    _ensure_merge_done(ledger, run_id, "99.2-001", attempts)
+
+    assert _merge_done(db, run_id, "99.2-001") == 1  # no duplicate row
+
+
+def test_ensure_merge_done_promotes_existing_attempt(tmp_path: Path) -> None:
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "99.2-002", "99", "x", "P1", 1, "g", "", None, "TODO")
+    # A merge attempt that started but never reached DONE (e.g. failed/parked).
+    ledger.stage_start(run_id, "99.2-002", "merge", 1)
+    ledger.stage_finish(run_id, "99.2-002", "merge", 1, "FAILED")
+
+    attempts = ledger.stage_breakdown(run_id)["99.2-002"]
+    _ensure_merge_done(ledger, run_id, "99.2-002", attempts)
+
+    # The latest attempt is promoted in place — exactly one DONE, no new attempt.
+    assert _merge_done(db, run_id, "99.2-002") == 1
+    merge_rows = [a for a in ledger.stage_breakdown(run_id)["99.2-002"] if a["name"] == "merge"]
+    assert len(merge_rows) == 1
+
+
+# --- _compute_terminal classification ---------------------------------------
+
+
+def test_compute_terminal_classifications() -> None:
+    assert _compute_terminal({"a": "DONE", "b": "SKIPPED"}) == "DONE"
+    assert _compute_terminal({"a": "DONE", "b": "FAILED"}) == "FAILED"
+    assert _compute_terminal({"a": "BLOCKED"}) == "FAILED"
+    # Leftover work that is neither failed nor done parks the run.
+    assert _compute_terminal({"a": "DONE", "b": "AWAITING_APPROVAL"}) == "NEEDS_ATTENTION"
+
+
+# --- fetch raising (not just non-zero) still degrades to a skip --------------
+
+
+def test_fetch_exception_degrades_to_skip(tmp_path: Path, monkeypatch) -> None:
+    root = _init_repo(tmp_path)
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.2-003", "FAILED", 200)])
+
+    def raising_git(_root, *args):
+        raise OSError("git binary unavailable")
+
+    monkeypatch.setattr("sdlc.reconcile._git", raising_git)
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=True)
+
+    assert result.skipped is True
+    assert result.reclassified == []
+    assert result.run_status_after == "FAILED"
