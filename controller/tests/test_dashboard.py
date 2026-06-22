@@ -364,6 +364,46 @@ def test_page_has_stage_columns() -> None:
         assert f"<th>{header}</th>" in _PAGE
 
 
+# --- live story status labels (Story 11.2-009) -----------------------------
+
+
+def test_page_maps_in_progress_to_started_label() -> None:
+    """The dashboard renders an IN_PROGRESS story as STARTED (not TODO / not the
+    raw status), via a label map the badge function reads (Story 11.2-009)."""
+    from sdlc.dashboard import _PAGE
+
+    # A label map exists and remaps IN_PROGRESS to the human-facing STARTED.
+    assert "STARTED" in _PAGE
+    assert '"IN_PROGRESS": "STARTED"' in _PAGE
+    # The badge renders the mapped label, not the raw status text, while keeping
+    # the raw status as the CSS class (so colors/styling are unchanged).
+    assert "function statusLabel(" in _PAGE
+    assert "statusLabel(s)" in _PAGE
+
+
+def test_page_keeps_distinct_status_labels() -> None:
+    """BLOCKED / NEEDS_ATTENTION / SKIPPED keep their own distinct labels — only
+    IN_PROGRESS is remapped, so no real state is collapsed away (Story 11.2-009)."""
+    from sdlc.dashboard import _PAGE
+
+    # Pull out the LABELS object literal and confirm it remaps nothing else.
+    start = _PAGE.index("const LABELS = {")
+    end = _PAGE.index("}", start)
+    labels_src = _PAGE[start:end]
+    for status in ("BLOCKED", "NEEDS_ATTENTION", "SKIPPED", "TODO", "DONE", "FAILED"):
+        assert status not in labels_src
+    # They still each have a distinct badge style (their own colour).
+    for status in (".BLOCKED", ".NEEDS_ATTENTION", ".SKIPPED", ".TODO"):
+        assert status in _PAGE
+
+
+def test_page_has_started_badge_style() -> None:
+    """A .STARTED badge style exists alongside .IN_PROGRESS (Story 11.2-009)."""
+    from sdlc.dashboard import _PAGE
+
+    assert ".STARTED" in _PAGE
+
+
 # --- multi-run registry overview (Story 11.2-002) --------------------------
 
 

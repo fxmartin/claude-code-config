@@ -264,7 +264,10 @@ _PAGE = """<!doctype html>
   th { color: var(--sub); font-weight: 600; font-size: 12px; }
   .badge { padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
   .DONE { background: #e6f4ea; color: var(--green); }
-  .IN_PROGRESS { background: #e4ecfd; color: var(--blue); }
+  /* Story 11.2-009: IN_PROGRESS reads as STARTED in the UI; both selectors share
+     one style so the colour is identical whether the class is the raw status or
+     the display label. */
+  .IN_PROGRESS, .STARTED { background: #e4ecfd; color: var(--blue); }
   .FAILED { background: #fbe3e8; color: var(--red); }
   .BLOCKED { background: #fdeede; color: var(--peach); }
   .NEEDS_ATTENTION { background: #fdeede; color: var(--peach); }
@@ -313,7 +316,16 @@ let sel = null;  // null = Live (latest)
 // (runtimeAnchor). null disables the ticker (finished run / no timestamps).
 let runtimeBase = null, runtimeAnchor = null;
 function esc(s){return String(s==null?"":s).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));}
-function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(s)+"</span>";}
+// Story 11.2-009: display labels decouple the rendered text from the ledger
+// status vocabulary. A story marked IN_PROGRESS the moment its first stage starts
+// (controller; see _run_story) reads as STARTED in the UI, so the status column
+// tracks real progress instead of sitting on TODO for the whole build. Only
+// IN_PROGRESS is remapped — BLOCKED / NEEDS_ATTENTION / SKIPPED / RATE_LIMITED /
+// AWAITING_APPROVAL keep their own distinct labels so no real state is hidden.
+// The CSS class stays the raw status, so colours/styling are unchanged.
+const LABELS = {"IN_PROGRESS": "STARTED"};
+function statusLabel(s){return LABELS[s] || s;}
+function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(statusLabel(s))+"</span>";}
 function humanTokens(n){
   if(n==null) return "—";
   if(n>=1e6) return (n/1e6).toFixed(n>=1e7?0:1)+"M";
@@ -467,7 +479,7 @@ function renderMain(d){
   document.getElementById("bar").style.width = (total? Math.round(100*done/total):0) + "%";
   document.getElementById("chips").innerHTML = ORDER
     .filter(k => (c[k.toLowerCase()]||0) > 0 || k==="DONE")
-    .map(k => "<span class='chip'><b class='"+k+"'>"+(c[k.toLowerCase()]||0)+"</b> "+k.toLowerCase().replace("_"," ")+"</span>")
+    .map(k => "<span class='chip'><b class='"+k+"'>"+(c[k.toLowerCase()]||0)+"</b> "+statusLabel(k).toLowerCase().replace("_"," ")+"</span>")
     .join("");
   const prBase = d.pr_base;
   const rows = (d.stories||[]).map(s => {
