@@ -464,11 +464,11 @@ runs collapse to one story per wave (still valid). Stay within the epic's single
 server + no-heavy-frontend-deps constraint.
 
 **Definition of Done**:
-- [ ] Per-run detail renders a wave-column DAG (columns=waves, nodes=stories, edges=deps) with inline SVG, no external graph lib
-- [ ] Node status updates live on the refresh transport; static fallback at page load
-- [ ] Graceful degradation for missing wave/deps and `--sequential` runs
-- [ ] API payload exposes wave + deps per story
-- [ ] Tests for layout assignment (wave→column, order→row), edge derivation, and the degradation path
+- [x] Per-run detail renders a wave-column DAG (columns=waves, nodes=stories, edges=deps) with inline SVG, no external graph lib
+- [x] Node status updates live on the refresh transport; static fallback at page load
+- [x] Graceful degradation for missing wave/deps and `--sequential` runs
+- [x] API payload exposes wave + deps per story
+- [x] Tests for layout assignment (wave→column, order→row), edge derivation, and the degradation path
 
 **Dependencies**: 11.2-007 (wave + deps in the ledger); pairs with 11.2-002 (run selection) and 11.2-003 (live status)
 **Risk Level**: Medium
