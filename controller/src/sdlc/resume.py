@@ -28,6 +28,7 @@ from sdlc.build import (
 from sdlc.cohort import Story, compute_cohorts
 from sdlc.discovery import discover_queue
 from sdlc.dispatch import dispatch_agent
+from sdlc.registry import Registry
 
 __all__ = ["StoryResumeState", "ResumeResult", "compute_resume_plan", "run_resume"]
 
@@ -211,6 +212,7 @@ def run_resume(
     run_id: str | None = None,
     render_view: Callable[[str], None] | None = None,
     root: Path | None = None,
+    registry: Registry | None = None,
     budget: int | None = None,
     budget_policy: str | None = None,
     cost_threshold: int | None = None,
@@ -232,6 +234,11 @@ def run_resume(
     that is how a paused run is continued ("resumable once the budget is raised").
     When the accrual is already at/over the ceiling, the gate re-halts before
     dispatching anything.
+
+    Issue #121: on terminal close-out the host-level registry entry is stamped
+    with the recovered status and completed count (via the shared
+    :func:`finalize_run`), so a resumed run no longer shows its stale original
+    status in the dashboard sidebar. Best-effort, exactly like ``run_build``.
     """
     rid = run_id or ledger.latest_resumable_run(scope)
     if rid is None:
@@ -270,6 +277,15 @@ def run_resume(
     # ``dispatch_agent`` so a test that monkeypatches ``sdlc.resume.dispatch_agent``
     # still routes through its fake.
     dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
+
+    # Issue #121: refresh the host-level registry on close-out so a resumed run no
+    # longer shows its stale original status in the dashboard sidebar. A real run
+    # (dispatcher is None) gets the default `Registry()` when the caller injects
+    # none — the same `dispatcher is None` gate that guards reconciliation and the
+    # per-story HEAD reposition, so injected-fake orchestration tests never touch
+    # host state. Tests inject a path-scoped Registry to assert the refresh.
+    if registry is None and dispatcher is None:
+        registry = Registry()
 
     # Recompute the queue from the markdown source so each story carries its
     # title/epic_file/dependencies (the ledger stores progress, not the spec).
@@ -482,6 +498,7 @@ def run_resume(
         status,
         reconcile=dispatcher is None,
         root=root,
+        registry=registry,
         finish_label="resume finished",
         finish_suffix=f" ({resumed} resumed)",
         render_view=render_view,
