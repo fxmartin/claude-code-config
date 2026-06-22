@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS stories (
     pr_number       INTEGER,
     current_stage   TEXT,                       -- last stage transitioned through.
     status          TEXT NOT NULL,              -- 'TODO' | 'IN_PROGRESS' | 'DONE' | 'FAILED' | 'BLOCKED'.
+    wave            INTEGER,                    -- cohort (wave) index; same wave runs in parallel (Story 11.2-007). NULL on older ledgers.
+    dependencies    TEXT,                       -- JSON array of in-queue story ids this story waits on (Story 11.2-007). NULL on older ledgers.
     PRIMARY KEY (run_id, story_id),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
