@@ -39,7 +39,7 @@ debuggable in flight; multi-run support makes parallel batches manageable from o
 
 ## Epic Scope
 
-**Total Stories**: 14 | **Total Points**: 49 | **MVP Stories**: 0 (roadmap — Should Have)
+**Total Stories**: 16 | **Total Points**: 56 | **MVP Stories**: 0 (roadmap — Should Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -603,6 +603,86 @@ updates; this story only stabilises their layout.
 **Dependencies**: None (stabilises the regions produced by 11.2-003 and 11.2-004)
 **Risk Level**: Low
 
+##### Story 11.2-012: Show story titles on the dashboard
+**User Story**: As FX watching a build, I want each story's **title** shown next to its ID on the
+dashboard so that I can tell what is being developed without opening the epic files.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** a run's stories **When** the per-story detail table renders **Then** each row shows
+  the story **title** alongside its ID (e.g. `11.2-006 · GitHub repo health on the multi-run
+  dashboard`), so the view is self-reading.
+- **Given** the title already lives in the ledger `stories.title` **When** the status snapshot is
+  built **Then** it carries the title through to the client (extend `status_snapshot` to include
+  `title`; no schema change — the column exists, written on `story_upsert`).
+- **Given** a long title **When** rendered **Then** it is truncated/ellipsized to keep the row
+  layout stable (full title on hover), consistent with 11.2-011's no-reflow goal.
+- **Given** an older ledger row with a null/empty title **When** rendered **Then** it degrades to
+  just the ID (no blank / `undefined`).
+- **Given** the multi-run overview **When** rendered **Then** it is unchanged (titles are
+  per-story detail, not per-run).
+
+**Technical Notes**: Pure read-path + front-end. The gap is (a) `status_snapshot`
+(`controller/src/sdlc/status.py`) not selecting/returning `title`, and (b) `renderMain()`'s
+story table in `dashboard.py` (~lines 460–475) not displaying it. No backend write change, no
+schema change. Pairs with 11.2-004 (detail view) and 11.2-011 (stable-height rows).
+
+**Definition of Done**:
+- [ ] `status_snapshot` returns each story's `title`
+- [ ] Per-story detail rows render `id · title`, truncated-with-hover; null title → ID only
+- [ ] Overview unchanged; no reflow regression
+- [ ] Tests for the snapshot field + the render (incl. null-title fallback)
+- [ ] No schema/backend-write change
+
+**Dependencies**: None (title already in the ledger; complements 11.2-004)
+**Risk Level**: Low
+
+##### Story 11.2-013: Surface `fix-issue` runs in the dashboard
+**User Story**: As FX, I want a `fix-issue` session to show up in the dashboard like an
+`sdlc build` run so that I can watch issue-fix pipelines on the same single pane of glass instead
+of only via cmux/Telegram.
+**Priority**: Should Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** the `fix-issue` skill runs **When** it starts **Then** it **registers a run** in the
+  host registry (`~/.sdlc/registry.json`) so the multi-run dashboard discovers it alongside
+  `sdlc build` runs (repo, scope = the issue, pid, status, started_at).
+- **Given** a `fix-issue` phase executes (investigate / build / coverage / review / E2E / merge)
+  **When** it starts and finishes **Then** a **ledger stage row** is written (status, timestamps,
+  and usage where available), so the run's detail view shows the pipeline progressing.
+- **Given** the run completes (or fails/aborts) **When** it ends **Then** the run is **finalized**
+  (DONE/FAILED) and a crashed/aborted `fix-issue` is detectable by dead pid, like a controller run.
+- **Given** the run-logging path is unavailable (CLI missing, ledger unwritable) **When**
+  `fix-issue` runs **Then** logging is **best-effort and never blocks the fix** — the pipeline
+  still completes; the dashboard simply doesn't show it.
+- **Given** the existing `sdlc build` runs **When** the dashboard renders **Then** they are
+  unaffected (no change to controller-run behavior).
+
+**Technical Notes**: `fix-issue` is a markdown skill (bash + Task sub-agents), not the controller,
+so it cannot call Python directly. It needs a **minimal run-logging CLI** to shell out to per
+phase — e.g. `sdlc run-open` / `sdlc run-stage <start|finish>` / `sdlc run-close` (or one
+`sdlc run-event` verb) that reuses the existing `Registry.register` (`registry.py`),
+`Ledger.run_create` / `stage_start` / `stage_finish` (`build.py`), and is read back by
+`status_snapshot`. The skill's `## Phase N` blocks already shell `cmux-bridge.sh`, so the
+run-logging calls slot in beside those. **Scope: fix-issue-only** — `build-stories` and future
+skills can adopt the same CLI later (deliberately not generalised now). The new CLI surface is the
+only addition; storage/render reuse the multi-run dashboard as-is.
+
+**Definition of Done**:
+- [ ] Minimal `sdlc` run-logging CLI (open/stage/close) reusing `Registry` + `Ledger`
+- [ ] `fix-issue` registers a run on start, logs a stage per phase, finalizes on completion
+- [ ] `fix-issue` session appears in the multi-run dashboard with per-phase detail
+- [ ] Best-effort logging: a logging failure never blocks the fix
+- [ ] `sdlc build` runs unaffected
+- [ ] Tests for the run-logging CLI (open/stage/close → ledger + registry) without a live skill run
+- [ ] Documented in `docs/controller-architecture.md` and the `fix-issue` skill
+
+**Dependencies**: 11.2-001 (registry) and the ledger run/stage API — both shipped. Reuses
+`status_snapshot` (11.2-002/11.2-004 rendering).
+**Risk Level**: Medium
+
 ## Story Dependencies (within Epic-11)
 
 ```
@@ -612,7 +692,7 @@ updates; this story only stabilises their layout.
 11.2-003 (SSE transport) ──────────────────────────────┘
 ```
 
-- **Cohort 1** (no deps): 11.1-001, 11.2-001, 11.2-003, 11.2-005, 11.2-007, 11.2-009, 11.2-010, 11.2-011
+- **Cohort 1** (no deps): 11.1-001, 11.2-001, 11.2-003, 11.2-005, 11.2-007, 11.2-009, 11.2-010, 11.2-011, 11.2-012, 11.2-013
 - **Cohort 2**: 11.1-002, 11.1-003 (need 11.1-001); 11.2-002 (needs 11.2-001)
 - **Cohort 3**: 11.2-004 (needs 11.1-002 + 11.2-003); 11.2-006 (needs 11.2-001 + 11.2-002); 11.2-008 (needs 11.2-007)
 
