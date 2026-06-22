@@ -436,6 +436,48 @@ announces itself in a host-level **registry** (`sdlc/registry.py`).
 - **`sdlc runs`** lists the registry view (repo, scope, derived state, progress);
   `--json` emits it for tooling and `--prune` clears crashed entries first.
 
+## Run-logging CLI for non-controller pipelines (Story 11.2-013)
+
+The `fix-issue` skill is a **markdown skill** (bash + `Agent` sub-agents), not the
+controller, so it cannot call `Ledger`/`Registry` in-process the way `run_build`
+does. To let a `fix-issue` session show up in the same dashboard as a `sdlc build`
+run, the controller exposes a **minimal run-logging CLI** (`sdlc/runlog.py`) that
+the skill shells out to per phase. It deliberately reuses the existing storage —
+no new tables, no new render path — so the multi-run dashboard surfaces these runs
+as-is:
+
+- **`sdlc run-open --scope issue-N [--db --repo --mode --story-id --title --pid]`** —
+  `run_open` calls `Ledger.init` + `run_create` (mode defaults to `fix-issue`),
+  seeds **one** synthetic story (the issue itself, so stages have a FK parent),
+  and `Registry.register`s the run. It prints the new `run_id` on stdout (or
+  `{run_id, db, story_id}` with `--json`) for the skill to capture and thread into
+  later calls. **`--pid` is the long-lived orchestrator's pid**, whose liveness
+  stands in for the run's so `derive_state` can flag a crash as `DEAD`. A markdown
+  skill must pass its `$PPID` (the Claude session): the `sdlc run-open` subprocess
+  exits the instant it returns, so registering its *own* pid — the default — would
+  make the registry derive a still-running fix `DEAD`. The in-process default
+  (`os.getpid()`) only suits a long-running caller, as `sdlc build` is.
+- **`sdlc run-stage <start|finish> --run ID --stage NAME [--db --story-id --attempt --status --failure-category]`**
+  — `run_stage` calls `Ledger.stage_start` / `stage_finish` against the run's sole
+  story (resolved from the ledger when `--story-id` is omitted). The skill emits
+  one per `fix-issue` phase; the `build`/`coverage`/`review`/`merge` stage names
+  line up with the dashboard's pipeline columns (`_STAGES`), while extra phases
+  (`investigate`, `e2e`) live in the run's stage history.
+- **`sdlc run-close --run ID [--db --status --completed --story-id]`** —
+  `run_close` stamps the run (and its story) terminal via `Ledger.run_update_status`
+  and mirrors it into the registry with `Registry.mark_finished`. A session that
+  crashes before closing is detected as `DEAD` by dead pid, exactly like a
+  controller run.
+
+**Best-effort by construction.** Every verb swallows ledger/registry IO errors
+(`run_open` returns `None`, the others return `False`) and the skill suffixes each
+call with `2>/dev/null || true`, so a missing `sdlc`, an unwritable ledger, or a
+corrupt registry never blocks or fails the fix — the pipeline still completes; the
+dashboard simply doesn't show that run. `sdlc build` runs are untouched: the CLI is
+additive and shares the same storage read by `status_snapshot`. Scope is
+**fix-issue-only** for now; `build-stories` and future skills can adopt the same
+verbs later.
+
 ## Live dashboard transport (Story 11.2-003)
 
 The dashboard updates itself — no manual reload — over a **Server-Sent Events**
