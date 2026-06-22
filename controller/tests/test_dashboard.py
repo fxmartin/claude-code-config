@@ -581,6 +581,14 @@ def test_change_token_advances_on_event(tmp_path: Path) -> None:
     assert Ledger(db).change_token() != first  # changes on new activity
 
 
+def test_change_token_unreadable_ledger_returns_zero(tmp_path: Path) -> None:
+    """A db file that exists but is not a valid SQLite database degrades to "0"
+    rather than crashing the SSE poll loop (the ``except sqlite3.Error`` path)."""
+    db = tmp_path / ".sdlc-state.db"
+    db.write_bytes(b"this is not a sqlite database")  # exists, but corrupt
+    assert Ledger(db).change_token() == "0"
+
+
 def test_change_token_advances_on_non_event_write(tmp_path: Path) -> None:
     """In-place writes the dashboard renders but that emit no event still move
     the token — otherwise the SSE stream would miss stage/story/PR/usage updates."""
