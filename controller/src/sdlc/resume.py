@@ -24,6 +24,7 @@ from sdlc.build import (
     apply_cost_gate_pause,
     apply_rate_limit_park,
     finalize_run,
+    persist_cohort_structure,
 )
 from sdlc.cohort import Story, compute_cohorts
 from sdlc.discovery import discover_queue
@@ -299,6 +300,10 @@ def run_resume(
 
     logs_dir = Path(f"{ledger.db_path}.logs") / rid
     cohorts = compute_cohorts(run_queue)
+    # Story 11.2-007: re-record wave + intra-queue deps from the recomputed
+    # cohorts so a resumed run persists the *same* parallelism structure
+    # run_build would for this queue (the two scheduling paths agree).
+    persist_cohort_structure(ledger, rid, cohorts)
     status: dict[str, str] = {s.id: plan[s.id].status for s in run_queue}
     resumed = 0
     budget_stopped = False

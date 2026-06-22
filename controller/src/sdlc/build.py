@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS stories (
     pr_number       INTEGER,
     current_stage   TEXT,
     status          TEXT NOT NULL,
+    wave            INTEGER,
+    dependencies    TEXT,
     PRIMARY KEY (run_id, story_id),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
@@ -219,6 +221,20 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
             ("estimated_cost_usd", "REAL"),
         ],
     ),
+    # Migration 4 adds the wave (cohort) index + intra-queue dependency list
+    # (Story 11.2-007) to a pre-existing ledger's `stories` table. Additive and
+    # back-compatible: old story rows keep NULL wave/dependencies and read as
+    # "no recorded parallelism structure"; only stories scheduled after this
+    # story populate them. A fresh DB created from the up-to-date DDL is a no-op.
+    (
+        4,
+        "story wave + dependency columns",
+        "stories",
+        [
+            ("wave", "INTEGER"),
+            ("dependencies", "TEXT"),
+        ],
+    ),
 ]
 
 
@@ -245,10 +261,16 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     for version, name, table, columns in _MIGRATIONS:
         if version in applied:
             continue
+        # A pre-framework ledger may be missing the target table entirely (a
+        # partial ancient DB). PRAGMA table_info returns empty for an absent
+        # table, so guard the ALTERs on table existence and still record the
+        # version: if the table is later created it comes from the up-to-date
+        # DDL, which already carries the column.
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        for col, col_type in columns:
-            if col not in existing:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+        if existing:
+            for col, col_type in columns:
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
         conn.execute(
             "INSERT OR IGNORE INTO _migrations(version, name) VALUES (?, ?)",
             (version, name),
@@ -955,6 +977,24 @@ class Ledger:
                 (pr_number, run_id, story_id),
             )
 
+    def set_story_wave(
+        self, run_id: str, story_id: str, wave: int, dependencies: list[str]
+    ) -> None:
+        """Record a story's cohort wave index and intra-queue dependency list.
+
+        Story 11.2-007: written at schedule time (run_build / resume) from the
+        ``compute_cohorts`` result. ``wave`` is the cohort's 0-based position —
+        stories sharing a wave run in parallel — and ``dependencies`` is the JSON
+        array of in-queue story ids this story waits on. Both columns are
+        nullable, so older ledgers read as NULL/empty (no parallelism structure).
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stories SET wave = ?, dependencies = ? "
+                "WHERE run_id = ? AND story_id = ?",
+                (wave, json.dumps(dependencies), run_id, story_id),
+            )
+
     def stage_start(
         self, run_id: str, story_id: str, stage_name: str, attempt: int = 1
     ) -> None:
@@ -1261,10 +1301,20 @@ class Ledger:
         if not self.db_path.exists():
             return []
         with self._connect_ro() as conn:
+            # Story 11.2-007: the dashboard reads read-only and never migrates, so
+            # an unmigrated ledger may lack the wave/dependencies columns. Select
+            # them only when present and degrade to NULL otherwise — mirroring the
+            # column guard stage_breakdown uses for the usage columns.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(stories)").fetchall()}
+            wave_sel = "s.wave" if "wave" in cols else "NULL AS wave"
+            deps_sel = (
+                "s.dependencies" if "dependencies" in cols else "NULL AS dependencies"
+            )
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     s.story_id, s.title, s.priority, s.status, s.pr_number,
+                    {wave_sel}, {deps_sel},
                     (SELECT st.stage_name FROM stages st
                        WHERE st.run_id = s.run_id AND st.story_id = s.story_id
                        ORDER BY st.started_at DESC, st.rowid DESC LIMIT 1) AS current_stage,
@@ -1277,7 +1327,16 @@ class Ledger:
                 """,
                 (run_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        # `dependencies` is stored as a JSON array; an un-recorded story (older
+        # ledger, `--sequential` schedule, or a done-skip outside the cohorts)
+        # reads back as an empty list / NULL wave.
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            raw_deps = d.get("dependencies")
+            d["dependencies"] = json.loads(raw_deps) if raw_deps else []
+            out.append(d)
+        return out
 
     def recent_events(self, run_id: str, limit: int = 10) -> list[dict]:
         """The last ``limit`` human audit events for ``run_id``, oldest-first.
@@ -2271,6 +2330,26 @@ def _registry_finish(
         pass
 
 
+def persist_cohort_structure(
+    ledger: Ledger, run_id: str, cohorts: list[list[Story]]
+) -> None:
+    """Persist each story's wave index + intra-queue deps (Story 11.2-007).
+
+    Enumerates the :func:`compute_cohorts` result so a story's ``wave`` is its
+    cohort position (stories sharing a wave run in parallel) and records only
+    intra-queue dependency edges — matching ``compute_cohorts`` semantics, so a
+    dependency on an already-merged (out-of-queue) story is dropped and the
+    persisted structure reflects the actual runtime parallelism. Shared by
+    ``run_build`` (Phase 2) and ``resume`` so both scheduling paths record
+    identical waves for the same queue.
+    """
+    in_queue = {story.id for cohort in cohorts for story in cohort}
+    for wave, cohort in enumerate(cohorts):
+        for story in cohort:
+            intra_deps = [dep for dep in story.dependencies if dep in in_queue]
+            ledger.set_story_wave(run_id, story.id, wave, intra_deps)
+
+
 def run_build(
     opts: BuildOptions,
     *,
@@ -2413,6 +2492,11 @@ def run_build(
         )
 
     cohorts = compute_cohorts(buildable)
+    # Story 11.2-007: record each story's wave (cohort) index + intra-queue deps
+    # at schedule time so the dashboard / `sdlc status` can show the run's
+    # parallelism structure without re-reading the epic files. Done-skips stay
+    # out of the cohorts (NULL wave) — they are not part of the build's DAG.
+    persist_cohort_structure(ledger, run_id, cohorts)
     status: dict[str, str] = {s.id: "TODO" for s in buildable}
 
     # --- Phase 2: cohort-by-cohort execution ---------------------------------
