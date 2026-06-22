@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.49.10] - 2026-06-22
+
+### Fixed
+
+- fix(controller): render skipped-story pipeline cells as skipped (#131)
+
+
 ## [v1.49.9] - 2026-06-22
 
 ### Fixed
