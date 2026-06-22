@@ -512,6 +512,41 @@ dependency footprint stays at zero web frameworks.
   the render replaces (never appends) DOM, a dropped-and-resumed connection never
   duplicates rows. Browsers without `EventSource` fall back to gentle polling.
 
+## GitHub repo health on the dashboard (Story 11.2-006)
+
+Each run's external GitHub state — open/closed issues, open/closed PRs, and the
+latest **default-branch** CI conclusion — is shown alongside the ledger-driven
+view: a **compact badge on every overview row** and a **full panel in the
+selected run's detail view**. The work lives in `sdlc/github_stats.py`; the
+dashboard only wires it in.
+
+- **Slug resolution.** `dashboard.repo_slug(root)` reuses `git_project_url`
+  (and thus the shared `_SCP_REMOTE`/`_URL_REMOTE` regexes) to derive the run's
+  `owner/repo` slug from its git remote. No remote ⇒ `None` ⇒ the "unavailable"
+  state. The repo comes from the registry's `RunRecord.repo` (registry mode) or
+  the ledger's parent dir (single-`--db` mode), so stats are per-repo with no
+  cross-repo bleed.
+- **Fetch.** `github_stats.fetch_stats(slug)` reads counts via the search API
+  (`gh api search/issues` `total_count` for each `type:issue|pr state:open|closed`
+  — closed PRs include merged) and the latest default-branch run via
+  `gh run list --branch <default>`. `gh` talks to **GitHub's** rate limit, not
+  the Claude Max window. Every call degrades to `None` on failure; when *all*
+  fail the repo is reported `unavailable` (`gh` absent/unauthenticated/
+  rate-limited), and a partial result (counts but no CI run yet) still renders.
+- **Cache, off the request path.** `GitHubStatsCache` keys entries by repo slug
+  with a ~60 s TTL. A `get()` never drives `gh` on the request path: a fresh
+  entry is served as-is; a stale/absent one returns the last-known value (or a
+  muted pending sentinel) and schedules a **background** refresh, deduped per
+  slug. So N runs in one repo — and any number of polling tabs — cost one fetch
+  per TTL window. The overview view (`_registry_runs_view`) further dedups the
+  read **per repo** within a single render.
+- **Wiring.** `/api/github?run=<id>` (`_github_stats`) serves the detail panel;
+  `_registry_runs_view` enriches each overview row with a compact `github`
+  summary. The client's existing ~2.5 s poll fetches `/api/github` alongside
+  `/api/runs` + `/api/status` and reads the cache — it never itself drives `gh`,
+  and a missing/unavailable summary degrades to a muted "GitHub unavailable"
+  badge/panel without ever throwing or blocking the ledger-driven dashboard.
+
 ## Story status lifecycle and dashboard labels (Story 11.2-009)
 
 A story row's ledger status tracks its actual progress, and the dashboard maps

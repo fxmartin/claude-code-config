@@ -1171,3 +1171,172 @@ def test_migrate_registry_ledgers_dedups_and_tolerates_bad_ledgers(tmp_path: Pat
 
     # Must complete without raising despite the bad ledger.
     _migrate_registry_ledgers(registry)
+
+
+# --- GitHub repo health (Story 11.2-006) -----------------------------------
+
+
+def _git_repo_with_origin(path: Path, remote: str) -> None:
+    """Init a git repo at ``path`` with an ``origin`` remote (for slug tests)."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "remote", "add", "origin", remote], check=True
+    )
+
+
+def test_repo_slug_from_origin(tmp_path: Path) -> None:
+    """The ``owner/repo`` slug is derived from the run's git remote."""
+    from sdlc.dashboard import repo_slug
+
+    _git_repo_with_origin(tmp_path, "git@github.com:fxmartin/claude-code-config.git")
+    assert repo_slug(tmp_path) == "fxmartin/claude-code-config"
+
+
+def test_repo_slug_none_without_remote(tmp_path: Path) -> None:
+    """No git remote → no slug (the badge then degrades to unavailable)."""
+    from sdlc.dashboard import repo_slug
+
+    assert repo_slug(tmp_path) is None
+
+
+class _StubCache:
+    """A GitHub cache double: records slug lookups, returns canned stats."""
+
+    def __init__(self) -> None:
+        self.calls: list[str | None] = []
+
+    def get(self, slug):
+        self.calls.append(slug)
+        if not slug:
+            return {"available": False, "slug": None, "reason": "no-remote"}
+        return {"available": True, "slug": slug, "issues_open": 4, "prs_open": 1,
+                "ci_status": "success", "ci_branch": "main", "ci_created_at": "t"}
+
+
+@contextmanager
+def _running_registry_gh(registry, cache):
+    """Registry-mode dashboard with an injected GitHub stats cache."""
+    server = make_server(db_path=None, host="127.0.0.1", port=0, registry=registry)
+    server.github_cache = cache  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_api_github_registry_mode_resolves_repo(tmp_path: Path) -> None:
+    """``/api/github?run=`` resolves the selected run's repo slug + full stats."""
+    registry, run_a, _run_b, repo_a, _repo_b = _two_repo_registry(tmp_path)
+    _git_repo_with_origin(Path(repo_a), "git@github.com:acme/repo-a.git")
+    cache = _StubCache()
+    with _running_registry_gh(registry, cache) as base:
+        _s, ctype, body = _get(base + "/api/github?run=" + run_a)
+    assert "application/json" in ctype
+    payload = json.loads(body)
+    assert payload["available"] is True
+    assert payload["slug"] == "acme/repo-a"
+    assert cache.calls == ["acme/repo-a"]
+
+
+def test_api_github_unknown_run_is_unavailable(tmp_path: Path) -> None:
+    registry, _ra, _rb, _x, _y = _two_repo_registry(tmp_path)
+    cache = _StubCache()
+    with _running_registry_gh(registry, cache) as base:
+        _s, _c, body = _get(base + "/api/github?run=does-not-exist")
+    assert json.loads(body)["available"] is False
+
+
+def test_overview_rows_carry_github_deduped_per_repo(tmp_path: Path) -> None:
+    """Two runs in one repo share a single per-repo fetch (deduped by slug)."""
+    import os
+
+    import sdlc.dashboard as dash
+    from sdlc.registry import Registry, RunRecord
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo_with_origin(repo, "git@github.com:acme/shared.git")
+    db = repo / ".sdlc-state.db"
+    run1 = _seed_run(db, "epic-x", "X.1-001", "IN_PROGRESS")
+    # A second registered run pointing at the SAME repo/ledger.
+    Ledger(db).story_upsert(run1, "X.1-002", "epic-x", "Two", "med", 1, "backend", "", None, "TODO")
+    run2 = Ledger(db).run_create("epic-x", "parallel")
+
+    registry = Registry(tmp_path / "registry.json")
+    for rid, started in ((run1, "2026-01-01T00:00:00+00:00"), (run2, "2026-01-02T00:00:00+00:00")):
+        registry.register(
+            RunRecord(rid, str(repo), str(db), "epic-x", os.getpid(),
+                      "IN_PROGRESS", started, total=1, completed=0)
+        )
+
+    cache = _StubCache()
+    rows = dash._registry_runs_view(registry, cache)
+    assert len(rows) == 2
+    # Both rows carry the same repo's stats…
+    assert all(r["github"]["slug"] == "acme/shared" for r in rows)
+    # …but the slug was resolved once and the cache hit once per repo, not per run.
+    assert cache.calls == ["acme/shared"]
+
+
+def test_registry_runs_view_without_github_omits_field(tmp_path: Path) -> None:
+    """Backwards-compatible: no cache passed → rows have no ``github`` key."""
+    import sdlc.dashboard as dash
+
+    registry, _a, _b, _x, _y = _two_repo_registry(tmp_path)
+    rows = dash._registry_runs_view(registry)
+    assert rows and all("github" not in r for r in rows)
+
+
+def test_api_github_single_db_mode(tmp_path: Path) -> None:
+    """Single-``--db`` mode resolves the slug from the ledger's parent repo."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo_with_origin(repo, "git@github.com:acme/solo.git")
+    db = repo / ".sdlc-state.db"
+    _seed(db)
+    server = make_server(db, host="127.0.0.1", port=0)
+    cache = _StubCache()
+    server.github_cache = cache  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        _s, _c, body = _get(base + "/api/github")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert json.loads(body)["slug"] == "acme/solo"
+    assert cache.calls == ["acme/solo"]
+
+
+def test_make_server_creates_github_cache_both_modes(tmp_path: Path) -> None:
+    """A real GitHubStatsCache is attached in both single-db and registry modes."""
+    from sdlc.github_stats import GitHubStatsCache
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    single = make_server(db, host="127.0.0.1", port=0)
+    assert isinstance(single.github_cache, GitHubStatsCache)
+    single.server_close()
+
+    from sdlc.registry import Registry
+
+    reg = Registry(tmp_path / "registry.json")
+    disco = make_server(db_path=None, host="127.0.0.1", port=0, registry=reg)
+    assert isinstance(disco.github_cache, GitHubStatsCache)
+    disco.server_close()
+
+
+def test_page_has_github_panel_and_badge_hooks() -> None:
+    """The page ships the GitHub render hooks (panel container + fetch route)."""
+    from sdlc.dashboard import _PAGE
+
+    assert "/api/github" in _PAGE
+    assert 'id="github"' in _PAGE

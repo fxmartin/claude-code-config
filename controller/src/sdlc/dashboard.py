@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from sdlc import __version__
+from sdlc import __version__, github_stats
 from sdlc.build import _EMPTY_COUNTS, Ledger, _duration_seconds, status_snapshot
 from sdlc.registry import Registry, RunRecord, derive_state
 
@@ -76,13 +76,36 @@ def _project_name(project_url: str | None, db_path: Path) -> str:
     return db_path.resolve().parent.name
 
 
+def _slug_from_url(project_url: str | None) -> str | None:
+    """``owner/repo`` GitHub slug from a forge web base, or None."""
+    if not project_url:
+        return None
+    parts = project_url.rstrip("/").split("/")
+    if len(parts) < 2:
+        return None
+    return "/".join(parts[-2:])
+
+
+def repo_slug(root: str | Path) -> str | None:
+    """Derive the run's ``owner/repo`` GitHub slug from its git remote.
+
+    Reuses :func:`git_project_url` (and thus the shared remote regexes), so the
+    slug resolution matches the PR-link/header resolution exactly. Returns None
+    when ``root`` is not a git repo / has no origin — the GitHub badge/panel then
+    degrades to the "unavailable" state.
+    """
+    return _slug_from_url(git_project_url(root))
+
+
 # --- multi-run registry discovery (Story 11.2-002) -------------------------
 # In discovery mode the dashboard has no single ledger: it reads the host-level
 # registry to find every `sdlc build` across repos, and resolves each run's own
 # ledger on demand. The per-repo ledger stays authoritative for run detail.
 
 
-def _registry_runs_view(registry: Registry) -> list[dict]:
+def _registry_runs_view(
+    registry: Registry, github: "github_stats.GitHubStatsCache | None" = None
+) -> list[dict]:
     """Normalize the host-level registry into the runs-browser row shape.
 
     Each row carries the cross-repo discovery fields (``repo``, ``scope``) plus
@@ -90,8 +113,14 @@ def _registry_runs_view(registry: Registry) -> list[dict]:
     run's own ledger when reachable — falling back to the registry's cached
     counts when a ledger is missing/corrupt (the registry is best-effort).
     Newest run first.
+
+    When a ``github`` cache is supplied, each row gains a compact ``github``
+    summary (issues/PRs/CI) for its repo. The repo→slug resolution and the cache
+    read are **deduped per repo** within one view, so N runs in one repo cost a
+    single slug lookup and a single (cached) fetch — never one per run.
     """
     rows: list[dict] = []
+    gh_by_repo: dict[str, dict] = {}
     for rec in registry.records():
         done, total = rec.completed, rec.total
         try:
@@ -101,19 +130,22 @@ def _registry_runs_view(registry: Registry) -> list[dict]:
                     break
         except (OSError, sqlite3.Error):
             pass  # unreachable ledger → keep the registry's cached counts
-        rows.append(
-            {
-                "id": rec.run_id,
-                "repo": rec.repo,
-                "scope": rec.scope,
-                "status": derive_state(rec),
-                "started_at": rec.started_at,
-                "finished_at": rec.finished_at,
-                "duration_seconds": _duration_seconds(rec.started_at, rec.finished_at),
-                "done": done,
-                "total": total,
-            }
-        )
+        row = {
+            "id": rec.run_id,
+            "repo": rec.repo,
+            "scope": rec.scope,
+            "status": derive_state(rec),
+            "started_at": rec.started_at,
+            "finished_at": rec.finished_at,
+            "duration_seconds": _duration_seconds(rec.started_at, rec.finished_at),
+            "done": done,
+            "total": total,
+        }
+        if github is not None:
+            if rec.repo not in gh_by_repo:
+                gh_by_repo[rec.repo] = github.get(repo_slug(rec.repo))
+            row["github"] = gh_by_repo[rec.repo]
+        rows.append(row)
     rows.sort(key=lambda r: (r["started_at"] or ""), reverse=True)
     return rows
 
@@ -286,6 +318,17 @@ _PAGE = """<!doctype html>
   #updated { float: right; font-size: 12px; }
   code { color: var(--text); }
   a { color: var(--blue); text-decoration: none; } a:hover { text-decoration: underline; }
+  /* Story 11.2-006: GitHub repo-health badge (overview row) + panel (detail). */
+  .gh { display: inline-flex; gap: 8px; align-items: center; margin-top: 4px;
+        font-size: 12px; color: var(--sub); }
+  .gh .gh-sep { color: var(--overlay); }
+  .gh.unavail { font-style: italic; }
+  .ci-success { color: var(--green); } .ci-failure { color: var(--red); }
+  .ci-in_progress { color: var(--blue); } .ci-cancelled { color: var(--peach); }
+  .ghpanel { margin: 16px 0; padding: 12px 14px; background: var(--mantle);
+             border: 1px solid var(--surface); border-radius: 8px; }
+  .ghpanel h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  .ghpanel.unavail { color: var(--sub); font-style: italic; }
   @media (max-width: 760px) {
     .wrap { flex-direction: column; }
     .side { width: auto; border-right: none; border-bottom: 1px solid var(--surface); }
@@ -304,6 +347,7 @@ _PAGE = """<!doctype html>
       <div id="head" class="muted"></div>
       <div class="bar"><span id="bar" style="width:0%"></span></div>
       <div class="chips" id="chips"></div>
+      <div id="github"></div>
       <div id="stories"></div>
       <div class="events" id="events"></div>
     </div>
@@ -333,6 +377,42 @@ function humanTokens(n){
   return String(n);
 }
 function usd(n){ return n==null ? "" : "$"+Number(n).toFixed(n<1?3:2); }
+// GitHub repo health (Story 11.2-006). The badge/panel read a backend-cached
+// per-repo summary; the client never drives `gh`. Both degrade to a muted
+// "GitHub unavailable" state when the summary is absent or not available.
+const CI_GLYPH = {success:"\\u2713", failure:"\\u2717", in_progress:"\\u25f7", cancelled:"\\u2298"};
+function ciGlyph(s){
+  const g = CI_GLYPH[s] || "\\u2014";
+  return "<span class='ci-"+esc(s||"none")+"' title='CI "+esc(s||"unknown")+"'>"+g+"</span>";
+}
+function ghCount(n){ return n==null ? "\\u2014" : esc(n); }
+// Compact per-row badge: open issues, open PRs, latest default-branch CI.
+function ghBadge(g){
+  if(!g || !g.available)
+    return "<div class='gh unavail' title='GitHub unavailable'>GitHub \\u2014</div>";
+  return "<div class='gh' title='open issues \\u00b7 open PRs \\u00b7 default-branch CI'>"
+    + "<span>\\u26a0 "+ghCount(g.issues_open)+"</span>"
+    + "<span class='gh-sep'>|</span><span>\\u21c4 "+ghCount(g.prs_open)+"</span>"
+    + "<span class='gh-sep'>|</span>"+ciGlyph(g.ci_status)+"</div>";
+}
+// Full panel for the selected run's repo: issues + PRs open/closed and CI.
+function renderGithub(g){
+  const el = document.getElementById("github");
+  if(!el) return;
+  if(!g || !g.available){ el.innerHTML =
+    "<div class='ghpanel unavail'>GitHub unavailable</div>"; return; }
+  const ciAge = g.ci_created_at
+    ? " <span class='muted' title='"+esc(g.ci_created_at)+"'>"+esc(fmtLocal(g.ci_created_at))+"</span>"
+    : "";
+  const ciBranch = g.ci_branch ? " on <code>"+esc(g.ci_branch)+"</code>" : "";
+  el.innerHTML = "<div class='ghpanel'><h3>GitHub \\u00b7 <code>"+esc(g.slug||"")+"</code></h3>"
+    + "<div class='chips'>"
+    + "<span class='chip'>issues <b>"+ghCount(g.issues_open)+"</b> open \\u00b7 "+ghCount(g.issues_closed)+" closed</span>"
+    + "<span class='chip'>PRs <b>"+ghCount(g.prs_open)+"</b> open \\u00b7 "+ghCount(g.prs_closed)+" closed</span>"
+    + "</div>"
+    + "<div class='small'>CI "+ciGlyph(g.ci_status)+" "+esc(g.ci_status||"\\u2014")+ciBranch+ciAge+"</div>"
+    + "</div>";
+}
 // Render a UTC ledger timestamp in the viewer's local timezone (Issue #77).
 // Ledger timestamps arrive in two UTC shapes: SQLite CURRENT_TIMESTAMP
 // ("YYYY-MM-DD HH:MM:SS", space-separated, no zone suffix) and registry
@@ -395,12 +475,14 @@ function activityRow(s){
 async function tick(){
   try{
     const q = sel ? ("?run=" + encodeURIComponent(sel)) : "";
-    const [runsR, statR] = await Promise.all([
+    const [runsR, statR, ghR] = await Promise.all([
       fetch("/api/runs",{cache:"no-store"}),
       fetch("/api/status"+q,{cache:"no-store"}),
+      fetch("/api/github"+q,{cache:"no-store"}),
     ]);
     renderRuns(await runsR.json());
     renderMain(await statR.json());
+    renderGithub(await ghR.json());
     document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
   }catch(e){
     document.getElementById("updated").textContent = "reconnecting…";
@@ -419,9 +501,11 @@ function renderRuns(runs){
     const repo = r.repo
       ? "<div class='muted small'>📁 " + esc(String(r.repo).split(/[\\\\/]/).pop()) + "</div>"
       : "";
+    const gh = ("github" in r) ? ghBadge(r.github) : "";
     return "<div class='run "+(sel===r.id?"active":"")+"' data-run='"+esc(r.id)+"'>"
       + badge(r.status) + " <code>" + esc(r.id.slice(0,8)) + "</code>"
       + repo
+      + gh
       + "<div class='muted small'>" + sub + "</div>"
       + "<div class='muted small' title='" + esc(r.started_at||"") + "'>" + esc(fmtLocal(r.started_at||"")) + "</div></div>";
   }).join("");
@@ -590,9 +674,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(snap)
         elif path == "/api/runs":
             if self.server.registry is not None:
-                self._json(_registry_runs_view(self.server.registry))
+                self._json(_registry_runs_view(self.server.registry, self.server.github_cache))
             else:
                 self._json(Ledger(self.server.db_path).list_runs())
+        elif path == "/api/github":
+            self._json(self._github_stats(run))
         elif path == "/api/stream":
             self._serve_stream()
         elif path == "/log":
@@ -639,6 +725,30 @@ class _Handler(BaseHTTPRequestHandler):
         snap["pr_base"] = project_url
         snap["project"] = {"name": _project_name(project_url, Path(rec.db)), "url": project_url}
         return snap
+
+    # --- GitHub repo health (Story 11.2-006) -------------------------------
+
+    def _github_stats(self, run_id: str | None) -> dict:
+        """GitHub health for the selected run's repo, served from the cache.
+
+        Registry mode resolves the repo via the run's registry record; single
+        ``--db`` mode resolves it from the ledger's parent directory. The read
+        goes through the per-slug TTL cache, so it never drives ``gh`` on the
+        request path and degrades to the muted "unavailable" sentinel when the
+        run / repo / ``gh`` cannot be resolved.
+        """
+        cache = self.server.github_cache
+        if self.server.registry is not None:
+            rec = self._resolve_run(run_id)
+            if rec is None:
+                return github_stats.unavailable(None, "no-run")
+            slug = repo_slug(rec.repo)
+        else:
+            db_path = self.server.db_path
+            if db_path is None:
+                return github_stats.unavailable(None, "no-run")
+            slug = repo_slug(Path(db_path).parent)
+        return cache.get(slug)
 
     # --- live auto-refresh transport (Story 11.2-003) ----------------------
 
@@ -757,6 +867,9 @@ def make_server(
     """
     server = ThreadingHTTPServer((host, port), _Handler)
     server.run_id = run_id  # type: ignore[attr-defined]
+    # Shared GitHub-health cache: per-repo-slug, short TTL, refreshed off the
+    # request path so a slow/failing `gh` never blocks the ledger-driven view.
+    server.github_cache = github_stats.GitHubStatsCache()  # type: ignore[attr-defined]
     if db_path is None:
         # Registry-discovery mode: no single ledger; project/logs resolve per run.
         reg = registry if registry is not None else Registry()

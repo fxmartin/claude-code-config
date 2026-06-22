@@ -380,15 +380,15 @@ limit, not the Claude Max window. **Deferred**: PR-branch-specific CI (the SDLC 
 checks) — default-branch latest run only; revisit if per-PR CI proves more useful.
 
 **Definition of Done**:
-- [ ] `github_stats.py` fetch with per-repo-slug TTL cache (~60 s), off the request path; graceful "unavailable" sentinel
-- [ ] Repo slug derived from the run's git remote (reusing `git_project_url`/remote regexes)
-- [ ] Overview rows show a compact per-repo badge (issues / PRs / CI), deduped per repo
-- [ ] Selected run's detail view shows the full GitHub panel
-- [ ] ~60 s server-side refresh; client poll reads cache, never drives `gh`; no full reload
-- [ ] Per-repo isolation via the registry (no cross-repo bleed); single-`--db` fallback works
-- [ ] Graceful degradation when `gh` is absent/unauthenticated/rate-limited or no GitHub remote
-- [ ] Tests for slug resolution, count/CI parsing, caching/TTL, dedup, and the unavailable fallback (no live `gh` dependency)
-- [ ] Story doc + `docs/controller-architecture.md` dashboard section updated
+- [x] `github_stats.py` fetch with per-repo-slug TTL cache (~60 s), off the request path; graceful "unavailable" sentinel
+- [x] Repo slug derived from the run's git remote (reusing `git_project_url`/remote regexes)
+- [x] Overview rows show a compact per-repo badge (issues / PRs / CI), deduped per repo
+- [x] Selected run's detail view shows the full GitHub panel
+- [x] ~60 s server-side refresh; client poll reads cache, never drives `gh`; no full reload
+- [x] Per-repo isolation via the registry (no cross-repo bleed); single-`--db` fallback works
+- [x] Graceful degradation when `gh` is absent/unauthenticated/rate-limited or no GitHub remote
+- [x] Tests for slug resolution, count/CI parsing, caching/TTL, dedup, and the unavailable fallback (no live `gh` dependency)
+- [x] Story doc + `docs/controller-architecture.md` dashboard section updated
 
 **Dependencies**: 11.2-001 (registry `repo` path) and 11.2-002 (multi-run overview) — **both
 shipped (v1.34.0), so this is unblocked**. The ~60 s poll is independent of the 11.2-003 SSE
