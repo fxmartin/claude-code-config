@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.49.6] - 2026-06-22
+
+### Fixed
+
+- fix(dashboard): render times in viewer local timezone (#77) (#124)
+
+
 ## [v1.49.5] - 2026-06-22
 
 ### Fixed
