@@ -138,6 +138,15 @@ def test_terminal_needs_attention_beats_awaiting() -> None:
     ) == "NEEDS_ATTENTION"
 
 
+def test_terminal_non_terminal_leftover_beats_awaiting() -> None:
+    # A crashed-run leftover (IN_PROGRESS) is not DONE/SKIPPED/AWAITING_APPROVAL,
+    # so it outranks an awaiting-approval merge: a human must finish it, so the
+    # run is NEEDS_ATTENTION rather than honestly parked AWAITING_APPROVAL.
+    assert compute_run_terminal(
+        {"a": "IN_PROGRESS", "b": "AWAITING_APPROVAL"}
+    ) == "NEEDS_ATTENTION"
+
+
 def test_terminal_all_done_is_done() -> None:
     assert compute_run_terminal({"a": "DONE", "b": "SKIPPED"}) == "DONE"
 
