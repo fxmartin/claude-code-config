@@ -134,6 +134,33 @@ def test_page_includes_duration_formatter_and_column(tmp_path: Path) -> None:
     assert "<th>duration</th>" in text         # per-story duration column header
 
 
+def test_page_renders_timestamps_in_local_time(tmp_path: Path) -> None:
+    """Timestamps route through fmtLocal so the viewer sees local time (Issue #77)."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/")
+    text = body.decode("utf-8")
+    # The helper that converts UTC ISO timestamps to the viewer's local zone.
+    assert "function fmtLocal" in text
+    assert "toLocaleString()" in text
+    # fmtLocal must pin the zone to UTC for the SQLite CURRENT_TIMESTAMP shape
+    # ("YYYY-MM-DD HH:MM:SS", no offset): new Date() parses a bare string as
+    # *local*, so without this normalization events/activity would still read
+    # UTC and Issue #77 would only be half-fixed. Append "Z" after swapping the
+    # space for "T" when the value carries no explicit offset.
+    assert '.replace(" ", "T")' in text
+    assert '+ "Z"' in text
+    # Each absolute-time display site routes through fmtLocal (not raw esc()).
+    assert "esc(fmtLocal(r.started_at" in text   # run sidebar started_at
+    assert "esc(fmtLocal(e.ts))" in text          # event log ts
+    assert "esc(fmtLocal(a.ts))" in text          # activity ts
+    # Raw UTC retained in title= so the viewer can inspect the exact value.
+    assert "title='" in text and "esc(r.started_at" in text   # run sidebar tooltip
+    assert "title='" in text and "esc(e.ts)" in text          # event tooltip
+    assert "title='" in text and "esc(a.ts)" in text          # activity tooltip
+
+
 # --- clickable PR links ----------------------------------------------------
 
 
