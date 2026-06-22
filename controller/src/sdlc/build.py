@@ -1670,11 +1670,16 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         for a in attempts:  # chronological, so the last write wins per stage
             latest[a["name"]] = a
         pipeline = []
+        # A story skipped wholesale (already Done in a prior run) writes no stage
+        # rows, so its cells would otherwise render PENDING; surface them SKIPPED.
+        story_skipped = s.get("status") == "SKIPPED"
         for name in _STAGES:
             row = latest.get(name)
             if row is not None:
                 pipeline.append(row)
             elif name == "coverage" and skip_coverage:
+                pipeline.append({"name": name, "status": "SKIPPED"})
+            elif story_skipped:
                 pipeline.append({"name": name, "status": "SKIPPED"})
             else:
                 pipeline.append({"name": name, "status": "PENDING"})
