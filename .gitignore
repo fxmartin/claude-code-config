@@ -9,3 +9,5 @@
 .sdlc-state.db-journal
 .sdlc-state.db-wal
 .sdlc-state.db-shm
+# Per-run agent log directories written alongside the ledger; machine-local.
+.sdlc-state.db.logs/
