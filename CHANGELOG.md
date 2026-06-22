@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.49.8] - 2026-06-22
+
+### Fixed
+
+- fix(controller): surface stream resetsat into rate-limit reset_at signal (#126)
+
+
 ## [v1.49.7] - 2026-06-22
 
 ### Fixed
