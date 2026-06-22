@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.53.0] - 2026-06-22
+
+### Added
+
+- feat(realtime-observability): github repo health on the dashboard
+
+### Fixed
+
+- fix(realtime-observability): refresh github stats on a steady cadence
+
+
 ## [v1.52.0] - 2026-06-22
 
 ### Added
