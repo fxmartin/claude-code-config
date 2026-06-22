@@ -1195,3 +1195,45 @@ def test_streaming_malformed_rate_limit_event_does_not_crash(
     with pytest.raises(RateLimitError) as exc:
         dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
     assert exc.value.signal.reset_at is None
+
+
+def test_streaming_matched_text_surfaces_reset_from_rate_limit_event(
+    monkeypatch,
+) -> None:
+    # Issue #120 follow-up: the *common* path — the result text is recognised as a
+    # rate limit ("session limit") but carries no parseable reset epoch, so
+    # detect_rate_limit returns a signal with reset_at=None. The resetsAt captured
+    # from the preceding rate_limit_event must still be threaded onto the signal.
+    epoch = 1_700_000_000.0
+    matched = json.loads(
+        _stream_result_event("You've hit your session limit", is_error=True)
+    )
+    lines = [_rate_limit_event(int(epoch)), json.dumps(matched) + "\n"]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    with pytest.raises(RateLimitError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert exc.value.signal.reset_at == epoch
+    now = epoch - 120
+    assert seconds_until_reset(
+        exc.value.signal, now=now, window_s=18_000
+    ) == 120
+
+
+def test_streaming_text_reset_not_overridden_by_rate_limit_event(
+    monkeypatch,
+) -> None:
+    # Guard: when the result text already carries its own parseable reset epoch,
+    # the stream-captured resetsAt must NOT override it — the text-surfaced value
+    # wins so a more specific signal is never clobbered.
+    text_epoch = 1_700_000_500
+    stream_epoch = 1_700_000_000
+    matched = json.loads(
+        _stream_result_event(
+            f"rate limit hit; resets_at={text_epoch}", is_error=True
+        )
+    )
+    lines = [_rate_limit_event(stream_epoch), json.dumps(matched) + "\n"]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    with pytest.raises(RateLimitError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert exc.value.signal.reset_at == float(text_epoch)
