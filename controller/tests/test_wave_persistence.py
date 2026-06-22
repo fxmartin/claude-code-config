@@ -146,6 +146,24 @@ def test_story_rows_unrecorded_story_degrades_to_empty_deps(tmp_path) -> None:
     assert row["dependencies"] == []
 
 
+def test_story_rows_unmigrated_ledger_degrades_when_columns_absent(tmp_path) -> None:
+    """`story_rows` reads read-only and never migrates: a pre-11.2-007 ledger
+    whose `stories` table lacks wave/dependencies must still return rows,
+    selecting NULL for the missing columns (the column-guard else-branch)."""
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO runs(id, status) VALUES ('r1','IN_PROGRESS')")
+        conn.execute(
+            "INSERT INTO stories(run_id, story_id, status) VALUES ('r1','s1','TODO')"
+        )
+    assert not (_WAVE_COLS & _story_columns(db))  # columns genuinely absent
+    row = Ledger(db).story_rows("r1")[0]  # read-only — must not raise or migrate
+    assert row["wave"] is None
+    assert row["dependencies"] == []
+    assert not (_WAVE_COLS & _story_columns(db))  # still unmigrated afterwards
+
+
 # ---------------------------------------------------------------------------
 # persist_cohort_structure — wave assignment + intra-queue edge filtering
 # ---------------------------------------------------------------------------
