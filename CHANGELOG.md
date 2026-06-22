@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.49.5] - 2026-06-22
+
+### Fixed
+
+- fix(controller-robustness): refresh registry on resume finalize (#121) (#123)
+
+
 ## [v1.49.4] - 2026-06-21
 
 ### Fixed
