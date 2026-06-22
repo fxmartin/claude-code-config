@@ -1568,6 +1568,39 @@ def test_status_snapshot_run_usage_and_per_story_totals(tmp_path) -> None:
     assert s["cost_usd"] is not None
 
 
+def test_status_snapshot_skipped_story_cells_render_skipped(tmp_path) -> None:
+    """A story skipped wholesale (no stage rows) renders all four cells SKIPPED,
+    not PENDING; a real built story is unaffected (Issue #130)."""
+    from sdlc.build import status_snapshot
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    # Skipped story: already Done in a prior run, so no stage rows are written.
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "SKIPPED")
+    # Normal story with a recorded build stage.
+    ledger.story_upsert(run_id, "s2", "99", "S", "P1", 2, "py", "", None, "DONE")
+    ledger.stage_start(run_id, "s2", "build", 1)
+    ledger.stage_finish(run_id, "s2", "build", 1, "DONE")
+
+    snap = status_snapshot(ledger, run_id)
+    by_id = {s["story_id"]: s for s in snap["stories"]}
+
+    skipped_stages = {st["name"]: st["status"] for st in by_id["s1"]["stages"]}
+    assert skipped_stages == {
+        "build": "SKIPPED",
+        "coverage": "SKIPPED",
+        "review": "SKIPPED",
+        "merge": "SKIPPED",
+    }
+
+    # The built story keeps its real stage row and PENDING placeholders.
+    built_stages = {st["name"]: st["status"] for st in by_id["s2"]["stages"]}
+    assert built_stages["build"] == "DONE"
+    assert built_stages["coverage"] == "PENDING"
+    assert built_stages["merge"] == "PENDING"
+
+
 def test_status_snapshot_exposes_run_and_story_durations(tmp_path) -> None:
     """Durations come from the persisted stage/run timestamps (Story 11.2-005)."""
     import sqlite3
