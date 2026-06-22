@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sdlc.build import Ledger, _base_ref, _git
+from sdlc.build import Ledger, _base_ref, _git, compute_run_terminal
 
 __all__ = ["ReconcileResult", "reconcile_run"]
 
@@ -147,21 +147,6 @@ def _ensure_merge_done(
         )
 
 
-def _compute_terminal(statuses: dict[str, str]) -> str:
-    """The run terminal implied by per-story statuses (mirrors run_build).
-
-    A failed/blocked story makes the run FAILED; any other not-yet-done leftover
-    (NEEDS_ATTENTION / AWAITING_APPROVAL / IN_PROGRESS) makes it NEEDS_ATTENTION;
-    only an all-DONE/SKIPPED run is DONE.
-    """
-    vals = list(statuses.values())
-    if any(v in {"FAILED", "BLOCKED"} for v in vals):
-        return "FAILED"
-    if any(v not in {"DONE", "SKIPPED"} for v in vals):
-        return "NEEDS_ATTENTION"
-    return "DONE"
-
-
 def reconcile_run(
     ledger: Ledger,
     run_id: str | None = None,
@@ -241,7 +226,10 @@ def reconcile_run(
         )
 
     statuses = {row["story_id"]: row["status"] for row in ledger.story_rows(rid)}
-    after = _compute_terminal(statuses)
+    # Story 12.3-003: shared terminal logic with run_build/run_resume — an
+    # AWAITING_APPROVAL-only leftover recomputes to AWAITING_APPROVAL (not
+    # FAILED), and once the human approves and the branch lands it flips to DONE.
+    after = compute_run_terminal(statuses)
     completed = sum(1 for v in statuses.values() if v == "DONE")
     failed = sum(1 for v in statuses.values() if v == "FAILED")
     ledger.run_update_counts(rid, completed, failed)

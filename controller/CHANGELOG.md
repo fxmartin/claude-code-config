@@ -8,6 +8,19 @@ stories.
 ## [Unreleased]
 
 ### Added
+- **`AWAITING_APPROVAL` merge state** (Story 12.3-003) — a merge blocked solely by
+  the high-risk human-approval gate (PR carries `risk:high` without a
+  `risk-approved` label / `risk-approver` review) is now parked
+  `AWAITING_APPROVAL` instead of being driven into the bugfix loop and exhausted
+  to `FAILED`. The merge agent signals the block *additively* (`block_reason`),
+  `_dispatch_stage` classifies it (`_merge_awaiting_approval` →
+  `kind="awaiting_approval"`), and `_run_story` short-circuits before the bugfix
+  loop — the open PR / committed branch are preserved (R10). The run terminal
+  gains a non-FAILED `AWAITING_APPROVAL` bucket via a shared `compute_run_terminal`
+  helper (used by `run_build`, `run_resume`, and reconciliation); `sdlc reconcile`
+  flips an approved-and-merged story back to `DONE`. Status counts and the
+  dashboard render the new state. Orthogonal to epic-14's `PAUSED`/`RATE_LIMITED`.
+
 - **Controller-native `resume`** (Story 10.1-001) — `sdlc resume [scope]` recovers
   an interrupted build directly from the SQLite ledger. It finds the most recent
   run still marked `IN_PROGRESS`, recomputes the remaining queue from the markdown

@@ -162,9 +162,16 @@ def build(ctx: typer.Context) -> None:
     typer.echo(
         f"build finished: {result.completed} done, {result.failed} failed, "
         f"{result.blocked} blocked, {result.needs_attention} need attention, "
-        f"{result.skipped} skipped."
+        f"{result.awaiting_approval} awaiting approval, {result.skipped} skipped."
     )
-    clean = result.failed == 0 and result.blocked == 0 and result.needs_attention == 0
+    # Story 12.3-003: AWAITING_APPROVAL is not a failure, but the run is not
+    # fully done — exit non-zero so the unattended runner surfaces it for a human.
+    clean = (
+        result.failed == 0
+        and result.blocked == 0
+        and result.needs_attention == 0
+        and result.awaiting_approval == 0
+    )
     raise typer.Exit(code=0 if clean else 1)
 
 
@@ -212,10 +219,15 @@ def resume(
 
     typer.echo(
         f"resume finished: {result.completed} done, {result.failed} failed, "
-        f"{result.blocked} blocked, {result.needs_attention} need attention "
-        f"({result.resumed} resumed)."
+        f"{result.blocked} blocked, {result.needs_attention} need attention, "
+        f"{result.awaiting_approval} awaiting approval ({result.resumed} resumed)."
     )
-    clean = result.failed == 0 and result.blocked == 0 and result.needs_attention == 0
+    clean = (
+        result.failed == 0
+        and result.blocked == 0
+        and result.needs_attention == 0
+        and result.awaiting_approval == 0
+    )
     raise typer.Exit(code=0 if clean else 1)
 
 
@@ -269,7 +281,8 @@ def status(
     typer.echo(
         f"run {run_id[:8]}  {snap['run'].get('status', '?')}  "
         f"{counts['done']}/{counts['total']} done, {counts['failed']} failed, "
-        f"{counts['blocked']} blocked, {counts['in_progress']} in progress  "
+        f"{counts['blocked']} blocked, {counts['in_progress']} in progress, "
+        f"{counts.get('awaiting_approval', 0)} awaiting approval  "
         f"(scope={snap['run'].get('scope', '?')}, {snap['run'].get('mode', '?')})"
     )
     if stories:

@@ -94,6 +94,23 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    exhausted is the story parked: `NEEDS_ATTENTION` when committed work exists on
    `feature/<story>` (preserved for manual push/MR, R10), otherwise `FAILED`
    (`_exhausted_status`).
+
+   **Awaiting human approval (Story 12.3-003).** One merge outcome is *not* a
+   defect the bugfix loop can fix: a merge blocked solely by the high-risk
+   human-approval gate (the PR carries `risk:high` from `risk_gate.py` /
+   `risk-gate.yml` with no `risk-approved` label or `risk-approver` review). The
+   merge schema enum is only `MERGED|FAILED|SKIPPED`, so the agent surfaces the
+   block *additively* — a free-text `block_reason` (or `error_summary`) naming
+   the gate — rather than redefining the result contract. `_dispatch_stage`
+   detects it (`_merge_awaiting_approval`) and returns a distinct
+   `kind="awaiting_approval"`; `_run_story` short-circuits to `AWAITING_APPROVAL`
+   **before** the bugfix loop (which cannot self-approve and would only exhaust
+   into `FAILED`). The open PR and committed branch are preserved (R10), the
+   merge stage row is recorded `BLOCKED` (a human gate, not a defect), and once
+   the human approves and the PR merges, **close-out reconciliation** (step 9)
+   flips the story to `DONE`. `AWAITING_APPROVAL` is orthogonal to epic-14's
+   run-level `PAUSED`/`RATE_LIMITED` (waiting on a *person* vs. on *time*);
+   neither is `FAILED`.
 7. **Commit-message lint** — after any **commit-authoring** stage succeeds
    (build, coverage, a confirmed bugfix, and an *envelope-recovered* build/
    coverage stage), the controller lints the HEAD commit of `feature/<story>`
@@ -138,10 +155,11 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    lets the re-lint see the now-compliant message. Only when that recovery *also*
    fails is the story parked.
 8. **Dependency blocking** — if a dependency ends FAILED/BLOCKED/SKIPPED/
-   NEEDS_ATTENTION, the dependent story is marked BLOCKED and never dispatched.
-   NEEDS_ATTENTION counts as not-done: the dependency's work is committed but
-   unmerged (parked for manual push/MR or a commit-message fix), so a dependent
-   built on top of it would race incomplete work.
+   NEEDS_ATTENTION/AWAITING_APPROVAL, the dependent story is marked BLOCKED and
+   never dispatched. These all count as not-done: the dependency's work is
+   committed but unmerged (parked for manual push/MR, a commit-message fix, or a
+   pending human approval), so a dependent built on top of it would race
+   incomplete work.
 9. **Close-out reconciliation** — after the cohort loop and **before** the
    terminal tally, `run_build` (real runs only — injected fakes skip it, like the
    recursion guard) calls `reconcile.reconcile_run` to re-check every parked
@@ -149,8 +167,15 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    merged after a 429, by hand the next morning, or transitively as part of a
    stacked PR leaves a story parked even though its work shipped. Reconciliation
    verifies the truth on `origin/main` and corrects the ledger so the run
-   terminal reports DONE instead of a stale FAILED/NEEDS_ATTENTION. See
-   [Reconciliation](#reconciliation-against-originmain) below.
+   terminal reports DONE instead of a stale FAILED/NEEDS_ATTENTION/
+   AWAITING_APPROVAL. See [Reconciliation](#reconciliation-against-originmain)
+   below. The run terminal itself is computed by one shared helper,
+   `compute_run_terminal`, used by `run_build`, `run_resume`, and reconciliation
+   so the three paths can never drift: any FAILED/BLOCKED story → `FAILED`; else
+   any NEEDS_ATTENTION (or other non-terminal leftover) → `NEEDS_ATTENTION`; else
+   any AWAITING_APPROVAL → `AWAITING_APPROVAL`; else `DONE`. `AWAITING_APPROVAL`
+   is added to `_TERMINAL_RUN_STATES` (it stamps `finished_at` — an unattended
+   run genuinely stops there until a human approves).
 
 ## Reconciliation against origin/main
 

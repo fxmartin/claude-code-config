@@ -150,7 +150,43 @@ CREATE INDEX IF NOT EXISTS idx_runs_status     ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_run_ts   ON events(run_id, ts);
 """
 
-_TERMINAL_RUN_STATES = {"DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION"}
+_TERMINAL_RUN_STATES = {
+    "DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION", "AWAITING_APPROVAL"
+}
+
+
+def compute_run_terminal(statuses) -> str:
+    """The run terminal implied by per-story statuses (one source of truth).
+
+    Shared by ``run_build``, ``run_resume`` and reconciliation so the three paths
+    can never drift on how leftovers map to a run terminal. Precedence, strongest
+    first:
+
+    - any ``FAILED``/``BLOCKED`` story → ``FAILED`` (a genuine failure dominates);
+    - any ``NEEDS_ATTENTION`` story → ``NEEDS_ATTENTION`` (committed-but-unmerged
+      work a human must finish);
+    - any other non-terminal leftover (e.g. an ``IN_PROGRESS`` story from a
+      crashed run) → ``NEEDS_ATTENTION``;
+    - else any ``AWAITING_APPROVAL`` story → ``AWAITING_APPROVAL`` (Story
+      12.3-003: the only thing left is a merge parked on the human-approval gate —
+      honestly awaiting a person, **not** a failure);
+    - else (all ``DONE``/``SKIPPED``) → ``DONE``.
+
+    ``AWAITING_APPROVAL`` ranks *below* ``NEEDS_ATTENTION`` so a run that also has
+    fixable trouble is reported as needing attention, and is orthogonal to
+    epic-14's run-level ``PAUSED``/``RATED_LIMITED`` (waiting on time, not a
+    person) — neither is ``FAILED``.
+    """
+    vals = list(statuses.values()) if isinstance(statuses, dict) else list(statuses)
+    if any(v in {"FAILED", "BLOCKED"} for v in vals):
+        return "FAILED"
+    if any(v == "NEEDS_ATTENTION" for v in vals):
+        return "NEEDS_ATTENTION"
+    if any(v not in {"DONE", "SKIPPED", "AWAITING_APPROVAL"} for v in vals):
+        return "NEEDS_ATTENTION"
+    if any(v == "AWAITING_APPROVAL" for v in vals):
+        return "AWAITING_APPROVAL"
+    return "DONE"
 
 # Schema migrations applied by Ledger.init() after the base DDL. Each entry adds
 # missing columns to an existing ledger idempotently (guarded by PRAGMA
@@ -911,6 +947,7 @@ class Ledger:
 _EMPTY_COUNTS = {
     "total": 0, "done": 0, "failed": 0, "blocked": 0,
     "in_progress": 0, "skipped": 0, "todo": 0, "needs_attention": 0,
+    "awaiting_approval": 0,
 }
 
 # The four per-stage token components recorded from the agent usage envelope.
@@ -1125,6 +1162,7 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "skipped": _count("SKIPPED"),
         "todo": _count("TODO"),
         "needs_attention": _count("NEEDS_ATTENTION"),
+        "awaiting_approval": _count("AWAITING_APPROVAL"),
     }
     payload["stories"] = stories
     payload["events"] = events
@@ -1157,6 +1195,9 @@ class BuildResult:
     skipped: int = 0
     blocked: int = 0
     needs_attention: int = 0
+    # Story 12.3-003: stories parked on the high-risk human-approval gate — a
+    # non-FAILED, non-DONE bucket reported honestly as awaiting a person.
+    awaiting_approval: int = 0
     planned: int = 0
     dry_run: bool = False
     preflight_failed: bool = False
@@ -1356,6 +1397,13 @@ def render_merge_prompt(story: Story, pr_number: int | None) -> str:
     return (
         f"Merge the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
         "Rebase before merge to absorb baseline drift, then emit the result block.\n"
+        # Story 12.3-003: a merge blocked only by the high-risk approval gate is
+        # not a defect the bugfix loop can fix — tell the agent to signal it
+        # additively so the controller parks the story AWAITING_APPROVAL.
+        "If the merge is blocked solely by the high-risk human-approval gate "
+        "(PR carries risk:high without a risk-approved label or risk-approver "
+        "review), set merge_status to FAILED and add a block_reason field of "
+        "\"BLOCKED_HIGH_RISK\" — do not retry or treat it as a code defect.\n"
         + _result_wrapper("merge-agent-response.schema.json")
     )
 
@@ -1694,7 +1742,8 @@ def run_build(
             blocked_by = [
                 dep
                 for dep in story.dependencies
-                if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED", "NEEDS_ATTENTION"}
+                if status.get(dep)
+                in {"FAILED", "BLOCKED", "SKIPPED", "NEEDS_ATTENTION", "AWAITING_APPROVAL"}
             ]
             if blocked_by:
                 status[story.id] = "BLOCKED"
@@ -1736,16 +1785,16 @@ def run_build(
     # Stories whose work was committed but whose result was unparseable (R10):
     # not a clean success, but deliberately not a destructive FAILED.
     needs_attention = sum(1 for v in status.values() if v == "NEEDS_ATTENTION")
+    # Story 12.3-003: merges parked on the high-risk human-approval gate — a
+    # non-FAILED, non-DONE bucket. The run terminal honours its precedence below.
+    awaiting_approval = sum(1 for v in status.values() if v == "AWAITING_APPROVAL")
     # Shipped stories were skipped before the loop; fold them into the tally.
     skipped = len(done_skips) + sum(1 for v in status.values() if v == "SKIPPED")
 
-    if failed or blocked:
-        run_terminal = "FAILED"
-    elif needs_attention:
-        run_terminal = "NEEDS_ATTENTION"
-    else:
-        run_terminal = "DONE"
-    run_level = {"DONE": "success", "NEEDS_ATTENTION": "warn"}.get(run_terminal, "error")
+    run_terminal = compute_run_terminal(status)
+    run_level = {
+        "DONE": "success", "NEEDS_ATTENTION": "warn", "AWAITING_APPROVAL": "warn",
+    }.get(run_terminal, "error")
     ledger.run_update_counts(run_id, completed, failed)
     ledger.event_log(
         run_id,
@@ -1753,7 +1802,8 @@ def run_build(
         run_level,
         "controller",
         f"run finished: {completed} done, {failed} failed, {blocked} blocked, "
-        f"{needs_attention} need attention, {skipped} skipped",
+        f"{needs_attention} need attention, {awaiting_approval} awaiting approval, "
+        f"{skipped} skipped",
     )
     ledger.run_update_status(run_id, run_terminal)
     if registry is not None:
@@ -1772,6 +1822,7 @@ def run_build(
         skipped=skipped,
         blocked=blocked,
         needs_attention=needs_attention,
+        awaiting_approval=awaiting_approval,
         planned=len(buildable),
         run_id=run_id,
         story_status=story_status,
@@ -1793,10 +1844,12 @@ def _run_story(
 ) -> str:
     """Drive one story through build → coverage → review → merge.
 
-    Returns the terminal story status: ``DONE``, ``FAILED``, or
-    ``NEEDS_ATTENTION``. A stage failure (agent FAILED status, dispatch error, or
-    schema-invalid output) enters the bounded bugfix loop; the stage is retried
-    after a successful fix. If a result is *unparseable* (contract error) but the
+    Returns the terminal story status: ``DONE``, ``FAILED``,
+    ``NEEDS_ATTENTION``, or ``AWAITING_APPROVAL``. A stage failure (agent FAILED
+    status, dispatch error, or schema-invalid output) enters the bounded bugfix
+    loop; the stage is retried after a successful fix. A merge blocked only by
+    the high-risk human-approval gate short-circuits to ``AWAITING_APPROVAL``
+    *before* the bugfix loop (Story 12.3-003) — the loop cannot self-approve. If a result is *unparseable* (contract error) but the
     agent already committed the story branch, the work is preserved as
     ``NEEDS_ATTENTION`` instead of being discarded and rebuilt (R10). Each
     dispatch's transcript is persisted under ``logs_dir`` and its path recorded
@@ -1862,6 +1915,26 @@ def _run_story(
                     if not lint_ok:
                         return "NEEDS_ATTENTION"
                 break
+
+            # Story 12.3-003: a merge blocked solely by the high-risk human-
+            # approval gate is parked AWAITING_APPROVAL *before* any recovery —
+            # the bugfix loop cannot self-approve and would only exhaust into
+            # FAILED. The merge stage row is recorded BLOCKED (not FAILED: this
+            # is a human gate, not a defect) and the open PR / committed work are
+            # preserved (R10); reconcile flips the story to DONE once approved
+            # and merged (12.3-001).
+            if kind == "awaiting_approval":
+                ledger.stage_finish(
+                    run_id, story.id, stage, attempt, "BLOCKED",
+                    "awaiting-approval", str(tpath),
+                )
+                _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    f"{failure} — story parked AWAITING_APPROVAL "
+                    "(awaiting human approval; PR/branch preserved, no bugfix)",
+                )
+                return "AWAITING_APPROVAL"
 
             # Stage failed: record it, then attempt a bounded bugfix.
             ledger.stage_finish(
@@ -2035,7 +2108,16 @@ def _dispatch_stage(
         return False, None, f"dispatch error: {exc}", "dispatch"
 
     if not _stage_succeeded(stage, result.data):
-        return False, result, _stage_failure_summary(stage, result.data), "reported"
+        # Story 12.3-003: a merge blocked solely by the high-risk human-approval
+        # gate is not a generic stage failure — the bugfix loop cannot self-
+        # approve and would only exhaust into FAILED. Classify it distinctly so
+        # the caller parks the story AWAITING_APPROVAL instead.
+        kind = (
+            "awaiting_approval"
+            if stage == "merge" and _merge_awaiting_approval(result.data)
+            else "reported"
+        )
+        return False, result, _stage_failure_summary(stage, result.data), kind
     return True, result, "", ""
 
 
@@ -2064,9 +2146,46 @@ def _stage_succeeded(stage: str, data: dict) -> bool:
     return False
 
 
+# Story 12.3-003: the merge schema enum is MERGED|FAILED|SKIPPED, so a merge
+# blocked only by the high-risk human-approval gate (risk_gate.py / the
+# risk-gate.yml workflow apply ``risk:high``; the merge agent maps its internal
+# BLOCKED_HIGH_RISK to FAILED today) is surfaced *additively* — a free-text
+# ``block_reason`` (or the existing ``error_summary``) naming the gate — rather
+# than by re-enumerating the result contract. These tokens, matched
+# case-insensitively, distinguish "waiting on a person" from a real merge
+# failure. ``risk:high`` is :data:`risk_gate.RISK_LABEL`.
+_HIGH_RISK_BLOCK_TOKENS = ("BLOCKED_HIGH_RISK", "AWAITING_APPROVAL", "RISK:HIGH")
+# The additive fields a merge agent may use to explain a non-merge; scanned in
+# order for a high-risk-block token.
+_MERGE_BLOCK_FIELDS = ("block_reason", "error_summary")
+
+
+def _merge_awaiting_approval(data: dict) -> bool:
+    """True when a non-merged merge response is blocked on the high-risk gate.
+
+    The PR carries ``risk:high`` and lacks the approval label/review, so the
+    merge agent could not self-merge and signalled it additively (see
+    :data:`_HIGH_RISK_BLOCK_TOKENS`). Detecting it lets :func:`_run_story` park
+    the story ``AWAITING_APPROVAL`` — preserving the open PR / committed work
+    (R10) and keeping the run out of ``FAILED`` — instead of burning the bugfix
+    loop. A generic merge failure (a rebase conflict, say) carries none of these
+    tokens and stays a normal, bugfix-eligible failure.
+    """
+    for field_name in _MERGE_BLOCK_FIELDS:
+        value = data.get(field_name)
+        if isinstance(value, str):
+            upper = value.upper()
+            if any(token in upper for token in _HIGH_RISK_BLOCK_TOKENS):
+                return True
+    return False
+
+
 def _stage_failure_summary(stage: str, data: dict) -> str:
     if stage == "build":
         return data.get("error_summary", "build reported FAILED")
+    if stage == "merge":
+        reason = data.get("block_reason") or data.get("error_summary")
+        return f"merge blocked: {reason}" if reason else "merge reported non-success status"
     return f"{stage} reported non-success status"
 
 
