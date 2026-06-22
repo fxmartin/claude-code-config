@@ -345,3 +345,39 @@ def test_cli_run_stage_rejects_bad_action(tmp_path, monkeypatch):
         app, ["run-stage", "bogus", "--run", "x", "--stage", "build", "--db", str(db)]
     )
     assert result.exit_code == 2
+
+
+def test_cli_run_open_logging_unavailable_exits_nonzero(tmp_path, monkeypatch):
+    """run-open exits 1 + warns when run_open degrades to None (ledger write failed).
+
+    The markdown skill's best-effort guard (`|| true`) relies on the non-zero exit
+    to carry on unlogged, and the stderr message tells the operator logging is off.
+    """
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(tmp_path / "registry.json"))
+    monkeypatch.setattr("sdlc.runlog.run_open", lambda **_: None)
+    db = tmp_path / ".sdlc-state.db"
+    result = runner.invoke(
+        app, ["run-open", "--scope", "issue-13", "--db", str(db), "--repo", str(tmp_path)]
+    )
+    assert result.exit_code == 1
+    assert "logging unavailable" in result.output
+
+
+def test_cli_run_stage_finish_failure_exits_one(tmp_path, monkeypatch):
+    """run-stage exits 1 when the ledger write fails (no run-open, no schema)."""
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(tmp_path / "registry.json"))
+    db = tmp_path / ".sdlc-state.db"
+    result = runner.invoke(
+        app, ["run-stage", "start", "--run", "missing", "--stage", "build", "--db", str(db)]
+    )
+    assert result.exit_code == 1
+
+
+def test_cli_run_close_failure_exits_one(tmp_path, monkeypatch):
+    """run-close exits 1 when the ledger write fails (unknown db/run)."""
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(tmp_path / "registry.json"))
+    db = tmp_path / ".sdlc-state.db"
+    result = runner.invoke(
+        app, ["run-close", "--run", "missing", "--db", str(db), "--status", "DONE"]
+    )
+    assert result.exit_code == 1
