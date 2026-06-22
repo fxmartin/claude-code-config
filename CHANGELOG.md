@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.50.0] - 2026-06-22
+
+### Added
+
+- feat(realtime-observability): persist story wave + deps (#11.2-007)
+- feat(realtime-observability): central run registry (#11.2-001)
+
+
 ## [v1.49.10] - 2026-06-22
 
 ### Fixed
