@@ -81,8 +81,13 @@ CHANGED_FILES=$(git diff --name-only main...HEAD)
 uv tool run bandit -r $CHANGED_FILES 2>/dev/null || true
 
 # Python dependency audit (BLOCKING on critical/high)
+# IMPORTANT: audit the PROJECT's own dependencies, not pip-audit's ephemeral
+# tool environment. Bare `uv tool run pip-audit` audits pip-audit's own runtime
+# deps (requests->urllib3/idna, cachecontrol->msgpack, pip), surfacing phantom
+# advisories that have nothing to do with the project (see issue #119). Inject
+# pip-audit into the project venv with `--with` and scope to local deps via `-l`.
 if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
-  PIP_AUDIT_OUTPUT=$(uv tool run pip-audit --format json 2>/dev/null || pip-audit --format json 2>/dev/null || echo '[]')
+  PIP_AUDIT_OUTPUT=$(uv run --with pip-audit pip-audit -l --format json 2>/dev/null || pip-audit -l --format json 2>/dev/null || echo '[]')
 
   # Check for critical or high severity vulnerabilities
   CRITICAL_HIGH=$(echo "$PIP_AUDIT_OUTPUT" | jq '[.[] | select(.fix_versions != [] and (.aliases[]? // "" | test("CVE")) ) | .vulnerability] | length' 2>/dev/null || echo "0")
