@@ -470,6 +470,35 @@ dependency footprint stays at zero web frameworks.
   the render replaces (never appends) DOM, a dropped-and-resumed connection never
   duplicates rows. Browsers without `EventSource` fall back to gentle polling.
 
+## Story status lifecycle and dashboard labels (Story 11.2-009)
+
+A story row's ledger status tracks its actual progress, and the dashboard maps
+that status to a human-facing label:
+
+- **Start.** `_run_story` sets the story `IN_PROGRESS` the moment its first
+  pending stage begins (Story 11.1-002), *before* any stage dispatch. Both
+  scheduling paths inherit this: `run_build` and `resume` drive a story through
+  `_run_story_rate_limited` → `_run_story`, so neither leaves a story on `TODO`
+  while its stages run. Without this a story went `TODO` → terminal with no
+  in-flight window, so `sdlc status`, the dashboard, and `counts.in_progress`
+  never reflected work happening mid-run.
+- **Terminal.** Once `_run_story` returns, the caller stamps the terminal status
+  (`set_story_status(outcome)`): `DONE`, `FAILED`, `NEEDS_ATTENTION`, `BLOCKED`
+  (unmet dependency), `RATE_LIMITED`, or `AWAITING_APPROVAL`. Stories skipped as
+  already-merged are seeded `SKIPPED`.
+- **Display labels.** The dashboard renders the status via a small label map
+  (`LABELS` in the embedded page): `IN_PROGRESS` → **STARTED**, so the status
+  column reads `TODO → STARTED → DONE/FAILED`. Only `IN_PROGRESS` is remapped —
+  `BLOCKED`, `NEEDS_ATTENTION`, `SKIPPED`, `RATE_LIMITED`, and
+  `AWAITING_APPROVAL` keep their own distinct labels so no real state is hidden.
+  The badge's CSS class stays the **raw** status (e.g. `IN_PROGRESS`), so colours
+  and the `counts.*` summary chips are unchanged; `.STARTED` shares the
+  `.IN_PROGRESS` style. The shared `badge()` helper applies the map everywhere a
+  status is rendered (the per-story status column, the run badges, and the
+  summary chips), so an in-progress run reads `STARTED` consistently. This is
+  foundational for Epic-17 17.3-001, which extends "started" to *multiple*
+  concurrently-active stages.
+
 ## There is no `init` verb
 
 Epic-07 scaffolded an `init` stub, but `build` already creates the SQLite ledger

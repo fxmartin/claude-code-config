@@ -364,6 +364,46 @@ def test_page_has_stage_columns() -> None:
         assert f"<th>{header}</th>" in _PAGE
 
 
+# --- live story status labels (Story 11.2-009) -----------------------------
+
+
+def test_page_maps_in_progress_to_started_label() -> None:
+    """The dashboard renders an IN_PROGRESS story as STARTED (not TODO / not the
+    raw status), via a label map the badge function reads (Story 11.2-009)."""
+    from sdlc.dashboard import _PAGE
+
+    # A label map exists and remaps IN_PROGRESS to the human-facing STARTED.
+    assert "STARTED" in _PAGE
+    assert '"IN_PROGRESS": "STARTED"' in _PAGE
+    # The badge renders the mapped label, not the raw status text, while keeping
+    # the raw status as the CSS class (so colors/styling are unchanged).
+    assert "function statusLabel(" in _PAGE
+    assert "statusLabel(s)" in _PAGE
+
+
+def test_page_keeps_distinct_status_labels() -> None:
+    """BLOCKED / NEEDS_ATTENTION / SKIPPED keep their own distinct labels — only
+    IN_PROGRESS is remapped, so no real state is collapsed away (Story 11.2-009)."""
+    from sdlc.dashboard import _PAGE
+
+    # Pull out the LABELS object literal and confirm it remaps nothing else.
+    start = _PAGE.index("const LABELS = {")
+    end = _PAGE.index("}", start)
+    labels_src = _PAGE[start:end]
+    for status in ("BLOCKED", "NEEDS_ATTENTION", "SKIPPED", "TODO", "DONE", "FAILED"):
+        assert status not in labels_src
+    # They still each have a distinct badge style (their own colour).
+    for status in (".BLOCKED", ".NEEDS_ATTENTION", ".SKIPPED", ".TODO"):
+        assert status in _PAGE
+
+
+def test_page_has_started_badge_style() -> None:
+    """A .STARTED badge style exists alongside .IN_PROGRESS (Story 11.2-009)."""
+    from sdlc.dashboard import _PAGE
+
+    assert ".STARTED" in _PAGE
+
+
 # --- multi-run registry overview (Story 11.2-002) --------------------------
 
 
@@ -1047,3 +1087,45 @@ def test_serve_stream_returns_when_change_push_fails() -> None:
     """A drop on the first change push ends the stream cleanly."""
     h = _stream_handler(fail_after=2)  # headers + retry ok, change push fails
     h._serve_stream()
+
+
+def test_migrate_registry_ledgers_dedups_and_tolerates_bad_ledgers(tmp_path: Path) -> None:
+    """Each distinct DB is migrated once; unreachable/corrupt ledgers are skipped.
+
+    Two records sharing one DB exercise the dedup ``continue``; a record pointing
+    at a directory (which exists but cannot be opened as SQLite) exercises the
+    best-effort ``except`` so a bad ledger never crashes the dashboard.
+    """
+    import os
+
+    from sdlc.dashboard import _migrate_registry_ledgers
+    from sdlc.registry import Registry, RunRecord
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db = repo / ".sdlc-state.db"
+    run_id = _seed_run(db, "epic-aaa", "AAA.1-001", "IN_PROGRESS")
+
+    # A path that exists but is not a SQLite file → open raises sqlite3.Error.
+    bad_db = tmp_path / "not-a-db"
+    bad_db.mkdir()
+
+    registry = Registry(tmp_path / "registry.json")
+    started = "2026-01-01T00:00:00+00:00"
+    registry.register(
+        RunRecord(run_id, str(repo), str(db), "epic-aaa", os.getpid(),
+                  "IN_PROGRESS", started, total=1, completed=0)
+    )
+    # Second record on the SAME db → the dedup branch (seen) skips re-migration.
+    registry.register(
+        RunRecord("dup-run", str(repo), str(db), "epic-aaa", os.getpid(),
+                  "IN_PROGRESS", started, total=1, completed=0)
+    )
+    # Record on an unopenable db → the except branch leaves it untouched.
+    registry.register(
+        RunRecord("bad-run", str(tmp_path / "broken"), str(bad_db), "epic-bbb",
+                  os.getpid(), "IN_PROGRESS", started, total=1, completed=0)
+    )
+
+    # Must complete without raising despite the bad ledger.
+    _migrate_registry_ledgers(registry)
