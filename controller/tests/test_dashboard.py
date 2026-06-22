@@ -187,6 +187,22 @@ def test_web_url_from_remote(remote: str, expected) -> None:
     assert _web_url_from_remote(remote) == expected
 
 
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://github.com/owner/repo", "owner/repo"),
+        ("https://github.com/owner/repo/", "owner/repo"),
+        (None, None),
+        ("", None),
+        ("singlepart", None),
+    ],
+)
+def test_slug_from_url(url, expected) -> None:
+    from sdlc.dashboard import _slug_from_url
+
+    assert _slug_from_url(url) == expected
+
+
 def test_page_has_pr_link_template() -> None:
     from sdlc.dashboard import _PAGE
 
@@ -1314,6 +1330,19 @@ def test_api_github_single_db_mode(tmp_path: Path) -> None:
         thread.join(timeout=5)
     assert json.loads(body)["slug"] == "acme/solo"
     assert cache.calls == ["acme/solo"]
+
+
+def test_github_stats_single_db_mode_without_db_path_is_no_run() -> None:
+    """Single-db mode with no ledger path degrades to the ``no-run`` sentinel."""
+    from types import SimpleNamespace
+
+    from sdlc.dashboard import _Handler
+
+    h = _Handler.__new__(_Handler)
+    h.server = SimpleNamespace(registry=None, db_path=None, github_cache=_StubCache())
+    result = h._github_stats(None)
+    assert result["available"] is False
+    assert result["reason"] == "no-run"
 
 
 def test_make_server_creates_github_cache_both_modes(tmp_path: Path) -> None:
