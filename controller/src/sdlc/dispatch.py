@@ -9,7 +9,7 @@ import re
 import shlex
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -609,17 +609,30 @@ def _interpret(
 
     ``stream_resets_at`` (issue #120) is the absolute window-reset epoch captured
     from a ``rate_limit_event`` stream line on the streaming path; the captured
-    path never sees a stream so it defaults to None. When a structured 429 has no
-    parseable reset in its result text, this epoch is threaded onto the signal so
-    the wait resumes precisely on reset instead of using the full-window fallback.
+    path never sees a stream so it defaults to None. It is threaded onto whichever
+    rate-limit signal is produced whenever that signal lacks its own reset epoch —
+    covering both the structured-429 fallback and the common case where the human
+    result text is *recognised* as a rate limit but names no parseable reset time —
+    so the wait resumes precisely on reset instead of using the full-window fallback.
     """
+
+    def _with_stream_reset(sig: RateLimitSignal | None) -> RateLimitSignal | None:
+        # Issue #120 follow-up: detect_rate_limit() recognises the session-limit
+        # text but the common message carries no parseable epoch, so the matched
+        # signal's reset_at is None. Fill it from the stream-captured resetsAt so
+        # the precise resume applies on the text-matched path too — never override
+        # an epoch the text did surface.
+        if sig is not None and sig.reset_at is None and stream_resets_at is not None:
+            return replace(sig, reset_at=stream_resets_at)
+        return sig
+
     if returncode != 0:
         detail = (stderr or stdout or "").strip()
         # Story 14.1-003: a non-zero exit caused by the Max plan's rate limit is a
         # recoverable, time-based pause — not a generic dispatch failure. Surface
         # it as a distinct RateLimitError so the controller waits/parks instead of
         # burning a bugfix attempt. Absent a rate-limit signal, behaviour is today's.
-        signal = detect_rate_limit(detail)
+        signal = _with_stream_reset(detect_rate_limit(detail))
         if signal is not None:
             raise RateLimitError(
                 f"{agent_type} agent hit the rate limit (exit {returncode}): {detail}",
@@ -644,7 +657,7 @@ def _interpret(
             # (``api_error_status``/``error``). Treat that as a definitive
             # rate-limit signal even when the human ``result`` text is not
             # recognised, preferring a structured reset epoch when surfaced.
-            signal = detect_rate_limit(str(detail))
+            signal = _with_stream_reset(detect_rate_limit(str(detail)))
             if signal is None and (
                 envelope.get("api_error_status") == 429
                 or envelope.get("error") == "rate_limit"
