@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.51.0] - 2026-06-22
+
+### Added
+
+- feat(realtime-observability): live story status in dashboard (#11.2-009)
+
+
 ## [v1.50.0] - 2026-06-22
 
 ### Added
