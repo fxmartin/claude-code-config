@@ -1007,6 +1007,40 @@ def test_serve_runs_until_interrupt(tmp_path: Path, monkeypatch) -> None:
     assert not dash._pidfile("127.0.0.1", 0).exists()  # PID file cleaned up
 
 
+def test_serve_sigterm_handler_raises_keyboard_interrupt(tmp_path: Path, monkeypatch) -> None:
+    """The SIGTERM handler serve() installs re-raises as KeyboardInterrupt.
+
+    `--stop`/`--restart` send SIGTERM; serve() maps it onto KeyboardInterrupt so
+    the same finally-block cleanup (PID file removal) runs as for Ctrl-C.
+    """
+    import signal as signal_mod
+    from http.server import ThreadingHTTPServer
+
+    import sdlc.dashboard as dash
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+
+    captured: dict[int, object] = {}
+
+    def _record(signum, handler):
+        captured[signum] = handler
+
+    monkeypatch.setattr(dash.signal, "signal", _record)
+
+    def _interrupt(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ThreadingHTTPServer, "serve_forever", _interrupt)
+
+    dash.serve(db, host="127.0.0.1", port=0, open_browser=False)
+
+    handler = captured.get(signal_mod.SIGTERM)
+    assert callable(handler)
+    with pytest.raises(KeyboardInterrupt):
+        handler(signal_mod.SIGTERM, None)
+
+
 def test_serve_skips_signal_off_main_thread(tmp_path: Path, monkeypatch) -> None:
     """Off the main thread, signal registration is skipped without error."""
     from http.server import ThreadingHTTPServer
