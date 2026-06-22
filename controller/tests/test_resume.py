@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sdlc.build import Ledger, run_build
 from sdlc.cohort import Story
+from sdlc.registry import Registry, RunRecord
 from sdlc.resume import ResumeResult, compute_resume_plan, run_resume
 
 from test_build import (  # reuse the canned dispatchers
@@ -563,3 +564,101 @@ def test_resume_injected_dispatcher_never_repositions_head(
 
     assert result.resumed == 1
     assert reposition_calls == []  # injected fake → no git side effect
+
+
+# --- registry finalize on resume (#121) ------------------------------------
+
+
+def _seed_registry_failed(reg_path: Path, run_id: str, db_path: Path) -> Registry:
+    """Seed a registry entry for ``run_id`` stamped terminal FAILED.
+
+    Mirrors the host-level state the dashboard sidebar reads after a build that
+    finished FAILED — the stale status a later resume must overwrite.
+    """
+    registry = Registry(reg_path)
+    registry.register(
+        RunRecord(
+            run_id=run_id,
+            repo=str(db_path.parent.resolve()),
+            db=str(db_path.resolve()),
+            scope="epic-99",
+            pid=1,
+            status="IN_PROGRESS",
+            started_at="",
+            total=2,
+            completed=1,
+        )
+    )
+    registry.mark_finished(run_id, "FAILED", completed=1)
+    return registry
+
+
+def test_resume_refreshes_registry_to_done(tmp_path: Path) -> None:
+    """A run recovered via resume must overwrite its stale registry status so the
+    dashboard sidebar no longer shows the original FAILED (#121)."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_interrupted(db)
+
+    reg_path = tmp_path / "registry.json"
+    registry = _seed_registry_failed(reg_path, run_id, db)
+    assert registry.records()[0].status == "FAILED"
+
+    result = run_resume(
+        "epic-99",
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.completed == 2
+    record = next(r for r in registry.records() if r.run_id == run_id)
+    assert record.status == "DONE"
+    assert record.completed == 2  # the recovered DONE count, not the stale 1
+
+
+def test_resume_registry_missing_run_id_does_not_crash(tmp_path: Path) -> None:
+    """Resuming a run with no registry entry (started elsewhere) is fine —
+    mark_finished is a documented no-op for unknown run_ids."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_interrupted(db)
+
+    # An empty registry: this run was never registered here.
+    registry = Registry(tmp_path / "registry.json")
+
+    result = run_resume(
+        "epic-99",
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.completed == 2  # resume still succeeds
+    assert registry.records() == []  # no entry conjured for an unknown run
+
+
+def test_resume_registry_io_error_is_swallowed(tmp_path: Path) -> None:
+    """A registry IO failure must never fail an otherwise-good resume —
+    best-effort, exactly like the build path's _registry_finish (#121)."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_interrupted(db)
+
+    class _BoomRegistry(Registry):
+        def mark_finished(self, *args, **kwargs):  # type: ignore[override]
+            raise OSError("registry unwritable")
+
+    registry = _BoomRegistry(tmp_path / "registry.json")
+
+    result = run_resume(
+        "epic-99",
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.completed == 2  # resume returns its normal result despite IO error
