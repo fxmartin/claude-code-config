@@ -145,6 +145,26 @@ def test_run_gh_returns_none_on_nonzero(monkeypatch) -> None:
     assert gh._run_gh(["api", "x"]) is None
 
 
+def test_run_gh_returns_stdout_on_success(monkeypatch) -> None:
+    class R:
+        returncode = 0
+        stdout = "42\n"
+    monkeypatch.setattr(gh.subprocess, "run", lambda *a, **k: R())
+    assert gh._run_gh(["api", "x"]) == "42\n"
+
+
+def test_count_parses_int_and_strips() -> None:
+    assert gh._count("  7\n") == 7
+
+
+def test_count_none_on_none_input() -> None:
+    assert gh._count(None) is None
+
+
+def test_count_none_on_non_numeric() -> None:
+    assert gh._count("not-a-number") is None
+
+
 # --- per-slug TTL cache, off the request path -------------------------------
 
 
