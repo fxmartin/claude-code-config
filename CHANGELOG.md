@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.49.7] - 2026-06-22
+
+### Fixed
+
+- fix(deps): audit project deps not pip-audit tool env (#119) (#125)
+
+
 ## [v1.49.6] - 2026-06-22
 
 ### Fixed
