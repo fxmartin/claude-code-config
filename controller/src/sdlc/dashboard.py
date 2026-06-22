@@ -625,6 +625,14 @@ function tickRuntime(){
 }
 setInterval(tickRuntime, 1000);
 
+// GitHub repo health (Story 11.2-006) is time-based, not ledger-driven: the SSE
+// stream only pushes on ledger movement, so a quiet/finished run would never
+// refresh its GitHub badges/panel. Re-tick on the backend cache's ~60s cadence
+// (independent of SSE) so the data refreshes without a full reload — tick()
+// reads the cached summary and never itself drives `gh`.
+const GH_REFRESH_INTERVAL = 30000;
+setInterval(tick, GH_REFRESH_INTERVAL);
+
 tick();          // immediate first paint
 connectStream(); // then live updates (the stream's initial change repaints too)
 </script>

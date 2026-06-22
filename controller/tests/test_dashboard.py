@@ -1340,3 +1340,15 @@ def test_page_has_github_panel_and_badge_hooks() -> None:
 
     assert "/api/github" in _PAGE
     assert 'id="github"' in _PAGE
+
+
+def test_page_refreshes_github_on_a_steady_cadence() -> None:
+    """GitHub data is time-based, so the page must re-tick independent of SSE.
+
+    The SSE stream only fires on ledger movement; without a steady poll a quiet
+    run's GitHub badges/panel would never hit the ~60 s backend-cache refresh.
+    """
+    from sdlc.dashboard import _PAGE
+
+    assert "GH_REFRESH_INTERVAL" in _PAGE
+    assert "setInterval(tick, GH_REFRESH_INTERVAL)" in _PAGE
