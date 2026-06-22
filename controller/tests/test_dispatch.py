@@ -24,6 +24,7 @@ from sdlc.dispatch import (
     dispatch_agent,
     resolve_agent_cmd,
 )
+from sdlc.rate_limit import seconds_until_reset
 
 
 def _wrap(payload: dict) -> str:
@@ -1115,3 +1116,82 @@ def test_no_thinking_cap_leaves_env_unchanged_on_streaming_path(monkeypatch) -> 
     monkeypatch.setattr(subprocess, "Popen", make)
     dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
     assert seen["env"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #120: a rate_limit_event's resetsAt is surfaced into RateLimitSignal
+# ---------------------------------------------------------------------------
+
+
+def _rate_limit_event(resets_at) -> str:
+    """A stream-json ``rate_limit_event`` line carrying ``rate_limit_info.resetsAt``."""
+    return json.dumps({
+        "type": "rate_limit_event",
+        "rate_limit_info": {"resetsAt": resets_at},
+    }) + "\n"
+
+
+def test_streaming_structured_429_surfaces_reset_from_rate_limit_event(
+    monkeypatch,
+) -> None:
+    # Issue #120: a rate_limit_event carrying resetsAt precedes a structured-429
+    # result envelope whose text has no parseable reset. The captured epoch must
+    # be threaded onto RateLimitSignal.reset_at so the wait resumes precisely.
+    epoch = 1_700_000_000.0
+    structured_429 = _stream_result_event("rejected, try later", is_error=True)
+    # Inject the structured-429 fields the streaming envelope lacks by default.
+    envelope = json.loads(structured_429)
+    envelope["api_error_status"] = 429
+    lines = [_rate_limit_event(int(epoch)), json.dumps(envelope) + "\n"]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    with pytest.raises(RateLimitError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert exc.value.signal.reset_at == epoch
+    # seconds_until_reset honours the epoch, not the full-window fallback.
+    now = epoch - 120
+    assert seconds_until_reset(
+        exc.value.signal, now=now, window_s=18_000
+    ) == 120
+
+
+def test_streaming_structured_429_without_rate_limit_event_keeps_reset_none(
+    monkeypatch,
+) -> None:
+    # Regression guard: a structured 429 with NO prior rate_limit_event still
+    # raises RateLimitError, but reset_at stays None (full-window fallback).
+    structured_429 = json.loads(
+        _stream_result_event("rejected, try later", is_error=True)
+    )
+    structured_429["api_error_status"] = 429
+    lines = [json.dumps(structured_429) + "\n"]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    with pytest.raises(RateLimitError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert exc.value.signal.reset_at is None
+
+
+@pytest.mark.parametrize(
+    "event_dict",
+    [
+        {"type": "rate_limit_event"},  # missing rate_limit_info
+        {"type": "rate_limit_event", "rate_limit_info": {}},  # missing resetsAt
+        {"type": "rate_limit_event", "rate_limit_info": "nope"},  # wrong type
+        {"type": "rate_limit_event", "rate_limit_info": {"resetsAt": "soon"}},
+        {"type": "rate_limit_event", "rate_limit_info": {"resetsAt": None}},
+        {"type": "rate_limit_event", "rate_limit_info": {"resetsAt": True}},
+    ],
+)
+def test_streaming_malformed_rate_limit_event_does_not_crash(
+    monkeypatch, event_dict
+) -> None:
+    # Edge cases: a malformed rate_limit_event must not crash the stream loop and
+    # must leave reset_at None on the structured-429 signal.
+    structured_429 = json.loads(
+        _stream_result_event("rejected, try later", is_error=True)
+    )
+    structured_429["api_error_status"] = 429
+    lines = [json.dumps(event_dict) + "\n", json.dumps(structured_429) + "\n"]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    with pytest.raises(RateLimitError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert exc.value.signal.reset_at is None

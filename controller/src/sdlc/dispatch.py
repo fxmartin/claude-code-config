@@ -179,6 +179,24 @@ def _parse_stream_line(line: str) -> dict[str, Any] | None:
         return None
     return obj if isinstance(obj, dict) else None
 
+
+def _extract_resets_at(event: dict[str, Any]) -> float | None:
+    """The ``resetsAt`` epoch from a ``rate_limit_event`` stream line, or None.
+
+    Issue #120: a structured 429 carries its absolute window-reset epoch as
+    ``{"type": "rate_limit_event", "rate_limit_info": {"resetsAt": <epoch>}}``.
+    Returns the epoch as a float when present and numeric; returns None on any
+    malformed shape (missing ``rate_limit_info``, missing ``resetsAt``, or a
+    non-numeric value) so a defensive parse can never crash the stream loop.
+    """
+    info = event.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return None
+    resets_at = info.get("resetsAt")
+    if isinstance(resets_at, bool) or not isinstance(resets_at, (int, float)):
+        return None
+    return float(resets_at)
+
 # A generous default ceiling. A single story build can legitimately run for
 # many minutes; the controller (not the agent) owns this timeout so a hung
 # agent surfaces as a typed failure instead of blocking the run forever.
@@ -491,6 +509,12 @@ def _dispatch_streaming(
     transcript = _StreamTranscript(transcript_path)
     raw_lines: list[str] = []
     result_event: dict[str, Any] | None = None
+    # Issue #120: a structured 429 surfaces its absolute window-reset epoch on a
+    # separate ``rate_limit_event`` stream line (``rate_limit_info.resetsAt``),
+    # not in the terminal result envelope. Capture it as it passes so the
+    # structured-429 fallback in _interpret() can resume precisely on reset
+    # instead of falling back to the full rolling-window heuristic.
+    stream_resets_at: float | None = None
     try:
         if proc.stdin is not None:
             # A killed child (watchdog) breaks the stdin pipe; tolerate that so
@@ -513,6 +537,10 @@ def _dispatch_streaming(
                     _emit_progress(on_progress, event)
                     if event.get("type") == "result":
                         result_event = event
+                    elif event.get("type") == "rate_limit_event":
+                        captured = _extract_resets_at(event)
+                        if captured is not None:
+                            stream_resets_at = captured
         # Claim completion: if the watchdog hasn't already fired, mark the read
         # done so a later firing is a no-op. If it *has* fired, the kill is what
         # ended the read — honour the timeout.
@@ -557,6 +585,7 @@ def _dispatch_streaming(
         transcript_path,
         envelope=result_event,
         streaming=True,
+        stream_resets_at=stream_resets_at,
     )
 
 
@@ -569,6 +598,7 @@ def _interpret(
     *,
     envelope: dict[str, Any] | None,
     streaming: bool,
+    stream_resets_at: float | None = None,
 ) -> AgentResult:
     """Shared post-collection logic for both the captured and streamed paths.
 
@@ -576,6 +606,12 @@ def _interpret(
     it is derived from ``stdout`` (captured path, or a streamed run whose result
     event never arrived — the graceful fallback). ``streaming`` suppresses the
     transcript rewrite so the live stream is preserved verbatim for ``tail -f``.
+
+    ``stream_resets_at`` (issue #120) is the absolute window-reset epoch captured
+    from a ``rate_limit_event`` stream line on the streaming path; the captured
+    path never sees a stream so it defaults to None. When a structured 429 has no
+    parseable reset in its result text, this epoch is threaded onto the signal so
+    the wait resumes precisely on reset instead of using the full-window fallback.
     """
     if returncode != 0:
         detail = (stderr or stdout or "").strip()
@@ -613,7 +649,9 @@ def _interpret(
                 envelope.get("api_error_status") == 429
                 or envelope.get("error") == "rate_limit"
             ):
-                signal = RateLimitSignal(source="usage-limit")
+                signal = RateLimitSignal(
+                    source="usage-limit", reset_at=stream_resets_at
+                )
             if signal is not None:
                 raise RateLimitError(
                     f"{agent_type} agent hit the rate limit: {detail}",
