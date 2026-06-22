@@ -9,6 +9,16 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 
 > **cmux environment check** — this skill emits cmux sidebar updates via `cmux-bridge.sh`. Before emitting any call whose subcommand is `status`, `progress`, `log`, or `clear`, check whether the `$CMUX_SOCKET_PATH` environment variable is set. If it is **empty** (running outside cmux — e.g. Claude Desktop App), **skip every such call in this skill**: they only drive the cmux sidebar UI and produce no effect elsewhere. Always run `cmux-bridge.sh notify` and `cmux-bridge.sh telegram` calls regardless of environment — they deliver to Telegram even when cmux is absent.
 
+> **Dashboard run logging (Story 11.2-013)** — this skill mirrors its pipeline into the SDLC ledger + host registry so a `fix-issue` session shows up in `sdlc dashboard` beside `sdlc build` runs. It shells out to the minimal `sdlc run-open` / `sdlc run-stage` / `sdlc run-close` verbs (run from the repo root so they hit the repo's `.sdlc-state.db`). **All run-logging is strictly best-effort: every call is suffixed with `2>/dev/null || true`, and if `sdlc` is missing or `$RUN_ID` is empty, skip the rest — a logging failure must never block or fail the fix.**
+>
+> - **Open** (Phase 1, once the issue number is known): `RUN_ID=$(sdlc run-open --scope "issue-$ISSUE_NUMBER" --pid "$PPID" 2>/dev/null || true)`. Pass `--pid "$PPID"` (the long-lived orchestrator process) — **not** the default, which would be this short-lived `sdlc run-open` subprocess and would make the dashboard derive the still-running fix as `DEAD`. Reuse `$RUN_ID` for the rest of this issue. In batch mode each issue opens (and closes) its own run.
+> - **Per phase** — at each dispatched phase's start emit `sdlc run-stage start --run "$RUN_ID" --stage <name> 2>/dev/null || true`, and at its end `sdlc run-stage finish --run "$RUN_ID" --stage <name> --status <DONE|FAILED> 2>/dev/null || true`. Phase→stage names: Phase 3 `investigate`, Phase 4 `build`, Phase 5 `coverage`, Phase 6 `review`, Phase 7 `e2e`, Phase 9 `merge` (`build`/`coverage`/`review`/`merge` map onto the dashboard's pipeline columns; the rest appear in the run's stage history).
+> - **Close — on EVERY exit path once the run is open, not just Phase 11.** A run left open lingers `IN_PROGRESS` forever in the dashboard (the orchestrator is still alive, so dead-pid detection never fires). So before *any* terminal exit after `run-open`, close it:
+>   - **Success** (Phase 11): `sdlc run-close --run "$RUN_ID" --status DONE --completed 1 2>/dev/null || true`.
+>   - **Deliberate stop** (a Phase 2 stop condition — issue closed / assigned elsewhere / `wontfix`; or any other "STOP and report" before a fix is produced): `sdlc run-close --run "$RUN_ID" --status ABORTED --completed 0 2>/dev/null || true`.
+>   - **Failure** (the Phase 8 bugfix loop exhausts its retries / `FIX_STATUS: UNFIXED`, a `MERGE_STATUS: CONFLICT|FAILED`, or any other failure exit): `sdlc run-close --run "$RUN_ID" --status FAILED --completed 0 2>/dev/null || true`.
+>   - Only a genuine process crash should fall through to dead-pid detection — every reachable stop in this skill closes the run explicitly.
+
 You are a **thin dispatcher** orchestrator. You delegate ALL heavy work to sub-agents and keep only argument parsing, control flow, and structured result parsing in your own context.
 
 ## Phase 1: Parse Arguments & Validate Environment (DIRECT)
@@ -81,6 +91,12 @@ bash -c '~/.claude/hooks/cmux-bridge.sh notify "Fix Issue Started" "#[ISSUE_NUMB
 bash -c '~/.claude/hooks/cmux-bridge.sh telegram "🔧 Fix Issue Started" "#[ISSUE_NUMBER] — [ISSUE_TITLE]"'
 ```
 
+Open a dashboard run (best-effort — see the run-logging note above) and capture `RUN_ID` for the rest of this issue:
+
+```bash
+RUN_ID=$(sdlc run-open --scope "issue-$ISSUE_NUMBER" --pid "$PPID" 2>/dev/null || true)
+```
+
 Record `FIX_START_TIME` for duration tracking.
 
 ## Phase 2: Fetch Issue & Validate (DIRECT)
@@ -98,6 +114,12 @@ gh issue view $ISSUE_NUMBER --json number,title,body,state,assignees,labels
 - Issue is `closed`
 - Issue is assigned to someone else (not the current `gh` user)
 - Issue has label `wontfix` or `won't fix`
+
+Before stopping on any of these, close the open dashboard run as aborted (the run-logging note above) so it does not linger `IN_PROGRESS`:
+
+```bash
+sdlc run-close --run "$RUN_ID" --status ABORTED --completed 0 2>/dev/null || true
+```
 
 Extract: `ISSUE_NUMBER`, `ISSUE_TITLE`, `ISSUE_BODY`, `ISSUE_LABELS`.
 
@@ -223,8 +245,10 @@ Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER` (sub-issue), `FIX_STATUS`, `TESTS_PAS
     - If review flagged issues → re-run Phase 6
     - If E2E failed → re-run Phase 7
   - Allow **max 2 bugfix iterations** to prevent infinite loops
-- If `FIX_STATUS: UNFIXED`:
-  - Log the failure details and skip this issue (continue to next issue in batch mode, or STOP if single issue)
+- If `FIX_STATUS: UNFIXED` (or the 2-iteration cap is hit without a passing fix):
+  - Log the failure details
+  - Close the dashboard run as failed (the run-logging note above): `sdlc run-close --run "$RUN_ID" --status FAILED --completed 0 2>/dev/null || true`
+  - Skip this issue (continue to next issue in batch mode, or STOP if single issue)
 
 ## Phase 9: Merge Agent (DISPATCHED — general-purpose, haiku)
 
@@ -242,7 +266,7 @@ The agent merges the PR, comments on and closes the issue, returns to main.
 
 Extract `MERGE_STATUS` from the agent result.
 
-If `MERGE_STATUS: CONFLICT` or `MERGE_STATUS: FAILED` — log error and STOP.
+If `MERGE_STATUS: CONFLICT` or `MERGE_STATUS: FAILED` — log error, close the dashboard run as failed (`sdlc run-close --run "$RUN_ID" --status FAILED --completed 0 2>/dev/null || true`), and STOP.
 
 ## Phase 10: Summary Agent (DISPATCHED — general-purpose, haiku)
 
@@ -315,6 +339,14 @@ bash -c '~/.claude/hooks/cmux-bridge.sh log success "Fix complete: #[ISSUE_NUMBE
 bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Fix Issue Complete" "#[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]"'
 bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Fix Issue Complete" "#[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]"'
 ```
+
+Finalize the dashboard run (best-effort — see the run-logging note above):
+
+```bash
+sdlc run-close --run "$RUN_ID" --status DONE --completed 1 2>/dev/null || true
+```
+
+If the fix instead ended in a terminal failure/abort (e.g. the Phase 8 bugfix loop exhausted its retries), close it `FAILED` rather than `DONE`: `sdlc run-close --run "$RUN_ID" --status FAILED --completed 0 2>/dev/null || true`.
 
 - Use `✅` if all gates passed cleanly, `⚠️` if any gate had warnings
 

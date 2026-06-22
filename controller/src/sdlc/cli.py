@@ -27,6 +27,9 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
     "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
     "depscan": "Classify an osv-scanner report into a CLEAN | WARN | BLOCK gate verdict.",
+    "run-open": "Register a fix-issue run so the dashboard surfaces it.",
+    "run-stage": "Log a fix-issue phase start/finish to the ledger.",
+    "run-close": "Finalize a fix-issue run (DONE/FAILED) in ledger + registry.",
 }
 
 app = typer.Typer(
@@ -494,6 +497,148 @@ def runs(
             f"{str(r.get('state', '?')):<14}{progress:<10}{r.get('repo', '?')}"
         )
     raise typer.Exit(code=0)
+
+
+@app.command(name="run-open", help=PLANNED_SUBCOMMANDS["run-open"])
+def run_open_cmd(
+    scope: str = typer.Option(
+        ..., "--scope", help="The issue being fixed (e.g. issue-42); the run's scope."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    repo: Path | None = typer.Option(
+        None, "--repo", help="Repo path recorded in the registry (default: cwd)."
+    ),
+    mode: str = typer.Option(
+        "fix-issue", "--mode", help="Run lineage tag (default: fix-issue)."
+    ),
+    story_id: str | None = typer.Option(
+        None, "--story-id", help="Synthetic story id (default: the scope)."
+    ),
+    title: str | None = typer.Option(
+        None, "--title", help="Human title for the run's story (default: the scope)."
+    ),
+    pid: int | None = typer.Option(
+        None,
+        "--pid",
+        help="Orchestrator pid whose liveness stands in for the run's (a markdown "
+        "skill passes its $PPID, not this subprocess's pid). Default: this process.",
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit {run_id, db, story_id} as JSON instead of the id."
+    ),
+) -> None:
+    """Open a fix-issue run in the ledger + host registry.
+
+    Minimal run-logging verb the markdown ``fix-issue`` skill shells out to so its
+    session shows up in the multi-run dashboard beside ``sdlc build`` runs. Prints
+    the new run id on stdout for the skill to capture; exits non-zero when logging
+    is unavailable so the skill's best-effort guard (``|| true``) can carry on.
+
+    Pass ``--pid`` the *orchestrator's* long-lived pid (the skill's ``$PPID``): the
+    ``sdlc run-open`` process itself exits immediately, so registering its own pid
+    would make the registry derive a still-running fix ``DEAD``.
+    """
+    from sdlc.runlog import run_open
+
+    handle = run_open(
+        scope=scope,
+        db=db,
+        repo=repo,
+        mode=mode,
+        story_id=story_id,
+        title=title,
+        pid=pid,
+    )
+    if handle is None:
+        typer.echo("run-open: logging unavailable (fix continues unlogged).", err=True)
+        raise typer.Exit(code=1)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {"run_id": handle.run_id, "db": handle.db, "story_id": handle.story_id}
+            )
+        )
+    else:
+        typer.echo(handle.run_id)
+    raise typer.Exit(code=0)
+
+
+@app.command(name="run-stage", help=PLANNED_SUBCOMMANDS["run-stage"])
+def run_stage_cmd(
+    action: str = typer.Argument(..., help="start | finish"),
+    run: str = typer.Option(..., "--run", help="Run id from run-open."),
+    stage: str = typer.Option(
+        ..., "--stage", help="Phase name (investigate/build/coverage/review/e2e/merge)."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    story_id: str | None = typer.Option(
+        None, "--story-id", help="Story id (default: the run's sole story)."
+    ),
+    attempt: int = typer.Option(1, "--attempt", help="Attempt number (default: 1)."),
+    status: str = typer.Option(
+        "DONE", "--status", help="Terminal status for `finish` (default: DONE)."
+    ),
+    failure_category: str = typer.Option(
+        "", "--failure-category", help="Optional failure category for `finish`."
+    ),
+) -> None:
+    """Log a fix-issue phase boundary to the ledger (best-effort).
+
+    ``start`` appends an IN_PROGRESS stage row; ``finish`` transitions it to
+    ``--status``. Exits 2 on a bad action and 1 when the write failed, so the
+    skill can ignore logging failures without aborting the fix.
+    """
+    if action not in ("start", "finish"):
+        typer.echo("run-stage: action must be 'start' or 'finish'.", err=True)
+        raise typer.Exit(code=2)
+
+    from sdlc.runlog import run_stage
+
+    ok = run_stage(
+        action=action,
+        run_id=run,
+        stage=stage,
+        db=db,
+        story_id=story_id,
+        attempt=attempt,
+        status=status,
+        failure_category=failure_category,
+    )
+    raise typer.Exit(code=0 if ok else 1)
+
+
+@app.command(name="run-close", help=PLANNED_SUBCOMMANDS["run-close"])
+def run_close_cmd(
+    run: str = typer.Option(..., "--run", help="Run id from run-open."),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    status: str = typer.Option(
+        "DONE", "--status", help="Terminal run status (DONE/FAILED/ABORTED)."
+    ),
+    completed: int | None = typer.Option(
+        None, "--completed", help="Completed count recorded on the run + registry."
+    ),
+    story_id: str | None = typer.Option(
+        None, "--story-id", help="Story id (default: the run's sole story)."
+    ),
+) -> None:
+    """Finalize a fix-issue run terminal in the ledger and the registry.
+
+    Stamps the run (and its sole story) ``--status`` and mirrors it into the
+    registry so a clean finish stops deriving as DEAD. Exits 1 when the ledger
+    write failed; the registry mirror is best-effort.
+    """
+    from sdlc.runlog import run_close
+
+    ok = run_close(
+        run_id=run, db=db, status=status, completed=completed, story_id=story_id
+    )
+    raise typer.Exit(code=0 if ok else 1)
 
 
 @app.command(help="Serve a local web dashboard of live build progress.")
