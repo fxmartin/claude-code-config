@@ -48,6 +48,12 @@ def test_duration_seconds_negative_span_degrades_to_none() -> None:
     assert _duration_seconds("2026-06-20 11:04:12", "2026-06-20 11:00:00") is None
 
 
+def test_duration_seconds_unparseable_finish_is_none() -> None:
+    # A present-but-garbage finished_at parses to None → degrade (no `now`
+    # fallback, since finished_at is truthy) rather than render NaN.
+    assert _duration_seconds("2026-06-20 11:00:00", "not-a-date") is None
+
+
 def test_story_duration_spans_earliest_start_to_latest_finish() -> None:
     stages = [
         {"name": "build", "started_at": "2026-06-20 11:00:00", "finished_at": "2026-06-20 11:02:00"},
@@ -74,3 +80,13 @@ def test_story_duration_no_started_stages_is_none() -> None:
 
 def test_story_duration_empty_is_none() -> None:
     assert _story_duration_seconds([], now=_NOW) is None
+
+
+def test_story_duration_finished_with_unparseable_finishes_is_none() -> None:
+    # Not in-flight (every started stage has a truthy finished_at), but all
+    # finish timestamps are garbage → no parseable end → degrade to None.
+    stages = [
+        {"name": "build", "started_at": "2026-06-20 11:00:00", "finished_at": "garbage"},
+        {"name": "review", "started_at": "2026-06-20 11:03:00", "finished_at": "also-bad"},
+    ]
+    assert _story_duration_seconds(stages, now=_NOW) is None
