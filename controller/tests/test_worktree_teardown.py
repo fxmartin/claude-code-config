@@ -106,6 +106,35 @@ def test_remove_worktree_outside_repo_is_non_fatal(tmp_path) -> None:
     assert remove_story_worktree(plain, plain / "nope") is False
 
 
+def test_remove_worktree_clears_untracked_leftover_dir(tmp_path) -> None:
+    """A directory git never registered as a worktree (crash debris that was
+    deregistered but not deleted) is still wiped from disk by the belt-and-braces
+    ``rmtree`` so the checkout cannot linger, and removal reports success."""
+    work = _repo_with_origin(tmp_path)
+    leftover = work / ".claude" / "worktrees" / "agent-orphan-17.2-002"
+    leftover.mkdir(parents=True)
+    (leftover / "junk.txt").write_text("crash debris\n")
+    # Present on disk, but not one of git's registered worktrees.
+    assert leftover.resolve() not in _registered(work)
+
+    assert remove_story_worktree(work, leftover) is True
+    assert not leftover.exists()
+
+
+def test_remove_worktree_returns_false_on_internal_error(tmp_path, monkeypatch) -> None:
+    """A genuine git/OS failure mid-removal is swallowed and reported as ``False``
+    (never raised) so close-out cannot fail an otherwise-good story."""
+    work = _repo_with_origin(tmp_path)
+
+    def _boom(_root):
+        raise OSError("git worktree list exploded")
+
+    # The registration probe is inside the guarded block; its failure must
+    # degrade to False rather than escape.
+    monkeypatch.setattr("sdlc.build._worktree_registered_paths", _boom)
+    assert remove_story_worktree(work, work / "whatever") is False
+
+
 # ---------------------------------------------------------------------------
 # _teardown_story_workdir: ledger-driven close-out (AC1)
 # ---------------------------------------------------------------------------
@@ -163,6 +192,30 @@ def test_teardown_skipped_for_fake_run(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("sdlc.build.remove_story_worktree", _boom)
     _teardown_story_workdir(ledger, run_id, "17.2-002", real_run=False)
     assert called["hit"] is False
+
+
+def test_teardown_warns_when_removal_fails(tmp_path, monkeypatch) -> None:
+    """When the worktree removal fails, teardown logs a warning (the
+    orphan-sweeper reclaims the worktree later) rather than raising — close-out
+    of an otherwise-good story must never blow up on a teardown hiccup."""
+    work = _repo_with_origin(tmp_path)
+    monkeypatch.chdir(work)
+    ledger = Ledger(work / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-17", "parallel")
+    ledger.story_upsert(
+        run_id, "17.2-002", "17", "Teardown", "P2", 5, "py", "", None, "TODO"
+    )
+    ledger.set_story_worktree(
+        run_id, "17.2-002", str(work / ".claude" / "worktrees" / "agent-x")
+    )
+    # Force the removal to report failure so the warn branch is taken.
+    monkeypatch.setattr("sdlc.build.remove_story_worktree", lambda *a, **k: False)
+
+    _teardown_story_workdir(ledger, run_id, "17.2-002", real_run=True)
+
+    messages = [e["message"] for e in ledger.recent_events(run_id, limit=20)]
+    assert any("could not remove worktree" in m for m in messages)
 
 
 def test_teardown_only_touches_its_own_story_worktree(tmp_path, monkeypatch) -> None:
@@ -347,6 +400,138 @@ def test_resume_end_crash_only_run_finalises_and_tears_down(
     rows = {r["story_id"]: r["status"] for r in Ledger(db).story_rows(run_id)}
     assert rows["99.1-001"] == "DONE"
     assert "99.1-001" in torn_down
+
+
+# ---------------------------------------------------------------------------
+# parallel resume close-out: the cohort-loop disposition branches (Story 17.2)
+# ---------------------------------------------------------------------------
+
+def test_parallel_resume_end_crash_closeout_tears_down_without_dispatch(
+    tmp_path, monkeypatch
+) -> None:
+    """On the *parallel* resume path (mode != serial → workers > 1), an end-crash
+    story (all stages DONE, status never finalised) is closed out DONE and its
+    worktree torn down with no dispatch; an already-terminal peer is skipped. With
+    nothing dispatchable in either cohort the pool is never invoked (covers the
+    parallel end-crash close-out + the no-dispatchable short-circuit)."""
+    from sdlc import resume as resume_mod
+    from sdlc.resume import run_resume
+    from test_build import FakeDispatcher
+    from test_resume import _make_project
+
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    ledger.set_total(run_id, 2)
+    ledger.event_log(
+        run_id, "", "info", "config", json.dumps({"skip_coverage": True})
+    )
+    ledger.story_upsert(
+        run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    ledger.story_upsert(
+        run_id, "99.1-002", "99", "Two", "P2", 2, "general-purpose", "", None, "TODO"
+    )
+    # 99.1-001: end-crash (all stages DONE, status IN_PROGRESS) with a worktree.
+    for stage in ("build", "review", "merge"):
+        ledger.stage_start(run_id, "99.1-001", stage, 1)
+        ledger.stage_finish(run_id, "99.1-001", stage, 1, "DONE")
+    ledger.set_story_pr(run_id, "99.1-001", 100)
+    ledger.set_story_status(run_id, "99.1-001", "IN_PROGRESS")
+    ledger.set_story_worktree(run_id, "99.1-001", "/tmp/agent-x-99.1-001")
+    # 99.1-002 (depends on 99.1-001): already terminal DONE → skipped, never re-run.
+    for stage in ("build", "review", "merge"):
+        ledger.stage_start(run_id, "99.1-002", stage, 1)
+        ledger.stage_finish(run_id, "99.1-002", stage, 1, "DONE")
+    ledger.set_story_pr(run_id, "99.1-002", 100)
+    ledger.set_story_status(run_id, "99.1-002", "DONE")
+
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        resume_mod,
+        "_teardown_story_workdir",
+        lambda _l, _r, sid, *, real_run: torn_down.append(sid),
+    )
+
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-99", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path
+    )
+
+    assert result.story_status["99.1-001"] == "DONE"
+    assert "99.1-001" in torn_down  # end-crash close-out reached teardown
+    assert dispatcher.calls == []   # neither cohort had a dispatchable story
+
+
+def test_parallel_resume_blocks_story_when_dependency_failed(
+    tmp_path, monkeypatch
+) -> None:
+    """On the parallel resume path, a story whose dependency fails on re-dispatch
+    is marked BLOCKED before dispatch and never submitted to the pool (R2/R4).
+    The failed dependency runs in cohort 1; the dependent's cohort then finds it
+    FAILED and blocks it without dispatch."""
+    from sdlc.resume import run_resume
+    from test_build import FakeDispatcher
+    from test_resume import _make_project
+
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    ledger.set_total(run_id, 2)
+    # auto=True so the bugfix loop runs to its UNFIXED verdict without an
+    # interactive gate; skip_coverage keeps the pipeline build->review->merge.
+    ledger.event_log(
+        run_id, "", "info", "config", json.dumps({"skip_coverage": True, "auto": True})
+    )
+    ledger.story_upsert(
+        run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    ledger.story_upsert(
+        run_id, "99.1-002", "99", "Two", "P2", 2, "general-purpose", "", None, "TODO"
+    )
+    # 99.1-001 (no dependency): re-enters at build and fails permanently.
+    ledger.stage_start(run_id, "99.1-001", "build", 1)  # IN_PROGRESS → next_stage build
+    ledger.set_story_status(run_id, "99.1-001", "IN_PROGRESS")
+    # 99.1-002 (depends on 99.1-001): genuinely incomplete (review interrupted) so
+    # the run has real work; its only dependency FAILS, so it must be BLOCKED.
+    ledger.stage_start(run_id, "99.1-002", "build", 1)
+    ledger.stage_finish(run_id, "99.1-002", "build", 1, "DONE")
+    ledger.set_story_pr(run_id, "99.1-002", 100)
+    ledger.stage_start(run_id, "99.1-002", "review", 1)  # left IN_PROGRESS
+    ledger.set_story_status(run_id, "99.1-002", "IN_PROGRESS")
+
+    dispatcher = FakeDispatcher(
+        overrides={
+            ("build", "99.1-001"): {
+                "branch_name": "feature/99.1-001",
+                "build_status": "FAILED",
+                "commit_sha": "0",
+                "error_summary": "nope",
+            },
+            ("bugfix", "99.1-001"): {
+                "failure_category": "CODE_BUG",
+                "fix_status": "UNFIXED",
+                "tests_passing": False,
+                "bugs_fixed": 0,
+                "tests_fixed": 0,
+            },
+        }
+    )
+    result = run_resume(
+        "epic-99", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path
+    )
+
+    assert result.story_status["99.1-001"] == "FAILED"
+    assert result.story_status["99.1-002"] == "BLOCKED"
+    # The blocked story was never dispatched (no review re-entry for it).
+    assert ("review", "99.1-002") not in dispatcher.calls
+    # The ledger persisted the BLOCKED disposition.
+    rows = {r["story_id"]: r["status"] for r in Ledger(db).story_rows(run_id)}
+    assert rows["99.1-002"] == "BLOCKED"
 
 
 def test_create_worktree_recreates_after_stale_dir(tmp_path) -> None:
