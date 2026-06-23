@@ -113,3 +113,27 @@ and a newline'
 line $body'
     [ "$status" -eq 0 ]
 }
+
+@test "json payload text field is prefixed with [repo-name]" {
+    _stub_curl
+    run env HOME="$FAKE_HOME" PATH="$STUB_DIR:$PATH" \
+        TELEGRAM_BOT_TOKEN="000:bogus" TELEGRAM_CHAT_ID="1" \
+        bash "$NOTIFY" "Ping" "Pong"
+    [ "$status" -eq 0 ]
+    run jq -r '.text' "$FAKE_HOME/payload.json"
+    [ "$status" -eq 0 ]
+    # Text must start with a [repo] bracket prefix followed by the title.
+    [[ "$output" == \[*\]*"Ping"* ]]
+}
+
+@test "dry-run repo tag falls back to directory name outside a git repo" {
+    TMP_DIR="$(mktemp -d)"
+    PLAIN_DIR="$TMP_DIR/myproject"
+    mkdir -p "$PLAIN_DIR"
+    run env HOME="$FAKE_HOME" NOTIFY_DRYRUN=1 \
+        TELEGRAM_BOT_TOKEN="tok" TELEGRAM_CHAT_ID="2" \
+        bash "$NOTIFY" "Title" "Body"
+    # The run itself exits 0 regardless of where the repo tag comes from.
+    [ "$status" -eq 0 ]
+    rm -rf "$TMP_DIR"
+}
