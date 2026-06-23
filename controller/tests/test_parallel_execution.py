@@ -761,3 +761,14 @@ def test_resume_widening_a_real_serial_run_actually_fans_out(tmp_path) -> None:
     assert ledger.run_row(rid)["mode"] == "parallel"
     snap = status_snapshot(ledger, rid)
     assert snap["run"]["concurrency"]["limit"] == 4
+
+
+def test_effective_worker_limit_non_numeric_config_falls_back_to_default() -> None:
+    """A parallel run whose persisted ``concurrency`` is a non-numeric string
+    (a corrupt/legacy ledger) must not crash: the unparseable value is swallowed
+    and the cap falls back to the build default rather than zero (Story 17.3-001)."""
+    from sdlc.build import _effective_worker_limit
+
+    assert _effective_worker_limit("parallel", {"concurrency": "lots"}) == (
+        BuildOptions.concurrency
+    )
