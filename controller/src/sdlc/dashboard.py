@@ -351,7 +351,17 @@ _PAGE = """<!doctype html>
   .SKIPPED { background: var(--surface); color: var(--sub); }
   .TODO { background: var(--crust); color: var(--overlay); }
   .PENDING { background: var(--crust); color: var(--overlay); }
-  .substage > td { border-bottom: 1px solid var(--surface); padding-top: 0; color: var(--sub); }
+  /* Story 11.2-014: the activity line is the third row of a story's stacked
+     block — no inner border below it; the next block's title-row border-top is
+     the separator (see .story-title below). */
+  .substage > td { border-bottom: none; padding-top: 0; color: var(--sub); }
+  /* Story 11.2-014: each story is a stacked block of three rows — a full-width
+     title row, a step-columns row, then the activity line. A border-top on the
+     title row sets one block apart from the next; the inner borders between the
+     three rows are removed so the block reads as a single unit. */
+  .story-title > td { border-top: 1px solid var(--surface); border-bottom: none;
+                      padding-bottom: 2px; }
+  .story-stages > td { border-bottom: none; padding-top: 2px; padding-bottom: 2px; }
   .substage .kind { color: var(--blue); margin-right: 4px; }
   /* Story 11.2-011: stable-height live regions. #head (run summary), the
      per-story .substage activity line, and #updated all re-render on every SSE
@@ -408,12 +418,12 @@ _PAGE = """<!doctype html>
      per story opens a modal listing that story's stage transcripts and renders
      each inline — no leaving the page. The new-tab /log link stays as fallback. */
   .view-session { cursor: pointer; font-size: 11px; color: var(--blue); margin-left: 6px; white-space: nowrap; }
-  /* Story 11.2-012: the human-readable story title beside its ID. Ellipsized to
-     keep rows stable (11.2-011 no-reflow goal); full title shown on hover via
-     the title= tooltip. A null/empty title renders nothing (degrades to ID). */
-  .stitle { color: var(--sub); display: inline-block; max-width: 22em;
-            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-            vertical-align: bottom; }
+  /* Story 11.2-012 / 11.2-014: the human-readable story title beside its ID.
+     The title now owns a full-width row (.story-title), so the 22em ellipsis
+     truncation is dropped — it is shown in full and may wrap freely. The title
+     is static per render, so wrapping never reflows on an SSE tick (11.2-011).
+     A null/empty title renders nothing (degrades to just the ID). */
+  .stitle { color: var(--sub); }
   .modal { position: fixed; inset: 0; z-index: 50; background: rgba(76,79,105,.45);
            display: flex; align-items: center; justify-content: center; padding: 24px; }
   .modal[hidden] { display: none; }
@@ -579,12 +589,13 @@ function activityRow(s){
   if(!a) return "";  // no streamed sub-stage data → stay stage-level
   const glyph = KIND_GLYPH[a.kind] || "▸";
   const stage = a.stage ? "<code>"+esc(a.stage)+"</code> " : "";
-  // Span every column but the leading story cell so the activity reads as a
-  // continuation of its story row. Update the colspan if columns change.
+  // Story 11.2-014: span the full 8-column width as the third row of the story's
+  // stacked block (the leading story column is gone). The colspan is hard-coupled
+  // to the header column count — keep it in sync with renderMain's <th> row.
   // Story 11.2-011: the content rides in a `.act` element clamped to one
   // ellipsized line (full message on hover) so a refresh/SSE tick never grows
   // this row from 1 to 2–3 lines and reflows the table below it.
-  return "<tr class='substage'><td></td>"
+  return "<tr class='substage'>"
     + "<td colspan='8' class='small'><div class='act' title='"+esc(a.message)+"'><span class='kind'>"+glyph+"</span>"
     + stage + esc(a.message)
     + (a.ts ? " <span class='muted' title='"+esc(a.ts)+"'>"+esc(fmtLocal(a.ts))+"</span>" : "") + "</div></td></tr>";
@@ -745,14 +756,21 @@ function renderMain(d){
     const tok = s.tokens!=null
       ? humanTokens(s.tokens)+(s.cost_usd!=null?(" "+usd(s.cost_usd)):"")
       : "—";
-    // Story 11.2-012: show the title beside the ID (id · title), ellipsized with
-    // the full text on hover. A null/empty title degrades to just the ID.
+    // Story 11.2-014: each story is a stacked block of three rows in the single
+    // table — (1) a full-width title row `id · title  view session` shown in
+    // full (no ellipsis: the title is static per render, so wrapping never
+    // reflows on an SSE tick), (2) a step-columns row aligned under the headers,
+    // and (3) the existing live activity line spanning the full width below.
+    // The `story` header column is dropped → 8 columns; the title and activity
+    // rows span them with colspan='8' (hard-coupled to the column count — update
+    // both this and the header together). Supersedes the 11.2-012 truncation.
+    // Story 11.2-012: a null/empty title degrades to just the ID.
     const stitle = s.title
       ? " <span class='sep muted'>\\u00b7</span> <span class='stitle' title='"+esc(s.title)+"'>"+esc(s.title)+"</span>"
       : "";
-    return "<tr><td><code>"+esc(s.story_id)+"</code>"+stitle
-    + "<a class='view-session' data-story='"+esc(s.story_id)+"' title='read this story\\u2019s agent transcripts here'>view session</a></td>"
-    + "<td>"+badge(s.status)+bug+"</td>"
+    return "<tr class='story-title'><td colspan='8'><code>"+esc(s.story_id)+"</code>"+stitle
+    + "<a class='view-session' data-story='"+esc(s.story_id)+"' title='read this story\\u2019s agent transcripts here'>view session</a></td></tr>"
+    + "<tr class='story-stages'><td>"+badge(s.status)+bug+"</td>"
     + stageCells
     + "<td>"+pr+"</td>"
     + "<td class='muted small'>"+tok+"</td>"
@@ -760,7 +778,7 @@ function renderMain(d){
     + activityRow(s);
   }).join("");
   document.getElementById("stories").innerHTML = rows
-    ? "<table><tr><th>story</th><th>status</th><th>build</th><th>QA</th>"
+    ? "<table><tr><th>status</th><th>build</th><th>QA</th>"
       + "<th>review</th><th>merge</th><th>PR</th><th>tokens</th><th>duration</th></tr>"+rows+"</table>"
     : "<p class='muted'>no stories yet…</p>";
   renderDag(d);
