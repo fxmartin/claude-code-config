@@ -224,7 +224,7 @@ The orchestrator prints a final summary with the merged-PR manifest. On GitHub, 
 The pipeline fails gracefully. The three most common failure modes:
 
 1. **Preflight test red** — your local `main` is already broken. Fix the failing test before re-running. The orchestrator will refuse to start otherwise.
-2. **Agent dispatch fail** — usually a Claude Code permission prompt waiting in the background. Check the cmux permission pill (red) or the Claude Code permission dialog and accept; the agent will resume.
+2. **Agent dispatch fail** — usually a Claude Code permission prompt waiting in the background. Check the Claude Code permission dialog and accept; the agent will resume.
 3. **Merge conflict** — two stories in the same cohort touched overlapping files. The merge agent will report `MERGE_CONFLICT <story-id>` and skip it. Re-run with `/build-stories resume` after fixing the conflict.
 
 If the pipeline gives up on a story (status `FAILED` after two retries), its dependents in later cohorts become `BLOCKED`. The Summary agent emits a clear failed-stories list at the end so you can decide whether to retry, refactor, or defer.
@@ -237,14 +237,7 @@ These are **opt-in**. Skip them on your first install and add them later if you 
 
 ### cmux (macOS only)
 
-[cmux](https://www.cmux.dev/) is a native macOS terminal built on Ghostty for multi-agent AI development. With cmux running, the harness emits:
-
-- **Status pills** showing the current phase and story
-- **Progress bar** showing global run progress (`Cohort 2/4, Stage 3/4`)
-- **Sidebar ledger** of structured per-agent events
-- **Desktop notifications** on milestones (preflight failure, first story failure, finish)
-
-Without cmux, every call to `cmux-bridge.sh` silently no-ops. Nothing in the pipeline depends on cmux being present. **WSL2 colleagues: cmux is macOS-only and the `dev()` shell helper is a no-op stub for you** — your pipeline runs identically, just without the sidebar UI. See [`docs/cmux-integration.md`](cmux-integration.md) for setup details.
+[cmux](https://www.cmux.dev/) is a native macOS terminal built on Ghostty for multi-agent AI development. It is purely an optional terminal app — the harness no longer integrates with it, so the pipeline behaves identically whether or not you run inside cmux. The `dev()` shell helper launches it on macOS; **WSL2 colleagues: cmux is macOS-only and `dev()` is a no-op stub for you.**
 
 ### Telegram notifications
 

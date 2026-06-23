@@ -7,7 +7,7 @@ argument-hint: "<issue-number|issue-url|next|all> [--skip-coverage] [--e2e-gate=
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent
 ---
 
-> **cmux environment check** — this skill emits cmux sidebar updates via `cmux-bridge.sh`. Before emitting any call whose subcommand is `status`, `progress`, `log`, or `clear`, check whether the `$CMUX_SOCKET_PATH` environment variable is set. If it is **empty** (running outside cmux — e.g. Claude Desktop App), **skip every such call in this skill**: they only drive the cmux sidebar UI and produce no effect elsewhere. Always run `cmux-bridge.sh notify` and `cmux-bridge.sh telegram` calls regardless of environment — they deliver to Telegram even when cmux is absent.
+> **Notifications** — this skill sends Telegram pings at lifecycle milestones via `~/.claude/hooks/notify-telegram.sh "<title>" "<body>"`, called unconditionally (Telegram-only; a silent no-op when unconfigured). There are no sidebar or desktop notifications.
 
 > **Dashboard run logging (Story 11.2-013)** — this skill mirrors its pipeline into the SDLC ledger + host registry so a `fix-issue` session shows up in `sdlc dashboard` beside `sdlc build` runs. It shells out to the minimal `sdlc run-open` / `sdlc run-stage` / `sdlc run-close` verbs (run from the repo root so they hit the repo's `.sdlc-state.db`). **All run-logging is strictly best-effort: every call is suffixed with `2>/dev/null || true`, and if `sdlc` is missing or `$RUN_ID` is empty, skip the rest — a logging failure must never block or fail the fix.**
 >
@@ -85,10 +85,7 @@ Determine `AGENT_TYPE` for the build agent:
 ### Notification: Fix Started
 
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Validating issue" --icon hammer --color "#007AFF"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.09 --label "Phase 1: Validate"'
-bash -c '~/.claude/hooks/cmux-bridge.sh notify "Fix Issue Started" "#[ISSUE_NUMBER] — [ISSUE_TITLE]"'
-bash -c '~/.claude/hooks/cmux-bridge.sh telegram "🔧 Fix Issue Started" "#[ISSUE_NUMBER] — [ISSUE_TITLE]"'
+bash -c '~/.claude/hooks/notify-telegram.sh "🔧 Fix Issue Started" "#[ISSUE_NUMBER] — [ISSUE_TITLE]"'
 ```
 
 Open a dashboard run (best-effort — see the run-logging note above) and capture `RUN_ID` for the rest of this issue:
@@ -100,11 +97,6 @@ RUN_ID=$(sdlc run-open --scope "issue-$ISSUE_NUMBER" --pid "$PPID" 2>/dev/null |
 Record `FIX_START_TIME` for duration tracking.
 
 ## Phase 2: Fetch Issue & Validate (DIRECT)
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Fetching issue" --icon hammer --color "#007AFF"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.18 --label "Phase 2: Fetch issue"'
-```
 
 ```bash
 gh issue view $ISSUE_NUMBER --json number,title,body,state,assignees,labels
@@ -125,11 +117,6 @@ Extract: `ISSUE_NUMBER`, `ISSUE_TITLE`, `ISSUE_BODY`, `ISSUE_LABELS`.
 
 ## Phase 3: Investigation Agent (DISPATCHED — general-purpose, sonnet)
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Investigating" --icon hammer --color "#007AFF"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.27 --label "Phase 3: Investigate"'
-```
-
 Launch a `general-purpose` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/investigation-agent-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
@@ -145,11 +132,6 @@ If `INVESTIGATION_STATUS: BLOCKED` — log the reason, skip this issue, and cont
 
 ## Phase 4: Build Agent (DISPATCHED — dynamic AGENT_TYPE, opus)
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Building fix" --icon hammer --color "#FF9500"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.36 --label "Phase 4: Build"'
-```
-
 Launch an agent with `subagent_type` set to `AGENT_TYPE` (detected in Phase 1) and model: **opus**, with the prompt from `${CLAUDE_SKILL_DIR}/build-agent-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
@@ -164,11 +146,6 @@ Launch an agent with `subagent_type` set to `AGENT_TYPE` (detected in Phase 1) a
 **If coverage enabled** (default): Extract `BRANCH_NAME` and `BUILD_STATUS` from the agent result. Proceed to Phase 5.
 
 ## Phase 5: Coverage Gate (DISPATCHED — qa-engineer, sonnet) — skip if `--skip-coverage`
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Coverage check" --icon hammer --color "#FF9500"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.45 --label "Phase 5: Coverage"'
-```
 
 Launch a `qa-engineer` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/coverage-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -186,11 +163,6 @@ If the coverage agent fails entirely — proceed to Phase 8 (bugfix loop).
 
 ## Phase 6: Review Gate (DISPATCHED — senior-code-reviewer, opus)
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Code review" --icon hammer --color "#FF9500"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.64 --label "Phase 6: Review"'
-```
-
 Launch a `senior-code-reviewer` agent (model: **opus**) with the prompt from `${CLAUDE_SKILL_DIR}/review-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
@@ -203,11 +175,6 @@ Extract `APPROVAL_STATUS`, `REVIEW_SUMMARY`, and `FIXES_APPLIED` from the agent 
 If `APPROVAL_STATUS: CHANGES_NEEDED` persists after the review agent's fixes, proceed to Phase 8 (bugfix loop).
 
 ## Phase 7: E2E Gate (DISPATCHED — qa-engineer, sonnet) — skip unless `--e2e-gate=block|warn`
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "E2E testing" --icon hammer --color "#FF9500"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.73 --label "Phase 7: E2E"'
-```
 
 Launch a `qa-engineer` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/e2e-gate-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -222,11 +189,6 @@ Handle result per `--e2e-gate` mode:
 If FAIL with `--e2e-gate=warn`, log the failure and proceed (do not block).
 
 ## Phase 8: Bugfix Loop (on any gate failure — general-purpose, opus)
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Bugfix loop" --icon hammer --color "#FF3B30"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log warning "Gate failure — entering bugfix loop" --source fix-issue'
-```
 
 Launch a `general-purpose` agent (model: **opus**) with the prompt from `${CLAUDE_SKILL_DIR}/bugfix-agent-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -252,11 +214,6 @@ Extract `FAILURE_CATEGORY`, `ISSUE_NUMBER` (sub-issue), `FIX_STATUS`, `TESTS_PAS
 
 ## Phase 9: Merge Agent (DISPATCHED — general-purpose, haiku)
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Merging" --icon hammer --color "#34C759"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.82 --label "Phase 9: Merge"'
-```
-
 Once all gates pass, launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAUDE_SKILL_DIR}/merge-agent-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
 - `{{ISSUE_TITLE}}` → current issue title
@@ -269,11 +226,6 @@ Extract `MERGE_STATUS` from the agent result.
 If `MERGE_STATUS: CONFLICT` or `MERGE_STATUS: FAILED` — log error, close the dashboard run as failed (`sdlc run-close --run "$RUN_ID" --status FAILED --completed 0 2>/dev/null || true`), and STOP.
 
 ## Phase 10: Summary Agent (DISPATCHED — general-purpose, haiku)
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Summarizing" --icon hammer --color "#34C759"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.91 --label "Phase 10: Summary"'
-```
 
 Launch a `general-purpose` agent (model: **haiku**) with the prompt from `${CLAUDE_SKILL_DIR}/summary-prompt.md`, substituting:
 - `{{ISSUE_NUMBER}}` → current issue number
@@ -301,28 +253,12 @@ The agent produces a formatted markdown summary.
 ## Phase 10b: Documentation Update (DISPATCHED — general-purpose, sonnet) — batch mode only
 
 In batch mode (when multiple issues were fixed), update documentation once after all issues are processed:
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Updating docs" --icon pencil --color "#5856D6"'
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 0.95 --label "Phase 10b: Docs"'
-```
-
 If at least one issue was fixed successfully, launch a `general-purpose` agent (model: **sonnet**) with the prompt from `${CLAUDE_SKILL_DIR}/doc-update-prompt.md`, substituting:
 - `{{SCOPE}}` → batch scope description (e.g., "all open issues" or "next 5 bugs")
 - `{{COMPLETED_ISSUES}}` → comma-separated list of fixed issue numbers and titles
 - `{{COMPLETED_PRS}}` → comma-separated list of merged PR numbers
 
 The agent reviews all fixes and updates README + story docs in a single pass. **Non-blocking** — if it fails, the batch still reports success.
-
-On success:
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "Documentation updated for [N] fixed issues" --source fix-issue'
-```
-
-On failure:
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh log warning "Documentation update failed — manual review needed" --source fix-issue'
-```
 
 Skip this phase entirely for single-issue fixes (the PostToolUse hook handles those).
 
@@ -333,11 +269,7 @@ Print the formatted summary returned by the summary agent.
 ### Notification: Fix Complete
 
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh progress 1.0 --label "Complete"'
-bash -c '~/.claude/hooks/cmux-bridge.sh status fix-issue "Complete" --icon sparkle --color "#34C759"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "Fix complete: #[ISSUE_NUMBER] — [ISSUE_TITLE]" --source fix-issue'
-bash -c '~/.claude/hooks/cmux-bridge.sh notify "[EMOJI] Fix Issue Complete" "#[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]"'
-bash -c '~/.claude/hooks/cmux-bridge.sh telegram "[EMOJI] Fix Issue Complete" "#[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]"'
+bash -c '~/.claude/hooks/notify-telegram.sh "[EMOJI] Fix Issue Complete" "#[ISSUE_NUMBER] — [ISSUE_TITLE]\nPR: #[PR_NUMBER]\nDuration: [DURATION]"'
 ```
 
 Finalize the dashboard run (best-effort — see the run-logging note above):
@@ -401,10 +333,6 @@ From the example above:
 - **Parallel Group C**: Issue #71 (independent)
 
 Groups A, B, and C run their stages concurrently. Within Group A, #42 completes fully before #63 starts.
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh log info "Parallel batch: [N] issues in [G] groups ([S] serialized due to file overlap)" --source fix-issue'
-```
 
 #### Phase P3: Parallel Build (concurrent, worktree-isolated)
 
@@ -486,11 +414,7 @@ If any serial groups have remaining issues after the first round:
 
 #### Progress Tracking in Parallel Mode
 
-The orchestrator tracks progress centrally — agents do NOT update any shared progress files. Progress notifications update per-stage:
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh progress [FRACTION] --label "Stage [S]: [stage-name] ([N] issues)"'
-```
+The orchestrator tracks progress centrally — agents do NOT update any shared progress files.
 
 ## Context Budget Rules
 

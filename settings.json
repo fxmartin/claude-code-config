@@ -11,10 +11,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/cmux-session-start.sh"
-          },
-          {
-            "type": "command",
             "command": "~/.claude/hooks/forge-worktree-bootstrap.sh"
           }
         ]
@@ -25,21 +21,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/cmux-agent-start.sh"
-          },
-          {
-            "type": "command",
             "command": "~/.claude/hooks/forge-worktree-bootstrap.sh"
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/cmux-agent-stop.sh"
           }
         ]
       }
@@ -49,34 +31,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/cmux-stop.sh"
-          },
-          {
-            "type": "command",
             "command": "~/.claude/hooks/worktree-gc.sh"
           }
         ]
       }
     ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/cmux-permission-clear.sh"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/cmux-permission-clear.sh"
-          }
-        ]
-      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -84,17 +44,6 @@
             "type": "command",
             "command": "~/.claude/hooks/on-pr-merge-docs.sh",
             "if": "Bash(gh pr merge *)"
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "permission_prompt",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/cmux-permission.sh"
           }
         ]
       }

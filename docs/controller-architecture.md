@@ -1055,9 +1055,8 @@ so the fidelity claim is honest:
   prompts), so it already behaves as the skill did under `--auto` for the
   no-prompt aspect. It does **not** reclassify a FAILED story's dependents as
   SKIPPED — they are marked BLOCKED. The flag is accepted for compatibility.
-- **No cmux sidebar emission from the controller.** Per-stage observability is
-  written to the ledger `events` table and surfaced via the markdown render
-  hook; the controller does not call `cmux-bridge.sh` directly. The skill
-  wrapper still owns any cmux interaction (unchanged contract).
+- **Per-stage observability is ledger-based.** Stage transitions are written to
+  the ledger `events` table and surfaced via the markdown render hook. Run
+  lifecycle milestones are mirrored to Telegram via `notify.py`.
 - **`current_stage` is not written.** The column exists in the schema for the
   resume story (4.3-001); the build state machine does not populate it yet.

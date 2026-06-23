@@ -329,9 +329,9 @@ setup() {
 }
 
 @test "sdlc-state-emit.sh is silent when SDLC_STATE_DB is empty (graceful no-op)" {
-    # Mirrors cmux-bridge.sh's graceful-degradation pattern: when the orchestrator
-    # has not initialised a ledger, emit calls must succeed silently so agents
-    # do not blow up in environments where SQLite tracking is disabled.
+    # Graceful-degradation pattern: when the orchestrator has not initialised a
+    # ledger, emit calls must succeed silently so agents do not blow up in
+    # environments where SQLite tracking is disabled.
     unset SDLC_STATE_DB
     run "${EMIT_HOOK}" event-log "${BATS_TEST_TMPDIR}/nope" 4.2-001 info build-stories "no-op"
     [ "${status}" -eq 0 ]

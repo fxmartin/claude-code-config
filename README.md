@@ -6,7 +6,7 @@
 
 A complete, opinionated Claude Code configuration: agents, skills, slash commands, MCP servers, hooks, and observability — engineered to take an idea from **one-line concept to merged PR without a human in the loop**.
 
-This is the harness behind a multi-agent AGILE pipeline that runs on [cmux](https://www.cmux.dev/) (native macOS terminal for AI development) with full real-time visibility, parallel worktree execution, and automatic bug triage.
+This is the harness behind a multi-agent AGILE pipeline with parallel worktree execution, automatic bug triage, and Telegram notifications for monitoring long-running runs away from the machine.
 
 The harness ships as **two mirror plugins** — `autonomous-sdlc` for Claude Code (in this repo at `plugins/autonomous-sdlc/`) and `autonomous-sdlc` for Codex (in the sibling [`nix-install`](https://github.com/fxmartin/nix-install) repo). Same plugin name, same pipeline shape, same skill IDs — so the SDLC workflow is portable across both runtimes. On Claude Code the plugin's skills surface as bare slash-commands (`/brainstorm`, `/create-story`, etc.) labelled `(autonomous-sdlc)` in the autocomplete; on Codex they're invoked as `Use autonomous-sdlc <name>`.
 
@@ -40,7 +40,7 @@ We also use the Codex mirror as an automated adversarial review layer for Claude
      /project-review · /coverage · /create-project-summary-stats
 ```
 
-Every phase emits structured events to a cmux sidebar pill + progress bar + ledger, and mirrors milestones to Telegram so long-running runs can be monitored away from the machine.
+Every phase emits structured events to the ledger and mirrors milestones to Telegram so long-running runs can be monitored away from the machine.
 
 ---
 
@@ -182,22 +182,14 @@ The full workflow is documented end-to-end in [`WORKFLOW-v2.md`](WORKFLOW-v2.md)
 
 ---
 
-## cmux observability layer
+## Telegram notifications
 
-Runs without cmux work fine — all sidebar calls silently no-op when `$CMUX_SOCKET_PATH` is unset, and Telegram notifications fall through regardless.
+Long-running autonomous runs mirror lifecycle milestones to Telegram so you can monitor them away from the machine:
 
-With cmux, you get:
+- **Skills** call [`hooks/notify-telegram.sh`](hooks/notify-telegram.sh) `"<title>" "<body>"` at milestones (fix-issue started/complete, requirements/stories/epic created).
+- **The controller** (`sdlc build`/`resume`) emits run-lifecycle notifications directly via `notify.py` (run started / finished / rate-limited / first story failure) — gated to one-per-run for failures so your phone doesn't buzz 47 times during a bad run.
 
-| Surface | What it shows |
-|---------|---------------|
-| **Status pills** | Current macro-phase (`Preflight`, `Discovery`, `Building`, `Summarizing`, `Complete`) + current sub-step (story ID, stage name) |
-| **Progress bar** | Global run progress (`Cohort 2/4, Stage 3/4`, `5/18 stories`) |
-| **Sidebar ledger** | Structured per-agent events: `BUILD_STARTED`, `TESTS_GREEN`, `BRANCH_PUSHED`, `COVERAGE_MEASURED`, `APPROVED`, `MERGED`, `BUILD_FAILED`, etc. — taggable with `--source story-<ID>` to trace a single story across all four stages |
-| **Desktop notifications** | Milestones only (preflight failure, first story failure, E2E gate, finish) — never noisy |
-| **Permission pill (red)** | Instant alert when a tool is blocked on approval |
-| **Telegram envelope** | Start / first failure / E2E failure / abort / finish — gated to one-per-run for failures so your phone doesn't buzz 47 times during a bad run |
-
-All of this routes through a single entry point, [`hooks/cmux-bridge.sh`](hooks/cmux-bridge.sh), with five subcommands (`status`, `progress`, `log`, `notify`, `clear`). Lifecycle hooks fire automatically — no per-skill configuration needed. See [`docs/cmux-integration.md`](docs/cmux-integration.md) for the full event schema and architecture.
+Both paths are best-effort and Telegram-only: credentials come from `$TELEGRAM_BOT_TOKEN` / `$TELEGRAM_CHAT_ID` (env first, then `~/.claude/config/.env`), and every call is a silent no-op when unconfigured.
 
 ---
 
@@ -228,12 +220,12 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `skills/` | Loose user-level Claude skills not part of the SDLC plugin (generators, e2e, claude-docs, telegram, demo) | 9 |
 | `commands/` | Namespaced slash commands (`dev/`, `devops/`, `issues/`, `project/`, `quality/`, `research/`) | 17 |
 | `agents/` | Specialist agent definitions (flat) | 12 |
-| `hooks/` | cmux lifecycle hooks, Telegram bridge, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper | 9 scripts |
+| `hooks/` | Telegram notifier, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper, worktree GC, SQLite ledger emitter | 6 scripts |
 | `scripts/` | Standalone scripts run by CI (`validate-agent-registry.sh`), the release workflow (`compute-release.sh`, `release-guard.sh`), and controller bootstrap (`install-controller.sh`) + shared-skills sync (`sync-shared-skills.sh`) | 5 |
-| `tests/` | bats test suite for hooks and install smoke tests (cmux-bridge, install dry-run, agent-registry, sweep-orphan-worktrees) | 6 bats |
+| `tests/` | bats test suite for hooks, install smoke tests, the controller, and release gates (notify-telegram, install dry-run, agent-registry, sweep-orphan-worktrees, sdlc-state, release-guard) | 30 bats |
 | `templates/` | Shared scaffolding used by generator skills | 3 |
 | `reference-docs/` | Language/tooling references loaded via `@` imports | 3 |
-| `docs/` | User-facing docs (cmux integration, CLAUDE.md guide, Python/container/DB/testing best practices, generators, controller architecture, ADRs, contracts) | — |
+| `docs/` | User-facing docs (CLAUDE.md guide, Python/container/DB/testing best practices, generators, controller architecture, ADRs, contracts) | — |
 | `settings.json` | Hooks config, statusline, enabled plugins, marketplaces | — |
 | `statusline-command.sh` | Statusline renderer | — |
 | `keybindings.json` | Keybindings override | — |
@@ -440,7 +432,7 @@ Copy `.env.example` to `.env` and fill in:
 | Variable | Purpose |
 |----------|---------|
 | `BROWSER_PATH` | Absolute path to a Chromium-based browser for the Playwright MCP server |
-| `TELEGRAM_BOT_TOKEN` | Optional — enables Telegram notifications via `cmux-bridge.sh notify` and the `/telegram` skill |
+| `TELEGRAM_BOT_TOKEN` | Optional — enables Telegram notifications via `hooks/notify-telegram.sh` and the `/telegram` skill |
 | `TELEGRAM_CHAT_ID` | Optional — target chat for Telegram notifications |
 
 ---
@@ -475,9 +467,8 @@ See [`docs/generators.md`](docs/generators.md).
 ## Reference material
 
 - [`CLAUDE.md`](CLAUDE.md) — global instructions loaded into every session (core principles, coding standards, CLI tool preferences, GitHub workflow)
-- [`WORKFLOW-v2.md`](WORKFLOW-v2.md) — end-to-end workflow with cmux sidebar integration
+- [`WORKFLOW-v2.md`](WORKFLOW-v2.md) — end-to-end workflow walkthrough
 - [`docs/claude-md-guide.md`](docs/claude-md-guide.md) — deep dive on CLAUDE.md structure, guardrails, and maintenance
-- [`docs/cmux-integration.md`](docs/cmux-integration.md) — full cmux integration architecture and event schema
 - [`docs/generators.md`](docs/generators.md) — generator skills documentation
 - [`docs/controller-architecture.md`](docs/controller-architecture.md) — `sdlc` controller module map, state-machine, and retry semantics (Epic-07)
 - [`docs/contracts.md`](docs/contracts.md) — agent I/O JSON-schema contracts reference
@@ -496,11 +487,10 @@ Every push to `main` that contains a `feat:` or `fix:` commit (or better) trigge
 
 ## Acknowledgements
 
-Three external sources shaped this harness:
+Two external sources shaped this harness:
 
 - **[forrestchang/andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills)** (MIT) — the *Surgical Changes* sub-rules, *Complexity check* heuristic, and *Verifiable Goals* plan template in [`CLAUDE.md`](CLAUDE.md) are adapted from this repo, which itself derives from Andrej Karpathy's observations on LLM coding pitfalls. Absorbed as prose rather than installed as a plugin, for single-source ownership.
 - **[anthropics/skills](https://github.com/anthropics/skills)** — Anthropic's official example-skills marketplace, wired in via `settings.json`. Provides the `example-skills` plugin bundle (web-artifacts-builder, webapp-testing, frontend-design, canvas-design, algorithmic-art, skill-creator, claude-api, theme-factory, mcp-builder, docx/xlsx/pptx/pdf, brand-guidelines, internal-comms, doc-coauthoring, slack-gif-creator).
-- **[cmux](https://www.cmux.dev/)** — native macOS terminal built on Ghostty for multi-agent AI development. The entire observability layer (sidebar pills, progress bar, structured ledger, desktop notifications, workspace management) is built against cmux's CLI via [`hooks/cmux-bridge.sh`](hooks/cmux-bridge.sh), with graceful degradation when cmux is absent.
 
 ---
 
