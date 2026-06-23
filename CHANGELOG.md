@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.56.1] - 2026-06-23
+
+### Fixed
+
+- fix(release): bump controller version in lockstep with the tag (#148)
+
+
 ## [v1.56.0] - 2026-06-23
 
 ### Added
