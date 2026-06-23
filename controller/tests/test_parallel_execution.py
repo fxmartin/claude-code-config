@@ -359,3 +359,228 @@ def test_resume_sequential_runs_one_at_a_time(tmp_path) -> None:
     dispatcher = ConcurrencyProbeDispatcher()
     run_resume("epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
     assert dispatcher.max_active == 1
+
+
+# ---------------------------------------------------------------------------
+# Cohort-boundary pause signals under concurrency (build path)
+# ---------------------------------------------------------------------------
+
+def test_parallel_cost_gate_pauses_run_resumably(tmp_path) -> None:
+    """An interactive over-threshold estimate gates every ready story *before*
+    dispatch; the cohort executor captures the pause and the run halts resumably
+    (NEEDS_ATTENTION stories, no agent ever runs)."""
+    dispatcher = ConcurrencyProbeDispatcher()
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, concurrency=5,
+        cost_estimate_threshold=1, auto=False,
+    )
+    result = run_build(
+        opts,
+        queue=_independent(2),
+        ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert result.cost_gated is True
+    assert dispatcher.calls == []  # the gate halts before any agent dispatch
+    assert result.story_status["p0-001"] == "NEEDS_ATTENTION"
+
+
+def test_parallel_rate_limit_park_hands_off_resumable(tmp_path) -> None:
+    """A story whose window reset is beyond the auto-wait cap parks the run
+    RATE_LIMITED after the cohort barrier — while its peer still runs to DONE in
+    the pool (cohort-barrier failure-free isolation)."""
+    from sdlc.rate_limit import RateLimitSignal
+    from test_build import _sample_queue
+    from test_rate_limit_gate import RateLimitingDispatcher, _Sleeps
+
+    db = tmp_path / "ledger.db"
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", "s1-001"),
+        signal=RateLimitSignal(source="usage-limit", reset_at=999_999.0),
+        times=99,  # keep throttling s1-001 — it must park, not spin
+    )
+    result = run_build(
+        BuildOptions(
+            scope="epic-99", skip_preflight=True, concurrency=5,
+            rate_limit_max_wait_s=300, window_s=18000,
+        ),
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+        sleep_fn=_Sleeps(),
+        clock=lambda: 0.0,
+    )
+    assert result.rate_limited is True
+    ledger = Ledger(db)
+    statuses = {r["story_id"]: r["status"] for r in ledger.story_rows(result.run_id)}
+    assert statuses["s1-001"] == "RATE_LIMITED"  # parked, resumable
+    assert statuses["s1-002"] == "DONE"  # peer finished in the pool
+
+
+def _boom_story_failed(event, **kwargs):
+    """A notifier that fails only on the terminal story_failed event."""
+    if event == "story_failed":
+        raise RuntimeError("notifier down")
+
+
+def test_parallel_worker_error_notify_failure_is_swallowed(tmp_path, monkeypatch) -> None:
+    """Failure isolation records the raising worker FAILED and fires story_failed;
+    a notifier that itself raises is swallowed so peers still complete."""
+    import sdlc.build as build_mod
+
+    monkeypatch.setattr(build_mod, "notify", _boom_story_failed)
+
+    probe = ConcurrencyProbeDispatcher()
+
+    def explode(agent_type, prompt, story=None, **kwargs):
+        if getattr(story, "id", "") == "p1-001" and agent_type == "build":
+            raise RuntimeError("worker exploded")
+        return ConcurrencyProbeDispatcher.__call__(probe, agent_type, prompt, story, **kwargs)
+
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, concurrency=5),
+        queue=_independent(3),
+        ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=explode,
+        preflight=lambda: True,
+    )
+    assert result.story_status["p1-001"] == "FAILED"  # captured + notify swallowed
+    assert result.story_status["p0-001"] == "DONE"
+    assert result.story_status["p2-001"] == "DONE"
+
+
+def test_serial_failed_story_notify_failure_is_swallowed(tmp_path, monkeypatch) -> None:
+    """In the serial path a terminal FAILED story fires story_failed; a raising
+    notifier is swallowed so the run still closes out cleanly."""
+    import sdlc.build as build_mod
+
+    monkeypatch.setattr(build_mod, "notify", _boom_story_failed)
+
+    def fail_build():
+        return {
+            "branch_name": "feature/p0-001",
+            "build_status": "FAILED",
+            "commit_sha": "0",
+            "error_summary": "boom",
+        }
+
+    dispatcher = ConcurrencyProbeDispatcher(
+        overrides={("build", "p0-001"): fail_build}
+    )
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True, auto=True),
+        queue=_independent(1),
+        ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert result.story_status["p0-001"] == "FAILED"
+
+
+# ---------------------------------------------------------------------------
+# Resume mirrors the same cohort-boundary pause + isolation semantics
+# ---------------------------------------------------------------------------
+
+def _seed_parallel_cost_gated(db_path) -> str:
+    """A parallel run interrupted before build, with the interactive cost gate on."""
+    import json
+
+    ledger = Ledger(db_path)
+    ledger.init()
+    rid = ledger.run_create("epic-88", "parallel")
+    ledger.set_total(rid, 2)
+    ledger.event_log(rid, "", "info", "controller", "run started: scope=epic-88 mode=parallel")
+    ledger.event_log(
+        rid, "", "info", "config",
+        json.dumps({
+            "skip_coverage": True,
+            "coverage_threshold": 90,
+            "concurrency": 5,
+            "cost_estimate_threshold": 1,
+            "auto": False,
+        }),
+    )
+    ledger.story_upsert(rid, "88.1-001", "88", "One", "P1", 1, "general-purpose", "", None, "TODO")
+    ledger.story_upsert(rid, "88.1-002", "88", "Two", "P1", 1, "general-purpose", "", None, "TODO")
+    return rid
+
+
+def test_resume_concurrency_override_fans_out(tmp_path) -> None:
+    """`sdlc resume --concurrency=N` overrides the persisted worker cap."""
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    _seed_parallel_interrupted(db, concurrency=1)  # persisted serial cap…
+    dispatcher = ConcurrencyProbeDispatcher()
+    result = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        concurrency=3,  # …overridden wider for this resume
+    )
+    assert result.completed == 2
+    assert dispatcher.max_active >= 2  # the override took effect (was serial)
+
+
+def test_resume_parallel_cost_gate_pauses_run(tmp_path) -> None:
+    """A resumed parallel cohort honours the persisted interactive cost gate."""
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    _seed_parallel_cost_gated(db)
+    dispatcher = ConcurrencyProbeDispatcher()
+    result = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+    )
+    assert result.cost_gated is True
+    assert dispatcher.calls == []  # gate halts pre-dispatch under concurrency too
+    statuses = {r["story_id"]: r["status"] for r in Ledger(db).story_rows(result.run_id)}
+    assert statuses["88.1-001"] == "NEEDS_ATTENTION"
+
+
+def test_resume_parallel_failure_isolation(tmp_path) -> None:
+    """A worker that raises mid-resume is recorded FAILED; its peer still finishes."""
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    _seed_parallel_interrupted(db, concurrency=5)
+    probe = ConcurrencyProbeDispatcher()
+
+    def explode(agent_type, prompt, story=None, **kwargs):
+        if getattr(story, "id", "") == "88.1-001" and agent_type == "build":
+            raise RuntimeError("worker exploded on resume")
+        return ConcurrencyProbeDispatcher.__call__(probe, agent_type, prompt, story, **kwargs)
+
+    result = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=explode, root=tmp_path,
+    )
+    statuses = {r["story_id"]: r["status"] for r in Ledger(db).story_rows(result.run_id)}
+    assert statuses["88.1-001"] == "FAILED"
+    assert statuses["88.1-002"] == "DONE"
+
+
+def test_resume_parallel_rate_limit_park(tmp_path) -> None:
+    """A resumed cohort that re-hits a beyond-cap throttle re-parks RATE_LIMITED."""
+    from sdlc.rate_limit import RateLimitSignal
+    from sdlc.resume import run_resume
+    from test_rate_limit_gate import RateLimitingDispatcher, _Sleeps
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    _seed_parallel_interrupted(db, concurrency=5)
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", "88.1-001"),
+        signal=RateLimitSignal(source="usage-limit", reset_at=999_999.0),
+        times=99,
+    )
+    result = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        clock=lambda: 0.0, sleep_fn=_Sleeps(),
+    )
+    statuses = {r["story_id"]: r["status"] for r in Ledger(db).story_rows(result.run_id)}
+    assert statuses["88.1-001"] == "RATE_LIMITED"
+    assert statuses["88.1-002"] == "DONE"
+    assert Ledger(db).run_row(result.run_id)["status"] == "RATE_LIMITED"
