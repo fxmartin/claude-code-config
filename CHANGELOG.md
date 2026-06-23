@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.56.0] - 2026-06-23
+
+### Added
+
+- feat(realtime-observability): show story titles on the dashboard (#147)
+
+
 ## [v1.55.0] - 2026-06-23
 
 ### Added
