@@ -321,6 +321,7 @@ def dispatch_agent(
     timeout: int = DEFAULT_TIMEOUT_S,
     transcript_path: Path | None = None,
     on_progress: ProgressCallback | None = None,
+    cwd: Path | None = None,
 ) -> AgentResult:
     """Dispatch one agent as a subprocess and validate its response.
 
@@ -343,6 +344,11 @@ def dispatch_agent(
     sub-stage progress to the ledger. It is never called on the captured path
     (no streaming → no sub-stage milestones); failures inside the callback are
     isolated so progress recording can never break the run.
+
+    ``cwd`` (Story 17.2-001) is the working directory the agent subprocess runs
+    in — the controller sets it to a per-story git worktree so concurrent stories
+    never collide in a shared checkout. ``None`` inherits the parent's cwd, so the
+    shared-root / sequential path is byte-for-byte today's.
     """
     cmd = resolve_agent_cmd(agent_cmd, model=model)
     env = _dispatch_env(thinking_cap)
@@ -350,10 +356,11 @@ def dispatch_agent(
         return _dispatch_streaming(
             agent_type, prompt, cmd, timeout=timeout,
             transcript_path=transcript_path, on_progress=on_progress, env=env,
+            cwd=cwd,
         )
     return _dispatch_captured(
         agent_type, prompt, cmd, timeout=timeout,
-        transcript_path=transcript_path, env=env,
+        transcript_path=transcript_path, env=env, cwd=cwd,
     )
 
 
@@ -365,6 +372,7 @@ def _dispatch_captured(
     timeout: int,
     transcript_path: Path | None,
     env: dict[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> AgentResult:
     """Buffered dispatch: run the agent and read all of stdout at once.
 
@@ -373,6 +381,8 @@ def _dispatch_captured(
     is present; otherwise treats stdout as the raw agent response. ``env`` is the
     subprocess environment (Story 14.2-002: carries a ``MAX_THINKING_TOKENS`` cap);
     ``None`` means inherit the parent environment, so the no-cap path is unchanged.
+    ``cwd`` (Story 17.2-001) is the per-story worktree the agent runs in; ``None``
+    inherits the parent's cwd (the shared-root path, unchanged).
     """
     try:
         completed = subprocess.run(
@@ -382,6 +392,7 @@ def _dispatch_captured(
             text=True,
             timeout=timeout,
             env=env,
+            cwd=cwd,
         )
     except subprocess.TimeoutExpired as exc:
         _write_transcript(transcript_path, "", f"TIMEOUT after {timeout}s")
@@ -433,6 +444,7 @@ def _dispatch_streaming(
     transcript_path: Path | None,
     on_progress: ProgressCallback | None = None,
     env: dict[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> AgentResult:
     """Streamed dispatch: consume stdout line-by-line, teeing each to the transcript.
 
@@ -454,6 +466,7 @@ def _dispatch_streaming(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            cwd=cwd,
         )
     except (FileNotFoundError, OSError) as exc:
         _write_transcript(transcript_path, "", f"could not launch {cmd[0]!r}: {exc}")

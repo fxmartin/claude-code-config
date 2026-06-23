@@ -436,6 +436,61 @@ def test_dispatch_agent_passes_routed_model_to_default_cmd(monkeypatch) -> None:
     assert seen["cmd"][0]  # ran, model on explicit cmd is intentionally ignored
 
 
+# --- 17.2-001: per-story working directory (cwd) propagation ---------------
+
+
+def test_dispatch_passes_cwd_to_captured_subprocess(monkeypatch, tmp_path) -> None:
+    """A cwd is forwarded to the captured subprocess.run so the agent runs there."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cwd"] = kwargs.get("cwd")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], cwd=tmp_path)
+    assert seen["cwd"] == tmp_path
+
+
+def test_dispatch_no_cwd_defaults_to_none_captured(monkeypatch) -> None:
+    """No cwd → subprocess inherits the parent cwd (None), the unchanged path."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cwd"] = kwargs.get("cwd")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert seen["cwd"] is None
+
+
+def test_dispatch_passes_cwd_to_streaming_subprocess(monkeypatch, tmp_path) -> None:
+    """A cwd is forwarded to the streamed Popen (the default dispatch path)."""
+    seen = {}
+
+    def make(*a, **kw):
+        seen["cwd"] = kw.get("cwd")
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", make)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, cwd=tmp_path)
+    assert seen["cwd"] == tmp_path
+
+
+def test_dispatch_no_cwd_defaults_to_none_streaming(monkeypatch) -> None:
+    """No cwd on the streaming path → Popen gets cwd=None (unchanged behaviour)."""
+    seen = {}
+
+    def make(*a, **kw):
+        seen["cwd"] = kw.get("cwd")
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", make)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert seen["cwd"] is None
+
+
 # --- R8: transcript persistence --------------------------------------------
 
 

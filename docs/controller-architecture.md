@@ -95,10 +95,12 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    **Branch isolation (Story 12.4-001).** The build prompt
    (`render_build_prompt`) cuts the story branch from a freshly-fetched remote
    base — `git fetch origin && git checkout -b feature/<id> origin/main` — not
-   the base-less `git checkout -b feature/<id>`. Agents share one working dir
-   (`dispatch.py` has no per-call `cwd`/worktree yet — full worktree isolation is
-   deferred to epic-17 17.2-001/17.2-002), and the merge agent only returns HEAD
-   to `main` on its **success** path; on a parked/blocked/conflict path it leaves
+   the base-less `git checkout -b feature/<id>`. In a real `parallel` run each
+   story now builds in its **own git worktree** (see *Per-story worktree
+   isolation* below), so concurrent agents no longer share a working dir; a
+   `--sequential` run keeps the shared root for back-compat. The merge agent only
+   returns HEAD to `main` on its **success** path; on a parked/blocked/conflict
+   path it leaves
    the working dir on the story's feature branch. A base-less checkout would then
    stack the next story on that leftover branch, so a later successful merge would
    transitively land the earlier (parked) story's commits on `main` — leaving the
@@ -727,6 +729,53 @@ not carried per turn in `stream-json`, so it lands only at this reconciliation
 (still a strict improvement over the previous run-level-only total). The per-run
 and per-story/stage breakdowns surface through the existing query path
 (`stage_breakdown`, `_aggregate_run_usage`, `status_snapshot`) with no new schema.
+
+### Per-story working directory (Story 17.2-001)
+
+`dispatch_agent(…, cwd=…)` is the seam that lets the controller run an agent in
+a directory other than its own cwd. It threads straight onto the `subprocess`
+call of **both** dispatch paths (`subprocess.run(cwd=…)` /
+`subprocess.Popen(cwd=…)`); `cwd=None` inherits the parent's working directory,
+so the no-isolation path is byte-for-byte today's.
+
+## Per-story worktree isolation (Story 17.2-001)
+
+Until concurrency, every story built in the **shared repo root**: the build
+agent ran `git checkout -b feature/<id>` in one working tree. That is unsafe the
+moment two stories run at once — they would fight over one index and working
+tree. So a real `parallel` run now gives each story its **own git worktree**.
+
+`_prepare_story_workdir(opts, story, ledger, run_id, real_run=…)` decides, per
+story, what cwd its agent runs in:
+
+- **Real `parallel` run** → `create_story_worktree(root, story_id, run_id)` makes
+  a checkout at `<root>/.claude/worktrees/agent-<run>-<story>`. The path follows
+  the `agent-*` convention the orphan-sweeper (`hooks/sweep-orphan-worktrees.sh`)
+  and the worktree-bootstrap hook (`hooks/forge-worktree-bootstrap.sh`) already
+  key off, and `.claude/worktrees/` is gitignored so the checkouts never show in
+  `git status`. The worktree is checked out **detached at the base ref**
+  (`origin/main` when set, else `HEAD`), so the build agent cuts its own
+  `feature/<id>` branch **inside** it exactly as on the shared-root path — the
+  build prompt is unchanged. Concurrent stories therefore land on separate
+  worktrees and separate branches over one **shared object store**, with no
+  shared index or working-tree contention.
+- **`--sequential` (or `--concurrency=1`)** → `None`: one story at a time cannot
+  collide, so the shared root is kept for byte-for-byte back-compat.
+- **A fake-dispatcher (test) run** (`real_run=False`) → `None`: orchestration is
+  exercised without touching the real repo, exactly like the `_reposition_head`
+  and close-out reconcile guards.
+- **Worktree creation fails** (no repo, colliding path) → it logs the reason and
+  falls back to the shared root: a `WorktreeError` is recoverable, **never**
+  fatal to the build.
+
+The chosen path is recorded on the story row (`stories.worktree_path`, added by
+migration 5) so teardown (Story 17.2-002) and observability can locate the
+checkout. `_run_story` binds the worktree onto the dispatch seam as `cwd` via
+`functools.partial`, so **every** dispatch for that story — each stage, the
+envelope re-ask, the commit-lint amend, and the bugfix loop — runs inside the
+isolated checkout. Worktree **teardown** (removal on close-out, orphan sweep,
+resume re-attach) is Story 17.2-002; this story owns creation, dispatch, and
+recording only.
 
 ## Per-run token budget gate (Story 14.1-001)
 

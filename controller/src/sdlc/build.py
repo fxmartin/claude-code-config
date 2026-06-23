@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS stories (
     status          TEXT NOT NULL,
     wave            INTEGER,
     dependencies    TEXT,
+    worktree_path   TEXT,
     PRIMARY KEY (run_id, story_id),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
@@ -243,6 +244,19 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
         [
             ("wave", "INTEGER"),
             ("dependencies", "TEXT"),
+        ],
+    ),
+    # Migration 5 adds the per-story worktree path (Story 17.2-001) to a
+    # pre-existing ledger's `stories` table. Additive and back-compatible: old
+    # story rows keep NULL worktree_path (they built in the shared repo root);
+    # only stories the controller isolates in a dedicated git worktree populate
+    # it. A fresh DB created from the up-to-date DDL is a no-op.
+    (
+        5,
+        "story worktree path column",
+        "stories",
+        [
+            ("worktree_path", "TEXT"),
         ],
     ),
 ]
@@ -1017,6 +1031,31 @@ class Ledger:
                 "WHERE run_id = ? AND story_id = ?",
                 (wave, json.dumps(dependencies), run_id, story_id),
             )
+
+    def set_story_worktree(self, run_id: str, story_id: str, path: str) -> None:
+        """Record the git worktree a story's agent was dispatched into (17.2-001).
+
+        Written when the controller creates a dedicated per-story worktree so
+        concurrent stories cannot collide in a shared checkout. The column is
+        nullable — a sequential / shared-root run leaves it NULL — and is read
+        back by teardown (17.2-002) and observability to locate the checkout.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stories SET worktree_path = ? "
+                "WHERE run_id = ? AND story_id = ?",
+                (path, run_id, story_id),
+            )
+
+    def story_worktree(self, run_id: str, story_id: str) -> str | None:
+        """The recorded worktree path for a story, or ``None`` (shared root)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT worktree_path FROM stories "
+                "WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            ).fetchone()
+        return row[0] if row else None
 
     def stage_start(
         self, run_id: str, story_id: str, stage_name: str, attempt: int = 1
@@ -2279,6 +2318,99 @@ def _reposition_head(root: Path) -> None:
         pass
 
 
+class WorktreeError(Exception):
+    """A per-story git worktree could not be created (Story 17.2-001).
+
+    Raised by :func:`create_story_worktree` when ``git worktree add`` fails (no
+    repo, a colliding path, a detached base that cannot be resolved). The caller
+    (:func:`_prepare_story_workdir`) treats it as recoverable: it logs the reason
+    and falls back to the shared repo root, so a worktree problem never fails a
+    build.
+    """
+
+
+# Per-story worktrees live under this directory, matching the agent-* convention
+# the orphan-sweeper (`hooks/sweep-orphan-worktrees.sh`) and the worktree
+# bootstrap hook (`hooks/forge-worktree-bootstrap.sh`) already key off, and it is
+# gitignored (`.claude/worktrees/`) so the checkouts never show in git status.
+_WORKTREE_SUBDIR = (".claude", "worktrees")
+
+
+def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
+    """Create a dedicated git worktree for a story's build and return its path.
+
+    Story 17.2-001: the worktree lives at
+    ``<root>/.claude/worktrees/agent-<run>-<story>`` so it matches the ``agent-*``
+    orphan-sweeper and worktree-bootstrap conventions and stays out of git status.
+    It is checked out **detached** at the base ref (``origin/main`` when set, else
+    ``HEAD``) so the build agent cuts its own ``feature/<id>`` branch inside it
+    exactly as on the shared-root path — concurrent stories therefore land on
+    separate worktrees and separate branches over one shared object store, with no
+    shared index or working-tree contention. Raises :class:`WorktreeError` when
+    ``git worktree add`` fails so the caller can fall back to the shared root.
+    """
+    worktrees_dir = root.joinpath(*_WORKTREE_SUBDIR)
+    try:
+        worktrees_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WorktreeError(f"could not create {worktrees_dir}: {exc}") from exc
+    # A short run prefix keeps the directory unique across concurrent runs while
+    # the story id keeps it human-legible and grep-able in `git worktree list`.
+    short_run = run_id.split("-")[0]
+    path = worktrees_dir / f"agent-{short_run}-{story_id}"
+    base = _base_ref(root) or "HEAD"
+    try:
+        res = _git(root, "worktree", "add", "--detach", "--force", str(path), base)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorktreeError(f"git worktree add failed: {exc}") from exc
+    if res.returncode != 0:
+        raise WorktreeError(
+            f"git worktree add for {story_id} failed: {res.stderr.strip()}"
+        )
+    return path
+
+
+def _prepare_story_workdir(
+    opts: "BuildOptions",
+    story: "Story",
+    ledger: "Ledger",
+    run_id: str,
+    *,
+    real_run: bool,
+) -> Path | None:
+    """The cwd a story's agent should run in: a per-story worktree, or the root.
+
+    Story 17.2-001: a real ``parallel`` run isolates each story in its own git
+    worktree (created here and recorded on the story row) so concurrent agents
+    never collide in the shared checkout. Returns ``None`` — meaning "reuse the
+    repo root", today's behaviour — when:
+
+    * ``--sequential`` (or ``--concurrency=1``) is in effect: one story at a time
+      cannot collide, so the shared root is kept for byte-for-byte back-compat;
+    * this is not a real run (``real_run=False``, i.e. a test injected a fake
+      dispatcher): the orchestration is exercised without touching the real repo;
+    * worktree creation fails: it degrades to the shared root and logs the
+      reason rather than failing the build (best-effort, never fatal).
+    """
+    if opts.sequential or not real_run:
+        return None
+    root = Path.cwd()
+    try:
+        path = create_story_worktree(root, story.id, run_id)
+    except WorktreeError as exc:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"worktree isolation unavailable ({exc}); building in the repo root",
+        )
+        return None
+    ledger.set_story_worktree(run_id, story.id, str(path))
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"isolated build worktree ready at {path}",
+    )
+    return path
+
+
 def story_commit_exists(story_id: str, root: Path | None = None) -> bool:
     """Best-effort: True when ``feature/<story_id>`` holds a commit beyond the base.
 
@@ -2577,9 +2709,16 @@ def run_build(
                 )
                 continue
 
+            # Story 17.2-001: isolate a real parallel story in its own git
+            # worktree so concurrent agents never collide in the shared checkout
+            # (None reuses the root for --sequential / fakes / on creation failure).
+            workdir = _prepare_story_workdir(
+                opts, story, ledger, run_id, real_run=dispatcher is None
+            )
             try:
                 sr = _run_story_rate_limited(
-                    rl_ctx, story, ledger, run_id, dispatch, logs_dir
+                    rl_ctx, story, ledger, run_id, dispatch, logs_dir,
+                    workdir=workdir,
                 )
             except _CostGatePause as gate:
                 # Story 14.1-002: the interactive cost gate halted a stage. Park
@@ -3021,6 +3160,7 @@ def _run_story(
     pr_number: int | None = None,
     bugfix_seq: int = 0,
     rl_ctx: "_RateLimitContext | None" = None,
+    workdir: Path | None = None,
 ) -> str:
     """Drive one story through build → coverage → review → merge.
 
@@ -3055,7 +3195,15 @@ def _run_story(
     FAILED attempts — so a stage that had climbed to a stronger tier before an
     interruption resumes on that tier rather than dropping back to its cheap base.
     The defaults reproduce a fresh full build exactly.
+
+    ``workdir`` (Story 17.2-001) is the per-story git worktree the agent runs in.
+    When set it is bound onto the dispatch seam as ``cwd`` so **every** dispatch
+    for this story — each stage, the envelope re-ask, the commit-lint amend, and
+    the bugfix loop — runs inside the isolated checkout. ``None`` keeps the
+    shared-root path (sequential / back-compat) byte-for-byte unchanged.
     """
+    if workdir is not None:
+        dispatch = functools.partial(dispatch, cwd=workdir)
     stages = [s for s in _STAGES if not (s == "coverage" and opts.skip_coverage)]
     # Already-completed stages are skipped on resume; a fresh build skips none.
     pending = [s for s in stages if s not in done_stages]
