@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.58.1] - 2026-06-23
+
+### Changed
+
+- refactor(commands): relative symlinks into shared-skills (#155)
+
+
 ## [v1.58.0] - 2026-06-23
 
 ### Added
