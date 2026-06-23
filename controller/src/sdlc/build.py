@@ -46,6 +46,7 @@ from sdlc.model_routing import (
     routing_config,
     select_model,
 )
+from sdlc.notify import notify
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
 from sdlc.rate_limit import RateLimitSignal, WindowQuota, seconds_until_reset, within_wait_cap
 from sdlc.registry import Registry, RunRecord
@@ -588,6 +589,13 @@ def apply_rate_limit_park(
     cfg["rate_limit_reset_at"] = float(reset_at)
     ledger.event_log(run_id, "", "info", "config", json.dumps(cfg))
     ledger.run_update_status(run_id, "RATE_LIMITED")
+    try:  # best-effort lifecycle notification; never fail a run
+        notify(
+            "rate_limited", run=run_id, source=signal.source,
+            reset_at=int(reset_at), waited_s=waited_s,
+        )
+    except Exception:
+        pass
     return reset_at
 
 
@@ -2428,6 +2436,10 @@ def run_build(
     ledger.event_log(
         run_id, "", "info", "controller", f"run started: scope={opts.scope} mode={mode}"
     )
+    try:  # best-effort lifecycle notification; never fail a build
+        notify("run_started", run=run_id, scope=opts.scope, mode=mode)
+    except Exception:
+        pass
     # Persist the run's options as an immutable config marker (read back by the
     # dashboard header). Kept as an event so no schema migration is needed.
     ledger.event_log(
@@ -2572,6 +2584,11 @@ def run_build(
             outcome = sr.status or "FAILED"  # non-parked always carries a status
             status[story.id] = outcome
             ledger.set_story_status(run_id, story.id, outcome)
+            if outcome == "FAILED":
+                try:  # best-effort; terminal FAILED only (no bugfix-retry noise)
+                    notify("story_failed", run=run_id, story_id=story.id)
+                except Exception:
+                    pass
 
             # Story 12.4-001: reposition HEAD back to the base between stories so
             # a parked/blocked story's feature branch (the merge agent only
@@ -2949,6 +2966,15 @@ def finalize_run(
         f"{skipped} skipped{finish_suffix}",
     )
     ledger.run_update_status(run_id, run_terminal)
+    try:  # best-effort lifecycle notification; never fail a run
+        notify(
+            "run_finished", run=run_id, terminal=run_terminal,
+            done=completed, failed=failed, blocked=blocked,
+            needs_attention=needs_attention, awaiting_approval=awaiting_approval,
+            skipped=skipped,
+        )
+    except Exception:
+        pass
     if registry is not None:
         _registry_finish(registry, run_id, run_terminal, completed)
 

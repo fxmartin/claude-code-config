@@ -29,6 +29,7 @@ from sdlc.build import (
 from sdlc.cohort import Story, compute_cohorts
 from sdlc.discovery import discover_queue
 from sdlc.dispatch import dispatch_agent
+from sdlc.notify import notify
 from sdlc.registry import Registry
 
 __all__ = ["StoryResumeState", "ResumeResult", "compute_resume_plan", "run_resume"]
@@ -297,6 +298,10 @@ def run_resume(
     # Mark the run live again and announce the resume.
     ledger.run_update_status(rid, "IN_PROGRESS")
     ledger.event_log(rid, "", "info", "controller", f"run resumed: scope={scope}")
+    try:  # best-effort lifecycle notification; never fail a resume
+        notify("run_started", run=rid, scope=scope, mode="resume")
+    except Exception:
+        pass
 
     logs_dir = Path(f"{ledger.db_path}.logs") / rid
     cohorts = compute_cohorts(run_queue)
