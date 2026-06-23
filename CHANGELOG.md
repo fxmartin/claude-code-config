@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.59.0] - 2026-06-23
+
+### Added
+
+- feat(parallel-execution): concurrency-safe ledger writes (#17.1-002)
+
+
 ## [v1.58.2] - 2026-06-23
 
 ### Fixed
