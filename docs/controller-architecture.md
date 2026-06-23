@@ -576,6 +576,43 @@ that status to a human-facing label:
   foundational for Epic-17 17.3-001, which extends "started" to *multiple*
   concurrently-active stages.
 
+## In-dashboard transcript viewer (Story 11.2-010)
+
+Each story row carries a **"view session"** control that opens a modal listing
+that story's stage transcripts — build, coverage, review, merge, and any bugfix
+retries — and renders each one inline, so FX reads what every `claude -p`
+session did without hunting for `.log` files or leaving the page. The work is in
+`sdlc/dashboard.py`: a small JSON endpoint plus the embedded modal.
+
+- **Endpoint.** `/api/logs?run=<id>&story=<id>` (`_serve_logs`) resolves the
+  run's ledger (the registry record in discovery mode, the latest run in
+  single-`--db` mode), reads `Ledger.stage_breakdown(run)`, and for the story
+  enumerates **every** stage attempt — so a bugfix retry shows as its own
+  transcript, not just the latest attempt the stage-pipeline view collapses to.
+  Each entry is `{stage, attempt, status, path, exists, content}`.
+- **Path confinement, shared with `/log`.** Transcript content is read through
+  `_read_confined(root, output_path)`, which applies the same
+  `Path.resolve().relative_to(logs_root)` guard as the `/log` route (factored
+  into the shared `_logs_root(run)` helper). A ledger row whose `output_path`
+  escapes the logs root — or points at a file that was never written — yields
+  `exists: False` with empty content, so a bad/missing path can never leak a
+  file outside the logs tree and the viewer shows a **placeholder, not an
+  error**. An unknown/blank story or unreachable ledger returns an empty list
+  (HTTP 200, never 404/500).
+- **Rendering + graceful degradation.** The client's `renderTranscriptContent`
+  shows plain-text transcripts (today) verbatim and readably. Once Epic-11
+  11.1-001 streaming lands and logs become **stream-json** (one JSON object per
+  line), it collapses each event to a compact `type: message` line and falls
+  back to the raw line for anything that is not valid JSON — so a mixed or
+  future format degrades rather than breaking.
+- **Fallback preserved.** The existing new-tab `/log` link is kept per
+  transcript (and on the stage badges), so the previous behaviour is a
+  no-regression fallback. The modal closes on its backdrop, its × button, or
+  `Esc`; the per-story control is bound by delegation on the `#stories`
+  container, which the live transport re-renders each tick. Transcripts stay on
+  disk (an Epic-11 non-goal: not in SQLite); the localhost-only surface means
+  raw agent output is acceptable here and dovetails with Epic-13 sanitization.
+
 ## There is no `init` verb
 
 Epic-07 scaffolded an `init` stub, but `build` already creates the SQLite ledger
