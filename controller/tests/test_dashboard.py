@@ -377,15 +377,35 @@ def test_api_status_null_title_degrades(tmp_path: Path) -> None:
     assert by_id["99.9-001"]["title"] is None
 
 
-def test_page_renders_story_title_truncated_with_hover() -> None:
-    """Story 11.2-012: the per-story row shows id · title, ellipsized, full on hover."""
+def test_page_renders_story_title_in_full() -> None:
+    """Story 11.2-014: the title owns a full-width row and is shown in full — the
+    22em ellipsis truncation from 11.2-012 is removed (it never reflows since the
+    title is static per render). A null/empty title still degrades to just the ID."""
     from sdlc.dashboard import _PAGE
 
-    # The title is escaped, carried in a title= tooltip (hover), and only shown
-    # when present (null/empty title degrades to just the ID).
+    # The title is still escaped and only shown when present.
     assert "s.title" in _PAGE                 # render reads the threaded field
-    assert "class='stitle'" in _PAGE          # dedicated, ellipsized title span
-    assert ".stitle" in _PAGE and "text-overflow: ellipsis" in _PAGE  # truncation CSS
+    assert "class='stitle'" in _PAGE          # dedicated title span retained
+    # The previous 22em ellipsis truncation is gone — the title now wraps freely.
+    assert "max-width: 22em" not in _PAGE
+
+
+def test_page_renders_story_as_stacked_block() -> None:
+    """Story 11.2-014: each story renders as three stacked rows inside the single
+    table — a full-width title row, a step-columns row, then the activity line —
+    and the leading `story` header column is dropped (→ 8 columns)."""
+    from sdlc.dashboard import _PAGE
+
+    # The two new block rows.
+    assert "story-title" in _PAGE             # full-width title row class
+    assert "story-stages" in _PAGE            # step-columns row class
+    # The title row spans the full 8-column width.
+    assert "<td colspan='8'>" in _PAGE
+    # The header drops the story column and starts at status (8 columns).
+    assert "<th>story</th>" not in _PAGE
+    assert "<tr><th>status</th>" in _PAGE
+    # Block-separation CSS: a border-top on the title row sets one block apart.
+    assert ".story-title" in _PAGE
 
 
 def test_log_endpoint_serves_within_root_and_confines(tmp_path: Path) -> None:
