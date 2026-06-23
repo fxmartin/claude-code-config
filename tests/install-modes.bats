@@ -61,9 +61,11 @@ _run_install() {
     do
         [[ "$output" == *"[dry-run]"*"${target}"* ]]
     done
-    # 18 ln -s lines expected (10 config items + 1 marketplace + 7 shared skills)
+    # 11 ln -s lines expected (10 config items + 1 marketplace). Shared skills
+    # are committed relative symlinks inside commands/, so the installer no
+    # longer links them in separately (they would dirty the repo).
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 18 ]
+    [ "$ln_lines" -eq 11 ]
 }
 
 @test "--core --dry-run previews git submodule init" {

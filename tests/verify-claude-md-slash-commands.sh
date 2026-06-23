@@ -36,9 +36,9 @@ resolves() {
   if [ -f "$REPO_ROOT/plugins/autonomous-sdlc/skills/$name/SKILL.md" ]; then return 0; fi
   if [ -f "$REPO_ROOT/skills/$name/SKILL.md" ]; then return 0; fi
   # Shared skills (ADR-002) live in a single source of truth under
-  # shared-skills/ and are NOT duplicated under commands/. The installer
-  # symlinks each one in as a bare top-level command, so a bare reference
-  # like /coverage resolves here.
+  # shared-skills/ and are exposed as bare top-level commands via committed
+  # relative symlinks inside commands/ (so the commands/ check above usually
+  # resolves them). This direct check covers the source of truth as well.
   if [ -f "$REPO_ROOT/shared-skills/$name.md" ]; then return 0; fi
   return 1
 }

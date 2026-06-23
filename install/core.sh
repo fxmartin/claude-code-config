@@ -33,17 +33,14 @@ install_core_run() {
   create_symlink "$SCRIPT_DIR/skills"                  "$CLAUDE_DIR/skills"
   create_symlink "$SCRIPT_DIR/hooks"                   "$CLAUDE_DIR/hooks"
 
-  # Shared skills (ADR-002) are the single source of truth synced to the Codex
-  # mirror; they are NOT duplicated under commands/. Symlink each one in as a
-  # bare top-level slash command (e.g. /coverage, /roast, /create-issue) so the
-  # commands CLAUDE.md advertises keep resolving — one copy, no duplication.
-  ensure_dir "$CLAUDE_DIR/commands"
-  for shared_skill in "$SCRIPT_DIR"/shared-skills/*.md; do
-    [ -e "$shared_skill" ] || continue
-    skill_name="$(basename "$shared_skill")"
-    [ "$skill_name" = "README.md" ] && continue
-    create_symlink "$shared_skill" "$CLAUDE_DIR/commands/$skill_name"
-  done
+  # Shared skills (ADR-002) are the single source of truth under shared-skills/.
+  # They are exposed as bare top-level slash commands (e.g. /coverage, /roast,
+  # /create-issue) via committed RELATIVE symlinks inside commands/ (e.g.
+  # commands/coverage.md -> ../shared-skills/coverage.md), which the commands
+  # directory symlink above already carries into ~/.claude. We must NOT symlink
+  # them in here: $CLAUDE_DIR/commands resolves back to $SCRIPT_DIR/commands, so
+  # writing into it would replace the committed relative links with absolute
+  # ones and dirty the repo on every run.
 
   # Local marketplace — exposes the autonomous-sdlc plugin to Claude Code.
   ensure_dir "$CLAUDE_DIR/plugins/marketplaces"
@@ -62,11 +59,7 @@ install_core_uninstall() {
   remove_symlink "$CLAUDE_DIR/docs"                    "$SCRIPT_DIR/docs"
   remove_symlink "$CLAUDE_DIR/skills"                  "$SCRIPT_DIR/skills"
   remove_symlink "$CLAUDE_DIR/hooks"                   "$SCRIPT_DIR/hooks"
-  for shared_skill in "$SCRIPT_DIR"/shared-skills/*.md; do
-    [ -e "$shared_skill" ] || continue
-    skill_name="$(basename "$shared_skill")"
-    [ "$skill_name" = "README.md" ] && continue
-    remove_symlink "$CLAUDE_DIR/commands/$skill_name" "$shared_skill"
-  done
+  # Shared-skill commands are committed relative symlinks inside commands/, so
+  # removing the commands symlink above already unlinks them; nothing to do here.
   remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
 }

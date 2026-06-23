@@ -66,8 +66,10 @@ _snapshot() {
 @test "dry-run emits a [dry-run] line for every symlink it would create" {
     run env HOME="${FAKE_HOME}" bash "${INSTALL}" --dry-run --skip-tools --skip-mcp
     [ "$status" -eq 0 ]
-    # install.sh links 10 config items, the local marketplace, and the 7
-    # shared skills (ADR-002) as bare commands = 18 symlinks.
+    # install.sh links 10 config items and the local marketplace = 11 symlinks.
+    # Shared skills (ADR-002) are committed relative symlinks inside commands/,
+    # carried in by the commands directory symlink, so they are not linked
+    # separately (doing so would rewrite them as absolute and dirty the repo).
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 18 ]
+    [ "$ln_lines" -eq 11 ]
 }
