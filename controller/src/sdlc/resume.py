@@ -14,8 +14,10 @@ from sdlc.build import (
     Ledger,
     _budget_exceeded,
     _CostGatePause,
+    _dispatch_cohort,
     _honor_parked_reset,
     _make_rate_limit_context,
+    _prepare_story_workdir,
     _reposition_head,
     _resolve_dispatch,
     _run_story_rate_limited,
@@ -23,6 +25,7 @@ from sdlc.build import (
     apply_budget_stop,
     apply_cost_gate_pause,
     apply_rate_limit_park,
+    effective_concurrency,
     finalize_run,
     persist_cohort_structure,
 )
@@ -175,6 +178,10 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         skip_coverage=bool(config.get("skip_coverage")),
         coverage_threshold=int(config.get("coverage_threshold", 90)),
         sequential=(run_row.get("mode") == "serial"),
+        # Story 17.1-001: carry the worker cap so a resumed parallel run fans out
+        # a cohort with the same effective concurrency the original run used.
+        # Defaults to 5 for runs that predate the field — matching BuildOptions.
+        concurrency=int(config.get("concurrency", 5) or 5),
         # Story 14.1-001: carry the original token budget so a resume re-enforces
         # the same ceiling rather than continuing unbounded. `sdlc resume
         # --budget` overrides this in run_resume before the loop.
@@ -218,6 +225,7 @@ def run_resume(
     budget: int | None = None,
     budget_policy: str | None = None,
     cost_threshold: int | None = None,
+    concurrency: int | None = None,
     clock: Callable[[], float] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
 ) -> ResumeResult:
@@ -271,6 +279,10 @@ def run_resume(
     # a story parked by the gate can proceed (0 disables it for this resume).
     if cost_threshold is not None:
         opts.cost_estimate_threshold = cost_threshold
+    # Story 17.1-001: --concurrency overrides the persisted worker cap so a resume
+    # can fan out wider/narrower than the original run (>= 1 enforced at the CLI).
+    if concurrency is not None:
+        opts.concurrency = concurrency
 
     # Story 14.2-002: bind the persisted thinking-token cap onto the real dispatch
     # seam (no-op for an injected fake / no cap), so a resumed run re-applies the
@@ -331,18 +343,124 @@ def run_resume(
     )
     cost_gated: _CostGatePause | None = None
 
+    # Story 17.1-001: re-enter one story at its interrupted stage. The parallel
+    # path isolates each story in its own worktree (concurrent agents must not
+    # collide); the serial path keeps today's shared-root behaviour (workdir
+    # left None) so `--sequential` resume is byte-for-byte unchanged.
+    def _run_one(story: Story, *, workdir) -> _StoryRunOutcome:
+        st = plan[story.id]
+        return _run_story_rate_limited(
+            rl_ctx, story, ledger, rid, dispatch, logs_dir,
+            done_stages=st.done_pipeline_stages,
+            start_attempt=st.start_attempt,
+            start_escalation=st.start_escalation,
+            pr_number=st.pr_number,
+            bugfix_seq=st.bugfix_seq,
+            workdir=workdir,
+        )
+
+    def _run_one_parallel(story: Story) -> _StoryRunOutcome:
+        # Parallel resume isolates each re-entered story in its own worktree so
+        # concurrent agents never collide in the shared checkout (Story 17.2-001).
+        workdir = _prepare_story_workdir(
+            opts, story, ledger, rid, real_run=dispatcher is None
+        )
+        return _run_one(story, workdir=workdir)
+
+    workers = effective_concurrency(opts)
     for cohort in cohorts:
         if budget_stopped or rate_limit_park is not None or cost_gated is not None:
             break
+
+        # --- Serial path (--sequential / --concurrency=1) — byte-for-byte ----
+        if workers == 1:
+            for story in cohort:
+                st = plan[story.id]
+
+                # Already-finished stories stay put — never rebuilt.
+                if st.status in _TERMINAL_STORY_STATES:
+                    continue
+
+                # Crashed at the very end (all stages DONE, status never
+                # finalised): close it out without dispatching anything.
+                if st.next_stage is None:
+                    status[story.id] = "DONE"
+                    ledger.set_story_status(rid, story.id, "DONE")
+                    ledger.event_log(
+                        rid, story.id, "info", "controller",
+                        "resume: all stages already complete — marked DONE",
+                    )
+                    resumed += 1
+                    continue
+
+                # A dependency that failed/blocked/skipped blocks this story (R2/R4).
+                blocked_by = [
+                    dep
+                    for dep in story.dependencies
+                    if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED", "AWAITING_APPROVAL"}
+                ]
+                if blocked_by:
+                    status[story.id] = "BLOCKED"
+                    ledger.set_story_status(rid, story.id, "BLOCKED")
+                    ledger.event_log(
+                        rid, story.id, "warn", "controller",
+                        f"blocked: dependency not done ({', '.join(blocked_by)})",
+                    )
+                    continue
+
+                # Story 14.1-001: re-enforce the budget ceiling before dispatching.
+                # The accrual carried in the ledger already counts the pre-pause
+                # spend, so an un-raised resume stops here and re-parks immediately.
+                if _budget_exceeded(ledger, rid, opts.budget):
+                    budget_stopped = True
+                    break
+
+                ledger.event_log(
+                    rid, story.id, "info", "controller",
+                    f"resume: re-entering at stage '{st.next_stage}' "
+                    f"(attempt {st.start_attempt})",
+                )
+                try:
+                    sr = _run_one(story, workdir=None)
+                except _CostGatePause as gate:
+                    # Story 14.1-002: the cost gate re-halted this stage on resume.
+                    status[story.id] = "NEEDS_ATTENTION"
+                    ledger.set_story_status(rid, story.id, "NEEDS_ATTENTION")
+                    cost_gated = gate
+                    break
+                if sr.parked:
+                    status[story.id] = "RATE_LIMITED"
+                    ledger.set_story_status(rid, story.id, "RATE_LIMITED")
+                    rate_limit_park = sr
+                    break
+                outcome = sr.status or "FAILED"
+                status[story.id] = outcome
+                ledger.set_story_status(rid, story.id, outcome)
+                resumed += 1
+
+                # Story 12.4-001: reposition HEAD back to the base between stories
+                # so a parked story's leftover feature branch is never the base the
+                # next story stacks on. Real runs only (injected fakes operate on
+                # the test's cwd); best-effort and never fatal.
+                if dispatcher is None:
+                    _reposition_head(root or Path.cwd())
+            continue
+
+        # --- Parallel path (Story 17.1-001) — same semantics as run_build ----
+        # Budget gate at the cohort boundary (the pool cannot interleave a
+        # per-story check; the barrier bounds mid-cohort spend).
+        if _budget_exceeded(ledger, rid, opts.budget):
+            budget_stopped = True
+            break
+
+        # Resolve each story's pre-dispatch disposition sequentially (terminal
+        # skip, end-crash close-out, dependency block) — only the genuinely
+        # dispatchable stories are submitted to the pool.
+        dispatchable: list[Story] = []
         for story in cohort:
             st = plan[story.id]
-
-            # Already-finished stories stay put — never rebuilt.
             if st.status in _TERMINAL_STORY_STATES:
                 continue
-
-            # Crashed at the very end (all stages DONE, status never finalised):
-            # close it out without dispatching anything.
             if st.next_stage is None:
                 status[story.id] = "DONE"
                 ledger.set_story_status(rid, story.id, "DONE")
@@ -352,8 +470,6 @@ def run_resume(
                 )
                 resumed += 1
                 continue
-
-            # A dependency that failed/blocked/skipped blocks this story (R2/R4).
             blocked_by = [
                 dep
                 for dep in story.dependencies
@@ -367,50 +483,51 @@ def run_resume(
                     f"blocked: dependency not done ({', '.join(blocked_by)})",
                 )
                 continue
-
-            # Story 14.1-001: re-enforce the budget ceiling before dispatching.
-            # The accrual carried in the ledger already counts the pre-pause
-            # spend, so an un-raised resume stops here and re-parks immediately.
-            if _budget_exceeded(ledger, rid, opts.budget):
-                budget_stopped = True
-                break
-
             ledger.event_log(
                 rid, story.id, "info", "controller",
                 f"resume: re-entering at stage '{st.next_stage}' "
                 f"(attempt {st.start_attempt})",
             )
-            try:
-                sr = _run_story_rate_limited(
-                    rl_ctx, story, ledger, rid, dispatch, logs_dir,
-                    done_stages=st.done_pipeline_stages,
-                    start_attempt=st.start_attempt,
-                    start_escalation=st.start_escalation,
-                    pr_number=st.pr_number,
-                    bugfix_seq=st.bugfix_seq,
-                )
-            except _CostGatePause as gate:
-                # Story 14.1-002: the cost gate re-halted this stage on resume.
+            dispatchable.append(story)
+        if not dispatchable:
+            continue
+
+        for result in _dispatch_cohort(
+            dispatchable, max_workers=workers, run_one=_run_one_parallel
+        ):
+            story = result.story
+            if result.cost_gate is not None:
                 status[story.id] = "NEEDS_ATTENTION"
                 ledger.set_story_status(rid, story.id, "NEEDS_ATTENTION")
-                cost_gated = gate
-                break
+                if cost_gated is None:
+                    cost_gated = result.cost_gate
+                continue
+            if result.error is not None:
+                # Failure isolation (AC4): an unexpected raise → FAILED here; the
+                # other workers already finished in the pool.
+                status[story.id] = "FAILED"
+                ledger.set_story_status(rid, story.id, "FAILED")
+                ledger.event_log(
+                    rid, story.id, "error", "controller",
+                    f"story raised during concurrent resume: {result.error}",
+                )
+                continue
+            sr = result.outcome
+            assert sr is not None
             if sr.parked:
                 status[story.id] = "RATE_LIMITED"
                 ledger.set_story_status(rid, story.id, "RATE_LIMITED")
-                rate_limit_park = sr
-                break
+                if rate_limit_park is None:
+                    rate_limit_park = sr
+                continue
             outcome = sr.status or "FAILED"
             status[story.id] = outcome
             ledger.set_story_status(rid, story.id, outcome)
             resumed += 1
 
-            # Story 12.4-001: reposition HEAD back to the base between stories so
-            # a parked story's leftover feature branch is never the base the next
-            # story stacks on. Real runs only (injected fakes operate on the
-            # test's cwd); best-effort and never fatal.
-            if dispatcher is None:
-                _reposition_head(root or Path.cwd())
+        # Reposition HEAD once after the cohort barrier (real runs only).
+        if dispatcher is None:
+            _reposition_head(root or Path.cwd())
 
     # Story 14.1-003: the resume re-hit the rate-limit window beyond the auto-wait
     # cap — durably re-park RATE_LIMITED (resumable again) without the terminal

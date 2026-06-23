@@ -203,6 +203,31 @@ def test_prepare_workdir_sequential_reuses_root(tmp_path) -> None:
     assert ledger.story_worktree(run_id, "17.2-001") is None
 
 
+def test_prepare_workdir_concurrency_one_reuses_root(tmp_path) -> None:
+    """`--concurrency=1` (not --sequential) is byte-for-byte the serial path:
+    an effective cap of 1 means no concurrency, so it must reuse the shared root
+    just like --sequential — never create a worktree (Story 17.1-001 AC3).
+
+    Regression: keying the decision off ``opts.sequential`` alone leaked a
+    per-story worktree into a real ``--concurrency=1`` run, diverging from the
+    serial path. Fake-dispatcher tests miss it (real_run=False short-circuits),
+    so this asserts the real-run decision directly.
+    """
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-17", "parallel")
+    ledger.story_upsert(
+        run_id, "17.2-001", "17", "Worktree", "P2", 5, "py", "", None, "TODO"
+    )
+    opts = BuildOptions(concurrency=1)  # parallel mode, but cap of 1
+    assert opts.sequential is False
+    workdir = _prepare_story_workdir(
+        opts, _story("17.2-001"), ledger, run_id, real_run=True
+    )
+    assert workdir is None
+    assert ledger.story_worktree(run_id, "17.2-001") is None
+
+
 def test_prepare_workdir_fake_run_reuses_root(tmp_path) -> None:
     """A fake-dispatcher (test) run never touches the real repo: no worktree."""
     ledger = Ledger(tmp_path / "ledger.db")
