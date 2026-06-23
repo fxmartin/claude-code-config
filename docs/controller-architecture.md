@@ -409,7 +409,19 @@ ledger alone is enough to recover an interrupted run — no separate journal.
 - **`sdlc status`** reports the active/most-recent run from the ledger
   (`status_snapshot`): scope, run id, per-story current stage, and aggregate
   counts (done / failed / blocked / in-progress). It never reads
-  `.build-progress.md`.
+  `.build-progress.md`. **Truthful mode + concurrency (Story 17.3-001):** the
+  run's `mode` is derived from `authoritative_mode(opts)` — the same
+  `effective_concurrency` figure the executor dispatches through — so a
+  `--concurrency=1` run is labelled `serial`, never `parallel`. The snapshot's
+  `run.concurrency` block carries `{limit, active}` (the worker cap and how many
+  workers are busy now), and every `IN_PROGRESS` story is in `stories[]` — so a
+  parallel run surfaces *all* active stories at once, not just one. The CLI
+  renders this as `N/M workers busy`; the Epic-11 dashboard reads the same
+  block. A `resume` re-stamps `runs.mode` and the persisted `concurrency` from
+  `authoritative_mode(opts)` after applying any `--concurrency` override, so a
+  resumed run reports the worker cap *it* runs with rather than the original
+  run's stale figure. This epic produces the truth; rendering stays in Epic-11
+  (no double-implementation).
 - **`sdlc state`** (`sdlc/status.py` + `Ledger.state_rows`) dumps every stage
   row (story id, stage, status, attempt, PR, branch) in a stable, greppable
   format for debugging.

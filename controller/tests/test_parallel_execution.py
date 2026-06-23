@@ -584,3 +584,191 @@ def test_resume_parallel_rate_limit_park(tmp_path) -> None:
     assert statuses["88.1-001"] == "RATE_LIMITED"
     assert statuses["88.1-002"] == "DONE"
     assert Ledger(db).run_row(result.run_id)["status"] == "RATE_LIMITED"
+
+
+# ---------------------------------------------------------------------------
+# Story 17.3-001: truthful `mode` + concurrency observability
+# ---------------------------------------------------------------------------
+
+def test_authoritative_mode_sequential_is_serial() -> None:
+    from sdlc.build import authoritative_mode
+
+    assert authoritative_mode(BuildOptions(sequential=True, concurrency=5)) == "serial"
+
+
+def test_authoritative_mode_concurrency_one_is_serial() -> None:
+    """`--concurrency=1` is byte-for-byte serial, so it must not wear `parallel`."""
+    from sdlc.build import authoritative_mode
+
+    assert authoritative_mode(BuildOptions(concurrency=1)) == "serial"
+
+
+def test_authoritative_mode_multiworker_is_parallel() -> None:
+    from sdlc.build import authoritative_mode
+
+    assert authoritative_mode(BuildOptions(concurrency=3)) == "parallel"
+
+
+def test_run_build_records_serial_mode_for_concurrency_one(tmp_path) -> None:
+    """A `--concurrency=1` run persists mode `serial` in the run row and config."""
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, concurrency=1)
+    result = run_build(
+        opts,
+        queue=_independent(2),
+        ledger=Ledger(db),
+        dispatcher=ConcurrencyProbeDispatcher(),
+        preflight=lambda: True,
+    )
+    ledger = Ledger(db)
+    assert ledger.run_row(result.run_id)["mode"] == "serial"
+    assert ledger.run_config(result.run_id)["mode"] == "serial"
+
+
+def test_run_build_records_parallel_mode_for_multiworker(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, concurrency=5)
+    result = run_build(
+        opts,
+        queue=_independent(2),
+        ledger=Ledger(db),
+        dispatcher=ConcurrencyProbeDispatcher(),
+        preflight=lambda: True,
+    )
+    assert Ledger(db).run_row(result.run_id)["mode"] == "parallel"
+
+
+def _seed_active_cohort(db, *, mode: str, concurrency: int, active: int, idle: int):
+    """A run with ``active`` stories IN_PROGRESS and ``idle`` still TODO."""
+    import json as _json
+
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", mode)
+    ledger.event_log(
+        run_id, "", "info", "config", _json.dumps({"concurrency": concurrency, "mode": mode})
+    )
+    for i in range(active):
+        ledger.story_upsert(run_id, f"a{i}", "99", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+        ledger.stage_start(run_id, f"a{i}", "build", 1)
+    for i in range(idle):
+        ledger.story_upsert(run_id, f"t{i}", "99", "S", "P1", 2, "py", "", None, "TODO")
+    return ledger, run_id
+
+
+def test_status_snapshot_exposes_concurrency_figure(tmp_path) -> None:
+    """A parallel run surfaces all active stories + an effective-concurrency figure."""
+    from sdlc.build import status_snapshot
+
+    ledger, run_id = _seed_active_cohort(
+        tmp_path / "ledger.db", mode="parallel", concurrency=5, active=3, idle=2
+    )
+    snap = status_snapshot(ledger, run_id)
+
+    conc = snap["run"]["concurrency"]
+    assert conc["limit"] == 5
+    assert conc["active"] == 3  # 3 of 5 workers busy — not just one
+    # All three active stories are visible in the snapshot, not a single one.
+    active_ids = {s["story_id"] for s in snap["stories"] if s["status"] == "IN_PROGRESS"}
+    assert active_ids == {"a0", "a1", "a2"}
+
+
+def test_status_snapshot_serial_run_concurrency_limit_is_one(tmp_path) -> None:
+    """A serial run reports a worker cap of 1 regardless of any persisted figure."""
+    from sdlc.build import status_snapshot
+
+    ledger, run_id = _seed_active_cohort(
+        tmp_path / "ledger.db", mode="serial", concurrency=5, active=1, idle=1
+    )
+    snap = status_snapshot(ledger, run_id)
+    assert snap["run"]["concurrency"] == {"limit": 1, "active": 1}
+
+
+def test_resume_narrowed_concurrency_restamps_truthful_cap(tmp_path) -> None:
+    """A resume that narrows the worker cap re-stamps mode + cap, so the snapshot
+    reports the resumed run's real concurrency — not the original run's stale 5."""
+    from sdlc.build import status_snapshot
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    rid = _seed_parallel_interrupted(db, concurrency=5)
+    # Resume the original parallel(5) run as a strictly serial one-worker run.
+    run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=ConcurrencyProbeDispatcher(),
+        root=tmp_path, concurrency=1,
+    )
+    ledger = Ledger(db)
+    # The run row's mode is now authoritative — a 1-worker run is serial.
+    assert ledger.run_row(rid)["mode"] == "serial"
+    snap = status_snapshot(ledger, rid)
+    # Not the stale 5 the original parallel run persisted.
+    assert snap["run"]["concurrency"]["limit"] == 1
+    assert snap["run"]["mode"] == "serial"
+
+
+def test_resume_widened_concurrency_restamps_truthful_cap(tmp_path) -> None:
+    """A resume that widens the cap re-stamps the parallel mode + the new cap."""
+    from sdlc.build import status_snapshot
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    rid = _seed_parallel_interrupted(db, concurrency=2)
+    run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=ConcurrencyProbeDispatcher(),
+        root=tmp_path, concurrency=4,
+    )
+    ledger = Ledger(db)
+    assert ledger.run_row(rid)["mode"] == "parallel"
+    snap = status_snapshot(ledger, rid)
+    assert snap["run"]["concurrency"]["limit"] == 4
+
+
+def _seed_serial_interrupted(db_path) -> str:
+    """A real `--sequential` run (mode=serial) crashed before either story built."""
+    import json
+
+    ledger = Ledger(db_path)
+    ledger.init()
+    rid = ledger.run_create("epic-88", "serial")
+    ledger.set_total(rid, 2)
+    ledger.event_log(
+        rid, "", "info", "config",
+        json.dumps({"skip_coverage": True, "coverage_threshold": 90, "concurrency": 5}),
+    )
+    ledger.story_upsert(rid, "88.1-001", "88", "One", "P1", 1, "general-purpose", "", None, "TODO")
+    ledger.story_upsert(rid, "88.1-002", "88", "Two", "P1", 1, "general-purpose", "", None, "TODO")
+    return rid
+
+
+def test_resume_widening_a_real_serial_run_actually_fans_out(tmp_path) -> None:
+    """Widening a run created `--sequential` must override the reconstructed
+    sequential flag — the resume genuinely runs >1 worker and reports parallel."""
+    from sdlc.build import status_snapshot
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    rid = _seed_serial_interrupted(db)
+    dispatcher = ConcurrencyProbeDispatcher()
+    run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        concurrency=4,
+    )
+    assert dispatcher.max_active >= 2  # genuinely fanned out, not still serial
+    ledger = Ledger(db)
+    assert ledger.run_row(rid)["mode"] == "parallel"
+    snap = status_snapshot(ledger, rid)
+    assert snap["run"]["concurrency"]["limit"] == 4
+
+
+def test_effective_worker_limit_non_numeric_config_falls_back_to_default() -> None:
+    """A parallel run whose persisted ``concurrency`` is a non-numeric string
+    (a corrupt/legacy ledger) must not crash: the unparseable value is swallowed
+    and the cap falls back to the build default rather than zero (Story 17.3-001)."""
+    from sdlc.build import _effective_worker_limit
+
+    assert _effective_worker_limit("parallel", {"concurrency": "lots"}) == (
+        BuildOptions.concurrency
+    )

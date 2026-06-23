@@ -102,6 +102,34 @@ def test_status_human_snapshot(tmp_path: Path) -> None:
     assert "#42" in out  # PR rendered with the GitHub # prefix
 
 
+def test_status_human_shows_workers_busy_for_parallel(tmp_path: Path) -> None:
+    """A parallel run surfaces "N/M workers busy" — several stories at once (17.3-001)."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("all", "parallel")
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"concurrency": 5, "mode": "parallel"}))
+    for i in range(3):
+        ledger.story_upsert(run_id, f"a{i}", "34", "S", "high", 2, "backend", "", None, "IN_PROGRESS")
+        ledger.stage_start(run_id, f"a{i}", "build", 1)
+    result = runner.invoke(app, ["status", "--db", str(db)])
+    assert result.exit_code == 0
+    assert "3/5 workers busy" in result.stdout
+
+
+def test_status_human_omits_workers_for_serial(tmp_path: Path) -> None:
+    """A serial run (cap 1) carries no worker-busy figure."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("all", "serial")
+    ledger.story_upsert(run_id, "a0", "34", "S", "high", 2, "backend", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "a0", "build", 1)
+    result = runner.invoke(app, ["status", "--db", str(db)])
+    assert result.exit_code == 0
+    assert "workers busy" not in result.stdout
+
+
 def test_status_json_snapshot(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     run_id = _seed(db)

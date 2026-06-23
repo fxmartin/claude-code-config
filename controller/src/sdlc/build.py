@@ -739,6 +739,18 @@ def effective_concurrency(opts: BuildOptions) -> int:
     return max(1, opts.concurrency)
 
 
+def authoritative_mode(opts: BuildOptions) -> str:
+    """The run's ``mode`` label, made truthful by actual dispatch behaviour (17.3-001).
+
+    A run drives a cohort through :func:`effective_concurrency` workers; when that
+    is ``1`` — ``--sequential`` *or* ``--concurrency=1`` — the run is byte-for-byte
+    serial and must never wear a ``parallel`` label. Any higher worker cap is a
+    genuine ``parallel`` run. Keeping the label derived from the same figure the
+    executor uses means the displayed mode can never disagree with reality (AC2).
+    """
+    return "serial" if effective_concurrency(opts) == 1 else "parallel"
+
+
 @dataclass
 class _StoryDispatch:
     """One story's result from a concurrent cohort dispatch (Story 17.1-001).
@@ -1022,6 +1034,17 @@ class Ledger:
                 conn.execute(
                     "UPDATE runs SET status = ? WHERE id = ?", (status, run_id)
                 )
+
+    def run_set_mode(self, run_id: str, mode: str) -> None:
+        """Re-stamp a run's ``mode`` (Story 17.3-001).
+
+        A resume can change the effective worker cap (``--concurrency``), so the
+        run's serial/parallel label must be re-derived to stay authoritative —
+        otherwise ``status``/the dashboard would report the original run's stale
+        mode and worker cap.
+        """
+        with self._connect() as conn:
+            conn.execute("UPDATE runs SET mode = ? WHERE id = ?", (mode, run_id))
 
     def run_update_counts(self, run_id: str, completed: int, failed: int) -> None:
         """Record the final completed/failed tallies on the run row."""
@@ -1833,6 +1856,26 @@ def _aggregate_run_usage(breakdown: dict[str, list[dict]]) -> dict | None:
     return {**totals, "total_tokens": sum(totals.values()), "cost_usd": cost}
 
 
+def _effective_worker_limit(mode: str | None, config: dict) -> int:
+    """The worker cap a persisted run actually dispatched through (Story 17.3-001).
+
+    A ``serial`` run is one worker by definition. A ``parallel`` run honours the
+    persisted ``concurrency`` config, floored at 1; when that figure is missing
+    (an older ledger) it falls back to the build default so the snapshot still
+    reports a sensible cap rather than zero. Mirrors :func:`effective_concurrency`
+    on the read side, where only the persisted run row and config are available.
+    """
+    if mode == "serial":
+        return 1
+    raw = config.get("concurrency")
+    if isinstance(raw, (int, float, str)):
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return max(1, BuildOptions.concurrency)
+
+
 def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
     """A read-only progress snapshot of ``run_id`` (default: the latest run).
 
@@ -1915,6 +1958,16 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
     # Run-level usage rollup across every stage attempt of every story.
     run_usage = _aggregate_run_usage(breakdown)
 
+    # Story 17.3-001: surface the run's real concurrency so tooling reflects
+    # that several stories run at once, not just one. ``limit`` is the worker
+    # cap the executor uses (1 for a serial run); ``active`` is how many of
+    # those workers are busy right now. Consumers (e.g. the Epic-11 dashboard)
+    # render "active of limit workers busy" — this side produces only the truth.
+    concurrency = {
+        "limit": _effective_worker_limit(run_row.get("mode"), config),
+        "active": _count("IN_PROGRESS"),
+    }
+
     payload["run"] = {
         "id": rid,
         "scope": run_row.get("scope"),
@@ -1926,6 +1979,7 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
             run_row.get("started_at"), run_row.get("finished_at"), now=now
         ),
         "config": config,
+        "concurrency": concurrency,
         "usage": run_usage,
     }
     payload["counts"] = {
@@ -2775,7 +2829,9 @@ def run_build(
     # --- Ledger bootstrap ----------------------------------------------------
     ledger.init()
     _ensure_repo_ignores(ledger.db_path)  # keep ledger files out of git status (R9)
-    mode = "serial" if opts.sequential else "parallel"
+    # Story 17.3-001: the label is derived from the worker cap the executor will
+    # actually use, so `--concurrency=1` reports `serial` rather than lying.
+    mode = authoritative_mode(opts)
     run_id = ledger.run_create(opts.scope, mode)
     ledger.set_total(run_id, len(buildable))
     # Announce the run in the host-level registry so a single dashboard can
