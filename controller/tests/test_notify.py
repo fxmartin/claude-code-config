@@ -228,3 +228,75 @@ def test_load_creds_strips_export_and_quotes(monkeypatch, tmp_path):
     token, chat = notify_mod._load_creds()
     assert token == "singlequoted"
     assert chat == "spacedvalue"
+
+
+# --- _load_creds OSError branch (lines 64-66) ---------------------------------
+
+
+def test_load_creds_os_error_on_read_returns_none(monkeypatch, tmp_path):
+    """_load_creds silently returns (None, None) when .env exists but is unreadable.
+
+    Covers the OSError handler at lines 64-66. We patch the Path object so that
+    is_file() returns True but read_text() raises OSError, without needing
+    actual filesystem permission changes.
+    """
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    class _UnreadablePath:
+        def is_file(self):
+            return True
+
+        def read_text(self, encoding="utf-8"):  # noqa: ARG002
+            raise OSError("permission denied")
+
+    monkeypatch.setattr(notify_mod, "_ENV_FILE", _UnreadablePath())
+    token, chat = notify_mod._load_creds()
+    # OSError path must return the current (None, None) values, never propagate.
+    assert token is None
+    assert chat is None
+
+
+# --- _default_sender error-swallow branch (lines 80-90) ----------------------
+
+
+def test_default_sender_swallows_network_error(monkeypatch):
+    """_default_sender silently drops any Exception from urlopen (lines 88-90).
+
+    This exercises the real sender function that wraps urllib — it must never
+    surface network failures to the caller.
+    """
+    import urllib.request as _urllib_req
+
+    def _boom(req, timeout=None):  # noqa: ARG001
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(_urllib_req, "urlopen", _boom)
+    # Must not raise — the exception is swallowed.
+    notify_mod._default_sender("https://api.telegram.org/bot_fake/sendMessage", b"{}")
+
+
+def test_default_sender_success_path(monkeypatch):
+    """_default_sender builds a correct POST Request and calls urlopen (lines 80-87).
+
+    A fake urlopen captures the Request object so we can assert it was built
+    correctly without making a real network call.
+    """
+    import urllib.request as _urllib_req
+
+    captured_reqs: list = []
+
+    def _fake_urlopen(req, timeout=None):  # noqa: ARG001
+        captured_reqs.append(req)
+
+    monkeypatch.setattr(_urllib_req, "urlopen", _fake_urlopen)
+    notify_mod._default_sender(
+        "https://api.telegram.org/botTOKEN/sendMessage",
+        b'{"chat_id": "123", "text": "hi"}',
+    )
+
+    assert len(captured_reqs) == 1
+    req = captured_reqs[0]
+    assert req.full_url == "https://api.telegram.org/botTOKEN/sendMessage"
+    assert req.get_header("Content-type") == "application/json"
+    assert req.data == b'{"chat_id": "123", "text": "hi"}'
