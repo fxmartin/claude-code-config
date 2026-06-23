@@ -150,6 +150,47 @@ def _registry_runs_view(
     return rows
 
 
+# --- wave-column dependency DAG (Story 11.2-008) ---------------------------
+# The per-run detail renders a DAG where each column is a cohort wave (left→right
+# = execution order), each node a story, and each edge a story→dependency link.
+# The layout is fully constrained by the wave index recorded in 11.2-007, so no
+# graph-layout library is needed: this helper turns the story rows into the
+# column/row/edge structure the client paints with inline SVG + HTML.
+
+
+def dag_layout(stories: list[dict]) -> dict:
+    """Group ``stories`` into wave columns with intra-queue dependency edges.
+
+    Returns ``{"available", "waves", "edges"}`` where ``waves`` is an
+    execution-ordered list of ``{"index", "stories": [story_id, …]}`` (stories
+    sharing a wave run in parallel, kept in input order = order-within-wave) and
+    ``edges`` is a list of ``{"from", "to"}`` story-id pairs, one per dependency
+    that is itself in the queue. Only in-queue edges are emitted, matching
+    ``compute_cohorts`` semantics — a dependency on an already-merged
+    out-of-queue story is not a node, so it produces no dangling edge.
+
+    Degrades gracefully: when no story carries a wave (an older ledger or a run
+    scheduled before 11.2-007 persisted waves), ``available`` is False and the
+    client falls back to the flat story list. A rare story with a NULL wave in
+    an otherwise-waved run is coerced to wave 0 so no node is dropped.
+    """
+    present = {s["story_id"] for s in stories if s.get("story_id")}
+    if not any(s.get("wave") is not None for s in stories):
+        return {"available": False, "waves": [], "edges": []}
+    by_wave: dict[int, list[str]] = {}
+    for s in stories:
+        wave = s.get("wave")
+        by_wave.setdefault(int(wave) if wave is not None else 0, []).append(s["story_id"])
+    waves = [{"index": w, "stories": by_wave[w]} for w in sorted(by_wave)]
+    edges = [
+        {"from": dep, "to": s["story_id"]}
+        for s in stories
+        for dep in (s.get("dependencies") or [])
+        if dep in present
+    ]
+    return {"available": True, "waves": waves, "edges": edges}
+
+
 # --- live transport: change detection (Story 11.2-003) ---------------------
 # The SSE endpoint pushes a delta only when the ledger actually moves. We avoid
 # diffing rows by collapsing all activity into a cheap token; when it changes,
@@ -329,6 +370,23 @@ _PAGE = """<!doctype html>
              border: 1px solid var(--surface); border-radius: 8px; }
   .ghpanel h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
   .ghpanel.unavail { color: var(--sub); font-style: italic; }
+  /* Story 11.2-008: wave-column dependency DAG. Columns = cohort waves, nodes =
+     stories, edges = SVG connectors. position:relative anchors the absolute edge
+     overlay; nodes flow as normal columns so no per-pixel layout maths leak in. */
+  .dagwrap { margin: 16px 0; padding: 12px 14px; background: var(--mantle);
+             border: 1px solid var(--surface); border-radius: 8px; }
+  .dagwrap h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
+  .dag-cols { position: relative; display: flex; gap: 36px; align-items: flex-start; }
+  .dag-edges { position: absolute; inset: 0; width: 100%; height: 100%;
+               pointer-events: none; overflow: visible; }
+  .dag-edges path { fill: none; stroke: var(--overlay); stroke-width: 1.5; opacity: 0.7; }
+  .dag-col { display: flex; flex-direction: column; gap: 12px; min-width: 150px; z-index: 1; }
+  .dag-col .wave-h { font-size: 11px; color: var(--sub); font-weight: 600; }
+  .dag-node { padding: 6px 8px; background: var(--base); border: 1px solid var(--surface);
+              border-radius: 6px; font-size: 12px; }
+  .dag-node .nid { font-family: monospace; color: var(--text); }
+  .dag-node .ntitle { color: var(--sub); display: block; margin: 2px 0 4px;
+                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   @media (max-width: 760px) {
     .wrap { flex-direction: column; }
     .side { width: auto; border-right: none; border-bottom: 1px solid var(--surface); }
@@ -348,6 +406,7 @@ _PAGE = """<!doctype html>
       <div class="bar"><span id="bar" style="width:0%"></span></div>
       <div class="chips" id="chips"></div>
       <div id="github"></div>
+      <div id="dag"></div>
       <div id="stories"></div>
       <div class="events" id="events"></div>
     </div>
@@ -512,6 +571,52 @@ function renderRuns(runs){
   document.getElementById("runs").innerHTML = html;
 }
 
+// Wave-column dependency DAG (Story 11.2-008). The server (dag_layout) groups
+// stories into waves (columns, left→right = execution order) and lists the
+// in-queue dependency edges; this paints columns of HTML nodes and overlays the
+// edges as inline SVG connectors — no external graph library. It re-renders on
+// every tick, so node status tracks the run live (11.2-003) or static at load.
+// Degrades to nothing (the flat story table remains) when wave data is absent.
+function renderDag(d){
+  const el = document.getElementById("dag");
+  if(!el) return;
+  const dag = d.dag;
+  if(!dag || !dag.available || !(dag.waves||[]).length){ el.innerHTML = ""; return; }
+  const byId = {};
+  (d.stories||[]).forEach(s => { byId[s.story_id] = s; });
+  const cols = dag.waves.map(w => {
+    const nodes = w.stories.map(id => {
+      const s = byId[id] || {story_id:id, status:"TODO", title:""};
+      return "<div class='dag-node' id='dagn-"+esc(id)+"'>"
+        + "<span class='nid'>"+esc(id)+"</span> "+badge(s.status||"TODO")
+        + "<span class='ntitle' title='"+esc(s.title||"")+"'>"+esc(s.title||"")+"</span></div>";
+    }).join("");
+    return "<div class='dag-col'><div class='wave-h'>Wave "+(w.index+1)
+      + " \\u2014 runs in parallel</div>"+nodes+"</div>";
+  }).join("");
+  el.innerHTML = "<div class='dagwrap'><h3>Dependency DAG \\u00b7 waves left\\u2192right</h3>"
+    + "<div class='dag-cols' id='dagcols'><svg class='dag-edges' id='dagedges'></svg>"
+    + cols + "</div></div>";
+  drawDagEdges(dag.edges||[]);
+}
+// Edges connect each dependency (upstream node, right edge) to its dependent
+// (downstream node, left edge) as a smooth SVG cubic curve. Coordinates are
+// taken from the laid-out nodes' offsets relative to the positioned .dag-cols,
+// so the connectors track the flexbox columns without hard-coded geometry.
+function drawDagEdges(edges){
+  const svg = document.getElementById("dagedges");
+  if(!svg) return;
+  svg.innerHTML = edges.map(e => {
+    const a = document.getElementById("dagn-"+e.from);
+    const b = document.getElementById("dagn-"+e.to);
+    if(!a || !b) return "";
+    const x1 = a.offsetLeft + a.offsetWidth, y1 = a.offsetTop + a.offsetHeight/2;
+    const x2 = b.offsetLeft, y2 = b.offsetTop + b.offsetHeight/2;
+    const mx = (x1 + x2) / 2;
+    return "<path d='M"+x1+" "+y1+" C"+mx+" "+y1+" "+mx+" "+y2+" "+x2+" "+y2+"'></path>";
+  }).join("");
+}
+
 function renderMain(d){
   const run = d.run, c = d.counts || {}, p = d.project || {};
   document.getElementById("repo").innerHTML = p.name
@@ -523,6 +628,7 @@ function renderMain(d){
     document.getElementById("bar").style.width = "0%";
     document.getElementById("chips").innerHTML = "";
     document.getElementById("stories").innerHTML = "";
+    document.getElementById("dag").innerHTML = "";
     document.getElementById("events").innerHTML = "";
     return;
   }
@@ -592,6 +698,7 @@ function renderMain(d){
     ? "<table><tr><th>story</th><th>status</th><th>build</th><th>QA</th>"
       + "<th>review</th><th>merge</th><th>PR</th><th>tokens</th><th>duration</th></tr>"+rows+"</table>"
     : "<p class='muted'>no stories yet…</p>";
+  renderDag(d);
   document.getElementById("events").innerHTML = (d.events||[]).slice().reverse().map(e =>
     "<div><span class='muted' title='"+esc(e.ts)+"'>"+esc(fmtLocal(e.ts))+"</span> <span class='lvl-"+esc(e.level)+"'>"+esc(e.level)+"</span> "+esc(e.message)+"</div>"
   ).join("");
@@ -671,7 +778,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         elif path in ("/api/status", "/status.json"):
             if self.server.registry is not None:
-                self._json(self._registry_status(run))
+                snap = self._registry_status(run)
             else:
                 snap = status_snapshot(Ledger(self.server.db_path), run)
                 snap["pr_base"] = self.server.project_url
@@ -679,7 +786,11 @@ class _Handler(BaseHTTPRequestHandler):
                     "name": self.server.project_name,
                     "url": self.server.project_url,
                 }
-                self._json(snap)
+            # Story 11.2-008: the wave-column DAG layout is derived from the
+            # run's stories (wave + deps recorded by 11.2-007) so the client can
+            # paint columns/edges without a graph library.
+            snap["dag"] = dag_layout(snap.get("stories", []))
+            self._json(snap)
         elif path == "/api/runs":
             if self.server.registry is not None:
                 self._json(_registry_runs_view(self.server.registry, self.server.github_cache))

@@ -1381,3 +1381,137 @@ def test_page_refreshes_github_on_a_steady_cadence() -> None:
 
     assert "GH_REFRESH_INTERVAL" in _PAGE
     assert "setInterval(tick, GH_REFRESH_INTERVAL)" in _PAGE
+
+
+# --- Story 11.2-008: wave-column dependency DAG ----------------------------
+
+
+def _seed_waves(db_path: Path) -> str:
+    """A three-wave queue: A (w0) → {B,C} (w1) → D (w2).
+
+    B and C share wave 1 (run in parallel), both depend on A; D depends on B.
+    Mirrors how ``run_build`` records ``compute_cohorts`` output via
+    :meth:`Ledger.set_story_wave`.
+    """
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("all", "parallel")
+    ledger.set_total(run_id, 4)
+    for sid, title, status in (
+        ("1.1-001", "Foundation", "DONE"),
+        ("1.1-002", "Left branch", "IN_PROGRESS"),
+        ("1.1-003", "Right branch", "TODO"),
+        ("1.1-004", "Join", "TODO"),
+    ):
+        ledger.story_upsert(run_id, sid, "1", title, "high", 2, "backend", "", None, status)
+    ledger.set_story_wave(run_id, "1.1-001", 0, [])
+    ledger.set_story_wave(run_id, "1.1-002", 1, ["1.1-001"])
+    ledger.set_story_wave(run_id, "1.1-003", 1, ["1.1-001"])
+    ledger.set_story_wave(run_id, "1.1-004", 2, ["1.1-002"])
+    return run_id
+
+
+def test_dag_layout_assigns_waves_to_columns_in_order() -> None:
+    """Each wave is a column, left→right = execution order; rows preserve input order."""
+    from sdlc.dashboard import dag_layout
+
+    stories = [
+        {"story_id": "a", "wave": 0, "dependencies": []},
+        {"story_id": "b", "wave": 1, "dependencies": ["a"]},
+        {"story_id": "c", "wave": 1, "dependencies": ["a"]},
+        {"story_id": "d", "wave": 2, "dependencies": ["b"]},
+    ]
+    dag = dag_layout(stories)
+    assert dag["available"] is True
+    assert [w["index"] for w in dag["waves"]] == [0, 1, 2]
+    assert dag["waves"][0]["stories"] == ["a"]
+    assert dag["waves"][1]["stories"] == ["b", "c"]  # same wave, input order
+    assert dag["waves"][2]["stories"] == ["d"]
+
+
+def test_dag_layout_derives_edges_from_in_queue_deps_only() -> None:
+    """Edges connect a dependency (upstream) to its dependent; out-of-queue deps drop."""
+    from sdlc.dashboard import dag_layout
+
+    stories = [
+        {"story_id": "a", "wave": 0, "dependencies": []},
+        {"story_id": "b", "wave": 1, "dependencies": ["a", "merged-elsewhere"]},
+    ]
+    dag = dag_layout(stories)
+    assert {"from": "a", "to": "b"} in dag["edges"]
+    # The out-of-queue dependency is not a node, so no dangling edge is emitted.
+    assert all(e["from"] != "merged-elsewhere" for e in dag["edges"])
+    assert len(dag["edges"]) == 1
+
+
+def test_dag_layout_degrades_when_no_wave_data() -> None:
+    """Older ledger / unpersisted run: no wave anywhere → not available (flat fallback)."""
+    from sdlc.dashboard import dag_layout
+
+    stories = [
+        {"story_id": "a", "wave": None, "dependencies": []},
+        {"story_id": "b", "wave": None, "dependencies": []},
+    ]
+    dag = dag_layout(stories)
+    assert dag["available"] is False
+    assert dag["waves"] == []
+    assert dag["edges"] == []
+
+
+def test_dag_layout_sequential_run_is_one_story_per_wave() -> None:
+    """A --sequential run records ascending waves: each story its own column."""
+    from sdlc.dashboard import dag_layout
+
+    stories = [
+        {"story_id": "a", "wave": 0, "dependencies": []},
+        {"story_id": "b", "wave": 1, "dependencies": ["a"]},
+        {"story_id": "c", "wave": 2, "dependencies": ["b"]},
+    ]
+    dag = dag_layout(stories)
+    assert dag["available"] is True
+    assert [w["stories"] for w in dag["waves"]] == [["a"], ["b"], ["c"]]
+
+
+def test_dag_layout_handles_empty_stories() -> None:
+    from sdlc.dashboard import dag_layout
+
+    dag = dag_layout([])
+    assert dag == {"available": False, "waves": [], "edges": []}
+
+
+def test_api_status_includes_dag(tmp_path: Path) -> None:
+    """The /api/status payload exposes the wave-column DAG layout for the run."""
+    db = tmp_path / "ledger.db"
+    run_id = _seed_waves(db)
+    with _running(db) as base:
+        status, _, body = _get(f"{base}/api/status?run={run_id}")
+    assert status == 200
+    dag = json.loads(body)["dag"]
+    assert dag["available"] is True
+    assert [w["index"] for w in dag["waves"]] == [0, 1, 2]
+    assert dag["waves"][1]["stories"] == ["1.1-002", "1.1-003"]
+    assert {"from": "1.1-001", "to": "1.1-002"} in dag["edges"]
+    assert {"from": "1.1-002", "to": "1.1-004"} in dag["edges"]
+
+
+def test_api_status_dag_degrades_without_wave_data(tmp_path: Path) -> None:
+    """A run with no recorded waves still serves a dag block (unavailable, no error)."""
+    db = tmp_path / "ledger.db"
+    run_id = _seed(db)  # seeds stories but never calls set_story_wave
+    with _running(db) as base:
+        status, _, body = _get(f"{base}/api/status?run={run_id}")
+    assert status == 200
+    assert json.loads(body)["dag"]["available"] is False
+
+
+def test_page_renders_wave_dag() -> None:
+    """The page ships the DAG render hooks: container, renderer, SVG edges, no graph lib."""
+    from sdlc.dashboard import _PAGE
+
+    assert 'id="dag"' in _PAGE
+    assert "function renderDag(" in _PAGE
+    assert "renderDag(d)" in _PAGE              # invoked from the main render path
+    assert "d.dag" in _PAGE                      # reads the layout from the payload
+    assert "runs in parallel" in _PAGE          # wave header copy
+    assert "<svg" in _PAGE                       # inline SVG edges, no external lib
+    assert "<path" in _PAGE                      # edges as SVG connectors
