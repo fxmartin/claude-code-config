@@ -81,6 +81,8 @@ Flags:
   --skip-preflight          skip the preflight quality gate
   --rebuild                 rebuild stories the epic already marks Done
   --sequential              one story at a time (no cohort parallelism)
+  --concurrency=N           max stories of a cohort to run at once in parallel
+                            mode (default 5; --sequential forces 1)
   --limit=N                 build at most N stories
   --coverage-threshold=N    required new-code coverage % (default 90)
   --preflight-timeout=SEC   abort the preflight gate after SEC seconds (default 600)
@@ -271,6 +273,12 @@ def resume(
         "to a notional token ceiling; 0 disables it). Pass this to continue a "
         "story the gate parked.",
     ),
+    concurrency: int | None = typer.Option(
+        None, "--concurrency",
+        help="Override the cohort worker cap for this resume (>= 1; default: the "
+        "value the original run used). A serial-mode run stays one-at-a-time.",
+        min=1,
+    ),
 ) -> None:
     """Resume an interrupted build from the SQLite ledger.
 
@@ -317,7 +325,7 @@ def resume(
     result = run_resume(
         scope, ledger=ledger, run_id=run, render_view=make_render_view(db_path),
         budget=budget_tokens, budget_policy=budget_policy,
-        cost_threshold=cost_threshold_tokens,
+        cost_threshold=cost_threshold_tokens, concurrency=concurrency,
     )
 
     if result.nothing_to_resume:

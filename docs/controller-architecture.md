@@ -87,6 +87,30 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
 3. **Cohort scheduling** — `compute_cohorts` groups stories whose dependencies
    are all satisfied (already merged or in an earlier cohort). A cycle is a hard
    `ValueError`, never an infinite loop.
+
+   **Concurrent cohort execution (Story 17.1-001).** A `parallel` run (the
+   default) dispatches a cohort's *ready* stories through a bounded
+   `ThreadPoolExecutor` — at most `effective_concurrency(opts)` at once (default
+   **5**, set with `--concurrency=N`). Work is I/O-bound on the agent
+   subprocesses, so threads suffice (the same model `adversarial.py` uses). The
+   cohort loop is **cohort-barrier scheduled**: `_dispatch_cohort` blocks until
+   *every* story in the cohort reaches a terminal/parked outcome before the next
+   cohort begins, so dependency ordering is never violated. Within a cohort the
+   dependency-block check still runs **before** a story is submitted — a story
+   whose dependency did not cleanly finish is marked `BLOCKED` and never
+   dispatched — and a worker that raises mid-flight is captured (failure
+   isolation): its story is recorded `FAILED` while its peers run to completion.
+   Outcomes are applied in cohort (submission) order so the end state is
+   deterministic regardless of which worker finished first. `--sequential` (or
+   `--concurrency=1`) forces an effective cap of **1**, taking a separate,
+   byte-for-byte-unchanged serial path: the budget gate is re-checked before
+   every story and a cost-gate/rate-limit park breaks mid-cohort, exactly as
+   before. The budget gate on the parallel path is checked once at each cohort
+   boundary (the pool cannot interleave a per-story check; the barrier bounds
+   mid-cohort spend). `resume` mirrors the same executor and honours the
+   persisted (or `--concurrency`-overridden) worker cap. Concurrent ledger writes
+   are kept safe by the WAL + `busy_timeout` work in Story 17.1-002 (see
+   *Concurrency-safe writes* below).
 4. **Per-story execution** — each story walks `build → coverage → review →
    merge` (coverage is skipped under `--skip-coverage`). Each stage dispatches
    an agent and the response is validated against its schema *before* the next
