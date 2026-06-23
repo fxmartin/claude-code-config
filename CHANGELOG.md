@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.57.0] - 2026-06-23
+
+### Added
+
+- feat(controller): emit telegram notifications at run lifecycle events (#141) (#149)
+
+
 ## [v1.56.1] - 2026-06-23
 
 ### Fixed

@@ -1,6 +1,6 @@
 {
   "name": "autonomous-sdlc",
-  "version": "1.56.1",
+  "version": "1.57.0",
   "description": "Claude-native SDLC workflows: project bootstrap, requirements discovery, epic/story planning, issue handling, and orchestrated build. Mirror of the Codex autonomous-sdlc plugin.",
   "author": {
     "name": "FX Martin",
