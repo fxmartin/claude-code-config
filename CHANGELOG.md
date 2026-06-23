@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.57.2] - 2026-06-23
+
+### Changed
+
+- refactor(hooks): remove cmux integration; extract notify-telegram (#143) (#151)
+
+
 ## [v1.57.1] - 2026-06-23
 
 ### Changed
