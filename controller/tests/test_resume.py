@@ -395,17 +395,22 @@ def _seed_skipped_dep_blocks(db_path: Path) -> str:
     return run_id
 
 
-def test_resume_all_stages_done_unfinalised_is_noop(tmp_path: Path) -> None:
+def test_resume_all_stages_done_unfinalised_closes_out(tmp_path: Path) -> None:
     """A resumable run whose only story has every stage DONE (just not finalised)
-    has nothing incomplete to dispatch — it is a no-op, not a rebuild."""
+    has no stage to dispatch, but it is *not* a no-op: leaving it stranded
+    IN_PROGRESS would also strand its per-story worktree (Story 17.2-002). The
+    end-crash story is closed out (marked DONE, no dispatch) so the run finalises
+    coherently and its worktree can be torn down rather than leaked."""
     _make_project(tmp_path)
     db = tmp_path / ".sdlc-state.db"
     rid = _seed_all_stages_done_unfinalised(db)
     dispatcher = FakeDispatcher()
     result = run_resume("epic-99", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
-    assert result.nothing_to_resume is True
+    assert result.nothing_to_resume is False
     assert result.run_id == rid
-    assert dispatcher.calls == []  # nothing was dispatched
+    assert dispatcher.calls == []  # closed out without dispatching any stage
+    rows = {r["story_id"]: r for r in Ledger(db).story_rows(rid)}
+    assert rows["99.1-001"]["status"] == "DONE"
 
 
 def test_resume_closes_out_unfinalised_story_without_dispatch(tmp_path: Path) -> None:

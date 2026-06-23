@@ -22,6 +22,7 @@ from sdlc.build import (
     _resolve_dispatch,
     _run_story_rate_limited,
     _StoryRunOutcome,
+    _teardown_story_workdir,
     apply_budget_stop,
     apply_cost_gate_pause,
     apply_rate_limit_park,
@@ -265,7 +266,21 @@ def run_resume(
         for sid, st in plan.items()
         if st.status not in _TERMINAL_STORY_STATES and st.next_stage is not None
     }
-    if not incomplete:
+    # Story 17.2-002: end-crash stories (all stages done, status never
+    # finalised) own no stage to dispatch yet are *not* finished — the cohort
+    # loop's end-crash branch marks them DONE and tears down their worktree, and
+    # the normal close-out finalises the run. So a run is genuinely
+    # nothing-to-resume only when it has neither dispatchable work nor an
+    # end-crash story to close out. Short-circuiting on ``incomplete`` alone
+    # would strand an end-crash-only run IN_PROGRESS and leak its worktree;
+    # tearing the worktree down here while leaving the run resumable would be an
+    # incoherent half-state — so we let it flow through the close-out instead.
+    end_crash = {
+        sid: st
+        for sid, st in plan.items()
+        if st.status not in _TERMINAL_STORY_STATES and st.next_stage is None
+    }
+    if not incomplete and not end_crash:
         return ResumeResult(run_id=rid, nothing_to_resume=True)
 
     opts = _options_from_config(scope, run_row, config)
@@ -390,6 +405,12 @@ def run_resume(
                         rid, story.id, "info", "controller",
                         "resume: all stages already complete — marked DONE",
                     )
+                    # Story 17.2-002: this story finishes here without dispatch,
+                    # so the per-story close-out below never runs — tear down the
+                    # worktree the original build recorded or it leaks on resume.
+                    _teardown_story_workdir(
+                        ledger, rid, story.id, real_run=dispatcher is None
+                    )
                     resumed += 1
                     continue
 
@@ -437,6 +458,11 @@ def run_resume(
                 status[story.id] = outcome
                 ledger.set_story_status(rid, story.id, outcome)
                 resumed += 1
+                # Story 17.2-002: close-out tears down the re-entered story's
+                # worktree (branch/PR preserved); resumable holds `break`d first.
+                _teardown_story_workdir(
+                    ledger, rid, story.id, real_run=dispatcher is None
+                )
 
                 # Story 12.4-001: reposition HEAD back to the base between stories
                 # so a parked story's leftover feature branch is never the base the
@@ -467,6 +493,11 @@ def run_resume(
                 ledger.event_log(
                     rid, story.id, "info", "controller",
                     "resume: all stages already complete — marked DONE",
+                )
+                # Story 17.2-002: closed out here without dispatch, so tear down
+                # the recorded worktree now or it leaks past resume.
+                _teardown_story_workdir(
+                    ledger, rid, story.id, real_run=dispatcher is None
                 )
                 resumed += 1
                 continue
@@ -511,6 +542,9 @@ def run_resume(
                     rid, story.id, "error", "controller",
                     f"story raised during concurrent resume: {result.error}",
                 )
+                _teardown_story_workdir(
+                    ledger, rid, story.id, real_run=dispatcher is None
+                )
                 continue
             sr = result.outcome
             assert sr is not None
@@ -524,6 +558,11 @@ def run_resume(
             status[story.id] = outcome
             ledger.set_story_status(rid, story.id, outcome)
             resumed += 1
+            # Story 17.2-002: terminal story → remove its worktree after the
+            # barrier (single-threaded here, never races a live worker).
+            _teardown_story_workdir(
+                ledger, rid, story.id, real_run=dispatcher is None
+            )
 
         # Reposition HEAD once after the cohort barrier (real runs only).
         if dispatcher is None:

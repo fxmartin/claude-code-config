@@ -120,16 +120,18 @@ def test_resume_command_nothing_to_resume(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_resume_command_run_with_no_incomplete_stories(tmp_path: Path, monkeypatch) -> None:
-    """A resumable run whose stories are all (unfinalised but) complete reports
-    the run id and exits 0 — distinct from the no-run-at-all message."""
+    """A resumable run whose stories are all (unfinalised but) complete is closed
+    out rather than stranded: its end-crash story is finalised DONE without
+    dispatching any stage (Story 17.2-002), so the run finalises coherently and
+    its per-story worktree is reclaimed rather than leaked. Exits 0."""
     _make_project(tmp_path)
     db = tmp_path / ".sdlc-state.db"
-    rid = _seed_all_stages_done_unfinalised(db)
+    _seed_all_stages_done_unfinalised(db)
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["resume", "epic-99", "--db", str(db)])
     assert result.exit_code == 0, result.output
-    assert "nothing to resume" in result.output.lower()
-    assert rid[:8] in result.output  # names the specific run, not "no incomplete run"
+    assert "1 done" in result.output.lower()
+    assert "nothing to resume" not in result.output.lower()
 
 
 def test_resume_is_not_a_stub(tmp_path: Path) -> None:
