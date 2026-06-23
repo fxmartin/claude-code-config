@@ -351,6 +351,43 @@ def test_api_status_has_stage_breakdown(tmp_path: Path) -> None:
     assert "bugfix_attempts" in story
 
 
+def test_api_status_carries_story_title(tmp_path: Path) -> None:
+    """Story 11.2-012: the snapshot threads each story's ledger title to the client."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)  # 34.5-003 "Build it", 34.6-001 "Wire it"
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/status")
+    by_id = {s["story_id"]: s for s in json.loads(body)["stories"]}
+    assert by_id["34.5-003"]["title"] == "Build it"
+    assert by_id["34.6-001"]["title"] == "Wire it"
+
+
+def test_api_status_null_title_degrades(tmp_path: Path) -> None:
+    """Story 11.2-012: a row with an empty/null title carries None, not a blank lie."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("all", "parallel")
+    ledger.set_total(run_id, 1)
+    # Empty title (older ledger / un-titled row) → stored and read back as NULL.
+    ledger.story_upsert(run_id, "99.9-001", "99", "", "high", 1, "backend", "", None, "TODO")
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/status")
+    by_id = {s["story_id"]: s for s in json.loads(body)["stories"]}
+    assert by_id["99.9-001"]["title"] is None
+
+
+def test_page_renders_story_title_truncated_with_hover() -> None:
+    """Story 11.2-012: the per-story row shows id · title, ellipsized, full on hover."""
+    from sdlc.dashboard import _PAGE
+
+    # The title is escaped, carried in a title= tooltip (hover), and only shown
+    # when present (null/empty title degrades to just the ID).
+    assert "s.title" in _PAGE                 # render reads the threaded field
+    assert "class='stitle'" in _PAGE          # dedicated, ellipsized title span
+    assert ".stitle" in _PAGE and "text-overflow: ellipsis" in _PAGE  # truncation CSS
+
+
 def test_log_endpoint_serves_within_root_and_confines(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     _seed(db)

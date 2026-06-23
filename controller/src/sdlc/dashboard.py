@@ -408,6 +408,12 @@ _PAGE = """<!doctype html>
      per story opens a modal listing that story's stage transcripts and renders
      each inline — no leaving the page. The new-tab /log link stays as fallback. */
   .view-session { cursor: pointer; font-size: 11px; color: var(--blue); margin-left: 6px; }
+  /* Story 11.2-012: the human-readable story title beside its ID. Ellipsized to
+     keep rows stable (11.2-011 no-reflow goal); full title shown on hover via
+     the title= tooltip. A null/empty title renders nothing (degrades to ID). */
+  .stitle { color: var(--sub); display: inline-block; max-width: 22em;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            vertical-align: bottom; }
   .modal { position: fixed; inset: 0; z-index: 50; background: rgba(76,79,105,.45);
            display: flex; align-items: center; justify-content: center; padding: 24px; }
   .modal[hidden] { display: none; }
@@ -739,7 +745,12 @@ function renderMain(d){
     const tok = s.tokens!=null
       ? humanTokens(s.tokens)+(s.cost_usd!=null?(" "+usd(s.cost_usd)):"")
       : "—";
-    return "<tr><td><code>"+esc(s.story_id)+"</code>"
+    // Story 11.2-012: show the title beside the ID (id · title), ellipsized with
+    // the full text on hover. A null/empty title degrades to just the ID.
+    const stitle = s.title
+      ? " <span class='sep muted'>\\u00b7</span> <span class='stitle' title='"+esc(s.title)+"'>"+esc(s.title)+"</span>"
+      : "";
+    return "<tr><td><code>"+esc(s.story_id)+"</code>"+stitle
     + "<a class='view-session' data-story='"+esc(s.story_id)+"' title='read this story\\u2019s agent transcripts here'>view session</a></td>"
     + "<td>"+badge(s.status)+bug+"</td>"
     + stageCells
