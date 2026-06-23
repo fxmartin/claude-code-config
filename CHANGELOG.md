@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.54.0] - 2026-06-23
+
+### Added
+
+- feat(realtime-observability): wave-column dependency dag in run detail (#140)
+
+
 ## [v1.53.0] - 2026-06-22
 
 ### Added
