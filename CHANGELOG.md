@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.57.3] - 2026-06-23
+
+### Fixed
+
+- fix(dashboard): keep view-session link on one line (#152)
+
+
 ## [v1.57.2] - 2026-06-23
 
 ### Changed
