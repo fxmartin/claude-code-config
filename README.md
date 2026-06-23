@@ -169,6 +169,42 @@ The full workflow is documented end-to-end in [`WORKFLOW-v2.md`](WORKFLOW-v2.md)
 
 ---
 
+## Observability — the live dashboard
+
+Autonomous runs are no longer a black box. `sdlc dashboard` serves a single browser pane that watches every run as it happens — across every repo on the machine — with no manual reload.
+
+![The Autonomous SDLC live dashboard](screenshot/dashboard.jpg)
+
+```bash
+sdlc dashboard --open          # serve, and open it in the browser
+```
+
+It binds to **http://127.0.0.1:8787** by default (localhost-only).
+
+**What it shows**
+
+- **Multi-run sidebar** — every live and past run, each with its status, scope, done/total story count, duration, tokens, and cost. Click any run to focus it.
+- **Run header** — run id, status, scope and mode (e.g. `epic-17 · parallel`), elapsed time, the preflight/QA-gate/coverage config, and live **token (in / out / cache) and cost** accounting.
+- **GitHub repo-health panel** — open/closed issues, open/closed PRs, and the latest CI status on `main`, refreshed every 30 seconds.
+- **Dependency DAG** — the cohort plan as wave columns, so you can see at a glance which stories are scheduled to run in parallel and what blocks what.
+- **Per-story stage table** — a row per story across the four stages (**build · QA · review · merge**) plus PR number, tokens, and duration. Each story exposes a **"view session"** link that opens its full agent transcript in a modal.
+- **Events log** — the run's ledger events (errors, warnings, milestones) in chronological order.
+
+**One pane, every repo.** Launched without `--db`, the dashboard reads the host-level run registry (`~/.sdlc/registry.json`) and discovers runs across all your repos; each is still backed by its own per-repo ledger, so there is no cross-run data bleed. Point it at a single run's ledger with `--db <path>` to scope it to one repo.
+
+**Live, not polled-by-hand.** Updates stream over Server-Sent Events driven by a ~1 s ledger change-token, with a 2.5 s polling fallback if the browser can't hold an SSE connection; the elapsed timer ticks every second so an in-flight run always reads true.
+
+| Flag | Effect |
+|------|--------|
+| `--open` | Open the dashboard in a browser on start |
+| `--port N` | Bind port (default `8787`) |
+| `--host H` | Bind host (default `127.0.0.1`, localhost-only) |
+| `--run <id>` | Focus a specific run (default: the most recent) |
+| `--db <path>` | Single-ledger mode (default: host registry, all repos) |
+| `--restart` / `--stop` | Restart, or stop, a dashboard already running on this host:port |
+
+---
+
 ## Why it works
 
 - **Thin-dispatcher orchestrators** — skills like `/build-stories` and `/fix-issue` carry only control flow; heavy I/O and reasoning are delegated to sub-agents so the orchestrator's context window stays lean across tens of stories.
