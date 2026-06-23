@@ -408,6 +408,31 @@ def test_page_renders_story_as_stacked_block() -> None:
     assert ".story-title" in _PAGE
 
 
+def test_activity_row_spans_full_block_width() -> None:
+    """Story 11.2-014: the activity line is the third row of the stacked block.
+    With the leading `story` column dropped it no longer carries an empty leading
+    cell — it spans the full 8-column width as a single `.substage` cell."""
+    from sdlc.dashboard import _PAGE
+
+    # The activity row is emitted with no leading <td></td> spacer and spans 8.
+    assert "<tr class='substage'><td></td>" not in _PAGE   # leading spacer gone
+    assert "<tr class='substage'>" in _PAGE                # row still emitted
+    assert "colspan='8' class='small'" in _PAGE            # full-width activity cell
+
+
+def test_block_rows_have_no_inner_borders() -> None:
+    """Story 11.2-014: the three stacked rows read as one unit — the inner borders
+    between title, step-columns, and activity rows are removed; the next block's
+    title-row border-top is the only separator."""
+    from sdlc.dashboard import _PAGE
+
+    # The activity line no longer draws its own bottom border (was the separator).
+    assert ".substage > td { border-bottom: none;" in _PAGE
+    # The step-columns row carries no bottom border either.
+    assert ".story-stages > td" in _PAGE
+    assert "border-bottom: none" in _PAGE
+
+
 def test_log_endpoint_serves_within_root_and_confines(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     _seed(db)
