@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.63.0] - 2026-06-23
+
+### Added
+
+- feat(parallel-execution): make `mode` authoritative and (#17.3-001)
+
+### Fixed
+
+- fix(parallel-execution): resume override widens serial run (#17.3-001)
+- fix(parallel-execution): re-stamp worker cap on resume (#17.3-001)
+
+
 ## [v1.62.0] - 2026-06-23
 
 ### Added
