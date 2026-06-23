@@ -682,3 +682,44 @@ def test_status_snapshot_serial_run_concurrency_limit_is_one(tmp_path) -> None:
     )
     snap = status_snapshot(ledger, run_id)
     assert snap["run"]["concurrency"] == {"limit": 1, "active": 1}
+
+
+def test_resume_narrowed_concurrency_restamps_truthful_cap(tmp_path) -> None:
+    """A resume that narrows the worker cap re-stamps mode + cap, so the snapshot
+    reports the resumed run's real concurrency — not the original run's stale 5."""
+    from sdlc.build import status_snapshot
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    rid = _seed_parallel_interrupted(db, concurrency=5)
+    # Resume the original parallel(5) run as a strictly serial one-worker run.
+    run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=ConcurrencyProbeDispatcher(),
+        root=tmp_path, concurrency=1,
+    )
+    ledger = Ledger(db)
+    # The run row's mode is now authoritative — a 1-worker run is serial.
+    assert ledger.run_row(rid)["mode"] == "serial"
+    snap = status_snapshot(ledger, rid)
+    # Not the stale 5 the original parallel run persisted.
+    assert snap["run"]["concurrency"]["limit"] == 1
+    assert snap["run"]["mode"] == "serial"
+
+
+def test_resume_widened_concurrency_restamps_truthful_cap(tmp_path) -> None:
+    """A resume that widens the cap re-stamps the parallel mode + the new cap."""
+    from sdlc.build import status_snapshot
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    rid = _seed_parallel_interrupted(db, concurrency=2)
+    run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=ConcurrencyProbeDispatcher(),
+        root=tmp_path, concurrency=4,
+    )
+    ledger = Ledger(db)
+    assert ledger.run_row(rid)["mode"] == "parallel"
+    snap = status_snapshot(ledger, rid)
+    assert snap["run"]["concurrency"]["limit"] == 4

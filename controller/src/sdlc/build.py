@@ -1035,6 +1035,17 @@ class Ledger:
                     "UPDATE runs SET status = ? WHERE id = ?", (status, run_id)
                 )
 
+    def run_set_mode(self, run_id: str, mode: str) -> None:
+        """Re-stamp a run's ``mode`` (Story 17.3-001).
+
+        A resume can change the effective worker cap (``--concurrency``), so the
+        run's serial/parallel label must be re-derived to stay authoritative —
+        otherwise ``status``/the dashboard would report the original run's stale
+        mode and worker cap.
+        """
+        with self._connect() as conn:
+            conn.execute("UPDATE runs SET mode = ? WHERE id = ?", (mode, run_id))
+
     def run_update_counts(self, run_id: str, completed: int, failed: int) -> None:
         """Record the final completed/failed tallies on the run row."""
         with self._connect() as conn:

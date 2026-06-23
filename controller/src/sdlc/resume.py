@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -26,6 +27,7 @@ from sdlc.build import (
     apply_budget_stop,
     apply_cost_gate_pause,
     apply_rate_limit_park,
+    authoritative_mode,
     effective_concurrency,
     finalize_run,
     persist_cohort_structure,
@@ -298,6 +300,17 @@ def run_resume(
     # can fan out wider/narrower than the original run (>= 1 enforced at the CLI).
     if concurrency is not None:
         opts.concurrency = concurrency
+
+    # Story 17.3-001: a resume can change the effective worker cap (or re-derive
+    # serial/parallel), so re-stamp the authoritative mode + cap onto the run row
+    # and config. Without this, `status`/the dashboard would report the original
+    # run's stale worker cap and mode instead of the ones this resume runs with.
+    resumed_mode = authoritative_mode(opts)
+    ledger.run_set_mode(rid, resumed_mode)
+    ledger.event_log(
+        rid, "", "info", "config",
+        json.dumps({**config, "mode": resumed_mode, "concurrency": opts.concurrency}),
+    )
 
     # Story 14.2-002: bind the persisted thinking-token cap onto the real dispatch
     # seam (no-op for an injected fake / no cap), so a resumed run re-applies the
