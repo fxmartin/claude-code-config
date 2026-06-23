@@ -8,9 +8,19 @@
 -- chain so that a fresh DB and an evolved DB converge on the same schema and
 -- so that `_migrations` is populated identically in both cases.
 --
--- Treat this file as the human-readable reference. To change the schema,
--- write a new `state/migrations/NNN-<name>.sql`. The CI / bats suite verifies
--- that the migration chain produces exactly the tables and columns below.
+-- Treat this file as the human-readable reference. To change the schema for the
+-- legacy shell path, write a new `state/migrations/NNN-<name>.sql`; the bats
+-- suite verifies the Epic-04 columns the chain must produce.
+--
+-- NOTE: the live ledger is now created and migrated by the Python controller
+-- (`controller/src/sdlc/build.py` — `_SCHEMA_DDL` + the `_MIGRATIONS` list),
+-- which owns the same `.sdlc-state.db`. Columns added by later epics are
+-- recorded here as the reference shape but applied by that controller migration
+-- list, NOT by a `state/migrations/` file — both runners share one integer
+-- `_migrations` version space on the same DB, so a duplicate shell migration
+-- would collide with a controller version (and the controller's full DDL already
+-- creates these columns). `wave`/`dependencies` (Story 11.2-007) and
+-- `worktree_path` (Story 17.2-001) below are such controller-applied columns.
 --
 -- Consumed by:
 --   * Story 4.2-001 (write path: orchestrator + agents INSERT/UPDATE here).
@@ -52,6 +62,7 @@ CREATE TABLE IF NOT EXISTS stories (
     status          TEXT NOT NULL,              -- 'TODO' | 'IN_PROGRESS' | 'DONE' | 'FAILED' | 'BLOCKED'.
     wave            INTEGER,                    -- cohort (wave) index; same wave runs in parallel (Story 11.2-007). NULL on older ledgers.
     dependencies    TEXT,                       -- JSON array of in-queue story ids this story waits on (Story 11.2-007). NULL on older ledgers.
+    worktree_path   TEXT,                       -- per-story git worktree the agent built in (Story 17.2-001). NULL on a shared-root / sequential run.
     PRIMARY KEY (run_id, story_id),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
