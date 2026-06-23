@@ -142,6 +142,15 @@ jobs:
           echo "Manifests set to ${number}:"
           jq -r '.version' "${plugin}" "${marketplace}"
 
+          # The controller package version (and its uv.lock pin) must move with
+          # the tag too, otherwise `sdlc --version` reports a stale number while
+          # the repo advances (Issue #46). This job has no Python/uv, so the
+          # helper edits both files as plain text; controller-smoke verifies the
+          # binary<->pyproject alignment downstream.
+          ./scripts/bump-controller-version.sh "${number}" \
+            controller/pyproject.toml \
+            controller/uv.lock
+
       - name: Update CHANGELOG
         if: steps.version.outputs.bump != 'none' && steps.exists.outputs.skip != 'true'
         run: |
@@ -243,6 +252,8 @@ jobs:
           # CHANGELOG-SECTION.md is a build artifact, not part of the repo.
           git add plugins/autonomous-sdlc/.claude-plugin/plugin.json \
                   .claude-plugin/marketplace.json \
+                  controller/pyproject.toml \
+                  controller/uv.lock \
                   CHANGELOG.md
 
           # The `chore(release):` subject is what guard 1 keys off to prevent
