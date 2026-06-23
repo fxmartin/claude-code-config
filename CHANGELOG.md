@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.55.0] - 2026-06-23
+
+### Added
+
+- feat(realtime-observability): stable-height live regions (#11.2-011) (#146)
+
+
 ## [v1.54.0] - 2026-06-23
 
 ### Added
