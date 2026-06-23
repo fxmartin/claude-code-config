@@ -238,11 +238,11 @@ original confusion ("the dashboard only shows one"). Coordinate with Epic-11 11.
 detail) so rendering stays in Epic-11.
 
 **Definition of Done**:
-- [ ] `status`/ledger expose all active stories + effective concurrency
-- [ ] Displayed `mode` matches real execution
-- [ ] No rendering logic duplicated from Epic-11 (data only)
-- [ ] Tests for the multi-active snapshot
-- [ ] Documented
+- [x] `status`/ledger expose all active stories + effective concurrency
+- [x] Displayed `mode` matches real execution
+- [x] No rendering logic duplicated from Epic-11 (data only)
+- [x] Tests for the multi-active snapshot
+- [x] Documented
 
 **Dependencies**: 17.1-001
 **Risk Level**: Medium

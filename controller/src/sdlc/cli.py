@@ -425,11 +425,21 @@ def status(
     counts = snap["counts"]
     stories = snap["stories"]
     events = snap["events"]
+    # Story 17.3-001: surface the run's real concurrency — "N/M workers busy" —
+    # so a parallel run shows several stories active at once, not just one. Only
+    # a genuine parallel run (cap > 1) carries the figure; a serial run is silent.
+    concurrency = snap["run"].get("concurrency") or {}
+    worker_limit = concurrency.get("limit") or 1
+    workers = (
+        f", {concurrency.get('active', 0)}/{worker_limit} workers busy"
+        if worker_limit > 1
+        else ""
+    )
     typer.echo(
         f"run {run_id[:8]}  {snap['run'].get('status', '?')}  "
         f"{counts['done']}/{counts['total']} done, {counts['failed']} failed, "
         f"{counts['blocked']} blocked, {counts['in_progress']} in progress  "
-        f"(scope={snap['run'].get('scope', '?')}, {snap['run'].get('mode', '?')})"
+        f"(scope={snap['run'].get('scope', '?')}, {snap['run'].get('mode', '?')}{workers})"
     )
     if stories:
         typer.echo(f"  {'STORY':<14}{'STATUS':<13}{'STAGE':<11}PR")
