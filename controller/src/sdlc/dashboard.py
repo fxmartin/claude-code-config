@@ -353,6 +353,23 @@ _PAGE = """<!doctype html>
   .PENDING { background: var(--crust); color: var(--overlay); }
   .substage > td { border-bottom: 1px solid var(--surface); padding-top: 0; color: var(--sub); }
   .substage .kind { color: var(--blue); margin-right: 4px; }
+  /* Story 11.2-011: stable-height live regions. #head (run summary), the
+     per-story .substage activity line, and #updated all re-render on every SSE
+     tick (11.2-003 / 11.2-004) and their content can occupy 1–3 lines. Reserving
+     each region's max height keeps a full innerHTML swap from changing its box
+     height, so the elements below it never reflow — the page does not jump and a
+     scrolled view does not shift under the cursor. #head reserves its 3-line max
+     (run line + config + usage); #updated stays one line; the substage activity
+     clamps to a single ellipsized line (full text on hover) instead of growing. */
+  #head { min-height: 4.5em; }
+  #updated { min-height: 1.5em; }
+  /* Clamp the substage activity to a single line. `white-space: nowrap` +
+     text-overflow can't be used here: in an auto-layout table a nowrap cell
+     grows the column (and scrolls .main sideways) instead of ellipsizing. The
+     line-clamp idiom keeps normal wrapping — so the cell stays at the table
+     width — then clips to one line with an ellipsis, giving a stable height. */
+  .substage .act { display: -webkit-box; -webkit-box-orient: vertical;
+                   -webkit-line-clamp: 1; line-clamp: 1; overflow: hidden; }
   .events { margin-top: 16px; }
   .events div { padding: 2px 0; border-bottom: 1px solid var(--crust); font-size: 13px; }
   .lvl-error { color: var(--red); } .lvl-warn { color: var(--peach); } .lvl-success { color: var(--green); }
@@ -558,10 +575,13 @@ function activityRow(s){
   const stage = a.stage ? "<code>"+esc(a.stage)+"</code> " : "";
   // Span every column but the leading story cell so the activity reads as a
   // continuation of its story row. Update the colspan if columns change.
+  // Story 11.2-011: the content rides in a `.act` element clamped to one
+  // ellipsized line (full message on hover) so a refresh/SSE tick never grows
+  // this row from 1 to 2–3 lines and reflows the table below it.
   return "<tr class='substage'><td></td>"
-    + "<td colspan='8' class='small'><span class='kind'>"+glyph+"</span>"
+    + "<td colspan='8' class='small'><div class='act' title='"+esc(a.message)+"'><span class='kind'>"+glyph+"</span>"
     + stage + esc(a.message)
-    + (a.ts ? " <span class='muted' title='"+esc(a.ts)+"'>"+esc(fmtLocal(a.ts))+"</span>" : "") + "</td></tr>";
+    + (a.ts ? " <span class='muted' title='"+esc(a.ts)+"'>"+esc(fmtLocal(a.ts))+"</span>" : "") + "</div></td></tr>";
 }
 
 async function tick(){
