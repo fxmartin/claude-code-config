@@ -236,24 +236,23 @@ Opens with the story-driven-development paragraph, then:
 
 **The Agents + Skills inventory** is worth calling out as an anti-pattern you avoided: you *could* duplicate each agent's full description here. You don't. You just name them. Sub-agents' full descriptions live in `agents/*.md` — CLAUDE.md just orients Claude to what's available. This is the right depth: enough that Claude knows to dispatch `ui-engineer` for frontend work, not so much that the list swallows the file.
 
-### Section 5: cmux Observability (lines 60–62)
+### Section 5: Reference Materials (the link-out layer)
 
 ```markdown
-## cmux Observability
-
-Running on **cmux** — native macOS terminal for multi-agent AI development.
-All workflow visibility is routed through `~/.claude/hooks/cmux-bridge.sh`
-which provides graceful degradation (silent no-op if cmux unavailable).
-See `docs/cmux-integration.md` for the full bridge API...
+## Reference Materials
+- **Database**: `docs/database-best-practices.md`
+- **Containers**: `docs/container-best-practices.md`
+- **Testing & TDD**: `docs/testing-best-practices.md`
+- **Full Workflow**: `WORKFLOW-v2.md`
 ```
 
-**What it solves:** environment-specific context. Claude needs to know: *cmux is the runtime, the bridge handles visibility, details are in the linked doc*. Three facts. No more.
+**What it solves:** depth without bloat. Claude needs to know *where the authoritative detail lives* — not carry it inline. Each line is a pointer to a deep-dive doc, not a summary of one.
 
-**What it wisely omits:** the actual bridge API. Thirty-plus subcommands, flag details, hook semantics — all live in `docs/cmux-integration.md`. CLAUDE.md has a pointer, not the content.
+**What it wisely omits:** the actual content. Schema-design rules, N+1 avoidance, container layering — all live in `docs/database-best-practices.md` and friends. CLAUDE.md has the index, not the encyclopedia.
 
-**Pattern:** for platform/infra facts Claude needs at session start (so it doesn't suggest tools you don't use), inline 2–3 sentences. For the full reference, link out.
+**Pattern:** inline only the 2–3 facts Claude needs at session start; for the full reference, link out. A linked doc is read on demand, so it costs no context until a task actually needs it.
 
-**Weak version:** "we use cmux for observability." Doesn't tell Claude where to look when it needs to emit a status update. The strong version names the specific bridge script path.
+**Weak version:** pasting the whole database best-practices doc into CLAUDE.md. It swells the always-loaded file, drowns the sharp rules, and still goes stale the moment the deep-dive doc updates. The strong version keeps one source of truth and points at it.
 
 ### Section 6: CLI Tools (lines 64–83)
 
@@ -617,7 +616,7 @@ Six months from now, when a new teammate joins or you spin up a new project, thi
 ## Further reading
 
 - This repo's [`CLAUDE.md`](../CLAUDE.md) — the file this guide dissects
-- [`docs/cmux-integration.md`](cmux-integration.md) — example of a deep-dive that CLAUDE.md links to rather than inlines
+- [`docs/database-best-practices.md`](database-best-practices.md) — example of a deep-dive that CLAUDE.md links to rather than inlines
 - [`WORKFLOW-v2.md`](../WORKFLOW-v2.md) — the multi-agent workflow CLAUDE.md orients Claude toward
 - [forrestchang/andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills) — upstream for three of this file's rules
 - Anthropic's [Claude Code documentation](https://docs.claude.com/en/docs/claude-code) — authoritative reference for CLAUDE.md loading behavior and harness mechanics
