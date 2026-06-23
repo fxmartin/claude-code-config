@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.60.0] - 2026-06-23
+
+### Added
+
+- feat(parallel-execution): controller-owned git worktree (#17.2-001)
+
+
 ## [v1.59.0] - 2026-06-23
 
 ### Added
