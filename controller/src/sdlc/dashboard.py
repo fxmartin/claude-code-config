@@ -407,7 +407,7 @@ _PAGE = """<!doctype html>
   /* Story 11.2-010: in-dashboard transcript viewer. A "view session" control
      per story opens a modal listing that story's stage transcripts and renders
      each inline — no leaving the page. The new-tab /log link stays as fallback. */
-  .view-session { cursor: pointer; font-size: 11px; color: var(--blue); margin-left: 6px; }
+  .view-session { cursor: pointer; font-size: 11px; color: var(--blue); margin-left: 6px; white-space: nowrap; }
   /* Story 11.2-012: the human-readable story title beside its ID. Ellipsized to
      keep rows stable (11.2-011 no-reflow goal); full title shown on hover via
      the title= tooltip. A null/empty title renders nothing (degrades to ID). */
