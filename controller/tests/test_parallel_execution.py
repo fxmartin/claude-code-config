@@ -723,3 +723,41 @@ def test_resume_widened_concurrency_restamps_truthful_cap(tmp_path) -> None:
     assert ledger.run_row(rid)["mode"] == "parallel"
     snap = status_snapshot(ledger, rid)
     assert snap["run"]["concurrency"]["limit"] == 4
+
+
+def _seed_serial_interrupted(db_path) -> str:
+    """A real `--sequential` run (mode=serial) crashed before either story built."""
+    import json
+
+    ledger = Ledger(db_path)
+    ledger.init()
+    rid = ledger.run_create("epic-88", "serial")
+    ledger.set_total(rid, 2)
+    ledger.event_log(
+        rid, "", "info", "config",
+        json.dumps({"skip_coverage": True, "coverage_threshold": 90, "concurrency": 5}),
+    )
+    ledger.story_upsert(rid, "88.1-001", "88", "One", "P1", 1, "general-purpose", "", None, "TODO")
+    ledger.story_upsert(rid, "88.1-002", "88", "Two", "P1", 1, "general-purpose", "", None, "TODO")
+    return rid
+
+
+def test_resume_widening_a_real_serial_run_actually_fans_out(tmp_path) -> None:
+    """Widening a run created `--sequential` must override the reconstructed
+    sequential flag — the resume genuinely runs >1 worker and reports parallel."""
+    from sdlc.build import status_snapshot
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    rid = _seed_serial_interrupted(db)
+    dispatcher = ConcurrencyProbeDispatcher()
+    run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        concurrency=4,
+    )
+    assert dispatcher.max_active >= 2  # genuinely fanned out, not still serial
+    ledger = Ledger(db)
+    assert ledger.run_row(rid)["mode"] == "parallel"
+    snap = status_snapshot(ledger, rid)
+    assert snap["run"]["concurrency"]["limit"] == 4

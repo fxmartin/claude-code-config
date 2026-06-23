@@ -300,6 +300,13 @@ def run_resume(
     # can fan out wider/narrower than the original run (>= 1 enforced at the CLI).
     if concurrency is not None:
         opts.concurrency = concurrency
+        # Story 17.3-001: the override fully specifies the worker behaviour, so it
+        # must win over the `sequential` flag reconstructed from the original run's
+        # mode. Otherwise a run created `--sequential` (mode=serial → sequential=
+        # True) could never be widened: `effective_concurrency` keys off
+        # `sequential` and would pin the run to 1 worker, silently ignoring the
+        # override. `--concurrency=1` collapses to the serial path; >1 fans out.
+        opts.sequential = concurrency == 1
 
     # Story 17.3-001: a resume can change the effective worker cap (or re-derive
     # serial/parallel), so re-stamp the authoritative mode + cap onto the run row
