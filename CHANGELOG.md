@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.57.1] - 2026-06-23
+
+### Changed
+
+- refactor(hooks): relocate worktree gc out of cmux-stop (#142) (#150)
+
+
 ## [v1.57.0] - 2026-06-23
 
 ### Added
