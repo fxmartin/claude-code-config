@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.58.2] - 2026-06-23
+
+### Fixed
+
+- fix(install): stop --core rewriting command symlinks as absolute (#156)
+
+
 ## [v1.58.1] - 2026-06-23
 
 ### Changed
