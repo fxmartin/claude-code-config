@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.62.0] - 2026-06-23
+
+### Added
+
+- feat(parallel-execution): safe worktree integration and (#17.2-002)
+
+
 ## [v1.61.0] - 2026-06-23
 
 ### Added
