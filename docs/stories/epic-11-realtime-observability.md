@@ -39,7 +39,7 @@ debuggable in flight; multi-run support makes parallel batches manageable from o
 
 ## Epic Scope
 
-**Total Stories**: 16 | **Total Points**: 56 | **MVP Stories**: 0 (roadmap — Should Have)
+**Total Stories**: 17 | **Total Points**: 59 | **MVP Stories**: 0 (roadmap — Should Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -683,6 +683,61 @@ only addition; storage/render reuse the multi-run dashboard as-is.
 `status_snapshot` (11.2-002/11.2-004 rendering).
 **Risk Level**: Medium
 
+##### Story 11.2-014: Stack each story into a title / step-columns / activity block in the run detail
+**User Story**: As FX reading the per-run detail, I want each story rendered as a stacked block —
+a full-width title line, then its step-status columns, then its live activity line — so that the
+story title is shown in full (not cramped and truncated in a narrow first column) and the row is
+easier to scan.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** the per-run detail story table renders **When** a story is shown **Then** it appears
+  as three stacked rows: (1) a full-width title row `id · title  view session` with the title
+  shown **in full** (no ellipsis truncation), (2) a step-columns row aligned under the headers
+  (status, build, QA, review, merge, PR, tokens, duration), and (3) the existing live
+  sub-stage/merge activity line spanning the full width below.
+- **Given** several stories render **When** the table draws **Then** their step-columns rows stay
+  column-aligned with each other and the header, and each story's three rows read as one visual
+  block, visually separated from the next story.
+- **Given** the no-reflow guarantee (11.2-011) **When** a live activity line updates on an SSE
+  tick **Then** it stays a single clamped line and the rows below do **not** jump; the title row
+  (static per render) may wrap without causing tick-driven reflow.
+- **Given** a story with no sub-stage activity (older run / fallback) **When** it renders **Then**
+  only the title and step-columns rows show (graceful, no empty activity row), matching today's
+  degrade behaviour.
+- **Given** a long story title **When** the title row renders **Then** it is shown in full — the
+  previous 22em ellipsis truncation from 11.2-012 is removed, since the title now owns a
+  full-width row.
+- **Given** the existing controls **When** the block renders **Then** `view session`, the `/log`
+  stage transcript links, the `🔧×N` bugfix badge, the PR link, and tokens/duration are all
+  preserved.
+
+**Technical Notes**: Pure front-end — the `_PAGE` JS template + CSS in
+`controller/src/sdlc/dashboard.py`; **no `status_snapshot`/schema change** (every field is already
+threaded). Recommended approach: keep the single `<table>` and render **three `<tr>` per story via
+colspan** — drop the `story` header column (→ 8 columns: status|build|QA|review|merge|PR|tokens|duration);
+a `.story-title` `<td colspan='8'>` row, a `.story-stages` row (status + stage cells + PR + tokens +
+duration), and the existing `activityRow` changed to a full-width `<td colspan='8'>` (its colspan is
+hard-coupled to the column count — update the contract comment with the header). CSS: redefine
+`.stitle` to drop `max-width`/ellipsis (the title is static, so wrapping never reflows on a tick);
+add `.story-title`/`.story-stages` block-separation rules (border-top on the title row, inner
+borders removed). **Keep the `.act` `-webkit-line-clamp:1` idiom (11.2-011)** — do NOT switch to
+`white-space: nowrap`, which widens columns in the auto-layout table. The DAG view (`#dag`) is
+independent and untouched. Supersedes the 11.2-012 title truncation (the title now has its own row).
+
+**Definition of Done**:
+- [ ] Each story renders as a stacked title / step-columns / activity block in the per-run detail
+- [ ] Title shown in full (no ellipsis); `view session`, `/log` links, `🔧×N`, PR, tokens/duration preserved
+- [ ] Step-columns stay aligned across stories; the `story` header column dropped (8 columns)
+- [ ] No-reflow preserved: activity line stays clamped on SSE ticks (line-clamp, not nowrap)
+- [ ] `test_page_renders_story_title_truncated_with_hover` updated for the full-width title; new test asserts the stacked-block markup; `test_dashboard.py` green
+- [ ] No backend/schema change
+
+**Dependencies**: None (restructures the render added in 11.2-004; supersedes the 11.2-012 title
+truncation; pairs with 11.2-011 no-reflow)
+**Risk Level**: Low
+
 ## Story Dependencies (within Epic-11)
 
 ```
@@ -692,7 +747,7 @@ only addition; storage/render reuse the multi-run dashboard as-is.
 11.2-003 (SSE transport) ──────────────────────────────┘
 ```
 
-- **Cohort 1** (no deps): 11.1-001, 11.2-001, 11.2-003, 11.2-005, 11.2-007, 11.2-009, 11.2-010, 11.2-011, 11.2-012, 11.2-013
+- **Cohort 1** (no deps): 11.1-001, 11.2-001, 11.2-003, 11.2-005, 11.2-007, 11.2-009, 11.2-010, 11.2-011, 11.2-012, 11.2-013, 11.2-014
 - **Cohort 2**: 11.1-002, 11.1-003 (need 11.1-001); 11.2-002 (needs 11.2-001)
 - **Cohort 3**: 11.2-004 (needs 11.1-002 + 11.2-003); 11.2-006 (needs 11.2-001 + 11.2-002); 11.2-008 (needs 11.2-007)
 
