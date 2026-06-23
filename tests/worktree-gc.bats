@@ -83,3 +83,26 @@ teardown() {
     [ "$status" -eq 0 ]
     [ ! -d "$wt" ]
 }
+
+@test "stop-hook path: stdin consumed, repo resolved via git rev-parse, merged worktree removed" {
+    # Simulates the actual Stop-hook invocation: no CLI args, stdin piped in.
+    # The script must read+discard stdin and resolve the repo via `git rev-parse`.
+    wt="$REPO/.claude/worktrees/agent-stophook"
+    git -C "$REPO" worktree add -q -b feat/stophook "$wt" >/dev/null
+    echo change > "$wt/seed"
+    git -C "$wt" commit -q -am change
+    git -C "$REPO" merge -q feat/stophook
+    # Run with no args from inside the repo (mimics Stop-hook CWD) and pipe stdin.
+    run bash -c "cd \"$REPO\" && echo '{\"stop_hook\":true}' | bash \"$REPO_ROOT/hooks/worktree-gc.sh\""
+    [ "$status" -eq 0 ]
+    [ ! -d "$wt" ]
+}
+
+@test "non-git directory: no-op, exits 0 without error" {
+    # When invoked outside a git repo (git rev-parse returns nothing),
+    # the script must silently exit 0 — never block session end.
+    plain="$(mktemp -d)"
+    run bash -c "cd \"$plain\" && bash \"$REPO_ROOT/hooks/worktree-gc.sh\""
+    rm -rf "$plain"
+    [ "$status" -eq 0 ]
+}
