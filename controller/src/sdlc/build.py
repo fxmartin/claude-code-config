@@ -8,6 +8,7 @@ import functools
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -2424,8 +2425,31 @@ class WorktreeError(Exception):
 _WORKTREE_SUBDIR = (".claude", "worktrees")
 
 
+def _worktree_registered_paths(root: Path) -> set[Path]:
+    """The resolved paths git currently tracks as live worktrees (Story 17.2-002).
+
+    The single source of truth for "is this checkout in use right now": callers
+    consult it before tearing a worktree down (so a peer story's in-flight
+    checkout is never removed) and to decide whether a re-entered story can
+    re-attach to its existing worktree rather than re-create it. Best-effort —
+    outside a git repo, or if ``git worktree list`` fails, it returns an empty
+    set rather than raising, so a degraded git never crashes the controller.
+    """
+    try:
+        res = _git(root, "worktree", "list", "--porcelain")
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if res.returncode != 0:
+        return set()
+    paths: set[Path] = set()
+    for line in res.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.add(Path(line.removeprefix("worktree ")).resolve())
+    return paths
+
+
 def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
-    """Create a dedicated git worktree for a story's build and return its path.
+    """Create (or deterministically re-attach) a story's git worktree, returning it.
 
     Story 17.2-001: the worktree lives at
     ``<root>/.claude/worktrees/agent-<run>-<story>`` so it matches the ``agent-*``
@@ -2436,6 +2460,14 @@ def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
     separate worktrees and separate branches over one shared object store, with no
     shared index or working-tree contention. Raises :class:`WorktreeError` when
     ``git worktree add`` fails so the caller can fall back to the shared root.
+
+    Story 17.2-002 makes re-entry deterministic so a `resume` never trips the
+    "already exists"/"already registered" `git worktree add` failure:
+
+    * if the target path is **still a live registered worktree**, it is re-attached
+      — returned as-is, preserving the in-flight branch and committed work; and
+    * if a **stale directory** is left at the path (a crash that git no longer
+      tracks), it is cleared and pruned before the fresh ``worktree add``.
     """
     worktrees_dir = root.joinpath(*_WORKTREE_SUBDIR)
     try:
@@ -2446,6 +2478,17 @@ def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
     # the story id keeps it human-legible and grep-able in `git worktree list`.
     short_run = run_id.split("-")[0]
     path = worktrees_dir / f"agent-{short_run}-{story_id}"
+    # Resume re-attach (17.2-002): an already-live worktree at this exact path is
+    # reused verbatim — re-adding it would fail, and recreating it would discard
+    # the resumed story's in-flight work.
+    if path.resolve() in _worktree_registered_paths(root):
+        return path
+    # A directory git no longer tracks (crash debris) would make `worktree add`
+    # fail with "already exists"; clear it and prune the registry first so the
+    # add below is deterministic.
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+        _git(root, "worktree", "prune")
     base = _base_ref(root) or "HEAD"
     try:
         res = _git(root, "worktree", "add", "--detach", "--force", str(path), base)
@@ -2456,6 +2499,37 @@ def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
             f"git worktree add for {story_id} failed: {res.stderr.strip()}"
         )
     return path
+
+
+def remove_story_worktree(root: Path, path: Path) -> bool:
+    """Remove one story's worktree on close-out, preserving its branch (Story 17.2-002).
+
+    Reuses the merged-worktree removal semantics of ``hooks/worktree-gc.sh``:
+    ``git worktree remove --force`` drops the working-tree checkout and its
+    registration, then ``git worktree prune`` clears any dangling metadata. The
+    story's ``feature/<id>`` branch and every commit on it are **never** touched —
+    the branch/PR is the deliverable, so committed work survives the teardown
+    (R10). ``--force`` only discards the worktree's own (expendable) working-tree
+    state, not history.
+
+    Best-effort and idempotent: removing a path git no longer tracks (a crash
+    already cleaned it, or it was never created) is a no-op that still returns
+    ``True``; only a genuine git/OS failure — e.g. not a repo — returns ``False``.
+    Never raises, so close-out cannot fail an otherwise-good story.
+    """
+    try:
+        if _git(root, "rev-parse", "--git-dir").returncode != 0:
+            return False
+        if path.resolve() in _worktree_registered_paths(root):
+            _git(root, "worktree", "remove", "--force", str(path))
+        # Belt-and-braces: a leftover directory git did not deregister is cleared
+        # so the checkout never lingers on disk.
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        _git(root, "worktree", "prune")
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _prepare_story_workdir(
@@ -2500,6 +2574,46 @@ def _prepare_story_workdir(
         f"isolated build worktree ready at {path}",
     )
     return path
+
+
+def _teardown_story_workdir(
+    ledger: "Ledger",
+    run_id: str,
+    story_id: str,
+    *,
+    real_run: bool,
+) -> None:
+    """Remove a story's isolated worktree once it closes out (Story 17.2-002).
+
+    Called when a story reaches a terminal outcome (DONE / FAILED /
+    NEEDS_ATTENTION): its ``feature/<id>`` branch and PR are the deliverable and
+    are preserved, while the now-idle worktree checkout is removed so a long
+    parallel run never leaks ``agent-*`` worktrees on disk. Teardown is keyed by
+    *this* story's recorded worktree path, so it can never race or remove a peer
+    worker's in-flight checkout (AC2).
+
+    A no-op when the story built in the shared root (NULL ``worktree_path`` —
+    ``--sequential`` / fallback) or for a fake-dispatcher run that never touched
+    the real repo. Best-effort and never fatal: a removal failure is logged, not
+    raised, so close-out cannot fail an otherwise-good story. Resumable holds
+    (rate-limit park, cost gate) deliberately do **not** call this — their
+    worktree is kept so the re-entered story can continue in place.
+    """
+    if not real_run:
+        return
+    path = ledger.story_worktree(run_id, story_id)
+    if not path:
+        return
+    if remove_story_worktree(Path.cwd(), Path(path)):
+        ledger.event_log(
+            run_id, story_id, "info", "controller",
+            f"isolated build worktree torn down ({path}); branch/PR preserved",
+        )
+    else:
+        ledger.event_log(
+            run_id, story_id, "warn", "controller",
+            f"could not remove worktree {path}; orphan-sweeper will reclaim it",
+        )
 
 
 def story_commit_exists(story_id: str, root: Path | None = None) -> bool:
@@ -2850,6 +2964,12 @@ def run_build(
                         notify("story_failed", run=run_id, story_id=story.id)
                     except Exception:
                         pass
+                # Story 17.2-002: a terminal story closes out — remove its isolated
+                # worktree (branch/PR preserved). Resumable holds above `break`d out
+                # first, so they keep their worktree for re-entry.
+                _teardown_story_workdir(
+                    ledger, run_id, story.id, real_run=dispatcher is None
+                )
 
                 # Story 12.4-001: reposition HEAD back to the base between stories
                 # so a parked/blocked story's feature branch (the merge agent only
@@ -2917,6 +3037,11 @@ def run_build(
                     notify("story_failed", run=run_id, story_id=story.id)
                 except Exception:
                     pass
+                # Story 17.2-002: failure isolation still closes the story out —
+                # tear its worktree down (committed work stays on its branch).
+                _teardown_story_workdir(
+                    ledger, run_id, story.id, real_run=dispatcher is None
+                )
                 continue
             sr = result.outcome
             assert sr is not None  # exactly one of outcome/cost_gate/error is set
@@ -2934,6 +3059,12 @@ def run_build(
                     notify("story_failed", run=run_id, story_id=story.id)
                 except Exception:
                     pass
+            # Story 17.2-002: terminal story → remove its isolated worktree once
+            # the cohort barrier has it in hand (single-threaded here, so this
+            # never races a live worker); parked holds above `continue`d first.
+            _teardown_story_workdir(
+                ledger, run_id, story.id, real_run=dispatcher is None
+            )
 
         # Reposition HEAD once after the cohort barrier (real runs only). Each
         # concurrent story committed in its own worktree, so the shared root only

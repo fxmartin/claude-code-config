@@ -797,9 +797,58 @@ migration 5) so teardown (Story 17.2-002) and observability can locate the
 checkout. `_run_story` binds the worktree onto the dispatch seam as `cwd` via
 `functools.partial`, so **every** dispatch for that story — each stage, the
 envelope re-ask, the commit-lint amend, and the bugfix loop — runs inside the
-isolated checkout. Worktree **teardown** (removal on close-out, orphan sweep,
-resume re-attach) is Story 17.2-002; this story owns creation, dispatch, and
-recording only.
+isolated checkout.
+
+## Per-story worktree teardown (Story 17.2-002)
+
+Creating a worktree per concurrent story (17.2-001) is only safe if each one is
+cleaned up again — otherwise a long `parallel` run leaks `agent-*` checkouts on
+disk, or a crash/resume trips a duplicate `git worktree add`. Story 17.2-002
+closes the lifecycle, reusing the merged-worktree-removal semantics of
+`hooks/worktree-gc.sh` and the registration-aware safety of
+`hooks/sweep-orphan-worktrees.sh`.
+
+- **Close-out (AC1).** When a story reaches a **terminal** outcome — `DONE`,
+  `FAILED`, or a per-story `NEEDS_ATTENTION` (including the failure-isolation
+  `FAILED` of a worker that raised) — `_teardown_story_workdir` looks up the
+  story's recorded `worktree_path` and calls `remove_story_worktree`, which runs
+  `git worktree remove --force` then `git worktree prune`. The `feature/<id>`
+  branch and its commits are **never** touched: the branch/PR is the deliverable,
+  so committed work survives (R10); `--force` only discards the worktree's own
+  expendable working-tree state. Teardown is **keyed by the story's own recorded
+  path**, so it can never race or remove a peer worker's in-flight checkout — and
+  it runs *after* the cohort barrier on the parallel path (single-threaded there)
+  for belt-and-braces. It is best-effort and never fatal: a removal failure is
+  logged (the orphan-sweeper will later reclaim it), not raised.
+- **Resumable holds keep their worktree.** A rate-limit park (`RATE_LIMITED`) or
+  cost-gate pause `break`s/`continue`s *before* teardown, so the in-flight story's
+  worktree is preserved for re-entry rather than torn down mid-flight.
+- **Orphan sweep (AC2).** A crash or abort leaves the worktree behind. The
+  existing `hooks/sweep-orphan-worktrees.sh` (6-hour `agent-*` sweep) reclaims it,
+  and crucially **never removes a checkout `git worktree list` still tracks** —
+  the same registration guard the controller uses via
+  `_worktree_registered_paths`, so an in-flight story's worktree is safe even
+  while the sweeper runs.
+- **Resume re-attach (AC3).** `create_story_worktree` is deterministic on
+  re-entry: if the target path is **still a live registered worktree** it is
+  re-attached (returned as-is, preserving the resumed branch and committed work)
+  rather than re-added; if a **stale directory** git no longer tracks is found, it
+  is cleared and pruned before a fresh `worktree add`. Either way a `resume` never
+  hits an "already exists"/"already registered" failure.
+- **Resume close-out of end-crash stories.** A story whose stages are all `DONE`
+  but whose status was never finalised ("end-crash") owns no stage to dispatch,
+  yet it is **not** nothing-to-resume — it is closed out (`DONE`, no dispatch) and
+  its worktree torn down, both in the cohort loop *and* when it is the only kind
+  of work left. (Previously an end-crash-only run short-circuited as a no-op,
+  stranding the run `IN_PROGRESS` and leaking its worktree — tearing the worktree
+  down while leaving the run resumable would be an incoherent half-state, so the
+  story is finalised instead.) `run_resume` therefore treats a run as
+  nothing-to-resume only when it has neither dispatchable work nor an end-crash
+  story to finalise.
+
+`--sequential` / `--concurrency=1` and fake-dispatcher (test) runs record no
+worktree, so teardown is a no-op and the shared-root path stays byte-for-byte
+unchanged.
 
 ## Per-run token budget gate (Story 14.1-001)
 
