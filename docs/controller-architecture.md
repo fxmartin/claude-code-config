@@ -283,6 +283,25 @@ read-model (`docs/stories/.build-progress.md`) is regenerated from the ledger
 via `sdlc-state.sh render` when that script is present (best-effort — a render
 failure never fails an otherwise-good build).
 
+### Concurrency-safe writes (Story 17.1-002)
+
+The DDL opens the ledger in **WAL** mode (`PRAGMA journal_mode = WAL`), which
+allows concurrent readers alongside a single writer. Under a `parallel` run
+(Epic-17), several cohort workers drive `_run_story` on separate threads and
+write story/stage/event rows at the same instant, so two writers can contend for
+the one WAL write lock. To keep that contention from surfacing as a
+"database is locked" error, the write connection (`Ledger._connect`) sets an
+**explicit** `busy_timeout` — `LEDGER_BUSY_TIMEOUT_MS` (5000ms), mirrored on the
+`sqlite3.connect(timeout=…)` argument — so a contended writer retries internally
+for that window and waits the brief lock out rather than failing. It is set
+explicitly (not left to Python's implicit `sqlite3.connect` default) so the
+guarantee can never be silently dropped by a later change to the connect call,
+and is at least as generous as the read connection's 2000ms (`_connect_ro`).
+Because each write method runs a single-statement transaction, writers never
+hold the lock long, so the timeout is never approached in practice. A
+single-threaded (`--sequential` / `--concurrency=1`) run sees identical
+behaviour — the same effective timeout it always had.
+
 ### Schema migrations (auto-applied at launch)
 
 The schema evolves additively: each `_MIGRATIONS` entry in `build.py` adds

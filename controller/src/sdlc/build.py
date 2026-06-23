@@ -89,6 +89,15 @@ def in_test_sentinel() -> bool:
 # reaches a PR, but never spin forever over a cosmetic message issue.
 MAX_COMMITLINT_REASK = 2
 
+# How long a contended ledger writer waits out the WAL writer lock before it
+# errors with "database is locked" (Story 17.1-002). WAL allows concurrent
+# readers plus a single writer, so when several parallel-cohort workers write at
+# once SQLite serializes them; the busy_timeout makes the losers *retry
+# internally* for this window rather than fail immediately. Set explicitly on the
+# write connection so the guarantee never silently depends on Python's implicit
+# ``sqlite3.connect`` default. At least as generous as the read side's 2000ms.
+LEDGER_BUSY_TIMEOUT_MS = 5000
+
 # Canonical ledger DDL. Kept in sync with state/schema.sql (Epic-04). Embedded
 # here so the controller can create a ledger even when installed standalone via
 # `uv tool install` with no repo checkout in reach.
@@ -841,8 +850,14 @@ class Ledger:
         # Commit-or-rollback like sqlite3's own context manager, then *close* the
         # connection so a long run does not leak a file handle per write (the
         # bare ``with sqlite3.connect(...)`` form commits but never closes).
-        conn = sqlite3.connect(self.db_path)
+        # ``timeout`` is set explicitly (not left to Python's 5.0s default) and
+        # mirrored by an explicit ``PRAGMA busy_timeout`` so concurrent
+        # parallel-cohort writers wait out the WAL writer lock and retry
+        # internally rather than erroring with "database is locked"
+        # (Story 17.1-002).
+        conn = sqlite3.connect(self.db_path, timeout=LEDGER_BUSY_TIMEOUT_MS / 1000)
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute(f"PRAGMA busy_timeout = {LEDGER_BUSY_TIMEOUT_MS};")
         try:
             with conn:
                 yield conn
