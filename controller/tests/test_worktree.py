@@ -113,6 +113,31 @@ def test_create_worktree_raises_outside_a_repo(tmp_path) -> None:
         create_story_worktree(not_a_repo, "17.2-001", "run-abc12345")
 
 
+def test_create_worktree_raises_when_worktrees_dir_unmakeable(tmp_path) -> None:
+    """An unmakeable .claude/worktrees dir surfaces as WorktreeError, not OSError."""
+    # A *file* at .claude makes `.claude/worktrees` mkdir(parents=True) fail with
+    # an OSError subclass; create_story_worktree must wrap it as WorktreeError so
+    # the caller's recoverable fallback fires instead of an uncaught crash.
+    (tmp_path / ".claude").write_text("not a directory\n")
+    with pytest.raises(WorktreeError, match="could not create"):
+        create_story_worktree(tmp_path, "17.2-001", "run-abc12345")
+
+
+def test_create_worktree_wraps_git_invocation_error(tmp_path, monkeypatch) -> None:
+    """If invoking git raises (e.g. binary missing), it surfaces as WorktreeError."""
+    # Resolve the base ref without git, then make the `git worktree add` call
+    # raise an OSError — the branch that turns a subprocess launch failure into a
+    # recoverable WorktreeError rather than an uncaught exception.
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "HEAD")
+
+    def _no_git(*a, **k):
+        raise OSError("git: command not found")
+
+    monkeypatch.setattr("sdlc.build._git", _no_git)
+    with pytest.raises(WorktreeError, match="git worktree add failed"):
+        create_story_worktree(tmp_path, "17.2-001", "run-abc12345")
+
+
 # ---------------------------------------------------------------------------
 # Ledger: the worktree path is recorded and read back
 # ---------------------------------------------------------------------------
