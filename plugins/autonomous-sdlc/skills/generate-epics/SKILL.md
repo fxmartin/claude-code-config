@@ -7,7 +7,7 @@ argument-hint: "[requirements-file-path]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
-> **cmux environment check** — this skill emits cmux sidebar updates via `cmux-bridge.sh`. Before emitting any call whose subcommand is `status`, `progress`, `log`, or `clear`, check whether the `$CMUX_SOCKET_PATH` environment variable is set. If it is **empty** (running outside cmux — e.g. Claude Desktop App), **skip every such call in this skill**: they only drive the cmux sidebar UI and produce no effect elsewhere. Always run `cmux-bridge.sh notify` and `cmux-bridge.sh telegram` calls regardless of environment — they deliver to Telegram even when cmux is absent.
+> **Notifications** — this skill sends Telegram pings at lifecycle milestones via `~/.claude/hooks/notify-telegram.sh "<title>" "<body>"`, called unconditionally (Telegram-only; a silent no-op when unconfigured). There are no sidebar or desktop notifications.
 
 You are an expert AGILE product manager and story writer. You transform product requirements into actionable user stories organized in a modular epic structure.
 
@@ -19,30 +19,18 @@ Check for existing requirements and stories:
 
 ## Execution Flow
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status generate-epics "Reading requirements" --icon sparkle --color "#007AFF"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log info "Story generation started" --source generate-epics'
-```
-
 1. **Read and analyze** docs/REQUIREMENTS.md (or path from `$ARGUMENTS`) thoroughly
 2. **Identify story categories**: Core functionality, admin, integration, infrastructure, quality
 3. **Read generation rules**: `${CLAUDE_SKILL_DIR}/generation-rules.md` for story templates and INVEST criteria
 4. **Create directory structure**: `mkdir -p docs/stories`
 5. **Generate STORIES.md** overview with epic navigation, personas, metrics
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status generate-epics "Generating stories" --icon sparkle --color "#FF9500"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log progress "Requirements analyzed — generating epics" --source generate-epics'
-```
 6. **Generate individual epic files** in `docs/stories/epic-XX-[name].md`
 7. **Generate NFR file** at `docs/stories/non-functional-requirements.md`
 8. **Read CLAUDE.md instructions**: `${CLAUDE_SKILL_DIR}/claude-md-update.md` for story management protocol
 9. **Update CLAUDE.md** with story management protocol
 10. **Validate** cross-references between files
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status generate-epics "Complete" --icon sparkle --color "#34C759"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "Stories generated" --source generate-epics'
-bash -c '~/.claude/hooks/cmux-bridge.sh notify "Stories Created" "STORIES.md + epic files generated"'
-bash -c '~/.claude/hooks/cmux-bridge.sh telegram "✅ Stories Created" "STORIES.md + epic files generated"'
+bash -c '~/.claude/hooks/notify-telegram.sh "✅ Stories Created" "STORIES.md + epic files generated"'
 ```
 
 ## Output Structure

@@ -7,7 +7,7 @@ argument-hint: "[epic-number] <story description>"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
-> **cmux environment check** — this skill emits cmux sidebar updates via `cmux-bridge.sh`. Before emitting any call whose subcommand is `status`, `progress`, `log`, or `clear`, check whether the `$CMUX_SOCKET_PATH` environment variable is set. If it is **empty** (running outside cmux — e.g. Claude Desktop App), **skip every such call in this skill**: they only drive the cmux sidebar UI and produce no effect elsewhere. Always run `cmux-bridge.sh notify` and `cmux-bridge.sh telegram` calls regardless of environment — they deliver to Telegram even when cmux is absent.
+> **Notifications** — this skill sends Telegram pings at lifecycle milestones via `~/.claude/hooks/notify-telegram.sh "<title>" "<body>"`, called unconditionally (Telegram-only; a silent no-op when unconfigured). There are no sidebar or desktop notifications.
 
 This is the companion to `create-epic` for adding stories to an existing epic. Use it when the user wants to extend an epic that already exists rather than create a new one. The skill can infer the right epic from the requirement alone, and will redirect the user to `create-epic` when the requirement is too large to fit one story.
 
@@ -34,11 +34,6 @@ Parse `$ARGUMENTS` as:
 If the story description is missing, ask for it in one concise message before doing anything else. If the epic number is missing, do **not** ask — proceed to Discovery and infer it.
 
 ## Discovery
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status create-story "Discovery" --icon sparkle --color "#007AFF"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log info "Story discovery started" --source create-story'
-```
 
 Before asking detailed product questions or writing files:
 
@@ -69,10 +64,6 @@ When triggered:
 
 ## Clarifying Questions
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status create-story "Interview" --icon sparkle --color "#007AFF"'
-```
-
 Ask questions **one at a time**, building on previous answers. Ask enough questions to make the story implementation-ready, but do not over-interview. Skip any question already answered by the epic, existing stories, or the user's description.
 
 Cover:
@@ -89,11 +80,6 @@ Cover:
 If the description naturally splits into multiple independently deliverable outcomes, say so and propose the story split. Ask for confirmation unless the user already requested multiple stories.
 
 ## Generation
-
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status create-story "Generating story" --icon sparkle --color "#FF9500"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log progress "Discovery complete — generating story" --source create-story'
-```
 
 Update the requested epic file. Match the repository's existing conventions exactly:
 
@@ -130,13 +116,10 @@ After writing files, report:
 - Assumptions made
 - Verification performed, or why verification was not applicable
 
-If the Scope Check fired and you redirected the user to `/create-epic`, **do not** emit the cmux/Telegram "Story Created" notifications below — the skill produced no story.
+If the Scope Check fired and you redirected the user to `/create-epic`, **do not** emit the Telegram "Story Created" notification below — the skill produced no story.
 
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status create-story "Complete" --icon sparkle --color "#34C759"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "Story added to epic" --source create-story'
-bash -c '~/.claude/hooks/cmux-bridge.sh notify "Story Created" "Added to epic"'
-bash -c '~/.claude/hooks/cmux-bridge.sh telegram "✅ Story Created" "Added to epic"'
+bash -c '~/.claude/hooks/notify-telegram.sh "✅ Story Created" "Added to epic"'
 ```
 
 ## Guardrails

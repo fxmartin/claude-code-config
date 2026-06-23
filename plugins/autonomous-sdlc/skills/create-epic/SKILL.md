@@ -7,7 +7,7 @@ argument-hint: "<epic-number> [topic]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
-> **cmux environment check** — this skill emits cmux sidebar updates via `cmux-bridge.sh`. Before emitting any call whose subcommand is `status`, `progress`, `log`, or `clear`, check whether the `$CMUX_SOCKET_PATH` environment variable is set. If it is **empty** (running outside cmux — e.g. Claude Desktop App), **skip every such call in this skill**: they only drive the cmux sidebar UI and produce no effect elsewhere. Always run `cmux-bridge.sh notify` and `cmux-bridge.sh telegram` calls regardless of environment — they deliver to Telegram even when cmux is absent.
+> **Notifications** — this skill sends Telegram pings at lifecycle milestones via `~/.claude/hooks/notify-telegram.sh "<title>" "<body>"`, called unconditionally (Telegram-only; a silent no-op when unconfigured). There are no sidebar or desktop notifications.
 
 You are a seasoned Senior Product Manager at a high-growth tech company with 8+ years of experience shipping complex B2B products. You combine ruthless clarity with AGILE expertise to produce actionable epic specifications with properly structured user stories.
 
@@ -33,11 +33,6 @@ If no arguments are provided, ask for the epic number first.
 
 ## Interactive Discovery
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status create-epic "Interview" --icon sparkle --color "#007AFF"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log info "Epic discovery started" --source create-epic'
-```
-
 Ask questions **one at a time**, building on previous answers. Cover these areas in order:
 
 1. **Problem space**: What user problem or business need does this epic address?
@@ -53,10 +48,6 @@ Stop asking when you have enough detail to write actionable stories. Typically 5
 
 ## Generation
 
-```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status create-epic "Generating epic" --icon sparkle --color "#FF9500"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log progress "Discovery complete — generating epic" --source create-epic'
-```
 
 Once discovery is complete, generate the epic file using the template below.
 
@@ -126,11 +117,9 @@ Once discovery is complete, generate the epic file using the template below.
 ```
 
 4. **Display summary**: Show the epic name, story count, total points, and file path
-5. Update cmux sidebar:
+5. Send a Telegram notification:
 ```bash
-bash -c '~/.claude/hooks/cmux-bridge.sh status create-epic "Complete" --icon sparkle --color "#34C759"'
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "Epic created: epic-{NN}-{name}" --source create-epic'
-bash -c '~/.claude/hooks/cmux-bridge.sh notify "Epic Created" "Epic {NN}: {Name} — {N} stories, {N} points"'
+bash -c '~/.claude/hooks/notify-telegram.sh "Epic Created" "Epic {NN}: {Name} — {N} stories, {N} points"'
 ```
 6. **Ask**: "Want me to adjust any stories, add more, or proceed?"
 

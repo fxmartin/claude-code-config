@@ -58,10 +58,6 @@ Strong success criteria let agents loop independently. Weak criteria ("make it w
 
 **Integration patterns**: API-agnostic frontends · database optimization (no N+1) · Podman + OCI · security-first · performance monitoring.
 
-## cmux Observability
-
-Running on **cmux** — native macOS terminal for multi-agent AI development. All workflow visibility is routed through `~/.claude/hooks/cmux-bridge.sh` which provides graceful degradation (silent no-op if cmux unavailable). See `docs/cmux-integration.md` for the full bridge API, hook listing, and subcommand reference.
-
 ## CLI Tools — Prefer installed utilities over builtins
 The following tools are installed and SHOULD be used via Bash when the built-in Claude Code tools (Read, Grep, Glob, Edit) are insufficient or when working in shell scripts, pipelines, or subagents:
 
@@ -128,9 +124,9 @@ docs: document the commit format in the source-control reference
 ```
 
 ```
-fix(cmux)!: drop unused stdin in permission hooks
+fix(hooks)!: drop unused stdin in permission hooks
 
-BREAKING CHANGE: cmux-bridge no longer reads stdin for the log subcommand.
+BREAKING CHANGE: the permission hook no longer reads stdin for the log subcommand.
 ```
 
 ## Reference Materials

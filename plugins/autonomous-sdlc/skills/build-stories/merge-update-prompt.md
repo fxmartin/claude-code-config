@@ -205,22 +205,14 @@ commit SHA and an ISO-8601 timestamp:
 
 The controller validates this block against the schema before acting on it.
 
-## Sidebar Ledger + SQLite Ledger
-Emit structured log entries at each milestone. Only emit if $CMUX_SOCKET_PATH is set. The SQLite ledger emit lines (`sdlc-state-emit.sh`) run unconditionally — the hook degrades silently when no ledger DB is configured (Story 4.2-001).
+## SQLite Ledger
+Emit structured ledger entries at each milestone. The SQLite ledger emit lines (`sdlc-state-emit.sh`) run unconditionally — the hook degrades silently when no ledger DB is configured (Story 4.2-001).
 
-bash -c '~/.claude/hooks/cmux-bridge.sh log info "MERGE_STARTED {{STORY_ID}}: rebasing onto main" --source story-{{STORY_ID}}'
+# At merge start:
 ~/.claude/hooks/sdlc-state-emit.sh stage-start "${SDLC_RUN_ID:-}" "{{STORY_ID}}" merge 1
 
-# After rebase succeeds:
-bash -c '~/.claude/hooks/cmux-bridge.sh log info "REBASE_DONE {{STORY_ID}}: branch up to date" --source story-{{STORY_ID}}'
-# After gh pr merge succeeds:
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "MERGED {{STORY_ID}}: PR #{{PR_NUMBER}} squash-merged" --source story-{{STORY_ID}}'
-# After DoD update:
-bash -c '~/.claude/hooks/cmux-bridge.sh log info "DOD_UPDATED {{STORY_ID}}: all done criteria checked" --source story-{{STORY_ID}}'
 # After final commit/push:
-bash -c '~/.claude/hooks/cmux-bridge.sh log success "MERGE_DONE {{STORY_ID}}: {{STORY_TITLE}}" --source story-{{STORY_ID}}'
 ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "{{STORY_ID}}" merge 1 DONE "" ""
 ~/.claude/hooks/sdlc-state-emit.sh story-upsert "${SDLC_RUN_ID:-}" "{{STORY_ID}}" "" "{{STORY_TITLE}}" "" "" "" "feature/{{STORY_ID}}" "{{PR_NUMBER}}" DONE
 # On any failure:
-bash -c '~/.claude/hooks/cmux-bridge.sh log error "MERGE_FAILED {{STORY_ID}}: [REBASE_CONFLICT|CONFLICT|FAILED]" --source story-{{STORY_ID}}'
 ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "{{STORY_ID}}" merge 1 FAILED "[REBASE_CONFLICT|CONFLICT|FAILED]" ""

@@ -65,6 +65,3 @@ The worker agent prompts (`*-agent-prompt.md`, `coverage-gate-prompt.md`,
 `merge-update-prompt.md`, `e2e-gate.md`, etc.) in this directory remain the
 source of truth for what each dispatched agent does — the controller renders
 them when it dispatches.
-
-cmux sidebar updates are still emitted via `cmux-bridge.sh` (unchanged
-contract); skip them when `$CMUX_SOCKET_PATH` is unset.

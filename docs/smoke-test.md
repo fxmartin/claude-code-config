@@ -58,9 +58,8 @@ the path-B install on a clean machine and confirms the skills resolve:
      `/project-init`, `/resume-build-agents` all show up.
    - Invoke `/brainstorm` and confirm it runs the interview flow.
 2. **WSL2 (Ubuntu 22.04, clean user)**:
-   - Same sequence. cmux is unavailable on WSL2; the skills must still load
-     and the `cmux-bridge.sh` graceful-degradation path should keep them
-     usable (no fatal errors when a skill emits a cmux sidebar event).
+   - Same sequence. The skills must load and run; `notify-telegram.sh` is a
+     silent no-op when Telegram is unconfigured (no fatal errors).
 
 **Pass criteria:** all eight skills surface in the slash menu on both
 platforms; `/brainstorm` reaches at least the first interview question
