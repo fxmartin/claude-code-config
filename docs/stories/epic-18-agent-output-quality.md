@@ -40,7 +40,7 @@ say "that's too much."
 
 ## Epic Scope
 
-**Total Stories**: 4 | **Total Points**: 18 | **MVP Stories**: 0 (roadmap — Should Have)
+**Total Stories**: 5 | **Total Points**: 21 | **MVP Stories**: 0 (roadmap — Should Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -194,14 +194,71 @@ the lens actually reduces LOC without hurting gate pass rates.
 **Dependencies**: None (verified by 18.1; may reuse the Epic-08 adversarial slot)
 **Risk Level**: Medium
 
+### Feature 18.3: Documentation Currency
+
+Make "the docs match the behavior I just shipped" a property the autonomous pipeline enforces,
+not a manual chore (`/sync-progress`, `/backfill-docs`) FX runs after the fact. Today the four
+stages (build → coverage → review → merge) never instruct an agent to touch user-facing docs;
+only the CHANGELOG is maintained, and that is the Epic-05 release workflow's job, not the build
+loop's.
+
+#### Stories
+
+##### Story 18.3-001: Keep user-facing docs current with each story
+**User Story**: As FX running unattended builds, I want the pipeline to update the user-facing docs
+a story changes — and to flag when it didn't — so that docs don't drift from behavior across
+overnight batches and I stop hand-running `/sync-progress` after every run.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a story whose diff changes user-facing behavior (a CLI verb/flag, a skill, a hook, a
+  documented config key, an installer step) **When** the build stage runs **Then** the build-agent
+  prompt and the story's Definition-of-Done require it to update the relevant docs in the same
+  commit (`README.md`, `docs/`, usage/help text) — scoped to docs the change actually affects, no
+  speculative doc-writing.
+- **Given** a behavior-changing diff that ships with **no** corresponding doc update **When** the
+  review stage runs **Then** a **documentation-currency** review dimension flags it as a structured
+  finding (which doc looks stale + a one-line why), defaulting to **advisory** on the PR so it never
+  blocks shipping; an optional `route-to-bugfix` policy hands the gap to the bounded bugfix loop.
+- **Given** a docs-only or behavior-neutral diff (refactor, internal-only change) **When** the lens
+  runs **Then** it stays quiet — no nagging for doc updates a change does not warrant (low
+  false-positive rate).
+- **Given** the CHANGELOG **When** a story builds **Then** this story does **not** touch it — the
+  CHANGELOG stays owned by the Epic-05 release workflow; no duplication.
+- **Given** the feature is disabled (config/off) **When** a build runs **Then** behavior is
+  unchanged from today (build prompt and review stage as they are now).
+
+**Technical Notes**: Two surgical touch-points, no new stage (consistent with the Epic-18 non-goal
+and `CLAUDE.md` surgical-changes): (1) extend `render_build_prompt` in `controller/src/sdlc/build.py`
+with a docs-update instruction and add the matching DoD line to the story template; (2) add a
+documentation-currency dimension to the review stage, reusing the 18.2-001 over-engineering-lens
+scaffolding (structured findings, advisory-default policy, disable switch, route-to-bugfix reuse of
+the bounded loop). "Behavior-changing" is detected from the diff's touched paths (controller verbs,
+`skills/`, `hooks/`, documented config) — keep the heuristic conservative to hold the
+false-positive rate down. The eval harness (18.1) is how we'd confirm the build-prompt change
+raises doc-update rate without inflating LOC or lowering gate pass rates.
+
+**Definition of Done**:
+- [ ] Build-agent prompt + story-template DoD require same-commit doc updates for behavior-changing diffs
+- [ ] Review stage emits a documentation-currency finding (stale doc + reason) on a behavior-changing diff with no doc update
+- [ ] Policy: advisory (default) or route-to-bugfix; CHANGELOG explicitly out of scope (Epic-05 owns it)
+- [ ] Stays quiet on docs-only / behavior-neutral diffs (tested with both fixtures)
+- [ ] Disable switch; off = unchanged behavior
+- [ ] Tests for the behavior-change heuristic + finding/policy routing; documented in the controller-architecture doc
+
+**Dependencies**: None (composes with the review stage; reuses 18.2-001's review-dimension scaffolding if that ships first)
+**Risk Level**: Medium
+
 ## Story Dependencies (within Epic-18)
 
 ```
 18.1-001 (eval harness) ──> 18.1-002 (variant compare + baselines) ──> 18.1-003 (CI eval)
 18.2-001 (over-engineering lens)   independent (verified by 18.1; may reuse Epic-08 slot)
+18.3-001 (documentation currency)  independent (reuses 18.2-001's review-dimension scaffolding)
 ```
 
-- **Cohort 1** (no deps): 18.1-001, 18.2-001
+- **Cohort 1** (no deps): 18.1-001, 18.2-001, 18.3-001
 - **Cohort 2**: 18.1-002 (needs 18.1-001)
 - **Cohort 3**: 18.1-003 (needs 18.1-001 + 18.1-002)
 
@@ -217,3 +274,6 @@ the lens actually reduces LOC without hurting gate pass rates.
 - An over-engineering lens flags over-built code on each story's diff (advisory by default, or
   route-to-simplify), staying quiet on already-minimal code — and the eval harness confirms it cuts
   LOC without hurting gate pass rates.
+- The pipeline updates user-facing docs for behavior-changing stories in the same commit and flags
+  stale docs at review (advisory by default), staying quiet on docs-only/behavior-neutral diffs —
+  with the CHANGELOG left to the Epic-05 release workflow.
