@@ -497,6 +497,67 @@ def test_api_logs_registry_mode_per_run(tmp_path: Path) -> None:
     assert build["exists"] is True and build["content"] == "BUILD TRANSCRIPT"
 
 
+def test_api_logs_unstarted_stage_has_no_path(tmp_path: Path) -> None:
+    """A stage that started but never finished has a null ``output_path`` — the
+    viewer reports it ``exists: False`` with empty content rather than trying to
+    read a non-path, exactly like a missing transcript."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    rid = ledger.run_create("all", "parallel")
+    ledger.set_total(rid, 1)
+    ledger.story_upsert(rid, "70.3-001", "70", "Unfinished", "high", 1, "backend", "", None, "IN_PROGRESS")
+    ledger.stage_start(rid, "70.3-001", "build", 1)  # never finished → output_path NULL
+    with _running(db) as base:
+        status, _c, body = _get(base + "/api/logs?story=70.3-001")
+    assert status == 200
+    t = next(x for x in json.loads(body)["transcripts"] if x["stage"] == "build")
+    assert t["path"] is None and t["exists"] is False and t["content"] == ""
+
+
+def test_api_logs_unknown_run_in_registry_mode(tmp_path: Path) -> None:
+    """In discovery mode a request naming a run the registry doesn't know about
+    resolves to no ledger → an empty transcript list (HTTP 200), not an error."""
+    registry, _run_a, _run_b, _ra, _rb = _two_repo_registry(tmp_path)
+    with _running_registry(registry) as base:
+        status, _c, body = _get(base + "/api/logs?story=AAA.1-001&run=no-such-run")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["run"] is None and payload["transcripts"] == []
+
+
+def test_api_logs_unreadable_ledger_returns_empty(monkeypatch, tmp_path: Path) -> None:
+    """A ledger that raises while enumerating stages degrades to an empty list
+    (HTTP 200) instead of surfacing a 500 to the viewer."""
+    import sqlite3
+
+    import sdlc.dashboard as dash
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed_with_transcripts(db)
+
+    def _raise(self, run_id):
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(dash.Ledger, "stage_breakdown", _raise)
+    with _running(db) as base:
+        status, _c, body = _get(base + "/api/logs?story=70.1-001")
+    assert status == 200
+    assert json.loads(body)["transcripts"] == []
+
+
+def test_resolve_run_db_no_source_returns_none() -> None:
+    """``_resolve_run_db`` with neither a registry nor a single ``db_path``
+    yields ``(None, None)`` — the idle-dashboard guard for the logs viewer."""
+    from types import SimpleNamespace
+
+    from sdlc.dashboard import _Handler
+
+    handler = _Handler.__new__(_Handler)
+    handler.server = SimpleNamespace(registry=None, db_path=None)
+    assert handler._resolve_run_db(None) == (None, None)
+
+
 def test_page_has_session_viewer() -> None:
     """The page ships an in-dashboard session viewer: a per-story 'view session'
     control, a modal, the /api/logs fetch, and a graceful stream-json renderer —
