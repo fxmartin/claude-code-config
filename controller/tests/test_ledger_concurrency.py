@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from pathlib import Path
+
+import pytest
 
 from sdlc.build import LEDGER_BUSY_TIMEOUT_MS, Ledger
 
@@ -126,3 +129,86 @@ def test_serial_writes_unchanged(tmp_path: Path) -> None:
         conn.close()
     assert row[0] == "DONE"
     assert row[1] is not None
+
+
+def _hold_writer_lock(db: Path, acquired: threading.Event, release: threading.Event) -> None:
+    """Grab SQLite's single writer lock via ``BEGIN IMMEDIATE`` and hold it until
+    ``release`` is set, signalling ``acquired`` once the lock is genuinely held."""
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("BEGIN IMMEDIATE;")  # takes the writer lock now, not lazily
+        acquired.set()
+        release.wait(timeout=5)
+        conn.rollback()  # drop the lock without mutating any rows
+    finally:
+        conn.close()
+
+
+def test_contended_writer_waits_out_lock_then_succeeds(tmp_path: Path) -> None:
+    """The story's core guarantee: when the writer lock is already held, a Ledger
+    write does NOT error with "database is locked" — the explicit busy_timeout
+    makes it wait out the lock and then commit once the holder releases."""
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-17", "serial")
+    ledger.story_upsert(run_id, "17.1-002", "17", "Story", "P2", 3, "py", "", None, "TODO")
+
+    acquired = threading.Event()
+    release = threading.Event()
+    holder = threading.Thread(target=_hold_writer_lock, args=(db, acquired, release))
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5), "lock holder never acquired the writer lock"
+
+        # Release the lock shortly after the Ledger write begins waiting, so the
+        # write must wait out a real, held lock — but well within busy_timeout.
+        hold_s = 0.4
+        threading.Timer(hold_s, release.set).start()
+
+        start = time.monotonic()
+        ledger.set_story_status(run_id, "17.1-002", "DONE")  # must not raise
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+        holder.join(timeout=5)
+
+    # It waited (rather than the lock being instantly free) yet stayed far under
+    # the 5000ms ceiling, and the write actually landed.
+    assert elapsed >= hold_s / 2
+    assert elapsed < LEDGER_BUSY_TIMEOUT_MS / 1000
+    conn = _open(db)
+    try:
+        status = conn.execute(
+            "SELECT status FROM stories WHERE run_id=? AND story_id='17.1-002'",
+            (run_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert status == "DONE"
+
+
+def test_zero_timeout_writer_fails_proving_busy_timeout_is_what_saves_us(
+    tmp_path: Path,
+) -> None:
+    """Control test: with no busy_timeout a writer hitting the same held lock
+    errors immediately — demonstrating the explicit timeout, not luck, is what
+    keeps the Ledger's contended writes from failing."""
+    db = tmp_path / "ledger.db"
+    Ledger(db).init()
+
+    acquired = threading.Event()
+    release = threading.Event()
+    holder = threading.Thread(target=_hold_writer_lock, args=(db, acquired, release))
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5), "lock holder never acquired the writer lock"
+        loser = sqlite3.connect(db, timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                loser.execute("BEGIN IMMEDIATE;")
+        finally:
+            loser.close()
+    finally:
+        release.set()
+        holder.join(timeout=5)
