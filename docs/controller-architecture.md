@@ -613,6 +613,37 @@ session did without hunting for `.log` files or leaving the page. The work is in
   disk (an Epic-11 non-goal: not in SQLite); the localhost-only surface means
   raw agent output is acceptable here and dovetails with Epic-13 sanitization.
 
+## Stable-height live regions (Story 11.2-011)
+
+The live transport (11.2-003) and the live detail view (11.2-004) re-render the
+auto-updating regions with a full `innerHTML` swap on **every** tick. Their
+content is variable-height — the run summary `#head` is 1–3 lines (run line +
+optional config line + optional usage line), the per-story `.substage` activity
+line can wrap, and `#updated` is a single clock line — so a swap that changed a
+region's box height would reflow everything below it and make the page jump (and
+shift content under a scrolled cursor). This is fixed in CSS only (**no backend
+change**), in `sdlc/dashboard.py`'s embedded stylesheet:
+
+- **`#head` reserves its 3-line maximum** (`min-height: 4.5em`), so toggling
+  between 1, 2 and 3 lines never changes its height — the bar/chips/stories
+  below it stay put.
+- **`#updated` reserves one line** (`min-height: 1.5em`).
+- **The `.substage` activity content clamps to a single line** via the
+  line-clamp idiom (`.act { display: -webkit-box; -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1; overflow: hidden }`, full message on hover via
+  `title`), so a long milestone is clipped rather than growing the row.
+  `activityRow` wraps its content in that `.act` element. `white-space: nowrap`
+  + `text-overflow: ellipsis` is deliberately **not** used here: the activity
+  rides in a `colspan` cell of an auto-layout table, where a nowrap cell widens
+  the column (and scrolls `.main` sideways) instead of ellipsizing. Line-clamp
+  keeps normal wrapping — so the cell stays at the table width — then clips to
+  one line. Verified live with a long message: the row stays one line and the
+  table does not overflow horizontally.
+
+Scroll position is preserved for free: `renderMain` only swaps the `innerHTML`
+of individual child regions inside the `.main` scroll container, so a fixed-box
+swap leaves `.main.scrollTop` untouched — there is no jump-to-top and no shift.
+
 ## There is no `init` verb
 
 Epic-07 scaffolded an `init` stub, but `build` already creates the SQLite ledger

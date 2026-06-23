@@ -1723,3 +1723,39 @@ def test_page_renders_wave_dag() -> None:
     assert "runs in parallel" in _PAGE          # wave header copy
     assert "<svg" in _PAGE                       # inline SVG edges, no external lib
     assert "<path" in _PAGE                      # edges as SVG connectors
+
+
+# --- stable-height live regions (Story 11.2-011) ---------------------------
+
+
+def test_page_reserves_stable_height_for_live_regions() -> None:
+    """The auto-updating regions reserve a stable height so a content swap that
+    toggles between 1, 2 and 3 lines never reflows the elements below them — the
+    page does not jump and a scrolled view does not shift (Story 11.2-011)."""
+    from sdlc.dashboard import _PAGE
+
+    # #head (run summary: run line + config line + usage line) reserves space
+    # for its 3-line maximum, so a 1↔2↔3-line swap keeps its box height stable.
+    assert "#head { min-height:" in _PAGE
+    # The #updated clock line keeps a stable single-line height across ticks.
+    assert "#updated { min-height:" in _PAGE
+    # The per-story sub-stage activity line is clamped to a single line so a long
+    # milestone is clipped rather than growing the row. The line-clamp idiom is
+    # used (not nowrap + text-overflow), because in an auto-layout table a nowrap
+    # cell widens the column instead of ellipsizing — verified live with a long
+    # activity message (the row stays one line and the table does not overflow).
+    assert ".substage .act {" in _PAGE
+    assert "-webkit-line-clamp: 1" in _PAGE
+    assert "overflow: hidden" in _PAGE
+
+
+def test_activity_row_wraps_content_for_clamping() -> None:
+    """activityRow wraps its content in the clamped `.act` element (with the full
+    message available on hover) so the substage line's height stays stable across
+    SSE ticks instead of wrapping to 2–3 lines (Story 11.2-011)."""
+    from sdlc.dashboard import _PAGE
+
+    assert "<div class='act'" in _PAGE  # clamped wrapper around the activity content
+    # The full (un-clamped) message is exposed on hover, matching the no-reflow
+    # truncation pattern used elsewhere on the dashboard.
+    assert "title='\"+esc(a.message)+\"'" in _PAGE
