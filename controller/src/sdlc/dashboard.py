@@ -387,6 +387,32 @@ _PAGE = """<!doctype html>
   .dag-node .nid { font-family: monospace; color: var(--text); }
   .dag-node .ntitle { color: var(--sub); display: block; margin: 2px 0 4px;
                       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Story 11.2-010: in-dashboard transcript viewer. A "view session" control
+     per story opens a modal listing that story's stage transcripts and renders
+     each inline — no leaving the page. The new-tab /log link stays as fallback. */
+  .view-session { cursor: pointer; font-size: 11px; color: var(--blue); margin-left: 6px; }
+  .modal { position: fixed; inset: 0; z-index: 50; background: rgba(76,79,105,.45);
+           display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .modal[hidden] { display: none; }
+  .modal-card { background: var(--base); border: 1px solid var(--surface);
+                border-radius: 10px; width: min(920px, 94vw); max-height: 86vh;
+                display: flex; flex-direction: column; overflow: hidden; }
+  .modal-head { display: flex; align-items: center; justify-content: space-between;
+                gap: 12px; padding: 12px 16px; background: var(--mantle);
+                border-bottom: 1px solid var(--surface); }
+  .modal-head h3 { margin: 0; font-size: 13px; font-weight: 600; }
+  .modal-close { background: none; border: none; font-size: 22px; line-height: 1;
+                 cursor: pointer; color: var(--sub); padding: 0 4px; }
+  .modal-close:hover { color: var(--text); }
+  .modal-body { padding: 12px 16px; overflow: auto; }
+  .transcript { margin-bottom: 12px; }
+  .transcript > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+  .transcript .tlink { font-size: 11px; margin: 4px 0; }
+  .transcript pre { background: var(--mantle); border: 1px solid var(--surface);
+                    border-radius: 6px; padding: 10px; margin: 4px 0 0; overflow: auto;
+                    max-height: 50vh; white-space: pre-wrap; word-break: break-word;
+                    font-size: 12px; }
+  .transcript .empty { color: var(--sub); font-style: italic; }
   @media (max-width: 760px) {
     .wrap { flex-direction: column; }
     .side { width: auto; border-right: none; border-bottom: 1px solid var(--surface); }
@@ -409,6 +435,13 @@ _PAGE = """<!doctype html>
       <div id="dag"></div>
       <div id="stories"></div>
       <div class="events" id="events"></div>
+    </div>
+  </div>
+  <div id="sessionModal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head"><h3 id="sessionTitle"></h3>
+        <button id="sessionClose" class="modal-close" aria-label="close">&times;</button></div>
+      <div id="sessionBody" class="modal-body"></div>
     </div>
   </div>
 <script>
@@ -686,7 +719,8 @@ function renderMain(d){
     const tok = s.tokens!=null
       ? humanTokens(s.tokens)+(s.cost_usd!=null?(" "+usd(s.cost_usd)):"")
       : "—";
-    return "<tr><td><code>"+esc(s.story_id)+"</code></td>"
+    return "<tr><td><code>"+esc(s.story_id)+"</code>"
+    + "<a class='view-session' data-story='"+esc(s.story_id)+"' title='read this story\\u2019s agent transcripts here'>view session</a></td>"
     + "<td>"+badge(s.status)+bug+"</td>"
     + stageCells
     + "<td>"+pr+"</td>"
@@ -707,7 +741,13 @@ function renderMain(d){
 document.getElementById("runs").addEventListener("click", e => {
   const el = e.target.closest(".run");
   if(!el) return;
-  sel = el.dataset.run || null;  // "" → Live
+  const next = el.dataset.run || null;  // "" → Live
+  // A transcript modal is bound to the run that was selected when it opened, so
+  // a run switch must dismiss it and invalidate its in-flight /api/logs fetch
+  // (closeSession bumps the token) — otherwise the old run's reply could paint
+  // into a modal that now belongs to a different run. closeSession is hoisted.
+  if(next !== sel) closeSession();
+  sel = next;
   tick();
 });
 
@@ -739,6 +779,98 @@ setInterval(tickRuntime, 1000);
 // reads the cached summary and never itself drives `gh`.
 const GH_REFRESH_INTERVAL = 30000;
 setInterval(tick, GH_REFRESH_INTERVAL);
+
+// In-dashboard transcript viewer (Story 11.2-010). A per-story "view session"
+// control opens a modal that lists the story's stage transcripts (build,
+// coverage, review, merge, and any bugfix retries) and renders each inline, so
+// FX reads what each `claude -p` session did without hunting for .log files or
+// leaving the page. Content comes from /api/logs (the same path-confined logs
+// root as /log); the new-tab /log link is preserved per transcript as fallback.
+function logHref(path){
+  return "/log?path=" + encodeURIComponent(path)
+    + (sel ? "&run=" + encodeURIComponent(sel) : "");
+}
+// Guard against out-of-order fetches: clicking a second story (or reselecting a
+// run) before the first /api/logs resolves must not paint the slower, stale
+// response into the modal. Each open captures a monotonic token; a response
+// repaints only while it is still the latest, and closing invalidates any
+// in-flight fetch so a late reply never reopens/repopulates a dismissed modal.
+let sessionReq = 0;
+// Plain-text transcripts render verbatim (readably). Once 11.1-001 streaming
+// lands and logs become stream-json (one JSON object per line), the viewer
+// degrades gracefully: each event collapses to a compact "type: message" line,
+// and any line that is not valid JSON falls back to its raw text — so a mixed
+// or future format never breaks the view.
+function renderTranscriptContent(text){
+  const raw = String(text==null?"":text);
+  const lines = raw.split("\\n").filter(l => l.trim().length);
+  const looksJsonl = lines.length>0 && lines.every(l => {
+    const c = l.trim()[0]; return c==="{" || c==="[";
+  });
+  if(!looksJsonl) return esc(raw);
+  return lines.map(l => {
+    try{
+      const ev = JSON.parse(l);
+      const type = ev.type || ev.event || ev.kind || "event";
+      const msg = ev.message || ev.text || ev.content;
+      const body = msg==null ? "" : (typeof msg==="string" ? msg : JSON.stringify(msg));
+      return esc(type) + (body ? ": " + esc(body) : "");
+    }catch(_){ return esc(l); }  // not JSON → show the raw line, never break
+  }).join("\\n");
+}
+function renderTranscripts(d){
+  const ts = (d && d.transcripts) || [];
+  if(!ts.length)
+    return "<p class='empty'>No transcripts for this story yet \\u2014 it has not started, "
+      + "or no stage has written a session log.</p>";
+  return ts.map((t, i) => {
+    const head = "<code>"+esc(t.stage||"?")+"</code>"
+      + (t.attempt ? " <span class='muted small'>attempt "+esc(t.attempt)+"</span>" : "")
+      + " " + badge(t.status||"PENDING");
+    const link = t.path
+      ? "<div class='tlink'><a href='"+logHref(t.path)+"' target='_blank' rel='noopener'>open in new tab</a></div>"
+      : "";
+    const inner = t.exists
+      ? link + "<pre>"+renderTranscriptContent(t.content)+"</pre>"
+      : "<p class='empty'>No transcript on disk for this stage.</p>" + link;
+    return "<details class='transcript'"+(i===0?" open":"")+">"
+      + "<summary>"+head+"</summary>"+inner+"</details>";
+  }).join("");
+}
+async function openSession(storyId){
+  const myReq = ++sessionReq;  // claim the latest-open token for this click
+  const modal = document.getElementById("sessionModal");
+  document.getElementById("sessionTitle").textContent = "Session transcripts \\u00b7 " + storyId;
+  const bodyEl = document.getElementById("sessionBody");
+  bodyEl.innerHTML = "<p class='muted'>loading\\u2026</p>";
+  modal.hidden = false;
+  try{
+    const q = "?story=" + encodeURIComponent(storyId)
+      + (sel ? "&run=" + encodeURIComponent(sel) : "");
+    const r = await fetch("/api/logs" + q, {cache:"no-store"});
+    const d = await r.json();
+    if(myReq !== sessionReq) return;  // superseded / closed → drop this response
+    bodyEl.innerHTML = renderTranscripts(d);
+  }catch(e){
+    if(myReq !== sessionReq) return;
+    bodyEl.innerHTML = "<p class='empty'>Could not load transcripts.</p>";
+  }
+}
+// Bumping the token invalidates any in-flight fetch so a late reply can't paint
+// into the dismissed (or next) modal.
+function closeSession(){ sessionReq++; document.getElementById("sessionModal").hidden = true; }
+// Delegated: the stories table re-renders every tick, so bind on its container.
+document.getElementById("stories").addEventListener("click", e => {
+  const el = e.target.closest(".view-session");
+  if(!el) return;
+  e.preventDefault();
+  openSession(el.dataset.story);
+});
+document.getElementById("sessionClose").addEventListener("click", closeSession);
+document.getElementById("sessionModal").addEventListener("click", e => {
+  if(e.target.id === "sessionModal") closeSession();  // click the backdrop to close
+});
+document.addEventListener("keydown", e => { if(e.key === "Escape") closeSession(); });
 
 tick();          // immediate first paint
 connectStream(); // then live updates (the stream's initial change repaints too)
@@ -802,6 +934,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_stream()
         elif path == "/log":
             self._serve_log(query.get("path", [""])[0], run)
+        elif path == "/api/logs":
+            self._serve_logs(run, query.get("story", [""])[0])
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
@@ -926,17 +1060,25 @@ class _Handler(BaseHTTPRequestHandler):
                     idle = 0.0
             time.sleep(poll)
 
+    def _logs_root(self, run_id: str | None) -> Path | None:
+        """The logs root that confines transcript serving for ``run_id``.
+
+        In registry-discovery mode this is the selected run's own ``<db>.logs``
+        directory (per-run confinement); in single-``--db`` mode it is the
+        server's one logs root. None when no run resolves.
+        """
+        if self.server.registry is not None:
+            rec = self._resolve_run(run_id)
+            return Path(f"{rec.db}.logs").resolve() if rec is not None else None
+        return self.server.logs_root
+
     def _serve_log(self, requested: str, run_id: str | None = None) -> None:
         """Serve a transcript file, but only one resolving inside the logs root.
 
         In registry-discovery mode the logs root is the selected run's own
         ``<db>.logs`` directory, keeping the path confinement per-run.
         """
-        if self.server.registry is not None:
-            rec = self._resolve_run(run_id)
-            root = Path(f"{rec.db}.logs").resolve() if rec is not None else None
-        else:
-            root = self.server.logs_root
+        root = self._logs_root(run_id)
         if root is None:
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
@@ -948,6 +1090,78 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         self._send(200, body, "text/plain; charset=utf-8")
+
+    # --- in-dashboard transcript viewer (Story 11.2-010) -------------------
+
+    @staticmethod
+    def _read_confined(root: Path, requested: str | None) -> str | None:
+        """Read a transcript only when it resolves inside ``root``; else None.
+
+        Shares the path-traversal guard with :meth:`_serve_log`: a recorded
+        ``output_path`` that escapes the logs root (or cannot be read) yields
+        None, so the viewer reports the transcript as missing rather than ever
+        leaking a file outside the logs tree.
+        """
+        if not requested:
+            return None
+        try:
+            target = Path(requested).resolve()
+            target.relative_to(root)  # raises ValueError if outside the root
+            return target.read_text(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            return None
+
+    def _resolve_run_db(self, run_id: str | None) -> tuple[str | None, Path | None]:
+        """``(run_id, db_path)`` for the selected run, resolving 'latest' in
+        single-``--db`` mode and the registry record in discovery mode."""
+        if self.server.registry is not None:
+            rec = self._resolve_run(run_id)
+            if rec is None:
+                return None, None
+            return rec.run_id, Path(rec.db)
+        db_path = self.server.db_path
+        if db_path is None:
+            return None, None
+        rid = run_id or Ledger(db_path).latest_run_id()
+        return rid, db_path
+
+    def _serve_logs(self, run_id: str | None, story_id: str) -> None:
+        """List a story's stage transcripts (path + inline content) as JSON.
+
+        Enumerates every stage attempt the ledger recorded for the story —
+        build, coverage, review, merge, and any bugfix retries — and folds in
+        each transcript's content read through the same path-confined guard as
+        ``/log``. A stage whose transcript is absent on disk (not started yet or
+        the file was never written) reports ``exists: False`` with empty content
+        so the client shows a placeholder, never an error. An unknown / blank
+        story, or an unreachable ledger, returns an empty list (HTTP 200).
+        """
+        rid, db_path = self._resolve_run_db(run_id)
+        root = self._logs_root(run_id)
+        payload: dict = {"run": rid, "story": story_id, "transcripts": []}
+        if not story_id or rid is None or db_path is None or root is None:
+            self._json(payload)
+            return
+        try:
+            attempts = Ledger(db_path).stage_breakdown(rid).get(story_id, [])
+        except (OSError, sqlite3.Error):
+            self._json(payload)
+            return
+        transcripts = []
+        for a in attempts:
+            content = self._read_confined(root, a.get("output_path"))
+            transcripts.append(
+                {
+                    "stage": a.get("name"),
+                    "attempt": a.get("attempt"),
+                    "status": a.get("status"),
+                    "path": a.get("output_path"),
+                    "exists": content is not None,
+                    "content": content or "",
+                }
+            )
+        payload["transcripts"] = transcripts
+        self._json(payload)
 
 
 def _migrate_registry_ledgers(registry: Registry) -> None:

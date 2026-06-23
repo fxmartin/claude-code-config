@@ -380,6 +380,153 @@ def test_page_has_stage_columns() -> None:
         assert f"<th>{header}</th>" in _PAGE
 
 
+# --- in-dashboard transcript viewer (Story 11.2-010) -----------------------
+
+
+def _seed_with_transcripts(db_path: Path, run_id: str | None = None) -> tuple[str, Path]:
+    """Seed a story whose stages point at on-disk transcript files.
+
+    Returns ``(run_id, logs_dir)``. Lays down build (DONE) + a bugfix attempt so
+    the viewer must enumerate every attempt, plus a coverage stage whose
+    ``output_path`` points at a file that does NOT exist (missing-transcript
+    placeholder case).
+    """
+    ledger = Ledger(db_path)
+    ledger.init()
+    rid = run_id or ledger.run_create("all", "parallel")
+    ledger.set_total(rid, 1)
+    ledger.story_upsert(rid, "70.1-001", "70", "Viewer", "high", 3, "backend", "", None, "DONE")
+    logs = Path(f"{db_path}.logs") / rid
+    logs.mkdir(parents=True, exist_ok=True)
+    build_log = logs / "70.1-001-build-1.log"
+    build_log.write_text("BUILD TRANSCRIPT", encoding="utf-8")
+    ledger.stage_start(rid, "70.1-001", "build", 1)
+    ledger.stage_finish(rid, "70.1-001", "build", 1, "DONE", output_path=str(build_log.resolve()))
+    bug_log = logs / "70.1-001-bugfix-1.log"
+    bug_log.write_text("BUGFIX TRANSCRIPT", encoding="utf-8")
+    ledger.stage_start(rid, "70.1-001", "bugfix", 1)
+    ledger.stage_finish(rid, "70.1-001", "bugfix", 1, "DONE", output_path=str(bug_log.resolve()))
+    # A coverage stage whose recorded path was never written to disk.
+    missing = logs / "70.1-001-coverage-1.log"
+    ledger.stage_start(rid, "70.1-001", "coverage", 1)
+    ledger.stage_finish(rid, "70.1-001", "coverage", 1, "DONE", output_path=str(missing.resolve()))
+    return rid, logs
+
+
+def test_api_logs_lists_story_transcripts(tmp_path: Path) -> None:
+    """``/api/logs?story=`` enumerates every stage attempt with inline content."""
+    db = tmp_path / ".sdlc-state.db"
+    rid, _logs = _seed_with_transcripts(db)
+    with _running(db) as base:
+        _s, ctype, body = _get(base + "/api/logs?story=70.1-001")
+    assert "application/json" in ctype
+    payload = json.loads(body)
+    assert payload["run"] == rid and payload["story"] == "70.1-001"
+    by_stage = {(t["stage"], t["attempt"]): t for t in payload["transcripts"]}
+    # build + bugfix transcripts exist and carry their content inline.
+    assert by_stage[("build", 1)]["exists"] is True
+    assert by_stage[("build", 1)]["content"] == "BUILD TRANSCRIPT"
+    assert by_stage[("bugfix", 1)]["exists"] is True
+    assert by_stage[("bugfix", 1)]["content"] == "BUGFIX TRANSCRIPT"
+
+
+def test_api_logs_missing_transcript_placeholder(tmp_path: Path) -> None:
+    """A stage whose recorded transcript is absent on disk → exists False, no
+    content — the client renders a placeholder, never an error (200, not 500)."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_with_transcripts(db)
+    with _running(db) as base:
+        status, _c, body = _get(base + "/api/logs?story=70.1-001")
+    assert status == 200
+    cov = next(t for t in json.loads(body)["transcripts"] if t["stage"] == "coverage")
+    assert cov["exists"] is False and cov["content"] == ""
+
+
+def test_api_logs_empty_for_unknown_story(tmp_path: Path) -> None:
+    """An unknown / story-less request returns an empty transcript list, not 404."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_with_transcripts(db)
+    with _running(db) as base:
+        s1, _c, b1 = _get(base + "/api/logs?story=does-not-exist")
+        s2, _c, b2 = _get(base + "/api/logs")  # no story param
+    assert s1 == 200 and json.loads(b1)["transcripts"] == []
+    assert s2 == 200 and json.loads(b2)["transcripts"] == []
+
+
+def test_api_logs_confines_to_logs_root(tmp_path: Path) -> None:
+    """A ledger row whose ``output_path`` escapes the logs root is never read —
+    the transcript reports ``exists: False`` rather than leaking an outside file."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    rid = ledger.run_create("all", "parallel")
+    ledger.set_total(rid, 1)
+    ledger.story_upsert(rid, "70.2-001", "70", "Escape", "high", 1, "backend", "", None, "DONE")
+    outside = tmp_path / "secret.txt"  # NOT under <db>.logs
+    outside.write_text("DO NOT SERVE", encoding="utf-8")
+    ledger.stage_start(rid, "70.2-001", "build", 1)
+    ledger.stage_finish(rid, "70.2-001", "build", 1, "DONE", output_path=str(outside.resolve()))
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/logs?story=70.2-001")
+    t = json.loads(body)["transcripts"][0]
+    assert t["exists"] is False
+    assert "DO NOT SERVE" not in t["content"]
+
+
+def test_api_logs_registry_mode_per_run(tmp_path: Path) -> None:
+    """In registry-discovery mode ``/api/logs`` resolves the selected run's own
+    ledger + logs root, so transcripts never bleed across repos."""
+    import os
+
+    from sdlc.registry import Registry, RunRecord
+
+    repo_a = tmp_path / "repo-a"
+    repo_a.mkdir()
+    db_a = repo_a / ".sdlc-state.db"
+    run_a, _logs = _seed_with_transcripts(db_a)
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord(run_a, str(repo_a), str(db_a), "all", os.getpid(),
+                  "DONE", "2026-01-01T00:00:00+00:00", total=1, completed=1)
+    )
+    with _running_registry(registry) as base:
+        _s, _c, body = _get(base + "/api/logs?story=70.1-001&run=" + run_a)
+    payload = json.loads(body)
+    assert payload["run"] == run_a
+    build = next(t for t in payload["transcripts"] if t["stage"] == "build")
+    assert build["exists"] is True and build["content"] == "BUILD TRANSCRIPT"
+
+
+def test_page_has_session_viewer() -> None:
+    """The page ships an in-dashboard session viewer: a per-story 'view session'
+    control, a modal, the /api/logs fetch, and a graceful stream-json renderer —
+    while preserving the new-tab /log link as a fallback (Story 11.2-010)."""
+    from sdlc.dashboard import _PAGE
+
+    assert "view-session" in _PAGE  # per-story control
+    assert "sessionModal" in _PAGE  # in-dashboard modal (no leaving the page)
+    assert "function openSession(" in _PAGE
+    assert "/api/logs" in _PAGE  # fetches the stage→content list
+    assert "renderTranscriptContent" in _PAGE  # plain-text + stream-json degrade
+    assert "target='_blank'" in _PAGE  # new-tab /log fallback preserved
+
+
+def test_page_session_viewer_guards_stale_fetches() -> None:
+    """Opening a second story (or reselecting a run) before the first /api/logs
+    resolves must not paint the slower, stale response — the viewer claims a
+    monotonic token per open and drops a superseded/closed response."""
+    from sdlc.dashboard import _PAGE
+
+    assert "let sessionReq = 0;" in _PAGE  # monotonic open token
+    assert "++sessionReq" in _PAGE  # each open claims the latest token
+    assert "if(myReq !== sessionReq) return;" in _PAGE  # stale response is dropped
+    # Closing invalidates any in-flight fetch so a late reply can't repaint.
+    assert "sessionReq++; document.getElementById(\"sessionModal\").hidden = true;" in _PAGE
+    # Switching runs dismisses the (run-bound) modal and invalidates its in-flight
+    # fetch, so the old run's reply can never paint into the now-different run.
+    assert "if(next !== sel) closeSession();" in _PAGE
+
+
 # --- live story status labels (Story 11.2-009) -----------------------------
 
 
