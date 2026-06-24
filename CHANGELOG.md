@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.66.0] - 2026-06-24
+
+### Added
+
+- feat(agent-runtime-security): sanitize untrusted inputs (#13.3-001)
+
+### Fixed
+
+- fix(agent-runtime-security): sanitize untrusted inputs (#13.3-001)
+
+
 ## [v1.65.0] - 2026-06-24
 
 ### Added
