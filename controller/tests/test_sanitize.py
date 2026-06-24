@@ -246,3 +246,93 @@ def test_finding_is_frozen() -> None:
     finding = SanitizationFinding(category=CATEGORY_SCRIPT, count=1, action="stripped")
     with pytest.raises(Exception):
         finding.count = 2  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Result aggregation surface — properties + finding metadata (AC #1, #2)
+# ---------------------------------------------------------------------------
+
+
+def test_neutralized_action_for_data_uri_and_base64() -> None:
+    # data: and base64 payloads are replaced by an inert placeholder, not deleted,
+    # so their findings carry action="neutralized" (not "stripped").
+    data_uri = sanitize_untrusted("see data:text/html,<b>x</b> end")
+    by_cat = {f.category: f for f in data_uri.findings}
+    assert by_cat[CATEGORY_DATA_URI].action == "neutralized"
+
+    b64 = sanitize_untrusted("blob ;base64,QUJDREVG tail")
+    by_cat = {f.category: f for f in b64.findings}
+    assert by_cat[CATEGORY_BASE64].action == "neutralized"
+
+
+def test_stripped_action_for_unicode_comment_and_script() -> None:
+    payload = "x​y<!-- h --><script>z()</script>"
+    by_cat = {f.category: f.action for f in sanitize_untrusted(payload).findings}
+    assert by_cat[CATEGORY_ZERO_WIDTH] == "stripped"
+    assert by_cat[CATEGORY_HTML_COMMENT] == "stripped"
+    assert by_cat[CATEGORY_SCRIPT] == "stripped"
+
+
+def test_categories_property_maps_each_category_to_its_count() -> None:
+    # Two zero-width chars + one HTML comment → exact per-category tally.
+    result = sanitize_untrusted("a​b​c<!-- hidden -->d")
+    assert result.categories == {CATEGORY_ZERO_WIDTH: 2, CATEGORY_HTML_COMMENT: 1}
+
+
+def test_total_sums_counts_across_categories() -> None:
+    result = sanitize_untrusted("a​b​c<!-- hidden -->d")
+    assert result.total == 3
+    assert result.total == sum(result.categories.values())
+
+
+def test_risk_score_is_severity_weighted_sum() -> None:
+    # Two zero-width (weight 1 each) + one HTML comment (weight 3) → 2*1 + 3 = 5.
+    result = sanitize_untrusted("a​b​c<!-- hidden -->d")
+    assert result.risk_score == 5
+
+
+def test_findings_are_ordered_by_descending_severity() -> None:
+    # A lone zero-width (sev 1) and a script (sev 5) must surface script first.
+    result = sanitize_untrusted("lead​<script>x()</script>tail")
+    ordered = [f.category for f in result.findings]
+    assert ordered == [CATEGORY_SCRIPT, CATEGORY_ZERO_WIDTH]
+
+
+def test_clean_text_has_zero_risk_score() -> None:
+    result = sanitize_untrusted(CLEAN_MARKDOWN)
+    assert result.risk_score == 0
+    assert result.categories == {}
+
+
+# ---------------------------------------------------------------------------
+# Dispatch-boundary helper — review escalation + custom threshold (AC #2)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_prompt_logs_review_recommended_true_above_threshold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="sdlc.sanitize"):
+        sanitize_prompt("<script>x()</script>", source="merge")
+    msg = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "review_recommended=True" in msg
+    assert "source=merge" in msg
+
+
+def test_sanitize_prompt_logs_review_recommended_false_for_lone_zero_width(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="sdlc.sanitize"):
+        sanitize_prompt("a​b", source="build")
+    msg = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "review_recommended=False" in msg
+
+
+def test_sanitize_prompt_honours_custom_threshold_in_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A lone zero-width is below the default but trips a threshold of 1.
+    with caplog.at_level(logging.WARNING, logger="sdlc.sanitize"):
+        sanitize_prompt("a​b", source="coverage", threshold=1)
+    msg = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "review_recommended=True" in msg
