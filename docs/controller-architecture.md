@@ -858,6 +858,58 @@ built-in baseline, so the secure default needs no configuration.
 The stronger option for genuinely untrusted repos is the opt-in container sandbox
 (Story 13.4-002); the deny baseline is the host-path floor that always applies.
 
+### Container sandbox for untrusted repos (Story 13.4-002)
+
+The deny baseline narrows what a dispatched agent can touch on the **host**. For a
+genuinely untrusted repo — one you're reviewing or building but don't trust — the
+stronger, **recommended** option is to give the agent no host or network reach at
+all: run it inside a container. This is opt-in (`--sandbox`, or `SDLC_SANDBOX=1`
+per repo); trusted local runs stay on the host, where the deny baseline is the
+floor.
+
+When enabled, `dispatch_agent` resolves the agent command exactly as on the host
+path (default, `SDLC_AGENT_CMD`, deny baseline, routed model — all unchanged) and
+then **wraps** it in a hardened `<runtime> run` invocation (`_apply_sandbox` /
+`sandbox_wrap` in `dispatch.py`). The wrap is transparent: the prompt still
+arrives on stdin and the agent's `stream-json` / `<<<RESULT_JSON>>>` envelope
+still streams out on stdout, so usage extraction, schema validation, the branch,
+and the commits are **byte-for-byte the host path's** — the result contract is
+unchanged. The worktree is bind-mounted, so commits the agent makes land back in
+the host worktree exactly as before.
+
+The container is locked down:
+
+| Flag | Effect |
+|------|--------|
+| `--network none` | **no egress** — a compromised agent can reach neither the host nor the internet (default) |
+| `--cap-drop ALL` | every Linux capability dropped |
+| `--security-opt no-new-privileges` | no privilege escalation inside the container |
+| `--user <uid>:<gid>` | runs as the **host operator's non-root uid/gid**, so mounted files stay owned by you |
+| `-v <worktree>:/workspace:Z` + `-w /workspace` | the per-story worktree is the only mount; the agent runs there |
+| `--rm` | the container is discarded after the stage |
+
+**Fail-fast (AC3).** If `--sandbox` is requested but no container runtime is on
+`PATH`, dispatch raises `SandboxUnavailableError` **before any agent launches** —
+it never silently falls back to an unsandboxed host run. Runtime is auto-detected
+(`podman`, then `docker`) or forced with `SDLC_SANDBOX_RUNTIME`.
+
+**Configuration knobs** (all optional):
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `SDLC_SANDBOX` | unset (off) | per-repo opt-in equivalent of `--sandbox`; also covers resumed runs |
+| `SDLC_SANDBOX_IMAGE` | `sdlc-agent-sandbox:latest` | the image the agent runs in (must already contain `claude` + toolchain; the controller never builds it) |
+| `SDLC_SANDBOX_RUNTIME` | auto (`podman`→`docker`) | force a specific runtime |
+| `SDLC_SANDBOX_NETWORK` | `none` | egress mode — point at a locked-down filtering network only for a stage that genuinely needs the API ("explicit allowlist only if a stage needs it") |
+
+Because egress is off by default, an agent inside the sandbox cannot reach the
+Anthropic API unless the operator opts into a filtering egress network via
+`SDLC_SANDBOX_NETWORK` (and mounts/forwards credentials accordingly). Building
+that proxy is out of scope; the hook is the network knob. The `--sandbox` flag is
+bound onto the real dispatch seam in `_resolve_dispatch` and persisted per run, so
+a resumed run keeps the same isolation; `SDLC_SANDBOX` is honoured directly at the
+dispatch boundary and so covers runs the flag never threaded through.
+
 ## Per-story worktree isolation (Story 17.2-001)
 
 Until concurrency, every story built in the **shared repo root**: the build

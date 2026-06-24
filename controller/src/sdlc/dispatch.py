@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -429,6 +430,159 @@ def _is_context_overflow(text: str) -> bool:
     return any(pattern.search(text) for pattern in _CONTEXT_OVERFLOW_PATTERNS)
 
 
+
+
+# --- Story 13.4-002: optional container sandbox for untrusted repos --------
+#
+# The deny baseline (13.1-001) narrows what a dispatched agent can touch on the
+# *host*; the sandbox is the stronger option for an untrusted repo — the agent
+# never had host or network reach to begin with. When enabled, the resolved agent
+# command is *wrapped* in a hardened ``<runtime> run`` invocation: the worktree is
+# bind-mounted, egress is off, every Linux capability is dropped, privilege
+# escalation is disabled, and the process runs as a non-root user matching the
+# host operator. The prompt still arrives on stdin and the ``<<<RESULT_JSON>>>``
+# envelope still streams out on stdout, so the result contract is byte-for-byte
+# the host path's (AC2). Opt-in only — trusted local runs stay on the host (AC1).
+
+# Opt-in to the sandbox. ``--sandbox`` threads ``sandbox=True`` down from the build
+# loop; ``SDLC_SANDBOX`` (``1``/``true``/``yes``/``on``) is the per-repo / per-env
+# config equivalent so an untrusted repo can default to sandboxed without the flag
+# — and so a *resumed* run honours it even before the flag is re-supplied.
+SANDBOX_ENV = "SDLC_SANDBOX"
+# The container image the agent runs inside. It must already contain ``claude``
+# (and the repo's toolchain); the controller never builds it. Default is a
+# conventional name the operator is expected to have built or pulled.
+SANDBOX_IMAGE_ENV = "SDLC_SANDBOX_IMAGE"
+DEFAULT_SANDBOX_IMAGE = "sdlc-agent-sandbox:latest"
+# Force a specific container runtime; unset → auto-detect (podman, then docker).
+SANDBOX_RUNTIME_ENV = "SDLC_SANDBOX_RUNTIME"
+# Network mode for the container. Default ``none`` = no egress (AC1). The operator
+# can point this at a locked-down filtering network for the rare stage that
+# genuinely needs the API — "explicit allowlist only if a stage needs it" — but
+# the default keeps the agent fully off-network.
+SANDBOX_NETWORK_ENV = "SDLC_SANDBOX_NETWORK"
+DEFAULT_SANDBOX_NETWORK = "none"
+# Runtimes tried, in order, when ``$SDLC_SANDBOX_RUNTIME`` is unset.
+_SANDBOX_RUNTIMES: tuple[str, ...] = ("podman", "docker")
+# Where the worktree is bind-mounted inside the container; the agent runs here.
+_SANDBOX_WORKDIR = "/workspace"
+
+
+class SandboxUnavailableError(AgentDispatchError):
+    """``--sandbox`` was requested but no container runtime is available (AC3).
+
+    A subclass of :class:`AgentDispatchError` so an existing ``except
+    AgentDispatchError`` still degrades gracefully, but it is raised *before* any
+    agent is launched so the controller fails fast with a clear message rather
+    than silently dispatching unsandboxed on the host.
+    """
+
+
+def sandbox_enabled(explicit: bool | None = None) -> bool:
+    """Whether the dispatched agent should run inside the container sandbox.
+
+    The explicit flag wins both ways: ``True`` forces it on, ``False`` forces it
+    off even when the env opts in (a per-repo override of the env config). ``None``
+    defers to ``$SDLC_SANDBOX`` (``1``/``true``/``yes``/``on``, case-insensitive)
+    so an untrusted repo can default to sandboxed without the flag. Unset → off, so
+    the host path is byte-for-byte today's.
+    """
+    if explicit is not None:
+        return explicit
+    return os.environ.get(SANDBOX_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def detect_container_runtime() -> str:
+    """The container runtime to use, or raise :class:`SandboxUnavailableError`.
+
+    ``$SDLC_SANDBOX_RUNTIME`` forces a specific binary (still verified present on
+    PATH); unset auto-detects ``podman`` then ``docker``. Raising here — before any
+    agent is dispatched — is the fail-fast that AC3 requires, so a requested
+    sandbox never silently degrades to an unsandboxed host run.
+    """
+    forced = os.environ.get(SANDBOX_RUNTIME_ENV, "").strip()
+    for name in (forced,) if forced else _SANDBOX_RUNTIMES:
+        if name and shutil.which(name):
+            return name
+    if forced:
+        raise SandboxUnavailableError(
+            f"sandbox requested but container runtime {forced!r} "
+            f"(${SANDBOX_RUNTIME_ENV}) was not found on PATH"
+        )
+    raise SandboxUnavailableError(
+        "sandbox requested but no container runtime found on PATH (looked for "
+        f"{', '.join(_SANDBOX_RUNTIMES)}); install one or unset ${SANDBOX_ENV}"
+    )
+
+
+def sandbox_wrap(
+    cmd: list[str],
+    *,
+    runtime: str,
+    image: str,
+    mount: Path,
+    network: str = DEFAULT_SANDBOX_NETWORK,
+    env: dict[str, str] | None = None,
+    forward_env: tuple[str, ...] = (),
+) -> list[str]:
+    """Wrap ``cmd`` in a hardened, no-egress ``<runtime> run`` invocation (AC1).
+
+    The worktree (``mount``) is bind-mounted at ``/workspace`` and becomes the
+    agent's working directory, so branches/commits the agent makes land back in
+    the host worktree and the ``<<<RESULT_JSON>>>`` envelope streams out over
+    stdout exactly as on the host path (AC2 — the contract is unchanged). The
+    container has no network egress (``--network none`` by default), every Linux
+    capability dropped (``--cap-drop ALL``), no privilege escalation
+    (``--security-opt no-new-privileges``), and a non-root user matching the host
+    uid/gid so mounted files stay owned by the operator. ``-i`` keeps stdin open so
+    the prompt is delivered exactly as on the host path; ``--rm`` discards the
+    container after the stage. ``forward_env`` names env vars (e.g. the
+    thinking-token cap) to pass through into the container from ``env``.
+    """
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    gid = os.getgid() if hasattr(os, "getgid") else 0
+    argv = [
+        runtime, "run", "--rm", "-i",
+        "--network", network,
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--user", f"{uid}:{gid}",
+        "-v", f"{Path(mount)}:{_SANDBOX_WORKDIR}:Z",
+        "-w", _SANDBOX_WORKDIR,
+    ]
+    source = env if env is not None else os.environ
+    for key in forward_env:
+        value = source.get(key)
+        if value is not None:
+            argv += ["-e", f"{key}={value}"]
+    argv.append(image)
+    argv += cmd
+    return argv
+
+
+def _apply_sandbox(
+    cmd: list[str], *, cwd: Path | None, env: dict[str, str] | None
+) -> list[str]:
+    """Resolve sandbox config and wrap ``cmd``; fail fast if no runtime (AC3).
+
+    Reads the runtime (auto-detected or ``$SDLC_SANDBOX_RUNTIME``), image
+    (``$SDLC_SANDBOX_IMAGE`` → :data:`DEFAULT_SANDBOX_IMAGE`), and network mode
+    (``$SDLC_SANDBOX_NETWORK`` → ``none``) from the environment. The bind mount is
+    the per-story worktree ``cwd`` (the controller's concurrency unit); ``None``
+    falls back to the current directory. The thinking-token cap, when set on the
+    dispatch ``env``, is forwarded into the container so the in-sandbox agent
+    honours the same ``MAX_THINKING_TOKENS`` bound as the host path.
+    """
+    runtime = detect_container_runtime()
+    image = os.environ.get(SANDBOX_IMAGE_ENV, "").strip() or DEFAULT_SANDBOX_IMAGE
+    network = os.environ.get(SANDBOX_NETWORK_ENV, "").strip() or DEFAULT_SANDBOX_NETWORK
+    mount = Path(cwd) if cwd is not None else Path.cwd()
+    return sandbox_wrap(
+        cmd, runtime=runtime, image=image, mount=mount, network=network,
+        env=env, forward_env=(THINKING_CAP_ENV,),
+    )
+
+
 @dataclass(frozen=True)
 class AgentResult:
     """A validated agent response.
@@ -483,6 +637,7 @@ def dispatch_agent(
     transcript_path: Path | None = None,
     on_progress: ProgressCallback | None = None,
     cwd: Path | None = None,
+    sandbox: bool | None = None,
 ) -> AgentResult:
     """Dispatch one agent as a subprocess and validate its response.
 
@@ -516,9 +671,20 @@ def dispatch_agent(
     is killed as *stalled* with a clear message, bounding any hang well inside the
     much larger wall-clock ``timeout``. ``None`` disables it. The captured path has
     no stream to monitor, so it relies on ``timeout`` alone (unchanged).
+
+    ``sandbox`` (Story 13.4-002) runs the agent inside a no-egress, cap-dropped,
+    non-root container with the worktree (``cwd``) bind-mounted — the recommended
+    path for an untrusted repo. ``True`` forces it on, ``False`` off, ``None``
+    defers to ``$SDLC_SANDBOX`` (the per-repo config). When enabled the resolved
+    command is wrapped in ``<runtime> run`` and, if no container runtime is
+    present, dispatch fails fast with :class:`SandboxUnavailableError` rather than
+    running unsandboxed (AC3). The result contract is identical to the host path
+    (AC2). Default (``None`` with the env unset) is the host path, unchanged.
     """
     cmd = resolve_agent_cmd(agent_cmd, model=model)
     env = _dispatch_env(thinking_cap)
+    if sandbox_enabled(sandbox):
+        cmd = _apply_sandbox(cmd, cwd=cwd, env=env)
     # Story 13.3-001: the agent runs under --dangerously-skip-permissions, so any
     # untrusted text woven into the prompt (story bodies, issue/PR comments) is a
     # prompt-injection surface. Sanitize the assembled prompt at this single

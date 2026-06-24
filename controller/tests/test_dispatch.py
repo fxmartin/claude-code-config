@@ -18,15 +18,25 @@ from sdlc.contracts import (
 )
 from sdlc.dispatch import (
     DEFAULT_AGENT_CMD,
+    DEFAULT_SANDBOX_IMAGE,
+    DEFAULT_SANDBOX_NETWORK,
     DENY_BASELINE,
     DENY_BASELINE_ENV,
+    SANDBOX_ENV,
+    SANDBOX_IMAGE_ENV,
+    SANDBOX_NETWORK_ENV,
+    SANDBOX_RUNTIME_ENV,
     AgentDispatchError,
     AgentResult,
     ContextOverflowError,
     RateLimitError,
+    SandboxUnavailableError,
+    detect_container_runtime,
     dispatch_agent,
     resolve_agent_cmd,
     resolve_deny_rules,
+    sandbox_enabled,
+    sandbox_wrap,
 )
 from sdlc.rate_limit import seconds_until_reset
 
@@ -1752,3 +1762,205 @@ def test_streaming_dispatch_quarantines_transcript_on_timeout(
     quarantined = tpath.with_suffix(tpath.suffix + ".killed")
     assert quarantined.exists()
     assert str(quarantined) in str(exc.value)
+
+
+# --- Story 13.4-002: optional container sandbox ---------------------------
+
+
+def test_sandbox_enabled_explicit_overrides_env(monkeypatch) -> None:
+    """The explicit flag wins both ways: True forces on, False opts out even when
+    the env opts in (per-repo override of the env config)."""
+    monkeypatch.setenv(SANDBOX_ENV, "1")
+    assert sandbox_enabled(False) is False
+    monkeypatch.delenv(SANDBOX_ENV, raising=False)
+    assert sandbox_enabled(True) is True
+
+
+def test_sandbox_enabled_env_opt_in(monkeypatch) -> None:
+    """`SDLC_SANDBOX` is the per-repo config equivalent of `--sandbox` (AC1)."""
+    monkeypatch.delenv(SANDBOX_ENV, raising=False)
+    assert sandbox_enabled() is False
+    for truthy in ("1", "true", "YES", "On"):
+        monkeypatch.setenv(SANDBOX_ENV, truthy)
+        assert sandbox_enabled() is True
+    for falsy in ("0", "", "no", "off"):
+        monkeypatch.setenv(SANDBOX_ENV, falsy)
+        assert sandbox_enabled() is False
+
+
+def test_detect_container_runtime_prefers_podman(monkeypatch) -> None:
+    monkeypatch.delenv(SANDBOX_RUNTIME_ENV, raising=False)
+    monkeypatch.setattr(
+        "sdlc.dispatch.shutil.which",
+        lambda name: f"/usr/bin/{name}" if name in {"podman", "docker"} else None,
+    )
+    assert detect_container_runtime() == "podman"
+
+
+def test_detect_container_runtime_falls_back_to_docker(monkeypatch) -> None:
+    monkeypatch.delenv(SANDBOX_RUNTIME_ENV, raising=False)
+    monkeypatch.setattr(
+        "sdlc.dispatch.shutil.which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    assert detect_container_runtime() == "docker"
+
+
+def test_detect_container_runtime_honours_forced_choice(monkeypatch) -> None:
+    monkeypatch.setenv(SANDBOX_RUNTIME_ENV, "docker")
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/x/{name}")
+    assert detect_container_runtime() == "docker"
+
+
+def test_detect_container_runtime_fail_fast_when_absent(monkeypatch) -> None:
+    """AC3: no runtime on PATH → a clear fail-fast, never a silent host run."""
+    monkeypatch.delenv(SANDBOX_RUNTIME_ENV, raising=False)
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: None)
+    with pytest.raises(SandboxUnavailableError):
+        detect_container_runtime()
+
+
+def test_detect_container_runtime_fail_fast_forced_missing(monkeypatch) -> None:
+    monkeypatch.setenv(SANDBOX_RUNTIME_ENV, "nerdctl")
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: None)
+    with pytest.raises(SandboxUnavailableError) as exc:
+        detect_container_runtime()
+    assert "nerdctl" in str(exc.value)
+
+
+def test_sandbox_wrap_builds_hardened_no_egress_argv(tmp_path) -> None:
+    """AC1: the wrap drops all caps, blocks egress, and bind-mounts the worktree."""
+    inner = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+    argv = sandbox_wrap(inner, runtime="podman", image="img:latest", mount=tmp_path)
+    assert argv[:2] == ["podman", "run"]
+    assert "--rm" in argv and "-i" in argv
+    assert argv[argv.index("--network") + 1] == DEFAULT_SANDBOX_NETWORK == "none"
+    assert argv[argv.index("--cap-drop") + 1] == "ALL"
+    assert argv[argv.index("--security-opt") + 1] == "no-new-privileges"
+    assert "--user" in argv  # a non-root user is always pinned
+    assert f"{tmp_path}:/workspace:Z" in argv
+    assert argv[argv.index("-w") + 1] == "/workspace"
+    # The image, then the original command verbatim, at the tail (AC2 transparency).
+    assert argv[argv.index("img:latest") + 1:] == inner
+    assert argv[-len(inner):] == inner
+
+
+def test_sandbox_wrap_runs_as_non_root_host_user(monkeypatch, tmp_path) -> None:
+    """AC1: the container user maps to the host uid/gid — never root."""
+    monkeypatch.setattr("sdlc.dispatch.os.getuid", lambda: 1234, raising=False)
+    monkeypatch.setattr("sdlc.dispatch.os.getgid", lambda: 5678, raising=False)
+    argv = sandbox_wrap(["claude"], runtime="podman", image="i", mount=tmp_path)
+    assert argv[argv.index("--user") + 1] == "1234:5678"
+
+
+def test_sandbox_wrap_network_override_for_allowlist(tmp_path) -> None:
+    """An operator can swap `none` for a locked-down egress network when a stage
+    genuinely needs the API ("explicit allowlist only if a stage needs it")."""
+    argv = sandbox_wrap(
+        ["claude"], runtime="podman", image="i", mount=tmp_path, network="sdlc-egress"
+    )
+    assert argv[argv.index("--network") + 1] == "sdlc-egress"
+
+
+def test_sandbox_wrap_forwards_named_env_only(tmp_path) -> None:
+    argv = sandbox_wrap(
+        ["claude"], runtime="podman", image="i", mount=tmp_path,
+        env={"MAX_THINKING_TOKENS": "2048", "SECRET": "leak"},
+        forward_env=("MAX_THINKING_TOKENS",),
+    )
+    forwarded = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
+    assert "MAX_THINKING_TOKENS=2048" in forwarded
+    assert all(not v.startswith("SECRET") for v in forwarded)
+
+
+def _sandbox_popen(seen):
+    def fake_popen(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+    return fake_popen
+
+
+def test_dispatch_sandbox_wraps_command_and_keeps_contract(monkeypatch) -> None:
+    """AC1+AC2: with `--sandbox` the agent runs in a hardened, no-egress container
+    and the validated result is identical to the host path."""
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
+    seen: dict = {}
+    monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    # The result contract is unchanged from the host path.
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert result.session_id == "sess-123"
+    assert result.cost_usd == 0.42
+    # The launched command is the hardened wrap, with the agent command at the tail.
+    cmd = seen["cmd"]
+    assert cmd[:2] == ["podman", "run"]
+    assert cmd[cmd.index("--network") + 1] == "none"
+    assert cmd[cmd.index("--cap-drop") + 1] == "ALL"
+    assert cmd[-len(_STREAM_CMD):] == _STREAM_CMD
+
+
+def test_dispatch_sandbox_off_runs_on_host_unchanged(monkeypatch) -> None:
+    """sandbox=False leaves the host path byte-for-byte today's (no wrapping)."""
+    seen: dict = {}
+    monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=False)
+    assert seen["cmd"] == _STREAM_CMD
+
+
+def test_dispatch_sandbox_fail_fast_without_runtime(monkeypatch) -> None:
+    """AC3: requested sandbox with no runtime raises before any agent is launched."""
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: None)
+    launched = {"popen": False}
+
+    def boom(*args, **kwargs):
+        launched["popen"] = True
+        raise AssertionError("subprocess must never start when the sandbox is unavailable")
+
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    with pytest.raises(SandboxUnavailableError):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    assert launched["popen"] is False
+
+
+def test_dispatch_sandbox_mounts_cwd_worktree(monkeypatch, tmp_path) -> None:
+    """The per-story worktree (cwd) is the bind mount, so commits land on the host
+    and the result contract round-trips (AC2)."""
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
+    seen: dict = {}
+    monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True, cwd=tmp_path)
+    assert f"{tmp_path}:/workspace:Z" in seen["cmd"]
+
+
+def test_dispatch_sandbox_via_env_config(monkeypatch) -> None:
+    """`SDLC_SANDBOX=1` opts in without the flag (the per-repo config path, AC1)."""
+    monkeypatch.setenv(SANDBOX_ENV, "1")
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
+    seen: dict = {}
+    monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert seen["cmd"][:2] == ["podman", "run"]
+
+
+def test_dispatch_sandbox_network_env_override(monkeypatch) -> None:
+    """`SDLC_SANDBOX_NETWORK` swaps the no-egress default for a locked-down egress
+    network when a stage genuinely needs the API (operator-controlled allowlist)."""
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv(SANDBOX_NETWORK_ENV, "sdlc-egress")
+    seen: dict = {}
+    monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    assert seen["cmd"][seen["cmd"].index("--network") + 1] == "sdlc-egress"
+
+
+def test_dispatch_sandbox_uses_configured_image(monkeypatch) -> None:
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv(SANDBOX_IMAGE_ENV, "my-registry/agent:pinned")
+    seen: dict = {}
+    monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    assert "my-registry/agent:pinned" in seen["cmd"]
+    # default image is used when unset
+    monkeypatch.delenv(SANDBOX_IMAGE_ENV, raising=False)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    assert DEFAULT_SANDBOX_IMAGE in seen["cmd"]
