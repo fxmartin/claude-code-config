@@ -774,6 +774,50 @@ call of **both** dispatch paths (`subprocess.run(cwd=…)` /
 `subprocess.Popen(cwd=…)`); `cwd=None` inherits the parent's working directory,
 so the no-isolation path is byte-for-byte today's.
 
+### Deny baseline under the permission bypass (Story 13.1-001)
+
+Every dispatched agent runs `claude -p … --dangerously-skip-permissions`: with no
+human to approve tool calls, the bypass is what lets a headless agent actually
+write files, commit, and call `gh` instead of being silently denied. That same
+bypass, though, gives the agent the blast radius of the whole machine. The deny
+baseline narrows it back down **without** reintroducing prompts (which would
+break unattended runs).
+
+The flag suppresses the permission *prompt*; it does **not** disable an explicit
+deny list supplied on the command surface. `settings.json`'s `permissions.deny`
+*is* bypassed by the flag — so it is the wrong enforcement point — but
+`--disallowedTools` on the `claude` invocation is honoured. So `resolve_agent_cmd`
+appends the baseline as `--disallowedTools "<rule>,<rule>,…"` to the **built-in
+default command only**. The default baseline (`DENY_BASELINE` in
+`dispatch.py`) is:
+
+| Rule | Blocks |
+|------|--------|
+| `Read(~/.ssh/**)` / `Write(~/.ssh/**)` | reading or tampering with SSH keys |
+| `Read(~/.aws/**)` | reading AWS credentials |
+| `Read(**/.env*)` | reading `.env` secret files anywhere in the tree |
+| `Bash(curl * \| bash)` | "pipe the internet into a shell" remote execution |
+| `Bash(ssh *)` | outbound SSH egress |
+
+The rules are deliberately narrow — they block only the listed secret paths and
+egress shells, so ordinary development (editing repo files, running the test
+command) is unaffected.
+
+Precedence mirrors model routing (Story 14.2-001): the baseline decorates only the
+built-in default. A `SDLC_AGENT_CMD` or an explicit `agent_cmd` is the escape
+hatch and **owns its own permission posture**, so no deny rules are appended to it
+— an operator taking over the command can set their own `--disallowedTools`.
+
+**Per-repo override.** Set `SDLC_DENY_BASELINE` to a comma-separated rule list to
+*replace* the baseline for one repo without editing controller code, or to the
+empty string to opt out entirely (the flag is then omitted and the default is
+byte-for-byte its pre-13.1 form). Whitespace is trimmed and blank entries
+dropped, so `"Read(~/.aws/**), , Bash(ssh *)"` resolves to two rules. Unset → the
+built-in baseline, so the secure default needs no configuration.
+
+The stronger option for genuinely untrusted repos is the opt-in container sandbox
+(Story 13.4-002); the deny baseline is the host-path floor that always applies.
+
 ## Per-story worktree isolation (Story 17.2-001)
 
 Until concurrency, every story built in the **shared repo root**: the build
