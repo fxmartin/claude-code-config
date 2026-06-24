@@ -1539,6 +1539,52 @@ def test_terminate_process_group_graceful_exit_skips_kill() -> None:
     assert not proc.killed  # graceful TERM was enough; no hard kill
 
 
+def test_signal_process_group_falls_back_when_killpg_raises(monkeypatch) -> None:
+    """A killpg that raises (gone/no-perm) falls back to signalling the child directly."""
+    from sdlc.dispatch import _signal_process_group
+
+    proc = _FakePopen([])
+    proc.pid = 4321
+
+    def boom(pgid, sig) -> None:
+        raise ProcessLookupError("group already reaped")
+
+    monkeypatch.setattr("sdlc.dispatch.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("sdlc.dispatch.os.killpg", boom)
+
+    _signal_process_group(proc, signal.SIGTERM)
+
+    # killpg blew up, so the direct-child fallback delivered the signal instead.
+    assert signal.SIGTERM in proc.signals
+
+
+def test_signal_process_group_swallows_child_signal_error(monkeypatch) -> None:
+    """A child that is already gone when signalled never propagates the error."""
+    from sdlc.dispatch import _signal_process_group
+
+    proc = _FakePopen([])  # pid is None → straight to the direct-child path
+
+    def gone(sig) -> None:
+        raise ProcessLookupError("child already reaped")
+
+    proc.send_signal = gone  # type: ignore[method-assign]
+    # Best-effort: the "already gone" race is swallowed, not raised.
+    _signal_process_group(proc, signal.SIGTERM)
+
+
+def test_terminate_process_group_swallows_non_timeout_wait_error() -> None:
+    """A wait() that raises something other than TimeoutExpired still escalates to KILL."""
+    from sdlc.dispatch import _terminate_process_group
+
+    proc = _FakePopen([])  # pid None → child path
+    proc._wait_exc = RuntimeError("reap exploded")  # both waits raise this
+
+    # The non-timeout reap error is swallowed; termination proceeds to the hard kill.
+    _terminate_process_group(proc, grace_s=0.05)
+    assert signal.SIGTERM in proc.signals
+    assert proc.killed  # escalated to SIGKILL despite the broken wait()
+
+
 def test_streaming_dispatch_kills_process_group_on_timeout(monkeypatch) -> None:
     """A wall-clock timeout SIGKILLs the whole process group so no child survives."""
     blocking = _BlockingStdout()
@@ -1638,6 +1684,17 @@ def test_quarantine_transcript_missing_file_is_noop(tmp_path) -> None:
     from sdlc.dispatch import _quarantine_transcript
 
     assert _quarantine_transcript(tmp_path / "absent.log", "reason") is None
+
+
+def test_quarantine_transcript_io_error_is_noop(tmp_path) -> None:
+    """An I/O error reading/writing the transcript is swallowed (returns None)."""
+    from sdlc.dispatch import _quarantine_transcript
+
+    # A directory exists at the path, so exists() is True but read_text() raises
+    # IsADirectoryError (an OSError) — quarantine can never itself fail the run.
+    src = tmp_path / "build-1.log"
+    src.mkdir()
+    assert _quarantine_transcript(src, "reason") is None
 
 
 def test_streaming_dispatch_quarantines_transcript_on_timeout(
