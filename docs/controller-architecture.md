@@ -766,6 +766,46 @@ not carried per turn in `stream-json`, so it lands only at this reconciliation
 and per-story/stage breakdowns surface through the existing query path
 (`stage_breakdown`, `_aggregate_run_usage`, `status_snapshot`) with no new schema.
 
+### Kill-switch and heartbeat dead-man (Story 13.4-001)
+
+A dispatched agent that hangs or loops must never hold an unattended run (or the
+machine) hostage, so `_dispatch_streaming` bounds *any* stall and kills cleanly:
+
+- **Process-group kill, not just the parent.** The agent is launched with
+  `start_new_session=True` so it leads its own session / process group. When it
+  must be terminated, the controller signals the whole **group**
+  (`os.killpg(os.getpgid(pid), …)`) so a tool subprocess the agent spawned cannot
+  be orphaned and survive the kill. `_signal_process_group` falls back to
+  signalling just the direct child when the group cannot be reached (no pid yet,
+  already reaped, or a platform without POSIX process groups).
+- **Graceful then hard (`SIGTERM` → grace → `SIGKILL`).**
+  `_terminate_process_group` sends `SIGTERM` to the group first so a well-behaved
+  agent can flush and exit, waits `_TERM_GRACE_S` (10 s), then escalates to
+  `SIGKILL` so a runaway is terminated for certain. A child that exits on
+  `SIGTERM` is never `SIGKILL`-ed.
+- **Two independent kill triggers.** The existing wall-clock `timeout` (default
+  `DEFAULT_TIMEOUT_S`, 3600 s) is joined by a **heartbeat dead-man**: an
+  output-idle monitor thread that kills the agent after `stall_timeout` seconds
+  with no stream line (`DEFAULT_STALL_TIMEOUT_S`, 300 s; `None` disables it). The
+  monitor re-arms on every line received, so slow-but-productive work is never
+  killed, while a genuine hang is caught far inside the wall-clock bound. The
+  raised `AgentDispatchError` names which trigger fired (`stalled: no output for
+  Ns` vs `timed out after Ns`).
+- **Quarantine + ledger.** On a kill the partial transcript is copied to a
+  `<transcript>.killed` sibling (`_quarantine_transcript`) so the event can be
+  reviewed without the next run overwriting the live log, and the quarantine path
+  is included in the error message — which the build loop records as the failed
+  stage's `event_log` entry, so the kill is captured in the ledger through the
+  existing dispatch-error path (no new schema).
+
+The **captured** path (a non-streaming `SDLC_AGENT_CMD`) also launches with
+`start_new_session=True` for group isolation, but relies on
+`subprocess.run(timeout=…)` reaping the direct child; full graceful
+process-group escalation and the heartbeat live on the streaming path, which is
+the default real-agent dispatch. This complements Epic-12 story 12.1-002
+(preflight hang guard, which prevents recursive self-invocation): 12.1-002 bounds
+the test command, this bounds the agent subprocess itself.
+
 ### Per-story working directory (Story 17.2-001)
 
 `dispatch_agent(…, cwd=…)` is the seam that lets the controller run an agent in
