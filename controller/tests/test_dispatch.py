@@ -1964,3 +1964,36 @@ def test_dispatch_sandbox_uses_configured_image(monkeypatch) -> None:
     monkeypatch.delenv(SANDBOX_IMAGE_ENV, raising=False)
     dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
     assert DEFAULT_SANDBOX_IMAGE in seen["cmd"]
+
+
+def test_sandbox_wrap_falls_back_to_zero_uid_without_getuid(monkeypatch, tmp_path) -> None:
+    """On a platform without POSIX uid/gid (no `os.getuid`/`getgid`), the user pin
+    falls back to 0:0 rather than crashing — the cross-platform safety net."""
+    monkeypatch.delattr("sdlc.dispatch.os.getuid", raising=False)
+    monkeypatch.delattr("sdlc.dispatch.os.getgid", raising=False)
+    argv = sandbox_wrap(["claude"], runtime="podman", image="i", mount=tmp_path)
+    assert argv[argv.index("--user") + 1] == "0:0"
+
+
+def test_dispatch_sandbox_blank_env_falls_back_to_defaults(monkeypatch) -> None:
+    """Whitespace-only `SDLC_SANDBOX_IMAGE` / `SDLC_SANDBOX_NETWORK` are treated as
+    unset, so the built-in defaults apply (the `.strip() or DEFAULT` normalization)."""
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv(SANDBOX_IMAGE_ENV, "   ")
+    monkeypatch.setenv(SANDBOX_NETWORK_ENV, "  ")
+    seen: dict = {}
+    monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    assert DEFAULT_SANDBOX_IMAGE in seen["cmd"]
+    assert seen["cmd"][seen["cmd"].index("--network") + 1] == DEFAULT_SANDBOX_NETWORK
+
+
+def test_detect_container_runtime_blank_force_auto_detects(monkeypatch) -> None:
+    """An empty/whitespace `SDLC_SANDBOX_RUNTIME` is treated as unset, so detection
+    falls back to the podman→docker auto-detect order rather than forcing a binary."""
+    monkeypatch.setenv(SANDBOX_RUNTIME_ENV, "   ")
+    monkeypatch.setattr(
+        "sdlc.dispatch.shutil.which",
+        lambda name: f"/usr/bin/{name}" if name in {"podman", "docker"} else None,
+    )
+    assert detect_container_runtime() == "podman"
