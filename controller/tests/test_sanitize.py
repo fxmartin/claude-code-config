@@ -116,6 +116,23 @@ def test_data_uri_neutralized() -> None:
     assert CATEGORY_DATA_URI in cats
 
 
+def test_data_uri_html_body_does_not_leak() -> None:
+    # Story 13.3-001 regression: a data:text/html, payload must be consumed
+    # whole. The body must not survive past a ``>`` and leak into the prompt the
+    # permission-bypassed agent reads.
+    result = sanitize_untrusted("Click data:text/html,<h1>hi</h1> to continue.")
+    assert result.cleaned == "Click [sanitized:data-uri] to continue."
+    assert "hi</h1>" not in result.cleaned
+
+
+def test_data_uri_in_quoted_attribute_stays_bounded() -> None:
+    # A data: URI inside a quoted HTML attribute is still bounded by the quote,
+    # so neutralization does not over-consume the surrounding markup.
+    result = sanitize_untrusted('<a href="data:text/plain,abc">link</a>')
+    assert "data:text/plain" not in result.cleaned
+    assert '">link</a>' in result.cleaned
+
+
 def test_base64_data_uri_neutralized_once() -> None:
     payload = "img: data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA end"
     result = sanitize_untrusted(payload)
