@@ -58,6 +58,46 @@ DEFAULT_AGENT_CMD: list[str] = [
 # not a CLI flag, so it never has to be threaded into the (escape-hatch) argv.
 THINKING_CAP_ENV = "MAX_THINKING_TOKENS"
 
+# Story 13.1-001: the default deny baseline for a dispatched agent. Every agent
+# runs under ``--dangerously-skip-permissions`` (no human to approve tool calls),
+# which suppresses the *prompt* but does NOT disable an explicit deny list on the
+# command surface. ``settings.json`` ``permissions.deny`` is bypassed by the flag;
+# ``--disallowedTools`` on the ``claude`` invocation is not. So this baseline is
+# wired onto the built-in command (see ``resolve_agent_cmd``) to keep a refused
+# floor — secret-bearing reads/writes and "pipe the internet into a shell" egress —
+# even with prompts suppressed. The rules are deliberately narrow: they block only
+# the listed secret paths and egress shells, never ordinary edit/test work.
+DENY_BASELINE: tuple[str, ...] = (
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(**/.env*)",
+    "Write(~/.ssh/**)",
+    "Bash(curl * | bash)",
+    "Bash(ssh *)",
+)
+
+# Per-repo override for the deny baseline (AC3): set ``SDLC_DENY_BASELINE`` to a
+# comma-separated rule list to *replace* the baseline for one repo without editing
+# controller code, or to the empty string to opt out entirely. Unset → the
+# built-in baseline above. This mirrors the ``SDLC_AGENT_CMD`` escape-hatch model:
+# the operator owns the posture per environment.
+DENY_BASELINE_ENV = "SDLC_DENY_BASELINE"
+
+
+def resolve_deny_rules() -> list[str]:
+    """The deny rules to apply to the built-in dispatch command.
+
+    Story 13.1-001: ``$SDLC_DENY_BASELINE`` (comma-separated) replaces the
+    built-in :data:`DENY_BASELINE` when set — an empty value disables the baseline
+    for that repo (the documented per-repo opt-out). Whitespace around each rule is
+    trimmed and blank entries are dropped, so ``"A, , B"`` yields ``["A", "B"]``.
+    Unset → the built-in baseline, so default behaviour needs no configuration.
+    """
+    override = os.environ.get(DENY_BASELINE_ENV)
+    if override is not None:
+        return [rule.strip() for rule in override.split(",") if rule.strip()]
+    return list(DENY_BASELINE)
+
 
 def _dispatch_env(thinking_cap: int | None) -> dict[str, str] | None:
     """The subprocess environment for a dispatch, or ``None`` to inherit the parent.
@@ -92,6 +132,13 @@ def resolve_agent_cmd(
     and owns its own model selection, so the routed model is deliberately ignored
     there (precedence: explicit/env > map). With no ``model`` the default command
     is byte-for-byte today's, so routing-off behaviour is unchanged.
+
+    Story 13.1-001: the deny baseline (:func:`resolve_deny_rules`) is appended to
+    the built-in command as ``--disallowedTools`` so the secret/egress floor holds
+    under ``--dangerously-skip-permissions``. Like ``model``, it decorates only the
+    built-in default — an explicit/env command owns its own permission posture, so
+    no deny rules are appended there. An empty resolved baseline (per-repo opt-out)
+    omits the flag entirely, leaving the default byte-for-byte its pre-13.1 form.
     """
     if explicit is not None:
         return list(explicit)
@@ -99,6 +146,9 @@ def resolve_agent_cmd(
     if env:
         return shlex.split(env)
     cmd = list(DEFAULT_AGENT_CMD)
+    deny = resolve_deny_rules()
+    if deny:
+        cmd += ["--disallowedTools", ",".join(deny)]
     if model:
         cmd += ["--model", model]
     return cmd

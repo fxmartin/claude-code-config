@@ -319,6 +319,42 @@ The secrets bats test plants the fixture token in a temp dir, confirms gitleaks
 flags it with the default rules, confirms the value is redacted out of the
 output, and confirms `.gitleaks.toml` allowlists the fixture at its real path.
 
+## Agent runtime: deny baseline for dispatched agents (Story 13.1-001)
+
+The gates above secure the **target repo's code**. This section secures the
+**agent harness itself**. The controller dispatches every agent with
+`--dangerously-skip-permissions` (`controller/src/sdlc/dispatch.py`): there is no
+human to approve tool calls in a headless `-p` run, so the bypass is what lets the
+agent write, commit, and call `gh`. The trade-off is blast radius — without a
+floor, a prompt-injected or misbehaving agent could read `~/.ssh`, exfiltrate
+secrets, or pipe the internet into a shell.
+
+The deny baseline restores that floor **without** reintroducing prompts (which
+would break unattended runs). The permission bypass suppresses the *prompt* but
+not an explicit deny list on the command surface: `settings.json`
+`permissions.deny` is ignored by the flag, but `--disallowedTools` on the `claude`
+invocation is honoured. So `resolve_agent_cmd` appends the baseline as
+`--disallowedTools` to the built-in default command. `DENY_BASELINE` blocks, at
+minimum:
+
+| Rule | Blocks |
+|------|--------|
+| `Read(~/.ssh/**)`, `Write(~/.ssh/**)` | SSH key read / tamper |
+| `Read(~/.aws/**)` | AWS credential read |
+| `Read(**/.env*)` | `.env` secret-file read anywhere in the tree |
+| `Bash(curl * \| bash)` | remote "curl \| bash" execution |
+| `Bash(ssh *)` | outbound SSH egress |
+
+The rules are narrow by design: they refuse only the listed secret paths and
+egress shells, so ordinary edit/test work is unaffected.
+
+**Per-repo override.** Set `SDLC_DENY_BASELINE` to a comma-separated rule list to
+replace the baseline for one repo without editing controller code, or to the empty
+string to opt out. A `SDLC_AGENT_CMD` / explicit `agent_cmd` is the escape hatch
+and owns its own posture — no deny rules are appended to it. The opt-in container
+sandbox (Story 13.4-002) is the stronger option for untrusted repos; the deny
+baseline is the always-on host-path floor.
+
 ## Reference
 
 - SAST wrapper script: `scripts/sast-scan.sh`
@@ -332,3 +368,4 @@ output, and confirms `.gitleaks.toml` allowlists the fixture at its real path.
 - Bugfix prompt (dep remediation): `plugins/autonomous-sdlc/skills/build-stories/bugfix-agent-prompt.md`
 - Bats coverage: `tests/sast-scan.bats` (SAST), `tests/osv-scan.bats` (dependencies), `tests/gitleaks-secrets.bats` (secrets)
 - Stories: `docs/stories/epic-09-security-quality-gates.md` (Stories 9.1-001, 9.1-002, 9.2-001)
+- Deny baseline: `controller/src/sdlc/dispatch.py` (`DENY_BASELINE`, `resolve_deny_rules`, `SDLC_DENY_BASELINE`); story `docs/stories/epic-13-agent-runtime-security.md` (Story 13.1-001)

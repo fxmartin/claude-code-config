@@ -17,12 +17,15 @@ from sdlc.contracts import (
 )
 from sdlc.dispatch import (
     DEFAULT_AGENT_CMD,
+    DENY_BASELINE,
+    DENY_BASELINE_ENV,
     AgentDispatchError,
     AgentResult,
     ContextOverflowError,
     RateLimitError,
     dispatch_agent,
     resolve_agent_cmd,
+    resolve_deny_rules,
 )
 from sdlc.rate_limit import seconds_until_reset
 
@@ -386,7 +389,12 @@ def test_resolve_agent_cmd_env_override(monkeypatch) -> None:
 
 def test_resolve_agent_cmd_default(monkeypatch) -> None:
     monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
-    assert resolve_agent_cmd() == DEFAULT_AGENT_CMD
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    # The built-in default is the base command plus the deny baseline (13.1-001):
+    # the base prefix is unchanged, with the deny rules appended.
+    cmd = resolve_agent_cmd()
+    assert cmd[: len(DEFAULT_AGENT_CMD)] == DEFAULT_AGENT_CMD
+    assert "--disallowedTools" in cmd
 
 
 # --- Story 14.2-001: per-task model routing (--model on the default cmd) ----
@@ -399,9 +407,13 @@ def test_resolve_agent_cmd_appends_model_to_default(monkeypatch) -> None:
     assert cmd[-2:] == ["--model", "sonnet"]
 
 
-def test_resolve_agent_cmd_no_model_is_unchanged_default(monkeypatch) -> None:
+def test_resolve_agent_cmd_no_model_omits_model_flag(monkeypatch) -> None:
     monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
-    assert resolve_agent_cmd(model=None) == DEFAULT_AGENT_CMD
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    # No routed model → no --model flag, but the deny baseline is still applied.
+    cmd = resolve_agent_cmd(model=None)
+    assert "--model" not in cmd
+    assert cmd[: len(DEFAULT_AGENT_CMD)] == DEFAULT_AGENT_CMD
 
 
 def test_resolve_agent_cmd_env_override_ignores_routed_model(monkeypatch) -> None:
@@ -434,6 +446,120 @@ def test_dispatch_agent_passes_routed_model_to_default_cmd(monkeypatch) -> None:
     # Here we only assert dispatch accepts the kwarg without error.
     dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], model="sonnet")
     assert seen["cmd"][0]  # ran, model on explicit cmd is intentionally ignored
+
+
+# --- Story 13.1-001: deny-rules baseline for agent dispatch ----------------
+
+
+# The secret-bearing / egress rules the story requires the baseline to carry.
+_REQUIRED_DENY_RULES = (
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(**/.env*)",
+    "Write(~/.ssh/**)",
+    "Bash(curl * | bash)",
+    "Bash(ssh *)",
+)
+
+
+def test_deny_baseline_covers_required_secret_and_egress_rules() -> None:
+    """The baseline denies, at minimum, the secret paths and egress shells (AC1)."""
+    for rule in _REQUIRED_DENY_RULES:
+        assert rule in DENY_BASELINE
+
+
+def test_resolve_deny_rules_default_is_the_baseline(monkeypatch) -> None:
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    assert resolve_deny_rules() == list(DENY_BASELINE)
+
+
+def test_default_cmd_applies_deny_baseline_under_permission_bypass(monkeypatch) -> None:
+    """Even with --dangerously-skip-permissions, the default cmd carries the deny
+    list on its command surface, so the secret/egress rules are refused (AC1)."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    cmd = resolve_agent_cmd()
+    assert "--dangerously-skip-permissions" in cmd
+    assert "--disallowedTools" in cmd
+    deny_arg = cmd[cmd.index("--disallowedTools") + 1]
+    for rule in _REQUIRED_DENY_RULES:
+        assert rule in deny_arg
+
+
+def test_dispatched_default_subprocess_receives_deny_baseline(monkeypatch) -> None:
+    """The wired streaming dispatch (default cmd) actually launches with the deny
+    rules on argv — proves the baseline reaches every dispatched agent (DoD)."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    seen = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    dispatch_agent("build", "prompt")
+    assert "--disallowedTools" in seen["cmd"]
+
+
+def test_deny_baseline_does_not_block_legitimate_dev_work() -> None:
+    """Regression (AC2): the baseline blocks only the listed secret/egress paths,
+    never ordinary editing or running the test command."""
+    deny = list(DENY_BASELINE)
+    # No blanket bans on the everyday tools a build/test agent needs.
+    assert not any(rule.startswith("Edit(") for rule in deny)
+    assert "Bash(*)" not in deny and "Write(*)" not in deny and "Read(*)" not in deny
+    # The only Write denial is the SSH key dir, not the working tree.
+    write_rules = [r for r in deny if r.startswith("Write(")]
+    assert write_rules == ["Write(~/.ssh/**)"]
+    # Bash denials are specific egress patterns, never a catch-all.
+    for rule in (r for r in deny if r.startswith("Bash(")):
+        assert rule != "Bash(*)"
+
+
+def test_resolve_deny_rules_override_replaces_baseline(monkeypatch) -> None:
+    """Per-repo override (AC3): the operator relaxes the baseline via an env var,
+    no controller-code edit required."""
+    monkeypatch.setenv(DENY_BASELINE_ENV, "Read(~/.aws/**),Bash(ssh *)")
+    assert resolve_deny_rules() == ["Read(~/.aws/**)", "Bash(ssh *)"]
+
+
+def test_resolve_deny_rules_override_trims_and_ignores_blanks(monkeypatch) -> None:
+    monkeypatch.setenv(DENY_BASELINE_ENV, " Read(~/.aws/**) , , Bash(ssh *) ")
+    assert resolve_deny_rules() == ["Read(~/.aws/**)", "Bash(ssh *)"]
+
+
+def test_resolve_deny_rules_override_empty_disables_baseline(monkeypatch) -> None:
+    """An empty override is the documented per-repo opt-out (AC3)."""
+    monkeypatch.setenv(DENY_BASELINE_ENV, "")
+    assert resolve_deny_rules() == []
+
+
+def test_empty_override_omits_disallowed_tools_flag(monkeypatch) -> None:
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    monkeypatch.setenv(DENY_BASELINE_ENV, "")
+    assert "--disallowedTools" not in resolve_agent_cmd()
+
+
+def test_override_flows_onto_default_cmd(monkeypatch) -> None:
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    monkeypatch.setenv(DENY_BASELINE_ENV, "Read(/etc/**)")
+    cmd = resolve_agent_cmd()
+    assert cmd[cmd.index("--disallowedTools") + 1] == "Read(/etc/**)"
+
+
+def test_env_override_cmd_owns_its_posture_no_deny_appended(monkeypatch) -> None:
+    """SDLC_AGENT_CMD is the escape hatch: it owns its permission posture, so the
+    controller never appends the deny baseline to it (precedence: env > baseline)."""
+    monkeypatch.setenv("SDLC_AGENT_CMD", "claude -p --permission-mode acceptEdits")
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    assert resolve_agent_cmd() == ["claude", "-p", "--permission-mode", "acceptEdits"]
+
+
+def test_explicit_cmd_gets_no_deny_baseline(monkeypatch) -> None:
+    """An explicit agent_cmd owns its own posture — no deny rules appended."""
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    assert resolve_agent_cmd(["my", "agent"]) == ["my", "agent"]
 
 
 # --- 17.2-001: per-story working directory (cwd) propagation ---------------
