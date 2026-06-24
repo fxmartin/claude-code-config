@@ -355,6 +355,43 @@ and owns its own posture — no deny rules are appended to it. The opt-in contai
 sandbox (Story 13.4-002) is the stronger option for untrusted repos; the deny
 baseline is the always-on host-path floor.
 
+## Agent runtime: container sandbox for untrusted repos (Story 13.4-002)
+
+The deny baseline above narrows what an agent can touch on the **host**. For a
+repo you don't trust, the **recommended** path is stronger still: give the agent
+no host or network reach at all by running it inside a container. It is opt-in —
+`sdlc build --sandbox`, or `SDLC_SANDBOX=1` as per-repo config — so trusted local
+runs stay on the host.
+
+When enabled, the resolved agent command (deny baseline, routed model, and all)
+is **wrapped** in a hardened `<runtime> run` invocation. The wrap is transparent:
+the prompt arrives on stdin and the `<<<RESULT_JSON>>>` envelope streams back on
+stdout exactly as on the host path, so the branch, commits, usage, and schema
+validation are **identical** — the result contract is unchanged. The worktree is
+the only bind mount, so the agent's commits land back on the host. The container:
+
+| Flag | Effect |
+|------|--------|
+| `--network none` | **no egress** by default — neither host nor internet is reachable |
+| `--cap-drop ALL` | all Linux capabilities dropped |
+| `--security-opt no-new-privileges` | no privilege escalation |
+| `--user <uid>:<gid>` | runs as the **non-root** host operator |
+| `-v <worktree>:/workspace:Z`, `-w /workspace` | per-story worktree mounted; agent runs there |
+| `--rm` | container discarded after the stage |
+
+**Fail-fast.** If `--sandbox` is requested with no container runtime on `PATH`,
+dispatch raises `SandboxUnavailableError` **before any agent runs** — it never
+silently degrades to an unsandboxed host run. Runtime is auto-detected
+(`podman`→`docker`) or forced via `SDLC_SANDBOX_RUNTIME`.
+
+**Knobs.** `SDLC_SANDBOX` (opt-in, covers resumes), `SDLC_SANDBOX_IMAGE`
+(the image; must already contain `claude` — the controller never builds it),
+`SDLC_SANDBOX_RUNTIME` (force a runtime), `SDLC_SANDBOX_NETWORK` (egress mode;
+default `none` — point at a locked-down filtering network only for a stage that
+genuinely needs the API). Because egress is off by default, reaching the live API
+from inside the sandbox requires opting into such a network — building that proxy
+is out of scope; the knob is the hook.
+
 ## Untrusted-input sanitization (Story 13.3-001)
 
 The gates above scan the **target repo's code**. This control hardens the
@@ -411,6 +448,7 @@ sees them; clean prompts pass through unchanged).
 - Bats coverage: `tests/sast-scan.bats` (SAST), `tests/osv-scan.bats` (dependencies), `tests/gitleaks-secrets.bats` (secrets)
 - Stories: `docs/stories/epic-09-security-quality-gates.md` (Stories 9.1-001, 9.1-002, 9.2-001)
 - Deny baseline: `controller/src/sdlc/dispatch.py` (`DENY_BASELINE`, `resolve_deny_rules`, `SDLC_DENY_BASELINE`); story `docs/stories/epic-13-agent-runtime-security.md` (Story 13.1-001)
+- Container sandbox: `controller/src/sdlc/dispatch.py` (`sandbox_enabled`, `detect_container_runtime`, `sandbox_wrap`, `SandboxUnavailableError`, `SDLC_SANDBOX*`); CLI `sdlc build --sandbox`; tests `controller/tests/test_sandbox.py` + `controller/tests/test_dispatch.py`; story `docs/stories/epic-13-agent-runtime-security.md` (Story 13.4-002)
 - Input-sanitization module: `controller/src/sdlc/sanitize.py` (Story 13.3-001)
 - Input-sanitization tests: `controller/tests/test_sanitize.py`, `controller/tests/test_dispatch.py`
 - Harness-hardening story: `docs/stories/epic-13-agent-runtime-security.md` (Story 13.3-001)

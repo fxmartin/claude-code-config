@@ -312,6 +312,8 @@ _BOOL_FLAGS = {
     "--sequential": "sequential",
     "--skip-preflight": "skip_preflight",
     "--rebuild": "rebuild",
+    # Story 13.4-002: run dispatched agents inside the container sandbox.
+    "--sandbox": "sandbox",
 }
 
 
@@ -388,6 +390,13 @@ class BuildOptions:
     # budget). It is a per-run constant, bound onto the real dispatch seam in
     # :func:`_resolve_dispatch`; auto-compaction stays at Claude Code's default.
     thinking_cap: int = 0
+    # Story 13.4-002: run every dispatched agent inside a no-egress, cap-dropped,
+    # non-root container with the worktree bind-mounted — the recommended path for
+    # an untrusted repo. False = host path (today's default). Bound onto the real
+    # dispatch seam in :func:`_resolve_dispatch`; persisted per run so a resume
+    # keeps the isolation. ``SDLC_SANDBOX`` is the env equivalent honoured directly
+    # at the dispatch boundary, so it covers runs this flag never threaded through.
+    sandbox: bool = False
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -2038,6 +2047,12 @@ def _resolve_dispatch(
     dispatch = dispatcher or default
     if dispatcher is None and opts.thinking_cap:
         dispatch = functools.partial(dispatch, thinking_cap=opts.thinking_cap)
+    # Story 13.4-002: bind the container-sandbox flag onto the real seam so every
+    # stage's dispatch (build/coverage/review/merge/bugfix/reask) runs inside the
+    # no-egress container. Only the real default seam is wrapped (an injected fake
+    # owns its own signature); off → the seam is returned unchanged (host path).
+    if dispatcher is None and opts.sandbox:
+        dispatch = functools.partial(dispatch, sandbox=True)
     return dispatch
 
 
@@ -2893,6 +2908,10 @@ def run_build(
             # the same MAX_THINKING_TOKENS bound and the dashboard can show it.
             # 0 keeps today's default thinking budget.
             "thinking_cap": opts.thinking_cap,
+            # Story 13.4-002: persist the container-sandbox flag so a resumed run
+            # keeps the same isolation posture (and the dashboard can show it).
+            # False keeps the host path — unchanged for runs that predate this.
+            "sandbox": opts.sandbox,
         }),
     )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of

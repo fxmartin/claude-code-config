@@ -111,6 +111,11 @@ Flags:
                             hatch), e.g. --model-build=opus --model-merge=haiku
   --thinking-cap=N          cap per-request thinking tokens (MAX_THINKING_TOKENS)
                             on every dispatched agent; 0 = no cap (default)
+  --sandbox                 run every dispatched agent inside a no-egress,
+                            cap-dropped, non-root container with the worktree
+                            mounted (recommended for untrusted repos); fails fast
+                            if no container runtime is present. SDLC_SANDBOX=1 is
+                            the per-repo config equivalent
 """
 
 

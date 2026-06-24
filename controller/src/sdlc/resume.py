@@ -213,6 +213,10 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         # the same MAX_THINKING_TOKENS bound. Defaults to 0 (no cap) for runs that
         # predate this field — unchanged behaviour.
         thinking_cap=int(config.get("thinking_cap", 0) or 0),
+        # Story 13.4-002: carry the container-sandbox flag so a resumed run keeps
+        # the same isolation. Defaults to the host path for runs that predate the
+        # field. (``SDLC_SANDBOX`` also covers resume directly at dispatch time.)
+        sandbox=bool(config.get("sandbox", False)),
     )
 
 
