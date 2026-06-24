@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.67.0] - 2026-06-24
+
+### Added
+
+- feat(agent-runtime-security): optional container sandbox (#13.4-002)
+
+
 ## [v1.66.0] - 2026-06-24
 
 ### Added
