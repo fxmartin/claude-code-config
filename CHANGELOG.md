@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.65.0] - 2026-06-24
+
+### Added
+
+- feat(agent-runtime-security): kill-switch and heartbeat (#13.4-001)
+
+
 ## [v1.64.0] - 2026-06-24
 
 ### Added
