@@ -1418,3 +1418,35 @@ def test_streaming_text_reset_not_overridden_by_rate_limit_event(
     with pytest.raises(RateLimitError) as exc:
         dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
     assert exc.value.signal.reset_at == float(text_epoch)
+
+
+# --- 11.1-001: defensive guards for a child with no stdin / stdout pipe ------
+
+
+def test_streaming_dispatch_handles_missing_stdin(monkeypatch) -> None:
+    """A child whose stdin pipe is None skips the prompt write and still parses.
+
+    Popen can hand back a process with ``stdin is None`` (e.g. an inherited fd);
+    the ``if proc.stdin is not None`` guard must short-circuit the write/close
+    block rather than raise, so the stream is still consumed and validated.
+    """
+    fake = _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+    fake.stdin = None  # the prompt-write block must be skipped, not crash
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["branch_name"] == "feature/7.3-001"
+
+
+def test_streaming_dispatch_handles_missing_stdout(monkeypatch) -> None:
+    """A child whose stdout pipe is None skips the read loop and degrades cleanly.
+
+    With ``stdout is None`` there are no stream lines to consume, so no result
+    event arrives; interpretation falls back to parsing the (empty) accumulated
+    stdout, which has no result block — a contract failure, not a crash in the
+    read loop. The point is the ``if proc.stdout is not None`` guard is honoured.
+    """
+    fake = _FakePopen([])
+    fake.stdout = None  # the read loop must be skipped, not crash
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    with pytest.raises(ResultBlockError):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
