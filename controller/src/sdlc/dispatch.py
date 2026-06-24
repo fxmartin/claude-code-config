@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from sdlc.contracts import parse_and_validate
 from sdlc.rate_limit import RateLimitSignal, detect_rate_limit
+from sdlc.sanitize import sanitize_prompt
 
 # A sink that receives each parsed stream-json event as it arrives (Story
 # 11.1-002), used to emit fine-grained sub-stage progress to the ledger.
@@ -402,6 +403,14 @@ def dispatch_agent(
     """
     cmd = resolve_agent_cmd(agent_cmd, model=model)
     env = _dispatch_env(thinking_cap)
+    # Story 13.3-001: the agent runs under --dangerously-skip-permissions, so any
+    # untrusted text woven into the prompt (story bodies, issue/PR comments) is a
+    # prompt-injection surface. Sanitize the assembled prompt at this single
+    # dispatch boundary — stripping zero-width/bidi Unicode, HTML comment/script,
+    # and data:/base64 payloads — before it ever reaches the subprocess. Clean
+    # prompts round-trip unchanged; suspicious payloads are logged (and flagged
+    # for review above a threshold) rather than silently obeyed.
+    prompt = sanitize_prompt(prompt, source=agent_type).cleaned
     if _is_streaming_cmd(cmd):
         return _dispatch_streaming(
             agent_type, prompt, cmd, timeout=timeout,

@@ -355,6 +355,48 @@ and owns its own posture — no deny rules are appended to it. The opt-in contai
 sandbox (Story 13.4-002) is the stronger option for untrusted repos; the deny
 baseline is the always-on host-path floor.
 
+## Untrusted-input sanitization (Story 13.3-001)
+
+The gates above scan the **target repo's code**. This control hardens the
+**agent harness itself**. The controller dispatches every agent with
+`--dangerously-skip-permissions` (`controller/src/sdlc/dispatch.py`), so the
+agent reads its prompt with no permission prompt between that text and the host.
+Any untrusted text woven into a prompt — story bodies, issue/PR comments — is
+therefore a **prompt-injection surface**: a hidden instruction could hijack a
+permission-bypassed agent.
+
+`controller/src/sdlc/sanitize.py` neutralizes that text at the single dispatch
+boundary, immediately before the subprocess is launched. It strips or
+neutralizes:
+
+| Vector | Category | Action |
+|--------|----------|--------|
+| Zero-width / bidi Unicode (`U+200B`–`U+200F`, `U+202A`–`U+202E`, `U+2060`–`U+2069`, `U+FEFF`) | `zero-width-unicode` | stripped |
+| HTML comments (`<!-- … -->`, multi-line) | `html-comment` | stripped |
+| `<script>…</script>` blocks and stray tags | `script-tag` | stripped |
+| `data:` URIs (incl. `data:text/html`, `data:…;base64,…`) | `data-uri` | neutralized → `[sanitized:data-uri]` |
+| Standalone `base64,` payloads | `base64-payload` | neutralized → `[sanitized:base64]` |
+
+**Conservative code-fence handling.** Inside a fenced code block (```` ``` ````
+or `~~~`) only the always-unsafe zero-width/bidi strip applies, so a story that
+legitimately *quotes* `<script>` or a `data:` URI as a code sample survives
+intact. An *unterminated* fence is treated as prose and fully sanitized — the
+safe default. Clean text round-trips byte-for-byte.
+
+**Logging and review routing.** When anything is stripped, the sanitizer emits a
+structured `WARNING` on the `sdlc.sanitize` logger naming the `source` stage, the
+per-category counts, the weighted `risk_score`, and a `review_recommended` flag.
+Each category carries a severity weight (script 5, HTML-comment / data-URI 3,
+base64 2, zero-width 1); a `risk_score` at or above `DEFAULT_REVIEW_THRESHOLD`
+(3) trips `review_recommended` — so any single script/HTML-comment/data-URI
+vector routes the story to human review, while a lone stray zero-width character
+is stripped and logged but does not. Clean input logs nothing.
+
+Tests live in `controller/tests/test_sanitize.py` (a malicious-fixture corpus and
+a clean corpus, including a code block) and `controller/tests/test_dispatch.py`
+(the dispatch-boundary wiring: poisoned prompts are cleaned before the subprocess
+sees them; clean prompts pass through unchanged).
+
 ## Reference
 
 - SAST wrapper script: `scripts/sast-scan.sh`
@@ -369,3 +411,6 @@ baseline is the always-on host-path floor.
 - Bats coverage: `tests/sast-scan.bats` (SAST), `tests/osv-scan.bats` (dependencies), `tests/gitleaks-secrets.bats` (secrets)
 - Stories: `docs/stories/epic-09-security-quality-gates.md` (Stories 9.1-001, 9.1-002, 9.2-001)
 - Deny baseline: `controller/src/sdlc/dispatch.py` (`DENY_BASELINE`, `resolve_deny_rules`, `SDLC_DENY_BASELINE`); story `docs/stories/epic-13-agent-runtime-security.md` (Story 13.1-001)
+- Input-sanitization module: `controller/src/sdlc/sanitize.py` (Story 13.3-001)
+- Input-sanitization tests: `controller/tests/test_sanitize.py`, `controller/tests/test_dispatch.py`
+- Harness-hardening story: `docs/stories/epic-13-agent-runtime-security.md` (Story 13.3-001)
