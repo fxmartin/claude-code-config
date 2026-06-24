@@ -85,8 +85,12 @@ _SCRIPT_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>", re.IGNORECASE | re.DO
 _SCRIPT_TAG_RE = re.compile(r"</?script\b[^>]*>", re.IGNORECASE)
 # ``data:`` URIs — captures ``data:text/html,…`` and ``data:…;base64,…`` up to
 # the first whitespace/closing delimiter. The base64 payload it carries is part
-# of this one finding (it is not double-counted by the base64 pass below).
-_DATA_URI_RE = re.compile(r"data:[\w./+-]*(?:;[\w=+-]+)*,[^\s)>\]\"']*", re.IGNORECASE)
+# of this one finding (it is not double-counted by the base64 pass below). The
+# payload class deliberately keeps ``<``/``>`` so a ``data:text/html,<h1>…</h1>``
+# body is consumed whole rather than truncated at the first ``>`` (which would
+# leak the rest of the HTML into the prompt); ``)``/``]``/quotes still bound a
+# data: URI embedded in markdown-link or HTML-attribute context.
+_DATA_URI_RE = re.compile(r"data:[\w./+-]*(?:;[\w=+-]+)*,[^\s)\]\"']*", re.IGNORECASE)
 # A standalone ``base64,`` payload marker that is not part of a ``data:`` URI.
 _BASE64_RE = re.compile(r";?base64,[A-Za-z0-9+/=]*", re.IGNORECASE)
 
