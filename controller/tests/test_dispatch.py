@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import threading
 
@@ -784,6 +785,13 @@ class _FakePopen:
         self._returncode = returncode
         self._wait_exc = wait_exc
         self.killed = False
+        # Story 13.4-001: a fake pid is left None by default so the group-kill
+        # plumbing takes its child-fallback path deterministically (no real
+        # process group to signal); the process-group tests set it explicitly
+        # and monkeypatch os.getpgid/os.killpg. ``signals`` records every signal
+        # the dispatcher sends to the child so a test can assert TERM→KILL.
+        self.pid = None
+        self.signals: list[int] = []
         self.wait_delay = 0.0  # seconds wait() lingers, to provoke timer races
 
     def wait(self, timeout=None):  # noqa: ANN001 - mirror subprocess API
@@ -794,8 +802,12 @@ class _FakePopen:
             raise self._wait_exc
         return self._returncode
 
+    def send_signal(self, sig) -> None:  # noqa: ANN001 - mirror subprocess API
+        self.signals.append(sig)
+
     def kill(self) -> None:
         self.killed = True
+        self.signals.append(signal.SIGKILL)
 
     def poll(self):
         return self._returncode
@@ -920,18 +932,20 @@ def test_streaming_dispatch_timeout_raises(monkeypatch) -> None:
     fake = _FakePopen([])
     fake.stdout = blocking
 
-    original_kill = fake.kill
+    # Story 13.4-001: termination is now graceful (SIGTERM→grace→SIGKILL of the
+    # process group). With no real pid the dispatcher signals the child directly;
+    # either signal closes stdout, so release on whichever lands first.
+    def terminate_and_release(sig=signal.SIGKILL) -> None:
+        fake.signals.append(sig)
+        blocking.released.set()  # the signal closes stdout → loop ends
 
-    def kill_and_release() -> None:
-        original_kill()
-        blocking.released.set()  # the kill closes stdout → loop ends
-
-    fake.kill = kill_and_release  # type: ignore[method-assign]
+    fake.send_signal = lambda sig: terminate_and_release(sig)  # type: ignore[method-assign]
+    fake.kill = lambda: terminate_and_release(signal.SIGKILL)  # type: ignore[method-assign]
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
     with pytest.raises(AgentDispatchError, match="timed out"):
         # A tiny timeout makes the watchdog fire promptly; no real agent stalls.
         dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, timeout=0.2)
-    assert fake.killed  # the hung child is killed
+    assert fake.signals  # the hung child's process group was signalled
 
 
 def test_streaming_dispatch_late_watchdog_does_not_false_timeout(monkeypatch) -> None:
@@ -1450,3 +1464,260 @@ def test_streaming_dispatch_handles_missing_stdout(monkeypatch) -> None:
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
     with pytest.raises(ResultBlockError):
         dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+
+
+# ---------------------------------------------------------------------------
+# Story 13.4-001: kill-switch (process-group TERM→KILL) and heartbeat dead-man
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_dispatch_launches_in_new_session(monkeypatch) -> None:
+    """The streamed agent leads its own session/process group (start_new_session)."""
+    seen = {}
+
+    def make(*a, **kw):
+        seen["start_new_session"] = kw.get("start_new_session")
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", make)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert seen["start_new_session"] is True
+
+
+def test_captured_dispatch_launches_in_new_session(monkeypatch) -> None:
+    """The captured agent also leads its own session so its group can be isolated."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["start_new_session"] = kwargs.get("start_new_session")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert seen["start_new_session"] is True
+
+
+def test_terminate_process_group_signals_whole_group(monkeypatch) -> None:
+    """SIGTERM then SIGKILL are sent to the agent's process group, not just the parent."""
+    from sdlc.dispatch import _terminate_process_group
+
+    proc = _FakePopen([])
+    proc.pid = 4321
+    proc._wait_exc = subprocess.TimeoutExpired("cmd", 1)  # never exits on TERM
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr("sdlc.dispatch.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("sdlc.dispatch.os.killpg", lambda pgid, sig: sent.append((pgid, sig)))
+
+    _terminate_process_group(proc, grace_s=0.05)
+
+    # The whole group (pgid == pid here) is signalled TERM first, then KILL.
+    assert (4321, signal.SIGTERM) in sent
+    assert (4321, signal.SIGKILL) in sent
+    # The child itself was never signalled directly — the group path covered it.
+    assert proc.signals == []
+
+
+def test_terminate_process_group_falls_back_to_child(monkeypatch) -> None:
+    """With no signalable group, termination falls back to the direct child."""
+    from sdlc.dispatch import _terminate_process_group
+
+    proc = _FakePopen([])  # pid is None → no group to signal
+    proc._wait_exc = subprocess.TimeoutExpired("cmd", 1)
+    _terminate_process_group(proc, grace_s=0.05)
+    # Child got SIGTERM (send_signal) then SIGKILL (kill) — graceful escalation.
+    assert signal.SIGTERM in proc.signals
+    assert proc.killed
+
+
+def test_terminate_process_group_graceful_exit_skips_kill() -> None:
+    """A child that exits on SIGTERM within the grace window is never SIGKILLed."""
+    from sdlc.dispatch import _terminate_process_group
+
+    proc = _FakePopen([])  # wait() returns 0 immediately → "exited" on TERM
+    _terminate_process_group(proc, grace_s=0.05)
+    assert signal.SIGTERM in proc.signals
+    assert not proc.killed  # graceful TERM was enough; no hard kill
+
+
+def test_signal_process_group_falls_back_when_killpg_raises(monkeypatch) -> None:
+    """A killpg that raises (gone/no-perm) falls back to signalling the child directly."""
+    from sdlc.dispatch import _signal_process_group
+
+    proc = _FakePopen([])
+    proc.pid = 4321
+
+    def boom(pgid, sig) -> None:
+        raise ProcessLookupError("group already reaped")
+
+    monkeypatch.setattr("sdlc.dispatch.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("sdlc.dispatch.os.killpg", boom)
+
+    _signal_process_group(proc, signal.SIGTERM)
+
+    # killpg blew up, so the direct-child fallback delivered the signal instead.
+    assert signal.SIGTERM in proc.signals
+
+
+def test_signal_process_group_swallows_child_signal_error(monkeypatch) -> None:
+    """A child that is already gone when signalled never propagates the error."""
+    from sdlc.dispatch import _signal_process_group
+
+    proc = _FakePopen([])  # pid is None → straight to the direct-child path
+
+    def gone(sig) -> None:
+        raise ProcessLookupError("child already reaped")
+
+    proc.send_signal = gone  # type: ignore[method-assign]
+    # Best-effort: the "already gone" race is swallowed, not raised.
+    _signal_process_group(proc, signal.SIGTERM)
+
+
+def test_terminate_process_group_swallows_non_timeout_wait_error() -> None:
+    """A wait() that raises something other than TimeoutExpired still escalates to KILL."""
+    from sdlc.dispatch import _terminate_process_group
+
+    proc = _FakePopen([])  # pid None → child path
+    proc._wait_exc = RuntimeError("reap exploded")  # both waits raise this
+
+    # The non-timeout reap error is swallowed; termination proceeds to the hard kill.
+    _terminate_process_group(proc, grace_s=0.05)
+    assert signal.SIGTERM in proc.signals
+    assert proc.killed  # escalated to SIGKILL despite the broken wait()
+
+
+def test_streaming_dispatch_kills_process_group_on_timeout(monkeypatch) -> None:
+    """A wall-clock timeout SIGKILLs the whole process group so no child survives."""
+    blocking = _BlockingStdout()
+    fake = _FakePopen([])
+    fake.stdout = blocking
+    fake.pid = 4321
+    fake._wait_exc = subprocess.TimeoutExpired("cmd", 1)  # lingers past grace → KILL
+    sent: list[tuple[int, int]] = []
+
+    def record_killpg(pgid, sig) -> None:
+        sent.append((pgid, sig))
+        blocking.released.set()  # killing the group closes stdout → loop ends
+
+    monkeypatch.setattr("sdlc.dispatch.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("sdlc.dispatch.os.killpg", record_killpg)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+
+    with pytest.raises(AgentDispatchError, match="timed out"):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, timeout=0.2)
+    sigs = {sig for _pgid, sig in sent}
+    assert signal.SIGTERM in sigs  # graceful first
+    assert signal.SIGKILL in sigs  # then hard kill of the GROUP (orphans die)
+    assert all(pgid == 4321 for pgid, _sig in sent)
+
+
+def test_streaming_dispatch_stall_kills_idle_agent(monkeypatch) -> None:
+    """An agent that stops emitting output is killed within the stall window."""
+    blocking = _BlockingStdout()
+    fake = _FakePopen([])
+    fake.stdout = blocking
+
+    def terminate_and_release(sig=signal.SIGKILL) -> None:
+        fake.signals.append(sig)
+        blocking.released.set()
+
+    fake.send_signal = lambda sig: terminate_and_release(sig)  # type: ignore[method-assign]
+    fake.kill = lambda: terminate_and_release(signal.SIGKILL)  # type: ignore[method-assign]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+
+    # A large wall-clock timeout proves the *stall* window (not the wall clock)
+    # is what kills the idle agent — the message must name the stall.
+    with pytest.raises(AgentDispatchError, match="stalled"):
+        dispatch_agent(
+            "build", "prompt", agent_cmd=_STREAM_CMD, timeout=30, stall_timeout=0.2
+        )
+    assert fake.signals  # the stalled child was signalled
+
+
+def test_streaming_dispatch_stall_resets_on_output(monkeypatch) -> None:
+    """A stream that keeps emitting lines is not falsely flagged as stalled."""
+    lines = list(_STREAM_PREAMBLE) + [_stream_result_event(_wrap(_VALID_BUILD))]
+    fake = _FakePopen(lines)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    # Lines arrive instantly (well within the window), so the run completes.
+    result = dispatch_agent(
+        "build", "prompt", agent_cmd=_STREAM_CMD, timeout=30, stall_timeout=0.5
+    )
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert not fake.killed  # a productive agent is never killed
+
+
+def test_streaming_dispatch_stall_timeout_none_disables_heartbeat(monkeypatch) -> None:
+    """stall_timeout=None disables the heartbeat; a normal run still succeeds."""
+    lines = [_stream_result_event(_wrap(_VALID_BUILD))]
+    fake = _FakePopen(lines)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    result = dispatch_agent(
+        "build", "prompt", agent_cmd=_STREAM_CMD, stall_timeout=None
+    )
+    assert result.data["branch_name"] == "feature/7.3-001"
+    assert not fake.killed
+
+
+def test_quarantine_transcript_copies_killed_log(tmp_path) -> None:
+    """A killed agent's transcript is copied to a `.killed` sibling for review."""
+    from sdlc.dispatch import _quarantine_transcript
+
+    src = tmp_path / "build-1.log"
+    src.write_text("partial agent output\n", encoding="utf-8")
+    dest = _quarantine_transcript(src, "stalled: no output for 0.2s")
+    assert dest is not None
+    body = dest.read_text(encoding="utf-8")
+    assert "partial agent output" in body
+    assert "QUARANTINED" in body  # the reason header is recorded
+    assert "stalled" in body
+
+
+def test_quarantine_transcript_no_path_is_noop() -> None:
+    """No transcript path → quarantine is a no-op returning None (best-effort)."""
+    from sdlc.dispatch import _quarantine_transcript
+
+    assert _quarantine_transcript(None, "reason") is None
+
+
+def test_quarantine_transcript_missing_file_is_noop(tmp_path) -> None:
+    """A transcript that was never written cannot be quarantined (returns None)."""
+    from sdlc.dispatch import _quarantine_transcript
+
+    assert _quarantine_transcript(tmp_path / "absent.log", "reason") is None
+
+
+def test_quarantine_transcript_io_error_is_noop(tmp_path) -> None:
+    """An I/O error reading/writing the transcript is swallowed (returns None)."""
+    from sdlc.dispatch import _quarantine_transcript
+
+    # A directory exists at the path, so exists() is True but read_text() raises
+    # IsADirectoryError (an OSError) — quarantine can never itself fail the run.
+    src = tmp_path / "build-1.log"
+    src.mkdir()
+    assert _quarantine_transcript(src, "reason") is None
+
+
+def test_streaming_dispatch_quarantines_transcript_on_timeout(
+    monkeypatch, tmp_path
+) -> None:
+    """On a kill, the partial transcript is quarantined and named in the error."""
+    blocking = _BlockingStdout()
+    fake = _FakePopen([])
+    fake.stdout = blocking
+
+    def terminate_and_release(sig=signal.SIGKILL) -> None:
+        fake.signals.append(sig)
+        blocking.released.set()
+
+    fake.send_signal = lambda sig: terminate_and_release(sig)  # type: ignore[method-assign]
+    fake.kill = lambda: terminate_and_release(signal.SIGKILL)  # type: ignore[method-assign]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    tpath = tmp_path / "build-1.log"
+    with pytest.raises(AgentDispatchError, match="quarantined") as exc:
+        dispatch_agent(
+            "build", "prompt", agent_cmd=_STREAM_CMD, timeout=0.2,
+            transcript_path=tpath,
+        )
+    quarantined = tpath.with_suffix(tpath.suffix + ".killed")
+    assert quarantined.exists()
+    assert str(quarantined) in str(exc.value)

@@ -7,8 +7,10 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -257,6 +259,113 @@ DEFAULT_TIMEOUT_S = 3600
 # pathological case of a child that lingers after EOF so a reap cannot hang.
 _POST_STREAM_WAIT_S = 30
 
+# Story 13.4-001 — kill-switch and heartbeat dead-man.
+#
+# When a dispatched agent must be terminated (wall-clock timeout, output-idle
+# stall) the controller kills the agent's whole **process group**, not just the
+# parent, so a tool subprocess the agent spawned cannot be orphaned and survive
+# the kill. Termination is graceful-then-hard: SIGTERM the group first (the
+# agent can flush and exit cleanly), wait ``_TERM_GRACE_S``, then SIGKILL the
+# group to make termination certain.
+_TERM_GRACE_S = 10.0
+
+# Output-idle (heartbeat) stall window for the streaming path. A streamed agent
+# that emits no stream-json line for this long is treated as **stalled** and
+# killed with a clear message, rather than waiting out the full wall-clock
+# ``timeout``. ``None`` disables stall detection (only the wall-clock guard
+# applies). Generous by default: a single tool call can run for minutes without
+# emitting a line, so the dead-man only fires on a genuine hang, not slow work.
+DEFAULT_STALL_TIMEOUT_S = 300.0
+
+# How often the heartbeat monitor re-checks output idleness, capped so a tiny
+# stall window (tests, aggressive configs) is still detected promptly and the
+# monitor thread notices a wall-clock kill and exits without lingering. Four
+# wakeups/second is negligible CPU even on an hour-long run.
+_HEARTBEAT_POLL_S = 0.25
+
+# Quarantine suffix for a killed agent's transcript. The partial transcript is
+# copied to ``<transcript>.killed`` so the kill can be reviewed without the next
+# run overwriting the live log, and the path is named in the raised error so it
+# lands in the controller's ledger event for the failed stage.
+_QUARANTINE_SUFFIX = ".killed"
+
+
+def _signal_process_group(proc: Any, sig: int) -> None:
+    """Send ``sig`` to the agent's process group, falling back to the direct child.
+
+    ``os.killpg(os.getpgid(pid), sig)`` reaches every process in the group — the
+    agent and any tool subprocess it spawned — so orphaned children cannot
+    survive (Story 13.4-001). When the group cannot be signalled (no pid yet, the
+    child already reaped, a permission error, or a platform without POSIX process
+    groups) it falls back to signalling just the direct child via
+    ``proc.send_signal`` / ``proc.kill``. Best-effort throughout: every "already
+    gone" race is swallowed because it means the work is already done.
+    """
+    pid = getattr(proc, "pid", None)
+    if pid is not None and hasattr(os, "killpg") and hasattr(os, "getpgid"):
+        try:
+            os.killpg(os.getpgid(pid), sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.send_signal(sig)
+    except (ProcessLookupError, OSError, ValueError):
+        pass
+
+
+def _terminate_process_group(proc: Any, *, grace_s: float = _TERM_GRACE_S) -> None:
+    """Graceful-then-hard kill of the agent's whole process group (Story 13.4-001).
+
+    SIGTERM the group first so a well-behaved agent (and its children) can exit
+    cleanly, wait up to ``grace_s`` for that exit, then SIGKILL the group so a
+    runaway / hung agent is terminated for certain and nothing is left orphaned.
+    Both the wait and the signalling are best-effort — a child that exits on
+    SIGTERM is never SIGKILLed, and a reap that times out simply proceeds to the
+    next step rather than raising.
+    """
+    _signal_process_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=grace_s)
+        return  # exited cleanly on SIGTERM; no hard kill needed
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:  # noqa: BLE001 - reaping is best-effort, never fatal
+        pass
+    _signal_process_group(proc, signal.SIGKILL)
+    try:
+        proc.wait(timeout=grace_s)
+    except Exception:  # noqa: BLE001 - reaping is best-effort, never fatal
+        pass
+
+
+def _quarantine_transcript(path: Path | None, reason: str) -> Path | None:
+    """Copy a killed agent's transcript to a quarantine sibling for review (R8, 13.4-001).
+
+    When the controller kills a stalled / runaway agent its partial transcript is
+    preserved under ``<transcript>.killed`` (prefixed with the kill reason) so the
+    event can be reviewed and the next run cannot silently overwrite it. Entirely
+    best-effort: no transcript path, a transcript that was never written, or any
+    I/O error returns ``None`` so quarantine can never itself fail the run.
+    """
+    if path is None:
+        return None
+    try:
+        src = Path(path)
+        if not src.exists():
+            return None
+        dest = src.with_name(src.name + _QUARANTINE_SUFFIX)
+        body = src.read_text(encoding="utf-8")
+        dest.write_text(
+            f"--- QUARANTINED: {reason} ---\n{body}", encoding="utf-8"
+        )
+        return dest
+    except OSError:
+        return None
+
 
 class AgentDispatchError(Exception):
     """The agent subprocess could not be run to completion.
@@ -369,6 +478,7 @@ def dispatch_agent(
     model: str | None = None,
     thinking_cap: int | None = None,
     timeout: int = DEFAULT_TIMEOUT_S,
+    stall_timeout: float | None = DEFAULT_STALL_TIMEOUT_S,
     transcript_path: Path | None = None,
     on_progress: ProgressCallback | None = None,
     cwd: Path | None = None,
@@ -399,12 +509,18 @@ def dispatch_agent(
     in — the controller sets it to a per-story git worktree so concurrent stories
     never collide in a shared checkout. ``None`` inherits the parent's cwd, so the
     shared-root / sequential path is byte-for-byte today's.
+
+    ``stall_timeout`` (Story 13.4-001) is the output-idle (heartbeat) dead-man for
+    the streaming path: an agent that emits no stream line for this many seconds
+    is killed as *stalled* with a clear message, bounding any hang well inside the
+    much larger wall-clock ``timeout``. ``None`` disables it. The captured path has
+    no stream to monitor, so it relies on ``timeout`` alone (unchanged).
     """
     cmd = resolve_agent_cmd(agent_cmd, model=model)
     env = _dispatch_env(thinking_cap)
     if _is_streaming_cmd(cmd):
         return _dispatch_streaming(
-            agent_type, prompt, cmd, timeout=timeout,
+            agent_type, prompt, cmd, timeout=timeout, stall_timeout=stall_timeout,
             transcript_path=transcript_path, on_progress=on_progress, env=env,
             cwd=cwd,
         )
@@ -433,6 +549,12 @@ def _dispatch_captured(
     ``None`` means inherit the parent environment, so the no-cap path is unchanged.
     ``cwd`` (Story 17.2-001) is the per-story worktree the agent runs in; ``None``
     inherits the parent's cwd (the shared-root path, unchanged).
+
+    Story 13.4-001: ``start_new_session=True`` puts the agent in its own session /
+    process group so it is isolated from the controller's group. On timeout
+    ``subprocess.run`` reaps the direct child; full graceful process-group
+    TERM→KILL escalation (so spawned children cannot survive) lives on the
+    streaming path, which is the default real-agent dispatch.
     """
     try:
         completed = subprocess.run(
@@ -443,6 +565,7 @@ def _dispatch_captured(
             timeout=timeout,
             env=env,
             cwd=cwd,
+            start_new_session=True,
         )
     except subprocess.TimeoutExpired as exc:
         _write_transcript(transcript_path, "", f"TIMEOUT after {timeout}s")
@@ -491,6 +614,7 @@ def _dispatch_streaming(
     cmd: list[str],
     *,
     timeout: int,
+    stall_timeout: float | None = DEFAULT_STALL_TIMEOUT_S,
     transcript_path: Path | None,
     on_progress: ProgressCallback | None = None,
     env: dict[str, str] | None = None,
@@ -517,6 +641,10 @@ def _dispatch_streaming(
             text=True,
             env=env,
             cwd=cwd,
+            # Story 13.4-001: lead a new session/process group so the controller
+            # can signal the whole group (the agent + any tool subprocess it
+            # spawned) on timeout/stall — no orphaned child survives the kill.
+            start_new_session=True,
         )
     except (FileNotFoundError, OSError) as exc:
         _write_transcript(transcript_path, "", f"could not launch {cmd[0]!r}: {exc}")
@@ -554,20 +682,56 @@ def _dispatch_streaming(
     # valid result. The watchdog only acts while the read is still outstanding,
     # and the loop only claims success while no timeout has fired — the lock makes
     # exactly one of the two win, so a completed child is never a false timeout.
+    #
+    # Story 13.4-001: there are now two ways the run can be killed — the existing
+    # wall-clock ``timeout`` and a *heartbeat dead-man* that fires after
+    # ``stall_timeout`` seconds with no output. ``stalled`` distinguishes the two
+    # so the raised error names the cause. Both terminate the whole **process
+    # group** (graceful SIGTERM → grace → SIGKILL) via ``_terminate``, so a
+    # spawned tool subprocess cannot outlive the kill.
     timed_out = threading.Event()
+    stalled = threading.Event()
     read_done = threading.Event()
     state_lock = threading.Lock()
+    last_activity = [time.monotonic()]  # bumped on each stream line (heartbeat)
 
-    def _on_timeout() -> None:
+    def _terminate(*, reason_stalled: bool) -> None:
+        # Claim the kill only while the read is still outstanding; a completed
+        # read (read_done) means the child finished in time, so do nothing.
         with state_lock:
             if read_done.is_set():
-                return  # stdout already fully read; the child finished in time
+                return
             timed_out.set()
-        proc.kill()  # unblock the still-outstanding stdout read
+            if reason_stalled:
+                stalled.set()
+        # Graceful group kill unblocks the still-outstanding stdout read.
+        _terminate_process_group(proc)
+
+    def _on_timeout() -> None:
+        _terminate(reason_stalled=False)
 
     watchdog = threading.Timer(timeout, _on_timeout)
     watchdog.daemon = True
     watchdog.start()
+
+    # Heartbeat dead-man: an output-idle monitor that kills the agent if no
+    # stream line has arrived for ``stall_timeout`` seconds — bounding a hang far
+    # inside the (much larger) wall-clock ``timeout``. Disabled when
+    # ``stall_timeout`` is falsy, so the wall-clock guard is then the only bound.
+    heartbeat: threading.Thread | None = None
+    if stall_timeout and stall_timeout > 0:
+        poll = max(0.01, min(stall_timeout / 2, _HEARTBEAT_POLL_S))
+
+        def _heartbeat_monitor() -> None:
+            while not read_done.wait(timeout=poll):
+                if timed_out.is_set():
+                    return
+                if time.monotonic() - last_activity[0] >= stall_timeout:
+                    _terminate(reason_stalled=True)
+                    return
+
+        heartbeat = threading.Thread(target=_heartbeat_monitor, daemon=True)
+        heartbeat.start()
 
     transcript = _StreamTranscript(transcript_path)
     raw_lines: list[str] = []
@@ -593,6 +757,7 @@ def _dispatch_streaming(
                     pass
         if proc.stdout is not None:
             for line in proc.stdout:
+                last_activity[0] = time.monotonic()  # heartbeat: output seen
                 transcript.append(line)
                 raw_lines.append(line)
                 event = _parse_stream_line(line)
@@ -617,21 +782,33 @@ def _dispatch_streaming(
                 pass
             watchdog.cancel()
             drainer.join(timeout=1)
-            transcript.append(f"\n--- TIMEOUT after {timeout}s ---\n")
+            # Story 13.4-001: name the cause (stall vs wall clock), then quarantine
+            # the partial transcript so the kill can be reviewed and the path is
+            # surfaced in the error → the controller records it in the ledger.
+            if stalled.is_set():
+                reason = f"stalled: no output for {stall_timeout:g}s"
+            else:
+                reason = f"timed out after {timeout}s"
+            transcript.append(f"\n--- KILLED ({reason}) ---\n")
             transcript.close()
-            raise AgentDispatchError(
-                f"{agent_type} agent timed out after {timeout}s"
+            quarantined = _quarantine_transcript(transcript_path, reason)
+            detail = (
+                f"; transcript quarantined at {quarantined}" if quarantined else ""
             )
+            raise AgentDispatchError(f"{agent_type} agent {reason}{detail}")
         # stdout hit EOF, so the child is exiting; bound the reap so a process
         # that closes stdout but lingers cannot hang the run (the watchdog is a
-        # no-op now that read_done is set).
+        # no-op now that read_done is set). A lingering child is group-killed so
+        # any orphaned tool subprocess goes with it (Story 13.4-001).
         try:
             returncode = proc.wait(timeout=_POST_STREAM_WAIT_S)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _terminate_process_group(proc)
             returncode = proc.wait()
     finally:
         watchdog.cancel()
+        if heartbeat is not None:
+            heartbeat.join(timeout=1)
 
     drainer.join(timeout=1)
     stderr = "".join(stderr_chunks)
