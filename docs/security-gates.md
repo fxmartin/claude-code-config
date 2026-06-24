@@ -6,7 +6,9 @@ embeds security scanning into the same quality gate that measures coverage, so
 security becomes a **gate**, not a follow-up.
 
 This page documents the **SAST gate** (Story 9.1-001), the **dependency gate**
-(`osv-scanner`, Story 9.1-002), and the **secrets gate** (Story 9.2-001).
+(`osv-scanner`, Story 9.1-002), the **secrets gate** (Story 9.2-001), and the
+**supply-chain gate** (Story 13.2-001) that scans the framework's own
+hooks/skills/MCP/settings for dangerous patterns.
 
 ## SAST gate (semgrep)
 
@@ -250,6 +252,110 @@ decision. Do all of the following, in order:
    looks like a key), add a narrow path or regex entry to `.gitleaks.toml` with a
    comment explaining why it is safe. Never allowlist a live value.
 
+## Supply-chain gate (hooks/skills/MCP/settings)
+
+The supply-chain gate (Story 13.2-001) treats the framework's own installed
+config — hooks, skills, MCP server config, and `settings.json` — as
+supply-chain artifacts and scans them for dangerous patterns **before they ever
+run**. The other gates secure the *target* repo's code; this gate secures the
+*harness* a poisoned or accidentally unsafe artifact would execute with full
+host access under the agent's permission bypass.
+
+### What it does
+
+It reads each artifact line-by-line and flags dangerous tokens, classifying the
+scan into one of three verdicts:
+
+| Verdict | Meaning | Gate outcome |
+|---------|---------|--------------|
+| `CLEAN` | No findings | passes |
+| `WARN`  | Only advisory findings (plain egress tools) | passes (advisory) |
+| `BLOCK` | One or more high-signal poisoning markers | **fails the PR** |
+
+The patterns split into two bands so the gate is precise rather than noisy:
+
+| Pattern id | Band | What it catches |
+|------------|------|-----------------|
+| `pipe-to-shell` | BLOCK | `curl`/`wget … | sh` — the internet piped into a shell |
+| `mcp-trust-all` | BLOCK | `enableAllProjectMcpServers` — auto-trusts every project MCP server |
+| `anthropic-base-url` | BLOCK | `ANTHROPIC_BASE_URL` — redirects the API endpoint (credential/exfil risk) |
+| `data-uri-html` | BLOCK | `data:text/html` — embeds an executable HTML/script payload |
+| `base64-payload` | BLOCK | `base64,` — carries an obfuscated encoded payload |
+| `zero-width-unicode` | BLOCK | zero-width / bidi-control Unicode — hidden instructions |
+| `network-egress` | WARN | a plain `curl`/`wget`/`nc`/`scp`/`ssh` invocation |
+
+Egress tools are **WARN**, not BLOCK: a legitimate `curl` in a notification hook
+is reviewed, not a build break. The markers that have essentially no honest use
+in a config artifact — API redirection, MCP auto-trust, encoded payloads, hidden
+Unicode, pipe-to-shell — hard-fail.
+
+### Scan surface
+
+The gate scans, relative to the repo root:
+
+- `hooks/` (recursively)
+- `skills/` (recursively)
+- `plugins/*/skills/` (recursively)
+- `mcp/config.template.json`
+- `settings.json`
+
+Binary / non-UTF-8 files under those directories are skipped. Skills shipped as
+git submodules (e.g. `skills/model-shelf`) are part of the supply-chain surface,
+so the CI job checks out submodules and scans their real content — an installed
+skill is not exempt because it comes from upstream.
+
+### How it runs
+
+The `supply-chain-scan` job in `.github/workflows/ci.yml` runs on every pull
+request and push to `main` (with submodules checked out) via the
+`scripts/supply-chain-scan.sh` wrapper, which calls the controller's classifier:
+
+```bash
+sdlc supplychain .            # prints "SUPPLY_CHAIN_STATUS: CLEAN|WARN|BLOCK", exit 1 on BLOCK
+```
+
+A `BLOCK` exits non-zero and **fails the PR**, so a poisoned config cannot merge
+unreviewed. The bats suite (`tests/supply-chain-scan.bats`) proves the verdicts
+against committed clean and poisoned fixture trees
+(`tests/fixtures/supply-chain/`).
+
+### `.supply-chain-allowlist.yaml` — suppress a finding by path + line + pattern + sha256
+
+When a flagged token is a reviewed, legitimate use, suppress *that specific
+finding* — never the whole scan. The allowlist lives at the repo root; each
+entry names a `path`, the `line` of the finding, a `pattern` id, the content
+`sha256`, and a mandatory `reason`. The gate prints all four for every finding
+(`path:line pattern sha256:<digest>`), so the entry is a copy-paste:
+
+```yaml
+allow:
+  - path: hooks/notify-telegram.sh
+    line: 57
+    pattern: network-egress
+    # full 64-char SHA-256 the gate prints for the finding (not a truncation)
+    sha256: 3b1c2d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff001
+    reason: posts build notifications to the Telegram Bot API; reviewed 2026-06-24
+```
+
+An entry only suppresses the matching `(path, line, pattern, sha256)` — the same
+pattern on a *different line*, a different pattern on the same line, or
+*different content* on the same line is still gated. Two keys matter: the `line`
+stops one entry from blanket-suppressing every same-pattern occurrence in a
+file, and the `sha256` binds the entry to the exact reviewed text — if the
+content at that line is later swapped (a benign documented command replaced with
+a malicious one), the digest no longer matches and the gate re-surfaces the
+finding. Either change fails toward re-review rather than passing silently. A
+missing `reason`, a missing `path`/`line`/`pattern`/`sha256`, a non-integer
+`line`, or an unknown `pattern` id is a hard error (exit 2), so the allowlist
+cannot silently disable detection.
+
+The repo ships one entry in [`.supply-chain-allowlist.yaml`](../.supply-chain-allowlist.yaml):
+the `model-shelf` submodule's README documents the official Astral `uv` installer
+(`curl … | sh`), which trips `pipe-to-shell`. It is reviewed, points at the
+official endpoint, and is documentation rather than a harness-executed hook —
+so it is suppressed at its exact line. If the submodule is bumped and the README
+shifts, the gate re-surfaces the finding for re-review.
+
 ## Tuning the scan per repo
 
 ### `.semgrepignore` — exclude paths from scanning
@@ -311,8 +417,11 @@ bash scripts/osv-scan.sh
 # Secrets: scan the working tree exactly as CI does:
 gitleaks detect --no-banner --redact --config .gitleaks.toml
 
-# Run the bats coverage for all three gates (requires the tools + bats):
-bats tests/sast-scan.bats tests/osv-scan.bats tests/gitleaks-secrets.bats
+# Supply chain: scan hooks/skills/MCP/settings (no external tool needed):
+bash scripts/supply-chain-scan.sh
+
+# Run the bats coverage for all the gates (requires the tools + bats):
+bats tests/sast-scan.bats tests/osv-scan.bats tests/gitleaks-secrets.bats tests/supply-chain-scan.bats
 ```
 
 The secrets bats test plants the fixture token in a temp dir, confirms gitleaks
@@ -443,6 +552,10 @@ sees them; clean prompts pass through unchanged).
 - Dependency classifier module: `controller/src/sdlc/dependency_scan.py`
 - Dependency CLI: `sdlc depscan [REPORT_FILE] [--suppressions .dep-scan-suppressions.yaml]`
 - Secrets config: `.gitleaks.toml` (CI, pre-commit, Home Manager hook)
+- Supply-chain wrapper script: `scripts/supply-chain-scan.sh`
+- Supply-chain scanner module: `controller/src/sdlc/supply_chain_scan.py`
+- Supply-chain CLI: `sdlc supplychain [ROOT] [--allowlist .supply-chain-allowlist.yaml]`
+- Supply-chain allowlist: `.supply-chain-allowlist.yaml` (per-finding, path+line+pattern+sha256)
 - Gate prompt: `plugins/autonomous-sdlc/skills/build-stories/coverage-gate-prompt.md`
 - Bugfix prompt (dep remediation): `plugins/autonomous-sdlc/skills/build-stories/bugfix-agent-prompt.md`
 - Bats coverage: `tests/sast-scan.bats` (SAST), `tests/osv-scan.bats` (dependencies), `tests/gitleaks-secrets.bats` (secrets)
