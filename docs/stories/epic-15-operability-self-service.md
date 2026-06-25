@@ -1,6 +1,8 @@
 # Epic 15: Operability & Self-Service
 
-> **Status: PLANNED** — created 2026-06-20. Inspired by the external
+> **Status: COMPLETE (5/5)** — all stories merged on `main` (2026-06-25): 15.3-001 `sdlc clean`
+> (#174), 15.1-001 `sdlc doctor` (#175), 15.1-003 `sdlc repair` (#176), 15.2-001 hook profiles
+> (#177), 15.1-002 `status --markdown` (#178). Created 2026-06-20, inspired by the external
 > [affaan-m/ECC](https://github.com/affaan-m/ECC) operator tooling (`ecc doctor`/`repair`,
 > `status --markdown` portable handoff). Adds new **read-side** CLI verbs so the five LTM
 > colleagues can self-diagnose instead of pinging FX. (These are new verbs, so they belong here
