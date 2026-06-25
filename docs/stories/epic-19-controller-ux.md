@@ -1,6 +1,9 @@
 # Epic 19: Controller UX & Ergonomics
 
-> **Status: PLANNED** — created 2026-06-25. Quality-of-life improvements to the
+> **Status: COMPLETE (3/3)** — all stories merged on `main` (2026-06-25, parallel
+> run 1ac839c4): multi-epic build scope 19.1-001 (#193), dashboard sidebar
+> active-vs-finished 19.2-001 (#192), live per-story parallel progress 19.2-002
+> (#194). Created 2026-06-25. Quality-of-life improvements to the
 > `sdlc` controller CLI + dashboard surface (Epic-07/Epic-11) discovered through
 > daily use. Seeded by the multi-epic build-scope request and two dashboard
 > observability gaps spotted in a live parallel run.
