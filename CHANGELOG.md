@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.73.1] - 2026-06-25
+
+### Fixed
+
+- fix(controller): lock worktrees so gc hook cannot reap mid-build
+
+
 ## [v1.73.0] - 2026-06-25
 
 ### Added
