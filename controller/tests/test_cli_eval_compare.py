@@ -113,3 +113,17 @@ def test_eval_baseline_requires_candidate(tmp_path: Path) -> None:
     base = _write_board(tmp_path / "base.json", "base", _score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0))
     result = runner.invoke(app, ["eval-baseline", "--baseline", str(base)])
     assert result.exit_code == 2
+
+
+def test_eval_baseline_bad_candidate_exits_2(tmp_path: Path) -> None:
+    base = _write_board(tmp_path / "base.json", "base", _score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0))
+    result = runner.invoke(app, ["eval-baseline", "--baseline", str(base), "--candidate", str(tmp_path / "nope.json")])
+    assert result.exit_code == 2
+    assert "error:" in result.stderr
+
+
+def test_eval_baseline_bad_baseline_exits_2(tmp_path: Path) -> None:
+    cand = _write_board(tmp_path / "cand.json", "new", _score("t1", loc=8, tokens=900, cost=0.04, wall=19, qual=1.0))
+    result = runner.invoke(app, ["eval-baseline", "--baseline", str(tmp_path / "nope.json"), "--candidate", str(cand)])
+    assert result.exit_code == 2
+    assert "error:" in result.stderr

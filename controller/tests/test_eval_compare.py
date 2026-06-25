@@ -285,6 +285,23 @@ def test_render_comparison_table_contains_names_and_verdict() -> None:
     assert BETTER in table
 
 
+def test_render_comparison_table_handles_missing_pct() -> None:
+    # A candidate-only ticket has no baseline, so every metric's pct is None and
+    # renders as the em-dash placeholder rather than a percentage.
+    base = _board("A", [_score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0)], None)
+    cand = _board(
+        "B",
+        [
+            _score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0),
+            _score("t2", loc=5, tokens=500, cost=0.02, wall=10, qual=1.0),
+        ],
+        None,
+    )
+    table = render_comparison_table(compare_scoreboards(base, cand))
+    assert "t2" in table
+    assert "—" in table
+
+
 def test_comparison_to_dict_roundtrips_shape() -> None:
     base = _board("A", [_score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0)], None)
     cand = _board("B", [_score("t1", loc=4, tokens=600, cost=0.02, wall=15, qual=1.0)], None)
