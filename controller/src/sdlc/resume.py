@@ -33,7 +33,7 @@ from sdlc.build import (
     persist_cohort_structure,
 )
 from sdlc.cohort import Story, compute_cohorts
-from sdlc.discovery import discover_queue
+from sdlc.discovery import canonical_scope, discover_queue
 from sdlc.dispatch import dispatch_agent
 from sdlc.notify import notify
 from sdlc.registry import Registry
@@ -256,7 +256,13 @@ def run_resume(
     with the recovered status and completed count (via the shared
     :func:`finalize_run`), so a resumed run no longer shows its stale original
     status in the dashboard sidebar. Best-effort, exactly like ``run_build``.
+
+    Story 19.1-001: ``scope`` may name several epics (space-/comma-separated). It
+    is canonicalised once here so the run lookup, queue recomputation, and event
+    logs all use the same sorted label a composite build persisted — resume then
+    matches regardless of the order the scopes were typed.
     """
+    scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
     if rid is None:
         return ResumeResult(run_id=None, nothing_to_resume=True)
