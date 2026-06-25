@@ -113,6 +113,19 @@ def test_eval_full_run_emits_scoreboard_json(tmp_path: Path) -> None:
     assert overall["quality_pass_rate"] == 1.0
 
 
+def test_eval_n_override_changes_run_count(tmp_path: Path) -> None:
+    # Config ships n=1; --n 2 overrides it, so the scoreboard reports two runs.
+    config = _write_eval_bundle(tmp_path, n=1)
+    stub = _write_stub_agent(tmp_path)
+    env = dict(os.environ, SDLC_AGENT_CMD=str(stub))
+    result = runner.invoke(
+        app, ["eval", "--config", str(config), "--n", "2", "--json"], env=env
+    )
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["overall"]["runs"] == 2
+
+
 def test_eval_full_run_table_output(tmp_path: Path) -> None:
     config = _write_eval_bundle(tmp_path)
     stub = _write_stub_agent(tmp_path)
