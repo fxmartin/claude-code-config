@@ -161,11 +161,50 @@ exit on regression is what later wires a bounded eval into CI (18.1-003, warn or
 fail configurable). The comparison itself never mutates `main` or opens PRs — it is
 pure scoreboard arithmetic.
 
+## CI integration (18.1-003)
+
+The full eval stays a manual/local command (it spends real quota on Max). What
+runs **in CI** is a deliberately tiny slice — one ticket at `n=1` — wired to flag
+a quality regression on the PR rather than in an overnight batch. The job lives in
+[`.github/workflows/eval-ci.yml`](../.github/workflows/eval-ci.yml) and the bounded
+subset is `controller/eval/ci-config.yaml` (a true slice of the full eval: same
+sample target, prompt, and quality check as the `add-capitalize` ticket, so its
+scoreboard is directly comparable to `eval/baseline.json`).
+
+**Path-filtered.** The job only triggers on PRs that touch agent-affecting files,
+so unrelated PRs skip it and CI stays fast and cheap:
+
+- `controller/src/sdlc/build.py` — the build-agent prompt the eval drives
+- `controller/src/sdlc/schemas/**` — the agent response schemas
+- `skills/**` — skills the agents may invoke
+- `controller/eval/**` — the eval bundle itself
+
+**Quota-bounded.** The eval drives the live agent, so the job only runs when the
+`ANTHROPIC_API_KEY` secret is configured — forks and credential-less PRs skip it
+cleanly (a notice, not a failure). One ticket × `n=1` plus a 15-minute timeout cap
+the spend.
+
+**Warn or fail — configurable.** After the run, the job checks the fresh
+scoreboard against the committed baseline with `sdlc eval-baseline`. The
+warn-vs-fail behaviour is driven by the repo variable **`EVAL_CI_WARN_ONLY`**:
+
+- **unset / anything but `false`** (default) → **advisory**: regressions are
+  reported but the job stays green, so a borderline eval never blocks a PR.
+- **`false`** → **blocking**: a baseline regression beyond tolerance fails the job.
+
+Flipping the policy needs no code change — set the variable under
+*Settings → Secrets and variables → Actions → Variables*. The full local commands
+(`sdlc eval`, `eval-compare`, `eval-baseline`) are unchanged; CI just reuses them.
+
 ## Tested vs. live
 
 The scoring and aggregation logic is fully unit-tested (`tests/test_evaluate.py`)
 with an injected fake dispatcher and real git — diff parsing, usage/cost
 extraction, quality checks, aggregation, config validation, and the isolation
 guarantee (no template mutation). The CLI wiring is covered end-to-end
-(`tests/test_cli_eval.py`) with a stub agent via `$SDLC_AGENT_CMD`. The **live
-model** is never invoked from the test suite — only from `sdlc eval` itself.
+(`tests/test_cli_eval.py`) with a stub agent via `$SDLC_AGENT_CMD`. The CI wiring
+itself is asserted without a model: `tests/test_eval_ci_config.py` checks the
+bounded subset is a valid, baseline-comparable slice, and
+`tests/test_eval_ci_workflow.py` checks the workflow is path-filtered,
+quota-gated, and baseline-checked. The **live model** is never invoked from the
+test suite — only from `sdlc eval` itself.

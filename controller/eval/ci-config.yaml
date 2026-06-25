@@ -1,0 +1,25 @@
+# ABOUTME: Bounded in-CI eval subset (Story 18.1-003) — one ticket at n=1 so a PR
+# ABOUTME: touching agent prompts/skills/schemas gets a quick quality check on Max.
+
+# Same scoreboard label family as the full eval; this is the CI-sized slice.
+name: strutils-baseline
+
+# Reuse the full eval's versioned sample target — no separate fixture to drift.
+target: sample-target
+
+# n=1: the CI eval spends real quota on Max, so it runs a single pass. The full
+# eval (eval/eval-config.yaml) keeps n=3 over the larger ticket set for local runs.
+n: 1
+seed: 1801
+agent_type: build
+
+# Exactly one ticket — a true slice of the full eval (same prompt + quality_cmd),
+# present in eval/baseline.json so `sdlc eval-baseline` has a row to check against.
+tickets:
+  - id: add-capitalize
+    prompt: >-
+      In strutils.py add a function `capitalize_words(text: str) -> str` that
+      returns text with the first letter of each whitespace-separated word
+      upper-cased and the rest unchanged. Add a focused test for it in
+      test_strutils.py. Keep the change minimal.
+    quality_cmd: ["python", "-m", "pytest", "-q"]
