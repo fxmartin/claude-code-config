@@ -310,6 +310,59 @@ def test_load_config_missing_file_raises() -> None:
         load_config(Path("/no/such/eval.yaml"))
 
 
+def test_load_config_rejects_invalid_yaml(tmp_path: Path) -> None:
+    path = tmp_path / "eval.yaml"
+    path.write_text("name: [unterminated\n", encoding="utf-8")
+    with pytest.raises(EvalConfigError, match="invalid YAML"):
+        load_config(path)
+
+
+def test_load_config_rejects_non_mapping_root(tmp_path: Path) -> None:
+    path = tmp_path / "eval.yaml"
+    path.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    with pytest.raises(EvalConfigError, match="must be a mapping"):
+        load_config(path)
+
+
+def test_load_config_rejects_bad_seed_type(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\nseed: not-an-int\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="seed"):
+        load_config(path)
+
+
+def test_load_config_rejects_empty_agent_type(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\nagent_type: ''\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="agent_type"):
+        load_config(path)
+
+
+def test_load_config_rejects_non_mapping_ticket(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\ntickets:\n  - just-a-string\n",
+    )
+    with pytest.raises(EvalConfigError, match="must be a mapping"):
+        load_config(path)
+
+
+def test_load_config_rejects_bad_quality_cmd(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\ntickets:\n"
+        "  - id: t1\n    prompt: p\n    quality_cmd: not-a-list\n",
+    )
+    with pytest.raises(EvalConfigError, match="quality_cmd"):
+        load_config(path)
+
+
 # ---------------------------------------------------------------------------
 # run_eval — the isolation runner (fake dispatcher, real git)
 # ---------------------------------------------------------------------------
