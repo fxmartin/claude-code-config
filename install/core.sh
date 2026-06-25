@@ -5,6 +5,19 @@
 # Sourced by install.sh after common.sh. Expects SCRIPT_DIR, CLAUDE_DIR, DRY_RUN.
 
 install_core_run() {
+  # Guard (#179): refuse to install from an ephemeral build worktree. --core
+  # symlinks every managed ~/.claude entry to $SCRIPT_DIR; if SCRIPT_DIR is a
+  # throwaway agent worktree (.claude/worktrees/agent-*), those links dangle the
+  # moment the worktree is torn down, silently breaking the live install. Only
+  # the stable main checkout may own ~/.claude.
+  case "$SCRIPT_DIR" in
+    */.claude/worktrees/*)
+      error "Refusing --core install: SCRIPT_DIR is inside an agent worktree (${SCRIPT_DIR})."
+      error "Run install.sh from the main checkout so ~/.claude links to a stable path."
+      return 1
+      ;;
+  esac
+
   echo ""
   echo "[core] Symlinking config into ${CLAUDE_DIR}..."
 

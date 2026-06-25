@@ -66,6 +66,26 @@ PLUGIN_SKILLS_DIR="${REPO_ROOT}/plugins/autonomous-sdlc/skills"
     [ -d "$resolved" ]
 }
 
+# ─── Path A guard: never install from an ephemeral worktree (#179) ───────────
+
+@test "install.sh --core refuses to run from an agent worktree (#179)" {
+    # install.sh --core symlinks every managed ~/.claude entry to SCRIPT_DIR.
+    # From an ephemeral build worktree those links dangle on teardown, silently
+    # breaking the live install. The guard must abort before creating any link.
+    fake_home="$(mktemp -d)"
+    wt="$(mktemp -d)/.claude/worktrees/agent-test-1"
+    mkdir -p "$wt"
+    # Symlink the installer + its lib dir so SCRIPT_DIR resolves to the worktree
+    # while sourcing still works.
+    ln -s "${REPO_ROOT}/install.sh" "$wt/install.sh"
+    ln -s "${REPO_ROOT}/install"    "$wt/install"
+    run env HOME="$fake_home" CLAUDE_CONFIG_NO_ENV=1 bash "$wt/install.sh" --core
+    [ "$status" -ne 0 ]
+    [[ "$output" == *worktree* ]]
+    [ ! -e "$fake_home/.claude/CLAUDE.md" ]
+    rm -rf "$fake_home" "${wt%/.claude/*}"
+}
+
 # ─── Plugin manifest structural sanity ───────────────────────────────────────
 
 @test "autonomous-sdlc plugin manifest exists" {
