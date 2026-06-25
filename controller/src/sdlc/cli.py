@@ -27,6 +27,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "reconcile": "Re-check a run against origin/main and correct the ledger.",
     "clean": "Garbage-collect build leftovers (orphan worktrees, merged branches, stale logs).",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
+    "repair": "Restore the framework's managed symlinks/config without a full reinstall.",
     "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
     "depscan": "Classify an osv-scanner report into a CLEAN | WARN | BLOCK gate verdict.",
     "supplychain": "Scan hooks/skills/MCP/settings for dangerous patterns (CLEAN | WARN | BLOCK).",
@@ -1284,6 +1285,79 @@ def sync_check(
             typer.echo(f"{skill.name}: {skill.state.value}")
     typer.echo("shared skills drifted — run `git submodule update --remote`.")
     raise typer.Exit(code=1)
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["repair"])
+def repair(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report what would be restored without changing anything.",
+    ),
+    claude_dir: Path = typer.Option(
+        None,
+        "--claude-dir",
+        help="Claude config dir to repair (default: ~/.claude).",
+        show_default=False,
+    ),
+    root: Path = typer.Option(
+        None,
+        "--root",
+        help="Framework repo root that owns the managed set (default: this install).",
+        show_default=False,
+    ),
+) -> None:
+    """Restore the framework's managed symlinks/config without a full reinstall.
+
+    Recreates any of the install's managed symlinks (``CLAUDE.md``, ``agents/``,
+    ``hooks/``, the plugin marketplace, …) that are missing or have drifted to a
+    wrong target. A real file occupying a managed slot is moved into a timestamped
+    backup dir (never deleted) before linking. Idempotent: a healthy install is a
+    no-op, and nothing outside the managed set is ever touched. ``--dry-run``
+    reports the plan without acting.
+    """
+    from sdlc.repair import (
+        RepairAction,
+        apply_plan,
+        build_plan,
+        default_backup_dir,
+        default_claude_dir,
+        default_repo_root,
+    )
+
+    repo_root = (root or default_repo_root()).resolve()
+    cdir = claude_dir or default_claude_dir()
+
+    plan = build_plan(repo_root, cdir)
+    if plan.healthy:
+        typer.echo(
+            f"install healthy — {len(plan.artifacts)} managed artifacts in place, "
+            "nothing to repair."
+        )
+        raise typer.Exit(code=0)
+
+    results = apply_plan(plan, dry_run=dry_run, backup_dir=default_backup_dir(cdir))
+
+    prefix = "[dry-run] would " if dry_run else ""
+    restored = 0
+    for r in results:
+        a = r.artifact
+        if r.action is RepairAction.LINKED:
+            typer.echo(f"{prefix}link {a.rel_dest} → {a.src} (was missing)")
+        elif r.action is RepairAction.RELINKED:
+            typer.echo(f"{prefix}relink {a.rel_dest} → {a.src} (pointed elsewhere)")
+        elif r.action is RepairAction.BACKED_UP:
+            typer.echo(
+                f"{prefix}back up {a.rel_dest} to {r.backup_path} and link → {a.src} "
+                "(a real file occupied the slot)"
+            )
+        else:
+            continue
+        restored += 1
+
+    verb = "would restore" if dry_run else "restored"
+    typer.echo(f"{verb} {restored} managed artifact(s).")
+    raise typer.Exit(code=0)
 
 
 if __name__ == "__main__":
