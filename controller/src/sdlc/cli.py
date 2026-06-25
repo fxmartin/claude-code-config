@@ -24,6 +24,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "validate": "Validate an agent response against its JSON schema.",
     "rollback": "Roll a run back to a prior ledger checkpoint.",
     "reconcile": "Re-check a run against origin/main and correct the ledger.",
+    "clean": "Garbage-collect build leftovers (orphan worktrees, merged branches, stale logs).",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
     "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
     "depscan": "Classify an osv-scanner report into a CLEAN | WARN | BLOCK gate verdict.",
@@ -966,6 +967,74 @@ def reconcile(
         f"run {result.run_id[:8]} {result.run_status_before} → "
         f"{result.run_status_after}."
     )
+    raise typer.Exit(code=0)
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["clean"])
+def clean(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "--yes",
+        help="Actually remove the candidates. Without it, clean is dry-run only.",
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the plan as JSON instead of a human summary."
+    ),
+) -> None:
+    """Safely garbage-collect build leftovers — dry-run by default.
+
+    Reclaims three classes of cruft a finished/crashed build leaves behind:
+    orphaned ``agent-*`` git worktrees, squash-merged ``feature/<id>`` branches,
+    and stale ``.sdlc-state.db.logs/`` transcript dirs. It is **dry-run by
+    default** — it reports what it *would* remove and removes nothing until
+    ``--force``/``--yes`` is passed.
+
+    Safe to run beside a live build: every candidate is cross-checked against the
+    host run registry + a live-pid probe, so a worktree or branch an
+    ``IN_PROGRESS`` run owns (here or in another session/clone) is never touched.
+    "Merged" is decided by the ledger (``status=DONE``) and the PR's merge state —
+    not ``git branch --merged``, which misreports squash-merges. Removals are
+    recoverable where git allows (a deleted branch's tip stays reachable via
+    reflog) and the command never pushes to or fetches from the remote. Exits 0.
+    """
+    from sdlc.clean import run_clean
+    from sdlc.ledger_view import default_db_path
+
+    db_path = db or default_db_path()
+    plan = run_clean(db_path=db_path, force=force)
+
+    if as_json:
+        typer.echo(json.dumps(plan.to_dict(), default=str))
+        raise typer.Exit(code=0)
+
+    verb = "removed" if force else "would remove"
+    if not plan.candidates:
+        typer.echo("clean: nothing to do — workspace already tidy.")
+        raise typer.Exit(code=0)
+
+    for kind, label in (("worktree", "worktrees"), ("branch", "branches"), ("logs", "logs")):
+        items = plan.by_kind(kind)
+        if not items:
+            continue
+        typer.echo(f"{label} ({len(items)}):")
+        for item in items:
+            mark = "✓" if item.removed else ("·" if not force else "✗")
+            target = item.path or item.name
+            typer.echo(f"  {mark} {verb}: {target} — {item.reason}")
+
+    if force:
+        typer.echo(f"clean: removed {plan.removed_count}/{plan.total} candidate(s).")
+        for err in plan.errors:
+            typer.echo(f"  warning: {err}", err=True)
+    else:
+        typer.echo(
+            f"clean: {plan.total} candidate(s) — dry-run, nothing removed. "
+            "Re-run with --force to act."
+        )
     raise typer.Exit(code=0)
 
 
