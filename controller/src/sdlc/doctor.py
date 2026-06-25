@@ -1,0 +1,458 @@
+# ABOUTME: `sdlc doctor` — read-side health-check across install/ledger/runs/config/deps.
+# ABOUTME: Story 15.1-001. Each finding carries a CLEAN/WARN/FAIL status and a remedy.
+
+from __future__ import annotations
+
+import json
+import shutil
+import sqlite3
+import subprocess
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+from sdlc.build import _MIGRATIONS, Ledger, status_snapshot
+from sdlc.ledger_view import default_db_path
+from sdlc.registry import Registry, derive_state
+
+__all__ = [
+    "MANAGED_PATHS",
+    "DEPENDENCIES",
+    "Finding",
+    "DoctorReport",
+    "run_doctor",
+    "worst_status",
+]
+
+# The framework's managed install artifacts, mirroring `install/core.sh`'s
+# --core symlink set. `doctor` checks each of these exists (and, when a symlink,
+# resolves) under ~/.claude — exactly what `install.sh --core` would restore.
+MANAGED_PATHS: tuple[str, ...] = (
+    "CLAUDE.md",
+    "agents",
+    "commands",
+    "settings.json",
+    "statusline-command.sh",
+    "keybindings.json",
+    "reference-docs",
+    "docs",
+    "skills",
+    "hooks",
+    "plugins/marketplaces/fx-claude-config",
+)
+
+# External tools the framework shells out to. `gh`/`claude` drive the core
+# workflow; `semgrep`/`osv-scanner` gate the security stages. A missing tool
+# degrades a feature rather than breaking the install, so it is a WARN.
+DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
+    ("gh", "GitHub CLI (gh)", "install gh — https://cli.github.com"),
+    (
+        "claude",
+        "Claude Code CLI (claude)",
+        "install Claude Code — https://claude.com/claude-code",
+    ),
+    (
+        "semgrep",
+        "SAST scanner (semgrep)",
+        "install semgrep — `uv tool install semgrep`",
+    ),
+    (
+        "osv-scanner",
+        "dependency scanner (osv-scanner)",
+        "install osv-scanner — https://google.github.io/osv-scanner",
+    ),
+)
+
+# Status severity ordering: a report's overall status is the worst of its parts.
+_SEVERITY = {"CLEAN": 0, "WARN": 1, "FAIL": 2}
+
+# A run still IN_PROGRESS in the registry with no live owner and no activity for
+# longer than this is reported stale (seconds). Generous so a slow stage that is
+# genuinely still running is never mislabelled stuck.
+_STALE_AFTER_S = 6 * 3600
+
+
+def worst_status(statuses: list[str]) -> str:
+    """The most severe status in ``statuses`` (CLEAN < WARN < FAIL; empty=CLEAN)."""
+    worst = "CLEAN"
+    for status in statuses:
+        if _SEVERITY.get(status, 0) > _SEVERITY[worst]:
+            worst = status
+    return worst
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One health-check result: a status plus an actionable remedy.
+
+    ``check`` is the category id (install/ledger/runs/config/dependency);
+    ``name`` is a human label; ``remedy`` is the command or doc that fixes the
+    problem, and is empty for a CLEAN finding.
+    """
+
+    check: str
+    name: str
+    status: str  # CLEAN | WARN | FAIL
+    detail: str
+    remedy: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class DoctorReport:
+    """The aggregate of every check, with a derived overall ``status``."""
+
+    findings: list[Finding] = field(default_factory=list)
+
+    @property
+    def status(self) -> str:
+        return worst_status([f.status for f in self.findings])
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "findings": [f.to_dict() for f in self.findings],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Individual checks
+# ---------------------------------------------------------------------------
+
+
+def check_install(claude_dir: Path) -> Finding:
+    """Verify the managed ~/.claude symlinks/files are present and resolvable."""
+    if not claude_dir.exists():
+        return Finding(
+            "install",
+            "Install integrity",
+            "FAIL",
+            f"{claude_dir} does not exist — framework not installed",
+            "run: ./install.sh --core",
+        )
+    # A name is broken when it is absent or a dangling symlink (a symlink whose
+    # target is gone): Path.exists() follows the link, so it is False for both.
+    broken = [name for name in MANAGED_PATHS if not (claude_dir / name).exists()]
+    if broken:
+        return Finding(
+            "install",
+            "Install integrity",
+            "FAIL",
+            f"missing/broken managed paths under {claude_dir}: {', '.join(broken)}",
+            "run: ./install.sh --core (restores managed symlinks)",
+        )
+    return Finding(
+        "install",
+        "Install integrity",
+        "CLEAN",
+        f"all {len(MANAGED_PATHS)} managed paths present under {claude_dir}",
+    )
+
+
+def check_ledger(db_path: Path) -> Finding:
+    """Verify the ledger is readable and its schema is current (migrations applied)."""
+    if not db_path.exists():
+        return Finding(
+            "ledger",
+            "Ledger schema + integrity",
+            "CLEAN",
+            "no ledger yet — nothing has been built in this repo",
+        )
+
+    expected = {version for version, *_ in _MIGRATIONS}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error as exc:
+        return Finding(
+            "ledger",
+            "Ledger schema + integrity",
+            "FAIL",
+            f"ledger could not be opened: {exc}",
+            "inspect/restore .sdlc-state.db (a fresh build recreates it)",
+        )
+    try:
+        try:
+            applied = {
+                row[0]
+                for row in conn.execute("SELECT version FROM _migrations").fetchall()
+            }
+        except sqlite3.DatabaseError:
+            # Either the file is corrupt or it predates the migration framework
+            # (no _migrations table). Probe the runs table to tell them apart.
+            try:
+                conn.execute("SELECT count(*) FROM runs").fetchone()
+            except sqlite3.DatabaseError as exc:
+                return Finding(
+                    "ledger",
+                    "Ledger schema + integrity",
+                    "FAIL",
+                    f"ledger is unreadable / corrupt: {exc}",
+                    "inspect/restore .sdlc-state.db (a fresh build recreates it)",
+                )
+            return Finding(
+                "ledger",
+                "Ledger schema + integrity",
+                "WARN",
+                "ledger predates the migration framework (no _migrations table)",
+                "any `sdlc` verb auto-migrates it on next use (Epic-12 12.2-003)",
+            )
+        # _migrations read; confirm the core table reads too (integrity probe).
+        conn.execute("SELECT count(*) FROM runs").fetchone()
+    except sqlite3.DatabaseError as exc:
+        return Finding(
+            "ledger",
+            "Ledger schema + integrity",
+            "FAIL",
+            f"ledger is unreadable / corrupt: {exc}",
+            "inspect/restore .sdlc-state.db (a fresh build recreates it)",
+        )
+    finally:
+        conn.close()
+
+    missing = expected - applied
+    if missing:
+        return Finding(
+            "ledger",
+            "Ledger schema + integrity",
+            "WARN",
+            f"schema behind by {len(missing)} migration(s): {sorted(missing)}",
+            "any `sdlc` verb auto-migrates it on next use (Epic-12 12.2-003)",
+        )
+    return Finding(
+        "ledger",
+        "Ledger schema + integrity",
+        "CLEAN",
+        "schema current, ledger readable",
+    )
+
+
+def check_runs(
+    ledger: Ledger,
+    registry: Registry,
+    *,
+    now: datetime | None = None,
+    stale_after_s: int = _STALE_AFTER_S,
+) -> Finding:
+    """Detect stuck/stale runs: an IN_PROGRESS run with a dead pid or no activity.
+
+    The registry's pid logic (Epic-11 11.2-001) is authoritative for liveness: a
+    run still IN_PROGRESS whose pid is gone derives ``DEAD`` (crashed). A run with
+    no registry entry is checked against the ledger's last activity instead, so a
+    run whose registry record was pruned still surfaces when stale.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    dead: list[str] = []
+    live_run_ids: set[str] = set()
+    for record in registry.records():
+        if derive_state(record) == "DEAD":
+            dead.append(record.run_id)
+        elif not record.finished_at:
+            live_run_ids.add(record.run_id)
+
+    # Ledger-side stale check: the latest run still IN_PROGRESS with no registry
+    # liveness signal and no recent event is likely stuck (orphaned). A corrupt
+    # or unreadable ledger is already reported by check_ledger — degrade to the
+    # registry-only signal here rather than crashing the whole report.
+    stale: list[str] = []
+    try:
+        snap = status_snapshot(ledger)
+    except sqlite3.DatabaseError:
+        snap = {}
+    run = snap.get("run")
+    if run and run.get("status") == "IN_PROGRESS":
+        rid = run["id"]
+        if rid not in live_run_ids and rid not in dead:
+            last = _last_activity(snap)
+            if last is not None and (now - last).total_seconds() > stale_after_s:
+                stale.append(rid)
+
+    if dead:
+        ids = ", ".join(r[:8] for r in dead)
+        return Finding(
+            "runs",
+            "Stuck / stale runs",
+            "FAIL",
+            f"{len(dead)} run(s) IN_PROGRESS with a dead pid (crashed): {ids}",
+            "`sdlc reconcile` to re-check against origin, then `sdlc runs --prune`",
+        )
+    if stale:
+        ids = ", ".join(r[:8] for r in stale)
+        return Finding(
+            "runs",
+            "Stuck / stale runs",
+            "WARN",
+            f"{len(stale)} run(s) IN_PROGRESS with no activity for >"
+            f"{stale_after_s // 3600}h: {ids}",
+            "`sdlc status` to inspect, then `sdlc resume` or `sdlc reconcile`",
+        )
+    return Finding(
+        "runs",
+        "Stuck / stale runs",
+        "CLEAN",
+        "no stuck or stale runs detected",
+    )
+
+
+def _last_activity(snap: dict) -> datetime | None:
+    """The most recent event/started_at timestamp in a status snapshot, or None."""
+    candidates: list[str] = []
+    run = snap.get("run") or {}
+    if run.get("started_at"):
+        candidates.append(str(run["started_at"]))
+    for event in snap.get("events") or []:
+        if event.get("ts"):
+            candidates.append(str(event["ts"]))
+    latest: datetime | None = None
+    for raw in candidates:
+        parsed = _parse_ts(raw)
+        if parsed is not None and (latest is None or parsed > latest):
+            latest = parsed
+    return latest
+
+
+def _parse_ts(raw: str) -> datetime | None:
+    """Parse a ledger timestamp (SQLite ``CURRENT_TIMESTAMP`` or ISO) as UTC-aware."""
+    text = raw.strip()
+    try:
+        # SQLite CURRENT_TIMESTAMP is naive UTC: "YYYY-MM-DD HH:MM:SS".
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def check_config(repo_root: Path) -> Finding:
+    """Verify packaged JSON schemas and the managed settings.json parse cleanly."""
+    bad: list[str] = []
+
+    schemas_dir = Path(__file__).resolve().parent / "schemas"
+    for schema in sorted(schemas_dir.glob("*.json")):
+        try:
+            json.loads(schema.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            bad.append(schema.name)
+
+    settings = repo_root / "settings.json"
+    if settings.is_file():
+        try:
+            json.loads(settings.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            bad.append("settings.json")
+
+    if bad:
+        return Finding(
+            "config",
+            "Config validity",
+            "FAIL",
+            f"invalid JSON in: {', '.join(bad)}",
+            "fix the malformed JSON (validate with `jq . <file>`)",
+        )
+    return Finding(
+        "config",
+        "Config validity",
+        "CLEAN",
+        "settings + packaged schemas parse",
+    )
+
+
+def _default_dep_probe(tool: str) -> bool:
+    """True when ``tool`` is on PATH and answers ``--version`` with exit 0.
+
+    A missing binary short-circuits via ``shutil.which`` (no subprocess). A
+    present-but-broken binary (non-zero ``--version``) reports False so doctor
+    flags it rather than silently trusting it.
+    """
+    if shutil.which(tool) is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [tool, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def check_dependencies(probe: Callable[[str], bool]) -> list[Finding]:
+    """One finding per external dependency: CLEAN when present, WARN when absent."""
+    findings: list[Finding] = []
+    for tool, label, remedy in DEPENDENCIES:
+        if probe(tool):
+            findings.append(Finding("dependency", label, "CLEAN", f"{tool} available"))
+        else:
+            findings.append(
+                Finding(
+                    "dependency",
+                    label,
+                    "WARN",
+                    f"{tool} not found (a feature that uses it will be unavailable)",
+                    remedy,
+                )
+            )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
+def _detect_repo_root() -> Path:
+    """The config repo root: the git toplevel of cwd, else the package's ancestor."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # doctor.py -> sdlc -> src -> controller -> <config repo root>
+    return Path(__file__).resolve().parents[3]
+
+
+def run_doctor(
+    *,
+    repo_root: Path | None = None,
+    claude_dir: Path | None = None,
+    db_path: Path | None = None,
+    registry: Registry | None = None,
+    dep_probe: Callable[[str], bool] | None = None,
+    now: datetime | None = None,
+    stale_after_s: int = _STALE_AFTER_S,
+) -> DoctorReport:
+    """Run every health-check and return the aggregated :class:`DoctorReport`.
+
+    Read-only: doctor never mutates the ledger or the install — a behind-on-
+    migrations DB is *reported* (Epic-12 12.2-003 fixes it), not migrated here.
+    All inputs are injectable so the checks are testable against seeded-broken
+    fixtures.
+    """
+    repo_root = repo_root or _detect_repo_root()
+    claude_dir = claude_dir or (Path.home() / ".claude")
+    db_path = db_path or default_db_path()
+    registry = registry or Registry()
+    dep_probe = dep_probe or _default_dep_probe
+
+    findings: list[Finding] = [
+        check_install(claude_dir),
+        check_ledger(db_path),
+        check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
+        check_config(repo_root),
+    ]
+    findings.extend(check_dependencies(dep_probe))
+    return DoctorReport(findings=findings)

@@ -26,6 +26,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/reconcile.py` | Verifies parked stories against `origin/main` and recomputes the run terminal — shared by close-out and `sdlc reconcile` (Stories 12.3-001/12.3-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
+| `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
 
 ## The state machine
 
@@ -501,6 +502,42 @@ the cruft → `clean` *fixes* it).
   and a read-only `gh pr list`; it never pushes or fetches. Each removal is logged
   to stdout; `--json` emits the full `{candidates, protected, errors}` plan. Exits
   0.
+
+## Doctor (health-check verb)
+
+`sdlc doctor` (`sdlc/doctor.py`, Story 15.1-001) is a **read-side** self-service
+diagnostic: one command that answers "is my install healthy and is anything
+stuck?" and prints a concrete remedy for each problem, so a colleague resolves
+common breakages without pinging FX. It never mutates the ledger or the install
+— a behind-on-migrations DB is *reported*, not migrated (Epic-12 12.2-003 fixes
+it on the next real run).
+
+- **Checks** (each yields a `CLEAN` / `WARN` / `FAIL` `Finding` with a remedy):
+  - **Install integrity** — every managed `~/.claude` symlink/file from
+    `install/core.sh` is present and resolves (a dangling link counts as broken).
+    Missing/broken → `FAIL`, remedy `./install.sh --core`.
+  - **Ledger schema + integrity** — the ledger opens read-only and every
+    `_MIGRATIONS` version is applied. Behind / pre-migration-framework → `WARN`
+    (auto-migrates on the next `sdlc` verb); unreadable/corrupt → `FAIL`. No
+    ledger yet is `CLEAN` ("nothing built").
+  - **Stuck / stale runs** — reuses the registry's pid logic
+    ([the run registry](#the-run-registry-cross-repo-discovery)): an
+    `IN_PROGRESS` run whose pid is dead derives `DEAD` → `FAIL` (remedy
+    `sdlc reconcile` then `sdlc runs --prune`); a ledger run `IN_PROGRESS` with
+    no registry liveness and no activity for >6h → `WARN`.
+  - **Config validity** — the packaged JSON schemas and the managed
+    `settings.json` parse. A malformed file → `FAIL`.
+  - **Dependencies** — one finding per external tool (`gh`, `claude`, `semgrep`,
+    `osv-scanner`), each probed via `<tool> --version`. A missing tool is a `WARN`
+    (it degrades a feature, not the install) with an install remedy.
+- **Overall status** is the worst finding (`worst_status`: CLEAN < WARN < FAIL).
+- **Exit code.** Defaults to **0** so it is safe to run anywhere; `--exit-code`
+  makes a WARN exit 1 and a FAIL exit 2 so a wrapping script can gate on health.
+- **`--json`** emits `{status, findings:[{check, name, status, detail, remedy}]}`
+  for tooling and the markdown handoff (Story 15.1-002).
+- **Overrides.** `--db`, `--claude-dir`, and `--repo-root` make every check
+  point at an explicit location (used by tests and for diagnosing a non-default
+  install).
 
 ## The run registry (cross-repo discovery)
 

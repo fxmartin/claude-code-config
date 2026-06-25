@@ -19,6 +19,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "build": "Run the full build-stories orchestration for a scope.",
     "resume": "Resume an interrupted build from the ledger state.",
     "status": "Show the current run status and stage progress.",
+    "doctor": "Health-check the install, ledger, runs, config, and dependencies.",
     "runs": "List every known run from the host-level registry.",
     "state": "Inspect the persisted state machine for a run.",
     "validate": "Validate an agent response against its JSON schema.",
@@ -486,6 +487,67 @@ def status(
                 f"  {e.get('ts', '')}  {str(e.get('level', '')):<8}"
                 f"{str(e.get('source') or ''):<11} {e.get('message', '')}"
             )
+    raise typer.Exit(code=0)
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["doctor"])
+def doctor(
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    claude_dir: Path | None = typer.Option(
+        None,
+        "--claude-dir",
+        help="Install dir to check (default: ~/.claude).",
+    ),
+    repo_root: Path | None = typer.Option(
+        None,
+        "--repo-root",
+        help="Config repo root for config checks (default: the git toplevel).",
+    ),
+    exit_code: bool = typer.Option(
+        False,
+        "--exit-code",
+        help="Exit non-zero when any check is WARN (1) or FAIL (2), for automation.",
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the report as a JSON object."
+    ),
+) -> None:
+    """Check the install and run state, reporting a remedy for each problem.
+
+    Runs read-only health-checks across install integrity (managed symlinks),
+    ledger schema currency + integrity, stuck/stale runs (an IN_PROGRESS run with
+    a dead pid or no recent activity), config validity (settings/schemas parse),
+    and dependency availability (gh, claude, semgrep, osv-scanner). Each finding
+    reports CLEAN/WARN/FAIL plus the command or doc that fixes it.
+
+    Always exits 0 by default so it is safe to run anywhere; ``--exit-code`` makes
+    a WARN exit 1 and a FAIL exit 2 so a wrapping script can gate on health.
+    """
+    from sdlc.doctor import run_doctor
+
+    report = run_doctor(
+        repo_root=repo_root,
+        claude_dir=claude_dir,
+        db_path=db,
+    )
+
+    if as_json:
+        typer.echo(json.dumps(report.to_dict(), default=str))
+        raise typer.Exit(code=0)
+
+    for finding in report.findings:
+        typer.echo(f"[{finding.status}] {finding.name} — {finding.detail}")
+        if finding.remedy:
+            typer.echo(f"    ↳ remedy: {finding.remedy}")
+    if report.status == "CLEAN":
+        typer.echo(f"doctor: all {len(report.findings)} checks passed (CLEAN).")
+    else:
+        typer.echo(f"doctor: overall {report.status} — see remedies above.")
+
+    if exit_code and report.status != "CLEAN":
+        raise typer.Exit(code=2 if report.status == "FAIL" else 1)
     raise typer.Exit(code=0)
 
 
