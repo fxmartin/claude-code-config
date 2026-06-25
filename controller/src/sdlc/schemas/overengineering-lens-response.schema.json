@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/overengineering-lens-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for the over-engineering review lens (Story 18.2-001). ABOUTME: Draft 2020-12; a structured delete-list of over-built code; extra fields allowed for forward-compat.",
+  "title": "OverEngineeringLensResponse",
+  "description": "Structured delete-list returned by the over-engineering review lens for one story's diff.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["summary", "findings"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One-paragraph summary; says so explicitly when the diff is already minimal."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Zero or more over-engineering findings. An empty list means the diff is already lean.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["category", "file", "line", "reason"],
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "speculative_abstraction",
+              "unused_code",
+              "reinvented_wheel",
+              "premature_generality",
+              "other"
+            ],
+            "description": "Kind of over-engineering: speculative abstraction, unused param/branch, hand-rolled code a stdlib/dep/one-liner covers, premature generality, or other."
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Path of the file the finding refers to."
+          },
+          "line": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Line number, or null when the finding is file-level."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "One-line 'why' — what to delete and what makes it over-built."
+          }
+        }
+      }
+    }
+  }
+}
