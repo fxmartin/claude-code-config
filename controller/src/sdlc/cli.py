@@ -11,6 +11,7 @@ import typer
 
 from sdlc import __version__
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
+from sdlc.eval_compare import DEFAULT_TOLERANCE
 
 # The full set of planned subcommands with one-line descriptions. `--help`
 # renders these even while the bodies are stubs, so the surface area is visible
@@ -35,6 +36,8 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "run-stage": "Log a fix-issue phase start/finish to the ledger.",
     "run-close": "Finalize a fix-issue run (DONE/FAILED) in ledger + registry.",
     "eval": "Run the agentic eval harness over a fixed ticket set and emit a scoreboard.",
+    "eval-compare": "Compare two eval scoreboards (A/B) with a per-metric delta + verdict.",
+    "eval-baseline": "Check an eval scoreboard against a committed baseline; flag regressions.",
 }
 
 app = typer.Typer(
@@ -1479,6 +1482,155 @@ def eval_cmd(
     else:
         typer.echo(render_table(board))
     raise typer.Exit(code=0)
+
+
+@app.command(name="eval-compare", help=PLANNED_SUBCOMMANDS["eval-compare"])
+def eval_compare_cmd(
+    baseline: Path = typer.Option(
+        ...,
+        "--baseline",
+        help="Variant-A scoreboard JSON (from `sdlc eval --json`).",
+    ),
+    candidate: Path = typer.Option(
+        ...,
+        "--candidate",
+        help="Variant-B scoreboard JSON to compare against the baseline.",
+    ),
+    tolerance: float = typer.Option(
+        DEFAULT_TOLERANCE,
+        "--tolerance",
+        help="Relative move (fraction of baseline) before a metric flags as better/worse.",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the comparison as JSON instead of a text table.",
+    ),
+    out: Path = typer.Option(
+        None,
+        "--out",
+        help="Also persist the comparison JSON to this path (records the A/B decision).",
+        show_default=False,
+    ),
+) -> None:
+    """Compare two eval scoreboards on the same tickets — per-metric delta + verdict.
+
+    Reads two scoreboard JSON files (variant A vs B: a prompt/skill/model change run
+    through `sdlc eval --json`), produces a side-by-side delta and a clear
+    better/worse/neutral verdict per ticket and overall, and can persist the
+    comparison (`--out`) so a prompt/model decision is backed by data, not vibes. A
+    malformed scoreboard exits 2.
+    """
+    from sdlc.eval_compare import (
+        BaselineError,
+        comparison_to_dict,
+        compare_scoreboards,
+        load_scoreboard,
+        render_comparison_table,
+    )
+
+    try:
+        base_board = load_scoreboard(baseline)
+        cand_board = load_scoreboard(candidate)
+    except BaselineError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    comparison = compare_scoreboards(base_board, cand_board, tolerance=tolerance)
+    payload = comparison_to_dict(comparison)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        typer.echo(render_comparison_table(comparison))
+    raise typer.Exit(code=0)
+
+
+@app.command(name="eval-baseline", help=PLANNED_SUBCOMMANDS["eval-baseline"])
+def eval_baseline_cmd(
+    baseline: Path = typer.Option(
+        Path("eval/baseline.json"),
+        "--baseline",
+        help="Committed baseline scoreboard to check against (or write with --update).",
+    ),
+    candidate: Path = typer.Option(
+        None,
+        "--candidate",
+        help="Fresh scoreboard JSON (from `sdlc eval --json`) to check / promote.",
+        show_default=False,
+    ),
+    tolerance: float = typer.Option(
+        DEFAULT_TOLERANCE,
+        "--tolerance",
+        help="Relative move (fraction of baseline) before a metric counts as a regression.",
+    ),
+    update: bool = typer.Option(
+        False,
+        "--update",
+        help="Promote the candidate to the baseline file (no regression check).",
+    ),
+    warn_only: bool = typer.Option(
+        False,
+        "--warn-only",
+        help="Report regressions but still exit 0 (advisory, not a gate).",
+    ),
+) -> None:
+    """Flag metrics that regressed beyond tolerance vs a committed baseline.
+
+    Compares a fresh scoreboard (`--candidate`, from `sdlc eval --json`) against the
+    committed baseline and lists any metric that got materially worse (quality down,
+    or LOC/tokens/cost/wall up beyond `--tolerance`). Exits 1 when regressions are
+    found (unless `--warn-only`), 0 when clean. `--update` promotes the candidate to
+    the baseline file instead of checking. A malformed file exits 2.
+    """
+    from sdlc.eval_compare import (
+        BaselineError,
+        compare_scoreboards,
+        load_scoreboard,
+        regressions,
+        save_scoreboard,
+    )
+
+    if candidate is None:
+        typer.echo("error: --candidate is required", err=True)
+        raise typer.Exit(code=2)
+
+    try:
+        cand_board = load_scoreboard(candidate)
+    except BaselineError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if update:
+        save_scoreboard(cand_board, baseline)
+        typer.echo(f"baseline updated: {baseline}")
+        raise typer.Exit(code=0)
+
+    try:
+        base_board = load_scoreboard(baseline)
+    except BaselineError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    comparison = compare_scoreboards(base_board, cand_board, tolerance=tolerance)
+    flagged = regressions(comparison)
+    if not flagged:
+        typer.echo(
+            f"baseline OK: no regressions beyond {tolerance:.0%} "
+            f"({comparison.candidate_name} vs {comparison.baseline_name})"
+        )
+        raise typer.Exit(code=0)
+
+    typer.echo(f"regressions vs baseline (tolerance {tolerance:.0%}):", err=True)
+    for ticket_id, metric in flagged:
+        base = "—" if metric.baseline is None else f"{metric.baseline:.4g}"
+        cand = "—" if metric.candidate is None else f"{metric.candidate:.4g}"
+        pct = "—" if metric.pct is None else f"{metric.pct * 100:+.0f}%"
+        typer.echo(f"  {ticket_id}: {metric.label} {base} -> {cand} ({pct})", err=True)
+    raise typer.Exit(code=0 if warn_only else 1)
 
 
 if __name__ == "__main__":
