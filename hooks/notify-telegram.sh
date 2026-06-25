@@ -4,6 +4,16 @@
 
 set -euo pipefail
 
+# Story 15.2-001: honor hook strictness controls. A Telegram ping is a
+# non-essential *notification*, so the `minimal` profile and an explicit
+# SDLC_DISABLED_HOOKS entry both skip it; defaults are preserved when unset.
+_HP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -n "${_HP_DIR:-}" ] && [ -f "$_HP_DIR/hook-profile.sh" ]; then
+    # shellcheck source=hooks/hook-profile.sh
+    . "$_HP_DIR/hook-profile.sh"
+    hook_should_run notify-telegram notification || exit 0
+fi
+
 # Resolve the parent repo name, stripping any `.claude/worktrees/<slug>` suffix
 # so sub-agent notifications identify the real repo, not the worktree.
 _repo_tag() {

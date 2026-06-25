@@ -12,6 +12,10 @@
           {
             "type": "command",
             "command": "~/.claude/hooks/forge-worktree-bootstrap.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session-context.sh"
           }
         ]
       }
