@@ -1,0 +1,22 @@
+# Supply-chain scan allowlist (Story 13.2-001).
+#
+# Each entry suppresses ONE specific finding — keyed by (path, line, pattern,
+# sha256) — that has been human-reviewed and deemed safe. This is NOT a blanket
+# disable: the same pattern on a different line, a different pattern on the same
+# line, or different content on the same line is still gated. The sha256 is the
+# content digest the gate prints for the finding. See docs/security-gates.md.
+#
+# Reviewed exceptions:
+allow:
+  # The model-shelf skill is a pinned git submodule (skills/model-shelf). Its
+  # README documents the canonical Astral `uv` installer one-liner
+  # (`curl -LsSf https://astral.sh/uv/install.sh | sh`). It is documentation,
+  # not a harness-executed hook, and points at the official uv endpoint.
+  # Pinned at submodule commit cb55819 — the sha256 binds this entry to the exact
+  # reviewed line, so if the submodule is bumped and the line's content changes
+  # (or shifts to another line) the gate re-surfaces the finding for review.
+  - path: skills/model-shelf/README.md
+    line: 34
+    pattern: pipe-to-shell
+    sha256: 696f70047c39d4b84ed0307d830c9c364e8f8a1886b504ae500fec1597974c20
+    reason: documented official Astral uv installer in the upstream model-shelf README; not executed by the harness; submodule pinned at cb55819

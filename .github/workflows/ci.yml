@@ -100,6 +100,28 @@ jobs:
           done < <(git ls-files '*.md')
           exit "$fail"
 
+  supply-chain-scan:
+    name: Supply-chain pattern scan (hooks/skills/MCP/settings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Story 13.2-001: treat installed hooks/skills/MCP/settings as supply-chain
+    # artifacts and fail the PR on a BLOCK so a poisoned or accidentally unsafe
+    # config never merges unreviewed.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # skills/model-shelf is a git submodule that ships an installed skill;
+          # it is part of the supply-chain surface, so fetch it and scan its
+          # real content (an empty submodule dir would silently skip it).
+          submodules: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Scan for dangerous patterns (fail on BLOCK)
+        run: bash scripts/supply-chain-scan.sh
+
   contract-checks:
     name: Contract checks
     runs-on: ubuntu-latest
@@ -161,7 +183,7 @@ jobs:
         run: |
           bats --version
           jq --version
-          bats tests/notify-telegram.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/risk-gate.bats tests/codex-adversarial-review.bats tests/sast-scan.bats tests/osv-scan.bats tests/gitleaks-secrets.bats
+          bats tests/notify-telegram.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/risk-gate.bats tests/codex-adversarial-review.bats tests/sast-scan.bats tests/osv-scan.bats tests/gitleaks-secrets.bats tests/supply-chain-scan.bats
 
   controller-smoke:
     name: Controller CLI smoke test (uv tool install)

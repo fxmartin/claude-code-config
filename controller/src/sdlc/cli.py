@@ -27,6 +27,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
     "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
     "depscan": "Classify an osv-scanner report into a CLEAN | WARN | BLOCK gate verdict.",
+    "supplychain": "Scan hooks/skills/MCP/settings for dangerous patterns (CLEAN | WARN | BLOCK).",
     "run-open": "Register a fix-issue run so the dashboard surfaces it.",
     "run-stage": "Log a fix-issue phase start/finish to the ledger.",
     "run-close": "Finalize a fix-issue run (DONE/FAILED) in ledger + registry.",
@@ -259,27 +260,34 @@ def resume(
         help="Scope of the run to resume: all, epic-NN, an epic name, or X.Y-NNN.",
     ),
     run: str | None = typer.Option(
-        None, "--run", help="Resume a specific run id (default: the latest incomplete run)."
+        None,
+        "--run",
+        help="Resume a specific run id (default: the latest incomplete run).",
     ),
     db: Path | None = typer.Option(
         None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
     ),
     budget: str | None = typer.Option(
-        None, "--budget",
+        None,
+        "--budget",
         help="Raise/override the run's token budget (a $-value converts to a "
         "notional API-equivalent ceiling). Required to continue a budget-paused run.",
     ),
     budget_policy: str | None = typer.Option(
-        None, "--budget-policy", help="Override the budget policy: pause or abort.",
+        None,
+        "--budget-policy",
+        help="Override the budget policy: pause or abort.",
     ),
     cost_threshold: str | None = typer.Option(
-        None, "--cost-threshold",
+        None,
+        "--cost-threshold",
         help="Raise/override the per-stage cost-estimate gate (a $-value converts "
         "to a notional token ceiling; 0 disables it). Pass this to continue a "
         "story the gate parked.",
     ),
     concurrency: int | None = typer.Option(
-        None, "--concurrency",
+        None,
+        "--concurrency",
         help="Override the cohort worker cap for this resume (>= 1; default: the "
         "value the original run used). A serial-mode run stays one-at-a-time.",
         min=1,
@@ -328,9 +336,14 @@ def resume(
     # Migrate a pre-existing (possibly stale) ledger before resume reads it.
     ledger.ensure_migrated()
     result = run_resume(
-        scope, ledger=ledger, run_id=run, render_view=make_render_view(db_path),
-        budget=budget_tokens, budget_policy=budget_policy,
-        cost_threshold=cost_threshold_tokens, concurrency=concurrency,
+        scope,
+        ledger=ledger,
+        run_id=run,
+        render_view=make_render_view(db_path),
+        budget=budget_tokens,
+        budget_policy=budget_policy,
+        cost_threshold=cost_threshold_tokens,
+        concurrency=concurrency,
     )
 
     if result.nothing_to_resume:
@@ -683,7 +696,9 @@ def dashboard(
         False, "--stop", help="Stop a dashboard running on this host:port and exit."
     ),
     restart: bool = typer.Option(
-        False, "--restart", help="Stop any running dashboard on this host:port, then start fresh."
+        False,
+        "--restart",
+        help="Stop any running dashboard on this host:port, then start fresh.",
     ),
 ) -> None:
     """Serve an auto-refreshing local dashboard of build progress.
@@ -981,7 +996,9 @@ def sast(
         load_sast_config,
     )
 
-    report = report_file.read_text(encoding="utf-8") if report_file else sys.stdin.read()
+    report = (
+        report_file.read_text(encoding="utf-8") if report_file else sys.stdin.read()
+    )
 
     try:
         config = load_sast_config(config_file)
@@ -1027,7 +1044,9 @@ def depscan(
         load_dep_scan_suppressions,
     )
 
-    report = report_file.read_text(encoding="utf-8") if report_file else sys.stdin.read()
+    report = (
+        report_file.read_text(encoding="utf-8") if report_file else sys.stdin.read()
+    )
 
     try:
         suppressions = load_dep_scan_suppressions(suppressions_file)
@@ -1044,6 +1063,57 @@ def depscan(
         )
     for finding in result.suppressed:
         typer.echo(f"  [suppressed] {finding.coordinate()} {finding.osv_id}")
+
+    raise typer.Exit(code=1 if result.status == "BLOCK" else 0)
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["supplychain"])
+def supplychain(
+    root: Path = typer.Argument(
+        Path("."),
+        help="Repo root to scan (hooks/, skills/, plugins/*/skills/, mcp, settings.json).",
+    ),
+    allowlist_file: Path = typer.Option(
+        Path(".supply-chain-allowlist.yaml"),
+        "--allowlist",
+        help="Per-finding allowlist (each entry needs path, pattern, and reason).",
+    ),
+) -> None:
+    """Scan installed hooks/skills/MCP/settings for dangerous patterns.
+
+    Treats those config artifacts as supply-chain inputs and flags egress tools,
+    MCP auto-trust, ANTHROPIC_BASE_URL overrides, encoded payloads, and hidden
+    Unicode. Prints ``SUPPLY_CHAIN_STATUS: CLEAN | WARN | BLOCK`` followed by one
+    line per gating finding (file, line, pattern). Exits 0 for CLEAN/WARN and 1
+    for BLOCK so a CI gate can branch on the exit code. A malformed allowlist
+    exits 2.
+    """
+    from sdlc.supply_chain_scan import (
+        SupplyChainConfigError,
+        load_allowlist,
+        scan_repo,
+    )
+
+    try:
+        allowlist = load_allowlist(allowlist_file)
+        result = scan_repo(root, allowlist=allowlist)
+    except SupplyChainConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(f"SUPPLY_CHAIN_STATUS: {result.status}")
+    for finding in result.findings:
+        # The sha256 is printed so an operator can copy path/line/pattern/sha256
+        # straight into a .supply-chain-allowlist.yaml entry.
+        typer.echo(
+            f"  [{finding.band}] {finding.location()} {finding.pattern_id}"
+            f" sha256:{finding.digest} — {finding.description}"
+        )
+    for finding in result.suppressed:
+        typer.echo(
+            f"  [suppressed] {finding.location()} {finding.pattern_id}"
+            f" sha256:{finding.digest}"
+        )
 
     raise typer.Exit(code=1 if result.status == "BLOCK" else 0)
 
