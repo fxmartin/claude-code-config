@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.76.0] - 2026-06-25
+
+### Added
+
+- feat(agent-output-quality): reproducible agentic eval (#18.1-001)
+
+
 ## [v1.75.0] - 2026-06-25
 
 ### Added
