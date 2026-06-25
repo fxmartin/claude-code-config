@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.74.0] - 2026-06-25
+
+### Added
+
+- feat(agent-output-quality): over-engineering review lens (#18.2-001)
+
+
 ## [v1.73.2] - 2026-06-25
 
 ### Fixed
