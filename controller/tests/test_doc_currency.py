@@ -59,6 +59,13 @@ def test_paths_from_diff_empty() -> None:
     assert paths_from_diff("") == []
 
 
+def test_paths_from_diff_rename_without_git_header() -> None:
+    # A rename line whose path was not pre-seeded by a `diff --git` header still
+    # surfaces — covers the append branch for paths first seen on a rename line.
+    fragment = "rename from notes/guide.md\nrename to notes/guide-v2.md\n"
+    assert paths_from_diff(fragment) == ["notes/guide.md", "notes/guide-v2.md"]
+
+
 # ---------------------------------------------------------------------------
 # Path classification
 # ---------------------------------------------------------------------------
@@ -255,6 +262,12 @@ def test_summary_is_human_readable() -> None:
     assert "skill" in summary.lower()
     quiet = analyze_paths(["README.md"], enabled=True).summary()
     assert quiet  # non-empty even when clean
+
+
+def test_summary_when_disabled() -> None:
+    # A disabled lens summarizes its own off state rather than any verdict.
+    result = analyze_paths(["skills/foo/run.py"], enabled=False)
+    assert result.summary() == "documentation-currency lens disabled"
 
 
 # ---------------------------------------------------------------------------
