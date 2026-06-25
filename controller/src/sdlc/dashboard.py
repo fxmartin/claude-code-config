@@ -324,6 +324,19 @@ _PAGE = """<!doctype html>
   .run { padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 6px; }
   .run:hover { background: var(--crust); }
   .run.active { background: var(--surface); }
+  /* Story 19.2-001: an active (building) run carries a blue left-accent border
+     and a pulsing live dot, so in-progress runs are recognizable at a glance
+     without reading the badge. This is a separate visual channel from .active
+     (selected-for-viewing, a background fill) — the two mean different things
+     (building vs currently-viewed) and a run can read as both at once. The 7px
+     left padding offsets the 3px border so card text stays aligned. */
+  .run--live { border-left: 3px solid var(--blue); padding-left: 7px; }
+  .run--live::before { content: "\\25cf"; color: var(--blue); margin-right: 6px;
+                       animation: run-pulse 1.4s ease-in-out infinite; }
+  @keyframes run-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
+  @media (prefers-reduced-motion: reduce) {
+    .run--live::before { animation: none; }
+  }
   .main { flex: 1; padding: 24px; overflow: auto; }
   h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
   .muted { color: var(--sub); } .small { font-size: 12px; }
@@ -631,7 +644,12 @@ function renderRuns(runs){
       ? "<div class='muted small'>📁 " + esc(String(r.repo).split(/[\\\\/]/).pop()) + "</div>"
       : "";
     const gh = ("github" in r) ? ghBadge(r.github) : "";
-    return "<div class='run "+(sel===r.id?"active":"")+"' data-run='"+esc(r.id)+"'>"
+    // Story 19.2-001: tag active (building) runs with run--live so they stand
+    // out from terminal runs. run status is IN_PROGRESS; STARTED is included so
+    // the marker survives any display-status pass. This is orthogonal to active
+    // (selected-for-viewing), so a selected building run carries both classes.
+    const live = (r.status==="IN_PROGRESS"||r.status==="STARTED") ? " run--live" : "";
+    return "<div class='run "+(sel===r.id?"active":"")+live+"' data-run='"+esc(r.id)+"'>"
       + badge(r.status) + " <code>" + esc(r.id.slice(0,8)) + "</code>"
       + repo
       + gh

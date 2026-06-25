@@ -710,6 +710,50 @@ def test_page_has_started_badge_style() -> None:
     assert ".STARTED" in _PAGE
 
 
+# --- active-run sidebar styling (Story 19.2-001) --------------------------
+
+
+def test_render_runs_marks_active_runs_live() -> None:
+    """renderRuns tags an active (IN_PROGRESS/STARTED) run card with the
+    ``run--live`` modifier class so building runs stand out (Story 19.2-001)."""
+    from sdlc.dashboard import _PAGE
+
+    # The modifier class is emitted from renderRuns, keyed on the run status.
+    start = _PAGE.index("function renderRuns(")
+    end = _PAGE.index("\n}", start)
+    body = _PAGE[start:end]
+    assert "run--live" in body
+    # Both active statuses drive the modifier (run status is IN_PROGRESS; STARTED
+    # is the UI label, included so the rule survives a display-status pass).
+    assert "IN_PROGRESS" in body
+    assert "STARTED" in body
+
+
+def test_page_has_live_run_style() -> None:
+    """A ``.run--live`` CSS rule exists with a pulsing dot animation so active
+    runs are recognizable without reading the badge (Story 19.2-001)."""
+    from sdlc.dashboard import _PAGE
+
+    assert ".run--live" in _PAGE
+    assert "@keyframes run-pulse" in _PAGE
+    assert "animation:" in _PAGE
+
+
+def test_live_styling_distinct_from_selection() -> None:
+    """The active-run styling (``run--live``) is visually separable from the
+    selection highlight (``.run.active``) — they mean different things
+    (building vs currently-viewed) (Story 19.2-001)."""
+    from sdlc.dashboard import _PAGE
+
+    # Selection uses a background fill; the live marker uses a left accent border
+    # + animated dot — distinct visual channels, so a run can read as both.
+    assert ".run.active { background:" in _PAGE
+    live_start = _PAGE.index(".run--live {")
+    live_end = _PAGE.index("}", live_start)
+    live_rule = _PAGE[live_start:live_end]
+    assert "border-left" in live_rule
+
+
 # --- multi-run registry overview (Story 11.2-002) --------------------------
 
 
