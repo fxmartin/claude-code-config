@@ -1404,6 +1404,39 @@ the wait/park is shared between `run_build` and `run_resume` (`_make_rate_limit_
 to a fresh build. The `clock` / `sleep_fn` are injectable so the in-process wait
 is deterministic and instant under test.
 
+## Documentation-currency lens (Story 18.3-001)
+
+The four stages never used to tell an agent to touch user-facing docs, so docs
+drifted from behaviour across unattended batches and FX hand-ran `/sync-progress`
+after every run. `doc_currency.py` closes that gap at two surgical touch-points —
+no new stage:
+
+1. **Build prompt + story-template DoD.** When the lens is enabled (the default),
+   `render_build_prompt` appends an instruction to update the affected user-facing
+   docs (`README.md`, `docs/`, usage/help text) **in the same commit** as the code
+   change — scoped to what the diff actually touches, never the CHANGELOG (the
+   Epic-05 release workflow owns that). The matching DoD line ships in the
+   `create-epic` / `generate-epics` story templates.
+2. **Review dimension.** `render_review_prompt` appends a documentation-currency
+   dimension, and `doc_currency.analyze_diff` / `analyze_paths` are the
+   deterministic core: they parse a `git diff`, classify each touched path against
+   a conservative behaviour heuristic — a CLI verb/flag (`controller/src/sdlc/cli.py`),
+   a skill (`skills/**`), a hook (`hooks/**`), or an installer step
+   (`setup.sh` / `bootstrap*.sh` / `lib/*.sh`) — and emit one finding per category
+   (which doc looks stale + a one-line why) **only** when a behaviour-changing diff
+   ships with no doc update. Any doc touch in the same diff suppresses all findings
+   (the low-false-positive choice), test/fixture files never count as behaviour,
+   and a CHANGELOG bump neither satisfies currency nor is ever flagged.
+
+**Policy.** `SDLC_DOC_CURRENCY_POLICY` selects `advisory` (default — record on the
+PR, never blocks shipping) or `route_to_bugfix` (hand the gap to the bounded
+bugfix loop). `DocCurrencyResult.route_to_bugfix` is true only when the policy
+routes *and* there is a finding to route.
+
+**Disable switch.** `SDLC_DOC_CURRENCY` set to `0`/`false`/`no`/`off` reverts to
+today's behaviour — the build prompt and review prompt drop their docs language,
+and the lens returns no findings. Default is on.
+
 ## Backward compatibility
 
 Users still type `/build-stories` in Claude Code. The skill shells out to

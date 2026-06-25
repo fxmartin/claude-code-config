@@ -89,7 +89,7 @@ Every story must be:
 **Definition of Done**:
 - [ ] Code implemented and peer reviewed
 - [ ] Tests written and passing
-- [ ] Documentation updated
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: [other story IDs]
 **Risk Level**: High / Medium / Low
