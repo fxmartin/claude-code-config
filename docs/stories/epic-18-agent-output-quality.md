@@ -1,6 +1,9 @@
 # Epic 18: Agent Output Quality — Evaluation & Simplicity
 
-> **Status: PLANNED** — created 2026-06-20. Inspired by the external
+> **Status: COMPLETE (5/5)** — all stories merged on `main` (2026-06-25): eval
+> harness (#186), variant comparison + baselines (#187), eval-in-CI (#188),
+> over-engineering review lens (#184), doc-currency (#185). Built in parallel run
+> c82ed1f3. Created 2026-06-20. Inspired by the external
 > [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) YAGNI toolkit — but only
 > the parts we *don't* already have. Ponytail's philosophy (smallest-diff, "best code is the code
 > you never wrote") is already baked into our `CLAUDE.md` (Surgical Changes + Complexity Check,
