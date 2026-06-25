@@ -90,6 +90,26 @@ def test_remove_worktree_drops_checkout_but_keeps_branch_and_commits(tmp_path) -
     assert _git(work, "rev-parse", "feature/17.2-002").stdout.strip() == sha
 
 
+def test_remove_worktree_removes_a_locked_worktree(tmp_path) -> None:
+    """Intentional close-out must reclaim a git-locked worktree (#180): the
+    controller locks its worktrees, so teardown unlocks-then-removes rather than
+    failing on the lock. A plain ``git worktree remove --force`` refuses a locked
+    worktree, so this exercises the unlock path."""
+    work = _repo_with_origin(tmp_path)
+    path = create_story_worktree(work, "17.2-002", "run-abc12345")
+    # create_story_worktree locks it; the agent commits its work.
+    _git(path, "checkout", "-b", "feature/17.2-002", "origin/main")
+    (path / "feature.txt").write_text("work\n")
+    _git(path, "add", "-A")
+    _git(path, "commit", "-m", "feat: story work")
+
+    assert remove_story_worktree(work, path) is True
+    assert not path.exists()
+    assert path.resolve() not in _registered(work)
+    # The branch survives the teardown.
+    assert "feature/17.2-002" in _git(work, "branch", "--list", "feature/17.2-002").stdout
+
+
 def test_remove_worktree_is_idempotent_when_already_gone(tmp_path) -> None:
     """Removing a path that was never (or is no longer) a worktree is a safe
     no-op — teardown can run after a crash already cleaned the checkout."""

@@ -28,6 +28,15 @@ _prune_worktrees() {
     [ -n "$repo_root" ] || return 0
     git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1 || return 0
 
+    # Locked worktrees are in use by a live build (#180): the controller locks
+    # each story worktree it owns. A story's feature branch is 0 commits ahead of
+    # main until the build agent commits late, so the merge check below would
+    # otherwise reap a still-in-use checkout. `git worktree list --porcelain`
+    # emits a `locked` line in a locked worktree's record — collect those paths.
+    local locked_paths
+    locked_paths="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null \
+        | awk '/^worktree / { wt = substr($0, 10) } /^locked/ { print wt }')"
+
     local wt branch
     while IFS= read -r wt; do
         [ -n "$wt" ] || continue
@@ -35,6 +44,10 @@ _prune_worktrees() {
             */.claude/worktrees/agent-*) ;;
             *) continue ;;
         esac
+        # Skip worktrees git reports as locked — a live build owns them (#180).
+        if printf '%s\n' "$locked_paths" | grep -Fxq "$wt"; then
+            continue
+        fi
         # Branch backing this worktree, e.g. "refs/heads/feature/x".
         branch="$(git -C "$wt" symbolic-ref --quiet HEAD 2>/dev/null || true)"
         [ -n "$branch" ] || continue

@@ -34,6 +34,22 @@ teardown() {
     ! git -C "$REPO" worktree list --porcelain | grep -q "agent-merged"
 }
 
+@test "locked merged worktree is preserved (live build guard, #180)" {
+    # A controller-owned story worktree is git-locked while in use. Even when its
+    # feature branch is 0 commits ahead of main (thus "merged"), the Stop-hook
+    # reaper must NOT remove it — locked == in use by a live build.
+    wt="$REPO/.claude/worktrees/agent-locked"
+    git -C "$REPO" worktree add -q -b feat/locked "$wt" >/dev/null
+    echo change > "$wt/seed"
+    git -C "$wt" commit -q -am change
+    git -C "$REPO" merge -q feat/locked
+    git -C "$REPO" worktree lock "$wt"
+    run bash "$REPO_ROOT/hooks/worktree-gc.sh" prune-worktrees "$REPO"
+    [ "$status" -eq 0 ]
+    [ -d "$wt" ]
+    git -C "$REPO" worktree list --porcelain | grep -q "agent-locked"
+}
+
 @test "unmerged worktree branch is preserved" {
     wt="$REPO/.claude/worktrees/agent-unmerged"
     git -C "$REPO" worktree add -q -b feat/unmerged "$wt" >/dev/null
