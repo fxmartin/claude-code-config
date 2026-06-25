@@ -360,3 +360,298 @@ def test_empty_repo_yields_empty_plan(tmp_path):
     plan = plan_clean(root=root, db_path=db, registry=_registry(tmp_path))
     assert plan.candidates == []
     assert plan.total == 0
+
+
+# ---------------------------------------------------------------------------
+# CleanPlan kind properties / to_dict
+# ---------------------------------------------------------------------------
+
+
+def test_plan_kind_properties_partition_candidates(tmp_path):
+    """`.worktrees` / `.branches` / `.logs` filter candidates by kind."""
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    run_id = _new_run(db, status="DONE")
+    prefix = run_id.split("-")[0]
+
+    _make_feature_branch(root, "15.3-030")
+    _seed_story(db, run_id, "15.3-030", "DONE")
+    wt = _add_worktree(root, prefix, "15.3-030")
+    (Path(f"{db}.logs") / run_id).mkdir(parents=True)
+
+    plan = plan_clean(
+        root=root, db_path=db, registry=_registry(tmp_path),
+        gh_merged_fn=lambda branch, root: False,
+    )
+
+    assert {c.kind for c in plan.worktrees} == {"worktree"}
+    assert {c.kind for c in plan.branches} == {"branch"}
+    assert {c.kind for c in plan.logs} == {"logs"}
+    assert plan.total == len(plan.worktrees) + len(plan.branches) + len(plan.logs)
+    assert any(Path(c.path) == wt for c in plan.worktrees)
+    d = plan.to_dict()
+    assert d["total"] == plan.total and d["removed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Worktree edge cases: untracked debris, missing-on-disk, locked, cwd
+# ---------------------------------------------------------------------------
+
+
+def test_untracked_agent_dir_is_candidate_and_live_prefix_protected(tmp_path):
+    """An `agent-*` dir git no longer registers is reclaimable — unless live owns it."""
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    live_run = _new_run(db, status="IN_PROGRESS")
+    live_prefix = live_run.split("-")[0]
+
+    wt_dir = root / ".claude" / "worktrees"
+    wt_dir.mkdir(parents=True)
+    # Untracked, terminal-owned → candidate.
+    (wt_dir / "agent-deadbeef-15.3-031").mkdir()
+    # Untracked but owned by a live run prefix → protected.
+    (wt_dir / f"agent-{live_prefix}-15.3-032").mkdir()
+    # A non-agent dir and a stray file are ignored entirely.
+    (wt_dir / "not-an-agent").mkdir()
+    (wt_dir / "stray.txt").write_text("x", encoding="utf-8")
+
+    reg = _registry(tmp_path)
+    _register(reg, live_run, root, os.getpid(), finished=False)
+
+    plan = plan_clean(root=root, db_path=db, registry=reg)
+    wt_cand = {c.name for c in plan.candidates if c.kind == "worktree"}
+    wt_prot = {c.name for c in plan.protected if c.kind == "worktree"}
+    assert "agent-deadbeef-15.3-031" in wt_cand
+    assert f"agent-{live_prefix}-15.3-032" in wt_prot
+    assert "not-an-agent" not in wt_cand and "stray.txt" not in wt_cand
+
+
+def test_registered_worktree_missing_on_disk_is_candidate(tmp_path):
+    """A registered worktree whose directory vanished is reclaimable."""
+    import shutil as _shutil
+
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    run_id = _new_run(db, status="DONE")
+    prefix = run_id.split("-")[0]
+    wt = _add_worktree(root, prefix, "15.3-033")
+    _shutil.rmtree(wt)  # registration remains, directory is gone
+
+    plan = plan_clean(root=root, db_path=db, registry=_registry(tmp_path))
+    assert any(
+        c.kind == "worktree" and Path(c.path) == wt and "missing" in c.reason
+        for c in plan.candidates
+    )
+
+
+def test_locked_worktree_owned_by_live_run_is_protected(tmp_path):
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    run_id = _new_run(db, status="IN_PROGRESS")
+    prefix = run_id.split("-")[0]
+    wt = _add_worktree(root, prefix, "15.3-034")
+    _git(root, "worktree", "lock", str(wt))
+
+    reg = _registry(tmp_path)
+    _register(reg, run_id, root, os.getpid(), finished=False)
+
+    plan = plan_clean(root=root, db_path=db, registry=reg)
+    assert any(
+        c.kind == "worktree" and Path(c.path) == wt and "locked" in c.reason
+        for c in plan.protected
+    )
+
+
+def test_cwd_agent_worktree_is_protected(tmp_path, monkeypatch):
+    """An `agent-*` worktree that is the current working directory is spared."""
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    run_id = _new_run(db, status="DONE")  # terminal — would otherwise be a candidate
+    prefix = run_id.split("-")[0]
+    wt = _add_worktree(root, prefix, "15.3-035")
+
+    monkeypatch.chdir(wt)  # cwd == the worktree → "active worktree (main/cwd)"
+    plan = plan_clean(root=root, db_path=db, registry=_registry(tmp_path))
+    assert any(
+        c.kind == "worktree" and Path(c.path).name == wt.name and "cwd" in c.reason
+        for c in plan.protected
+    )
+
+
+# ---------------------------------------------------------------------------
+# Branch edge cases: current branch, default gh signal
+# ---------------------------------------------------------------------------
+
+
+def test_current_feature_branch_is_protected(tmp_path):
+    """The checked-out feature branch is never a candidate."""
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    run_id = _new_run(db, status="DONE")
+    _make_feature_branch(root, "15.3-036")
+    _seed_story(db, run_id, "15.3-036", "DONE")  # DONE, yet HEAD is on it
+    _git(root, "checkout", "-q", "feature/15.3-036")
+
+    plan = plan_clean(
+        root=root, db_path=db, registry=_registry(tmp_path),
+        gh_merged_fn=lambda branch, root: False,
+    )
+    assert all(c.name != "feature/15.3-036" for c in plan.candidates)
+    assert any(
+        c.kind == "branch" and c.name == "feature/15.3-036"
+        and c.reason == "current branch"
+        for c in plan.protected
+    )
+
+
+def test_default_gh_signal_used_when_ledger_not_done(tmp_path):
+    """With no ledger DONE, the real `gh` helper runs and (offline) protects the branch."""
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    _make_feature_branch(root, "15.3-037")  # no ledger row at all
+
+    # gh_merged_fn=None → the real _gh_branch_merged runs; no remote/PR → False.
+    plan = plan_clean(root=root, db_path=db, registry=_registry(tmp_path))
+    assert any(
+        c.kind == "branch" and c.name == "feature/15.3-037" for c in plan.protected
+    )
+
+
+def test_gh_branch_merged_handles_missing_gh(tmp_path, monkeypatch):
+    """The gh helper is best-effort: a missing/erroring binary yields False, never raises."""
+    root = _init_repo(tmp_path)
+
+    def _boom(*a, **k):
+        raise FileNotFoundError("gh not installed")
+
+    monkeypatch.setattr(clean_mod.subprocess, "run", _boom)
+    assert clean_mod._gh_branch_merged("feature/x", root) is False
+
+
+# ---------------------------------------------------------------------------
+# Helper degradation: a failing/erroring git never crashes clean
+# ---------------------------------------------------------------------------
+
+
+def _fake_proc(returncode: int, stdout: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(args=["git"], returncode=returncode, stdout=stdout, stderr="")
+
+
+def test_registered_worktrees_degrades_on_git_error(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
+    assert clean_mod._registered_worktrees(root) == []
+    # And on a non-zero return code.
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: _fake_proc(1))
+    assert clean_mod._registered_worktrees(root) == []
+
+
+def test_is_dirty_protects_when_status_cannot_run(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
+    assert clean_mod._is_dirty(root) is True  # un-inspectable → treat as dirty
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: _fake_proc(128))
+    assert clean_mod._is_dirty(root) is True
+
+
+def test_local_feature_branches_degrades_on_git_error(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
+    assert clean_mod._local_feature_branches(root) == []
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: _fake_proc(1))
+    assert clean_mod._local_feature_branches(root) == []
+
+
+def test_current_branch_degrades_on_git_error(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
+    assert clean_mod._current_branch(root) is None
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: _fake_proc(1))
+    assert clean_mod._current_branch(root) is None
+
+
+def test_delete_branch_degrades_on_git_error(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    monkeypatch.setattr(clean_mod, "_git", lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
+    assert clean_mod._delete_branch(root, "feature/x") is False
+
+
+def test_collect_logs_skips_files_and_survives_iterdir_error(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    logs_root = Path(f"{db}.logs")
+    logs_root.mkdir(parents=True)
+    (logs_root / "stray.txt").write_text("x", encoding="utf-8")  # a file, not a run dir
+
+    plan = plan_clean(root=root, db_path=db, registry=_registry(tmp_path))
+    assert all(c.kind != "logs" for c in plan.candidates)  # the file is ignored
+
+    # iterdir raising is swallowed (best-effort).
+    from sdlc.clean import _collect_logs, CleanPlan
+
+    def _boom(self):
+        raise OSError("denied")
+
+    monkeypatch.setattr(Path, "iterdir", _boom)
+    empty = CleanPlan(root=str(root))
+    _collect_logs(db, set(), empty)  # must not raise
+    assert empty.candidates == []
+
+
+# ---------------------------------------------------------------------------
+# --force failure handling: errors are recorded, never raised
+# ---------------------------------------------------------------------------
+
+
+def test_force_records_error_when_branch_removal_fails(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    run_id = _new_run(db, status="DONE")
+    _make_feature_branch(root, "15.3-038")
+    _seed_story(db, run_id, "15.3-038", "DONE")
+
+    monkeypatch.setattr(clean_mod, "_delete_branch", lambda root, branch: False)
+    plan = run_clean(
+        root=root, db_path=db, registry=_registry(tmp_path), force=True,
+        gh_merged_fn=lambda branch, root: False,
+    )
+    assert any(c.name == "feature/15.3-038" and not c.removed for c in plan.candidates)
+    assert any("feature/15.3-038" in e for e in plan.errors)
+
+
+def test_force_records_error_when_worktree_removal_raises(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    run_id = _new_run(db, status="DONE")
+    prefix = run_id.split("-")[0]
+    _add_worktree(root, prefix, "15.3-039")
+
+    def _boom(root, path):
+        raise OSError("cannot remove")
+
+    monkeypatch.setattr(clean_mod, "remove_story_worktree", _boom)
+    plan = run_clean(
+        root=root, db_path=db, registry=_registry(tmp_path), force=True,
+    )
+    assert plan.errors  # the OSError is captured, not propagated
+    assert any(not c.removed for c in plan.candidates if c.kind == "worktree")
+
+
+def test_finished_registered_run_is_not_treated_as_live(tmp_path):
+    """A registry record with finished_at set is terminal → its branch is reclaimable."""
+    root = _init_repo(tmp_path)
+    db = root / ".sdlc-state.db"
+    run_id = _new_run(db, status="DONE")
+    _make_feature_branch(root, "15.3-040")
+    _seed_story(db, run_id, "15.3-040", "DONE")
+
+    reg = _registry(tmp_path)
+    _register(reg, run_id, root, os.getpid(), finished=True)  # finished_at set
+
+    plan = plan_clean(
+        root=root, db_path=db, registry=reg,
+        gh_merged_fn=lambda branch, root: False,
+    )
+    assert any(
+        c.kind == "branch" and c.name == "feature/15.3-040" for c in plan.candidates
+    )
