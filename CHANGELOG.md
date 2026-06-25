@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.78.0] - 2026-06-25
+
+### Added
+
+- feat(agent-output-quality): wire a lightweight eval into (#18.1-003)
+
+
 ## [v1.77.0] - 2026-06-25
 
 ### Added
