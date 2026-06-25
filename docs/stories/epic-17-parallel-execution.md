@@ -1,6 +1,6 @@
 # Epic 17: True Parallel Story Execution
 
-> **Status: PLANNED** — created 2026-06-20 from a live post-mortem of the epic-11 run: the
+> **Status: COMPLETE (5/5)** — all stories merged on `main` (PRs #161-#165); validated end-to-end by the epic-13 parallel run (4 concurrent agents). Created 2026-06-20 from a live post-mortem of the epic-11 run: the
 > controller computes dependency cohorts but the executor runs stories **strictly one at a time**.
 > `mode=parallel` is a label written to the ledger, never acted on. This epic makes the executor
 > actually run a cohort's stories concurrently, with the isolation and concurrency-safety that

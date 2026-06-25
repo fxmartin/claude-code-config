@@ -1,6 +1,6 @@
 # Epic 12: Controller Robustness & Failure Recovery
 
-> **Status: PLANNED** — created 2026-06-20 from [issue #72](https://github.com/fxmartin/claude-code-config/issues/72),
+> **Status: COMPLETE (12/12)** — all 12 stories merged on `main` (PRs through #98). Created 2026-06-20 from [issue #72](https://github.com/fxmartin/claude-code-config/issues/72),
 > a post-mortem of the `sdlc build epic-10` run (ledger run `a07a1855`). Distinct from
 > Epic-10 (which *completed the stub CLI verbs*) and Epic-11 (realtime/multi-run
 > *observability*): this epic makes the controller **resilient** — it should not strand
