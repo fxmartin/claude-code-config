@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.73.0] - 2026-06-25
+
+### Added
+
+- feat(operability-self-service): `sdlc status --markdown` (#15.1-002)
+
+
 ## [v1.72.0] - 2026-06-25
 
 ### Added
