@@ -410,14 +410,26 @@ def status(
     as_json: bool = typer.Option(
         False, "--json", help="Emit a machine-readable JSON snapshot."
     ),
+    markdown: bool = typer.Option(
+        False,
+        "--markdown",
+        help="Emit a portable, secret-free markdown handoff (readiness + run + approvals).",
+    ),
+    write: Path | None = typer.Option(
+        None,
+        "--write",
+        help="With --markdown, write the report to this file instead of stdout.",
+    ),
 ) -> None:
     """Show the progress of a build run from the SQLite ledger.
 
     Reads the ledger **read-only** (safe to poll while a build is writing) and
     prints a run summary, a per-story table, and the most recent events. With
     ``--json`` it emits one object so the build-stories skill can poll it and
-    report progress. When there is no ledger or no run yet it says so and exits
-    0 — absence means "not started", not an error.
+    report progress. With ``--markdown`` (optionally ``--write <file>``) it emits
+    a portable handoff a colleague can paste into an issue or chat. When there is
+    no ledger or no run yet it says so and exits 0 — absence means "not started",
+    not an error.
     """
     from sdlc.build import Ledger, status_snapshot
     from sdlc.ledger_view import default_db_path
@@ -429,6 +441,21 @@ def status(
     # No-op when the DB does not exist — absence stays "not started".
     ledger.ensure_migrated()
     snap = status_snapshot(ledger, run)
+
+    # The markdown handoff (Story 15.1-002) renders even with no run — readiness
+    # and "no active run" are exactly what a colleague needs to share.
+    if markdown:
+        from sdlc.doctor import run_doctor
+        from sdlc.status import format_markdown
+
+        report = run_doctor(db_path=db_path)
+        md = format_markdown(snap, report.to_dict())
+        if write is not None:
+            write.write_text(md, encoding="utf-8")
+            typer.echo(f"wrote status handoff to {write}")
+        else:
+            typer.echo(md, nl=False)
+        raise typer.Exit(code=0)
 
     if snap["run"] is None:
         if as_json:
