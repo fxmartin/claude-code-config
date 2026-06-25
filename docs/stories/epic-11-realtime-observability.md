@@ -1,6 +1,6 @@
 # Epic 11: Realtime Progress & Multi-Run Observability
 
-> **Status: IN PROGRESS (8/13 shipped)** — created 2026-06-20. The original 8 stories merged
+> **Status: COMPLETE (17/17)** — created 2026-06-20; all stories merged on `main` (PRs #78-#83 + dashboard batch through #154). The original 8 stories merged
 > (released through v1.34.0): 11.1-001 (#78), 11.1-002 (#80), 11.1-003 (#81), 11.2-001 (#79),
 > 11.2-004 (#82), 11.2-005 (#83); 11.2-002 and 11.2-003 were stranded `NEEDS_ATTENTION` by a
 > malformed result envelope, then recovered (committed work preserved — R10) and merged directly

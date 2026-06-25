@@ -1,6 +1,6 @@
 # Epic 13: Agent Runtime Security Hardening
 
-> **Status: PLANNED** — created 2026-06-20. Inspired by the threat model in the external
+> **Status: COMPLETE (5/5)** — all stories merged on `main` (PRs #167-#171), built in parallel run 4fed56b0. Created 2026-06-20. Inspired by the threat model in the external
 > [affaan-m/ECC](https://github.com/affaan-m/ECC) `the-security-guide.md`. Distinct from
 > Epic-09 (which scans the *target code* via SAST/OSV/gitleaks): this epic hardens the
 > **agent harness itself** — the controller that dispatches headless agents with

@@ -1,6 +1,6 @@
 # Epic 14: Cost & Model Governance
 
-> **Status: PLANNED** — created 2026-06-20; revised 2026-06-20 for the **Claude Max subscription**
+> **Status: COMPLETE (6/6)** — all stories merged on `main` (PRs through #114). Created 2026-06-20; revised 2026-06-20 for the **Claude Max subscription**
 > billing model. Inspired by the token-economics patterns in the external
 > [affaan-m/ECC](https://github.com/affaan-m/ECC) `the-longform-guide.md` (model selection by task,
 > thinking-token caps, early compaction). Distinct from Epic-11, which makes cost *observable*:
