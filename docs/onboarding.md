@@ -87,6 +87,11 @@ The installer is **modal** — pick one or more of these flags. Order does not m
 | `--dry-run` | Prints every action it WOULD take, mutates nothing | — |
 | `--uninstall` | Removes the `--core` symlinks (other modes untouched) | `~/.claude/` |
 
+> **Drifted install?** If the `--core` symlinks later go missing or point at the
+> wrong place, you don't need a full reinstall — run `sdlc repair --dry-run` to
+> preview, then `sdlc repair` to restore them idempotently (it never touches
+> files outside the managed set). See `controller/README.md`.
+
 Recommended for the pilot:
 
 ```bash

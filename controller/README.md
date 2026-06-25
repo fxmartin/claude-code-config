@@ -40,8 +40,9 @@ sdlc --help       # lists every planned subcommand
 | `state`    | Inspect the persisted state machine for a run.       |
 | `validate` | Validate an agent response against its JSON schema.  |
 | `rollback` | Roll a run back to a prior ledger checkpoint.        |
+| `repair`   | Restore the framework's managed symlinks/config (`--dry-run` to preview). |
 
-`build`, `status`, `dashboard`, and `validate` are implemented. The remaining
+`build`, `status`, `dashboard`, `repair`, and `validate` are implemented. The remaining
 subcommands (`init`, `resume`, `state`, `rollback`) are stubs at this stage; they
 print a "not yet implemented" notice and exit cleanly.
 
@@ -71,6 +72,26 @@ past runs** (the ledger is per-repo, with token/cost per run) so you can click a
 run to inspect it; "● Live" follows the newest. The **header names the GitHub
 project** (`owner/repo`, linked). Binds **localhost only** by default
 (`--host`/`--port`/`--run` to override). Runs until Ctrl-C.
+
+## Repairing a drifted install
+
+If `~/.claude` symlinks go missing or point at the wrong place (a partial
+install, a moved clone, a half-applied upgrade), `sdlc repair` restores the
+framework's managed set — `CLAUDE.md`, `agents/`, `commands/`, `settings.json`,
+`statusline-command.sh`, `keybindings.json`, `reference-docs/`, `docs/`,
+`skills/`, `hooks/`, and the plugin marketplace link — without a full reinstall:
+
+```bash
+sdlc repair --dry-run   # preview what would be restored; changes nothing
+sdlc repair             # restore missing/drifted symlinks idempotently
+```
+
+It mirrors `install.sh --core`'s managed set exactly and is safe to re-run: a
+healthy install is a no-op, nothing outside the managed set is touched, and a
+real file occupying a managed slot is **moved** into `~/.claude/backups/`
+(never deleted) before the symlink is recreated. `--root`/`--claude-dir`
+override the repo root and config dir for non-default layouts. Full
+install/uninstall remains `install.sh`'s job.
 
 ## Agent I/O contracts (Story 7.2-001)
 
