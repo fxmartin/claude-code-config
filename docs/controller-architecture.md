@@ -25,6 +25,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/rollback.py` | Returns a run to a prior checkpoint by resetting the later stories (Story 10.2-001). |
 | `sdlc/reconcile.py` | Verifies parked stories against `origin/main` and recomputes the run terminal — shared by close-out and `sdlc reconcile` (Stories 12.3-001/12.3-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
+| `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 
 ## The state machine
 
@@ -465,6 +466,41 @@ longer shows FAILED days after the work actually shipped.
 - **Clean absence.** No ledger / no runs reports cleanly and never materialises a
   spurious empty ledger; only a genuinely-unknown *explicit* run id exits
   non-zero (CLI exit 2).
+
+## Clean (workspace garbage collection)
+
+`sdlc clean` makes build-leftover cleanup a safe, repeatable verb instead of a
+manual `git worktree`/`git branch` ritual. It promotes the orphan-worktree sweep
+(`hooks/sweep-orphan-worktrees.sh`) and the merged-worktree teardown into a
+first-class controller command and pairs with `sdlc doctor` (15.1-001 *detects*
+the cruft → `clean` *fixes* it).
+
+- **`sdlc clean [--force/--yes] [--db PATH] [--json]`** (`sdlc/cli.py` →
+  `clean.run_clean`). **Dry-run by default**: it reports what it *would* remove
+  and removes nothing until `--force`/`--yes` is passed.
+- **Three classes of cruft** (`clean.plan_clean`):
+  - **Orphan `agent-*` worktrees** — a registered worktree under
+    `.claude/worktrees/` is reclaimable only when it is **not dirty** and its
+    owning run is terminal or its pid is dead; untracked `agent-*` debris dirs a
+    crash left behind are swept too. The main worktree and the cwd are always
+    spared.
+  - **Squash-merged `feature/<id>` branches** — "merged" is decided by the
+    ledger (`status=DONE`) **and** the PR's merge state (`gh pr list --head … --state
+    merged`), **not** `git branch --merged`, which misreports squash-merged
+    branches as unmerged (the observed 0-of-18 case). Deletion is via
+    `git branch -D`, so the tip stays reachable via reflog (recoverable).
+  - **Stale transcript logs** — `.sdlc-state.db.logs/<run_id>/` dirs whose run is
+    terminal; a live run's transcripts are kept.
+- **Safe beside a live build.** Every candidate is cross-checked against the host
+  run registry + a live-pid probe (`registry.pid_alive`): a worktree or branch an
+  `IN_PROGRESS` run owns — here or in another session/clone sharing this repo path
+  — is never touched. This registry-awareness is the differentiator over the blunt
+  hook sweeper. A crashed run (ledger still `IN_PROGRESS` but dead pid) is *not*
+  live, so its leftovers are reclaimable.
+- **Never mutates the remote.** `clean` only reads git, the ledger, the registry,
+  and a read-only `gh pr list`; it never pushes or fetches. Each removal is logged
+  to stdout; `--json` emits the full `{candidates, protected, errors}` plan. Exits
+  0.
 
 ## The run registry (cross-repo discovery)
 
