@@ -667,3 +667,101 @@ def test_resume_registry_io_error_is_swallowed(tmp_path: Path) -> None:
     )
 
     assert result.completed == 2  # resume returns its normal result despite IO error
+
+
+# --- 19.1-001: composite (multi-scope) resume ------------------------------
+
+_EPIC_34_MINI = """# Epic 34
+
+##### Story 34.1-001: Alpha
+**Priority**: P1
+**Points**: 1
+**Dependencies**: None.
+"""
+
+
+def _make_composite_project(tmp_path: Path) -> Path:
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-99-sample.md").write_text(_SAMPLE_EPIC, encoding="utf-8")
+    (stories / "epic-34-mini.md").write_text(_EPIC_34_MINI, encoding="utf-8")
+    return tmp_path
+
+
+def _seed_composite_interrupted(db_path: Path) -> str:
+    """A composite run over epic-34 + epic-99, scope stored canonically.
+
+    34.1-001 + 99.1-001 fully DONE; 99.1-002 interrupted mid-review. The run is
+    left IN_PROGRESS with the canonical (sorted) scope a real build would persist.
+    """
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("epic-34,epic-99", "serial")
+    ledger.set_total(run_id, 3)
+    ledger.event_log(
+        run_id, "", "info", "config",
+        json.dumps({"skip_coverage": True, "coverage_threshold": 90}),
+    )
+    ledger.story_upsert(run_id, "34.1-001", "34", "Alpha", "P1", 1, "general-purpose", "", None, "TODO")
+    ledger.story_upsert(run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO")
+    ledger.story_upsert(run_id, "99.1-002", "99", "Two", "P2", 2, "general-purpose", "", None, "TODO")
+    for sid in ("34.1-001", "99.1-001"):
+        for stage in ("build", "review", "merge"):
+            ledger.stage_start(run_id, sid, stage, 1)
+            ledger.stage_finish(run_id, sid, stage, 1, "DONE")
+        ledger.set_story_status(run_id, sid, "DONE")
+    ledger.stage_start(run_id, "99.1-002", "build", 1)
+    ledger.stage_finish(run_id, "99.1-002", "build", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-002", "review", 1)  # left IN_PROGRESS
+    ledger.set_story_status(run_id, "99.1-002", "IN_PROGRESS")
+    return run_id
+
+
+def test_latest_resumable_run_matches_composite_scope_any_order(tmp_path: Path) -> None:
+    """AC5: a composite run is found regardless of scope token order/form."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_composite_interrupted(db)
+    assert Ledger(db).latest_resumable_run("epic-34,epic-99") == run_id
+    assert Ledger(db).latest_resumable_run("epic-99,epic-34") == run_id  # reversed
+    assert Ledger(db).latest_resumable_run("epic-99 epic-34") == run_id  # spaced
+    # A single sub-scope is not the composite run.
+    assert Ledger(db).latest_resumable_run("epic-99") is None
+
+
+def test_resume_composite_scope_order_independent(tmp_path: Path) -> None:
+    """AC5: `resume` over the same epics in any order resumes the same run."""
+    _make_composite_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_composite_interrupted(db)
+
+    result = run_resume(
+        "epic-99 epic-34",  # opposite order + space form of the stored scope
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        root=tmp_path,
+    )
+
+    assert result.run_id == run_id          # same run, order-independent
+    assert result.nothing_to_resume is False
+    assert result.completed == 3            # all three stories end DONE
+    assert result.resumed == 1              # only 99.1-002 was re-run
+
+
+def test_resume_cli_accepts_multiple_positionals(tmp_path: Path, monkeypatch) -> None:
+    """AC5: the `resume` command accepts several positionals and canonicalises
+    them into one label before resolving the run."""
+    import sdlc.resume as resume_mod
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    captured: dict[str, str] = {}
+
+    def _fake_run_resume(scope, **kwargs):
+        captured["scope"] = scope
+        return ResumeResult(run_id=None, nothing_to_resume=True)
+
+    monkeypatch.setattr(resume_mod, "run_resume", _fake_run_resume)
+    result = CliRunner().invoke(app, ["resume", "epic-18", "epic-15"])
+    assert result.exit_code == 0, result.output
+    assert captured["scope"] == "epic-15,epic-18"

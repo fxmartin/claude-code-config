@@ -115,13 +115,15 @@ def _open_db(db: Path) -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# build.py — parse_build_args: second positional argument raises (line 148)
+# build.py — parse_build_args: extra positionals fold into a canonical scope
 # ---------------------------------------------------------------------------
 
-def test_parse_build_args_rejects_second_positional() -> None:
-    """Two bare positional tokens is an error — only one scope is allowed."""
-    with pytest.raises(ValueError, match="unexpected positional"):
-        parse_build_args(["epic-07", "extra"])
+def test_parse_build_args_accepts_second_positional() -> None:
+    """Story 19.1-001: a second bare positional is no longer an error — every
+    positional is collected and folded into one canonical (sorted, deduped,
+    comma-joined) scope label."""
+    opts = parse_build_args(["epic-07", "extra"])
+    assert opts.scope == "epic-07,extra"
 
 
 # ---------------------------------------------------------------------------

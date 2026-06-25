@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from sdlc.cohort import Story
@@ -29,6 +30,9 @@ _STATUS = re.compile(r"^\*\*Status\*\*:\s*(.+?)\s*$")
 _DOD_BOX = re.compile(r"^\s*-\s*\[([ xX])\]")
 # A bare scope that names exactly one story, e.g. `34.5-003`.
 _STORY_ID_SCOPE = re.compile(r"^[0-9]+\.[0-9]+-[0-9]+$")
+# Scope tokens are separated by commas and/or whitespace (`epic-15,epic-18` or
+# `epic-15 epic-18`) so both forms a user can type resolve identically.
+_SCOPE_SEP = re.compile(r"[,\s]+")
 # The numeric epic id embedded in an `epic-34-*.md` / `epic-07-*.md` filename.
 _EPIC_FILE_NUM = re.compile(r"^epic-0*([0-9]+)")
 
@@ -180,13 +184,84 @@ def _story_dir(root: Path) -> Path | None:
     return None
 
 
+def _split_scope(scope: str) -> list[str]:
+    """Split a (possibly composite) scope string into its individual tokens.
+
+    Tokens may be comma- and/or whitespace-separated; empty fragments are
+    dropped. ``"epic-15,epic-18"`` and ``"epic-15 epic-18"`` both yield
+    ``["epic-15", "epic-18"]``.
+    """
+    return [t for t in _SCOPE_SEP.split(scope.strip()) if t]
+
+
+def canonical_scope(scope: str | Iterable[str]) -> str:
+    """Normalise one or more scope tokens into a single canonical label.
+
+    Accepts a raw string (which may itself be comma-/space-separated) or an
+    iterable of tokens, and returns a lowercased, deduped, sorted, comma-joined
+    label — the form persisted in the ledger/registry and matched on resume so a
+    composite run resolves regardless of the order its scopes were typed (Story
+    19.1-001). ``all`` (alone or mixed with explicit epics) collapses to ``all``
+    since it already covers every epic; an empty input defaults to ``all``.
+    """
+    raw: list[str] = [scope] if isinstance(scope, str) else list(scope)
+    tokens = [t.lower() for item in raw for t in _split_scope(item)]
+    if not tokens:
+        return "all"
+    if "all" in tokens:
+        return "all"
+    return ",".join(sorted(set(tokens)))
+
+
+def _resolve_scope_token(token: str, epic_files: list[Path]) -> list[Story]:
+    """Resolve a single scope token to its stories (the pre-19.1-001 behaviour).
+
+    ``token`` is ``all`` (every epic), ``epic-NN`` (one epic by number), a bare
+    epic name substring, or a single story id ``X.Y-NNN`` (resolved to its epic
+    by the leading major number, returning only that story).
+    """
+    token = token.strip()
+
+    # Single-story scope: find the epic by major number and return just that story.
+    if _STORY_ID_SCOPE.match(token):
+        major = int(token.split(".", 1)[0])
+        for epic in epic_files:
+            m = _EPIC_FILE_NUM.match(epic.stem.lower())
+            if m and int(m.group(1)) == major:
+                for story in parse_epic_file(epic):
+                    if story.id == token:
+                        return [story]
+        return []
+
+    selected: list[Path] = []
+    token_l = token.lower()
+    for epic in epic_files:
+        if token_l == "all":
+            selected.append(epic)
+        elif token_l.startswith("epic-"):
+            # Match epic-07 against epic-07-external-controller.md.
+            number = token_l.split("-", 1)[1]
+            if epic.stem.lower().startswith(f"epic-{number}"):
+                selected.append(epic)
+        elif token_l and token_l in epic.stem.lower():
+            selected.append(epic)
+
+    stories: list[Story] = []
+    for epic in selected:
+        stories.extend(parse_epic_file(epic))
+    return stories
+
+
 def discover_queue(scope: str, root: Path | None = None) -> list[Story]:
     """Build the story queue for ``scope`` from the markdown epic files.
 
-    ``scope`` accepts ``all`` (every epic), ``epic-NN`` (one epic by number), a
-    bare epic name, or a single story id ``X.Y-NNN`` (resolved to its epic by the
-    leading major number, returning only that story). Returns an empty queue when
-    nothing matches — the caller decides whether that is an error.
+    ``scope`` accepts one *or several* tokens (comma-/space-separated): ``all``
+    (every epic), ``epic-NN`` (one epic by number), a bare epic name, or a single
+    story id ``X.Y-NNN`` (resolved to its epic by the leading major number,
+    returning only that story). Multiple tokens are resolved independently and
+    unioned, deduped by ``Story.id`` with first-seen order preserved (Story
+    19.1-001); ``all`` anywhere in the list resolves to every epic. Returns an
+    empty queue when nothing matches — the caller decides whether that is an error.
     """
     root = root or Path.cwd()
     story_dir = _story_dir(root)
@@ -195,32 +270,15 @@ def discover_queue(scope: str, root: Path | None = None) -> list[Story]:
 
     epic_files = sorted(story_dir.glob("epic-*.md"))
 
-    # Single-story scope: find the epic by major number and return just that story.
-    if _STORY_ID_SCOPE.match(scope.strip()):
-        target = scope.strip()
-        major = int(target.split(".", 1)[0])
-        for epic in epic_files:
-            m = _EPIC_FILE_NUM.match(epic.stem.lower())
-            if m and int(m.group(1)) == major:
-                for story in parse_epic_file(epic):
-                    if story.id == target:
-                        return [story]
-        return []
-
-    selected: list[Path] = []
-    scope_l = scope.lower()
-    for epic in epic_files:
-        if scope_l == "all":
-            selected.append(epic)
-        elif scope_l.startswith("epic-"):
-            # Match epic-07 against epic-07-external-controller.md.
-            number = scope_l.split("-", 1)[1]
-            if epic.stem.lower().startswith(f"epic-{number}"):
-                selected.append(epic)
-        elif scope_l in epic.stem.lower():
-            selected.append(epic)
+    tokens = _split_scope(scope)
+    if any(t.lower() == "all" for t in tokens):
+        tokens = ["all"]
 
     queue: list[Story] = []
-    for epic in selected:
-        queue.extend(parse_epic_file(epic))
+    seen: set[str] = set()
+    for token in tokens:
+        for story in _resolve_scope_token(token, epic_files):
+            if story.id not in seen:
+                seen.add(story.id)
+                queue.append(story)
     return queue

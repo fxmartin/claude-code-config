@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from sdlc.cohort import compute_cohorts
-from sdlc.discovery import discover_queue, parse_epic_file
+from sdlc.discovery import canonical_scope, discover_queue, parse_epic_file
 
 _SAMPLE_EPIC = """# Epic 99: Sample
 
@@ -324,3 +324,79 @@ def test_discover_queue_without_story_dir_returns_empty(tmp_path, monkeypatch) -
     """No docs/stories or stories directory under root → empty queue, no error."""
     monkeypatch.chdir(tmp_path)
     assert discover_queue("all") == []
+
+
+# --- 19.1-001: multiple explicit epic/story scopes --------------------------
+
+
+def _write_two_epics(tmp_path):
+    """epic-99 (two stories) + epic-34 (three stories) in docs/stories."""
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-99-sample.md").write_text(_SAMPLE_EPIC, encoding="utf-8")
+    (stories / "epic-34-user-management.md").write_text(_EPIC_34_LIKE, encoding="utf-8")
+    return stories
+
+
+def test_discover_queue_unions_multiple_epics(tmp_path, monkeypatch) -> None:
+    """AC1: `epic-99,epic-34` is the union of both epics' stories."""
+    _write_two_epics(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    queue = discover_queue("epic-99,epic-34")
+    assert {s.id for s in queue} == {
+        "99.1-001", "99.1-002", "34.1-001", "34.2-001", "34.5-003",
+    }
+
+
+def test_discover_queue_space_separated_scopes(tmp_path, monkeypatch) -> None:
+    """AC2: space-separated tokens resolve the same as comma-separated."""
+    _write_two_epics(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert {s.id for s in discover_queue("epic-99 epic-34")} == {
+        s.id for s in discover_queue("epic-99,epic-34")
+    }
+
+
+def test_discover_queue_dedups_overlapping_scopes(tmp_path, monkeypatch) -> None:
+    """AC1: an epic + a story already in it dedups by story id, order preserved."""
+    _write_two_epics(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    queue = discover_queue("epic-99,99.1-001")
+    ids = [s.id for s in queue]
+    assert ids == ["99.1-001", "99.1-002"]  # no duplicate, epic order preserved
+
+
+def test_discover_queue_all_mixed_with_epic_yields_all(tmp_path, monkeypatch) -> None:
+    """AC3: `all` mixed with an explicit epic resolves to every epic."""
+    _write_two_epics(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    queue = discover_queue("all,epic-99")
+    assert {s.id for s in queue} == {
+        "99.1-001", "99.1-002", "34.1-001", "34.2-001", "34.5-003",
+    }
+
+
+def test_canonical_scope_sorts_dedups_and_lowercases() -> None:
+    """A composite label is lowercased, deduped, sorted, comma-joined."""
+    assert canonical_scope("Epic-18 epic-15") == "epic-15,epic-18"
+    assert canonical_scope("epic-18,epic-15,epic-18") == "epic-15,epic-18"
+    assert canonical_scope(["epic-18", "epic-15"]) == "epic-15,epic-18"
+
+
+def test_canonical_scope_order_independent() -> None:
+    """AC5: any token order maps to the same canonical label."""
+    assert canonical_scope("epic-18 epic-15") == canonical_scope("epic-15 epic-18")
+
+
+def test_canonical_scope_all_collapses() -> None:
+    """AC3: `all` (alone or mixed) collapses to `all`; empty defaults to `all`."""
+    assert canonical_scope("all") == "all"
+    assert canonical_scope("epic-99 all epic-34") == "all"
+    assert canonical_scope("") == "all"
+    assert canonical_scope([]) == "all"
+
+
+def test_canonical_scope_single_scope_unchanged() -> None:
+    """A single scope round-trips to its lowercased self (backward compatible)."""
+    assert canonical_scope("epic-99") == "epic-99"
+    assert canonical_scope("34.5-003") == "34.5-003"

@@ -75,11 +75,14 @@ def main(
 
 _BUILD_EPILOG = """\
 \b
-Scope (first positional, default `all`):
+Scope (positional, default `all`):
   all              every epic
   epic-NN          one epic by number, e.g. epic-34
   <name>           epic-name substring, e.g. user-management
   X.Y-NNN          a single story, e.g. 34.5-003
+  epic-A epic-B    several scopes (space- or comma-separated, any order) build the
+                   union of their incomplete stories in one run, e.g.
+                   `epic-15 epic-18` or `epic-15,epic-18`; `all` mixed in wins
 
 \b
 Flags:
@@ -262,9 +265,11 @@ def build(ctx: typer.Context) -> None:
 
 @app.command(help=PLANNED_SUBCOMMANDS["resume"])
 def resume(
-    scope: str = typer.Argument(
-        "all",
-        help="Scope of the run to resume: all, epic-NN, an epic name, or X.Y-NNN.",
+    scope: list[str] | None = typer.Argument(
+        None,
+        help="Scope(s) of the run to resume: all, epic-NN, an epic name, or "
+        "X.Y-NNN. Several scopes (space- or comma-separated, any order) resume a "
+        "composite run; default all.",
     ),
     run: str | None = typer.Option(
         None,
@@ -314,8 +319,14 @@ def resume(
     continue.
     """
     from sdlc.build import _parse_budget_value
+    from sdlc.discovery import canonical_scope
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
     from sdlc.resume import run_resume
+
+    # Story 19.1-001: fold the (possibly several) positional scopes into one
+    # canonical label so a composite run resumes in any order; no positional
+    # defaults to `all`, exactly as before.
+    scope_label = canonical_scope(scope or ["all"])
 
     budget_tokens: int | None = None
     if budget is not None:
@@ -343,7 +354,7 @@ def resume(
     # Migrate a pre-existing (possibly stale) ledger before resume reads it.
     ledger.ensure_migrated()
     result = run_resume(
-        scope,
+        scope_label,
         ledger=ledger,
         run_id=run,
         render_view=make_render_view(db_path),
@@ -355,7 +366,7 @@ def resume(
 
     if result.nothing_to_resume:
         if result.run_id is None:
-            typer.echo(f"nothing to resume: no incomplete run for scope '{scope}'.")
+            typer.echo(f"nothing to resume: no incomplete run for scope '{scope_label}'.")
         else:
             typer.echo(
                 f"nothing to resume: run {result.run_id[:8]} has no incomplete stories."

@@ -33,6 +33,7 @@ from sdlc.contracts import (
     ContractError,
 )
 from sdlc.cost_estimate import StageEstimate, estimate_stage
+from sdlc.discovery import canonical_scope
 from sdlc.doc_currency import doc_currency_enabled
 from sdlc.dispatch import (
     AgentDispatchError,
@@ -860,14 +861,17 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
     """Parse the `sdlc build` argument vector into :class:`BuildOptions`.
 
     Accepts the exact flags the skill documents:
-    ``[scope] [--dry-run] [--auto] [--skip-coverage] [--limit=N]
+    ``[scope...] [--dry-run] [--auto] [--skip-coverage] [--limit=N]
     [--sequential] [--concurrency=N] [--coverage-threshold=N] [--skip-preflight]
-    [--rebuild] [--preflight-timeout=SEC]``. ``scope`` is ``all``, ``epic-NN``, an epic
-    name, or a single story id ``X.Y-NNN`` (default ``all``). Unknown flags
-    raise :class:`ValueError` so a typo never silently changes behaviour.
+    [--rebuild] [--preflight-timeout=SEC]``. Each ``scope`` is ``all``,
+    ``epic-NN``, an epic name, or a single story id ``X.Y-NNN`` (default ``all``).
+    Several scopes may be given (space- or comma-separated); they are collapsed
+    into one canonical, sorted, deduped label so a composite run resolves and
+    resumes regardless of the order they were typed (Story 19.1-001). Unknown
+    flags raise :class:`ValueError` so a typo never silently changes behaviour.
     """
     opts = BuildOptions()
-    scope_set = False
+    scopes: list[str] = []
     for arg in args:
         if arg in _BOOL_FLAGS:
             setattr(opts, _BOOL_FLAGS[arg], True)
@@ -947,11 +951,15 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
             opts.model_overrides[stage] = model
         elif arg.startswith("--"):
             raise ValueError(f"unknown flag: {arg}")
-        elif not scope_set:
-            opts.scope = arg
-            scope_set = True
         else:
-            raise ValueError(f"unexpected positional argument: {arg}")
+            # Story 19.1-001: collect every positional as a scope token instead of
+            # rejecting the second. They are canonicalised below into one label.
+            scopes.append(arg)
+    # Story 19.1-001: fold all positionals into one canonical scope label (sorted,
+    # deduped, lowercased, comma-joined). No positional → the BuildOptions default
+    # (`all`) is left untouched so the single-scope and `all` paths are unchanged.
+    if scopes:
+        opts.scope = canonical_scope(scopes)
     return opts
 
 
@@ -1397,6 +1405,11 @@ class Ledger:
         """
         if not self.db_path.exists():
             return None
+        # Story 19.1-001: a composite scope is stored as a canonical (sorted,
+        # deduped) label, so canonicalise the lookup key too — `epic-18 epic-15`
+        # and `epic-15,epic-18` then exact-match the same run, order-independent.
+        if scope is not None:
+            scope = canonical_scope(scope)
         with self._connect_ro() as conn:
             if scope and scope.lower() != "all":
                 row = conn.execute(

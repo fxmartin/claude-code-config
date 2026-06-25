@@ -199,3 +199,62 @@ def test_build_reports_budget_stop_with_notional_label(tmp_path, monkeypatch) ->
     assert "budget ceiling crossed" in result.output
     assert "12345 tokens accrued" in result.output
     assert "not billed on subscription" in result.output
+
+
+# --- 19.1-001: multiple explicit epic/story scopes --------------------------
+
+_SAMPLE_EPIC_34 = """# Epic 34
+
+##### Story 34.1-001: Alpha
+**Priority**: P1
+**Points**: 1
+**Dependencies**: None.
+"""
+
+
+def _make_two_epic_project(tmp_path):
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-99-sample.md").write_text(_SAMPLE_EPIC, encoding="utf-8")
+    (stories / "epic-34-other.md").write_text(_SAMPLE_EPIC_34, encoding="utf-8")
+    return tmp_path
+
+
+def test_build_multi_positional_scopes_dry_run(tmp_path, monkeypatch) -> None:
+    """AC1: `build epic-99 epic-34` plans the union of both epics' stories."""
+    _make_two_epic_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "epic-99", "epic-34", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "3 stories" in result.output  # 2 from epic-99 + 1 from epic-34
+
+
+def test_build_comma_separated_scopes_dry_run(tmp_path, monkeypatch) -> None:
+    """AC2: a single comma-separated token resolves the same union."""
+    _make_two_epic_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "epic-99,epic-34", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "3 stories" in result.output
+
+
+def test_parse_build_args_collects_canonical_multi_scope() -> None:
+    """AC2/AC4: multiple positionals become one sorted, deduped canonical label."""
+    from sdlc.build import parse_build_args
+
+    opts = parse_build_args(["epic-18", "epic-15", "--dry-run"])
+    assert opts.scope == "epic-15,epic-18"
+    assert opts.dry_run is True
+    # comma form and reversed order both canonicalise identically
+    assert parse_build_args(["epic-15,epic-18"]).scope == "epic-15,epic-18"
+    assert parse_build_args(["epic-18", "epic-15"]).scope == "epic-15,epic-18"
+    # a single scope is unchanged (backward compatible)
+    assert parse_build_args(["epic-99"]).scope == "epic-99"
+    assert parse_build_args([]).scope == "all"
+
+
+def test_build_help_documents_multi_scope() -> None:
+    """AC3: the build epilog documents the multi-scope form (incl. `all` mixing)."""
+    from sdlc.cli import _BUILD_EPILOG
+
+    assert "epic-A epic-B" in _BUILD_EPILOG or "epic-15 epic-18" in _BUILD_EPILOG
