@@ -783,6 +783,7 @@ def _dispatch_cohort(
     *,
     max_workers: int,
     run_one: Callable[[Story], _StoryRunOutcome],
+    on_terminal: Callable[[Story, str], None] | None = None,
 ) -> list[_StoryDispatch]:
     """Drive a cohort's ready stories through a bounded thread pool (Story 17.1-001).
 
@@ -799,16 +800,29 @@ def _dispatch_cohort(
     other workers run to completion (failure isolation, AC4). ``_CostGatePause``
     — a deliberate run-level pause signal — is captured separately so the caller
     can halt the run after the barrier, exactly as the serial path does.
+
+    Story 19.2-002: ``on_terminal(story, status)`` — when supplied — fires the
+    instant a worker reaches a *terminal* outcome (a non-parked status, or an
+    unexpected raise → ``FAILED``), so the caller can persist that story's status
+    live rather than waiting for the barrier. A parked outcome is a resumable
+    run-pause, not a terminal story state, so it is never credited here.
     """
     results = {story.id: _StoryDispatch(story=story) for story in dispatchable}
 
     def _worker(story: Story) -> None:
         try:
-            results[story.id].outcome = run_one(story)
+            outcome = run_one(story)
         except _CostGatePause as gate:
             results[story.id].cost_gate = gate
+            return
         except Exception as exc:  # noqa: BLE001 — failure isolation (AC4)
             results[story.id].error = exc
+            if on_terminal is not None:
+                on_terminal(story, "FAILED")
+            return
+        results[story.id].outcome = outcome
+        if on_terminal is not None and not outcome.parked:
+            on_terminal(story, outcome.status or "FAILED")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(_worker, story) for story in dispatchable]
@@ -3044,6 +3058,16 @@ def run_build(
             rl_ctx, story, ledger, run_id, dispatch, logs_dir, workdir=workdir,
         )
 
+    # Story 19.2-002: credit a parallel story's terminal status the instant its
+    # worker finishes — not at the cohort barrier — so status_snapshot's derived
+    # done/total counts (and the dashboard's top bar) move live as each story
+    # completes. The post-barrier loop re-applies the same status as part of its
+    # control-flow bookkeeping; set_story_status is a by-value UPDATE on the
+    # single story row, so the repeat write can never double-count, keeping the
+    # barrier finalize idempotent. Serial mode never routes through here.
+    def _credit_terminal(story: Story, outcome_status: str) -> None:
+        ledger.set_story_status(run_id, story.id, outcome_status)
+
     workers = effective_concurrency(opts)
     for cohort in cohorts:
         if budget_stopped or rate_limit_park is not None or cost_gated is not None:
@@ -3156,7 +3180,8 @@ def run_build(
         # Apply outcomes in cohort (submission) order so the result is
         # deterministic regardless of which worker finished first.
         for result in _dispatch_cohort(
-            dispatchable, max_workers=workers, run_one=_run_one
+            dispatchable, max_workers=workers, run_one=_run_one,
+            on_terminal=_credit_terminal,
         ):
             story = result.story
             if result.cost_gate is not None:
