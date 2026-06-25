@@ -751,6 +751,34 @@ def test_dispatch_cohort_on_terminal_credits_each_outcome() -> None:
     assert dict(credited) == {"s-done": "DONE", "s-boom": "FAILED"}
 
 
+def test_dispatch_cohort_on_terminal_falls_back_to_failed_when_status_blank() -> None:
+    """A *non-parked* terminal outcome whose ``status`` is falsy (None/empty) is
+    credited ``FAILED`` via the ``outcome.status or "FAILED"`` fallback — distinct
+    from the unexpected-raise path, which also credits ``FAILED`` (Story 19.2-002).
+    A blank-status outcome is still a finished, non-resumable worker, so it must
+    be credited terminally rather than silently dropped."""
+    from sdlc.build import _dispatch_cohort, _StoryRunOutcome
+
+    blank = Story("s-blank", "Blank", "99", "sample", "epic-99.md", "P1", 1, "py", [])
+
+    def _run_one(story):
+        # Finished cleanly (not parked) but resolved no concrete status.
+        return _StoryRunOutcome(status=None, parked=False)
+
+    credited: list[tuple[str, str]] = []
+
+    def _on_terminal(story, status) -> None:
+        credited.append((story.id, status))
+
+    results = _dispatch_cohort(
+        [blank], max_workers=1, run_one=_run_one, on_terminal=_on_terminal,
+    )
+
+    assert results[0].outcome.parked is False
+    assert results[0].outcome.status is None
+    assert credited == [("s-blank", "FAILED")]  # fallback, not a dropped credit
+
+
 def test_dispatch_cohort_without_on_terminal_still_isolates_failures() -> None:
     """Default ``on_terminal=None``: a worker that raises is captured (failure
     isolation) and no callback path runs — the live-credit hook is opt-in
