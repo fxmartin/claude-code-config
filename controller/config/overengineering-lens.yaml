@@ -1,0 +1,27 @@
+# ABOUTME: Config for the over-engineering review lens (Story 18.2-001).
+# ABOUTME: Operationalizes CLAUDE.md's complexity-check inside the autonomous pipeline.
+#
+# The lens runs as a review *dimension* (not a new stage): on each story's diff
+# it asks an LLM for a structured delete-list of over-built code — speculative
+# abstractions, unused params/branches, hand-rolled code a stdlib/dep/one-liner
+# would cover, premature generality. The controller then applies the policy
+# below. Swapping the lens runtime is a config change here, not orchestrator code.
+#
+# The `command` template may use {pr_number}, {pr_url}, and {story_id}
+# placeholders; the controller substitutes them before invoking the lens.
+
+# Master switch. When false the lens never runs and behaviour is unchanged from
+# before this story (no extra quota spend, no findings, no PR comment).
+enabled: false
+
+# What the controller does with a non-empty delete-list:
+#   advisory (default):  record the delete-list as an advisory PR comment; never
+#                        block shipping. Safe to leave on in unattended batches.
+#   route_to_simplify:   hand the delete-list to the bounded bugfix loop so an
+#                        agent applies the cuts and the gates re-run.
+policy: advisory
+
+# Reviewer runtime. The wrapper fetches the PR diff, runs a simplify/roast-style
+# delete-list pass, and emits overengineering-lens-response.schema.json JSON.
+command: "overengineering-lens.sh --pr-number {pr_number}"
+timeout_sec: 300
