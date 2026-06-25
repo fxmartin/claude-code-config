@@ -587,6 +587,124 @@ def test_resume_parallel_rate_limit_park(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Story 19.2-002: live progress credits each parallel story as it finishes
+# ---------------------------------------------------------------------------
+
+class _GatedDispatcher:
+    """Lets one story complete fully while holding its siblings in their build
+    stage, so a test can observe a *mid-cohort* snapshot (Story 19.2-002).
+
+    A "slow" story blocks in its ``build`` stage on ``release`` — at which point
+    its row is IN_PROGRESS — until the test lifts the barrier. The "fast" story
+    runs all four stages straight through, so its worker reaches a terminal
+    outcome while the slow siblings are still in flight.
+    """
+
+    def __init__(self, slow_ids) -> None:
+        self.slow_ids = set(slow_ids)
+        self.release = threading.Event()
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.dispatch import AgentResult
+
+        sid = getattr(story, "id", "")
+        if sid in self.slow_ids and agent_type == "build":
+            # Hold the worker here (story is IN_PROGRESS) until the test releases.
+            self.release.wait(timeout=15)
+        return AgentResult(agent_type=agent_type, data=_payload(agent_type, story), raw="")
+
+
+def test_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> None:
+    """A parallel story that finishes first is credited DONE the instant its
+    worker completes — the done counter increments mid-cohort, while its siblings
+    are still IN_PROGRESS, not only at the cohort barrier (Story 19.2-002)."""
+    from sdlc.build import status_snapshot
+
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    queue = _independent(3)  # p0-001 (fast) + p1-001, p2-001 (held in build)
+    dispatcher = _GatedDispatcher(slow_ids=["p1-001", "p2-001"])
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, concurrency=5)
+
+    box: dict = {}
+
+    def _run() -> None:
+        box["result"] = run_build(
+            opts, queue=queue, ledger=ledger, dispatcher=dispatcher,
+            preflight=lambda: True,
+        )
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    try:
+        # Poll the live snapshot until the fast story is credited DONE while a
+        # sibling is still IN_PROGRESS — the proof the credit precedes the barrier.
+        observed = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            counts = status_snapshot(Ledger(db))["counts"]
+            if counts["done"] >= 1 and counts["in_progress"] >= 1:
+                observed = counts
+                break
+            time.sleep(0.02)
+        assert observed is not None, "no DONE credit before the cohort barrier"
+        assert observed["done"] >= 1
+        assert observed["in_progress"] >= 1  # siblings still mid-flight
+    finally:
+        dispatcher.release.set()
+        worker.join(timeout=20)
+
+    # Barrier finalize stays idempotent: final counts equal the per-story sum.
+    assert box["result"].completed == 3
+    final = status_snapshot(Ledger(db))["counts"]
+    assert final["done"] == 3
+    assert final["in_progress"] == 0
+
+
+def test_resume_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> None:
+    """A resumed parallel run credits each story DONE the instant its worker
+    finishes too — the done counter moves mid-cohort, not at the barrier
+    (Story 19.2-002, resume path mirrors run_build)."""
+    from sdlc.build import status_snapshot
+    from sdlc.resume import run_resume
+
+    _make_parallel_project(tmp_path)
+    db = tmp_path / "ledger.db"
+    rid = _seed_parallel_interrupted(db, concurrency=5)  # 88.1-001 + 88.1-002
+    dispatcher = _GatedDispatcher(slow_ids=["88.1-002"])  # hold one, free the other
+
+    box: dict = {}
+
+    def _run() -> None:
+        box["result"] = run_resume(
+            "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        )
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    try:
+        observed = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            counts = status_snapshot(Ledger(db), rid)["counts"]
+            if counts["done"] >= 1 and counts["in_progress"] >= 1:
+                observed = counts
+                break
+            time.sleep(0.02)
+        assert observed is not None, "no DONE credit before the cohort barrier"
+        assert observed["done"] >= 1
+        assert observed["in_progress"] >= 1
+    finally:
+        dispatcher.release.set()
+        worker.join(timeout=20)
+
+    assert box["result"].completed == 2
+    final = status_snapshot(Ledger(db), rid)["counts"]
+    assert final["done"] == 2
+    assert final["in_progress"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Story 17.3-001: truthful `mode` + concurrency observability
 # ---------------------------------------------------------------------------
 

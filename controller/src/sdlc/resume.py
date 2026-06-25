@@ -412,6 +412,14 @@ def run_resume(
         )
         return _run_one(story, workdir=workdir)
 
+    # Story 19.2-002: credit each re-entered story's terminal status the instant
+    # its worker finishes — not at the cohort barrier — so the dashboard's done
+    # counter + top bar move live on a resumed parallel run too, exactly like
+    # run_build. The post-barrier loop re-applies the same status idempotently
+    # (a by-value UPDATE on the single story row), so no double count.
+    def _credit_terminal(story: Story, outcome_status: str) -> None:
+        ledger.set_story_status(rid, story.id, outcome_status)
+
     workers = effective_concurrency(opts)
     for cohort in cohorts:
         if budget_stopped or rate_limit_park is not None or cost_gated is not None:
@@ -554,7 +562,8 @@ def run_resume(
             continue
 
         for result in _dispatch_cohort(
-            dispatchable, max_workers=workers, run_one=_run_one_parallel
+            dispatchable, max_workers=workers, run_one=_run_one_parallel,
+            on_terminal=_credit_terminal,
         ):
             story = result.story
             if result.cost_gate is not None:
