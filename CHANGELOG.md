@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.69.0] - 2026-06-25
+
+### Added
+
+- feat(operability-self-service): `sdlc clean` — safe (#15.3-001)
+
+
 ## [v1.68.0] - 2026-06-25
 
 ### Added
