@@ -424,6 +424,15 @@ ledger alone is enough to recover an interrupted run — no separate journal.
   resumed run reports the worker cap *it* runs with rather than the original
   run's stale figure. This epic produces the truth; rendering stays in Epic-11
   (no double-implementation).
+- **`sdlc status --markdown [--write <file>]`** (`format_markdown` in
+  `sdlc/status.py`, Story 15.1-002) renders a **portable handoff** — a single
+  self-contained markdown document a colleague can paste into an issue or chat
+  when asking for help. It reuses the `status_snapshot` and the `doctor` report
+  (15.1-001) to cover readiness, install health, the active/recent run and its
+  stages, and pending risk-gate approvals (stories parked `AWAITING_APPROVAL`).
+  Home paths are scrubbed to `~` (the only PII the snapshot/doctor strings carry)
+  so the export is secret-free. `--markdown` is an *added* format: plain `status`
+  and `status --json` are byte-for-byte unchanged.
 - **`sdlc state`** (`sdlc/status.py` + `Ledger.state_rows`) dumps every stage
   row (story id, stage, status, attempt, PR, branch) in a stable, greppable
   format for debugging.

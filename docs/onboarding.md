@@ -156,6 +156,17 @@ sdlc doctor
 
 It checks install integrity (managed `~/.claude` symlinks), the ledger schema + integrity, stuck/stale runs, config validity, and dependency availability (`gh`, `claude`, `semgrep`, `osv-scanner`). Each line is `[CLEAN|WARN|FAIL] <check> — <detail>` with a `↳ remedy:` for anything that is not clean — follow the remedy to fix it yourself. `sdlc doctor --exit-code` exits non-zero (1 for WARN, 2 for FAIL) for use in scripts, and `--json` emits a machine-readable report.
 
+### Share your state when asking for help
+
+When a remedy is not obvious and you still need FX, don't screen-share — export a portable handoff and paste it into the issue or chat:
+
+```bash
+sdlc status --markdown            # print to stdout
+sdlc status --markdown --write handoff.md   # or save to a file
+```
+
+The report is a single self-contained markdown document covering readiness (the `doctor` summary), install health, the active/recent run and its stages, and any pending risk-gate approvals. Home paths are scrubbed to `~` and no secrets are included, so it is safe to paste anywhere. The plain `sdlc status` and `sdlc status --json` outputs are unchanged — `--markdown` is an added format.
+
 ---
 
 ## Your first autonomous build
