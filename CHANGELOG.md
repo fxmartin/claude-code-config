@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.79.0] - 2026-06-25
+
+### Added
+
+- feat(controller-ux): live progress credits each parallel (#19.2-002)
+
+### Fixed
+
+- fix(controller-ux): live progress credits each parallel (#19.2-002)
+
+
 ## [v1.78.0] - 2026-06-25
 
 ### Added
