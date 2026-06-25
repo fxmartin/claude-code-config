@@ -1,0 +1,95 @@
+name: Eval (agent output quality)
+
+# Story 18.1-003: run a bounded agentic eval on PRs that touch agent prompts,
+# skills, or response schemas, and flag a quality regression vs the committed
+# baseline BEFORE merge — not in an overnight batch. The full eval stays a
+# manual/local command (`uv run sdlc eval`); this is the tiny, quota-bounded
+# slice (one ticket, n=1). Path-filtered so unrelated PRs skip it entirely.
+on:
+  pull_request:
+    paths:
+      # Agent prompts — build.py renders the build-agent prompt the eval drives.
+      - controller/src/sdlc/build.py
+      # Agent response schemas (the <<<RESULT_JSON>>> contracts).
+      - controller/src/sdlc/schemas/**
+      # Skills the agents may invoke.
+      - skills/**
+      # The eval bundle itself (config, tickets, sample target, baseline).
+      - controller/eval/**
+  # Allow a manual run from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: Bounded eval vs baseline
+    runs-on: ubuntu-latest
+    # Quota/runtime backstop: a single ticket at n=1 on a tiny repo is fast; if a
+    # dispatch hangs, kill the job rather than burn quota.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # The eval drives the live build agent and spends real quota on Max, so it
+      # only runs when the model credential is configured. Forks and PRs without
+      # the secret skip cleanly instead of failing.
+      - name: Check for model credential
+        id: guard
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "${ANTHROPIC_API_KEY}" ]; then
+            echo "have_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ANTHROPIC_API_KEY not set — skipping the eval (no quota to spend)."
+          fi
+
+      - name: Install uv
+        if: steps.guard.outputs.have_key == 'true'
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install the Claude Code CLI
+        if: steps.guard.outputs.have_key == 'true'
+        # The harness dispatches `claude -p` (see dispatch.py); install the CLI so
+        # the headless agent can run in CI.
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Install controller CLI
+        if: steps.guard.outputs.have_key == 'true'
+        run: bash scripts/install-controller.sh
+
+      - name: Run the bounded CI eval
+        id: eval
+        if: steps.guard.outputs.have_key == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        working-directory: controller
+        run: |
+          uv run sdlc eval --config eval/ci-config.yaml --n 1 --json \
+            | tee "${RUNNER_TEMP}/scoreboard.json"
+
+      - name: Check the scoreboard against the baseline
+        if: steps.guard.outputs.have_key == 'true'
+        # warn/fail is configurable via the repo variable EVAL_CI_WARN_ONLY.
+        # Default is advisory (warn-only): the job reports regressions but stays
+        # green so a borderline eval never blocks a PR. Set the variable to
+        # 'false' to make a baseline regression fail the job.
+        env:
+          EVAL_CI_WARN_ONLY: ${{ vars.EVAL_CI_WARN_ONLY }}
+        working-directory: controller
+        run: |
+          warn_flag="--warn-only"
+          if [ "${EVAL_CI_WARN_ONLY}" = "false" ]; then
+            warn_flag=""
+            echo "::notice::EVAL_CI_WARN_ONLY=false — a baseline regression will fail this job."
+          fi
+          uv run sdlc eval-baseline \
+            --baseline eval/baseline.json \
+            --candidate "${RUNNER_TEMP}/scoreboard.json" \
+            ${warn_flag}
