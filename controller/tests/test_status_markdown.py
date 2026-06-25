@@ -143,6 +143,47 @@ def test_format_markdown_doctor_overall_status(tmp_path: Path) -> None:
     assert "uv tool install semgrep" in md
 
 
+def test_format_markdown_install_remedy_rendered(tmp_path: Path) -> None:
+    """A failing install check surfaces its remedy under 'Install health'."""
+    snap = status_snapshot(Ledger(tmp_path / ".sdlc-state.db"))
+    doctor = {
+        "status": "WARN",
+        "findings": [
+            {
+                "check": "install",
+                "name": "Install integrity",
+                "status": "WARN",
+                "detail": "2 managed paths missing",
+                "remedy": "re-run `sdlc install` to restore the missing paths",
+            }
+        ],
+    }
+    md = format_markdown(snap, doctor)
+    health = md.split("## Install health", 1)[1].split("##", 1)[0]
+    assert "2 managed paths missing" in health
+    assert "Remedy: re-run `sdlc install`" in health
+
+
+def test_format_markdown_no_install_check(tmp_path: Path) -> None:
+    """With no install finding, the section degrades to a clear placeholder."""
+    snap = status_snapshot(Ledger(tmp_path / ".sdlc-state.db"))
+    doctor = {
+        "status": "CLEAN",
+        "findings": [
+            {
+                "check": "dependency",
+                "name": "SAST scanner (semgrep)",
+                "status": "CLEAN",
+                "detail": "semgrep present",
+                "remedy": "",
+            }
+        ],
+    }
+    md = format_markdown(snap, doctor)
+    health = md.split("## Install health", 1)[1].split("##", 1)[0]
+    assert "_No install check available._" in health
+
+
 # --- CLI -------------------------------------------------------------------
 
 
