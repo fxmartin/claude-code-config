@@ -141,6 +141,16 @@ The script creates an isolated `$HOME` under `mktemp -d`, runs `./install.sh --c
 
 Full smoke-test reference, including the manual checklist for `--tools`/`--mcp` and the path-B Claude Code session verification, is in [`docs/smoke-test.md`](smoke-test.md).
 
+### Health-check with `sdlc doctor`
+
+If you installed the controller CLI (`bash scripts/install-controller.sh`), `sdlc doctor` is the fastest way to confirm the install is healthy and nothing is stuck:
+
+```bash
+sdlc doctor
+```
+
+It checks install integrity (managed `~/.claude` symlinks), the ledger schema + integrity, stuck/stale runs, config validity, and dependency availability (`gh`, `claude`, `semgrep`, `osv-scanner`). Each line is `[CLEAN|WARN|FAIL] <check> — <detail>` with a `↳ remedy:` for anything that is not clean — follow the remedy to fix it yourself. `sdlc doctor --exit-code` exits non-zero (1 for WARN, 2 for FAIL) for use in scripts, and `--json` emits a machine-readable report.
+
 ---
 
 ## Your first autonomous build
@@ -366,6 +376,7 @@ A human-readable markdown view of the ledger is generated on demand by `scripts/
 
 If anything in this guide is wrong, unclear, or broken:
 
+0. **Self-diagnose first.** If you have the controller CLI, run `sdlc doctor` (see [Health-check with `sdlc doctor`](#health-check-with-sdlc-doctor)) and follow the remedy it prints — it resolves the common breakages (drifted install, stale ledger, a stuck run, a missing dependency) without anyone else's help.
 1. **File a GitHub issue** at <https://github.com/fxmartin/claude-code-config/issues/new>. Include:
    - your OS + version (e.g. `macOS 14.4 Apple Silicon`, `Windows 11 + WSL2 Ubuntu 22.04`)
    - the exact command you ran
