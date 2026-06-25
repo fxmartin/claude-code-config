@@ -1,0 +1,49 @@
+# ABOUTME: Versioned agentic-eval definition (Story 18.1-001) — fixed ticket set,
+# ABOUTME: sample target, and run count so `sdlc eval` is reproducible in-repo.
+
+# A human-readable name for the scoreboard.
+name: strutils-baseline
+
+# Sample target the agent edits, relative to THIS file. A plain directory of
+# files (not a nested git repo); the harness copies + git-inits it per run so the
+# framework repo is never mutated and the diff is measured in isolation.
+target: sample-target
+
+# Runs per ticket. Model sampling is non-deterministic, so n>1 averages out
+# variance; keep it low to bound quota spend (the eval runs against Max).
+n: 3
+
+# Recorded for reproducibility provenance — config + tickets + seed are versioned
+# so a re-run is comparable within model variance. (Live model sampling is not
+# bit-for-bit deterministic; the seed pins the harness inputs, not the model.)
+seed: 1801
+
+# The agent role to dispatch. `build` exercises the same headless build agent the
+# pipeline uses, so eval metrics line up with ledger metrics.
+agent_type: build
+
+# Fixed ticket set. Each ticket is a small, well-scoped edit on the sample target
+# with a quality_cmd (exit 0 = pass) so "tests pass / no breakage" is measurable.
+tickets:
+  - id: add-capitalize
+    prompt: >-
+      In strutils.py add a function `capitalize_words(text: str) -> str` that
+      returns text with the first letter of each whitespace-separated word
+      upper-cased and the rest unchanged. Add a focused test for it in
+      test_strutils.py. Keep the change minimal.
+    quality_cmd: ["python", "-m", "pytest", "-q"]
+
+  - id: add-count-vowels
+    prompt: >-
+      In strutils.py add a function `count_vowels(text: str) -> int` that returns
+      the number of vowels (a, e, i, o, u, case-insensitive) in text. Add a
+      focused test for it in test_strutils.py. Keep the change minimal.
+    quality_cmd: ["python", "-m", "pytest", "-q"]
+
+  - id: add-truncate
+    prompt: >-
+      In strutils.py add a function `truncate(text: str, length: int) -> str`
+      that returns text unchanged when it is at most `length` characters,
+      otherwise the first `length` characters with a trailing "…". Add a focused
+      test in test_strutils.py. Keep the change minimal.
+    quality_cmd: ["python", "-m", "pytest", "-q"]

@@ -34,6 +34,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "run-open": "Register a fix-issue run so the dashboard surfaces it.",
     "run-stage": "Log a fix-issue phase start/finish to the ledger.",
     "run-close": "Finalize a fix-issue run (DONE/FAILED) in ledger + registry.",
+    "eval": "Run the agentic eval harness over a fixed ticket set and emit a scoreboard.",
 }
 
 app = typer.Typer(
@@ -1384,6 +1385,99 @@ def repair(
 
     verb = "would restore" if dry_run else "restored"
     typer.echo(f"{verb} {restored} managed artifact(s).")
+    raise typer.Exit(code=0)
+
+
+@app.command(name="eval", help=PLANNED_SUBCOMMANDS["eval"])
+def eval_cmd(
+    config_file: Path = typer.Option(
+        Path("eval/eval-config.yaml"),
+        "--config",
+        help="Versioned eval config (sample target + fixed ticket set + n runs).",
+    ),
+    n: int = typer.Option(
+        None,
+        "--n",
+        help="Override the config's runs-per-ticket (e.g. --n 1 for a quick pass).",
+        show_default=False,
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the scoreboard as JSON instead of a text table.",
+    ),
+    workspace: Path = typer.Option(
+        None,
+        "--workspace",
+        help="Throwaway dir for per-run git checkouts (default: a temp dir).",
+        show_default=False,
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="List the tickets the eval would run and exit (dispatch nothing).",
+    ),
+) -> None:
+    """Run the agentic eval harness over a fixed ticket set and emit a scoreboard.
+
+    Drives the build agent headlessly against a versioned sample target — once per
+    ticket × ``n`` runs, each in an isolated git checkout — and scores every result
+    on LOC delta, token usage, notional cost, wall-time, and a quality check (the
+    ticket's ``quality_cmd``, exit 0 = pass). The framework repo and the sample
+    target are never mutated and no PRs are opened. ``--dry-run`` lists the tickets
+    without spending any quota. A malformed config exits 2.
+    """
+    import tempfile
+
+    from sdlc.evaluate import (
+        EvalConfig,
+        EvalConfigError,
+        aggregate,
+        load_config,
+        render_table,
+        run_eval,
+        scoreboard_to_dict,
+    )
+
+    try:
+        config = load_config(config_file)
+    except EvalConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if n is not None:
+        if n < 1:
+            typer.echo("error: --n must be >= 1", err=True)
+            raise typer.Exit(code=2)
+        config = EvalConfig(
+            name=config.name,
+            target=config.target,
+            tickets=config.tickets,
+            n=n,
+            seed=config.seed,
+            agent_type=config.agent_type,
+            usd_per_million_tokens=config.usd_per_million_tokens,
+        )
+
+    if dry_run:
+        typer.echo(
+            f"eval: {config.name} — {len(config.tickets)} ticket(s) × {config.n} run(s) "
+            f"against {config.target}"
+        )
+        for ticket in config.tickets:
+            typer.echo(f"  - {ticket.id}")
+        raise typer.Exit(code=0)
+
+    with tempfile.TemporaryDirectory(prefix="sdlc-eval-") as tmp:
+        ws = workspace or Path(tmp)
+        ws.mkdir(parents=True, exist_ok=True)
+        results = run_eval(config, ws)
+
+    board = aggregate(results, config.name)
+    if as_json:
+        typer.echo(json.dumps(scoreboard_to_dict(board), indent=2))
+    else:
+        typer.echo(render_table(board))
     raise typer.Exit(code=0)
 
 
