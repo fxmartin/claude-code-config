@@ -1,0 +1,54 @@
+{
+  "_note": "Placeholder baseline for `sdlc eval-baseline` (Story 18.1-002). Regenerate from a real run with `uv run sdlc eval --json > eval/baseline.json` so the figures reflect live model output, then commit. The numbers below are illustrative, not measured.",
+  "config_name": "strutils-baseline",
+  "tickets": [
+    {
+      "ticket_id": "add-capitalize",
+      "runs": 3,
+      "errors": 0,
+      "loc_added_mean": 8.0,
+      "loc_removed_mean": 0.0,
+      "loc_net_mean": 8.0,
+      "tokens_mean": 4200.0,
+      "cost_mean": 0.063,
+      "wall_mean": 22.0,
+      "quality_pass_rate": 1.0
+    },
+    {
+      "ticket_id": "add-count-vowels",
+      "runs": 3,
+      "errors": 0,
+      "loc_added_mean": 7.0,
+      "loc_removed_mean": 0.0,
+      "loc_net_mean": 7.0,
+      "tokens_mean": 3900.0,
+      "cost_mean": 0.0585,
+      "wall_mean": 20.0,
+      "quality_pass_rate": 1.0
+    },
+    {
+      "ticket_id": "add-truncate",
+      "runs": 3,
+      "errors": 0,
+      "loc_added_mean": 9.0,
+      "loc_removed_mean": 0.0,
+      "loc_net_mean": 9.0,
+      "tokens_mean": 4500.0,
+      "cost_mean": 0.0675,
+      "wall_mean": 24.0,
+      "quality_pass_rate": 1.0
+    }
+  ],
+  "overall": {
+    "ticket_id": "OVERALL",
+    "runs": 9,
+    "errors": 0,
+    "loc_added_mean": 8.0,
+    "loc_removed_mean": 0.0,
+    "loc_net_mean": 8.0,
+    "tokens_mean": 4200.0,
+    "cost_mean": 0.063,
+    "wall_mean": 22.0,
+    "quality_pass_rate": 1.0
+  }
+}

@@ -95,6 +95,72 @@ The `--json` form (`scoreboard_to_dict`) is the shape later stories store as a
 **baseline** to flag regressions (18.1-002) and run in **CI** on agent-affecting
 changes (18.1-003).
 
+## Variant comparison & regression baselines (18.1-002)
+
+A scoreboard on its own says *how good*, not *better or worse than what*. Story
+18.1-002 adds a thin layer on top: diff two scoreboards (variant A vs B) and check
+a fresh scoreboard against a committed **baseline** to catch regressions. Both work
+on the `--json` scoreboards above — no live model is involved, so the logic is
+fully unit-tested.
+
+### A/B compare two variants
+
+Run the eval once per variant (e.g. prompt A vs B, or Haiku vs Sonnet on a stage),
+saving each scoreboard, then compare:
+
+```bash
+cd controller
+
+uv run sdlc eval --config eval/variant-a.yaml --json > /tmp/a.json
+uv run sdlc eval --config eval/variant-b.yaml --json > /tmp/b.json
+
+# Side-by-side per-metric delta + a better/worse/neutral verdict per ticket + overall.
+uv run sdlc eval-compare --baseline /tmp/a.json --candidate /tmp/b.json
+
+# Record the decision (so a prompt/model choice is backed by data, not vibes).
+uv run sdlc eval-compare --baseline /tmp/a.json --candidate /tmp/b.json \
+  --json --out docs/decisions/haiku-vs-sonnet-coverage.json
+```
+
+Each ticket (and the `OVERALL` row) gets a verdict:
+
+- **Quality is decisive** — a `quality_pass_rate` drop is always `WORSE`, a rise is
+  always `BETTER`, however much cheaper the run got. We never trade quality for cost.
+- With quality unchanged, the efficiency metrics (netLOC, tokens, cost, wall) are
+  tallied: more improvements than regressions → `BETTER`, the reverse → `WORSE`, a
+  tie → `NEUTRAL`.
+
+A metric only counts as moved when it changes by more than `--tolerance` (default
+**10%**, relative to the baseline value) — below that, model-run variance swamps
+the signal, so it stays neutral. This is the knob that keeps the false-positive
+rate down. This directly answers the Epic-14 question: *does cheaper-model routing
+hold quality?* — compare the two scoreboards and read the verdict.
+
+### Regression baselines
+
+`eval/baseline.json` is a committed scoreboard (regenerate it from a real run with
+`uv run sdlc eval --json > eval/baseline.json` — the shipped file is an illustrative
+placeholder). Check a fresh scoreboard against it:
+
+```bash
+uv run sdlc eval --json > /tmp/new.json
+
+# Flags any metric that regressed beyond tolerance; exits 1 if so, 0 if clean.
+uv run sdlc eval-baseline --baseline eval/baseline.json --candidate /tmp/new.json
+
+# Advisory mode — report regressions but never fail (exit 0).
+uv run sdlc eval-baseline --candidate /tmp/new.json --warn-only
+
+# Promote a new known-good scoreboard to the baseline.
+uv run sdlc eval-baseline --candidate /tmp/new.json --update
+```
+
+A "regression" is a `quality_pass_rate` drop or a netLOC/tokens/cost/wall **rise**
+beyond `--tolerance`; cost and wall that hold steady are not flagged. The non-zero
+exit on regression is what later wires a bounded eval into CI (18.1-003, warn or
+fail configurable). The comparison itself never mutates `main` or opens PRs — it is
+pure scoreboard arithmetic.
+
 ## Tested vs. live
 
 The scoring and aggregation logic is fully unit-tested (`tests/test_evaluate.py`)
