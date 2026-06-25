@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 
@@ -614,6 +615,29 @@ class _GatedDispatcher:
         return AgentResult(agent_type=agent_type, data=_payload(agent_type, story), raw="")
 
 
+def _await_live_credit(db, run_id=None, timeout=10):
+    """Poll the live status snapshot until a story is credited DONE while a
+    sibling is still IN_PROGRESS, then return those counts (or None on timeout).
+
+    The worker thread is still bootstrapping the ledger schema when the poll
+    starts, so an early read can race the ``runs`` table into existence; a
+    transient ``OperationalError`` just means "not ready yet — keep polling".
+    """
+    from sdlc.build import status_snapshot
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            counts = status_snapshot(Ledger(db), run_id)["counts"]
+        except sqlite3.OperationalError:
+            time.sleep(0.02)
+            continue
+        if counts["done"] >= 1 and counts["in_progress"] >= 1:
+            return counts
+        time.sleep(0.02)
+    return None
+
+
 def test_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> None:
     """A parallel story that finishes first is credited DONE the instant its
     worker completes — the done counter increments mid-cohort, while its siblings
@@ -639,14 +663,7 @@ def test_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> None:
     try:
         # Poll the live snapshot until the fast story is credited DONE while a
         # sibling is still IN_PROGRESS — the proof the credit precedes the barrier.
-        observed = None
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            counts = status_snapshot(Ledger(db))["counts"]
-            if counts["done"] >= 1 and counts["in_progress"] >= 1:
-                observed = counts
-                break
-            time.sleep(0.02)
+        observed = _await_live_credit(db)
         assert observed is not None, "no DONE credit before the cohort barrier"
         assert observed["done"] >= 1
         assert observed["in_progress"] >= 1  # siblings still mid-flight
@@ -683,14 +700,7 @@ def test_resume_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> 
     worker = threading.Thread(target=_run)
     worker.start()
     try:
-        observed = None
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            counts = status_snapshot(Ledger(db), rid)["counts"]
-            if counts["done"] >= 1 and counts["in_progress"] >= 1:
-                observed = counts
-                break
-            time.sleep(0.02)
+        observed = _await_live_credit(db, rid)
         assert observed is not None, "no DONE credit before the cohort barrier"
         assert observed["done"] >= 1
         assert observed["in_progress"] >= 1
@@ -702,6 +712,64 @@ def test_resume_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> 
     final = status_snapshot(Ledger(db), rid)["counts"]
     assert final["done"] == 2
     assert final["in_progress"] == 0
+
+
+def test_dispatch_cohort_on_terminal_credits_each_outcome() -> None:
+    """``_dispatch_cohort`` invokes ``on_terminal`` once per *terminal* outcome —
+    the resolved status on a normal finish and ``FAILED`` on an unexpected raise —
+    but never for a parked (resumable) outcome (Story 19.2-002)."""
+    from sdlc.build import _dispatch_cohort, _StoryRunOutcome
+
+    done = Story("s-done", "Done", "99", "sample", "epic-99.md", "P1", 1, "py", [])
+    parked = Story("s-park", "Parked", "99", "sample", "epic-99.md", "P1", 1, "py", [])
+    boom = Story("s-boom", "Boom", "99", "sample", "epic-99.md", "P1", 1, "py", [])
+
+    def _run_one(story):
+        if story.id == "s-park":
+            return _StoryRunOutcome(status=None, parked=True)
+        if story.id == "s-boom":
+            raise RuntimeError("worker blew up")
+        return _StoryRunOutcome(status="DONE")
+
+    credited: list[tuple[str, str]] = []
+    lock = threading.Lock()
+
+    def _on_terminal(story, status) -> None:
+        with lock:
+            credited.append((story.id, status))
+
+    results = _dispatch_cohort(
+        [done, parked, boom], max_workers=3, run_one=_run_one,
+        on_terminal=_on_terminal,
+    )
+
+    by_id = {r.story.id: r for r in results}
+    assert by_id["s-done"].outcome.status == "DONE"
+    assert by_id["s-park"].outcome.parked is True
+    assert isinstance(by_id["s-boom"].error, RuntimeError)  # failure isolation
+    # A terminal finish + an unexpected raise are credited; a park is not.
+    assert dict(credited) == {"s-done": "DONE", "s-boom": "FAILED"}
+
+
+def test_dispatch_cohort_without_on_terminal_still_isolates_failures() -> None:
+    """Default ``on_terminal=None``: a worker that raises is captured (failure
+    isolation) and no callback path runs — the live-credit hook is opt-in
+    (Story 19.2-002)."""
+    from sdlc.build import _dispatch_cohort, _StoryRunOutcome
+
+    ok = Story("s-ok", "Ok", "99", "sample", "epic-99.md", "P1", 1, "py", [])
+    boom = Story("s-boom", "Boom", "99", "sample", "epic-99.md", "P1", 1, "py", [])
+
+    def _run_one(story):
+        if story.id == "s-boom":
+            raise RuntimeError("worker blew up")
+        return _StoryRunOutcome(status="DONE")
+
+    results = _dispatch_cohort([ok, boom], max_workers=2, run_one=_run_one)
+
+    by_id = {r.story.id: r for r in results}
+    assert by_id["s-ok"].outcome.status == "DONE"
+    assert isinstance(by_id["s-boom"].error, RuntimeError)
 
 
 # ---------------------------------------------------------------------------
