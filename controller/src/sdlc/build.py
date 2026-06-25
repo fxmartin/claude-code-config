@@ -33,6 +33,7 @@ from sdlc.contracts import (
     ContractError,
 )
 from sdlc.cost_estimate import StageEstimate, estimate_stage
+from sdlc.doc_currency import doc_currency_enabled
 from sdlc.dispatch import (
     AgentDispatchError,
     AgentResult,
@@ -2228,6 +2229,21 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         if opts.skip_coverage
         else "6. Commit locally; the coverage agent pushes and opens the PR."
     )
+    # Story 18.3-001: keep user-facing docs current with each story. When the
+    # documentation-currency lens is enabled (the default), instruct the build
+    # agent to update the affected docs in the SAME commit as the code change —
+    # scoped to what the diff actually touches, never the CHANGELOG (Epic-05's
+    # release workflow owns that). Disabling the lens reverts to today's prompt.
+    docs_instruction = (
+        "If this story changes user-facing behavior (a CLI verb/flag, a skill, a "
+        "hook, a documented config key, or an installer step), update the affected "
+        "user-facing docs (README.md, docs/, usage/help text) in the SAME commit as "
+        "step 5 — scoped to what the change actually affects; do not write "
+        "speculative docs and do NOT touch the CHANGELOG (the release workflow owns "
+        "it).\n\n"
+        if doc_currency_enabled()
+        else ""
+    )
     # Story 12.2-004: derive a commitlint-compliant subject by construction
     # rather than asking the agent to transcribe the (often long, Title-Case)
     # story title verbatim — which fails ``header-max-length``/``subject-case``
@@ -2256,6 +2272,7 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         "5. Commit with this exact, conventional-commit-compliant message — do "
         f"not alter it:\n   {commit_header}\n"
         f"{push}\n\n"
+        + docs_instruction
         + _result_wrapper("build-agent-response.schema.json")
     )
 
@@ -2282,10 +2299,25 @@ def render_coverage_prompt(story: Story, opts: BuildOptions) -> str:
 
 
 def render_review_prompt(story: Story, pr_number: int | None) -> str:
+    # Story 18.3-001: documentation-currency review dimension. When enabled (the
+    # default), the reviewer also checks that a behavior-changing diff shipped its
+    # doc update; gaps are flagged as advisory findings (never blocks shipping).
+    # Disabling the lens reverts to today's review prompt.
+    docs_dimension = (
+        "Also apply the documentation-currency dimension: if the diff changes "
+        "user-facing behavior (a CLI verb/flag, a skill, a hook, a documented "
+        "config key, or an installer step) but ships no matching doc update, flag "
+        "the stale doc as an advisory finding (name the doc + a one-line why) — "
+        "advisory only, it does not block shipping. Stay quiet on "
+        "docs-only/behavior-neutral diffs, and never flag the CHANGELOG.\n"
+        if doc_currency_enabled()
+        else ""
+    )
     return (
         f"Review the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
         "Check architecture, security, performance, coverage, code quality; "
         "approve when satisfied, then emit the result block.\n"
+        + docs_dimension
         + _result_wrapper("review-agent-response.schema.json")
     )
 
