@@ -21,6 +21,7 @@ from sdlc.overengineering import (
     LensConfig,
     OverEngineeringContractError,
     OverEngineeringError,
+    _default_invoke,
     dispatch_overengineering_lens,
     extract_findings,
     load_lens_config,
@@ -233,6 +234,12 @@ def test_clean_outcome_has_no_advisory_comment() -> None:
     assert outcome.advisory_comment() == ""
 
 
+def test_clean_outcome_has_no_simplify_directive() -> None:
+    # Nothing to cut -> the bugfix loop gets an empty directive, not noise.
+    outcome = route_findings([], _enabled("route_to_simplify"))
+    assert outcome.simplify_directive() == ""
+
+
 # ---------------------------------------------------------------------------
 # Prompt rendering
 # ---------------------------------------------------------------------------
@@ -339,3 +346,55 @@ def test_dispatch_propagates_contract_error(tmp_path: Path) -> None:
             config_path=p,
             invoke=_invoke,
         )
+
+
+# ---------------------------------------------------------------------------
+# Default invoker (real subprocess — the production dispatch seam)
+# ---------------------------------------------------------------------------
+
+
+def test_default_invoke_returns_stdout() -> None:
+    # The happy path: a zero-exit command's stdout is handed back verbatim.
+    assert _default_invoke("printf hello", 5) == "hello"
+
+
+def test_default_invoke_raises_on_nonzero_exit() -> None:
+    with pytest.raises(OverEngineeringError) as exc:
+        _default_invoke("sh -c 'echo boom >&2; exit 2'", 5)
+    assert "exited 2" in str(exc.value)
+    assert "boom" in str(exc.value)
+
+
+def test_default_invoke_raises_when_command_missing() -> None:
+    with pytest.raises(OverEngineeringError) as exc:
+        _default_invoke("definitely-not-a-real-binary-xyz", 5)
+    assert "could not launch lens" in str(exc.value)
+
+
+def test_default_invoke_raises_on_timeout() -> None:
+    with pytest.raises(OverEngineeringError) as exc:
+        _default_invoke("sleep 3", 1)
+    assert "timed out" in str(exc.value)
+
+
+def test_dispatch_uses_default_invoker_when_seam_omitted(tmp_path: Path) -> None:
+    # No invoke seam -> dispatch falls back to the real subprocess runner.
+    lens = tmp_path / "lens.sh"
+    lens.write_text(
+        '#!/bin/sh\nprintf \'{"summary": "ran", "findings": []}\'\n',
+        encoding="utf-8",
+    )
+    lens.chmod(0o755)
+    p = tmp_path / "lens.yaml"
+    p.write_text(
+        f"enabled: true\npolicy: advisory\ncommand: {lens}\n", encoding="utf-8"
+    )
+
+    outcome = dispatch_overengineering_lens(
+        pr_number=7,
+        story_id="18.2-001",
+        diff="diff",
+        config_path=p,
+    )
+    assert outcome.action == ACTION_CLEAN
+    assert outcome.summary == "ran"
