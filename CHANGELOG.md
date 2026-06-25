@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.72.0] - 2026-06-25
+
+### Added
+
+- feat(operability-self-service): hook profiles and context (#15.2-001)
+
+
 ## [v1.71.0] - 2026-06-25
 
 ### Added
