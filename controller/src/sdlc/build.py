@@ -2551,6 +2551,10 @@ def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
     # reused verbatim — re-adding it would fail, and recreating it would discard
     # the resumed story's in-flight work.
     if path.resolve() in _worktree_registered_paths(root):
+        # Re-assert the lock on resume so a pre-fix (unlocked) checkout is still
+        # protected from the Stop-hook reaper (#180); idempotent — a redundant
+        # lock just returns non-zero, which we ignore.
+        _lock_story_worktree(root, path, story_id, run_id)
         return path
     # A directory git no longer tracks (crash debris) would make `worktree add`
     # fail with "already exists"; clear it and prune the registry first so the
@@ -2567,7 +2571,33 @@ def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
         raise WorktreeError(
             f"git worktree add for {story_id} failed: {res.stderr.strip()}"
         )
+    # Lock the worktree so the global Stop-hook reaper (hooks/worktree-gc.sh)
+    # cannot force-remove it mid-build (#180). A story's feature branch is 0
+    # commits ahead of main until the build agent commits late, so the reaper's
+    # `git branch --merged main` lists it as "merged"; the lock is what marks it
+    # as in-use. Best-effort — a lock failure must not abort the build.
+    _lock_story_worktree(root, path, story_id, run_id)
     return path
+
+
+def _lock_story_worktree(root: Path, path: Path, story_id: str, run_id: str) -> None:
+    """Lock a story worktree as in-use so the Stop-hook reaper spares it (#180).
+
+    Best-effort and idempotent: re-locking an already-locked worktree returns
+    non-zero, which is ignored, and any git/OS failure is swallowed so a lock
+    problem never fails an otherwise-good build.
+    """
+    try:
+        _git(
+            root,
+            "worktree",
+            "lock",
+            str(path),
+            "--reason",
+            f"sdlc run {run_id} story {story_id}",
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def remove_story_worktree(root: Path, path: Path) -> bool:
@@ -2590,6 +2620,10 @@ def remove_story_worktree(root: Path, path: Path) -> bool:
         if _git(root, "rev-parse", "--git-dir").returncode != 0:
             return False
         if path.resolve() in _worktree_registered_paths(root):
+            # The controller locks its worktrees (#180); unlock before removing
+            # since `git worktree remove --force` refuses a locked worktree.
+            # Ignore unlock failures — an unlocked worktree returns non-zero.
+            _git(root, "worktree", "unlock", str(path))
             _git(root, "worktree", "remove", "--force", str(path))
         # Belt-and-braces: a leftover directory git did not deregister is cleared
         # so the checkout never lingers on disk.

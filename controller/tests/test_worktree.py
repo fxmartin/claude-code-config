@@ -77,6 +77,44 @@ def test_create_story_worktree_makes_isolated_checkout(tmp_path) -> None:
     }
 
 
+def test_create_story_worktree_is_git_locked(tmp_path) -> None:
+    """The worktree is git-locked so the Stop-hook reaper cannot remove it
+    mid-build (#180). A locked worktree emits a ``locked`` line in porcelain."""
+    work = _repo_with_origin(tmp_path)
+    path = create_story_worktree(work, "17.2-001", "run-abc12345")
+
+    porcelain = _git(work, "worktree", "list", "--porcelain").stdout
+    locked: set[str] = set()
+    current: str | None = None
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            current = str(Path(line.removeprefix("worktree ")).resolve())
+        elif line.startswith("locked") and current is not None:
+            locked.add(current)
+    assert str(path.resolve()) in locked
+
+
+def test_reattached_worktree_is_git_locked(tmp_path) -> None:
+    """Re-entry (resume) re-attaches an existing worktree and re-asserts the lock
+    so a previously-unlocked checkout is protected on resume (#180)."""
+    work = _repo_with_origin(tmp_path)
+    path = create_story_worktree(work, "17.2-001", "run-abc12345")
+    # Simulate a pre-fix checkout that was never locked, then resume re-attaches.
+    _git(work, "worktree", "unlock", str(path))
+    again = create_story_worktree(work, "17.2-001", "run-abc12345")
+    assert again == path
+
+    porcelain = _git(work, "worktree", "list", "--porcelain").stdout
+    locked: set[str] = set()
+    current: str | None = None
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            current = str(Path(line.removeprefix("worktree ")).resolve())
+        elif line.startswith("locked") and current is not None:
+            locked.add(current)
+    assert str(path.resolve()) in locked
+
+
 def test_worktree_path_matches_sweeper_convention(tmp_path) -> None:
     """The worktree lives under .claude/worktrees/agent-* (orphan-sweeper compatible)."""
     work = _repo_with_origin(tmp_path)
@@ -136,6 +174,38 @@ def test_create_worktree_wraps_git_invocation_error(tmp_path, monkeypatch) -> No
     monkeypatch.setattr("sdlc.build._git", _no_git)
     with pytest.raises(WorktreeError, match="git worktree add failed"):
         create_story_worktree(tmp_path, "17.2-001", "run-abc12345")
+
+
+def test_lock_failure_is_best_effort_create_still_succeeds(tmp_path, monkeypatch) -> None:
+    """An OSError from `git worktree lock` is swallowed — the lock is
+    best-effort (#180). The worktree is created and returned even when locking
+    fails, covering the except branch of _lock_story_worktree (lines 2599-2600)."""
+    import sdlc.build as build_mod
+
+    work = _repo_with_origin(tmp_path)
+    _real_git = build_mod._git
+
+    def _git_fail_on_lock(root, *args):
+        # Let every git call through except the lock itself.
+        if len(args) >= 2 and args[0] == "worktree" and args[1] == "lock":
+            raise OSError("permission denied: .git/worktrees/agent-x/locked")
+        return _real_git(root, *args)
+
+    monkeypatch.setattr(build_mod, "_git", _git_fail_on_lock)
+    # Must not raise — lock failure is deliberately swallowed so it never aborts a build.
+    path = create_story_worktree(work, "17.2-001", "run-abc12345")
+    assert path.is_dir()
+    # Worktree is still git-registered (the add succeeded; only the lock was skipped).
+    live = _git(work, "worktree", "list", "--porcelain").stdout
+    assert str(path.resolve()) in {
+        str(Path(p).resolve())
+        for p in (
+            line.removeprefix("worktree ")
+            for line in live.splitlines()
+            if line.startswith("worktree ")
+        )
+    }
+
 
 
 # ---------------------------------------------------------------------------
