@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.83.0] - 2026-06-26
+
+### Added
+
+- feat(cross-harness-portability): pluggable per-harness (#20.1-002)
+
+
 ## [v1.82.0] - 2026-06-26
 
 ### Added
