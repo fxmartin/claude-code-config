@@ -15,7 +15,7 @@ def state_report(ledger: Ledger, run_id: str) -> list[dict]:
 
     A thin pass-through to :meth:`Ledger.state_rows` so the CLI and any future
     consumer share one shape: ``{story_id, stage_name, status, attempt, branch,
-    pr_number}``.
+    pr_number, harness}``.
     """
     return ledger.state_rows(run_id)
 
@@ -26,9 +26,13 @@ def format_state(rows: list[dict]) -> list[str]:
     The columns are stable so ``sdlc state | grep <story>`` and column-based
     tooling stay reliable. A missing branch falls back to the deterministic
     ``feature/<story_id>`` the build state machine uses; a missing PR renders
-    as ``-``.
+    as ``-``. The ``HARNESS`` column (Story 20.2-002) shows which harness ran
+    each stage, defaulting to ``claude`` for rows that predate harness routing.
     """
-    lines = [f"{'STORY':<16}{'STAGE':<11}{'STATUS':<13}{'ATT':<5}{'PR':<7}BRANCH"]
+    lines = [
+        f"{'STORY':<16}{'STAGE':<11}{'STATUS':<13}{'ATT':<5}"
+        f"{'HARNESS':<9}{'PR':<7}BRANCH"
+    ]
     for r in rows:
         pr = r.get("pr_number")
         pr_disp = f"#{pr}" if pr else "-"
@@ -38,6 +42,7 @@ def format_state(rows: list[dict]) -> list[str]:
             f"{str(r.get('stage_name', '?')):<11}"
             f"{str(r.get('status', '?')):<13}"
             f"{str(r.get('attempt', '?')):<5}"
+            f"{str(r.get('harness') or 'claude'):<9}"
             f"{pr_disp:<7}{branch}"
         )
     return lines

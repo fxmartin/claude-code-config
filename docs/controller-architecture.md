@@ -438,8 +438,12 @@ ledger alone is enough to recover an interrupted run — no separate journal.
   so the export is secret-free. `--markdown` is an *added* format: plain `status`
   and `status --json` are byte-for-byte unchanged.
 - **`sdlc state`** (`sdlc/status.py` + `Ledger.state_rows`) dumps every stage
-  row (story id, stage, status, attempt, PR, branch) in a stable, greppable
-  format for debugging.
+  row (story id, stage, status, attempt, harness, PR, branch) in a stable,
+  greppable format for debugging. The `HARNESS` column (Story 20.2-002) records
+  which harness ran each stage so a heterogeneous `--harness` run is auditable;
+  the ledger's nullable `stages.harness` column defaults to `claude` for rows
+  that predate harness routing (an existing pre-migration ledger still loads via
+  the additive Migration 6).
 
 ## Rollback
 
