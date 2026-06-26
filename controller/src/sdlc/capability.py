@@ -30,12 +30,6 @@ CAPABILITY_KEYS: tuple[str, ...] = (
 MODE_SERIAL = "serial"
 MODE_PARALLEL = "parallel"
 
-# Capabilities a parallel run requires: it fans a cohort across workers
-# (``parallel``) each in its own git worktree (``worktree_isolation``). A harness
-# missing either cannot run parallel safely and is degraded to serial in
-# preflight (the safe alternative; the full degradation matrix is Story 20.5-002).
-_PARALLEL_REQUIRES: tuple[str, ...] = ("parallel", "worktree_isolation")
-
 # How long a probe command may run before it is treated as unavailable. A probe
 # is a cheap "is the CLI installed/authenticated?" check, so this is short.
 _PROBE_TIMEOUT_SECONDS = 10
@@ -164,21 +158,27 @@ def preflight_harness(
     alternative (serial) and records a warning, rather than failing mid-run. A
     declared probe command is run and an ``unavailable`` result surfaces as a
     warning too. Serial is always supportable, so it never degrades.
+
+    The mode decision is delegated to :func:`sdlc.degradation.evaluate_degradations`
+    (Story 20.5-002), the single source of truth for the degradation matrix.
+    Preflight surfaces only the *mode* fallback here; the usage / rate-limit
+    fallbacks in the same plan are recorded by the build flow, not as preflight
+    warnings. The import is local to avoid a module-load import cycle (the
+    degradation module imports this module's mode constants).
     """
+    from sdlc.degradation import DegradationKind, evaluate_degradations
+
     capabilities = resolve_capabilities(harness)
     probe = probe_harness(harness, runner=probe_runner)
     warnings: list[str] = []
 
-    effective_mode = requested_mode
-    if requested_mode == MODE_PARALLEL:
-        missing = [cap for cap in _PARALLEL_REQUIRES if not capabilities.get(cap)]
-        if missing:
-            effective_mode = MODE_SERIAL
-            warnings.append(
-                f"harness {harness.name!r} cannot run mode=parallel "
-                f"(missing capability: {', '.join(missing)}); "
-                f"degrading to mode=serial"
-            )
+    plan = evaluate_degradations(
+        harness.name, capabilities, requested_mode=requested_mode
+    )
+    effective_mode = plan.effective_mode
+    for degradation in plan.degradations:
+        if degradation.kind is DegradationKind.PARALLEL_TO_SERIAL:
+            warnings.append(degradation.message)
 
     if probe.status is ProbeStatus.UNAVAILABLE:
         warnings.append(

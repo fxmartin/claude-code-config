@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
 
-from sdlc.capability import preflight_harness
+from sdlc.capability import preflight_harness, resolve_capabilities
+from sdlc.degradation import evaluate_degradations
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.commitlint import (
     build_commit_header,
@@ -2314,6 +2315,30 @@ def _log_harness_preflight(ledger: "Ledger", run_id: str, requested_mode: str) -
         pass
 
 
+def _record_degradations(ledger: "Ledger", run_id: str, requested_mode: str) -> None:
+    """Record the dispatch harness's degradation plan in the ledger (Story 20.5-002).
+
+    Resolves the default-slot harness, evaluates the centralized degradation
+    matrix for ``requested_mode``, and writes one ``warn`` event per applied
+    fallback (parallel→serial, usage "unavailable", rate-limit backoff skipped) to
+    the ``degradation`` event source so any capability gap is auditable in the run
+    summary (AC3). For the built-in Claude harness the plan is empty, so this is
+    purely additive and writes nothing. Best-effort: a logging failure must never
+    fail an otherwise-good build.
+    """
+    try:
+        harness = resolve_harness()
+        capabilities = resolve_capabilities(harness)
+        plan = evaluate_degradations(
+            harness.name, capabilities, requested_mode=requested_mode
+        )
+        for record in plan.to_records():
+            print(record["message"], file=sys.stderr)
+            ledger.event_log(run_id, "", "warn", "degradation", record["message"])
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Prompt rendering (kept terse — the agent reads the epic file itself)
 # ---------------------------------------------------------------------------
@@ -3050,6 +3075,11 @@ def run_build(
     # default slot is the built-in Claude harness (no probe, all capabilities),
     # so this is purely additive logging and never alters dispatch behaviour.
     _log_harness_preflight(ledger, run_id, mode)
+    # Story 20.5-002: record any safe fallback the harness's capability gaps force
+    # (parallel→serial, usage "unavailable", rate-limit backoff skipped) so a
+    # degradation is auditable in the run summary, never silent. Empty (no-op) for
+    # the built-in Claude harness, which has every capability.
+    _record_degradations(ledger, run_id, mode)
     try:  # best-effort lifecycle notification; never fail a build
         notify("run_started", run=run_id, scope=opts.scope, mode=mode)
     except Exception:

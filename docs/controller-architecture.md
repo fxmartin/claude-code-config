@@ -20,6 +20,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/parsers.py` | Pluggable per-harness output parsers — interpret an agent's stdout into a validated `AgentResult`, registered by id (Story 20.1-002). |
 | `sdlc/harness.py` | Config-driven harness registry — declares each agent harness (claude, codex, …) and how to invoke it (Story 20.1-001). |
 | `sdlc/capability.py` | Harness capability resolution, optional CLI probe, and the preflight mode decision (Story 20.5-001). |
+| `sdlc/degradation.py` | Centralized degradation matrix — maps capability gaps to safe fallbacks (parallel→serial, usage "unavailable", rate-limit skipped) (Story 20.5-002). |
 | `sdlc/role_routing.py` | Per-role harness routing — maps build/coverage/review/merge/docs to harnesses, fails fast on unknown/disabled (Story 20.2-001). |
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
 | `sdlc/contracts.py` | JSON-schema parse + validation (Story 7.2-001). |
@@ -883,7 +884,36 @@ additive logging (all capabilities `true`, no probe), so dispatch is unchanged.
 A `parallel` request on `codex` (no `worktree_isolation`, no `parallel`) degrades
 to `serial` with an explicit warning; its missing `usage_tracking` /
 `rate_limit_aware` are recorded as "unavailable" rather than fabricated
-(Story 20.5-002).
+(Story 20.5-002, below).
+
+### Degradation matrix and safe fallbacks (Story 20.5-002)
+
+`sdlc/degradation.py` is the **single, testable decision point** for what the
+controller does when a harness lacks a capability — so a capability gap never
+crashes a run and never degrades silently. `evaluate_degradations(harness,
+capabilities, *, requested_mode=...)` returns an immutable `DegradationPlan`
+listing every fallback applied (each a `Degradation` with a stable `kind`, the
+`missing` capability flag(s), and a human-readable `message`).
+
+| Missing capability | Requested | Fallback (`DegradationKind`) | Effect |
+|---|---|---|---|
+| `parallel` or `worktree_isolation` | `parallel` | `parallel_to_serial` | the cohort runs **serially** (the safe alternative), one explicit log line |
+| `usage_tracking` | any | `usage_unavailable` | cost/usage recorded as **"unavailable"**, not fabricated as zero (the `PlainResultParser` returns `usage_available=False`) |
+| `rate_limit_aware` | any | `rate_limit_skipped` | **rate-limit backoff is skipped** — no fabricated 429 handling (a non-zero exit is a plain dispatch error) |
+
+A **fully capable** harness (the built-in Claude harness — every flag `true`)
+yields an **empty plan**, so wiring this in is purely additive for the default
+path; nothing is recorded and dispatch is unchanged.
+
+`capability.preflight_harness` (Story 20.5-001) **delegates** its mode decision to
+this matrix — it surfaces only the `parallel_to_serial` fallback as a preflight
+warning, while the build flow records the full plan. `run_build` calls
+`_record_degradations` right after the capability preflight: it resolves the
+default-slot harness, evaluates the matrix for the run's mode, and writes one
+`warn` event per fallback to the `degradation` event source — so any degradation
+is auditable in the run summary (AC3). `DegradationPlan.to_records()` yields the
+structured rows (`harness`, `kind`, `missing`, `message`, `requested_mode`,
+`effective_mode`) the ledger/summary persists.
 
 ### Per-role harness routing (Story 20.2-001)
 
