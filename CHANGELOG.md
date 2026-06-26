@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.79.2] - 2026-06-26
+
+### Fixed
+
+- fix(controller): refresh the host registry on sdlc reconcile
+
+
 ## [v1.79.1] - 2026-06-26
 
 ### Fixed
