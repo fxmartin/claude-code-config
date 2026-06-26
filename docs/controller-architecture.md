@@ -17,6 +17,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/build.py` | The state machine: options, `Ledger`, preflight, prompts, `run_build`. |
 | `sdlc/cohort.py` | Pure dependency-cohort scheduling + `--limit` truncation. |
 | `sdlc/dispatch.py` | The agent-dispatch boundary — shells out, validates output. |
+| `sdlc/parsers.py` | Pluggable per-harness output parsers — interpret an agent's stdout into a validated `AgentResult`, registered by id (Story 20.1-002). |
 | `sdlc/harness.py` | Config-driven harness registry — declares each agent harness (claude, codex, …) and how to invoke it (Story 20.1-001). |
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
 | `sdlc/contracts.py` | JSON-schema parse + validation (Story 7.2-001). |
@@ -854,10 +855,12 @@ instead of hanging the build.
 
 The terminal `result` event in the stream has the **same shape** as the old
 `--output-format json` envelope, so the controller captures it during the loop
-and hands it to a shared `_interpret` step: `<<<RESULT_JSON>>>` extraction,
-`usage`/`total_cost_usd`/`session_id` capture, and schema validation are
-byte-for-byte identical to the captured path. Unknown / non-JSON stream lines
-are teed to the transcript but ignored for control flow.
+and hands it, with the accumulated stdout, to a shared `_interpret` step. That
+step is harness-neutral: it builds a `CollectedOutput` and delegates to the
+harness's **output parser** (see below), which owns `<<<RESULT_JSON>>>`
+extraction, `usage`/`total_cost_usd`/`session_id` capture, and schema validation.
+Unknown / non-JSON stream lines are teed to the transcript but ignored for
+control flow.
 
 Any command **without** `stream-json` (a custom `SDLC_AGENT_CMD`, or an older
 agent) takes the **captured** path (`_dispatch_captured`, the original
@@ -867,6 +870,48 @@ parsing the accumulated stdout exactly as the captured path would, so a
 malformed stream never fails the run on its own. The streaming path keeps the
 verbatim stream in the transcript (it is the live view); the captured envelope
 path still rewrites the transcript to the readable agent text.
+
+### Pluggable output parsers (Story 20.1-002)
+
+The Claude-specific *interpretation* (envelope unwrapping, usage/cost capture,
+429/`resetsAt` rate-limit and "prompt is too long" context-overflow recognition)
+used to live inline in `dispatch._interpret`. It is now an **output-parser
+interface** (`sdlc/parsers.py`) so a non-Claude harness gets proper handling
+instead of the lossy plain-stdout fallback. The split is *collection* vs
+*interpretation*:
+
+- **Collection** stays in `dispatch.py`: running the subprocess, streaming vs
+  captured I/O, the kill-switch / heartbeat. It hands the result to a parser as a
+  harness-neutral `CollectedOutput` (agent type, stdout/stderr, returncode,
+  transcript path, the optional Claude `result` envelope, and any stream-captured
+  reset epoch).
+- **Interpretation** is per-harness, owned by an `OutputParser` resolved **by id**
+  through `get_parser(parser_id)`. Each `harnesses.yaml` entry declares its parser
+  id; `None` selects the built-in default. An **unregistered id fails fast** with
+  `UnknownParserError` (the typo + the registered ids), never a silent mis-parse.
+
+Two parsers ship:
+
+- **`claude-stream-json`** — `ClaudeStreamJsonParser`, the built-in default. The
+  former `_interpret` body, preserved **verbatim**, so the Claude path is
+  byte-for-byte today's: the `<<<RESULT_JSON>>>` contract, `usage` /
+  `total_cost_usd` / `session_id`, structured-429 / `resetsAt` rate-limits, and
+  context-overflow detection all behave exactly as before.
+- **`codex-exec`** — `PlainResultParser`, for a harness with a JSON contract but
+  **no usage / rate-limit semantics**. It reads the harness-neutral
+  `<<<RESULT_JSON>>>` block straight out of stdout and validates it against the
+  *same* contract schema, but it does **not** unwrap a Claude envelope and has no
+  rate-limit / context-overflow recognition — a non-zero exit is always a plain
+  `AgentDispatchError`, never a fabricated 429. Usage is recorded as
+  **unavailable** (`AgentResult.usage_available=False`, `usage=None`) rather than
+  fabricated as zero, so cost tracking skips the stage and the run still advances.
+
+The `<<<RESULT_JSON>>>` contract (`sdlc.contracts.parse_and_validate`) is the
+harness-neutral seam both parsers validate against. `dispatch_agent(…, parser=…)`
+threads the id from the resolved harness; with no id the default keeps today's
+Claude behaviour, so the change is fully backward compatible. Adding a harness
+that reuses an existing parser shape needs **no new Python** — only a
+`harnesses.yaml` entry naming a registered parser id.
 
 On the streaming path the same per-stage progress sink also accrues **running
 token usage** (Story 11.1-003): a `UsageAccumulator` sums each assistant turn's
