@@ -257,6 +257,22 @@ def test_unknown_harness_block_is_rejected_on_parse() -> None:
     assert "opencode" in str(exc.value)
 
 
+def test_valid_harness_block_passes_parse_check() -> None:
+    """A body with only known harness tags parses without raising.
+
+    Complements the rejection test above: exercises the loop's accept path so
+    `_check_body` validates a real harness block rather than only bailing on a
+    bad one.
+    """
+    text = (
+        "---\nname: d\ndescription: d\n---\n"
+        "<!-- harness:claude -->\nclaude-only\n<!-- /harness -->\n"
+        "<!-- harness:codex -->\ncodex-only\n<!-- /harness -->"
+    )
+    skill = parse_neutral_skill(text)
+    assert [b.harness for b in harness_blocks(skill.body)] == ["claude", "codex"]
+
+
 # ---------------------------------------------------------------------------
 # AC: the 7 shared skills are expressible in the format without loss
 # ---------------------------------------------------------------------------
