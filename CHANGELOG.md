@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.86.0] - 2026-06-26
+
+### Added
+
+- feat(cross-harness-portability): degradation matrix and (#20.5-002)
+
+
 ## [v1.85.0] - 2026-06-26
 
 ### Added
