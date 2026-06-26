@@ -25,6 +25,27 @@ directory as a git submodule.
 | `project-review` | Senior-lead architecture and quality review. |
 | `roast` | Opinionated senior code review. |
 
+## Harness-neutral sources (`neutral/`)
+
+`neutral/<name>.skill.md` holds each shared skill in the **harness-neutral
+definition format** (Epic-20, Story 20.4-001): YAML frontmatter with
+harness-agnostic metadata plus a body that carries Claude-only constructs as
+neutral placeholder tokens (`{{ARGUMENTS}}`, `{{SKILL_DIR}}`, `{{SHELL:cmd}}`)
+and optional `<!-- harness:<name> --> … <!-- /harness -->` blocks. One neutral
+source is the single thing authored; the Claude `SKILL.md` and the Codex
+skill/manifest are generated from it (generator: Story 20.4-002).
+
+The format, schema, and rationale are in
+[`docs/adr/003-harness-neutral-skill-format.md`](../docs/adr/003-harness-neutral-skill-format.md).
+The parser/validator/renderer is `controller/src/sdlc/skill_format.py`; the
+frontmatter schema is
+`controller/src/sdlc/schemas/neutral-skill.schema.json`. A controller test
+renders every neutral source back to its live `*.md` body byte-for-byte, so the
+two stay in lockstep until the generator removes the duplication.
+
+The byte-parity `sdlc sync-check` below globs the top-level `*.md` skills only,
+so the `neutral/` subdirectory does not affect it.
+
 ## Syncing (consumer side)
 
 A consumer repo pulls the latest shared skills with one command:
