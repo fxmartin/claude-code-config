@@ -12,12 +12,11 @@ import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from sdlc.contracts import parse_and_validate
-from sdlc.rate_limit import RateLimitSignal, detect_rate_limit
+from sdlc.rate_limit import RateLimitSignal
 from sdlc.sanitize import sanitize_prompt
 
 # A sink that receives each parsed stream-json event as it arrives (Story
@@ -594,6 +593,12 @@ class AgentResult:
     ``usage`` / ``cost_usd`` / ``session_id`` come from the ``--output-format
     json`` envelope and are None when the agent emitted plain text (a custom
     ``SDLC_AGENT_CMD`` or older ``claude``).
+
+    ``usage_available`` (Story 20.1-002) marks whether the *harness* tracks usage
+    at all. The Claude parser leaves it ``True`` even when a given run carried no
+    usage (the value reflects the run, the flag reflects the harness). A parser
+    for a harness with no usage/rate-limit semantics (e.g. ``codex-exec``) sets it
+    ``False`` so usage is recorded as *unavailable* rather than fabricated as zero.
     """
 
     agent_type: str
@@ -602,6 +607,7 @@ class AgentResult:
     usage: dict[str, Any] | None = None
     cost_usd: float | None = None
     session_id: str | None = None
+    usage_available: bool = True
 
 
 def _parse_envelope(stdout: str) -> dict[str, Any] | None:
@@ -638,6 +644,7 @@ def dispatch_agent(
     on_progress: ProgressCallback | None = None,
     cwd: Path | None = None,
     sandbox: bool | None = None,
+    parser: str | None = None,
 ) -> AgentResult:
     """Dispatch one agent as a subprocess and validate its response.
 
@@ -680,6 +687,13 @@ def dispatch_agent(
     present, dispatch fails fast with :class:`SandboxUnavailableError` rather than
     running unsandboxed (AC3). The result contract is identical to the host path
     (AC2). Default (``None`` with the env unset) is the host path, unchanged.
+
+    ``parser`` (Story 20.1-002) is the id of the per-harness output parser used to
+    interpret the agent's stdout into the validated result. ``None`` selects the
+    built-in Claude parser, so the default path is byte-for-byte today's; a
+    non-Claude harness passes its declared parser id (e.g. ``"codex-exec"``) so it
+    gets proper handling instead of the lossy plain-stdout fallback. An
+    unregistered id fails fast with :class:`~sdlc.parsers.UnknownParserError`.
     """
     cmd = resolve_agent_cmd(agent_cmd, model=model)
     env = _dispatch_env(thinking_cap)
@@ -697,11 +711,11 @@ def dispatch_agent(
         return _dispatch_streaming(
             agent_type, prompt, cmd, timeout=timeout, stall_timeout=stall_timeout,
             transcript_path=transcript_path, on_progress=on_progress, env=env,
-            cwd=cwd,
+            cwd=cwd, parser=parser,
         )
     return _dispatch_captured(
         agent_type, prompt, cmd, timeout=timeout,
-        transcript_path=transcript_path, env=env, cwd=cwd,
+        transcript_path=transcript_path, env=env, cwd=cwd, parser=parser,
     )
 
 
@@ -714,6 +728,7 @@ def _dispatch_captured(
     transcript_path: Path | None,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
+    parser: str | None = None,
 ) -> AgentResult:
     """Buffered dispatch: run the agent and read all of stdout at once.
 
@@ -765,6 +780,7 @@ def _dispatch_captured(
         transcript_path,
         envelope=None,
         streaming=False,
+        parser=parser,
     )
 
 
@@ -794,6 +810,7 @@ def _dispatch_streaming(
     on_progress: ProgressCallback | None = None,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
+    parser: str | None = None,
 ) -> AgentResult:
     """Streamed dispatch: consume stdout line-by-line, teeing each to the transcript.
 
@@ -1001,6 +1018,7 @@ def _dispatch_streaming(
         envelope=result_event,
         streaming=True,
         stream_resets_at=stream_resets_at,
+        parser=parser,
     )
 
 
@@ -1014,106 +1032,39 @@ def _interpret(
     envelope: dict[str, Any] | None,
     streaming: bool,
     stream_resets_at: float | None = None,
+    parser: str | None = None,
 ) -> AgentResult:
-    """Shared post-collection logic for both the captured and streamed paths.
+    """Hand the collected output to the harness's output parser (Story 20.1-002).
 
-    ``envelope`` is the terminal ``result`` event (streaming) or None; when None
-    it is derived from ``stdout`` (captured path, or a streamed run whose result
-    event never arrived — the graceful fallback). ``streaming`` suppresses the
-    transcript rewrite so the live stream is preserved verbatim for ``tail -f``.
+    Collection — running the subprocess, streaming vs captured, the kill-switch —
+    is harness-neutral and stays here; *interpretation* — envelope shape,
+    usage/cost extraction, rate-limit and context-overflow recognition — is
+    per-harness and owned by an :class:`~sdlc.parsers.OutputParser` resolved by id.
+    ``parser`` is the harness's declared parser id; ``None`` selects the built-in
+    Claude parser, so the default path is byte-for-byte today's. The Claude-specific
+    logic that used to live inline here now lives in
+    :class:`~sdlc.parsers.ClaudeStreamJsonParser`, preserved verbatim.
 
-    ``stream_resets_at`` (issue #120) is the absolute window-reset epoch captured
-    from a ``rate_limit_event`` stream line on the streaming path; the captured
-    path never sees a stream so it defaults to None. It is threaded onto whichever
-    rate-limit signal is produced whenever that signal lacks its own reset epoch —
-    covering both the structured-429 fallback and the common case where the human
-    result text is *recognised* as a rate limit but names no parseable reset time —
-    so the wait resumes precisely on reset instead of using the full-window fallback.
+    ``envelope`` is the terminal ``result`` event (streaming) or None — derived
+    from ``stdout`` by the Claude parser when None. ``stream_resets_at`` (issue
+    #120) is the absolute rate-limit reset epoch captured from a stream line, used
+    by the Claude parser to resume precisely on reset.
+
+    The parsers module is imported **lazily** here so the dispatch↔parsers
+    dependency stays one-way: parsers imports dispatch's errors / ``AgentResult``
+    at module load, while dispatch imports parsers only at call time.
     """
+    from sdlc.parsers import CollectedOutput, get_parser
 
-    def _with_stream_reset(sig: RateLimitSignal | None) -> RateLimitSignal | None:
-        # Issue #120 follow-up: detect_rate_limit() recognises the session-limit
-        # text but the common message carries no parseable epoch, so the matched
-        # signal's reset_at is None. Fill it from the stream-captured resetsAt so
-        # the precise resume applies on the text-matched path too — never override
-        # an epoch the text did surface.
-        if sig is not None and sig.reset_at is None and stream_resets_at is not None:
-            return replace(sig, reset_at=stream_resets_at)
-        return sig
-
-    if returncode != 0:
-        detail = (stderr or stdout or "").strip()
-        # Story 14.1-003: a non-zero exit caused by the Max plan's rate limit is a
-        # recoverable, time-based pause — not a generic dispatch failure. Surface
-        # it as a distinct RateLimitError so the controller waits/parks instead of
-        # burning a bugfix attempt. Absent a rate-limit signal, behaviour is today's.
-        signal = _with_stream_reset(detect_rate_limit(detail))
-        if signal is not None:
-            raise RateLimitError(
-                f"{agent_type} agent hit the rate limit (exit {returncode}): {detail}",
-                signal=signal,
-            )
-        raise AgentDispatchError(
-            f"{agent_type} agent exited {returncode}: {detail}"
+    return get_parser(parser).parse(
+        CollectedOutput(
+            agent_type=agent_type,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=returncode,
+            transcript_path=transcript_path,
+            envelope=envelope,
+            streaming=streaming,
+            stream_resets_at=stream_resets_at,
         )
-
-    if envelope is None:
-        envelope = _parse_envelope(stdout)
-
-    if envelope is not None:
-        if envelope.get("is_error"):
-            detail = (
-                envelope.get("result") or envelope.get("subtype") or "unknown error"
-            )
-            # Story 14.1-003: an error envelope whose subtype/text names a rate
-            # limit is the same recoverable pause as a non-zero exit.
-            # Issue #109: the CLI rejects a dispatch with a *successful* exit but
-            # an error envelope carrying structured 429 fields
-            # (``api_error_status``/``error``). Treat that as a definitive
-            # rate-limit signal even when the human ``result`` text is not
-            # recognised, preferring a structured reset epoch when surfaced.
-            signal = _with_stream_reset(detect_rate_limit(str(detail)))
-            if signal is None and (
-                envelope.get("api_error_status") == 429
-                or envelope.get("error") == "rate_limit"
-            ):
-                signal = RateLimitSignal(
-                    source="usage-limit", reset_at=stream_resets_at
-                )
-            if signal is not None:
-                raise RateLimitError(
-                    f"{agent_type} agent hit the rate limit: {detail}",
-                    signal=signal,
-                )
-            # Issue #104: a prompt-too-long / context-window overflow. Checked
-            # AFTER the rate-limit detection so the two never shadow each other,
-            # and BEFORE the generic dispatch error so the controller can
-            # fail-fast instead of burning the bugfix loop on an unshrinkable
-            # in-session context.
-            if _is_context_overflow(str(detail)):
-                raise ContextOverflowError(
-                    f"{agent_type} agent exceeded context window: {detail}"
-                )
-            raise AgentDispatchError(
-                f"{agent_type} agent reported an error: {detail}"
-            )
-        agent_text = envelope.get("result") or ""
-        usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else None
-        raw_cost = envelope.get("total_cost_usd")
-        cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
-        session_id = envelope.get("session_id")
-        # Captured path: the raw envelope is already on disk (R8 persist), so
-        # rewrite the transcript with the readable agent text. Streaming path:
-        # leave the verbatim stream in place — that is the live tail -f view.
-        if not streaming:
-            _write_transcript(transcript_path, agent_text, stderr)
-        data = parse_and_validate(agent_type, agent_text)
-        return AgentResult(
-            agent_type=agent_type, data=data, raw=agent_text,
-            usage=usage, cost_usd=cost, session_id=session_id,
-        )
-
-    # Fallback: plain-text agent output (custom SDLC_AGENT_CMD / older claude, or
-    # a streamed run that produced no result event).
-    data = parse_and_validate(agent_type, stdout)
-    return AgentResult(agent_type=agent_type, data=data, raw=stdout)
+    )
