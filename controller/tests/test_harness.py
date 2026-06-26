@@ -106,6 +106,28 @@ def test_load_applies_enabled_default(tmp_path: Path) -> None:
     assert registry["foo"].enabled is True
 
 
+def test_load_rejects_default_naming_undefined_harness(tmp_path: Path) -> None:
+    """A `default` that points at an undefined harness fails fast with its name."""
+    bad = tmp_path / "harnesses.yaml"
+    bad.write_text(
+        "default: ghost\nharnesses:\n  foo:\n    command: foo run\n    parser: plain\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(HarnessError, match="ghost"):
+        load_harnesses_config(bad)
+
+
+def test_load_accepts_default_naming_defined_harness(tmp_path: Path) -> None:
+    """A `default` that names a defined harness loads cleanly."""
+    cfg = tmp_path / "harnesses.yaml"
+    cfg.write_text(
+        "default: foo\nharnesses:\n  foo:\n    command: foo run\n    parser: plain\n",
+        encoding="utf-8",
+    )
+    registry = load_harnesses_config(cfg)
+    assert "foo" in registry
+
+
 # ---------------------------------------------------------------------------
 # Command rendering + placeholder templating
 # ---------------------------------------------------------------------------
