@@ -172,6 +172,79 @@ def test_default_paths_resolve() -> None:
     assert backup.name.startswith("repair-")
 
 
+
+# --- default_repo_root: worktree fallback (#179 defense-in-depth) -----------
+
+
+def test_default_repo_root_fallback_absolute_marketplace(tmp_path: Path, monkeypatch) -> None:
+    """Falls back to a canonical root via an absolute marketplace symlink.
+
+    When ``__file__`` resolves inside a worktree, ``default_repo_root`` follows
+    the ``plugins/marketplaces/fx-claude-config`` symlink back to the stable
+    checkout rather than returning the throwaway worktree path.
+    """
+    import sdlc.repair as repair_mod
+
+    canonical = tmp_path / "stable-checkout"
+    canonical.mkdir()
+    claude_dir = tmp_path / "dot-claude"
+    marketplace_dir = claude_dir / "plugins" / "marketplaces"
+    marketplace_dir.mkdir(parents=True)
+    marketplace = marketplace_dir / "fx-claude-config"
+    os.symlink(canonical, marketplace)
+
+    # Treat every path except canonical as a worktree root.
+    monkeypatch.setattr(repair_mod, "is_worktree_root", lambda p: p.resolve() != canonical.resolve())
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    result = repair_mod.default_repo_root()
+    assert result == canonical.resolve()
+
+
+def test_default_repo_root_fallback_relative_marketplace(tmp_path: Path, monkeypatch) -> None:
+    """Falls back via a relative marketplace symlink, resolving path correctly.
+
+    Exercises the ``target = marketplace.parent / target`` branch that converts
+    a relative readlink result into an absolute path before resolving.
+    """
+    import sdlc.repair as repair_mod
+
+    canonical = tmp_path / "stable-checkout"
+    canonical.mkdir()
+    claude_dir = tmp_path / "dot-claude"
+    marketplace_dir = claude_dir / "plugins" / "marketplaces"
+    marketplace_dir.mkdir(parents=True)
+    marketplace = marketplace_dir / "fx-claude-config"
+    rel_target = os.path.relpath(canonical, start=marketplace_dir)
+    os.symlink(rel_target, marketplace)
+
+    monkeypatch.setattr(repair_mod, "is_worktree_root", lambda p: p.resolve() != canonical.resolve())
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    result = repair_mod.default_repo_root()
+    assert result == canonical.resolve()
+
+
+def test_default_repo_root_falls_back_to_derived_when_no_marketplace(tmp_path: Path, monkeypatch) -> None:
+    """Returns the derived (worktree) path when the marketplace link is absent.
+
+    When there is no ``plugins/marketplaces/fx-claude-config`` symlink available
+    to recover from, the primary ``build_plan`` guard is the only protection.
+    """
+    import sdlc.repair as repair_mod
+
+    claude_dir = tmp_path / "dot-claude"
+    claude_dir.mkdir()
+    # No marketplace symlink created.
+
+    monkeypatch.setattr(repair_mod, "is_worktree_root", lambda p: True)
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    derived = Path(repair_mod.__file__).resolve().parents[3]
+    result = repair_mod.default_repo_root()
+    assert result == derived
+
+
 # --- apply_plan: restore ----------------------------------------------------
 
 
