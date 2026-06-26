@@ -16,13 +16,42 @@ __all__ = [
     "RepairAction",
     "RepairPlan",
     "RepairResult",
+    "WorktreeRootError",
     "apply_plan",
     "build_plan",
     "default_backup_dir",
     "default_claude_dir",
     "default_repo_root",
+    "is_worktree_root",
     "plan_action",
 ]
+
+
+class WorktreeRootError(RuntimeError):
+    """Raised when a repair is sourced from an ephemeral agent worktree.
+
+    ``repair`` re-points every managed ``~/.claude`` symlink at its source
+    ``repo_root``. If that root lives inside ``.claude/worktrees`` (a throwaway
+    build worktree), the links dangle the moment the worktree is torn down,
+    silently breaking the live install. Only the stable main checkout may own
+    ``~/.claude`` — the twin of install/core.sh's ``--core`` guard (#179).
+    """
+
+
+def is_worktree_root(repo_root: Path) -> bool:
+    """True when *repo_root* lives inside an ephemeral agent worktree.
+
+    Mirrors install/core.sh's glob guard (``*/.claude/worktrees/*``): a path
+    with ``.claude/worktrees`` followed by at least one more component is a
+    throwaway build worktree, never the stable main checkout.
+    """
+    parts = repo_root.resolve().parts
+    # range(len - 2) guarantees a component exists *after* "worktrees", matching
+    # the trailing "/*" in the shell glob.
+    return any(
+        parts[i] == ".claude" and parts[i + 1] == "worktrees"
+        for i in range(len(parts) - 2)
+    )
 
 # The managed-artifact set, mirroring install/core.sh's install_core_run().
 # Each entry is (destination relative to the Claude config dir, source relative
@@ -141,7 +170,19 @@ def _inspect(rel_dest: str, src_rel: str, repo_root: Path, claude_dir: Path) -> 
 
 
 def build_plan(repo_root: Path, claude_dir: Path) -> RepairPlan:
-    """Inspect every managed artifact and return the resulting repair plan."""
+    """Inspect every managed artifact and return the resulting repair plan.
+
+    Refuses (#179) when *repo_root* is an ephemeral agent worktree: building a
+    plan there would re-point ``~/.claude`` at a path that vanishes on teardown.
+    Guarding here protects both ``sdlc repair`` and any direct ``apply_plan``
+    caller, since no plan is produced for a worktree source.
+    """
+    if is_worktree_root(repo_root):
+        raise WorktreeRootError(
+            f"refusing to repair from an agent worktree ({repo_root}); run "
+            "sdlc repair from the main checkout so ~/.claude links to a stable "
+            "path."
+        )
     artifacts = tuple(
         _inspect(dest_rel, src_rel, repo_root, claude_dir)
         for dest_rel, src_rel in MANAGED_LINKS
@@ -204,8 +245,27 @@ def default_repo_root() -> Path:
 
     ``controller/src/sdlc/repair.py`` → ``parents[3]`` is the repo root where
     ``install.sh``, ``CLAUDE.md`` and the rest of the managed set live.
+
+    Defense-in-depth (#179): when ``__file__`` resolves inside an ephemeral
+    agent worktree (``uv run sdlc repair`` invoked from a worktree cwd loads the
+    worktree's own copy of this module), the derived root is the throwaway path.
+    Prefer the canonical install root recorded by the healthy marketplace link
+    so the repair still targets the stable checkout. The ``build_plan`` guard is
+    the primary protection if no healthy link is available to fall back to.
     """
-    return Path(__file__).resolve().parents[3]
+    derived = Path(__file__).resolve().parents[3]
+    if not is_worktree_root(derived):
+        return derived
+
+    marketplace = default_claude_dir() / "plugins" / "marketplaces" / "fx-claude-config"
+    if marketplace.is_symlink():
+        target = Path(os.readlink(marketplace))
+        if not target.is_absolute():
+            target = marketplace.parent / target
+        canonical = target.resolve()
+        if canonical.is_dir() and not is_worktree_root(canonical):
+            return canonical
+    return derived
 
 
 def default_claude_dir() -> Path:

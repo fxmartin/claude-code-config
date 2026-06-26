@@ -7,12 +7,16 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 from sdlc.repair import (
     MANAGED_LINKS,
     ArtifactStatus,
     RepairAction,
+    WorktreeRootError,
     apply_plan,
     build_plan,
+    is_worktree_root,
 )
 
 
@@ -286,6 +290,35 @@ def test_repair_never_touches_unmanaged_files(tmp_path: Path) -> None:
 
     assert user_file.read_text(encoding="utf-8") == "private"
     assert (user_dir / "data.db").read_text(encoding="utf-8") == "ledger"
+
+
+# --- worktree-root guard (#179) ---------------------------------------------
+
+
+def test_is_worktree_root_detects_agent_worktree(tmp_path: Path) -> None:
+    wt = tmp_path / ".claude" / "worktrees" / "agent-run-story" / "controller"
+    assert is_worktree_root(wt) is True
+
+
+def test_is_worktree_root_accepts_main_checkout(tmp_path: Path) -> None:
+    main = tmp_path / "claude-code-config" / "controller"
+    assert is_worktree_root(main) is False
+
+
+def test_build_plan_refuses_worktree_root(tmp_path: Path) -> None:
+    """build_plan must refuse a worktree source before any plan exists to apply.
+
+    Guards direct callers of build_plan/apply_plan too, not just the CLI: a
+    repair sourced from an ephemeral worktree would re-point ~/.claude into a
+    path that vanishes on teardown.
+    """
+    wt = tmp_path / ".claude" / "worktrees" / "agent-test-1"
+    repo = _seed_repo(wt)
+    claude_dir = tmp_path / "claude"
+    _link_all(repo, claude_dir)
+
+    with pytest.raises(WorktreeRootError, match="worktree"):
+        build_plan(repo, claude_dir)
 
 
 # --- managed set authority: parity with install/core.sh ---------------------

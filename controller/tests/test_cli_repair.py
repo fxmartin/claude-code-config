@@ -71,6 +71,27 @@ def test_repair_restores_missing_link(tmp_path: Path) -> None:
     assert Path(os.readlink(dest)).resolve() == (repo / "CLAUDE.md").resolve()
 
 
+def test_repair_refuses_worktree_root(tmp_path: Path) -> None:
+    # Guard (#179): repair re-points every managed ~/.claude link at --root. If
+    # --root is an ephemeral agent worktree (.claude/worktrees/agent-*), those
+    # links dangle the moment the worktree is torn down, clobbering the live
+    # install. The verb must refuse before mutating anything. Seed the managed
+    # set inside the worktree so only the guard — not a missing source — stops it.
+    wt = tmp_path / ".claude" / "worktrees" / "agent-test-1"
+    repo = _seed_repo(wt)
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()  # empty target — everything would be "missing"
+
+    result = runner.invoke(
+        app, ["repair", "--root", str(repo), "--claude-dir", str(claude_dir)]
+    )
+
+    assert result.exit_code != 0
+    assert "worktree" in result.output.lower()
+    # No managed symlink was created in the target.
+    assert list(claude_dir.iterdir()) == []
+
+
 def test_repair_dry_run_reports_without_acting(tmp_path: Path) -> None:
     repo = _seed_repo(tmp_path)
     claude_dir = tmp_path / "claude"
