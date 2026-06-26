@@ -166,3 +166,31 @@ def test_format_state_shows_harness_column(tmp_path: Path) -> None:
     lines = format_state(state_report(ledger, run_id))
     assert "HARNESS" in lines[0]
     assert any("codex" in line for line in lines[1:])
+
+
+# --- read-only viewer over a pre-migration ledger --------------------------
+# The code's contract is that a read-only viewer NEVER migrates: state_rows and
+# stage_breakdown tolerate a missing `harness` column and render the default
+# without mutating the DB. The migration tests above call ensure_migrated()
+# first, so they don't exercise that read-side fallback arm.
+
+
+def test_state_rows_on_unmigrated_ledger_defaults_without_migrating(tmp_path: Path) -> None:
+    db = tmp_path / "old.db"
+    _old_schema_db(db, with_stage=True)
+
+    rows = Ledger(db).state_rows("r1")
+
+    assert rows and rows[0]["harness"] == "claude"
+    # The read-only viewer must not have migrated the on-disk schema.
+    assert "harness" not in _columns(db, "stages")
+
+
+def test_stage_breakdown_on_unmigrated_ledger_defaults_without_migrating(tmp_path: Path) -> None:
+    db = tmp_path / "old.db"
+    _old_schema_db(db, with_stage=True)
+
+    breakdown = Ledger(db).stage_breakdown("r1")
+
+    assert breakdown["s1"][0]["harness"] == "claude"
+    assert "harness" not in _columns(db, "stages")
