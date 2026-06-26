@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.79.1] - 2026-06-26
+
+### Fixed
+
+- fix(controller): guard sdlc repair against an agent-worktree root
+
+
 ## [v1.79.0] - 2026-06-25
 
 ### Added
