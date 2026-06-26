@@ -312,6 +312,64 @@ def test_run_build_logs_harness_capabilities(tmp_path, monkeypatch) -> None:
     assert "worktree_isolation" in joined
 
 
+def test_run_build_records_no_degradation_for_builtin_claude(tmp_path, monkeypatch) -> None:
+    """Story 20.5-002 AC3: the fully-capable Claude harness records no degradation."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='degradation'"
+    ).fetchall()
+    assert rows == [], "fully-capable Claude harness must not degrade"
+
+
+def test_run_build_records_degradations_for_bare_harness(tmp_path, monkeypatch) -> None:
+    """Story 20.5-002 AC3: a harness with capability gaps records each fallback."""
+    from sdlc.harness import HarnessConfig
+
+    bare = HarnessConfig(
+        name="codex",
+        command="codex exec",
+        parser="codex-exec",
+        capabilities={
+            "worktree_isolation": False,
+            "parallel": False,
+            "json_contract": True,
+            "usage_tracking": False,
+            "rate_limit_aware": False,
+        },
+    )
+    # The default-slot resolver returns Claude; force the recording helper to see
+    # a non-Claude harness so the degradation paths fire.
+    monkeypatch.setattr("sdlc.build.resolve_harness", lambda *a, **k: bare)
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='degradation'"
+    ).fetchall()
+    joined = "\n".join(r[0] for r in rows)
+    # A serial run requests serial mode, so no parallel→serial line; the
+    # telemetry gaps (usage, rate-limit) are always recorded.
+    assert "unavailable" in joined
+    assert "rate-limit" in joined
+
+
 def test_run_build_writes_ledger_after_every_stage(tmp_path) -> None:
     db = tmp_path / "ledger.db"
     opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
