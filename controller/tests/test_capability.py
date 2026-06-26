@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import pytest
 
+import subprocess
+
 from sdlc.capability import (
     CAPABILITY_KEYS,
     MODE_PARALLEL,
@@ -12,6 +14,7 @@ from sdlc.capability import (
     HarnessPreflight,
     ProbeResult,
     ProbeStatus,
+    _default_probe_runner,
     preflight_harness,
     probe_harness,
     resolve_capabilities,
@@ -117,6 +120,60 @@ def test_probe_splits_command_into_argv() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Default probe runner (real subprocess execution, no injected runner)
+# ---------------------------------------------------------------------------
+
+
+def test_default_probe_runner_returns_zero_for_real_command() -> None:
+    """A command that exists and succeeds yields its zero return code."""
+    returncode, _detail = _default_probe_runner(["true"])
+    assert returncode == 0
+
+
+def test_default_probe_runner_captures_nonzero_exit() -> None:
+    returncode, _detail = _default_probe_runner(["false"])
+    assert returncode != 0
+
+
+def test_default_probe_runner_prefers_stderr_detail() -> None:
+    """When the command writes to stderr, that text is the captured detail."""
+    returncode, detail = _default_probe_runner(
+        ["sh", "-c", "echo boom >&2; exit 3"]
+    )
+    assert returncode == 3
+    assert detail == "boom"
+
+
+def test_default_probe_runner_falls_back_to_stdout_detail() -> None:
+    returncode, detail = _default_probe_runner(["sh", "-c", "echo hi; exit 0"])
+    assert returncode == 0
+    assert detail == "hi"
+
+
+def test_default_probe_runner_handles_missing_command() -> None:
+    returncode, detail = _default_probe_runner(["sdlc-no-such-binary-xyz"])
+    assert returncode == 127
+    assert "command not found" in detail
+
+
+def test_default_probe_runner_handles_timeout(monkeypatch) -> None:
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="probe", timeout=10)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    returncode, detail = _default_probe_runner(["codex", "--version"])
+    assert returncode == 124
+    assert "timed out" in detail
+
+
+def test_probe_harness_uses_default_runner_when_none_given() -> None:
+    """With no injected runner the real subprocess path resolves availability."""
+    result = probe_harness(_harness(probe="true"))
+    assert result.status is ProbeStatus.AVAILABLE
+    assert result.command == "true"
+
+
+# ---------------------------------------------------------------------------
 # Preflight mode decision (AC2): degrade rather than fail mid-run
 # ---------------------------------------------------------------------------
 
@@ -181,6 +238,24 @@ def test_preflight_log_lines_include_capability_summary() -> None:
     joined = "\n".join(pf.log_lines())
     assert "codex" in joined
     assert "parallel" in joined
+
+
+def test_preflight_log_lines_include_probe_status_when_probed() -> None:
+    """A harness that declared a probe surfaces the probe outcome in the log."""
+    pf = preflight_harness(
+        _harness(probe="codex --version"),
+        requested_mode=MODE_SERIAL,
+        probe_runner=lambda argv: (0, "codex 1.0"),
+    )
+    joined = "\n".join(pf.log_lines())
+    assert f"probe {ProbeStatus.AVAILABLE.value}" in joined
+
+
+def test_preflight_log_lines_omit_probe_status_when_unknown() -> None:
+    """No probe command means no probe line in the log output."""
+    pf = preflight_harness(_harness(probe=None), requested_mode=MODE_SERIAL)
+    joined = "\n".join(pf.log_lines())
+    assert "probe" not in joined
 
 
 def test_preflight_log_lines_announce_degradation() -> None:
