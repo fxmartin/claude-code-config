@@ -3,7 +3,7 @@
 
 # ADR-002: Codex Mirror Sync Mechanism
 
-- **Status**: Accepted
+- **Status**: Accepted (extended by [ADR-003](003-harness-neutral-skill-format.md))
 - **Date**: 2026-06-12
 - **Epic / Story**: Epic-07 / Story 7.4-001
 - **Deciders**: FX

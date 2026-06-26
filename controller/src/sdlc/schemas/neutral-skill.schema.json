@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/neutral-skill.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for a harness-neutral skill source's metadata (Story 20.4-001). ABOUTME: Draft 2020-12; captures everything the Claude SKILL.md frontmatter and the Codex .codex-plugin manifest both need from one source.",
+  "title": "NeutralSkillMetadata",
+  "description": "Harness-agnostic metadata block (YAML frontmatter) of a neutral skill source. One source generates both the Claude SKILL.md and the Codex skill/manifest, so this captures the union of what each target requires without privileging either harness's spelling.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "description"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "Kebab-case skill identifier, e.g. 'coverage'. Becomes the Claude skill/slash-command name and the Codex 'Use <name>' verb."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One-line trigger description. Feeds the Claude frontmatter 'description' and the Codex manifest 'description'."
+    },
+    "short_description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Terse label for the Codex manifest 'metadata.short-description' / interface summary."
+    },
+    "argument_hint": {
+      "type": "string",
+      "description": "Argument usage hint, rendered into the Claude frontmatter 'argument-hint'."
+    },
+    "allowed_tools": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Tool allow-list, rendered into the Claude frontmatter 'allowed-tools'. Empty means no restriction is declared."
+    },
+    "model_invocation": {
+      "type": "string",
+      "enum": ["auto", "disabled"],
+      "description": "Harness-neutral form of Claude's 'disable-model-invocation'. 'auto' lets the model trigger the skill; 'disabled' restricts it to explicit invocation."
+    },
+    "user_invocable": {
+      "type": "boolean",
+      "description": "Whether the skill is exposed as a user-invocable slash command. Maps to the Claude frontmatter 'user-invocable'."
+    },
+    "invocation_examples": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Example invocations, e.g. 'coverage focus on lib/preflight.sh'. Rendered as Codex 'Use <name> ...' forms and as Claude usage examples."
+    },
+    "harnesses": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["claude", "codex"] },
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Target harnesses this skill is generated for. Defaults to both; Claude-only skills (e.g. fix-issue) list just ['claude']."
+    }
+  }
+}
