@@ -370,6 +370,34 @@ def test_run_build_records_degradations_for_bare_harness(tmp_path, monkeypatch) 
     assert "rate-limit" in joined
 
 
+def test_run_build_degradation_recording_is_best_effort(tmp_path, monkeypatch) -> None:
+    """Story 20.5-002 AC3: a failure while recording degradations never fails the
+    build. The recorder is best-effort, so a raising dependency is swallowed and
+    the run still completes with no degradation events written."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("harness resolution exploded")
+
+    # Force the recorder's first call to raise so the except guard fires.
+    monkeypatch.setattr("sdlc.build.resolve_harness", _boom)
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    assert isinstance(result, BuildResult)
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='degradation'"
+    ).fetchall()
+    assert rows == [], "a recorder failure must write nothing, not crash the build"
+
+
 def test_run_build_writes_ledger_after_every_stage(tmp_path) -> None:
     db = tmp_path / "ledger.db"
     opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
