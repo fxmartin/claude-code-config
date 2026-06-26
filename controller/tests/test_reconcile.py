@@ -920,3 +920,36 @@ def test_reconcile_with_run_absent_from_registry_is_noop(tmp_path: Path) -> None
 
     assert result.run_status_after == "DONE"
     assert registry.records() == []
+
+
+def test_reconcile_registry_oserror_is_best_effort(tmp_path: Path) -> None:
+    """An OSError from registry.mark_finished must not abort reconcile (#173).
+
+    The contract states reconcile never raises and never fails an otherwise-good
+    run.  If the registry JSON is on a read-only filesystem (or any other I/O
+    problem surfaces as OSError), the ledger update must still complete and the
+    result must reflect the reconciled state.
+    """
+
+    class _BrokenRegistry:
+        """Stub whose mark_finished always raises OSError (disk-full / readonly)."""
+
+        def mark_finished(self, run_id: str, status: str, *, completed: int | None = None) -> None:
+            raise OSError("simulated disk-full")
+
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-202", new=True)
+    _commit(root, "land.py", "x = 1\n", "feat: land (#99.1-202)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-202")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-202", "FAILED", 202)])
+
+    # Reconcile must still succeed even though registry write fails.
+    result = reconcile_run(
+        Ledger(db), run_id, root=root, fetch=False, registry=_BrokenRegistry()
+    )
+
+    assert result.run_status_after == "DONE"
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-202"]
