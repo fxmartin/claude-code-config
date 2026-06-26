@@ -854,3 +854,69 @@ def test_ensure_stages_done_promotes_non_done_attempt(tmp_path: Path) -> None:
     assert _stage_done(db, run_id, "99.1-043", "coverage") == 1
     assert _stage_done(db, run_id, "99.1-043", "review") == 1
     assert _merge_done(db, run_id, "99.1-043") == 1
+
+
+# --- registry refresh on reconcile (#173) -----------------------------------
+
+
+def test_reconcile_refreshes_registry(tmp_path: Path) -> None:
+    """Reconcile must re-stamp the host registry, not just the ledger (#173).
+
+    A run parked FAILED in the registry (completed=N-1) whose work has since
+    landed should, after reconcile flips it DONE in the ledger, show DONE with
+    the corrected done count in the registry too — otherwise the dashboard keeps
+    serving the stale status.
+    """
+    from sdlc.registry import Registry, RunRecord
+
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-200", new=True)
+    _commit(root, "land.py", "x = 1\n", "feat: land (#99.1-200)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-200")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-200", "FAILED", 200)])
+
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord(
+            run_id=run_id,
+            repo=str(root),
+            db=str(db),
+            scope="epic-99",
+            pid=1,
+            status="FAILED",
+            started_at="2026-01-01T00:00:00+00:00",
+            total=1,
+            completed=0,
+        )
+    )
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False, registry=registry)
+
+    assert result.run_status_after == "DONE"
+    record = {r.run_id: r for r in registry.records()}[run_id]
+    assert record.status == "DONE"
+    assert record.completed == 1
+
+
+def test_reconcile_with_run_absent_from_registry_is_noop(tmp_path: Path) -> None:
+    """Reconciling a run unknown to the registry is a safe no-op (#173)."""
+    from sdlc.registry import Registry
+
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-201", new=True)
+    _commit(root, "land.py", "x = 1\n", "feat: land (#99.1-201)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-201")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-201", "FAILED", 201)])
+
+    registry = Registry(tmp_path / "registry.json")
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False, registry=registry)
+
+    assert result.run_status_after == "DONE"
+    assert registry.records() == []

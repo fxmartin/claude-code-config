@@ -1031,6 +1031,7 @@ def reconcile(
     """
     from sdlc.ledger_view import Ledger, default_db_path
     from sdlc.reconcile import reconcile_run
+    from sdlc.registry import Registry
 
     db_path = db or default_db_path()
     ledger = Ledger(db_path)
@@ -1044,7 +1045,7 @@ def reconcile(
         typer.echo(f"error: no such run '{run}' in ledger: {db_path}", err=True)
         raise typer.Exit(code=2)
 
-    result = reconcile_run(ledger, run)
+    result = reconcile_run(ledger, run, registry=Registry())
 
     if not result.run_id:
         typer.echo(f"no build run found in ledger: {db_path}")
