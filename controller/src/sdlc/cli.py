@@ -28,6 +28,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "reconcile": "Re-check a run against origin/main and correct the ledger.",
     "clean": "Garbage-collect build leftovers (orphan worktrees, merged branches, stale logs).",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
+    "generate-skills": "Generate Claude + Codex skill files from the neutral sources.",
     "repair": "Restore the framework's managed symlinks/config without a full reinstall.",
     "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
     "depscan": "Classify an osv-scanner report into a CLEAN | WARN | BLOCK gate verdict.",
@@ -1328,6 +1329,50 @@ def sync_check(
             typer.echo(f"{skill.name}: {skill.state.value}")
     typer.echo("shared skills drifted — run `git submodule update --remote`.")
     raise typer.Exit(code=1)
+
+
+@app.command(name="generate-skills", help=PLANNED_SUBCOMMANDS["generate-skills"])
+def generate_skills(
+    neutral_dir: Path = typer.Argument(
+        ...,
+        help="Neutral skill sources directory (e.g. shared-skills/neutral).",
+    ),
+    claude_base: Path = typer.Option(
+        ...,
+        "--claude-base",
+        help="Base dir for Claude skills (e.g. plugins/autonomous-sdlc/skills).",
+    ),
+    codex_base: Path = typer.Option(
+        ...,
+        "--codex-base",
+        help="Base dir for Codex skills (the nix-install mirror's skills dir).",
+    ),
+) -> None:
+    """Generate Claude + Codex ``SKILL.md`` files from the neutral sources.
+
+    One authored neutral source per skill emits both harness files, so the two
+    runtimes stay in lock-step automatically. Exits 0 on success and 2 when the
+    neutral directory is missing or a source fails to parse.
+    """
+    from sdlc.skill_generator import SkillGeneratorError, generate_all
+
+    try:
+        generated = generate_all(neutral_dir, claude_base, codex_base)
+    except (FileNotFoundError, SkillGeneratorError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    for skill in generated:
+        targets = [
+            label
+            for label, path in (
+                ("claude", skill.claude_path),
+                ("codex", skill.codex_path),
+            )
+            if path is not None
+        ]
+        typer.echo(f"{skill.name}: {', '.join(targets)}")
+    typer.echo(f"generated {len(generated)} skill(s).")
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["repair"])

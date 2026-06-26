@@ -33,7 +33,7 @@ harness-agnostic metadata plus a body that carries Claude-only constructs as
 neutral placeholder tokens (`{{ARGUMENTS}}`, `{{SKILL_DIR}}`, `{{SHELL:cmd}}`)
 and optional `<!-- harness:<name> --> … <!-- /harness -->` blocks. One neutral
 source is the single thing authored; the Claude `SKILL.md` and the Codex
-skill/manifest are generated from it (generator: Story 20.4-002).
+skill/manifest are generated from it.
 
 The format, schema, and rationale are in
 [`docs/adr/003-harness-neutral-skill-format.md`](../docs/adr/003-harness-neutral-skill-format.md).
@@ -41,7 +41,26 @@ The parser/validator/renderer is `controller/src/sdlc/skill_format.py`; the
 frontmatter schema is
 `controller/src/sdlc/schemas/neutral-skill.schema.json`. A controller test
 renders every neutral source back to its live `*.md` body byte-for-byte, so the
-two stay in lockstep until the generator removes the duplication.
+two stay in lockstep.
+
+### Authoring and regenerating skills (Story 20.4-002)
+
+Author or edit a skill in exactly one place — `neutral/<name>.skill.md` — then
+regenerate both harness files with the transpiler:
+
+```bash
+./scripts/generate-skills.sh generate
+```
+
+This drives `sdlc generate-skills`, which emits the Claude
+`plugins/autonomous-sdlc/skills/<name>/SKILL.md` and the Codex mirror's
+`plugins/autonomous-sdlc/skills/<name>/SKILL.md` from each neutral source. The
+Claude body restores the `$ARGUMENTS` / `${CLAUDE_SKILL_DIR}` / `` !`…` ``
+constructs; the Codex output carries the `.codex-plugin` manifest-schema
+frontmatter (`metadata.short-description`) and the `Use <skill> …` invocation
+forms. Pass explicit `CLAUDE_BASE` / `CODEX_BASE` arguments to target other
+trees (defaults assume the `nix-install` submodule layout). The generator itself
+is `controller/src/sdlc/skill_generator.py`.
 
 The byte-parity `sdlc sync-check` below globs the top-level `*.md` skills only,
 so the `neutral/` subdirectory does not affect it.
