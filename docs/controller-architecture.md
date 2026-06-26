@@ -20,6 +20,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/parsers.py` | Pluggable per-harness output parsers — interpret an agent's stdout into a validated `AgentResult`, registered by id (Story 20.1-002). |
 | `sdlc/harness.py` | Config-driven harness registry — declares each agent harness (claude, codex, …) and how to invoke it (Story 20.1-001). |
 | `sdlc/capability.py` | Harness capability resolution, optional CLI probe, and the preflight mode decision (Story 20.5-001). |
+| `sdlc/role_routing.py` | Per-role harness routing — maps build/coverage/review/merge/docs to harnesses, fails fast on unknown/disabled (Story 20.2-001). |
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
 | `sdlc/contracts.py` | JSON-schema parse + validation (Story 7.2-001). |
 | `sdlc/ledger_view.py` | DB-path resolution + markdown render hook. |
@@ -879,6 +880,48 @@ A `parallel` request on `codex` (no `worktree_isolation`, no `parallel`) degrade
 to `serial` with an explicit warning; its missing `usage_tracking` /
 `rate_limit_aware` are recorded as "unavailable" rather than fabricated
 (Story 20.5-002).
+
+### Per-role harness routing (Story 20.2-001)
+
+`sdlc/role_routing.py` maps each **pipeline role** to a harness so that, for
+example, Claude builds while Codex reviews and QAs in one run. The role catalog is
+the controller's dispatch stages:
+
+| Role | Runs | Notes |
+|------|------|-------|
+| `build` | the build agent (story implementation + PR) | |
+| `coverage` | the coverage/QA gate agent | `qa` is an accepted alias |
+| `review` | the adversarial review slot | bridged to `adversarial-reviewers.yaml` |
+| `merge` | the merge agent | |
+| `docs` | the doc-currency agent | |
+
+The map is supplied with `sdlc build --harness ROLE=NAME,…` (space- or
+`--harness=`-joined), e.g.:
+
+```
+# Claude builds; Codex reviews and QAs:
+sdlc build epic-20 --harness build=claude,review=codex,qa=codex
+
+# Everything on the default (claude) — equivalent to no flag at all:
+sdlc build epic-20
+```
+
+`parse_role_harness_map` canonicalises role names (`qa` → `coverage`), rejects an
+unknown role or a malformed entry at parse time, and refuses two different
+harnesses for the same role (`coverage=claude,qa=codex`). `resolve_role_routing`
+then resolves **every** role to a `HarnessConfig`: a role absent from the map
+collapses to the default harness (today's behaviour), and a role mapped to a
+non-default harness is resolved from `config/harnesses.yaml`. An **unknown** or
+**disabled** harness, or a missing registry, raises `RoleRoutingError` so the CLI
+**fails fast in preflight** (exit 2, no half-run) before any stage runs.
+
+`check_review_bridge` is the Epic-08 coordination point: when the `review` role is
+routed to a harness that *also* appears as a reviewer in
+`adversarial-reviewers.yaml`, that reviewer must be **enabled** there — otherwise
+the two configs would conflict (route review to a harness the reviewer registry has
+switched off). A review harness absent from the reviewer registry, or a missing
+reviewers file, is a no-op. Epic-08 still owns the reviewer-consensus semantics;
+this bridge only prevents the registries from disagreeing.
 
 ### Streaming vs captured dispatch (Story 11.1-001)
 

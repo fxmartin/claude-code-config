@@ -181,13 +181,14 @@ def test_no_subcommand_prints_not_yet_implemented() -> None:
     old "not yet implemented" stub text (they may legitimately error on missing
     args, but never as an unimplemented stub).
     """
-    # `build` is excluded: invoking it bare runs the real orchestration
-    # (preflight → `subprocess.run` of the project test command), which would
-    # recurse into pytest and hang. It was never a stub, so the stub check does
-    # not apply to it; the remaining verbs error on missing args or report empty
-    # state quickly.
+    # `build` and `eval` are excluded: invoked bare they run real orchestration
+    # that dispatches the build agent (build → preflight + `subprocess.run` of the
+    # project test command; eval → `run_eval` against the default eval config),
+    # which would recurse into pytest and hang. Neither was ever a stub, so the
+    # stub check does not apply to them; the remaining verbs error on missing args
+    # or report empty state quickly.
     for name in PLANNED_SUBCOMMANDS:
-        if name == "build":
+        if name in ("build", "eval"):
             continue
         result = runner.invoke(app, [name])
         assert "not yet implemented" not in result.stdout, (

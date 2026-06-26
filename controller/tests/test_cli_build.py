@@ -49,6 +49,39 @@ def test_build_rejects_unknown_flag(tmp_path, monkeypatch) -> None:
     assert "unknown" in result.output.lower()
 
 
+def test_build_harness_routing_dry_run(tmp_path, monkeypatch) -> None:
+    """Story 20.2-001: a valid `--harness` map passes preflight and plans normally."""
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["build", "epic-99", "--dry-run", "--harness", "build=claude,review=codex,qa=codex"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "dry run" in result.output.lower()
+
+
+def test_build_harness_unknown_fails_fast(tmp_path, monkeypatch) -> None:
+    """Story 20.2-001 AC3: a role routed to an unknown harness fails fast (exit 2)."""
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["build", "epic-99", "--dry-run", "--harness", "review=nope"]
+    )
+    assert result.exit_code == 2, result.output
+    assert "review" in result.output.lower()
+
+
+def test_build_harness_unknown_role_rejected_in_parse(tmp_path, monkeypatch) -> None:
+    """Story 20.2-001: an unknown role is a parse error (exit 2)."""
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["build", "epic-99", "--dry-run", "--harness", "deploy=codex"]
+    )
+    assert result.exit_code == 2, result.output
+    assert "unknown pipeline role" in result.output.lower()
+
+
 def test_build_limit_truncates_in_dry_run(tmp_path, monkeypatch) -> None:
     """`--limit=1` truncates the dry-run plan (dependency pull-in aside)."""
     _make_project(tmp_path)

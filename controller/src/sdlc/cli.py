@@ -120,6 +120,12 @@ Flags:
                             skeptic is always Opus
   --model-<stage>=MODEL     pin one stage's model, winning over the map (escape
                             hatch), e.g. --model-build=opus --model-merge=haiku
+  --harness ROLE=NAME,...   route pipeline roles to harnesses from the registry
+                            (controller/config/harnesses.yaml), e.g.
+                            --harness build=claude,review=codex,qa=codex. Roles:
+                            build, coverage (qa), review, merge, docs. Unmapped
+                            roles run on the default (claude). An unknown/disabled
+                            harness fails fast in preflight
   --thinking-cap=N          cap per-request thinking tokens (MAX_THINKING_TOKENS)
                             on every dispatched agent; 0 = no cap (default)
   --sandbox                 run every dispatched agent inside a no-egress,
@@ -155,6 +161,30 @@ def build(ctx: typer.Context) -> None:
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+    # Story 20.2-001: resolve and validate per-role harness routing before any
+    # stage runs. An unknown/disabled harness, a missing registry, or a conflict
+    # with the adversarial-reviewers registry fails fast here (no half-run). With
+    # no `--harness` map this is skipped entirely — behaviour is unchanged.
+    if opts.harness_map:
+        from sdlc.role_routing import (
+            RoleRoutingError,
+            check_review_bridge,
+            default_registry_path,
+            default_reviewers_path,
+            resolve_role_routing,
+        )
+
+        try:
+            resolved_harnesses = resolve_role_routing(
+                opts.harness_map, config_path=default_registry_path()
+            )
+            check_review_bridge(
+                resolved_harnesses, reviewers_path=default_reviewers_path()
+            )
+        except RoleRoutingError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
 
     queue = discover_queue(opts.scope)
 

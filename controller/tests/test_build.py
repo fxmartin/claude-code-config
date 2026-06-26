@@ -66,6 +66,38 @@ def test_parse_rejects_unknown_flag() -> None:
         parse_build_args(["--frobnicate"])
 
 
+def test_parse_harness_map_space_form() -> None:
+    """Story 20.2-001: the space-separated `--harness ROLE=NAME,…` form parses."""
+    opts = parse_build_args(
+        ["epic-99", "--harness", "build=claude,review=codex,qa=codex"]
+    )
+    assert opts.harness_map == {
+        "build": "claude",
+        "review": "codex",
+        "coverage": "codex",
+    }
+    assert opts.scope == "epic-99"
+
+
+def test_parse_harness_map_equals_form() -> None:
+    opts = parse_build_args(["--harness=review=codex"])
+    assert opts.harness_map == {"review": "codex"}
+
+
+def test_parse_harness_no_map_is_empty() -> None:
+    assert parse_build_args(["epic-99"]).harness_map == {}
+
+
+def test_parse_harness_missing_value_errors() -> None:
+    with pytest.raises(ValueError, match="--harness needs a value"):
+        parse_build_args(["--harness"])
+
+
+def test_parse_harness_unknown_role_errors() -> None:
+    with pytest.raises(ValueError, match="unknown pipeline role"):
+        parse_build_args(["--harness", "deploy=codex"])
+
+
 # ---------------------------------------------------------------------------
 # Ledger — thin wrapper over the Epic-04 SQLite schema
 # ---------------------------------------------------------------------------
