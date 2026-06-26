@@ -194,6 +194,20 @@ def test_write_skill_files_skips_untargeted_harness(tmp_path: Path) -> None:
     assert not (tmp_path / "codex" / "claude-only").exists()
 
 
+def test_write_skill_files_skips_untargeted_claude_harness(tmp_path: Path) -> None:
+    """The mirror case: a codex-only source skips Claude entirely."""
+    skill = NeutralSkill(
+        metadata=SkillMetadata(
+            name="codex-only", description="d", harnesses=("codex",)
+        ),
+        body="b",
+    )
+    result = write_skill_files(skill, tmp_path / "claude", tmp_path / "codex")
+    assert result.codex_path is not None and result.codex_path.exists()
+    assert result.claude_path is None
+    assert not (tmp_path / "claude" / "codex-only").exists()
+
+
 def test_generate_all_covers_every_neutral_source(tmp_path: Path) -> None:
     generated = generate_all(_NEUTRAL_DIR, tmp_path / "claude", tmp_path / "codex")
     names = {g.name for g in generated}
