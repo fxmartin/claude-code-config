@@ -61,6 +61,20 @@ def test_codex_capabilities_loaded_from_yaml() -> None:
     assert codex.capabilities["json_contract"] is True
 
 
+def test_codex_probe_loaded_from_yaml() -> None:
+    """Story 20.5-001: the optional probe command round-trips from the registry."""
+    registry = load_harnesses_config(CONFIG_PATH)
+    assert registry["codex"].probe == "codex --version"
+    # Claude declares no probe command.
+    assert registry[DEFAULT_HARNESS].probe is None
+
+
+def test_load_omitted_probe_is_none(tmp_path: Path) -> None:
+    cfg = tmp_path / "harnesses.yaml"
+    cfg.write_text("harnesses:\n  foo:\n    command: foo run\n    parser: plain\n", encoding="utf-8")
+    assert load_harnesses_config(cfg)["foo"].probe is None
+
+
 def test_load_rejects_non_mapping(tmp_path: Path) -> None:
     bad = tmp_path / "harnesses.yaml"
     bad.write_text("- not\n- a mapping\n", encoding="utf-8")

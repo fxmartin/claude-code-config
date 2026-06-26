@@ -258,6 +258,28 @@ def test_run_build_happy_path_marks_all_done(tmp_path) -> None:
     assert {"build", "coverage", "review", "merge"}.issubset(agent_types)
 
 
+def test_run_build_logs_harness_capabilities(tmp_path, monkeypatch) -> None:
+    """Story 20.5-001 AC1: preflight resolves and logs the dispatch harness capabilities."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='harness'"
+    ).fetchall()
+    assert rows, "expected at least one harness capability event"
+    joined = "\n".join(r[0] for r in rows)
+    assert "claude" in joined
+    assert "worktree_isolation" in joined
+
+
 def test_run_build_writes_ledger_after_every_stage(tmp_path) -> None:
     db = tmp_path / "ledger.db"
     opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)

@@ -18,6 +18,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/cohort.py` | Pure dependency-cohort scheduling + `--limit` truncation. |
 | `sdlc/dispatch.py` | The agent-dispatch boundary — shells out, validates output. |
 | `sdlc/harness.py` | Config-driven harness registry — declares each agent harness (claude, codex, …) and how to invoke it (Story 20.1-001). |
+| `sdlc/capability.py` | Harness capability resolution, optional CLI probe, and the preflight mode decision (Story 20.5-001). |
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
 | `sdlc/contracts.py` | JSON-schema parse + validation (Story 7.2-001). |
 | `sdlc/ledger_view.py` | DB-path resolution + markdown render hook. |
@@ -834,6 +835,49 @@ with `HarnessError` rather than half-running. The default slot does **not** cons
 foundation for parsers (Story 20.1-002) and role routing (Story 20.2-001) without
 changing today's dispatch behaviour. `resolve_agent_argv(...)` is the convenience
 wrapper returning the launch argv directly.
+
+### Harness capability probe and preflight (Story 20.5-001)
+
+`sdlc/capability.py` turns the registry's declared capability flags into a
+**preflight decision** so a run plans safely *before* dispatching. It is the seam
+the degradation matrix (Story 20.5-002) centralizes on.
+
+- **`resolve_capabilities(harness)`** returns the full canonical capability map.
+  Declared flags win; any **undeclared** canonical key defaults to `False` — an
+  undeclared capability is assumed *absent* (conservative), so a harness only
+  earns a capability it explicitly claims. Extra, non-canonical flags are
+  preserved.
+- **`probe_harness(harness)`** runs the optional `probe` command from the
+  registry entry to confirm the CLI is installed/authenticated. A zero exit is
+  `available`, a non-zero exit is `unavailable` (with the captured detail), and a
+  harness with **no** `probe` command is `unknown` — never probed, no subprocess.
+- **`preflight_harness(harness, requested_mode=...)`** resolves capabilities,
+  probes, and decides the **effective run mode**. A `parallel` request requires
+  both the `parallel` and `worktree_isolation` capabilities; when either is
+  missing the controller **degrades to `serial`** and records a warning rather
+  than failing mid-run (the safe alternative — Story 20.5-002 owns the full
+  matrix). `serial` is always supportable. The returned `HarnessPreflight` is
+  immutable and yields `log_lines()` for the ledger/stderr.
+
+`run_build` calls this in preflight (after the run row is created) for the
+default-slot harness and writes each line to the `harness` event source — `info`
+normally, `warn` on any downgrade. For the built-in Claude harness this is purely
+additive logging (all capabilities `true`, no probe), so dispatch is unchanged.
+
+**Capability matrix** (canonical flags; the shipped `harnesses.yaml` values):
+
+| Capability | Meaning | `claude` | `codex` |
+|---|---|---|---|
+| `worktree_isolation` | Can run each story in its own git worktree | ✅ | ❌ |
+| `parallel` | Can fan a cohort across concurrent workers | ✅ | ❌ |
+| `json_contract` | Emits the `<<<RESULT_JSON>>>` contract | ✅ | ✅ |
+| `usage_tracking` | Reports token usage / cost | ✅ | ❌ |
+| `rate_limit_aware` | Surfaces 429 / reset semantics for backoff | ✅ | ❌ |
+
+A `parallel` request on `codex` (no `worktree_isolation`, no `parallel`) degrades
+to `serial` with an explicit warning; its missing `usage_tracking` /
+`rate_limit_aware` are recorded as "unavailable" rather than fabricated
+(Story 20.5-002).
 
 ### Streaming vs captured dispatch (Story 11.1-001)
 
