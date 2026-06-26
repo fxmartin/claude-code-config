@@ -237,6 +237,27 @@ def test_review_bridge_noop_when_review_is_default() -> None:
     check_review_bridge(resolved, reviewers_path=REVIEWERS_PATH)  # no raise
 
 
+def test_review_bridge_noop_when_reviewers_path_is_none() -> None:
+    # No reviewers registry to reconcile against -> nothing to check.
+    resolved = resolve_role_routing({"review": "codex"}, config_path=CONFIG_PATH)
+    check_review_bridge(resolved, reviewers_path=None)  # no raise
+
+
+def test_review_bridge_noop_when_no_review_role() -> None:
+    # A resolved map without a 'review' role (nothing to reconcile) is a no-op,
+    # even when a real reviewers file is supplied.
+    check_review_bridge({}, reviewers_path=REVIEWERS_PATH)  # no raise
+
+
+def test_review_bridge_noop_when_reviewers_file_malformed(tmp_path: Path) -> None:
+    # A malformed reviewer registry is Epic-08's gate to flag, not ours: the
+    # bridge swallows the loader's AdversarialError and stays a no-op.
+    reviewers = tmp_path / "adversarial-reviewers.yaml"
+    reviewers.write_text("- not\n- a\n- mapping\n", encoding="utf-8")
+    resolved = resolve_role_routing({"review": "codex"}, config_path=CONFIG_PATH)
+    check_review_bridge(resolved, reviewers_path=reviewers)  # no raise
+
+
 # ---------------------------------------------------------------------------
 # Default config-path helpers
 # ---------------------------------------------------------------------------
