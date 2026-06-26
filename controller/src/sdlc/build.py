@@ -401,6 +401,13 @@ class BuildOptions:
     # keeps the isolation. ``SDLC_SANDBOX`` is the env equivalent honoured directly
     # at the dispatch boundary, so it covers runs this flag never threaded through.
     sandbox: bool = False
+    # Story 20.2-001: per-role harness routing. ``harness_map`` maps a pipeline
+    # role (build/coverage/review/merge/docs; ``qa`` aliases ``coverage``) to the
+    # harness that runs it, e.g. ``{"build": "claude", "review": "codex"}``. Empty
+    # = today's behaviour (every role on the built-in ``claude`` default). Parsed
+    # eagerly from ``--harness=`` and resolved/validated against the registry in
+    # the CLI preflight so an unknown/disabled harness fails fast (no half-run).
+    harness_map: dict[str, str] = field(default_factory=dict)
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -888,7 +895,10 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
     """
     opts = BuildOptions()
     scopes: list[str] = []
-    for arg in args:
+    # An explicit iterator lets a two-token flag (`--harness build=claude,…`,
+    # Story 20.2-001) consume its value; every other flag stays single-token.
+    arg_iter = iter(args)
+    for arg in arg_iter:
         if arg in _BOOL_FLAGS:
             setattr(opts, _BOOL_FLAGS[arg], True)
         elif arg.startswith("--limit="):
@@ -965,6 +975,27 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
                     f"(expected one of {sorted(_ROUTABLE_STAGES)})"
                 )
             opts.model_overrides[stage] = model
+        elif arg == "--harness" or arg.startswith("--harness="):
+            # Story 20.2-001: per-role harness routing, e.g.
+            # `--harness build=claude,review=codex,qa=codex` (the space-separated
+            # form the skill documents) or `--harness=…`. Parsed eagerly so a
+            # malformed entry or unknown role fails the parse; the registry-bound
+            # checks (unknown/disabled harness) happen in the CLI preflight.
+            from sdlc.role_routing import RoleRoutingError, parse_role_harness_map
+
+            if arg == "--harness":
+                spec = next(arg_iter, None)
+                if spec is None:
+                    raise ValueError(
+                        "--harness needs a value, e.g. "
+                        "--harness build=claude,review=codex,qa=codex"
+                    )
+            else:
+                spec = arg.split("=", 1)[1]
+            try:
+                opts.harness_map = parse_role_harness_map(spec)
+            except RoleRoutingError as exc:
+                raise ValueError(str(exc)) from exc
         elif arg.startswith("--"):
             raise ValueError(f"unknown flag: {arg}")
         else:
