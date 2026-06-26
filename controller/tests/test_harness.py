@@ -235,7 +235,9 @@ def test_resolve_named_harness_from_registry(monkeypatch) -> None:
     harness = resolve_harness("codex", config_path=CONFIG_PATH)
     assert harness.source == "registry"
     assert harness.name == "codex"
-    assert resolve_agent_argv("codex", config_path=CONFIG_PATH) == ["codex", "exec"]
+    assert resolve_agent_argv("codex", config_path=CONFIG_PATH) == [
+        "codex-build-adapter.sh"
+    ]
 
 
 def test_resolve_unknown_harness_raises(monkeypatch) -> None:

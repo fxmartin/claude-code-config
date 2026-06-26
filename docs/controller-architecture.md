@@ -18,7 +18,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/cohort.py` | Pure dependency-cohort scheduling + `--limit` truncation. |
 | `sdlc/dispatch.py` | The agent-dispatch boundary — shells out, validates output. |
 | `sdlc/parsers.py` | Pluggable per-harness output parsers — interpret an agent's stdout into a validated `AgentResult`, registered by id (Story 20.1-002). |
-| `sdlc/harness.py` | Config-driven harness registry — declares each agent harness (claude, codex, …) and how to invoke it (Story 20.1-001). |
+| `sdlc/harness.py` | Config-driven harness registry — declares each agent harness (claude, codex, …) and how to invoke it (Story 20.1-001); `dispatch_on_harness` runs an agent on a resolved harness (Story 20.3-001). |
 | `sdlc/capability.py` | Harness capability resolution, optional CLI probe, and the preflight mode decision (Story 20.5-001). |
 | `sdlc/role_routing.py` | Per-role harness routing — maps build/coverage/review/merge/docs to harnesses, fails fast on unknown/disabled (Story 20.2-001). |
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
@@ -922,6 +922,32 @@ the two configs would conflict (route review to a harness the reviewer registry 
 switched off). A review harness absent from the reviewer registry, or a missing
 reviewers file, is a no-op. Epic-08 still owns the reviewer-consensus semantics;
 this bridge only prevents the registries from disagreeing.
+
+### Codex build/QA adapter (Story 20.3-001)
+
+The `codex` registry entry is the first concrete **non-Claude** adapter, proving
+the abstraction end-to-end: a build or coverage/QA agent runs on Codex through the
+same registry the default Claude slot uses.
+
+- **Wrapper.** `scripts/codex-build-adapter.sh` receives the controller-assembled
+  prompt on **stdin**, runs Codex headlessly via `codex exec`, and **forwards
+  Codex's stdout verbatim** so the agent's `<<<RESULT_JSON>>>` block round-trips
+  untouched. `--self-test` emits a schema-valid `build` block with no real Codex,
+  and `HARNESS_AGENT_CMD` overrides the underlying command (e.g. to add
+  `--full-auto`). Because the wrapper only ever runs `codex`, a run routed here
+  spawns **zero `claude` processes** (AC3).
+- **Dispatch seam.** `harness.dispatch_on_harness(harness, agent_type, prompt, …)`
+  is the single call site that runs an agent on a resolved `HarnessConfig`: it
+  renders the harness's own argv (`to_argv`) and selects its declared parser, then
+  hands both to `dispatch_agent`. A registry harness (codex) uses its declared
+  `codex-exec` parser; the built-in/`env` Claude slots keep the stream-json parser
+  (`parser=None`), so the default path is unchanged. Role routing (Story 20.3-002)
+  reuses this seam for the `review`/`qa` roles.
+- **Parsing.** Codex output is interpreted by the `codex-exec` parser
+  (`PlainResultParser`, Story 20.1-002): it reads the result block straight from
+  stdout, records usage as **unavailable** (never fabricated as zero), and treats
+  any non-zero exit as a plain dispatch failure (no fabricated 429). The stage then
+  advances exactly like a Claude stage.
 
 ### Streaming vs captured dispatch (Story 11.1-001)
 
