@@ -41,6 +41,11 @@
           "minLength": 1,
           "description": "Id of the output parser used to interpret this harness's stdout (Story 20.1-002 registers parsers by id)."
         },
+        "probe": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional command run in preflight to confirm the harness CLI is installed/authenticated (Story 20.5-001). A zero exit means available; omit to skip probing (status 'unknown')."
+        },
         "enabled": {
           "type": "boolean",
           "description": "Whether this harness may be dispatched to. Defaults to true."

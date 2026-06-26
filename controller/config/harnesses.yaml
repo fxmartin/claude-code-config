@@ -41,6 +41,11 @@ harnesses:
     command: "codex exec"
     parser: codex-exec
     enabled: true
+    # Optional preflight check (Story 20.5-001): confirms the Codex CLI is
+    # installed/authenticated before a run routes a role to it. A zero exit is
+    # "available"; a non-zero exit degrades to a warning rather than a mid-run
+    # crash. Omit `probe` entirely to skip the check (status "unknown").
+    probe: "codex --version"
     capabilities:
       worktree_isolation: false
       parallel: false

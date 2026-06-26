@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
 
+from sdlc.capability import preflight_harness
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.commitlint import (
     build_commit_header,
@@ -42,6 +43,7 @@ from sdlc.dispatch import (
     RateLimitError,
     dispatch_agent,
 )
+from sdlc.harness import resolve_harness
 from sdlc.model_routing import (
     ModelRoutingConfig,
     OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
@@ -2221,6 +2223,26 @@ def default_preflight(root: Path | None = None, timeout: int = 600) -> bool:
     return completed.returncode == 0
 
 
+def _log_harness_preflight(ledger: "Ledger", run_id: str, requested_mode: str) -> None:
+    """Resolve and log the dispatch harness's capabilities (Story 20.5-001).
+
+    Resolves the default-slot harness, decides the safe run mode for
+    ``requested_mode``, and records each capability/probe/degradation line to
+    stderr and the ledger event log. A degradation downgrades the event level to
+    ``warn`` so a capability gap is never silent. Best-effort: a logging failure
+    must never fail an otherwise-good build.
+    """
+    try:
+        harness = resolve_harness()
+        preflight = preflight_harness(harness, requested_mode=requested_mode)
+        level = "warn" if preflight.degraded else "info"
+        for line in preflight.log_lines():
+            print(line, file=sys.stderr)
+            ledger.event_log(run_id, "", level, "harness", line)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Prompt rendering (kept terse — the agent reads the epic file itself)
 # ---------------------------------------------------------------------------
@@ -2952,6 +2974,11 @@ def run_build(
     ledger.event_log(
         run_id, "", "info", "controller", f"run started: scope={opts.scope} mode={mode}"
     )
+    # Story 20.5-001: resolve and log the dispatch harness's capabilities so a
+    # heterogeneous run is auditable and any mode downgrade is explicit. The
+    # default slot is the built-in Claude harness (no probe, all capabilities),
+    # so this is purely additive logging and never alters dispatch behaviour.
+    _log_harness_preflight(ledger, run_id, mode)
     try:  # best-effort lifecycle notification; never fail a build
         notify("run_started", run=run_id, scope=opts.scope, mode=mode)
     except Exception:

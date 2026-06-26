@@ -80,6 +80,10 @@ class HarnessConfig:
     capabilities: dict[str, bool] = field(default_factory=dict)
     enabled: bool = True
     source: str = "registry"
+    # Optional command that confirms the harness CLI is installed/authenticated.
+    # Consumed by the capability preflight (Story 20.5-001); ``None`` means the
+    # harness is not probed (status "unknown").
+    probe: str | None = None
 
     def render_command(self, **placeholders: Any) -> list[str]:
         """Render this harness's command template into an argv, appending flags.
@@ -144,6 +148,7 @@ def load_harnesses_config(path: str | Path) -> dict[str, HarnessConfig]:
             capabilities=dict(settings.get("capabilities", {})),
             enabled=bool(settings.get("enabled", True)),
             source="registry",
+            probe=(str(settings["probe"]) if settings.get("probe") else None),
         )
 
     default = raw.get("default")
