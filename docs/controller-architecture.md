@@ -17,6 +17,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/build.py` | The state machine: options, `Ledger`, preflight, prompts, `run_build`. |
 | `sdlc/cohort.py` | Pure dependency-cohort scheduling + `--limit` truncation. |
 | `sdlc/dispatch.py` | The agent-dispatch boundary — shells out, validates output. |
+| `sdlc/harness.py` | Config-driven harness registry — declares each agent harness (claude, codex, …) and how to invoke it (Story 20.1-001). |
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
 | `sdlc/contracts.py` | JSON-schema parse + validation (Story 7.2-001). |
 | `sdlc/ledger_view.py` | DB-path resolution + markdown render hook. |
@@ -800,6 +801,39 @@ returns canned schema-valid responses, so **no real agent is ever invoked in
 CI**. Infrastructure failures (non-zero exit, timeout, missing executable)
 surface as `AgentDispatchError`; contract failures surface as the
 `ContractError` subclasses from `sdlc.contracts`.
+
+### Harness registry (Story 20.1-001)
+
+`sdlc/harness.py` generalizes the dispatch seam and the
+`config/adversarial-reviewers.yaml` pattern into one config-driven **harness
+abstraction**: a `config/harnesses.yaml` keyed by harness name (`claude`,
+`codex`, …) where each entry declares a **command template**, **invocation
+flags**, **capability flags** (`worktree_isolation`, `parallel`, `json_contract`,
+`usage_tracking`, `rate_limit_aware`), and an **output-parser id**. The file is
+validated against `schemas/harness-registry.schema.json` (draft 2020-12) on load;
+`load_harnesses_config` raises `HarnessError` with an actionable, field-named
+message on any malformed entry. Command templates reuse the
+`{pr_number}`/`{pr_url}`/`{story_id}` placeholder style of the reviewer registry.
+
+`resolve_harness(name=None, *, config_path=None)` returns a `HarnessConfig` and is
+the seam the rest of Epic-20 builds on. Its **default slot** (`name` is `None` or
+`"claude"`) is deliberately backward-compatible:
+
+- **No registry wired and no `SDLC_AGENT_CMD`** → the built-in Claude harness
+  (`source="builtin"`), whose argv resolves through the *existing*
+  `resolve_agent_cmd`, so it is **byte-identical** to today's `DEFAULT_AGENT_CMD`
+  path (deny baseline + routed `--model` decoration included).
+- **`SDLC_AGENT_CMD` set** → that override is **re-expressed as an ad-hoc registry
+  entry** (`source="env"`), not removed; its argv is again `resolve_agent_cmd`'s
+  env path, and the escape hatch owns its own model.
+
+A **named non-default** harness (e.g. `codex`) is resolved from the registry and
+renders its own template; an absent `config_path` or an unknown name fails fast
+with `HarnessError` rather than half-running. The default slot does **not** consult
+`harnesses.yaml` for its argv, so the shipped registry is a reference + the
+foundation for parsers (Story 20.1-002) and role routing (Story 20.2-001) without
+changing today's dispatch behaviour. `resolve_agent_argv(...)` is the convenience
+wrapper returning the launch argv directly.
 
 ### Streaming vs captured dispatch (Story 11.1-001)
 

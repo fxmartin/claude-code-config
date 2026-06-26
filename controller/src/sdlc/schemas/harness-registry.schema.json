@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/harness-registry.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for the harness registry (harnesses.yaml, Story 20.1-001). ABOUTME: Draft 2020-12; each entry declares command template, flags, capability flags, and an output-parser id.",
+  "title": "HarnessRegistry",
+  "description": "Config-driven registry of agent harnesses (claude, codex, ...) the controller can dispatch to. Generalizes the dispatch seam and the adversarial-reviewers registry into one harness abstraction.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["harnesses"],
+  "properties": {
+    "default": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Name of the harness used when a role/run names none. Must be a key of 'harnesses'."
+    },
+    "harnesses": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "Map of harness name -> adapter declaration.",
+      "additionalProperties": { "$ref": "#/$defs/harness" }
+    }
+  },
+  "$defs": {
+    "harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "parser"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Command template invoked to run an agent on this harness. May use {pr_number}/{pr_url}/{story_id} placeholders, substituted before invocation."
+        },
+        "flags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Invocation flags appended verbatim to the rendered command."
+        },
+        "parser": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Id of the output parser used to interpret this harness's stdout (Story 20.1-002 registers parsers by id)."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether this harness may be dispatched to. Defaults to true."
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": { "type": "boolean" },
+          "description": "Capability flags (worktree_isolation, parallel, json_contract, usage_tracking, rate_limit_aware, ...) the controller gates run modes on (Feature 20.5)."
+        }
+      }
+    }
+  }
+}
