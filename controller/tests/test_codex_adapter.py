@@ -144,3 +144,73 @@ def test_dispatch_on_harness_passes_through_dispatch_kwargs(monkeypatch) -> None
     dispatch_on_harness(codex, "build", "prompt", cwd=worktree)
 
     assert seen_cwd == [worktree]
+
+
+# --- The same seam, the *other* branch: a built-in / env slot is Claude under the
+# hood, so dispatch_on_harness must select the dispatch default (stream-json)
+# parser and decorate the Claude argv with the routed model — never the codex-exec
+# parser. The codex tests above only ever exercise the registry branch, so without
+# these the "default path is unchanged" promise in the docstring is untested.
+
+
+def _capture_dispatch(monkeypatch) -> dict:
+    """Swap dispatch_agent for a capturing stub; return the captured-kwargs dict."""
+    captured: dict = {}
+
+    def fake_dispatch(agent_type, prompt, *, agent_cmd=None, parser=None, **kwargs):
+        captured.update(
+            agent_type=agent_type,
+            prompt=prompt,
+            agent_cmd=agent_cmd,
+            parser=parser,
+            kwargs=kwargs,
+        )
+        return "dispatched"
+
+    # dispatch_agent is imported into the harness namespace, so patch it there.
+    monkeypatch.setattr("sdlc.harness.dispatch_agent", fake_dispatch)
+    return captured
+
+
+def test_builtin_slot_keeps_the_claude_default_parser(monkeypatch) -> None:
+    """The built-in Claude slot dispatches with parser=None (the stream-json default)."""
+    captured = _capture_dispatch(monkeypatch)
+
+    builtin = resolve_harness()  # no name, no SDLC_AGENT_CMD -> built-in Claude
+    assert builtin.source == "builtin"
+
+    dispatch_on_harness(builtin, "build", "build on claude")
+
+    # None -> dispatch picks the built-in Claude parser; the codex-exec parser is
+    # never substituted onto the default slot.
+    assert captured["parser"] is None
+    # The argv is the Claude default command, not a registry template.
+    assert "claude" in captured["agent_cmd"][0]
+
+
+def test_builtin_slot_decorates_argv_with_routed_model(monkeypatch) -> None:
+    """`model` flows into the built-in Claude argv via resolve_agent_cmd (AC: default path)."""
+    captured = _capture_dispatch(monkeypatch)
+
+    builtin = resolve_harness()
+    dispatch_on_harness(builtin, "build", "prompt", model="opus")
+
+    # resolve_agent_cmd appends `--model opus` for the default slot.
+    argv = captured["agent_cmd"]
+    assert argv[-2:] == ["--model", "opus"]
+
+
+def test_env_override_slot_routes_through_the_default_parser(monkeypatch) -> None:
+    """An SDLC_AGENT_CMD override is Claude under the hood — parser=None, no codex-exec."""
+    captured = _capture_dispatch(monkeypatch)
+
+    # The env slot's argv resolves through resolve_agent_cmd, which reads the real
+    # environment — so set the override there, not via a throwaway dict.
+    monkeypatch.setenv("SDLC_AGENT_CMD", "my-claude-wrapper --flag")
+    override = resolve_harness()
+    assert override.source == "env"
+
+    dispatch_on_harness(override, "coverage", "qa prompt")
+
+    assert captured["parser"] is None
+    assert captured["agent_cmd"][0] == "my-claude-wrapper"
