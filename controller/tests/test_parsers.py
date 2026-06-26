@@ -200,6 +200,38 @@ def test_claude_parser_nonzero_exit_rate_limit_text_raises_rate_limit() -> None:
         )
 
 
+def test_claude_parser_fills_reset_at_from_stream_when_text_lacks_epoch() -> None:
+    # Issue #120 follow-up: the session-limit text matches but carries no parseable
+    # epoch, so the signal's reset_at is None. With a stream-captured resetsAt, the
+    # parser fills it in so the precise resume applies on the text-matched path.
+    parser = get_parser(CLAUDE_PARSER_ID)
+    with pytest.raises(RateLimitError) as exc:
+        parser.parse(
+            _collected(
+                returncode=1,
+                stderr="Claude AI usage limit reached. Try again later.",
+                stream_resets_at=1717171717.0,
+            )
+        )
+    assert exc.value.signal is not None
+    assert exc.value.signal.reset_at == pytest.approx(1717171717.0)
+
+
+def test_claude_parser_generic_error_envelope_raises_dispatch_error() -> None:
+    # An error envelope whose text is neither a rate limit nor a context overflow,
+    # and that carries no structured 429 fields, falls through to a plain dispatch
+    # error — not a fabricated RateLimitError or ContextOverflowError.
+    parser = get_parser(CLAUDE_PARSER_ID)
+    env = {
+        "type": "result",
+        "result": "the build agent crashed unexpectedly",
+        "is_error": True,
+    }
+    with pytest.raises(AgentDispatchError) as exc:
+        parser.parse(_collected(envelope=env, streaming=True))
+    assert not isinstance(exc.value, (RateLimitError, ContextOverflowError))
+
+
 # --- Alt-parser path (Story AC2) -------------------------------------------
 
 
@@ -292,3 +324,16 @@ def test_dispatch_agent_default_parser_is_claude(monkeypatch) -> None:
 def test_output_parser_is_abstract() -> None:
     with pytest.raises(TypeError):
         OutputParser()  # type: ignore[abstract]
+
+
+def test_output_parser_base_parse_raises_not_implemented() -> None:
+    # A subclass that delegates to the ABC's parse() hits the NotImplementedError
+    # guard — the contract for any harness parser that forgets to implement parse.
+    class _StubParser(OutputParser):
+        id = "stub"
+
+        def parse(self, output: CollectedOutput) -> AgentResult:
+            return super().parse(output)  # type: ignore[safe-super]
+
+    with pytest.raises(NotImplementedError):
+        _StubParser().parse(_collected(stdout=_wrap(_VALID_BUILD)))
