@@ -43,7 +43,7 @@ from sdlc.dispatch import (
     RateLimitError,
     dispatch_agent,
 )
-from sdlc.harness import resolve_harness
+from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.model_routing import (
     ModelRoutingConfig,
     OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS stages (
     cost_usd            REAL,
     estimated_tokens    INTEGER,
     estimated_cost_usd  REAL,
+    harness             TEXT,
     PRIMARY KEY (run_id, story_id, stage_name, attempt),
     FOREIGN KEY (run_id, story_id) REFERENCES stories(run_id, story_id) ON DELETE CASCADE
 );
@@ -263,6 +264,20 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
         "stories",
         [
             ("worktree_path", "TEXT"),
+        ],
+    ),
+    # Migration 6 adds the per-stage harness (Story 20.2-002) to a pre-existing
+    # ledger's `stages` table. Additive and back-compatible: old stage rows keep
+    # NULL harness and the read side renders them as the built-in default
+    # ``claude`` (everything before this story ran on Claude); only stages
+    # dispatched after this story populate the column. A fresh DB created from
+    # the up-to-date DDL is a no-op.
+    (
+        6,
+        "stage harness column",
+        "stages",
+        [
+            ("harness", "TEXT"),
         ],
     ),
 ]
@@ -1235,15 +1250,25 @@ class Ledger:
         return row[0] if row else None
 
     def stage_start(
-        self, run_id: str, story_id: str, stage_name: str, attempt: int = 1
+        self,
+        run_id: str,
+        story_id: str,
+        stage_name: str,
+        attempt: int = 1,
+        harness: str = DEFAULT_HARNESS,
     ) -> None:
-        """Append an IN_PROGRESS stage attempt row."""
+        """Append an IN_PROGRESS stage attempt row.
+
+        ``harness`` (Story 20.2-002) records which harness ran this stage so a
+        heterogeneous run is auditable; it defaults to the built-in ``claude``,
+        keeping a run that passes no ``--harness`` map unchanged.
+        """
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO stages "
-                "(run_id, story_id, stage_name, attempt, status, started_at) "
-                "VALUES (?, ?, ?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP)",
-                (run_id, story_id, stage_name, attempt),
+                "(run_id, story_id, stage_name, attempt, status, started_at, harness) "
+                "VALUES (?, ?, ?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP, ?)",
+                (run_id, story_id, stage_name, attempt, harness),
             )
 
     def stage_finish(
@@ -1475,23 +1500,32 @@ class Ledger:
         """Every persisted stage-machine row for ``run_id`` for `sdlc state`.
 
         Each row is ``{story_id, stage_name, status, attempt, branch,
-        pr_number}`` in a stable, chronological order (by story, then start
-        time) — a greppable dump of the state machine for debugging.
+        pr_number, harness}`` in a stable, chronological order (by story, then
+        start time) — a greppable dump of the state machine for debugging.
+        ``harness`` (Story 20.2-002) is the harness that ran the stage; a
+        pre-migration ledger (no ``harness`` column) and old NULL rows both read
+        as the built-in default ``claude``.
         """
         if not self.db_path.exists():
             return []
         with self._connect_ro() as conn:
+            # Tolerate a ledger created before the harness column existed
+            # (read-only viewers never migrate): select it only when present.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()}
+            harness_sel = (
+                "COALESCE(st.harness, ?)" if "harness" in cols else "?"
+            )
             rows = conn.execute(
-                """
+                f"""
                 SELECT st.story_id, st.stage_name, st.status, st.attempt,
-                       s.branch, s.pr_number
+                       s.branch, s.pr_number, {harness_sel} AS harness
                 FROM stages st
                 JOIN stories s
                   ON st.run_id = s.run_id AND st.story_id = s.story_id
                 WHERE st.run_id = ?
                 ORDER BY st.story_id, st.started_at, st.rowid
                 """,
-                (run_id,),
+                (DEFAULT_HARNESS, run_id),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1673,9 +1707,15 @@ class Ledger:
                 "cache_creation_tokens, cost_usd"
                 if "input_tokens" in cols else ""
             )
+            # Story 20.2-002: surface the per-stage harness when present; a
+            # pre-migration ledger and old NULL rows read as the default claude.
+            harness_sel = (
+                f", COALESCE(harness, '{DEFAULT_HARNESS}') AS harness"
+                if "harness" in cols else f", '{DEFAULT_HARNESS}' AS harness"
+            )
             rows = conn.execute(
                 "SELECT story_id, stage_name AS name, attempt, status, started_at, "
-                "finished_at, failure_category, output_path" + usage_sel +
+                "finished_at, failure_category, output_path" + usage_sel + harness_sel +
                 " FROM stages WHERE run_id = ? ORDER BY story_id, started_at, rowid",
                 (run_id,),
             ).fetchall()
@@ -3792,7 +3832,9 @@ def _run_story(
         # is unchanged, preserving its existing per-resume reset semantics.
         stage_escalation_base = start_escalation if idx == 0 else 0
         while True:
-            ledger.stage_start(run_id, story.id, stage, attempt)
+            ledger.stage_start(
+                run_id, story.id, stage, attempt, harness=_stage_harness(stage, opts)
+            )
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             sink = _make_progress_sink(ledger, run_id, story.id, stage, attempt)
             # Story 14.1-002: estimate this stage's usage before dispatch, record
@@ -4092,6 +4134,33 @@ def _make_progress_sink(
 _ROUTABLE_STAGES = frozenset(
     {"build", "coverage", "review", "merge", "bugfix", "reask"}
 )
+
+# Story 20.2-002: map a dispatch stage to the pipeline role whose harness runs it
+# so the ledger can record *which* harness executed each stage. The pipeline
+# stages (`_STAGES`) map 1:1 to roles; the recovery stages (bugfix/reask/
+# commitlint) re-dispatch the *originating* stage's agent, so callers pass that
+# originating stage here rather than the recovery stage's own name. Any unknown
+# stage falls back to the build role — the conservative default for a heavy
+# code-producing dispatch.
+_STAGE_ROLE: dict[str, str] = {
+    "build": "build",
+    "coverage": "coverage",
+    "review": "review",
+    "merge": "merge",
+    "docs": "docs",
+}
+
+
+def _stage_harness(stage: str, opts: BuildOptions) -> str:
+    """The harness name that runs ``stage`` (Story 20.2-002).
+
+    Resolves the stage's pipeline role and looks it up in the run's per-role
+    ``--harness`` map (Story 20.2-001). A role absent from the map collapses to
+    the built-in default ``claude`` — today's behaviour — so a run with no
+    ``--harness`` flag records every stage as ``claude``.
+    """
+    role = _STAGE_ROLE.get(stage, "build")
+    return opts.harness_map.get(role) or DEFAULT_HARNESS
 
 # Story 14.2-001: stages whose changed-files risk signal is *stable* at the
 # moment their model is chosen — the story branch is already pushed, so the same
@@ -4476,7 +4545,11 @@ def _reask_envelope(
     falls through to the bugfix path (AC2). The attempt is recorded as a
     ``reask`` stage row and logged to the ledger events (AC3).
     """
-    ledger.stage_start(run_id, story.id, "reask", seq)
+    # The re-ask re-dispatches the originating `stage` agent, so record it on the
+    # harness that runs that stage (Story 20.2-002), not a notional "reask" role.
+    ledger.stage_start(
+        run_id, story.id, "reask", seq, harness=_stage_harness(stage, opts)
+    )
     out = str(transcript_path) if transcript_path is not None else ""
     ledger.event_log(
         run_id, story.id, "warn", "controller",
@@ -4585,7 +4658,11 @@ def _lint_stage_commit(
             f"({'; '.join(violations)}) — re-asking the {stage} agent to amend",
         )
         cpath = logs_dir / f"{story.id}-commitlint-{lint_seq}.log"
-        ledger.stage_start(run_id, story.id, "commitlint", lint_seq)
+        # The amend re-dispatches the originating `stage` agent (Story 20.2-002).
+        ledger.stage_start(
+            run_id, story.id, "commitlint", lint_seq,
+            harness=_stage_harness(stage, opts),
+        )
         prompt = render_commit_lint_reask_prompt(stage, story, message, violations)
         sink = _make_progress_sink(ledger, run_id, story.id, "commitlint", lint_seq)
         try:
@@ -4673,7 +4750,12 @@ def _run_bugfix(
     stage recurs across retries and stages and would otherwise collide on the
     stages UNIQUE key).
     """
-    ledger.stage_start(run_id, story.id, "bugfix", attempt)
+    # The bugfix re-dispatches the originating `failed_stage` agent, so record it
+    # on that stage's harness (Story 20.2-002).
+    ledger.stage_start(
+        run_id, story.id, "bugfix", attempt,
+        harness=_stage_harness(failed_stage, opts),
+    )
     out = str(transcript_path) if transcript_path is not None else ""
     prompt = render_bugfix_prompt(story, failed_stage, failure)
     sink = _make_progress_sink(ledger, run_id, story.id, "bugfix", attempt)
