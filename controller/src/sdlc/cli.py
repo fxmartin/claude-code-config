@@ -1360,6 +1360,7 @@ def repair(
     """
     from sdlc.repair import (
         RepairAction,
+        WorktreeRootError,
         apply_plan,
         build_plan,
         default_backup_dir,
@@ -1370,7 +1371,11 @@ def repair(
     repo_root = (root or default_repo_root()).resolve()
     cdir = claude_dir or default_claude_dir()
 
-    plan = build_plan(repo_root, cdir)
+    try:
+        plan = build_plan(repo_root, cdir)
+    except WorktreeRootError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     if plan.healthy:
         typer.echo(
             f"install healthy — {len(plan.artifacts)} managed artifacts in place, "

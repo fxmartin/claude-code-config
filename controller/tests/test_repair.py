@@ -7,12 +7,16 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 from sdlc.repair import (
     MANAGED_LINKS,
     ArtifactStatus,
     RepairAction,
+    WorktreeRootError,
     apply_plan,
     build_plan,
+    is_worktree_root,
 )
 
 
@@ -168,6 +172,79 @@ def test_default_paths_resolve() -> None:
     assert backup.name.startswith("repair-")
 
 
+
+# --- default_repo_root: worktree fallback (#179 defense-in-depth) -----------
+
+
+def test_default_repo_root_fallback_absolute_marketplace(tmp_path: Path, monkeypatch) -> None:
+    """Falls back to a canonical root via an absolute marketplace symlink.
+
+    When ``__file__`` resolves inside a worktree, ``default_repo_root`` follows
+    the ``plugins/marketplaces/fx-claude-config`` symlink back to the stable
+    checkout rather than returning the throwaway worktree path.
+    """
+    import sdlc.repair as repair_mod
+
+    canonical = tmp_path / "stable-checkout"
+    canonical.mkdir()
+    claude_dir = tmp_path / "dot-claude"
+    marketplace_dir = claude_dir / "plugins" / "marketplaces"
+    marketplace_dir.mkdir(parents=True)
+    marketplace = marketplace_dir / "fx-claude-config"
+    os.symlink(canonical, marketplace)
+
+    # Treat every path except canonical as a worktree root.
+    monkeypatch.setattr(repair_mod, "is_worktree_root", lambda p: p.resolve() != canonical.resolve())
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    result = repair_mod.default_repo_root()
+    assert result == canonical.resolve()
+
+
+def test_default_repo_root_fallback_relative_marketplace(tmp_path: Path, monkeypatch) -> None:
+    """Falls back via a relative marketplace symlink, resolving path correctly.
+
+    Exercises the ``target = marketplace.parent / target`` branch that converts
+    a relative readlink result into an absolute path before resolving.
+    """
+    import sdlc.repair as repair_mod
+
+    canonical = tmp_path / "stable-checkout"
+    canonical.mkdir()
+    claude_dir = tmp_path / "dot-claude"
+    marketplace_dir = claude_dir / "plugins" / "marketplaces"
+    marketplace_dir.mkdir(parents=True)
+    marketplace = marketplace_dir / "fx-claude-config"
+    rel_target = os.path.relpath(canonical, start=marketplace_dir)
+    os.symlink(rel_target, marketplace)
+
+    monkeypatch.setattr(repair_mod, "is_worktree_root", lambda p: p.resolve() != canonical.resolve())
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    result = repair_mod.default_repo_root()
+    assert result == canonical.resolve()
+
+
+def test_default_repo_root_falls_back_to_derived_when_no_marketplace(tmp_path: Path, monkeypatch) -> None:
+    """Returns the derived (worktree) path when the marketplace link is absent.
+
+    When there is no ``plugins/marketplaces/fx-claude-config`` symlink available
+    to recover from, the primary ``build_plan`` guard is the only protection.
+    """
+    import sdlc.repair as repair_mod
+
+    claude_dir = tmp_path / "dot-claude"
+    claude_dir.mkdir()
+    # No marketplace symlink created.
+
+    monkeypatch.setattr(repair_mod, "is_worktree_root", lambda p: True)
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    derived = Path(repair_mod.__file__).resolve().parents[3]
+    result = repair_mod.default_repo_root()
+    assert result == derived
+
+
 # --- apply_plan: restore ----------------------------------------------------
 
 
@@ -286,6 +363,35 @@ def test_repair_never_touches_unmanaged_files(tmp_path: Path) -> None:
 
     assert user_file.read_text(encoding="utf-8") == "private"
     assert (user_dir / "data.db").read_text(encoding="utf-8") == "ledger"
+
+
+# --- worktree-root guard (#179) ---------------------------------------------
+
+
+def test_is_worktree_root_detects_agent_worktree(tmp_path: Path) -> None:
+    wt = tmp_path / ".claude" / "worktrees" / "agent-run-story" / "controller"
+    assert is_worktree_root(wt) is True
+
+
+def test_is_worktree_root_accepts_main_checkout(tmp_path: Path) -> None:
+    main = tmp_path / "claude-code-config" / "controller"
+    assert is_worktree_root(main) is False
+
+
+def test_build_plan_refuses_worktree_root(tmp_path: Path) -> None:
+    """build_plan must refuse a worktree source before any plan exists to apply.
+
+    Guards direct callers of build_plan/apply_plan too, not just the CLI: a
+    repair sourced from an ephemeral worktree would re-point ~/.claude into a
+    path that vanishes on teardown.
+    """
+    wt = tmp_path / ".claude" / "worktrees" / "agent-test-1"
+    repo = _seed_repo(wt)
+    claude_dir = tmp_path / "claude"
+    _link_all(repo, claude_dir)
+
+    with pytest.raises(WorktreeRootError, match="worktree"):
+        build_plan(repo, claude_dir)
 
 
 # --- managed set authority: parity with install/core.sh ---------------------

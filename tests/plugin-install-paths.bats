@@ -86,6 +86,22 @@ PLUGIN_SKILLS_DIR="${REPO_ROOT}/plugins/autonomous-sdlc/skills"
     rm -rf "$fake_home" "${wt%/.claude/*}"
 }
 
+@test "sdlc repair refuses to run from an agent worktree (#179)" {
+    # Twin of the install.sh --core guard: `sdlc repair` re-points every managed
+    # ~/.claude link at its source root. From an ephemeral worktree those links
+    # dangle on teardown, clobbering the live install. The guard must abort
+    # before mutating the target.
+    fake_home="$(mktemp -d)"
+    wt="$(mktemp -d)/.claude/worktrees/agent-test-1"
+    mkdir -p "$wt"
+    run env HOME="$fake_home" uv run --project "${REPO_ROOT}/controller" sdlc repair \
+        --root "$wt" --claude-dir "$fake_home/.claude"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *worktree* ]]
+    [ ! -e "$fake_home/.claude/CLAUDE.md" ]
+    rm -rf "$fake_home" "${wt%/.claude/*}"
+}
+
 # ─── Plugin manifest structural sanity ───────────────────────────────────────
 
 @test "autonomous-sdlc plugin manifest exists" {
