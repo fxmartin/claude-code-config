@@ -6,8 +6,12 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from sdlc.build import _STAGES, Ledger, _base_ref, _git
+
+if TYPE_CHECKING:
+    from sdlc.registry import Registry
 
 __all__ = ["ReconcileResult", "reconcile_run"]
 
@@ -277,6 +281,7 @@ def reconcile_run(
     run_id: str | None = None,
     root: Path | None = None,
     fetch: bool = True,
+    registry: "Registry | None" = None,
 ) -> ReconcileResult:
     """Reconcile a run's parked stories against ``origin/main``, then re-terminal.
 
@@ -365,6 +370,14 @@ def reconcile_run(
     failed = sum(1 for v in statuses.values() if v == "FAILED")
     ledger.run_update_counts(rid, completed, failed)
     ledger.run_update_status(rid, after)
+    # Mirror the normal build close-out: stamp the host registry so the
+    # dashboard reflects the reconciled terminal + done count instead of the
+    # stale pre-reconcile values. A run absent from the registry is a no-op.
+    if registry is not None:
+        try:
+            registry.mark_finished(rid, after, completed=completed)
+        except OSError:
+            pass
 
     if reclassified:
         ledger.event_log(
