@@ -508,6 +508,7 @@ See [`docs/generators.md`](docs/generators.md).
 - [`docs/generators.md`](docs/generators.md) — generator skills documentation
 - [`docs/controller-architecture.md`](docs/controller-architecture.md) — `sdlc` controller module map, state-machine, and retry semantics (Epic-07)
 - [`docs/contracts.md`](docs/contracts.md) — agent I/O JSON-schema contracts reference
+- [`docs/harness-adapters.md`](docs/harness-adapters.md) — add a new agent harness (config + wrapper, no Python) and the generic CLI adapter template (Epic-20)
 - [`docs/adr/001-controller-runtime.md`](docs/adr/001-controller-runtime.md) · [`docs/adr/002-codex-mirror-sync.md`](docs/adr/002-codex-mirror-sync.md) — architecture decision records
 - [`docs/python-best-practices.md`](docs/python-best-practices.md) · [`docs/testing-best-practices.md`](docs/testing-best-practices.md) · [`docs/container-best-practices.md`](docs/container-best-practices.md) · [`docs/database-best-practices.md`](docs/database-best-practices.md)
 
