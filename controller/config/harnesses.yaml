@@ -1,0 +1,49 @@
+# ABOUTME: Registry of agent harnesses the controller can dispatch to (Story 20.1-001).
+# ABOUTME: One entry per harness — command template, invocation flags, capability flags, parser id.
+#
+# This file generalizes the dispatch seam (controller/src/sdlc/dispatch.py) and the
+# adversarial-reviewers registry into one config-driven harness abstraction. Adding a
+# new harness is a config + wrapper-script change here, not a Python change.
+#
+# The controller does NOT auto-load this file for the default dispatch path: with no
+# registry wired and no `SDLC_AGENT_CMD`, behaviour is byte-identical to the built-in
+# `claude -p` default (see dispatch.DEFAULT_AGENT_CMD). Role routing (Story 20.2-001)
+# is what points the controller at a registry entry by name.
+#
+# Command templates may use {pr_number}, {pr_url}, and {story_id} placeholders, which
+# the controller substitutes before invoking the harness (same style as the reviewer
+# registry).
+
+# Harness used when a role/run names none.
+default: claude
+
+harnesses:
+  # The built-in default. This entry mirrors dispatch.DEFAULT_AGENT_CMD for
+  # introspection; the dispatch seam still applies the deny baseline
+  # (Story 13.1-001) and the routed --model (Story 14.2-001) as decorations at
+  # resolve time, so they are not repeated in this static template.
+  claude:
+    command: "claude -p --output-format stream-json --verbose --dangerously-skip-permissions"
+    parser: claude-stream-json
+    enabled: true
+    capabilities:
+      worktree_isolation: true
+      parallel: true
+      json_contract: true
+      usage_tracking: true
+      rate_limit_aware: true
+
+  # First concrete non-Claude adapter (built out in Feature 20.3). The wrapper
+  # runs Codex via `codex exec` and emits the harness-neutral <<<RESULT_JSON>>>
+  # contract. Codex has no stream-json / usage / rate-limit semantics, so those
+  # capabilities are false and the run degrades safely (Feature 20.5).
+  codex:
+    command: "codex exec"
+    parser: codex-exec
+    enabled: true
+    capabilities:
+      worktree_isolation: false
+      parallel: false
+      json_contract: true
+      usage_tracking: false
+      rate_limit_aware: false
