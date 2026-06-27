@@ -6,6 +6,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
+import yaml
+
 from sdlc.harness import (
     HarnessConfig,
     HarnessError,
@@ -24,6 +26,16 @@ PIPELINE_ROLES: tuple[str, ...] = ("build", "coverage", "review", "merge", "docs
 # `review` and `qa` roles in the epic's headline example resolve without a third
 # stage the controller does not actually dispatch.
 ROLE_ALIASES: dict[str, str] = {"qa": "coverage"}
+
+# Story 20.7-005: the additive per-repo override file a consumer repo may ship at
+# its root to declare its default harness (and an optional per-role map), so a
+# repo need not pass `--harness` on every build. Mirrors the existing `.sdlc-*`
+# convention (`.sdlc-model-routing.yaml`, `.sdlc-risk-config.yaml`).
+HARNESS_OVERRIDE_FILENAME = ".sdlc-harness.yaml"
+
+# The single top-level key the override file uses, matching the `model_routing` /
+# `high_risk_patterns` convention of the sibling override files.
+HARNESS_KEY = "harness"
 
 
 class RoleRoutingError(Exception):
@@ -81,6 +93,126 @@ def parse_role_harness_map(spec: str) -> dict[str, str]:
             )
         role_map[role] = harness
     return role_map
+
+
+def load_repo_harness_defaults(
+    *,
+    override_path: Path | None = None,
+    override_text: str | None = None,
+) -> tuple[str | None, dict[str, str]]:
+    """Load a repo's ``.sdlc-harness.yaml`` (Story 20.7-005).
+
+    Returns ``(default_harness, {role: harness})``. ``default_harness`` is the
+    harness every unmapped role routes to (or ``None`` when the file declares no
+    default); the role map is the file's optional per-role overrides, with role
+    names canonicalised (``qa`` -> ``coverage``, same vocabulary as ``--harness``).
+
+    A missing file / blank text returns ``(None, {})`` — today's behaviour, so the
+    common path costs one ``stat``. ``override_text`` is the inline form tests use;
+    otherwise the YAML at ``override_path`` is read when it exists. The override is
+    *additive*: a present-but-malformed file (bad YAML, missing ``harness:`` key,
+    an unknown role, or an empty harness name) raises :class:`RoleRoutingError` so
+    a typo fails fast in preflight rather than silently routing nothing.
+
+    Harness *existence* is not checked here (an unknown harness name parses fine);
+    that is the registry-bound preflight's job, reached the same way as a
+    ``--harness`` flag once the file is merged onto the run's role map.
+    """
+    text = override_text
+    if text is None and override_path is not None and override_path.is_file():
+        text = override_path.read_text(encoding="utf-8")
+    if text is None:
+        return None, {}
+
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise RoleRoutingError(
+            f"{HARNESS_OVERRIDE_FILENAME} is not valid YAML: {exc}"
+        ) from exc
+    if raw is None:
+        return None, {}
+    if not isinstance(raw, dict) or HARNESS_KEY not in raw:
+        raise RoleRoutingError(
+            f"{HARNESS_OVERRIDE_FILENAME} must define a top-level {HARNESS_KEY!r} key"
+        )
+    section = raw[HARNESS_KEY]
+    if not isinstance(section, dict):
+        raise RoleRoutingError(f"{HARNESS_KEY!r} must be a mapping")
+
+    default = section.get("default")
+    if default is not None:
+        if not isinstance(default, str) or not default.strip():
+            raise RoleRoutingError(
+                f"{HARNESS_KEY}.default must be a non-empty harness name"
+            )
+        default = default.strip()
+
+    roles_raw = section.get("roles", {})
+    if roles_raw and not isinstance(roles_raw, dict):
+        raise RoleRoutingError(
+            f"{HARNESS_KEY}.roles must be a mapping of role -> harness"
+        )
+    roles: dict[str, str] = {}
+    for role_token, harness in (roles_raw or {}).items():
+        if not isinstance(harness, str) or not harness.strip():
+            raise RoleRoutingError(
+                f"{HARNESS_KEY}.roles entry for {str(role_token)!r} "
+                "must be a non-empty harness name"
+            )
+        roles[canonical_role(str(role_token))] = harness.strip()
+    return default, roles
+
+
+def merge_harness_defaults(
+    cli_map: Mapping[str, str] | None,
+    file_default: str | None,
+    file_roles: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Merge a repo ``.sdlc-harness.yaml`` under the CLI ``--harness`` map.
+
+    Precedence per role (Story 20.7-005 AC1/AC2): the CLI flag wins over the
+    file's per-role entry, which wins over the file's ``default``. A role covered
+    by none is left **absent** so it collapses to the built-in default — today's
+    behaviour (AC3). When ``file_default`` is set, every pipeline role gets an
+    explicit assignment unless the CLI overrides it, so the file's default truly
+    routes all otherwise-unmapped roles.
+
+    The returned map is the run's effective role->harness routing; feeding it to
+    the existing :func:`resolve_role_routing` preflight makes an unknown/disabled
+    harness named anywhere (flag *or* file) fail fast on the same path (AC4).
+    """
+    cli = {canonical_role(r): h for r, h in (cli_map or {}).items()}
+    roles = {canonical_role(r): h for r, h in (file_roles or {}).items()}
+    effective: dict[str, str] = {}
+    for role in PIPELINE_ROLES:
+        if role in cli:
+            effective[role] = cli[role]
+        elif role in roles:
+            effective[role] = roles[role]
+        elif file_default is not None:
+            effective[role] = file_default
+    return effective
+
+
+def apply_repo_harness_defaults(
+    cli_map: Mapping[str, str] | None,
+    *,
+    override_path: Path | None = None,
+) -> dict[str, str]:
+    """Resolve the run's effective role->harness map from CLI flag + repo file.
+
+    Convenience wrapper the CLI calls once after arg parsing: it loads the repo's
+    ``.sdlc-harness.yaml`` (at ``override_path``, defaulting to the working-tree
+    root) and merges it under ``cli_map`` per the documented precedence. A missing
+    file is a no-op (the CLI map is returned canonicalised). A malformed file
+    raises :class:`RoleRoutingError`, surfaced as the same fail-fast exit as a bad
+    ``--harness`` flag.
+    """
+    if override_path is None:
+        override_path = Path(HARNESS_OVERRIDE_FILENAME)
+    default, roles = load_repo_harness_defaults(override_path=override_path)
+    return merge_harness_defaults(cli_map, default, roles)
 
 
 def resolve_role_routing(

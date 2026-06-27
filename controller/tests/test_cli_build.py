@@ -82,6 +82,80 @@ def test_build_harness_unknown_role_rejected_in_parse(tmp_path, monkeypatch) -> 
     assert "unknown pipeline role" in result.output.lower()
 
 
+def test_build_repo_harness_default_applied(tmp_path, monkeypatch) -> None:
+    """Story 20.7-005 AC1: a repo `.sdlc-harness.yaml` default routes every role."""
+    _make_project(tmp_path)
+    (tmp_path / ".sdlc-harness.yaml").write_text(
+        "harness:\n  default: codex\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "dry run" in result.output.lower()
+
+
+def test_build_repo_harness_per_role_honoured(tmp_path, monkeypatch) -> None:
+    """Story 20.7-005 AC1: the file's per-role map (qa alias incl.) passes preflight."""
+    _make_project(tmp_path)
+    (tmp_path / ".sdlc-harness.yaml").write_text(
+        "harness:\n  default: claude\n  roles:\n    review: codex\n    qa: codex\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+    assert result.exit_code == 0, result.output
+
+
+def test_build_cli_harness_overrides_repo_file(tmp_path, monkeypatch) -> None:
+    """Story 20.7-005 AC2: an explicit --harness wins over the repo file.
+
+    The file would route `build` to an unknown harness; the CLI flag overrides it
+    with a valid one, so preflight passes — proving the flag beats the file.
+    """
+    _make_project(tmp_path)
+    (tmp_path / ".sdlc-harness.yaml").write_text(
+        "harness:\n  roles:\n    build: nope\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["build", "epic-99", "--dry-run", "--harness", "build=codex"]
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_build_repo_harness_unknown_fails_fast(tmp_path, monkeypatch) -> None:
+    """Story 20.7-005 AC4: a file naming an unknown harness fails fast (exit 2)."""
+    _make_project(tmp_path)
+    (tmp_path / ".sdlc-harness.yaml").write_text(
+        "harness:\n  default: nope\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+    assert result.exit_code == 2, result.output
+    assert "nope" in result.output.lower()
+
+
+def test_build_repo_harness_malformed_fails_fast(tmp_path, monkeypatch) -> None:
+    """Story 20.7-005: a malformed `.sdlc-harness.yaml` fails fast (exit 2)."""
+    _make_project(tmp_path)
+    (tmp_path / ".sdlc-harness.yaml").write_text(
+        "harness:\n  roles:\n    deploy: codex\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+    assert result.exit_code == 2, result.output
+    assert "unknown pipeline role" in result.output.lower()
+
+
+def test_build_no_repo_harness_file_unchanged(tmp_path, monkeypatch) -> None:
+    """Story 20.7-005 AC3: no file and no flag → today's behaviour (plans normally)."""
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "2 stories" in result.output
+
+
 def test_build_limit_truncates_in_dry_run(tmp_path, monkeypatch) -> None:
     """`--limit=1` truncates the dry-run plan (dependency pull-in aside)."""
     _make_project(tmp_path)

@@ -148,6 +148,40 @@ declares neither `parallel` nor `worktree_isolation` — automatically runs that
 role serially with a logged warning instead of failing. No `sdlc/*.py` file was
 touched.
 
+## Setting a repo's default harness
+
+Passing `--harness …` on every `sdlc build` gets old in a repo that always wants
+the same routing. Drop a `.sdlc-harness.yaml` at the **consumer repo root** to
+declare a default harness (and, optionally, a per-role map) once — mirroring the
+sibling `.sdlc-model-routing.yaml` and `.sdlc-risk-config.yaml` override files
+(Story 20.7-005). A sample:
+
+```yaml
+# .sdlc-harness.yaml — per-repo harness routing for `sdlc build`.
+harness:
+  # Every pipeline role (build, coverage, review, merge, docs) routes here unless
+  # overridden below. Omit `default:` to keep the built-in `claude` default and
+  # only remap specific roles.
+  default: codex
+  roles:
+    # Per-role overrides win over `default:`. Role names match `--harness`
+    # (build / coverage / review / merge / docs; `qa` aliases `coverage`).
+    review: claude
+    qa: codex
+```
+
+**Precedence** is `--harness` flag **>** repo file **>** built-in `claude`
+default:
+
+- With no file and no flag, behaviour is unchanged — every role runs on `claude`.
+- The file's `default:` routes every role it does not name in `roles:`.
+- An explicit `--harness` flag always wins over the file, role by role.
+
+The file is validated in the same preflight as the flag: a malformed file, an
+unknown role, or a `default:`/`roles:` harness that is unknown or disabled in
+[`controller/config/harnesses.yaml`](../controller/config/harnesses.yaml) fails
+fast (exit 2) before any stage runs — no half-run.
+
 ## Candidate future targets
 
 The abstraction exists so these become config exercises, not engineering
