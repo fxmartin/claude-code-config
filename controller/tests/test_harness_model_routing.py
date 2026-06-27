@@ -50,6 +50,22 @@ def test_registry_no_longer_ignores_model_routing() -> None:
     assert cfg.to_argv(stage="build") != cfg.to_argv(stage="merge")
 
 
+def test_to_argv_appends_flags_after_substituted_model() -> None:
+    """A {model} harness's invocation flags land *after* the substituted model.
+
+    The `{model}` branch appends `flags` just like the static path; pin that the
+    flags follow the routed model id rather than being dropped or reordered.
+    """
+    cfg = _registry_harness(flags=["--headless", "--json"])
+    assert cfg.to_argv(stage="build") == [
+        "acme", "run", "--model", "acme-pro", "--headless", "--json",
+    ]
+    # Unmapped stage still routes the default model, flags still trail it.
+    assert cfg.to_argv(stage="coverage") == [
+        "acme", "run", "--model", "acme-base", "--headless", "--json",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # AC3: a stage with no explicit mapping falls back to the harness `default`
 #      model; a harness whose command has no {model} placeholder is unchanged.
