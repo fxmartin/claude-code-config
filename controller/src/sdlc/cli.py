@@ -126,7 +126,9 @@ Flags:
                             --harness build=claude,review=codex,qa=codex. Roles:
                             build, coverage (qa), review, merge, docs. Unmapped
                             roles run on the default (claude). An unknown/disabled
-                            harness fails fast in preflight
+                            harness fails fast in preflight. A repo can set its own
+                            default in a root .sdlc-harness.yaml (the flag wins);
+                            see docs/harness-adapters.md
   --thinking-cap=N          cap per-request thinking tokens (MAX_THINKING_TOKENS)
                             on every dispatched agent; 0 = no cap (default)
   --sandbox                 run every dispatched agent inside a no-egress,
@@ -163,13 +165,25 @@ def build(ctx: typer.Context) -> None:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
 
+    # Story 20.7-005: merge a repo-root `.sdlc-harness.yaml` under the CLI
+    # `--harness` map (precedence: CLI flag > repo file > built-in default) so the
+    # preflight below and every stage dispatch see one effective role->harness map.
+    # A malformed file or an unknown role fails fast here, the same path as the flag.
+    from sdlc.role_routing import RoleRoutingError, apply_repo_harness_defaults
+
+    try:
+        opts.harness_map = apply_repo_harness_defaults(opts.harness_map)
+    except RoleRoutingError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
     # Story 20.2-001: resolve and validate per-role harness routing before any
     # stage runs. An unknown/disabled harness, a missing registry, or a conflict
     # with the adversarial-reviewers registry fails fast here (no half-run). With
-    # no `--harness` map this is skipped entirely — behaviour is unchanged.
+    # no `--harness` map (and no repo file) this is skipped entirely — behaviour is
+    # unchanged.
     if opts.harness_map:
         from sdlc.role_routing import (
-            RoleRoutingError,
             check_review_bridge,
             default_registry_path,
             default_reviewers_path,

@@ -9,6 +9,7 @@ import pytest
 
 from sdlc.harness import DEFAULT_HARNESS
 from sdlc.role_routing import (
+    HARNESS_OVERRIDE_FILENAME,
     PIPELINE_ROLES,
     ROLE_ALIASES,
     RoleRoutingError,
@@ -16,6 +17,8 @@ from sdlc.role_routing import (
     check_review_bridge,
     default_registry_path,
     default_reviewers_path,
+    load_repo_harness_defaults,
+    merge_harness_defaults,
     parse_role_harness_map,
     resolve_role_routing,
 )
@@ -269,3 +272,112 @@ def test_default_registry_path_points_at_checked_in_config() -> None:
 
 def test_default_reviewers_path_points_at_checked_in_config() -> None:
     assert default_reviewers_path() == REVIEWERS_PATH
+
+
+# ---------------------------------------------------------------------------
+# Per-repo default harness override (Story 20.7-005)
+# ---------------------------------------------------------------------------
+
+
+def test_repo_harness_override_filename_matches_sdlc_convention() -> None:
+    # Mirrors `.sdlc-model-routing.yaml` / `.sdlc-risk-config.yaml`.
+    assert HARNESS_OVERRIDE_FILENAME == ".sdlc-harness.yaml"
+
+
+def test_repo_harness_defaults_absent_is_noop() -> None:
+    # No file and no inline text → today's behaviour (no default, no roles).
+    assert load_repo_harness_defaults(override_text=None) == (None, {})
+
+
+def test_repo_harness_defaults_empty_yaml_is_noop() -> None:
+    assert load_repo_harness_defaults(override_text="\n") == (None, {})
+
+
+def test_repo_harness_defaults_default_only() -> None:
+    default, roles = load_repo_harness_defaults(override_text="harness:\n  default: codex\n")
+    assert default == "codex"
+    assert roles == {}
+
+
+def test_repo_harness_defaults_per_role_map_canonicalises_qa() -> None:
+    text = "harness:\n  default: codex\n  roles:\n    review: claude\n    qa: codex\n"
+    default, roles = load_repo_harness_defaults(override_text=text)
+    assert default == "codex"
+    # `qa` aliases `coverage`, the same vocabulary as `--harness`.
+    assert roles == {"review": "claude", "coverage": "codex"}
+
+
+def test_repo_harness_defaults_unknown_role_fails_fast() -> None:
+    with pytest.raises(RoleRoutingError, match="unknown pipeline role"):
+        load_repo_harness_defaults(override_text="harness:\n  roles:\n    deploy: codex\n")
+
+
+def test_repo_harness_defaults_missing_top_level_key_fails() -> None:
+    with pytest.raises(RoleRoutingError, match="harness"):
+        load_repo_harness_defaults(override_text="default: codex\n")
+
+
+def test_repo_harness_defaults_invalid_yaml_fails() -> None:
+    with pytest.raises(RoleRoutingError, match="valid YAML"):
+        load_repo_harness_defaults(override_text="harness: [unclosed\n")
+
+
+def test_repo_harness_defaults_empty_default_fails() -> None:
+    with pytest.raises(RoleRoutingError, match="default"):
+        load_repo_harness_defaults(override_text="harness:\n  default: ''\n")
+
+
+def test_repo_harness_defaults_empty_role_harness_fails() -> None:
+    with pytest.raises(RoleRoutingError, match="review"):
+        load_repo_harness_defaults(override_text="harness:\n  roles:\n    review: ''\n")
+
+
+def test_repo_harness_defaults_section_must_be_mapping() -> None:
+    with pytest.raises(RoleRoutingError, match="mapping"):
+        load_repo_harness_defaults(override_text="harness: codex\n")
+
+
+def test_repo_harness_defaults_reads_from_path(tmp_path: Path) -> None:
+    f = tmp_path / HARNESS_OVERRIDE_FILENAME
+    f.write_text("harness:\n  default: codex\n", encoding="utf-8")
+    assert load_repo_harness_defaults(override_path=f) == ("codex", {})
+
+
+def test_repo_harness_defaults_missing_path_is_noop(tmp_path: Path) -> None:
+    assert load_repo_harness_defaults(override_path=tmp_path / "nope.yaml") == (None, {})
+
+
+# --- merge precedence: CLI flag > repo file > built-in default --------------
+
+
+def test_merge_file_default_routes_every_unmapped_role() -> None:
+    effective = merge_harness_defaults({}, "codex", {})
+    assert set(effective) == set(PIPELINE_ROLES)
+    assert all(h == "codex" for h in effective.values())
+
+
+def test_merge_cli_flag_overrides_file_default() -> None:
+    effective = merge_harness_defaults({"build": "claude"}, "codex", {})
+    assert effective["build"] == "claude"  # CLI wins
+    assert effective["review"] == "codex"  # file default fills the rest
+
+
+def test_merge_cli_flag_overrides_file_per_role() -> None:
+    effective = merge_harness_defaults({"review": "claude"}, None, {"review": "codex"})
+    assert effective["review"] == "claude"
+
+
+def test_merge_file_per_role_overrides_file_default() -> None:
+    effective = merge_harness_defaults({}, "codex", {"review": "claude"})
+    assert effective["review"] == "claude"
+    assert effective["build"] == "codex"
+
+
+def test_merge_no_file_no_flag_is_empty() -> None:
+    # Nothing declared → empty map → every role collapses to the built-in default.
+    assert merge_harness_defaults({}, None, {}) == {}
+
+
+def test_merge_cli_only_is_unchanged() -> None:
+    # With no file, the effective map is exactly the CLI map (today's behaviour).
+    assert merge_harness_defaults({"build": "claude"}, None, {}) == {"build": "claude"}
