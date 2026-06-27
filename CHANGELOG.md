@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.87.0] - 2026-06-27
+
+### Added
+
+- feat(cross-harness-portability): codex build/qa adapter (#20.3-001)
+
+
 ## [v1.86.0] - 2026-06-26
 
 ### Added
