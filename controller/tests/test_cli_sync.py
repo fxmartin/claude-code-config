@@ -129,6 +129,104 @@ def test_sync_check_no_consumer_no_neutral_exits_two(tmp_path: Path) -> None:
     assert "error" in result.output.lower()
 
 
+# --- pipeline-skill parity gate (Story 20.7-002) ----------------------------
+
+from sdlc.skill_generator import generate_claude_skill  # noqa: E402
+
+_PIPE_NAME = "build-stories"
+_PIPE_SRC = (
+    "---\n"
+    f"name: {_PIPE_NAME}\n"
+    "description: Use when batch-building stories via the controller.\n"
+    "allowed_tools:\n"
+    "- Bash\n"
+    "model_invocation: disabled\n"
+    "---\n\n"
+    "Run the controller.\n\n"
+    "```bash\n"
+    "sdlc build {{ARGUMENTS}}\n"
+    "```\n"
+)
+
+
+def _seed_skill_base(root: Path, skills: dict[str, str]) -> Path:
+    base = root / "skills"
+    for name, text in skills.items():
+        d = base / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(text, encoding="utf-8")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _pipe_claude() -> str:
+    return generate_claude_skill(parse_neutral_skill(_PIPE_SRC))
+
+
+def test_sync_check_skill_base_in_sync_exits_zero(tmp_path: Path) -> None:
+    neutral = _seed_neutral(tmp_path / "neutral", {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: _pipe_claude()})
+    # An empty body-mirror source dir keeps that check trivially in sync.
+    src = _seed(tmp_path / "src", {})
+
+    result = runner.invoke(
+        app,
+        ["sync-check", str(src), "--neutral", str(neutral), "--skill-base", str(base)],
+    )
+
+    assert result.exit_code == 0
+    assert "pipeline skills in sync" in result.output.lower()
+
+
+def test_sync_check_skill_base_drift_exits_one_with_fix_hint(tmp_path: Path) -> None:
+    neutral = _seed_neutral(tmp_path / "neutral", {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: "hand-edited drift\n"})
+    src = _seed(tmp_path / "src", {})
+
+    result = runner.invoke(
+        app,
+        ["sync-check", str(src), "--neutral", str(neutral), "--skill-base", str(base)],
+    )
+
+    assert result.exit_code == 1
+    assert _PIPE_NAME in result.output
+    assert "--fix" in result.output
+
+
+def test_sync_check_skill_base_fix_rewrites_and_exits_zero(tmp_path: Path) -> None:
+    neutral = _seed_neutral(tmp_path / "neutral", {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: "drifted\n"})
+    src = _seed(tmp_path / "src", {})
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-check",
+            str(src),
+            "--neutral",
+            str(neutral),
+            "--skill-base",
+            str(base),
+            "--fix",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (base / _PIPE_NAME / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == _pipe_claude()
+
+
+def test_sync_check_skill_base_without_neutral_exits_two(tmp_path: Path) -> None:
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: _pipe_claude()})
+    src = _seed(tmp_path / "src", {})
+
+    result = runner.invoke(app, ["sync-check", str(src), "--skill-base", str(base)])
+
+    assert result.exit_code == 2
+    assert "--skill-base requires --neutral" in result.output
+
+
 def test_sync_check_fix_without_neutral_exits_two(tmp_path: Path) -> None:
     # --fix only makes sense for the generated-parity gate, so it requires
     # --neutral; asking for it against a consumer mirror is a usage error.

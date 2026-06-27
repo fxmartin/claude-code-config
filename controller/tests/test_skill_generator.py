@@ -66,6 +66,54 @@ def test_codex_golden_matches() -> None:
     assert generate_codex_skill(_coverage_skill()) == expected
 
 
+# ---------------------------------------------------------------------------
+# build-stories pipeline skill (Story 20.7-002)
+# ---------------------------------------------------------------------------
+
+
+def _build_stories_skill() -> NeutralSkill:
+    return parse_neutral_skill(
+        (_NEUTRAL_DIR / "build-stories.skill.md").read_text(encoding="utf-8")
+    )
+
+
+def test_build_stories_claude_golden_matches() -> None:
+    expected = (_GOLDEN_DIR / "build-stories.claude.SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert generate_claude_skill(_build_stories_skill()) == expected
+
+
+def test_build_stories_codex_golden_matches() -> None:
+    expected = (_GOLDEN_DIR / "build-stories.codex.SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert generate_codex_skill(_build_stories_skill()) == expected
+
+
+def test_build_stories_claude_preserves_pipeline_frontmatter() -> None:
+    """AC #2: the regenerated Claude skill keeps the hand-written thin-wrapper's
+    pipeline frontmatter and runs `sdlc build $ARGUMENTS`."""
+    text = generate_claude_skill(_build_stories_skill())
+    fm, body = _split_frontmatter(text)
+    assert fm["allowed-tools"] == "Bash"
+    assert fm["disable-model-invocation"] is True
+    assert fm["argument-hint"].startswith("[all|resume|epic-NN")
+    assert "sdlc build $ARGUMENTS" in body
+
+
+def test_build_stories_codex_is_an_honest_controller_wrapper() -> None:
+    """AC #3: the Codex skill runs `sdlc build` via the controller and is invoked
+    as `Use build-stories …` — not the misleading "Codex-native port" preamble."""
+    text = generate_codex_skill(_build_stories_skill())
+    assert "Codex-native port" not in text
+    assert "thin wrapper around the `sdlc` controller" in text
+    assert "- `Use build-stories all --auto --limit=5`" in text
+    assert "sdlc build" in text
+    # Claude-only constructs are dropped on the codex target.
+    assert "$ARGUMENTS" not in text
+
+
 def test_claude_body_is_identical_to_live_skill() -> None:
     """AC #2: the generated Claude body reproduces the hand-written skill body.
 
@@ -208,14 +256,24 @@ def test_write_skill_files_skips_untargeted_claude_harness(tmp_path: Path) -> No
     assert not (tmp_path / "claude" / "codex-only").exists()
 
 
-def test_generate_all_covers_every_neutral_source(tmp_path: Path) -> None:
+def test_generate_all_covers_only_pipeline_skills(tmp_path: Path) -> None:
+    """generate_all emits the pipeline skills (full SKILL.md) into both bases.
+
+    The seven body-only utility skills are mirrored separately (shared-skills/),
+    so generating them here would plant spurious plugin-skill directories.
+    """
+    from sdlc.skill_generator import PIPELINE_SKILLS
+
     generated = generate_all(_NEUTRAL_DIR, tmp_path / "claude", tmp_path / "codex")
     names = {g.name for g in generated}
-    expected = {p.stem.removesuffix(".skill") for p in _NEUTRAL_DIR.glob("*.skill.md")}
-    assert names == expected
+    authored = {p.stem.removesuffix(".skill") for p in _NEUTRAL_DIR.glob("*.skill.md")}
+    assert names == authored & set(PIPELINE_SKILLS)
+    assert "build-stories" in names
     for g in generated:
         assert g.claude_path is not None and g.claude_path.exists()
         assert g.codex_path is not None and g.codex_path.exists()
+    # No utility skill leaked into the plugin trees.
+    assert not (tmp_path / "claude" / "coverage").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +314,11 @@ def test_cli_generate_skills_writes_files(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "generated" in result.output
-    assert (claude_base / "coverage" / "SKILL.md").exists()
-    assert (codex_base / "coverage" / "SKILL.md").exists()
+    # Pipeline skills (build-stories) land as full SKILL.md in both plugin trees.
+    assert (claude_base / "build-stories" / "SKILL.md").exists()
+    assert (codex_base / "build-stories" / "SKILL.md").exists()
+    # The body-only utility skills are not emitted here.
+    assert not (claude_base / "coverage" / "SKILL.md").exists()
 
 
 def test_cli_generate_skills_missing_dir_exits_2(tmp_path: Path) -> None:

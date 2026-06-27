@@ -114,9 +114,35 @@ This story defines and proves the **format** only. Emitting whole skill *files*
   Rejected: markdown-with-frontmatter is already the idiom both harnesses use and
   keeps sources human-authorable and diff-friendly.
 
+## Update (Story 20.7-002): pipeline skills generated as full `SKILL.md`
+
+The format and generator above were proven against the **seven body-only utility
+skills**, which are mirrored as `shared-skills/<name>.md` bodies. Story 20.7-002
+brings the first **pipeline skill**, `build-stories`, under the same single
+source — but a pipeline skill is a full `SKILL.md` plugin skill, not a body
+mirror, so the generation model is extended (the *format* and schema are
+unchanged):
+
+- **Source.** `shared-skills/neutral/build-stories.skill.md` carries the pipeline
+  frontmatter the utility skills don't use (`allowed_tools: [Bash]`,
+  `argument_hint`, `model_invocation: disabled`) and a harness-tagged body so the
+  Claude block keeps the `command -v sdlc` fallback while Codex gets a clean
+  `sdlc build` invocation.
+- **Targets.** `generate_all` emits only the pipeline skills
+  (`skill_generator.PIPELINE_SKILLS`, aligned with `portability.CROSS_HARNESS_SKILLS`)
+  as full `SKILL.md` files into each harness's `plugins/autonomous-sdlc/skills/`
+  tree. The Codex preamble is the honest "thin wrapper around the `sdlc`
+  controller" line, not the utility skills' "Codex-native port".
+- **Parity gate.** `sdlc sync-check … --skill-base <plugins/skills>` (wired into
+  `scripts/sync-shared-skills.sh verify-generated`) compares each committed
+  pipeline `<name>/SKILL.md` against its regenerated form, red-on-drift with a
+  diff and a regenerate command — the body-mirror gate skips pipeline skills, so
+  the two gates partition the sources with no overlap.
+
 ## References
 
 - `docs/adr/002-codex-mirror-sync.md`
+- `docs/stories/epic-20-cross-harness-portability.md` (Story 20.7-002)
 - `docs/stories/epic-20-cross-harness-portability.md` (Story 20.4-001)
 - `controller/src/sdlc/skill_format.py`
 - `controller/src/sdlc/schemas/neutral-skill.schema.json`

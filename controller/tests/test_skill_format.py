@@ -279,10 +279,18 @@ def test_valid_harness_block_passes_parse_check() -> None:
 
 
 def test_seven_neutral_sources_present() -> None:
-    """Exactly the seven shared skills have a committed neutral source."""
-    present = {p.name for p in _NEUTRAL_DIR.glob("*.skill.md")}
-    expected = {f"{name}.skill.md" for name in SHARED_SKILLS}
-    assert present == expected
+    """The seven shared skills each have a committed neutral source.
+
+    The neutral dir also holds the pipeline skills (build-stories, a full
+    SKILL.md skill, Story 20.7-002), so the seven are a subset rather than the
+    whole set.
+    """
+    from sdlc.skill_generator import PIPELINE_SKILLS
+
+    present = {p.stem.removesuffix(".skill") for p in _NEUTRAL_DIR.glob("*.skill.md")}
+    assert set(SHARED_SKILLS) <= present
+    # The only non-utility sources are the known pipeline skills.
+    assert present - set(SHARED_SKILLS) == set(PIPELINE_SKILLS)
 
 
 @pytest.mark.parametrize("name", SHARED_SKILLS)
