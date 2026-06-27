@@ -1,6 +1,6 @@
 # Epic 20: Cross-Harness SDLC Portability — run the pipeline on any agent harness
 
-> **Status: IN PROGRESS (17/18)** — the original 13 stories merged on `main` (2026-06-27): harness
+> **Status: COMPLETE (18/18)** — the original 13 stories merged on `main` (2026-06-27): harness
 > registry + adapter contract, pluggable output parsing, role→harness config, per-stage harness in
 > the ledger, Codex build/QA adapter + review/QA routing, harness-neutral skill format +
 > generator/transpiler + parity CI gate, capability probe + degradation matrix, and the "add a new
@@ -14,8 +14,9 @@
 > skills were); (3) per-stage *model* routing (Epic-14's Balanced map) was Claude-only — a registry
 > harness ignored the routed model. Feature 20.7 closes all three plus a per-repo default-harness
 > override; **Story 20.7-001 wired the routing into real dispatch, so per-role `--harness` is now
-> functional** (a codex-routed stage dispatches the Codex adapter, not just a ledger label). Only the
-> runtime/status docs (20.7-003) remain.
+> functional** (a codex-routed stage dispatches the Codex adapter, not just a ledger label). All five
+> Feature 20.7 stories are now merged (20.7-001..005), and 20.7-003 documented the Codex-worker
+> runtime and corrected the harness-support status.
 > Created 2026-06-26. Triggered by FX's request to make the autonomous-sdlc
 > framework run beyond Claude Code (Codex, opencode, pi, …) and to allow alternate-harness role
 > assignment (e.g. Codex for review and QA while Claude builds). This epic generalizes the
