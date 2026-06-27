@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.91.2] - 2026-06-27
+
+### Fixed
+
+- fix(controller): keep dispatched agents from nested builds and browsers
+
+
 ## [v1.91.1] - 2026-06-27
 
 ### Fixed
