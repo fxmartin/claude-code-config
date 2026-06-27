@@ -1,6 +1,11 @@
 # Epic 20: Cross-Harness SDLC Portability — run the pipeline on any agent harness
 
-> **Status: PLANNED** — created 2026-06-26. Triggered by FX's request to make the autonomous-sdlc
+> **Status: COMPLETE (13/13)** — all stories merged on `main` (2026-06-27): harness registry +
+> adapter contract, pluggable output parsing, role→harness config, per-stage harness in the ledger,
+> Codex build/QA adapter + review/QA routing, harness-neutral skill format + generator/transpiler +
+> parity CI gate, capability probe + degradation matrix, and the "add a new harness" guide +
+> in-process-agent boundary docs. Built across parallel runs 68e5a36c / e4f9976c (PRs #200-#212).
+> Created 2026-06-26. Triggered by FX's request to make the autonomous-sdlc
 > framework run beyond Claude Code (Codex, opencode, pi, …) and to allow alternate-harness role
 > assignment (e.g. Codex for review and QA while Claude builds). This epic generalizes the
 > vendor-agnostic registry pattern that Epic-08 introduced for *adversarial review* into a
