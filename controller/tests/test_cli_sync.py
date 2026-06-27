@@ -127,3 +127,17 @@ def test_sync_check_no_consumer_no_neutral_exits_two(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "error" in result.output.lower()
+
+
+def test_sync_check_fix_without_neutral_exits_two(tmp_path: Path) -> None:
+    # --fix only makes sense for the generated-parity gate, so it requires
+    # --neutral; asking for it against a consumer mirror is a usage error.
+    src = _seed(tmp_path / "src", {"roast": "x"})
+    consumer = _seed(tmp_path / "consumer", {"roast": "x"})
+
+    result = runner.invoke(
+        app, ["sync-check", str(src), str(consumer), "--fix"]
+    )
+
+    assert result.exit_code == 2
+    assert "--fix requires --neutral" in result.output
