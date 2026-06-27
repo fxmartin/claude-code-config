@@ -337,6 +337,14 @@ def test_repo_harness_defaults_section_must_be_mapping() -> None:
         load_repo_harness_defaults(override_text="harness: codex\n")
 
 
+def test_repo_harness_defaults_roles_must_be_mapping() -> None:
+    """A `harness.roles` that is not a role->harness mapping fails fast."""
+    with pytest.raises(RoleRoutingError, match="roles must be a mapping"):
+        load_repo_harness_defaults(
+            override_text="harness:\n  roles:\n    - review\n    - qa\n"
+        )
+
+
 def test_repo_harness_defaults_reads_from_path(tmp_path: Path) -> None:
     f = tmp_path / HARNESS_OVERRIDE_FILENAME
     f.write_text("harness:\n  default: codex\n", encoding="utf-8")
