@@ -188,6 +188,43 @@ declares neither `parallel` nor `worktree_isolation` — automatically runs that
 role serially with a logged warning instead of failing. No `sdlc/*.py` file was
 touched.
 
+## Running a Codex-worker build
+
+Routing a role to `codex` (`sdlc build --harness build=codex,…`, Story 20.7-001)
+dispatches that stage's worker through
+[`scripts/codex-build-adapter.sh`](../scripts/codex-build-adapter.sh). Getting a
+codex-worker run green on a host comes down to three things — get them wrong and
+you hit an auth or sandbox dead-end instead of a clear error:
+
+1. **Pre-authenticate codex first.** The controller runs the worker **headless**
+   (no TTY, no interactive approval), so it cannot complete a login flow mid-run.
+   Run `codex login` (or set the API key the CLI expects) once on the host and
+   confirm `codex exec` works non-interactively *before* starting a build.
+2. **Use `HARNESS_AGENT_CMD="codex exec --full-auto"` for non-interactive
+   write/exec.** A worker has to edit files and run commands without stopping for
+   per-action approval; `--full-auto` is the mode that grants that headlessly. The
+   adapter honours `HARNESS_AGENT_CMD`, so export it to override the default
+   `codex exec`:
+
+   ```bash
+   export HARNESS_AGENT_CMD="codex exec --full-auto"
+   sdlc build epic-20 --harness build=codex,coverage=codex
+   ```
+3. **Do not combine a Codex worker with the controller `--sandbox` flag, and run
+   on the host path.** The controller's `--sandbox` is **Claude-only** — it runs
+   the agent inside a **no-egress** container image that has neither the Codex CLI
+   nor network. A Codex worker must run on the **host path** instead: its `gh`
+   operations (branch push, PR open, status checks) need the **network** and
+   GitHub auth that *both* the controller's no-egress image **and** Codex's own
+   `workspace-write` sandbox block. Leave `--sandbox` off and let the host provide
+   the network/auth the worker's `gh` calls require.
+
+> **Provenance.** Per-role `--harness` routing was a ledger **label** only until
+> Story 20.7-001: `cli.py` validated the resolved harnesses and then discarded
+> them, so `--harness build=codex` *labelled* the ledger while every stage still
+> ran `claude`. Story 20.7-001 wired the routing through the build loop, so a
+> codex-routed stage now dispatches the Codex adapter for real.
+
 ## Setting a repo's default harness
 
 Passing `--harness …` on every `sdlc build` gets old in a repo that always wants
