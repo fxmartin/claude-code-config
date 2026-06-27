@@ -158,6 +158,111 @@ def check_review_bridge(
             )
 
 
+def reconcile_reviewer_registry(
+    *,
+    registry_path: str | Path | None,
+    reviewers_path: str | Path | None,
+) -> None:
+    """Enforce the single-source-of-truth link between the two registries (20.3-002).
+
+    A reviewer in ``adversarial-reviewers.yaml`` may declare ``harness: <name>``
+    to make itself a *view* over a ``harnesses.yaml`` entry. The harness registry
+    then owns whether that runtime (e.g. Codex) is available; the reviewer entry
+    contributes only the review-role specifics Epic-08 owns (its command,
+    ``timeout_sec``, ``allowed_verdicts``, and the file-level ``consensus`` rule).
+    This gate fails fast when the two would diverge — exactly the "two competing
+    Codex configurations" drift the story eliminates:
+
+    - a reviewer links a harness that is **absent** from the registry (a dangling
+      link — the reviewer references a runtime nothing else declares), or
+    - an **enabled** reviewer links a harness that is **disabled** in the registry
+      (the single availability switch must win; you can't review with a runtime
+      the registry has switched off).
+
+    A reviewer with no ``harness:`` link is left untouched (standalone, legacy).
+    Missing/unreadable/malformed files are no-ops, mirroring
+    :func:`check_review_bridge`: a malformed file is the owning gate's job to flag.
+    Identity-only — consensus aggregation is not consulted or changed here.
+    """
+    if registry_path is None or reviewers_path is None:
+        return
+    reviewers_file = Path(reviewers_path)
+    registry_file = Path(registry_path)
+    if not reviewers_file.exists() or not registry_file.exists():
+        return
+
+    # Local imports keep both loaders off the hot import path and avoid coupling
+    # routing to Epic-08's / Story 20.1-001's loaders at module load time.
+    from sdlc.adversarial import AdversarialError, load_reviewers_config
+    from sdlc.harness import HarnessError, load_harnesses_config
+
+    try:
+        registry = load_harnesses_config(registry_file)
+        _consensus, reviewers = load_reviewers_config(reviewers_file)
+    except (AdversarialError, HarnessError):
+        return
+
+    for reviewer in reviewers:
+        if reviewer.harness is None:
+            continue
+        harness = registry.get(reviewer.harness)
+        if harness is None:
+            known = ", ".join(sorted(registry)) or "(none)"
+            raise RoleRoutingError(
+                f"reviewer {reviewer.name!r} links harness {reviewer.harness!r}, "
+                f"which is not defined in harnesses.yaml (known: {known}) — the "
+                "two registries have diverged; add the harness or drop the link"
+            )
+        if reviewer.enabled and not harness.enabled:
+            raise RoleRoutingError(
+                f"reviewer {reviewer.name!r} is enabled but its linked harness "
+                f"{reviewer.harness!r} is disabled in harnesses.yaml — the harness "
+                "registry is the single availability switch; enable the harness or "
+                "disable the reviewer"
+            )
+
+
+def review_reviewer_for(
+    resolved: Mapping[str, HarnessConfig],
+    *,
+    reviewers_path: str | Path | None,
+):
+    """The adversarial reviewer that governs the ``review`` role, or ``None``.
+
+    Given a resolved role→harness map, returns the *enabled* reviewer whose
+    linked ``harness`` (or, for an unlinked legacy entry, whose ``name``) matches
+    the harness the ``review`` role runs on. This is the concrete proof of AC2:
+    with ``review`` routed to Codex, the governing reviewer comes from the one
+    reviewer registry — there is no second, divergent Codex review command.
+
+    Returns ``None`` when the review role runs on a harness no reviewer claims
+    (e.g. the default ``claude``, whose review goes through the standard pipeline
+    review agent, not the adversarial slot), or when the reviewers file is
+    missing/unreadable. The return type is :class:`ReviewerConfig` but it is
+    imported lazily, so it is left unannotated to keep the import off the hot path.
+    """
+    review = resolved.get("review")
+    if review is None or reviewers_path is None:
+        return None
+    path = Path(reviewers_path)
+    if not path.exists():
+        return None
+
+    from sdlc.adversarial import AdversarialError, load_reviewers_config
+
+    try:
+        _consensus, reviewers = load_reviewers_config(path)
+    except AdversarialError:
+        return None
+    for reviewer in reviewers:
+        if not reviewer.enabled:
+            continue
+        linked = reviewer.harness or reviewer.name
+        if linked == review.name:
+            return reviewer
+    return None
+
+
 def _config_file(name: str) -> Path | None:
     """Locate a checked-in controller config file, or ``None`` when absent.
 

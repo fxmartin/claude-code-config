@@ -101,13 +101,22 @@ class ReviewRequest:
 
 @dataclass(frozen=True)
 class ReviewerConfig:
-    """One registered reviewer from ``adversarial-reviewers.yaml``."""
+    """One registered reviewer from ``adversarial-reviewers.yaml``.
+
+    ``harness`` (Story 20.3-002) optionally links this reviewer to an entry in
+    the harness registry (``harnesses.yaml``), making the reviewer a *view* over
+    it: the linked harness is the single source of truth for whether the runtime
+    (e.g. Codex) is available, so the two registries can never present "two
+    competing Codex configurations". ``None`` means the reviewer is standalone —
+    it carries its own availability, exactly as before this story.
+    """
 
     name: str
     command: str
     timeout_sec: int
     enabled: bool
     allowed_verdicts: list[str] = field(default_factory=lambda: list(VERDICTS))
+    harness: str | None = None
 
 
 def load_reviewers_config(path: str | Path) -> tuple[str, list[ReviewerConfig]]:
@@ -142,6 +151,7 @@ def load_reviewers_config(path: str | Path) -> tuple[str, list[ReviewerConfig]]:
                 timeout_sec=int(settings.get("timeout_sec", 300)),
                 enabled=bool(settings.get("enabled", False)),
                 allowed_verdicts=list(settings.get("allowed_verdicts", VERDICTS)),
+                harness=(str(settings["harness"]) if settings.get("harness") else None),
             )
         )
     return consensus, reviewers

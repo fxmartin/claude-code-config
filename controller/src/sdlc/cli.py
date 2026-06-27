@@ -173,6 +173,7 @@ def build(ctx: typer.Context) -> None:
             check_review_bridge,
             default_registry_path,
             default_reviewers_path,
+            reconcile_reviewer_registry,
             resolve_role_routing,
         )
 
@@ -182,6 +183,13 @@ def build(ctx: typer.Context) -> None:
             )
             check_review_bridge(
                 resolved_harnesses, reviewers_path=default_reviewers_path()
+            )
+            # Story 20.3-002: the reviewer registry is a view over the harness
+            # registry — fail fast if a Codex reviewer link has diverged from its
+            # harness (dangling link, or enabled-reviewer/disabled-harness).
+            reconcile_reviewer_registry(
+                registry_path=default_registry_path(),
+                reviewers_path=default_reviewers_path(),
             )
         except RoleRoutingError as exc:
             typer.echo(f"error: {exc}", err=True)
