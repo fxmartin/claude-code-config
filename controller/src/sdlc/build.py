@@ -4197,6 +4197,41 @@ def _stage_harness(stage: str, opts: BuildOptions) -> str:
     role = _STAGE_ROLE.get(stage, "build")
     return opts.harness_map.get(role) or DEFAULT_HARNESS
 
+
+def _harness_dispatch_kwargs(
+    harness_stage: str, opts: BuildOptions, model: str | None
+) -> dict[str, object]:
+    """Per-role ``--harness`` routing → dispatch kwargs (Story 20.7-001).
+
+    Resolves the harness that runs ``harness_stage`` (the same role lookup
+    :func:`_stage_harness` records in the ledger) and returns the
+    ``agent_cmd``/``parser`` that route the dispatch to it — so a role mapped to
+    a registry harness (e.g. ``codex``) *actually runs* that harness's argv with
+    its declared parser, not just a label in the ledger. The ``builtin``/``env``
+    Claude slots return ``parser=None`` so dispatch keeps its stream-json
+    default, and ``model`` still decorates the Claude argv via
+    :meth:`HarnessConfig.to_argv` (a registry entry owns its own argv and ignores
+    it).
+
+    Returns an **empty dict** when no ``--harness`` map is set, so the default
+    path passes no ``agent_cmd``/``parser`` and dispatch is byte-identical to
+    today (AC3). The registry is the repo's checked-in
+    ``controller/config/harnesses.yaml`` — already validated in ``cli.py`` before
+    any stage runs; an absent registry resolves the built-in Claude default.
+    """
+    if not opts.harness_map:
+        return {}
+    from sdlc.role_routing import default_registry_path
+
+    harness = resolve_harness(
+        _stage_harness(harness_stage, opts), config_path=default_registry_path()
+    )
+    return {
+        "agent_cmd": harness.to_argv(model=model),
+        "parser": None if harness.source in ("builtin", "env") else harness.parser,
+    }
+
+
 # Story 14.2-001: stages whose changed-files risk signal is *stable* at the
 # moment their model is chosen — the story branch is already pushed, so the same
 # diff (and therefore the same risk verdict) is seen on the original run and on a
@@ -4312,10 +4347,14 @@ def _dispatch_stage(
     """
     prompt = _render_stage_prompt(stage, story, opts, pr_number)
     model = _select_stage_model(stage, story, opts, escalation_steps=escalation_steps)
+    # Story 20.7-001: route this stage to its mapped harness's argv/parser when a
+    # `--harness` map is set; empty (the default path) leaves dispatch unchanged.
+    harness_kwargs = _harness_dispatch_kwargs(stage, opts, model)
     try:
         result = dispatch(
             stage, prompt, story=story, model=model,
             transcript_path=transcript_path, on_progress=on_progress,
+            **harness_kwargs,
         )
     except RateLimitError:
         # Story 14.1-003: a Max rate-limit hit is a recoverable, time-based pause,
@@ -4596,10 +4635,14 @@ def _reask_envelope(
     # routes on the map's `reask` tier (its own override beats it) rather than the
     # stage's — and never the unconfigured CLI default under an active profile.
     model = _select_stage_model("reask", story, opts)
+    # The re-ask re-dispatches the originating `stage` agent, so route it to that
+    # stage's harness too (Story 20.7-001) — the ledger and reality stay in sync.
+    harness_kwargs = _harness_dispatch_kwargs(stage, opts, model)
     try:
         result = dispatch(
             stage, prompt, story=story, model=model,
             transcript_path=transcript_path, on_progress=sink,
+            **harness_kwargs,
         )
     except RateLimitError:
         # Story 14.1-003: a throttle during recovery is a pause, not a failed fix —
@@ -4700,9 +4743,12 @@ def _lint_stage_commit(
         )
         prompt = render_commit_lint_reask_prompt(stage, story, message, violations)
         sink = _make_progress_sink(ledger, run_id, story.id, "commitlint", lint_seq)
+        # The amend re-dispatches the originating `stage` agent (Story 20.7-001).
+        harness_kwargs = _harness_dispatch_kwargs(stage, opts, None)
         try:
             result = dispatch(
                 stage, prompt, story=story, transcript_path=cpath, on_progress=sink,
+                **harness_kwargs,
             )
         except RateLimitError:
             # Story 14.1-003: a throttle during the commit-lint amend is a pause,
@@ -4808,10 +4854,14 @@ def _run_bugfix(
         f"model={model or 'cli-default'} (escalation +{escalation_steps}, "
         "Story 14.2-003 cheap-first)",
     )
+    # The bugfix re-dispatches the originating `failed_stage` agent, so route it
+    # to that stage's harness (Story 20.7-001), matching its ledger record above.
+    harness_kwargs = _harness_dispatch_kwargs(failed_stage, opts, model)
     try:
         result = dispatch(
             "bugfix", prompt, story=story, model=model,
             transcript_path=transcript_path, on_progress=sink,
+            **harness_kwargs,
         )
     except RateLimitError:
         # Story 14.1-003: a throttle during the bugfix dispatch is a pause, not a

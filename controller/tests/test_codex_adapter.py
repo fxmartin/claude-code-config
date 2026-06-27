@@ -13,7 +13,6 @@ from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
 from sdlc.dispatch import AgentDispatchError
 from sdlc.harness import dispatch_on_harness, resolve_harness
 from sdlc.parsers import PlainResultParser, get_parser
-from sdlc.role_routing import PIPELINE_ROLES, resolve_role_routing
 
 # The checked-in registry — the one a real run loads. Exercising the adapter
 # against it (rather than a bespoke tmp file) is what proves AC1: "harnesses.yaml
@@ -118,15 +117,12 @@ def test_codex_nonzero_exit_is_plain_dispatch_error(monkeypatch) -> None:
     assert type(excinfo.value) is AgentDispatchError
 
 
-def test_full_codex_run_spawns_zero_claude() -> None:
-    """Every pipeline role routed to codex resolves to a claude-free argv (AC3)."""
-    role_map = {role: "codex" for role in PIPELINE_ROLES}
-    resolved = resolve_role_routing(role_map, config_path=CONFIG_PATH)
-
-    assert set(resolved) == set(PIPELINE_ROLES)
-    for role, harness in resolved.items():
-        assert harness.name == "codex", f"role {role} did not route to codex"
-        assert not any("claude" in token for token in harness.to_argv())
+# The zero-claude property is now asserted where it actually matters — against a
+# recording dispatcher inside the *build loop* (Story 20.7-001), not on
+# `harness.to_argv()` in isolation, which only ever proved the registry renders a
+# claude-free template and never that a run dispatches to it. See
+# tests/test_harness_routing_dispatch.py::
+# test_full_codex_map_dispatches_codex_argv_for_every_stage.
 
 
 def test_dispatch_on_harness_passes_through_dispatch_kwargs(monkeypatch) -> None:

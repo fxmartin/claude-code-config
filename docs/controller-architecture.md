@@ -958,6 +958,23 @@ switched off). A review harness absent from the reviewer registry, or a missing
 reviewers file, is a no-op. Epic-08 still owns the reviewer-consensus semantics;
 this bridge only prevents the registries from disagreeing.
 
+**Wiring routing into actual dispatch (Story 20.7-001).** Resolving the map is only
+half the job — until Story 20.7-001 the resolved harnesses were validated in `cli.py`
+and then **discarded**, so `--harness build=codex` *labelled* the ledger but every
+stage still ran on `claude`. The routing is now wired through the build loop:
+`_dispatch_stage` (and the recovery re-dispatches: envelope re-ask, commitlint amend,
+bugfix) call `_harness_dispatch_kwargs(stage, opts, model)`, which resolves the
+stage's harness via the same `_stage_harness` role lookup the ledger records and
+returns the dispatch kwargs that route it — `agent_cmd=harness.to_argv(model=model)`
+and `parser=(None if harness.source in ("builtin","env") else harness.parser)` — into
+the existing `dispatch` seam. So a role mapped to `codex` **actually runs** the Codex
+adapter argv with the `codex-exec` parser, and the ledger `harness` column matches
+what ran. With **no** `--harness` map the helper returns an empty dict, so the
+dispatch passes no `agent_cmd`/`parser` and is byte-identical to today's default path
+(the `_resolve_dispatch` thinking-cap/sandbox binding and test injection are
+preserved). A registry harness owns its own argv, so the routed `--model` decorates
+only the built-in/`env` Claude slots — a codex stage ignores it.
+
 ### Codex build/QA adapter (Story 20.3-001)
 
 The `codex` registry entry is the first concrete **non-Claude** adapter, proving
@@ -972,12 +989,14 @@ same registry the default Claude slot uses.
   `--full-auto`). Because the wrapper only ever runs `codex`, a run routed here
   spawns **zero `claude` processes** (AC3).
 - **Dispatch seam.** `harness.dispatch_on_harness(harness, agent_type, prompt, …)`
-  is the single call site that runs an agent on a resolved `HarnessConfig`: it
-  renders the harness's own argv (`to_argv`) and selects its declared parser, then
-  hands both to `dispatch_agent`. A registry harness (codex) uses its declared
-  `codex-exec` parser; the built-in/`env` Claude slots keep the stream-json parser
-  (`parser=None`), so the default path is unchanged. Role routing (Story 20.3-002)
-  reuses this seam for the `review`/`qa` roles.
+  expresses the contract for running an agent on a resolved `HarnessConfig`: render
+  the harness's own argv (`to_argv`), select its declared parser, and hand both to
+  `dispatch_agent`. A registry harness (codex) uses its declared `codex-exec` parser;
+  the built-in/`env` Claude slots keep the stream-json parser (`parser=None`), so the
+  default path is unchanged. The build loop applies that same contract inline via
+  `_harness_dispatch_kwargs` (Story 20.7-001, see *Per-role harness routing* above) so
+  the routed `agent_cmd`/`parser` flow through the existing `dispatch` seam — keeping
+  its thinking-cap/sandbox binding and test injection — rather than bypassing it.
 - **Parsing.** Codex output is interpreted by the `codex-exec` parser
   (`PlainResultParser`, Story 20.1-002): it reads the result block straight from
   stdout, records usage as **unavailable** (never fabricated as zero), and treats
