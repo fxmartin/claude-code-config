@@ -2411,6 +2411,11 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         # story's leftover feature branch, so a later successful merge can
         # transitively land the earlier (parked) story's commits on main.
         f"1. Create branch: git fetch origin && git checkout -b feature/{story.id} origin/main\n"
+        # Issue #214: if the branch cannot be created (it already exists, a worktree
+        # conflict, etc.) the agent must NOT fall back to committing story work on the
+        # currently checked-out branch (typically main). Fail the build immediately.
+        f"   If branch creation fails for any reason, emit BUILD_STATUS: FAILED "
+        "immediately and do not commit on the current branch or any other branch.\n"
         f"2. Read {story.epic_file} and find the full story section for {story.id}\n"
         "3. Follow TDD: write failing tests first, then implement\n"
         "4. Run all quality gates (tests, types, lint, security)\n"

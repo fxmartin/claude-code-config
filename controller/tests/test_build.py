@@ -2587,6 +2587,18 @@ def test_build_prompt_commit_subject_is_compliant_by_construction() -> None:
     assert f"feat(controller-robustness): {long_title}" not in prompt
 
 
+def test_build_prompt_aborts_rather_than_committing_off_feature_branch() -> None:
+    """Issue #214: branch-creation failure must fail the build, never commit elsewhere."""
+    from sdlc.build import render_build_prompt
+
+    prompt = render_build_prompt(_story("99.1-001"), BuildOptions())
+    assert "BUILD_STATUS: FAILED" in prompt
+    # The instruction must tie the failure to branch creation and forbid a fallback commit.
+    lowered = prompt.lower()
+    assert "branch" in lowered
+    assert "do not commit" in lowered
+
+
 def test_coverage_prompt_commit_subject_is_compliant_by_construction() -> None:
     """The coverage agent commits too — its supplied header is compliant (12.2-004 AC1)."""
     from sdlc.build import render_coverage_prompt
