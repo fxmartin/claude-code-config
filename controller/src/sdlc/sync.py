@@ -3,9 +3,16 @@
 
 from __future__ import annotations
 
+import difflib
 import enum
 from dataclasses import dataclass
 from pathlib import Path
+
+from sdlc.skill_format import parse_neutral_skill, render_body
+
+# Neutral skill sources are authored as `<name>.skill.md` (Story 20.4-001); the
+# generated Claude/Codex bodies they produce are the plain `<name>.md` skills.
+_NEUTRAL_SUFFIX = ".skill.md"
 
 # The seven Codex extras that became the single source-of-truth shared skill
 # set (Story 7.4-001 AC #3). `claude-code-config` hosts them under
@@ -101,3 +108,136 @@ def parity_report(source_dir: Path, consumer_dir: Path) -> SyncReport:
         verdicts.append(SkillParity(name=name, state=state))
 
     return SyncReport(skills=tuple(verdicts))
+
+
+# --- generated-skill parity gate (Story 20.4-003) ---------------------------
+#
+# The shared-skills byte-mirror check above guards that a *consumer* checkout
+# matches the source tree. This second gate guards one level up: that each
+# committed generated body (`shared-skills/<name>.md`) still matches what its
+# harness-neutral source (`shared-skills/neutral/<name>.skill.md`) generates.
+# It is what fails CI when a generated skill file drifts from its source, so the
+# Claude and Codex harnesses can never silently diverge.
+
+
+class GeneratedState(enum.Enum):
+    """Parity verdict for one skill between its neutral source and committed body."""
+
+    IN_SYNC = "in_sync"
+    DRIFTED = "drifted"
+    MISSING = "missing"  # neutral source exists, no committed generated body
+    ORPHAN = "orphan"  # committed generated body with no neutral source
+
+
+@dataclass(frozen=True)
+class GeneratedParity:
+    """One skill's generated-output parity verdict, with a diff when it drifted."""
+
+    name: str
+    state: GeneratedState
+    diff: str = ""
+
+
+@dataclass(frozen=True)
+class GeneratedParityReport:
+    """The full generated-output parity verdict for one harness.
+
+    ``in_sync`` is true only when every skill is :data:`GeneratedState.IN_SYNC`,
+    i.e. every committed body is exactly what its neutral source regenerates.
+    """
+
+    harness: str
+    skills: tuple[GeneratedParity, ...]
+
+    @property
+    def in_sync(self) -> bool:
+        return all(s.state is GeneratedState.IN_SYNC for s in self.skills)
+
+
+def discover_neutral_skills(neutral_dir: Path) -> dict[str, str]:
+    """Map skill name → neutral source text for every ``*.skill.md`` in *neutral_dir*.
+
+    Raises ``FileNotFoundError`` if *neutral_dir* does not exist so a
+    mis-pointed sources path fails loudly instead of reporting a phantom empty
+    set. Plain ``*.md`` files (e.g. a README) are not neutral sources and are
+    ignored — only the ``.skill.md`` suffix counts.
+    """
+    neutral_dir = Path(neutral_dir)
+    if not neutral_dir.is_dir():
+        raise FileNotFoundError(f"neutral skills directory not found: {neutral_dir}")
+
+    sources: dict[str, str] = {}
+    for path in sorted(neutral_dir.glob(f"*{_NEUTRAL_SUFFIX}")):
+        name = path.name[: -len(_NEUTRAL_SUFFIX)]
+        sources[name] = path.read_text(encoding="utf-8")
+    return sources
+
+
+def generated_parity_report(
+    neutral_dir: Path, generated_dir: Path, *, harness: str = "claude"
+) -> GeneratedParityReport:
+    """Compare every committed generated body against its neutral source.
+
+    For each skill, the body rendered from the neutral source for *harness* is
+    compared against the committed ``<name>.md`` in *generated_dir*. The union
+    of names from both sides is reported, sorted by name, so a drift, a source
+    that was never generated, and a stale generated file all surface in one
+    pass. Drifted skills carry a unified diff (committed → regenerated).
+
+    Raises ``FileNotFoundError`` if either directory is missing and
+    :class:`sdlc.skill_format.SkillFormatError` if a neutral source is malformed.
+    """
+    sources = discover_neutral_skills(neutral_dir)
+    generated = discover_shared_skills(generated_dir)
+
+    verdicts: list[GeneratedParity] = []
+    for name in sorted(set(sources) | set(generated)):
+        in_source = name in sources
+        in_generated = name in generated
+        if in_source and not in_generated:
+            verdicts.append(GeneratedParity(name=name, state=GeneratedState.MISSING))
+            continue
+        if in_generated and not in_source:
+            verdicts.append(GeneratedParity(name=name, state=GeneratedState.ORPHAN))
+            continue
+
+        expected = render_body(parse_neutral_skill(sources[name]), harness)
+        actual = generated[name]
+        if expected == actual:
+            verdicts.append(GeneratedParity(name=name, state=GeneratedState.IN_SYNC))
+        else:
+            diff = "".join(
+                difflib.unified_diff(
+                    actual.splitlines(keepends=True),
+                    expected.splitlines(keepends=True),
+                    fromfile=f"{name}.md (committed)",
+                    tofile=f"{name}.md (regenerated)",
+                )
+            )
+            verdicts.append(
+                GeneratedParity(name=name, state=GeneratedState.DRIFTED, diff=diff)
+            )
+
+    return GeneratedParityReport(harness=harness, skills=tuple(verdicts))
+
+
+def write_generated_skills(
+    neutral_dir: Path, generated_dir: Path, *, harness: str = "claude"
+) -> list[str]:
+    """Render every neutral source into *generated_dir* as ``<name>.md``.
+
+    This is the regenerate / ``--fix`` path the parity gate points at: it makes
+    each committed body exactly what its neutral source produces, so a follow-up
+    :func:`generated_parity_report` is in sync. Returns the skill names written,
+    sorted. *generated_dir* is created if absent.
+    """
+    sources = discover_neutral_skills(neutral_dir)
+    generated_dir = Path(generated_dir)
+    generated_dir.mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+    for name, text in sources.items():
+        body = render_body(parse_neutral_skill(text), harness)
+        (generated_dir / f"{name}.md").write_text(body, encoding="utf-8")
+        written.append(name)
+    return sorted(written)

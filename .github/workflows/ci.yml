@@ -230,6 +230,13 @@ jobs:
             exit 1
           fi
 
+      - name: Verify generated skills match neutral sources (Story 20.4-003)
+        # Cross-harness parity gate: every committed shared-skills/<name>.md must
+        # be exactly what its harness-neutral source regenerates, so the Claude
+        # and Codex skill files can never silently diverge. Fails with a diff and
+        # the `--fix` regenerate command on drift.
+        run: bash scripts/sync-shared-skills.sh verify-generated
+
       - name: Run controller test suite
         run: |
           cd controller
