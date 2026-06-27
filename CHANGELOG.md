@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.92.0] - 2026-06-27
+
+### Added
+
+- feat(cross-harness-portability): wire per-role `--harness` (#20.7-001)
+
+
 ## [v1.91.2] - 2026-06-27
 
 ### Fixed
