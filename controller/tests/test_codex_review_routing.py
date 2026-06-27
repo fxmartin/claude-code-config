@@ -231,6 +231,22 @@ def test_review_reviewer_for_none_when_reviewers_path_missing() -> None:
     assert review_reviewer_for(resolved, reviewers_path=None) is None
 
 
+def test_review_reviewer_for_none_when_reviewers_file_absent(tmp_path: Path) -> None:
+    # A reviewers path that points at no file is a no-op: no reviewer can govern
+    # the review role when the registry it would come from does not exist on disk.
+    resolved = resolve_role_routing({"review": "codex"}, config_path=CONFIG_PATH)
+    missing = tmp_path / "adversarial-reviewers.yaml"
+    assert review_reviewer_for(resolved, reviewers_path=missing) is None
+
+
+def test_review_reviewer_for_none_when_reviewers_file_malformed(tmp_path: Path) -> None:
+    # A malformed reviewer registry is the owning gate's job to flag, not this
+    # resolver's — it swallows the load error and reports no governing reviewer.
+    resolved = resolve_role_routing({"review": "codex"}, config_path=CONFIG_PATH)
+    bad = _write_reviewers(tmp_path, "- not\n- a\n- mapping\n")
+    assert review_reviewer_for(resolved, reviewers_path=bad) is None
+
+
 # ---------------------------------------------------------------------------
 # Full review-on-codex path (AC2: review+qa on Codex, build on Claude)
 # ---------------------------------------------------------------------------
