@@ -87,6 +87,21 @@ Two paths depending on how much control you want:
 | **Autonomous** | `/build-stories [all\|resume\|epic-NN] [--sequential]` | Full batch — parses the story graph, schedules cohorts, runs until done |
 | **Issue-driven** | `/fix-issue <N\|url\|next\|all>` | 11-phase pipeline: investigate → build → coverage → review → E2E → merge → summary, with auto-classified bugfix retries |
 
+##### Harness support: cross-harness vs Claude-only
+
+`/build-stories` runs through the controller's dispatch seam, so its roles can be
+routed to any registered harness (`--harness build=claude,review=codex,…`).
+`/fix-issue` and `/resume-build-agents` spawn their sub-agents **in-process** with
+the Claude Code `Agent` tool (`subagent_type` / `isolation="worktree"`), which has
+no CLI-harness equivalent — they stay **Claude-only** by design. The boundary is
+documented in [`docs/controller-architecture.md`](docs/controller-architecture.md#the-in-process-agent-boundary-story-206-002) and enforced by `sdlc/portability.py`.
+
+| Skill | Dispatch mechanism | Harness support |
+|-------|--------------------|-----------------|
+| `build-stories` | controller dispatch seam | **Any registry harness** |
+| `fix-issue` | in-process `Agent` tool | **Claude only** |
+| `resume-build-agents` | in-process `Agent` tool | **Claude only** |
+
 #### The autonomous path: how `/build-stories` actually runs
 
 The skill is a **thin dispatcher** — argument parsing, control flow, and structured-result parsing only. All heavy lifting is delegated to sub-agents, which preserves the orchestrator's context across 20+ story builds.

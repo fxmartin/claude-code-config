@@ -22,6 +22,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/capability.py` | Harness capability resolution, optional CLI probe, and the preflight mode decision (Story 20.5-001). |
 | `sdlc/degradation.py` | Centralized degradation matrix — maps capability gaps to safe fallbacks (parallel→serial, usage "unavailable", rate-limit skipped) (Story 20.5-002). |
 | `sdlc/role_routing.py` | Per-role harness routing — maps build/coverage/review/merge/docs to harnesses, fails fast on unknown/disabled (Story 20.2-001). |
+| `sdlc/portability.py` | The in-process-agent boundary — cross-harness vs Claude-only skills, with a fail-fast guard pointing at the boundary doc (Story 20.6-002). |
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
 | `sdlc/contracts.py` | JSON-schema parse + validation (Story 7.2-001). |
 | `sdlc/ledger_view.py` | DB-path resolution + markdown render hook. |
@@ -1073,6 +1074,31 @@ not carried per turn in `stream-json`, so it lands only at this reconciliation
 (still a strict improvement over the previous run-level-only total). The per-run
 and per-story/stage breakdowns surface through the existing query path
 (`stage_breakdown`, `_aggregate_run_usage`, `status_snapshot`) with no new schema.
+
+### The in-process-agent boundary (Story 20.6-002)
+
+Epic-20 makes the controller's dispatch path **cross-harness**: `build-stories`
+assembles a prompt and shells out through the dispatch seam (`sdlc/dispatch.py`),
+so a role can be routed to any registry harness (`claude`, `codex`, …) via
+`--harness`. Two skills deliberately stay **Claude-only**: `fix-issue` and
+`resume-build-agents` spawn their sub-agents **in-process** with the Claude Code
+`Agent` tool (`subagent_type` / `model` / `isolation="worktree"`). That tool is a
+Claude Code primitive with **no CLI-harness equivalent** — there is no prompt to
+hand to `codex exec`, so there is nothing to port. This is a design boundary, not
+a gap to be closed later.
+
+| Skill | Dispatch mechanism | Harness support |
+|-------|--------------------|-----------------|
+| `build-stories` | controller dispatch seam (`sdlc/dispatch.py`) | **Any registry harness** (`--harness build=claude,review=codex,…`) |
+| `fix-issue` | in-process `Agent` tool (`subagent_type` / `isolation`) | **Claude only** |
+| `resume-build-agents` | in-process `Agent` tool (`subagent_type` / `isolation`) | **Claude only** |
+
+`sdlc/portability.py` encodes this matrix as the single source of truth
+(`CROSS_HARNESS_SKILLS`, `CLAUDE_ONLY_SKILLS`, `support_matrix()`) and exposes a
+fail-fast guard: `assert_harness_supports_skill(skill, harness)` raises
+`HarnessError` pointing back at this section when a Claude-only skill is asked to
+run on a non-Claude harness, so a misrouted invocation fails before doing half a
+run rather than crashing deep inside a sub-agent call.
 
 ### Kill-switch and heartbeat dead-man (Story 13.4-001)
 
