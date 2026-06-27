@@ -142,15 +142,26 @@ _make_stub_root() {
     [ "$after_count" -eq "$before_count" ]
 }
 
+# Helper for G4: list ~/.claude entries a live Claude Code session does NOT
+# continuously mutate, so before/after comparison doesn't race a background
+# session write (issue #39).
+_claude_stable_entries() {
+    local dir="$1"
+    ls -1a "${dir}" 2>/dev/null \
+        | grep -vE '^(history\.jsonl|backups|projects|todos|logs|shell-snapshots|statsig|telemetry|\.claude\.json\.backup\.|\.\.?$)' \
+        | LC_ALL=C sort
+}
+
 @test "G4: smoke-test does not write to the caller's real HOME when SMOKE_HOME_OVERRIDE is absent" {
-    # Record the mtime of $HOME/.claude (or note its absence) before the run.
+    # Snapshot the stable entry list of $HOME/.claude (or note its absence)
+    # before the run. We compare a filtered entry list rather than the dir
+    # mtime because a live Claude Code session continuously writes session
+    # state (history.jsonl, .claude.json.backup.*) which races mtime (#39).
     real_claude="${HOME}/.claude"
     if [ -d "${real_claude}" ]; then
-        # stat flags differ between macOS (-f %m) and Linux (-c %Y).
-        before_mtime=$(stat -f "%m" "${real_claude}" 2>/dev/null \
-                       || stat -c "%Y" "${real_claude}" 2>/dev/null)
+        before_entries="$(_claude_stable_entries "${real_claude}")"
     else
-        before_mtime="absent"
+        before_entries="absent"
     fi
 
     # Run without SMOKE_HOME_OVERRIDE — the script must create its own mktemp.
@@ -158,11 +169,10 @@ _make_stub_root() {
     [ "$status" -eq 0 ]
 
     if [ -d "${real_claude}" ]; then
-        after_mtime=$(stat -f "%m" "${real_claude}" 2>/dev/null \
-                      || stat -c "%Y" "${real_claude}" 2>/dev/null)
+        after_entries="$(_claude_stable_entries "${real_claude}")"
     else
-        after_mtime="absent"
+        after_entries="absent"
     fi
 
-    [ "${before_mtime}" = "${after_mtime}" ]
+    [ "${before_entries}" = "${after_entries}" ]
 }
