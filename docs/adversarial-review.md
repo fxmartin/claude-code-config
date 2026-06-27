@@ -88,6 +88,43 @@ reviewers:
 Command templates may use `{pr_number}`, `{pr_url}`, and `{story_id}`
 placeholders; the controller substitutes them before invoking the reviewer.
 
+### Link to the harness registry (Story 20.3-002)
+
+Codex appears in two registries: here, as the `codex` *reviewer*, and in
+`controller/config/harnesses.yaml`, as the `codex` *harness* the `review`/`qa`
+roles route to (`sdlc build --harness review=codex,qa=codex`). To keep those
+from becoming **two competing Codex configurations**, the reviewer registry is a
+**view** over the harness registry:
+
+```yaml
+reviewers:
+  codex:
+    harness: codex          # <- links to the `codex` entry in harnesses.yaml
+    command: "codex-adversarial-review.sh --pr-number {pr_number}"
+    timeout_sec: 300
+    enabled: true
+    allowed_verdicts: ["approve", "request_changes", "block"]
+```
+
+- **Single source of availability.** The linked harness (`harnesses.yaml`) owns
+  whether Codex is available — its `enabled` flag and optional `probe`. The
+  reviewer entry owns only the review-role specifics Epic-08's consensus needs:
+  the review command, `timeout_sec`, `allowed_verdicts`, and the file-level
+  `consensus` rule. The two commands are *intentionally* different — `codex exec`
+  is the build/QA invocation, `codex-adversarial-review.sh` is the PR-review
+  invocation — but there is now exactly one switch for "is Codex set up".
+- **Preflight reconciliation.** When a run passes a `--harness` map, `sdlc build`
+  runs `reconcile_reviewer_registry` in preflight and **fails fast** (no
+  half-run) if the link has diverged: a reviewer that links a harness absent from
+  `harnesses.yaml` (a dangling link), or an **enabled** reviewer linked to a
+  **disabled** harness (the harness registry's availability switch must win).
+- **Consensus is untouched.** The link is identity-only. `dispatch_adversarial_review`
+  still invokes every enabled reviewer in parallel and applies the same consensus
+  rule — Epic-08 owns that semantics and Story 20.3-002 does not change it.
+
+A reviewer with no `harness:` key (e.g. `gemini` above) stays standalone: it is
+not reconciled against the harness registry and carries its own availability.
+
 ### Enabling and disabling reviewers
 
 Flip `enabled` to add or remove a reviewer from the gate. To swap Codex for a
@@ -131,15 +168,20 @@ which is how the `tests/codex-adversarial-review.bats` suite and the controller
 
 ### Disabling the Codex reviewer
 
-`codex` is `enabled: true` by default. If you do not have Codex installed, set
-`enabled: false` for the `codex` entry in `adversarial-reviewers.yaml`:
+`codex` is `enabled: true` by default. If you do not have Codex installed,
+disable it in **`harnesses.yaml`** (`harnesses.codex.enabled: false`) — that is
+the single availability switch, and the linked reviewer follows it. Disabling
+only the reviewer while leaving the harness enabled is fine; the reverse
+(reviewer enabled, harness disabled) is the divergence the preflight rejects, so
+turn the harness off and set the reviewer to match:
 
 ```yaml
 reviewers:
   codex:
+    harness: codex
     command: "codex-adversarial-review.sh --pr-number {pr_number}"
     timeout_sec: 300
-    enabled: false   # <- turn off when Codex is not available
+    enabled: false   # <- match the harness when Codex is not available
     allowed_verdicts: ["approve", "request_changes", "block"]
 ```
 

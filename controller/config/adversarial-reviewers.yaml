@@ -21,6 +21,15 @@ reviewers:
   # and emits this schema's JSON. Enabled by default for FX's environment;
   # users without Codex set `enabled: false` (see docs/adversarial-review.md).
   codex:
+    # Single source of truth (Story 20.3-002): `harness: codex` makes this
+    # reviewer a *view* over the `codex` entry in controller/config/harnesses.yaml.
+    # That harness entry owns whether Codex is available (its `enabled` flag and
+    # probe); this entry owns only the review-role specifics — the command,
+    # timeout, and verdict vocabulary Epic-08's consensus needs. The `sdlc build`
+    # preflight (reconcile_reviewer_registry) fails fast if the link dangles or if
+    # this reviewer is enabled while the harness is disabled, so the two registries
+    # can never present two competing Codex configurations.
+    harness: codex
     command: "codex-adversarial-review.sh --pr-number {pr_number}"
     timeout_sec: 300
     enabled: true
