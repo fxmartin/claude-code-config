@@ -61,6 +61,15 @@ DEFAULT_AGENT_CMD: list[str] = [
 # not a CLI flag, so it never has to be threaded into the (escape-hatch) argv.
 THINKING_CAP_ENV = "MAX_THINKING_TOKENS"
 
+# Issue #145: the in-test sentinel env var (mirrors ``build.IN_TEST_ENV_VAR`` —
+# duplicated, not imported, because ``build`` imports ``dispatch`` and the reverse
+# would be a circular import). Exporting it into every dispatch env makes a
+# *nested* ``sdlc build`` shelled out by a dispatched agent a no-op: the build's
+# ``in_test_sentinel()`` guard short-circuits dispatcher/preflight when it is set,
+# so a doc/visual story can never kick off a second real orchestration. The value
+# is presence-/truthy-based on the build side, so ``"1"`` satisfies the guard.
+_DISPATCH_IN_TEST_ENV = "SDLC_IN_TEST"
+
 # Story 13.1-001: the default deny baseline for a dispatched agent. Every agent
 # runs under ``--dangerously-skip-permissions`` (no human to approve tool calls),
 # which suppresses the *prompt* but does NOT disable an explicit deny list on the
@@ -70,6 +79,11 @@ THINKING_CAP_ENV = "MAX_THINKING_TOKENS"
 # floor — secret-bearing reads/writes and "pipe the internet into a shell" egress —
 # even with prompts suppressed. The rules are deliberately narrow: they block only
 # the listed secret paths and egress shells, never ordinary edit/test work.
+#
+# Issue #145: the baseline also denies the Playwright **browser** MCP tools so a
+# dispatched agent (e.g. a dashboard-visual story) cannot launch a headed browser.
+# ``mcp__<server>__<glob>`` is the documented MCP deny syntax; the wildcard removes
+# every ``browser_*`` tool the playwright server exposes from the agent's context.
 DENY_BASELINE: tuple[str, ...] = (
     "Read(~/.ssh/**)",
     "Read(~/.aws/**)",
@@ -77,6 +91,7 @@ DENY_BASELINE: tuple[str, ...] = (
     "Write(~/.ssh/**)",
     "Bash(curl * | bash)",
     "Bash(ssh *)",
+    "mcp__playwright__browser_*",
 )
 
 # Per-repo override for the deny baseline (AC3): set ``SDLC_DENY_BASELINE`` to a
@@ -127,6 +142,9 @@ def _dispatch_env(thinking_cap: int | None) -> dict[str, str]:
     """
     env = dict(os.environ)
     env["SDLC_BATCH_BUILD"] = "1"
+    # Issue #145: mark the dispatch as in-test so a nested ``sdlc build`` the agent
+    # might shell out short-circuits instead of launching a second real run.
+    env[_DISPATCH_IN_TEST_ENV] = "1"
     if thinking_cap and thinking_cap > 0:
         env[THINKING_CAP_ENV] = str(thinking_cap)
     return env

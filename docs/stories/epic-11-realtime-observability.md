@@ -597,7 +597,7 @@ updates; this story only stabilises their layout.
 - [ ] Live regions reserve stable height; content toggling 1↔2↔3 lines causes no reflow of elements below
 - [ ] Scroll position preserved across updates (no jump-to-top, no shift under the cursor)
 - [ ] Overflow beyond the reserved lines is clamped/scrolled, not grown
-- [ ] Verified on a live (or simulated) run; test toggles 1/2/3-line content and asserts stable container height
+- [ ] Verified at the Python level against a seeded ledger fixture (the `_seed()` / `_running()` + `_PAGE` CSS-assertion pattern in `controller/tests/test_dashboard.py`) — NO `sdlc build`, NO browser; the test toggles 1/2/3-line content and asserts stable container height
 - [ ] No backend change; dashboard section of `docs/controller-architecture.md` noted if relevant
 
 **Dependencies**: None (stabilises the regions produced by 11.2-003 and 11.2-004)
