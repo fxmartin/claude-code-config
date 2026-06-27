@@ -1,10 +1,18 @@
 # Epic 20: Cross-Harness SDLC Portability — run the pipeline on any agent harness
 
-> **Status: COMPLETE (13/13)** — all stories merged on `main` (2026-06-27): harness registry +
-> adapter contract, pluggable output parsing, role→harness config, per-stage harness in the ledger,
-> Codex build/QA adapter + review/QA routing, harness-neutral skill format + generator/transpiler +
-> parity CI gate, capability probe + degradation matrix, and the "add a new harness" guide +
-> in-process-agent boundary docs. Built across parallel runs 68e5a36c / e4f9976c (PRs #200-#212).
+> **Status: IN PROGRESS (13/18)** — the original 13 stories merged on `main` (2026-06-27): harness
+> registry + adapter contract, pluggable output parsing, role→harness config, per-stage harness in
+> the ledger, Codex build/QA adapter + review/QA routing, harness-neutral skill format +
+> generator/transpiler + parity CI gate, capability probe + degradation matrix, and the "add a new
+> harness" guide + in-process-agent boundary docs. Built across parallel runs 68e5a36c / e4f9976c
+> (PRs #200-#212). **Re-opened 2026-06-27 with Feature 20.7 (5 stories)** after cross-harness usage
+> testing found three gaps the original stories shipped incomplete: (1) per-role `--harness` routing
+> was wired for preflight + ledger *label* only — `dispatch_on_harness`/`resolve_agent_argv` have no
+> callers and `_dispatch_stage` still runs `claude` for every stage; (2) the Codex `build-stories` is
+> still a hand-maintained native orchestrator in the mirror, never brought under the single-source
+> generator (only the 7 utility skills were); (3) per-stage *model* routing (Epic-14's Balanced map)
+> is Claude-only — a registry harness ignores the routed model. Feature 20.7 closes all three plus a
+> per-repo default-harness override.
 > Created 2026-06-26. Triggered by FX's request to make the autonomous-sdlc
 > framework run beyond Claude Code (Codex, opencode, pi, …) and to allow alternate-harness role
 > assignment (e.g. Codex for review and QA while Claude builds). This epic generalizes the
@@ -51,7 +59,7 @@ Claude/Codex skill-mirror maintenance burden into a single source of truth.
 
 ## Epic Scope
 
-**Total Stories**: 13 | **Total Points**: 52 | **MVP Stories**: 0 (roadmap — Should Have)
+**Total Stories**: 18 | **Total Points**: 72 | **MVP Stories**: 0 (roadmap — Should Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -438,6 +446,184 @@ Claude-only so that no one wastes time trying to run them on a CLI harness.
 **Dependencies**: 20.6-001
 **Risk Level**: Low
 
+### Feature 20.7: Cross-Harness Completion
+
+Finish what 20.2/20.3 began — and close two gaps the original epic shipped incomplete: route a
+stage's worker to its assigned harness *for real*, make the Codex `build-stories` controller-driven
+from a single source, give non-Claude harnesses per-stage model routing, and let a repo declare its
+own default harness. Added 2026-06-27 after cross-harness usage testing.
+
+#### Stories
+
+##### Story 20.7-001: Wire per-role `--harness` routing into actual dispatch
+**User Story**: As FX, I want `--harness build=codex` to actually run Codex workers (not just label
+the ledger) so that per-role cross-harness routing works as Epic-20 intended.
+**Priority**: Should Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** `--harness build=codex,coverage=codex,review=codex,merge=codex` **When** a build runs
+  **Then** every dispatched worker uses the codex adapter argv (zero `claude` processes) and the
+  `codex-exec` parser — asserted against a recording dispatcher in the **build loop**, not
+  `harness.to_argv()` in isolation.
+- **Given** a mixed map `build=claude,review=codex` **When** a build runs **Then** the build stage
+  argv is claude and the review stage argv is the codex adapter, and the ledger `harness` column
+  matches what actually ran.
+- **Given** no `--harness` flag and no `SDLC_AGENT_CMD` **When** a build runs **Then** dispatch is
+  byte-identical to today (the default path passes no `agent_cmd`/`parser`).
+- **Given** codex's capabilities (`worktree_isolation:false, parallel:false`) **When** a parallel
+  build routes a stage to it **Then** it degrades to serial with the existing warn log, not a crash.
+
+**Technical Notes**: Thread the per-stage harness through `_dispatch_stage` (`build.py:4286`) using
+the existing `_stage_harness` (`build.py:4184`) + `resolve_harness`/`default_registry_path()`
+(`role_routing.py:278`); on the opt-in path pass `agent_cmd=h.to_argv(model=model)` and
+`parser=(None if h.source in ("builtin","env") else h.parser)` into the existing `dispatch` seam
+(preserves `_resolve_dispatch`'s thinking-cap/sandbox binding and test injection). `dispatch_agent`
+already accepts both (`dispatch.py:633`). Root cause of the gap: `dispatch_on_harness`/
+`resolve_agent_argv` (`harness.py:228,240`) have no callers and `cli.py:170` discards
+`resolved_harnesses`. Replace the misleading `test_full_codex_run_spawns_zero_claude` (asserts on
+`harness.to_argv()` only) with a real build-loop assertion.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] TDD build-loop tests (zero-claude, mixed-harness, default-unchanged, degradation)
+- [ ] `docs/controller-architecture.md` routing section corrected
+
+**Dependencies**: 20.1-001, 20.1-002, 20.2-001, 20.2-002, 20.3-001 (completes their intent)
+**Risk Level**: High
+
+##### Story 20.7-002: Bring `build-stories` under the single-source skill generator
+**User Story**: As FX maintaining the pipeline, I want the Codex `build-stories` generated from one
+neutral source as a thin `sdlc build` wrapper so that it stops being a hand-maintained native
+orchestrator and can't drift from the Claude side.
+**Priority**: Should Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** a new `shared-skills/neutral/build-stories.skill.md` (thin wrapper, `{{ARGUMENTS}}`)
+  **When** `scripts/generate-skills.sh generate` runs **Then** it emits both the Claude
+  `plugins/autonomous-sdlc/skills/build-stories/SKILL.md` and the Codex mirror copy.
+- **Given** the regenerated Claude skill **When** loaded **Then** it is functionally identical to the
+  current hand-written thin wrapper (preserves `allowed-tools: Bash`, `disable-model-invocation`,
+  `argument-hint`; runs `sdlc build $ARGUMENTS`) — golden comparison.
+- **Given** the regenerated Codex skill **When** loaded **Then** it runs `sdlc build` via the
+  controller (an honest wrapper, not the "native port" orchestrator) and invokes as
+  `Use build-stories …`.
+- **Given** a generated file is hand-edited **When** the parity gate runs in CI **Then** it fails
+  with a diff + regenerate command; in-sync passes.
+
+**Technical Notes**: Extend `controller/src/sdlc/skill_format.py` + `skill_generator.py`
+(`generate_claude_skill`/`generate_codex_skill`) + `neutral-skill.schema.json` to carry pipeline
+frontmatter (the 7 utility skills don't use `allowed-tools`/`argument-hint`); adjust the codex
+template's hardcoded "Codex-native port" preamble for a controller wrapper. Add `build-stories` to the
+generated-parity set (`controller/src/sdlc/sync.py`, `scripts/sync-shared-skills.sh
+verify-generated`). Overwrites the mirror's hand-written orchestrator; bump the `nix-install`
+submodule. Aligns with `portability.py` `CROSS_HARNESS_SKILLS = {"build-stories"}`.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Golden Claude + Codex output tests
+- [ ] Parity gate red-on-drift / green-in-sync
+- [ ] ADR-002/003 updated if the format scope is extended
+
+**Dependencies**: 20.4-001, 20.4-002, 20.4-003 (extends the generator to a pipeline skill); 20.7-001
+(so the generated wrapper actually routes)
+**Risk Level**: Medium
+
+##### Story 20.7-003: Document Codex-worker runtime and correct the harness-support status
+**User Story**: As an LTM colleague, I want clear docs on running a Codex-worker build and an honest
+epic status so that I don't hit auth/sandbox dead-ends or trust a misleading `COMPLETE`.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** `docs/harness-adapters.md` **When** a reader sets up a codex-worker run **Then** it
+  states: pre-authenticate codex; `HARNESS_AGENT_CMD="codex exec --full-auto"` for non-interactive
+  write/exec; do **not** combine with controller `--sandbox` (claude-only, no-egress image); run on
+  the host path (worker `gh` ops need network/auth that codex's `workspace-write` sandbox blocks).
+- **Given** `STORIES.md` and the epic file **When** Epic-20 status is read **Then** it reflects that
+  per-role routing was label-only until 20.7-001 and is now functional.
+
+**Technical Notes**: Update `docs/harness-adapters.md`, `docs/controller-architecture.md` (if wording
+needs), and the Epic-20 status lines. Capture the routing-gap root cause as a one-line provenance note.
+
+**Definition of Done**:
+- [ ] Codex-worker runtime documented in `docs/harness-adapters.md`
+- [ ] Epic-20 status lines corrected (epic file + STORIES.md)
+- [ ] Reviewed
+
+**Dependencies**: 20.7-001, 20.7-002
+**Risk Level**: Low
+
+##### Story 20.7-004: Per-harness, per-stage model routing
+**User Story**: As FX, I want each non-Claude harness to map pipeline stages to its own models
+(e.g. Codex: build=`gpt-5.4-codex`, merge=a cheaper model, adversarial=a stronger one) so that
+cost/capability tuning works on every harness, not just Claude — the OpenAI analog of Epic-14's
+Balanced map.
+**Priority**: Should Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** a registry harness whose command template carries a `{model}` placeholder and a
+  per-harness stage→model map **When** a stage routes to it **Then** `to_argv` substitutes the mapped
+  model for that stage (registry harnesses no longer ignore `model`).
+- **Given** the `codex` harness with a stage→model map (build/coverage/review/merge/adversarial)
+  **When** a build runs **Then** each stage's codex worker launches with its mapped OpenAI model.
+- **Given** a harness/stage with no model mapping **When** a stage routes to it **Then** it falls back
+  to the harness's default command (today's single fixed model) — no regression.
+- **Given** the Claude harness **When** a build runs **Then** Epic-14's Haiku/Sonnet/Opus routing is
+  unchanged.
+
+**Technical Notes**: Extend `HarnessConfig.to_argv` (`harness.py:102`) so a registry entry with a
+`{model}` placeholder receives the routed model (today it's ignored for registry, `harness.py:109`);
+add a per-harness model map to `harnesses.yaml` (the `codex` command gains `--model {model}` + a
+stage→model table, analogous to `ModelRoutingConfig`/`BALANCED` in `model_routing.py`); reuse
+`select_model`/`escalate_model` for the stage *role*, then resolve the harness-specific id. Epic-14's
+`haiku`/`sonnet`/`opus` aliases are Claude-only — codex needs its own id set (`gpt-5.4-codex`
+variants). `codex-build-adapter.sh` must pass the model through (`codex exec --model …`).
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests (registry model substitution, codex per-stage models, no-map fallback, claude unchanged)
+- [ ] `docs/harness-adapters.md` model-map section
+
+**Dependencies**: 20.7-001 (routing must actually run codex first); relates to 20.2-001 (role map)
+and Epic-14 (model-routing concepts)
+**Risk Level**: Medium
+
+##### Story 20.7-005: Per-repo default harness override
+**User Story**: As FX, I want a repo to declare its default harness (and optional per-role defaults)
+in a root override file so that I don't pass `--harness` on every `sdlc build` in that repo.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a consumer repo with a root `.sdlc-harness.yaml` declaring `default: codex` (and an
+  optional per-role map) **When** `sdlc build` runs with no `--harness` flag **Then** every unmapped
+  role routes to the file's default.
+- **Given** an explicit `--harness` flag **When** a build runs **Then** the flag wins over the file
+  (precedence: CLI flag > repo file > registry `default:`).
+- **Given** no file and no flag **When** a build runs **Then** behaviour is today's (registry
+  `default: claude`).
+- **Given** the file names an unknown/disabled harness **When** a build starts **Then** it fails fast
+  in preflight — the same path as the CLI flag.
+
+**Technical Notes**: Add an additive per-repo override at the consumer repo root, mirroring
+`.sdlc-model-routing.yaml` (`model_routing.py:OVERRIDE_FILENAME`) and `.sdlc-risk-config.yaml`
+(`risk_gate.py`). Resolve in `_stage_harness` (`build.py:4184`) / `resolve_role_routing`
+(`role_routing.py`) as the fallback below the `--harness` map and above the registry `default:`.
+Reuse the existing preflight validation (`resolve_role_routing`/`check_review_bridge`/
+`reconcile_reviewer_registry`, `cli.py:170`). YAML to match the existing `.sdlc-*.yaml` convention.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests (file default applied, CLI overrides file, no-file unchanged, per-role map honoured,
+  invalid-harness fails fast)
+- [ ] `docs/harness-adapters.md` + a sample `.sdlc-harness.yaml`
+
+**Dependencies**: 20.7-001 (routing must run); relates to 20.2-001 (role map)
+**Risk Level**: Low
+
 ## Story Dependencies (within Epic-20)
 
 ```
@@ -448,6 +634,11 @@ Claude-only so that no one wastes time trying to run them on a CLI harness.
                                                 └─> 20.6-001 (guide) ─> 20.6-002 (boundary)
 
 20.4-001 (skill format) ─> 20.4-002 (generator) ─> 20.4-003 (parity gate)
+
+# Feature 20.7 (cross-harness completion) — gates on the original routing/skill/model work:
+20.7-001 (real routing) ─┬─> 20.7-002 (build-stories single-source) ─┐
+                         ├─> 20.7-004 (per-stage model routing) ─────┼─> 20.7-003 (runtime docs + status)
+                         └─> 20.7-005 (per-repo default harness) ────┘
 ```
 
 - **Cohort 1** (no deps): 20.1-001, 20.4-001
@@ -457,6 +648,9 @@ Claude-only so that no one wastes time trying to run them on a CLI harness.
   20.4-002), 20.6-001 (needs 20.1-002, 20.5-001)
 - **Cohort 4**: 20.3-002 (needs 20.2-001, 20.3-001), 20.5-002 (needs 20.5-001, 20.2-002), 20.6-002
   (needs 20.6-001)
+- **Feature 20.7** (re-opened completion work): 20.7-001 is the unblocker (needs the original
+  20.1/20.2/20.3); 20.7-002, 20.7-004, 20.7-005 each build on 20.7-001; 20.7-003 (docs + status)
+  closes out after 20.7-001/002.
 
 > Cross-epic: Epic-08 *owns* the adversarial-reviewer registry this epic generalizes (20.3-002 must
 > preserve its consensus semantics). Epic-11 *renders* the per-stage harness this epic *records*
@@ -471,3 +665,6 @@ Claude-only so that no one wastes time trying to run them on a CLI harness.
 - Claude and Codex skill files are generated from one source and CI fails on drift.
 - Capability gaps degrade safely (parallel→serial, usage "unavailable") with explicit logging.
 - The Claude-only boundary for `fix-issue`/`resume-build-agents` is documented with a support matrix.
+- **(Feature 20.7)** `--harness build=codex` *actually* dispatches Codex workers (not just a ledger
+  label); the Codex `build-stories` is generated from the single neutral source; each harness can
+  route models per stage; and a repo can set its default harness via `.sdlc-harness.yaml`.
