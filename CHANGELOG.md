@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.96.0] - 2026-06-27
+
+### Added
+
+- feat(cross-harness-portability): document codex-worker (#20.7-003)
+
+
 ## [v1.95.0] - 2026-06-27
 
 ### Added
