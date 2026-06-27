@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.91.1] - 2026-06-27
+
+### Fixed
+
+- fix(controller): stop sdlc build committing on the checked-out branch
+
+
 ## [v1.91.0] - 2026-06-27
 
 ### Added
