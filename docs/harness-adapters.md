@@ -11,9 +11,9 @@ point it at a wrapper script, reuse an existing output parser, and declare what
 the harness can do. The controller code never changes.
 
 This guide walks the four moving parts, then a complete worked example for a
-hypothetical harness. The shipped **codex** entry is the canonical real example;
-**opencode**, **pi**, and **gemini** are the candidate future targets this
-abstraction exists for.
+hypothetical harness. The shipped **codex** and **qwen** entries are the
+canonical real examples; **opencode**, **pi**, and **gemini** are the candidate
+future targets this abstraction exists for.
 
 ## The contract every harness speaks
 
@@ -77,7 +77,7 @@ genuinely new telemetry semantics:
 | Parser id           | Use it when                                                                 |
 | ------------------- | --------------------------------------------------------------------------- |
 | `claude-stream-json`| The harness is Claude (stream-json envelope, usage, rate-limit, overflow).   |
-| `codex-exec`        | A plain CLI with a JSON contract but **no** usage/rate-limit telemetry. This is the parser any new stdin→`<<<RESULT_JSON>>>` harness should declare. |
+| `codex-exec`        | A plain CLI with a JSON contract but **no** usage/rate-limit telemetry. This is the parser any new stdin→`<<<RESULT_JSON>>>` harness should declare, including Qwen Code's `qwen -p` wrapper. |
 
 The `codex-exec` parser reads the result block straight from stdout, records
 usage as *unavailable* (rather than a misleading zero), and treats every
@@ -153,14 +153,15 @@ touched.
 The abstraction exists so these become config exercises, not engineering
 projects:
 
+- **qwen** — Qwen Code headless coding agent; shipped as `qwen-build-adapter.sh` using `qwen -p`.
 - **opencode** — open-source headless coding CLI; `opencode run`-style invocation.
 - **pi** — lightweight agent CLI; stdin prompt, JSON result.
 - **gemini** — Google's CLI; wrap `gemini`'s headless mode to emit the result block.
 
 Each is the same recipe: a wrapper that maps stdin→CLI and CLI-stdout→result
 block, a `harnesses.yaml` entry with `parser: codex-exec`, and honest capability
-flags. The [codex entry](../controller/config/harnesses.yaml) is the canonical
-real-world example to copy from.
+flags. The [codex and qwen entries](../controller/config/harnesses.yaml) are the
+canonical real-world examples to copy from.
 
 ## Where the boundary stays Claude-only
 

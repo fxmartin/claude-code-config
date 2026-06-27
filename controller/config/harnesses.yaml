@@ -55,3 +55,20 @@ harnesses:
       json_contract: true
       usage_tracking: false
       rate_limit_aware: false
+
+  # Qwen Code adapter. The wrapper receives the assembled prompt on stdin and
+  # runs Qwen Code headlessly with `qwen -p "$prompt"`, forwarding the neutral
+  # <<<RESULT_JSON>>> contract to the same plain parser used by Codex. Qwen Code
+  # does not expose Claude-style stream-json / usage / rate-limit telemetry
+  # through this wrapper, so those capabilities stay false.
+  qwen:
+    command: "qwen-build-adapter.sh"
+    parser: codex-exec
+    enabled: true
+    probe: "qwen --version"
+    capabilities:
+      worktree_isolation: false
+      parallel: false
+      json_contract: true
+      usage_tracking: false
+      rate_limit_aware: false

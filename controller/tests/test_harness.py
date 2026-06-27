@@ -40,6 +40,7 @@ def test_checked_in_config_loads() -> None:
     registry = load_harnesses_config(CONFIG_PATH)
     assert DEFAULT_HARNESS in registry
     assert "codex" in registry
+    assert "qwen" in registry
 
 
 def test_loaded_entry_resolves_all_four_aspects() -> None:
@@ -65,6 +66,7 @@ def test_codex_probe_loaded_from_yaml() -> None:
     """Story 20.5-001: the optional probe command round-trips from the registry."""
     registry = load_harnesses_config(CONFIG_PATH)
     assert registry["codex"].probe == "codex --version"
+    assert registry["qwen"].probe == "qwen --version"
     # Claude declares no probe command.
     assert registry[DEFAULT_HARNESS].probe is None
 
@@ -237,6 +239,16 @@ def test_resolve_named_harness_from_registry(monkeypatch) -> None:
     assert harness.name == "codex"
     assert resolve_agent_argv("codex", config_path=CONFIG_PATH) == [
         "codex-build-adapter.sh"
+    ]
+
+
+def test_resolve_qwen_harness_from_registry(monkeypatch) -> None:
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    harness = resolve_harness("qwen", config_path=CONFIG_PATH)
+    assert harness.source == "registry"
+    assert harness.name == "qwen"
+    assert resolve_agent_argv("qwen", config_path=CONFIG_PATH) == [
+        "qwen-build-adapter.sh"
     ]
 
 
