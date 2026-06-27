@@ -98,7 +98,7 @@ def _stage_rows(db: Path) -> dict[str, str]:
 
 
 def test_full_codex_map_dispatches_codex_argv_for_every_stage(tmp_path) -> None:
-    codex_argv = resolve_harness("codex", config_path=CONFIG_PATH).to_argv()
+    codex = resolve_harness("codex", config_path=CONFIG_PATH)
     disp = RecordingDispatcher()
     opts = BuildOptions(
         scope="epic-99",
@@ -118,7 +118,11 @@ def test_full_codex_map_dispatches_codex_argv_for_every_stage(tmp_path) -> None:
     seen = disp.by_stage()
     assert {"build", "coverage", "review", "merge"}.issubset(seen)
     for stage, call in seen.items():
-        assert call["agent_cmd"] == codex_argv, f"{stage} did not route to codex argv"
+        # Each stage routes to the codex argv carrying *its own* mapped model
+        # (Story 20.7-004), not one fixed command for every stage.
+        assert call["agent_cmd"] == codex.to_argv(stage=stage), (
+            f"{stage} did not route to its codex argv"
+        )
         assert call["parser"] == "codex-exec", f"{stage} kept the claude parser"
         # The whole point of AC3: zero `claude` processes.
         assert not any("claude" in token for token in call["agent_cmd"])
@@ -128,7 +132,7 @@ def test_full_codex_map_dispatches_codex_argv_for_every_stage(tmp_path) -> None:
 
 
 def test_mixed_map_routes_each_stage_and_ledger_matches(tmp_path) -> None:
-    codex_argv = resolve_harness("codex", config_path=CONFIG_PATH).to_argv()
+    codex = resolve_harness("codex", config_path=CONFIG_PATH)
     db = tmp_path / "ledger.db"
     disp = RecordingDispatcher()
     opts = BuildOptions(
@@ -149,8 +153,9 @@ def test_mixed_map_routes_each_stage_and_ledger_matches(tmp_path) -> None:
     # The build stage runs on claude — a claude argv, the stream-json default parser.
     assert any("claude" in token for token in seen["build"]["agent_cmd"])
     assert seen["build"]["parser"] is None
-    # The review stage runs on the codex adapter argv + codex-exec parser.
-    assert seen["review"]["agent_cmd"] == codex_argv
+    # The review stage runs on the codex adapter argv (carrying review's mapped
+    # model, Story 20.7-004) + codex-exec parser.
+    assert seen["review"]["agent_cmd"] == codex.to_argv(stage="review")
     assert seen["review"]["parser"] == "codex-exec"
     # An unmapped stage (coverage/merge) falls back to claude.
     assert seen["coverage"]["parser"] is None
@@ -187,7 +192,7 @@ def test_no_harness_map_passes_no_agent_cmd_or_parser(tmp_path, monkeypatch) -> 
 
 
 def test_codex_route_survives_a_parallel_run(tmp_path) -> None:
-    codex_argv = resolve_harness("codex", config_path=CONFIG_PATH).to_argv()
+    codex = resolve_harness("codex", config_path=CONFIG_PATH)
     disp = RecordingDispatcher()
     # A real parallel run (concurrency>1) routing every role to codex. Codex
     # declares parallel:false / worktree_isolation:false; the build must degrade
@@ -207,9 +212,10 @@ def test_codex_route_survives_a_parallel_run(tmp_path) -> None:
     )
     assert result.completed == 1
     assert result.failed == 0
-    # The route held under the parallel path — every dispatched stage still codex.
+    # The route held under the parallel path — every dispatched stage still codex,
+    # each with its own per-stage model (Story 20.7-004).
     for call in disp.calls:
-        assert call["agent_cmd"] == codex_argv
+        assert call["agent_cmd"] == codex.to_argv(stage=call["stage"])
         assert call["parser"] == "codex-exec"
 
 
@@ -228,14 +234,15 @@ def test_dispatch_kwargs_empty_when_no_harness_map() -> None:
 
 def test_dispatch_kwargs_registry_harness_routes_argv_and_parser() -> None:
     """A role mapped to a registry harness → that harness's argv + declared parser."""
-    codex_argv = resolve_harness("codex", config_path=CONFIG_PATH).to_argv()
+    codex = resolve_harness("codex", config_path=CONFIG_PATH)
     opts = BuildOptions(scope="epic-99", harness_map={"build": "codex"})
     kwargs = _harness_dispatch_kwargs("build", opts, "opus")
     argv = kwargs["agent_cmd"]
     assert isinstance(argv, list)
-    assert argv == codex_argv
+    # The build stage's codex argv carries build's mapped model (Story 20.7-004).
+    assert argv == codex.to_argv(stage="build")
     assert kwargs["parser"] == "codex-exec"
-    # A registry entry owns its argv — the routed model never decorates it.
+    # A registry entry owns its argv — the Claude tier alias never decorates it.
     assert not any("opus" in token for token in argv)
 
 

@@ -29,7 +29,12 @@
         "command": {
           "type": "string",
           "minLength": 1,
-          "description": "Command template invoked to run an agent on this harness. May use {pr_number}/{pr_url}/{story_id} placeholders, substituted before invocation."
+          "description": "Command template invoked to run an agent on this harness. May use {pr_number}/{pr_url}/{story_id} placeholders, substituted before invocation. May also carry a {model} placeholder, substituted per stage from 'models' (Story 20.7-004)."
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "description": "Optional per-stage model map (stage name -> harness-specific model id) used to substitute the {model} placeholder in 'command' (Story 20.7-004). A 'default' key supplies the model for stages absent from the map. A command using {model} must declare a 'default'. Analogous to Epic-14's per-stage Balanced map, but with this harness's own model ids."
         },
         "flags": {
           "type": "array",

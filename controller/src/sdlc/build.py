@@ -4210,8 +4210,11 @@ def _harness_dispatch_kwargs(
     its declared parser, not just a label in the ledger. The ``builtin``/``env``
     Claude slots return ``parser=None`` so dispatch keeps its stream-json
     default, and ``model`` still decorates the Claude argv via
-    :meth:`HarnessConfig.to_argv` (a registry entry owns its own argv and ignores
-    it).
+    :meth:`HarnessConfig.to_argv`. A registry harness owns its own argv: it
+    ignores the Claude tier alias in ``model`` and instead routes *its own* model
+    per stage — ``harness_stage`` is threaded into :meth:`HarnessConfig.to_argv`
+    so a registry entry with a ``{model}`` placeholder launches with the model its
+    ``models`` map assigns this stage (Story 20.7-004).
 
     Returns an **empty dict** when no ``--harness`` map is set, so the default
     path passes no ``agent_cmd``/``parser`` and dispatch is byte-identical to
@@ -4227,7 +4230,7 @@ def _harness_dispatch_kwargs(
         _stage_harness(harness_stage, opts), config_path=default_registry_path()
     )
     return {
-        "agent_cmd": harness.to_argv(model=model),
+        "agent_cmd": harness.to_argv(model=model, stage=harness_stage),
         "parser": None if harness.source in ("builtin", "env") else harness.parser,
     }
 

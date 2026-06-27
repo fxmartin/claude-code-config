@@ -104,6 +104,46 @@ Optionally add a `probe:` command (a cheap "is the CLI installed/authenticated?"
 check). A zero exit means available; a non-zero exit degrades to a warning in
 preflight rather than a mid-run crash. Omit it to skip the check.
 
+### 5. Per-stage model routing (optional)
+
+A registry harness can route a **different model per pipeline stage** — the
+OpenAI analog of Epic-14's Claude Balanced map (build on a capable model, the
+mechanical merge/coverage on a cheaper one, the adversarial skeptic on a stronger
+one). Epic-14's `haiku`/`sonnet`/`opus` aliases are Claude-only, so a non-Claude
+harness carries **its own model ids**.
+
+Opt in with two pieces: a `{model}` placeholder in `command`, and a `models:` map
+of stage → model id. The controller substitutes the stage's mapped model into the
+placeholder at dispatch; your wrapper forwards it to the CLI (the codex wrapper
+forwards `--model <id>` to `codex exec`).
+
+```yaml
+codex:
+  command: "codex-build-adapter.sh --model {model}"
+  parser: codex-exec
+  models:
+    default: gpt-5.4-codex        # required when command uses {model}
+    build: gpt-5.4-codex
+    coverage: gpt-5.4-codex-mini  # cheaper for mechanical stages
+    review: gpt-5.4-codex
+    merge: gpt-5.4-codex-mini
+    adversarial: gpt-5.4-codex-high  # stronger skeptic
+```
+
+Rules:
+
+- A command using `{model}` **must** declare a `default` — it covers any stage not
+  listed (e.g. the `bugfix`/`reask` recovery agents), so an unmapped stage always
+  resolves rather than failing. The registry loader rejects a `{model}` command
+  with no `default`.
+- A harness whose command has **no** `{model}` placeholder routes a single fixed
+  model (whatever the CLI defaults to) — no map needed, no behaviour change.
+- The Claude harness is unaffected: its per-stage Haiku/Sonnet/Opus routing
+  (Epic-14) flows through the dispatch seam exactly as before.
+- The model is chosen by the **stage** (build, coverage, review, merge,
+  adversarial, …), the same stage the ledger records — so a heterogeneous run is
+  auditable down to which model ran each stage.
+
 ## Worked example: a hypothetical `acme` harness
 
 Suppose Acme ships a headless CLI, `acme run`, that reads a prompt on stdin and

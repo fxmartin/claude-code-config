@@ -46,3 +46,33 @@ WRAPPER="${BATS_TEST_DIRNAME}/../scripts/codex-build-adapter.sh"
     [ "${status}" -eq 2 ]
     [[ "${output}" == *"unexpected argument"* ]]
 }
+
+# Story 20.7-004: per-stage model routing — the controller substitutes the
+# stage's mapped model into the `{model}` placeholder and passes `--model <id>`,
+# which the wrapper must forward to the underlying command.
+@test "forwards --model to the underlying command" {
+    # HARNESS_AGENT_CMD=echo stands in for `codex exec`: it prints its argv, so we
+    # can assert the model id reached the underlying command.
+    run bash -c "echo prompt | HARNESS_AGENT_CMD=echo bash '${WRAPPER}' --model gpt-5.4-codex"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"--model gpt-5.4-codex"* ]]
+}
+
+@test "accepts --model=<id> form" {
+    run bash -c "echo prompt | HARNESS_AGENT_CMD=echo bash '${WRAPPER}' --model=gpt-5.4-codex-mini"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"--model gpt-5.4-codex-mini"* ]]
+}
+
+@test "rejects --model with no value" {
+    run bash -c "echo prompt | bash '${WRAPPER}' --model"
+    [ "${status}" -eq 2 ]
+    [[ "${output}" == *"--model needs a value"* ]]
+}
+
+@test "no --model still runs the bare command (no regression)" {
+    transcript=$'p\n<<<RESULT_JSON>>>\n{"branch_name":"feature/x","build_status":"SUCCESS","commit_sha":"abc"}\n<<<END_RESULT>>>'
+    run bash -c "printf '%s' \"\$1\" | HARNESS_AGENT_CMD=cat bash '${WRAPPER}'" _ "${transcript}"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"<<<RESULT_JSON>>>"* ]]
+}

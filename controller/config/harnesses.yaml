@@ -41,7 +41,12 @@ harnesses:
   # The wrapper only ever runs `codex`, so a run routed here spawns zero `claude`
   # processes (AC3).
   codex:
-    command: "codex-build-adapter.sh"
+    # Per-stage model routing (Story 20.7-004): the {model} placeholder is
+    # substituted from the `models` map below per stage, and the adapter forwards
+    # it as `codex exec --model <id>`. This is the OpenAI analog of Epic-14's
+    # Balanced map — Epic-14's haiku/sonnet/opus aliases are Claude-only, so codex
+    # carries its own model ids here.
+    command: "codex-build-adapter.sh --model {model}"
     parser: codex-exec
     enabled: true
     # Optional preflight check (Story 20.5-001): confirms the Codex CLI is
@@ -49,6 +54,18 @@ harnesses:
     # "available"; a non-zero exit degrades to a warning rather than a mid-run
     # crash. Omit `probe` entirely to skip the check (status "unknown").
     probe: "codex --version"
+    # Stage -> OpenAI model id. `default` covers any stage not listed (e.g. the
+    # bugfix/reask recovery agents), so an unmapped stage never fails to resolve.
+    # Tune these to your codex model entitlements; the tiers mirror Epic-14's
+    # intent — a capable model for code-producing stages, a cheaper one for the
+    # mechanical merge/coverage, a stronger one pinned to the adversarial skeptic.
+    models:
+      default: gpt-5.4-codex
+      build: gpt-5.4-codex
+      coverage: gpt-5.4-codex-mini
+      review: gpt-5.4-codex
+      merge: gpt-5.4-codex-mini
+      adversarial: gpt-5.4-codex-high
     capabilities:
       worktree_isolation: false
       parallel: false
