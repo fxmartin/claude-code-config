@@ -38,6 +38,7 @@ from sdlc.dispatch import (
     sandbox_enabled,
     sandbox_wrap,
 )
+from sdlc.dispatch import _dispatch_env
 from sdlc.rate_limit import seconds_until_reset
 
 
@@ -1269,6 +1270,41 @@ def test_streaming_dispatch_eof_reap_timeout_kills_child(monkeypatch) -> None:
     assert fake_ref["p"].killed  # the lingering child was force-killed on reap timeout
 
 
+# --- issue #214: dispatched agents are marked SDLC_BATCH_BUILD --------------
+
+
+def test_dispatch_env_always_marks_batch_build_without_cap() -> None:
+    """_dispatch_env always returns an env marking SDLC_BATCH_BUILD, even with no cap."""
+    env = _dispatch_env(None)
+    assert env is not None
+    assert env["SDLC_BATCH_BUILD"] == "1"
+    assert "MAX_THINKING_TOKENS" not in env
+
+
+def test_dispatch_env_marks_batch_build_and_cap_together() -> None:
+    """A thinking cap is layered on top of the SDLC_BATCH_BUILD marker."""
+    env = _dispatch_env(4096)
+    assert env is not None
+    assert env["SDLC_BATCH_BUILD"] == "1"
+    assert env["MAX_THINKING_TOKENS"] == "4096"
+
+
+def test_dispatch_env_zero_cap_marks_batch_build_only() -> None:
+    """A zero / falsy cap is no cap, but the batch-build marker is still set."""
+    env = _dispatch_env(0)
+    assert env is not None
+    assert env["SDLC_BATCH_BUILD"] == "1"
+    assert "MAX_THINKING_TOKENS" not in env
+
+
+def test_dispatch_env_preserves_parent_environment(monkeypatch) -> None:
+    """The markers are layered on top of the inherited environment, not in place of it."""
+    monkeypatch.setenv("SDLC_SENTINEL_VAR", "keep-me")
+    env = _dispatch_env(None)
+    assert env["SDLC_SENTINEL_VAR"] == "keep-me"
+    assert env["SDLC_BATCH_BUILD"] == "1"
+
+
 # --- 14.2-002: thinking-token cap surfaced as MAX_THINKING_TOKENS ----------
 
 
@@ -1286,8 +1322,8 @@ def test_thinking_cap_sets_env_on_captured_path(monkeypatch) -> None:
     assert seen["env"]["MAX_THINKING_TOKENS"] == "4096"
 
 
-def test_no_thinking_cap_leaves_env_unchanged_on_captured_path(monkeypatch) -> None:
-    """No cap → env=None so the subprocess inherits the parent environment (unchanged)."""
+def test_no_thinking_cap_still_marks_batch_build_on_captured_path(monkeypatch) -> None:
+    """No cap → env carries SDLC_BATCH_BUILD=1 (and no cap) so dispatched agents are marked."""
     seen = {}
 
     def fake_run(cmd, **kwargs):
@@ -1296,11 +1332,13 @@ def test_no_thinking_cap_leaves_env_unchanged_on_captured_path(monkeypatch) -> N
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
-    assert seen["env"] is None
+    assert seen["env"] is not None
+    assert seen["env"]["SDLC_BATCH_BUILD"] == "1"
+    assert "MAX_THINKING_TOKENS" not in seen["env"]
 
 
 def test_thinking_cap_zero_is_no_cap(monkeypatch) -> None:
-    """A zero / falsy cap is treated as no cap — env stays None (unchanged path)."""
+    """A zero / falsy cap is treated as no cap — env still marks SDLC_BATCH_BUILD, no cap var."""
     seen = {}
 
     def fake_run(cmd, **kwargs):
@@ -1309,7 +1347,9 @@ def test_thinking_cap_zero_is_no_cap(monkeypatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     dispatch_agent("build", "prompt", agent_cmd=["fake-claude"], thinking_cap=0)
-    assert seen["env"] is None
+    assert seen["env"] is not None
+    assert seen["env"]["SDLC_BATCH_BUILD"] == "1"
+    assert "MAX_THINKING_TOKENS" not in seen["env"]
 
 
 def test_thinking_cap_env_preserves_parent_environment(monkeypatch) -> None:
@@ -1341,8 +1381,8 @@ def test_thinking_cap_sets_env_on_streaming_path(monkeypatch) -> None:
     assert seen["env"]["MAX_THINKING_TOKENS"] == "1024"
 
 
-def test_no_thinking_cap_leaves_env_unchanged_on_streaming_path(monkeypatch) -> None:
-    """No cap on the streaming path → env=None (inherits parent), behaviour unchanged."""
+def test_no_thinking_cap_still_marks_batch_build_on_streaming_path(monkeypatch) -> None:
+    """No cap on the streaming path → env carries SDLC_BATCH_BUILD=1 (no cap var)."""
     seen = {}
 
     def make(*a, **kw):
@@ -1351,7 +1391,9 @@ def test_no_thinking_cap_leaves_env_unchanged_on_streaming_path(monkeypatch) -> 
 
     monkeypatch.setattr(subprocess, "Popen", make)
     dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
-    assert seen["env"] is None
+    assert seen["env"] is not None
+    assert seen["env"]["SDLC_BATCH_BUILD"] == "1"
+    assert "MAX_THINKING_TOKENS" not in seen["env"]
 
 
 # ---------------------------------------------------------------------------

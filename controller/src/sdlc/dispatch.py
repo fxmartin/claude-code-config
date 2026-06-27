@@ -102,14 +102,22 @@ def resolve_deny_rules() -> list[str]:
     return list(DENY_BASELINE)
 
 
-def _dispatch_env(thinking_cap: int | None) -> dict[str, str] | None:
-    """The subprocess environment for a dispatch, or ``None`` to inherit the parent.
+def _dispatch_env(thinking_cap: int | None) -> dict[str, str]:
+    """The subprocess environment for a dispatch (always a copy of the parent).
+
+    Issue #214: every controller-dispatched agent is marked with
+    ``SDLC_BATCH_BUILD=1`` so host hooks can tell a batch-build agent from an
+    interactive session. The ``on-pr-merge-docs`` PostToolUse hook keys off this
+    marker to stay a no-op during a build — otherwise it injects "update the docs"
+    context into the dispatched merge agent, which then commits the regenerated
+    build-progress render onto whatever branch is checked out (main). The marker is
+    layered on top of a copy of the current environment, so it is always returned
+    (never ``None``) — the dispatch must run with this env in place.
 
     Story 14.2-002: when a thinking-token cap is configured, export it as
-    ``MAX_THINKING_TOKENS`` on top of a copy of the current environment so the
-    dispatched agent bounds its extended-thinking budget. Returns ``None`` when no
-    cap is set (``0`` / ``None``), so the subprocess inherits the parent
-    environment exactly as before — the no-cap path is byte-for-byte today's.
+    ``MAX_THINKING_TOKENS`` on top of that environment so the dispatched agent
+    bounds its extended-thinking budget. A falsy cap (``0`` / ``None``) simply omits
+    the cap var while still carrying the batch-build marker.
 
     Auto-compaction is deliberately left at Claude Code's default (enabled,
     ``autoCompactEnabled``): the controller never sets ``DISABLE_AUTO_COMPACT``,
@@ -117,10 +125,10 @@ def _dispatch_env(thinking_cap: int | None) -> dict[str, str] | None:
     env var to lower the *threshold*, so "early compaction" here means honouring —
     not disabling — the built-in behaviour while the thinking cap does the bounding.
     """
-    if not thinking_cap or thinking_cap <= 0:
-        return None
     env = dict(os.environ)
-    env[THINKING_CAP_ENV] = str(thinking_cap)
+    env["SDLC_BATCH_BUILD"] = "1"
+    if thinking_cap and thinking_cap > 0:
+        env[THINKING_CAP_ENV] = str(thinking_cap)
     return env
 
 

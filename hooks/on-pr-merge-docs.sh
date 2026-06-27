@@ -1,34 +1,49 @@
 #!/bin/bash
 # PostToolUse hook: trigger documentation update after a standalone PR merge
-# Gated by the build-stories sentinel — skipped during batch builds.
+# Gated by SDLC_BATCH_BUILD — skipped during controller batch builds.
 set -e
 
 INPUT=$(cat)
 
 # Extract fields from the hook payload
-EXIT_CODE=$(echo "$INPUT" | jq -r '.tool_response.exitCode // "1"')
-COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
+EXIT_CODE=$(jq -r '.tool_response.exitCode // "1"' <<<"${INPUT}")
+COMMAND=$(jq -r '.tool_input.command // ""' <<<"${INPUT}")
 
 # Only proceed if the command succeeded
-if [ "$EXIT_CODE" -ne 0 ]; then
+if [[ "${EXIT_CODE}" -ne 0 ]]; then
   exit 0
 fi
 
-# Guard: skip if build-stories skill is running (it handles docs in its own phase)
-if [ -f /tmp/.claude-skill-active ]; then
+# Guard: skip during a controller batch build (issue #214). Dispatched agents are
+# marked with SDLC_BATCH_BUILD; the build handles docs in its own phase, so this
+# hook must not inject doc-update context (which makes the merge agent commit the
+# regenerated build-progress render onto the checked-out branch).
+if [[ -n "${SDLC_BATCH_BUILD:-}" ]]; then
   exit 0
 fi
 
 # Extract PR number from command (gh pr merge 42, gh pr merge #42, etc.)
-PR_NUM=$(echo "$COMMAND" | grep -oP '(?:gh pr merge\s+#?)(\d+)' | grep -oP '\d+' || echo "unknown")
+PR_NUM="unknown"
+if [[ "${COMMAND}" =~ gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+\#?([0-9]+) ]]; then
+  PR_NUM="${BASH_REMATCH[1]}"
+fi
 
 # Extract merge output for context
-STDOUT=$(echo "$INPUT" | jq -r '.tool_response.stdout // ""' | head -5)
+STDOUT_RAW=$(jq -r '.tool_response.stdout // ""' <<<"${INPUT}")
+STDOUT=""
+line_count=0
+while IFS= read -r line && [[ "${line_count}" -lt 5 ]]; do
+  if [[ "${line_count}" -gt 0 ]]; then
+    STDOUT+=$'\n'
+  fi
+  STDOUT+="${line}"
+  line_count=$((line_count + 1))
+done <<<"${STDOUT_RAW}"
 
 # Inject additionalContext so Claude updates documentation
 jq -n \
-  --arg pr_num "$PR_NUM" \
-  --arg stdout "$STDOUT" \
+  --arg pr_num "${PR_NUM}" \
+  --arg stdout "${STDOUT}" \
   '{
     "hookSpecificOutput": {
       "hookEventName": "PostToolUse",
