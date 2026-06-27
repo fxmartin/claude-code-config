@@ -227,6 +227,25 @@ def test_sync_check_skill_base_without_neutral_exits_two(tmp_path: Path) -> None
     assert "--skill-base requires --neutral" in result.output
 
 
+def test_sync_check_skill_base_malformed_source_exits_two(tmp_path: Path) -> None:
+    # A malformed pipeline source slips past the body-mirror gate (which excludes
+    # pipeline skills) but fails the pipeline gate when it tries to render it, so
+    # the --skill-base error handler must turn that into a clean exit 2.
+    neutral = _seed_neutral(
+        tmp_path / "neutral", {_PIPE_NAME: "not valid frontmatter\n"}
+    )
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: _pipe_claude()})
+    src = _seed(tmp_path / "src", {})
+
+    result = runner.invoke(
+        app,
+        ["sync-check", str(src), "--neutral", str(neutral), "--skill-base", str(base)],
+    )
+
+    assert result.exit_code == 2
+    assert "error" in result.output.lower()
+
+
 def test_sync_check_fix_without_neutral_exits_two(tmp_path: Path) -> None:
     # --fix only makes sense for the generated-parity gate, so it requires
     # --neutral; asking for it against a consumer mirror is a usage error.

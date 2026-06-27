@@ -299,6 +299,29 @@ def test_pipeline_parity_detects_missing(tmp_path: Path) -> None:
     assert report.skills[0].state is GeneratedState.MISSING
 
 
+def test_pipeline_parity_detects_orphan(tmp_path: Path) -> None:
+    # A committed pipeline SKILL.md whose neutral source was deleted is an
+    # orphan: it must surface so a stale generated file fails the gate.
+    neutral = _seed_neutral(tmp_path, {})  # no pipeline source
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: "left behind\n"})
+
+    report = pipeline_parity_report(neutral, base)
+
+    assert report.in_sync is False
+    assert report.skills[0].state is GeneratedState.ORPHAN
+    assert report.skills[0].name == _PIPE_NAME
+
+
+def test_pipeline_parity_unknown_harness_raises(tmp_path: Path) -> None:
+    # An unknown harness has no full-SKILL.md generator, so rendering must fail
+    # loudly rather than silently skip the parity check.
+    neutral = _seed_neutral(tmp_path, {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: _pipe_claude()})
+
+    with pytest.raises(ValueError, match="unknown harness"):
+        pipeline_parity_report(neutral, base, harness="bogus")
+
+
 def test_pipeline_write_restores_parity(tmp_path: Path) -> None:
     neutral = _seed_neutral(tmp_path, {_PIPE_NAME: _PIPE_SRC})
     base = _seed_skill_base(tmp_path, {_PIPE_NAME: "drifted\n"})
