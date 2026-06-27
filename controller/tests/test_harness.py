@@ -237,9 +237,11 @@ def test_resolve_named_harness_from_registry(monkeypatch) -> None:
     harness = resolve_harness("codex", config_path=CONFIG_PATH)
     assert harness.source == "registry"
     assert harness.name == "codex"
-    assert resolve_agent_argv("codex", config_path=CONFIG_PATH) == [
-        "codex-build-adapter.sh"
-    ]
+    # With no stage, the {model} placeholder resolves to the harness default model
+    # (Story 20.7-004); the wrapper is still the first token and no claude appears.
+    argv = resolve_agent_argv("codex", config_path=CONFIG_PATH)
+    assert argv[0] == "codex-build-adapter.sh"
+    assert argv[argv.index("--model") + 1] == harness.models["default"]
 
 
 def test_resolve_qwen_harness_from_registry(monkeypatch) -> None:

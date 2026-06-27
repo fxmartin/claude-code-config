@@ -89,6 +89,24 @@ class HarnessConfig:
     # Consumed by the capability preflight (Story 20.5-001); ``None`` means the
     # harness is not probed (status "unknown").
     probe: str | None = None
+    # Optional per-stage model map (Story 20.7-004): stage name -> this harness's
+    # own model id, with a ``default`` key for stages it does not list. It feeds
+    # the ``{model}`` placeholder in ``command`` so a registry harness routes a
+    # distinct model per stage (the OpenAI analog of Epic-14's Balanced map),
+    # rather than ignoring the routed model. Empty means no model routing.
+    models: dict[str, str] = field(default_factory=dict)
+
+    def resolve_model(self, stage: str | None = None) -> str | None:
+        """The model id this harness runs ``stage`` on, or ``None`` when unmapped.
+
+        Prefers an explicit per-stage entry, then the ``default`` key — so a stage
+        absent from the map falls back to the harness's single default model
+        rather than failing. Returns ``None`` when the harness declares no model
+        map at all (it opts out of model routing and renders a static command).
+        """
+        if stage is not None and stage in self.models:
+            return self.models[stage]
+        return self.models.get("default")
 
     def render_command(self, **placeholders: Any) -> list[str]:
         """Render this harness's command template into an argv, appending flags.
@@ -99,18 +117,34 @@ class HarnessConfig:
         rendered = self.command.format(**placeholders) if placeholders else self.command
         return shlex.split(rendered) + list(self.flags)
 
-    def to_argv(self, *, model: str | None = None) -> list[str]:
+    def to_argv(
+        self, *, model: str | None = None, stage: str | None = None
+    ) -> list[str]:
         """The command to launch an agent on this harness.
 
         The ``builtin`` and ``env`` slots delegate to
         :func:`sdlc.dispatch.resolve_agent_cmd` so the default-command and
         ``SDLC_AGENT_CMD`` paths are byte-identical to today (deny baseline +
         routed ``--model`` decoration included; the env escape hatch owns its own
-        model, so ``model`` is deliberately ignored there). A ``registry`` entry
-        renders its own template — it owns its invocation surface.
+        model, so both ``model`` and ``stage`` are deliberately ignored there).
+
+        A ``registry`` entry renders its own template — it owns its invocation
+        surface, so the Claude tier alias in ``model`` (Epic-14's
+        ``haiku``/``sonnet``/``opus``) does not apply to it. Instead, when its
+        command carries a ``{model}`` placeholder (Story 20.7-004), the per-harness
+        ``models`` map resolves *this harness's own* model id for ``stage`` (with a
+        ``default`` fallback) and substitutes it. A registry entry without a
+        ``{model}`` placeholder renders its static command unchanged — no
+        regression for harnesses that route a single fixed model.
         """
         if self.source in ("builtin", "env"):
             return resolve_agent_cmd(model=model)
+        if "{model}" in self.command:
+            # The loader guarantees a `{model}` command declares a `default`, so
+            # an unmapped stage still resolves (never KeyError on .format()).
+            resolved = self.resolve_model(stage)
+            rendered = self.command.format(model=resolved)
+            return shlex.split(rendered) + list(self.flags)
         return self.render_command()
 
 
@@ -145,15 +179,26 @@ def load_harnesses_config(path: str | Path) -> dict[str, HarnessConfig]:
 
     registry: dict[str, HarnessConfig] = {}
     for name, settings in raw["harnesses"].items():
+        command = str(settings["command"])
+        models = {str(k): str(v) for k, v in dict(settings.get("models", {})).items()}
+        # A `{model}` command must resolve a model for *every* stage, including
+        # one not in the map — so it must declare a `default`. Fail fast here
+        # rather than KeyError at dispatch time (Story 20.7-004).
+        if "{model}" in command and "default" not in models:
+            raise HarnessError(
+                f"harness {name!r} command uses {{model}} but its 'models' map "
+                f"declares no 'default' to fall back to"
+            )
         registry[str(name)] = HarnessConfig(
             name=str(name),
-            command=str(settings["command"]),
+            command=command,
             parser=str(settings["parser"]),
             flags=list(settings.get("flags", [])),
             capabilities=dict(settings.get("capabilities", {})),
             enabled=bool(settings.get("enabled", True)),
             source="registry",
             probe=(str(settings["probe"]) if settings.get("probe") else None),
+            models=models,
         )
 
     default = raw.get("default")
@@ -259,12 +304,15 @@ def dispatch_on_harness(
     built-in/``env`` Claude slots keep their stream-json parser by passing
     ``parser=None`` (the dispatch default), so the default path is unchanged.
 
-    ``model`` decorates only the built-in/``env`` Claude argv (a registry entry
-    owns its own invocation surface). Extra ``dispatch_kwargs`` (e.g. ``cwd``,
-    ``timeout``, ``transcript_path``, ``on_progress``) pass straight through to
+    ``model`` decorates only the built-in/``env`` Claude argv; a registry entry
+    owns its own invocation surface and instead routes its own model per stage —
+    here ``agent_type`` *is* the stage, so a registry harness with a ``{model}``
+    placeholder launches with the model its ``models`` map assigns this stage
+    (Story 20.7-004). Extra ``dispatch_kwargs`` (e.g. ``cwd``, ``timeout``,
+    ``transcript_path``, ``on_progress``) pass straight through to
     :func:`dispatch_agent`.
     """
-    argv = harness.to_argv(model=model)
+    argv = harness.to_argv(model=model, stage=agent_type)
     # Built-in / env slots are Claude under the hood; let dispatch pick its
     # default (stream-json) parser. A registry harness names its own parser.
     parser = None if harness.source in ("builtin", "env") else harness.parser

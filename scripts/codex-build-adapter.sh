@@ -24,7 +24,14 @@
 # zero `claude` processes (Story 20.3-001 AC3).
 #
 # Usage:
-#   echo "<agent prompt>" | codex-build-adapter.sh
+#   echo "<agent prompt>" | codex-build-adapter.sh [--model <id>]
+#
+# Arguments:
+#   --model <id>   Per-stage model routing (Story 20.7-004): the controller
+#                  substitutes the stage's mapped model into the `{model}`
+#                  placeholder of the registry command and passes it here; the
+#                  wrapper forwards it as `codex exec --model <id>`. Omitted when
+#                  the harness routes a single fixed model.
 #
 # Environment:
 #   HARNESS_AGENT_CMD  Override the underlying command (default `codex exec`),
@@ -61,11 +68,38 @@ EOF
   exit 0
 fi
 
-if [ "$#" -gt 0 ]; then
-  echo "codex-build-adapter: unexpected argument: $1 (the prompt is read from stdin)" >&2
-  exit 2
-fi
+# Story 20.7-004: accept an optional `--model <id>` (or `--model=<id>`) to route a
+# per-stage model; any other argument is a usage error (the prompt is on stdin).
+MODEL=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      shift
+      MODEL="${1:-}"
+      if [ -z "$MODEL" ]; then
+        echo "codex-build-adapter: --model needs a value" >&2
+        exit 2
+      fi
+      ;;
+    --model=*)
+      MODEL="${1#--model=}"
+      if [ -z "$MODEL" ]; then
+        echo "codex-build-adapter: --model needs a value" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "codex-build-adapter: unexpected argument: $1 (the prompt is read from stdin)" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 # The controller delivers the prompt on stdin; hand it to Codex on its stdin and
 # forward Codex's stdout verbatim so the result block round-trips to the parser.
+# When a model was routed, append `--model "<id>"` to the underlying command.
+if [ -n "$MODEL" ]; then
+  exec bash -c "$AGENT_CMD"' --model "$1"' _ "$MODEL"
+fi
 exec bash -c "$AGENT_CMD"
