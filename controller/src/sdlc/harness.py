@@ -17,7 +17,12 @@ import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
-from sdlc.dispatch import DEFAULT_AGENT_CMD, resolve_agent_cmd
+from sdlc.dispatch import (
+    DEFAULT_AGENT_CMD,
+    AgentResult,
+    dispatch_agent,
+    resolve_agent_cmd,
+)
 
 # The registry schema ships inside the package (alongside the Epic-07 agent
 # schemas and the adversarial-reviewer schema) so it resolves under
@@ -230,3 +235,43 @@ def resolve_agent_argv(
     """The argv to launch an agent on the resolved harness (convenience wrapper)."""
     harness = resolve_harness(name, config_path=config_path, env=env)
     return harness.to_argv(model=model)
+
+
+def dispatch_on_harness(
+    harness: HarnessConfig,
+    agent_type: str,
+    prompt: str,
+    *,
+    model: str | None = None,
+    **dispatch_kwargs: Any,
+) -> AgentResult:
+    """Dispatch one agent onto a resolved harness through the unified seam.
+
+    This is the single call site by which a pipeline role — build, coverage/QA,
+    review, merge — reaches a registry harness (Story 20.3-001). It renders the
+    harness's own argv (:meth:`HarnessConfig.to_argv`) and selects the harness's
+    declared output parser, then hands both to :func:`sdlc.dispatch.dispatch_agent`.
+
+    For the Codex adapter that means the build/coverage agent runs via the Codex
+    wrapper command (never ``claude``) and its ``<<<RESULT_JSON>>>`` output is
+    interpreted by the ``codex-exec`` parser — so usage is recorded as
+    *unavailable* rather than fabricated, and the stage advances normally. The
+    built-in/``env`` Claude slots keep their stream-json parser by passing
+    ``parser=None`` (the dispatch default), so the default path is unchanged.
+
+    ``model`` decorates only the built-in/``env`` Claude argv (a registry entry
+    owns its own invocation surface). Extra ``dispatch_kwargs`` (e.g. ``cwd``,
+    ``timeout``, ``transcript_path``, ``on_progress``) pass straight through to
+    :func:`dispatch_agent`.
+    """
+    argv = harness.to_argv(model=model)
+    # Built-in / env slots are Claude under the hood; let dispatch pick its
+    # default (stream-json) parser. A registry harness names its own parser.
+    parser = None if harness.source in ("builtin", "env") else harness.parser
+    return dispatch_agent(
+        agent_type,
+        prompt,
+        agent_cmd=argv,
+        parser=parser,
+        **dispatch_kwargs,
+    )

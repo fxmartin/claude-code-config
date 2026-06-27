@@ -33,12 +33,15 @@ harnesses:
       usage_tracking: true
       rate_limit_aware: true
 
-  # First concrete non-Claude adapter (built out in Feature 20.3). The wrapper
-  # runs Codex via `codex exec` and emits the harness-neutral <<<RESULT_JSON>>>
-  # contract. Codex has no stream-json / usage / rate-limit semantics, so those
-  # capabilities are false and the run degrades safely (Feature 20.5).
+  # First concrete non-Claude adapter (Story 20.3-001). The wrapper
+  # `scripts/codex-build-adapter.sh` receives the assembled prompt on stdin, runs
+  # Codex via `codex exec`, and forwards the harness-neutral <<<RESULT_JSON>>>
+  # contract on stdout. Codex has no stream-json / usage / rate-limit semantics,
+  # so those capabilities are false and the run degrades safely (Feature 20.5).
+  # The wrapper only ever runs `codex`, so a run routed here spawns zero `claude`
+  # processes (AC3).
   codex:
-    command: "codex exec"
+    command: "codex-build-adapter.sh"
     parser: codex-exec
     enabled: true
     # Optional preflight check (Story 20.5-001): confirms the Codex CLI is
