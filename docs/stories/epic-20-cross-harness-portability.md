@@ -1,18 +1,21 @@
 # Epic 20: Cross-Harness SDLC Portability — run the pipeline on any agent harness
 
-> **Status: IN PROGRESS (13/18)** — the original 13 stories merged on `main` (2026-06-27): harness
+> **Status: IN PROGRESS (17/18)** — the original 13 stories merged on `main` (2026-06-27): harness
 > registry + adapter contract, pluggable output parsing, role→harness config, per-stage harness in
 > the ledger, Codex build/QA adapter + review/QA routing, harness-neutral skill format +
 > generator/transpiler + parity CI gate, capability probe + degradation matrix, and the "add a new
 > harness" guide + in-process-agent boundary docs. Built across parallel runs 68e5a36c / e4f9976c
 > (PRs #200-#212). **Re-opened 2026-06-27 with Feature 20.7 (5 stories)** after cross-harness usage
 > testing found three gaps the original stories shipped incomplete: (1) per-role `--harness` routing
-> was wired for preflight + ledger *label* only — `dispatch_on_harness`/`resolve_agent_argv` have no
-> callers and `_dispatch_stage` still runs `claude` for every stage; (2) the Codex `build-stories` is
-> still a hand-maintained native orchestrator in the mirror, never brought under the single-source
-> generator (only the 7 utility skills were); (3) per-stage *model* routing (Epic-14's Balanced map)
-> is Claude-only — a registry harness ignores the routed model. Feature 20.7 closes all three plus a
-> per-repo default-harness override.
+> was wired for preflight + ledger *label* only — the resolved harnesses were validated in `cli.py`
+> and then discarded, so `--harness build=codex` *labelled* the ledger while `_dispatch_stage` still
+> ran `claude` for every stage; (2) the Codex `build-stories` was still a hand-maintained native
+> orchestrator in the mirror, never brought under the single-source generator (only the 7 utility
+> skills were); (3) per-stage *model* routing (Epic-14's Balanced map) was Claude-only — a registry
+> harness ignored the routed model. Feature 20.7 closes all three plus a per-repo default-harness
+> override; **Story 20.7-001 wired the routing into real dispatch, so per-role `--harness` is now
+> functional** (a codex-routed stage dispatches the Codex adapter, not just a ledger label). Only the
+> runtime/status docs (20.7-003) remain.
 > Created 2026-06-26. Triggered by FX's request to make the autonomous-sdlc
 > framework run beyond Claude Code (Codex, opencode, pi, …) and to allow alternate-harness role
 > assignment (e.g. Codex for review and QA while Claude builds). This epic generalizes the
