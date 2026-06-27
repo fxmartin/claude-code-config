@@ -12,6 +12,7 @@ _REPO_ROOT = _CONTROLLER.parent
 GUIDE = _REPO_ROOT / "docs" / "harness-adapters.md"
 EPIC = _REPO_ROOT / "docs" / "stories" / "epic-20-cross-harness-portability.md"
 STORIES = _REPO_ROOT / "docs" / "stories" / "STORIES.md"
+ADAPTER = _REPO_ROOT / "scripts" / "codex-build-adapter.sh"
 
 
 def _guide_text() -> str:
@@ -71,6 +72,58 @@ def test_guide_captures_routing_gap_provenance() -> None:
     assert "20.7-001" in text
     low = text.lower()
     assert "label" in low  # the gap: it labelled the ledger but ran claude
+
+
+# ---------------------------------------------------------------------------
+# AC1 (coverage gate): the remaining documented runtime claims, each pinned
+# against the real artifact it describes so the doc cannot silently rot.
+# ---------------------------------------------------------------------------
+
+
+def test_guide_links_to_the_codex_build_adapter_script() -> None:
+    """The runtime section names the adapter a codex stage dispatches through —
+    and that linked script must actually exist on disk (no dangling link)."""
+    text = _guide_text()
+    assert "scripts/codex-build-adapter.sh" in text
+    # The markdown link target resolves to a real, present script.
+    assert ADAPTER.is_file(), f"documented adapter missing: {ADAPTER}"
+
+
+def test_guide_default_codex_exec_matches_the_adapter() -> None:
+    """The doc says the adapter defaults to `codex exec` and honours
+    HARNESS_AGENT_CMD; both claims must match the adapter's own default."""
+    text = _guide_text()
+    assert "codex exec" in text
+    assert "HARNESS_AGENT_CMD" in text
+    # Cross-check the documented default against the script that implements it.
+    adapter_src = ADAPTER.read_text(encoding="utf-8")
+    assert 'AGENT_CMD="${HARNESS_AGENT_CMD:-codex exec}"' in adapter_src
+
+
+def test_guide_shows_a_runnable_codex_build_example() -> None:
+    """An operator can copy a concrete `sdlc build … --harness …=codex` line."""
+    text = _guide_text()
+    assert re.search(r"sdlc build .*--harness [^\n]*\bcodex\b", text), (
+        "no runnable codex-routed `sdlc build` example in the guide"
+    )
+
+
+def test_guide_says_run_codex_login_before_a_build() -> None:
+    """Pre-authentication is concrete: run `codex login` once on the host first."""
+    text = _guide_text().lower()
+    assert "codex login" in text
+    assert "before" in text  # the ordering matters: auth precedes the build
+
+
+def test_guide_provenance_names_the_cli_validate_then_discard_gap() -> None:
+    """Provenance is specific: cli.py validated the harnesses then discarded
+    them, and 20.7-001 wired routing through the build loop for real dispatch."""
+    text = _guide_text()
+    low = text.lower()
+    assert "cli.py" in low
+    assert "discard" in low  # validated then *discarded* — the precise gap
+    assert "build loop" in low  # 20.7-001 wired it through the build loop
+    assert "dispatch" in low  # now dispatches the Codex adapter for real
 
 
 # ---------------------------------------------------------------------------
