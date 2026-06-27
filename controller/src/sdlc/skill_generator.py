@@ -8,12 +8,19 @@ from pathlib import Path
 
 import yaml
 
+from sdlc.portability import CROSS_HARNESS_SKILLS
 from sdlc.skill_format import (
     NeutralSkill,
     SkillFormatError,
     parse_neutral_skill,
     render_body,
 )
+
+# Skills generated as full ``SKILL.md`` files into the harness plugin trees
+# (not as the body-only ``shared-skills/<name>.md`` mirrors the seven utility
+# skills use). Aligned with the cross-harness boundary: a controller-dispatch
+# skill is exactly the kind that ships a real SKILL.md to every harness.
+PIPELINE_SKILLS = CROSS_HARNESS_SKILLS
 
 # Where each harness expects a skill to live, relative to its repo root. The
 # Claude plugin and the Codex mirror happen to share the same sub-path, but they
@@ -107,6 +114,26 @@ def generate_claude_skill(skill: NeutralSkill) -> str:
     return f"{frontmatter}\n\n{body}"
 
 
+def _codex_preamble(skill: NeutralSkill) -> str:
+    """The one-line preamble under the Codex skill's ``# Title``.
+
+    A cross-harness pipeline skill (e.g. ``build-stories``) is a thin wrapper
+    around the ``sdlc`` controller, so it gets an honest controller-wrapper
+    preamble — *not* the "Codex-native port" line the self-contained utility
+    skills use, which would mislead a reader into thinking the orchestration was
+    reimplemented natively here.
+    """
+    name = skill.metadata.name
+    if name in PIPELINE_SKILLS:
+        return (
+            f"This Codex skill is a thin wrapper around the `sdlc` controller, "
+            f"which owns the build pipeline. It runs the same controller as the "
+            f"Claude `{name}` skill — there is no Codex-specific orchestration "
+            f"here."
+        )
+    return f"This is a Codex-native port of the Claude Code `{name}` workflow."
+
+
 def generate_codex_skill(skill: NeutralSkill) -> str:
     """Emit the full Codex ``SKILL.md`` text for *skill*.
 
@@ -122,8 +149,7 @@ def generate_codex_skill(skill: NeutralSkill) -> str:
     sections = [
         frontmatter,
         f"# {title}",
-        f"This is a Codex-native port of the Claude Code "
-        f"`{skill.metadata.name}` workflow.",
+        _codex_preamble(skill),
         "## Invocation",
         invocation,
         "Treat the user arguments as input to the workflow below.",
@@ -182,8 +208,15 @@ def load_neutral_skills(neutral_dir: Path) -> list[NeutralSkill]:
 def generate_all(
     neutral_dir: Path, claude_base: Path, codex_base: Path
 ) -> list[GeneratedSkill]:
-    """Generate every neutral source under *neutral_dir* into both harness bases."""
+    """Generate the pipeline skills under *neutral_dir* into both harness bases.
+
+    Only :data:`PIPELINE_SKILLS` are emitted as full ``SKILL.md`` files into the
+    plugin trees; the seven self-contained utility skills are body-only mirrors
+    (``shared-skills/<name>.md``) owned by the sync gate, so generating them here
+    would plant spurious plugin-skill directories.
+    """
     return [
         write_skill_files(skill, claude_base, codex_base)
         for skill in load_neutral_skills(neutral_dir)
+        if skill.metadata.name in PIPELINE_SKILLS
     ]

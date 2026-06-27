@@ -2,9 +2,11 @@
 # ABOUTME: Regenerate Claude + Codex skill files from the neutral sources (Story 20.4-002).
 # ABOUTME: One authored neutral source per skill emits both harness files, killing mirror drift.
 #
-# generate-skills.sh — transpile every harness-neutral skill source into the
-# Claude `SKILL.md` and the Codex mirror `SKILL.md` so the two runtimes stay in
-# lock-step automatically (no hand-maintained copies).
+# generate-skills.sh — transpile the harness-neutral pipeline skill sources
+# (e.g. build-stories) into the Claude `SKILL.md` and the Codex mirror `SKILL.md`
+# so the two runtimes stay in lock-step automatically (no hand-maintained
+# copies). The body-only utility skills are mirrored separately via
+# `sync-shared-skills.sh` and are not emitted here.
 #
 # Per ADR-003, `shared-skills/neutral/<name>.skill.md` is the single authored
 # artifact; this script drives the controller's tested generator

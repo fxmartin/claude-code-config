@@ -8,13 +8,17 @@ from pathlib import Path
 import pytest
 
 from sdlc.skill_format import parse_neutral_skill, render_body
+from sdlc.skill_generator import PIPELINE_SKILLS, generate_claude_skill
 from sdlc.sync import (
     SHARED_SKILLS,
     GeneratedParityReport,
     GeneratedState,
     discover_neutral_skills,
+    discover_pipeline_sources,
     generated_parity_report,
+    pipeline_parity_report,
     write_generated_skills,
+    write_pipeline_skills,
 )
 
 # The committed shared-skills tree (source of truth) two levels up from tests/.
@@ -203,6 +207,149 @@ def test_real_shared_skills_are_in_sync_with_neutral() -> None:
 
 
 def test_real_neutral_covers_every_shared_skill() -> None:
-    """The neutral sources cover exactly the seven shared skills."""
+    """The neutral sources cover exactly the seven shared skills.
+
+    The body-mirror discovery deliberately excludes the pipeline skills
+    (build-stories), which are full SKILL.md plugin skills checked separately.
+    """
     discovered = set(discover_neutral_skills(_NEUTRAL_DIR))
     assert discovered == set(SHARED_SKILLS)
+
+
+# --- pipeline-skill parity gate (Story 20.7-002) ----------------------------
+
+# A minimal pipeline neutral source. `build-stories` is the only PIPELINE_SKILL,
+# so the gate keys off that name.
+_PIPE_NAME = "build-stories"
+_PIPE_SRC = (
+    "---\n"
+    f"name: {_PIPE_NAME}\n"
+    "description: Use when batch-building stories via the controller.\n"
+    "allowed_tools:\n"
+    "- Bash\n"
+    "model_invocation: disabled\n"
+    "---\n\n"
+    "Run the controller.\n\n"
+    "```bash\n"
+    "sdlc build {{ARGUMENTS}}\n"
+    "```\n"
+)
+
+
+def _seed_skill_base(root: Path, skills: dict[str, str]) -> Path:
+    """Lay down a plugin skills base (`<name>/SKILL.md`) and return its path."""
+    base = root / "skills"
+    for name, text in skills.items():
+        d = base / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(text, encoding="utf-8")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _pipe_claude() -> str:
+    return generate_claude_skill(parse_neutral_skill(_PIPE_SRC))
+
+
+def test_build_stories_is_the_pipeline_skill() -> None:
+    assert "build-stories" in PIPELINE_SKILLS
+
+
+def test_discover_pipeline_sources_excludes_body_mirror(tmp_path: Path) -> None:
+    neutral = _seed_neutral(tmp_path, {"demo": _DEMO_SRC, _PIPE_NAME: _PIPE_SRC})
+    # The body-mirror discovery sees only the utility skill...
+    assert set(discover_neutral_skills(neutral)) == {"demo"}
+    # ...and the pipeline discovery sees only the pipeline skill.
+    assert set(discover_pipeline_sources(neutral)) == {_PIPE_NAME}
+
+
+def test_pipeline_parity_in_sync(tmp_path: Path) -> None:
+    neutral = _seed_neutral(tmp_path, {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: _pipe_claude()})
+
+    report = pipeline_parity_report(neutral, base)
+
+    assert isinstance(report, GeneratedParityReport)
+    assert report.in_sync is True
+    assert {s.name: s.state for s in report.skills} == {
+        _PIPE_NAME: GeneratedState.IN_SYNC
+    }
+
+
+def test_pipeline_parity_detects_drift_with_diff(tmp_path: Path) -> None:
+    neutral = _seed_neutral(tmp_path, {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: "hand-edited SKILL.md\n"})
+
+    report = pipeline_parity_report(neutral, base)
+
+    assert report.in_sync is False
+    drifted = next(s for s in report.skills if s.name == _PIPE_NAME)
+    assert drifted.state is GeneratedState.DRIFTED
+    assert "regenerated" in drifted.diff
+    assert "SKILL.md" in drifted.diff
+
+
+def test_pipeline_parity_detects_missing(tmp_path: Path) -> None:
+    neutral = _seed_neutral(tmp_path, {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {})  # no committed SKILL.md
+
+    report = pipeline_parity_report(neutral, base)
+
+    assert report.in_sync is False
+    assert report.skills[0].state is GeneratedState.MISSING
+
+
+def test_pipeline_parity_detects_orphan(tmp_path: Path) -> None:
+    # A committed pipeline SKILL.md whose neutral source was deleted is an
+    # orphan: it must surface so a stale generated file fails the gate.
+    neutral = _seed_neutral(tmp_path, {})  # no pipeline source
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: "left behind\n"})
+
+    report = pipeline_parity_report(neutral, base)
+
+    assert report.in_sync is False
+    assert report.skills[0].state is GeneratedState.ORPHAN
+    assert report.skills[0].name == _PIPE_NAME
+
+
+def test_pipeline_parity_unknown_harness_raises(tmp_path: Path) -> None:
+    # An unknown harness has no full-SKILL.md generator, so rendering must fail
+    # loudly rather than silently skip the parity check.
+    neutral = _seed_neutral(tmp_path, {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: _pipe_claude()})
+
+    with pytest.raises(ValueError, match="unknown harness"):
+        pipeline_parity_report(neutral, base, harness="bogus")
+
+
+def test_pipeline_write_restores_parity(tmp_path: Path) -> None:
+    neutral = _seed_neutral(tmp_path, {_PIPE_NAME: _PIPE_SRC})
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: "drifted\n"})
+    assert pipeline_parity_report(neutral, base).in_sync is False
+
+    written = write_pipeline_skills(neutral, base)
+
+    assert written == [_PIPE_NAME]
+    assert pipeline_parity_report(neutral, base).in_sync is True
+
+
+def test_pipeline_parity_missing_neutral_dir_raises(tmp_path: Path) -> None:
+    base = _seed_skill_base(tmp_path, {_PIPE_NAME: _pipe_claude()})
+    with pytest.raises(FileNotFoundError):
+        pipeline_parity_report(tmp_path / "nope", base)
+
+
+def test_real_build_stories_skill_is_in_sync_with_neutral() -> None:
+    """The committed Claude build-stories SKILL.md matches its neutral source.
+
+    This is the live pipeline parity gate: the plugin SKILL.md must never drift
+    from the harness-neutral source it is generated from.
+    """
+    skill_base = _REPO_ROOT / "plugins" / "autonomous-sdlc" / "skills"
+    report = pipeline_parity_report(_NEUTRAL_DIR, skill_base)
+    drifted = [
+        f"{s.name}:{s.state.value}"
+        for s in report.skills
+        if s.state is not GeneratedState.IN_SYNC
+    ]
+    assert report.in_sync is True, f"drift detected: {drifted}"

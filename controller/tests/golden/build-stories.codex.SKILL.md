@@ -2,12 +2,21 @@
 name: build-stories
 description: Batch build all incomplete stories across epics — thin wrapper that shells
   out to the external `sdlc` controller, which owns the deterministic state machine.
-disable-model-invocation: true
-argument-hint: '[all|resume|epic-NN|epic-name|story-id] [--dry-run] [--auto] [--skip-coverage]
-  [--rebuild] [--limit=N] [--sequential] [--coverage-threshold=N] [--skip-preflight]
-  [--preflight-timeout=N]'
-allowed-tools: Bash
+metadata:
+  short-description: Build story queues via the sdlc controller
 ---
+
+# Build Stories
+
+This Codex skill is a thin wrapper around the `sdlc` controller, which owns the build pipeline. It runs the same controller as the Claude `build-stories` skill — there is no Codex-specific orchestration here.
+
+## Invocation
+
+- `Use build-stories all --auto --limit=5`
+- `Use build-stories epic-01 --dry-run`
+- `Use build-stories resume`
+
+Treat the user arguments as input to the workflow below.
 
 You are a **thin wrapper** around the external `sdlc` controller (Epic-07).
 
@@ -23,22 +32,13 @@ stdout/stderr and propagate its exit code unchanged. Do not re-implement any of
 the orchestration here.
 
 ```bash
-sdlc build $ARGUMENTS
+sdlc build <arguments from the Use invocation>
 ```
 
-If `sdlc` is not on `PATH`, fall back to running it from the controller
-checkout:
+If `sdlc` is not on `PATH`, run it from the controller checkout instead:
 
 ```bash
-if command -v sdlc >/dev/null 2>&1; then
-    sdlc build $ARGUMENTS
-elif [ -d controller ]; then
-    ( cd controller && uv run sdlc build $ARGUMENTS )
-else
-    echo "error: sdlc controller not found. Install it with:" >&2
-    echo "  uv tool install ./controller" >&2
-    exit 1
-fi
+( cd controller && uv run sdlc build <arguments from the Use invocation> )
 ```
 
 ## What the controller does (reference only)

@@ -1367,6 +1367,15 @@ def sync_check(
         "(Story 20.4-003).",
         show_default=False,
     ),
+    skill_base: Path = typer.Option(
+        None,
+        "--skill-base",
+        help="Plugin skills base dir (e.g. plugins/autonomous-sdlc/skills). When "
+        "set with --neutral, also verify that every committed pipeline "
+        "<name>/SKILL.md matches what its neutral source generates (Story "
+        "20.7-002).",
+        show_default=False,
+    ),
     harness: str = typer.Option(
         "claude",
         "--harness",
@@ -1376,8 +1385,9 @@ def sync_check(
     fix: bool = typer.Option(
         False,
         "--fix",
-        help="Regenerate SOURCE_DIR's bodies from the neutral sources instead "
-        "of reporting drift (requires --neutral).",
+        help="Regenerate SOURCE_DIR's bodies (and --skill-base SKILL.md files) "
+        "from the neutral sources instead of reporting drift (requires "
+        "--neutral).",
     ),
 ) -> None:
     """Verify shared-skill parity — between repos, and against neutral sources.
@@ -1391,6 +1401,9 @@ def sync_check(
       generated body under SOURCE matches what its harness-neutral source
       regenerates, so Claude and Codex skill files cannot silently diverge.
       ``--fix`` rewrites the bodies from the sources instead of reporting drift.
+    * Pipeline parity (``--skill-base BASE`` with ``--neutral``): every committed
+      pipeline ``<name>/SKILL.md`` under BASE matches what its neutral source
+      generates (Story 20.7-002). Folds into the same exit code and ``--fix``.
 
     Exits 0 when everything is in sync, 1 on drift, and 2 when a directory is
     missing or a neutral source is malformed.
@@ -1401,8 +1414,14 @@ def sync_check(
         SkillState,
         generated_parity_report,
         parity_report,
+        pipeline_parity_report,
         write_generated_skills,
+        write_pipeline_skills,
     )
+
+    if skill_base is not None and neutral_dir is None:
+        typer.echo("error: --skill-base requires --neutral.", err=True)
+        raise typer.Exit(code=2)
 
     if neutral_dir is None and consumer_dir is None:
         typer.echo(
@@ -1445,6 +1464,42 @@ def sync_check(
                         "generated skills drifted — regenerate with "
                         f"`sdlc sync-check {source_dir} --neutral {neutral_dir} "
                         f"--harness {harness} --fix`."
+                    )
+                    exit_code = 1
+        except (FileNotFoundError, SkillFormatError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+
+    if skill_base is not None:
+        try:
+            if fix:
+                written = write_pipeline_skills(
+                    neutral_dir, skill_base, harness=harness
+                )
+                typer.echo(
+                    f"regenerated {len(written)} {harness} pipeline skill(s) "
+                    f"into {skill_base}."
+                )
+            else:
+                report = pipeline_parity_report(
+                    neutral_dir, skill_base, harness=harness
+                )
+                if report.in_sync:
+                    typer.echo(
+                        f"generated {harness} pipeline skills in sync "
+                        f"({len(report.skills)} skills)."
+                    )
+                else:
+                    for skill in report.skills:
+                        if skill.state is not GeneratedState.IN_SYNC:
+                            typer.echo(f"{skill.name}: {skill.state.value}")
+                            if skill.diff:
+                                typer.echo(skill.diff)
+                    typer.echo(
+                        "pipeline skills drifted — regenerate with "
+                        f"`sdlc sync-check {source_dir} --neutral {neutral_dir} "
+                        f"--skill-base {skill_base} --harness {harness} --fix` "
+                        "(or `scripts/generate-skills.sh generate`)."
                     )
                     exit_code = 1
         except (FileNotFoundError, SkillFormatError) as exc:

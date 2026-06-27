@@ -39,6 +39,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SHARED_DIR="${REPO_ROOT}/shared-skills"
 NEUTRAL_DIR="${SHARED_DIR}/neutral"
+# Pipeline skills (build-stories) ship a full SKILL.md into the Claude plugin
+# tree, checked alongside the body-only shared-skills mirror (Story 20.7-002).
+CLAUDE_SKILLS_BASE="${REPO_ROOT}/plugins/autonomous-sdlc/skills"
 
 usage() {
   sed -n '4,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -69,20 +72,27 @@ cmd_verify() {
 }
 
 cmd_verify_generated() {
-  # The cross-harness parity gate: every committed generated body must match
-  # what its neutral source regenerates. Defaults target this repo's tree.
+  # The cross-harness parity gate: every committed body-mirror skill AND every
+  # committed pipeline SKILL.md (--skill-base) must match what its neutral source
+  # regenerates. Defaults target this repo's tree.
   local generated_dir="${1:-${SHARED_DIR}}"
   local neutral_dir="${2:-${NEUTRAL_DIR}}"
   # `sdlc` exits 0 in sync, 1 on drift (with a diff + regenerate command), 2 on
   # a missing directory or malformed source — propagate that verbatim.
-  sdlc sync-check "${generated_dir}" --neutral "${neutral_dir}"
+  sdlc sync-check "${generated_dir}" \
+    --neutral "${neutral_dir}" \
+    --skill-base "${CLAUDE_SKILLS_BASE}"
 }
 
 cmd_regenerate() {
-  # The fix the gate points at: rewrite the committed bodies from the sources.
+  # The fix the gate points at: rewrite the committed body-mirror skills and the
+  # pipeline SKILL.md files from the neutral sources.
   local generated_dir="${1:-${SHARED_DIR}}"
   local neutral_dir="${2:-${NEUTRAL_DIR}}"
-  sdlc sync-check "${generated_dir}" --neutral "${neutral_dir}" --fix
+  sdlc sync-check "${generated_dir}" \
+    --neutral "${neutral_dir}" \
+    --skill-base "${CLAUDE_SKILLS_BASE}" \
+    --fix
 }
 
 cmd_list() {
