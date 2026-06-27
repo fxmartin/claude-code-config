@@ -511,6 +511,30 @@ def test_deny_baseline_covers_required_secret_and_egress_rules() -> None:
         assert rule in DENY_BASELINE
 
 
+def test_deny_baseline_blocks_playwright_browser_tools() -> None:
+    """Issue #145: the baseline denies the Playwright browser MCP tools so a
+    dispatched agent (e.g. a dashboard-visual story) can't launch a headed
+    browser. The wildcard form is the documented MCP deny syntax
+    (``mcp__<server>__<glob>``) and removes every browser_* tool from context."""
+    assert "mcp__playwright__browser_*" in DENY_BASELINE
+
+
+def test_dispatched_default_subprocess_blocks_playwright(monkeypatch) -> None:
+    """The Playwright deny rule actually reaches the dispatched agent's argv."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    seen = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    dispatch_agent("build", "prompt")
+    deny_arg = seen["cmd"][seen["cmd"].index("--disallowedTools") + 1]
+    assert "mcp__playwright__browser_*" in deny_arg
+
+
 def test_resolve_deny_rules_default_is_the_baseline(monkeypatch) -> None:
     monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
     assert resolve_deny_rules() == list(DENY_BASELINE)
@@ -1303,6 +1327,39 @@ def test_dispatch_env_preserves_parent_environment(monkeypatch) -> None:
     env = _dispatch_env(None)
     assert env["SDLC_SENTINEL_VAR"] == "keep-me"
     assert env["SDLC_BATCH_BUILD"] == "1"
+
+
+# --- issue #145: dispatched agents carry the in-test sentinel ---------------
+# A doc/visual story could shell out a real *nested* `sdlc build`. Exporting the
+# in-test sentinel into the dispatch env makes that nested build a no-op (the
+# build.py in_test_sentinel() guard short-circuits dispatcher/preflight).
+
+
+def test_dispatch_env_sets_in_test_sentinel_without_cap() -> None:
+    """The dispatch env marks SDLC_IN_TEST so a nested sdlc build is a no-op."""
+    env = _dispatch_env(None)
+    assert env["SDLC_IN_TEST"] == "1"
+    # Don't regress #214: the batch-build marker is still set.
+    assert env["SDLC_BATCH_BUILD"] == "1"
+
+
+def test_dispatch_env_sets_in_test_sentinel_with_cap() -> None:
+    """The in-test sentinel rides alongside the thinking cap and batch-build marker."""
+    env = _dispatch_env(4096)
+    assert env["SDLC_IN_TEST"] == "1"
+    assert env["SDLC_BATCH_BUILD"] == "1"
+    assert env["MAX_THINKING_TOKENS"] == "4096"
+
+
+def test_dispatch_env_in_test_sentinel_value_satisfies_build_guard(monkeypatch) -> None:
+    """The exported value is one build.in_test_sentinel() treats as truthy, so a
+    nested build genuinely short-circuits (key name and value both line up)."""
+    from sdlc.build import IN_TEST_ENV_VAR, in_test_sentinel
+
+    env = _dispatch_env(None)
+    assert env[IN_TEST_ENV_VAR] == "1"
+    monkeypatch.setenv(IN_TEST_ENV_VAR, env[IN_TEST_ENV_VAR])
+    assert in_test_sentinel() is True
 
 
 # --- 14.2-002: thinking-token cap surfaced as MAX_THINKING_TOKENS ----------
