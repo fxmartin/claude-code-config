@@ -1328,37 +1328,124 @@ def supplychain(
 def sync_check(
     source_dir: Path = typer.Argument(
         ...,
-        help="Source-of-truth shared-skills directory (this repo).",
+        help="Source-of-truth shared-skills directory (this repo). With "
+        "--neutral, the directory holding the committed generated bodies.",
     ),
     consumer_dir: Path = typer.Argument(
-        ...,
-        help="Consumer submodule checkout (e.g. the nix-install Codex mirror).",
+        None,
+        help="Consumer submodule checkout (e.g. the nix-install Codex mirror). "
+        "Optional when only a --neutral parity check is wanted.",
+        show_default=False,
+    ),
+    neutral_dir: Path = typer.Option(
+        None,
+        "--neutral",
+        help="Harness-neutral skill sources dir. When set, also verify that "
+        "SOURCE_DIR's committed bodies match what these sources generate "
+        "(Story 20.4-003).",
+        show_default=False,
+    ),
+    harness: str = typer.Option(
+        "claude",
+        "--harness",
+        help="Harness whose generated body to compare against the neutral "
+        "source (default: claude).",
+    ),
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help="Regenerate SOURCE_DIR's bodies from the neutral sources instead "
+        "of reporting drift (requires --neutral).",
     ),
 ) -> None:
-    """Verify a consumer's shared-skills submodule mirrors the source of truth.
+    """Verify shared-skill parity — between repos, and against neutral sources.
 
-    Run this after ``git submodule update --remote`` in a consumer repo to
-    confirm the propagation landed byte-for-byte. Exits 0 when every shared
-    skill is in sync, 1 when any skill drifted or is missing/extra, and 2 when
-    a directory is missing entirely.
+    Two complementary checks, either or both run in one invocation:
+
+    * Consumer mirror (``sync-check SOURCE CONSUMER``): a consumer's
+      shared-skills submodule mirrors the source of truth byte-for-byte. Run
+      after ``git submodule update --remote``.
+    * Generated parity (``sync-check SOURCE --neutral NEUTRAL``): every committed
+      generated body under SOURCE matches what its harness-neutral source
+      regenerates, so Claude and Codex skill files cannot silently diverge.
+      ``--fix`` rewrites the bodies from the sources instead of reporting drift.
+
+    Exits 0 when everything is in sync, 1 on drift, and 2 when a directory is
+    missing or a neutral source is malformed.
     """
-    from sdlc.sync import SkillState, parity_report
+    from sdlc.skill_format import SkillFormatError
+    from sdlc.sync import (
+        GeneratedState,
+        SkillState,
+        generated_parity_report,
+        parity_report,
+        write_generated_skills,
+    )
 
-    try:
-        report = parity_report(source_dir, consumer_dir)
-    except FileNotFoundError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+    if neutral_dir is None and consumer_dir is None:
+        typer.echo(
+            "error: provide a CONSUMER_DIR and/or --neutral NEUTRAL_DIR.", err=True
+        )
+        raise typer.Exit(code=2)
 
-    if report.in_sync:
-        typer.echo(f"shared skills in sync ({len(report.skills)} skills).")
-        raise typer.Exit(code=0)
+    if fix and neutral_dir is None:
+        typer.echo("error: --fix requires --neutral.", err=True)
+        raise typer.Exit(code=2)
 
-    for skill in report.skills:
-        if skill.state is not SkillState.IN_SYNC:
-            typer.echo(f"{skill.name}: {skill.state.value}")
-    typer.echo("shared skills drifted — run `git submodule update --remote`.")
-    raise typer.Exit(code=1)
+    exit_code = 0
+
+    if neutral_dir is not None:
+        try:
+            if fix:
+                written = write_generated_skills(
+                    neutral_dir, source_dir, harness=harness
+                )
+                typer.echo(
+                    f"regenerated {len(written)} {harness} skill(s) "
+                    f"from {neutral_dir}."
+                )
+            else:
+                report = generated_parity_report(
+                    neutral_dir, source_dir, harness=harness
+                )
+                if report.in_sync:
+                    typer.echo(
+                        f"generated {harness} skills in sync "
+                        f"({len(report.skills)} skills)."
+                    )
+                else:
+                    for skill in report.skills:
+                        if skill.state is not GeneratedState.IN_SYNC:
+                            typer.echo(f"{skill.name}: {skill.state.value}")
+                            if skill.diff:
+                                typer.echo(skill.diff)
+                    typer.echo(
+                        "generated skills drifted — regenerate with "
+                        f"`sdlc sync-check {source_dir} --neutral {neutral_dir} "
+                        f"--harness {harness} --fix`."
+                    )
+                    exit_code = 1
+        except (FileNotFoundError, SkillFormatError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+
+    if consumer_dir is not None:
+        try:
+            report = parity_report(source_dir, consumer_dir)
+        except FileNotFoundError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+
+        if report.in_sync:
+            typer.echo(f"shared skills in sync ({len(report.skills)} skills).")
+        else:
+            for skill in report.skills:
+                if skill.state is not SkillState.IN_SYNC:
+                    typer.echo(f"{skill.name}: {skill.state.value}")
+            typer.echo("shared skills drifted — run `git submodule update --remote`.")
+            exit_code = 1
+
+    raise typer.Exit(code=exit_code)
 
 
 @app.command(name="generate-skills", help=PLANNED_SUBCOMMANDS["generate-skills"])

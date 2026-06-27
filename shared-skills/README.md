@@ -65,6 +65,27 @@ is `controller/src/sdlc/skill_generator.py`.
 The byte-parity `sdlc sync-check` below globs the top-level `*.md` skills only,
 so the `neutral/` subdirectory does not affect it.
 
+### Cross-harness parity gate (Story 20.4-003)
+
+A committed body (`<name>.md`) must always be exactly what its neutral source
+regenerates, or the Claude and Codex harnesses silently diverge. CI enforces
+this on every PR; run it locally with:
+
+```bash
+./scripts/sync-shared-skills.sh verify-generated
+```
+
+This delegates to `sdlc sync-check shared-skills --neutral shared-skills/neutral`
+and exits non-zero with a unified diff when any body drifts. The failure names
+the fix — rewrite the bodies from the sources:
+
+```bash
+./scripts/sync-shared-skills.sh regenerate   # sdlc sync-check … --fix
+```
+
+Pass explicit `[GENERATED_DIR] [NEUTRAL_DIR]` arguments to either subcommand to
+gate another generated tree (the defaults target this repo).
+
 ## Syncing (consumer side)
 
 A consumer repo pulls the latest shared skills with one command:
