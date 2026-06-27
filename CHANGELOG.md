@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.91.0] - 2026-06-27
+
+### Added
+
+- feat: add qwen harness privacy defaults
+
+
 ## [v1.90.0] - 2026-06-27
 
 ### Added
