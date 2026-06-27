@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.90.0] - 2026-06-27
+
+### Added
+
+- feat(cross-harness-portability): cross-harness parity ci (#20.4-003)
+
+### Shared skills
+
+Codex mirror artifact: bump the `shared-skills` submodule to this tag and run `git submodule update --remote` (see ADR-002).
+
+- feat(cross-harness-portability): cross-harness parity ci (#20.4-003)
+
+
 ## [v1.89.0] - 2026-06-27
 
 ### Added
