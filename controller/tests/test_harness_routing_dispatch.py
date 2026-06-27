@@ -6,7 +6,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from sdlc.build import BuildOptions, Ledger, run_build
+from sdlc.build import BuildOptions, Ledger, _harness_dispatch_kwargs, run_build
 from sdlc.cohort import Story
 from sdlc.harness import resolve_harness
 from sdlc.role_routing import PIPELINE_ROLES
@@ -211,3 +211,67 @@ def test_codex_route_survives_a_parallel_run(tmp_path) -> None:
     for call in disp.calls:
         assert call["agent_cmd"] == codex_argv
         assert call["parser"] == "codex-exec"
+
+
+# --- _harness_dispatch_kwargs: the helper every dispatch + recovery call site --
+# routes through. The integration tests above exercise it via `_dispatch_stage`;
+# these pin its full branch matrix directly, including the two paths no full run
+# reaches — the `SDLC_AGENT_CMD` env slot, and `model` decoration of the Claude
+# argv that the reask/commitlint/bugfix re-dispatches (Story 20.7-001) lean on.
+
+
+def test_dispatch_kwargs_empty_when_no_harness_map() -> None:
+    """No `--harness` map → an empty dict, so dispatch is byte-identical (AC3)."""
+    opts = BuildOptions(scope="epic-99")
+    assert _harness_dispatch_kwargs("build", opts, "opus") == {}
+
+
+def test_dispatch_kwargs_registry_harness_routes_argv_and_parser() -> None:
+    """A role mapped to a registry harness → that harness's argv + declared parser."""
+    codex_argv = resolve_harness("codex", config_path=CONFIG_PATH).to_argv()
+    opts = BuildOptions(scope="epic-99", harness_map={"build": "codex"})
+    kwargs = _harness_dispatch_kwargs("build", opts, "opus")
+    argv = kwargs["agent_cmd"]
+    assert isinstance(argv, list)
+    assert argv == codex_argv
+    assert kwargs["parser"] == "codex-exec"
+    # A registry entry owns its argv — the routed model never decorates it.
+    assert not any("opus" in token for token in argv)
+
+
+def test_dispatch_kwargs_builtin_claude_decorates_model_keeps_default_parser() -> None:
+    """A Claude (builtin) role → no parser override; the routed model decorates argv."""
+    opts = BuildOptions(scope="epic-99", harness_map={"build": "claude"})
+    kwargs = _harness_dispatch_kwargs("build", opts, "opus")
+    argv = kwargs["agent_cmd"]
+    assert isinstance(argv, list)
+    assert kwargs["parser"] is None
+    assert any("claude" in token for token in argv)
+    assert "--model" in argv
+    assert "opus" in argv
+
+
+def test_dispatch_kwargs_unmapped_stage_falls_back_to_claude() -> None:
+    """A stage outside a partial map → the built-in Claude slot, not the mapped one."""
+    opts = BuildOptions(scope="epic-99", harness_map={"build": "codex"})
+    kwargs = _harness_dispatch_kwargs("coverage", opts, None)
+    argv = kwargs["agent_cmd"]
+    assert isinstance(argv, list)
+    assert kwargs["parser"] is None
+    assert any("claude" in token for token in argv)
+
+
+def test_dispatch_kwargs_env_slot_owns_its_argv_and_ignores_model(monkeypatch) -> None:
+    """`SDLC_AGENT_CMD` re-expresses the Claude slot as an `env` harness (AC3).
+
+    The env override owns its own command + model, so dispatch keeps the default
+    (stream-json) parser and the routed model is deliberately not appended.
+    """
+    monkeypatch.setenv("SDLC_AGENT_CMD", "my-agent --flag")
+    opts = BuildOptions(scope="epic-99", harness_map={"build": "claude"})
+    kwargs = _harness_dispatch_kwargs("build", opts, "opus")
+    argv = kwargs["agent_cmd"]
+    assert isinstance(argv, list)
+    assert kwargs["parser"] is None
+    assert argv == ["my-agent", "--flag"]
+    assert "opus" not in argv
