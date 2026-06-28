@@ -13,6 +13,8 @@ from sdlc.role_routing import (
     PIPELINE_ROLES,
     ROLE_ALIASES,
     RoleRoutingError,
+    apply_registry_default,
+    bundled_config_path,
     canonical_role,
     check_review_bridge,
     default_registry_path,
@@ -20,12 +22,13 @@ from sdlc.role_routing import (
     load_repo_harness_defaults,
     merge_harness_defaults,
     parse_role_harness_map,
+    registry_default_harness,
     resolve_role_routing,
 )
 
 # The repo's checked-in default registry.
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "harnesses.yaml"
-REVIEWERS_PATH = Path(__file__).resolve().parents[1] / "config" / "adversarial-reviewers.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
+REVIEWERS_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "adversarial-reviewers.yaml"
 
 
 @pytest.fixture(autouse=True)
@@ -389,3 +392,116 @@ def test_merge_no_file_no_flag_is_empty() -> None:
 def test_merge_cli_only_is_unchanged() -> None:
     # With no file, the effective map is exactly the CLI map (today's behaviour).
     assert merge_harness_defaults({"build": "claude"}, None, {}) == {"build": "claude"}
+
+
+# ---------------------------------------------------------------------------
+# Config packaging / resolution (config-packaging fix)
+# ---------------------------------------------------------------------------
+
+
+def test_bundled_config_path_resolves_from_source() -> None:
+    # The four configs ship inside the package; the resolver returns a real,
+    # existing Path in the source/editable layout (and the same call resolves to
+    # site-packages under a `uv tool install`ed wheel).
+    path = bundled_config_path("harnesses.yaml")
+    assert path is not None
+    assert path.exists()
+    assert path == CONFIG_PATH
+
+
+def test_bundled_config_path_returns_none_for_absent_file() -> None:
+    assert bundled_config_path("does-not-exist.yaml") is None
+
+
+def test_default_registry_path_is_an_existing_path() -> None:
+    path = default_registry_path()
+    assert path is not None
+    assert path.exists()
+    # Downstream callers do Path(...).read_text()/.exists(), so it must be a Path.
+    assert isinstance(path, Path)
+
+
+def test_shipped_registry_resolves_codex_adapter() -> None:
+    # The shipped harnesses.yaml still validates and resolves codex -> its adapter.
+    resolved = resolve_role_routing({"build": "codex"}, config_path=default_registry_path())
+    assert resolved["build"].name == "codex"
+    assert "codex-build-adapter.sh" in resolved["build"].command
+
+
+# ---------------------------------------------------------------------------
+# Registry global default harness (config-default fix)
+# ---------------------------------------------------------------------------
+
+
+def test_registry_default_harness_reads_shipped_default() -> None:
+    # The shipped registry ships `default: claude`.
+    assert registry_default_harness(default_registry_path()) == "claude"
+
+
+def test_registry_default_harness_reads_configured_default(tmp_path: Path) -> None:
+    f = tmp_path / "harnesses.yaml"
+    f.write_text(
+        "default: codex\n"
+        "harnesses:\n"
+        "  codex:\n"
+        '    command: "scripts/codex-build-adapter.sh"\n'
+        "    parser: codex-exec\n",
+        encoding="utf-8",
+    )
+    assert registry_default_harness(f) == "codex"
+
+
+def test_registry_default_harness_none_path_is_none() -> None:
+    assert registry_default_harness(None) is None
+
+
+def test_registry_default_harness_absent_path_is_none(tmp_path: Path) -> None:
+    assert registry_default_harness(tmp_path / "nope.yaml") is None
+
+
+def test_registry_default_harness_undefined_default_fails_fast(tmp_path: Path) -> None:
+    # A registry naming an undefined default must fail fast (reuses the loader's
+    # validation) rather than silently routing to a non-existent harness.
+    from sdlc.harness import HarnessError
+
+    f = tmp_path / "harnesses.yaml"
+    f.write_text(
+        "default: ghost\n"
+        "harnesses:\n"
+        "  codex:\n"
+        '    command: "scripts/codex-build-adapter.sh"\n'
+        "    parser: codex-exec\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(HarnessError):
+        registry_default_harness(f)
+
+
+# --- default-selection precedence: flag > repo file > registry default -------
+
+
+def test_registry_default_fills_every_unmapped_role() -> None:
+    # (i) empty CLI map + registry default "codex" -> all roles route to codex.
+    effective = apply_registry_default({}, "codex")
+    assert set(effective) == set(PIPELINE_ROLES)
+    assert all(h == "codex" for h in effective.values())
+
+
+def test_cli_flag_overrides_registry_default() -> None:
+    # (ii) `--harness review=claude` + registry default "codex" -> review stays
+    # claude, every other role takes the registry default.
+    effective = apply_registry_default({"review": "claude"}, "codex")
+    assert effective["review"] == "claude"
+    assert all(effective[r] == "codex" for r in PIPELINE_ROLES if r != "review")
+
+
+def test_registry_default_claude_is_noop() -> None:
+    # (iii) registry default "claude" -> empty map stays empty (unchanged), so the
+    # CLI's empty-map fast path still skips routing entirely.
+    assert apply_registry_default({}, "claude") == {}
+    assert apply_registry_default({}, None) == {}
+
+
+def test_registry_default_does_not_clobber_existing_cli_map() -> None:
+    # A no-op default leaves a populated CLI map untouched.
+    assert apply_registry_default({"build": "codex"}, "claude") == {"build": "codex"}

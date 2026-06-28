@@ -7,7 +7,7 @@
 # the pattern it hit ("PATH\tPATTERN"). Exit status reflects whether any match
 # was found, so a CI gate can fail the check when the risk set is non-empty.
 #
-# Patterns are loaded from controller/config/high-risk-patterns.yaml (the
+# Patterns are loaded from controller/src/sdlc/config/high-risk-patterns.yaml (the
 # baseline shared with the controller's sdlc.risk_gate module) plus, when
 # present, an additive per-repo override at .sdlc-risk-config.yaml in REPO_ROOT.
 #
@@ -34,7 +34,7 @@ if [ -z "${repo_root}" ]; then
   repo_root="$(cd "${script_dir}/.." && pwd)"
 fi
 
-config_file="${RISK_GATE_CONFIG:-${repo_root}/controller/config/high-risk-patterns.yaml}"
+config_file="${RISK_GATE_CONFIG:-${repo_root}/controller/src/sdlc/config/high-risk-patterns.yaml}"
 override_file="${repo_root}/.sdlc-risk-config.yaml"
 
 if [ ! -f "${config_file}" ]; then

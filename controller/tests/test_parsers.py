@@ -107,7 +107,7 @@ def test_get_parser_unknown_id_fails_fast() -> None:
 def test_every_harness_parser_id_is_registered() -> None:
     # Config↔code consistency: each parser id declared in harnesses.yaml must
     # resolve to a registered parser, or a real harness run would crash.
-    config = Path(__file__).resolve().parents[1] / "config" / "harnesses.yaml"
+    config = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
     raw = yaml.safe_load(config.read_text(encoding="utf-8"))
     declared = {entry["parser"] for entry in raw["harnesses"].values()}
     assert declared, "harnesses.yaml declared no parsers"

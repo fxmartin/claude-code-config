@@ -156,6 +156,25 @@ def test_build_no_repo_harness_file_unchanged(tmp_path, monkeypatch) -> None:
     assert "2 stories" in result.output
 
 
+def test_build_malformed_registry_default_exits_cleanly(tmp_path, monkeypatch) -> None:
+    """A malformed registry `default:` (surfaced by the harness loader as
+    HarnessError, not RoleRoutingError) must exit 2 with a message, not a
+    traceback. Guards the fail-fast edge on the new `harnesses.yaml` `default:`
+    toggle this PR wires in."""
+    from sdlc.harness import HarnessError
+
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def _boom(_path):
+        raise HarnessError("default harness 'ghost' is not defined in 'harnesses'")
+
+    monkeypatch.setattr("sdlc.role_routing.registry_default_harness", _boom)
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+    assert result.exit_code == 2, result.output
+    assert "ghost" in result.output.lower()
+
+
 def test_build_limit_truncates_in_dry_run(tmp_path, monkeypatch) -> None:
     """`--limit=1` truncates the dry-run plan (dependency pull-in aside)."""
     _make_project(tmp_path)

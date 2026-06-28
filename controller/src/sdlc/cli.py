@@ -169,11 +169,31 @@ def build(ctx: typer.Context) -> None:
     # `--harness` map (precedence: CLI flag > repo file > built-in default) so the
     # preflight below and every stage dispatch see one effective role->harness map.
     # A malformed file or an unknown role fails fast here, the same path as the flag.
-    from sdlc.role_routing import RoleRoutingError, apply_repo_harness_defaults
+    from sdlc.harness import HarnessError
+    from sdlc.role_routing import (
+        RoleRoutingError,
+        apply_registry_default,
+        apply_repo_harness_defaults,
+        default_registry_path,
+        registry_default_harness,
+    )
 
     try:
         opts.harness_map = apply_repo_harness_defaults(opts.harness_map)
-    except RoleRoutingError as exc:
+        # The harness registry's top-level `default:` is the global default
+        # harness: it routes every role left unmapped by `--harness` and the repo
+        # `.sdlc-harness.yaml`. Precedence: --harness flag > repo file > registry
+        # default > built-in claude. A registry default of `claude` (or a missing
+        # registry) is a no-op, so the empty-map fast path below still skips
+        # routing and behaviour is byte-identical to today.
+        reg_default = registry_default_harness(default_registry_path())
+        opts.harness_map = apply_registry_default(opts.harness_map, reg_default)
+    except (RoleRoutingError, HarnessError) as exc:
+        # registry_default_harness delegates registry validation to the harness
+        # loader, which raises HarnessError (not RoleRoutingError) on a malformed
+        # registry or a `default:` naming an undefined harness — the most likely
+        # typo on the new toggle. Catch it here so it exits cleanly (2) like every
+        # other config error rather than surfacing a traceback.
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
 

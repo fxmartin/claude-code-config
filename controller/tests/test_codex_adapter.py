@@ -17,7 +17,7 @@ from sdlc.parsers import PlainResultParser, get_parser
 # The checked-in registry — the one a real run loads. Exercising the adapter
 # against it (rather than a bespoke tmp file) is what proves AC1: "harnesses.yaml
 # has a codex entry ... a build dispatches a build/coverage agent to it".
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "harnesses.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
 
 _VALID_BUILD = {
     "branch_name": "feature/20.3-001",

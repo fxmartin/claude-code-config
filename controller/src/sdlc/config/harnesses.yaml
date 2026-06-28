@@ -14,8 +14,23 @@
 # the controller substitutes before invoking the harness (same style as the reviewer
 # registry).
 
-# Harness used when a role/run names none.
+# Global default harness toggle.
+#
+# `default:` selects the active harness for EVERY pipeline role (build, coverage,
+# review, merge, docs) unless overridden by a `--harness role=…` CLI flag or a
+# per-repo `.sdlc-harness.yaml`. Precedence: --harness flag > repo file >
+# this default > built-in claude.
+#
+# To switch the whole controller to another harness, make exactly one `default:`
+# line active (uncomment it) and comment the others out — keep only ONE active
+# `default:` key so this stays valid YAML.
+#
+# NOTE: this file ships INSIDE the installed controller, so `uv tool install
+# --force` overwrites it back to the shipped default below. For a redeploy-safe,
+# per-repo switch that survives reinstalls, drop a `.sdlc-harness.yaml` in the
+# target repo instead of editing this line.
 default: claude
+# default: codex
 
 harnesses:
   # The built-in default. This entry mirrors dispatch.DEFAULT_AGENT_CMD for

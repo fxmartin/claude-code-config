@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from importlib import resources
 from pathlib import Path
 
 import yaml
 
 from sdlc.harness import (
+    DEFAULT_HARNESS,
     HarnessConfig,
     HarnessError,
     resolve_harness,
@@ -395,23 +397,98 @@ def review_reviewer_for(
     return None
 
 
-def _config_file(name: str) -> Path | None:
-    """Locate a checked-in controller config file, or ``None`` when absent.
+def bundled_config_path(name: str) -> Path | None:
+    """Locate a bundled controller config file, or ``None`` when absent.
 
-    Resolved relative to this package's source tree (``controller/config/<name>``).
-    Returns ``None`` when the file is missing — e.g. an installed wheel without the
-    repo's config dir — in which case the default-harness path needs no registry
-    and non-default routing fails fast with a clear message.
+    The four controller YAML configs ship inside the ``sdlc`` package
+    (``sdlc/config/<name>``) and are bundled into the wheel the same way the JSON
+    schemas are, so they resolve in BOTH layouts:
+
+    - an editable / source install (``uv run``, tests):
+      ``controller/src/sdlc/config/<name>``;
+    - an installed wheel (``uv tool install``):
+      ``…/site-packages/sdlc/config/<name>``.
+
+    ``importlib.resources`` returns a ``Traversable``; ``uv tool install`` unzips
+    the wheel onto disk, so converting it to a concrete :class:`pathlib.Path` via
+    ``str()`` yields a real filesystem path. Downstream callers do ``.read_text()``
+    and ``.exists()`` on a ``Path``, so a real ``Path`` is required (not a bare
+    ``Traversable``). Returns ``None`` when the file is genuinely absent.
     """
-    candidate = Path(__file__).resolve().parents[2] / "config" / name
+    candidate = Path(str(resources.files("sdlc") / "config" / name))
     return candidate if candidate.exists() else None
 
 
+def _config_file(name: str) -> Path | None:
+    """Locate a bundled controller config file, or ``None`` when absent.
+
+    Thin alias of :func:`bundled_config_path` kept for the registry/reviewer
+    loaders below.
+    """
+    return bundled_config_path(name)
+
+
 def default_registry_path() -> Path | None:
-    """The repo's harness registry (``controller/config/harnesses.yaml``), or None."""
+    """The bundled harness registry (``sdlc/config/harnesses.yaml``), or None."""
     return _config_file("harnesses.yaml")
 
 
 def default_reviewers_path() -> Path | None:
-    """The repo's reviewer registry (``controller/config/adversarial-reviewers.yaml``)."""
+    """The bundled reviewer registry (``sdlc/config/adversarial-reviewers.yaml``)."""
     return _config_file("adversarial-reviewers.yaml")
+
+
+def registry_default_harness(config_path: str | Path | None) -> str | None:
+    """The harness registry's top-level ``default:`` value, or ``None``.
+
+    Returns the global default harness declared in ``harnesses.yaml`` (the value
+    every unmapped pipeline role collapses to unless ``--harness`` or a repo
+    ``.sdlc-harness.yaml`` overrides it). Returns ``None`` when ``config_path`` is
+    ``None`` or the file does not exist (no registry wired → no global default,
+    behaviour unchanged).
+
+    Validation is delegated to :func:`sdlc.harness.load_harnesses_config`, so a
+    registry naming an undefined ``default`` still fails fast here rather than
+    silently routing to a non-existent harness.
+    """
+    if config_path is None:
+        return None
+    path = Path(config_path)
+    if not path.exists():
+        return None
+    # Local import keeps the harness loader off this module's hot import path.
+    from sdlc.harness import load_harnesses_config
+
+    # Validate the registry (raises HarnessError on an undefined default), then
+    # read the raw `default` key — load_harnesses_config returns only the harness
+    # map, not the top-level default, so the YAML is re-read for that one value.
+    load_harnesses_config(path)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    default = raw.get("default") if isinstance(raw, dict) else None
+    return str(default) if default else None
+
+
+def apply_registry_default(
+    cli_map: Mapping[str, str] | None,
+    reg_default: str | None,
+) -> dict[str, str]:
+    """Fill every unmapped pipeline role with the registry's global ``default:``.
+
+    ``cli_map`` is the run's effective role->harness map after the CLI flag and any
+    repo ``.sdlc-harness.yaml`` have already been merged (it already wins per role).
+    ``reg_default`` is the harness registry's top-level ``default:`` value (see
+    :func:`registry_default_harness`).
+
+    Returns a copy of ``cli_map`` with each role in :data:`PIPELINE_ROLES` that is
+    still unmapped defaulted to ``reg_default``. The precedence this completes is:
+    ``--harness`` flag > repo ``.sdlc-harness.yaml`` > registry ``default:`` >
+    built-in ``claude``. A ``reg_default`` of ``None`` or the built-in
+    ``claude`` is a deliberate no-op — the map is returned unchanged, so an empty
+    map stays empty and the caller's empty-map fast path still skips routing
+    (behaviour byte-identical to today).
+    """
+    effective = dict(cli_map or {})
+    if reg_default and reg_default != DEFAULT_HARNESS:
+        for role in PIPELINE_ROLES:
+            effective.setdefault(role, reg_default)
+    return effective

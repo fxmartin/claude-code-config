@@ -17,7 +17,7 @@ from sdlc.harness import (
 
 # The repo's checked-in registry — the one a real run loads (proves AC2 against
 # the real codex entry rather than a bespoke fixture).
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "harnesses.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
 
 
 def _registry_harness(**overrides) -> HarnessConfig:

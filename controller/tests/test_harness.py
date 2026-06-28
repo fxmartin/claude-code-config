@@ -19,7 +19,7 @@ from sdlc.harness import (
 )
 
 # The repo's checked-in default registry.
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "harnesses.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
 
 
 # ---------------------------------------------------------------------------

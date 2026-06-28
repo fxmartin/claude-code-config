@@ -15,7 +15,7 @@ from sdlc.harness import dispatch_on_harness, resolve_harness
 from sdlc.parsers import PlainResultParser, get_parser
 from sdlc.role_routing import PIPELINE_ROLES, resolve_role_routing
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "harnesses.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
 
 _VALID_BUILD = {
     "branch_name": "feature/qwen",

@@ -6,7 +6,7 @@
 The controller dispatches each pipeline role (build, coverage/qa, review, merge,
 docs) to a **harness** — an agent CLI wrapped so it speaks one neutral contract.
 Adding a harness is a **config + wrapper-script change, no Python edits**: you
-declare an entry in [`controller/config/harnesses.yaml`](../controller/config/harnesses.yaml),
+declare an entry in [`controller/src/sdlc/config/harnesses.yaml`](../controller/src/sdlc/config/harnesses.yaml),
 point it at a wrapper script, reuse an existing output parser, and declare what
 the harness can do. The controller code never changes.
 
@@ -166,7 +166,7 @@ controller/adapters/acme-adapter.sh --self-test   # confirms the contract round-
 ```
 
 **Step 2 — registry entry.** Add a key under `harnesses:` in
-`controller/config/harnesses.yaml` (the existing `default: claude` and the
+`controller/src/sdlc/config/harnesses.yaml` (the existing `default: claude` and the
 `claude`/`codex` entries stay as they are):
 
 ```yaml
@@ -271,7 +271,7 @@ default:
 
 The file is validated in the same preflight as the flag: a malformed file, an
 unknown role, or a `default:`/`roles:` harness that is unknown or disabled in
-[`controller/config/harnesses.yaml`](../controller/config/harnesses.yaml) fails
+[`controller/src/sdlc/config/harnesses.yaml`](../controller/src/sdlc/config/harnesses.yaml) fails
 fast (exit 2) before any stage runs — no half-run.
 
 ## Candidate future targets
@@ -286,7 +286,7 @@ projects:
 
 Each is the same recipe: a wrapper that maps stdin→CLI and CLI-stdout→result
 block, a `harnesses.yaml` entry with `parser: codex-exec`, and honest capability
-flags. The [codex and qwen entries](../controller/config/harnesses.yaml) are the
+flags. The [codex and qwen entries](../controller/src/sdlc/config/harnesses.yaml) are the
 canonical real-world examples to copy from.
 
 ## Where the boundary stays Claude-only
