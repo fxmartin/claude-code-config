@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.98.0] - 2026-06-28
+
+### Added
+
+- feat(install): symlink build adapters onto path in core mode (#241)
+
+
 ## [v1.97.0] - 2026-06-28
 
 ### Added
