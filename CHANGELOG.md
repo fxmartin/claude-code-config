@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.99.0] - 2026-06-28
+
+### Added
+
+- feat(github-story-mirror): code-host adapter — github (#22.2-001)
+
+
 ## [v1.98.0] - 2026-06-28
 
 ### Added
