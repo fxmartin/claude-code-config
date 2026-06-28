@@ -191,17 +191,50 @@ CREATE INDEX IF NOT EXISTS idx_runs_status     ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_run_ts   ON events(run_id, ts);
 """
 
+# story_inventory: Epic-22 (Story 22.1-001) cross-backlog cache — one row per
+# story across *every* epic, keyed by the bare story id (not per-run like the
+# `stories` table). The local projection the host issue mirror and the portfolio
+# dashboard both render from. `status`/`owner`/`issue_ref` are written by sync and
+# the build (not hand-edited); `host`+`issue_ref` together identify the remote
+# item (GitHub issue number / GitLab iid, stored host-neutral as text); `harness`
+# is the derived per-story harness summary (Epic-20 20.2-002). Kept as a standalone
+# constant so it can be both embedded in `_SCHEMA_DDL` (fresh DB) and run by
+# Migration 7 (upgrade an existing ledger), guaranteeing both paths are identical.
+_STORY_INVENTORY_DDL = """
+CREATE TABLE IF NOT EXISTS story_inventory (
+    story_id    TEXT PRIMARY KEY,                -- bare story id, e.g. '22.1-001'.
+    epic        TEXT,                            -- e.g. '22'.
+    feature     TEXT,                            -- e.g. '22.1'.
+    title       TEXT,
+    points      INTEGER,
+    risk        TEXT,                            -- 'Low' | 'Medium' | 'High'.
+    status      TEXT,                            -- cached execution status (sync/build owned).
+    owner       TEXT,                            -- cached read of the host assignee.
+    host        TEXT,                            -- 'github' | 'gitlab'.
+    issue_ref   TEXT,                            -- GitHub issue number / GitLab iid (host-neutral text).
+    harness     TEXT,                            -- derived per-story harness summary (Epic-20 20.2-002).
+    updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# The base DDL plus every standalone table constant, run as one script by
+# ``Ledger.init()`` on a fresh DB (each statement is ``IF NOT EXISTS``).
+_SCHEMA_DDL = _SCHEMA_DDL + _STORY_INVENTORY_DDL
+
 _TERMINAL_RUN_STATES = {
     "DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION", "AWAITING_APPROVAL",
 }
 
-# Schema migrations applied by Ledger.init() after the base DDL. Each entry adds
-# missing columns to an existing ledger idempotently (guarded by PRAGMA
-# table_info, so a fresh DB created with the up-to-date DDL is a no-op) and is
-# recorded in the _migrations table so it runs at most once per DB. Migration 1
-# adds the per-stage token/cost columns to a pre-existing ledger without
-# touching its rows (old stages keep NULL usage and render as "—").
-_MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
+# Schema migrations applied by Ledger.init() after the base DDL. Each entry is
+# ``(version, name, table, columns, create_sql)``. Most entries add missing
+# columns to an existing ledger idempotently (guarded by PRAGMA table_info, so a
+# fresh DB created with the up-to-date DDL is a no-op); an entry whose
+# ``create_sql`` is set instead runs that ``CREATE TABLE IF NOT EXISTS`` to add a
+# whole new table to a pre-existing ledger (the column-add path cannot, since the
+# table is absent). Each is recorded in the _migrations table so it runs at most
+# once per DB. Migration 1 adds the per-stage token/cost columns to a pre-existing
+# ledger without touching its rows (old stages keep NULL usage and render as "—").
+_MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (
         1,
         "stage usage columns",
@@ -214,6 +247,7 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
             ("cache_creation_tokens", "INTEGER"),
             ("cost_usd", "REAL"),
         ],
+        None,
     ),
     # Migration 2 adds the sub-stage progress columns (Story 11.1-002) to a
     # pre-existing ledger. Additive and back-compatible: old event rows keep
@@ -227,6 +261,7 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
             ("stage", "TEXT"),
             ("kind", "TEXT"),
         ],
+        None,
     ),
     # Migration 3 adds the pre-dispatch estimate columns (Story 14.1-002) to a
     # pre-existing ledger. Additive and back-compatible: old stage rows keep NULL
@@ -240,6 +275,7 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
             ("estimated_tokens", "INTEGER"),
             ("estimated_cost_usd", "REAL"),
         ],
+        None,
     ),
     # Migration 4 adds the wave (cohort) index + intra-queue dependency list
     # (Story 11.2-007) to a pre-existing ledger's `stories` table. Additive and
@@ -254,6 +290,7 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
             ("wave", "INTEGER"),
             ("dependencies", "TEXT"),
         ],
+        None,
     ),
     # Migration 5 adds the per-story worktree path (Story 17.2-001) to a
     # pre-existing ledger's `stories` table. Additive and back-compatible: old
@@ -267,6 +304,7 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
         [
             ("worktree_path", "TEXT"),
         ],
+        None,
     ),
     # Migration 6 adds the per-stage harness (Story 20.2-002) to a pre-existing
     # ledger's `stages` table. Additive and back-compatible: old stage rows keep
@@ -281,6 +319,20 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]]]] = [
         [
             ("harness", "TEXT"),
         ],
+        None,
+    ),
+    # Migration 7 adds the Epic-22 (Story 22.1-001) `story_inventory` cross-backlog
+    # cache to a pre-existing ledger. Unlike the column-add migrations above, the
+    # table is wholly new, so it carries a ``CREATE TABLE IF NOT EXISTS`` rather
+    # than an ALTER column list. Additive and back-compatible: existing rows in
+    # every other table are untouched; a fresh DB created from the up-to-date DDL
+    # already has the table, so this is a no-op there.
+    (
+        7,
+        "story inventory table",
+        "story_inventory",
+        [],
+        _STORY_INVENTORY_DDL,
     ),
 ]
 
@@ -305,9 +357,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         "applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
     applied = {r[0] for r in conn.execute("SELECT version FROM _migrations").fetchall()}
-    for version, name, table, columns in _MIGRATIONS:
+    for version, name, table, columns, create_sql in _MIGRATIONS:
         if version in applied:
             continue
+        # A table-creation migration brings a wholly new table onto a pre-existing
+        # ledger (the column-add path below cannot, since PRAGMA table_info is
+        # empty for an absent table). The DDL is ``CREATE TABLE IF NOT EXISTS``, so
+        # it is a no-op when ``init`` already created the table from the base DDL.
+        if create_sql:
+            conn.executescript(create_sql)
         # A pre-framework ledger may be missing the target table entirely (a
         # partial ancient DB). PRAGMA table_info returns empty for an absent
         # table, so guard the ALTERs on table existence and still record the

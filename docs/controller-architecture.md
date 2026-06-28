@@ -338,12 +338,19 @@ behaviour — the same effective timeout it always had.
 
 ### Schema migrations (auto-applied at launch)
 
-The schema evolves additively: each `_MIGRATIONS` entry in `build.py` adds
-missing columns to an existing ledger via `ALTER TABLE`, guarded by
-`PRAGMA table_info` so a fresh DB built from the current DDL is a no-op, and
-records its version in the `_migrations` table so it runs at most once per DB
-(`_apply_migrations`). A fresh `build` gets this for free — `Ledger.init()`
-runs the DDL then `_apply_migrations`.
+The schema evolves additively: each `_MIGRATIONS` entry in `build.py` is
+`(version, name, table, columns, create_sql)`. Most entries add missing columns
+to an existing ledger via `ALTER TABLE`, guarded by `PRAGMA table_info` so a
+fresh DB built from the current DDL is a no-op, and record their version in the
+`_migrations` table so they run at most once per DB (`_apply_migrations`). An
+entry whose `create_sql` is set instead runs a `CREATE TABLE IF NOT EXISTS` to
+bring a *whole new table* onto a pre-existing ledger (the column-add path cannot,
+since `PRAGMA table_info` is empty for an absent table) — used by Migration 7 for
+the Epic-22 `story_inventory` cross-backlog cache. The new-table DDL lives in a
+standalone constant (`_STORY_INVENTORY_DDL`) embedded into `_SCHEMA_DDL` *and*
+referenced by its migration, so the fresh-create and upgrade paths are identical.
+A fresh `build` gets all of this for free — `Ledger.init()` runs the DDL then
+`_apply_migrations`.
 
 The read/recovery verbs, however, open the ledger **read-only** (`_connect_ro`),
 and a read-only connection cannot `ALTER TABLE`. So a ledger that predates a
