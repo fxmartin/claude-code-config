@@ -237,11 +237,15 @@ def test_resolve_named_harness_from_registry(monkeypatch) -> None:
     harness = resolve_harness("codex", config_path=CONFIG_PATH)
     assert harness.source == "registry"
     assert harness.name == "codex"
-    # With no stage, the {model} placeholder resolves to the harness default model
-    # (Story 20.7-004); the wrapper is still the first token and no claude appears.
+    # The shipped codex harness ships WITHOUT a per-stage model map (issue #228):
+    # its argv is the bare wrapper, so Codex uses the account's own configured
+    # model and no `--model` entitlement is assumed. Per-stage routing is opt-in
+    # (exercised in test_harness_model_routing.py).
     argv = resolve_agent_argv("codex", config_path=CONFIG_PATH)
     assert argv[0] == "codex-build-adapter.sh"
-    assert argv[argv.index("--model") + 1] == harness.models["default"]
+    assert "--model" not in argv
+    assert harness.models == {}
+    assert not any("claude" in token for token in argv)
 
 
 def test_resolve_qwen_harness_from_registry(monkeypatch) -> None:

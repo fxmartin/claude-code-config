@@ -127,14 +127,40 @@ def test_env_slot_ignores_stage_and_model(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC2: the checked-in codex harness maps each pipeline stage to its own model.
+# AC2: an OPT-IN codex harness maps each pipeline stage to its own model.
+#
+# The shipped codex entry intentionally ships WITHOUT a models map (issue #228:
+# hardcoded ids 400'd on a ChatGPT-account Codex), so the portable default uses
+# the account's own model. These tests therefore drive the per-stage routing
+# mechanism from an explicit opt-in config — what a user writes when they enable
+# it with model ids they're entitled to.
 # ---------------------------------------------------------------------------
 
 
-def test_codex_harness_routes_each_stage_to_its_mapped_model() -> None:
-    codex = resolve_harness("codex", config_path=CONFIG_PATH)
+def _opt_in_codex_config(tmp_path: Path) -> Path:
+    """A codex entry that opts in to per-stage model routing (distinct cost tiers)."""
+    cfg = tmp_path / "harnesses.yaml"
+    cfg.write_text(
+        "harnesses:\n"
+        "  codex:\n"
+        "    command: codex-build-adapter.sh --model {model}\n"
+        "    parser: codex-exec\n"
+        "    models:\n"
+        "      default: ex-base\n"
+        "      build: ex-pro\n"
+        "      coverage: ex-mini\n"
+        "      review: ex-pro\n"
+        "      merge: ex-mini\n"
+        "      adversarial: ex-high\n",
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_codex_harness_routes_each_stage_to_its_mapped_model(tmp_path: Path) -> None:
+    codex = resolve_harness("codex", config_path=_opt_in_codex_config(tmp_path))
     assert "{model}" in codex.command
-    # Each pipeline stage's worker launches with its own OpenAI model id.
+    # Each pipeline stage's worker launches with its own model id.
     for stage in ("build", "coverage", "review", "merge", "adversarial"):
         argv = codex.to_argv(stage=stage)
         assert argv[0] == "codex-build-adapter.sh"
@@ -144,14 +170,14 @@ def test_codex_harness_routes_each_stage_to_its_mapped_model() -> None:
         assert not any("claude" in token for token in argv)
 
 
-def test_codex_stage_models_differ_by_cost_tier() -> None:
+def test_codex_stage_models_differ_by_cost_tier(tmp_path: Path) -> None:
     """The cheaper mechanical stages route to a different model than build/review."""
-    codex = resolve_harness("codex", config_path=CONFIG_PATH)
+    codex = resolve_harness("codex", config_path=_opt_in_codex_config(tmp_path))
     assert codex.resolve_model("merge") != codex.resolve_model("build")
 
 
-def test_codex_unmapped_stage_uses_default_model() -> None:
-    codex = resolve_harness("codex", config_path=CONFIG_PATH)
+def test_codex_unmapped_stage_uses_default_model(tmp_path: Path) -> None:
+    codex = resolve_harness("codex", config_path=_opt_in_codex_config(tmp_path))
     # bugfix/reask are routable recovery stages absent from the AC stage list;
     # they fall back to the harness default rather than crashing.
     assert codex.resolve_model("bugfix") == codex.models["default"]
@@ -216,13 +242,19 @@ def test_schema_allows_models_property() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_loop_launches_each_codex_stage_with_its_mapped_model(tmp_path) -> None:
+def test_build_loop_launches_each_codex_stage_with_its_mapped_model(tmp_path, monkeypatch) -> None:
+    import sdlc.role_routing as role_routing
     from sdlc.build import BuildOptions, Ledger, run_build
     from sdlc.cohort import Story
     from sdlc.dispatch import AgentResult
     from sdlc.role_routing import PIPELINE_ROLES
 
-    codex = resolve_harness("codex", config_path=CONFIG_PATH)
+    # The build loop resolves each stage's harness from `default_registry_path()`
+    # (the shipped registry). Point it at the opt-in config so the real dispatch
+    # path renders the per-stage `--model` argv we then assert on.
+    cfg = _opt_in_codex_config(tmp_path)
+    monkeypatch.setattr(role_routing, "default_registry_path", lambda: cfg)
+    codex = resolve_harness("codex", config_path=cfg)
     payloads = {
         "build": {"branch_name": "feature/m1-001", "build_status": "SUCCESS", "commit_sha": "dead"},
         "coverage": {
