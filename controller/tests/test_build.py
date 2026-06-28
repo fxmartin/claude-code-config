@@ -1423,6 +1423,14 @@ def test_stage_artifact_exists_is_stage_aware(tmp_path, monkeypatch) -> None:
     assert _stage_artifact_exists("merge", "x", 100, root=tmp_path) is True
     assert landing_calls["n"] == 1
 
+    # merge ignores the branch-commit signal entirely: a commit on the branch
+    # (always present at merge time) is NOT evidence the merge landed, so when
+    # landing detection says "not landed" the artifact is absent despite the
+    # commit — otherwise an unlanded merge would be masked as recoverable (#232).
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
+    monkeypatch.setattr(reconcile_mod, "_detect_landing", lambda sid, pr, base, root: None)
+    assert _stage_artifact_exists("merge", "x", 100, root=tmp_path) is False
+
 
 def test_merge_contract_error_with_landing_recovers_not_failed(
     tmp_path, monkeypatch
@@ -1478,6 +1486,39 @@ def test_merge_contract_error_without_artifact_still_fails(
         ledger=Ledger(tmp_path / "l.db"),
         dispatcher=disp,
         preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "FAILED"
+    assert result.failed == 1
+    assert result.needs_attention == 0
+
+
+def test_merge_contract_error_unlanded_with_branch_commit_still_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """An unlanded merge is FAILED even though feature/<id> carries commits (#232).
+
+    This is the realistic merge-stage state: build/coverage/review already
+    authored commits, so ``story_commit_exists`` is true. A branch commit is NOT
+    evidence the merge landed, so the merge artifact probe must rely solely on
+    landing detection — otherwise a genuine merge failure (conflict, gh error)
+    whose result block was lost would be masked as recoverable.
+    """
+    import sdlc.reconcile as reconcile_mod
+
+    # Realistic: the branch carries the earlier reviewed commits ...
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
+    # ... but the merge never landed.
+    monkeypatch.setattr(
+        reconcile_mod, "_detect_landing", lambda sid, pr, base, root: None
+    )
+    disp = _RaisingDispatcher(raise_on="merge", bugfix_fixed=False)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+        root=tmp_path,
     )
     assert result.story_status["99.1-001"] == "FAILED"
     assert result.failed == 1

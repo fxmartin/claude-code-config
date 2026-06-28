@@ -3018,27 +3018,29 @@ def _stage_artifact_exists(
       committed-but-unmerged branch here, so these stages deliberately never
       consult landing detection.
     - ``merge`` *lands* the work, so its artifact is a merged PR / commit present
-      on base. Reuse reconcile's :func:`_detect_landing` (is-ancestor /
-      git-cherry / gh-pr-merged / commit-tag) — the same detection a later
-      ``sdlc reconcile`` uses — so the two paths agree. The branch-commit signal
-      is still accepted first for the merge stage too: a merge whose branch
-      carries the committed work but has not yet landed is recoverable (the
-      commit is real and reconcile can later confirm the merge).
+      on base. Its existence is decided **solely** by reconcile's
+      :func:`_detect_landing` (is-ancestor / git-cherry / gh-pr-merged /
+      commit-tag) — the same detection a later ``sdlc reconcile`` uses, so the
+      two paths agree. The branch-commit probe is deliberately NOT consulted for
+      ``merge``: by the time the merge stage runs, ``feature/<id>`` always
+      carries the earlier build/coverage/review commits, so
+      :func:`story_commit_exists` is unconditionally true here and is *not*
+      evidence the merge landed. Accepting it would mask an unlanded merge
+      (conflict, ``gh`` failure) as recoverable instead of the honest FAILED.
 
     Best-effort and never raises: the underlying probes swallow git errors and
     degrade to "no artifact", preserving the conservative hard-FAILED path.
     """
     root = root or Path.cwd()
-    if story_commit_exists(story_id, root=root):
-        return True
     if stage == "merge":
-        # Imported lazily: reconcile imports from build, so a top-level import
-        # would be circular.
+        # The merge artifact is a *landed* merge, not a branch commit (which is
+        # always present here). Imported lazily: reconcile imports from build, so
+        # a top-level import would be circular.
         from sdlc.reconcile import _detect_landing
 
         base = _base_ref(root)
         return _detect_landing(story_id, pr_number, base, root) is not None
-    return False
+    return story_commit_exists(story_id, root=root)
 
 
 def _commit_message(ref: str, root: Path | None = None) -> str | None:
