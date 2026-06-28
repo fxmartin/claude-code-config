@@ -418,6 +418,36 @@ and maps the epic to an `epic-NN` milestone (points stay the `points:N` label).
 The full label/board schema per host is in
 [`docs/issue-host-adapters.md`](issue-host-adapters.md).
 
+### Idempotent story ↔ issue mapping (Story 22.2-003)
+
+`story_mirror.py` is the engine that maps each story to **exactly one** host
+issue, so re-running the mirror **updates** issues instead of duplicating them.
+The mapping lives in the inventory (`story_inventory.host` + `issue_ref`) and is
+recoverable from the issue body's `<!-- sdlc-story: <id> -->` marker via the
+adapter's `issue_find`. `mirror_story(adapter, ledger, doc)` resolves in three
+steps and returns a `MirrorOutcome` (`created` / `updated` / `recovered` /
+`recreated`):
+
+1. **By inventory ref** — if the story is mapped *on this host* and the ref still
+   resolves, the issue is updated (`updated`). A ref recorded for a *different*
+   host is ignored (this host is unmapped); cross-host refs never collide.
+2. **By marker** — if there is no usable ref, or the ref no longer resolves (the
+   issue was deleted on the host), the issue is re-discovered by its marker via
+   `issue_find`. Found → refreshed and the mapping re-recorded (`recovered`), so
+   a wiped local ledger never produces a duplicate.
+3. **Create / re-create** — nothing maps and nothing is found: a fresh story gets
+   a new issue (`created`); an orphaned mapping whose issue *and* marker are both
+   gone is re-created (`recreated`), never silently dropped.
+
+The mapping is read/written through `Ledger.inventory_get_mapping()` /
+`inventory_set_mapping()`, which touch only the cache columns — the projector
+still owns the spec columns (one writer per field). `mirror_stories()` batches
+the pass through the single adapter (one rate-limit seam) and persists each
+mapping as it goes, so an interrupted run resumes cheaply. The update step writes
+the freshly rendered managed block; preserving human content *outside* the
+managed region is the reconcile/sync path's concern (Story 22.4-001), not the
+mapping engine's.
+
 Per Epic-12's non-goals there is no `sdlc migrate` verb — migrations apply
 automatically at launch.
 
