@@ -2978,6 +2978,46 @@ def story_commit_exists(story_id: str, root: Path | None = None) -> bool:
         return False
 
 
+def _stage_artifact_exists(
+    stage: str,
+    story_id: str,
+    pr_number: int | None = None,
+    root: Path | None = None,
+) -> bool:
+    """True when ``stage``'s expected git artifact for ``story_id`` actually exists.
+
+    The deliverable differs by stage, so one uniform "did the work survive?"
+    probe would misjudge one of them (#232):
+
+    - ``build`` / ``coverage`` / ``review`` author a commit on ``feature/<id>``
+      *ahead of base* — not necessarily merged — so :func:`story_commit_exists`
+      is the right probe. A merged-to-main check would wrongly reject an honestly
+      committed-but-unmerged branch here, so these stages deliberately never
+      consult landing detection.
+    - ``merge`` *lands* the work, so its artifact is a merged PR / commit present
+      on base. Reuse reconcile's :func:`_detect_landing` (is-ancestor /
+      git-cherry / gh-pr-merged / commit-tag) — the same detection a later
+      ``sdlc reconcile`` uses — so the two paths agree. The branch-commit signal
+      is still accepted first for the merge stage too: a merge whose branch
+      carries the committed work but has not yet landed is recoverable (the
+      commit is real and reconcile can later confirm the merge).
+
+    Best-effort and never raises: the underlying probes swallow git errors and
+    degrade to "no artifact", preserving the conservative hard-FAILED path.
+    """
+    root = root or Path.cwd()
+    if story_commit_exists(story_id, root=root):
+        return True
+    if stage == "merge":
+        # Imported lazily: reconcile imports from build, so a top-level import
+        # would be circular.
+        from sdlc.reconcile import _detect_landing
+
+        base = _base_ref(root)
+        return _detect_landing(story_id, pr_number, base, root) is not None
+    return False
+
+
 def _commit_message(ref: str, root: Path | None = None) -> str | None:
     """The full commit message of ``ref``'s tip, or ``None`` if unreadable.
 
@@ -4080,7 +4120,9 @@ def _run_story(
                     # Recovery exhausted (AC2). R10: never discard committed work —
                     # if the agent already committed the story branch, park it for
                     # manual push/MR rather than reporting an outright failure.
-                    return _exhausted_status(kind, story.id, ledger, run_id)
+                    return _exhausted_status(
+                        kind, stage, story.id, pr_number, ledger, run_id
+                    )
 
                 bugfix_attempts += 1
                 bugfix_seq += 1
@@ -4090,7 +4132,9 @@ def _run_story(
                     bpath, bugfix_seq,
                     escalation_steps=stage_escalation_base + bugfix_attempts,
                 ):
-                    return _exhausted_status(kind, story.id, ledger, run_id)
+                    return _exhausted_status(
+                        kind, stage, story.id, pr_number, ledger, run_id
+                    )
                 # Story 12.2-002: the bugfix agent authors a commit too — lint its
                 # message and amend early. This is best-effort (no park): the stage
                 # is about to be retried, and that retry's own success-time lint is
@@ -4146,17 +4190,27 @@ def _run_story(
 
 
 def _exhausted_status(
-    kind: str, story_id: str, ledger: Ledger, run_id: str
+    kind: str,
+    stage: str,
+    story_id: str,
+    pr_number: int | None,
+    ledger: Ledger,
+    run_id: str,
 ) -> str:
     """Terminal status once bounded recovery is exhausted (Story 12.1-001 AC2).
 
-    R10: a contract failure (missing/malformed envelope) whose agent already
-    committed the story branch is parked ``NEEDS_ATTENTION`` for manual push/MR
-    — committed work is never discarded. Any other exhausted failure (or an
-    uncommitted contract failure) is an outright ``FAILED``, unchanged from
-    before. The parking decision is recorded in the ledger events.
+    R10: a contract failure (missing/malformed envelope) whose stage already
+    produced its expected git artifact is parked ``NEEDS_ATTENTION`` for manual
+    push/MR — committed work is never discarded. The artifact probe is
+    stage-aware (#232): ``build``/``coverage``/``review`` look for a commit on
+    ``feature/<id>``; ``merge`` looks for a landed PR via reconcile's
+    ``_detect_landing`` (a commit-ahead probe cannot see a merged-away branch).
+    Any other exhausted failure (a ``dispatch``/``reported`` kind, or a contract
+    failure with no artifact) is an outright ``FAILED``, unchanged from before —
+    a genuine no-work failure is never masked. The parking decision is recorded
+    in the ledger events.
     """
-    if kind == "contract" and story_commit_exists(story_id):
+    if kind == "contract" and _stage_artifact_exists(stage, story_id, pr_number):
         ledger.event_log(
             run_id, story_id, "warn", "controller",
             f"recovery exhausted but work committed on feature/{story_id} — "

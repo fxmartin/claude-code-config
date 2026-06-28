@@ -1240,6 +1240,138 @@ def test_contract_error_without_commit_still_fails(tmp_path, monkeypatch) -> Non
 
 
 # ---------------------------------------------------------------------------
+# Issue #232 — a committed-but-unvalidated stage is recoverable, not hard FAILED.
+# The artifact a stage leaves behind differs by stage: build/coverage/review
+# leave a commit on feature/<id>; merge lands a PR. The exhaustion classifier
+# must probe the *right* artifact per stage (reusing reconcile's _detect_landing
+# for merge) so a merge that actually landed but lost its result block parks
+# NEEDS_ATTENTION rather than cascading a false FAILED.
+# ---------------------------------------------------------------------------
+
+
+def test_stage_artifact_exists_is_stage_aware(tmp_path, monkeypatch) -> None:
+    """build probes the feature-branch commit; merge probes the merged PR (#232)."""
+    import sdlc.reconcile as reconcile_mod
+    from sdlc.build import _stage_artifact_exists
+
+    landing_calls = {"n": 0}
+
+    def fake_landing(sid, pr, base, root):
+        landing_calls["n"] += 1
+        return ("gh-pr-merged", "abc1234")
+
+    monkeypatch.setattr(reconcile_mod, "_detect_landing", fake_landing)
+
+    # build: only the commit-ahead-of-base probe decides; landing is never
+    # consulted (a merged-to-main check would wrongly reject an honestly
+    # committed-but-unmerged branch). This is the unchanged pre-#232 behaviour.
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
+    assert _stage_artifact_exists("build", "x", None, root=tmp_path) is True
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    assert _stage_artifact_exists("build", "x", None, root=tmp_path) is False
+    assert landing_calls["n"] == 0  # build never falls back to landing detection
+
+    # merge: with no commit ahead of base, the merged-PR landing is the artifact.
+    assert _stage_artifact_exists("merge", "x", 100, root=tmp_path) is True
+    assert landing_calls["n"] == 1
+
+
+def test_merge_contract_error_with_landing_recovers_not_failed(
+    tmp_path, monkeypatch
+) -> None:
+    """A merge whose result block is unparseable but whose PR landed parks
+    NEEDS_ATTENTION, never hard FAILED (#232).
+
+    ``story_commit_exists`` (a commit-ahead-of-base probe) cannot see a landing
+    once the branch has merged/squashed away, so the pre-#232 classifier would
+    fail the merge outright. Reusing reconcile's ``_detect_landing`` recognises
+    the merged PR and preserves the work.
+    """
+    import sdlc.reconcile as reconcile_mod
+
+    # No commit ahead of base (branch merged away) ...
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    # ... but the PR provably landed.
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_detect_landing",
+        lambda sid, pr, base, root: ("gh-pr-merged", "cafef00d"),
+    )
+    disp = _RaisingDispatcher(raise_on="merge", bugfix_fixed=False)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+    assert result.needs_attention == 1
+    assert result.failed == 0
+
+
+def test_merge_contract_error_without_artifact_still_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """No commit and no landing ⇒ unchanged hard FAILED (#232 regression guard)."""
+    import sdlc.reconcile as reconcile_mod
+
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    monkeypatch.setattr(
+        reconcile_mod, "_detect_landing", lambda sid, pr, base, root: None
+    )
+    disp = _RaisingDispatcher(raise_on="merge", bugfix_fixed=False)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "FAILED"
+    assert result.failed == 1
+    assert result.needs_attention == 0
+
+
+def test_recovered_merge_converges_to_done_on_reconcile(
+    tmp_path, monkeypatch
+) -> None:
+    """reconcile converges a #232-parked merge to DONE once the landing shows.
+
+    The recoverable NEEDS_ATTENTION is idempotent with ``sdlc reconcile``: a
+    later reconcile re-checks the parked story against the landing and flips it
+    to its true status (DONE), exactly as it would for any other parked story.
+    """
+    import sdlc.reconcile as reconcile_mod
+    from sdlc.reconcile import reconcile_run
+
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: False)
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_detect_landing",
+        lambda sid, pr, base, root: ("gh-pr-merged", "cafef00d"),
+    )
+    db = tmp_path / "l.db"
+    disp = _RaisingDispatcher(raise_on="merge", bugfix_fixed=False)
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
+
+    # fetch=False keeps the pass offline-deterministic; the monkeypatched
+    # _detect_landing supplies the landing signal reconcile keys off.
+    rec = reconcile_run(Ledger(db), root=tmp_path, fetch=False)
+    assert [r["story_id"] for r in rec.reclassified] == ["99.1-001"]
+    assert {
+        r["story_id"]: r["status"] for r in Ledger(db).story_rows(rec.run_id)
+    }["99.1-001"] == "DONE"
+
+
+# ---------------------------------------------------------------------------
 # Story 12.1-001 — recover a missing/malformed result envelope before parking
 # ---------------------------------------------------------------------------
 
