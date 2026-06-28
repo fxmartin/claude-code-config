@@ -32,6 +32,7 @@ written against the interface is identical on both hosts:
 | `issue_close(ref)` | close the issue | `gh issue close` | `glab issue close` |
 | `issue_find(marker)` | find a managed issue by its hidden marker | `gh issue list --search` | `glab issue list --search` |
 | `issue_view(ref)` | fetch one issue *with* body + labels + assignees | `gh issue view --json …` | `glab issue view --output json` |
+| `user_exists(user)` | is this a real host account? (assign fail-fast) | `gh api users/<u>` (404 ⇒ no) | `glab api users?username=<u>` (empty ⇒ no) |
 | `close_keyword(ref)` | the PR/MR close-link line | `Closes #N` | `Closes #N` |
 
 ### Normalised types
@@ -230,6 +231,35 @@ sdlc issues init              # a 429 or Ctrl-C stopped the first pass? re-run i
 
 The second pass reports `updated` instead of `created` — each story resolves to
 its existing issue, so nothing is duplicated and the Done issues stay closed.
+
+## Assigning a story or an epic (`sdlc issues assign`, Story 22.5-002)
+
+Ownership is the **human-write-back lane** of the projection — the one place a CLI
+writes *to* the host. The host (GitHub/GitLab) stays authoritative; the inventory
+`owner` is a cached read.
+
+```bash
+sdlc issues assign 22.5-002 alice        # assign one story
+sdlc issues assign epic-22 bob           # cascade: every story in epic-22 → bob
+sdlc issues assign 22.5-002 alice --host gitlab   # force the host (else auto-detect)
+```
+
+- **Target** is a story id (`NN.F-NNN`) or an epic id (`epic-NN`). An `epic-NN`
+  target **cascades** to every story in that epic (enumerated from the inventory,
+  Story 22.1-002) in one idempotent pass — assigning the epic is how its DRI is set.
+- **Fail fast (exit 2)** on an empty/unknown user (validated once up front via
+  `user_exists`, so a typo never half-assigns a cascade), a malformed target, an
+  unsupported host, or an epic with no stories — nothing is assigned.
+- **Unmapped stories are reported, never silently skipped (exit 1).** A story with
+  no issue on this host (never mirrored, or mirrored only to the *other* host) is
+  listed with a "mirror it first" hint; the mapped stories in the same cascade are
+  still assigned.
+- **Idempotent**: re-assigning the same user is a no-op — the cached `owner` is
+  checked first, so an already-owned story needs no host write.
+
+The verb is a thin command over the adapter's `issue_assign`
+([`controller/src/sdlc/story_assign.py`](../controller/src/sdlc/story_assign.py)),
+so it works unchanged on GitHub and GitLab.
 
 ## Identity is free
 

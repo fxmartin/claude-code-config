@@ -84,6 +84,9 @@ class FakeHost(IssueHostAdapter):
         ref = ref.ref if isinstance(ref, Issue) else str(ref)
         return Issue(host=self.host, ref=ref, assignees=(assignee,))
 
+    def user_exists(self, user):  # pragma: no cover - unused here
+        return True
+
     def issue_close(self, ref):  # pragma: no cover - unused here
         ref = ref.ref if isinstance(ref, Issue) else str(ref)
         self.issues[ref]["state"] = "closed"

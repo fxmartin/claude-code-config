@@ -256,6 +256,14 @@ class IssueHostAdapter(ABC):
         """Assign an issue to a single user (Free-tier: one assignee)."""
 
     @abstractmethod
+    def user_exists(self, user: str) -> bool:
+        """Report whether ``user`` is a real account on the host.
+
+        The assign command validates the target user once, up front, so an unknown
+        user fails fast rather than partially assigning a cascade (Story 22.5-002).
+        """
+
+    @abstractmethod
     def issue_close(self, ref: "str | Issue") -> Issue:
         """Close an issue."""
 
@@ -366,6 +374,12 @@ class GitHubAdapter(IssueHostAdapter):
         self._run("issue", "edit", ref, "--add-assignee", assignee)
         return Issue(host=self.host, ref=ref, assignees=(assignee,))
 
+    def user_exists(self, user: str) -> bool:
+        # `gh api users/<login>` is 200 for a real account, 404 (non-zero) for an
+        # unknown one — so a clean exit means the user exists. Use `_invoke` (not
+        # `_run`) so a 404 reads as "no such user" rather than raising.
+        return self._invoke("api", f"users/{user}").returncode == 0
+
     def issue_close(self, ref: "str | Issue") -> Issue:
         ref = _ref_of(ref)
         self._run("issue", "close", ref)
@@ -475,6 +489,14 @@ class GitLabAdapter(IssueHostAdapter):
         ref = _ref_of(ref)
         self._run("issue", "update", ref, "--assignee", assignee)
         return Issue(host=self.host, ref=ref, assignees=(assignee,))
+
+    def user_exists(self, user: str) -> bool:
+        # GitLab has no per-login endpoint; `glab api users?username=<u>` returns a
+        # (possibly empty) array — a non-empty result means the username resolves.
+        result = self._invoke("api", f"users?username={user}")
+        if result.returncode != 0:
+            return False
+        return bool(_parse_json_array(result.stdout))
 
     def issue_close(self, ref: "str | Issue") -> Issue:
         ref = _ref_of(ref)
