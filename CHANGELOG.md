@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.100.0] - 2026-06-28
+
+### Added
+
+- feat(github-story-mirror): story inventory schema + (#22.1-001)
+
+
 ## [v1.99.0] - 2026-06-28
 
 ### Added
