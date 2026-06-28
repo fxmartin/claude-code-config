@@ -1495,6 +1495,50 @@ class Ledger:
                 (run_id or None, story_id or None, message, stage or None, kind or None),
             )
 
+    # --- Story inventory (Epic-22) -----------------------------------------
+    # The cross-backlog cache the MD-spec projector (Story 22.1-002) fills and
+    # the host issue mirror + portfolio dashboard read. The projector owns the
+    # *spec* columns (epic/feature/title/points/risk); the sync/build paths own
+    # the *cache* columns (status/owner/host/issue_ref/harness), so the upsert
+    # below deliberately refreshes only the spec columns and leaves the cache
+    # columns untouched on conflict.
+
+    def inventory_story_ids(self) -> set[str]:
+        """Return the bare story ids already present in the inventory cache."""
+        with self._connect() as conn:
+            return {
+                r[0] for r in conn.execute("SELECT story_id FROM story_inventory")
+            }
+
+    def inventory_upsert_specs(
+        self, rows: Iterable[tuple[str, str, str, str, int | None, str | None]]
+    ) -> None:
+        """Upsert MD-projected spec rows in one transaction (Story 22.1-002).
+
+        Each ``rows`` tuple is ``(story_id, epic, feature, title, points, risk)``
+        — the spec projected from the MD. On conflict (the story already exists)
+        only those spec columns are refreshed; ``status``/``owner``/``host``/
+        ``issue_ref``/``harness`` are left as-is so a story already linked to an
+        issue keeps its cached host fields (MD owns the spec, sync/build own the
+        cache — one writer per field). Rows for stories no longer in the MD are
+        never touched here; the projector reports them as removed (it does not
+        silently drop them).
+        """
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO story_inventory "
+                "  (story_id, epic, feature, title, points, risk, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(story_id) DO UPDATE SET "
+                "  epic = excluded.epic, "
+                "  feature = excluded.feature, "
+                "  title = excluded.title, "
+                "  points = excluded.points, "
+                "  risk = excluded.risk, "
+                "  updated_at = CURRENT_TIMESTAMP",
+                rows,
+            )
+
     # --- Read-only queries -------------------------------------------------
     # These power `sdlc status`. They open the ledger read-only with a
     # busy timeout so a poll issued *while the controller is writing* waits out

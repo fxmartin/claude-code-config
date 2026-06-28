@@ -375,6 +375,32 @@ discovered run's own ledger up front (`_migrate_registry_ledgers`), best-effort
 — a missing/corrupt ledger is skipped rather than failing startup, since the
 read paths already tolerate an unreachable ledger.
 
+### Story inventory: projecting the MD specs (Story 22.1-002)
+
+The `story_inventory` table (Story 22.1-001) is a cross-backlog cache — one row
+per story across *every* epic — that the Epic-22 host issue mirror and the
+portfolio dashboard both render from. `story_inventory.py` fills it by
+projecting the Markdown specs: `parse_inventory_specs()` walks every
+`docs/stories/epic-*.md` (the authoritative per-story source; `STORIES.md` is the
+epic-level index and carries no per-story spec rows) and parses each
+`##### Story N.F-NNN:` block into a `StorySpec` — `story_id`, `epic`/`feature`
+(derived from the id: `22.1-002` → epic `22`, feature `22.1`), `title`, `points`,
+and `risk` (first word of the `**Risk Level**:` line; a trailing ` — prose` aside
+is discarded). It reuses `discovery.py`'s story-header regex so both readers stay
+in lock-step on the epic format.
+
+`project_specs(ledger, root)` is **idempotent and field-directional**: it upserts
+each spec via `Ledger.inventory_upsert_specs()`, whose `ON CONFLICT(story_id)`
+clause refreshes *only* the spec columns (`epic`/`feature`/`title`/`points`/
+`risk`). The cache columns the sync and build paths own —
+`status`/`owner`/`host`/`issue_ref`/`harness` — are deliberately left untouched,
+so a story already linked to a host issue keeps its cached mapping across
+re-projections (MD owns the spec, sync/build own the cache — one writer per
+field). The pass returns a `ProjectionResult` reporting `added`, `updated`, and
+`removed` story ids; **removed stories are flagged, not deleted** — a row whose
+story disappeared from the MD survives (it may still point at a live host issue)
+and is surfaced for the caller to decide on, never silently dropped.
+
 Per Epic-12's non-goals there is no `sdlc migrate` verb — migrations apply
 automatically at launch.
 
