@@ -10,7 +10,7 @@ This is the harness behind a multi-agent AGILE pipeline with parallel worktree e
 
 The harness ships as **two mirror plugins** — `autonomous-sdlc` for Claude Code (in this repo at `plugins/autonomous-sdlc/`) and `autonomous-sdlc` for Codex (in the sibling [`nix-install`](https://github.com/fxmartin/nix-install) repo). Same plugin name, same pipeline shape, same skill IDs — so the SDLC workflow is portable across both runtimes. On Claude Code the plugin's skills surface as bare slash-commands (`/brainstorm`, `/create-story`, etc.) labelled `(autonomous-sdlc)` in the autocomplete; on Codex they're invoked as `Use autonomous-sdlc <name>`.
 
-We also use the Codex mirror as an automated adversarial review layer for Claude Code work. Claude Code remains the primary builder in this harness; Codex runs the same `autonomous-sdlc` plugin from the sibling repo to inspect Claude-produced changes, file high-signal issues, and challenge implementation quality from an independent runtime before work is considered done.
+We also use the Codex mirror as an automated adversarial review layer for Claude Code work. Claude Code remains the primary builder in this harness; Codex runs the same `autonomous-sdlc` plugin from the sibling repo to inspect Claude-produced changes, file high-signal issues, and challenge implementation quality from an independent runtime before work is considered done. Beyond review, Codex can now run the **build pipeline itself** — the controller dispatches each stage to a pluggable *agent harness*, so a repo can build entirely on Codex (or any mix). See [Cross-harness builds](#cross-harness-builds--run-the-pipeline-on-claude-or-codex-epic-2021).
 
 ---
 
@@ -160,6 +160,43 @@ cd controller && uv tool install .
 Every agent the orchestrator dispatches must return a JSON object fenced with `<<<RESULT_JSON>>>` ... `<<<END_RESULT>>>` markers matching one of five published schemas (build, coverage, review, merge, bugfix). A response that fails schema validation is treated as a build failure and routed to the bugfix loop — it never silently propagates bad data downstream. Full schema reference: [`docs/contracts.md`](docs/contracts.md).
 
 See [`docs/controller-architecture.md`](docs/controller-architecture.md) for the module map, state-machine diagram, and retry semantics. The runtime decision is recorded in [`docs/adr/001-controller-runtime.md`](docs/adr/001-controller-runtime.md) (Python + uv + Typer + Pydantic).
+
+---
+
+### Cross-harness builds — run the pipeline on Claude *or* Codex (Epic-20/21)
+
+The build is split into two **independent** layers, so either can be Claude or Codex:
+
+- **Driver** — what *launches* a run: the Claude `/build-stories` skill, the Codex `build-stories` skill, or the `sdlc` CLI directly. All three call the **same** controller — there is no runtime-specific orchestration, only one engine.
+- **Agent harness** — the agent CLI the controller dispatches each pipeline *stage* (build, coverage, review, merge) to: **`claude`** (`claude -p`, the default) or **`codex`** (`codex exec`, via `scripts/codex-build-adapter.sh`). A harness is a config + wrapper entry in [`controller/src/sdlc/config/harnesses.yaml`](controller/src/sdlc/config/harnesses.yaml) — adding one is a config change, never a Python change.
+
+The two axes are orthogonal: you can drive from Claude while the *workers* run on Codex, or any other combination. The controller ships its harness registry **inside the installed wheel**, so routing works from the PATH-installed `sdlc` in any repo — no source checkout required.
+
+**Activating a harness** — three layers, highest precedence first:
+
+| How | Scope | Notes |
+|---|---|---|
+| `sdlc build … --harness build=codex,review=codex` | one run | per-role; `qa` aliases `coverage` |
+| `.sdlc-harness.yaml` at the repo root | per repo | **recommended** — survives controller redeploys |
+| `default:` in `harnesses.yaml` | the installed controller | a `uv tool install --force` overwrites it back to the shipped default, so use the repo file for a durable switch |
+
+Precedence is **flag > repo file > registry `default:` > built-in `claude`**. A minimal Codex-only repo:
+
+```yaml
+# <repo-root>/.sdlc-harness.yaml
+harness:
+  default: codex          # every role → codex; omit it to keep claude and remap only some roles
+```
+
+**Codex prerequisites** (one-time):
+
+```bash
+codex login                                              # workers run headless — no mid-run login
+./install.sh --core                                      # symlinks the codex/qwen adapters onto PATH
+export HARNESS_AGENT_CMD="codex exec --dangerously-bypass-approvals-and-sandbox"
+```
+
+Run on the **host path** — do *not* combine with the controller's `--sandbox` flag (that runs a Claude-only, no-egress container; a Codex worker needs the network for its `gh` push/PR calls). Codex declares no parallelism, so a Codex-routed cohort runs serially with a logged warning rather than failing. Full guide — capability flags, output parsers, per-stage model routing, and how to add a new harness (Qwen, OpenCode, Gemini…): [`docs/harness-adapters.md`](docs/harness-adapters.md).
 
 ---
 
