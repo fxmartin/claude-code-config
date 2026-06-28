@@ -448,6 +448,44 @@ the freshly rendered managed block; preserving human content *outside* the
 managed region is the reconcile/sync path's concern (Story 22.4-001), not the
 mapping engine's.
 
+### Build-loop integration — close-link + live status (Story 22.4-002)
+
+`build_issue.py` lets a story's issue move **on its own** as the build runs, so
+status is truthful without anyone setting it by hand. It is wired into the
+existing build pipeline (`build.py`) at two seams and is **best-effort
+throughout**: every host call is wrapped so a failure (no auth, rate limit,
+missing label) is logged and the build continues. A story with **no mapped
+issue** — the common case today — is a clean no-op (`inventory_get_mapping`
+returns `None`), so builds are unchanged unless the mirror has run.
+
+- **Close-link (`Closes #N`).** `build_issue.close_link(ledger, story_id)` returns
+  the host-correct `Closes #N` keyword (via the adapter's `close_keyword`) for the
+  story's mapped issue. `_run_story` resolves it once and threads it into the
+  **PR-opening stage's** prompt only — the coverage agent on the default path, or
+  the build agent under `--skip-coverage` — so the opened PR carries the link and
+  **merging it auto-closes the story issue**. Review/merge prompts (the PR already
+  exists) are untouched.
+- **Live status.** On entering each stage, `_run_story` calls
+  `build_issue.announce_status(ledger, story_id, slug)` where `slug` is the coarse
+  status (`build`/`coverage` → `building`, `review` → `in-review`, `merge` →
+  `merging`); the build→coverage step is deduped to one comment. Each transition
+  posts a short comment and stamps a single `status:<slug>` label (adding the new
+  one, removing every other status label). A parked terminal (`NEEDS_ATTENTION` /
+  `FAILED` / `AWAITING_APPROVAL`) is announced via `announce_terminal` at the
+  status-recording seam (`DONE` is silent — the PR's `Closes #N` closes the issue).
+  Attribution is free: the comment is posted through the running developer's own
+  `gh`/`glab` auth, so no shared bot token is involved.
+
+The adapter gains two capabilities for this: `issue_comment(ref, body)` (`gh issue
+comment` / `glab issue note`) and a `remove_labels=` argument on `issue_update`
+(`gh --remove-label` / `glab --unlabel`) so the live `status:` label is *swapped*
+forward rather than accreted.
+
+**GitLab-MR dependency note.** On GitLab the build opens a **Merge Request**, which
+is part of the *separate "Pipeline on GitLab" epic* (Epic-23). Until that ships the
+`Closes #N` close-link lands only on the **GitHub PR** path; the issue-status
+**comments and labels work on both hosts** via the adapter.
+
 Per Epic-12's non-goals there is no `sdlc migrate` verb — migrations apply
 automatically at launch.
 

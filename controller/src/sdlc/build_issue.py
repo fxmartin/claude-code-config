@@ -1,0 +1,169 @@
+# ABOUTME: Best-effort build-loop ↔ host-issue integration — Closes #N close-link + live status.
+# ABOUTME: Story 22.4-002 — a story's issue moves on its own as the build runs; never blocks a build.
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from sdlc.issue_host import IssueHostError, Runner, get_adapter
+
+if TYPE_CHECKING:  # avoid a runtime import cycle with build.py (which imports this)
+    from sdlc.build import Ledger
+
+log = logging.getLogger(__name__)
+
+__all__ = ["stage_status", "close_link", "announce_status", "announce_terminal"]
+
+# Map a pipeline stage to the coarse, host-agnostic status slug shown on its
+# issue (a `status:<slug>` label + a short comment). ``build`` and ``coverage``
+# share ``building`` so advancing build→coverage is a silent no-op — no duplicate
+# comment, no redundant label churn — and the visible transitions are exactly
+# building → in-review → merging as the pipeline runs.
+_STAGE_STATUS = {
+    "build": "building",
+    "coverage": "building",
+    "review": "in-review",
+    "merge": "merging",
+}
+
+# Map a *terminal* story status to a status slug. DONE is intentionally absent:
+# the merge's ``Closes #N`` auto-closes the issue, so a separate "done" comment
+# would be redundant. RATE_LIMITED/BLOCKED are transient/scheduling states, not a
+# human-actionable issue signal, so they are omitted too.
+_TERMINAL_STATUS = {
+    "NEEDS_ATTENTION": "needs-attention",
+    "FAILED": "failed",
+    "AWAITING_APPROVAL": "awaiting-approval",
+}
+
+# The full closed set of status slugs this module ever stamps. announce_status
+# adds exactly one and removes every *other* one, so an issue carries a single
+# live ``status:<slug>`` label without the caller threading prior state.
+_ALL_STATUSES = (
+    "building",
+    "in-review",
+    "merging",
+    "needs-attention",
+    "failed",
+    "awaiting-approval",
+)
+
+_STATUS_LABEL = "status:{}"
+
+
+def stage_status(stage: str) -> str | None:
+    """The status slug for a pipeline ``stage`` (``building``/``in-review``/…), or None."""
+    return _STAGE_STATUS.get(stage)
+
+
+def _adapter_and_ref(ledger: "Ledger", story_id: str, runner: Runner | None):
+    """Return ``(adapter, ref)`` for a story's mapped issue, or None when unmapped.
+
+    Resolves the host from the inventory mapping and builds its adapter. Returns
+    None — never raises — when the story has no mapping or the recorded host is
+    unsupported, so every caller degrades to a clean no-op.
+    """
+    mapping = ledger.inventory_get_mapping(story_id)
+    if mapping is None:
+        return None
+    host, ref = mapping
+    try:
+        return get_adapter(host, runner=runner), ref
+    except IssueHostError:
+        return None
+
+
+def close_link(
+    ledger: "Ledger", story_id: str, *, runner: Runner | None = None
+) -> str | None:
+    """``Closes #<ref>`` for a story's mapped issue, or None when unmapped (AC1).
+
+    The build injects this into the PR description so merging the PR auto-closes
+    the story's tracking issue. Best-effort: any lookup/host failure (including a
+    ledger without the inventory table) yields None and the PR is opened without
+    a close-link — a build is never blocked on the mirror.
+    """
+    try:
+        got = _adapter_and_ref(ledger, story_id, runner)
+        if got is None:
+            return None
+        adapter, ref = got
+        return adapter.close_keyword(ref)
+    except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
+        log.debug("close_link failed for %s", story_id, exc_info=True)
+        return None
+
+
+def announce_status(
+    ledger: "Ledger",
+    story_id: str,
+    status: str | None,
+    *,
+    runner: Runner | None = None,
+) -> str | None:
+    """Move a story's issue to ``status`` — a short comment + a ``status:`` label (AC2).
+
+    On a stage transition the controller posts a short comment (attributed to the
+    running developer's own host identity — the comment is made via their
+    ``gh``/``glab`` auth, no shared token) and stamps the live ``status:<slug>``
+    label, removing every other status label so the issue shows one current state.
+    The comment and the label are independent best-effort lanes: one failing never
+    suppresses the other.
+
+    Returns the applied slug on success, else None — a story with no mapped issue,
+    a None/blank status, or any host failure is a logged no-op that never blocks
+    the build (AC3).
+    """
+    if not status:
+        return None
+    try:
+        got = _adapter_and_ref(ledger, story_id, runner)
+    except Exception:  # noqa: BLE001
+        log.debug("announce_status lookup failed for %s", story_id, exc_info=True)
+        return None
+    if got is None:
+        return None
+    adapter, ref = got
+
+    applied: str | None = None
+    # Lane 1: the human-readable live comment (the primary signal).
+    try:
+        adapter.issue_comment(ref, _status_comment(story_id, status))
+        applied = status
+    except Exception:  # noqa: BLE001
+        log.debug("status comment failed for %s", story_id, exc_info=True)
+    # Lane 2: the single live status label (a board/list filter hint). Status
+    # labels may not be provisioned in the repo, so a failure here is expected and
+    # tolerated — the comment above is the authoritative live signal.
+    try:
+        label = _STATUS_LABEL.format(status)
+        remove = [_STATUS_LABEL.format(s) for s in _ALL_STATUSES if s != status]
+        adapter.issue_update(ref, labels=[label], remove_labels=remove)
+        applied = status
+    except Exception:  # noqa: BLE001
+        log.debug("status label update failed for %s", story_id, exc_info=True)
+    return applied
+
+
+def announce_terminal(
+    ledger: "Ledger",
+    story_id: str,
+    outcome: str,
+    *,
+    runner: Runner | None = None,
+) -> str | None:
+    """Announce a story's terminal ``outcome`` (NEEDS_ATTENTION/FAILED/…) on its issue.
+
+    A thin wrapper over :func:`announce_status` that maps the terminal story
+    status to its slug. DONE/RATE_LIMITED/BLOCKED map to nothing and no-op (DONE
+    auto-closes via the PR's ``Closes #N``). Best-effort throughout.
+    """
+    return announce_status(
+        ledger, story_id, _TERMINAL_STATUS.get(outcome), runner=runner
+    )
+
+
+def _status_comment(story_id: str, status: str) -> str:
+    """The short, host-neutral status comment posted on a transition."""
+    return f"Status: **{status}** — automated build update for story {story_id}."

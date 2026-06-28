@@ -550,3 +550,46 @@ def test_remote_url_git_failure_returns_none(monkeypatch) -> None:
 
     monkeypatch.setattr(ih.subprocess, "run", boom)
     assert ih._remote_url(".") is None
+
+
+# --- issue_comment + status-label removal (Story 22.4-002) -------------------
+
+
+def test_github_issue_comment() -> None:
+    runner = FakeRunner({"issue comment": (0, "", "")})
+    ih.GitHubAdapter(runner=runner).issue_comment("9", "status: building")
+    assert runner.calls[-1] == ["gh", "issue", "comment", "9", "--body", "status: building"]
+
+
+def test_gitlab_issue_comment() -> None:
+    runner = FakeRunner({"issue note": (0, "", "")})
+    ih.GitLabAdapter(runner=runner).issue_comment("5", "status: building")
+    assert runner.calls[-1] == ["glab", "issue", "note", "5", "--message", "status: building"]
+
+
+def test_github_issue_comment_accepts_issue_object() -> None:
+    runner = FakeRunner({"issue comment": (0, "", "")})
+    issue = ih.Issue(host=ih.GITHUB, ref="11")
+    ih.GitHubAdapter(runner=runner).issue_comment(issue, "hi")
+    assert runner.calls[-1][:4] == ["gh", "issue", "comment", "11"]
+
+
+def test_github_issue_update_removes_labels() -> None:
+    runner = FakeRunner({"issue edit": (0, "https://github.com/fx/r/issues/9\n", "")})
+    ih.GitHubAdapter(runner=runner).issue_update(
+        "9", labels=["status:building"], remove_labels=["status:in-review", "status:merging"],
+    )
+    argv = runner.calls[-1]
+    assert "--add-label" in argv and "status:building" in argv
+    assert argv.count("--remove-label") == 2
+    assert "status:in-review" in argv and "status:merging" in argv
+
+
+def test_gitlab_issue_update_unlabels() -> None:
+    runner = FakeRunner({"issue update": (0, "", "")})
+    ih.GitLabAdapter(runner=runner).issue_update(
+        "5", labels=["status:building"], remove_labels=["status:in-review"],
+    )
+    argv = runner.calls[-1]
+    assert "--label" in argv and "status:building" in argv
+    assert "--unlabel" in argv and "status:in-review" in argv

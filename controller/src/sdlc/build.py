@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from sdlc.capability import preflight_harness, resolve_capabilities
+from sdlc import build_issue
 from sdlc.degradation import evaluate_degradations
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.commitlint import (
@@ -2639,13 +2640,22 @@ def _result_wrapper(schema_filename: str) -> str:
     )
 
 
-def render_build_prompt(story: Story, opts: BuildOptions) -> str:
+def render_build_prompt(
+    story: Story, opts: BuildOptions, close_link: str | None = None
+) -> str:
     """Render the build-agent instructions for one story.
 
     Deliberately mirrors the skill's build-agent prompt: create the branch, read
     the epic, TDD, quality gates, commit, and emit the result block the
     controller validates.
+
+    ``close_link`` (Story 22.4-002) is the ``Closes #N`` keyword for the story's
+    mapped issue. It is only appended when *this* agent opens the PR (the
+    ``--skip-coverage`` path); otherwise the coverage agent opens the PR and
+    carries the close-link instead.
     """
+    # Only inject the close-link when the build agent itself opens the PR.
+    close_hint = _close_link_instruction(close_link) if opts.skip_coverage else ""
     push = (
         "6. Push and create PR; include the PR number in the result block."
         if opts.skip_coverage
@@ -2699,12 +2709,31 @@ def render_build_prompt(story: Story, opts: BuildOptions) -> str:
         "5. Commit with this exact, conventional-commit-compliant message — do "
         f"not alter it:\n   {commit_header}\n"
         f"{push}\n\n"
+        + close_hint
         + docs_instruction
         + _result_wrapper("build-agent-response.schema.json")
     )
 
 
-def render_coverage_prompt(story: Story, opts: BuildOptions) -> str:
+def _close_link_instruction(close_link: str | None) -> str:
+    """The PR-description close-link instruction for a PR-opening stage (22.4-002).
+
+    ``close_link`` is the ``Closes #N`` keyword for the story's mapped issue;
+    empty when the story has no issue (then this is the empty string and the
+    prompt is byte-for-byte unchanged). When set, the agent is told to include it
+    in the PR description so merging the PR auto-closes the tracking issue.
+    """
+    if not close_link:
+        return ""
+    return (
+        f'When you open the PR, include "{close_link}" on its own line in the PR '
+        "description so merging the PR auto-closes the story's tracking issue.\n"
+    )
+
+
+def render_coverage_prompt(
+    story: Story, opts: BuildOptions, close_link: str | None = None
+) -> str:
     # Story 12.2-004: the coverage agent authors a commit too (it is linted via
     # the build/coverage success gate), so supply a commitlint-compliant header
     # by construction rather than letting it improvise a non-compliant one.
@@ -2714,6 +2743,8 @@ def render_coverage_prompt(story: Story, opts: BuildOptions) -> str:
         subject=story.title,
         trailer=f" (#{story.id})",
     )
+    # Story 22.4-002: the coverage agent opens the PR on the default path, so the
+    # close-link rides here; empty when the story has no mapped issue.
     return (
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
@@ -2721,6 +2752,7 @@ def render_coverage_prompt(story: Story, opts: BuildOptions) -> str:
         "conventional-commit-compliant message — do not alter it:\n"
         f"   {commit_header}\n"
         "Push, open the PR, then emit the result block.\n"
+        + _close_link_instruction(close_link)
         + _result_wrapper("coverage-agent-response.schema.json")
     )
 
@@ -3614,6 +3646,9 @@ def run_build(
     # barrier finalize idempotent. Serial mode never routes through here.
     def _credit_terminal(story: Story, outcome_status: str) -> None:
         ledger.set_story_status(run_id, story.id, outcome_status)
+        # Story 22.4-002: announce a parked terminal status (NEEDS_ATTENTION etc.)
+        # on the story's issue — best-effort, a no-op for DONE / unmapped stories.
+        build_issue.announce_terminal(ledger, story.id, outcome_status)
 
     workers = effective_concurrency(opts)
     for cohort in cohorts:
@@ -3671,6 +3706,9 @@ def run_build(
                 outcome = sr.status or "FAILED"  # non-parked always carries a status
                 status[story.id] = outcome
                 ledger.set_story_status(run_id, story.id, outcome)
+                # Story 22.4-002: mirror a parked terminal status onto the issue
+                # (best-effort; no-op for DONE / unmapped stories).
+                build_issue.announce_terminal(ledger, story.id, outcome)
                 if outcome == "FAILED":
                     try:  # best-effort; terminal FAILED only (no bugfix-retry noise)
                         notify("story_failed", run=run_id, story_id=story.id)
@@ -4260,13 +4298,27 @@ def _run_story(
     # IN_PROGRESS as resumable.
     if pending:
         ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
+    # Story 22.4-002: the close-link for this story's mapped issue (``Closes #N``),
+    # injected into the PR-opening stage's prompt so the merge auto-closes the
+    # issue. Resolved once per story; None when the story has no mapped issue (the
+    # common case today) or any host lookup fails — best-effort, never blocks.
+    close_link = build_issue.close_link(ledger, story.id)
     # Monotonic across the whole story: the "bugfix" stage rows share one
     # (run_id, story_id, stage_name) key, so every bugfix dispatch — across both
     # retries of one stage and across different stages — needs a distinct attempt
     # number, or the second insert hits the stages UNIQUE constraint.
 
     rl_waited = 0  # cumulative in-process auto-wait across reactive pauses (14.1-003)
+    last_status: str | None = None  # last status slug announced on the issue (22.4-002)
     for idx, stage in enumerate(pending):
+        # Story 22.4-002: post a live status comment/label on the story's issue as
+        # the build enters each stage (building → in-review → merging). Deduped
+        # against the previous stage so build→coverage (both "building") is silent.
+        # Best-effort and a no-op when the story has no mapped issue.
+        slug = build_issue.stage_status(stage)
+        if slug and slug != last_status:
+            build_issue.announce_status(ledger, story.id, slug)
+            last_status = slug
         bugfix_attempts = 0
         # Only the first resumed stage continues a prior attempt count; later
         # stages start fresh at attempt 1.
@@ -4343,6 +4395,7 @@ def _run_story(
                 ok, result, failure, kind = _dispatch_stage(
                     stage, story, opts, pr_number, dispatch, tpath,
                     on_progress=sink, escalation_steps=escalation_steps,
+                    close_link=close_link,
                 )
                 if ok:
                     ledger.stage_finish(
@@ -4763,6 +4816,7 @@ def _dispatch_stage(
     on_progress=None,
     *,
     escalation_steps: int = 0,
+    close_link: str | None = None,
 ) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one stage's agent and classify the outcome.
 
@@ -4775,7 +4829,7 @@ def _dispatch_stage(
     (R10). ``on_progress`` (Story 11.1-002) is forwarded to the dispatcher so the
     streamed stage emits sub-stage progress to the ledger.
     """
-    prompt = _render_stage_prompt(stage, story, opts, pr_number)
+    prompt = _render_stage_prompt(stage, story, opts, pr_number, close_link=close_link)
     model = _select_stage_model(stage, story, opts, escalation_steps=escalation_steps)
     # Story 20.7-001: route this stage to its mapped harness's argv/parser when a
     # `--harness` map is set; empty (the default path) leaves dispatch unchanged.
@@ -4821,12 +4875,16 @@ def _dispatch_stage(
 
 
 def _render_stage_prompt(
-    stage: str, story: Story, opts: BuildOptions, pr_number: int | None
+    stage: str,
+    story: Story,
+    opts: BuildOptions,
+    pr_number: int | None,
+    close_link: str | None = None,
 ) -> str:
     if stage == "build":
-        return render_build_prompt(story, opts)
+        return render_build_prompt(story, opts, close_link=close_link)
     if stage == "coverage":
-        return render_coverage_prompt(story, opts)
+        return render_coverage_prompt(story, opts, close_link=close_link)
     if stage == "review":
         return render_review_prompt(story, pr_number)
     return render_merge_prompt(story, pr_number)

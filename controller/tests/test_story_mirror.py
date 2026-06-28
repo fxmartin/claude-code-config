@@ -59,7 +59,7 @@ class FakeHost(IssueHostAdapter):
         return Issue(host=self.host, ref=ref, url=f"http://h/issues/{ref}",
                      title=title, state="open")
 
-    def issue_update(self, ref, title=None, body=None, labels=None):
+    def issue_update(self, ref, title=None, body=None, labels=None, remove_labels=None):
         ref = ref.ref if isinstance(ref, Issue) else str(ref)
         if ref not in self.issues:
             raise IssueHostError(f"issue {ref} not found")
@@ -71,8 +71,14 @@ class FakeHost(IssueHostAdapter):
         for label in labels or []:
             if label not in data["labels"]:
                 data["labels"].append(label)
+        for label in remove_labels or []:
+            if label in data["labels"]:
+                data["labels"].remove(label)
         self.updated += 1
         return Issue(host=self.host, ref=ref, title=data["title"])
+
+    def issue_comment(self, ref, body):  # pragma: no cover - unused here
+        pass
 
     def issue_assign(self, ref, assignee):  # pragma: no cover - unused here
         ref = ref.ref if isinstance(ref, Issue) else str(ref)
