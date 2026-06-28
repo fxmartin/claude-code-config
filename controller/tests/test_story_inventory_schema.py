@@ -211,7 +211,10 @@ def test_partially_migrated_ledger_gains_only_inventory(tmp_path: Path) -> None:
     Ledger(db).ensure_migrated()
 
     assert _has_table(db, "story_inventory")
-    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7]  # only Migration 7 was added
+    # Migration 7 creates the inventory table; Migration 8 adds its `human_status`
+    # column (a no-op against the table the up-to-date DDL just created, but still
+    # recorded). Both were the pending tail.
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_story_inventory_updated_at_is_autopopulated(tmp_path: Path) -> None:

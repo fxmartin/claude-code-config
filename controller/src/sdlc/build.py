@@ -210,6 +210,7 @@ CREATE TABLE IF NOT EXISTS story_inventory (
     risk        TEXT,                            -- 'Low' | 'Medium' | 'High'.
     status      TEXT,                            -- cached execution status (sync/build owned).
     owner       TEXT,                            -- cached read of the host assignee.
+    human_status TEXT,                           -- pulled human signal: 'blocked' | 'wontfix' (Story 22.4-001).
     host        TEXT,                            -- 'github' | 'gitlab'.
     issue_ref   TEXT,                            -- GitHub issue number / GitLab iid (host-neutral text).
     harness     TEXT,                            -- derived per-story harness summary (Epic-20 20.2-002).
@@ -333,6 +334,20 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         "story_inventory",
         [],
         _STORY_INVENTORY_DDL,
+    ),
+    # Migration 8 adds the Epic-22 (Story 22.4-001) `human_status` column to the
+    # `story_inventory` table — the pulled human signal (`blocked`/`wontfix`) the
+    # reconcile writes back from the host. Additive and back-compatible: older
+    # ledgers keep NULL (no signal) until the next sync pulls one; a fresh DB
+    # created from the up-to-date DDL already has the column, so this is a no-op.
+    (
+        8,
+        "story inventory human_status column",
+        "story_inventory",
+        [
+            ("human_status", "TEXT"),
+        ],
+        None,
     ),
 ]
 
@@ -1576,6 +1591,75 @@ class Ledger:
                 "WHERE story_id = ?",
                 (host, issue_ref, story_id),
             )
+
+    # --- Reconcile cache columns (Story 22.4-001) --------------------------
+    # The sync reconcile owns `status` (pushed *to* the host as a status label)
+    # and the pulled human fields `owner`/`human_status` (read *from* the host).
+    # Each is a single-column update so the field-directional contract is exact:
+    # push touches managed fields only, pull touches human fields only — one
+    # writer per field, no echo loop.
+
+    def _inventory_get_column(self, story_id: str, column: str) -> str | None:
+        """Read one inventory cache column for a story, or None when unset/absent.
+
+        ``column`` is one of the fixed reconcile column names (never user input),
+        so the f-string is safe — SQLite cannot parametrise a column name.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {column} FROM story_inventory WHERE story_id = ?",
+                (story_id,),
+            ).fetchone()
+        return row[0] if row is not None else None
+
+    def _inventory_set_column(self, story_id: str, column: str, value: str | None) -> None:
+        """Write one inventory cache column for a story (a no-op when the row is absent)."""
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE story_inventory "
+                f"SET {column} = ?, updated_at = CURRENT_TIMESTAMP "
+                f"WHERE story_id = ?",
+                (value, story_id),
+            )
+
+    def inventory_get_status(self, story_id: str) -> str | None:
+        """The cached execution status the reconcile pushes as a status label."""
+        return self._inventory_get_column(story_id, "status")
+
+    def inventory_set_status(self, story_id: str, status: str | None) -> None:
+        """Set the cached execution status (build/sync owned)."""
+        self._inventory_set_column(story_id, "status", status)
+
+    def inventory_get_owner(self, story_id: str) -> str | None:
+        """The cached host assignee pulled by the reconcile."""
+        return self._inventory_get_column(story_id, "owner")
+
+    def inventory_set_owner(self, story_id: str, owner: str | None) -> None:
+        """Set the cached owner (the pull side writes this from the host assignee)."""
+        self._inventory_set_column(story_id, "owner", owner)
+
+    def inventory_get_human_status(self, story_id: str) -> str | None:
+        """The pulled human signal (`blocked`/`wontfix`), or None."""
+        return self._inventory_get_column(story_id, "human_status")
+
+    def inventory_set_human_status(self, story_id: str, human_status: str | None) -> None:
+        """Set the pulled human signal (the pull side writes this from host labels)."""
+        self._inventory_set_column(story_id, "human_status", human_status)
+
+    def inventory_wontfix_story_ids(self) -> set[str]:
+        """Story ids the host has flagged ``wontfix`` — the build skips these.
+
+        Story 22.4-001: the reconcile pulls a `wontfix` label into
+        `human_status`; the build consults this set so it never works a story a
+        human has explicitly declined.
+        """
+        with self._connect() as conn:
+            return {
+                r[0]
+                for r in conn.execute(
+                    "SELECT story_id FROM story_inventory WHERE human_status = 'wontfix'"
+                )
+            }
 
     # --- Read-only queries -------------------------------------------------
     # These power `sdlc status`. They open the ledger read-only with a

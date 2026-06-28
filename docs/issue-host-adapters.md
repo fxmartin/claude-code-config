@@ -31,6 +31,7 @@ written against the interface is identical on both hosts:
 | `issue_assign(ref, assignee)` | set a single assignee | `gh issue edit --add-assignee` | `glab issue update --assignee` |
 | `issue_close(ref)` | close the issue | `gh issue close` | `glab issue close` |
 | `issue_find(marker)` | find a managed issue by its hidden marker | `gh issue list --search` | `glab issue list --search` |
+| `issue_view(ref)` | fetch one issue *with* body + labels + assignees | `gh issue view --json …` | `glab issue view --output json` |
 | `close_keyword(ref)` | the PR/MR close-link line | `Closes #N` | `Closes #N` |
 
 ### Normalised types
@@ -42,6 +43,8 @@ written against the interface is identical on both hosts:
 - **`Issue`** — a host-neutral record: `host`, `ref`, `url`, `title`, `state`
   (normalised to `open`/`closed` — GitHub `OPEN`/`CLOSED`, GitLab
   `opened`/`closed`), and `assignees` (a tuple of login/username strings).
+  `body` and `labels` are populated only by `issue_view` (the reconcile reads
+  them); the other verbs leave them empty.
 - **`close_keyword`** — both GitHub PRs and GitLab MRs auto-close an issue in
   the same project on merge with `Closes #N`, so the form is shared. (On GitLab
   the build opens an MR, which belongs to the separate Pipeline-on-GitLab epic;
@@ -132,6 +135,29 @@ board fields on top of those labels:
 
 The `points:N` label is the additive-safe baseline; the GitHub `Points` number
 field is a GitHub-only nicety. An unsupported host raises `IssueHostError`.
+
+## Reconcile — field-directional sync (Story 22.4-001)
+
+`sdlc issues sync` keeps each story's issue and the local ledger consistent
+without drift. The engine
+([`controller/src/sdlc/story_sync.py`](../controller/src/sdlc/story_sync.py))
+is **strictly field-directional** — every field has exactly one writer, which is
+what makes a repeated sync a no-op (no echo loop):
+
+| Field | Direction | Writer | How |
+|-------|-----------|--------|-----|
+| managed spec block | **push** (MD → host) | the MD spec | `replace_managed_block` rewrites only the managed region; human content outside it is preserved, a hand-edit inside it is reverted |
+| taxonomy labels (`story`, `epic:NN`, `feature:NN.F`, `points:N`, `risk:*`) | **push** (inventory → host) | the inventory spec | only *missing* labels are added, so an unchanged set writes nothing |
+| `status:<slug>` label | **push** (ledger → host) | the build/ledger execution status | rendered from the cached `status` (`DONE` → `status:done`); absent when no status is cached |
+| `owner` | **pull** (host → ledger) | the host assignee | the issue's single assignee is cached as `owner` |
+| `human_status` (`blocked` / `wontfix`) | **pull** (host → ledger) | a human's label | a `blocked`/`wontfix` label is cached; the build **skips** a `wontfix` story (`blocked` is surfaced but still worked) |
+
+**Push** writes only managed fields; **pull** reads only human fields and is the
+*only* write-back into the ledger from the host. So a second pass with no real
+change touches nothing on the host (`NOOP`). A story not yet mapped on the host
+is skipped (`UNMAPPED`) — the idempotent mirror (Story 22.2-003) must create the
+issue first. This is the same reconcile engine `sdlc issues init` (Story
+22.3-001) builds on.
 
 ## Identity is free
 
