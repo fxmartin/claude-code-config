@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.96.1] - 2026-06-28
+
+### Fixed
+
+- fix(controller): embed schema-derived field skeleton in result wrapper (#229)
+
+
 ## [v1.96.0] - 2026-06-27
 
 ### Added
