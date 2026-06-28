@@ -235,6 +235,139 @@ def test_parse_story_docs_empty_when_no_story_dir(tmp_path: Path) -> None:
     assert parse_story_docs(tmp_path) == []
 
 
+def test_parse_story_docs_accepts_plain_points_form(tmp_path: Path) -> None:
+    # discovery.py accepts both `**Story Points**` and the bare `**Points**`;
+    # the renderer's parser must read the same form-tolerant value.
+    epic = (
+        "# Epic 22: Sample\n\n"
+        "##### Story 22.3-001: Plain points\n"
+        "**User Story**: As FX, I want a thing.\n"
+        "**Points**: 8\n"
+    )
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-22.md").write_text(epic, encoding="utf-8")
+
+    doc = parse_story_docs(tmp_path)[0]
+    assert doc.points == 8
+
+
+def test_parse_story_docs_points_and_risk_are_first_line_wins(tmp_path: Path) -> None:
+    # A second points/risk line must not override the first (matches discovery).
+    epic = (
+        "# Epic 22: Sample\n\n"
+        "##### Story 22.4-001: First wins\n"
+        "**Story Points**: 2\n"
+        "**Risk Level**: Low\n"
+        "**Story Points**: 99\n"
+        "**Risk Level**: Critical\n"
+    )
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-22.md").write_text(epic, encoding="utf-8")
+
+    doc = parse_story_docs(tmp_path)[0]
+    assert doc.points == 2
+    assert doc.risk == "Low"
+
+
+def test_parse_story_docs_is_sorted_across_epic_files(tmp_path: Path) -> None:
+    # Files are globbed in sorted order, so the projection is deterministic.
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-02.md").write_text(
+        "##### Story 2.1-001: Two\n**User Story**: x.\n", encoding="utf-8"
+    )
+    (stories / "epic-01.md").write_text(
+        "##### Story 1.1-001: One\n**User Story**: y.\n", encoding="utf-8"
+    )
+
+    ids = [d.story_id for d in parse_story_docs(tmp_path)]
+    assert ids == ["1.1-001", "2.1-001"]
+
+
+# --- additional edge-case contracts ------------------------------------------
+
+
+def test_render_managed_block_strips_surrounding_blank_lines() -> None:
+    # spec_md is `.strip()`ed so stray leading/trailing whitespace never leaks
+    # blank lines into the managed region's framing.
+    doc = StoryDoc(
+        story_id="22.2-002",
+        epic="22",
+        feature="22.2",
+        title="t",
+        points=None,
+        risk=None,
+        spec_md="\n\n  **User Story**: spec.  \n\n",
+    )
+    body = render_issue_body(doc)
+    expected = "\n".join(
+        (
+            MANAGED_OPEN,
+            story_marker("22.2-002"),
+            "",
+            "**User Story**: spec.",
+            "",
+            MANAGED_CLOSE,
+        )
+    )
+    assert body == expected
+
+
+def test_replace_appends_block_to_empty_body_without_leading_newlines() -> None:
+    # Adopting a truly empty issue body yields just the block — no stray prefix.
+    result = replace_managed_block("", _DOC)
+    assert result == render_issue_body(_DOC)
+    assert not result.startswith("\n")
+
+
+def test_replace_only_regenerates_the_first_managed_block() -> None:
+    # Non-greedy + count=1: a body that somehow holds two managed regions has
+    # only the first rewritten, never collapsed or duplicated.
+    body = render_issue_body(_DOC)
+    doubled = body + "\n\nhuman note\n\n" + body
+    result = replace_managed_block(doubled, _DOC)
+    assert result.count(MANAGED_OPEN) == 2
+    assert "human note" in result
+
+
+def test_extract_returns_inner_for_empty_managed_region() -> None:
+    # An empty managed region extracts to "" (distinct from the None of absence).
+    body = f"{MANAGED_OPEN}\n{MANAGED_CLOSE}"
+    assert extract_managed_block(body) == ""
+
+
+def test_story_labels_lowercases_uppercase_risk() -> None:
+    labels = story_labels("22", "22.2", None, "HIGH")
+    assert "risk:high" in labels
+
+
+def test_status_surface_is_case_insensitive_on_host() -> None:
+    # Host is normalised before the supported-host check / dispatch.
+    surface = status_surface("GitHub", "22", "22.2", 3, "Medium")
+    assert surface.host == GITHUB
+    assert surface.status_field == "Status"
+
+
+def test_status_surface_rejects_none_host() -> None:
+    with pytest.raises(IssueHostError):
+        status_surface(None, "22", "22.2", 3, "Medium")  # type: ignore[arg-type]
+
+
+def test_issue_title_handles_minimal_doc() -> None:
+    doc = StoryDoc(
+        story_id="1.1-001",
+        epic="1",
+        feature="1.1",
+        title="Bare",
+        points=None,
+        risk=None,
+        spec_md="x",
+    )
+    assert issue_title(doc) == "1.1-001: Bare"
+
+
 def test_parsed_doc_renders_round_trip(tmp_path: Path) -> None:
     stories = tmp_path / "docs" / "stories"
     stories.mkdir(parents=True)
