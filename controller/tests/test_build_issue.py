@@ -158,6 +158,15 @@ def test_announce_status_comment_failure_does_not_block_label(tmp_path):
     assert any("edit" in c for c in runner.calls)
 
 
+def test_announce_status_tolerates_broken_ledger():
+    class _NoInventory:
+        pass
+
+    # A ledger stub lacking inventory_get_mapping must not crash the build — the
+    # lookup itself raising is swallowed to a logged no-op (mirrors close_link).
+    assert bi.announce_status(_NoInventory(), "22.4-002", "building") is None  # type: ignore[arg-type]
+
+
 # --- stage / terminal status mapping ----------------------------------------
 
 
