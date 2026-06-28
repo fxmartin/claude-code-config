@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.96.2] - 2026-06-28
+
+### Fixed
+
+- fix(harness): codex defaults to account model, not fixed ids (#230)
+
+
 ## [v1.96.1] - 2026-06-28
 
 ### Fixed
