@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Protocol
+from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from sdlc.capability import preflight_harness, resolve_capabilities
 from sdlc.degradation import evaluate_degradations
@@ -33,6 +33,7 @@ from sdlc.contracts import (
     RESULT_END_MARKER,
     RESULT_START_MARKER,
     ContractError,
+    load_schema,
 )
 from sdlc.cost_estimate import StageEstimate, estimate_stage
 from sdlc.discovery import canonical_scope
@@ -2343,22 +2344,74 @@ def _record_degradations(ledger: "Ledger", run_id: str, requested_mode: str) -> 
 # Prompt rendering (kept terse — the agent reads the epic file itself)
 # ---------------------------------------------------------------------------
 
+# Reverse of ``AGENT_SCHEMAS`` (agent type -> schema filename) so the result
+# wrapper can resolve a schema filename back through the cached package loader.
+_SCHEMA_FILE_TO_AGENT: dict[str, str] = {
+    filename: agent for agent, filename in AGENT_SCHEMAS.items()
+}
+
+
+def _field_hint(prop: dict[str, Any]) -> str:
+    """Render the value hint for one schema property.
+
+    Enum properties advertise their literals (``"A|B"``) so the agent copies an
+    exact allowed value; otherwise the JSON ``type`` drives a typed placeholder.
+    """
+    enum = prop.get("enum")
+    if enum:
+        return '"' + "|".join(str(value) for value in enum) + '"'
+    json_type = prop.get("type")
+    if json_type == "string":
+        return '"<string>"'
+    if json_type == "integer":
+        return "<integer>"
+    if json_type == "number":
+        return "<number>"
+    if json_type == "boolean":
+        return "true|false"
+    # Unknown/compound types: fall back to a generic string placeholder so the
+    # skeleton stays well-formed rather than emitting a bare key with no hint.
+    return '"<value>"'
+
+
+def _required_field_skeleton(schema_filename: str) -> str:
+    """Build a literal required-field skeleton from the named schema.
+
+    Emits ``{"key": <hint>, ...}`` for every name in the schema's ``required``
+    array, IN ORDER, so the agent sees the exact field names (and enum literals)
+    it must produce instead of a pointer to a file it cannot read.
+    """
+    schema = load_schema(_SCHEMA_FILE_TO_AGENT[schema_filename])
+    properties = schema.get("properties", {})
+    pairs = [
+        f'"{name}": {_field_hint(properties.get(name, {}))}'
+        for name in schema.get("required", [])
+    ]
+    return "{" + ", ".join(pairs) + "}"
+
+
 def _result_wrapper(schema_filename: str) -> str:
     """The exact result-block wrapper every agent must emit (R10).
 
-    Shown verbatim so the agent uses the sentinel markers rather than a markdown
-    ```json fence. The controller now tolerates fences as a fallback, but the
-    sentinels are unambiguous — this instruction reduces the drift at the source.
+    Shows a literal, schema-derived required-field skeleton (keys + enum
+    literals) between the sentinel markers rather than pointing at a schema file
+    the agent cannot read. Capable models otherwise paraphrase the required keys
+    (``branch`` vs ``branch_name``, ``PASSED`` vs ``SUCCESS``), producing a
+    schema-invalid block that fails an otherwise-green committed stage. Mirrors
+    the gate prompts, which embed literal examples and never drift.
     """
     return (
         "End your reply with EXACTLY this wrapper — the literal marker lines, "
         "no markdown code fences (do not wrap it in ```json), and nothing after "
         "the closing marker:\n"
         + RESULT_START_MARKER
-        + "\n{ ...the JSON object per controller/src/sdlc/schemas/"
-        + schema_filename
-        + " ... }\n"
+        + "\n"
+        + _required_field_skeleton(schema_filename)
+        + "\n"
         + RESULT_END_MARKER
+        + "\nUse these exact keys. Enum fields must be one of the literals shown. "
+        "Extra keys are allowed, but the keys above are required and must use "
+        "these exact names."
     )
 
 
