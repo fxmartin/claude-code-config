@@ -46,9 +46,9 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/risk-gate"
 
 @test "a per-repo override adds patterns additively" {
     tmp_root="$(mktemp -d)"
-    mkdir -p "${tmp_root}/controller/config"
-    cp "${BATS_TEST_DIRNAME}/../controller/config/high-risk-patterns.yaml" \
-        "${tmp_root}/controller/config/high-risk-patterns.yaml"
+    mkdir -p "${tmp_root}/controller/src/sdlc/config"
+    cp "${BATS_TEST_DIRNAME}/../controller/src/sdlc/config/high-risk-patterns.yaml" \
+        "${tmp_root}/controller/src/sdlc/config/high-risk-patterns.yaml"
     printf 'high_risk_patterns:\n  - "**/special/**"\n' \
         > "${tmp_root}/.sdlc-risk-config.yaml"
 
