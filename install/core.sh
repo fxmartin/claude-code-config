@@ -58,6 +58,26 @@ install_core_run() {
   # Local marketplace — exposes the autonomous-sdlc plugin to Claude Code.
   ensure_dir "$CLAUDE_DIR/plugins/marketplaces"
   create_symlink "$SCRIPT_DIR" "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config"
+
+  # Build-harness adapters on PATH (Story 21.3-001). The harness registry invokes
+  # the Codex/Qwen workers by BARE NAME (e.g. `codex-build-adapter.sh`), resolved
+  # on PATH at dispatch — so the adapters must live in a PATH dir or a cross-harness
+  # build fails with "command not found". uv installs the `sdlc` controller into
+  # ~/.local/bin, so we mirror the adapters into that same dir: an installed `sdlc`
+  # then runs a Codex/Qwen build with no manual `ln -sf`. Override with
+  # SDLC_ADAPTER_BIN_DIR (used by the bats suite to isolate state).
+  local bin_dir="${SDLC_ADAPTER_BIN_DIR:-$HOME/.local/bin}"
+  ensure_dir "$bin_dir"
+  create_symlink "$SCRIPT_DIR/scripts/codex-build-adapter.sh" "$bin_dir/codex-build-adapter.sh"
+  create_symlink "$SCRIPT_DIR/scripts/qwen-build-adapter.sh"  "$bin_dir/qwen-build-adapter.sh"
+
+  # The bare-name dispatch only resolves if $bin_dir is on PATH. Warn (never fail)
+  # with the exact line to fix it. The check is deterministic, so it is safe to
+  # emit in dry-run too.
+  case ":$PATH:" in
+    *":$bin_dir:"*) ;;
+    *) warn "$bin_dir is not on your PATH — add it so the build adapters resolve: export PATH=\"$bin_dir:\$PATH\"" ;;
+  esac
 }
 
 install_core_uninstall() {
@@ -75,4 +95,10 @@ install_core_uninstall() {
   # Shared-skill commands are committed relative symlinks inside commands/, so
   # removing the commands symlink above already unlinks them; nothing to do here.
   remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
+
+  # Build-harness adapters (Story 21.3-001). remove_symlink only unlinks a link
+  # that points at our src, so an unrelated file of the same name is left alone.
+  local bin_dir="${SDLC_ADAPTER_BIN_DIR:-$HOME/.local/bin}"
+  remove_symlink "$bin_dir/codex-build-adapter.sh" "$SCRIPT_DIR/scripts/codex-build-adapter.sh"
+  remove_symlink "$bin_dir/qwen-build-adapter.sh"  "$SCRIPT_DIR/scripts/qwen-build-adapter.sh"
 }

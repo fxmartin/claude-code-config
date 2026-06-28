@@ -247,9 +247,9 @@ _run_install() {
 @test "--core --tools combination runs both modes without error" {
     _run_install --core --tools --dry-run
     [ "$status" -eq 0 ]
-    # Core dry-run lines present
+    # Core dry-run lines present (13 = config set + marketplace + 2 adapters).
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 18 ]
+    [ "$ln_lines" -eq 13 ]
     # Tools output present (brew or apt mention)
     [[ "$output" == *"brew"* || "$output" == *"apt"* || "$output" == *"Homebrew"* ]]
 }
@@ -258,6 +258,6 @@ _run_install() {
     _run_install --core --mcp --dry-run
     [ "$status" -eq 0 ]
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 18 ]
+    [ "$ln_lines" -eq 13 ]
     [[ "$output" == *"MCP"* || "$output" == *"mcp"* ]]
 }
