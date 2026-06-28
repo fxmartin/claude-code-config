@@ -110,3 +110,25 @@ CREATE INDEX IF NOT EXISTS idx_stories_status      ON stories(status);
 CREATE INDEX IF NOT EXISTS idx_stages_status       ON stages(status);
 CREATE INDEX IF NOT EXISTS idx_runs_status         ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_run_ts       ON events(run_id, ts);
+
+-- story_inventory: Epic-22 (Story 22.1-001) cross-backlog cache — one row per
+-- story across *every* epic, keyed by the bare story id (NOT per-run like the
+-- `stories` table above). The shared local model the host issue mirror (GitHub /
+-- GitLab) and the portfolio dashboard both render from. Controller-applied: this
+-- table is created by the controller migration list (`build.py` Migration 7), NOT
+-- by a `state/migrations/` file — recorded here as the reference shape only.
+-- `status`/`owner`/`issue_ref` are written by sync and the build (not hand-edited).
+CREATE TABLE IF NOT EXISTS story_inventory (
+    story_id    TEXT PRIMARY KEY,               -- bare story id, e.g. '22.1-001'.
+    epic        TEXT,                            -- e.g. '22'.
+    feature     TEXT,                            -- e.g. '22.1'.
+    title       TEXT,
+    points      INTEGER,
+    risk        TEXT,                            -- 'Low' | 'Medium' | 'High'.
+    status      TEXT,                            -- cached execution status (sync/build owned).
+    owner       TEXT,                            -- cached read of the host assignee.
+    host        TEXT,                            -- 'github' | 'gitlab'.
+    issue_ref   TEXT,                            -- GitHub issue number / GitLab iid (host-neutral text).
+    harness     TEXT,                            -- derived per-story harness summary (Epic-20 20.2-002).
+    updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
