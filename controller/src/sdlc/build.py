@@ -2680,6 +2680,29 @@ def _base_ref(root: Path) -> str | None:
     return None
 
 
+def _refresh_base_ref(root: Path) -> None:
+    """Advance the local ``origin/*`` tracking refs before a cohort dispatches (#231).
+
+    Story worktrees are created detached at :func:`_base_ref` — ``origin/main``
+    when ``origin/HEAD`` is set. In a long parallel run, earlier cohorts merge and
+    push to ``main`` while the run is still in flight, but the *local* ``origin/main``
+    ref only moves when something fetches. Without this refresh, a cohort dispatched
+    after an earlier merge would branch from the pre-merge tip — re-introducing the
+    avoidable merge conflicts, stale sibling trees, and review noise of #231. A
+    guarded ``git fetch origin`` at each cohort boundary pulls the ref up to the
+    current remote tip so the cohort's worktrees branch from the latest merged state.
+
+    Best-effort and never fatal (mirrors :func:`reconcile_run`'s fetch contract):
+    offline — or any git/OS failure — degrades silently to the current local ref
+    rather than aborting the run. Does **not** touch in-flight worktrees; it only
+    moves the ref future :func:`create_story_worktree` calls read.
+    """
+    try:
+        _git(root, "fetch", "origin")
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _reposition_head(root: Path) -> None:
     """Return the working dir to the base branch between stories (Story 12.4-001).
 
@@ -3474,6 +3497,18 @@ def run_build(
             dispatchable.append(story)
         if not dispatchable:
             continue
+
+        # Story #231: refresh origin/main before this cohort's worktrees are cut so
+        # they branch from the latest merged state, not the main captured at run
+        # start. Earlier cohorts merge and push during a long run, so without this
+        # a later cohort would build against a stale base — avoidable conflicts and
+        # missing just-merged sibling changes. Real runs only (injected fakes must
+        # not touch the real repo, like the close-out reconcile/reposition guards);
+        # guarded and best-effort — offline degrades to the current local ref. This
+        # moves only the ref future create_story_worktree calls read; in-flight
+        # worktrees from earlier cohorts are never rebased.
+        if dispatcher is None:
+            _refresh_base_ref(Path.cwd())
 
         # Apply outcomes in cohort (submission) order so the result is
         # deterministic regardless of which worker finished first.
