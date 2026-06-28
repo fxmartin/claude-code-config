@@ -177,3 +177,58 @@ def test_inventory_migration_noop_on_fresh_db(tmp_path: Path) -> None:
     before = _columns(db, "story_inventory")
     ledger.ensure_migrated()  # must be a no-op, no regression
     assert before == _columns(db, "story_inventory")
+
+
+def test_fresh_init_records_inventory_migration_version(tmp_path: Path) -> None:
+    # A fresh DB gets the table from the base DDL, but Migration 7 must still be
+    # *recorded* as applied — otherwise a later ensure_migrated would re-run its
+    # CREATE (a no-op here, but the version bookkeeping must stay honest so the
+    # idempotency guard holds across the init → ensure_migrated boundary).
+    db = tmp_path / "fresh.db"
+    Ledger(db).init()
+    assert 7 in _versions(db)
+
+
+def test_partially_migrated_ledger_gains_only_inventory(tmp_path: Path) -> None:
+    # The realistic upgrade: a ledger already at Migrations 1-6 (the shape just
+    # before this story) where Migration 7 is the *only* pending one. Recording
+    # 1-6 as applied means the column-add migrations are skipped and only the
+    # table-creation path runs — the branch a from-empty `_migrations` fixture
+    # never isolates.
+    db = tmp_path / "v6.db"
+    _old_schema_db(db)
+    conn = sqlite3.connect(db)
+    try:
+        conn.executemany(
+            "INSERT INTO _migrations(version, name) VALUES (?, ?)",
+            [(v, f"migration {v}") for v in range(1, 7)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert not _has_table(db, "story_inventory")
+
+    Ledger(db).ensure_migrated()
+
+    assert _has_table(db, "story_inventory")
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7]  # only Migration 7 was added
+
+
+def test_story_inventory_updated_at_is_autopopulated(tmp_path: Path) -> None:
+    # `updated_at` is NOT NULL DEFAULT CURRENT_TIMESTAMP: a row inserted without
+    # it must still get a non-null stamp, so the projector/sync never has to
+    # supply one and a reader can always order by it.
+    db = tmp_path / "fresh.db"
+    Ledger(db).init()
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO story_inventory(story_id) VALUES ('22.1-001')"
+        )
+        conn.commit()
+        updated_at = conn.execute(
+            "SELECT updated_at FROM story_inventory WHERE story_id='22.1-001'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert updated_at is not None
