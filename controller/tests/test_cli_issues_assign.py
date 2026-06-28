@@ -62,6 +62,25 @@ def test_assign_epic_cascade(tmp_path, monkeypatch) -> None:
     assert "epic epic-22" in result.output
 
 
+def test_assign_already_owned_is_noop(tmp_path, monkeypatch) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    _seed_mapped(db, "22.5-002", ih.GITHUB, "42")
+    # Pre-cache the owner so re-assigning the same user is the idempotent path.
+    Ledger(db).inventory_set_owner("22.5-002", "alice")
+    fake = FakeHost(ih.GITHUB)
+    _patch_adapter(monkeypatch, fake)
+
+    result = runner.invoke(
+        app, ["issues", "assign", "22.5-002", "alice", "--host", "github", "--db", str(db)]
+    )
+
+    assert result.exit_code == 0, result.output
+    # No host write — the story is already owned by alice.
+    assert fake.assigned == []
+    assert "1 already" in result.output
+    assert "already alice" in result.output
+
+
 def test_assign_unknown_user_exits_2(tmp_path, monkeypatch) -> None:
     db = tmp_path / ".sdlc-state.db"
     _seed_mapped(db, "22.5-002", ih.GITHUB, "42")
