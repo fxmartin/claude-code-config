@@ -1909,5 +1909,93 @@ def eval_baseline_cmd(
     raise typer.Exit(code=0 if warn_only else 1)
 
 
+# --- `sdlc issues` command group (Epic-22) ----------------------------------
+# A dedicated group for the host story-mirror verbs. The bare `init` verb is
+# deliberately *not* reused (Epic-10 removed it); host backfill lives under
+# `issues` so its scope is unmistakable.
+issues_app = typer.Typer(
+    name="issues",
+    help="Mirror the story backlog onto a code host (GitHub/GitLab).",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(issues_app, name="issues")
+
+
+@issues_app.command(name="init")
+def issues_init(
+    host: str | None = typer.Option(
+        None, "--host", help="github|gitlab (default: auto-detect from origin)."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    root: Path | None = typer.Option(
+        None, "--root", help="Repo root holding docs/stories (default: cwd)."
+    ),
+) -> None:
+    """Backfill the full board: an issue for every story across every epic.
+
+    The one command to adopt a repo (Story 22.3-001). Provisions the taxonomy and
+    creates one issue per story via the host adapter, recording each mapping in the
+    inventory. A story already Done is created **and immediately closed**, so the
+    board shows full history while the open-issues list stays = real remaining
+    work. Idempotent: an interrupted or rate-limited run resumes cheaply —
+    already-mapped stories are updated, never duplicated.
+
+    With no framework-format stories it exits 1 pointing at ``generate-epics``; an
+    undeterminable/unsupported host or an unauthenticated CLI exits 2.
+    """
+    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.ledger_view import Ledger, default_db_path
+    from sdlc.story_init import NoStoriesError, init_issues
+    from sdlc.story_render import parse_story_docs
+
+    root_path = root or Path.cwd()
+
+    # No-stories guidance is independent of host auth — check before any host work.
+    if not parse_story_docs(root_path):
+        typer.echo(
+            "no framework-format stories found under docs/stories/; "
+            "run `generate-epics` to author them first",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        resolved = resolve_host(root_path, host)
+        adapter = get_adapter(resolved)
+        adapter.ensure_ready()
+    except IssueHostError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    db_path = db or default_db_path(root_path)
+    ledger = Ledger(db_path)
+    # init (not ensure_migrated) so adopting a never-built repo provisions the
+    # schema; idempotent CREATE-IF-NOT-EXISTS leaves an existing ledger intact.
+    ledger.init()
+
+    try:
+        result = init_issues(adapter, ledger, root=root_path)
+    except NoStoriesError as exc:  # defensive — the pre-check above usually wins
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    except IssueHostError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    actions: dict[str, int] = {}
+    for outcome in result.outcomes:
+        actions[outcome.action] = actions.get(outcome.action, 0) + 1
+    breakdown = ", ".join(f"{n} {action}" for action, n in sorted(actions.items()))
+    typer.echo(
+        f"init {result.host}: {result.total} story(ies) backfilled"
+        + (f" ({breakdown})" if breakdown else "")
+        + f"; {len(result.closed)} Done issue(s) closed."
+    )
+    raise typer.Exit(code=0)
+
+
 if __name__ == "__main__":
     app()
