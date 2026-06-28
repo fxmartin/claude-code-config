@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.97.0] - 2026-06-28
+
+### Added
+
+- feat(controller): ship config in wheel and wire harness default (#239)
+
+
 ## [v1.96.7] - 2026-06-28
 
 ### Fixed
