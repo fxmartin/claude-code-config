@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.103.0] - 2026-06-28
+
+### Added
+
+- feat(github-story-mirror): idempotent story ↔ issue mapping (#22.2-003)
+
+
 ## [v1.102.0] - 2026-06-28
 
 ### Added
