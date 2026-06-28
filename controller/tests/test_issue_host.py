@@ -275,6 +275,105 @@ def test_gitlab_issue_find_matches_marker() -> None:
     assert issue.assignees == ("fx",)
 
 
+# --- issue_view: reconcile read path (body + labels + assignees) ------------
+# Story 22.4-001: the reconcile reads the live issue to push only the managed
+# block and to pull human labels/assignee. issue_view must populate body and
+# labels (which the other verbs leave empty) off each host's JSON shape.
+
+
+def test_github_issue_view_populates_body_and_labels() -> None:
+    payload = json.dumps(
+        {
+            "number": 42,
+            "url": "https://github.com/fx/r/issues/42",
+            "title": "Story 22.4-001",
+            "state": "OPEN",
+            "body": "head\n<!-- sdlc-story: 22.4-001 -->\ntail",
+            "labels": [{"name": "story"}, {"name": "wontfix"}],
+            "assignees": [{"login": "fx"}],
+        }
+    )
+    runner = FakeRunner({"issue view": (0, payload, "")})
+    issue = ih.GitHubAdapter(runner=runner).issue_view("42")
+    assert issue.host == ih.GITHUB
+    assert issue.ref == "42"
+    assert issue.url == "https://github.com/fx/r/issues/42"
+    assert issue.state == "open"
+    assert issue.body == "head\n<!-- sdlc-story: 22.4-001 -->\ntail"
+    assert issue.labels == ("story", "wontfix")
+    assert issue.assignees == ("fx",)
+    argv = runner.calls[-1]
+    assert argv[:4] == ["gh", "issue", "view", "42"]
+    assert "--json" in argv
+    assert "number,url,title,state,body,labels,assignees" in argv
+
+
+def test_github_issue_view_accepts_issue_ref() -> None:
+    payload = json.dumps({"number": 7, "url": "u7", "state": "OPEN",
+                          "body": "b", "labels": [], "assignees": []})
+    runner = FakeRunner({"issue view": (0, payload, "")})
+    issue = ih.Issue(host=ih.GITHUB, ref="7")
+    out = ih.GitHubAdapter(runner=runner).issue_view(issue)
+    assert out.ref == "7"
+    assert runner.calls[-1][:4] == ["gh", "issue", "view", "7"]
+
+
+def test_github_issue_view_falls_back_to_ref_when_number_missing() -> None:
+    # No usable number in the payload → ref falls back to the requested ref.
+    payload = json.dumps({"url": "u", "state": "OPEN", "body": "b",
+                          "labels": [], "assignees": []})
+    runner = FakeRunner({"issue view": (0, payload, "")})
+    assert ih.GitHubAdapter(runner=runner).issue_view("99").ref == "99"
+
+
+def test_github_issue_view_empty_raises() -> None:
+    runner = FakeRunner({"issue view": (0, "", "")})
+    with pytest.raises(ih.IssueHostError) as exc:
+        ih.GitHubAdapter(runner=runner).issue_view("13")
+    assert "no issue" in str(exc.value).lower()
+
+
+def test_gitlab_issue_view_populates_body_and_labels() -> None:
+    payload = json.dumps(
+        {
+            "iid": 8,
+            "web_url": "https://gitlab.com/g/r/-/issues/8",
+            "title": "Story 22.4-001",
+            "state": "opened",
+            "description": "x\n<!-- sdlc-story: 22.4-001 -->\ny",
+            "labels": ["story", "blocked"],
+            "assignees": [{"username": "fx"}],
+        }
+    )
+    runner = FakeRunner({"issue view": (0, payload, "")})
+    issue = ih.GitLabAdapter(runner=runner).issue_view("8")
+    assert issue.host == ih.GITLAB
+    assert issue.ref == "8"
+    assert issue.url == "https://gitlab.com/g/r/-/issues/8"
+    assert issue.state == "open"
+    # GitLab maps `description` → body and yields plain-string labels.
+    assert issue.body == "x\n<!-- sdlc-story: 22.4-001 -->\ny"
+    assert issue.labels == ("story", "blocked")
+    assert issue.assignees == ("fx",)
+    argv = runner.calls[-1]
+    assert argv[:4] == ["glab", "issue", "view", "8"]
+    assert "--output" in argv and "json" in argv
+
+
+def test_gitlab_issue_view_falls_back_to_ref_when_iid_missing() -> None:
+    payload = json.dumps({"web_url": "u", "state": "opened", "description": "b",
+                          "labels": [], "assignees": []})
+    runner = FakeRunner({"issue view": (0, payload, "")})
+    assert ih.GitLabAdapter(runner=runner).issue_view("55").ref == "55"
+
+
+def test_gitlab_issue_view_empty_raises() -> None:
+    runner = FakeRunner({"issue view": (0, "", "")})
+    with pytest.raises(ih.IssueHostError) as exc:
+        ih.GitLabAdapter(runner=runner).issue_view("21")
+    assert "no issue" in str(exc.value).lower()
+
+
 # --- unauthenticated / failure fail-fast ------------------------------------
 
 
@@ -352,6 +451,38 @@ def test_parse_json_array_bad_input_returns_empty(stdout) -> None:
 
 def test_parse_json_array_valid_list() -> None:
     assert ih._parse_json_array('[{"a": 1}]') == [{"a": 1}]
+
+
+@pytest.mark.parametrize("stdout", ["", None, "not json{", "[1, 2, 3]"])
+def test_parse_json_object_bad_input_returns_empty(stdout) -> None:
+    # Empty/garbage, and a JSON array (not an object) all collapse to {}.
+    assert ih._parse_json_object(stdout) == {}
+
+
+def test_parse_json_object_valid_object() -> None:
+    assert ih._parse_json_object('{"number": 9, "state": "OPEN"}') == {
+        "number": 9,
+        "state": "OPEN",
+    }
+
+
+@pytest.mark.parametrize(
+    "labels, expected",
+    [
+        # GitHub shape: list of objects keyed by name.
+        ([{"name": "story"}, {"name": "wontfix"}], ("story", "wontfix")),
+        # GitLab shape: list of plain strings.
+        (["story", "blocked"], ("story", "blocked")),
+        # Mixed + malformed entries are skipped, valid ones survive in order.
+        (["a", {"name": "b"}, {"noname": "x"}, 7, {"name": 5}], ("a", "b")),
+        ([], ()),
+        # Non-list (None / object) → empty tuple.
+        (None, ()),
+        ({"name": "x"}, ()),
+    ],
+)
+def test_label_names_normalises_both_host_shapes(labels, expected) -> None:
+    assert ih._label_names(labels) == expected
 
 
 @pytest.mark.parametrize(
