@@ -168,3 +168,62 @@ def test_init_unauthenticated_cli_exits_two(tmp_path, monkeypatch):
 
     assert result.exit_code == 2
     assert "not authenticated" in result.output
+
+
+def test_init_host_error_mid_backfill_exits_two(tmp_path, monkeypatch):
+    """A host failure *during* the backfill (past ensure_ready) still exits 2.
+
+    The pre-check and ensure_ready both pass, then the very first issue_create
+    rate-limits/fails — init_issues propagates IssueHostError, which the command's
+    inner handler (covering the backfill call) maps to exit 2 with an error line.
+    """
+    _seed_stories(tmp_path)
+
+    class FlakyCreate(FakeHost):
+        def issue_create(self, title, body, labels=None, assignee=None):
+            raise IssueHostError("API rate limit exceeded for issue creation")
+
+    fake = FlakyCreate()
+    _patch_host(monkeypatch, fake)
+
+    result = runner.invoke(
+        app,
+        ["issues", "init", "--host", "github",
+         "--root", str(tmp_path), "--db", str(tmp_path / ".sdlc-state.db")],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "error" in result.output.lower()
+    assert "rate limit" in result.output
+    assert len(fake.issues) == 0  # nothing provisioned when the host fails
+
+
+def test_init_no_stories_race_defensive_exit_one(tmp_path, monkeypatch):
+    """The defensive NoStoriesError handler inside the command body exits 1.
+
+    The pre-check passes (stories exist on disk) yet init_issues raises
+    NoStoriesError — e.g. the story docs vanish between the pre-check and the
+    backfill. The inner handler still points the user at generate-epics, exit 1.
+    """
+    import sdlc.story_init as story_init
+
+    _seed_stories(tmp_path)
+    fake = FakeHost()
+    _patch_host(monkeypatch, fake)
+
+    def _vanished(adapter, ledger, root=None):
+        raise story_init.NoStoriesError(
+            "no framework-format stories found under docs/stories/; "
+            "run `generate-epics` to author them first"
+        )
+
+    monkeypatch.setattr(story_init, "init_issues", _vanished)
+
+    result = runner.invoke(
+        app,
+        ["issues", "init", "--host", "github",
+         "--root", str(tmp_path), "--db", str(tmp_path / ".sdlc-state.db")],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "generate-epics" in result.output
