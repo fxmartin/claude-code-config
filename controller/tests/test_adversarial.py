@@ -25,7 +25,7 @@ from sdlc.adversarial import (
 
 # The repo's checked-in default config.
 CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "config" / "adversarial-reviewers.yaml"
+    Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "adversarial-reviewers.yaml"
 )
 
 

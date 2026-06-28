@@ -12,7 +12,7 @@ from sdlc.harness import resolve_harness
 from sdlc.role_routing import PIPELINE_ROLES
 
 # The checked-in registry the real run loads — the same file cli.py validates.
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "harnesses.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
 
 
 def _one_story() -> list[Story]:

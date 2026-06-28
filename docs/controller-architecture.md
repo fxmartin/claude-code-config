@@ -814,8 +814,8 @@ surface as `AgentDispatchError`; contract failures surface as the
 ### Harness registry (Story 20.1-001)
 
 `sdlc/harness.py` generalizes the dispatch seam and the
-`config/adversarial-reviewers.yaml` pattern into one config-driven **harness
-abstraction**: a `config/harnesses.yaml` keyed by harness name (`claude`,
+`sdlc/config/adversarial-reviewers.yaml` pattern into one config-driven **harness
+abstraction**: a `sdlc/config/harnesses.yaml` keyed by harness name (`claude`,
 `codex`, …) where each entry declares a **command template**, **invocation
 flags**, **capability flags** (`worktree_isolation`, `parallel`, `json_contract`,
 `usage_tracking`, `rate_limit_aware`), and an **output-parser id**. The file is
@@ -946,7 +946,7 @@ unknown role or a malformed entry at parse time, and refuses two different
 harnesses for the same role (`coverage=claude,qa=codex`). `resolve_role_routing`
 then resolves **every** role to a `HarnessConfig`: a role absent from the map
 collapses to the default harness (today's behaviour), and a role mapped to a
-non-default harness is resolved from `config/harnesses.yaml`. An **unknown** or
+non-default harness is resolved from `sdlc/config/harnesses.yaml`. An **unknown** or
 **disabled** harness, or a missing registry, raises `RoleRoutingError` so the CLI
 **fails fast in preflight** (exit 2, no half-run) before any stage runs.
 

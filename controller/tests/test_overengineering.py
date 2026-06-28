@@ -32,7 +32,7 @@ from sdlc.overengineering import (
 
 # The repo's checked-in default config.
 CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "config" / "overengineering-lens.yaml"
+    Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "overengineering-lens.yaml"
 )
 
 

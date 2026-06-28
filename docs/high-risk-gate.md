@@ -20,7 +20,7 @@ Approval is satisfied by **either** of two paths:
 1. **Detection.** `.github/workflows/risk-gate.yml` runs on every pull request.
    It diffs the PR against its base and pipes the changed files through
    `scripts/risk-gate-detect.sh`, which matches each path against the glob
-   patterns in `controller/config/high-risk-patterns.yaml`.
+   patterns in `controller/src/sdlc/config/high-risk-patterns.yaml`.
 2. **Flagging.** If any file matches, the workflow:
    - adds the `risk:high` label to the PR;
    - posts (and keeps updated) a comment listing the matched files, the pattern
@@ -38,7 +38,7 @@ Approval is satisfied by **either** of two paths:
 
 ## Configuration
 
-The baseline patterns live in `controller/config/high-risk-patterns.yaml` as a
+The baseline patterns live in `controller/src/sdlc/config/high-risk-patterns.yaml` as a
 flat YAML list under `high_risk_patterns:`. Glob semantics:
 
 - `**` crosses path separators (a leading `**/` also matches at the repo root);

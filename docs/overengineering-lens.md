@@ -59,7 +59,7 @@ In Python the validated list is lifted into frozen `Finding` dataclasses by
 
 ## Policy
 
-Configured in `controller/config/overengineering-lens.yaml`:
+Configured in `controller/src/sdlc/config/overengineering-lens.yaml`:
 
 ```yaml
 enabled: false          # master switch — off = behaviour unchanged from before

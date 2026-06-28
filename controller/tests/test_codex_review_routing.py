@@ -26,8 +26,8 @@ from sdlc.role_routing import (
 # The repo's checked-in registries — the ones a real run loads. Exercising the
 # reconciliation against them (not a bespoke tmp file) is what proves AC1: the
 # `review` role on Codex is governed by a single source of truth.
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "harnesses.yaml"
-REVIEWERS_PATH = Path(__file__).resolve().parents[1] / "config" / "adversarial-reviewers.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
+REVIEWERS_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "adversarial-reviewers.yaml"
 
 
 @pytest.fixture(autouse=True)

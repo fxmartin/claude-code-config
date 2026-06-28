@@ -22,7 +22,7 @@ reviewers:
   # users without Codex set `enabled: false` (see docs/adversarial-review.md).
   codex:
     # Single source of truth (Story 20.3-002): `harness: codex` makes this
-    # reviewer a *view* over the `codex` entry in controller/config/harnesses.yaml.
+    # reviewer a *view* over the `codex` entry in controller/src/sdlc/config/harnesses.yaml.
     # That harness entry owns whether Codex is available (its `enabled` flag and
     # probe); this entry owns only the review-role specifics — the command,
     # timeout, and verdict vocabulary Epic-08's consensus needs. The `sdlc build`

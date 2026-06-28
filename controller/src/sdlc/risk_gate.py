@@ -5,18 +5,22 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-# The default config ships next to the package source (a sibling `config/`
-# directory of the controller project). It is read at runtime rather than
-# bundled into the wheel because the gate is exercised from the controller
-# checkout (CI workflow + merge agent), not from a `uv tool install`. The
-# config file is the single source of truth shared with the GitHub workflow.
-DEFAULT_CONFIG_PATH: Path = (
-    Path(__file__).resolve().parents[2] / "config" / "high-risk-patterns.yaml"
+# The default config ships inside the `sdlc` package (`sdlc/config/`) and is
+# bundled into the wheel the same way the JSON schemas are, so it resolves in
+# BOTH layouts: the controller checkout (editable install — CI workflow + merge
+# agent) AND a `uv tool install`ed wheel where the source tree is gone.
+# `importlib.resources` returns a Traversable; `uv tool install` unzips the wheel
+# onto disk, so converting it to a Path via `str()` yields a real filesystem
+# path. The config file remains the single source of truth shared with the
+# GitHub workflow.
+DEFAULT_CONFIG_PATH: Path = Path(
+    str(resources.files(__package__) / "config" / "high-risk-patterns.yaml")
 )
 
 # The additive per-repo override file a consumer repo may ship at its root.

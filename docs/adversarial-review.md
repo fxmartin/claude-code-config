@@ -63,7 +63,7 @@ Every reviewer must emit this shape (JSON-schema draft 2020-12, published at
 `AdversarialContractError` with the offending field named when it does not
 conform.
 
-## Config: `controller/config/adversarial-reviewers.yaml`
+## Config: `controller/src/sdlc/config/adversarial-reviewers.yaml`
 
 Reviewers are registered in YAML. Each entry declares the command to invoke, a
 timeout, an enabled flag, and the verdicts it is allowed to return. A top-level
@@ -91,7 +91,7 @@ placeholders; the controller substitutes them before invoking the reviewer.
 ### Link to the harness registry (Story 20.3-002)
 
 Codex appears in two registries: here, as the `codex` *reviewer*, and in
-`controller/config/harnesses.yaml`, as the `codex` *harness* the `review`/`qa`
+`controller/src/sdlc/config/harnesses.yaml`, as the `codex` *harness* the `review`/`qa`
 roles route to (`sdlc build --harness review=codex,qa=codex`). To keep those
 from becoming **two competing Codex configurations**, the reviewer registry is a
 **view** over the harness registry:
@@ -215,7 +215,7 @@ result = dispatch_adversarial_review(
     diff=diff_text,
     context=ReviewContext(tests_pass=True, coverage_pct=93.5, review_approved=True),
     pr_url="https://github.com/fxmartin/repo/pull/42",
-    config_path="controller/config/adversarial-reviewers.yaml",
+    config_path="controller/src/sdlc/config/adversarial-reviewers.yaml",
 )
 
 print(result.consensus)        # "approve" | "request_changes" | "block"
