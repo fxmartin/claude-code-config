@@ -80,6 +80,21 @@ def load_schema(agent_type: str) -> dict[str, Any]:
 _FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
 
 
+def _strip_fence(text: str) -> str:
+    """Strip a single surrounding markdown code fence, if the whole text is one.
+
+    Tolerates an agent wrapping the result JSON *inside* the sentinels in a
+    ```json … ``` (or ``` … ```) fence. Text that is not a lone fence is
+    returned stripped but otherwise untouched, so malformed JSON still surfaces
+    its own parse error downstream.
+    """
+    text = text.strip()
+    match = _FENCE_RE.fullmatch(text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
 def _try_json_object(payload: str) -> dict[str, Any] | None:
     """Parse ``payload`` and return it only if it is a JSON object, else None."""
     payload = payload.strip()
@@ -167,7 +182,7 @@ def _parse_sentinel(response: str, start: int) -> dict[str, Any]:
             f"found {RESULT_START_MARKER} but no closing {RESULT_END_MARKER} marker."
         )
 
-    payload = response[start + len(RESULT_START_MARKER) : end].strip()
+    payload = _strip_fence(response[start + len(RESULT_START_MARKER) : end])
     if not payload:
         raise ResultBlockError(
             f"the {RESULT_START_MARKER} ... {RESULT_END_MARKER} block is empty."
@@ -188,19 +203,48 @@ def _parse_sentinel(response: str, start: int) -> dict[str, Any]:
     return parsed
 
 
+def _sentinel_starts(response: str) -> list[int]:
+    """Offsets of every ``<<<RESULT_JSON>>>`` start marker, in document order."""
+    starts: list[int] = []
+    i = response.find(RESULT_START_MARKER)
+    while i != -1:
+        starts.append(i)
+        i = response.find(RESULT_START_MARKER, i + len(RESULT_START_MARKER))
+    return starts
+
+
+def _parse_last_sentinel(response: str, starts: list[int]) -> dict[str, Any]:
+    """Parse the LAST well-formed sentinel block (agents sometimes restate it).
+
+    Tries blocks last-first and returns the first that parses; if none parse,
+    re-raises the offending block's error so a single malformed block still
+    surfaces its precise, actionable message.
+    """
+    last_error: ResultBlockError | None = None
+    for start in reversed(starts):
+        try:
+            return _parse_sentinel(response, start)
+        except ResultBlockError as exc:
+            last_error = exc
+    assert last_error is not None  # starts non-empty ⇒ at least one attempt
+    raise last_error
+
+
 def parse_result_block(response: str) -> dict[str, Any]:
     """Extract and parse the agent's JSON result object.
 
     Preferred source is the ``<<<RESULT_JSON>>> ... <<<END_RESULT>>>`` block; a
-    present-but-malformed block raises a precise :class:`ResultBlockError`. When
-    the start marker is absent entirely, falls back to the last fenced
-    ```` ```json ```` block, then the last bare balanced JSON object (R10), so
-    format drift no longer discards a valid result. Raises
+    present-but-malformed block raises a precise :class:`ResultBlockError`. The
+    JSON inside the block may be wrapped in a markdown fence, surrounded by
+    whitespace, or followed by trailing prose, and a duplicated block resolves
+    to the last well-formed one. When the start marker is absent entirely, falls
+    back to the last fenced ```` ```json ```` block, then the last bare balanced
+    JSON object (R10), so format drift no longer discards a valid result. Raises
     :class:`ResultBlockError` only when nothing parseable is found.
     """
-    start = response.find(RESULT_START_MARKER)
-    if start != -1:
-        return _parse_sentinel(response, start)
+    starts = _sentinel_starts(response)
+    if starts:
+        return _parse_last_sentinel(response, starts)
 
     candidates = _fallback_candidates(response)
     if candidates:
@@ -249,15 +293,15 @@ def parse_and_validate(agent_type: str, response: str) -> dict[str, Any]:
     """Extract the result block from ``response`` and validate it.
 
     Combines :func:`parse_result_block` and :func:`validate_response`. With a
-    sentinel block, that single object is validated (strict). Without it, the
+    sentinel block, the last well-formed block is validated (strict). Without it, the
     fallback candidates (fenced/bare objects, last-first) are tried in order and
     the **first schema-valid** one wins — so an example/decoy object in the prose
     is skipped in favour of the real result (R10). Raises
     :class:`ResultBlockError` or :class:`SchemaValidationError`.
     """
-    start = response.find(RESULT_START_MARKER)
-    if start != -1:
-        return validate_response(agent_type, _parse_sentinel(response, start))
+    starts = _sentinel_starts(response)
+    if starts:
+        return validate_response(agent_type, _parse_last_sentinel(response, starts))
 
     candidates = _fallback_candidates(response)
     if not candidates:

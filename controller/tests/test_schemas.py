@@ -281,6 +281,97 @@ def test_contract_errors_share_base() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #233: tolerant sentinel-block extraction (harmless wrapper deviations)
+# ---------------------------------------------------------------------------
+
+_BUILD = VALID_RESPONSES["build"]
+
+
+def test_sentinel_block_with_json_fence_inside_parses() -> None:
+    """The JSON inside the sentinels may be wrapped in a ```json fence."""
+    body = json.dumps(_BUILD)
+    response = f"prose\n{RESULT_START_MARKER}\n```json\n{body}\n```\n{RESULT_END_MARKER}\n"
+    assert parse_result_block(response) == _BUILD
+    assert parse_and_validate("build", response) == _BUILD
+
+
+def test_sentinel_block_with_languageless_fence_inside_parses() -> None:
+    """A bare ``` fence (no language tag) inside the sentinels is also stripped."""
+    body = json.dumps(_BUILD)
+    response = f"{RESULT_START_MARKER}\n```\n{body}\n```\n{RESULT_END_MARKER}"
+    assert parse_result_block(response) == _BUILD
+
+
+def test_whole_envelope_wrapped_in_fence_parses() -> None:
+    """The agent may fence the entire envelope, markers and all."""
+    body = json.dumps(_BUILD)
+    response = f"```json\n{RESULT_START_MARKER}\n{body}\n{RESULT_END_MARKER}\n```\n"
+    assert parse_and_validate("build", response) == _BUILD
+
+
+def test_sentinel_block_trailing_prose_ignored() -> None:
+    """Free-form prose after the closing marker must not fail extraction."""
+    body = json.dumps(_BUILD)
+    response = (
+        f"{RESULT_START_MARKER}\n{body}\n{RESULT_END_MARKER}\n"
+        "And that's a wrap — let me know if you need anything else!"
+    )
+    assert parse_and_validate("build", response) == _BUILD
+
+
+def test_sentinel_block_extra_whitespace_parses() -> None:
+    """Leading/trailing whitespace around the markers and JSON is tolerated."""
+    body = json.dumps(_BUILD)
+    response = (
+        f"\n\n  {RESULT_START_MARKER}   \n\n   {body}   \n\n  {RESULT_END_MARKER}  \n\n"
+    )
+    assert parse_and_validate("build", response) == _BUILD
+
+
+def test_duplicate_sentinel_blocks_last_wins() -> None:
+    """When the agent restates the block, the LAST well-formed block wins."""
+    first = dict(_BUILD, branch_name="feature/first")
+    last = dict(_BUILD, branch_name="feature/last")
+    response = (
+        f"{RESULT_START_MARKER}\n{json.dumps(first)}\n{RESULT_END_MARKER}\n"
+        "on reflection, the final answer:\n"
+        f"{RESULT_START_MARKER}\n{json.dumps(last)}\n{RESULT_END_MARKER}\n"
+    )
+    assert parse_result_block(response)["branch_name"] == "feature/last"
+    assert parse_and_validate("build", response)["branch_name"] == "feature/last"
+
+
+def test_duplicate_sentinel_blocks_skip_malformed_last() -> None:
+    """A malformed trailing block is skipped in favour of an earlier well-formed one."""
+    response = (
+        f"{RESULT_START_MARKER}\n{json.dumps(_BUILD)}\n{RESULT_END_MARKER}\n"
+        f"{RESULT_START_MARKER}\n{{not json}}\n{RESULT_END_MARKER}\n"
+    )
+    assert parse_result_block(response) == _BUILD
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "no result block here, just prose and no json",  # genuinely absent
+        f"{RESULT_START_MARKER}\n{{not json}}\n{RESULT_END_MARKER}",  # malformed JSON
+    ],
+)
+def test_sentinel_extraction_still_rejects_garbage(response: str) -> None:
+    """Leniency does not weaken rejection of absent or malformed blocks."""
+    with pytest.raises(ContractError):
+        parse_and_validate("build", response)
+
+
+def test_sentinel_schema_invalid_still_raises() -> None:
+    """A well-formed but schema-invalid sentinel block still fails validation."""
+    bad = {"build_status": "SUCCESS"}  # missing branch_name, commit_sha
+    response = f"{RESULT_START_MARKER}\n{json.dumps(bad)}\n{RESULT_END_MARKER}\n"
+    with pytest.raises(SchemaValidationError):
+        parse_and_validate("build", response)
+
+
+# ---------------------------------------------------------------------------
 # R10: tolerant parsing when the sentinel markers are absent (format drift)
 # ---------------------------------------------------------------------------
 
@@ -403,8 +494,12 @@ def test_schema_path_raises_keyerror_for_unknown_type() -> None:
         assert valid in str(exc_info.value)
 
 
-def test_parse_result_block_uses_first_block_when_multiple_present() -> None:
-    """When multiple marker blocks appear, only the first is extracted."""
+def test_parse_result_block_uses_last_block_when_multiple_present() -> None:
+    """When multiple marker blocks appear, the last well-formed one is extracted.
+
+    Agents sometimes restate the result; the final block is the authoritative
+    one (issue #233).
+    """
     first = {"branch_name": "first", "build_status": "SUCCESS", "commit_sha": "aaa"}
     second = {"branch_name": "second", "build_status": "FAILED", "commit_sha": "bbb"}
     text = (
@@ -413,7 +508,7 @@ def test_parse_result_block_uses_first_block_when_multiple_present() -> None:
         f"{RESULT_START_MARKER}\n{json.dumps(second)}\n{RESULT_END_MARKER}\n"
     )
     result = parse_result_block(text)
-    assert result == first
+    assert result == second
 
 
 def test_parse_result_block_empty_string_raises_result_block_error() -> None:
@@ -484,8 +579,8 @@ def test_validate_command_unicode_valid_response() -> None:
     assert parsed_output["branch_name"] == payload["branch_name"]
 
 
-def test_validate_command_multiple_blocks_uses_first() -> None:
-    """`validate build` with multiple marker blocks validates the first one."""
+def test_validate_command_multiple_blocks_uses_last() -> None:
+    """`validate build` with multiple marker blocks validates the last one (issue #233)."""
     from typer.testing import CliRunner
     from sdlc.cli import app
 
@@ -499,7 +594,7 @@ def test_validate_command_multiple_blocks_uses_first() -> None:
     )
     result = cli_runner.invoke(app, ["validate", "build"], input=response)
     assert result.exit_code == 0, result.output
-    assert "feature/first" in result.output
+    assert "feature/second" in result.output
 
 
 def test_validate_command_malformed_json_in_block() -> None:
