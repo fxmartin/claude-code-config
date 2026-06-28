@@ -19,6 +19,7 @@ from sdlc.build import (
     BuildOptions,
     BuildResult,
     Ledger,
+    _filter_git_landed,
     default_preflight,
     detect_test_command,
     in_test_sentinel,
@@ -804,6 +805,153 @@ def test_rebuild_forces_done_stories(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# #227 — discovery done-detection is git-aware: a story merged in a prior run
+# whose markdown was never set to Status: Done must be skipped at the partition
+# (git-landed), not rebuilt — otherwise re-executing it fails and cascade-blocks
+# any newly-added story that depends on it.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_git_landed_moves_landed_to_done_skips(monkeypatch) -> None:
+    """A buildable story whose work is git-landed is moved into done_skips (#227)."""
+    import sdlc.reconcile as reconcile_mod
+
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "origin/main")
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_detect_landing",
+        lambda sid, pr, base, root: ("commit-tag", "abc") if sid == "20.1-001" else None,
+    )
+    landed, fresh = _story("20.1-001"), _story("20.7-001")
+    buildable, done_skips = _filter_git_landed([landed, fresh], [])
+    assert [s.id for s in buildable] == ["20.7-001"]
+    assert [s.id for s in done_skips] == ["20.1-001"]
+
+
+def test_filter_git_landed_no_base_is_noop(tmp_path, monkeypatch) -> None:
+    """No resolvable base ref ⇒ partition unchanged, detector never probed."""
+    import sdlc.reconcile as reconcile_mod
+
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: None)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_detect_landing",
+        lambda sid, pr, base, root: calls.append(sid),
+    )
+    buildable, done_skips = _filter_git_landed(
+        [_story("20.7-001"), _story("20.7-002")], [], root=tmp_path
+    )
+    assert [s.id for s in buildable] == ["20.7-001", "20.7-002"]
+    assert done_skips == []
+    assert calls == []  # short-circuit before any git probe
+
+
+def test_run_build_skips_git_landed_story(tmp_path, monkeypatch) -> None:
+    """A git-landed (but not markdown-done) story is SKIPPED, never dispatched."""
+    import sdlc.reconcile as reconcile_mod
+
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "origin/main")
+    monkeypatch.setattr(
+        reconcile_mod, "_detect_landing", lambda sid, pr, base, root: ("commit-tag", "x")
+    )
+    disp = FakeDispatcher()
+    result = run_build(
+        BuildOptions(scope="epic-20", skip_preflight=True, sequential=True),
+        queue=[_story("20.1-001", done=False)],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["20.1-001"] == "SKIPPED"
+    assert result.skipped == 1
+    assert all(sid != "20.1-001" for _, sid in disp.calls)
+
+
+def test_run_build_keeps_incomplete_story_buildable(tmp_path, monkeypatch) -> None:
+    """Neither markdown-done nor git-landed ⇒ the story still builds on a re-run."""
+    import sdlc.reconcile as reconcile_mod
+
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "origin/main")
+    monkeypatch.setattr(
+        reconcile_mod, "_detect_landing", lambda sid, pr, base, root: None
+    )
+    disp = FakeDispatcher()
+    result = run_build(
+        BuildOptions(scope="epic-20", skip_preflight=True, sequential=True),
+        queue=[_story("20.7-001", done=False)],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.skipped == 0
+    assert result.completed == 1
+    assert any(sid == "20.7-001" for _, sid in disp.calls)
+
+
+def test_run_build_new_story_builds_when_dep_is_git_landed(
+    tmp_path, monkeypatch
+) -> None:
+    """#227 repro: an epic re-run with a merged dep + a new dependent.
+
+    The merged dep is git-landed (not markdown-done) so it drops into done_skips
+    and out of the cohort DAG; its new dependent then sees a satisfied
+    out-of-queue edge and builds instead of being cascade-blocked.
+    """
+    import sdlc.reconcile as reconcile_mod
+
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "origin/main")
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_detect_landing",
+        lambda sid, pr, base, root: ("commit-tag", "x") if sid == "20.1-001" else None,
+    )
+    disp = FakeDispatcher()
+    result = run_build(
+        BuildOptions(scope="epic-20", skip_preflight=True, sequential=True),
+        queue=[
+            _story("20.1-001", done=False),
+            _story("20.7-001", done=False, deps=["20.1-001"]),
+        ],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["20.1-001"] == "SKIPPED"
+    assert result.story_status["20.7-001"] == "DONE"
+    assert "20.7-001" not in {
+        sid for sid, st in result.story_status.items() if st == "BLOCKED"
+    }
+
+
+def test_run_build_markdown_done_story_is_not_git_probed(
+    tmp_path, monkeypatch
+) -> None:
+    """A markdown-done story is skipped WITHOUT a git probe (the #227 fast path)."""
+    import sdlc.reconcile as reconcile_mod
+
+    monkeypatch.setattr("sdlc.build._base_ref", lambda root: "origin/main")
+    probed: list[str] = []
+
+    def _spy(sid, pr, base, root):
+        probed.append(sid)
+        return None
+
+    monkeypatch.setattr(reconcile_mod, "_detect_landing", _spy)
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001", done=True), _story("99.1-002", done=False)],
+        ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    # The markdown-done story is partitioned into done_skips before the probe and
+    # is never passed to the detector; only the genuinely-buildable story is.
+    assert "99.1-001" not in probed
+    assert probed == ["99.1-002"]
+
+
+# ---------------------------------------------------------------------------
 # R6: preflight detection + timeout/streaming
 # ---------------------------------------------------------------------------
 
@@ -1304,6 +1452,9 @@ def test_merge_contract_error_with_landing_recovers_not_failed(
         ledger=Ledger(tmp_path / "l.db"),
         dispatcher=disp,
         preflight=lambda: True,
+        # tmp_path has no .git: the #227 partition probe short-circuits so this
+        # exercises mid-build merge-stage recovery, not the partition skip.
+        root=tmp_path,
     )
     assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
     assert result.needs_attention == 1
@@ -1359,6 +1510,9 @@ def test_recovered_merge_converges_to_done_on_reconcile(
         ledger=Ledger(db),
         dispatcher=disp,
         preflight=lambda: True,
+        # tmp_path has no .git: the #227 partition probe short-circuits so this
+        # exercises mid-build merge-stage recovery, not the partition skip.
+        root=tmp_path,
     )
     assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
 
@@ -2245,6 +2399,7 @@ def test_streamed_stage_records_substage_activity(tmp_path) -> None:
         ledger=Ledger(db),
         dispatcher=_StreamingDispatcher(events),
         preflight=lambda: True,
+        root=tmp_path,  # hermetic: keep the #227 git-landed probe off the real repo
     )
     rid = Ledger(db).latest_run_id()
     latest = Ledger(db).latest_progress(rid)

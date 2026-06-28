@@ -3088,6 +3088,53 @@ def persist_cohort_structure(
             ledger.set_story_wave(run_id, story.id, wave, intra_deps)
 
 
+def _filter_git_landed(
+    buildable: list[Story], done_skips: list[Story], root: Path | None = None
+) -> tuple[list[Story], list[Story]]:
+    """Move git-landed stories out of ``buildable`` into ``done_skips`` (#227).
+
+    Discovery decides ``Story.done`` from markdown status alone, so a story merged
+    in a *prior* run whose markdown was never flipped to ``Status: Done`` is
+    markdown-``done=False`` and lands in ``buildable`` — where re-executing it
+    fails (the work is already on the base branch) and cascade-blocks every story
+    that depends on it, forcing the scoped-build workaround. This pass treats such
+    a story as done when its work is *git-landed* on the base branch, exactly as a
+    later :func:`sdlc.reconcile.reconcile_run` would (so the two paths agree and
+    the partition is idempotent with ``sdlc reconcile``). A landed story moved
+    into ``done_skips`` stays out of the cohort DAG, so its dependents see it as a
+    satisfied out-of-queue edge rather than a blocked in-queue one.
+
+    Performance: only ``buildable`` stories are probed, and those are by
+    construction the *non-markdown-done* set — a markdown-done story is already in
+    ``done_skips`` and never reaches the git probe (the short-circuit #227
+    requires). Each probe reuses reconcile's :func:`_detect_landing` with
+    ``pr_number=None`` so ``gh`` is never shelled — a probe is a small bounded set
+    of local git calls, run once per buildable story at schedule time. Best-effort
+    and offline-safe: a missing base ref or any git error leaves the story in
+    ``buildable``, degrading to today's markdown-only behaviour.
+    """
+    if not buildable:
+        return buildable, done_skips
+    root = root or Path.cwd()
+    base = _base_ref(root)
+    if base is None:
+        return buildable, done_skips
+    # reconcile imports from build, so a top-level import would be circular.
+    from sdlc.reconcile import _detect_landing
+
+    still_buildable: list[Story] = []
+    landed: list[Story] = []
+    for story in buildable:
+        try:
+            if _detect_landing(story.id, None, base, root) is not None:
+                landed.append(story)
+            else:
+                still_buildable.append(story)
+        except (OSError, subprocess.SubprocessError):
+            still_buildable.append(story)
+    return still_buildable, done_skips + landed
+
+
 def run_build(
     opts: BuildOptions,
     *,
@@ -3099,6 +3146,7 @@ def run_build(
     registry: "Registry | None" = None,
     clock: Callable[[], float] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
+    root: Path | None = None,
 ) -> BuildResult:
     """Run the build-stories orchestration deterministically.
 
@@ -3111,7 +3159,9 @@ def run_build(
     ``dispatcher`` defaults to the real subprocess-backed
     :func:`sdlc.dispatch.dispatch_agent`. Tests inject a fake. ``preflight``
     defaults to running the detected test suite. ``render_view`` is an optional
-    hook that regenerates the markdown progress view from the ledger.
+    hook that regenerates the markdown progress view from the ledger. ``root``
+    is the git project root the git-landed partition probe (#227) consults;
+    it defaults to the cwd in production and lets tests point at a non-repo dir.
     """
     dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
     check_preflight = preflight or (lambda: default_preflight(timeout=opts.preflight_timeout))
@@ -3122,6 +3172,15 @@ def run_build(
     else:
         buildable = [s for s in queue if not s.done]
         done_skips = [s for s in queue if s.done]
+        # Markdown done-detection misses stories merged in a prior run whose
+        # markdown was never flipped to Status: Done; treat those as done when
+        # their work is git-landed so an epic re-run skips them instead of
+        # rebuilding and cascade-blocking their dependents (#227). Only the
+        # non-markdown-done `buildable` set is probed — markdown-done stories
+        # already sit in `done_skips` and never trigger a git probe. ``root``
+        # (default cwd) lets tests point the probe at a non-repo dir to stay
+        # hermetic; production resolves git against the project root as before.
+        buildable, done_skips = _filter_git_landed(buildable, done_skips, root)
 
     # --- Limit truncation (applies to the buildable set) ---------------------
     if opts.limit:
