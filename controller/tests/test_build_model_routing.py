@@ -54,6 +54,7 @@ def _run(opts: BuildOptions, story: Story, tmp_path) -> _ModelRecordingDispatche
         ledger=Ledger(tmp_path / "ledger.db"),
         dispatcher=disp,
         preflight=lambda: True,
+        root=tmp_path,  # hermetic: keep the #227 git-landed probe off the real repo
     )
     return disp
 
@@ -283,7 +284,7 @@ def test_bugfix_stage_receives_routed_model(tmp_path, monkeypatch) -> None:
     )
     run_build(
         opts, queue=[_story(points=1)], ledger=Ledger(tmp_path / "ledger.db"),
-        dispatcher=disp, preflight=lambda: True,
+        dispatcher=disp, preflight=lambda: True, root=tmp_path,
     )
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
     assert bugfix_models, "bugfix agent was never dispatched"
@@ -302,7 +303,7 @@ def test_bugfix_override_wins_over_map(tmp_path, monkeypatch) -> None:
     )
     run_build(
         opts, queue=[_story(points=1)], ledger=Ledger(tmp_path / "ledger.db"),
-        dispatcher=disp, preflight=lambda: True,
+        dispatcher=disp, preflight=lambda: True, root=tmp_path,
     )
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
     assert bugfix_models[0] == HAIKU
@@ -350,7 +351,7 @@ class _FailNTimesDispatcher:
 def _run_disp(opts, story, disp, tmp_path):
     run_build(
         opts, queue=[story], ledger=Ledger(tmp_path / "ledger.db"),
-        dispatcher=disp, preflight=lambda: True,
+        dispatcher=disp, preflight=lambda: True, root=tmp_path,
     )
     return disp
 
@@ -466,6 +467,7 @@ def test_escalation_is_recorded_in_ledger_events(tmp_path, monkeypatch) -> None:
     run_build(
         opts, queue=[_story(points=1)], ledger=Ledger(tmp_path / "ledger.db"),
         dispatcher=_FailNTimesDispatcher("build", 1), preflight=lambda: True,
+        root=tmp_path,
     )
     conn = sqlite3.connect(tmp_path / "ledger.db")
     msgs = [
