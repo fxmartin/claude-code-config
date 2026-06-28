@@ -4,6 +4,18 @@
 [![Release](https://github.com/fxmartin/claude-code-config/actions/workflows/release.yml/badge.svg)](https://github.com/fxmartin/claude-code-config/actions/workflows/release.yml)
 [![GitHub release](https://img.shields.io/github/v/release/fxmartin/claude-code-config)](https://github.com/fxmartin/claude-code-config/releases/latest)
 
+> **In one sentence:** give it a plain-English idea, and it plans, builds, tests, reviews, and merges working software for you — running a whole AI development team end-to-end, with a human stepping in only for the calls that matter.
+
+**What it does, in plain terms.** Shipping software normally means a team moving an idea through a sequence of stages: nail down the requirements, break the work into tasks, write the code, write the tests, check coverage, review each other's work, and only then merge. This project automates that entire sequence. You describe what you want; it runs each stage and refuses to let work advance until it clears the same quality bars a good team insists on — tests green, coverage met, an independent code review passed.
+
+**Why "a harness of harnesses".** It doesn't write the code itself — it *directs* AI coding agents, and those agents are swappable: the same pipeline runs on Anthropic's **Claude** or OpenAI's **Codex** (or a mix, one engine per stage). The framework is the conductor; the AI agents are the musicians. That's the harness of harnesses — one control layer driving interchangeable AI engines through the full lifecycle, so you're never locked to a single vendor.
+
+**What keeps it trustworthy.** Autonomy without controls is just a fast way to make a mess. So every handoff between stages is validated against a strict contract, every run is checkpointed step-by-step (a crash or a closed laptop resumes cleanly), risky changes — CI, install scripts, security-sensitive files — are held for explicit human approval, and long runs ping you on Telegram. The point isn't "AI writes code" — it's a **controlled, auditable, autonomous SDLC** you can leave running and trust the result.
+
+**Where it's heading.** Today it's one operator launching autonomous runs. Next (planned, Epics 22–23) it becomes a *team*: every story mirrored to a shared **GitHub or GitLab** board as the single source of truth, and the pipeline running against GitLab projects too — so several developers, and their autonomous runs, work the same backlog **in parallel and jointly** instead of in separate silos.
+
+---
+
 A complete, opinionated Claude Code configuration: agents, skills, slash commands, MCP servers, hooks, and observability — engineered to take an idea from **one-line concept to merged PR without a human in the loop**.
 
 This is the harness behind a multi-agent AGILE pipeline with parallel worktree execution, automatic bug triage, and Telegram notifications for monitoring long-running runs away from the machine.
