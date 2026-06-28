@@ -594,7 +594,7 @@ wheels = [
 
 [[package]]
 name = "sdlc-controller"
-version = "1.96.2"
+version = "1.96.3"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },

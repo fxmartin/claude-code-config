@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.96.3] - 2026-06-28
+
+### Fixed
+
+- fix(controller): tolerate fenced and trailing result-block deviations (#234)
+
+
 ## [v1.96.2] - 2026-06-28
 
 ### Fixed
