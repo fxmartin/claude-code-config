@@ -123,7 +123,8 @@ CREATE TABLE IF NOT EXISTS runs (
     total_stories   INTEGER DEFAULT 0,
     completed       INTEGER DEFAULT 0,
     failed          INTEGER DEFAULT 0,
-    status          TEXT NOT NULL
+    status          TEXT NOT NULL,
+    actor           TEXT                            -- host login that drove the run (Story 22.5-001).
 );
 
 CREATE TABLE IF NOT EXISTS stories (
@@ -347,6 +348,21 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         "story_inventory",
         [
             ("human_status", "TEXT"),
+        ],
+        None,
+    ),
+    # Migration 9 adds the per-run `actor` (Story 22.5-001) to a pre-existing
+    # ledger's `runs` table — the host login (`gh api user` / `glab` equivalent)
+    # that drove the run. Additive and back-compatible: old run rows keep NULL
+    # actor and read as "unattributed"; only runs stamped after this story
+    # populate it (``unknown`` when host auth is absent — it degrades, never
+    # crashes). A fresh DB created from the up-to-date DDL is a no-op.
+    (
+        9,
+        "run actor column",
+        "runs",
+        [
+            ("actor", "TEXT"),
         ],
         None,
     ),
@@ -1201,6 +1217,28 @@ class Ledger:
         """
         with self._connect() as conn:
             conn.execute("UPDATE runs SET mode = ? WHERE id = ?", (mode, run_id))
+
+    def run_set_actor(self, run_id: str, actor: str) -> None:
+        """Stamp the host login that drove this run (Story 22.5-001).
+
+        Resolved once per run from the code host's own auth (`gh api user` /
+        `glab` equivalent) — the host *is* the identity provider, so there is no
+        shared token to attribute. When host auth is absent the caller passes
+        ``unknown`` (identity degrades, it never crashes); the column stays its
+        own writer so a re-stamp never touches the run's other fields.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET actor = ? WHERE id = ?", (actor, run_id)
+            )
+
+    def run_get_actor(self, run_id: str) -> str | None:
+        """Return the stamped actor for a run, or None when unattributed."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT actor FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return row[0] if row else None
 
     def run_update_counts(self, run_id: str, completed: int, failed: int) -> None:
         """Record the final completed/failed tallies on the run row."""

@@ -212,9 +212,10 @@ def test_partially_migrated_ledger_gains_only_inventory(tmp_path: Path) -> None:
 
     assert _has_table(db, "story_inventory")
     # Migration 7 creates the inventory table; Migration 8 adds its `human_status`
-    # column (a no-op against the table the up-to-date DDL just created, but still
-    # recorded). Both were the pending tail.
-    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8]
+    # column and Migration 9 the run `actor` column (each a no-op against the
+    # objects the up-to-date DDL just created, but still recorded). All were the
+    # pending tail.
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
 def test_story_inventory_updated_at_is_autopopulated(tmp_path: Path) -> None:
