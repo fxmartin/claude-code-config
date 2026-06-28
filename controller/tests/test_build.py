@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 
 import pytest
+
+from sdlc.contracts import AGENT_SCHEMAS
 
 from sdlc.build import (
     IN_TEST_ENV_VAR,
@@ -239,7 +242,7 @@ def _default_payload(agent_type, story):
         },
         "coverage": {
             "pr_number": 100,
-            "pr_url": f"https://example/pull/100",
+            "pr_url": "https://example/pull/100",
             "coverage_pct": 95.0,
             "tests_added": 3,
             "coverage_status": "PASS",
@@ -1381,8 +1384,9 @@ def test_envelope_reask_prompt_is_envelope_only() -> None:
     assert _REASK_SENTINEL in prompt
     assert RESULT_START_MARKER in prompt
     assert RESULT_END_MARKER in prompt
-    # It must steer the agent away from redoing the work / new commits.
-    assert "build-agent-response.schema.json" in prompt
+    # It validates against the build stage's own schema: the wrapper now embeds
+    # that schema's literal required fields rather than naming the schema file.
+    assert "branch_name" in prompt
 
 
 class _ReaskNonSuccessDispatcher:
@@ -2469,11 +2473,13 @@ def test_commit_lint_reask_prompt_uses_stage_schema() -> None:
     """The re-ask validates against the re-asked stage's own schema."""
     from sdlc.build import render_commit_lint_reask_prompt
 
+    # Each re-ask embeds its stage schema's literal required fields (the wrapper
+    # no longer names the schema file), so a stage-specific field proves routing.
     cov = render_commit_lint_reask_prompt("coverage", _story("99.1-001"), _BAD_COMMIT, ["x"])
-    assert "coverage-agent-response.schema.json" in cov
+    assert "coverage_pct" in cov
     assert "'coverage'" in cov
     bug = render_commit_lint_reask_prompt("bugfix", _story("99.1-001"), _BAD_COMMIT, ["x"])
-    assert "bugfix-agent-response.schema.json" in bug
+    assert "failure_category" in bug
 
 
 def test_coverage_stage_commit_is_also_linted(tmp_path, monkeypatch) -> None:
@@ -3308,3 +3314,81 @@ def test_context_overflow_is_subclass_of_agent_dispatch_error() -> None:
 
     exc = ContextOverflowError("too long")
     assert isinstance(exc, AgentDispatchError)
+
+
+# ---------------------------------------------------------------------------
+# _result_wrapper embeds a literal, schema-derived required-field skeleton so
+# agents stop paraphrasing the required keys (the contract-drift bug).
+# ---------------------------------------------------------------------------
+
+def _fill_skeleton(skeleton: str) -> str:
+    """Turn a wrapper skeleton into a concrete, schema-valid JSON string.
+
+    Picks the first enum literal for ``"A|B"`` hints and substitutes sample
+    values for the typed placeholders so the advertised shape can be validated.
+    """
+    # Collapse the unquoted boolean hint first so its pipe cannot be swept into
+    # the quoted-enum match below (the prior key's closing quote would otherwise
+    # act as an opening quote around ``: <bool>, "``).
+    filled = skeleton.replace("true|false", "true")
+    filled = re.sub(
+        r'"([^"|]+(?:\|[^"|]+)+)"',
+        lambda m: '"' + m.group(1).split("|")[0] + '"',
+        filled,
+    )
+    filled = filled.replace('"<string>"', '"sample"')
+    filled = filled.replace("<integer>", "1")
+    filled = filled.replace("<number>", "1.0")
+    return filled
+
+
+def test_build_result_wrapper_embeds_literal_field_skeleton() -> None:
+    """The build wrapper shows the real field names + enum literals, not a
+    pointer to an unreadable schema file."""
+    from sdlc.build import _result_wrapper
+
+    wrapper = _result_wrapper("build-agent-response.schema.json")
+    for substring in ("branch_name", "build_status", "commit_sha", "SUCCESS|FAILED"):
+        assert substring in wrapper
+    assert "the JSON object per" not in wrapper
+
+
+@pytest.mark.parametrize(
+    "agent_type,schema_filename", sorted(AGENT_SCHEMAS.items())
+)
+def test_result_wrapper_lists_every_required_field(
+    agent_type: str, schema_filename: str
+) -> None:
+    """Each wrapper names every field in its schema's ``required`` array."""
+    from sdlc.build import _result_wrapper
+    from sdlc.contracts import load_schema
+
+    wrapper = _result_wrapper(schema_filename)
+    for name in load_schema(agent_type).get("required", []):
+        assert name in wrapper, f"{agent_type}: missing required field {name!r}"
+
+
+@pytest.mark.parametrize(
+    "agent_type,schema_filename", sorted(AGENT_SCHEMAS.items())
+)
+def test_result_wrapper_skeleton_round_trips_through_contracts(
+    agent_type: str, schema_filename: str
+) -> None:
+    """The advertised skeleton, filled with sample values, satisfies the
+    enforced schema — proving the wrapper cannot tell agents to emit an invalid
+    shape."""
+    from sdlc.build import _result_wrapper
+    from sdlc.contracts import (
+        RESULT_END_MARKER,
+        RESULT_START_MARKER,
+        parse_and_validate,
+    )
+
+    wrapper = _result_wrapper(schema_filename)
+    start = wrapper.index(RESULT_START_MARKER) + len(RESULT_START_MARKER)
+    end = wrapper.index(RESULT_END_MARKER)
+    skeleton = wrapper[start:end].strip()
+
+    obj = json.loads(_fill_skeleton(skeleton))  # also proves it is valid JSON
+    response = f"{RESULT_START_MARKER}\n{json.dumps(obj)}\n{RESULT_END_MARKER}"
+    assert parse_and_validate(agent_type, response) == obj
