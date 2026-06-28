@@ -1,11 +1,12 @@
 # Epic 21: Controller Self-Containment & Harness Selection
 
-> **Status: CODE-COMPLETE (2/3)** — 21.1-001 + 21.2-001 merged on `main`
-> (2026-06-28, PR #239); 21.3-001 (installer puts the Codex adapter on PATH)
-> PLANNED — deferred because it edits `install.sh` and so must clear the
-> high-risk approval gate. Created 2026-06-28. Makes the `uv tool install`ed
-> `sdlc` actually usable for cross-harness (Codex) builds outside the source
-> checkout — surfaced while wiring a repo to run builds on Codex.
+> **Status: COMPLETE (3/3)** — 21.1-001 + 21.2-001 merged on `main`
+> (2026-06-28, PR #239); 21.3-001 merged (2026-06-28, PR #241 — installer puts
+> the Codex/Qwen adapters on PATH; risk-approved for the `install/core.sh` edit).
+> Created 2026-06-28. Makes the `uv tool install`ed `sdlc` usable for
+> cross-harness (Codex) builds outside the source checkout — surfaced while
+> wiring a repo to run builds on Codex. A Codex build now needs no manual steps
+> beyond `codex login` and a per-repo `.sdlc-harness.yaml`.
 
 ## Epic Overview
 
@@ -131,7 +132,7 @@ without a manual symlink.
 
 **Priority**: Should Have
 **Story Points**: 2
-**Status**: ⏳ PLANNED
+**Status**: ✅ COMPLETE (PR #241)
 
 **Acceptance Criteria**:
 - **Given** a fresh `install.sh` run **When** it completes **Then**
@@ -152,10 +153,10 @@ gate and needs the `risk-approved` label** — which is why it is split from the
 gate-free 21.1/21.2 work.
 
 **Definition of Done**:
-- [ ] Installer symlinks the codex (and qwen) adapter onto PATH, idempotently
-- [ ] Uninstall removes them
-- [ ] Documented in `docs/harness-adapters.md` (replace the manual `ln -sf` step)
-- [ ] bats coverage for the install/uninstall symlink behaviour
+- [x] Installer symlinks the codex (and qwen) adapter onto PATH, idempotently
+- [x] Uninstall removes them
+- [x] Documented in `docs/harness-adapters.md` (replaced the manual `ln -sf` step)
+- [x] bats coverage for the install/uninstall symlink behaviour
 
 **Dependencies**: 21.1-001 (installed tool now resolves the registry). None
 blocking.
