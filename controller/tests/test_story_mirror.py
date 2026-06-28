@@ -251,3 +251,58 @@ def test_mirror_stories_batches_and_is_idempotent(tmp_path):
     assert [o.action for o in second] == [UPDATED, UPDATED]
     assert adapter.created == 2  # still only two issues total
     assert len(adapter.issues) == 2
+
+
+# --- Ledger mapping accessors: edge behaviours the engine relies on -----------
+
+
+def test_get_mapping_returns_none_for_unseeded_story(tmp_path):
+    """No inventory row at all → unmapped (the `row is None` branch)."""
+    ledger = _ledger(tmp_path)
+    assert ledger.inventory_get_mapping("99.9-999") is None
+
+
+def test_get_mapping_treats_half_written_row_as_unmapped(tmp_path):
+    """A row with only one of host/issue_ref set reads as unmapped.
+
+    Story 22.2-003: a dangling ref must never be trusted — the engine recovers
+    via the body marker instead. Both columns must be present to count.
+    """
+    ledger = _ledger(tmp_path)
+    doc = _doc()
+    _seed_inventory(ledger, doc)
+
+    # host set, ref missing
+    ledger.inventory_set_mapping(doc.story_id, GITHUB, None)
+    assert ledger.inventory_get_mapping(doc.story_id) is None
+
+    # ref set, host missing
+    ledger.inventory_set_mapping(doc.story_id, None, "42")
+    assert ledger.inventory_get_mapping(doc.story_id) is None
+
+
+def test_set_mapping_clears_an_existing_mapping(tmp_path):
+    """Passing None/None clears a recorded mapping (round-trip)."""
+    ledger = _ledger(tmp_path)
+    doc = _doc()
+    _seed_inventory(ledger, doc)
+
+    ledger.inventory_set_mapping(doc.story_id, GITHUB, "7")
+    assert ledger.inventory_get_mapping(doc.story_id) == (GITHUB, "7")
+
+    ledger.inventory_set_mapping(doc.story_id, None, None)
+    assert ledger.inventory_get_mapping(doc.story_id) is None
+
+
+def test_set_mapping_is_a_noop_when_story_row_absent(tmp_path):
+    """The projector owns row creation — set_mapping never inserts.
+
+    Story 22.2-003: a no-op when the story row is absent, so a mapping write for
+    an unknown story neither raises nor conjures a row.
+    """
+    ledger = _ledger(tmp_path)
+
+    ledger.inventory_set_mapping("404.0-001", GITHUB, "1")
+
+    assert ledger.inventory_get_mapping("404.0-001") is None
+    assert "404.0-001" not in ledger.inventory_story_ids()
