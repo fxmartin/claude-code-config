@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.105.0] - 2026-06-28
+
+### Added
+
+- feat(github-story-mirror): build-loop integration — (#22.4-002)
+
+
 ## [v1.104.0] - 2026-06-28
 
 ### Added
