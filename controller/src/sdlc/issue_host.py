@@ -72,6 +72,9 @@ class Issue:
     value the inventory stores in `issue_ref` alongside `host`. `state` is
     normalised to ``open``/``closed`` (GitHub `OPEN`/`CLOSED`, GitLab
     `opened`/`closed`); `assignees` to a tuple of login/username strings.
+    ``body`` and ``labels`` are populated by :meth:`IssueHostAdapter.issue_view`
+    (the reconcile path reads them to push the managed block without clobbering
+    human content and to pull human labels); other verbs leave them empty.
     """
 
     host: str
@@ -80,6 +83,8 @@ class Issue:
     title: str | None = None
     state: str | None = None
     assignees: tuple[str, ...] = ()
+    body: str | None = None
+    labels: tuple[str, ...] = ()
 
 
 def _default_runner(argv: Sequence[str], timeout: float = _CLI_TIMEOUT) -> RunResult:
@@ -243,6 +248,15 @@ class IssueHostAdapter(ABC):
     def issue_find(self, marker: str) -> Issue | None:
         """Find a managed issue by its hidden ``<!-- sdlc-story: <id> -->`` marker."""
 
+    @abstractmethod
+    def issue_view(self, ref: "str | Issue") -> Issue:
+        """Fetch one issue *with* its `body`, `labels`, and `assignees` populated.
+
+        The reconcile path (Story 22.4-001) reads the live body to regenerate only
+        the managed block (preserving human content outside it) and the live
+        labels/assignees to pull human signals. Raises :class:`IssueHostError`
+        when the ref no longer resolves (deleted on the host)."""
+
     # -- shared call plumbing --
     def _invoke(self, *args: str) -> RunResult:
         """Run ``<cli> ARGS`` through the runner; a missing/broken CLI raises IssueHostError."""
@@ -353,6 +367,26 @@ class GitHubAdapter(IssueHostAdapter):
                 )
         return None
 
+    def issue_view(self, ref: "str | Issue") -> Issue:
+        ref = _ref_of(ref)
+        out = self._run(
+            "issue", "view", ref,
+            "--json", "number,url,title,state,body,labels,assignees",
+        ).stdout
+        row = _parse_json_object(out)
+        if not row:
+            raise IssueHostError(f"gh issue view {ref} returned no issue")
+        return Issue(
+            host=self.host,
+            ref=str(row.get("number") or ref),
+            url=row.get("url"),
+            title=row.get("title"),
+            state=_norm_state(row.get("state")),
+            body=row.get("body"),
+            labels=_label_names(row.get("labels")),
+            assignees=tuple(a.get("login") for a in row.get("assignees") or []),
+        )
+
 
 # --- GitLab (glab) -----------------------------------------------------------
 
@@ -436,6 +470,23 @@ class GitLabAdapter(IssueHostAdapter):
                 )
         return None
 
+    def issue_view(self, ref: "str | Issue") -> Issue:
+        ref = _ref_of(ref)
+        out = self._run("issue", "view", ref, "--output", "json").stdout
+        row = _parse_json_object(out)
+        if not row:
+            raise IssueHostError(f"glab issue view {ref} returned no issue")
+        return Issue(
+            host=self.host,
+            ref=str(row.get("iid") or ref),
+            url=row.get("web_url"),
+            title=row.get("title"),
+            state=_norm_state(row.get("state")),
+            body=row.get("description"),
+            labels=_label_names(row.get("labels")),
+            assignees=tuple(a.get("username") for a in row.get("assignees") or []),
+        )
+
 
 # --- shared parsing helpers --------------------------------------------------
 
@@ -449,6 +500,37 @@ def _parse_json_array(stdout: str | None) -> list[dict]:
     except (json.JSONDecodeError, ValueError):
         return []
     return data if isinstance(data, list) else []
+
+
+def _parse_json_object(stdout: str | None) -> dict:
+    """Parse a CLI's single-issue `--json`/`--output json` object; empty dict on bad/empty output."""
+    if not stdout:
+        return {}
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _label_names(labels: object) -> tuple[str, ...]:
+    """Normalise a host's label list to a tuple of names.
+
+    GitHub `--json labels` yields objects (`{"name": …}`); GitLab `--output json`
+    yields plain strings. Accept either (and a string-keyed object) so the same
+    reconcile reads labels off both hosts.
+    """
+    if not isinstance(labels, list):
+        return ()
+    names: list[str] = []
+    for label in labels:
+        if isinstance(label, str):
+            names.append(label)
+        elif isinstance(label, dict):
+            name = label.get("name")
+            if isinstance(name, str):
+                names.append(name)
+    return tuple(names)
 
 
 def _norm_state(state: str | None) -> str | None:

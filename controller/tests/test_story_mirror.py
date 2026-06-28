@@ -91,6 +91,13 @@ class FakeHost(IssueHostAdapter):
                              state=data["state"])
         return None
 
+    def issue_view(self, ref):  # pragma: no cover - unused here
+        ref = ref.ref if isinstance(ref, Issue) else str(ref)
+        data = self.issues[ref]
+        return Issue(host=self.host, ref=ref, title=data["title"],
+                     state=data["state"], body=data["body"],
+                     labels=tuple(data["labels"]))
+
 
 # --- fixtures ----------------------------------------------------------------
 

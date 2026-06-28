@@ -121,7 +121,7 @@ def test_ensure_migrated_ledger_predating_migrations_table(tmp_path: Path) -> No
 
     assert _USAGE_COLS <= _columns(db, "stages")
     assert _EVENT_COLS <= _columns(db, "events")
-    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7]
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_ensure_migrated_no_db_is_noop_and_creates_nothing(tmp_path: Path) -> None:
@@ -135,7 +135,7 @@ def test_ensure_migrated_is_idempotent(tmp_path: Path) -> None:
     _old_schema_db(db)
     Ledger(db).ensure_migrated()
     Ledger(db).ensure_migrated()  # second pass must not raise (no duplicate ALTER)
-    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7]
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_ensure_migrated_on_fresh_db_is_noop(tmp_path: Path) -> None:
@@ -179,7 +179,7 @@ def test_ensure_migrated_concurrent_launches_are_safe(tmp_path: Path) -> None:
 
     assert errors == []  # no double-apply ALTER crash, no busy-timeout failure
     assert _USAGE_COLS <= _columns(db, "stages")
-    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7]  # each migration recorded exactly once
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8]  # each migration recorded exactly once
 
 
 # --- auto-migrate at verb launch -------------------------------------------
@@ -329,7 +329,7 @@ def test_migrate_registry_ledgers_dedupes_shared_db(tmp_path: Path) -> None:
     _migrate_registry_ledgers(registry)  # must not raise on the duplicate db
 
     assert _USAGE_COLS <= _columns(shared_db, "stages")  # migrated exactly once
-    assert _versions(shared_db) == [1, 2, 3, 4, 5, 6, 7]  # no double-apply via the dupe record
+    assert _versions(shared_db) == [1, 2, 3, 4, 5, 6, 7, 8]  # no double-apply via the dupe record
 
 
 def test_migrate_registry_ledgers_skips_corrupt_existing_db(tmp_path: Path) -> None:
