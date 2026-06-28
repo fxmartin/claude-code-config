@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.104.0] - 2026-06-28
+
+### Added
+
+- feat(github-story-mirror): `sdlc issues sync` — reconcile (#22.4-001)
+
+
 ## [v1.103.0] - 2026-06-28
 
 ### Added
