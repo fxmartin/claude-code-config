@@ -159,6 +159,78 @@ is skipped (`UNMAPPED`) — the idempotent mirror (Story 22.2-003) must create t
 issue first. This is the same reconcile engine `sdlc issues init` (Story
 22.3-001) builds on.
 
+## Adopt a repo — `sdlc issues init` (Story 22.3-001)
+
+`sdlc issues init` is the one command to stand up the **full** board for a fresh
+or taken-over repo. It backfills an issue for **every** story across **every**
+epic — the complete picture, *done included* — not just open work.
+
+```text
+sdlc issues init [--host github|gitlab] [--root PATH] [--db PATH]
+```
+
+What it does, in order:
+
+1. **Projects every story** from `docs/stories/epic-*.md` into the local
+   inventory cache (the spec rows the mapping is recorded onto).
+2. **Backfills** — mirrors every story via the idempotent engine: each gets one
+   issue carrying the [taxonomy labels](#labels--the-portable-cross-host-baseline)
+   and the hidden `<!-- sdlc-story: <id> -->` marker, with its `host` + `issue_ref`
+   recorded. A re-run **updates** rather than duplicates.
+3. **Closes the Done stories** — a story whose `**Status**:` is `Done` (or whose
+   Definition-of-Done checklist is fully checked) is **created and immediately
+   closed**, so the board shows full history while the open-issues list stays
+   equal to the real remaining work.
+
+It is **idempotent**: an interrupted or rate-limited run just gets re-run —
+already-mapped stories are updated, never duplicated, so the resume is cheap.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--host` | auto-detect from `origin` | Force the host when the remote is ambiguous/absent. |
+| `--root` | current directory | Repo root holding `docs/stories/`. |
+| `--db` | `./.sdlc-state.db` | Ledger DB path (created if absent). |
+
+**Exit codes:** `0` on success; `1` when the repo has no framework-format stories
+(the message points at `generate-epics` first); `2` when the host can't be
+determined/is unsupported, or the host CLI isn't authenticated.
+
+### Walkthrough — GitHub
+
+```bash
+gh auth login                 # gh is the identity + transport (no shared token)
+cd ~/code/my-repo
+sdlc issues init
+# init github: 42 story(ies) backfilled (42 created); 9 Done issue(s) closed.
+```
+
+GitHub also gets the Projects v2 `Status` field and the `Points` number field
+described above.
+
+### Walkthrough — GitLab (Free/Core)
+
+```bash
+glab auth login               # same model — your own glab auth
+cd ~/code/my-repo
+sdlc issues init              # a gitlab remote routes to glab automatically
+# init gitlab: 42 story(ies) backfilled (42 created); 9 Done issue(s) closed.
+```
+
+On GitLab Free the epic surfaces as an `epic:NN` label + an `epic-NN` milestone
+on the Issue Board; points stay the `points:N` label. For self-hosted GitLab the
+host resolves by hostname substring — pass `--host gitlab` if detection can't
+tell from the remote.
+
+### Re-running after an interruption
+
+```bash
+sdlc issues init              # a 429 or Ctrl-C stopped the first pass? re-run it
+# init github: 42 story(ies) backfilled (42 updated); 9 Done issue(s) closed.
+```
+
+The second pass reports `updated` instead of `created` — each story resolves to
+its existing issue, so nothing is duplicated and the Done issues stay closed.
+
 ## Identity is free
 
 There is **no shared bot token**: identity is each contributor's own `gh`/`glab`
