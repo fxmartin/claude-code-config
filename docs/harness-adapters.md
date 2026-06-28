@@ -112,6 +112,13 @@ mechanical merge/coverage on a cheaper one, the adversarial skeptic on a stronge
 one). Epic-14's `haiku`/`sonnet`/`opus` aliases are Claude-only, so a non-Claude
 harness carries **its own model ids**.
 
+The **shipped default does not opt in**: the `codex` entry's `command` has no
+`{model}` placeholder, so Codex uses whatever model your `~/.codex/config.toml`
+declares (e.g. `gpt-5.5`). That keeps a build runnable on any authenticated Codex
+without assuming a model entitlement — **use model ids you actually have**, since a
+model your account can't serve fails the whole stage with a 400 (e.g. ChatGPT-account
+Codex rejects `gpt-5.4-codex`; verify any id with `echo hi | codex exec --model <id>`).
+
 Opt in with two pieces: a `{model}` placeholder in `command`, and a `models:` map
 of stage → model id. The controller substitutes the stage's mapped model into the
 placeholder at dispatch; your wrapper forwards it to the CLI (the codex wrapper
@@ -121,13 +128,13 @@ forwards `--model <id>` to `codex exec`).
 codex:
   command: "codex-build-adapter.sh --model {model}"
   parser: codex-exec
-  models:
-    default: gpt-5.4-codex        # required when command uses {model}
-    build: gpt-5.4-codex
-    coverage: gpt-5.4-codex-mini  # cheaper for mechanical stages
-    review: gpt-5.4-codex
-    merge: gpt-5.4-codex-mini
-    adversarial: gpt-5.4-codex-high  # stronger skeptic
+  models:                  # use ids your account is entitled to (these are examples)
+    default: gpt-5.5       # required when command uses {model}
+    build: gpt-5.5
+    coverage: gpt-5.5      # point at a cheaper model for mechanical stages if you have one
+    review: gpt-5.5
+    merge: gpt-5.5
+    adversarial: gpt-5.5   # point at a stronger skeptic if you have one
 ```
 
 Rules:
@@ -136,8 +143,9 @@ Rules:
   listed (e.g. the `bugfix`/`reask` recovery agents), so an unmapped stage always
   resolves rather than failing. The registry loader rejects a `{model}` command
   with no `default`.
-- A harness whose command has **no** `{model}` placeholder routes a single fixed
-  model (whatever the CLI defaults to) — no map needed, no behaviour change.
+- A harness whose command has **no** `{model}` placeholder (the shipped default)
+  routes a single fixed model — whatever the CLI defaults to — so it never assumes
+  an entitlement. No map needed, no behaviour change.
 - The Claude harness is unaffected: its per-stage Haiku/Sonnet/Opus routing
   (Epic-14) flows through the dispatch seam exactly as before.
 - The model is chosen by the **stage** (build, coverage, review, merge,
@@ -200,14 +208,20 @@ you hit an auth or sandbox dead-end instead of a clear error:
    (no TTY, no interactive approval), so it cannot complete a login flow mid-run.
    Run `codex login` (or set the API key the CLI expects) once on the host and
    confirm `codex exec` works non-interactively *before* starting a build.
-2. **Use `HARNESS_AGENT_CMD="codex exec --full-auto"` for non-interactive
-   write/exec.** A worker has to edit files and run commands without stopping for
-   per-action approval; `--full-auto` is the mode that grants that headlessly. The
-   adapter honours `HARNESS_AGENT_CMD`, so export it to override the default
-   `codex exec`:
+2. **Grant non-interactive write/exec via `HARNESS_AGENT_CMD`.** A worker has to
+   edit files and run commands without stopping for per-action approval. Modern
+   Codex uses `--sandbox workspace-write` for that (the older `--full-auto` is
+   **deprecated** — it warns and maps to the same thing). The adapter honours
+   `HARNESS_AGENT_CMD`, so export it to override the default `codex exec`. But note
+   `workspace-write` also **blocks network**, which the worker's `gh` push/PR calls
+   need (see point 3) — so for a trusted repo the practical override is the
+   full-access mode:
 
    ```bash
-   export HARNESS_AGENT_CMD="codex exec --full-auto"
+   # trusted repo (worker may write AND reach the network for gh):
+   export HARNESS_AGENT_CMD="codex exec --dangerously-bypass-approvals-and-sandbox"
+   # …or workspace-write + codex `network_access = true` in ~/.codex/config.toml:
+   # export HARNESS_AGENT_CMD="codex exec --sandbox workspace-write"
    sdlc build epic-20 --harness build=codex,coverage=codex
    ```
 3. **Do not combine a Codex worker with the controller `--sandbox` flag, and run
@@ -216,8 +230,9 @@ you hit an auth or sandbox dead-end instead of a clear error:
    nor network. A Codex worker must run on the **host path** instead: its `gh`
    operations (branch push, PR open, status checks) need the **network** and
    GitHub auth that *both* the controller's no-egress image **and** Codex's own
-   `workspace-write` sandbox block. Leave `--sandbox` off and let the host provide
-   the network/auth the worker's `gh` calls require.
+   `workspace-write` sandbox block. Leave `--sandbox` off and grant the worker
+   network either with `--dangerously-bypass-approvals-and-sandbox` (point 2) or by
+   enabling Codex's own `network_access`.
 
 > **Provenance.** Per-role `--harness` routing was a ledger **label** only until
 > Story 20.7-001: `cli.py` validated the resolved harnesses and then discarded

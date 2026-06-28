@@ -35,7 +35,11 @@
 #
 # Environment:
 #   HARNESS_AGENT_CMD  Override the underlying command (default `codex exec`),
-#                      e.g. "codex exec --full-auto". Word-split.
+#                      e.g. "codex exec --sandbox workspace-write" for headless
+#                      writes. A build whose worker pushes branches / opens PRs
+#                      via `gh` needs network too, so a trusted repo typically
+#                      uses "codex exec --dangerously-bypass-approvals-and-sandbox".
+#                      (`--full-auto` is deprecated in modern Codex.) Word-split.
 #
 # Exit status:
 #   0  forwarded the agent's output (the controller's parser validates the block)

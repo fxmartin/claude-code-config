@@ -41,10 +41,13 @@ def test_guide_says_pre_authenticate_codex() -> None:
     assert "headless" in text or "interactive" in text
 
 
-def test_guide_documents_full_auto_agent_cmd() -> None:
-    """The exact non-interactive write/exec invocation is documented verbatim."""
+def test_guide_documents_non_interactive_agent_cmd() -> None:
+    """The non-interactive write/exec invocation is documented with current,
+    non-deprecated Codex flags (issue #228: `--full-auto` is deprecated)."""
     text = _guide_text()
-    assert 'HARNESS_AGENT_CMD="codex exec --full-auto"' in text
+    assert 'HARNESS_AGENT_CMD="codex exec --dangerously-bypass-approvals-and-sandbox"' in text
+    assert "--sandbox workspace-write" in text
+    assert "deprecated" in text.lower()
 
 
 def test_guide_warns_against_combining_with_controller_sandbox() -> None:

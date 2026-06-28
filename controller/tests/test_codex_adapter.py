@@ -63,6 +63,23 @@ def test_codex_argv_never_invokes_claude() -> None:
     assert not any("claude" in token for token in argv)
 
 
+def test_shipped_codex_harness_pins_no_model_entitlement() -> None:
+    """Issue #228: the shipped codex harness must run out of the box without
+    assuming a specific model entitlement. Hardcoding `gpt-5.4-codex*` made every
+    stage 400 on a ChatGPT-account Codex. The default must let Codex use the
+    account's own configured model (no `--model` baked into the argv); per-stage
+    model routing stays an opt-in a user enables with their own ids."""
+    codex = resolve_harness("codex", config_path=CONFIG_PATH)
+    for stage in (None, "build", "coverage", "review", "merge", "adversarial"):
+        argv = codex.to_argv() if stage is None else codex.to_argv(stage=stage)
+        assert not any(
+            token.startswith("gpt-") for token in argv
+        ), f"shipped codex argv pins a model id for stage={stage}: {argv}"
+        assert "--model" not in argv, (
+            f"shipped codex argv forces a model for stage={stage}: {argv}"
+        )
+
+
 def test_build_agent_round_trips_through_codex(monkeypatch) -> None:
     """A build agent dispatched to codex returns the contract and validates (AC1/AC2)."""
     seen_cmd: list[str] = []
