@@ -314,3 +314,108 @@ def test_missing_cli_raises(monkeypatch) -> None:
     a = ih.GitHubAdapter(runner=boom)
     with pytest.raises(ih.IssueHostError):
         a.whoami()
+
+
+# --- issue_create with no parseable URL fails fast --------------------------
+
+
+def test_github_issue_create_no_url_raises() -> None:
+    runner = FakeRunner({"issue create": (0, "no url here\n", "")})
+    with pytest.raises(ih.IssueHostError) as exc:
+        ih.GitHubAdapter(runner=runner).issue_create(title="t", body="b")
+    assert "no issue URL" in str(exc.value)
+
+
+def test_gitlab_issue_create_no_url_raises() -> None:
+    runner = FakeRunner({"issue create": (0, "", "")})
+    with pytest.raises(ih.IssueHostError) as exc:
+        ih.GitLabAdapter(runner=runner).issue_create(title="t", body="b")
+    assert "no issue URL" in str(exc.value)
+
+
+def test_gitlab_issue_find_no_match_returns_none() -> None:
+    payload = json.dumps(
+        [{"iid": 1, "web_url": "u", "title": "x", "state": "opened",
+          "description": "unrelated", "assignees": []}]
+    )
+    runner = FakeRunner({"issue list": (0, payload, "")})
+    assert ih.GitLabAdapter(runner=runner).issue_find("<!-- sdlc-story: z -->") is None
+
+
+# --- shared parsing / state-normalisation helpers ----------------------------
+
+
+@pytest.mark.parametrize("stdout", ["", None, "not json{", "{\"not\": \"a list\"}"])
+def test_parse_json_array_bad_input_returns_empty(stdout) -> None:
+    assert ih._parse_json_array(stdout) == []
+
+
+def test_parse_json_array_valid_list() -> None:
+    assert ih._parse_json_array('[{"a": 1}]') == [{"a": 1}]
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, None),
+        ("", None),
+        ("OPEN", "open"),
+        ("opened", "open"),
+        ("CLOSED", "closed"),
+        ("closed", "closed"),
+        ("close", "closed"),
+        ("weird", "weird"),
+    ],
+)
+def test_norm_state(raw, expected) -> None:
+    assert ih._norm_state(raw) == expected
+
+
+# --- the default subprocess runner + remote reader (live, no host CLI) -------
+
+
+def test_default_runner_runs_a_real_command() -> None:
+    result = ih._default_runner(["printf", "hi"])
+    assert result.returncode == 0
+    assert result.stdout == "hi"
+
+
+def test_default_runner_missing_binary_raises() -> None:
+    with pytest.raises(ih.IssueHostError) as exc:
+        ih._default_runner(["sdlc-no-such-binary-xyz"])
+    assert "not found on PATH" in str(exc.value)
+
+
+def test_default_runner_os_error_raises(monkeypatch) -> None:
+    def boom(*a, **k):
+        raise OSError("exec format error")
+
+    monkeypatch.setattr(ih.subprocess, "run", boom)
+    with pytest.raises(ih.IssueHostError) as exc:
+        ih._default_runner(["whatever"])
+    assert "invocation failed" in str(exc.value)
+
+
+def test_remote_url_reads_origin(tmp_path) -> None:
+    import subprocess as sp
+
+    sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+    sp.run(["git", "-C", str(tmp_path), "remote", "add", "origin",
+            "git@github.com:fx/r.git"], check=True)
+    assert ih._remote_url(tmp_path) == "git@github.com:fx/r.git"
+
+
+def test_remote_url_no_remote_returns_none(tmp_path) -> None:
+    import subprocess as sp
+
+    sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+    # No origin configured → non-zero git exit → None.
+    assert ih._remote_url(tmp_path) is None
+
+
+def test_remote_url_git_failure_returns_none(monkeypatch) -> None:
+    def boom(*a, **k):
+        raise OSError("git missing")
+
+    monkeypatch.setattr(ih.subprocess, "run", boom)
+    assert ih._remote_url(".") is None
