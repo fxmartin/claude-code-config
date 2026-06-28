@@ -111,6 +111,9 @@ class FakeHost(IssueHostAdapter):
             assignees=tuple(data["assignees"]),
         )
 
+    def issue_comment(self, ref, body):  # pragma: no cover - unused here
+        pass
+
 
 # --- fixtures ----------------------------------------------------------------
 
