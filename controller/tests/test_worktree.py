@@ -13,6 +13,7 @@ from sdlc.build import (
     Ledger,
     WorktreeError,
     _prepare_story_workdir,
+    _refresh_base_ref,
     _run_story,
     create_story_worktree,
 )
@@ -206,6 +207,113 @@ def test_lock_failure_is_best_effort_create_still_succeeds(tmp_path, monkeypatch
         )
     }
 
+
+
+# ---------------------------------------------------------------------------
+# _refresh_base_ref: each cohort branches from the current origin/main (#231)
+# ---------------------------------------------------------------------------
+
+def _push_sibling_merge(origin: Path, tmp_path: Path) -> str:
+    """Advance the *remote* main via a second clone, returning the new tip SHA.
+
+    Simulates an earlier cohort merging and pushing to ``main`` mid-run, leaving
+    the primary checkout's local ``origin/main`` ref stale until it refetches.
+    """
+    other = tmp_path / "sibling"
+    subprocess.run(
+        ["git", "clone", str(origin), str(other)],
+        check=True, capture_output=True, text=True,
+    )
+    _git(other, "config", "user.email", "t@example.com")
+    _git(other, "config", "user.name", "Test")
+    (other / "sibling.txt").write_text("merged by an earlier cohort\n")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-m", "feat: sibling change")
+    _git(other, "push", "origin", "main")
+    return _git(other, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_refresh_advances_base_so_later_cohort_uses_merged_tip(tmp_path) -> None:
+    """#231: after an earlier cohort merges, a per-cohort refresh means a later
+    cohort's worktree branches from the new merged tip — not the run-start SHA."""
+    work = _repo_with_origin(tmp_path)
+    origin = tmp_path / "origin.git"
+
+    # Cohort 1's worktree is cut from the run-start tip.
+    run_start_sha = _git(work, "rev-parse", "origin/main").stdout.strip()
+    p1 = create_story_worktree(work, "17.2-001", "run-abc12345")
+    assert _git(p1, "rev-parse", "HEAD").stdout.strip() == run_start_sha
+
+    # A sibling cohort merges to main; work's local origin/main is now stale.
+    merged_sha = _push_sibling_merge(origin, tmp_path)
+    assert merged_sha != run_start_sha
+    assert _git(work, "rev-parse", "origin/main").stdout.strip() == run_start_sha
+
+    # The per-cohort refresh pulls the new tip into work's origin/main...
+    _refresh_base_ref(work)
+    assert _git(work, "rev-parse", "origin/main").stdout.strip() == merged_sha
+
+    # ...so cohort 2's worktree is created from the merged tip, not the stale one.
+    p2 = create_story_worktree(work, "17.2-002", "run-abc12345")
+    assert _git(p2, "rev-parse", "HEAD").stdout.strip() == merged_sha
+
+
+def test_refresh_base_ref_offline_degrades_without_raising(tmp_path, monkeypatch) -> None:
+    """#231: a failed fetch (offline) must never abort the run — it degrades to the
+    current local ref, and a worktree can still be created from that ref."""
+    import sdlc.build as build_mod
+
+    work = _repo_with_origin(tmp_path)
+    local_sha = _git(work, "rev-parse", "origin/main").stdout.strip()
+    _real_git = build_mod._git
+
+    def _git_fail_on_fetch(root, *args):
+        if args and args[0] == "fetch":
+            raise subprocess.SubprocessError("offline: could not reach origin")
+        return _real_git(root, *args)
+
+    monkeypatch.setattr(build_mod, "_git", _git_fail_on_fetch)
+    # Must not raise despite the fetch failure.
+    _refresh_base_ref(work)
+    # Degrades to the unchanged local ref; the worktree still builds from it.
+    path = create_story_worktree(work, "17.2-001", "run-abc12345")
+    assert _git(path, "rev-parse", "HEAD").stdout.strip() == local_sha
+
+
+def test_worktree_still_locked_after_base_refresh(tmp_path) -> None:
+    """#231 regression: refreshing the base before creation must not disturb the
+    #180 lock — the new worktree is still git-locked against the Stop-hook reaper."""
+    work = _repo_with_origin(tmp_path)
+    _refresh_base_ref(work)
+    path = create_story_worktree(work, "17.2-001", "run-abc12345")
+
+    porcelain = _git(work, "worktree", "list", "--porcelain").stdout
+    locked: set[str] = set()
+    current: str | None = None
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            current = str(Path(line.removeprefix("worktree ")).resolve())
+        elif line.startswith("locked") and current is not None:
+            locked.add(current)
+    assert str(path.resolve()) in locked
+
+
+def test_serial_path_never_creates_a_worktree_so_refresh_is_moot(tmp_path) -> None:
+    """#231: serial / single-story runs build in the shared root and never create a
+    per-story worktree, so cohort base-refresh cannot change their behaviour."""
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-17", "serial")
+    ledger.story_upsert(
+        run_id, "17.2-001", "17", "Worktree", "P2", 5, "py", "", None, "TODO"
+    )
+    # --sequential and an effective cap of 1 both reuse the root (no worktree).
+    for opts in (BuildOptions(sequential=True), BuildOptions(concurrency=1)):
+        workdir = _prepare_story_workdir(
+            opts, _story("17.2-001"), ledger, run_id, real_run=True
+        )
+        assert workdir is None
+    assert ledger.story_worktree(run_id, "17.2-001") is None
 
 
 # ---------------------------------------------------------------------------
