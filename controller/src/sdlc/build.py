@@ -1539,6 +1539,44 @@ class Ledger:
                 rows,
             )
 
+    def inventory_get_mapping(self, story_id: str) -> tuple[str, str] | None:
+        """Return ``(host, issue_ref)`` for a mapped story, or None when unmapped.
+
+        Story 22.2-003: the story↔issue mapping lives in the inventory cache. A
+        row exists for every projected story but is *unmapped* until the mirror
+        records its host issue; both columns must be set for a mapping to count
+        (a half-written row reads as unmapped, so the mirror recovers it via the
+        body marker rather than trusting a dangling ref).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT host, issue_ref FROM story_inventory WHERE story_id = ?",
+                (story_id,),
+            ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return (row[0], row[1])
+
+    def inventory_set_mapping(
+        self, story_id: str, host: str | None, issue_ref: str | None
+    ) -> None:
+        """Record (or clear) a story's host issue mapping in the inventory cache.
+
+        Story 22.2-003: the mirror calls this after creating/recovering an issue
+        so a re-run updates that issue instead of duplicating it. Passing
+        ``None``/``None`` clears the mapping (used to recover a story whose issue
+        survives but whose local ref was lost). Spec columns are untouched — one
+        writer per field. A no-op when the story row is absent (the projector
+        owns row creation).
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE story_inventory "
+                "SET host = ?, issue_ref = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE story_id = ?",
+                (host, issue_ref, story_id),
+            )
+
     # --- Read-only queries -------------------------------------------------
     # These power `sdlc status`. They open the ledger read-only with a
     # busy timeout so a poll issued *while the controller is writing* waits out
