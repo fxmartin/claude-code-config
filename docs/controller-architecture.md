@@ -514,6 +514,40 @@ Re-rendering the same ledger state is byte-identical (idempotent): the marker
 pair is never nested or duplicated. Plain `render` to stdout emits the same
 marker-fenced document.
 
+### Identity, ownership & attribution (Story 22.5-001)
+
+**The code host is the identity provider — there is no custom auth and no shared
+account.** `identity.py` resolves *who is doing what* straight from each
+developer's own host login, so attribution costs nothing extra and never invents
+a credential of its own:
+
+- **Actor** (who drove a run) — `resolve_actor(adapter)` calls the adapter's
+  `whoami` (`gh api user` / the `glab` equivalent) and `cache_actor(ledger,
+  run_id, adapter)` stamps the resolved login on the run row (`runs.actor`,
+  Migration 8). Resolved once per run.
+- **Owner** (who a story belongs to) — `owner_from_issue(issue)` reads the host
+  issue's first assignee and `cache_owner(ledger, story_id, issue)` writes it to
+  `story_inventory.owner`. This is a **cached read**: the assignee *on the host*
+  stays authoritative; the cache merely lets a local build show or skip by owner
+  **without an API call**. An unassigned issue clears the cache (passing `None`).
+
+Both writers stay in their own lane — stamping `actor` touches no other run
+column, and caching `owner` touches neither the spec columns (MD-owned) nor the
+`host`/`issue_ref` mapping (mirror-owned). One writer per field, as everywhere in
+the inventory cache.
+
+**Graceful degradation, never a crash.** When host auth is absent — not logged
+in, the CLI is missing, or `whoami` returns blank — `resolve_actor` returns the
+sentinel `unknown` rather than raising, so a run is always attributed to *some*
+value and identity resolution can never wedge a build.
+
+> **Anti-pattern — the shared service token.** Do *not* wire the controller to a
+> single bot/service account and attribute every run to it. That collapses
+> attribution (everyone shows up as the bot), defeats the host's own per-user
+> audit trail and permissions, and turns one leaked token into everyone's
+> access. Let each developer authenticate as themselves; the host already knows
+> who they are.
+
 ## Resume, status, and state
 
 Because every stage transition is persisted **before** the next stage runs, the
