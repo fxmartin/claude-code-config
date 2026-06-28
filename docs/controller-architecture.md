@@ -401,6 +401,23 @@ field). The pass returns a `ProjectionResult` reporting `added`, `updated`, and
 story disappeared from the MD survives (it may still point at a live host issue)
 and is surfaced for the caller to decide on, never silently dropped.
 
+### Rendering a story issue + the taxonomy (Story 22.2-002)
+
+`story_render.py` turns a story into its host issue — **pure**: a `StoryDoc`
+(spec parsed from the MD, including the verbatim spec body) in, markdown + labels
+out. The issue body wraps the spec in a **managed region** (`<!-- managed: do not
+edit -->` … `<!-- /managed -->`) carrying a hidden `<!-- sdlc-story: <id> -->`
+marker. `replace_managed_block()` regenerates *only* that region on sync (**MD
+wins** — a hand-edit inside it is reverted) while leaving human discussion
+outside the markers untouched; the marker is the exact-id identity, the `story`
+label only the coarse filter. `story_labels()` is the portable cross-host
+baseline (`story`, `epic:NN`, `feature:NN.F`, `points:N`, `risk:*`), and
+`status_surface(host, …)` adds the per-host board surface — GitHub gets a
+Projects v2 `Status` field and a `Points` number field; GitLab Free gets neither
+and maps the epic to an `epic-NN` milestone (points stay the `points:N` label).
+The full label/board schema per host is in
+[`docs/issue-host-adapters.md`](issue-host-adapters.md).
+
 Per Epic-12's non-goals there is no `sdlc migrate` verb — migrations apply
 automatically at launch.
 
