@@ -131,15 +131,40 @@ def test_run_get_actor_unset_is_none(tmp_path) -> None:
     assert ledger.run_get_actor(run_id) is None
 
 
+def test_run_set_actor_preserves_run_fields(tmp_path) -> None:
+    # actor is its own writer — stamping it must not disturb scope/mode/status.
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("all", "serial")
+    before = ledger.run_row(run_id)
+    assert before is not None
+
+    ledger.run_set_actor(run_id, "octocat")
+
+    after = ledger.run_row(run_id)
+    assert after is not None
+    assert after["actor"] == "octocat"
+    for field in ("scope", "mode", "status"):
+        assert after[field] == before[field]
+
+
+def test_run_set_actor_restamp_overwrites(tmp_path) -> None:
+    # A degraded first stamp can be corrected once host auth returns.
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("all", "serial")
+
+    ledger.run_set_actor(run_id, UNKNOWN_ACTOR)
+    ledger.run_set_actor(run_id, "octocat")
+
+    assert ledger.run_get_actor(run_id) == "octocat"
+
+
 # --- owner cache: a local build can show/skip by owner without an API call ---
 
 
 @pytest.mark.parametrize("host", [GITHUB, GITLAB])
 def test_cache_owner_records_assignee(tmp_path, host) -> None:
     ledger = _ledger(tmp_path)
-    ledger.inventory_upsert_specs(
-        [("22.5-001", "22", "22.5", "Identity", 3, "Medium")]
-    )
+    ledger.inventory_upsert_specs([("22.5-001", "22", "22.5", "Identity", 3, "Medium")])
     issue = Issue(host=host, ref="7", assignees=("alice",))
 
     owner = cache_owner(ledger, "22.5-001", issue)
@@ -150,9 +175,7 @@ def test_cache_owner_records_assignee(tmp_path, host) -> None:
 
 def test_cache_owner_unassigned_clears_owner(tmp_path) -> None:
     ledger = _ledger(tmp_path)
-    ledger.inventory_upsert_specs(
-        [("22.5-001", "22", "22.5", "Identity", 3, "Medium")]
-    )
+    ledger.inventory_upsert_specs([("22.5-001", "22", "22.5", "Identity", 3, "Medium")])
     issue = Issue(host=GITHUB, ref="7", assignees=("alice",))
     cache_owner(ledger, "22.5-001", issue)
 
@@ -162,12 +185,24 @@ def test_cache_owner_unassigned_clears_owner(tmp_path) -> None:
     assert ledger.inventory_get_owner("22.5-001") is None
 
 
+def test_cache_owner_resyncs_to_new_assignee(tmp_path) -> None:
+    # Reassignment on the host overwrites the cached owner on the next sync.
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("22.5-001", "22", "22.5", "Identity", 3, "Medium")])
+    cache_owner(ledger, "22.5-001", Issue(host=GITHUB, ref="7", assignees=("alice",)))
+
+    owner = cache_owner(
+        ledger, "22.5-001", Issue(host=GITHUB, ref="7", assignees=("bob",))
+    )
+
+    assert owner == "bob"
+    assert ledger.inventory_get_owner("22.5-001") == "bob"
+
+
 def test_inventory_set_owner_preserves_mapping(tmp_path) -> None:
     # owner is its own writer — stamping it must not disturb host/issue_ref.
     ledger = _ledger(tmp_path)
-    ledger.inventory_upsert_specs(
-        [("22.5-001", "22", "22.5", "Identity", 3, "Medium")]
-    )
+    ledger.inventory_upsert_specs([("22.5-001", "22", "22.5", "Identity", 3, "Medium")])
     ledger.inventory_set_mapping("22.5-001", GITHUB, "7")
 
     ledger.inventory_set_owner("22.5-001", "alice")
@@ -178,7 +213,5 @@ def test_inventory_set_owner_preserves_mapping(tmp_path) -> None:
 
 def test_inventory_get_owner_unmapped_is_none(tmp_path) -> None:
     ledger = _ledger(tmp_path)
-    ledger.inventory_upsert_specs(
-        [("22.5-001", "22", "22.5", "Identity", 3, "Medium")]
-    )
+    ledger.inventory_upsert_specs([("22.5-001", "22", "22.5", "Identity", 3, "Medium")])
     assert ledger.inventory_get_owner("22.5-001") is None
