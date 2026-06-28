@@ -228,8 +228,23 @@ class IssueHostAdapter(ABC):
         title: str | None = None,
         body: str | None = None,
         labels: Sequence[str] | None = None,
+        remove_labels: Sequence[str] | None = None,
     ) -> Issue:
-        """Update an existing issue's title/body and add labels."""
+        """Update an existing issue's title/body, adding ``labels`` and removing ``remove_labels``.
+
+        ``remove_labels`` (Story 22.4-002) lets a caller *swap* a label set — e.g.
+        move the live ``status:<slug>`` label forward as the build advances —
+        rather than only accreting labels.
+        """
+
+    @abstractmethod
+    def issue_comment(self, ref: "str | Issue", body: str) -> None:
+        """Post a comment on an issue, attributed to the running CLI's identity.
+
+        Story 22.4-002: the build loop posts a short status comment per stage
+        transition; the host's own auth (the developer's ``gh``/``glab`` login)
+        is the attribution, so no shared bot token is involved.
+        """
 
     @abstractmethod
     def issue_assign(self, ref: "str | Issue", assignee: str) -> Issue:
@@ -314,6 +329,7 @@ class GitHubAdapter(IssueHostAdapter):
         title: str | None = None,
         body: str | None = None,
         labels: Sequence[str] | None = None,
+        remove_labels: Sequence[str] | None = None,
     ) -> Issue:
         ref = _ref_of(ref)
         args = ["issue", "edit", ref]
@@ -323,8 +339,13 @@ class GitHubAdapter(IssueHostAdapter):
             args += ["--body", body]
         for label in labels or []:
             args += ["--add-label", label]
+        for label in remove_labels or []:
+            args += ["--remove-label", label]
         url = self._run(*args).stdout.strip() or None
         return Issue(host=self.host, ref=ref, url=url, title=title)
+
+    def issue_comment(self, ref: "str | Issue", body: str) -> None:
+        self._run("issue", "comment", _ref_of(ref), "--body", body)
 
     def issue_assign(self, ref: "str | Issue", assignee: str) -> Issue:
         ref = _ref_of(ref)
@@ -398,6 +419,7 @@ class GitLabAdapter(IssueHostAdapter):
         title: str | None = None,
         body: str | None = None,
         labels: Sequence[str] | None = None,
+        remove_labels: Sequence[str] | None = None,
     ) -> Issue:
         ref = _ref_of(ref)
         args = ["issue", "update", ref]
@@ -407,8 +429,13 @@ class GitLabAdapter(IssueHostAdapter):
             args += ["--description", body]
         for label in labels or []:
             args += ["--label", label]
+        for label in remove_labels or []:
+            args += ["--unlabel", label]
         self._run(*args)
         return Issue(host=self.host, ref=ref, title=title)
+
+    def issue_comment(self, ref: "str | Issue", body: str) -> None:
+        self._run("issue", "note", _ref_of(ref), "--message", body)
 
     def issue_assign(self, ref: "str | Issue", assignee: str) -> Issue:
         ref = _ref_of(ref)
