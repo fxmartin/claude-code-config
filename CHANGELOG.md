@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.96.5] - 2026-06-28
+
+### Fixed
+
+- fix(controller): make discovery done-detection git-aware (#236)
+
+
 ## [v1.96.4] - 2026-06-28
 
 ### Fixed
