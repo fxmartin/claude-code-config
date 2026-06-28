@@ -2008,5 +2008,77 @@ def issues_init(
     raise typer.Exit(code=0)
 
 
+# `assign` (Story 22.5-002) is the one place a CLI writes ownership *to* the host
+# — the host (GitHub/GitLab) stays authoritative; the ledger `owner` is the
+# cached read.
+@issues_app.command("assign")
+def issues_assign(
+    target: str = typer.Argument(
+        ...,
+        help="A story id (NN.F-NNN) to assign one story, or an epic id (epic-NN) "
+        "to cascade to every story in that epic.",
+    ),
+    user: str = typer.Argument(..., help="Host login/username to assign the work to."),
+    host: str | None = typer.Option(
+        None,
+        "--host",
+        help="Force the code host (github|gitlab); default: auto-detect from the "
+        "git remote.",
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+) -> None:
+    """Assign a single story or a whole epic to a host user.
+
+    ``sdlc issues assign <story-id> <user>`` sets that story issue's assignee on
+    the host and caches the ``owner`` locally. ``sdlc issues assign epic-NN
+    <user>`` cascades to every story in the epic in one idempotent pass. The host
+    (GitHub/GitLab) stays authoritative — the ledger ``owner`` is the cached read.
+
+    Fails fast (exit 2) on an unknown user, a malformed target, or an epic with no
+    stories — nothing is half-assigned. Exits 1 when one or more requested stories
+    have no issue on this host (reported, never silently skipped).
+    """
+    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.ledger_view import Ledger, default_db_path
+    from sdlc.story_assign import AssignError, assign
+
+    db_path = db or default_db_path()
+    ledger = Ledger(db_path)
+    # Migrate a pre-existing (possibly stale) ledger before the inventory reads.
+    ledger.ensure_migrated()
+
+    try:
+        resolved = resolve_host(Path.cwd(), override=host)
+        adapter = get_adapter(resolved)
+        # Fail fast on an unauthenticated host before any assignment.
+        adapter.ensure_ready()
+        result = assign(adapter, ledger, target, user)
+    except (IssueHostError, AssignError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    scope = f"epic {result.target}" if result.is_epic else f"story {result.target}"
+    typer.echo(
+        f"{scope} → {result.user} ({resolved}): "
+        f"{len(result.assigned)} assigned, {len(result.already)} already, "
+        f"{len(result.unmapped)} unmapped"
+    )
+    for sid in result.assigned:
+        typer.echo(f"  ✓ {sid}")
+    for sid in result.already:
+        typer.echo(f"  · {sid} (already {result.user})")
+    for sid in result.unmapped:
+        typer.echo(
+            f"  ! {sid} — no issue on {resolved}; mirror it first "
+            "(`sdlc issues init`)",
+            err=True,
+        )
+    # An unmapped story means the pass could not cover everything — exit non-zero
+    # so a partial run is never read as a clean success (Story 22.5-002 AC3).
+    raise typer.Exit(code=1 if result.unmapped else 0)
+
+
 if __name__ == "__main__":
     app()

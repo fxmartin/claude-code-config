@@ -181,6 +181,18 @@ def test_github_issue_assign() -> None:
     assert runner.calls[-1] == ["gh", "issue", "edit", "9", "--add-assignee", "alice"]
 
 
+def test_github_user_exists_true() -> None:
+    runner = FakeRunner({"api users/": (0, '{"login": "alice"}', "")})
+    assert ih.GitHubAdapter(runner=runner).user_exists("alice") is True
+    assert runner.calls[-1] == ["gh", "api", "users/alice"]
+
+
+def test_github_user_exists_false_on_404() -> None:
+    # `gh api users/<login>` exits non-zero (404) for an unknown account.
+    runner = FakeRunner({"api users/": (1, "", "Not Found (HTTP 404)")})
+    assert ih.GitHubAdapter(runner=runner).user_exists("ghost") is False
+
+
 def test_github_issue_close() -> None:
     runner = FakeRunner({"issue close": (0, "", "")})
     issue = ih.GitHubAdapter(runner=runner).issue_close("9")
@@ -248,6 +260,23 @@ def test_gitlab_issue_assign() -> None:
     runner = FakeRunner({"issue update": (0, "", "")})
     ih.GitLabAdapter(runner=runner).issue_assign("5", "alice")
     assert runner.calls[-1] == ["glab", "issue", "update", "5", "--assignee", "alice"]
+
+
+def test_gitlab_user_exists_true() -> None:
+    # `glab api users?username=<u>` returns a non-empty array for a real account.
+    runner = FakeRunner({"users?username=": (0, '[{"username": "alice"}]', "")})
+    assert ih.GitLabAdapter(runner=runner).user_exists("alice") is True
+    assert runner.calls[-1] == ["glab", "api", "users?username=alice"]
+
+
+def test_gitlab_user_exists_false_on_empty_array() -> None:
+    runner = FakeRunner({"users?username=": (0, "[]", "")})
+    assert ih.GitLabAdapter(runner=runner).user_exists("ghost") is False
+
+
+def test_gitlab_user_exists_false_on_error() -> None:
+    runner = FakeRunner({"users?username=": (1, "", "boom")})
+    assert ih.GitLabAdapter(runner=runner).user_exists("x") is False
 
 
 def test_gitlab_issue_close() -> None:

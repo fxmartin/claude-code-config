@@ -1701,6 +1701,23 @@ class Ledger:
                 )
             }
 
+    def inventory_stories_for_epic(self, epic: str) -> list[str]:
+        """Return every story id in ``epic`` from the inventory, sorted.
+
+        Story 22.5-002: the epic-cascade enumerates an epic's stories from the
+        inventory (projected by Story 22.1-002). Ordered by story id so a cascade
+        is deterministic and a resumed pass covers stories in a stable sequence.
+        """
+        with self._connect() as conn:
+            return [
+                r[0]
+                for r in conn.execute(
+                    "SELECT story_id FROM story_inventory WHERE epic = ? "
+                    "ORDER BY story_id",
+                    (epic,),
+                )
+            ]
+
     # --- Read-only queries -------------------------------------------------
     # These power `sdlc status`. They open the ledger read-only with a
     # busy timeout so a poll issued *while the controller is writing* waits out
