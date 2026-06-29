@@ -378,3 +378,53 @@ def test_parsed_doc_renders_round_trip(tmp_path: Path) -> None:
     assert story_marker("22.1-001") in body
     assert extract_managed_block(body) is not None
     assert "As FX, I want a thing." in body
+
+
+# --- a story body stops at the next feature/section boundary -----------------
+
+_BOUNDARY_EPIC = """# Epic 22: Boundary
+
+### Feature 22.1: First feature
+
+#### Stories
+
+##### Story 22.1-001: Last story in its feature
+**User Story**: As FX, I want a thing.
+**Story Points**: 3
+**Risk Level**: Low
+
+### Feature 22.2: Second feature
+
+Some feature blurb that must not leak into 22.1-001's body.
+
+#### Stories
+
+##### Story 22.2-001: First story of the next feature
+**User Story**: As FX, I want another thing.
+**Story Points**: 5
+**Risk Level**: High
+"""
+
+
+def test_story_body_stops_at_next_feature_heading(tmp_path: Path) -> None:
+    # Regression: a story that is the *last* in its feature must not absorb the
+    # following `### Feature …` / `#### Stories` headings (or the next feature's
+    # blurb) into its spec — the body ends at the section boundary.
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-22-boundary.md").write_text(_BOUNDARY_EPIC, encoding="utf-8")
+
+    docs = {d.story_id: d for d in parse_story_docs(tmp_path)}
+    assert set(docs) == {"22.1-001", "22.2-001"}
+
+    last = docs["22.1-001"]
+    assert "I want a thing." in last.spec_md  # its own spec is intact
+    assert "Risk Level" in last.spec_md
+    # …but nothing from the next feature leaked in.
+    assert "Feature 22.2" not in last.spec_md
+    assert "Second feature" not in last.spec_md
+    assert "#### Stories" not in last.spec_md
+    assert "must not leak" not in last.spec_md
+    # the next story still parses correctly and independently.
+    assert "I want another thing." in docs["22.2-001"].spec_md
+    assert "I want a thing." not in docs["22.2-001"].spec_md
