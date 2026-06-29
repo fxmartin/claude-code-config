@@ -20,6 +20,7 @@ from sdlc.build import (
     BuildResult,
     Ledger,
     _filter_git_landed,
+    _stamp_run_actor,
     default_preflight,
     detect_test_command,
     in_test_sentinel,
@@ -3720,3 +3721,91 @@ def test_result_wrapper_skeleton_round_trips_through_contracts(
     obj = json.loads(_fill_skeleton(skeleton))  # also proves it is valid JSON
     response = f"{RESULT_START_MARKER}\n{json.dumps(obj)}\n{RESULT_END_MARKER}"
     assert parse_and_validate(agent_type, response) == obj
+
+
+# --- Story 22.5-001 AC1: the run's actor is stamped from host identity --------
+# These wire the identity helpers (resolved + unit-tested in test_identity.py)
+# into the real run-create path; the reviewer flagged that the primitives existed
+# but `run_build` never called them, leaving `runs.actor` always NULL.
+
+
+def _gh_adapter(login: str | None, *, missing_cli: bool = False):
+    """A GitHubAdapter whose `gh api user` returns `login` (or fails)."""
+    from sdlc import issue_host as ih
+
+    if missing_cli:
+        def runner(argv, timeout=None):
+            raise FileNotFoundError(argv[0])
+        return ih.GitHubAdapter(runner=runner)
+
+    def runner(argv, timeout=None):
+        if "api user" in " ".join(argv):
+            return ih.RunResult(returncode=0, stdout=f"{login}\n", stderr="")
+        return ih.RunResult(returncode=0, stdout="", stderr="")
+
+    return ih.GitHubAdapter(runner=runner)
+
+
+def _actor_of(db: Path) -> str | None:
+    row = _open(db).execute("SELECT actor FROM runs").fetchone()
+    return row[0] if row else None
+
+
+def test_run_build_stamps_actor_from_adapter(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+        actor_adapter=_gh_adapter("octocat"),
+    )
+    assert _actor_of(db) == "octocat"
+
+
+def test_run_build_without_adapter_stamps_unknown(tmp_path) -> None:
+    # No adapter (host indeterminate) must still attribute the run — `unknown`,
+    # never NULL and never a crash (AC3).
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    assert _actor_of(db) == "unknown"
+
+
+def test_run_build_unauthenticated_adapter_stamps_unknown(tmp_path) -> None:
+    # Host CLI present but no auth → identity degrades to `unknown` (AC3).
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+        actor_adapter=_gh_adapter(None, missing_cli=True),
+    )
+    assert _actor_of(db) == "unknown"
+
+
+def test_stamp_run_actor_helper_none_adapter_is_unknown(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("all", "serial")
+    assert _stamp_run_actor(ledger, run_id, None) == "unknown"
+    assert ledger.run_get_actor(run_id) == "unknown"
+
+
+def test_stamp_run_actor_helper_with_adapter_stamps_login(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("all", "serial")
+    assert _stamp_run_actor(ledger, run_id, _gh_adapter("alice")) == "alice"
+    assert ledger.run_get_actor(run_id) == "alice"

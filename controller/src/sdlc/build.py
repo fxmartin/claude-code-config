@@ -58,6 +58,7 @@ from sdlc.model_routing import (
 from sdlc.notify import notify
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
 from sdlc.rate_limit import RateLimitSignal, WindowQuota, seconds_until_reset, within_wait_cap
+from sdlc.issue_host import IssueHostAdapter
 from sdlc.registry import Registry, RunRecord
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -3454,6 +3455,27 @@ def _filter_git_landed(
     return still_buildable, done_skips + landed
 
 
+def _stamp_run_actor(
+    ledger: Ledger, run_id: str, adapter: IssueHostAdapter | None
+) -> str:
+    """Stamp this run's actor from host identity (Story 22.5-001 AC1).
+
+    The code host *is* the identity provider (`gh api user` / `glab` equivalent),
+    so attribution needs no shared token. Best-effort and self-degrading: with no
+    ``adapter`` (the host could not be determined) or when host auth is absent,
+    the actor is :data:`~sdlc.identity.UNKNOWN_ACTOR` rather than a crash (AC3) —
+    so a run is always attributed *something*. Returns the stamped actor.
+    """
+    from sdlc.identity import UNKNOWN_ACTOR, cache_actor
+
+    if adapter is None:
+        ledger.run_set_actor(run_id, UNKNOWN_ACTOR)
+        return UNKNOWN_ACTOR
+    # cache_actor resolves via the adapter's whoami and degrades to `unknown`
+    # internally when host auth is missing, so this never raises on auth gaps.
+    return cache_actor(ledger, run_id, adapter)
+
+
 def run_build(
     opts: BuildOptions,
     *,
@@ -3466,6 +3488,7 @@ def run_build(
     clock: Callable[[], float] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     root: Path | None = None,
+    actor_adapter: "IssueHostAdapter | None" = None,
 ) -> BuildResult:
     """Run the build-stories orchestration deterministically.
 
@@ -3535,6 +3558,10 @@ def run_build(
     # actually use, so `--concurrency=1` reports `serial` rather than lying.
     mode = authoritative_mode(opts)
     run_id = ledger.run_create(opts.scope, mode)
+    # Story 22.5-001 AC1: stamp the run's actor from host identity, resolved once
+    # per run. Best-effort and self-degrading — no adapter (host indeterminate)
+    # or absent host auth yields `unknown`, never a crash (AC3).
+    _stamp_run_actor(ledger, run_id, actor_adapter)
     ledger.set_total(run_id, len(buildable))
     # Announce the run in the host-level registry so a single dashboard can
     # discover it across repos (Story 11.2-001). Best-effort: a registry IO
