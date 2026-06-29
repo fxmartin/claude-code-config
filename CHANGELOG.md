@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.109.1] - 2026-06-29
+
+### Fixed
+
+- fix(github-story-mirror): decide assign idempotency from host truth
+
+
 ## [v1.109.0] - 2026-06-29
 
 ### Added
