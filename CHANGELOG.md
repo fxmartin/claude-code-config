@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.109.2] - 2026-06-29
+
+### Fixed
+
+- fix(github-story-mirror): end story body at the next section heading
+- fix(github-story-mirror): init provisions taxonomy labels first
+
+
 ## [v1.109.1] - 2026-06-29
 
 ### Fixed
