@@ -39,6 +39,9 @@ class FakeHost(IssueHostAdapter):
     def ensure_ready(self) -> str:  # pragma: no cover - unused here
         return "fx"
 
+    def ensure_labels(self, labels):  # pragma: no cover - unused here
+        pass
+
     def user_exists(self, user: str) -> bool:
         return user in self.known_users
 

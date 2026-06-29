@@ -217,6 +217,18 @@ class IssueHostAdapter(ABC):
         """Verify the CLI is installed and authenticated; return the login or raise."""
 
     @abstractmethod
+    def ensure_labels(self, labels: Sequence[str]) -> None:
+        """Create each taxonomy label on the host if absent (idempotent).
+
+        `sdlc issues init` calls this to provision the board's taxonomy (`story`,
+        ``epic:NN``, ``feature:NN.F``, ``points:N``, ``risk:*``) *before* the
+        backfill, so ``issue_create --label`` never fails against a fresh repo
+        whose labels do not yet exist (Story 22.3-001 AC: init provisions the
+        board + taxonomy). Re-running, or a label a human already created, is a
+        harmless no-op.
+        """
+
+    @abstractmethod
     def issue_create(
         self,
         title: str,
@@ -311,6 +323,25 @@ def _ref_from_url(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+# A 6-hex colour (no leading `#`) per taxonomy category, so the provisioned board
+# reads at a glance: structural labels share a hue, risk is graded green→red. An
+# unrecognised name falls back to a neutral grey (matches GitHub's default).
+def _label_color(name: str) -> str:
+    if name == "story":
+        return "5319e7"  # purple — the framework-managed marker
+    if name.startswith("epic:"):
+        return "0e8a16"  # green
+    if name.startswith("feature:"):
+        return "1d76db"  # blue
+    if name.startswith("points:"):
+        return "fbca04"  # amber
+    if name.startswith("risk:"):
+        return {"risk:low": "c2e0c6", "risk:medium": "fbca04", "risk:high": "d93f0b"}.get(
+            name.lower(), "ededed"
+        )
+    return "ededed"  # neutral grey
+
+
 # --- GitHub (gh) -------------------------------------------------------------
 
 
@@ -325,6 +356,13 @@ class GitHubAdapter(IssueHostAdapter):
 
     def ensure_ready(self) -> str:
         return self._ensure_ready("gh auth login")
+
+    def ensure_labels(self, labels: Sequence[str]) -> None:
+        # `gh label create --force` is create-or-update, so it is idempotent: a
+        # missing label is created, an existing one (a prior init, or a label a
+        # human already made) is harmlessly refreshed rather than erroring.
+        for name in dict.fromkeys(labels):  # de-dupe, preserve order
+            self._run("label", "create", name, "--color", _label_color(name), "--force")
 
     def issue_create(
         self,
@@ -441,6 +479,20 @@ class GitLabAdapter(IssueHostAdapter):
 
     def ensure_ready(self) -> str:
         return self._ensure_ready("glab auth login")
+
+    def ensure_labels(self, labels: Sequence[str]) -> None:
+        # `glab label create` has no create-or-update flag and errors when the
+        # label already exists, so tolerate that one case to stay idempotent; any
+        # other failure (auth, network) still raises. Colour takes a leading `#`.
+        for name in dict.fromkeys(labels):  # de-dupe, preserve order
+            result = self._invoke(
+                "label", "create", "--name", name, "--color", f"#{_label_color(name)}"
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").lower()
+                if "already" in detail or "taken" in detail:
+                    continue  # label exists → idempotent no-op
+                raise IssueHostError(f"glab label create failed: {detail.strip()}")
 
     def issue_create(
         self,
