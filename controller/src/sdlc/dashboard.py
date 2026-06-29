@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from sdlc import __version__, github_stats
 from sdlc.build import _EMPTY_COUNTS, Ledger, _duration_seconds, status_snapshot
+from sdlc.portfolio import portfolio_view
 from sdlc.registry import Registry, RunRecord, derive_state
 
 # scp-like remote: git@host:owner/sub/repo.git
@@ -459,6 +460,35 @@ _PAGE = """<!doctype html>
                     max-height: 50vh; white-space: pre-wrap; word-break: break-word;
                     font-size: 12px; }
   .transcript .empty { color: var(--sub); font-style: italic; }
+  /* Story 22.6-001: top-bar view switch between the per-run Builds view and the
+     all-epics Portfolio panel. The two views are sibling containers toggled with
+     [hidden]; the buttons reuse the chip look with an active fill. */
+  .views { display: inline-flex; gap: 6px; }
+  .vbtn { font: inherit; font-size: 12px; cursor: pointer; padding: 3px 12px;
+          border-radius: 12px; border: 1px solid var(--surface);
+          background: var(--mantle); color: var(--sub); }
+  .vbtn.active { background: var(--surface); color: var(--text); font-weight: 600; }
+  /* Story 22.6-001: the portfolio panel — one section per epic, each a table of
+     its stories (status · harness · owner · title) with a per-epic harness
+     roll-up in the heading. Rendered from the local inventory cache, offline. */
+  .portfolio { padding: 24px; }
+  /* The view switch sets [hidden] on whichever container is inactive. `.wrap`
+     carries an explicit display:flex, which would beat the UA [hidden] rule at
+     equal specificity — so the toggle needs author [hidden] rules on both. */
+  .wrap[hidden] { display: none; }
+  .portfolio[hidden] { display: none; }
+  .portfolio .pf-head { display: flex; align-items: center; justify-content: space-between;
+                        gap: 12px; margin-bottom: 8px; }
+  .portfolio .epic { margin: 0 0 22px; }
+  .portfolio .epic h3 { font-size: 14px; margin: 0 0 6px; font-weight: 600; }
+  .pf-refresh { font: inherit; font-size: 12px; cursor: pointer; padding: 3px 12px;
+                border-radius: 12px; border: 1px solid var(--surface);
+                background: var(--mantle); color: var(--sub); }
+  .pf-refresh:hover { background: var(--crust); }
+  /* The harness badge (Claude / Codex / qwen) — a neutral pill distinct from the
+     coloured status badges so the two channels never read as the same thing. */
+  .hbadge { padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600;
+            background: var(--mantle); border: 1px solid var(--surface); color: var(--sub); }
   @media (max-width: 760px) {
     .wrap { flex-direction: column; }
     .side { width: auto; border-right: none; border-bottom: 1px solid var(--surface); }
@@ -468,9 +498,13 @@ _PAGE = """<!doctype html>
 <body>
   <header class="topbar">
     <span class="brand">Autonomous <span class="tld">SDLC</span><span class="ver">__SDLC_VERSION__</span></span>
+    <nav class="views">
+      <button id="viewBuilds" class="vbtn active">Builds</button>
+      <button id="viewPortfolio" class="vbtn">Portfolio</button>
+    </nav>
     <span id="repo" class="muted"></span>
   </header>
-  <div class="wrap">
+  <div class="wrap" id="buildsView">
     <div class="side"><h2>Runs</h2><div id="runs"></div></div>
     <div class="main">
       <div id="updated" class="muted">connecting…</div>
@@ -483,6 +517,13 @@ _PAGE = """<!doctype html>
       <div class="events" id="events"></div>
     </div>
   </div>
+  <section class="portfolio" id="portfolioView" hidden>
+    <div class="pf-head">
+      <h1>Portfolio <span class="muted small">every epic &amp; story &middot; status &middot; owner</span></h1>
+      <button id="pfRefresh" class="pf-refresh" title="re-read the local inventory cache">refresh</button>
+    </div>
+    <div id="portfolioBody"><p class="muted">loading&hellip;</p></div>
+  </section>
   <div id="sessionModal" class="modal" hidden>
     <div class="modal-card">
       <div class="modal-head"><h3 id="sessionTitle"></h3>
@@ -939,6 +980,63 @@ document.getElementById("sessionModal").addEventListener("click", e => {
 });
 document.addEventListener("keydown", e => { if(e.key === "Escape") closeSession(); });
 
+// All-epics portfolio panel (Story 22.6-001). A top-bar switch toggles between
+// the per-run Builds view and this Portfolio view. The panel renders from the
+// local inventory cache (/api/portfolio) with no host call, so it works offline;
+// the refresh button (and switching to the view) just re-reads that cache.
+const HARNESS_GLYPH = {claude:"\\u25c6", codex:"\\u25c8", qwen:"\\u25c7"};
+function harnessBadge(h){
+  const g = HARNESS_GLYPH[String(h||"").toLowerCase()] || "\\u25c7";
+  return "<span class='hbadge' title='harness'>"+g+" "+esc(h)+"</span>";
+}
+function renderPortfolio(d){
+  const el = document.getElementById("portfolioBody");
+  if(!el) return;
+  if(!d || !d.available || !(d.epics||[]).length){
+    el.innerHTML = "<p class='muted'>No stories in the inventory yet \\u2014 run "
+      + "<code>sdlc issues init</code> (or <code>sync</code>) to populate the portfolio.</p>";
+    return;
+  }
+  el.innerHTML = d.epics.map(ep => {
+    const roll = (ep.harness_rollup||[]).map(x => esc(x.count)+" on "+harnessBadge(x.harness)).join(" \\u00b7 ");
+    const rows = ep.stories.map(s => {
+      const owner = s.owner ? esc(s.owner) : "<span class='muted'>\\u2014</span>";
+      const human = s.human_status ? " "+badge(String(s.human_status).toUpperCase()) : "";
+      return "<tr><td><code>"+esc(s.story_id)+"</code></td>"
+        + "<td>"+badge(s.status)+human+"</td>"
+        + "<td>"+harnessBadge(s.harness)+"</td>"
+        + "<td>"+owner+"</td>"
+        + "<td class='stitle'>"+esc(s.title||"")+"</td></tr>";
+    }).join("");
+    return "<section class='epic'><h3>Epic-"+esc(ep.epic)
+      + " <span class='muted small'>("+esc(ep.count)+" "+(ep.count===1?"story":"stories")
+      + (roll ? " \\u00b7 "+roll : "")+")</span></h3>"
+      + "<table><tr><th>id</th><th>status</th><th>harness</th><th>owner</th><th>title</th></tr>"
+      + rows + "</table></section>";
+  }).join("");
+}
+async function refreshPortfolio(){
+  const el = document.getElementById("portfolioBody");
+  try{
+    const q = sel ? ("?run=" + encodeURIComponent(sel)) : "";
+    const r = await fetch("/api/portfolio"+q, {cache:"no-store"});
+    renderPortfolio(await r.json());
+  }catch(e){
+    if(el) el.innerHTML = "<p class='muted'>could not load the portfolio.</p>";
+  }
+}
+function showView(name){
+  const builds = name !== "portfolio";
+  document.getElementById("buildsView").hidden = !builds;
+  document.getElementById("portfolioView").hidden = builds;
+  document.getElementById("viewBuilds").classList.toggle("active", builds);
+  document.getElementById("viewPortfolio").classList.toggle("active", !builds);
+  if(!builds) refreshPortfolio();  // re-read the cache each time the view opens
+}
+document.getElementById("viewBuilds").addEventListener("click", () => showView("builds"));
+document.getElementById("viewPortfolio").addEventListener("click", () => showView("portfolio"));
+document.getElementById("pfRefresh").addEventListener("click", refreshPortfolio);
+
 tick();          // immediate first paint
 connectStream(); // then live updates (the stream's initial change repaints too)
 </script>
@@ -997,6 +1095,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(Ledger(self.server.db_path).list_runs())
         elif path == "/api/github":
             self._json(self._github_stats(run))
+        elif path == "/api/portfolio":
+            self._json(self._portfolio(run))
         elif path == "/api/stream":
             self._serve_stream()
         elif path == "/log":
@@ -1069,6 +1169,28 @@ class _Handler(BaseHTTPRequestHandler):
                 return github_stats.unavailable(None, "no-run")
             slug = repo_slug(Path(db_path).parent)
         return cache.get(slug)
+
+    # --- all-epics portfolio panel (Story 22.6-001) ------------------------
+
+    def _portfolio(self, run_id: str | None) -> dict:
+        """All-epics/all-stories portfolio, built from the local inventory cache.
+
+        Offline by design: it reads the per-repo ``story_inventory`` cache (the
+        sync populates it) and never calls the host, so the panel renders even
+        with no network. Registry-discovery mode resolves the selected run's own
+        ledger (per-repo inventory); single-``--db`` mode reads the server's
+        ledger directly — both independent of whether a build run exists. An
+        absent ledger / inventory yields the empty portfolio so the client shows
+        its "run sync first" state rather than an error.
+        """
+        _, db_path = self._resolve_run_db(run_id)
+        if db_path is None:
+            return portfolio_view([])
+        try:
+            rows = Ledger(db_path).inventory_rows()
+        except (OSError, sqlite3.Error):
+            rows = []
+        return portfolio_view(rows)
 
     # --- live auto-refresh transport (Story 11.2-003) ----------------------
 

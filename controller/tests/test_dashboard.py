@@ -1885,3 +1885,100 @@ def test_activity_row_wraps_content_for_clamping() -> None:
     # The full (un-clamped) message is exposed on hover, matching the no-reflow
     # truncation pattern used elsewhere on the dashboard.
     assert "title='\"+esc(a.message)+\"'" in _PAGE
+
+
+# --- all-epics portfolio panel (Story 22.6-001) ----------------------------
+
+
+def _seed_inventory(db_path: Path) -> Ledger:
+    """A ledger whose story_inventory holds two epics (built + unbuilt rows)."""
+    ledger = Ledger(db_path)
+    ledger.init()
+    ledger.inventory_upsert_specs(
+        [
+            ("22.1-001", "22", "22.1", "Inventory schema", 3, "Medium"),
+            ("22.6-001", "22", "22.6", "Portfolio panel", 5, "Medium"),
+            ("13.2-001", "13", "13.2", "Some epic-13 story", 2, "Low"),
+        ]
+    )
+    # Cache columns the sync/build own: a Done+owned+codex story, the rest unset.
+    ledger.inventory_set_status("22.1-001", "DONE")
+    ledger.inventory_set_owner("22.1-001", "fxmartin")
+    ledger._inventory_set_column("22.1-001", "harness", "codex")
+    return ledger
+
+
+def test_api_portfolio_renders_from_inventory_cache(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    _seed_inventory(db)
+    with _running(db) as base:
+        status, ctype, body = _get(base + "/api/portfolio")
+    assert status == 200
+    assert "application/json" in ctype
+    payload = json.loads(body)
+    assert payload["available"] is True
+    assert payload["total"] == 3
+    epics = {e["epic"]: e for e in payload["epics"]}
+    # Epics are grouped and numerically ordered (13 before 22).
+    assert [e["epic"] for e in payload["epics"]] == ["13", "22"]
+    e22 = epics["22"]
+    by_id = {s["story_id"]: s for s in e22["stories"]}
+    # Cached status + owner + harness surface on the built story…
+    assert by_id["22.1-001"]["status"] == "DONE"
+    assert by_id["22.1-001"]["owner"] == "fxmartin"
+    assert by_id["22.1-001"]["harness"] == "codex"
+    # …and an unbuilt story defaults to TODO + the built-in harness.
+    assert by_id["22.6-001"]["status"] == "TODO"
+    assert by_id["22.6-001"]["harness"] == "claude"
+    # The per-epic harness roll-up counts both harnesses.
+    assert {r["harness"]: r["count"] for r in e22["harness_rollup"]} == {"codex": 1, "claude": 1}
+
+
+def test_api_portfolio_empty_without_inventory(tmp_path: Path) -> None:
+    """A ledger with no projected stories renders the empty portfolio, not a 500."""
+    db = tmp_path / ".sdlc-state.db"
+    Ledger(db).init()
+    with _running(db) as base:
+        status, _ctype, body = _get(base + "/api/portfolio")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["available"] is False
+    assert payload["epics"] == []
+
+
+def test_api_portfolio_offline_with_no_run(tmp_path: Path) -> None:
+    """The panel reads the inventory cache directly — it does not need a build run
+    to exist (offline portfolio, Story 22.6-001)."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_inventory(db)  # inventory projected, but no run_create
+    with _running(db) as base:
+        status, _ctype, body = _get(base + "/api/portfolio")
+    assert status == 200
+    assert json.loads(body)["total"] == 3
+
+
+def test_api_portfolio_registry_mode_per_repo(tmp_path: Path) -> None:
+    """In registry-discovery mode the portfolio resolves the selected run's own
+    ledger, so each repo shows its own inventory."""
+    registry, _run_a, _run_b, repo_a, _repo_b = _two_repo_registry(tmp_path)
+    # Project an inventory row into repo-a's ledger.
+    Ledger(Path(repo_a) / ".sdlc-state.db").inventory_upsert_specs(
+        [("99.1-001", "99", "99.1", "Repo-A only", 1, "Low")]
+    )
+    with _running_registry(registry) as base:
+        status, _ctype, body = _get(base + "/api/portfolio?run=" + _run_a)
+    assert status == 200
+    payload = json.loads(body)
+    assert [e["epic"] for e in payload["epics"]] == ["99"]
+
+
+def test_portfolio_view_present_in_page() -> None:
+    """The portfolio view toggle, container, and renderer ship in the page so the
+    panel reuses the one dashboard (a new view, not a parallel dashboard)."""
+    from sdlc.dashboard import _PAGE
+
+    assert "viewPortfolio" in _PAGE
+    assert "id=\"portfolioView\"" in _PAGE
+    assert "/api/portfolio" in _PAGE
+    assert "renderPortfolio" in _PAGE
+    assert "harnessBadge" in _PAGE
