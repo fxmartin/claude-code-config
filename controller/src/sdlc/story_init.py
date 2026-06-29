@@ -97,12 +97,17 @@ def init_issues(
     # 1. Spec rows must exist before the mirror writes mappings onto them.
     project_specs(ledger, root)
 
+    # A story is Done if a build run completed it OR its markdown marks it Done.
+    # This single set drives BOTH the status seed and the issue close-out below, so
+    # a story can never read DONE while its issue stays open (the AC2 invariant:
+    # the open-issues list equals real remaining work).
+    done = done_story_ids(root) | ledger.build_done_story_ids()
+
     # 1a. Seed each story's execution status so the portfolio reflects already-
-    #     shipped work instead of a blanket TODO (Story 22.6-001). A story is DONE
-    #     if a build run completed it OR its markdown marks it Done; everything else
-    #     stays unset (reads TODO). This is the adoption-time seed — the build loop
-    #     and sync own the status thereafter.
-    for story_id in done_story_ids(root) | ledger.build_done_story_ids():
+    #     shipped work instead of a blanket TODO (Story 22.6-001). Non-done stories
+    #     stay unset (read TODO). The adoption-time seed — the build loop and sync
+    #     own the status thereafter.
+    for story_id in done:
         ledger.inventory_set_status(story_id, "DONE")
 
     # 1b. Provision the board's taxonomy labels before any issue is created, so
@@ -121,8 +126,9 @@ def init_issues(
     # 2. Backfill every story — idempotent, so a resume updates not duplicates.
     outcomes = mirror_stories(adapter, ledger, docs)
 
-    # 3. Done stories are created then immediately closed (full board history).
-    done = done_story_ids(root)
+    # 3. Done stories are created then immediately closed (full board history), so
+    #    their DONE status and a closed issue stay consistent — same `done` set as
+    #    the status seed.
     closed: list[str] = []
     for outcome in outcomes:
         if outcome.story_id in done:
