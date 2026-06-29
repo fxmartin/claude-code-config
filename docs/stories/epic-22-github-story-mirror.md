@@ -350,6 +350,7 @@ Who's doing what — from each developer's own host auth, with a real assign com
 #### Stories
 
 ##### Story 22.5-001: Resolve developer identity; cache owner & actor
+**Status**: Done
 **User Story**: As a team, I want each story's owner and each run's actor recorded from host identity so
 that we know who is doing what without passwords or shared accounts.
 **Priority**: Should Have
@@ -377,6 +378,7 @@ authoritative.
 **Risk Level**: Medium
 
 ##### Story 22.5-002: `sdlc issues assign` — assign a story or a whole epic
+**Status**: Done
 **User Story**: As FX, I want to assign a single story *or* an entire epic to someone so that I can hand
 off a whole area of work in one command and everyone knows who owns it.
 **Priority**: Should Have

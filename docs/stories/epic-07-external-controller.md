@@ -83,6 +83,7 @@
 #### Stories
 
 ##### Story 7.3-001: Port `build-stories` orchestration to the controller
+**Status**: Done
 **User Story**: As FX, I want `sdlc build` to run the full `build-stories` orchestration (discovery → cohort schedule → 4-stage execution → bugfix loop → E2E gate → summary) outside the Claude skill so that control flow is deterministic Python code, not a markdown playbook.
 **Priority**: P2
 **Points**: 8

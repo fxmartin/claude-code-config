@@ -77,6 +77,7 @@
 #### Stories
 
 ##### Story 3.2-001: Windows-via-WSL2 install guide
+**Status**: Done
 **User Story**: As an LTM colleague on Windows, I want a step-by-step guide that takes me from "fresh Windows 11" to "framework installed" without ambiguity so that I do not need to ping FX for help.
 **Priority**: P0
 **Points**: 2

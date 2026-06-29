@@ -59,6 +59,7 @@ reviewers:
 - [x] Change noted in `CHANGELOG.md` under "Added".
 
 ##### Story 8.1-002: Codex reference implementation of the slot
+**Status**: Done
 **User Story**: As FX, I want the Codex `autonomous-sdlc` plugin (in `nix-install`) to expose the `roast` and `project-review` skills via the adversarial reviewer slot contract so that today's Codex setup becomes the first concrete plug-in.
 **Priority**: P2
 **Points**: 3
@@ -87,6 +88,7 @@ reviewers:
 #### Stories
 
 ##### Story 8.2-001: High-risk file pattern detection and human-approval block
+**Status**: Done
 **User Story**: As FX, I want any PR that touches high-risk paths to block at merge until a human approves so that the autonomous loop can never silently change auth, payments, migrations, infrastructure, secrets, or destructive shell.
 **Priority**: P2
 **Points**: 5
