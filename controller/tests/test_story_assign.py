@@ -28,6 +28,9 @@ class FakeHost(IssueHostAdapter):
         self.host = host
         self.known_users = set(known_users)
         self.assigned: list[tuple[str, str]] = []
+        # The live host assignee per issue ref — `issue_view` reads it so the
+        # engine can decide idempotency from host truth, not the local cache.
+        self.live_assignee: dict[str, str] = {}
 
     # -- abstract verbs (only the ones the engine touches do real work) --
     def whoami(self) -> str:  # pragma: no cover - unused here
@@ -48,6 +51,7 @@ class FakeHost(IssueHostAdapter):
     def issue_assign(self, ref, assignee):
         ref = ref.ref if isinstance(ref, Issue) else str(ref)
         self.assigned.append((ref, assignee))
+        self.live_assignee[ref] = assignee
         return Issue(host=self.host, ref=ref, assignees=(assignee,))
 
     def issue_close(self, ref):  # pragma: no cover - unused here
@@ -56,8 +60,12 @@ class FakeHost(IssueHostAdapter):
     def issue_find(self, marker):  # pragma: no cover - unused here
         return None
 
-    def issue_view(self, ref):  # pragma: no cover - unused here
-        raise NotImplementedError
+    def issue_view(self, ref):
+        ref = ref.ref if isinstance(ref, Issue) else str(ref)
+        owner = self.live_assignee.get(ref)
+        return Issue(
+            host=self.host, ref=ref, assignees=(owner,) if owner else ()
+        )
 
     def issue_comment(self, ref, body):  # pragma: no cover - unused here
         raise NotImplementedError

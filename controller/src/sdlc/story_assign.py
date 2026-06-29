@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 
 from sdlc.build import Ledger
+from sdlc.identity import owner_from_issue
 from sdlc.issue_host import IssueHostAdapter
 
 __all__ = [
@@ -119,10 +120,14 @@ def assign(
         if ref is None:
             unmapped.append(story_id)
             continue
-        # Idempotent: a story already owned by this user needs no host write
-        # (re-assigning the same user is a no-op, AC4). The cache is the cheap
-        # check — the host call itself is idempotent too.
-        if ledger.inventory_get_owner(story_id) == user:
+        # Idempotent: a story already assigned to this user on the host needs no
+        # write (re-assigning the same user is a no-op, AC4). Decide that from the
+        # *live* host assignee, never the local cache — the host is authoritative
+        # and the cached owner can be stale (e.g. the assignee was changed on the
+        # host directly), so trusting it would skip a required assignment. Refresh
+        # the cache from the live read either way so it stops drifting.
+        if owner_from_issue(adapter.issue_view(ref)) == user:
+            ledger.inventory_set_owner(story_id, user)
             already.append(story_id)
             continue
         adapter.issue_assign(ref, user)
