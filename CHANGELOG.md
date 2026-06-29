@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.108.0] - 2026-06-29
+
+### Added
+
+- feat(github-story-mirror): `sdlc issues assign` — assign a (#22.5-002)
+
+### Fixed
+
+- fix(github-story-mirror): provision schema in issues assign (#22.5-002)
+
+
 ## [v1.107.0] - 2026-06-29
 
 ### Added
