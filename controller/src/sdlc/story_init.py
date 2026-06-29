@@ -11,7 +11,7 @@ from sdlc.discovery import _story_dir, parse_epic_file
 from sdlc.issue_host import IssueHostAdapter
 from sdlc.story_inventory import project_specs
 from sdlc.story_mirror import MirrorOutcome, mirror_stories
-from sdlc.story_render import parse_story_docs
+from sdlc.story_render import parse_story_docs, story_labels
 
 __all__ = [
     "NoStoriesError",
@@ -96,6 +96,19 @@ def init_issues(
 
     # 1. Spec rows must exist before the mirror writes mappings onto them.
     project_specs(ledger, root)
+
+    # 1b. Provision the board's taxonomy labels before any issue is created, so
+    #     `issue_create --label` never fails against a fresh repo whose labels do
+    #     not yet exist (Story 22.3-001 AC: init provisions the board + taxonomy).
+    #     The set is the union of every story's labels; ensure_labels is idempotent.
+    labels = sorted(
+        {
+            label
+            for doc in docs
+            for label in story_labels(doc.epic, doc.feature, doc.points, doc.risk)
+        }
+    )
+    adapter.ensure_labels(labels)
 
     # 2. Backfill every story — idempotent, so a resume updates not duplicates.
     outcomes = mirror_stories(adapter, ledger, docs)

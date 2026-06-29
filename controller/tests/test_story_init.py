@@ -38,6 +38,11 @@ class FakeHost(IssueHostAdapter):
         self.created = 0
         self.updated = 0
         self.closed = 0
+        # Labels provisioned via `ensure_labels`. `issue_create` enforces that a
+        # referenced label was provisioned first — modelling the real host, where
+        # `gh issue create --label <unknown>` fails. This is what makes the suite
+        # catch the missing-provisioning bug (Story 22.3-001 AC).
+        self.ensured_labels: set[str] = set()
 
     def whoami(self) -> str:
         return "me"
@@ -45,7 +50,13 @@ class FakeHost(IssueHostAdapter):
     def ensure_ready(self) -> str:
         return "me"
 
+    def ensure_labels(self, labels):
+        self.ensured_labels.update(labels)
+
     def issue_create(self, title, body, labels=None, assignee=None):
+        missing = [lbl for lbl in (labels or []) if lbl not in self.ensured_labels]
+        if missing:
+            raise IssueHostError(f"could not add label: {missing[0]!r} not found")
         ref = str(self._next)
         self._next += 1
         self.issues[ref] = {
@@ -187,6 +198,35 @@ def test_init_backfills_every_story_and_records_mapping(tmp_path, host):
     assert all(o.action == CREATED for o in result.outcomes)
 
 
+# --- AC: init provisions the taxonomy before the backfill --------------------
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_init_provisions_taxonomy_labels(tmp_path, host):
+    # Story 22.3-001 AC: init provisions the board + taxonomy. The fake host
+    # rejects `issue_create` for any label not ensured first (as a real `gh`
+    # does), so a green backfill here proves the full label set was provisioned.
+    _seed_stories(tmp_path)
+    ledger = _ledger(tmp_path)
+    adapter = FakeHost(host)
+
+    init_issues(adapter, ledger, root=tmp_path)
+
+    # the structural taxonomy for the seeded epic was created on the host…
+    assert {"story", "epic:22", "feature:22.1", "feature:22.2"} <= adapter.ensured_labels
+    # …including the points/risk labels the seeded stories carry.
+    assert {"points:3", "points:2", "points:5", "risk:low", "risk:high"} <= adapter.ensured_labels
+
+
+def test_init_without_provisioning_would_fail_to_create(tmp_path):
+    # Guard: with no labels ensured, the fake host rejects issue_create exactly as
+    # a real repo does — the regression the missing-provisioning bug produced.
+    _seed_stories(tmp_path)
+    adapter = FakeHost(GITHUB)
+    with pytest.raises(IssueHostError, match="not found"):
+        adapter.issue_create("t", "b", labels=["story"])
+
+
 # --- AC2: a Done story → created AND immediately closed -----------------------
 
 
@@ -240,13 +280,17 @@ def test_init_resume_after_partial_interrupt(tmp_path):
     ledger = _ledger(tmp_path)
     adapter = FakeHost(GITHUB)
 
-    # Simulate an interrupted first pass: only the first story got mirrored.
+    # Simulate an interrupted first pass: labels were provisioned (init does this
+    # before the backfill), then only the first story got mirrored before the crash.
     from sdlc.story_mirror import mirror_story
-    from sdlc.story_render import parse_story_docs
+    from sdlc.story_render import parse_story_docs, story_labels
 
     docs = parse_story_docs(tmp_path)
     ledger.inventory_upsert_specs(
         [(d.story_id, d.epic, d.feature, d.title, d.points, d.risk) for d in docs]
+    )
+    adapter.ensure_labels(
+        [lbl for d in docs for lbl in story_labels(d.epic, d.feature, d.points, d.risk)]
     )
     mirror_story(adapter, ledger, docs[0])
     assert adapter.created == 1

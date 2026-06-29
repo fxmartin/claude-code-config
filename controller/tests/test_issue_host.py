@@ -622,3 +622,55 @@ def test_gitlab_issue_update_unlabels() -> None:
     argv = runner.calls[-1]
     assert "--label" in argv and "status:building" in argv
     assert "--unlabel" in argv and "status:in-review" in argv
+
+
+# --- ensure_labels: provision the taxonomy (Story 22.3-001 label gap) ---------
+
+
+def test_github_ensure_labels_creates_each_idempotently():
+    runner = FakeRunner()
+    ih.GitHubAdapter(runner=runner).ensure_labels(["story", "epic:22", "risk:high"])
+    creates = [c for c in runner.calls if c[:3] == ["gh", "label", "create"]]
+    assert [c[3] for c in creates] == ["story", "epic:22", "risk:high"]
+    # every create is idempotent (create-or-update) and carries a colour
+    for c in creates:
+        assert "--force" in c
+        assert "--color" in c
+
+
+def test_github_ensure_labels_dedupes_preserving_order():
+    runner = FakeRunner()
+    ih.GitHubAdapter(runner=runner).ensure_labels(["story", "story", "epic:22"])
+    names = [c[3] for c in runner.calls if c[:3] == ["gh", "label", "create"]]
+    assert names == ["story", "epic:22"]  # the duplicate `story` collapsed
+
+
+def test_gitlab_ensure_labels_creates_each():
+    runner = FakeRunner()
+    ih.GitLabAdapter(runner=runner).ensure_labels(["story", "points:3"])
+    creates = [c for c in runner.calls if c[:3] == ["glab", "label", "create"]]
+    assert len(creates) == 2
+    assert "--name" in creates[0] and "story" in creates[0]
+    assert any(a.startswith("#") for a in creates[0])  # colour passed with leading '#'
+
+
+def test_gitlab_ensure_labels_tolerates_already_exists():
+    # glab errors when the label exists; that one case must be an idempotent no-op.
+    runner = FakeRunner(mapping={"label create": (1, "", "label already been taken")})
+    ih.GitLabAdapter(runner=runner).ensure_labels(["story"])  # must not raise
+
+
+def test_gitlab_ensure_labels_raises_on_other_failure():
+    runner = FakeRunner(mapping={"label create": (1, "", "401 unauthorized")})
+    with pytest.raises(ih.IssueHostError):
+        ih.GitLabAdapter(runner=runner).ensure_labels(["story"])
+
+
+def test_label_color_is_categorised():
+    assert ih._label_color("story") == "5319e7"
+    assert ih._label_color("epic:22") == "0e8a16"
+    assert ih._label_color("feature:22.1") == "1d76db"
+    assert ih._label_color("points:3") == "fbca04"
+    assert ih._label_color("risk:high") == "d93f0b"
+    assert ih._label_color("risk:low") == "c2e0c6"
+    assert ih._label_color("anything-else") == "ededed"

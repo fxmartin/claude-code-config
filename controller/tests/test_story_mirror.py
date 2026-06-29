@@ -46,6 +46,9 @@ class FakeHost(IssueHostAdapter):
     def ensure_ready(self) -> str:
         return "me"
 
+    def ensure_labels(self, labels):  # pragma: no cover - unused here
+        pass
+
     def issue_create(self, title, body, labels=None, assignee=None):
         ref = str(self._next)
         self._next += 1
