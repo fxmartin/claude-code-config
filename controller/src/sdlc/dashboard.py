@@ -481,6 +481,16 @@ _PAGE = """<!doctype html>
                         gap: 12px; margin-bottom: 8px; }
   .portfolio .epic { margin: 0 0 22px; }
   .portfolio .epic h3 { font-size: 14px; margin: 0 0 6px; font-weight: 600; }
+  /* Fixed column widths so every epic's table aligns with the next — without
+     table-layout:fixed each per-epic table auto-sizes to its own content and the
+     columns drift right epic after epic (Story 22.6-001). The title column has no
+     width, so it absorbs the remaining space and ellipsises when long. */
+  .portfolio table { table-layout: fixed; }
+  .portfolio th:nth-child(1), .portfolio td:nth-child(1) { width: 7rem; }
+  .portfolio th:nth-child(2), .portfolio td:nth-child(2) { width: 9rem; }
+  .portfolio th:nth-child(3), .portfolio td:nth-child(3) { width: 9rem; }
+  .portfolio th:nth-child(4), .portfolio td:nth-child(4) { width: 8rem; }
+  .portfolio td.stitle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .pf-refresh { font: inherit; font-size: 12px; cursor: pointer; padding: 3px 12px;
                 border-radius: 12px; border: 1px solid var(--surface);
                 background: var(--mantle); color: var(--sub); }
