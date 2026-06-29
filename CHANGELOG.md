@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.109.0] - 2026-06-29
+
+### Added
+
+- feat(github-story-mirror): all-epics/all-stories portfolio (#22.6-001)
+
+
 ## [v1.108.0] - 2026-06-29
 
 ### Added
