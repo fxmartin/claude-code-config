@@ -1718,6 +1718,35 @@ class Ledger:
                 )
             ]
 
+    def inventory_rows(self) -> list[dict]:
+        """Every ``story_inventory`` row, read-only, for the portfolio panel.
+
+        Story 22.6-001: the dashboard portfolio renders offline from this local
+        cache (no host call). Read-only with the busy-timeout connection so a
+        dashboard poll issued while the controller is writing waits out the lock
+        instead of erroring. Returns ``[]`` when the DB is absent or predates the
+        inventory migration (a read-only viewer never migrates), so the panel
+        shows its empty state rather than raising. Ordered by story id for a
+        deterministic render.
+        """
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "story_inventory" not in tables:
+                return []
+            rows = conn.execute(
+                "SELECT story_id, epic, feature, title, points, risk, status, "
+                "owner, human_status, host, issue_ref, harness "
+                "FROM story_inventory ORDER BY story_id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- Read-only queries -------------------------------------------------
     # These power `sdlc status`. They open the ledger read-only with a
     # busy timeout so a poll issued *while the controller is writing* waits out

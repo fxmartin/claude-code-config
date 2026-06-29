@@ -548,6 +548,31 @@ value and identity resolution can never wedge a build.
 > access. Let each developer authenticate as themselves; the host already knows
 > who they are.
 
+### Portfolio panel — all epics, all stories (Story 22.6-001)
+
+The dashboard gains a second view: a **Portfolio** panel that lists *every* epic
+and story with its status, owner, and harness, grouped by epic. It is a new view
+on the *same* dashboard server (a top-bar **Builds / Portfolio** switch), not a
+parallel dashboard — the Builds view stays the per-run pipeline detail.
+
+`portfolio.py` is **pure**: `portfolio_view(rows)` takes `story_inventory` rows
+and returns `{available, epics, total}`, where each epic carries its stories
+(status + owner + a **harness badge**) and a per-harness **roll-up** (e.g.
+*Epic-13: 4 on codex, 1 on claude*). Epics sort numerically; an unbuilt story
+defaults to `TODO` status and the built-in default harness (`claude`), mirroring
+the `state` view's COALESCE — the inventory `harness`/`status`/`owner` columns are
+sync/build-populated (Epic-20 20.2-002), so the panel simply *surfaces* whatever
+the cache holds, host-agnostic (GitHub or GitLab).
+
+The panel renders **offline from the local ledger cache** — `Ledger.inventory_rows()`
+is a read-only query over `story_inventory` (an absent ledger or a pre-inventory
+ledger yields `[]`, so the panel shows its "run `sdlc issues init`/`sync` first"
+empty state rather than erroring), and the `/api/portfolio` endpoint never calls
+the host. Registry-discovery mode resolves the selected run's own per-repo ledger,
+so each repo shows its own inventory; the refresh button (and opening the view)
+just re-reads the cache. The owner shown is the `22.5-001` cached read of the host
+assignee.
+
 ## Resume, status, and state
 
 Because every stage transition is persisted **before** the next stage runs, the
