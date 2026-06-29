@@ -50,6 +50,10 @@ _GITHUB_POINTS_FIELD = "Points"
 _POINTS = re.compile(r"^\*\*(?:Story\s+)?Points\*\*:\s*([0-9]+)")
 # `**Risk Level**: Medium` — first word only; a ` — prose` aside is discarded.
 _RISK = re.compile(r"^\*\*Risk Level\*\*:\s*([A-Za-z]+)")
+# Any markdown heading (`#`..`######`). A heading that is *not* a story header
+# ends the current story's body, so a last-in-feature story does not absorb the
+# following `### Feature …` / `#### Stories` section into its spec.
+_HEADING = re.compile(r"^#{1,6}\s")
 
 
 @dataclass(frozen=True)
@@ -254,6 +258,13 @@ def _parse_epic_file(path: Path) -> list[StoryDoc]:
             _flush()
             current = {"id": header.group(1), "title": header.group(2)}
             lines = []
+            continue
+        # A non-story heading (`### Feature …`, `#### Stories`, the next epic's
+        # `##`/`#`) closes the current story's body — its spec must end at the
+        # section boundary, not run on into the following feature's intro.
+        if current is not None and _HEADING.match(line):
+            _flush()
+            current = None
             continue
         if current is None:
             continue
