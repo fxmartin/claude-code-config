@@ -65,9 +65,10 @@ def test_assign_epic_cascade(tmp_path, monkeypatch) -> None:
 def test_assign_already_owned_is_noop(tmp_path, monkeypatch) -> None:
     db = tmp_path / ".sdlc-state.db"
     _seed_mapped(db, "22.5-002", ih.GITHUB, "42")
-    # Pre-cache the owner so re-assigning the same user is the idempotent path.
-    Ledger(db).inventory_set_owner("22.5-002", "alice")
     fake = FakeHost(ih.GITHUB)
+    # The *host* already has alice assigned — idempotency is decided from host
+    # truth, so re-assigning alice is a genuine no-op (no host write).
+    fake.live_assignee["42"] = "alice"
     _patch_adapter(monkeypatch, fake)
 
     result = runner.invoke(
@@ -79,6 +80,31 @@ def test_assign_already_owned_is_noop(tmp_path, monkeypatch) -> None:
     assert fake.assigned == []
     assert "1 already" in result.output
     assert "already alice" in result.output
+    # The cache is reconciled to the live owner even on the no-op path.
+    assert Ledger(db).inventory_get_owner("22.5-002") == "alice"
+
+
+def test_assign_stale_cache_does_not_skip_host_write(tmp_path, monkeypatch) -> None:
+    # Regression (Codex review): the idempotency check read the *local cache*, so a
+    # cached owner that no longer matched the host (assignee changed/removed on the
+    # host directly) let the command report success while skipping the required
+    # host assignment. Decide from host truth instead — the write must happen.
+    db = tmp_path / ".sdlc-state.db"
+    _seed_mapped(db, "22.5-002", ih.GITHUB, "42")
+    # Cache claims alice owns it, but the host has nobody assigned (stale cache).
+    Ledger(db).inventory_set_owner("22.5-002", "alice")
+    fake = FakeHost(ih.GITHUB)  # fake.live_assignee is empty → host unassigned
+    _patch_adapter(monkeypatch, fake)
+
+    result = runner.invoke(
+        app, ["issues", "assign", "22.5-002", "alice", "--host", "github", "--db", str(db)]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The required host write happened despite the matching stale cache.
+    assert fake.assigned == [("42", "alice")]
+    assert fake.live_assignee["42"] == "alice"
+    assert "1 assigned" in result.output
 
 
 def test_assign_unknown_user_exits_2(tmp_path, monkeypatch) -> None:
