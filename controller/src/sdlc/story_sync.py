@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sdlc.build import Ledger
+from sdlc.identity import owner_from_issue
 from sdlc.issue_host import IssueHostAdapter
 from sdlc.story_render import (
     StoryDoc,
@@ -150,7 +151,9 @@ def sync_story(
         action = PUSHED
 
     # --- pull: assignee → owner, human label → human_status ---
-    owner = live.assignees[0] if live.assignees else None
+    # `owner_from_issue` is the single source of the assignee→owner rule (Story
+    # 22.5-001): Free-tier single-assignee, first assignee wins, None clears.
+    owner = owner_from_issue(live)
     human_status = human_status_from_labels(live.labels)
     ledger.inventory_set_owner(doc.story_id, owner)
     ledger.inventory_set_human_status(doc.story_id, human_status)

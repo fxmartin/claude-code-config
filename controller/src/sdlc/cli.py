@@ -247,12 +247,23 @@ def build(ctx: typer.Context) -> None:
     # reads or writes it (run_build's init() also migrates, but a stale DB must
     # be safe the moment any code touches it). No-op when no DB exists yet.
     ledger.ensure_migrated()
+    # Story 22.5-001 AC1: resolve the host adapter once so run_build can stamp the
+    # run's actor from host identity. Best-effort — a repo with no/unsupported
+    # host remote yields no adapter, and run_build degrades the actor to
+    # `unknown` (it never blocks a build; AC3).
+    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+
+    try:
+        actor_adapter = get_adapter(resolve_host(Path.cwd()))
+    except IssueHostError:
+        actor_adapter = None
     result = run_build(
         opts,
         queue=queue,
         ledger=ledger,
         render_view=make_render_view(ledger.db_path),
         registry=Registry(),
+        actor_adapter=actor_adapter,
     )
 
     if result.skipped_in_test:
