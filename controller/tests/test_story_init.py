@@ -101,6 +101,9 @@ class FakeHost(IssueHostAdapter):
     def issue_comment(self, ref, body):  # pragma: no cover - unused here
         pass
 
+    def user_exists(self, user):  # pragma: no cover - unused here
+        return True
+
 
 # --- fixtures ----------------------------------------------------------------
 

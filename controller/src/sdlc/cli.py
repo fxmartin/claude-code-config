@@ -2035,8 +2035,12 @@ def issues_assign(
 
     db_path = db or default_db_path()
     ledger = Ledger(db_path)
-    # Migrate a pre-existing (possibly stale) ledger before the inventory reads.
-    ledger.ensure_migrated()
+    # init (not ensure_migrated) so assigning against a never-mirrored repo
+    # provisions the schema rather than reading a missing `story_inventory` table
+    # (ensure_migrated is a no-op when the DB is absent, which left the inventory
+    # SELECT crashing with an uncaught OperationalError). Idempotent
+    # CREATE-IF-NOT-EXISTS leaves an existing ledger intact, same as `issues init`.
+    ledger.init()
 
     try:
         resolved = resolve_host(Path.cwd(), override=host)

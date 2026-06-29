@@ -84,6 +84,9 @@ class FakeHost(IssueHostAdapter):
     def issue_comment(self, ref, body):  # pragma: no cover - unused here
         pass
 
+    def user_exists(self, user):  # pragma: no cover - unused here
+        return True
+
 
 def _seed_stories(root: Path, text: str = _EPIC_MD) -> None:
     story_dir = root / "docs" / "stories"

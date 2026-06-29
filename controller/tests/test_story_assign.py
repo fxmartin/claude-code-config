@@ -56,6 +56,12 @@ class FakeHost(IssueHostAdapter):
     def issue_find(self, marker):  # pragma: no cover - unused here
         return None
 
+    def issue_view(self, ref):  # pragma: no cover - unused here
+        raise NotImplementedError
+
+    def issue_comment(self, ref, body):  # pragma: no cover - unused here
+        raise NotImplementedError
+
 
 # --- fixtures ----------------------------------------------------------------
 
