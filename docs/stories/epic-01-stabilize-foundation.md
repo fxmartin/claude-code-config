@@ -25,6 +25,7 @@
 #### Stories
 
 ##### Story 1.1-001: Reconcile `qa-expert` → `qa-engineer` across all skills
+**Status**: Done
 **User Story**: As FX, I want every skill that dispatches a QA sub-agent to reference the actual agent file in `agents/` so that the coverage and E2E gates execute the specialist agent I defined rather than silently falling back to `general-purpose`.
 **Priority**: P0 (Critical)
 **Points**: 2
@@ -44,6 +45,7 @@
 - CI agent-registry validator (Epic-02 Story 2.1-003) passes once that story ships.
 
 ##### Story 1.1-002: Reconcile slash-command naming in CLAUDE.md
+**Status**: Done
 **User Story**: As FX, I want the slash-command references in `CLAUDE.md` to match the bare-name form used in `README.md` and `WORKFLOW-v2.md` so that any agent reading `CLAUDE.md` does not try to invoke commands under namespaces that have been removed.
 **Priority**: P0
 **Points**: 1
@@ -67,6 +69,7 @@
 #### Stories
 
 ##### Story 1.2-001: Resolve `WORKFLOW.md` and `workflow-diagram.png` dangling references
+**Status**: Done
 **User Story**: As an LTM colleague reading the docs for the first time, I want every documented file link to resolve so that I do not chase broken pointers on my first install.
 **Priority**: P0
 **Points**: 2
@@ -112,6 +115,7 @@
 - [x] Change noted in `CHANGELOG.md` under "Fixed".
 
 ##### Story 1.3-002: Fix `.env` source path and worktree leak
+**Status**: Done
 **User Story**: As FX, I want `cmux-bridge.sh` to find the actual `.env` file the installer writes, and I want completed worktrees to be torn down automatically, so that long parallel runs do not silently drop Telegram alerts and do not leave 150 MB of orphan checkouts on disk per run.
 **Priority**: P0
 **Points**: 5

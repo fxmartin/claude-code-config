@@ -23,6 +23,7 @@
 #### Stories
 
 ##### Story 6.1-001: Onboarding doc for LTM colleagues
+**Status**: Done
 **User Story**: As an LTM colleague new to the framework, I want a single document that walks me from "I have a Mac or WSL2 box" to "I just merged my first auto-built PR" in under 30 minutes of reading so that I do not need to ping FX or read the entire codebase.
 **Priority**: P1
 **Points**: 3

@@ -23,6 +23,7 @@
 #### Stories
 
 ##### Story 9.1-001: Semgrep SAST inside the coverage stage
+**Status**: Done
 **User Story**: As FX, I want every build to run a SAST scan as part of the coverage gate so that obvious security antipatterns (SQL injection, weak crypto, unsafe deserialization) are caught before merge.
 **Priority**: P2
 **Points**: 3
@@ -49,6 +50,7 @@
 - Change noted in `CHANGELOG.md` under "Added".
 
 ##### Story 9.1-002: Dependency scan with osv-scanner
+**Status**: Done
 **User Story**: As FX, I want every build to check the project's dependency tree against the OSV vulnerability database so that PRs that introduce known-vulnerable libraries are blocked.
 **Priority**: P2
 **Points**: 3
@@ -78,6 +80,7 @@
 #### Stories
 
 ##### Story 9.2-001: Gitleaks secrets scan on every PR
+**Status**: Done
 **User Story**: As FX, I want a secrets scanner to fail every PR that introduces a credential, API key, or token so that the framework can never autonomously commit a secret.
 **Priority**: P2
 **Points**: 4
