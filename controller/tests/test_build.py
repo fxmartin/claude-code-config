@@ -3809,3 +3809,22 @@ def test_stamp_run_actor_helper_with_adapter_stamps_login(tmp_path) -> None:
     run_id = ledger.run_create("all", "serial")
     assert _stamp_run_actor(ledger, run_id, _gh_adapter("alice")) == "alice"
     assert ledger.run_get_actor(run_id) == "alice"
+
+
+# --- Story 22.6-001: adoption-time status seed -------------------------------
+
+
+def test_build_done_story_ids_returns_only_done(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("all", "serial")
+    ledger.story_upsert(run_id, "1.1-001", "1", "t", "P1", 2, "py", "", None, "DONE")
+    ledger.story_upsert(run_id, "1.1-002", "1", "t", "P1", 2, "py", "", None, "FAILED")
+    ledger.story_upsert(run_id, "1.1-003", "1", "t", "P1", 2, "py", "", None, "DONE")
+    assert ledger.build_done_story_ids() == {"1.1-001", "1.1-003"}
+
+
+def test_build_done_story_ids_empty_when_no_runs(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    assert ledger.build_done_story_ids() == set()

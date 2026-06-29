@@ -97,6 +97,14 @@ def init_issues(
     # 1. Spec rows must exist before the mirror writes mappings onto them.
     project_specs(ledger, root)
 
+    # 1a. Seed each story's execution status so the portfolio reflects already-
+    #     shipped work instead of a blanket TODO (Story 22.6-001). A story is DONE
+    #     if a build run completed it OR its markdown marks it Done; everything else
+    #     stays unset (reads TODO). This is the adoption-time seed — the build loop
+    #     and sync own the status thereafter.
+    for story_id in done_story_ids(root) | ledger.build_done_story_ids():
+        ledger.inventory_set_status(story_id, "DONE")
+
     # 1b. Provision the board's taxonomy labels before any issue is created, so
     #     `issue_create --label` never fails against a fresh repo whose labels do
     #     not yet exist (Story 22.3-001 AC: init provisions the board + taxonomy).

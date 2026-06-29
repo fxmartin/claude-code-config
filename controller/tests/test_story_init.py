@@ -314,3 +314,22 @@ def test_init_no_stories_raises_guidance(tmp_path):
 
     assert "generate-epics" in str(exc.value)
     assert adapter.created == 0  # nothing provisioned on the host
+
+
+# --- Story 22.6-001: init seeds execution status (portfolio not all-TODO) -----
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_init_seeds_done_status_from_markdown_and_ledger(tmp_path, host):
+    _seed_stories(tmp_path)  # 22.2-001 is **Status**: Done in the markdown
+    ledger = _ledger(tmp_path)
+    # 22.1-001 was completed by a prior build run (ledger-done, not markdown-Done).
+    run_id = ledger.run_create("all", "serial")
+    ledger.story_upsert(run_id, "22.1-001", "22", "t", "P1", 3, "py", "", None, "DONE")
+    adapter = FakeHost(host)
+
+    init_issues(adapter, ledger, root=tmp_path)
+
+    assert ledger.inventory_get_status("22.2-001") == "DONE"  # markdown Done
+    assert ledger.inventory_get_status("22.1-001") == "DONE"  # build-ledger Done
+    assert ledger.inventory_get_status("22.1-002") is None    # neither → reads TODO

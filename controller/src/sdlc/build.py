@@ -1670,6 +1670,22 @@ class Ledger:
         """Set the cached execution status (build/sync owned)."""
         self._inventory_set_column(story_id, "status", status)
 
+    def build_done_story_ids(self) -> set[str]:
+        """Story ids that completed a build run (any run reached ``DONE``).
+
+        Story 22.6-001: `sdlc issues init` adopting an already-built repo seeds the
+        inventory `status` from this so the portfolio reflects shipped work instead
+        of a blanket TODO. A story counts as done if *any* run completed it — the
+        `stories` table is keyed per-run, so it can also hold earlier non-DONE rows.
+        """
+        with self._connect() as conn:
+            return {
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT story_id FROM stories WHERE status = 'DONE'"
+                )
+            }
+
     def inventory_get_owner(self, story_id: str) -> str | None:
         """The cached host assignee pulled by the reconcile."""
         return self._inventory_get_column(story_id, "owner")
