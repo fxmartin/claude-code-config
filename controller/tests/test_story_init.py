@@ -328,8 +328,16 @@ def test_init_seeds_done_status_from_markdown_and_ledger(tmp_path, host):
     ledger.story_upsert(run_id, "22.1-001", "22", "t", "P1", 3, "py", "", None, "DONE")
     adapter = FakeHost(host)
 
-    init_issues(adapter, ledger, root=tmp_path)
+    result = init_issues(adapter, ledger, root=tmp_path)
 
     assert ledger.inventory_get_status("22.2-001") == "DONE"  # markdown Done
     assert ledger.inventory_get_status("22.1-001") == "DONE"  # build-ledger Done
     assert ledger.inventory_get_status("22.1-002") is None    # neither → reads TODO
+    # Consistency: every DONE story's issue is closed (status DONE ⇔ closed issue),
+    # so a ledger-done story never reads DONE while its issue stays open.
+    assert set(result.closed) == {"22.1-001", "22.2-001"}
+    for sid in ("22.1-001", "22.2-001"):
+        ref = ledger.inventory_get_mapping(sid)[1]
+        assert adapter.issues[ref]["state"] == "closed"
+    open_ref = ledger.inventory_get_mapping("22.1-002")[1]
+    assert adapter.issues[open_ref]["state"] == "open"
