@@ -154,3 +154,28 @@ def test_assign_gitlab_host(tmp_path, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert fake.assigned == [("5", "alice")]
+
+
+def test_assign_against_never_mirrored_repo_does_not_crash(tmp_path, monkeypatch) -> None:
+    # Regression (review of PR #256): the command called `ensure_migrated()`,
+    # a no-op when the DB is absent, so assigning in a never-mirrored repo hit
+    # `SELECT ... FROM story_inventory` and raised an uncaught
+    # `sqlite3.OperationalError: no such table` — a raw traceback that escaped the
+    # `except (IssueHostError, AssignError)` handler. `init()` provisions the empty
+    # schema instead, so the story is cleanly reported unmapped (exit 1), no crash.
+    db = tmp_path / ".sdlc-state.db"
+    assert not db.exists()
+    fake = FakeHost(ih.GITHUB)
+    _patch_adapter(monkeypatch, fake)
+
+    result = runner.invoke(
+        app, ["issues", "assign", "22.5-002", "alice", "--host", "github", "--db", str(db)]
+    )
+
+    # A clean `typer.Exit` surfaces as SystemExit; the bug was an *uncaught*
+    # sqlite3.OperationalError leaking through. Assert it is the former, not a crash.
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code == 1
+    assert "1 unmapped" in result.output
+    assert fake.assigned == []
+    assert db.exists()  # the schema was provisioned
