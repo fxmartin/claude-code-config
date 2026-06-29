@@ -1972,6 +1972,42 @@ def test_api_portfolio_registry_mode_per_repo(tmp_path: Path) -> None:
     assert [e["epic"] for e in payload["epics"]] == ["99"]
 
 
+def test_portfolio_offline_no_source_is_empty() -> None:
+    """With neither a registry nor a single ``--db``, the portfolio resolves to no
+    ledger and returns the empty (unavailable) view rather than raising."""
+    from types import SimpleNamespace
+
+    from sdlc.dashboard import _Handler
+
+    handler = _Handler.__new__(_Handler)
+    handler.server = SimpleNamespace(registry=None, db_path=None)
+    view = handler._portfolio(None)
+    assert view["available"] is False
+    assert view["epics"] == []
+
+
+def test_api_portfolio_unreadable_ledger_returns_empty(monkeypatch, tmp_path: Path) -> None:
+    """A ledger that raises while reading the inventory degrades to the empty
+    portfolio (HTTP 200), not a 500 surfaced to the viewer."""
+    import sqlite3
+
+    import sdlc.dashboard as dash
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed_inventory(db)
+
+    def _raise(self):
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(dash.Ledger, "inventory_rows", _raise)
+    with _running(db) as base:
+        status, _ctype, body = _get(base + "/api/portfolio")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["available"] is False
+    assert payload["epics"] == []
+
+
 def test_portfolio_view_present_in_page() -> None:
     """The portfolio view toggle, container, and renderer ship in the page so the
     panel reuses the one dashboard (a new view, not a parallel dashboard)."""

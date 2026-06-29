@@ -54,6 +54,21 @@ def test_epics_sorted_numerically_not_lexically() -> None:
     assert [e["epic"] for e in view["epics"]] == ["4", "13", "22"]
 
 
+def test_non_numeric_epics_sort_after_numeric_ones() -> None:
+    # Non-numeric epic ids (e.g. "nfr") can't be int-parsed, so they fall to the
+    # lexical bucket and sort after every numeric epic, deterministically.
+    rows = [_row("nfr.1-001", "nfr"), _row("13.1-001", "13"), _row("abc.1-001", "abc")]
+    view = portfolio_view(rows)
+    assert [e["epic"] for e in view["epics"]] == ["13", "abc", "nfr"]
+
+
+def test_missing_epic_falls_back_to_placeholder() -> None:
+    # A row with no epic groups under "?" (also a non-numeric sort key), so the
+    # panel never drops a story for want of an epic id.
+    view = portfolio_view([_row("99.1-001", None)])
+    assert view["epics"][0]["epic"] == "?"
+
+
 def test_status_defaults_to_todo_when_unbuilt() -> None:
     view = portfolio_view([_row("22.1-001", "22", status=None)])
     assert view["epics"][0]["stories"][0]["status"] == "TODO"

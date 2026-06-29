@@ -236,3 +236,47 @@ def test_story_inventory_updated_at_is_autopopulated(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert updated_at is not None
+
+
+# --- inventory_rows read (Story 22.6-001 portfolio source) -----------------
+
+
+def test_inventory_rows_empty_when_db_absent(tmp_path: Path) -> None:
+    # A read-only viewer never migrates: an absent DB yields [] so the portfolio
+    # panel shows its empty state rather than raising (build.py inventory_rows).
+    ledger = Ledger(tmp_path / "missing.db")
+    assert ledger.inventory_rows() == []
+
+
+def test_inventory_rows_empty_when_table_predates_migration(tmp_path: Path) -> None:
+    # An old ledger without `story_inventory` is read, not migrated, by a viewer:
+    # the missing-table branch returns [] instead of erroring on the SELECT.
+    db = tmp_path / "old.db"
+    _old_schema_db(db)
+    assert not _has_table(db, "story_inventory")
+    assert Ledger(db).inventory_rows() == []
+
+
+def test_inventory_rows_returns_projected_rows_ordered_by_id(tmp_path: Path) -> None:
+    # The happy path: projected specs read back as dicts, ordered by story_id, so
+    # the portfolio view gets a deterministic, host-agnostic row set.
+    db = tmp_path / "fresh.db"
+    ledger = Ledger(db)
+    ledger.init()
+    ledger.inventory_upsert_specs(
+        [
+            ("22.6-001", "22", "22.6", "Portfolio panel", 5, "Medium"),
+            ("13.2-001", "13", "13.2", "Some epic-13 story", 2, "Low"),
+        ]
+    )
+    ledger.inventory_set_status("13.2-001", "DONE")
+    rows = ledger.inventory_rows()
+    assert [r["story_id"] for r in rows] == ["13.2-001", "22.6-001"]
+    by_id = {r["story_id"]: r for r in rows}
+    assert by_id["13.2-001"]["status"] == "DONE"
+    assert by_id["22.6-001"]["epic"] == "22"
+    # Every selected column is present on the projected dict.
+    assert set(by_id["22.6-001"]) >= {
+        "story_id", "epic", "feature", "title", "points", "risk",
+        "status", "owner", "human_status", "host", "issue_ref", "harness",
+    }
