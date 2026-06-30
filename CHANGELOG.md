@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.0.0] - 2026-06-30
+
+### Added
+
+- feat!: autonomous sdlc 2.0 — shared github backlog board
+
+
 ## [v1.109.3] - 2026-06-29
 
 ### Fixed
