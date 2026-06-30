@@ -1,0 +1,6 @@
+# Fixture: syntactically valid YAML whose top level is a sequence, not a
+# mapping. A GitLab CI config must be a mapping of jobs/keywords, so the
+# validator's parser must reject it as "not valid YAML".
+- stages
+- secrets-scan
+- ruff

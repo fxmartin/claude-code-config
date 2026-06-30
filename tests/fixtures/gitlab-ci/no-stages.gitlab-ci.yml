@@ -1,0 +1,30 @@
+# Fixture: every gate job is present and the YAML parses, but the top-level
+# `stages:` key is missing — so the validator must reject it before it even
+# reaches the per-job checks, naming the absent stages declaration.
+secrets-scan:
+  script:
+    - gitleaks detect --no-banner --redact
+
+shellcheck:
+  script:
+    - shellcheck --severity=warning hooks/*.sh
+
+ruff:
+  script:
+    - ruff check .
+
+json-schema:
+  script:
+    - echo validate
+
+commit-format:
+  script:
+    - npx commitlint --from "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --to HEAD
+
+pytest:
+  script:
+    - uv run pytest -q
+
+bats:
+  script:
+    - bats tests/

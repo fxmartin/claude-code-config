@@ -75,6 +75,22 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/gitlab-ci"
     [[ "${output}" == *"not valid YAML"* ]]
 }
 
+@test "validator fails and names the absent 'stages' declaration" {
+    # All gate jobs present but the top-level `stages:` key is missing — the
+    # validator must reject it at the stages check, before the per-job checks.
+    run "${VALIDATOR}" "${FIXTURES}/no-stages.gitlab-ci.yml"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"stages"* ]]
+}
+
+@test "validator fails when the template is not a YAML mapping" {
+    # Syntactically valid YAML whose top level is a sequence, not a mapping of
+    # jobs/keywords — the parser must reject it as not valid.
+    run "${VALIDATOR}" "${FIXTURES}/not-mapping.gitlab-ci.yml"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"not valid YAML"* ]]
+}
+
 @test "validator fails on a Premium-only keyword" {
     run "${VALIDATOR}" "${FIXTURES}/premium.gitlab-ci.yml"
     [ "${status}" -ne 0 ]
@@ -85,4 +101,12 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/gitlab-ci"
     run "${VALIDATOR}" "${FIXTURES}/does-not-exist.yml"
     [ "${status}" -ne 0 ]
     [[ "${output}" == *"not found"* ]]
+}
+
+@test "validator surfaces an environment error when no YAML parser is available" {
+    # Neither uv nor a PyYAML-capable python3 on PATH — the py_run helper must
+    # report that it needs one rather than silently mis-parsing the template.
+    run env PATH=/usr/bin:/bin bash "${VALIDATOR}" "${TEMPLATE}"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"need uv or a python3 with PyYAML"* ]]
 }
