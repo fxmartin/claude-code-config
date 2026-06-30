@@ -11,6 +11,7 @@ from sdlc.build import (
     BuildResult,
     Ledger,
     _extract_merge_sha,
+    _record_merge_landing,
     render_merge_prompt,
     run_build,
 )
@@ -140,6 +141,97 @@ def test_extract_merge_sha_none_when_absent_or_blank() -> None:
         raw="",
     )
     assert _extract_merge_sha(blank) is None
+
+
+def _seed_story_row(ledger: Ledger) -> str:
+    """Insert an IN_PROGRESS story row and return its run_id (shared test scaffold)."""
+    run_id = ledger.run_create("epic-23", "serial")
+    ledger.story_upsert(
+        run_id, "23.2-003", "epic-23", "Merge the MR", "Should", 3,
+        "merge", "feature/23.2-003", None, "IN_PROGRESS",
+    )
+    return run_id
+
+
+def test_record_merge_landing_noop_on_merge_stage_without_landed_sha(tmp_path) -> None:
+    """A merge stage that did NOT land (FAILED/empty sha) records nothing (AC3 guard).
+
+    Exercises the defensive ``if not sha: return`` path the happy-path
+    ``FakeDispatcher`` never hits — the merge agent always returns a real sha
+    there, so this branch needs a direct unit test. The story row must stay
+    merge_sha=NULL and no "merge landed" event may be written.
+    """
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = _seed_story_row(ledger)
+
+    failed = AgentResult(
+        agent_type="merge",
+        data={"merge_status": "FAILED", "merge_sha": ""},
+        raw="",
+    )
+    _record_merge_landing("merge", failed, ledger, run_id, _story(), 7)
+
+    assert ledger.story_merge_sha(run_id, "23.2-003") is None
+    conn = sqlite3.connect(db)
+    try:
+        events = conn.execute(
+            "SELECT message FROM events WHERE run_id = ? AND story_id = '23.2-003'",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert not any("merge landed" in row[0] for row in events)
+
+
+def test_record_merge_landing_noop_on_non_merge_stage(tmp_path) -> None:
+    """A non-merge stage is a no-op even when its result carries a sha-like field.
+
+    The early ``if stage != "merge": return`` must skip the ledger write so a
+    coverage/review stage can never stamp a merge sha onto the story row.
+    """
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = _seed_story_row(ledger)
+
+    # A coverage result that happens to carry a merge_sha must still be ignored.
+    coverage = AgentResult(
+        agent_type="coverage",
+        data={"coverage_status": "PASS", "merge_sha": "cafef00d"},
+        raw="",
+    )
+    _record_merge_landing("coverage", coverage, ledger, run_id, _story(), 7)
+
+    assert ledger.story_merge_sha(run_id, "23.2-003") is None
+
+
+def test_record_merge_landing_stamps_sha_and_logs_event(tmp_path) -> None:
+    """A landed merge stamps the sha and writes one "merge landed" event (AC3 happy path)."""
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = _seed_story_row(ledger)
+
+    merged = AgentResult(
+        agent_type="merge",
+        data={"merge_status": "MERGED", "merge_sha": "cafef00d", "merged_at": "x"},
+        raw="",
+    )
+    _record_merge_landing("merge", merged, ledger, run_id, _story(), 7)
+
+    assert ledger.story_merge_sha(run_id, "23.2-003") == "cafef00d"
+    conn = sqlite3.connect(db)
+    try:
+        events = conn.execute(
+            "SELECT message FROM events WHERE run_id = ? AND story_id = '23.2-003'",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    landings = [row[0] for row in events if "merge landed" in row[0]]
+    assert landings == ["merge landed: story DONE at cafef00d (cr=#7)"]
 
 
 def test_run_build_records_merge_sha_when_story_lands(tmp_path) -> None:
