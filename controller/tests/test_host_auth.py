@@ -59,6 +59,19 @@ def test_resolve_local_login_blank_login_raises() -> None:
         resolve_local_login(adapter)
 
 
+def test_resolve_local_login_strips_surrounding_whitespace() -> None:
+    # A CLI that prints the login with a trailing newline must not leak it.
+    adapter = FakeAdapter(login="  fxmartin\n")
+    assert resolve_local_login(adapter) == "fxmartin"
+
+
+def test_resolve_local_login_empty_login_raises() -> None:
+    # Distinct from the whitespace case: an outright empty string also fails.
+    adapter = FakeAdapter(login="")
+    with pytest.raises(HostAuthError, match="re-authenticate"):
+        resolve_local_login(adapter)
+
+
 # --- AC2: CI actions read a token from CI/CD env vars, never a committed file -
 
 
@@ -84,6 +97,17 @@ def test_resolve_ci_token_gitlab_falls_back_to_ci_job_token() -> None:
     assert token is not None
     assert token.source == "CI_JOB_TOKEN"
     assert token.value == "ci-job-token-value"
+
+
+def test_resolve_ci_token_gitlab_gl_token_middle_priority() -> None:
+    # GL_TOKEN sits between GITLAB_TOKEN and CI_JOB_TOKEN: it wins when the
+    # top name is unset but loses to it when both are present.
+    gl_only = resolve_ci_token(GITLAB, env={"GL_TOKEN": "gl", "CI_JOB_TOKEN": "job"})
+    assert gl_only is not None
+    assert gl_only.source == "GL_TOKEN"
+    both = resolve_ci_token(GITLAB, env={"GITLAB_TOKEN": _FAKE_GLPAT, "GL_TOKEN": "gl"})
+    assert both is not None
+    assert both.source == "GITLAB_TOKEN"
 
 
 def test_resolve_ci_token_github_priority_order() -> None:
@@ -138,6 +162,22 @@ def test_redact_masks_explicit_secret_literals() -> None:
     assert ha.REDACTED in out
 
 
+def test_redact_masks_fine_grained_github_pat_shape() -> None:
+    # GitHub's fine-grained PAT (`github_pat_…`) is a third recognised shape.
+    pat = "github_pat_" + "x" * 30
+    out = redact(f"token={pat}")
+    assert pat not in out
+    assert ha.REDACTED in out
+
+
+def test_redact_longest_secret_first_masks_whole_value() -> None:
+    # When one secret literal contains another, the longer is masked first so the
+    # full credential is elided rather than leaving a recognisable suffix.
+    out = redact("auth=job-token-supersecret", "job-token-supersecret", "secret")
+    assert "supersecret" not in out
+    assert out == "auth=" + ha.REDACTED
+
+
 def test_redact_ignores_empty_secrets() -> None:
     assert redact("nothing secret here", "", None) == "nothing secret here"
 
@@ -152,8 +192,24 @@ def test_find_committed_tokens_flags_token_shaped_literals() -> None:
     assert _FAKE_GHP in found
 
 
+def test_find_committed_tokens_flags_fine_grained_github_pat() -> None:
+    pat = "github_pat_" + "x" * 25
+    assert pat in find_committed_tokens(f"GH_TOKEN = '{pat}'")
+
+
 def test_find_committed_tokens_clean_content_is_empty() -> None:
     assert find_committed_tokens("export GITLAB_TOKEN=\"$CI_JOB_TOKEN\"  # from CI/CD vars") == []
+
+
+def test_str_includes_host_and_source_but_not_value() -> None:
+    # `str(token)` is the human-facing form: it must show host/source for debugging
+    # while keeping the secret elided, matching `repr`.
+    token = CiToken(host=GITHUB, source="GH_TOKEN", value=_FAKE_GHP)
+    rendered = str(token)
+    assert "GH_TOKEN" in rendered
+    assert GITHUB in rendered
+    assert _FAKE_GHP not in rendered
+    assert ha.REDACTED in rendered
 
 
 # --- minimal token scopes per host -------------------------------------------
