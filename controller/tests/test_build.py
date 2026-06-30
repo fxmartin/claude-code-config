@@ -3072,6 +3072,24 @@ def test_origin_default_ref_resolves_head(tmp_path, monkeypatch) -> None:
     assert build_mod._origin_default_ref(tmp_path) == "origin/main"
 
 
+def test_origin_default_ref_degrades_on_git_failure(tmp_path, monkeypatch) -> None:
+    """`_origin_default_ref` falls back to origin/main when `_git` itself raises (AC2)."""
+    from sdlc import build as build_mod
+
+    def _raise_oserror(root, *args):
+        raise OSError("git not found on PATH")
+
+    monkeypatch.setattr(build_mod, "_git", _raise_oserror)
+    assert build_mod._origin_default_ref(tmp_path) == "origin/main"
+
+    def _raise_subprocess(root, *args):
+        import subprocess as _sp
+        raise _sp.SubprocessError("symbolic-ref timed out")
+
+    monkeypatch.setattr(build_mod, "_git", _raise_subprocess)
+    assert build_mod._origin_default_ref(tmp_path) == "origin/main"
+
+
 def test_coverage_prompt_commit_subject_is_compliant_by_construction() -> None:
     """The coverage agent commits too — its supplied header is compliant (12.2-004 AC1)."""
     from sdlc.build import render_coverage_prompt
