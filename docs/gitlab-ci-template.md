@@ -19,8 +19,10 @@ Copy the template to the root of the target repo and commit it:
 cp templates/gitlab-ci.yml /path/to/target-repo/.gitlab-ci.yml
 ```
 
-The adoption preflight (Story 23.6-002) verifies the template is present along
-with the rest of the prerequisites. Validate the template locally with:
+The adoption preflight (Story 23.6-002, `sdlc doctor --gitlab`) verifies the
+template is present along with the rest of the prerequisites — see
+[gitlab-adoption.md](gitlab-adoption.md) for the worked zero-to-green-MR example.
+Validate the template locally with:
 
 ```bash
 scripts/validate-gitlab-ci.sh                 # checks the shipped template
