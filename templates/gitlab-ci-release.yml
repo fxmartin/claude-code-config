@@ -1,0 +1,103 @@
+# ABOUTME: Installable GitLab CI release pipeline for autonomous-SDLC target repos.
+# ABOUTME: Ports Epic-05's GitHub-Actions release flow to GitLab Free/Core (Story 23.4-001).
+#
+# Story 23.4-001 — copy this file into a company GitLab repo (merged into its
+# `.gitlab-ci.yml`, or kept as a separate pipeline include) together with
+# `scripts/compute-release.sh`. It is the GitLab equivalent of
+# `.github/workflows/release.yml`: on every push to the default branch it
+#   1. computes the Conventional-Commit semver bump since the last tag,
+#   2. no-ops when no feat/fix/perf/refactor or breaking commit landed,
+#   3. creates a `vX.Y.Z` tag and publishes a GitLab Release with generated notes.
+#
+# Free/Core only: it publishes through `release-cli` and GitLab Releases — no
+# merge trains, no Premium/Ultimate-only keywords.
+#
+# Bump truth is NOT forked: the version is computed by the very same
+# `scripts/compute-release.sh` that drives the GitHub release (Epic-05, Story
+# 5.2-001). Vendor that script into the target repo alongside this template so
+# both hosts share one source of truth.
+#
+# Prerequisites in the target repo (verified by the adoption preflight, 23.6-002):
+#   - `scripts/compute-release.sh` — the shared Conventional-Commit bumper.
+#   - A CI job token (`$CI_JOB_TOKEN`) with permission to create tags/releases,
+#     which release-cli uses by default.
+
+stages:
+  - release
+
+# release-cli consumes the `release:` keyword and also exposes the `create`
+# subcommand we call below. The image is alpine-based, so install bash (needed
+# by compute-release.sh's BASH_REMATCH) and git before running.
+publish-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  # Full history + tags so `git describe` finds the last tag and the commit log
+  # range is complete (GitLab shallow-clones by default).
+  variables:
+    GIT_DEPTH: "0"
+  # Run only on the default branch, and skip the workflow's own bump commit so a
+  # release never retriggers a release. The guard keys off the commit SUBJECT
+  # (CI_COMMIT_TITLE, first line) — the exact semantics of release-guard.sh:
+  #   * a `chore(release):` subject is this job's own push (recursion)
+  #   * a `[skip release]` subject is the manual emergency escape hatch
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+      when: never
+    - if: '$CI_COMMIT_TITLE =~ /^chore\(release\):/'
+      when: never
+    - if: '$CI_COMMIT_TITLE =~ /\[skip release\]/'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  before_script:
+    - apk add --no-cache bash git
+  script:
+    - |
+      set -euo pipefail
+
+      # 1. Last tag (default v0.0.0 for the very first release).
+      last="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
+      echo "Last tag: ${last}"
+
+      # 2. Compute the bump with the SHARED Epic-05 bumper. Feed every commit
+      #    subject + body since the last tag; %B is the raw body, range excludes
+      #    the tag itself.
+      result="$(git log "${last}..HEAD" --pretty=format:'%B%n' \
+        | bash scripts/compute-release.sh "${last}")"
+      echo "${result}"
+      bump="$(echo "${result}" | sed -n 's/^BUMP=//p')"
+      version="$(echo "${result}" | sed -n 's/^VERSION=//p')"
+
+      # 3. No release-worthy commits — no-op, exactly like Epic-05.
+      if [ "${bump}" = "none" ]; then
+        echo "No feat/fix/perf/refactor or breaking commits since ${last} — nothing to release."
+        exit 0
+      fi
+
+      # 4. Idempotency: a re-run on an already-tagged commit is a clean no-op.
+      if git rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+        echo "Tag ${version} already exists — re-run is a clean no-op."
+        exit 0
+      fi
+
+      # 5. Build release notes from the commit log. Grouping mirrors Keep a
+      #    Changelog (feat -> Added, fix -> Fixed, perf/refactor -> Changed),
+      #    matching the GitHub release-notes section.
+      notes="release-notes.md"
+      {
+        added="$(git log "${last}..HEAD" --no-merges --pretty=format:'%s' | grep -E '^feat(\(|!|:)' || true)"
+        fixed="$(git log "${last}..HEAD" --no-merges --pretty=format:'%s' | grep -E '^fix(\(|!|:)' || true)"
+        changed="$(git log "${last}..HEAD" --no-merges --pretty=format:'%s' | grep -E '^(perf|refactor)(\(|!|:)' || true)"
+        [ -n "${added}" ]   && { echo "### Added";   echo; echo "${added}"   | awk '{ print "- " $0 }'; echo; }
+        [ -n "${changed}" ] && { echo "### Changed"; echo; echo "${changed}" | awk '{ print "- " $0 }'; echo; }
+        [ -n "${fixed}" ]   && { echo "### Fixed";   echo; echo "${fixed}"   | awk '{ print "- " $0 }'; echo; }
+      } > "${notes}"
+      echo "Release ${version} (${bump}):"
+      cat "${notes}"
+
+      # 6. Create the tag + GitLab Release. release-cli creates the tag at the
+      #    release commit when it does not yet exist, then publishes the Release.
+      release-cli create \
+        --name "${version}" \
+        --tag-name "${version}" \
+        --ref "${CI_COMMIT_SHA}" \
+        --description "${notes}"

@@ -81,3 +81,62 @@ The template uses only GitLab Free/Core CI keywords. It deliberately avoids
 Premium/Ultimate-only constructs — **merge trains**, code-quality widgets,
 multiple-approver rules. The validator fails if a Premium keyword (e.g.
 `merge_train`) appears, keeping the template usable on the company standard.
+
+## Release flow (`templates/gitlab-ci-release.yml`)
+
+> Story 23.4-001. The GitLab port of Epic-05's GitHub-Actions release
+> (`.github/workflows/release.yml`). On every push to the **default branch** it
+> computes the Conventional-Commit semver bump, creates a `vX.Y.Z` **tag**, and
+> publishes a **GitLab Release** with generated notes — the GitLab equivalent of
+> the GitHub flow. Free/Core only: it publishes through `release-cli`.
+
+### What it is
+
+A second installable template, separate from the gate template, so the release
+pipeline is opt-in. Install it into a target GitLab repo together with the
+shared bumper:
+
+```bash
+cp templates/gitlab-ci-release.yml /path/to/target-repo/   # merge into .gitlab-ci.yml or include it
+cp scripts/compute-release.sh       /path/to/target-repo/scripts/
+```
+
+Validate it locally:
+
+```bash
+scripts/validate-gitlab-release.sh                 # checks the shipped template
+scripts/validate-gitlab-release.sh path/to/.gitlab-ci-release.yml
+```
+
+### Bump truth is shared, not forked
+
+The version is computed by the **same** `scripts/compute-release.sh` that drives
+the GitHub release (Epic-05, Story 5.2-001) — `feat` → MINOR, `fix`/`perf`/
+`refactor` → PATCH, `BREAKING CHANGE:`/`!` → MAJOR, everything else → no
+release. Vendoring that one script into the target repo keeps both hosts on a
+single source of truth; the release pipeline does not re-implement the bumper.
+
+### Release parity (GitHub Actions ↔ GitLab CI)
+
+| Step                | GitHub Actions (`release.yml`)            | GitLab CI (`gitlab-ci-release.yml`)                 |
+| ------------------- | ----------------------------------------- | --------------------------------------------------- |
+| Trigger             | `on: push: branches: [main]`              | `rules: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH`    |
+| Loop guard          | `release-guard.sh` (subject-only skip)    | `rules` skip on a `chore(release):` / `[skip release]` `$CI_COMMIT_TITLE` |
+| Compute bump        | `scripts/compute-release.sh`              | `scripts/compute-release.sh` (same script)          |
+| No release-worthy commits | guard/`BUMP=none` no-op             | `BUMP=none` → `exit 0` no-op                         |
+| Idempotency         | skip if tag exists                        | skip if `refs/tags/vX.Y.Z` exists                   |
+| Tag + publish       | `git tag` + `gh release create`           | `release-cli create --tag-name vX.Y.Z`              |
+| Notes               | grouped CHANGELOG section                 | same grouping (`Added`/`Changed`/`Fixed`)           |
+
+### Mapping notes
+
+- **No infinite loop.** The release's own `chore(release):` bump commit is
+  skipped by the `$CI_COMMIT_TITLE` rule (the GitLab equivalent of
+  `release-guard.sh`'s subject-only match), and even if it ran,
+  `compute-release.sh` would classify the lone bump commit as `BUMP=none`.
+- **Repo-specific manifest bumps are out of scope.** Unlike the framework's own
+  `release.yml` (which also bumps `plugin.json`/`marketplace.json`/the controller
+  version), the installable template ships only the generic bump-tag-release
+  flow; a target repo adds its own manifest steps if it needs them.
+- **Free/Core publish surface.** `release-cli` and GitLab Releases are Free-tier;
+  the validator rejects any Premium/Ultimate keyword, as with the gate template.

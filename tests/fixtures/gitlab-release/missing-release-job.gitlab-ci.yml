@@ -1,0 +1,11 @@
+# Fixture (Story 23.4-001): declares the release stage but no publish-release
+# job — the validator must reject it for the absent job.
+stages:
+  - release
+
+# A lint job, but nothing actually publishes a release.
+lint:
+  stage: release
+  image: alpine:latest
+  script:
+    - echo "no release happens here"
