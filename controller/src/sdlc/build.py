@@ -58,7 +58,7 @@ from sdlc.model_routing import (
 from sdlc.notify import notify
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
 from sdlc.rate_limit import RateLimitSignal, WindowQuota, seconds_until_reset, within_wait_cap
-from sdlc.issue_host import IssueHostAdapter
+from sdlc.issue_host import GITHUB_CR_TERMS, ChangeRequestTerms, IssueHostAdapter
 from sdlc.registry import Registry, RunRecord
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -2742,7 +2742,12 @@ def _result_wrapper(schema_filename: str) -> str:
 
 
 def render_build_prompt(
-    story: Story, opts: BuildOptions, close_link: str | None = None
+    story: Story,
+    opts: BuildOptions,
+    close_link: str | None = None,
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+    base_ref: str = "origin/main",
 ) -> str:
     """Render the build-agent instructions for one story.
 
@@ -2751,16 +2756,27 @@ def render_build_prompt(
     controller validates.
 
     ``close_link`` (Story 22.4-002) is the ``Closes #N`` keyword for the story's
-    mapped issue. It is only appended when *this* agent opens the PR (the
-    ``--skip-coverage`` path); otherwise the coverage agent opens the PR and
+    mapped issue. It is only appended when *this* agent opens the change request
+    (the ``--skip-coverage`` path); otherwise the coverage agent opens it and
     carries the close-link instead.
+
+    ``cr_terms`` (Story 23.2-001) carries the host-correct change-request phrasing
+    so a GitLab target opens a *Merge Request* (`glab mr create`) instead of a PR;
+    ``base_ref`` is the default branch ``feature/<id>`` is cut from and the change
+    request targets. Both default to GitHub's wording, so the GitHub path is
+    byte-identical to today (AC2).
     """
-    # Only inject the close-link when the build agent itself opens the PR.
-    close_hint = _close_link_instruction(close_link) if opts.skip_coverage else ""
-    push = (
-        "6. Push and create PR; include the PR number in the result block."
+    # Only inject the close-link when the build agent itself opens the change request.
+    close_hint = (
+        _close_link_instruction(close_link, cr_terms=cr_terms)
         if opts.skip_coverage
-        else "6. Commit locally; the coverage agent pushes and opens the PR."
+        else ""
+    )
+    push = (
+        f"6. Push and create {cr_terms.abbr}{cr_terms.cli_hint}; "
+        f"include the {cr_terms.ref_noun} in the result block."
+        if opts.skip_coverage
+        else f"6. Commit locally; the coverage agent pushes and opens the {cr_terms.abbr}."
     )
     # Story 18.3-001: keep user-facing docs current with each story. When the
     # documentation-currency lens is enabled (the default), instruct the build
@@ -2793,12 +2809,13 @@ def render_build_prompt(
         f"Epic: {story.epic_name} (from {story.epic_file})\n"
         f"Priority: {story.priority}\n\n"
         "## Instructions\n"
-        # Story 12.4-001: cut the branch from a freshly-fetched origin/main, not
-        # from whatever HEAD happens to be checked out. A base-less
+        # Story 12.4-001: cut the branch from a freshly-fetched base ref
+        # (``base_ref`` — the host default branch, Story 23.2-001 AC3; ``origin/main``
+        # by default), not from whatever HEAD happens to be checked out. A base-less
         # ``git checkout -b feature/<id>`` lets the branch stack on a previous
         # story's leftover feature branch, so a later successful merge can
-        # transitively land the earlier (parked) story's commits on main.
-        f"1. Create branch: git fetch origin && git checkout -b feature/{story.id} origin/main\n"
+        # transitively land the earlier (parked) story's commits on the base.
+        f"1. Create branch: git fetch origin && git checkout -b feature/{story.id} {base_ref}\n"
         # Issue #214: if the branch cannot be created (it already exists, a worktree
         # conflict, etc.) the agent must NOT fall back to committing story work on the
         # currently checked-out branch (typically main). Fail the build immediately.
@@ -2816,24 +2833,35 @@ def render_build_prompt(
     )
 
 
-def _close_link_instruction(close_link: str | None) -> str:
-    """The PR-description close-link instruction for a PR-opening stage (22.4-002).
+def _close_link_instruction(
+    close_link: str | None,
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+) -> str:
+    """The close-link instruction for a change-request-opening stage (22.4-002).
 
     ``close_link`` is the ``Closes #N`` keyword for the story's mapped issue;
     empty when the story has no issue (then this is the empty string and the
     prompt is byte-for-byte unchanged). When set, the agent is told to include it
-    in the PR description so merging the PR auto-closes the tracking issue.
+    in the change request's description so merging it auto-closes the tracking
+    issue. ``cr_terms`` (Story 23.2-001) picks the host noun (PR/MR); GitHub is
+    the default, so its phrasing is unchanged.
     """
     if not close_link:
         return ""
     return (
-        f'When you open the PR, include "{close_link}" on its own line in the PR '
-        "description so merging the PR auto-closes the story's tracking issue.\n"
+        f'When you open the {cr_terms.abbr}, include "{close_link}" on its own line '
+        f"in the {cr_terms.abbr} description so merging the {cr_terms.abbr} "
+        "auto-closes the story's tracking issue.\n"
     )
 
 
 def render_coverage_prompt(
-    story: Story, opts: BuildOptions, close_link: str | None = None
+    story: Story,
+    opts: BuildOptions,
+    close_link: str | None = None,
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
 ) -> str:
     # Story 12.2-004: the coverage agent authors a commit too (it is linted via
     # the build/coverage success gate), so supply a commitlint-compliant header
@@ -2844,16 +2872,17 @@ def render_coverage_prompt(
         subject=story.title,
         trailer=f" (#{story.id})",
     )
-    # Story 22.4-002: the coverage agent opens the PR on the default path, so the
-    # close-link rides here; empty when the story has no mapped issue.
+    # Story 22.4-002: the coverage agent opens the change request on the default
+    # path, so the close-link rides here; empty when the story has no mapped issue.
+    # Story 23.2-001: ``cr_terms`` picks the host noun/CLI (PR via gh / MR via glab).
     return (
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
         "Fetch the branch, fill coverage gaps, then commit with this exact, "
         "conventional-commit-compliant message — do not alter it:\n"
         f"   {commit_header}\n"
-        "Push, open the PR, then emit the result block.\n"
-        + _close_link_instruction(close_link)
+        f"Push, open the {cr_terms.abbr}{cr_terms.cli_hint}, then emit the result block.\n"
+        + _close_link_instruction(close_link, cr_terms=cr_terms)
         + _result_wrapper("coverage-agent-response.schema.json")
     )
 
@@ -3035,6 +3064,25 @@ def _base_ref(root: Path) -> str | None:
         if _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}").returncode == 0:
             return candidate
     return None
+
+
+def _origin_default_ref(root: Path) -> str:
+    """The ``origin/<default-branch>`` ref a story branch is cut from (Story 23.2-001).
+
+    Resolves the remote's default branch from ``origin/HEAD`` so a build on a
+    GitLab target cuts ``feature/<id>`` from — and its MR targets — that project's
+    default branch rather than a hardcoded ``main`` (AC3). Falls back to
+    ``origin/main`` whenever ``origin/HEAD`` is unset or unresolvable, so a GitHub
+    repo (and every prompt-rendering test) is byte-identical to today (AC2).
+    """
+    try:
+        head = _git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return "origin/main"
+    if head.returncode == 0 and head.stdout.strip():
+        # e.g. "refs/remotes/origin/develop" → "origin/develop"
+        return head.stdout.strip().removeprefix("refs/remotes/")
+    return "origin/main"
 
 
 def _refresh_base_ref(root: Path) -> None:
@@ -4430,6 +4478,13 @@ def _run_story(
     # issue. Resolved once per story; None when the story has no mapped issue (the
     # common case today) or any host lookup fails — best-effort, never blocks.
     close_link = build_issue.close_link(ledger, story.id)
+    # Story 23.2-001: the host-correct change-request phrasing (PR via gh / MR via
+    # glab) and the default branch ``feature/<id>`` is cut from + the change
+    # request targets. Resolved once per story from the story's mapped host and the
+    # working tree's ``origin/HEAD``; both fall back to GitHub/``origin/main`` so an
+    # unmapped story on GitHub is byte-identical to today (AC2).
+    cr_terms = build_issue.change_request_terms(ledger, story.id)
+    base_ref = _origin_default_ref(workdir or Path.cwd())
     # Monotonic across the whole story: the "bugfix" stage rows share one
     # (run_id, story_id, stage_name) key, so every bugfix dispatch — across both
     # retries of one stage and across different stages — needs a distinct attempt
@@ -4522,7 +4577,7 @@ def _run_story(
                 ok, result, failure, kind = _dispatch_stage(
                     stage, story, opts, pr_number, dispatch, tpath,
                     on_progress=sink, escalation_steps=escalation_steps,
-                    close_link=close_link,
+                    close_link=close_link, cr_terms=cr_terms, base_ref=base_ref,
                 )
                 if ok:
                     ledger.stage_finish(
@@ -4944,6 +4999,8 @@ def _dispatch_stage(
     *,
     escalation_steps: int = 0,
     close_link: str | None = None,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+    base_ref: str = "origin/main",
 ) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one stage's agent and classify the outcome.
 
@@ -4956,7 +5013,10 @@ def _dispatch_stage(
     (R10). ``on_progress`` (Story 11.1-002) is forwarded to the dispatcher so the
     streamed stage emits sub-stage progress to the ledger.
     """
-    prompt = _render_stage_prompt(stage, story, opts, pr_number, close_link=close_link)
+    prompt = _render_stage_prompt(
+        stage, story, opts, pr_number, close_link=close_link,
+        cr_terms=cr_terms, base_ref=base_ref,
+    )
     model = _select_stage_model(stage, story, opts, escalation_steps=escalation_steps)
     # Story 20.7-001: route this stage to its mapped harness's argv/parser when a
     # `--harness` map is set; empty (the default path) leaves dispatch unchanged.
@@ -5007,11 +5067,16 @@ def _render_stage_prompt(
     opts: BuildOptions,
     pr_number: int | None,
     close_link: str | None = None,
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+    base_ref: str = "origin/main",
 ) -> str:
     if stage == "build":
-        return render_build_prompt(story, opts, close_link=close_link)
+        return render_build_prompt(
+            story, opts, close_link=close_link, cr_terms=cr_terms, base_ref=base_ref
+        )
     if stage == "coverage":
-        return render_coverage_prompt(story, opts, close_link=close_link)
+        return render_coverage_prompt(story, opts, close_link=close_link, cr_terms=cr_terms)
     if stage == "review":
         return render_review_prompt(story, pr_number)
     return render_merge_prompt(story, pr_number)

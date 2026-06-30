@@ -62,6 +62,38 @@ def test_close_link_for_mapped_story(tmp_path, host):
     assert bi.close_link(ledger, "22.4-002", runner=runner) == "Closes #7"
 
 
+def test_change_request_terms_match_mapped_host(tmp_path):
+    """A story mapped to a host yields that host's CR terms (Story 23.2-001 AC1/AC2)."""
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, story_id="23.2-001", host=ih.GITLAB, ref="7")
+    _mapped(ledger, story_id="22.4-002", host=ih.GITHUB, ref="9")
+    assert bi.change_request_terms(ledger, "23.2-001") is ih.GITLAB_CR_TERMS
+    assert bi.change_request_terms(ledger, "22.4-002") is ih.GITHUB_CR_TERMS
+
+
+def test_change_request_terms_unmapped_defaults_to_github(tmp_path):
+    """An unmapped story falls back to GitHub terms so its prompt is unchanged (AC2)."""
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("22.4-002", "22", "22.4", "t", 5, "High")])
+    assert bi.change_request_terms(ledger, "22.4-002") is ih.GITHUB_CR_TERMS
+
+
+def test_change_request_terms_unsupported_host_defaults_to_github(tmp_path):
+    """An unsupported recorded host degrades to GitHub terms, never raises."""
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("22.4-002", "22", "22.4", "t", 5, "High")])
+    ledger.inventory_set_mapping("22.4-002", "bitbucket", "9")
+    assert bi.change_request_terms(ledger, "22.4-002") is ih.GITHUB_CR_TERMS
+
+
+def test_change_request_terms_tolerates_broken_ledger():
+    """A ledger stub lacking inventory_get_mapping must not crash the build."""
+    class _NoInventory:
+        pass
+
+    assert bi.change_request_terms(_NoInventory(), "22.4-002") is ih.GITHUB_CR_TERMS  # type: ignore[arg-type]
+
+
 def test_close_link_unmapped_is_none(tmp_path):
     ledger = _ledger(tmp_path)
     ledger.inventory_upsert_specs([("22.4-002", "22", "22.4", "t", 5, "High")])

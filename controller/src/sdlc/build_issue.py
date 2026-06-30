@@ -6,14 +6,26 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sdlc.issue_host import IssueHostError, Runner, get_adapter
+from sdlc.issue_host import (
+    GITHUB_CR_TERMS,
+    ChangeRequestTerms,
+    IssueHostError,
+    Runner,
+    get_adapter,
+)
 
 if TYPE_CHECKING:  # avoid a runtime import cycle with build.py (which imports this)
     from sdlc.build import Ledger
 
 log = logging.getLogger(__name__)
 
-__all__ = ["stage_status", "close_link", "announce_status", "announce_terminal"]
+__all__ = [
+    "stage_status",
+    "close_link",
+    "change_request_terms",
+    "announce_status",
+    "announce_terminal",
+]
 
 # Map a pipeline stage to the coarse, host-agnostic status slug shown on its
 # issue (a `status:<slug>` label + a short comment). ``build`` and ``coverage``
@@ -93,6 +105,29 @@ def close_link(
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
         log.debug("close_link failed for %s", story_id, exc_info=True)
         return None
+
+
+def change_request_terms(
+    ledger: "Ledger", story_id: str, *, runner: Runner | None = None
+) -> ChangeRequestTerms:
+    """The host-correct change-request terms for a story's target (Story 23.2-001).
+
+    Resolves the story's mapped host and returns its adapter's
+    :class:`~sdlc.issue_host.ChangeRequestTerms` — ``MR``/`glab` for a GitLab
+    target, ``PR``/`gh` for GitHub. Best-effort: an unmapped story, an unsupported
+    host, or any lookup failure (including a ledger without the inventory table)
+    falls back to :data:`~sdlc.issue_host.GITHUB_CR_TERMS`, so the GitHub path is
+    byte-identical to today (AC2) and a host hiccup never blocks a build.
+    """
+    try:
+        got = _adapter_and_ref(ledger, story_id, runner)
+        if got is None:
+            return GITHUB_CR_TERMS
+        adapter, _ = got
+        return adapter.cr_terms
+    except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
+        log.debug("change_request_terms failed for %s", story_id, exc_info=True)
+        return GITHUB_CR_TERMS
 
 
 def announce_status(

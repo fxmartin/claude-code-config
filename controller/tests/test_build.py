@@ -2934,6 +2934,144 @@ def test_build_prompt_aborts_rather_than_committing_off_feature_branch() -> None
     assert "do not commit" in lowered
 
 
+# Story 23.2-001: the build's change-request prompts open a PR on GitHub and an
+# MR on GitLab, routed through the adapter's change-request terms.
+
+
+def test_build_prompt_github_is_unchanged_pr_wording() -> None:
+    """The default (GitHub) build prompt still says PR — byte-identical (AC2)."""
+    from sdlc.build import render_build_prompt
+
+    prompt = render_build_prompt(_story("23.2-001"), BuildOptions(skip_coverage=True))
+    assert "Push and create PR; include the PR number in the result block." in prompt
+    assert "MR" not in prompt
+    assert "glab" not in prompt
+
+
+def test_build_prompt_gitlab_opens_a_merge_request() -> None:
+    """On a GitLab target the build agent opens an MR via glab (AC1/AC2)."""
+    from sdlc.build import render_build_prompt
+    from sdlc.issue_host import GITLAB_CR_TERMS
+
+    prompt = render_build_prompt(
+        _story("23.2-001"), BuildOptions(skip_coverage=True), cr_terms=GITLAB_CR_TERMS,
+    )
+    assert "Push and create MR (`glab mr create`); include the MR iid in the result block." in prompt
+    # The GitHub PR wording is gone on the GitLab path.
+    assert "create PR" not in prompt
+
+
+def test_build_prompt_close_link_uses_host_noun() -> None:
+    """The close-link instruction follows the host noun (PR vs MR)."""
+    from sdlc.build import render_build_prompt
+    from sdlc.issue_host import GITLAB_CR_TERMS
+
+    gh = render_build_prompt(
+        _story("23.2-001"), BuildOptions(skip_coverage=True), close_link="Closes #7",
+    )
+    assert 'When you open the PR, include "Closes #7"' in gh
+    gl = render_build_prompt(
+        _story("23.2-001"), BuildOptions(skip_coverage=True),
+        close_link="Closes #7", cr_terms=GITLAB_CR_TERMS,
+    )
+    assert 'When you open the MR, include "Closes #7"' in gl
+    assert "merging the MR auto-closes" in gl
+
+
+def test_build_prompt_cuts_branch_from_supplied_base_ref() -> None:
+    """A GitLab build cuts feature/<id> from the host default branch (AC3)."""
+    from sdlc.build import render_build_prompt
+
+    prompt = render_build_prompt(
+        _story("23.2-001"), BuildOptions(), base_ref="origin/develop",
+    )
+    assert "git checkout -b feature/23.2-001 origin/develop" in prompt
+
+
+def test_coverage_prompt_gitlab_opens_a_merge_request() -> None:
+    """The coverage agent opens an MR on a GitLab target (AC1/AC2)."""
+    from sdlc.build import render_coverage_prompt
+    from sdlc.issue_host import GITLAB_CR_TERMS
+
+    gh = render_coverage_prompt(_story("23.2-001"), BuildOptions())
+    assert "Push, open the PR, then emit the result block." in gh
+
+    gl = render_coverage_prompt(
+        _story("23.2-001"), BuildOptions(), cr_terms=GITLAB_CR_TERMS,
+    )
+    assert "Push, open the MR (`glab mr create`), then emit the result block." in gl
+
+
+class _PromptCapturingDispatcher(FakeDispatcher):
+    """A FakeDispatcher that also records each stage's rendered prompt."""
+
+    def __init__(self, overrides=None) -> None:
+        super().__init__(overrides)
+        self.prompts: list[tuple[str, str]] = []
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        self.prompts.append((agent_type, prompt))
+        return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+
+def test_build_on_gitlab_target_opens_an_mr_and_records_cr_ref(tmp_path) -> None:
+    """A GitLab-mapped story drives the build agent to open an MR; the cr_ref lands
+    in the ledger — the GitHub PR path is untouched (Story 23.2-001 AC1/AC2)."""
+    from sdlc.build import run_build
+
+    db = tmp_path / "l.db"
+    ledger = Ledger(db)
+    ledger.init()
+    # Map the story to a GitLab target so the build resolves GitLab CR terms.
+    ledger.inventory_upsert_specs([("23.2-001", "23", "23.2", "t", 5, "High")])
+    ledger.inventory_set_mapping("23.2-001", "gitlab", "5")
+
+    disp = _PromptCapturingDispatcher()
+    opts = BuildOptions(scope="epic-23", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=[_story("23.2-001")],
+        ledger=ledger,
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+
+    build_prompt = next(p for a, p in disp.prompts if a == "build")
+    coverage_prompt = next(p for a, p in disp.prompts if a == "coverage")
+    # The coverage agent (the default PR-opener) is told to open an MR via glab.
+    assert "open the MR (`glab mr create`)" in coverage_prompt
+    assert "open the PR" not in coverage_prompt
+    # The build agent's hand-off references the MR, never a PR.
+    assert "opens the MR" in build_prompt
+    # The MR iid (cr_ref) reported by the coverage agent is recorded in the ledger.
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT pr_number FROM stories WHERE story_id = '23.2-001'"
+        ).fetchone()
+    assert row is not None and row[0] == 100
+
+
+def test_origin_default_ref_resolves_head(tmp_path, monkeypatch) -> None:
+    """`_origin_default_ref` reads origin/HEAD, else falls back to origin/main (AC3)."""
+    from sdlc import build as build_mod
+
+    def _fake_git(root, *args):
+        import subprocess as _sp
+        if args[:2] == ("symbolic-ref", "--quiet"):
+            return _sp.CompletedProcess(args, 0, "refs/remotes/origin/develop\n", "")
+        return _sp.CompletedProcess(args, 1, "", "")
+
+    monkeypatch.setattr(build_mod, "_git", _fake_git)
+    assert build_mod._origin_default_ref(tmp_path) == "origin/develop"
+
+    # origin/HEAD unset → byte-identical default for GitHub repos (AC2).
+    monkeypatch.setattr(
+        build_mod, "_git",
+        lambda root, *a: __import__("subprocess").CompletedProcess(a, 1, "", ""),
+    )
+    assert build_mod._origin_default_ref(tmp_path) == "origin/main"
+
+
 def test_coverage_prompt_commit_subject_is_compliant_by_construction() -> None:
     """The coverage agent commits too — its supplied header is compliant (12.2-004 AC1)."""
     from sdlc.build import render_coverage_prompt

@@ -481,12 +481,18 @@ comment` / `glab issue note`) and a `remove_labels=` argument on `issue_update`
 (`gh --remove-label` / `glab --unlabel`) so the live `status:` label is *swapped*
 forward rather than accreted.
 
-**GitLab-MR dependency note.** On GitLab the build opens a **Merge Request**, which
-is part of the *separate "Pipeline on GitLab" epic* (Epic-23). The change-request
-adapter below (Story 23.1-001) is the seam that makes that possible; until the
-build loop is wired to it (Story 23.2-001) the `Closes #N` close-link lands only on
-the **GitHub PR** path, while the issue-status **comments and labels work on both
-hosts** via the adapter.
+**GitLab-MR note.** On a GitLab target the build opens a **Merge Request** instead
+of a PR (the *"Pipeline on GitLab" epic*, Epic-23). The change-request adapter below
+(Story 23.1-001) is the seam that makes that possible, and the build loop is wired
+to it (Story 23.2-001): the build/coverage agent's change-request prompt resolves
+the story's mapped host and tells the agent to open a **PR via `gh`** on GitHub or
+an **MR via `glab mr create`** on GitLab — same per-story branch lifecycle, host
+noun/CLI hidden behind the adapter's change-request *terms*. The branch is cut from
+(and the change request targets) the host's **default branch** (`origin/HEAD`), not
+a hardcoded `main`. The `Closes #N` close-link rides the change-request description
+on **both** hosts, and the issue-status **comments and labels work on both hosts**
+via the adapter. An unmapped story falls back to the GitHub PR wording, so that path
+is byte-identical to before this story.
 
 ### Change-request adapter — MR/PR operations (Story 23.1-001)
 
