@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.1.0] - 2026-06-30
+
+### Added
+
+- feat(pipeline-on-gitlab): mr/pr operation interface + (#23.1-001)
+
+
 ## [v2.0.0] - 2026-06-30
 
 ### Added
