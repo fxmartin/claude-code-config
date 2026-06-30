@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.5.0] - 2026-06-30
+
+### Added
+
+- feat(pipeline-on-gitlab): merge the mr + close the story (#23.2-003)
+
+
 ## [v2.4.0] - 2026-06-30
 
 ### Added
