@@ -25,6 +25,9 @@ __all__ = [
     "RunResult",
     "Issue",
     "ChangeRequest",
+    "ChangeRequestTerms",
+    "GITHUB_CR_TERMS",
+    "GITLAB_CR_TERMS",
     "IssueHostAdapter",
     "GitHubAdapter",
     "GitLabAdapter",
@@ -134,6 +137,39 @@ class ChangeRequest:
     source_branch: str | None = None
     target_branch: str | None = None
     status: str | None = None
+
+
+@dataclass(frozen=True)
+class ChangeRequestTerms:
+    """Host-correct phrasing for the change request a build agent opens (Story 23.2-001).
+
+    The build loop's PR-creation prompts route through these so the GitHub path
+    tells the agent to open a *Pull Request* and the GitLab path a *Merge
+    Request* — same per-story branch/PR lifecycle, only the noun/CLI differs.
+    ``abbr`` is the short token the prompt interpolates (``PR``/``MR``);
+    ``ref_noun`` names the identifier the agent reports in its result block
+    (``PR number``/``MR iid``); ``cli_hint`` is an *additive* parenthetical naming
+    the create command for the non-default host, and is the empty string for
+    GitHub so its prompt stays byte-identical to today (Story 23.2-001 AC2).
+    """
+
+    host: str
+    abbr: str
+    ref_noun: str
+    cli_hint: str
+
+
+# The GitHub default — chosen so an unmapped story (the common case for the
+# framework's own repo) renders the change-request prompts exactly as before this
+# story. ``cli_hint`` is empty: GitHub's prompt names no CLI, keeping it identical.
+GITHUB_CR_TERMS = ChangeRequestTerms(
+    host=GITHUB, abbr="PR", ref_noun="PR number", cli_hint=""
+)
+# GitLab opens a Merge Request via `glab mr create`; the hint disambiguates the
+# CLI for the agent on a GitLab target (where it must not reach for `gh`).
+GITLAB_CR_TERMS = ChangeRequestTerms(
+    host=GITLAB, abbr="MR", ref_noun="MR iid", cli_hint=" (`glab mr create`)"
+)
 
 
 def _default_runner(argv: Sequence[str], timeout: float = _CLI_TIMEOUT) -> RunResult:
@@ -247,6 +283,9 @@ class IssueHostAdapter(ABC):
 
     host: str
     cli: str
+    # Host-correct change-request phrasing the build loop's PR-creation prompts
+    # route through (Story 23.2-001); each backend binds its own constant.
+    cr_terms: ChangeRequestTerms
 
     def __init__(self, runner: Runner | None = None) -> None:
         self._runner = runner or _default_runner
@@ -452,6 +491,7 @@ class GitHubAdapter(IssueHostAdapter):
 
     host = GITHUB
     cli = "gh"
+    cr_terms = GITHUB_CR_TERMS
 
     def whoami(self) -> str:
         return self._run("api", "user", "--jq", ".login").stdout.strip()
@@ -617,6 +657,7 @@ class GitLabAdapter(IssueHostAdapter):
 
     host = GITLAB
     cli = "glab"
+    cr_terms = GITLAB_CR_TERMS
 
     def whoami(self) -> str:
         return self._run("api", "user", "--jq", ".username").stdout.strip()

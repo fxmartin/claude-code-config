@@ -393,3 +393,26 @@ def test_cr_verbs_present_on_both_adapters() -> None:
         adapter = ih.get_adapter(host)
         for verb in ("cr_create", "cr_diff", "cr_status", "cr_merge", "cr_url"):
             assert callable(getattr(adapter, verb))
+
+
+# --- change-request terms (Story 23.2-001) ----------------------------------
+
+
+def test_github_cr_terms_phrase_a_pull_request() -> None:
+    terms = ih.get_adapter(ih.GITHUB).cr_terms
+    assert terms is ih.GITHUB_CR_TERMS
+    assert terms.host == ih.GITHUB
+    assert terms.abbr == "PR"
+    assert terms.ref_noun == "PR number"
+    # GitHub names no CLI in its prompt, so the hint is empty (byte-identical, AC2).
+    assert terms.cli_hint == ""
+
+
+def test_gitlab_cr_terms_phrase_a_merge_request() -> None:
+    terms = ih.get_adapter(ih.GITLAB).cr_terms
+    assert terms is ih.GITLAB_CR_TERMS
+    assert terms.host == ih.GITLAB
+    assert terms.abbr == "MR"
+    assert terms.ref_noun == "MR iid"
+    # The GitLab hint names the create CLI so the agent reaches for glab, not gh.
+    assert "glab mr create" in terms.cli_hint
