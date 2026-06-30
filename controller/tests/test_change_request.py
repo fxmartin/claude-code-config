@@ -301,6 +301,19 @@ def test_gitlab_cr_url_queries_by_ref() -> None:
     )
 
 
+def test_gitlab_cr_url_from_change_request_is_offline() -> None:
+    # A ChangeRequest already carrying its url needs no glab call (mirrors GitHub).
+    runner = FakeRunner()
+    cr = ih.ChangeRequest(
+        host=ih.GITLAB, ref="5", url="https://gitlab.com/g/r/-/merge_requests/5"
+    )
+    assert (
+        ih.GitLabAdapter(runner=runner).cr_url(cr)
+        == "https://gitlab.com/g/r/-/merge_requests/5"
+    )
+    assert runner.calls == []
+
+
 # --- normalisation helpers ---------------------------------------------------
 
 
@@ -348,10 +361,28 @@ def test_gitlab_pipeline_status_mapping(raw, expected) -> None:
         ),
         # a neutral/skipped-only rollup yields no gating signal.
         ([{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SKIPPED"}], ih.CR_NONE),
+        # an unrecognised-only rollup is reported as unknown, not silently green.
+        ([{"__typename": "StatusContext", "state": "MYSTERY"}], ih.CR_UNKNOWN),
     ],
 )
 def test_github_rollup_status(rollup, expected) -> None:
     assert ih._github_rollup_status(rollup) == expected
+
+
+@pytest.mark.parametrize(
+    "item, expected",
+    [
+        # A COMPLETED CheckRun with no conclusion carries no pass/fail signal.
+        ({"status": "COMPLETED", "conclusion": None}, ih.CR_NONE),
+        # A CheckRun still in flight (status not COMPLETED, none of the explicit
+        # in-flight literals) defaults to pending rather than passing.
+        ({"status": "REQUESTED_ACTION", "conclusion": None}, ih.CR_PENDING),
+        # A StatusContext with an unrecognised state is unknown, not green.
+        ({"status": None, "state": "MYSTERY"}, ih.CR_UNKNOWN),
+    ],
+)
+def test_github_check_status(item, expected) -> None:
+    assert ih._github_check_status(item) == expected
 
 
 # --- get_adapter still routes both hosts (no regression) ---------------------
