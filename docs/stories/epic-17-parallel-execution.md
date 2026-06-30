@@ -141,6 +141,55 @@ Touches the `Ledger` connection helpers in `build.py`.
 **Dependencies**: None
 **Risk Level**: Medium
 
+##### Story 17.1-003: Ready-queue dispatch — retire the cohort barrier
+**User Story**: As FX running a `parallel` build, I want each story dispatched the moment its own
+dependencies are satisfied — not when its whole wave finishes — so that workers never sit idle
+behind an unrelated slow or human-gated story in the same cohort.
+**Priority**: Should Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** `mode=parallel` and a free worker **When** a story's dependencies are all done (or
+  absent from the queue) **Then** it is dispatched immediately, regardless of which cohort/wave it
+  sits in — there is no barrier between waves (continuous ready-queue / list scheduling).
+- **Given** a wave whose stories have uneven durations (or one parked `AWAITING_APPROVAL`/rate-limit
+  story) **When** an earlier-wave story a next-wave story depends on finishes first **Then** the
+  next-wave story starts straight away rather than waiting for the slow sibling — measurably higher
+  worker utilization than cohort-barrier scheduling.
+- **Given** a story whose dependency is `FAILED`, `BLOCKED`, or parked (not done) **When** the
+  scheduler evaluates readiness **Then** it is held `BLOCKED`/`TODO` and never dispatched on a
+  partially-satisfied graph (dependency-blocking preserved exactly as today).
+- **Given** the ready set has more entries than free workers **When** dispatching **Then** ties are
+  broken by ascending story id so the schedule stays deterministic and reproducible.
+- **Given** `--sequential` or `--concurrency=1` **When** the run executes **Then** it is
+  byte-for-byte today's serial path (one story at a time, ascending id) — proven by test, no
+  regression.
+- **Given** `resume` re-enters a partially-built run **When** it continues **Then** it rebuilds the
+  ready set from the ledger and honors the same dispatch semantics.
+
+**Technical Notes**: Replace the cohort-barrier loop (`_dispatch_cohort` in `build.py`, which today
+*"returns only once every story finishes"* before the next cohort begins) with a single continuous
+scheduler: maintain a `ready` set (deps ⊆ done) plus an in-flight set, submit ready stories to the
+bounded `ThreadPoolExecutor` (17.1-001) as workers free, and on each `as_completed` future recompute
+readiness from the updated done/blocked sets. `compute_cohorts` stays as the *display* grouping (the
+dashboard's wave view) but no longer gates execution. Care points: a parked story
+(`AWAITING_APPROVAL`, rate-limit) is terminal-for-run for *its dependents'* blocking decision (they
+become `BLOCKED`, not eligible) but must not stall *independent* branches; preserve failure
+isolation and the concurrency-safe ledger writes (17.1-002); keep the rate-limit park/wake loop
+working under the flatter scheduler.
+
+**Definition of Done**:
+- [ ] Cohort barrier retired; stories dispatch on per-story readiness across wave boundaries
+- [ ] Worker utilization improved (test: a slow wave-1 story does not delay a ready wave-2 story)
+- [ ] Dependency-blocking, failure isolation, and parked/rate-limit handling intact
+- [ ] Deterministic tie-break by story id; `--sequential`/`--concurrency=1` reproduce the serial path
+- [ ] `resume` rebuilds the ready set from the ledger and honors the same semantics
+- [ ] `compute_cohorts` retained for the dashboard wave view; execution decoupled from it
+- [ ] Documented in `docs/controller-architecture.md`
+
+**Dependencies**: 17.1-001, 17.1-002
+**Risk Level**: High
+
 ### Feature 17.2: Per-Story Worktree Isolation
 
 Give each concurrent story its own checkout so agents cannot collide in a shared working tree.
