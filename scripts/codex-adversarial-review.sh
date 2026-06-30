@@ -61,9 +61,17 @@ VALID_HOSTS=("github" "gitlab")
 # the controller's issue_host.host_from_remote heuristic. Prints github|gitlab,
 # or nothing when the remote is absent/unrecognised (caller then defaults).
 detect_host() {
-  local remote
+  local remote host
   remote="$(git remote get-url origin 2>/dev/null)" || return 0
-  case "${remote}" in
+  # Match the HOST portion only, never the repo path — a GitHub repo whose
+  # owner/name contains "gitlab" (e.g. github.com/foo/gitlab-tools) must route
+  # through `gh`, not `glab`. Strip scheme, user@, then the path/port to leave the
+  # bare hostname, mirroring issue_host.host_from_remote.
+  host="${remote#*://}"   # drop scheme:// (https form)
+  host="${host#*@}"       # drop user@ (scp form)
+  host="${host%%/*}"      # drop /path (https form)
+  host="${host%%:*}"      # drop :path / :port (scp form)
+  case "${host}" in
     *gitlab*) printf 'gitlab' ;;
     *github*) printf 'github' ;;
     *) : ;;

@@ -217,6 +217,22 @@ EOF
     grep -q '^glab mr diff 99' "${ARGLOG}"
 }
 
+@test "auto-detect keys off the hostname, not the repo path (github repo named *gitlab*)" {
+    # Regression: a GitHub repo whose owner/name contains "gitlab" must route
+    # through gh, not glab — detect_host must match the host, not the whole URL.
+    _make_host_shims
+    repo="${BATS_TMPDIR}/gh-gitlabname-${BATS_TEST_NUMBER}"
+    rm -rf "${repo}"; mkdir -p "${repo}"
+    git -C "${repo}" init -q
+    git -C "${repo}" remote add origin "git@github.com:acme/gitlab-migration-tools.git"
+    cd "${repo}"
+    ARGLOG="${ARGLOG}" PATH="${SHIMBIN}:${PATH}" \
+        run bash "${WRAPPER}" --pr-number 77
+    [ "${status}" -eq 0 ]
+    grep -q '^gh pr diff 77' "${ARGLOG}"
+    ! grep -q '^glab' "${ARGLOG}"
+}
+
 @test "rejects an unknown --host" {
     run bash "${WRAPPER}" --pr-number 1 --host bitbucket
     [ "${status}" -eq 2 ]
