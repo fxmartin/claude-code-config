@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.2.0] - 2026-06-30
+
+### Added
+
+- feat(pipeline-on-gitlab): gitlab auth & ci tokens (#23.6-001)
+
+
 ## [v2.1.0] - 2026-06-30
 
 ### Added
