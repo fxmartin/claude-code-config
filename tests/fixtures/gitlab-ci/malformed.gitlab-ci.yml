@@ -1,0 +1,8 @@
+# Fixture: broken YAML (bad indentation under a mapping) so the validator's
+# parse step must fail with a clear "not valid YAML" message.
+stages:
+  - lint
+shellcheck:
+  stage: lint
+   script:
+    - shellcheck foo.sh

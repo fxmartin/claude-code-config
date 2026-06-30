@@ -1,0 +1,36 @@
+# Fixture: structurally valid YAML but missing the `ruff` lint gate, so the
+# validator must reject it and name the absent job.
+stages:
+  - secret-scan
+  - lint
+  - test
+
+secrets-scan:
+  stage: secret-scan
+  script:
+    - gitleaks detect --no-banner --redact
+
+shellcheck:
+  stage: lint
+  script:
+    - shellcheck --severity=warning hooks/*.sh
+
+json-schema:
+  stage: lint
+  script:
+    - echo validate
+
+commit-format:
+  stage: lint
+  script:
+    - npx commitlint --from "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --to HEAD
+
+pytest:
+  stage: test
+  script:
+    - uv run pytest -q
+
+bats:
+  stage: test
+  script:
+    - bats tests/

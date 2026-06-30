@@ -1,0 +1,118 @@
+# ABOUTME: Installable GitLab CI quality-gate template for autonomous-SDLC target repos.
+# ABOUTME: Mirrors the GitHub Actions gate set (Epic-02/09) on GitLab Free/Core — no Premium keywords.
+#
+# Story 23.3-001 — copy this file to the root of a company GitLab repo as
+# `.gitlab-ci.yml`. It brings the same quality gates the framework enforces on
+# GitHub Actions to a GitLab Merge Request, so the autonomous build loop can gate
+# the merge on a GitLab CI pipeline (Story 23.2-002): a red pipeline blocks merge.
+#
+# Gate parity (GitHub Actions ↔ GitLab CI) is documented in
+# docs/gitlab-ci-template.md. Every job below maps 1:1 to a GitHub gate.
+#
+# Free/Core only: no merge trains, no Premium/Ultimate-only keywords. The
+# pipeline runs on Merge Request events and on pushes to the default branch —
+# the GitLab equivalent of `on: [pull_request, push: branches: [main]]`.
+#
+# Assumptions for the target repo (verified by the adoption preflight, 23.6-002):
+#   - `.gitleaks.toml`     — gitleaks allowlist/config (secret scan)
+#   - `.commitlintrc.json` — commitlint config (commit-format gate)
+#   - a Python project managed with `uv` (pytest + ruff), and `tests/*.bats`.
+# Jobs whose tooling a given repo does not use can be removed; the validator
+# (`scripts/validate-gitlab-ci.sh`) checks the full gate set is present.
+
+stages:
+  - secret-scan
+  - lint
+  - test
+
+# Run only for Merge Request pipelines and pushes to the default branch. This
+# avoids duplicate branch-pipeline + MR-pipeline runs on the same commit.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ---------------------------------------------------------------------------
+# Secret scan — must pass before any test job runs so a leaked credential is
+# never echoed into later job logs (GitHub: `secrets-scan`, Story 9.2-001).
+# Uses the same .gitleaks.toml as the local pre-commit hook and the GitHub job.
+# ---------------------------------------------------------------------------
+secrets-scan:
+  stage: secret-scan
+  image: zricethezav/gitleaks:latest
+  script:
+    - gitleaks detect --no-banner --redact --config .gitleaks.toml
+
+# ---------------------------------------------------------------------------
+# Lint — shell (shellcheck) and Python (ruff). GitHub: `static-checks`.
+# ---------------------------------------------------------------------------
+shellcheck:
+  stage: lint
+  image: koalaman/shellcheck-alpine:stable
+  script:
+    # Severity floor matches the GitHub static-checks job.
+    - shellcheck --severity=warning $(git ls-files '*.sh')
+
+ruff:
+  stage: lint
+  image: ghcr.io/astral-sh/ruff:latest
+  script:
+    - ruff check .
+
+# JSON validity + JSON-schema / contract checks. GitHub: `static-checks`
+# ("Validate JSON") + `contract-checks`.
+json-schema:
+  stage: lint
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache jq git
+  script:
+    - |
+      fail=0
+      for f in $(git ls-files '*.json'); do
+        if jq -e . "$f" >/dev/null; then
+          echo "ok   $f"
+        else
+          echo "FAIL $f"
+          fail=1
+        fi
+      done
+      exit "$fail"
+
+# ---------------------------------------------------------------------------
+# Commit format — commitlint over the MR commits only. GitHub: `commit-format`
+# (guarded by `if: pull_request`). On GitLab we diff against the MR base sha so
+# protected default-branch history stays exempt.
+# ---------------------------------------------------------------------------
+commit-format:
+  stage: lint
+  image: node:22-alpine
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  before_script:
+    - apk add --no-cache git
+  script:
+    - npm install --no-save @commitlint/cli@21 @commitlint/config-conventional@21
+    - npx commitlint --from "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --to HEAD --verbose
+
+# ---------------------------------------------------------------------------
+# Tests — Python (pytest) and behaviour (bats). GitHub: `controller-smoke`
+# (pytest) + `behavior-tests` (bats). Both gate on the secret scan so a leaked
+# credential fails the build before any test job echoes it (Story 9.2-001).
+# ---------------------------------------------------------------------------
+pytest:
+  stage: test
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  needs:
+    - secrets-scan
+  script:
+    - uv sync --extra dev
+    - uv run pytest -q
+
+bats:
+  stage: test
+  image: bats/bats:latest
+  needs:
+    - secrets-scan
+  script:
+    - bats tests/
