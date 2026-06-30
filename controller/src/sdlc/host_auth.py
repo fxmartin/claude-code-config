@@ -91,7 +91,7 @@ class CiToken:
         """The display form of the token — always :data:`REDACTED`."""
         return REDACTED
 
-    def __str__(self) -> str:  # pragma: no cover - trivial, exercised via test
+    def __str__(self) -> str:
         return f"CiToken(host={self.host!r}, source={self.source!r}, value={REDACTED})"
 
 
