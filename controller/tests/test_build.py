@@ -27,6 +27,7 @@ from sdlc.build import (
     parse_build_args,
     run_build,
 )
+from sdlc import issue_host as ih
 from sdlc.cohort import Story
 from sdlc.commitlint import lint_commit_message
 
@@ -560,6 +561,92 @@ def test_build_failure_routes_to_bugfix(tmp_path) -> None:
     assert ("bugfix", "s1-002") in dispatcher.calls
     # And s1-002 ultimately completed after the fix.
     assert result.completed == 3
+
+
+# ---------------------------------------------------------------------------
+# Story 23.2-002: gate the merge on the change request's CI/pipeline status
+# ---------------------------------------------------------------------------
+
+
+def _gate_story_queue() -> list[Story]:
+    """A single mapped-target story so the merge CI gate engages on its CR."""
+    return [Story("g1-001", "Gate story", "23", "pipeline-on-gitlab",
+                  "epic-23.md", "Should", 2, "py", [])]
+
+
+def test_merge_gate_blocks_on_red_pipeline(tmp_path, monkeypatch) -> None:
+    """A failed CR pipeline blocks the merge and routes the story to bugfix (AC2)."""
+    from sdlc import build_issue
+
+    monkeypatch.setattr(build_issue, "change_request_status", lambda *a, **k: ih.CR_FAILED)
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher()
+    opts = BuildOptions(scope="epic-23", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(opts, queue=_gate_story_queue(), ledger=Ledger(db),
+                       dispatcher=dispatcher, preflight=lambda: True)
+    # The merge agent is NEVER dispatched — the gate blocked before merge.
+    assert ("merge", "g1-001") not in dispatcher.calls
+    # The red pipeline routed the story into the bugfix loop, not a merge.
+    assert ("bugfix", "g1-001") in dispatcher.calls
+    assert result.completed == 0
+    assert result.failed == 1
+
+
+def test_merge_gate_passes_on_green_pipeline(tmp_path, monkeypatch) -> None:
+    """A green CR pipeline lets the merge proceed (AC3) with no bugfix detour."""
+    from sdlc import build_issue
+
+    monkeypatch.setattr(build_issue, "change_request_status", lambda *a, **k: ih.CR_SUCCESS)
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher()
+    opts = BuildOptions(scope="epic-23", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(opts, queue=_gate_story_queue(), ledger=Ledger(db),
+                       dispatcher=dispatcher, preflight=lambda: True)
+    assert ("merge", "g1-001") in dispatcher.calls
+    assert ("bugfix", "g1-001") not in dispatcher.calls
+    assert result.completed == 1
+
+
+def test_merge_gate_no_ci_allows_by_default(tmp_path, monkeypatch) -> None:
+    """A project with no CI signal degrades to a warning + merge under allow (AC4)."""
+    from sdlc import build_issue
+
+    monkeypatch.setattr(build_issue, "change_request_status", lambda *a, **k: ih.CR_NONE)
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher()
+    opts = BuildOptions(scope="epic-23", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(opts, queue=_gate_story_queue(), ledger=Ledger(db),
+                       dispatcher=dispatcher, preflight=lambda: True)
+    assert ("merge", "g1-001") in dispatcher.calls
+    assert result.completed == 1
+
+
+def test_merge_gate_no_ci_deny_blocks(tmp_path, monkeypatch) -> None:
+    """The no-CI policy is configurable: deny blocks a CI-less merge (AC4)."""
+    from sdlc import build_issue
+
+    monkeypatch.setattr(build_issue, "change_request_status", lambda *a, **k: ih.CR_NONE)
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher()
+    opts = BuildOptions(scope="epic-23", skip_preflight=True, sequential=True,
+                        auto=True, ci_gate_no_ci="deny")
+    result = run_build(opts, queue=_gate_story_queue(), ledger=Ledger(db),
+                       dispatcher=dispatcher, preflight=lambda: True)
+    assert ("merge", "g1-001") not in dispatcher.calls
+    assert result.completed == 0
+
+
+def test_merge_gate_unmapped_story_is_unchanged(tmp_path) -> None:
+    """A story with no host mapping skips the gate — the merge path is unchanged."""
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher()
+    opts = BuildOptions(scope="epic-23", skip_preflight=True, sequential=True, auto=True)
+    # change_request_status is NOT patched: with no inventory mapping it returns
+    # None, the gate skips, and the merge dispatches exactly as before this story.
+    result = run_build(opts, queue=_gate_story_queue(), ledger=Ledger(db),
+                       dispatcher=dispatcher, preflight=lambda: True)
+    assert ("merge", "g1-001") in dispatcher.calls
+    assert result.completed == 1
 
 
 def test_malformed_response_treated_as_build_failure(tmp_path) -> None:

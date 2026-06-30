@@ -23,6 +23,7 @@ __all__ = [
     "stage_status",
     "close_link",
     "change_request_terms",
+    "change_request_status",
     "announce_status",
     "announce_terminal",
 ]
@@ -128,6 +129,31 @@ def change_request_terms(
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
         log.debug("change_request_terms failed for %s", story_id, exc_info=True)
         return GITHUB_CR_TERMS
+
+
+def change_request_status(
+    ledger: "Ledger", story_id: str, cr_ref: object, *, runner: Runner | None = None
+) -> str | None:
+    """The normalised CI status of a story's open change request, or None (Story 23.2-002).
+
+    Resolves the story's mapped host, builds its adapter, and reads the
+    change request ``cr_ref``'s CI/pipeline status (`gh pr` checks rollup / the
+    GitLab MR pipeline) normalised to one of :data:`~sdlc.issue_host.CR_SUCCESS`
+    etc. The merge gate (:func:`sdlc.build._run_merge_ci_gate`) polls this to
+    decide whether the merge may proceed. Best-effort: an unmapped story, an
+    unsupported host, or any host failure yields None — never raises — so the
+    gate degrades to a clean no-op (today's agent-driven merge) rather than
+    blocking a build on a mirror hiccup.
+    """
+    try:
+        got = _adapter_and_ref(ledger, story_id, runner)
+        if got is None:
+            return None
+        adapter, _ = got
+        return adapter.cr_status(str(cr_ref))
+    except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
+        log.debug("change_request_status failed for %s", story_id, exc_info=True)
+        return None
 
 
 def announce_status(

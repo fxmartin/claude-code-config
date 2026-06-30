@@ -519,6 +519,36 @@ unchanged: a GitHub remote still routes every verb through `gh pr`. Everything
 stays inside GitLab **Free/Core** (no merge trains, no Premium-only keywords). See
 [`docs/issue-host-adapters.md`](issue-host-adapters.md) for the full contract.
 
+### Merge CI gate — only merge on green (Story 23.2-002)
+
+Before the **merge** stage dispatches, the controller gates the merge on the change
+request's CI/pipeline status — the host-neutral analogue of `gh pr checks`. It polls
+`cr_status(cr_ref)` (the `gh pr` check rollup / the GitLab MR pipeline, via the
+adapter) and only lets the merge proceed on green:
+
+- **`success`** → the gate passes and the merge stage dispatches as normal.
+- **`failed` / `unknown` / a timed-out still-`pending` pipeline** → the gate **blocks**
+  the merge and feeds the story into the existing **bugfix loop** (a synthetic
+  `ci-gate` stage failure), so a fix is attempted before a retry re-polls. After the
+  bounded bugfix attempts are exhausted the story ends `FAILED`, never merged — its
+  branch/MR preserved (R10).
+- **`none`** (the project has no CI signal) → degrades per policy, not a hang:
+  `--ci-gate-no-ci=allow` (the default) warns and merges, `--ci-gate-no-ci=deny` blocks.
+- An **unmapped story** (no host mapping, or no recorded `cr_ref`) → the gate is a
+  no-op and the merge path is byte-identical to before this story.
+
+The poll is bounded so a never-finishing pipeline can never stall a run. Config
+(`sdlc build` flags):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--ci-gate-timeout=SEC` | `1800` | Max seconds to poll a running pipeline (`0` = a single status read, no wait). |
+| `--ci-gate-poll=SEC` | `30` | Interval between status polls. |
+| `--ci-gate-no-ci=allow\|deny` | `allow` | What to do when the CR has **no** CI signal — warn + merge, or block. |
+
+The gate uses the same five normalised `cr_status` values on both hosts, so a red
+GitLab MR pipeline blocks the merge exactly as a failed GitHub Actions check does.
+
 Per Epic-12's non-goals there is no `sdlc migrate` verb — migrations apply
 automatically at launch.
 
