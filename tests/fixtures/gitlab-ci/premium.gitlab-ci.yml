@@ -1,0 +1,46 @@
+# Fixture: valid YAML with all gate jobs, but it references a Premium/Ultimate
+# construct (merge trains), which must be rejected to keep the template Free/Core.
+stages:
+  - secret-scan
+  - lint
+  - test
+
+secrets-scan:
+  stage: secret-scan
+  script:
+    - gitleaks detect --no-banner --redact
+
+shellcheck:
+  stage: lint
+  script:
+    - shellcheck --severity=warning hooks/*.sh
+
+ruff:
+  stage: lint
+  script:
+    - ruff check .
+
+json-schema:
+  stage: lint
+  script:
+    - echo validate
+
+commit-format:
+  stage: lint
+  script:
+    - npx commitlint --from "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --to HEAD
+
+pytest:
+  stage: test
+  script:
+    - uv run pytest -q
+
+bats:
+  stage: test
+  script:
+    - bats tests/
+
+merge-when-green:
+  stage: test
+  script:
+    - echo "queue this MR onto a merge_train"
