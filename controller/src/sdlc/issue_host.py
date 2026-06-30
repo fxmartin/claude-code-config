@@ -151,24 +151,34 @@ class ChangeRequestTerms:
     (``PR number``/``MR iid``); ``cli_hint`` is an *additive* parenthetical naming
     the create command for the non-default host, and is the empty string for
     GitHub so its prompt stays byte-identical to today (Story 23.2-001 AC2).
+    ``merge_cli_hint`` (Story 23.2-003) is the same additive parenthetical for the
+    *merge* command (``glab mr merge``), again empty for GitHub so the merge
+    prompt's GitHub path stays byte-identical.
     """
 
     host: str
     abbr: str
     ref_noun: str
     cli_hint: str
+    merge_cli_hint: str
 
 
 # The GitHub default — chosen so an unmapped story (the common case for the
 # framework's own repo) renders the change-request prompts exactly as before this
-# story. ``cli_hint`` is empty: GitHub's prompt names no CLI, keeping it identical.
+# story. ``cli_hint``/``merge_cli_hint`` are empty: GitHub's prompts name no CLI,
+# keeping them identical.
 GITHUB_CR_TERMS = ChangeRequestTerms(
-    host=GITHUB, abbr="PR", ref_noun="PR number", cli_hint=""
+    host=GITHUB, abbr="PR", ref_noun="PR number", cli_hint="", merge_cli_hint=""
 )
-# GitLab opens a Merge Request via `glab mr create`; the hint disambiguates the
-# CLI for the agent on a GitLab target (where it must not reach for `gh`).
+# GitLab opens a Merge Request via `glab mr create` and merges it via
+# `glab mr merge`; the hints disambiguate the CLI for the agent on a GitLab
+# target (where it must not reach for `gh`).
 GITLAB_CR_TERMS = ChangeRequestTerms(
-    host=GITLAB, abbr="MR", ref_noun="MR iid", cli_hint=" (`glab mr create`)"
+    host=GITLAB,
+    abbr="MR",
+    ref_noun="MR iid",
+    cli_hint=" (`glab mr create`)",
+    merge_cli_hint=" (`glab mr merge`)",
 )
 
 

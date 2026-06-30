@@ -549,6 +549,29 @@ The poll is bounded so a never-finishing pipeline can never stall a run. Config
 The gate uses the same five normalised `cr_status` values on both hosts, so a red
 GitLab MR pipeline blocks the merge exactly as a failed GitHub Actions check does.
 
+### Merge, close, and clean up — ending the loop on either host (Story 23.2-003)
+
+Once the gate is green the **merge** stage merges the change request via the
+adapter and the GitLab loop ends the same way the GitHub one does:
+
+- **Merge + issue close.** The merge prompt is host-neutral: `cr_terms` pick the
+  noun and merge-CLI hint — "Merge the PR …" via `gh`, "Merge the MR
+  (`glab mr merge`) …" via `glab`. The story's tracking issue auto-closes from
+  the `Closes #<issue>` injected into
+  the change-request description at create time (Story 22.4-002) — no separate
+  close call, and the Epic-22 story↔issue mapping resolves the link on either
+  host. The GitHub default (`abbr="PR"`, empty merge hint) keeps the prompt
+  byte-identical to before this story.
+- **Ledger DONE + merge sha.** When the merge lands, the merge agent's
+  `merge_sha` is recorded on the story row (`stories.merge_sha`, migration 10), so
+  the ledger marks the story **DONE *with* the GitLab/GitHub merge sha**. The same
+  column holds either host's merge commit; an unmerged outcome (FAILED/SKIPPED)
+  leaves it NULL. A landing event is logged for the audit trail.
+- **Branch cleanup.** The story branch and its worktree are torn down by the
+  **existing** worktree/branch GC (`hooks/worktree-gc.sh` /
+  `remove_story_worktree`) — host-agnostic local git, so it works unchanged on a
+  GitLab target. The branch/commits are the deliverable and survive teardown (R10).
+
 Per Epic-12's non-goals there is no `sdlc migrate` verb — migrations apply
 automatically at launch.
 

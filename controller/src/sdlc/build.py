@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS stories (
     wave            INTEGER,
     dependencies    TEXT,
     worktree_path   TEXT,
+    merge_sha       TEXT,
     PRIMARY KEY (run_id, story_id),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
@@ -373,6 +374,22 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         "runs",
         [
             ("actor", "TEXT"),
+        ],
+        None,
+    ),
+    # Migration 10 adds the GitLab/GitHub merge sha (Story 23.2-003) to a
+    # pre-existing ledger's `stories` table — the merge commit a story landed at,
+    # recorded when the merge stage succeeds so the ledger marks the story DONE
+    # *with* the merge sha (AC3). Additive and back-compatible: old story rows
+    # keep NULL merge_sha (they predate the capture); only stories merged after
+    # this story populate it. A fresh DB created from the up-to-date DDL is a
+    # no-op.
+    (
+        10,
+        "story merge sha column",
+        "stories",
+        [
+            ("merge_sha", "TEXT"),
         ],
         None,
     ),
@@ -1361,6 +1378,29 @@ class Ledger:
                 "UPDATE stories SET pr_number = ? WHERE run_id = ? AND story_id = ?",
                 (pr_number, run_id, story_id),
             )
+
+    def set_story_merge_sha(self, run_id: str, story_id: str, merge_sha: str) -> None:
+        """Record the merge commit sha a story landed at (Story 23.2-003).
+
+        Written when the merge stage succeeds (the merge agent's reported
+        ``merge_sha``) so the ledger marks the story DONE *with* the GitLab/GitHub
+        merge sha (AC3). Host-neutral — a `gh pr merge` and a `glab mr merge` both
+        yield a merge commit, so the same column holds either.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stories SET merge_sha = ? WHERE run_id = ? AND story_id = ?",
+                (merge_sha, run_id, story_id),
+            )
+
+    def story_merge_sha(self, run_id: str, story_id: str) -> str | None:
+        """The recorded merge sha for a story, or ``None`` when it has not merged."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT merge_sha FROM stories WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            ).fetchone()
+        return row[0] if row else None
 
     def set_story_wave(
         self, run_id: str, story_id: str, wave: int, dependencies: list[str]
@@ -2952,15 +2992,29 @@ def render_review_prompt(story: Story, pr_number: int | None) -> str:
     )
 
 
-def render_merge_prompt(story: Story, pr_number: int | None) -> str:
+def render_merge_prompt(
+    story: Story,
+    pr_number: int | None,
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+) -> str:
+    # Story 23.2-003: the merge stage is the last change-request prompt that was
+    # GitHub-coupled. ``cr_terms`` picks the host noun (PR via gh / MR via glab)
+    # and the merge-CLI hint so a GitLab build merges the *MR* via ``glab mr
+    # merge``; the ``Closes #N`` injected at create time (Story 22.4-002) then
+    # auto-closes the story's issue via the Epic-22 mapping on either host. The
+    # GitHub default leaves ``abbr="PR"`` and an empty ``merge_cli_hint`` so this
+    # prompt is byte-identical to today on the GitHub path.
+    abbr = cr_terms.abbr
     return (
-        f"Merge the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
+        f"Merge the {abbr}{cr_terms.merge_cli_hint} for story {story.id}: "
+        f"{story.title} ({abbr} #{pr_number}).\n"
         "Rebase before merge to absorb baseline drift, then emit the result block.\n"
         # Story 12.3-003: surface a high-risk human-approval block additively so
         # the controller parks AWAITING_APPROVAL instead of entering the bugfix
         # loop (which cannot self-approve). The instruction below is part of the
         # agent-facing prompt string, not a comment.
-        "If the PR is blocked only by the high-risk approval gate (it carries "
+        f"If the {abbr} is blocked only by the high-risk approval gate (it carries "
         "the `risk:high` label with no `risk-approved` label and no "
         "`risk-approver` review), do NOT force-merge or override the gate: "
         'report merge_status="FAILED" and set the extra field "block_reason" to '
@@ -4782,6 +4836,12 @@ def _run_story(
                     pr_number = _extract_pr(result, pr_number)
                     if pr_number is not None:
                         ledger.set_story_pr(run_id, story.id, pr_number)
+                    # Story 23.2-003: a landed merge records its sha so the story
+                    # is marked DONE *with* the GitLab/GitHub merge sha (AC3);
+                    # no-op for non-merge stages.
+                    _record_merge_landing(
+                        stage, result, ledger, run_id, story, pr_number
+                    )
                     # Story 12.2-002: lint the commit a commit-authoring stage just
                     # produced against commitlint before it can reach a PR; bounded
                     # amend re-ask on violation, no-op when there is no config /
@@ -4848,6 +4908,11 @@ def _run_story(
                         pr_number = _extract_pr(result_r, pr_number)
                         if pr_number is not None:
                             ledger.set_story_pr(run_id, story.id, pr_number)
+                        # Story 23.2-003: an envelope-recovered merge still landed —
+                        # record its sha so the DONE story carries the merge sha (AC3).
+                        _record_merge_landing(
+                            stage, result_r, ledger, run_id, story, pr_number
+                        )
                         # Story 12.2-002: an envelope-recovered stage committed work
                         # just like a first-pass success — lint its commit too, or
                         # an envelope-only failure would smuggle a non-compliant
@@ -5269,7 +5334,7 @@ def _render_stage_prompt(
         return render_coverage_prompt(story, opts, close_link=close_link, cr_terms=cr_terms)
     if stage == "review":
         return render_review_prompt(story, pr_number)
-    return render_merge_prompt(story, pr_number)
+    return render_merge_prompt(story, pr_number, cr_terms=cr_terms)
 
 
 def _stage_succeeded(stage: str, data: dict) -> bool:
@@ -5462,6 +5527,55 @@ def _extract_pr(result: AgentResult | None, current: int | None) -> int | None:
         return current
     pr = result.data.get("pr_number")
     return pr if isinstance(pr, int) else current
+
+
+def _extract_merge_sha(result: AgentResult | None) -> str | None:
+    """The merge commit sha from a successful merge agent response, or None (23.2-003).
+
+    The merge schema requires a non-empty ``merge_sha`` on a ``MERGED`` outcome;
+    a FAILED/SKIPPED response carries an empty string. Returns the trimmed sha
+    only when it is a non-blank string so the ledger records a real landing sha
+    and never an empty one.
+    """
+    if result is None:
+        return None
+    sha = result.data.get("merge_sha")
+    if isinstance(sha, str) and sha.strip():
+        return sha.strip()
+    return None
+
+
+def _record_merge_landing(
+    stage: str,
+    result: AgentResult | None,
+    ledger: Ledger,
+    run_id: str,
+    story: Story,
+    pr_number: int | None,
+) -> None:
+    """Stamp a landed merge's sha onto the story row (Story 23.2-003 AC3).
+
+    A no-op for any stage other than ``merge`` or when the merge agent reported
+    no sha, so every non-merge stage and a non-MERGED outcome are unchanged. When
+    a merge lands, the caller is about to mark the story DONE; this records the
+    GitLab/GitHub merge sha (and logs the landing) so the ledger marks the story
+    DONE *with* the merge sha. The story's issue auto-closes via the ``Closes #N``
+    injected at create time (Story 22.4-002), so no separate close call is needed
+    here (AC1); branch teardown is handled by the existing worktree/branch GC
+    (``hooks/worktree-gc.sh`` / :func:`remove_story_worktree`), host-agnostic
+    local git, so it works unchanged on a GitLab target (AC2).
+    """
+    if stage != "merge":
+        return
+    sha = _extract_merge_sha(result)
+    if not sha:
+        return
+    ledger.set_story_merge_sha(run_id, story.id, sha)
+    cr = f" (cr=#{pr_number})" if pr_number is not None else ""
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"merge landed: story DONE at {sha}{cr}",
+    )
 
 
 def _reask_envelope(
