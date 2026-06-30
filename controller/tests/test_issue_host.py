@@ -673,4 +673,8 @@ def test_label_color_is_categorised():
     assert ih._label_color("points:3") == "fbca04"
     assert ih._label_color("risk:high") == "d93f0b"
     assert ih._label_color("risk:low") == "c2e0c6"
+    # Story 23.5-001: the high-risk gate's maintainer-approval signal gets its
+    # own green colour — distinct from the `risk:` family — so it reads as an
+    # approval on the board (the sole approval path on GitLab Free/Core).
+    assert ih._label_color("risk-approved") == "0e8a16"
     assert ih._label_color("anything-else") == "ededed"
