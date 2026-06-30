@@ -16,9 +16,15 @@ __all__ = [
     "GITHUB",
     "GITLAB",
     "SUPPORTED_HOSTS",
+    "CR_SUCCESS",
+    "CR_FAILED",
+    "CR_PENDING",
+    "CR_NONE",
+    "CR_UNKNOWN",
     "IssueHostError",
     "RunResult",
     "Issue",
+    "ChangeRequest",
     "IssueHostAdapter",
     "GitHubAdapter",
     "GitLabAdapter",
@@ -43,6 +49,26 @@ _CLI_TIMEOUT = 30.0
 # GitLab `.../-/issues/5`. The ref is the GitHub issue *number* or the GitLab
 # per-project *iid*, normalised to a string behind `issue_ref` (Story 22.1-001).
 _ISSUE_REF_RE = re.compile(r"/issues/(\d+)")
+
+# Parse the change-request *ref* out of a created-CR URL — GitHub PR
+# `.../pull/123`, GitLab MR `.../-/merge_requests/5`. The ref is the PR *number*
+# or the MR *iid*, normalised to a string behind `cr_ref` (Story 23.1-001), the
+# exact PR↔MR / number↔iid hiding the build loop routes through.
+_CR_REF_RE = re.compile(r"/(?:pull|merge_requests)/(\d+)")
+
+# Normalised CI/pipeline status for a change request — the host-neutral signal
+# the merge gate (Story 23.2-002) polls. GitHub's status-check rollup and
+# GitLab's MR pipeline status both map onto these five values:
+#   success — every check/the pipeline is green (the gate may merge)
+#   failed  — at least one check failed or the pipeline failed/was canceled
+#   pending — checks/the pipeline are still in flight (keep polling)
+#   none    — no CI signal to gate on (no checks, no pipeline, or only skipped)
+#   unknown — the host reported a status this adapter does not recognise
+CR_SUCCESS = "success"
+CR_FAILED = "failed"
+CR_PENDING = "pending"
+CR_NONE = "none"
+CR_UNKNOWN = "unknown"
 
 
 class IssueHostError(Exception):
@@ -85,6 +111,29 @@ class Issue:
     assignees: tuple[str, ...] = ()
     body: str | None = None
     labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ChangeRequest:
+    """A host change request (GitHub *Pull Request* / GitLab *Merge Request*).
+
+    ``ref`` is the GitHub PR *number* or the GitLab MR *iid* as a string — the
+    `cr_ref` the build loop records and every later CR verb routes through, so a
+    caller never branches on PR↔MR or number↔iid. ``state`` is normalised
+    (``open``/``closed``/``merged``); ``source_branch``/``target_branch`` are the
+    story branch and the branch it targets. ``status`` holds the normalised
+    CI/pipeline signal (:data:`CR_SUCCESS` etc.) when populated by
+    :meth:`IssueHostAdapter.cr_status`; the other verbs leave it ``None``.
+    """
+
+    host: str
+    ref: str
+    url: str | None = None
+    title: str | None = None
+    state: str | None = None
+    source_branch: str | None = None
+    target_branch: str | None = None
+    status: str | None = None
 
 
 def _default_runner(argv: Sequence[str], timeout: float = _CLI_TIMEOUT) -> RunResult:
@@ -182,6 +231,10 @@ def resolve_host(root: str | Path, override: str | None = None) -> str:
 
 def _ref_of(ref: "str | Issue") -> str:
     return ref.ref if isinstance(ref, Issue) else str(ref)
+
+
+def _cr_ref_of(ref: "str | ChangeRequest") -> str:
+    return ref.ref if isinstance(ref, ChangeRequest) else str(ref)
 
 
 class IssueHostAdapter(ABC):
@@ -292,6 +345,49 @@ class IssueHostAdapter(ABC):
         labels/assignees to pull human signals. Raises :class:`IssueHostError`
         when the ref no longer resolves (deleted on the host)."""
 
+    # -- change-request (PR/MR) verbs (Story 23.1-001) --
+    @abstractmethod
+    def cr_create(
+        self,
+        source_branch: str,
+        title: str,
+        body: str,
+        target_branch: str | None = None,
+        draft: bool = False,
+    ) -> ChangeRequest:
+        """Open a change request (GitHub PR / GitLab MR) for ``source_branch``.
+
+        ``body`` carries the ``Closes #<issue>`` line (see :meth:`close_keyword`)
+        so the merge auto-closes the story issue. ``target_branch`` defaults to
+        the repo's default branch when omitted. Returns the CR with its `cr_ref`
+        populated; raises :class:`IssueHostError` if the host returns no CR URL.
+        """
+
+    @abstractmethod
+    def cr_diff(self, ref: "str | ChangeRequest") -> str:
+        """Return the unified diff of a change request (the adversarial-review feed)."""
+
+    @abstractmethod
+    def cr_status(self, ref: "str | ChangeRequest") -> str:
+        """Return the normalised CI status of a change request (one of `CR_*`).
+
+        The host-neutral analogue of ``gh pr checks`` / the GitLab MR pipeline:
+        :data:`CR_SUCCESS`/:data:`CR_FAILED`/:data:`CR_PENDING`/:data:`CR_NONE`/
+        :data:`CR_UNKNOWN`. The merge gate (Story 23.2-002) polls this.
+        """
+
+    @abstractmethod
+    def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
+        """Merge a change request; return it with ``state`` set to ``merged``."""
+
+    @abstractmethod
+    def cr_url(self, ref: "str | ChangeRequest") -> str:
+        """Resolve a change request's web URL.
+
+        A :class:`ChangeRequest` already carrying its ``url`` is returned without
+        a host call; a bare ref is resolved via the host CLI.
+        """
+
     # -- shared call plumbing --
     def _invoke(self, *args: str) -> RunResult:
         """Run ``<cli> ARGS`` through the runner; a missing/broken CLI raises IssueHostError."""
@@ -320,6 +416,12 @@ class IssueHostAdapter(ABC):
 
 def _ref_from_url(url: str) -> str | None:
     m = _ISSUE_REF_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _cr_ref_from_url(url: str) -> str | None:
+    """Parse the PR/MR ref out of a created-CR URL (`…/pull/N`, `…/merge_requests/N`)."""
+    m = _CR_REF_RE.search(url)
     return m.group(1) if m else None
 
 
@@ -460,6 +562,48 @@ class GitHubAdapter(IssueHostAdapter):
             assignees=tuple(a.get("login") for a in row.get("assignees") or []),
         )
 
+    # -- change-request verbs (gh pr) --
+    def cr_create(
+        self,
+        source_branch: str,
+        title: str,
+        body: str,
+        target_branch: str | None = None,
+        draft: bool = False,
+    ) -> ChangeRequest:
+        args = ["pr", "create", "--head", source_branch, "--title", title, "--body", body]
+        if target_branch:
+            args += ["--base", target_branch]
+        if draft:
+            args.append("--draft")
+        url = self._run(*args).stdout.strip()
+        ref = _cr_ref_from_url(url)
+        if ref is None:
+            raise IssueHostError(f"gh pr create returned no change-request URL: {url!r}")
+        return ChangeRequest(host=self.host, ref=ref, url=url, title=title, state="open",
+                             source_branch=source_branch, target_branch=target_branch)
+
+    def cr_diff(self, ref: "str | ChangeRequest") -> str:
+        return self._run("pr", "diff", _cr_ref_of(ref)).stdout
+
+    def cr_status(self, ref: "str | ChangeRequest") -> str:
+        out = self._run(
+            "pr", "view", _cr_ref_of(ref), "--json", "statusCheckRollup"
+        ).stdout
+        return _github_rollup_status(_parse_json_object(out).get("statusCheckRollup"))
+
+    def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
+        ref = _cr_ref_of(ref)
+        self._run("pr", "merge", ref, "--merge")
+        return ChangeRequest(host=self.host, ref=ref, state="merged")
+
+    def cr_url(self, ref: "str | ChangeRequest") -> str:
+        if isinstance(ref, ChangeRequest) and ref.url:
+            return ref.url
+        return self._run(
+            "pr", "view", _cr_ref_of(ref), "--json", "url", "--jq", ".url"
+        ).stdout.strip()
+
 
 # --- GitLab (glab) -----------------------------------------------------------
 
@@ -588,6 +732,50 @@ class GitLabAdapter(IssueHostAdapter):
             assignees=tuple(a.get("username") for a in row.get("assignees") or []),
         )
 
+    # -- change-request verbs (glab mr) --
+    def cr_create(
+        self,
+        source_branch: str,
+        title: str,
+        body: str,
+        target_branch: str | None = None,
+        draft: bool = False,
+    ) -> ChangeRequest:
+        args = [
+            "mr", "create", "--source-branch", source_branch,
+            "--title", title, "--description", body, "--yes",
+        ]
+        if target_branch:
+            args += ["--target-branch", target_branch]
+        if draft:
+            args.append("--draft")
+        url = self._run(*args).stdout.strip()
+        ref = _cr_ref_from_url(url)
+        if ref is None:
+            raise IssueHostError(f"glab mr create returned no change-request URL: {url!r}")
+        return ChangeRequest(host=self.host, ref=ref, url=url, title=title, state="open",
+                             source_branch=source_branch, target_branch=target_branch)
+
+    def cr_diff(self, ref: "str | ChangeRequest") -> str:
+        return self._run("mr", "diff", _cr_ref_of(ref)).stdout
+
+    def cr_status(self, ref: "str | ChangeRequest") -> str:
+        out = self._run("mr", "view", _cr_ref_of(ref), "--output", "json").stdout
+        pipeline = _parse_json_object(out).get("pipeline")
+        raw = pipeline.get("status") if isinstance(pipeline, dict) else None
+        return _gitlab_pipeline_status(raw)
+
+    def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
+        ref = _cr_ref_of(ref)
+        self._run("mr", "merge", ref, "--yes")
+        return ChangeRequest(host=self.host, ref=ref, state="merged")
+
+    def cr_url(self, ref: "str | ChangeRequest") -> str:
+        if isinstance(ref, ChangeRequest) and ref.url:
+            return ref.url
+        out = self._run("mr", "view", _cr_ref_of(ref), "--output", "json").stdout
+        return (_parse_json_object(out).get("web_url") or "").strip()
+
 
 # --- shared parsing helpers --------------------------------------------------
 
@@ -632,6 +820,89 @@ def _label_names(labels: object) -> tuple[str, ...]:
             if isinstance(name, str):
                 names.append(name)
     return tuple(names)
+
+
+# GitLab pipeline `status` → normalised `CR_*`. Free/Core pipeline states; a
+# canceled pipeline is *not* green (→ failed), an in-flight one keeps the gate
+# polling (→ pending), a skipped one carries no pass/fail signal (→ none).
+_GITLAB_PIPELINE_STATUS = {
+    "success": CR_SUCCESS,
+    "failed": CR_FAILED,
+    "canceled": CR_FAILED,
+    "cancelled": CR_FAILED,
+    "running": CR_PENDING,
+    "pending": CR_PENDING,
+    "created": CR_PENDING,
+    "preparing": CR_PENDING,
+    "waiting_for_resource": CR_PENDING,
+    "manual": CR_PENDING,
+    "scheduled": CR_PENDING,
+    "skipped": CR_NONE,
+}
+
+
+def _gitlab_pipeline_status(raw: str | None) -> str:
+    """Map a GitLab MR pipeline `status` to a normalised `CR_*` value."""
+    if not raw:
+        return CR_NONE
+    return _GITLAB_PIPELINE_STATUS.get(raw.lower(), CR_UNKNOWN)
+
+
+# GitHub check-run `conclusion` / status-context `state` → normalised `CR_*`.
+# Anything not green and not pending (timeouts, cancellations, action-required)
+# blocks the merge; neutral/skipped checks carry no gating signal.
+_GITHUB_CONCLUSION = {
+    "SUCCESS": CR_SUCCESS,
+    "FAILURE": CR_FAILED,
+    "TIMED_OUT": CR_FAILED,
+    "CANCELLED": CR_FAILED,
+    "STARTUP_FAILURE": CR_FAILED,
+    "ACTION_REQUIRED": CR_FAILED,
+    "ERROR": CR_FAILED,
+    "NEUTRAL": CR_NONE,
+    "SKIPPED": CR_NONE,
+    "STALE": CR_NONE,
+    "PENDING": CR_PENDING,
+    "EXPECTED": CR_PENDING,
+}
+# A check-run whose `status` is not COMPLETED is still in flight.
+_GITHUB_INFLIGHT = {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"}
+
+
+def _github_check_status(item: dict) -> str:
+    """Normalise one statusCheckRollup entry (CheckRun or StatusContext) to `CR_*`."""
+    # StatusContext: a flat `state` (no separate status/conclusion).
+    if item.get("status") is None and item.get("state") is not None:
+        return _GITHUB_CONCLUSION.get(str(item.get("state")).upper(), CR_UNKNOWN)
+    # CheckRun: in flight until COMPLETED, then read the conclusion.
+    status = str(item.get("status") or "").upper()
+    if status in _GITHUB_INFLIGHT:
+        return CR_PENDING
+    conclusion = item.get("conclusion")
+    if conclusion is None:
+        return CR_PENDING if status != "COMPLETED" else CR_NONE
+    return _GITHUB_CONCLUSION.get(str(conclusion).upper(), CR_UNKNOWN)
+
+
+def _github_rollup_status(rollup: object) -> str:
+    """Aggregate a GitHub statusCheckRollup to a single normalised `CR_*`.
+
+    Failure dominates (a red check blocks the merge); else a pending check keeps
+    the gate polling; else a green check passes; an empty/neutral-only rollup
+    carries no gating signal (`CR_NONE`).
+    """
+    if not isinstance(rollup, list) or not rollup:
+        return CR_NONE
+    statuses = {_github_check_status(item) for item in rollup if isinstance(item, dict)}
+    if CR_FAILED in statuses:
+        return CR_FAILED
+    if CR_PENDING in statuses:
+        return CR_PENDING
+    if CR_SUCCESS in statuses:
+        return CR_SUCCESS
+    if CR_UNKNOWN in statuses:
+        return CR_UNKNOWN
+    return CR_NONE
 
 
 def _norm_state(state: str | None) -> str | None:
