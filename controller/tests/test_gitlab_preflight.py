@@ -4,15 +4,21 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 from typer.testing import CliRunner
 
+import pytest
+
+import sdlc.gitlab_preflight as preflight_mod
 from sdlc.cli import app
 from sdlc.gitlab_preflight import (
     CHECK,
     GATE_TEMPLATE,
     ProjectInfo,
+    _default_glab_auth,
+    _default_project_probe,
     check_ci,
     check_gate_template,
     check_glab_auth,
@@ -263,3 +269,91 @@ def test_cli_doctor_gitlab_exit_code_flag_nonzero(tmp_path: Path) -> None:
     )
     # Missing gate template → FAIL → exit 2 under --exit-code.
     assert result.exit_code == 2
+
+
+# --- default live seams (_default_glab_auth / _default_project_probe) --------
+
+
+def test_default_glab_auth_delegates_to_resolve_local_login(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def _fake_resolve(adapter) -> str:
+        seen["adapter"] = adapter
+        return "fx"
+
+    monkeypatch.setattr(preflight_mod, "resolve_local_login", _fake_resolve)
+    assert _default_glab_auth() == "fx"
+    # It resolves the login against a GitLab adapter, not some other host.
+    assert type(seen["adapter"]).__name__ == "GitLabAdapter"
+
+
+class _FakeProc:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_default_project_probe_parses_project(monkeypatch) -> None:
+    payload = json.dumps(
+        {"path_with_namespace": "acme/widgets", "default_branch": "main", "builds_access_level": "enabled"}
+    )
+    monkeypatch.setattr(
+        preflight_mod.subprocess, "run", lambda *a, **k: _FakeProc(stdout=payload)
+    )
+    info = _default_project_probe()
+    assert info == ProjectInfo(path="acme/widgets", default_branch="main", ci_enabled=True)
+
+
+def test_default_project_probe_missing_cli_raises(monkeypatch) -> None:
+    from sdlc.issue_host import IssueHostError
+
+    def _missing(*a, **k):
+        raise FileNotFoundError("glab")
+
+    monkeypatch.setattr(preflight_mod.subprocess, "run", _missing)
+    with pytest.raises(IssueHostError, match="glab not found on PATH"):
+        _default_project_probe()
+
+
+def test_default_project_probe_subprocess_error_raises(monkeypatch) -> None:
+    from sdlc.issue_host import IssueHostError
+
+    def _boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="glab", timeout=30.0)
+
+    monkeypatch.setattr(preflight_mod.subprocess, "run", _boom)
+    with pytest.raises(IssueHostError, match="failed"):
+        _default_project_probe()
+
+
+def test_default_project_probe_nonzero_returncode_raises(monkeypatch) -> None:
+    from sdlc.issue_host import IssueHostError
+
+    monkeypatch.setattr(
+        preflight_mod.subprocess,
+        "run",
+        lambda *a, **k: _FakeProc(returncode=1, stderr="404 Not Found"),
+    )
+    with pytest.raises(IssueHostError, match="404 Not Found"):
+        _default_project_probe()
+
+
+def test_default_project_probe_invalid_json_raises(monkeypatch) -> None:
+    from sdlc.issue_host import IssueHostError
+
+    monkeypatch.setattr(
+        preflight_mod.subprocess, "run", lambda *a, **k: _FakeProc(stdout="not json")
+    )
+    with pytest.raises(IssueHostError, match="could not parse glab project JSON"):
+        _default_project_probe()
+
+
+def test_default_project_probe_non_object_json_raises(monkeypatch) -> None:
+    from sdlc.issue_host import IssueHostError
+
+    monkeypatch.setattr(
+        preflight_mod.subprocess, "run", lambda *a, **k: _FakeProc(stdout="[1, 2, 3]")
+    )
+    with pytest.raises(IssueHostError, match="not a JSON object"):
+        _default_project_probe()
