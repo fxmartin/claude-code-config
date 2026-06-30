@@ -192,6 +192,17 @@ def test_evaluate_no_ci_can_deny():
     assert verdict == _GATE_BLOCK
 
 
+def test_evaluate_unexpected_status_fails_safe():
+    """A status outside the known CR_* set fails safe — block, never silent merge.
+
+    Defends the gate against a future/garbled host status string the normaliser
+    might surface: the merge is blocked with the offending value in the reason.
+    """
+    verdict, reason = _evaluate_ci_gate("kaput", no_ci_policy="allow")
+    assert verdict == _GATE_BLOCK
+    assert "kaput" in reason
+
+
 # --- _run_merge_ci_gate (orchestration) --------------------------------------
 
 
