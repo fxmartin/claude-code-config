@@ -84,10 +84,41 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/gitlab-release"
     [ "${status}" -ne 0 ]
 }
 
+@test "validator fails when the stages key is absent" {
+    # The publish-release job is present, but the top-level stages: key is
+    # missing — the validator must reject the missing required key.
+    run "${VALIDATOR}" "${FIXTURES}/no-stages.gitlab-ci.yml"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"stages"* ]]
+}
+
+@test "validator fails when stages omits the release stage" {
+    # stages: is declared and publish-release exists, but the release stage is
+    # not in the list — the validator must reject the missing release stage.
+    run "${VALIDATOR}" "${FIXTURES}/no-release-stage.gitlab-ci.yml"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"release"* ]]
+}
+
 @test "validator fails when the release job is absent" {
     run "${VALIDATOR}" "${FIXTURES}/missing-release-job.gitlab-ci.yml"
     [ "${status}" -ne 0 ]
     [[ "${output}" == *"publish-release"* ]]
+}
+
+@test "validator fails when the template never invokes release-cli" {
+    # Structurally complete but tags only — Free/Core must publish via release-cli.
+    run "${VALIDATOR}" "${FIXTURES}/no-release-cli.gitlab-ci.yml"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"release-cli"* ]]
+}
+
+@test "validator fails when the release also runs on merge requests" {
+    # Scopes to the default branch (CI_DEFAULT_BRANCH present) but also adds a
+    # merge_request_event rule — the validator must still reject it.
+    run "${VALIDATOR}" "${FIXTURES}/mr-and-default.gitlab-ci.yml"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"merge request"* ]]
 }
 
 @test "validator fails when the template does not reuse compute-release.sh" {
@@ -130,4 +161,20 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/gitlab-release"
     run "${VALIDATOR}" "${FIXTURES}/does-not-exist.yml"
     [ "${status}" -ne 0 ]
     [[ "${output}" == *"not found"* ]]
+}
+
+@test "validator surfaces an environment error when no YAML parser is available" {
+    # Neither uv nor a PyYAML-capable python3 — the py_run helper must report that
+    # it needs one rather than silently mis-parsing the template. Stripping PATH
+    # alone is not portable: CI's /usr/bin/python3 ships PyYAML (a dev Mac's may
+    # not), so shadow python3 with a stub that fails `import yaml` to force the
+    # else branch deterministically, while keeping /usr/bin:/bin for `uv` absence
+    # and the script's other tools. Mirrors tests/gitlab-ci-template.bats.
+    local stubdir="${BATS_TEST_TMPDIR}/nopyyaml"
+    mkdir -p "${stubdir}"
+    printf '#!/bin/sh\nexit 1\n' > "${stubdir}/python3"
+    chmod +x "${stubdir}/python3"
+    run env PATH="${stubdir}:/usr/bin:/bin" bash "${VALIDATOR}" "${TEMPLATE}"
+    [ "${status}" -ne 0 ]
+    [[ "${output}" == *"need uv or a python3 with PyYAML"* ]]
 }
