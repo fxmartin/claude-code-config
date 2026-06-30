@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.7.0] - 2026-06-30
+
+### Added
+
+- feat(pipeline-on-gitlab): `.gitlab-ci.yml` quality-gate (#23.3-001)
+
+### Fixed
+
+- fix(pipeline-on-gitlab): `.gitlab-ci.yml` quality-gate (#23.3-001)
+
+
 ## [v2.6.0] - 2026-06-30
 
 ### Added
