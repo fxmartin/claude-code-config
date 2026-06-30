@@ -12,9 +12,12 @@ over [`glab`](https://gitlab.com/gitlab-org/cli). This mirrors Epic-20's harness
 philosophy: **swap the CLI behind a stable interface**; callers never branch on
 the host.
 
-> **Scope:** this is the *issue* adapter only. It does **not** make the build
-> *pipeline* run on GitLab (Merge Requests, GitLab CI, `glab mr diff`) — that is
-> the separate future "Pipeline on GitLab" epic.
+> **Scope:** the same adapter covers **two** verb families — *issue* ops
+> (Epic-22) and *change-request* (PR/MR) ops (Epic-23, Story 23.1-001, the
+> [`cr_*` contract](#change-request-prmr-operations-story-231-001) below). It does
+> **not** yet wire the build *pipeline* to those CR verbs (opening MRs in the
+> loop, the GitLab-CI merge gate, `glab mr diff` review) — those are the later
+> Epic-23 stories that route through this seam.
 
 ## The contract
 
@@ -56,6 +59,48 @@ written against the interface is identical on both hosts:
 The company GitLab is **Free/Core**, so the GitLab path avoids all
 Premium/Ultimate constructs: a **single assignee** (multiple assignees are
 Premium), and **labels** for taxonomy rather than native epics or issue weight.
+
+## Change-request (PR/MR) operations (Story 23.1-001)
+
+The same adapter hides **change-request** ops, so the build loop opens / diffs /
+status-checks / merges a change without knowing whether the host calls it a
+GitHub **Pull Request** or a GitLab **Merge Request**. This is the seam every
+later Epic-23 story routes through.
+
+| Verb | What it does | `gh pr` | `glab mr` |
+|------|--------------|---------|-----------|
+| `cr_create(source_branch, title, body, target_branch=None, draft=False)` | open a PR/MR for the story branch; `body` carries the `Closes #N` link | `gh pr create --head … [--base …] [--draft]` | `glab mr create --source-branch … --yes [--target-branch …] [--draft]` |
+| `cr_diff(ref)` | the unified diff (the adversarial-review feed) | `gh pr diff` | `glab mr diff` |
+| `cr_status(ref)` | the normalised CI status (the merge gate polls it) | `gh pr view --json statusCheckRollup` | `glab mr view --output json` → `.pipeline.status` |
+| `cr_merge(ref)` | merge the change (the `Closes #N` auto-closes the story issue) | `gh pr merge --merge` | `glab mr merge --yes` |
+| `cr_url(ref)` | the change's web URL | `gh pr view --json url` | `glab mr view --output json` → `.web_url` |
+
+### Normalised CR types
+
+- **`cr_ref`** — a string hiding the GitHub PR *number* vs the GitLab MR *iid*.
+  The adapter parses it out of the created-CR URL (`…/pull/123`, GitLab
+  `…/-/merge_requests/5`).
+- **`ChangeRequest`** — a host-neutral record: `host`, `ref`, `url`, `title`,
+  `state` (`open`/`closed`/`merged`), `source_branch`, `target_branch`, and
+  `status` (the normalised CI signal, populated only by `cr_status`).
+- **`cr_status`** — five normalised values shared by both hosts, so the merge
+  gate (Story 23.2-002) is host-agnostic:
+
+  | Value (`CR_*`) | Meaning | GitHub rollup | GitLab pipeline |
+  |----------------|---------|---------------|-----------------|
+  | `success` | green — the gate may merge | every check `SUCCESS` | `success` |
+  | `failed` | a check/the pipeline failed (or was canceled) — block merge | any `FAILURE`/`TIMED_OUT`/… | `failed`, `canceled` |
+  | `pending` | still in flight — keep polling | any `QUEUED`/`IN_PROGRESS` | `running`/`pending`/`created`/`manual`/… |
+  | `none` | no gating signal — no checks, no pipeline, or only skipped/neutral | empty or only `SKIPPED`/`NEUTRAL` | `null` pipeline or `skipped` |
+  | `unknown` | a status this adapter does not recognise | unmapped value | unmapped value |
+
+- **`Closes #N`** — `cr_create`'s `body` carries the close-link (from
+  `close_keyword`); merging the PR/MR auto-closes the story issue in the same
+  project on **both** hosts.
+
+The **GitHub path is unchanged** — a GitHub remote routes every CR verb through
+`gh pr`, byte-for-byte as before. On GitLab everything stays inside **Free/Core**:
+no merge trains, no Premium-only keywords.
 
 ## Choosing the host
 

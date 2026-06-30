@@ -482,9 +482,36 @@ comment` / `glab issue note`) and a `remove_labels=` argument on `issue_update`
 forward rather than accreted.
 
 **GitLab-MR dependency note.** On GitLab the build opens a **Merge Request**, which
-is part of the *separate "Pipeline on GitLab" epic* (Epic-23). Until that ships the
-`Closes #N` close-link lands only on the **GitHub PR** path; the issue-status
-**comments and labels work on both hosts** via the adapter.
+is part of the *separate "Pipeline on GitLab" epic* (Epic-23). The change-request
+adapter below (Story 23.1-001) is the seam that makes that possible; until the
+build loop is wired to it (Story 23.2-001) the `Closes #N` close-link lands only on
+the **GitHub PR** path, while the issue-status **comments and labels work on both
+hosts** via the adapter.
+
+### Change-request adapter — MR/PR operations (Story 23.1-001)
+
+The same code-host adapter that hides issue ops also hides **change-request** ops,
+so the build loop opens / diffs / status-checks / merges a change without knowing
+whether it is a GitHub **Pull Request** or a GitLab **Merge Request**. Every verb
+takes and returns host-neutral values behind a `cr_ref` (the PR *number* / MR
+*iid* as a string) and a `ChangeRequest` record:
+
+| Verb | What it does | `gh pr` | `glab mr` |
+|------|--------------|---------|-----------|
+| `cr_create(source_branch, title, body, target_branch=None, draft=False)` | open a PR/MR for the story branch; `body` carries the `Closes #N` line | `gh pr create --head … [--base …]` | `glab mr create --source-branch … --yes [--target-branch …]` |
+| `cr_diff(ref)` | the unified diff (the adversarial-review feed, Story 23.5-001) | `gh pr diff` | `glab mr diff` |
+| `cr_status(ref)` | the normalised CI signal — the merge gate (Story 23.2-002) polls it | `gh pr view --json statusCheckRollup` | `glab mr view --output json` → `.pipeline.status` |
+| `cr_merge(ref)` | merge the change; the `Closes #N` auto-closes the story issue | `gh pr merge --merge` | `glab mr merge --yes` |
+| `cr_url(ref)` | the change's web URL (offline when the `ChangeRequest` already holds it) | `gh pr view --json url` | `glab mr view --output json` → `.web_url` |
+
+`cr_status` collapses both hosts onto five normalised values — `success`,
+`failed`, `pending`, `none` (no CI signal: no checks, no pipeline, or a
+skipped/neutral one), `unknown` — so the gate logic is identical on either host.
+The host differences the adapter hides are **PR↔MR**, **number↔iid**, and the
+created-CR URL shape (`…/pull/N` vs `…/-/merge_requests/N`). The GitHub path is
+unchanged: a GitHub remote still routes every verb through `gh pr`. Everything
+stays inside GitLab **Free/Core** (no merge trains, no Premium-only keywords). See
+[`docs/issue-host-adapters.md`](issue-host-adapters.md) for the full contract.
 
 Per Epic-12's non-goals there is no `sdlc migrate` verb — migrations apply
 automatically at launch.

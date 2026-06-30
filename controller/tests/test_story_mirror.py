@@ -110,6 +110,22 @@ class FakeHost(IssueHostAdapter):
                      state=data["state"], body=data["body"],
                      labels=tuple(data["labels"]))
 
+    # -- change-request verbs (unused in these issue-mirror tests) --
+    def cr_create(self, source_branch, title, body, target_branch=None, draft=False):  # pragma: no cover - unused here
+        raise NotImplementedError
+
+    def cr_diff(self, ref):  # pragma: no cover - unused here
+        raise NotImplementedError
+
+    def cr_status(self, ref):  # pragma: no cover - unused here
+        raise NotImplementedError
+
+    def cr_merge(self, ref):  # pragma: no cover - unused here
+        raise NotImplementedError
+
+    def cr_url(self, ref):  # pragma: no cover - unused here
+        raise NotImplementedError
+
 
 # --- fixtures ----------------------------------------------------------------
 
