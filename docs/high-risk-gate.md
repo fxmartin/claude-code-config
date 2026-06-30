@@ -15,6 +15,14 @@ Approval is satisfied by **either** of two paths:
   for single-maintainer / personal repos, where there is no org team to check
   and a PR author cannot approve their own PR).
 
+On **GitLab** (Free/Core) there is no `risk-approver` team-review path, so the
+`risk-approved` **label** is the sole maintainer-approval signal — the Free/Core
+equivalent of the GitHub gate's label path (Story 23.5-001). Both gate labels
+(`risk:high` and `risk-approved`) are provisioned on the board by `sdlc issues
+init` on either host, so the approval label always exists for a maintainer to
+apply. The adversarial reviewers feeding the gate source the MR diff host-aware
+via `glab mr diff` (see [adversarial-review.md](adversarial-review.md)).
+
 ## How it works
 
 1. **Detection.** `.github/workflows/risk-gate.yml` runs on every pull request.

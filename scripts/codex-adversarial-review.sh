@@ -8,7 +8,10 @@
 # controller/config/adversarial-reviewers.yaml as the `codex` reviewer and
 # invokes it with `--pr-number {pr_number}`. The wrapper:
 #
-#   1. Fetches the PR diff via `gh pr diff`.
+#   1. Fetches the change-request diff via the host CLI — `gh pr diff` on
+#      GitHub, `glab mr diff` on GitLab (Story 23.5-001). The host comes from
+#      --host / CODEX_ADV_HOST, else is auto-detected from the `origin` remote,
+#      and defaults to GitHub so the existing GitHub path is unchanged.
 #   2. Invokes a Codex review skill (`roast` or `project-review`) via
 #      `codex exec`, instructing it to end with a single fenced ```json block
 #      that conforms to the adversarial-reviewer-response schema.
@@ -20,20 +23,27 @@
 # controller's parse_reviewer_response() accepts it unchanged.
 #
 # Usage:
-#   codex-adversarial-review.sh --pr-number <N> [--reviewer-skill roast|project-review]
+#   codex-adversarial-review.sh --pr-number <N> [--reviewer-skill roast|project-review] [--host github|gitlab]
 #
 # Options:
-#   --pr-number N         PR to review (required; must be a positive integer).
+#   --pr-number N         Change request to review (required; a positive integer).
+#                         The GitHub PR number or the GitLab MR IID.
 #   --reviewer-skill S    Codex review skill: roast (default) or project-review.
 #                         Override per repo via CODEX_ADV_REVIEW_SKILL.
+#   --host H              Code host: github (default) or gitlab. Selects the diff
+#                         source — `gh pr diff` vs `glab mr diff`. When omitted,
+#                         auto-detected from the `origin` remote, falling back to
+#                         github. Override the default via CODEX_ADV_HOST.
 #   -h, --help            Show this help.
 #
 # Environment (testing seams — not for normal use):
 #   CODEX_ADV_RAW_OUTPUT  Path to a captured Codex transcript. When set, the
-#                         wrapper skips `gh`/`codex` and parses this file. CI
-#                         uses it so no real reviewer subprocess runs.
+#                         wrapper skips the host CLI/`codex` and parses this file.
+#                         CI uses it so no real reviewer subprocess runs.
 #   CODEX_ADV_REVIEW_SKILL  Default reviewer skill when --reviewer-skill is
 #                         omitted.
+#   CODEX_ADV_HOST        Default host (github|gitlab) when --host is omitted and
+#                         no `origin` remote resolves.
 #
 # Exit status:
 #   0  emitted a valid reviewer verdict on stdout
@@ -45,6 +55,20 @@ set -euo pipefail
 REVIEWER_NAME="codex"
 VALID_SKILLS=("roast" "project-review")
 VALID_VERDICTS=("approve" "request_changes" "block")
+VALID_HOSTS=("github" "gitlab")
+
+# detect_host — map the `origin` remote to github/gitlab by hostname, mirroring
+# the controller's issue_host.host_from_remote heuristic. Prints github|gitlab,
+# or nothing when the remote is absent/unrecognised (caller then defaults).
+detect_host() {
+  local remote
+  remote="$(git remote get-url origin 2>/dev/null)" || return 0
+  case "${remote}" in
+    *gitlab*) printf 'gitlab' ;;
+    *github*) printf 'github' ;;
+    *) : ;;
+  esac
+}
 
 # die <message> [exit_code]; defaults to exit 2 (usage/environment error).
 die() {
@@ -64,6 +88,7 @@ usage() {
 # --- Parse arguments -------------------------------------------------------
 pr_number=""
 reviewer_skill="${CODEX_ADV_REVIEW_SKILL:-roast}"
+host=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -81,6 +106,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --reviewer-skill=*)
       reviewer_skill="${1#*=}"
+      shift
+      ;;
+    --host)
+      host="${2:-}"
+      shift 2 || die "--host requires a value"
+      ;;
+    --host=*)
+      host="${1#*=}"
       shift
       ;;
     -h | --help)
@@ -111,17 +144,46 @@ if [ "${skill_ok}" -eq 0 ]; then
   die "--reviewer-skill must be one of: ${VALID_SKILLS[*]} (got: ${reviewer_skill})"
 fi
 
+# Resolve the host: explicit --host wins, else auto-detect from the remote, else
+# the CODEX_ADV_HOST default, else github (so the existing GitHub path is the
+# unchanged default).
+if [ -z "${host}" ]; then
+  host="$(detect_host)"
+fi
+if [ -z "${host}" ]; then
+  host="${CODEX_ADV_HOST:-github}"
+fi
+host_ok=0
+for h in "${VALID_HOSTS[@]}"; do
+  [ "${host}" = "${h}" ] && host_ok=1 && break
+done
+if [ "${host_ok}" -eq 0 ]; then
+  die "--host must be one of: ${VALID_HOSTS[*]} (got: ${host})"
+fi
+
 # --- Obtain the Codex review transcript ------------------------------------
 # The test seam short-circuits the real reviewer so CI is hermetic.
 if [ -n "${CODEX_ADV_RAW_OUTPUT:-}" ]; then
   [ -f "${CODEX_ADV_RAW_OUTPUT}" ] || die "CODEX_ADV_RAW_OUTPUT not found: ${CODEX_ADV_RAW_OUTPUT}"
   transcript="$(cat "${CODEX_ADV_RAW_OUTPUT}")"
 else
-  command -v gh >/dev/null 2>&1 || die "gh CLI not found; cannot fetch PR #${pr_number}"
+  # Host adapter: GitHub sources the diff via `gh pr diff`, GitLab via
+  # `glab mr diff`. Both emit a unified diff, so the rest of the pipeline (and
+  # the verdict contract) is identical regardless of host.
+  if [ "${host}" = "gitlab" ]; then
+    host_cli="glab"
+    cr_args=("mr" "diff" "${pr_number}")
+  else
+    host_cli="gh"
+    cr_args=("pr" "diff" "${pr_number}")
+  fi
+
+  command -v "${host_cli}" >/dev/null 2>&1 \
+    || die "${host_cli} CLI not found; cannot fetch change request #${pr_number} on ${host}"
   command -v codex >/dev/null 2>&1 || die "codex CLI not found; cannot run the ${reviewer_skill} skill"
 
-  diff="$(gh pr diff "${pr_number}" 2>/dev/null)" \
-    || die "failed to fetch diff for PR #${pr_number} via gh" 1
+  diff="$("${host_cli}" "${cr_args[@]}" 2>/dev/null)" \
+    || die "failed to fetch diff for change request #${pr_number} via ${host_cli}" 1
 
   prompt="Use ${reviewer_skill} to review pull request #${pr_number}.
 

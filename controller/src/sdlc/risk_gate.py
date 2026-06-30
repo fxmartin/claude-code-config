@@ -29,8 +29,21 @@ OVERRIDE_FILENAME = ".sdlc-risk-config.yaml"
 # The single top-level key both the default config and overrides use.
 PATTERNS_KEY = "high_risk_patterns"
 
-# The GitHub label applied to any PR with a high-risk match.
+# The label applied to any change request with a high-risk match.
 RISK_LABEL = "risk:high"
+
+# The maintainer approval signal for the high-risk gate (Story 8.2-001 GitHub
+# path; Story 23.5-001 GitLab path). A maintainer (write+ access) applying this
+# label clears the gate. On GitLab Free/Core — which has no `risk-approver`
+# team-review path — it is the *only* approval signal, so it must be a
+# first-class board label there. Mirrors `RISK_APPROVED_LABEL` in
+# `.github/workflows/risk-gate.yml`.
+RISK_APPROVED_LABEL = "risk-approved"
+
+# The gate's operational labels, provisioned on the board so both the flag
+# (`risk:high`) and the approval signal (`risk-approved`) always exist for a
+# maintainer to apply — independent of whether a seeded story is high-risk.
+GATE_LABELS = (RISK_LABEL, RISK_APPROVED_LABEL)
 
 
 class RiskGateError(Exception):

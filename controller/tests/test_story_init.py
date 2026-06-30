@@ -234,6 +234,27 @@ def test_init_provisions_taxonomy_labels(tmp_path, host):
     assert {"points:3", "points:2", "points:5", "risk:low", "risk:high"} <= adapter.ensured_labels
 
 
+@pytest.mark.parametrize("host", HOSTS)
+def test_init_provisions_high_risk_gate_labels(tmp_path, host):
+    # Story 23.5-001: the high-risk approval gate is label-based on both hosts.
+    # On GitLab Free/Core there is no `risk-approver` team-review path, so the
+    # maintainer approval signal is the `risk-approved` label exclusively — it
+    # must exist on the board for a maintainer to apply it. Init provisions both
+    # the `risk:high` flag label and the `risk-approved` approval label
+    # unconditionally (not only when a seeded story happens to be high-risk), so
+    # the gate's signals are first-class on a fresh GitHub *and* GitLab board.
+    from sdlc.risk_gate import RISK_APPROVED_LABEL, RISK_LABEL
+
+    _seed_stories(tmp_path)
+    ledger = _ledger(tmp_path)
+    adapter = FakeHost(host)
+
+    init_issues(adapter, ledger, root=tmp_path)
+
+    assert RISK_LABEL in adapter.ensured_labels
+    assert RISK_APPROVED_LABEL in adapter.ensured_labels
+
+
 def test_init_without_provisioning_would_fail_to_create(tmp_path):
     # Guard: with no labels ensured, the fake host rejects issue_create exactly as
     # a real repo does — the regression the missing-provisioning bug produced.

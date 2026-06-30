@@ -9,6 +9,7 @@ from pathlib import Path
 from sdlc.build import Ledger
 from sdlc.discovery import _story_dir, parse_epic_file
 from sdlc.issue_host import IssueHostAdapter
+from sdlc.risk_gate import GATE_LABELS
 from sdlc.story_inventory import project_specs
 from sdlc.story_mirror import MirrorOutcome, mirror_stories
 from sdlc.story_render import parse_story_docs, story_labels
@@ -120,6 +121,12 @@ def init_issues(
             for doc in docs
             for label in story_labels(doc.epic, doc.feature, doc.points, doc.risk)
         }
+        # Story 23.5-001: always provision the high-risk gate's operational
+        # labels (`risk:high` flag + `risk-approved` approval signal), not only
+        # when a seeded story happens to be high-risk. On GitLab Free/Core the
+        # `risk-approved` label is the sole maintainer-approval path, so it must
+        # exist on the board for the gate to be cleared.
+        | set(GATE_LABELS)
     )
     adapter.ensure_labels(labels)
 
