@@ -12,7 +12,7 @@
 
 **What keeps it trustworthy.** Autonomy without controls is just a fast way to make a mess. So every handoff between stages is validated against a strict contract, every run is checkpointed step-by-step (a crash or a closed laptop resumes cleanly), risky changes — CI, install scripts, security-sensitive files — are held for explicit human approval, and long runs ping you on Telegram. The point isn't "AI writes code" — it's a **controlled, auditable, autonomous SDLC** you can leave running and trust the result.
 
-**Where it's heading.** Today it's one operator launching autonomous runs. Next (planned, Epics 22–23) it becomes a *team*: every story mirrored to a shared **GitHub or GitLab** board as the single source of truth, and the pipeline running against GitLab projects too — so several developers, and their autonomous runs, work the same backlog **in parallel and jointly** instead of in separate silos.
+**Where it's heading.** As of **2.0**, the team workflow is live on GitHub: every story is mirrored to a shared **GitHub issue board** as the single source of truth, with a portfolio dashboard showing status and owner across the whole backlog, and status/owner reconciliation keeping the board honest (Epic-22). Still ahead (Epic-23): the same pipeline running against **GitLab** projects too — so several developers, and their autonomous runs, work the same backlog **in parallel and jointly** instead of in separate silos.
 
 ---
 
