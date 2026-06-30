@@ -141,12 +141,17 @@ Codex `autonomous-sdlc` plugin (`nix-install`) so it is on `PATH` wherever Codex
 runs.
 
 ```
-codex-adversarial-review.sh --pr-number <N> [--reviewer-skill roast|project-review]
+codex-adversarial-review.sh --pr-number <N> [--reviewer-skill roast|project-review] [--host github|gitlab]
 ```
 
 What it does:
 
-1. Fetches the PR diff with `gh pr diff <N>`.
+1. Fetches the change-request diff via the host CLI (Story 23.5-001): `gh pr
+   diff <N>` on GitHub, `glab mr diff <N>` on GitLab — `<N>` is the PR number or
+   the MR IID. The host comes from `--host`, else `CODEX_ADV_HOST`, else is
+   auto-detected from the `origin` remote, and **defaults to GitHub** so the
+   existing GitHub path is unchanged. The diff is host-neutral, so the verdict
+   contract the reviewer emits is identical on both hosts.
 2. Runs a Codex review skill via `codex exec` — `roast` by default, or
    `project-review` (choose per repo with `--reviewer-skill`, or set
    `CODEX_ADV_REVIEW_SKILL`). The skill is instructed to end its output with a
@@ -162,9 +167,11 @@ contains no parseable JSON or an out-of-range verdict, the wrapper exits
 non-zero and prints nothing — it fails closed rather than waving a PR through.
 
 The wrapper never shells out during tests: setting `CODEX_ADV_RAW_OUTPUT` to a
-captured transcript file makes it parse that instead of calling `gh`/`codex`,
-which is how the `tests/codex-adversarial-review.bats` suite and the controller
-`test_codex_adversarial_review.py` schema-validity test run hermetically in CI.
+captured transcript file makes it parse that instead of calling the host CLI or
+`codex`, which is how the `tests/codex-adversarial-review.bats` suite and the
+controller `test_codex_adversarial_review.py` schema-validity test run
+hermetically in CI. The host-aware diff path (`gh pr diff` vs `glab mr diff`) is
+covered separately in the bats suite with shimmed host CLIs.
 
 ### Disabling the Codex reviewer
 

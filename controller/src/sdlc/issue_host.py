@@ -441,6 +441,8 @@ def _label_color(name: str) -> str:
         return {"risk:low": "c2e0c6", "risk:medium": "fbca04", "risk:high": "d93f0b"}.get(
             name.lower(), "ededed"
         )
+    if name == "risk-approved":
+        return "0e8a16"  # green — the high-risk gate's maintainer-approval signal
     return "ededed"  # neutral grey
 
 

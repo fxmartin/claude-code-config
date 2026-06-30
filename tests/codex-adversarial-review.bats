@@ -131,3 +131,105 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/codex-adversarial"
     [ "${status}" -eq 0 ]
     [ "$(echo "${output}" | jq -r .reviewer_skill)" = "project-review" ]
 }
+
+# --- Story 23.5-001: host-aware diff sourcing (gh pr diff / glab mr diff) -----
+#
+# These tests exercise the *real* diff-fetch path (no CODEX_ADV_RAW_OUTPUT seam)
+# by shimming fake `gh`, `glab`, and `codex` binaries on PATH that record their
+# argv. The wrapper must source the diff via the host's CLI — `gh pr diff` on
+# GitHub, `glab mr diff` on GitLab — and emit the identical verdict contract on
+# both (verdict parity). GitHub behaviour stays byte-for-byte unchanged.
+
+# Build a temp bin dir with fake gh/glab/codex that log their argv to $ARGLOG.
+_make_host_shims() {
+    SHIMBIN="${BATS_TMPDIR}/shimbin-${BATS_TEST_NUMBER}"
+    ARGLOG="${BATS_TMPDIR}/arglog-${BATS_TEST_NUMBER}"
+    rm -rf "${SHIMBIN}"; mkdir -p "${SHIMBIN}"; : > "${ARGLOG}"
+    for cli in gh glab; do
+        cat > "${SHIMBIN}/${cli}" <<EOF
+#!/usr/bin/env bash
+echo "${cli} \$*" >> "${ARGLOG}"
+# Emit a unified diff for the diff verb so the wrapper has something to review.
+if { [ "\$1" = "pr" ] || [ "\$1" = "mr" ]; } && [ "\$2" = "diff" ]; then
+  printf 'diff --git a/x b/x\n+touched\n'
+fi
+EOF
+        chmod +x "${SHIMBIN}/${cli}"
+    done
+    cat > "${SHIMBIN}/codex" <<'EOF'
+#!/usr/bin/env bash
+cat <<'TRANSCRIPT'
+Reviewed the change.
+```json
+{"reviewer_name":"codex","verdict":"approve","summary":"clean","findings":[]}
+```
+TRANSCRIPT
+EOF
+    chmod +x "${SHIMBIN}/codex"
+}
+
+@test "GitLab host sources the diff via glab mr diff and emits the verdict contract" {
+    _make_host_shims
+    ARGLOG="${ARGLOG}" PATH="${SHIMBIN}:${PATH}" \
+        run bash "${WRAPPER}" --pr-number 42 --host gitlab
+    [ "${status}" -eq 0 ]
+    # Sourced the diff through glab's MR verb (not gh).
+    grep -q '^glab mr diff 42' "${ARGLOG}"
+    ! grep -q '^gh ' "${ARGLOG}"
+    # Same verdict contract as the GitHub path.
+    echo "${output}" | jq -e . > /dev/null
+    [ "$(echo "${output}" | jq -r .reviewer_name)" = "codex" ]
+    [ "$(echo "${output}" | jq -r .verdict)" = "approve" ]
+    [ "$(echo "${output}" | jq -r '.findings | type')" = "array" ]
+}
+
+@test "GitHub host is unchanged: sources the diff via gh pr diff" {
+    _make_host_shims
+    ARGLOG="${ARGLOG}" PATH="${SHIMBIN}:${PATH}" \
+        run bash "${WRAPPER}" --pr-number 7 --host github
+    [ "${status}" -eq 0 ]
+    grep -q '^gh pr diff 7' "${ARGLOG}"
+    ! grep -q '^glab ' "${ARGLOG}"
+    [ "$(echo "${output}" | jq -r .verdict)" = "approve" ]
+}
+
+@test "defaults to the GitHub path when no host is given (back-compat)" {
+    _make_host_shims
+    # Run outside any GitLab remote so auto-detect cannot pick gitlab; the default
+    # must remain the GitHub CLI to keep existing behaviour byte-for-byte.
+    cd "${BATS_TMPDIR}"
+    ARGLOG="${ARGLOG}" PATH="${SHIMBIN}:${PATH}" \
+        run bash "${WRAPPER}" --pr-number 5
+    [ "${status}" -eq 0 ]
+    grep -q '^gh pr diff 5' "${ARGLOG}"
+}
+
+@test "auto-detects GitLab from the origin remote" {
+    _make_host_shims
+    repo="${BATS_TMPDIR}/gl-repo-${BATS_TEST_NUMBER}"
+    rm -rf "${repo}"; mkdir -p "${repo}"
+    git -C "${repo}" init -q
+    git -C "${repo}" remote add origin "https://gitlab.com/acme/widgets.git"
+    cd "${repo}"
+    ARGLOG="${ARGLOG}" PATH="${SHIMBIN}:${PATH}" \
+        run bash "${WRAPPER}" --pr-number 99
+    [ "${status}" -eq 0 ]
+    grep -q '^glab mr diff 99' "${ARGLOG}"
+}
+
+@test "rejects an unknown --host" {
+    run bash "${WRAPPER}" --pr-number 1 --host bitbucket
+    [ "${status}" -eq 2 ]
+    [[ "${output}" == *"host"* ]]
+}
+
+@test "CODEX_ADV_HOST sets the default host when no remote resolves" {
+    _make_host_shims
+    # Run outside any git repo so auto-detect yields nothing and the env default
+    # applies (the documented fallback precedence: --host > remote > env > github).
+    cd "${BATS_TMPDIR}"
+    ARGLOG="${ARGLOG}" CODEX_ADV_HOST="gitlab" PATH="${SHIMBIN}:${PATH}" \
+        run bash "${WRAPPER}" --pr-number 3
+    [ "${status}" -eq 0 ]
+    grep -q '^glab mr diff 3' "${ARGLOG}"
+}
