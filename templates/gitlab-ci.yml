@@ -49,6 +49,9 @@ secrets-scan:
 shellcheck:
   stage: lint
   image: koalaman/shellcheck-alpine:stable
+  before_script:
+    # The shellcheck-alpine image ships no git; `git ls-files` below needs it.
+    - apk add --no-cache git
   script:
     # Severity floor matches the GitHub static-checks job.
     - shellcheck --severity=warning $(git ls-files '*.sh')
