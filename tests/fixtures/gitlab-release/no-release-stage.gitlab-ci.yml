@@ -1,0 +1,16 @@
+# Fixture (Story 23.4-001): declares a `stages:` list and the publish-release
+# job, but the list omits the `release` stage — the validator must reject it.
+stages:
+  - build
+  - test
+
+publish-release:
+  stage: build
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: '$CI_COMMIT_TITLE =~ /^chore\(release\):/'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - result="$(bash scripts/compute-release.sh v0.0.0 < /dev/null)"
+    - release-cli create --name v1.0.0 --tag-name v1.0.0 --ref "${CI_COMMIT_SHA}"

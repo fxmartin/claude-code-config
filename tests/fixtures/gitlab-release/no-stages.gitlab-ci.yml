@@ -1,0 +1,12 @@
+# Fixture (Story 23.4-001): a valid YAML mapping with a publish-release job but
+# no top-level `stages:` key — the validator must reject the missing key.
+publish-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: '$CI_COMMIT_TITLE =~ /^chore\(release\):/'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - result="$(bash scripts/compute-release.sh v0.0.0 < /dev/null)"
+    - release-cli create --name v1.0.0 --tag-name v1.0.0 --ref "${CI_COMMIT_SHA}"
