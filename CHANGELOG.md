@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.6.0] - 2026-06-30
+
+### Added
+
+- feat(pipeline-on-gitlab): `glab mr diff` adversarial (#23.5-001)
+
+
 ## [v2.5.0] - 2026-06-30
 
 ### Added
