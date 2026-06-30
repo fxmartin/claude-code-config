@@ -640,6 +640,16 @@ def doctor(
     as_json: bool = typer.Option(
         False, "--json", help="Emit the report as a JSON object."
     ),
+    gitlab: bool = typer.Option(
+        False,
+        "--gitlab",
+        help="Also run the GitLab adoption preflight (glab auth, project, CI, gate template).",
+    ),
+    target: Path | None = typer.Option(
+        None,
+        "--target",
+        help="Target repo root for the GitLab preflight (default: cwd).",
+    ),
 ) -> None:
     """Check the install and run state, reporting a remedy for each problem.
 
@@ -648,6 +658,11 @@ def doctor(
     a dead pid or no recent activity), config validity (settings/schemas parse),
     and dependency availability (gh, claude, semgrep, osv-scanner). Each finding
     reports CLEAN/WARN/FAIL plus the command or doc that fixes it.
+
+    ``--gitlab`` additionally runs the GitLab adoption preflight against
+    ``--target`` (default: cwd): glab installed/authenticated, the project +
+    default branch exist, CI is enabled, and the `.gitlab-ci.yml` gate template is
+    present (Story 23.6-002). See docs/gitlab-adoption.md for the worked example.
 
     Always exits 0 by default so it is safe to run anywhere; ``--exit-code`` makes
     a WARN exit 1 and a FAIL exit 2 so a wrapping script can gate on health.
@@ -659,6 +674,12 @@ def doctor(
         claude_dir=claude_dir,
         db_path=db,
     )
+
+    if gitlab:
+        from sdlc.gitlab_preflight import run_gitlab_preflight
+
+        preflight = run_gitlab_preflight(repo_root=target or Path.cwd())
+        report.findings.extend(preflight.findings)
 
     if as_json:
         typer.echo(json.dumps(report.to_dict(), default=str))

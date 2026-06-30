@@ -356,6 +356,23 @@ no-secret-committed tripwire: a hardcoded PAT in tracked source is flagged, whil
 an env reference (`$CI_JOB_TOKEN`, `${GITLAB_TOKEN}`) passes clean — so the
 "read the token from a CI/CD variable" pattern is the only one that survives.
 
+## Adopt a GitLab project — preflight (Story 23.6-002)
+
+Before the first build against a company GitLab repo, run the **adoption
+preflight** so a run never fails halfway on a missing prerequisite:
+
+```bash
+sdlc doctor --gitlab [--target PATH]   # add --exit-code to gate automation
+```
+
+It extends the Epic-15 `sdlc doctor` health-check with four GitLab-target checks
+— glab installed/authenticated, the project + default branch resolve, CI/CD is
+enabled, and the [`.gitlab-ci.yml` gate template](gitlab-ci-template.md) is
+present — each reporting a `CLEAN`/`WARN`/`FAIL` and the remedy. The full
+zero-to-green-MR walkthrough is in
+[**gitlab-adoption.md**](gitlab-adoption.md)
+([`controller/src/sdlc/gitlab_preflight.py`](../controller/src/sdlc/gitlab_preflight.py)).
+
 ## Testing
 
 Every adapter takes an injectable **`runner`** (`Runner = Callable[[argv],
