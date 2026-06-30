@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.9.0] - 2026-06-30
+
+### Added
+
+- feat(pipeline-on-gitlab): gitlab release flow (semver tag (#23.4-001)
+
+### Fixed
+
+- fix(pipeline-on-gitlab): detect host by hostname, not the repo path
+
+
 ## [v2.8.0] - 2026-06-30
 
 ### Added
