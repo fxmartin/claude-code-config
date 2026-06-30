@@ -58,7 +58,16 @@ from sdlc.model_routing import (
 from sdlc.notify import notify
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
 from sdlc.rate_limit import RateLimitSignal, WindowQuota, seconds_until_reset, within_wait_cap
-from sdlc.issue_host import GITHUB_CR_TERMS, ChangeRequestTerms, IssueHostAdapter
+from sdlc.issue_host import (
+    CR_FAILED,
+    CR_NONE,
+    CR_PENDING,
+    CR_SUCCESS,
+    CR_UNKNOWN,
+    GITHUB_CR_TERMS,
+    ChangeRequestTerms,
+    IssueHostAdapter,
+)
 from sdlc.registry import Registry, RunRecord
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -516,6 +525,19 @@ class BuildOptions:
     # eagerly from ``--harness=`` and resolved/validated against the registry in
     # the CLI preflight so an unknown/disabled harness fails fast (no half-run).
     harness_map: dict[str, str] = field(default_factory=dict)
+    # Story 23.2-002: gate the merge on the change request's CI/pipeline status.
+    # Before the merge stage dispatches, the controller polls the CR's normalised
+    # CI status (the `gh pr` check rollup / the GitLab MR pipeline, via the
+    # adapter) and only proceeds on green — a red/timed-out pipeline routes the
+    # story into the bugfix loop, exactly as a failed merge does. ``ci_gate_timeout_s``
+    # bounds the poll so a never-finishing pipeline can never hang the run (0 = a
+    # single status read, no wait); ``ci_gate_poll_s`` is the between-poll
+    # interval; ``ci_gate_no_ci`` degrades a project with *no* CI signal — ``allow``
+    # warns and merges (today's behaviour), ``deny`` blocks. The gate is a no-op for
+    # a story with no host mapping or no CR ref, so the unmapped path is unchanged.
+    ci_gate_timeout_s: int = 1800
+    ci_gate_poll_s: int = 30
+    ci_gate_no_ci: str = "allow"
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -1043,6 +1065,25 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
             if cap < 0:
                 raise ValueError(f"--thinking-cap must be non-negative: {arg}")
             opts.thinking_cap = cap
+        elif arg.startswith("--ci-gate-timeout="):
+            # Story 23.2-002: bounded poll for the merge CI gate (seconds).
+            # 0 = a single status read with no wait; negative is nonsense.
+            timeout = int(arg.split("=", 1)[1])
+            if timeout < 0:
+                raise ValueError(f"--ci-gate-timeout must be non-negative: {arg}")
+            opts.ci_gate_timeout_s = timeout
+        elif arg.startswith("--ci-gate-poll="):
+            poll = int(arg.split("=", 1)[1])
+            if poll < 0:
+                raise ValueError(f"--ci-gate-poll must be non-negative: {arg}")
+            opts.ci_gate_poll_s = poll
+        elif arg.startswith("--ci-gate-no-ci="):
+            policy = arg.split("=", 1)[1]
+            if policy not in {"allow", "deny"}:
+                raise ValueError(
+                    f"invalid --ci-gate-no-ci: {policy} (expected allow|deny)"
+                )
+            opts.ci_gate_no_ci = policy
         elif arg.startswith("--rate-limit-max-wait="):
             wait = int(arg.split("=", 1)[1])
             if wait < 0:
@@ -2928,6 +2969,143 @@ def render_merge_prompt(story: Story, pr_number: int | None) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Story 23.2-002: gate the merge on the change request's CI/pipeline status
+# ---------------------------------------------------------------------------
+
+# The gate's three verdicts. ``pass`` lets the merge stage dispatch; ``block``
+# routes the story into the bugfix loop (a red/timed-out pipeline is a fixable
+# failure, never a silent merge); ``skip`` means there is nothing host-side to
+# gate on (no mapping / no CR ref / unresolvable status) so the merge proceeds
+# exactly as today — the unmapped path stays byte-identical.
+_GATE_PASS = "pass"
+_GATE_BLOCK = "block"
+_GATE_SKIP = "skip"
+
+
+@dataclass(frozen=True)
+class _MergeCIGate:
+    """The outcome of polling a change request's CI status before merge (Story 23.2-002)."""
+
+    verdict: str  # _GATE_PASS | _GATE_BLOCK | _GATE_SKIP
+    status: str | None  # the CR_* status observed (None when unresolvable)
+    reason: str
+    polls: int
+    waited_s: float
+
+
+def _poll_cr_status(
+    status_fn: Callable[[], str | None],
+    *,
+    timeout_s: float,
+    poll_s: float,
+    sleep_fn: Callable[[float], None],
+    clock: Callable[[], float],
+) -> tuple[str | None, int, float]:
+    """Poll ``status_fn`` until the pipeline finishes or the bounded timeout lapses.
+
+    Story 23.2-002 AC1: an open MR/PR with a running pipeline is polled until it
+    flips to a terminal status. Returns ``(status, polls, waited_s)``. A status
+    other than :data:`CR_PENDING` returns immediately; while pending it sleeps
+    ``poll_s`` (clamped so the cumulative wait never overshoots ``timeout_s``) and
+    re-reads, returning :data:`CR_PENDING` once the deadline passes so the caller
+    treats a never-finishing pipeline as a timeout rather than hanging. ``clock``
+    and ``sleep_fn`` are injected so the wait is deterministic under test.
+    """
+    start = clock()
+    polls = 0
+    while True:
+        status = status_fn()
+        polls += 1
+        if status != CR_PENDING:
+            return status, polls, clock() - start
+        elapsed = clock() - start
+        if elapsed >= timeout_s:
+            return CR_PENDING, polls, elapsed
+        sleep_fn(min(poll_s, max(0.0, timeout_s - elapsed)))
+
+
+def _evaluate_ci_gate(status: str | None, *, no_ci_policy: str) -> tuple[str, str]:
+    """Map a terminal CI ``status`` (+ the no-CI policy) to a gate ``(verdict, reason)``.
+
+    Story 23.2-002: a green pipeline passes (AC3); a failed/unknown/timed-out
+    (still-pending) pipeline blocks the merge (AC1/AC2); a resolved-but-absent CI
+    signal (:data:`CR_NONE`) degrades per ``no_ci_policy`` — ``allow`` warns and
+    merges, ``deny`` blocks (AC4); an unresolvable status (None — unmapped story
+    or a host error) skips the gate so the merge path is unchanged.
+    """
+    if status is None:
+        return _GATE_SKIP, "no resolvable CI source (unmapped or host error) — gate skipped"
+    if status == CR_SUCCESS:
+        return _GATE_PASS, "pipeline passed"
+    if status in (CR_FAILED, CR_UNKNOWN):
+        return _GATE_BLOCK, f"pipeline {status} — merge blocked"
+    if status == CR_PENDING:
+        return _GATE_BLOCK, "pipeline still running at timeout — merge blocked"
+    if status == CR_NONE:
+        if no_ci_policy == "deny":
+            return _GATE_BLOCK, "no CI configured — denied by --ci-gate-no-ci=deny"
+        return _GATE_PASS, "no CI configured — allowed by --ci-gate-no-ci=allow"
+    return _GATE_BLOCK, f"unexpected CI status {status!r} — merge blocked"
+
+
+def _run_merge_ci_gate(
+    stage: str,
+    ledger: Ledger,
+    run_id: str,
+    story: Story,
+    pr_number: int | None,
+    opts: BuildOptions,
+    *,
+    status_fn: Callable[[], str | None] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> _MergeCIGate | None:
+    """Poll the merge stage's CR pipeline and decide whether the merge may proceed.
+
+    Story 23.2-002: the host-neutral analogue of ``gh pr checks``. Returns None
+    (a no-op) for any stage other than ``merge`` or when the story has no recorded
+    CR ref, so non-merge stages and unmapped stories are unchanged. Otherwise it
+    polls the CR's normalised CI status — via :func:`build_issue.change_request_status`
+    by default, or the injected ``status_fn`` under test — within
+    ``opts.ci_gate_timeout_s``, evaluates the gate, records the outcome in the
+    ledger events, and returns the :class:`_MergeCIGate`. A ``_GATE_BLOCK`` tells
+    the caller to route the story into the bugfix loop instead of merging.
+    """
+    if stage != "merge" or pr_number is None:
+        return None
+    sleep_fn = sleep_fn or time.sleep
+    clock = clock or time.monotonic
+
+    def _default_status() -> str | None:
+        return build_issue.change_request_status(ledger, story.id, pr_number)
+
+    status, polls, waited = _poll_cr_status(
+        status_fn or _default_status,
+        timeout_s=opts.ci_gate_timeout_s,
+        poll_s=opts.ci_gate_poll_s,
+        sleep_fn=sleep_fn,
+        clock=clock,
+    )
+    verdict, reason = _evaluate_ci_gate(status, no_ci_policy=opts.ci_gate_no_ci)
+    # A no-CI allow is a notable warning (the merge ships ungated), a block is an
+    # error, a clean pass/skip is informational.
+    if verdict == _GATE_BLOCK:
+        level = "error"
+    elif verdict == _GATE_PASS and status == CR_NONE:
+        level = "warn"
+    else:
+        level = "info"
+    ledger.event_log(
+        run_id, story.id, level, "controller",
+        f"merge CI gate: {reason} (status={status}, polls={polls}, "
+        f"waited={int(waited)}s, cr=#{pr_number})",
+    )
+    return _MergeCIGate(
+        verdict=verdict, status=status, reason=reason, polls=polls, waited_s=waited
+    )
+
+
 def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
     # Story 12.2-004: the bugfix agent commits its fix (linted mid-loop), so give
     # it a commitlint-compliant header by construction too.
@@ -4574,11 +4752,23 @@ def _run_story(
                     "failed attempt(s) (Story 14.2-003 cheap-first)",
                 )
             try:
-                ok, result, failure, kind = _dispatch_stage(
-                    stage, story, opts, pr_number, dispatch, tpath,
-                    on_progress=sink, escalation_steps=escalation_steps,
-                    close_link=close_link, cr_terms=cr_terms, base_ref=base_ref,
+                # Story 23.2-002: gate the merge on the CR's CI/pipeline status.
+                # A red/timed-out pipeline is a synthetic stage failure (kind
+                # ``ci-gate``) so the existing bugfix loop tries to fix it before a
+                # retry re-polls; a green/no-CI-allow/unmapped gate falls through to
+                # the normal merge dispatch. The gate is a no-op for non-merge
+                # stages, so build/coverage/review are unchanged.
+                gate = _run_merge_ci_gate(
+                    stage, ledger, run_id, story, pr_number, opts
                 )
+                if gate is not None and gate.verdict == _GATE_BLOCK:
+                    ok, result, failure, kind = False, None, gate.reason, "ci-gate"
+                else:
+                    ok, result, failure, kind = _dispatch_stage(
+                        stage, story, opts, pr_number, dispatch, tpath,
+                        on_progress=sink, escalation_steps=escalation_steps,
+                        close_link=close_link, cr_terms=cr_terms, base_ref=base_ref,
+                    )
                 if ok:
                     ledger.stage_finish(
                         run_id, story.id, stage, attempt, "DONE", output_path=str(tpath)
