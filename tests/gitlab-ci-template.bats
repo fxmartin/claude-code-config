@@ -104,9 +104,17 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/gitlab-ci"
 }
 
 @test "validator surfaces an environment error when no YAML parser is available" {
-    # Neither uv nor a PyYAML-capable python3 on PATH — the py_run helper must
-    # report that it needs one rather than silently mis-parsing the template.
-    run env PATH=/usr/bin:/bin bash "${VALIDATOR}" "${TEMPLATE}"
+    # Neither uv nor a PyYAML-capable python3 — the py_run helper must report that
+    # it needs one rather than silently mis-parsing the template. Stripping PATH
+    # alone is not portable: CI's /usr/bin/python3 ships PyYAML (a dev Mac's may
+    # not), so shadow python3 with a stub that fails `import yaml` to force the
+    # else branch deterministically, while keeping /usr/bin:/bin for `uv` absence
+    # and the script's other tools.
+    local stubdir="${BATS_TEST_TMPDIR}/nopyyaml"
+    mkdir -p "${stubdir}"
+    printf '#!/bin/sh\nexit 1\n' > "${stubdir}/python3"
+    chmod +x "${stubdir}/python3"
+    run env PATH="${stubdir}:/usr/bin:/bin" bash "${VALIDATOR}" "${TEMPLATE}"
     [ "${status}" -ne 0 ]
     [[ "${output}" == *"need uv or a python3 with PyYAML"* ]]
 }
