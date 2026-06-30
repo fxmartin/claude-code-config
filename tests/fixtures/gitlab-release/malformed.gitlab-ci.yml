@@ -1,0 +1,6 @@
+# Fixture (Story 23.4-001): malformed YAML — unbalanced/invalid mapping.
+stages:
+  - release
+publish-release:
+    : this is not valid yaml
+  script: [unclosed

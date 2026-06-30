@@ -1,0 +1,13 @@
+# Fixture (Story 23.4-001): triggers on merge-request pipelines and never scopes
+# to the default branch — the validator must reject it (releases on every MR).
+stages:
+  - release
+
+publish-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - result="$(bash scripts/compute-release.sh v0.0.0 < /dev/null)"
+    - release-cli create --name v1.0.0 --tag-name v1.0.0 --ref "${CI_COMMIT_SHA}"

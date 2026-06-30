@@ -1,0 +1,4 @@
+# Fixture (Story 23.4-001): valid YAML whose top level is a sequence, not a
+# mapping of jobs/keywords — the validator must reject it as not valid.
+- release
+- publish-release

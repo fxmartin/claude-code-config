@@ -1,0 +1,16 @@
+# Fixture (Story 23.4-001): re-implements the bump inline instead of reusing the
+# shared Epic-05 bumper script — the validator must reject the fork.
+stages:
+  - release
+
+publish-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: '$CI_COMMIT_TITLE =~ /^chore\(release\):/'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    # Forked bump logic — not the shared bumper.
+    - version="v9.9.9"
+    - release-cli create --name "${version}" --tag-name "${version}" --ref "${CI_COMMIT_SHA}"
