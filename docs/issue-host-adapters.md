@@ -267,6 +267,50 @@ There is **no shared bot token**: identity is each contributor's own `gh`/`glab`
 auth, so attribution is real. A shared token is discouraged — it collapses
 attribution into one actor.
 
+## Auth & CI tokens (Story 23.6-001)
+
+Auth has two lanes — a **local** lane for developer-driven runs and a **CI** lane
+for jobs that run on a runner ([`controller/src/sdlc/host_auth.py`](../controller/src/sdlc/host_auth.py)).
+
+**Local runs** act as the developer. `resolve_local_login(adapter)` verifies the
+`gh`/`glab` CLI is installed and authenticated and returns the login — the same
+`ensure_ready` the mirror uses, so a local GitLab run uses the developer's
+`glab auth` identity (and `whoami` for attribution, per the section above). No
+token is read from the environment or a file; an unauthenticated CLI fails fast
+with the host's own `gh auth login` / `glab auth login` hint.
+
+**CI-side actions** (release, pipeline status) have no interactive login, so
+`resolve_ci_token(host, env)` reads a token from the process environment in
+priority order — **never from a committed file**:
+
+| Host | Env vars (priority order) |
+|------|---------------------------|
+| GitLab | `GITLAB_TOKEN` → `GL_TOKEN` → `CI_JOB_TOKEN` |
+| GitHub | `GH_TOKEN` → `GITHUB_TOKEN` |
+
+On GitLab, prefer a **project access token** or a masked CI/CD variable
+(`GITLAB_TOKEN`); the runner-injected, job-scoped `CI_JOB_TOKEN` is the fallback
+of last resort. A defined-but-blank variable is treated as absent, so an empty
+CI/CD variable never shadows a real token further down the list.
+
+**Minimal token scopes** (`token_scopes(host)`) — provision a least-privilege
+project access token, not an owner PAT:
+
+| Host | Scopes | Covers |
+|------|--------|--------|
+| GitLab | `api`, `write_repository` | release + MR pipeline status (`api`); the version tag push (`write_repository`) |
+| GitHub | `repo` | the equivalent grant |
+
+**Same protections, both hosts** (Epic-13). A `CiToken`'s `value` is excluded
+from its `repr`/`str` so the secret never lands in a traceback, log, or ledger
+record — only the `host` and the `source` env-var name are shown. `redact(text,
+*secrets)` masks both known credential shapes (GitHub `ghp_…` / `github_pat_…`,
+GitLab `glpat-…`) and any explicit literal a caller passes (for a shapeless
+`CI_JOB_TOKEN`) before anything is logged. `find_committed_tokens(text)` is the
+no-secret-committed tripwire: a hardcoded PAT in tracked source is flagged, while
+an env reference (`$CI_JOB_TOKEN`, `${GITLAB_TOKEN}`) passes clean — so the
+"read the token from a CI/CD variable" pattern is the only one that survives.
+
 ## Testing
 
 Every adapter takes an injectable **`runner`** (`Runner = Callable[[argv],
