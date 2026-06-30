@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.8.0] - 2026-06-30
+
+### Added
+
+- feat(pipeline-on-gitlab): "adopt a gitlab project" guide + (#23.6-002)
+
+
 ## [v2.7.0] - 2026-06-30
 
 ### Added
