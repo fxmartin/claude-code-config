@@ -1,5 +1,5 @@
-# ABOUTME: Tests for github_stats — GitHub repo-health fetch + per-slug TTL cache.
-# ABOUTME: Story 11.2-006; all gh calls are stubbed, so there is no live `gh` dependency.
+# ABOUTME: Tests for github_stats — GitHub + GitLab repo-health fetch + per-slug TTL cache.
+# ABOUTME: Story 11.2-006 / 23.7-001; all gh/glab calls are stubbed, so there is no live CLI dependency.
 
 from __future__ import annotations
 
@@ -65,6 +65,13 @@ def test_unavailable_shape() -> None:
         assert s[k] is None
 
 
+def test_unavailable_carries_host_for_wording() -> None:
+    # Story 23.7-001: the sentinel names its forge so the client renders
+    # host-appropriate wording ("GitLab unavailable" vs "GitHub unavailable").
+    assert gh.unavailable("o/r", "glab-unavailable", host=gh.GITLAB)["host"] == gh.GITLAB
+    assert gh.unavailable(None, "no-remote")["host"] is None
+
+
 # --- fetch_stats with a stubbed gh runner -----------------------------------
 
 
@@ -97,6 +104,7 @@ def test_fetch_stats_happy_path(monkeypatch) -> None:
     s = gh.fetch_stats("owner/repo")
     assert s["available"] is True
     assert s["slug"] == "owner/repo"
+    assert s["host"] == gh.GITHUB
     assert s["issues_open"] == 7 and s["issues_closed"] == 120
     assert s["prs_open"] == 3 and s["prs_closed"] == 88
     assert s["ci_status"] == "success" and s["ci_branch"] == "main"
@@ -165,6 +173,141 @@ def test_count_none_on_non_numeric() -> None:
     assert gh._count("not-a-number") is None
 
 
+# --- GitLab fetch (Story 23.7-001) ------------------------------------------
+
+
+def _stub_glab(monkeypatch, mapping):
+    """Stub ``_run_glab`` so a (args→stdout) mapping drives the GitLab fetch.
+
+    Matches the first needle that is a substring of the joined args (insertion
+    order), so list the more-specific endpoints (``pipelines``) first; value
+    None simulates a failing call.
+    """
+    def fake(args, timeout=gh._GH_TIMEOUT):
+        joined = " ".join(args)
+        for needle, out in mapping.items():
+            if needle in joined:
+                return out
+        return None
+    monkeypatch.setattr(gh, "_run_glab", fake)
+
+
+def test_normalize_gitlab_ci_maps_statuses() -> None:
+    p = {"status": "success", "ref": "main", "created_at": "2026-06-20T10:00:00Z"}
+    assert gh.normalize_gitlab_ci(p) == {
+        "status": "success", "branch": "main", "created_at": "2026-06-20T10:00:00Z"}
+    assert gh.normalize_gitlab_ci({"status": "failed"})["status"] == "failure"
+    assert gh.normalize_gitlab_ci({"status": "canceled"})["status"] == "cancelled"
+    assert gh.normalize_gitlab_ci({"status": "running"})["status"] == "in_progress"
+    assert gh.normalize_gitlab_ci({"status": "weird"})["status"] == "unknown"
+
+
+def test_normalize_gitlab_ci_none() -> None:
+    assert gh.normalize_gitlab_ci(None) is None
+    assert gh.normalize_gitlab_ci({}) is None  # no status → no CI signal
+
+
+def test_fetch_gitlab_stats_happy_path(monkeypatch) -> None:
+    pipeline = json.dumps([{"status": "success", "ref": "main",
+                            "created_at": "2026-06-20T10:00:00Z"}])
+    _stub_glab(monkeypatch, {
+        "pipelines?ref=main": pipeline,               # most specific first
+        "projects/owner%2Frepo": json.dumps({"default_branch": "main"}),
+        "issue list -R owner/repo --closed": json.dumps([{}, {}]),   # 2 closed
+        "issue list -R owner/repo --output": json.dumps([{}, {}, {}]),  # 3 open
+        "mr list -R owner/repo --closed": json.dumps([{}]),          # 1 closed
+        "mr list -R owner/repo --output": json.dumps([]),            # 0 open
+    })
+    s = gh.fetch_stats("owner/repo", host=gh.GITLAB)
+    assert s["available"] is True
+    assert s["slug"] == "owner/repo" and s["host"] == gh.GITLAB
+    assert s["issues_open"] == 3 and s["issues_closed"] == 2
+    assert s["prs_open"] == 0 and s["prs_closed"] == 1
+    assert s["ci_status"] == "success" and s["ci_branch"] == "main"
+    assert s["ci_created_at"] == "2026-06-20T10:00:00Z"
+
+
+def test_fetch_gitlab_stats_all_calls_fail_is_unavailable(monkeypatch) -> None:
+    # glab absent / unauthenticated → every call returns None → unavailable.
+    _stub_glab(monkeypatch, {})
+    s = gh.fetch_stats("owner/repo", host=gh.GITLAB)
+    assert s["available"] is False
+    assert s["reason"] == "glab-unavailable" and s["host"] == gh.GITLAB
+
+
+def test_fetch_gitlab_stats_counts_ok_but_no_pipeline(monkeypatch) -> None:
+    # Counts resolve, default branch resolves, but there is no pipeline yet.
+    _stub_glab(monkeypatch, {
+        "pipelines?ref=main": "[]",
+        "projects/owner%2Frepo": json.dumps({"default_branch": "main"}),
+        "issue list -R owner/repo --closed": "[]",
+        "issue list -R owner/repo --output": json.dumps([{}]),
+        "mr list -R owner/repo --closed": "[]",
+        "mr list -R owner/repo --output": "[]",
+    })
+    s = gh.fetch_stats("owner/repo", host=gh.GITLAB)
+    assert s["available"] is True
+    assert s["issues_open"] == 1
+    assert s["ci_status"] is None and s["ci_branch"] is None
+
+
+def test_fetch_stats_gitlab_no_slug_is_no_remote() -> None:
+    s = gh.fetch_stats(None, host=gh.GITLAB)
+    assert s["available"] is False and s["reason"] == "no-remote"
+    assert s["host"] == gh.GITLAB
+
+
+def test_run_glab_returns_none_on_oserror(monkeypatch) -> None:
+    def boom(*a, **k):
+        raise OSError("glab not installed")
+    monkeypatch.setattr(gh.subprocess, "run", boom)
+    assert gh._run_glab(["issue", "list"]) is None
+
+
+def test_run_glab_returns_stdout_on_success(monkeypatch) -> None:
+    class R:
+        returncode = 0
+        stdout = "[]\n"
+    monkeypatch.setattr(gh.subprocess, "run", lambda *a, **k: R())
+    assert gh._run_glab(["mr", "list"]) == "[]\n"
+
+
+def test_run_glab_returns_none_on_nonzero(monkeypatch) -> None:
+    # Unauthenticated / no such project → non-zero exit → None, not a raise.
+    class R:
+        returncode = 1
+        stdout = ""
+    monkeypatch.setattr(gh.subprocess, "run", lambda *a, **k: R())
+    assert gh._run_glab(["issue", "list"]) is None
+
+
+def test_json_len_none_on_malformed_or_non_list() -> None:
+    assert gh._json_len("not-json") is None
+    assert gh._json_len(json.dumps({"a": 1})) is None  # object, not array
+
+
+def test_gitlab_default_branch_none_on_malformed_json(monkeypatch) -> None:
+    _stub_glab(monkeypatch, {"projects/owner%2Frepo": "not-json"})
+    assert gh._gitlab_default_branch("owner/repo") is None
+
+
+def test_fetch_gitlab_ci_none_when_pipelines_call_fails(monkeypatch) -> None:
+    # Default branch resolves but the pipelines call itself fails → no CI signal.
+    _stub_glab(monkeypatch, {
+        "pipelines?ref=main": "",                     # most specific first
+        "projects/owner%2Frepo": json.dumps({"default_branch": "main"}),
+    })
+    assert gh._fetch_gitlab_ci("owner/repo") is None
+
+
+def test_fetch_gitlab_ci_none_on_malformed_pipelines_json(monkeypatch) -> None:
+    _stub_glab(monkeypatch, {
+        "pipelines?ref=main": "not-json",             # most specific first
+        "projects/owner%2Frepo": json.dumps({"default_branch": "main"}),
+    })
+    assert gh._fetch_gitlab_ci("owner/repo") is None
+
+
 # --- per-slug TTL cache, off the request path -------------------------------
 
 
@@ -184,7 +327,7 @@ def _sync_spawn(fn):
 def test_cache_fetches_once_and_serves_cached() -> None:
     calls = []
 
-    def fetcher(slug):
+    def fetcher(slug, host):
         calls.append(slug)
         return {"available": True, "slug": slug, "issues_open": len(calls)}
 
@@ -202,7 +345,7 @@ def test_cache_fetches_once_and_serves_cached() -> None:
 def test_cache_refetches_after_ttl() -> None:
     calls = []
 
-    def fetcher(slug):
+    def fetcher(slug, host):
         calls.append(slug)
         return {"available": True, "slug": slug, "issues_open": len(calls)}
 
@@ -217,7 +360,7 @@ def test_cache_refetches_after_ttl() -> None:
 def test_cache_dedups_per_slug() -> None:
     calls = []
 
-    def fetcher(slug):
+    def fetcher(slug, host):
         calls.append(slug)
         return {"available": True, "slug": slug}
 
@@ -229,10 +372,26 @@ def test_cache_dedups_per_slug() -> None:
     assert sorted(calls) == ["a/one", "b/two"]
 
 
+def test_cache_keys_by_host_and_slug() -> None:
+    # Story 23.7-001: the same slug on different forges is different data, so the
+    # cache keys on (host, slug) and passes the host through to the fetcher.
+    calls = []
+
+    def fetcher(slug, host):
+        calls.append((slug, host))
+        return {"available": True, "slug": slug, "host": host}
+
+    cache = gh.GitHubStatsCache(ttl=60.0, fetcher=fetcher, clock=_Clock(), spawn=_sync_spawn)
+    assert cache.get("o/r", gh.GITHUB)["host"] == gh.GITHUB
+    assert cache.get("o/r", gh.GITLAB)["host"] == gh.GITLAB
+    cache.get("o/r", gh.GITHUB)  # cached — no third fetch
+    assert calls == [("o/r", gh.GITHUB), ("o/r", gh.GITLAB)]
+
+
 def test_cache_none_slug_no_fetch() -> None:
     calls = []
     cache = gh.GitHubStatsCache(
-        ttl=60.0, fetcher=lambda s: calls.append(s), clock=_Clock(), spawn=_sync_spawn
+        ttl=60.0, fetcher=lambda s, h: calls.append(s), clock=_Clock(), spawn=_sync_spawn
     )
     s = cache.get(None)
     assert s["available"] is False and s["reason"] == "no-remote"
@@ -249,7 +408,7 @@ def test_cache_default_uses_background_thread() -> None:
     release = threading.Event()
     started = threading.Event()
 
-    def fetcher(slug):
+    def fetcher(slug, host):
         started.set()
         release.wait(timeout=5.0)  # hold the fetch open while we prove get() returned
         return {"available": True, "slug": slug, "issues_open": 9}
