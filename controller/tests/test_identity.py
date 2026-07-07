@@ -63,7 +63,8 @@ def test_resolve_actor_github_returns_login() -> None:
 
 
 def test_resolve_actor_gitlab_returns_login() -> None:
-    runner = FakeRunner({"api user": (0, "rootuser\n", "")})
+    # Raw `glab api user` JSON — the adapter extracts .username itself.
+    runner = FakeRunner({"api user": (0, '{"id": 1, "username": "rootuser"}\n', "")})
     assert resolve_actor(ih.GitLabAdapter(runner=runner)) == "rootuser"
 
 
