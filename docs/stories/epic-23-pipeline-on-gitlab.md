@@ -42,7 +42,7 @@ merged change) is GitHub-only. This unlocks the corporate-standard host end to e
 
 ## Epic Scope
 
-**Total Stories**: 9 | **Total Points**: 39 | **MVP Stories**: 0 (roadmap — Should Have)
+**Total Stories**: 10 | **Total Points**: 42 | **MVP Stories**: 0 (roadmap — Should Have)
 
 ## Out of Scope (Non-Goals)
 
