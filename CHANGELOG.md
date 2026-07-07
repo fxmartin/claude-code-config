@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.9.1] - 2026-07-07
+
+### Fixed
+
+- fix(issue-host): glab api has no --jq, parse username in python
+
+
 ## [v2.9.0] - 2026-06-30
 
 ### Added
