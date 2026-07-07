@@ -324,6 +324,42 @@ Epic-22 board setup so issues and the pipeline align.
 **Dependencies**: 23.2-003, 23.3-001
 **Risk Level**: Low
 
+### Feature 23.7: Forge-agnostic dashboard
+
+Make the dashboard's repo-health surface host-aware so a GitLab project shows
+GitLab health instead of "GitHub unavailable".
+
+#### Stories
+
+##### Story 23.7-001: Forge-agnostic dashboard repo-health surface
+**User Story**: As FX running the dashboard against a GitLab project, I want the repo-health badge/panel to
+show GitLab issue/MR/pipeline health instead of "GitHub unavailable" so that the dashboard is
+forge-agnostic like the rest of the pipeline.
+**Priority**: Could Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a GitLab project **When** the dashboard renders the repo-health surface (Story 11.2-006)
+  **Then** it fetches health via `glab` (open issues, open MRs, default-branch pipeline status) through the
+  host adapter and shows a populated badge/panel — not the "GitHub unavailable" sentinel.
+- **Given** a GitHub project **When** unchanged **Then** the badge still fetches via `gh` exactly as today.
+- **Given** neither `gh` nor `glab` is available / no forge remote **When** the fetch fails **Then** it
+  degrades to the existing muted "unavailable" sentinel (never throws), with host-appropriate wording.
+
+**Technical Notes**: `controller/src/sdlc/github_stats.py` currently shells out to `["gh", ...]`
+unconditionally. Make the fetch host-aware via `resolve_host()` / the issue-host adapter (Epic-22 / 23.1),
+adding a `glab`-based fetcher (`glab issue list`, `glab mr list`, `glab ci status`) behind the same stats
+shape and TTL cache. Rename the surface neutrally (repo-health, not GitHub-specific) where it doesn't churn
+the API. Keep the off-request-path cache behaviour from Story 11.2-006.
+
+**Definition of Done**:
+- [ ] Host-aware repo-health fetch (`gh` + `glab`) implemented and peer reviewed
+- [ ] Tests: `glab` fetch parity, GitHub-unchanged, graceful unavailable on both hosts
+- [ ] Dashboard shows GitLab repo health against a GitLab project (no "GitHub unavailable")
+
+**Dependencies**: 23.1-001 (adapter); Epic-11 (owns the dashboard/observability surface)
+**Risk Level**: Low
+
 ## Story Dependencies (within Epic-23)
 
 ```
@@ -333,10 +369,11 @@ Epic-22 adapter ─> 23.1-001 (MR adapter) ─┬─> 23.2-001 (open MR) ─> 23
 23.3-001 ─> 23.4-001 (GitLab release)
 23.6-001 (auth/tokens) ── foundational
 23.2-003 + 23.3-001 ─> 23.6-002 (adopt guide + preflight)
+23.1-001 ─> 23.7-001 (forge-agnostic dashboard repo-health)
 ```
 
 - **Cohort 1**: 23.1-001 (needs Epic-22 adapter), 23.3-001 (CI gate template), 23.6-001 (auth)
-- **Cohort 2**: 23.2-001 (needs 23.1-001), 23.5-001 (needs 23.1-001)
+- **Cohort 2**: 23.2-001 (needs 23.1-001), 23.5-001 (needs 23.1-001), 23.7-001 (needs 23.1-001)
 - **Cohort 3**: 23.2-002 (needs 23.2-001; uses 23.3-001), 23.4-001 (needs 23.3-001)
 - **Cohort 4**: 23.2-003 (needs 23.2-002), 23.6-002 (needs 23.2-003 + 23.3-001)
 
@@ -357,3 +394,5 @@ Epic-22 adapter ─> 23.1-001 (MR adapter) ─┬─> 23.2-001 (open MR) ─> 23
 - A release runs on GitLab CI — semver tag + GitLab Release with notes — the Epic-05 equivalent.
 - Everything runs on GitLab **Free/Core**; a preflight + guide take a company repo from zero to a first
   green MR.
+- The dashboard's repo-health surface is forge-agnostic — a GitLab project shows GitLab health, not
+  "GitHub unavailable".
