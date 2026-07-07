@@ -1,6 +1,10 @@
 # Epic 22: Centralized Story Tracking — Mirror Every Story to GitHub or GitLab
 
-> **Status: PLANNED** — created 2026-06-28. From FX's request for a centralized, multi-developer view
+> **Status: COMPLETE (11/11)** — created 2026-06-28. All 11 stories (22.1-001 → 22.6-001) are
+> implemented, tested, and merged: the story inventory + migration, the `gh`/`glab` code-host adapter,
+> host-aware issue rendering, idempotent story↔issue mapping, `sdlc issues init`/`sync`/`assign`, the
+> build-loop close-link + live status, developer-identity resolution, and the portfolio dashboard panel.
+> From FX's request for a centralized, multi-developer view
 > of every epic and story (status + ownership), since the framework is being shared from a solo
 > personal project into company team work. Two code hosts are in play by design: **GitHub** (FX's
 > personal repos, where the framework was built) and **GitLab** (the company corporate standard). The
@@ -110,9 +114,9 @@ story it is rolled up from the **per-stage `harness` already recorded in the led
 the per-repo routing config (`.sdlc-harness.yaml` / `harnesses.yaml` default, Epic-20).
 
 **Definition of Done**:
-- [ ] Schema + migration implemented and peer reviewed
-- [ ] Tests: fresh-create, backward-compat upgrade
-- [ ] `docs/controller-architecture.md` updated
+- [x] Schema + migration implemented and peer reviewed
+- [x] Tests: fresh-create, backward-compat upgrade
+- [x] `docs/controller-architecture.md` updated
 
 **Dependencies**: None
 **Risk Level**: Medium
@@ -136,9 +140,9 @@ discipline from Story 12.5-001 (parse intended structure, not prose). Same inven
 dashboard read.
 
 **Definition of Done**:
-- [ ] Projector implemented and peer reviewed
-- [ ] Tests: full-parse of a sample epic, idempotent re-run, added/removed-story handling
-- [ ] Docs updated
+- [x] Projector implemented and peer reviewed
+- [x] Tests: full-parse of a sample epic, idempotent re-run, added/removed-story handling
+- [x] Docs updated
 
 **Dependencies**: 22.1-001
 **Risk Level**: Medium
@@ -171,9 +175,9 @@ Normalize GitHub *issue number* vs GitLab *iid* + project path behind `issue_ref
 official CLI (issues, MRs, auth). No build-pipeline changes here — issue operations only.
 
 **Definition of Done**:
-- [ ] Adapter interface + GitHub and GitLab implementations, peer reviewed
-- [ ] Tests: each verb on both adapters (mocked `gh`/`glab`), host auto-detect, unauth fail-fast
-- [ ] Docs: the adapter contract + "choosing the host"
+- [x] Adapter interface + GitHub and GitLab implementations, peer reviewed
+- [x] Tests: each verb on both adapters (mocked `gh`/`glab`), host auto-detect, unauth fail-fast
+- [x] Docs: the adapter contract + "choosing the host"
 
 **Dependencies**: None
 **Risk Level**: High
@@ -214,9 +218,9 @@ The `points:N` **label is the portable cross-host baseline**; the GitHub number 
 GitHub-only nicety. Body markdown is host-neutral; only the status/board surface differs per host.
 
 **Definition of Done**:
-- [ ] Renderer + taxonomy implemented and peer reviewed
-- [ ] Tests: managed-block round-trip, marker present, managed-edit reversion, GitHub vs GitLab status surface
-- [ ] Docs: the label/board schema per host
+- [x] Renderer + taxonomy implemented and peer reviewed
+- [x] Tests: managed-block round-trip, marker present, managed-edit reversion, GitHub vs GitLab status surface
+- [x] Docs: the label/board schema per host
 
 **Dependencies**: 22.1-002
 **Risk Level**: Medium
@@ -239,9 +243,9 @@ updates issues instead of creating duplicates.
 marker via the adapter's `issue_find`. All host calls via the adapter, batched and rate-limit aware.
 
 **Definition of Done**:
-- [ ] Mapping implemented and peer reviewed
-- [ ] Tests: create-once, update-not-duplicate, marker-fallback match, orphan re-create — both hosts
-- [ ] Docs updated
+- [x] Mapping implemented and peer reviewed
+- [x] Tests: create-once, update-not-duplicate, marker-fallback match, orphan re-create — both hosts
+- [x] Docs updated
 
 **Dependencies**: 22.2-001, 22.2-002
 **Risk Level**: High
@@ -275,9 +279,9 @@ every epic/story on the configured host so that I get the complete picture immed
 persist progress to the inventory so a resume is cheap.
 
 **Definition of Done**:
-- [ ] `sdlc issues init` implemented and peer reviewed
-- [ ] Tests: full backfill, done→closed, resume-after-interrupt, no-stories guidance — both hosts
-- [ ] Docs: an "adopt a repo" walkthrough (GitHub + GitLab)
+- [x] `sdlc issues init` implemented and peer reviewed
+- [x] Tests: full backfill, done→closed, resume-after-interrupt, no-stories guidance — both hosts
+- [x] Docs: an "adopt a repo" walkthrough (GitHub + GitLab)
 
 **Dependencies**: 22.1-002, 22.2-003
 **Risk Level**: High
@@ -307,9 +311,9 @@ the board reflects reality and the local cache reflects the board.
 write-back into the ledger from the host. Idempotent, batched, resumable; the same engine `init` builds on.
 
 **Definition of Done**:
-- [ ] Sync implemented and peer reviewed
-- [ ] Tests: push managed block, pull assignee/labels, no-op idempotency, wontfix-skip — both hosts
-- [ ] Docs: the field-ownership / direction table
+- [x] Sync implemented and peer reviewed
+- [x] Tests: push managed block, pull assignee/labels, no-op idempotency, wontfix-skip — both hosts
+- [x] Docs: the field-ownership / direction table
 
 **Dependencies**: 22.2-003
 **Risk Level**: High
@@ -336,9 +340,9 @@ which is part of the *separate "Pipeline on GitLab"* epic — until that ships, 
 GitHub PR path; the issue-status comments work on both hosts via the adapter.
 
 **Definition of Done**:
-- [ ] Build integration implemented and peer reviewed
-- [ ] Tests: PR carries Closes #N, status comment on transition, no-issue no-op, host-failure tolerated
-- [ ] Docs updated (incl. the GitLab-MR dependency note)
+- [x] Build integration implemented and peer reviewed
+- [x] Tests: PR carries Closes #N, status comment on transition, no-issue no-op, host-failure tolerated
+- [x] Docs updated (incl. the GitLab-MR dependency note)
 
 **Dependencies**: 22.2-003
 **Risk Level**: High
@@ -370,9 +374,9 @@ anti-pattern in docs. `owner` is a cached read of the host assignee; the assigne
 authoritative.
 
 **Definition of Done**:
-- [ ] Identity resolution + owner/actor cache implemented and peer reviewed
-- [ ] Tests: login resolution (both hosts), assignee→owner cache, no-auth degradation
-- [ ] Docs: the identity/attribution model
+- [x] Identity resolution + owner/actor cache implemented and peer reviewed
+- [x] Tests: login resolution (both hosts), assignee→owner cache, no-auth degradation
+- [x] Docs: the identity/attribution model
 
 **Dependencies**: 22.2-001, 22.2-003
 **Risk Level**: Medium
@@ -400,9 +404,9 @@ stories from the inventory (22.1-002). Keep it idempotent (re-assigning the same
 the human-write-back lane of the projection — the one place a CLI writes ownership to the host.
 
 **Definition of Done**:
-- [ ] `sdlc issues assign` (story + epic-cascade) implemented and peer reviewed
-- [ ] Tests: single-story assign, epic cascade, unknown-user/unmapped fail-fast, idempotent re-assign — both hosts
-- [ ] Docs: assignment usage
+- [x] `sdlc issues assign` (story + epic-cascade) implemented and peer reviewed
+- [x] Tests: single-story assign, epic cascade, unknown-user/unmapped fail-fast, idempotent re-assign — both hosts
+- [x] Docs: assignment usage
 
 **Dependencies**: 22.2-001, 22.2-003, 22.1-002 (epic→stories enumeration)
 **Risk Level**: Medium
@@ -436,9 +440,9 @@ ownership comes from the `owner` cache (22.5-001). Host-agnostic — it shows wh
 regardless of GitHub vs GitLab origin.
 
 **Definition of Done**:
-- [ ] Portfolio panel implemented and peer reviewed
-- [ ] Tests: render from cache, offline behaviour, integration with the existing dashboard
-- [ ] Docs updated
+- [x] Portfolio panel implemented and peer reviewed
+- [x] Tests: render from cache, offline behaviour, integration with the existing dashboard
+- [x] Docs updated
 
 **Dependencies**: 22.1-002, 22.5-001
 **Risk Level**: Medium
