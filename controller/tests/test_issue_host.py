@@ -227,9 +227,11 @@ def test_github_issue_find_no_match_returns_none() -> None:
 
 
 def test_gitlab_whoami() -> None:
-    runner = FakeRunner({"api user": (0, "rootuser\n", "")})
+    # `glab api` has no `--jq` flag (unlike `gh api`), so the adapter must
+    # request the raw JSON and extract the username itself.
+    runner = FakeRunner({"api user": (0, '{"id": 1, "username": "rootuser"}\n', "")})
     assert ih.GitLabAdapter(runner=runner).whoami() == "rootuser"
-    assert runner.calls[-1] == ["glab", "api", "user", "--jq", ".username"]
+    assert runner.calls[-1] == ["glab", "api", "user"]
 
 
 def test_gitlab_issue_create() -> None:

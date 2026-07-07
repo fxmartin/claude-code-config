@@ -672,7 +672,9 @@ class GitLabAdapter(IssueHostAdapter):
     cr_terms = GITLAB_CR_TERMS
 
     def whoami(self) -> str:
-        return self._run("api", "user", "--jq", ".username").stdout.strip()
+        # `glab api` has no `--jq` flag (unlike `gh api`), so parse the JSON here.
+        out = self._run("api", "user").stdout
+        return str(_parse_json_object(out).get("username", "")).strip()
 
     def ensure_ready(self) -> str:
         return self._ensure_ready("glab auth login")
