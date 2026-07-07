@@ -1,6 +1,8 @@
 # Epic 23: Pipeline on GitLab — run the autonomous build against GitLab projects
 
-> **Status: PLANNED** — created 2026-06-28. Carved out of Epic-22 (which made the *issue/story mirror*
+> **Status: CODE-COMPLETE (9/10)** — created 2026-06-28. 9 of 10 stories (23.1-001 → 23.6-002) are
+> implemented, tested, and merged; only **23.7-001** (forge-agnostic dashboard repo-health) remains open.
+> Carved out of Epic-22 (which made the *issue/story mirror*
 > code-host-agnostic). Epic-22 lets the team *track* work on GitHub or GitLab; this epic lets the
 > autonomous **build pipeline itself run against a GitLab project** — opening **Merge Requests** instead
 > of PRs, gating on **GitLab CI** instead of GitHub Actions, releasing on GitLab, and reviewing via
@@ -84,9 +86,9 @@ CLI (`glab mr create/diff/merge`, `glab ci status`). Normalize PR/MR identity be
 the seam every later story in this epic routes through.
 
 **Definition of Done**:
-- [ ] Adapter CR interface + GitHub and GitLab implementations, peer reviewed
-- [ ] Tests: each verb on both adapters (mocked `gh`/`glab`), GitHub-unchanged regression
-- [ ] `docs/controller-architecture.md` + the adapter docs updated
+- [x] Adapter CR interface + GitHub and GitLab implementations, peer reviewed
+- [x] Tests: each verb on both adapters (mocked `gh`/`glab`), GitHub-unchanged regression
+- [x] `docs/controller-architecture.md` + the adapter docs updated
 
 **Dependencies**: Epic-22 Story 22.2-001 (the code-host adapter foundation)
 **Risk Level**: High
@@ -115,9 +117,9 @@ so that work lands through the same review/merge flow the team already uses.
 Reuse the existing per-story branch/PR lifecycle; only the create call changes (via 23.1-001).
 
 **Definition of Done**:
-- [ ] MR creation in the build loop implemented and peer reviewed
-- [ ] Tests: MR opened on GitLab target, GitHub PR path unchanged, branch targets GitLab default
-- [ ] Docs updated
+- [x] MR creation in the build loop implemented and peer reviewed
+- [x] Tests: MR opened on GitLab target, GitHub PR path unchanged, branch targets GitLab default
+- [x] Docs updated
 
 **Dependencies**: 23.1-001
 **Risk Level**: High
@@ -142,9 +144,9 @@ status-gate/poll structure; only the status source changes (via the adapter). Co
 GitLab CI template (23.3-001) for what "green" means.
 
 **Definition of Done**:
-- [ ] Pipeline-status merge gate implemented and peer reviewed
-- [ ] Tests: poll-to-completion, fail-blocks-merge, pass-merges, no-CI degradation
-- [ ] Docs updated
+- [x] Pipeline-status merge gate implemented and peer reviewed
+- [x] Tests: poll-to-completion, fail-blocks-merge, pass-merges, no-CI degradation
+- [x] Docs updated
 
 **Dependencies**: 23.2-001
 **Risk Level**: High
@@ -166,9 +168,9 @@ GitLab loop ends the same way the GitHub loop does.
 adapter (`cr_merge`); branch cleanup via the existing GC hooks.
 
 **Definition of Done**:
-- [ ] MR merge + issue close + cleanup implemented and peer reviewed
-- [ ] Tests: merge closes issue, branch removed, ledger DONE with sha
-- [ ] Docs updated
+- [x] MR merge + issue close + cleanup implemented and peer reviewed
+- [x] Tests: merge closes issue, branch removed, ledger DONE with sha
+- [x] Docs updated
 
 **Dependencies**: 23.2-002
 **Risk Level**: Medium
@@ -199,9 +201,9 @@ the CI config invokes them. This is shipped as an installable template for targe
 framework's own CI.
 
 **Definition of Done**:
-- [ ] `.gitlab-ci.yml` template + gate jobs implemented and peer reviewed
-- [ ] Tests/CI dry-run validating the pipeline lints/passes on a sample repo
-- [ ] Docs: gate-parity table (GitHub Actions ↔ GitLab CI)
+- [x] `.gitlab-ci.yml` template + gate jobs implemented and peer reviewed
+- [x] Tests/CI dry-run validating the pipeline lints/passes on a sample repo
+- [x] Docs: gate-parity table (GitHub Actions ↔ GitLab CI)
 
 **Dependencies**: None (informs 23.2-002)
 **Risk Level**: Medium
@@ -230,9 +232,9 @@ surface (GitHub Release → GitLab Release via `release-cli`/`glab release`). Co
 (owns the release semver logic) — port, don't fork.
 
 **Definition of Done**:
-- [ ] GitLab release job implemented and peer reviewed
-- [ ] Tests: bump computed, tag + release created, no-op on non-release commits
-- [ ] Docs: the GitLab release flow
+- [x] GitLab release job implemented and peer reviewed
+- [x] Tests: bump computed, tag + release created, no-op on non-release commits
+- [x] Docs: the GitLab release flow
 
 **Dependencies**: 23.3-001
 **Risk Level**: Medium
@@ -262,9 +264,9 @@ that company changes get the same scrutiny as GitHub PRs.
 `adversarial-reviewers.yaml` consensus + the `risk-approved` label mechanism (already label-based).
 
 **Definition of Done**:
-- [ ] Host-aware adversarial review + GitLab high-risk gate implemented and peer reviewed
-- [ ] Tests: glab-mr-diff verdict parity, GitLab risk-approved gate, GitHub-unchanged
-- [ ] Docs updated
+- [x] Host-aware adversarial review + GitLab high-risk gate implemented and peer reviewed
+- [x] Tests: glab-mr-diff verdict parity, GitLab risk-approved gate, GitHub-unchanged
+- [x] Docs updated
 
 **Dependencies**: 23.1-001 (Epic-08 owns the reviewer registry)
 **Risk Level**: Medium
@@ -293,9 +295,9 @@ a GitLab project without leaking or hardcoding credentials.
 Coordinate with Epic-13 (agent runtime security) for token handling.
 
 **Definition of Done**:
-- [ ] Auth/token handling implemented and peer reviewed
-- [ ] Tests: local glab-auth path, CI-token path, no-secret-committed check
-- [ ] Docs: token scopes + setup
+- [x] Auth/token handling implemented and peer reviewed
+- [x] Tests: local glab-auth path, CI-token path, no-secret-committed check
+- [x] Docs: token scopes + setup
 
 **Dependencies**: None
 **Risk Level**: Medium
@@ -317,9 +319,9 @@ that a first run doesn't fail halfway on a missing prerequisite.
 Epic-22 board setup so issues and the pipeline align.
 
 **Definition of Done**:
-- [ ] GitLab preflight + adoption guide written and reviewed
-- [ ] Tests: preflight detects each missing prerequisite
-- [ ] Linked from the harness/host docs
+- [x] GitLab preflight + adoption guide written and reviewed
+- [x] Tests: preflight detects each missing prerequisite
+- [x] Linked from the harness/host docs
 
 **Dependencies**: 23.2-003, 23.3-001
 **Risk Level**: Low
