@@ -272,6 +272,42 @@ def test_run_glab_returns_stdout_on_success(monkeypatch) -> None:
     assert gh._run_glab(["mr", "list"]) == "[]\n"
 
 
+def test_run_glab_returns_none_on_nonzero(monkeypatch) -> None:
+    # Unauthenticated / no such project → non-zero exit → None, not a raise.
+    class R:
+        returncode = 1
+        stdout = ""
+    monkeypatch.setattr(gh.subprocess, "run", lambda *a, **k: R())
+    assert gh._run_glab(["issue", "list"]) is None
+
+
+def test_json_len_none_on_malformed_or_non_list() -> None:
+    assert gh._json_len("not-json") is None
+    assert gh._json_len(json.dumps({"a": 1})) is None  # object, not array
+
+
+def test_gitlab_default_branch_none_on_malformed_json(monkeypatch) -> None:
+    _stub_glab(monkeypatch, {"projects/owner%2Frepo": "not-json"})
+    assert gh._gitlab_default_branch("owner/repo") is None
+
+
+def test_fetch_gitlab_ci_none_when_pipelines_call_fails(monkeypatch) -> None:
+    # Default branch resolves but the pipelines call itself fails → no CI signal.
+    _stub_glab(monkeypatch, {
+        "pipelines?ref=main": "",                     # most specific first
+        "projects/owner%2Frepo": json.dumps({"default_branch": "main"}),
+    })
+    assert gh._fetch_gitlab_ci("owner/repo") is None
+
+
+def test_fetch_gitlab_ci_none_on_malformed_pipelines_json(monkeypatch) -> None:
+    _stub_glab(monkeypatch, {
+        "pipelines?ref=main": "not-json",             # most specific first
+        "projects/owner%2Frepo": json.dumps({"default_branch": "main"}),
+    })
+    assert gh._fetch_gitlab_ci("owner/repo") is None
+
+
 # --- per-slug TTL cache, off the request path -------------------------------
 
 
