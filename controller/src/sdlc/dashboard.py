@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from sdlc import __version__, github_stats
 from sdlc.build import _EMPTY_COUNTS, Ledger, _duration_seconds, status_snapshot
+from sdlc.issue_host import GITHUB, detect_host
 from sdlc.portfolio import portfolio_view
 from sdlc.registry import Registry, RunRecord, derive_state
 
@@ -98,6 +99,17 @@ def repo_slug(root: str | Path) -> str | None:
     return _slug_from_url(git_project_url(root))
 
 
+def repo_host(root: str | Path) -> str:
+    """Detect the run's code host (``github``/``gitlab``) from its git remote.
+
+    Story 23.7-001: the repo-health surface fetches via the host's CLI, so it
+    must know which forge a run targets. Defaults to GitHub when the host can't
+    be determined (no remote, or an unrecognised host), so a GitHub repo — and
+    any ambiguous remote — behaves exactly as before this story.
+    """
+    return detect_host(root) or GITHUB
+
+
 # --- multi-run registry discovery (Story 11.2-002) -------------------------
 # In discovery mode the dashboard has no single ledger: it reads the host-level
 # registry to find every `sdlc build` across repos, and resolves each run's own
@@ -144,7 +156,7 @@ def _registry_runs_view(
         }
         if github is not None:
             if rec.repo not in gh_by_repo:
-                gh_by_repo[rec.repo] = github.get(repo_slug(rec.repo))
+                gh_by_repo[rec.repo] = github.get(repo_slug(rec.repo), repo_host(rec.repo))
             row["github"] = gh_by_repo[rec.repo]
         rows.append(row)
     rows.sort(key=lambda r: (r["started_at"] or ""), reverse=True)
@@ -566,38 +578,42 @@ function humanTokens(n){
   return String(n);
 }
 function usd(n){ return n==null ? "" : "$"+Number(n).toFixed(n<1?3:2); }
-// GitHub repo health (Story 11.2-006). The badge/panel read a backend-cached
-// per-repo summary; the client never drives `gh`. Both degrade to a muted
-// "GitHub unavailable" state when the summary is absent or not available.
+// Repo health (Story 11.2-006 GitHub + 23.7-001 GitLab). The badge/panel read a
+// backend-cached per-repo summary; the client never drives `gh`/`glab`. Both
+// degrade to a muted "<forge> unavailable" state when the summary is absent or
+// not available, with host-appropriate wording (GitLab MRs vs GitHub PRs).
 const CI_GLYPH = {success:"\\u2713", failure:"\\u2717", in_progress:"\\u25f7", cancelled:"\\u2298"};
 function ciGlyph(s){
   const g = CI_GLYPH[s] || "\\u2014";
   return "<span class='ci-"+esc(s||"none")+"' title='CI "+esc(s||"unknown")+"'>"+g+"</span>";
 }
 function ghCount(n){ return n==null ? "\\u2014" : esc(n); }
-// Compact per-row badge: open issues, open PRs, latest default-branch CI.
+// Forge-appropriate wording: GitLab opens Merge Requests, GitHub Pull Requests.
+function forgeName(g){ return (g && g.host === "gitlab") ? "GitLab" : "GitHub"; }
+function crNoun(g){ return (g && g.host === "gitlab") ? "MRs" : "PRs"; }
+// Compact per-row badge: open issues, open MRs/PRs, latest default-branch CI.
 function ghBadge(g){
   if(!g || !g.available)
-    return "<div class='gh unavail' title='GitHub unavailable'>GitHub \\u2014</div>";
-  return "<div class='gh' title='open issues \\u00b7 open PRs \\u00b7 default-branch CI'>"
+    return "<div class='gh unavail' title='"+forgeName(g)+" unavailable'>"+forgeName(g)+" \\u2014</div>";
+  return "<div class='gh' title='open issues \\u00b7 open "+crNoun(g)+" \\u00b7 default-branch CI'>"
     + "<span>\\u26a0 "+ghCount(g.issues_open)+"</span>"
     + "<span class='gh-sep'>|</span><span>\\u21c4 "+ghCount(g.prs_open)+"</span>"
     + "<span class='gh-sep'>|</span>"+ciGlyph(g.ci_status)+"</div>";
 }
-// Full panel for the selected run's repo: issues + PRs open/closed and CI.
+// Full panel for the selected run's repo: issues + MRs/PRs open/closed and CI.
 function renderGithub(g){
   const el = document.getElementById("github");
   if(!el) return;
   if(!g || !g.available){ el.innerHTML =
-    "<div class='ghpanel unavail'>GitHub unavailable</div>"; return; }
+    "<div class='ghpanel unavail'>"+forgeName(g)+" unavailable</div>"; return; }
   const ciAge = g.ci_created_at
     ? " <span class='muted' title='"+esc(g.ci_created_at)+"'>"+esc(fmtLocal(g.ci_created_at))+"</span>"
     : "";
   const ciBranch = g.ci_branch ? " on <code>"+esc(g.ci_branch)+"</code>" : "";
-  el.innerHTML = "<div class='ghpanel'><h3>GitHub \\u00b7 <code>"+esc(g.slug||"")+"</code></h3>"
+  el.innerHTML = "<div class='ghpanel'><h3>"+forgeName(g)+" \\u00b7 <code>"+esc(g.slug||"")+"</code></h3>"
     + "<div class='chips'>"
     + "<span class='chip'>issues <b>"+ghCount(g.issues_open)+"</b> open \\u00b7 "+ghCount(g.issues_closed)+" closed</span>"
-    + "<span class='chip'>PRs <b>"+ghCount(g.prs_open)+"</b> open \\u00b7 "+ghCount(g.prs_closed)+" closed</span>"
+    + "<span class='chip'>"+crNoun(g)+" <b>"+ghCount(g.prs_open)+"</b> open \\u00b7 "+ghCount(g.prs_closed)+" closed</span>"
     + "</div>"
     + "<div class='small'>CI "+ciGlyph(g.ci_status)+" "+esc(g.ci_status||"\\u2014")+ciBranch+ciAge+"</div>"
     + "</div>";
@@ -1159,26 +1175,28 @@ class _Handler(BaseHTTPRequestHandler):
     # --- GitHub repo health (Story 11.2-006) -------------------------------
 
     def _github_stats(self, run_id: str | None) -> dict:
-        """GitHub health for the selected run's repo, served from the cache.
+        """Repo health for the selected run's repo, served from the cache.
 
         Registry mode resolves the repo via the run's registry record; single
-        ``--db`` mode resolves it from the ledger's parent directory. The read
-        goes through the per-slug TTL cache, so it never drives ``gh`` on the
-        request path and degrades to the muted "unavailable" sentinel when the
-        run / repo / ``gh`` cannot be resolved.
+        ``--db`` mode resolves it from the ledger's parent directory. The forge
+        (``github``/``gitlab``) is detected from that repo's remote so a GitLab
+        project fetches GitLab health. The read goes through the per-(host,slug)
+        TTL cache, so it never drives ``gh``/``glab`` on the request path and
+        degrades to the muted "unavailable" sentinel when the run / repo / CLI
+        cannot be resolved.
         """
         cache = self.server.github_cache
         if self.server.registry is not None:
             rec = self._resolve_run(run_id)
             if rec is None:
                 return github_stats.unavailable(None, "no-run")
-            slug = repo_slug(rec.repo)
+            root: str | Path = rec.repo
         else:
             db_path = self.server.db_path
             if db_path is None:
                 return github_stats.unavailable(None, "no-run")
-            slug = repo_slug(Path(db_path).parent)
-        return cache.get(slug)
+            root = Path(db_path).parent
+        return cache.get(repo_slug(root), repo_host(root))
 
     # --- all-epics portfolio panel (Story 22.6-001) ------------------------
 

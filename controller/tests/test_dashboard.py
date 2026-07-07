@@ -1551,17 +1551,55 @@ def test_repo_slug_none_without_remote(tmp_path: Path) -> None:
     assert repo_slug(tmp_path) is None
 
 
+def test_repo_host_detects_gitlab(tmp_path: Path) -> None:
+    """Story 23.7-001: a GitLab remote resolves the run's forge to ``gitlab``."""
+    from sdlc.dashboard import repo_host
+
+    _git_repo_with_origin(tmp_path, "git@gitlab.com:acme/widgets.git")
+    assert repo_host(tmp_path) == "gitlab"
+
+
+def test_repo_host_defaults_github_without_remote(tmp_path: Path) -> None:
+    """No/unknown remote → GitHub, so a GitHub repo behaves exactly as before."""
+    from sdlc.dashboard import repo_host
+
+    assert repo_host(tmp_path) == "github"
+    _git_repo_with_origin(tmp_path, "git@github.com:fxmartin/claude-code-config.git")
+    assert repo_host(tmp_path) == "github"
+
+
+def test_github_stats_routes_gitlab_host(tmp_path: Path) -> None:
+    """A GitLab run's repo-health read is dispatched to the ``gitlab`` fetcher."""
+    from types import SimpleNamespace
+
+    from sdlc.dashboard import _Handler
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo_with_origin(repo, "git@gitlab.com:acme/widgets.git")
+    db = repo / ".sdlc-state.db"
+    _seed(db)
+    cache = _StubCache()
+    h = _Handler.__new__(_Handler)
+    h.server = SimpleNamespace(registry=None, db_path=db, github_cache=cache)
+    result = h._github_stats(None)
+    assert result["slug"] == "acme/widgets" and result["host"] == "gitlab"
+    assert cache.hosts == ["gitlab"]
+
+
 class _StubCache:
     """A GitHub cache double: records slug lookups, returns canned stats."""
 
     def __init__(self) -> None:
         self.calls: list[str | None] = []
+        self.hosts: list[str] = []
 
-    def get(self, slug):
+    def get(self, slug, host="github"):
         self.calls.append(slug)
+        self.hosts.append(host)
         if not slug:
-            return {"available": False, "slug": None, "reason": "no-remote"}
-        return {"available": True, "slug": slug, "issues_open": 4, "prs_open": 1,
+            return {"available": False, "slug": None, "host": host, "reason": "no-remote"}
+        return {"available": True, "slug": slug, "host": host, "issues_open": 4, "prs_open": 1,
                 "ci_status": "success", "ci_branch": "main", "ci_created_at": "t"}
 
 
@@ -1703,6 +1741,16 @@ def test_page_has_github_panel_and_badge_hooks() -> None:
 
     assert "/api/github" in _PAGE
     assert 'id="github"' in _PAGE
+
+
+def test_page_repo_health_wording_is_host_aware() -> None:
+    """Story 23.7-001: the badge/panel word themselves per forge (GitLab vs GitHub)."""
+    from sdlc.dashboard import _PAGE
+
+    # A forge-name helper drives the wording off the stats' `host` field so a
+    # GitLab project reads "GitLab", not the "GitHub unavailable" sentinel.
+    assert "function forgeName(g)" in _PAGE
+    assert '"gitlab"' in _PAGE and '"GitLab"' in _PAGE
 
 
 def test_page_refreshes_github_on_a_steady_cadence() -> None:

@@ -249,7 +249,7 @@ It binds to **http://127.0.0.1:8787** by default (localhost-only).
 
 - **Multi-run sidebar** — every live and past run, each with its status, scope, done/total story count, duration, tokens, and cost. Click any run to focus it.
 - **Run header** — run id, status, scope and mode (e.g. `epic-17 · parallel`), elapsed time, the preflight/QA-gate/coverage config, and live **token (in / out / cache) and cost** accounting.
-- **GitHub repo-health panel** — open/closed issues, open/closed PRs, and the latest CI status on `main`, refreshed every 30 seconds.
+- **Repo-health panel** — open/closed issues, open/closed PRs (or GitLab MRs), and the latest default-branch CI/pipeline status, refreshed every 30 seconds. Forge-agnostic: a GitHub run shows GitHub health via `gh`, a GitLab run shows GitLab health via `glab`.
 - **Dependency DAG** — the cohort plan as wave columns, so you can see at a glance which stories are scheduled to run in parallel and what blocks what.
 - **Per-story stage table** — a row per story across the four stages (**build · QA · review · merge**) plus PR number, tokens, and duration. Each story exposes a **"view session"** link that opens its full agent transcript in a modal.
 - **Events log** — the run's ledger events (errors, warnings, milestones) in chronological order.
