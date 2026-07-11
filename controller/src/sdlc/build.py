@@ -3169,9 +3169,17 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
         subject=story.title,
         trailer=f" (#{story.id})",
     )
+    # Story 26.1-001: root-cause-first discipline. Investigation precedes any
+    # fix, and the reported root_cause must diagnose the defect — the schema
+    # makes the field required, so the skeleton below already demands it.
     return (
         f"Bugfix story {story.id}: {story.title}. Stage '{failed_stage}' failed.\n"
         f"Failure: {failure}\n"
+        "Investigate the root cause BEFORE attempting any fix — no guard, retry, "
+        "or patch until you can state what broke and why. Refuse the shortcuts: "
+        "'the fix is obvious', 'just see if CI passes', 'retry budget is low'. "
+        "Report it in root_cause (what broke and why — "
+        "not a restatement of the symptom).\n"
         "Classify (CODE_BUG/TEST_BUG/ENV_ISSUE), fix where possible. If you "
         "commit the fix, use this exact, conventional-commit-compliant message "
         f"— do not alter it:\n   {commit_header}\n"

@@ -41,7 +41,7 @@ inside the `sdlc` package so they ship in the installed wheel) in
 | `coverage` | `coverage-agent-response.schema.json` | `pr_number`, `pr_url`, `coverage_pct`, `tests_added`, `coverage_status`, `security_status` |
 | `review`   | `review-agent-response.schema.json`   | `pr_number`, `approval_status`, `change_count`, `final_status` |
 | `merge`    | `merge-agent-response.schema.json`    | `pr_number`, `merge_status`, `merge_sha`, `merged_at` |
-| `bugfix`   | `bugfix-agent-response.schema.json`   | `failure_category`, `fix_status`, `tests_passing`, `bugs_fixed`, `tests_fixed` (optional `issue_number`) |
+| `bugfix`   | `bugfix-agent-response.schema.json`   | `failure_category`, `root_cause`, `fix_status`, `tests_passing`, `bugs_fixed`, `tests_fixed` (optional `issue_number`) |
 
 ### Status enums
 
@@ -55,6 +55,16 @@ historically emit a richer vocabulary (e.g. coverage `SECURITY_BLOCK`, merge
 - `merge_status`: `MERGED` | `FAILED` | `SKIPPED`
 - `fix_status`: `FIXED` | `UNFIXED` | `N/A`
 - `failure_category`: `CODE_BUG` | `TEST_BUG` | `ENV_ISSUE` | `BUILD_ERROR` | `TEST_FAILURE` | `SCHEMA_ERROR`
+
+### Bugfix root cause (Story 26.1-001)
+
+`root_cause` is a required, non-empty string on every bugfix response: what
+broke and why — a diagnosis of the defect, **not** a restatement of the symptom.
+A bugfix response without it fails contract validation and routes as malformed,
+exactly like any other schema violation. The field enforces the
+root-cause-first discipline the bugfix prompts require (investigation before
+any fix), so a symptom patch cannot silently consume a bounded,
+cost-escalating retry cycle.
 
 ## Examples
 

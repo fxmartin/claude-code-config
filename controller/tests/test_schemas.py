@@ -50,6 +50,7 @@ VALID_RESPONSES: dict[str, dict] = {
     },
     "bugfix": {
         "failure_category": "TEST_FAILURE",
+        "root_cause": "off-by-one in pagination cursor: page 2 reused page 1's offset",
         "fix_status": "FIXED",
         "tests_passing": True,
         "bugs_fixed": 1,
@@ -178,6 +179,35 @@ def test_bugfix_optional_issue_number_accepted() -> None:
     data = dict(VALID_RESPONSES["bugfix"])
     data["issue_number"] = 314
     assert validate_response("bugfix", data) == data
+
+
+# ---------------------------------------------------------------------------
+# Story 26.1-001: root_cause is a required, non-empty field of the bugfix
+# contract — a response without one routes as malformed, never propagates.
+# ---------------------------------------------------------------------------
+
+def test_bugfix_with_root_cause_is_valid() -> None:
+    """A bugfix response carrying a root_cause string validates (26.1-001)."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    assert data["root_cause"]  # the canonical valid response carries one
+    assert validate_response("bugfix", data) == data
+
+
+def test_bugfix_missing_root_cause_fails_naming_field() -> None:
+    """A bugfix response without root_cause fails validation, naming the field."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    del data["root_cause"]
+    with pytest.raises(SchemaValidationError) as exc_info:
+        validate_response("bugfix", data)
+    assert "root_cause" in str(exc_info.value)
+
+
+def test_bugfix_empty_root_cause_rejected() -> None:
+    """An empty root_cause is a dodge, not a diagnosis — rejected by schema."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["root_cause"] = ""
+    with pytest.raises(SchemaValidationError):
+        validate_response("bugfix", data)
 
 
 def test_coverage_optional_dep_scan_status_accepted() -> None:
