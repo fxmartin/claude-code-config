@@ -55,6 +55,33 @@ Based on the debugging checklist findings, classify:
 - **TEST_BUG** — the test itself is wrong (bad selector, incorrect assertion, timing issue, flaky test)
 - **ENV_ISSUE** — environment problem (missing dependency, config error, port conflict, network issue)
 
+### Step 1d: Receiving Review Findings — Verify Before Implementing
+
+When `{{FAILED_STEP}}` is `review` (or `{{FAILURE_OUTPUT}}` otherwise carries review
+findings), **review findings are claims, not orders.** Blindly implementing a wrong
+finding writes a non-bug into the codebase and burns a bounded, cost-escalating retry
+cycle. Process every finding through this reception sequence:
+
+**read → restate → verify → evaluate → respond → implement**
+
+1. **Read** the finding in full — do not skim.
+2. **Restate** it in your own words so the claim is explicit.
+3. **Verify** it against the actual code: open the cited file/line and confirm the
+   defect exists. A finding is a hypothesis until the code confirms it.
+4. **Evaluate** — correct, partially correct, or wrong? Correct code flagged as buggy is
+   a wrong finding.
+5. **Respond** with a disposition: `implemented` (verified, then fixed) or `disputed`
+   (refuted against the code, with concrete technical reasoning naming the file/line and
+   why the finding does not hold).
+6. **Implement** only the findings you verified. Never agree performatively —
+   implementing a finding you have not verified is exactly the failure this step exists
+   to prevent.
+
+Report every finding's verdict in the `finding_dispositions` array of the result block
+(see Output Contract). A dispute is structured data the controller surfaces to FX and
+the ledger; it is never silently swallowed, and a disputed finding is never counted as
+fixed.
+
 ### Step 2: Handle Based on Category
 
 **If CODE_BUG:**
@@ -143,4 +170,16 @@ BUGS_FIXED: [count]
 TESTS_FIXED: [count]
 DIAGNOSTIC_STEPS: [comma-separated list of checklist steps completed, e.g. reproduce,isolate,inspect]
 ISOLATED_TO: [file:function or file:line where the root cause was found, or UNKNOWN]
+```
+
+When the failure carried review findings (Step 1d), also emit a machine-readable
+result block whose `finding_dispositions` array records one entry per finding — each
+`{"finding": "...", "disposition": "implemented" | "disputed", "reasoning": "..."}`.
+`reasoning` is required and must be concrete for a `disputed` finding (a dispute without
+technical reasoning is performative and is rejected by the schema):
+
+```
+<<<RESULT_JSON>>>
+{"failure_category": "TEST_BUG", "root_cause": "the finding misread a guarded access; the code is correct", "fix_status": "N/A", "tests_passing": true, "bugs_fixed": 0, "tests_fixed": 0, "finding_dispositions": [{"finding": "null deref at line 42", "disposition": "disputed", "reasoning": "line 42 is guarded by `if node is not None` on line 40; no deref is reachable"}]}
+<<<END_RESULT>>>
 ```
