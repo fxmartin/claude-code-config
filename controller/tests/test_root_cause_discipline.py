@@ -88,3 +88,40 @@ def test_rendered_bugfix_prompt_keeps_wrapper_contract() -> None:
     prompt = render_bugfix_prompt(_story(), "build", "boom")
     assert RESULT_START_MARKER in prompt
     assert RESULT_END_MARKER in prompt
+
+
+@pytest.mark.parametrize("evasion", _RATIONALIZATIONS)
+def test_rendered_bugfix_prompt_refuses_each_rationalization(evasion: str) -> None:
+    """The rendered controller prompt — not just the .md files — names and
+    refuses every shortcut in the rationalization table (26.1-001 AC1), so the
+    discipline reaches whichever harness the orchestrator dispatches."""
+    prompt = render_bugfix_prompt(_story(), "build", "boom").lower()
+    assert evasion in prompt, f"rendered prompt missing rationalization: {evasion!r}"
+
+
+def test_rendered_bugfix_prompt_investigate_precedes_fix_ordering() -> None:
+    """Investigation is ordered strictly before any fix attempt: the 'investigate
+    ... BEFORE attempting any fix' clause appears ahead of the fix instruction."""
+    prompt = render_bugfix_prompt(_story(), "build", "boom")
+    lowered = prompt.lower()
+    investigate_at = lowered.find("investigate the root cause")
+    fix_at = lowered.find("fix where possible")
+    assert investigate_at != -1
+    assert fix_at != -1
+    assert investigate_at < fix_at
+
+
+def test_rendered_bugfix_prompt_carries_exact_failure_context() -> None:
+    """The rendered prompt threads the concrete failed stage and failure text
+    through unaltered, so the agent diagnoses the actual defect it was handed."""
+    prompt = render_bugfix_prompt(_story(), "coverage", "AssertionError: x != y")
+    assert "Stage 'coverage' failed" in prompt
+    assert "Failure: AssertionError: x != y" in prompt
+
+
+def test_rendered_bugfix_prompt_embeds_conventional_commit_header() -> None:
+    """The bugfix commit header stays conventional-commit-compliant and carries
+    the story id, unchanged by the root-cause discipline addition."""
+    prompt = render_bugfix_prompt(_story(), "build", "boom")
+    assert "fix(agent-process-discipline):" in prompt
+    assert "(#26.1-001)" in prompt
