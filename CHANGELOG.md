@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.13.0] - 2026-07-11
+
+### Added
+
+- feat(agent-process-discipline): bugfix agents verify (#26.2-001)
+
+
 ## [v2.12.0] - 2026-07-11
 
 ### Added
