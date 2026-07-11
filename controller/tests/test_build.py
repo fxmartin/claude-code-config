@@ -1915,6 +1915,30 @@ def test_review_prompt_distrusts_implementer_report() -> None:
     assert "unverified claims" in prompt
     assert "kept it simple per YAGNI" in prompt
     assert "concrete named risk" in prompt
+    # The distrust scope names each self-report surface, and off-diff
+    # exploration is bounded to a named risk the reviewer must justify.
+    assert "the PR description, commit" in prompt
+    assert "Inspect code outside the diff only" in prompt
+    assert "name both the risk and what you checked" in prompt
+
+
+def test_review_prompt_distrust_survives_doc_currency_off(monkeypatch) -> None:
+    """Story 26.2-002: the distrust hardening is unconditional — it must ride
+    the review prompt even when the documentation-currency lens is disabled,
+    exercising the ``docs_dimension`` else-branch it is emitted alongside."""
+    from sdlc.build import render_review_prompt
+    from sdlc.doc_currency import DOC_CURRENCY_ENV
+
+    monkeypatch.setenv(DOC_CURRENCY_ENV, "off")
+    prompt = render_review_prompt(_story("99.1-001"), None)
+    # Docs lens off ⇒ no documentation-currency dimension...
+    assert "documentation-currency dimension" not in prompt
+    # ...but the distrust + bounded-exploration instructions still stand,
+    # and the None PR number renders without error.
+    assert "PR #None" in prompt
+    assert "do not trust" in prompt.lower()
+    assert "unverified claims" in prompt
+    assert "concrete named risk" in prompt
 
 
 # ---------------------------------------------------------------------------
