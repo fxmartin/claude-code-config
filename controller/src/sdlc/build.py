@@ -2983,10 +2983,20 @@ def render_review_prompt(story: Story, pr_number: int | None) -> str:
         if doc_currency_enabled()
         else ""
     )
+    # Story 26.2-002: the PR description, commit messages, and any implementer
+    # summary are self-reports — the reviewer must verify them against the diff
+    # rather than accept them (pattern: superpowers task-reviewer-prompt).
     return (
         f"Review the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
         "Check architecture, security, performance, coverage, code quality; "
         "approve when satisfied, then emit the result block.\n"
+        "Do not trust the implementer's report: the PR description, commit "
+        "messages, and any summary are unverified claims — including design "
+        'rationales like "kept it simple per YAGNI" — until you have checked '
+        "each claim against the diff itself.\n"
+        "Inspect code outside the diff only for a concrete named risk; when "
+        "you do, name both the risk and what you checked in your review "
+        "summary.\n"
         + docs_dimension
         + _result_wrapper("review-agent-response.schema.json")
     )

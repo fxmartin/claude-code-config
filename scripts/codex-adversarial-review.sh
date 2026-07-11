@@ -193,10 +193,20 @@ else
   diff="$("${host_cli}" "${cr_args[@]}" 2>/dev/null)" \
     || die "failed to fetch diff for change request #${pr_number} via ${host_cli}" 1
 
+  # Story 26.2-002: the PR description/commits are the implementer's
+  # self-report — the reviewer verifies claims against the diff, never trusts
+  # them, and bounds off-diff exploration to a concrete named risk.
   prompt="Use ${reviewer_skill} to review pull request #${pr_number}.
 
 Diff under review:
 ${diff}
+
+Do not trust the implementer's report: the PR description, commit messages,
+and any summary are unverified claims — including design rationales like
+\"kept it simple per YAGNI\" — until you have checked each claim against the
+diff above.
+Inspect code outside the diff only for a concrete named risk; when you do,
+name both the risk and what you checked in your summary.
 
 After your review, output ONLY a single fenced json block conforming to the
 adversarial reviewer response contract, with keys: reviewer_name (\"codex\"),

@@ -155,7 +155,14 @@ What it does:
 2. Runs a Codex review skill via `codex exec` — `roast` by default, or
    `project-review` (choose per repo with `--reviewer-skill`, or set
    `CODEX_ADV_REVIEW_SKILL`). The skill is instructed to end its output with a
-   single fenced ` ```json ` block in the slot's response shape.
+   single fenced ` ```json ` block in the slot's response shape. The prompt also
+   hardens the review against optimistic self-reports (Story 26.2-002): the
+   reviewer is told to treat the implementer's PR description, commit messages,
+   and summaries as unverified claims until checked against the diff, and to
+   inspect code outside the diff only for a concrete named risk — naming both
+   the risk and what was checked. The same instruction rides in the pipeline's
+   review-stage prompt and the fix-issue review gate; `tests/reviewer-distrust.bats`
+   pins it on every surface so it cannot be silently dropped.
 3. Extracts that block, forces `reviewer_name` to `codex`, records which skill
    ran in an extra `reviewer_skill` field (the schema allows extra fields), and
    prints the normalised JSON to stdout.
