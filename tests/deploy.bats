@@ -2,19 +2,22 @@
 # ABOUTME: Behavior tests for scripts/deploy.sh — the single-command deploy that
 # ABOUTME: keeps the sdlc controller and the autonomous-sdlc plugin on one version.
 #
-# deploy.sh composes two steps that had drifted apart in practice:
+# deploy.sh composes two steps that had drifted apart in practice, run in this
+# order (the remote, fallible step first — see the ordering tests below):
 #
-#   1. scripts/install-controller.sh  → uv tool install --force controller/
-#   2. claude plugin update           → move the plugin pointer to the new version
+#   1. claude plugin update           → move the plugin pointer to the new version
+#   2. scripts/install-controller.sh  → uv tool install --force controller/
 #
 # Both steps are expensive and mutate the machine, so the script exposes two
 # seams the suite drives instead of the real thing:
 #
-#   - INSTALL_CONTROLLER  overrides the path to step 1's script.
-#   - `claude` is resolved from PATH, so a stub earlier on PATH intercepts step 2.
+#   - INSTALL_CONTROLLER  overrides the path to the controller step's script.
+#   - `claude` is resolved from PATH, so a stub earlier on PATH intercepts the
+#     plugin step.
 #
-# Each stub touches a marker file; a test asserts on the presence or absence of
-# that marker rather than on stdout, so the assertions survive log rewording.
+# Each stub touches a marker file and appends to a shared order log; tests
+# assert on markers and order rather than on stdout, so the assertions survive
+# log rewording.
 
 DEPLOY="${BATS_TEST_DIRNAME}/../scripts/deploy.sh"
 
@@ -25,20 +28,23 @@ setup() {
 
     CONTROLLER_MARKER="${TMP}/controller-ran"
     PLUGIN_MARKER="${TMP}/plugin-ran"
+    ORDER_LOG="${TMP}/order.log"
 
-    # Stub for step 1, injected via the INSTALL_CONTROLLER seam.
+    # Stub for the controller step, injected via the INSTALL_CONTROLLER seam.
     FAKE_INSTALL_CONTROLLER="${TMP}/fake-install-controller.sh"
     cat >"${FAKE_INSTALL_CONTROLLER}" <<EOF
 #!/usr/bin/env bash
 touch "${CONTROLLER_MARKER}"
+echo controller >>"${ORDER_LOG}"
 EOF
     chmod +x "${FAKE_INSTALL_CONTROLLER}"
 
-    # Stub for step 2, injected by prepending STUB_BIN to PATH. Records the
-    # argv so a test can assert the plugin id is passed through intact.
+    # Stub for the plugin step, injected by prepending STUB_BIN to PATH.
+    # Records the argv so a test can assert the plugin id is passed through.
     cat >"${STUB_BIN}/claude" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >"${PLUGIN_MARKER}"
+echo plugin >>"${ORDER_LOG}"
 EOF
     chmod +x "${STUB_BIN}/claude"
 }
@@ -200,7 +206,36 @@ _run_deploy_without_claude() {
     [ -e "${CONTROLLER_MARKER}" ]
 }
 
-@test "a failing controller install aborts before the plugin update" {
+# Ordering: the plugin update is the remote, fallible step (marketplace,
+# network) and its effect is deferred until Claude Code restarts; the controller
+# install is local and idempotent. Running the fallible step FIRST means its
+# failure leaves the machine untouched — preflight cannot predict a runtime
+# marketplace failure, but ordering can contain it.
+@test "default run updates the plugin before installing the controller" {
+    _run_deploy
+    [ "$status" -eq 0 ]
+    run cat "${ORDER_LOG}"
+    [ "${lines[0]}" = "plugin" ]
+    [ "${lines[1]}" = "controller" ]
+}
+
+@test "a failing plugin update aborts before the controller install" {
+    cat >"${STUB_BIN}/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "marketplace unreachable" >&2
+exit 1
+EOF
+    chmod +x "${STUB_BIN}/claude"
+    _run_deploy
+    [ "$status" -ne 0 ]
+    [ ! -e "${CONTROLLER_MARKER}" ]
+}
+
+# The residual window: plugin updated, then the local controller install fails.
+# The RUNNING system is still consistent (the new plugin only loads on restart),
+# and re-running deploy.sh converges — but the exit must be non-zero and must
+# say exactly that, so nobody restarts Claude Code onto a mismatched pair.
+@test "a failing controller install after the plugin update exits non-zero with a converge remedy" {
     cat >"${FAKE_INSTALL_CONTROLLER}" <<'EOF'
 #!/usr/bin/env bash
 exit 1
@@ -208,5 +243,7 @@ EOF
     chmod +x "${FAKE_INSTALL_CONTROLLER}"
     _run_deploy
     [ "$status" -ne 0 ]
-    [ ! -e "${PLUGIN_MARKER}" ]
+    [ -e "${PLUGIN_MARKER}" ]
+    [[ "$output" == *"re-run"* ]]
+    [[ "$output" == *"restart"* ]]
 }

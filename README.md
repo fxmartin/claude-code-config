@@ -167,7 +167,10 @@ A default `deploy.sh` run **requires `claude` on `PATH`** and aborts in prefligh
 without it, before installing anything — moving only one of the two pointers is
 the very drift the script exists to prevent, and `uv tool install --force` cannot
 be rolled back. On a box with no Claude Code, pass `--controller-only` to opt out
-deliberately.
+deliberately. Runtime failures are contained by ordering: the fallible plugin
+update runs **first** (a failure there leaves the machine untouched), and if the
+local controller install then fails, the script exits non-zero telling you not to
+restart Claude Code until a re-run converges the pair.
 
 #### Key subcommands
 
