@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.15.0] - 2026-07-11
+
+### Added
+
+- feat(agent-process-discipline): reviewers treat the (#26.2-002)
+
+
 ## [v2.14.0] - 2026-07-11
 
 ### Added
