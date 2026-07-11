@@ -17,7 +17,18 @@ gh pr view {{PR_NUMBER}} --json title,body,files
 gh pr diff {{PR_NUMBER}}
 ```
 
-### Step 2: Review the PR
+### Step 2: Do Not Trust the Report
+
+The PR description, commit messages, and any implementer summary are the
+implementer's self-report. Do not trust the report: its contents are
+unverified claims — including design rationales like "kept it simple per YAGNI"
+— until you have checked each claim against the diff itself.
+
+Inspect code outside the diff only when you have a concrete named risk (e.g.
+"this changes a shared helper — existing callers may break"); when you do,
+name both the risk and what you checked in your review summary.
+
+### Step 3: Review the PR
 
 Evaluate the fix against these criteria:
 
@@ -50,7 +61,7 @@ Evaluate the fix against these criteria:
 - No dead code or debugging artifacts left behind?
 - Proper error handling?
 
-### Step 3: Take Action
+### Step 4: Take Action
 
 **If changes are needed:**
 

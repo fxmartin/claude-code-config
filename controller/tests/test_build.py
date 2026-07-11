@@ -1904,6 +1904,19 @@ def test_prompts_show_verbatim_result_wrapper() -> None:
         assert "no markdown code fences" in p
 
 
+def test_review_prompt_distrusts_implementer_report() -> None:
+    """Story 26.2-002: the review-stage prompt treats the implementer's
+    self-report as unverified claims and bounds off-diff exploration to a
+    concrete named risk (pattern: superpowers task-reviewer-prompt)."""
+    from sdlc.build import render_review_prompt
+
+    prompt = render_review_prompt(_story("99.1-001"), 7)
+    assert "do not trust" in prompt.lower()
+    assert "unverified claims" in prompt
+    assert "kept it simple per YAGNI" in prompt
+    assert "concrete named risk" in prompt
+
+
 # ---------------------------------------------------------------------------
 # bugfix stage rows must use distinct attempt numbers (no UNIQUE collision)
 # ---------------------------------------------------------------------------
