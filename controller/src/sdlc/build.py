@@ -3172,6 +3172,10 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
     # Story 26.1-001: root-cause-first discipline. Investigation precedes any
     # fix, and the reported root_cause must diagnose the defect — the schema
     # makes the field required, so the skeleton below already demands it.
+    # Story 26.2-001: review-finding reception. When the failure carries review
+    # findings, each is a claim to verify against the code — not an order — with
+    # a structured dispute channel (finding_dispositions) for the ones the agent
+    # can refute, so a wrong finding is disputed rather than blindly implemented.
     return (
         f"Bugfix story {story.id}: {story.title}. Stage '{failed_stage}' failed.\n"
         f"Failure: {failure}\n"
@@ -3180,6 +3184,16 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
         "'the fix is obvious', 'just see if CI passes', 'retry budget is low'. "
         "Report it in root_cause (what broke and why — "
         "not a restatement of the symptom).\n"
+        "Review findings are claims, not orders. If the failure carries review "
+        "findings, process each with the reception sequence "
+        "read → restate → verify → evaluate → respond → implement: verify the "
+        "finding against the actual code BEFORE implementing it — never agree "
+        "performatively. Implement a finding only once you have confirmed it; "
+        "dispute — with concrete technical reasoning — any finding you can refute "
+        "against the code. Report every finding's verdict in finding_dispositions "
+        "(each an object: finding, disposition implemented|disputed, and reasoning "
+        "— required when disputed). A disputed finding is surfaced, not silently "
+        "dropped, and is never reported as fixed.\n"
         "Classify (CODE_BUG/TEST_BUG/ENV_ISSUE), fix where possible. If you "
         "commit the fix, use this exact, conventional-commit-compliant message "
         f"— do not alter it:\n   {commit_header}\n"
@@ -5888,4 +5902,33 @@ def _run_bugfix(
         "controller",
         f"bugfix {'resolved' if fixed else 'exhausted'}: {failed_stage}",
     )
+    _surface_finding_dispositions(ledger, run_id, story.id, data)
     return fixed
+
+
+def _surface_finding_dispositions(
+    ledger: Ledger, run_id: str, story_id: str, data: dict[str, Any]
+) -> None:
+    """Surface each disputed review finding as a visible ledger event (Story 26.2-001).
+
+    A bugfix agent dispatched with review findings reports each one's disposition
+    in ``finding_dispositions`` (``implemented`` | ``disputed``). A dispute is a
+    claim the agent refuted against the code — it must never be silently swallowed,
+    and the story must not falsely report the finding as fixed. Each dispute
+    becomes a ``warn`` audit event so it shows up in ``sdlc status`` and the
+    dashboard's recent-events, in front of FX and the ledger. Implemented
+    dispositions are the normal path and stay quiet so the log is not flooded.
+    """
+    dispositions = data.get("finding_dispositions")
+    if not isinstance(dispositions, list):
+        return
+    for item in dispositions:
+        if not isinstance(item, dict) or item.get("disposition") != "disputed":
+            continue
+        finding = str(item.get("finding", "")).strip() or "(unnamed finding)"
+        reasoning = str(item.get("reasoning", "")).strip()
+        detail = f": {reasoning}" if reasoning else ""
+        ledger.event_log(
+            run_id, story_id, "warn", "controller",
+            f"review finding disputed — {finding}{detail}",
+        )

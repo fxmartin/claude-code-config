@@ -41,7 +41,7 @@ inside the `sdlc` package so they ship in the installed wheel) in
 | `coverage` | `coverage-agent-response.schema.json` | `pr_number`, `pr_url`, `coverage_pct`, `tests_added`, `coverage_status`, `security_status` |
 | `review`   | `review-agent-response.schema.json`   | `pr_number`, `approval_status`, `change_count`, `final_status` |
 | `merge`    | `merge-agent-response.schema.json`    | `pr_number`, `merge_status`, `merge_sha`, `merged_at` |
-| `bugfix`   | `bugfix-agent-response.schema.json`   | `failure_category`, `root_cause`, `fix_status`, `tests_passing`, `bugs_fixed`, `tests_fixed` (optional `issue_number`) |
+| `bugfix`   | `bugfix-agent-response.schema.json`   | `failure_category`, `root_cause`, `fix_status`, `tests_passing`, `bugs_fixed`, `tests_fixed` (optional `issue_number`, `finding_dispositions`) |
 
 ### Status enums
 
@@ -65,6 +65,28 @@ exactly like any other schema violation. The field enforces the
 root-cause-first discipline the bugfix prompts require (investigation before
 any fix), so a symptom patch cannot silently consume a bounded,
 cost-escalating retry cycle.
+
+### Bugfix finding dispositions (Story 26.2-001)
+
+`finding_dispositions` is an **optional** array — present only when the bugfix
+was dispatched with review findings (it is absent for a plain build/test/coverage
+failure). Each entry records how one review finding was handled after the agent
+verified it against the code:
+
+- `finding` (required, non-empty): the finding being addressed, so the verdict is
+  traceable to its claim.
+- `disposition` (required): `implemented` (verified, then fixed) or `disputed`
+  (refuted against the code).
+- `reasoning` (required and non-empty **when disputed**): the concrete technical
+  argument that refutes the finding. A dispute without reasoning is performative,
+  not a refutation, and fails schema validation.
+
+Review findings are claims, not orders: the bugfix prompts require per-finding
+verification before implementation and forbid performative agreement, so a wrong
+finding is disputed rather than blindly "fixed" into the codebase. The controller
+surfaces every `disputed` disposition as a `warn` ledger event (visible in
+`sdlc status` and the dashboard's recent-events), so a dispute is never silently
+swallowed and the story never falsely reports a disputed finding as fixed.
 
 ## Examples
 

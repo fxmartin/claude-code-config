@@ -210,6 +210,79 @@ def test_bugfix_empty_root_cause_rejected() -> None:
         validate_response("bugfix", data)
 
 
+# ---------------------------------------------------------------------------
+# Story 26.2-001: finding_dispositions is an optional array of per-review-finding
+# verdicts — implemented, or disputed-with-reasoning. Absent for non-review
+# bugfixes; a disputed finding without reasoning is performative and rejected.
+# ---------------------------------------------------------------------------
+
+def test_bugfix_finding_dispositions_omitted_still_valid() -> None:
+    """finding_dispositions is optional: a build/test bugfix omits it and validates."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    assert "finding_dispositions" not in data
+    assert validate_response("bugfix", data) == data
+
+
+def test_bugfix_implemented_finding_disposition_valid() -> None:
+    """An implemented finding needs no reasoning and validates (26.2-001)."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [
+        {"finding": "missing null guard in parse()", "disposition": "implemented"}
+    ]
+    assert validate_response("bugfix", data) == data
+
+
+def test_bugfix_disputed_finding_with_reasoning_valid() -> None:
+    """A disputed finding carrying concrete reasoning validates (26.2-001)."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [
+        {
+            "finding": "null deref at line 42",
+            "disposition": "disputed",
+            "reasoning": "line 42 is guarded by `if node is not None` on line 40",
+        }
+    ]
+    assert validate_response("bugfix", data) == data
+
+
+def test_bugfix_disputed_finding_without_reasoning_rejected() -> None:
+    """A dispute without reasoning is performative, not a refutation — rejected."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [
+        {"finding": "null deref at line 42", "disposition": "disputed"}
+    ]
+    with pytest.raises(SchemaValidationError):
+        validate_response("bugfix", data)
+
+
+def test_bugfix_disputed_finding_empty_reasoning_rejected() -> None:
+    """An empty reasoning string on a dispute is a dodge — rejected by schema."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [
+        {"finding": "null deref", "disposition": "disputed", "reasoning": ""}
+    ]
+    with pytest.raises(SchemaValidationError):
+        validate_response("bugfix", data)
+
+
+def test_bugfix_finding_disposition_bad_enum_rejected() -> None:
+    """disposition is a closed enum: implemented | disputed only."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [
+        {"finding": "x", "disposition": "ignored"}
+    ]
+    with pytest.raises(SchemaValidationError):
+        validate_response("bugfix", data)
+
+
+def test_bugfix_finding_disposition_missing_finding_rejected() -> None:
+    """Every disposition must name its finding so the verdict is traceable."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [{"disposition": "implemented"}]
+    with pytest.raises(SchemaValidationError):
+        validate_response("bugfix", data)
+
+
 def test_coverage_optional_dep_scan_status_accepted() -> None:
     """The optional dep_scan_status (Story 9.1-002) validates when present."""
     data = dict(VALID_RESPONSES["coverage"])

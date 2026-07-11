@@ -55,6 +55,43 @@
       "type": "integer",
       "minimum": 0,
       "description": "Count of failing tests the agent made pass."
+    },
+    "finding_dispositions": {
+      "type": "array",
+      "description": "Per-review-finding disposition (Story 26.2-001). Present only when the bugfix was dispatched with review findings: every finding the agent processed, each verified against the code and marked implemented or disputed. A dispute is structured data the controller surfaces, not prose lost in a log.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["finding", "disposition"],
+        "properties": {
+          "finding": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The review finding being addressed — a short identifier or restatement so the disposition is traceable to its finding."
+          },
+          "disposition": {
+            "type": "string",
+            "enum": ["implemented", "disputed"],
+            "description": "implemented = verified against the code and fixed; disputed = refuted against the code with concrete technical reasoning."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Concrete technical reasoning for the disposition. Required and non-empty when disposition is 'disputed' — a dispute without reasoning is performative, not a refutation."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["disposition"],
+              "properties": { "disposition": { "const": "disputed" } }
+            },
+            "then": {
+              "required": ["reasoning"],
+              "properties": { "reasoning": { "minLength": 1 } }
+            }
+          }
+        ]
+      }
     }
   }
 }
