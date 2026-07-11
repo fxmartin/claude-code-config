@@ -146,12 +146,28 @@ The `build-stories` skill is now a **thin wrapper** — all orchestration logic 
 #### Install
 
 ```bash
-# From the repo root — bootstraps uv if needed, then installs the CLI:
+# Deploy both artifacts after a `git pull` — controller CLI + plugin, one version:
+./scripts/deploy.sh
+
+# Controller only — bootstraps uv if needed, then installs the CLI:
 ./scripts/install-controller.sh
 
 # Or directly if you already have uv:
 cd controller && uv tool install .
 ```
+
+The controller CLI and the `autonomous-sdlc` plugin ship from this repo on the
+same version, but install through separate mechanisms — `uv tool install` and
+`claude plugin update`. A `git pull` moves **neither** pointer, so running only
+`install-controller.sh` leaves the plugin's skills on an older version, silently
+driving a controller they no longer match. `./scripts/deploy.sh` runs both;
+prefer it. The plugin half needs a Claude Code restart to take effect.
+
+A default `deploy.sh` run **requires `claude` on `PATH`** and aborts in preflight
+without it, before installing anything — moving only one of the two pointers is
+the very drift the script exists to prevent, and `uv tool install --force` cannot
+be rolled back. On a box with no Claude Code, pass `--controller-only` to opt out
+deliberately.
 
 #### Key subcommands
 
