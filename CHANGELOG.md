@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.11.1] - 2026-07-11
+
+### Fixed
+
+- fix(deploy): update the plugin before installing the controller (#434)
+
+
 ## [v2.11.0] - 2026-07-11
 
 ### Added
