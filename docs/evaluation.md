@@ -208,3 +208,16 @@ bounded subset is a valid, baseline-comparable slice, and
 `tests/test_eval_ci_workflow.py` checks the workflow is path-filtered,
 quota-gated, and baseline-checked. The **live model** is never invoked from the
 test suite — only from `sdlc eval` itself.
+
+## Related: skill pressure-tests (process compliance)
+
+This harness scores **output quality** on real tickets. A complementary,
+narrower suite scores **process compliance** — does a discipline prompt actually
+change agent behaviour under pressure? The Epic-26 RED/GREEN skill pressure-tests
+live at [`plugins/autonomous-sdlc/evals/`](../plugins/autonomous-sdlc/evals/README.md)
+and run on-demand via `claude plugin eval autonomous-sdlc --ablation with-without`
+(the with/without-plugin ablation is the RED/GREEN split). Like this harness they
+dispatch live agents and are **not** wired into the PR gate; CI only asserts the
+suite's *shape* (`controller/tests/test_skill_pressure_tests.py`). If that suite's
+live runs are ever automated, fold them into this eval harness (Epic-18) rather
+than standing up a second runner.
