@@ -29,10 +29,16 @@ _EVALS_ROOT = _REPO_ROOT / "plugins/autonomous-sdlc/evals"
 _CASES = ["root-cause-discipline", "finding-verification"]
 
 # The dispatched bugfix prompts that carry the discipline being pressure-tested.
+# The discipline is cross-shipped in BOTH skills, so every scenario must name
+# both — otherwise the with/without-plugin ablation only exercises one path.
 _DISCIPLINE_PROMPTS = [
     "plugins/autonomous-sdlc/skills/build-stories/bugfix-agent-prompt.md",
     "plugins/autonomous-sdlc/skills/fix-issue/bugfix-agent-prompt.md",
 ]
+
+# The two non-scenario legs of each case's triple. `prompt.md` gets its own
+# nonempty check above; these two carry the recorded RED and the GREEN rubric.
+_ARTIFACTS = ["baseline.md", "graders/criteria.md"]
 
 
 def _case_dir(name: str) -> Path:
@@ -187,3 +193,77 @@ def test_readme_documents_adding_a_case() -> None:
     assert "add" in readme
     for part in ("prompt.md", "baseline.md", "criteria.md"):
         assert part in readme, f"README does not document the {part} step"
+
+
+def test_readme_cites_superpowers_pattern_source() -> None:
+    """AC3: the reusable methodology is not invented here — the README names its
+    provenance (obra/superpowers "TDD for skills") so the pattern is auditable
+    and reusable, not folklore."""
+    readme = _read(_EVALS_ROOT / "README.md").lower()
+    assert "superpowers" in readme
+
+
+# ---------------------------------------------------------------------------
+# The other two legs of the triple must exist AND carry content. `prompt.md`
+# has its own nonempty guard above; a gutted baseline or empty grader would
+# otherwise slip past the shape checks (an empty file is still a file).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("case", _CASES)
+@pytest.mark.parametrize("artifact", _ARTIFACTS)
+def test_case_artifact_is_nonempty(case: str, artifact: str) -> None:
+    """A recorded baseline or grader with no body cannot prove or grade
+    anything — the RED evidence and GREEN rubric must actually be written."""
+    assert _read(_case_dir(case) / artifact).strip(), f"{case}: empty {artifact}"
+
+
+# ---------------------------------------------------------------------------
+# RED/GREEN linkage — the whole method is "GREEN is meaningful only if it beats
+# the recorded RED". That only holds if baseline and grader cross-reference each
+# other; a broken link silently decouples the two arms.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("case", _CASES)
+def test_case_baseline_links_forward_to_grader(case: str) -> None:
+    """The RED baseline must point to the GREEN rubric that supersedes it, so a
+    reader lands on the compliance criteria, not a dead end."""
+    baseline = _read(_case_dir(case) / "baseline.md")
+    assert "graders/criteria.md" in baseline, f"{case}: baseline names no grader"
+
+
+@pytest.mark.parametrize("case", _CASES)
+def test_case_grader_links_baseline_for_red_comparison(case: str) -> None:
+    """The GREEN rubric must reference the recorded RED baseline: a PASS only
+    counts if it *beats* that RED arm. Drop the link and the ablation loses its
+    reference point."""
+    grader = _read(_case_dir(case) / "graders" / "criteria.md")
+    assert "baseline.md" in grader, f"{case}: grader names no RED baseline"
+
+
+@pytest.mark.parametrize("case", _CASES)
+def test_case_grader_is_bidirectional(case: str) -> None:
+    """A rubric that only lists what PASSES cannot reject the RED behaviour. Each
+    grader must both reward the discipline (PASS) and reject its violation
+    (FAIL) — otherwise the RED arm could score GREEN."""
+    grader = _read(_case_dir(case) / "graders" / "criteria.md").lower()
+    assert "pass" in grader, f"{case}: grader states no PASS criteria"
+    assert "fail" in grader, f"{case}: grader states no FAIL criteria"
+
+
+# ---------------------------------------------------------------------------
+# Cross-shipping parity — the discipline ships in BOTH the build-stories and
+# fix-issue skills. Each scenario must exercise both, or a regression in the
+# un-referenced copy would go untested by the ablation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("case", _CASES)
+def test_case_references_both_discipline_prompt_variants(case: str) -> None:
+    """Every scenario names both cross-shipped discipline prompts, and both
+    exist on disk — so neither copy can drift out from under the pressure-test."""
+    prompt = _read(_case_dir(case) / "prompt.md")
+    for rel in _DISCIPLINE_PROMPTS:
+        assert rel in prompt, f"{case}: prompt does not reference {rel}"
+        assert (_REPO_ROOT / rel).is_file(), f"{case}: references missing prompt {rel}"
