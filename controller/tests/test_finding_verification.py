@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from sdlc.build import BuildOptions, Ledger, _run_bugfix, render_bugfix_prompt
+from sdlc.build import (
+    BuildOptions,
+    Ledger,
+    _run_bugfix,
+    _surface_finding_dispositions,
+    render_bugfix_prompt,
+)
 from sdlc.cohort import Story
 from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
 from sdlc.dispatch import AgentResult
@@ -217,3 +223,117 @@ def test_bugfix_without_findings_surfaces_nothing(tmp_path) -> None:
     )
     events = ledger.recent_events(run_id, limit=20)
     assert not [e for e in events if "disput" in e["message"].lower()]
+
+
+# ---------------------------------------------------------------------------
+# _surface_finding_dispositions edge cases — the defensive surfacing contract.
+# Exercised directly: each disputed finding must surface, malformed shapes must
+# be tolerated, and neither the finding text nor the reasoning may be swallowed.
+# ---------------------------------------------------------------------------
+
+def _fresh_run(tmp_path):
+    """A ledger with an open run, ready to receive surfaced dispositions."""
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-26", "sequential")
+    return ledger, run_id
+
+
+def _dispute_events(ledger, run_id):
+    return [
+        e
+        for e in ledger.recent_events(run_id, limit=50)
+        if "disput" in e["message"].lower()
+    ]
+
+
+def test_multiple_disputed_findings_each_surface(tmp_path) -> None:
+    """Every disputed finding surfaces as its own warn event — none is dropped."""
+    ledger, run_id = _fresh_run(tmp_path)
+    data = {
+        "finding_dispositions": [
+            {"finding": "finding-alpha", "disposition": "disputed", "reasoning": "alpha is guarded"},
+            {"finding": "finding-beta", "disposition": "disputed", "reasoning": "beta is unreachable"},
+        ]
+    }
+    _surface_finding_dispositions(ledger, run_id, "26.2-001", data)
+
+    disputes = _dispute_events(ledger, run_id)
+    assert len(disputes) == 2
+    assert all(e["level"] == "warn" for e in disputes)
+    messages = " ".join(e["message"] for e in disputes)
+    assert "finding-alpha" in messages
+    assert "finding-beta" in messages
+
+
+def test_mixed_dispositions_surface_only_the_disputed(tmp_path) -> None:
+    """Implemented findings stay quiet; only the disputed one surfaces from a mix."""
+    ledger, run_id = _fresh_run(tmp_path)
+    data = {
+        "finding_dispositions": [
+            {"finding": "accepted-fix", "disposition": "implemented"},
+            {"finding": "refuted-claim", "disposition": "disputed", "reasoning": "code is correct"},
+        ]
+    }
+    _surface_finding_dispositions(ledger, run_id, "26.2-001", data)
+
+    disputes = _dispute_events(ledger, run_id)
+    assert len(disputes) == 1
+    assert "refuted-claim" in disputes[0]["message"]
+    assert "accepted-fix" not in disputes[0]["message"]
+
+
+def test_disputed_finding_without_reasoning_surfaces_bare(tmp_path) -> None:
+    """A dispute missing reasoning still surfaces — the finding is named, no ': ' tail."""
+    ledger, run_id = _fresh_run(tmp_path)
+    data = {"finding_dispositions": [{"finding": "bare-claim", "disposition": "disputed"}]}
+    _surface_finding_dispositions(ledger, run_id, "26.2-001", data)
+
+    disputes = _dispute_events(ledger, run_id)
+    assert len(disputes) == 1
+    message = disputes[0]["message"]
+    assert "bare-claim" in message
+    # No reasoning => the message ends at the finding name, with no reasoning suffix.
+    assert message.rstrip().endswith("bare-claim")
+
+
+def test_disputed_finding_with_blank_name_uses_placeholder(tmp_path) -> None:
+    """A disputed finding with an empty/missing name surfaces as '(unnamed finding)'."""
+    ledger, run_id = _fresh_run(tmp_path)
+    data = {
+        "finding_dispositions": [
+            {"disposition": "disputed", "reasoning": "no name was supplied"},
+            {"finding": "   ", "disposition": "disputed", "reasoning": "whitespace name"},
+        ]
+    }
+    _surface_finding_dispositions(ledger, run_id, "26.2-001", data)
+
+    disputes = _dispute_events(ledger, run_id)
+    assert len(disputes) == 2
+    assert all("(unnamed finding)" in e["message"] for e in disputes)
+
+
+def test_non_dict_disposition_items_are_skipped(tmp_path) -> None:
+    """Malformed (non-dict) items in the list are tolerated, not surfaced."""
+    ledger, run_id = _fresh_run(tmp_path)
+    data = {
+        "finding_dispositions": [
+            "not-a-dict",
+            None,
+            {"finding": "real-dispute", "disposition": "disputed", "reasoning": "verified false"},
+        ]
+    }
+    _surface_finding_dispositions(ledger, run_id, "26.2-001", data)
+
+    disputes = _dispute_events(ledger, run_id)
+    assert len(disputes) == 1
+    assert "real-dispute" in disputes[0]["message"]
+
+
+def test_non_list_dispositions_surface_nothing(tmp_path) -> None:
+    """A finding_dispositions value that is not a list is ignored defensively."""
+    ledger, run_id = _fresh_run(tmp_path)
+    for bad in ({"finding": "x", "disposition": "disputed"}, "disputed", 42):
+        _surface_finding_dispositions(ledger, run_id, "26.2-001", {"finding_dispositions": bad})
+
+    assert _dispute_events(ledger, run_id) == []
