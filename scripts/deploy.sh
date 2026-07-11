@@ -7,15 +7,20 @@
 # The controller CLI and the Claude Code plugin ship from the same repo and the
 # same version number, but they install through completely separate mechanisms:
 #
-#   controller → `uv tool install --force controller/`   (scripts/install-controller.sh)
 #   plugin     → `claude plugin update <plugin>@<marketplace>`
+#   controller → `uv tool install --force controller/`   (scripts/install-controller.sh)
 #
-# Running only the first leaves the plugin's skills on whatever version they were
-# last explicitly updated to, driving a controller they no longer match. That
-# drift is silent — `git pull` moves neither pointer. This script runs both.
+# Running only one leaves the other on whatever version it was last explicitly
+# updated to — a controller driving skills it no longer matches, or vice versa.
+# That drift is silent: `git pull` moves neither pointer. This script runs both,
+# plugin FIRST: it is the remote, fallible step (marketplace, network) and its
+# effect is deferred until Claude Code restarts, while the controller install is
+# local and idempotent. If the plugin update fails, nothing has moved; if the
+# controller install then fails, the running system is still consistent (the new
+# plugin loads only on restart) and re-running this script converges.
 #
 # Usage:
-#   ./scripts/deploy.sh                  # controller + plugin
+#   ./scripts/deploy.sh                  # plugin + controller
 #   ./scripts/deploy.sh --controller-only  # no Claude Code on this box
 #   ./scripts/deploy.sh --plugin-only
 #   ./scripts/deploy.sh --dry-run        # print what would run, change nothing
@@ -50,7 +55,7 @@ DO_PLUGIN=true
 DRY_RUN=false
 
 usage() {
-  sed -n '6,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '6,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 log() { printf '==> %s\n' "$*"; }
@@ -93,18 +98,9 @@ if [[ "${DRY_RUN}" == false ]]; then
   fi
 fi
 
-# 1. Controller CLI. install-controller.sh bootstraps uv when absent and is
-#    itself idempotent, so re-running deploy.sh is safe.
-if [[ "${DO_CONTROLLER}" == true ]]; then
-  if [[ "${DRY_RUN}" == true ]]; then
-    log "[dry-run] would run: ${INSTALL_CONTROLLER}"
-  else
-    log "installing the sdlc controller CLI"
-    "${INSTALL_CONTROLLER}"
-  fi
-fi
-
-# 2. Plugin pointer. `claude` was proven present in preflight.
+# 1. Plugin pointer — the fallible step goes first (see header). `claude` was
+#    proven present in preflight, but the update itself can still fail at
+#    runtime (marketplace, network); failing here leaves the machine untouched.
 if [[ "${DO_PLUGIN}" == true ]]; then
   if [[ "${DRY_RUN}" == true ]]; then
     log "[dry-run] would run: claude plugin update ${PLUGIN_ID}"
@@ -112,6 +108,28 @@ if [[ "${DO_PLUGIN}" == true ]]; then
     log "updating plugin ${PLUGIN_ID}"
     claude plugin update "${PLUGIN_ID}"
     log "plugin updated — restart Claude Code to load it"
+  fi
+fi
+
+# 2. Controller CLI. install-controller.sh bootstraps uv when absent and is
+#    itself idempotent, so re-running deploy.sh is safe. If this local step
+#    fails after the plugin moved, the running system is still consistent (the
+#    new plugin loads only on restart) — but say so explicitly, so nobody
+#    restarts Claude Code onto a mismatched pair.
+if [[ "${DO_CONTROLLER}" == true ]]; then
+  if [[ "${DRY_RUN}" == true ]]; then
+    log "[dry-run] would run: ${INSTALL_CONTROLLER}"
+  else
+    log "installing the sdlc controller CLI"
+    if ! "${INSTALL_CONTROLLER}"; then
+      if [[ "${DO_PLUGIN}" == true ]]; then
+        die "controller install failed AFTER the plugin was updated.
+       Do not restart Claude Code yet — the new plugin would load against the
+       old controller. re-run ${BASH_SOURCE[0]} (idempotent) to converge, or
+       ${BASH_SOURCE[0]} --controller-only to retry just the failed step."
+      fi
+      die "controller install failed: ${INSTALL_CONTROLLER}"
+    fi
   fi
 fi
 
