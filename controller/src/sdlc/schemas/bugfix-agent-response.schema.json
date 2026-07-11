@@ -8,6 +8,7 @@
   "additionalProperties": true,
   "required": [
     "failure_category",
+    "root_cause",
     "fix_status",
     "tests_passing",
     "bugs_fixed",
@@ -25,6 +26,11 @@
         "SCHEMA_ERROR"
       ],
       "description": "Failure classification (bugfix-agent vocabulary CODE_BUG/TEST_BUG/ENV_ISSUE, plus orchestrator routing categories)."
+    },
+    "root_cause": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What broke and why — the defect behind the failure, not a restatement of the symptom (Story 26.1-001)."
     },
     "issue_number": {
       "type": "integer",

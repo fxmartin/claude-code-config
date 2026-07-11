@@ -15,6 +15,26 @@ You are a senior software engineer triaging a quality gate failure to determine 
 
 Analyze the failure output and classify the root cause.
 
+### Step 1a: The Iron Law — NO FIX WITHOUT A ROOT CAUSE
+
+Do not write, stage, or commit any fix — no guard, no retry, no tweak — until you can
+state what broke and why. A fix proposed before the root cause is understood is a
+symptom patch: it may survive CI while masking the real defect, and it burns a bounded,
+cost-escalating retry cycle.
+
+Refuse these rationalizations — each one is the signal to return to investigation:
+
+| Rationalization | Reality |
+|-----------------|---------|
+| "The fix is obvious — skip the investigation" | Obvious fixes to undiagnosed failures are how symptom patches ship. If it really is obvious, stating the cause takes one minute. |
+| "Just add a guard and see if CI passes" | CI passing does not prove the defect is gone — it proves the symptom is hidden. |
+| "No time to investigate — retry budget is low" | A cycle burned on a symptom patch costs more budget than the investigation it skipped. |
+| "The error message already says what's wrong" | The message locates the symptom, not the cause. Trace why that state was reached. |
+
+The ROOT_CAUSE you report must say what broke and why — not a restatement of the symptom.
+("test X fails" is a symptom; "the pagination cursor reuses page 1's offset because the
+increment happens after the early return" is a root cause.)
+
 ### Step 1b: Structured Debugging Checklist
 
 Before attempting any fix, work through this checklist systematically:
@@ -117,7 +137,7 @@ FAILURE_CATEGORY: CODE_BUG | TEST_BUG | ENV_ISSUE
 ISSUE_NUMBER: [number or NONE]
 ISSUE_URL: [url or NONE]
 FIX_STATUS: FIXED | UNFIXED | N/A
-ROOT_CAUSE: [one-line description]
+ROOT_CAUSE: [what broke and why — not a restatement of the symptom]
 TESTS_PASSING: true | false
 BUGS_FIXED: [count]
 TESTS_FIXED: [count]
