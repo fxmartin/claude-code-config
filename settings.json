@@ -1,10 +1,19 @@
 {
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+    "OTEL_METRICS_EXPORTER": "none",
+    "OTEL_TRACES_EXPORTER": "none",
+    "OTEL_LOGS_EXPORTER": "none"
+  },
   "permissions": {
     "allow": [
       "Bash(model-shelf:*)"
     ],
     "defaultMode": "auto"
   },
+  "model": "fable",
   "hooks": {
     "SessionStart": [
       {
@@ -84,16 +93,8 @@
       }
     }
   },
-  "agentPushNotifEnabled": false,
   "feedbackSurveyRate": 0,
-  "env": {
-    "DISABLE_AUTOUPDATER": "1",
-    "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
-    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
-    "OTEL_METRICS_EXPORTER": "none",
-    "OTEL_TRACES_EXPORTER": "none",
-    "OTEL_LOGS_EXPORTER": "none"
-  },
+  "agentPushNotifEnabled": false,
   "skipAutoPermissionPrompt": true,
   "voiceEnabled": true
 }
