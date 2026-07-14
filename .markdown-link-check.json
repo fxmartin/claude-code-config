@@ -4,6 +4,7 @@
     { "pattern": "^https?://localhost" },
     { "pattern": "^https?://127\\.0\\.0\\.1" },
     { "pattern": "^https?://([^/]+\\.)?example\\.(com|org|net)" },
+    { "comment": "t.me refuses requests from CI runners (Status 0), so the link cannot be validated headlessly.", "pattern": "^https://t\\.me/" },
     { "comment": "Planned deliverable of Epic-06, not yet created; forward-referenced by epic planning docs.", "pattern": "(^|/)docs/onboarding\\.md$" }
   ],
   "httpHeaders": [
