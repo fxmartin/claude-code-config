@@ -1,6 +1,7 @@
 # Epic 26: Agent Process Discipline (Superpowers-Inspired)
 
-> **Status: PLANNED (0/4)** — created 2026-07-11 from a comparative analysis of
+> **Status: COMPLETE (4/4)** — all 4 stories implemented, tested, and merged (26.1-001 → 26.3-001,
+> released v2.12.0–v2.15.0). Created 2026-07-11 from a comparative analysis of
 > [obra/superpowers](https://github.com/obra/superpowers) (MIT, Jesse Vincent). Superpowers keeps
 > *orchestration* in markdown skills an LLM follows — the model Epic-07 deliberately replaced with
 > the deterministic controller — so its execution machinery is explicitly **not** imported. What it

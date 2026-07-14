@@ -10,9 +10,9 @@
 
 **Why "a harness of harnesses".** It doesn't write the code itself — it *directs* AI coding agents, and those agents are swappable: the same pipeline runs on Anthropic's **Claude** or OpenAI's **Codex** (or a mix, one engine per stage). The framework is the conductor; the AI agents are the musicians. That's the harness of harnesses — one control layer driving interchangeable AI engines through the full lifecycle, so you're never locked to a single vendor.
 
-**What keeps it trustworthy.** Autonomy without controls is just a fast way to make a mess. So every handoff between stages is validated against a strict contract, every run is checkpointed step-by-step (a crash or a closed laptop resumes cleanly), risky changes — CI, install scripts, security-sensitive files — are held for explicit human approval, and long runs ping you on Telegram. The point isn't "AI writes code" — it's a **controlled, auditable, autonomous SDLC** you can leave running and trust the result.
+**What keeps it trustworthy.** Autonomy without controls is just a fast way to make a mess. So every handoff between stages is validated against a strict contract, every run is checkpointed step-by-step (a crash or a closed laptop resumes cleanly), risky changes — CI, install scripts, security-sensitive files — are held for explicit human approval (enforced on GitHub; not yet on GitLab), and long runs ping you on Telegram. The point isn't "AI writes code" — it's a **controlled, auditable, autonomous SDLC** you can leave running and trust the result.
 
-**Where it's heading.** As of **2.0**, the team workflow is live on GitHub: every story is mirrored to a shared **GitHub issue board** as the single source of truth, with a portfolio dashboard showing status and owner across the whole backlog, and status/owner reconciliation keeping the board honest (Epic-22). Still ahead (Epic-23): the same pipeline running against **GitLab** projects too — so several developers, and their autonomous runs, work the same backlog **in parallel and jointly** instead of in separate silos.
+**Where it stands.** As of **2.x** the team workflow is live on **both forges**. Every story is mirrored to a shared issue board — GitHub or GitLab — as the single source of truth, with a portfolio dashboard showing status and owner across the whole backlog (Epic-22). The build pipeline itself runs against GitLab company repos too: it opens Merge Requests, gates the merge on GitLab CI, reviews via `glab mr diff`, and the live dashboard is forge-agnostic (Epic-23) — though the high-risk approval gate is enforced only on GitHub so far; its GitLab port is still open. Several developers, and their autonomous runs, work the same backlog **in parallel and jointly** instead of in separate silos. Still ahead: continuous ready-queue scheduling that retires the cohort barrier (Epic-24) and data-driven token/performance optimization (Epic-27).
 
 ---
 
@@ -23,6 +23,8 @@ This is the harness behind a multi-agent AGILE pipeline with parallel worktree e
 The harness ships as **two mirror plugins** — `autonomous-sdlc` for Claude Code (in this repo at `plugins/autonomous-sdlc/`) and `autonomous-sdlc` for Codex (in the sibling [`nix-install`](https://github.com/fxmartin/nix-install) repo). Same plugin name, same pipeline shape, same skill IDs — so the SDLC workflow is portable across both runtimes. On Claude Code the plugin's skills surface as bare slash-commands (`/brainstorm`, `/create-story`, etc.) labelled `(autonomous-sdlc)` in the autocomplete; on Codex they're invoked as `Use autonomous-sdlc <name>`.
 
 We also use the Codex mirror as an automated adversarial review layer for Claude Code work. Claude Code remains the primary builder in this harness; Codex runs the same `autonomous-sdlc` plugin from the sibling repo to inspect Claude-produced changes, file high-signal issues, and challenge implementation quality from an independent runtime before work is considered done. Beyond review, Codex can now run the **build pipeline itself** — the controller dispatches each stage to a pluggable *agent harness*, so a repo can build entirely on Codex (or any mix). See [Cross-harness builds](#cross-harness-builds--run-the-pipeline-on-claude-or-codex-epic-2021).
+
+**Contents:** [What it achieves](#what-this-harness-achieves) · [The workflow](#the-workflow-in-five-phases) · [The `sdlc` controller](#the-sdlc-controller-epic-07) · [Cross-harness builds](#cross-harness-builds--run-the-pipeline-on-claude-or-codex-epic-2021) · [Dashboard](#observability--the-live-dashboard) · [Why it works](#why-it-works) · [The gate stack](#the-gate-stack) · [Telegram](#telegram-notifications) · [Hardware envelope](#hardware-envelope) · [What's in the repo](#whats-in-the-repo) · [Install](#install) · [Reference](#reference-material)
 
 ---
 
@@ -46,13 +48,13 @@ We also use the Codex mirror as an automated adversarial review layer for Claude
          │  └─ Merge agent    (sequential, rebase-before-merge)
          │      └─ Bugfix loop on failure (classify → fix → retry ×2)
          ▼
-     E2E gate (Playwright, at epic boundaries)
+     /design-e2e · /execute-e2e-tests (Playwright, run at epic boundaries)
          │
          ▼
      /project-review · /coverage · /create-project-summary-stats
 ```
 
-Every phase emits structured events to the ledger and mirrors milestones to Telegram so long-running runs can be monitored away from the machine.
+Every phase emits structured events to the ledger and mirrors milestones to Telegram so long-running runs can be monitored away from the machine. The pipeline is forge-agnostic: on GitHub it opens PRs and gates on `gh pr checks`; on GitLab it opens MRs and gates on the GitLab CI pipeline (see [`docs/gitlab-adoption.md`](docs/gitlab-adoption.md)).
 
 ---
 
@@ -134,10 +136,10 @@ The skill is a **thin dispatcher** — argument parsing, control flow, and struc
 
 4. **Worktree isolation** (via the Agent tool's `isolation: "worktree"` flag) gives each concurrent agent a full, isolated checkout. No file-conflict races between agents working on overlapping areas of the codebase.
 5. **Bugfix loop** — if any stage fails, a Bugfix Agent classifies the failure as `CODE_BUG` / `TEST_BUG` / `ENV_ISSUE`, files a GitHub issue, auto-fixes, and retries (max 2 attempts). Failed stories are marked `FAILED`; their dependents become `BLOCKED` in subsequent cohorts.
-6. **E2E gate** at epic boundaries runs Playwright tests — blocking, warning, or off per flag.
+6. **E2E gate** at epic boundaries runs Playwright tests — part of the legacy skill pipeline; the `sdlc` controller does not dispatch an E2E stage yet, so run `/execute-e2e-tests` separately.
 7. **Summary agent** emits the run's metrics and a merged-PR manifest.
 
-Progress is persisted in a **SQLite state ledger** (`sdlc_state.db`) with a human-readable markdown view generated on demand. Legacy `docs/stories/.build-progress.md` is kept as a fallback view. Status values: `DONE` / `IN_PROGRESS` / `FAILED` / `SKIPPED` / `PENDING`. Any run is resumable from the last completed stage.
+Progress is persisted in a **SQLite state ledger** (`.sdlc-state.db`) with a human-readable markdown view generated on demand. Legacy `docs/stories/.build-progress.md` is kept as a fallback view. Status values: `DONE` / `IN_PROGRESS` / `FAILED` / `SKIPPED` / `PENDING`. Any run is resumable from the last completed stage.
 
 ### The `sdlc` controller (Epic-07)
 
@@ -157,31 +159,27 @@ cd controller && uv tool install .
 ```
 
 The controller CLI and the `autonomous-sdlc` plugin ship from this repo on the
-same version, but install through separate mechanisms — `uv tool install` and
-`claude plugin update`. A `git pull` moves **neither** pointer, so running only
-`install-controller.sh` leaves the plugin's skills on an older version, silently
-driving a controller they no longer match. `./scripts/deploy.sh` runs both;
-prefer it. The plugin half needs a Claude Code restart to take effect.
-
-A default `deploy.sh` run **requires `claude` on `PATH`** and aborts in preflight
-without it, before installing anything — moving only one of the two pointers is
-the very drift the script exists to prevent, and `uv tool install --force` cannot
-be rolled back. On a box with no Claude Code, pass `--controller-only` to opt out
-deliberately. Runtime failures are contained by ordering: the fallible plugin
-update runs **first** (a failure there leaves the machine untouched), and if the
-local controller install then fails, the script exits non-zero telling you not to
-restart Claude Code until a re-run converges the pair.
+same version, but install through separate mechanisms (`uv tool install` and
+`claude plugin update`) — a `git pull` moves **neither** pointer. Updating only
+one leaves the plugin's skills silently driving a controller they no longer
+match, so prefer `./scripts/deploy.sh`, which converges both (and aborts in
+preflight if `claude` isn't on `PATH`; pass `--controller-only` on a box without
+Claude Code). The plugin half needs a Claude Code restart to take effect.
 
 #### Key subcommands
 
 | Command | Purpose |
 |---------|---------|
-| `sdlc build [scope] [--dry-run] [--auto] [--skip-coverage] [--limit=N]` | Run the full build-stories orchestration |
+| `sdlc build [scope] [--dry-run] [--auto] [--harness role=name] [--concurrency=N]` | Run the full build-stories orchestration |
 | `sdlc resume` | Resume an interrupted build from the ledger state |
-| `sdlc status` | Show current run status and stage progress |
-| `sdlc state` | Inspect the persisted state machine for a run |
+| `sdlc status` · `sdlc state` | Run status and stage progress · inspect the persisted state machine |
+| `sdlc dashboard --open` | Live multi-run browser dashboard (see [Observability](#observability--the-live-dashboard)) |
+| `sdlc issues init` · `sdlc issues assign` | Backfill the GitHub/GitLab issue board (one issue per story) · assign a story or epic to a host user. During a build, each story's issue updates live (a `status:` label + comment as it moves `building → in-review → merging`) and auto-closes on merge via its `Closes #N` link |
+| `sdlc doctor [--gitlab]` | Health-check install, ledger, config, and forge prerequisites |
+| `sdlc clean` · `sdlc repair` · `sdlc rollback` · `sdlc reconcile` | Workspace GC · ledger repair · checkpoint unwind · terminal-status reconciliation vs `origin/main` |
+| `sdlc sast` · `sdlc depscan` · `sdlc supplychain` | Classify SAST/dependency scan reports · scan hooks/skills/MCP/settings for dangerous patterns — all exit non-zero on `BLOCK` for CI gating |
+| `sdlc eval` · `sdlc eval-compare` · `sdlc eval-baseline` | Agent-output evaluation harness (A/B, regression baselines) |
 | `sdlc validate <agent-type> <file>` | Validate an agent response against its JSON schema |
-| `sdlc rollback` | Roll a run back to a prior ledger checkpoint |
 | `sdlc sync-check <src> <dst>` | Verify shared-skills parity between repos |
 
 `sdlc build` accepts the same arguments as `/build-stories` — the skill simply shells out to it. Migration is invisible to end users.
@@ -293,11 +291,39 @@ It binds to **http://127.0.0.1:8787** by default (localhost-only).
 - **Thin-dispatcher orchestrators** — skills like `/build-stories` and `/fix-issue` carry only control flow; heavy I/O and reasoning are delegated to sub-agents so the orchestrator's context window stays lean across tens of stories.
 - **Specialist agents per story type** — the Build stage picks the right agent from the roster (`backend-typescript-architect`, `python-backend-engineer`, `ui-engineer`, `bash-zsh-macos-engineer`, `podman-container-architect`, `qa-engineer`) based on the story's tech stack.
 - **Mandatory senior-code-reviewer** — every PR flows through an architecture/security review before merge. Not a nice-to-have, not optional.
-- **TDD-first** — tests are written before implementation; the coverage gate fails the story if the final suite doesn't hit the threshold (default 90%).
+- **TDD-first** — tests are written before implementation; the coverage gate fails the story when the coverage agent reports the suite below the threshold (default 90%).
 - **Worktree isolation** — five agents can genuinely run in parallel without clobbering each other's files, because each has its own checkout.
 - **Sequential merge with rebase** — Stage 4 serializes merges with rebase-before-merge, preventing the race conditions that kill naive parallel-merge setups.
 - **Bugfix loop is a peer, not a god** — classifies failures, creates a GitHub issue (so there's an audit trail), fixes, retries. Two strikes and the story is marked `FAILED` rather than loop forever.
 - **Verifiable goals** — every skill enforces strong success criteria per step (test green, coverage ≥ N, review approved, merge clean), which is what makes unattended loops safe.
+- **Process discipline inside each agent's turn** — bugfix agents must state a root cause before fixing (schema-enforced in the bugfix contract), review findings are verified and disputable claims rather than orders, reviewers treat the implementer's self-report as unverified, and red/green pressure-tests prove these discipline prompts actually change agent behavior (Epic-26, patterns adapted from [obra/superpowers](https://github.com/obra/superpowers)).
+
+---
+
+## The gate stack
+
+Coverage alone is not a quality bar — a 90%-covered diff can still ship an injection bug or a needlessly clever abstraction. What follows is the honest map of what actually blocks a story in a default `sdlc build` today, versus what ships as an opt-in or standalone mechanism.
+
+**Enforced on every story by the controller:**
+
+| Check | How it's enforced | Docs |
+|-------|-------------------|------|
+| **Build** | The story fails unless the build agent's schema-validated response reports `SUCCESS`; failures route to the bugfix loop (root-cause-first, max 2 retries) | [`docs/contracts.md`](docs/contracts.md) |
+| **Coverage** | A dedicated agent fills gaps against the run's threshold (default 90%, `--coverage-threshold=N`); the story fails on a reported `FAIL`. Agent-reported — opt out with `--skip-coverage` | — |
+| **Senior code review** | The story does not advance unless the reviewer returns `APPROVED`; the reviewer is instructed to treat the implementer's self-report as unverified claims (Epic-26) | — |
+| **CI gate at merge** | Before merging, the controller polls the PR/MR's CI status and refuses to merge on failure (skipped when the repo has no CI mapped). This repo's CI carries the security jobs: gitleaks secret detection (fails on any finding) and a supply-chain scan | [`docs/security-gates.md`](docs/security-gates.md) |
+| **High-risk approval** | **Enforced on GitHub only** — a PR touching auth, payments, migrations, infrastructure, secrets, or destructive shell fails the `risk-gate` CI check (a GitHub Actions workflow); the merge CI gate refuses to merge over a red check and the merge agent is forbidden to force past it, so the PR cannot land without human approval. When the block is recognized, the run parks the story `AWAITING_APPROVAL`; that recognition isn't fully deterministic yet (a gated story can be misread as `FAILED` — Epic-25 tracks it), but the merge stays withheld either way. **On GitLab there is no enforced high-risk gate**: nothing detects high-risk paths, and even a maintainer-applied `risk:high` label fails no pipeline job and triggers no approval rule — it is honored only as a best-effort instruction to the merge agent | [`docs/high-risk-gate.md`](docs/high-risk-gate.md) |
+
+**Shipped, but opt-in or not yet wired into the build loop** — worth knowing before you rely on them:
+
+| Mechanism | Status today | Docs |
+|-----------|--------------|------|
+| **Adversarial review slot** | Vendor-agnostic second-reviewer interface with an `any_block_majority` consensus rule (Codex reference implementation: `scripts/codex-adversarial-review.sh`). Runs standalone — the build loop never dispatches it. Note that `--harness review=codex` is a different thing: it routes the *ordinary* review stage to a single Codex reviewer, not this slot | [`docs/adversarial-review.md`](docs/adversarial-review.md) |
+| **SAST / dependency scans** | `sdlc sast` / `sdlc depscan` classify an externally produced scan report (exit non-zero on `BLOCK`) — they do not run the scanners, and no CI job currently runs semgrep or osv-scanner: GitHub CI runs gitleaks + the supply-chain pattern scan, the GitLab template runs gitleaks only. The coverage contract's `security_status` field is not acted on by the controller | [`docs/security-gates.md`](docs/security-gates.md) |
+| **Over-engineering lens** | A structured *delete-list* review of a diff ("would a senior engineer call this overcomplicated?") — implemented and tested, advisory by design, but not yet dispatched by the build loop | [`docs/overengineering-lens.md`](docs/overengineering-lens.md) |
+| **E2E** | Playwright suites via the `/design-e2e` and `/execute-e2e-tests` skills; the epic-boundary E2E gate belongs to the legacy skill pipeline and is not yet a controller stage | — |
+
+Alongside the merge checks, two run-level control planes: **cost governance** (a per-run token budget gate that pauses resumably, per-task model routing by complexity and risk, rate-limit awareness with auto-resume — Epic-14), and an **evaluation harness** that scores agent output (LOC, tokens, cost, quality) across real tickets with variant A/B and regression baselines, so prompt/model/skill changes are measured rather than guessed — see [`docs/evaluation.md`](docs/evaluation.md).
 
 ---
 
@@ -323,7 +349,7 @@ Each concurrent agent runs:
 - Its own MCP server subprocesses (Playwright, context7, etc. as needed)
 - Live language servers (tsc, pyright) spun up by the typescript/pyright plugins
 
-At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sitting near memory pressure. Six would start swapping; seven would thrash. If you're running on less than 48 GB, drop the cap with `--sequential` or run narrower cohorts via `--limit=N`. This is the practical constraint that shapes the whole cohort model — not algorithm elegance, but RAM.
+At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sitting near memory pressure. Six would start swapping; seven would thrash. If you're running on less than 48 GB, lower the worker count with `--concurrency=N`, drop to `--sequential`, or run narrower cohorts via `--limit=N`. This is the practical constraint that shapes the whole cohort model — not algorithm elegance, but RAM.
 
 ---
 
@@ -336,13 +362,13 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `controller/` | **`sdlc` CLI** — Python controller that owns the build-stories state machine (Epic-07). Install via `./scripts/install-controller.sh`. See [`controller/README.md`](controller/README.md). | 1 package |
 | `shared-skills/` | Single source of truth for the 7 skills shared between the Claude Code and Codex plugins (`check-releases`, `coverage`, `create-issue`, etc.) — consumed as a git submodule by the `nix-install` Codex mirror | 7 skills |
 | `plugins/autonomous-sdlc/` | **Claude Code plugin** — SDLC skills surfaced as bare slash-commands labelled `(autonomous-sdlc)` (mirror of the Codex `autonomous-sdlc` plugin in `nix-install`) | 1 plugin / 8 skills |
-| `skills/` | Loose user-level Claude skills not part of the SDLC plugin (generators, e2e, claude-docs, telegram, demo) | 9 |
-| `commands/` | Namespaced slash commands (`dev/`, `devops/`, `issues/`, `project/`, `quality/`, `research/`) | 17 |
-| `agents/` | Specialist agent definitions (flat) | 12 |
-| `hooks/` | Telegram notifier, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper, worktree GC, SQLite ledger emitter | 6 scripts |
-| `scripts/` | Standalone scripts run by CI (`validate-agent-registry.sh`), the release workflow (`compute-release.sh`, `release-guard.sh`), and controller bootstrap (`install-controller.sh`) + shared-skills sync (`sync-shared-skills.sh`) | 5 |
-| `tests/` | bats test suite for hooks, install smoke tests, the controller, and release gates (notify-telegram, install dry-run, agent-registry, sweep-orphan-worktrees, sdlc-state, release-guard) | 30 bats |
-| `templates/` | Shared scaffolding used by generator skills | 3 |
+| `skills/` | Loose user-level Claude skills not part of the SDLC plugin (generators, e2e, claude-docs, model-shelf, telegram, demo) | 10 |
+| `commands/` | Namespaced slash commands (`dev/`, `project/`, `research/`, plus top-level) | 16 |
+| `agents/` | Specialist agent definitions (8 SDLC + 4 personal extras) | 12 |
+| `hooks/` | Telegram notifier, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper, worktree GC, SQLite ledger emitter, hook profiles, session context | 8 scripts |
+| `scripts/` | CI validators, release gates (`compute-release.sh`, `release-guard.sh`), deploy + controller bootstrap, harness adapters (`codex-build-adapter.sh`, `qwen-build-adapter.sh`), security scans (SAST, OSV, supply-chain), shared-skills sync, smoke test | 21 |
+| `tests/` | bats test suite for hooks, install smoke tests, the controller, harness adapters, and release gates | 39 bats |
+| `templates/` | Shared scaffolding used by generator skills | 5 |
 | `reference-docs/` | Language/tooling references loaded via `@` imports | 3 |
 | `docs/` | User-facing docs (CLAUDE.md guide, Python/container/DB/testing best practices, generators, controller architecture, ADRs, contracts) | — |
 | `settings.json` | Hooks config, statusline, enabled plugins, marketplaces | — |
@@ -592,6 +618,12 @@ See [`docs/generators.md`](docs/generators.md).
 - [`docs/controller-architecture.md`](docs/controller-architecture.md) — `sdlc` controller module map, state-machine, and retry semantics (Epic-07)
 - [`docs/contracts.md`](docs/contracts.md) — agent I/O JSON-schema contracts reference
 - [`docs/harness-adapters.md`](docs/harness-adapters.md) — add a new agent harness (config + wrapper, no Python) and the generic CLI adapter template (Epic-20)
+- [`docs/gitlab-adoption.md`](docs/gitlab-adoption.md) — take a company GitLab repo from zero to its first green `sdlc build` MR (Epic-23)
+- [`docs/issue-host-adapters.md`](docs/issue-host-adapters.md) — the `gh`/`glab` code-host adapter contract behind `sdlc issues` (Epic-22)
+- [`docs/security-gates.md`](docs/security-gates.md) · [`docs/high-risk-gate.md`](docs/high-risk-gate.md) · [`docs/adversarial-review.md`](docs/adversarial-review.md) · [`docs/overengineering-lens.md`](docs/overengineering-lens.md) — the gate stack
+- [`docs/evaluation.md`](docs/evaluation.md) — the agent-output evaluation harness (Epic-18)
+- [`docs/hook-profiles.md`](docs/hook-profiles.md) — tune hook strictness and SessionStart context from the environment (Epic-15)
+- [`docs/onboarding.md`](docs/onboarding.md) — 15-minute walkthrough from blank machine to first autonomous build
 - [`docs/adr/001-controller-runtime.md`](docs/adr/001-controller-runtime.md) · [`docs/adr/002-codex-mirror-sync.md`](docs/adr/002-codex-mirror-sync.md) — architecture decision records
 - [`docs/python-best-practices.md`](docs/python-best-practices.md) · [`docs/testing-best-practices.md`](docs/testing-best-practices.md) · [`docs/container-best-practices.md`](docs/container-best-practices.md) · [`docs/database-best-practices.md`](docs/database-best-practices.md)
 
@@ -607,9 +639,10 @@ Every push to `main` that contains a `feat:` or `fix:` commit (or better) trigge
 
 ## Acknowledgements
 
-Two external sources shaped this harness:
+Three external sources shaped this harness:
 
 - **[forrestchang/andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills)** (MIT) — the *Surgical Changes* sub-rules, *Complexity check* heuristic, and *Verifiable Goals* plan template in [`CLAUDE.md`](CLAUDE.md) are adapted from this repo, which itself derives from Andrej Karpathy's observations on LLM coding pitfalls. Absorbed as prose rather than installed as a plugin, for single-source ownership.
+- **[obra/superpowers](https://github.com/obra/superpowers)** (MIT, Jesse Vincent) — the agent-discipline patterns in Epic-26 (root-cause-first bugfix, review findings as disputable claims, red/green pressure-tests) are adapted from this project's prompt-level process rules and re-implemented as schema-enforced contracts in the deterministic controller.
 - **[anthropics/skills](https://github.com/anthropics/skills)** — Anthropic's official example-skills marketplace, wired in via `settings.json`. Provides the `example-skills` plugin bundle (web-artifacts-builder, webapp-testing, frontend-design, canvas-design, algorithmic-art, skill-creator, claude-api, theme-factory, mcp-builder, docx/xlsx/pptx/pdf, brand-guidelines, internal-comms, doc-coauthoring, slack-gif-creator).
 
 ---

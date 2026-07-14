@@ -315,6 +315,11 @@ write-back into the ledger from the host. Idempotent, batched, resumable; the sa
 - [x] Tests: push managed block, pull assignee/labels, no-op idempotency, wontfix-skip — both hosts
 - [x] Docs: the field-ownership / direction table
 
+> **Implementation note (2026-07-14)**: the reconcile engine shipped as a tested library
+> (`controller/src/sdlc/story_sync.py`); a standalone `sdlc issues sync` CLI verb is not wired yet.
+> Runtime board updates come from `sdlc issues init` (backfill) and the 22.4-002 build-loop
+> integration (live `status:` labels/comments + `Closes #N` auto-close).
+
 **Dependencies**: 22.2-003
 **Risk Level**: High
 
