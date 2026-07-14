@@ -38,8 +38,9 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/gitlab-ci"
 
 @test "template declares every required quality gate job" {
     # AC: lint (shellcheck/ruff), tests (pytest/bats), schema/contract checks,
-    # secret scan, and commit-format — all present as GitLab CI jobs.
-    for job in secrets-scan shellcheck ruff json-schema commit-format pytest bats; do
+    # secret scan, commit-format, and the high-risk approval gate — all present
+    # as GitLab CI jobs.
+    for job in secrets-scan shellcheck ruff json-schema commit-format risk-gate pytest bats; do
         run grep -E "^${job}:" "${TEMPLATE}"
         [ "${status}" -eq 0 ]
     done
@@ -54,6 +55,36 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/gitlab-ci"
     # commitlint must only lint MR commits, not the protected default branch
     # history (mirrors the GitHub `if: pull_request` guard).
     run grep -n "CI_MERGE_REQUEST_DIFF_BASE_SHA" "${TEMPLATE}"
+    [ "${status}" -eq 0 ]
+}
+
+@test "risk-gate job is scoped to merge-request pipelines" {
+    # The high-risk gate must only run on MR pipelines (it diffs against the MR
+    # base sha); it must not run on protected default-branch pushes.
+    run bash -c "awk '/^risk-gate:/{f=1} f&&/^[a-z]/&&!/^risk-gate:/{f=0} f' '${TEMPLATE}' | grep -F 'merge_request_event'"
+    [ "${status}" -eq 0 ]
+}
+
+@test "risk-gate job invokes the shared risk-gate detector" {
+    run grep -F "scripts/risk-gate-detect.sh" "${TEMPLATE}"
+    [ "${status}" -eq 0 ]
+}
+
+@test "risk-gate job reads CI_MERGE_REQUEST_LABELS for the risk-approved signal" {
+    run grep -F "CI_MERGE_REQUEST_LABELS" "${TEMPLATE}"
+    [ "${status}" -eq 0 ]
+    run grep -F "risk-approved" "${TEMPLATE}"
+    [ "${status}" -eq 0 ]
+}
+
+@test "risk-gate job uses the GitLab CI token priority with a no-token fallback" {
+    # Token priority GITLAB_TOKEN → GL_TOKEN → CI_JOB_TOKEN (issue-host-adapters)
+    # and a graceful degrade when no token is present.
+    for var in GITLAB_TOKEN GL_TOKEN CI_JOB_TOKEN; do
+        run grep -F "${var}" "${TEMPLATE}"
+        [ "${status}" -eq 0 ]
+    done
+    run grep -iE "no token|without a token|best.effort" "${TEMPLATE}"
     [ "${status}" -eq 0 ]
 }
 

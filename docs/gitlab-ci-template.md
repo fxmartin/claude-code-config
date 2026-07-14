@@ -41,6 +41,8 @@ the `contract-checks` and `bats` CI jobs.
 | `.commitlintrc.json` | `commit-format` | Conventional-commit rules.                       |
 | `uv` + `pyproject.toml` | `pytest`, `ruff` | Python project managed with `uv`.           |
 | `tests/*.bats`     | `bats`           | Behaviour/shell tests.                           |
+| `scripts/risk-gate-detect.sh` | `risk-gate` | Vendored detector, reused byte-for-byte from GitHub. |
+| `controller/src/sdlc/config/high-risk-patterns.yaml` | `risk-gate` | Vendored high-risk pattern list (or `RISK_GATE_CONFIG` pointing elsewhere). |
 
 Jobs whose tooling a given repo does not use can be removed from the copied
 file; the validator only enforces the full gate set on the shipped template.
@@ -57,6 +59,7 @@ set of checks passed on both hosts.
 | Lint — Python           | (target-repo gate)                          | `ruff` (stage `lint`)                 | ruff                         |
 | JSON / schema / contract | `static-checks` (Validate JSON) + `contract-checks` | `json-schema` (stage `lint`)  | jq                           |
 | Commit format           | `commit-format` (PR-only)                   | `commit-format` (MR-only)             | commitlint                   |
+| High-risk approval gate | `risk-gate` (PR-only)                       | `risk-gate` (MR-only)                 | `scripts/risk-gate-detect.sh` |
 | Tests — Python          | `controller-smoke` (pytest)                 | `pytest` (stage `test`)               | uv + pytest                  |
 | Tests — behaviour/shell | `behavior-tests` (bats)                     | `bats` (stage `test`)                 | bats                         |
 
@@ -74,6 +77,15 @@ set of checks passed on both hosts.
   events and pushes to the default branch — the GitLab equivalent of
   `on: [pull_request, push: branches: [main]]` — and avoid duplicate
   branch + MR pipelines on the same commit.
+- **Risk-gate label-retrigger gap.** The GitHub `risk-gate` workflow re-runs on
+  the `labeled`/review event, so adding `risk-approved` flips the check green
+  automatically. GitLab **Free/Core does not retrigger a pipeline on a label
+  event**, so after a maintainer adds `risk-approved` they must **retry the
+  `risk-gate` job** (`glab ci retry` / the pipeline UI) — no new push is needed,
+  but the green flip is a manual retry. Labelling uses the REST API with the
+  `GITLAB_TOKEN → GL_TOKEN → CI_JOB_TOKEN` token priority and degrades gracefully
+  (warn-and-continue) when no token is present; the exit code still enforces the
+  gate. See [high-risk-gate.md](high-risk-gate.md) for the vendoring prerequisite.
 
 ## Free/Core constraint
 

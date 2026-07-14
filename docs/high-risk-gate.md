@@ -23,15 +23,28 @@ either host, so the labels always exist for a maintainer to apply. The
 adversarial reviewers feeding the gate source the MR diff host-aware via
 `glab mr diff` (see [adversarial-review.md](adversarial-review.md)).
 
-**The gate is not enforced on GitLab today.** Detection lives in
-`.github/workflows/risk-gate.yml` — a GitHub Actions workflow — and the shipped
-`.gitlab-ci.yml` template carries no risk-gate job, so nothing detects high-risk
-paths or applies `risk:high` to an MR on its own. Even a maintainer-applied
-`risk:high` label fails no pipeline job and triggers no approval rule, so
-nothing platform-side blocks `glab mr merge`; the only backstop is the merge
-agent's prompt instruction to refuse and park the story `AWAITING_APPROVAL` —
-best-effort prompt compliance, not an enforced control. Porting the gate
-(detector + a blocking pipeline job) to the GitLab CI template is an open item.
+**The gate is enforced on GitLab too** (Story 23.5-002). The shipped
+`.gitlab-ci.yml` template carries a `risk-gate` job that, on every Merge Request
+pipeline, diffs the MR against its target-branch base and pipes the changed
+paths through the same `scripts/risk-gate-detect.sh`. On a match it applies the
+`risk:high` label via the GitLab REST API (best-effort — it warns and continues
+when no token is present) and, unless the MR carries the `risk-approved` label,
+**fails the pipeline**. The merge CI gate (Story 23.2-002) blocks
+`glab mr merge` on that red pipeline, so a high-risk MR cannot merge without a
+maintainer's `risk-approved` label — an enforced control, not just prompt
+compliance.
+
+One honest caveat versus GitHub: on GitLab **Free/Core a label event does not
+retrigger the pipeline**. GitHub's workflow re-runs on the `labeled`/review
+event and turns the check green automatically; on GitLab, after a maintainer
+adds `risk-approved` they must **retry the `risk-gate` job** (`glab ci retry` or
+the pipeline UI) — no new push is needed, but the green flip is a manual retry.
+
+The port has a **vendoring prerequisite**: the target repo must carry both
+`scripts/risk-gate-detect.sh` **and**
+`controller/src/sdlc/config/high-risk-patterns.yaml` at the same relative paths
+(or set `RISK_GATE_CONFIG` to point the detector at the patterns file
+elsewhere), exactly as the GitHub workflow requires them.
 
 ## How it works
 

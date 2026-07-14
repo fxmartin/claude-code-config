@@ -30,6 +30,11 @@ commit-format:
   script:
     - npx commitlint --from "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --to HEAD
 
+risk-gate:
+  stage: lint
+  script:
+    - git diff --name-only "$CI_MERGE_REQUEST_DIFF_BASE_SHA" | bash scripts/risk-gate-detect.sh
+
 pytest:
   stage: test
   script:
