@@ -5,6 +5,16 @@ SQL injection, a hardcoded credential, or a known-vulnerable dependency. Epic-09
 embeds security scanning into the same quality gate that measures coverage, so
 security becomes a **gate**, not a follow-up.
 
+> **Enforcement path today (2026-07-14)**: what actually runs in CI on every PR
+> of this repo is gitleaks (fails on any finding) and the supply-chain pattern
+> scan; the controller's merge stage gates on the PR/MR's CI status. `sdlc sast`
+> and `sdlc depscan` classify an externally produced scan report (exit non-zero
+> on `BLOCK`) but do not run semgrep/osv-scanner themselves, and no CI job
+> currently runs those scanners (the GitLab CI template runs gitleaks only).
+> The coverage-agent contract carries a `security_status` field, but the
+> controller does not currently act on it; the "coverage stage runs the scans"
+> flow described below is the Epic-09 design, not the current enforcement path.
+
 This page documents the **SAST gate** (Story 9.1-001), the **dependency gate**
 (`osv-scanner`, Story 9.1-002), the **secrets gate** (Story 9.2-001), and the
 **supply-chain gate** (Story 13.2-001) that scans the framework's own

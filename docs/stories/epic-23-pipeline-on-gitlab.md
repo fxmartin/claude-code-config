@@ -1,7 +1,7 @@
 # Epic 23: Pipeline on GitLab — run the autonomous build against GitLab projects
 
-> **Status: CODE-COMPLETE (9/10)** — created 2026-06-28. 9 of 10 stories (23.1-001 → 23.6-002) are
-> implemented, tested, and merged; only **23.7-001** (forge-agnostic dashboard repo-health) remains open.
+> **Status: COMPLETE (10/10)** — created 2026-06-28. All 10 stories (23.1-001 → 23.7-001) are
+> implemented, tested, and merged; **23.7-001** (forge-agnostic dashboard repo-health) shipped in v2.10.0.
 > Carved out of Epic-22 (which made the *issue/story mirror*
 > code-host-agnostic). Epic-22 lets the team *track* work on GitHub or GitLab; this epic lets the
 > autonomous **build pipeline itself run against a GitLab project** — opening **Merge Requests** instead

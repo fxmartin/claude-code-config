@@ -162,7 +162,7 @@ host:
 
 | Label | Meaning |
 |-------|---------|
-| `story` | framework-managed story issue (distinct from `bug`/own issues); the `sdlc issues sync --label story` filter |
+| `story` | framework-managed story issue (distinct from `bug`/own issues); enables a fast host-side filter (`gh issue list --label story`) |
 | `epic:NN` | the epic, e.g. `epic:22` |
 | `feature:NN.F` | the feature, e.g. `feature:22.2` |
 | `points:N` | story points — the **only** points surface on GitLab Free (omitted when unknown) |
@@ -184,8 +184,14 @@ field is a GitHub-only nicety. An unsupported host raises `IssueHostError`.
 
 ## Reconcile — field-directional sync (Story 22.4-001)
 
-`sdlc issues sync` keeps each story's issue and the local ledger consistent
-without drift. The engine
+The field-directional sync engine keeps each story's issue and the local ledger
+consistent without drift. It ships as a tested library, not a CLI verb — there
+is no `sdlc issues sync` command today. At runtime, `sdlc issues init` backfills
+the board, and the build loop keeps each story's issue current via Story
+22.4-002: a `status:<slug>` label + comment as the story moves through the
+coarse states `building → in-review → merging` (build and coverage share
+`building`, and duplicate transitions are deduplicated), plus auto-close on
+merge through the `Closes #N` link. The engine
 ([`controller/src/sdlc/story_sync.py`](../controller/src/sdlc/story_sync.py))
 is **strictly field-directional** — every field has exactly one writer, which is
 what makes a repeated sync a no-op (no echo loop):

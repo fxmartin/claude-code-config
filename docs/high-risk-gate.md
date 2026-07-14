@@ -18,10 +18,20 @@ Approval is satisfied by **either** of two paths:
 On **GitLab** (Free/Core) there is no `risk-approver` team-review path, so the
 `risk-approved` **label** is the sole maintainer-approval signal — the Free/Core
 equivalent of the GitHub gate's label path (Story 23.5-001). Both gate labels
-(`risk:high` and `risk-approved`) are provisioned on the board by `sdlc issues
-init` on either host, so the approval label always exists for a maintainer to
-apply. The adversarial reviewers feeding the gate source the MR diff host-aware
-via `glab mr diff` (see [adversarial-review.md](adversarial-review.md)).
+(`risk:high` and `risk-approved`) are provisioned by `sdlc issues init` on
+either host, so the labels always exist for a maintainer to apply. The
+adversarial reviewers feeding the gate source the MR diff host-aware via
+`glab mr diff` (see [adversarial-review.md](adversarial-review.md)).
+
+**The gate is not enforced on GitLab today.** Detection lives in
+`.github/workflows/risk-gate.yml` — a GitHub Actions workflow — and the shipped
+`.gitlab-ci.yml` template carries no risk-gate job, so nothing detects high-risk
+paths or applies `risk:high` to an MR on its own. Even a maintainer-applied
+`risk:high` label fails no pipeline job and triggers no approval rule, so
+nothing platform-side blocks `glab mr merge`; the only backstop is the merge
+agent's prompt instruction to refuse and park the story `AWAITING_APPROVAL` —
+best-effort prompt compliance, not an enforced control. Porting the gate
+(detector + a blocking pipeline job) to the GitLab CI template is an open item.
 
 ## How it works
 
