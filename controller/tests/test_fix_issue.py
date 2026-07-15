@@ -959,6 +959,7 @@ def _render_all_prompts(issue: FixIssue) -> dict[str, str]:
         "merge": render_merge_prompt(issue, 100),
         "bugfix": render_bugfix_prompt(issue, inv, "build", "boom"),
         "summary": render_summary_prompt(issue, inv, 100),
+        "e2e": render_e2e_prompt(issue, 100),
     }
 
 
@@ -972,7 +973,7 @@ def test_neutralize_untrusted_strips_envelope_tags() -> None:
 
 @pytest.mark.parametrize(
     "stage",
-    ["investigation", "build", "coverage", "review", "merge", "bugfix", "summary"],
+    ["investigation", "build", "coverage", "review", "merge", "bugfix", "summary", "e2e"],
 )
 def test_hostile_title_is_quarantined_in_every_prompt(stage: str) -> None:
     """Each fix prompt fences the hostile title as DATA — no breakout, no
@@ -1976,6 +1977,14 @@ def test_parse_fix_args_e2e_gate_defaults_off() -> None:
     assert parse_fix_args(["1"]).e2e_gate == "off"
 
 
+def test_parse_fix_args_issue_url_rejected_with_actionable_message() -> None:
+    """Issue #436's migration dropped URL parsing (skill parity narrowing) — a
+    URL target now fails loud with a message pointing at the bare number, never
+    silently misbehaving."""
+    with pytest.raises(FixConfigError, match="invalid issue argument"):
+        parse_fix_args(["https://github.com/owner/repo/issues/123"])
+
+
 def test_parse_fix_args_skip_e2e_sets_off() -> None:
     opts = parse_fix_args(["1", "--e2e-gate=warn", "--skip-e2e"])
     assert opts.e2e_gate == "off"  # the alias wins as the later flag
@@ -2178,3 +2187,42 @@ def test_single_fix_never_dispatches_doc_update(tmp_path) -> None:
         root=tmp_path,
     )
     assert "doc_update" not in dispatch.agents()
+
+def test_run_fix_e2e_error_ledger_logging_also_fails_is_swallowed(tmp_path) -> None:
+    """A double fault in the e2e warn-gate — dispatch crashes AND logging that
+    failure also crashes — is swallowed too (the inner best-effort guard at
+    fix_issue.py's e2e except-handler), never propagating past the gate."""
+
+    class _FlakyLedger:
+        """Delegates to a real Ledger, but raises on the e2e-FAILED write."""
+
+        def __init__(self, real: Ledger) -> None:
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def stage_finish(self, run_id, story_id, stage_name, attempt, status,
+                          failure_category="", output_path=""):
+            if stage_name == "e2e" and status == "FAILED":
+                raise RuntimeError("ledger write failed")
+            return self._real.stage_finish(
+                run_id, story_id, stage_name, attempt, status, failure_category, output_path
+            )
+
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(
+        overrides={"e2e": AgentDispatchError("e2e agent crashed")}
+    )
+    ledger = _FlakyLedger(_ledger(tmp_path))
+    result = run_fix(
+        FixOptions(issue=1, e2e_gate="warn"),
+        ledger=ledger,
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert "merge" in dispatch.agents()
+

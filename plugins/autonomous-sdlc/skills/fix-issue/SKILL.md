@@ -55,6 +55,15 @@ fi
   in `warn` mode a FAIL is logged and the fix still merges (it never blocks).
 - `--skip-e2e` — alias for `--e2e-gate=off`.
 
+**Changed from the pre-migration skill (issue #436):** two accepted inputs were
+deliberately narrowed and now fail with an explicit `FixConfigError` instead of
+silently misbehaving:
+- **Issue URLs are no longer accepted** — pass the bare `<issue-number>`
+  (`sdlc fix 123`, not `sdlc fix https://github.com/owner/repo/issues/123`).
+- **`--e2e-gate=block` is no longer supported** — only `warn`/`off` exist. The
+  old skill's blocking E2E mode (route a FAIL to the bugfix loop) is out of
+  scope for this migration; `warn` is strictly advisory.
+
 ## What the controller does (reference only)
 
 The controller (`controller/src/sdlc/fix_issue.py`) owns the full lifecycle:
