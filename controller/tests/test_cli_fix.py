@@ -69,6 +69,17 @@ def test_fix_batch_no_issues_exits_zero(tmp_path, monkeypatch) -> None:
     assert "no open issues" in result.output.lower()
 
 
+def test_fix_batch_preflight_failure_exits_one(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _stub_run_fix_batch(
+        monkeypatch,
+        FixBatchResult(preflight_failed=True, status="FAILED"),
+    )
+    result = runner.invoke(app, ["fix", "all"])
+    assert result.exit_code == 1
+    assert "PRE_FLIGHT_FAILURE" in result.output
+
+
 def test_fix_non_numeric_issue(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["fix", "frobnicate"])
