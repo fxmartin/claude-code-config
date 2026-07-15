@@ -219,17 +219,23 @@ if ! printf '%s' "${json_block}" | jq -e '(.findings // []) | type == "array"' >
   die "lens findings must be an array" 1
 fi
 
+# Every finding must carry a non-empty file and reason. Fail closed rather
+# than dropping malformed findings — a contract miss must never masquerade as
+# a clean review (the controller treats an empty delete-list as "diff is lean").
+if ! printf '%s' "${json_block}" | jq -e \
+  'all((.findings // [])[]; ((.file // "") != "") and ((.reason // "") != ""))' >/dev/null 2>&1; then
+  die "lens finding missing required file/reason — refusing to report a clean review" 1
+fi
+
 # Normalise:
 #   - default summary/findings so the schema's required set is always present
 #   - coerce unknown categories to "other" (schema enum), keep line/file/reason
-#   - drop findings with no file or no reason (schema requires both non-empty)
 printf '%s' "${json_block}" | jq \
   --argjson valid "${VALID_CATEGORIES}" \
   '{
      summary: (.summary // ""),
      findings: [
        (.findings // [])[]
-       | select((.file // "") != "" and (.reason // "") != "")
        | {
            category: (if ((.category // "") as $c | $valid | index($c)) then .category else "other" end),
            file: .file,
