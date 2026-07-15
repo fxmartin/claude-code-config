@@ -516,6 +516,22 @@ def run_resume(
         # plan and each re-entered story is submitted the moment its own
         # dependencies are DONE — no cohort barrier (AC6).
 
+        # Seeded ledger statuses are *stale* for any dependency this resume will
+        # re-enter (a FAILED retry, an interrupted IN_PROGRESS story, ...):
+        # blocking a dependent on the stale value would pre-judge a retry still
+        # in flight, where the barrier always read the post-rerun status. So
+        # triage only treats a dependency as blocking once it is *resolved in
+        # this run* — dropped below (terminal skip, end-crash close-out,
+        # dependency block) or its worker outcome applied — and holds otherwise.
+        # NEEDS_ATTENTION joins the blocking set on this path (run_build's
+        # rationale: committed but unmerged work); without it a dep finishing
+        # NEEDS_ATTENTION mid-run would leave its dependents held forever — the
+        # dep is neither pending nor in-flight, so the hold could never resolve
+        # and the scheduler would drain with them silently stranded TODO. The
+        # serial path above keeps the historical blocking set byte-for-byte.
+        resolved: set[str] = set()
+        parallel_dep_blocking = dep_blocking | {"NEEDS_ATTENTION"}
+
         def _triage(story: Story) -> str:
             # Pre-dispatch disposition on the scheduler thread (terminal skip,
             # end-crash close-out, dependency block) — only genuinely
@@ -523,6 +539,7 @@ def run_resume(
             nonlocal resumed
             st = plan[story.id]
             if st.status in _TERMINAL_STORY_STATES:
+                resolved.add(story.id)
                 return "drop"  # already finished — never rebuilt
             if st.next_stage is None:
                 status[story.id] = "DONE"
@@ -537,9 +554,11 @@ def run_resume(
                     ledger, rid, story.id, real_run=dispatcher is None
                 )
                 resumed += 1
+                resolved.add(story.id)
                 return "drop"
             blocked_by = [
-                dep for dep in story.dependencies if status.get(dep) in dep_blocking
+                dep for dep in story.dependencies
+                if dep in resolved and status.get(dep) in parallel_dep_blocking
             ]
             if blocked_by:
                 status[story.id] = "BLOCKED"
@@ -548,8 +567,12 @@ def run_resume(
                     rid, story.id, "warn", "controller",
                     f"blocked: dependency not done ({', '.join(blocked_by)})",
                 )
+                resolved.add(story.id)
                 return "drop"
-            if any(dep in status and status[dep] != "DONE" for dep in story.dependencies):
+            if any(
+                dep in status and (dep not in resolved or status[dep] != "DONE")
+                for dep in story.dependencies
+            ):
                 return "hold"
             return "ready"
 
@@ -571,6 +594,7 @@ def run_resume(
         def _apply(result) -> bool:
             nonlocal cost_gated, rate_limit_park, resumed
             story = result.story
+            resolved.add(story.id)  # this run's fresh outcome now gates dependents
             if result.cost_gate is not None:
                 status[story.id] = "NEEDS_ATTENTION"
                 ledger.set_story_status(rid, story.id, "NEEDS_ATTENTION")

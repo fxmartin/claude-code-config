@@ -127,8 +127,14 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    on the parallel path is re-checked before **each submission** (the scheduler
    thread owns dispatch, so the continuous path affords the per-story check the
    barrier could not interleave). `resume` mirrors the same scheduler — it
-   rebuilds the ready set from the ledger-derived plan — and honours the
-   persisted (or `--concurrency`-overridden) worker cap. Concurrent ledger writes
+   rebuilds the ready set from the ledger-derived plan, treats a dependency as
+   blocking only once it is *resolved in this run* (the seeded ledger status is
+   stale for a dependency the resume re-enters, e.g. a FAILED retry — a
+   dependent holds for the retry's fresh outcome instead of being pre-judged
+   `BLOCKED`), and adds `NEEDS_ATTENTION` to its blocking set so a dependency
+   parked mid-run resolves its dependents `BLOCKED` rather than holding them
+   forever — and honours the persisted (or `--concurrency`-overridden) worker
+   cap. Concurrent ledger writes
    are kept safe by the WAL + `busy_timeout` work in Story 17.1-002 (see
    *Concurrency-safe writes* below).
 4. **Per-story execution** — each story walks `build → coverage → review →

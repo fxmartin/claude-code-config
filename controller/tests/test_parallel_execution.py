@@ -678,10 +678,11 @@ def test_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> None:
     assert final["in_progress"] == 0
 
 
-def test_resume_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> None:
+def test_resume_parallel_story_credited_live_before_scheduler_applies(tmp_path) -> None:
     """A resumed parallel run credits each story DONE the instant its worker
-    finishes too — the done counter moves mid-cohort, not at the barrier
-    (Story 19.2-002, resume path mirrors run_build)."""
+    finishes too — the done counter moves while other stories are still in
+    flight (Story 19.2-002, resume path mirrors run_build; executor continuous
+    since 24.1-001)."""
     from sdlc.build import status_snapshot
     from sdlc.resume import run_resume
 
@@ -1204,6 +1205,95 @@ def test_resume_rebuilds_ready_set_and_dispatches_across_waves(tmp_path) -> None
     result = run_resume("epic-89", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
     assert result.completed == 3
     assert dispatcher.crossed is True, "resumed wave-2 story idled behind the slow sibling"
+
+
+_DEP_PAIR_RESUME_EPIC = """# Epic 88
+
+##### Story 88.1-001: Dependency
+**Priority**: P1
+**Points**: 1
+**Dependencies**: None.
+
+##### Story 88.1-002: Dependent
+**Priority**: P1
+**Points**: 1
+**Dependencies**: Story 88.1-001.
+"""
+
+
+def _seed_dep_pair_resume(tmp_path, dep_status: str = "TODO"):
+    """A crashed 2-story parallel run: a dependency (seeded ``dep_status``,
+    nothing built yet) and its dependent (TODO)."""
+    import json
+
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-88-sample.md").write_text(_DEP_PAIR_RESUME_EPIC, encoding="utf-8")
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    rid = ledger.run_create("epic-88", "parallel")
+    ledger.set_total(rid, 2)
+    ledger.event_log(rid, "", "info", "controller", "run started: scope=epic-88 mode=parallel")
+    ledger.event_log(
+        rid, "", "info", "config",
+        json.dumps({"skip_coverage": True, "coverage_threshold": 90, "concurrency": 3}),
+    )
+    ledger.story_upsert(
+        rid, "88.1-001", "88", "Dependency", "P1", 1, "general-purpose", "", None, dep_status
+    )
+    ledger.story_upsert(
+        rid, "88.1-002", "88", "Dependent", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    return db
+
+
+def test_resume_parallel_needs_attention_dep_blocks_dependent(tmp_path, monkeypatch) -> None:
+    """A dependency that finishes NEEDS_ATTENTION mid-resume resolves its
+    dependent BLOCKED — mirroring run_build's blocking set — instead of leaving
+    it held forever: the dep is neither pending nor in-flight afterwards, so an
+    unresolvable "hold" would drain the scheduler with the dependent silently
+    stranded TODO (Story 24.1-001)."""
+    from sdlc.contracts import ResultBlockError
+    from sdlc.resume import run_resume
+
+    db = _seed_dep_pair_resume(tmp_path)
+    # The dep's build result never parses; with a story commit present the
+    # exhausted recovery preserves the work as NEEDS_ATTENTION (R10) — a normal
+    # non-parked outcome the scheduler keeps running through.
+    monkeypatch.setattr("sdlc.build.story_commit_exists", lambda sid, root=None: True)
+
+    def _unparseable():
+        raise ResultBlockError("missing <<<RESULT_JSON>>> marker")
+
+    dispatcher = ConcurrencyProbeDispatcher(
+        hold=0.0, overrides={("build", "88.1-001"): _unparseable}
+    )
+    result = run_resume("epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    assert result.story_status["88.1-001"] == "NEEDS_ATTENTION"
+    assert result.story_status["88.1-002"] == "BLOCKED", (
+        "dependent of a NEEDS_ATTENTION dep was stranded instead of BLOCKED"
+    )
+    assert result.blocked == 1
+    assert ("build", "88.1-002") not in dispatcher.calls
+
+
+def test_resume_parallel_failed_dep_retry_unblocks_dependent(tmp_path) -> None:
+    """A dependency seeded FAILED is re-entered on resume; its dependent must
+    wait for the retry's fresh outcome — never be pre-judged BLOCKED off the
+    stale ledger status while the retry is still in flight (Story 24.1-001).
+    The serial path and the retired barrier both dispatched it after the retry
+    landed DONE."""
+    from sdlc.resume import run_resume
+
+    db = _seed_dep_pair_resume(tmp_path, dep_status="FAILED")
+    dispatcher = ConcurrencyProbeDispatcher(hold=0.01)
+    result = run_resume("epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    assert result.story_status == {"88.1-001": "DONE", "88.1-002": "DONE"}
+    assert result.completed == 2
+    assert ("build", "88.1-002") in dispatcher.calls
 
 
 # ---------------------------------------------------------------------------
