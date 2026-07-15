@@ -11,8 +11,7 @@
     "pr_url",
     "coverage_pct",
     "tests_added",
-    "coverage_status",
-    "security_status"
+    "coverage_status"
   ],
   "properties": {
     "pr_number": {
@@ -41,11 +40,6 @@
       "type": "string",
       "enum": ["PASS", "WARN", "FAIL"],
       "description": "Coverage gate outcome."
-    },
-    "security_status": {
-      "type": "string",
-      "enum": ["PASS", "WARN", "FAIL"],
-      "description": "Security scan outcome."
     },
     "sast_status": {
       "type": "string",
