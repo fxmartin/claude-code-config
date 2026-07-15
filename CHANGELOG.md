@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.17.0] - 2026-07-15
+
+### Added
+
+- feat(awaiting-approval-detection): a gate-blocked merge (#25.1-001) (#450)
+
+
 ## [v2.16.0] - 2026-07-15
 
 ### Added
