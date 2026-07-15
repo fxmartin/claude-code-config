@@ -207,6 +207,71 @@ def test_resume_escalation_reflects_prior_failed_attempts(tmp_path: Path) -> Non
     assert st.start_escalation == 2  # two FAILED attempts → two prior tier bumps
 
 
+def test_resume_treats_docs_only_skipped_coverage_as_done(tmp_path: Path) -> None:
+    """A docs-only coverage skip is terminal — resume must not re-enter it (27.2-001).
+
+    The docs-only gate records coverage SKIPPED/docs-only and continues to
+    review. If resume counts only DONE rows, an interruption past the skip
+    (crash or rate-limit park mid-review) re-plans from coverage; review then
+    restarts at attempt 1 in `_run_story` (non-first pending stages always do)
+    and its `stage_start` INSERT collides with the existing review attempt-1
+    row on the stages PRIMARY KEY, wedging every subsequent resume. The
+    deterministic verdict makes the skip as final as a DONE, so resume must
+    plan straight from the interrupted review at the next attempt.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"skip_coverage": False}))
+    ledger.story_upsert(
+        run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    ledger.stage_start(run_id, "99.1-001", "build", 1)
+    ledger.stage_finish(run_id, "99.1-001", "build", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-001", "coverage", 1)
+    ledger.stage_finish(run_id, "99.1-001", "coverage", 1, "SKIPPED", "docs-only")
+    ledger.set_story_pr(run_id, "99.1-001", 100)
+    ledger.stage_start(run_id, "99.1-001", "review", 1)  # left IN_PROGRESS (crashed)
+    ledger.set_story_status(run_id, "99.1-001", "IN_PROGRESS")
+
+    plan = compute_resume_plan(ledger, run_id, skip_coverage=False)
+    st = plan["99.1-001"]
+    assert "coverage" in st.done_pipeline_stages
+    assert st.next_stage == "review"
+    assert st.start_attempt == 2  # past the crashed review attempt, no PK collision
+
+
+def test_resume_still_reenters_cost_gated_skipped_stage(tmp_path: Path) -> None:
+    """A cost-gate SKIPPED stage keeps its pause semantics — resume re-runs it.
+
+    Only the docs-only skip is terminal (deterministic verdict); the cost gate
+    (14.1-002) skips a stage to pause the run *at* that stage so `sdlc resume
+    --cost-threshold` can raise the gate and dispatch it. Keying done-ness off
+    failure_category keeps the two apart.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"skip_coverage": False}))
+    ledger.story_upsert(
+        run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    ledger.stage_start(run_id, "99.1-001", "build", 1)
+    ledger.stage_finish(run_id, "99.1-001", "build", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-001", "coverage", 1)
+    ledger.stage_finish(run_id, "99.1-001", "coverage", 1, "SKIPPED", "cost-gate")
+    ledger.set_story_status(run_id, "99.1-001", "IN_PROGRESS")
+
+    plan = compute_resume_plan(ledger, run_id, skip_coverage=False)
+    st = plan["99.1-001"]
+    assert st.next_stage == "coverage"  # the gated stage itself is re-entered
+    assert st.start_attempt == 2  # continuing past the gated attempt row
+
+
 def test_resume_escalation_zero_when_stage_never_failed(tmp_path: Path) -> None:
     """A stage interrupted on its first (never-failed) attempt resumes cheap."""
     db = tmp_path / ".sdlc-state.db"

@@ -5159,8 +5159,10 @@ def _run_story(
         stage_escalation_base = start_escalation if idx == 0 else 0
         # Story 27.2-001: deterministic change-class gate. Classify once, from
         # the committed branch's real diff, when the first gated stage is
-        # reached (post-build, so a resume re-derives the same verdict from the
-        # same diff). A docs-only story skips the coverage dispatch — the
+        # reached (post-build; a resumed review re-derives the same verdict
+        # from the same diff, and resume treats the SKIPPED/docs-only coverage
+        # row as done — see compute_resume_plan — so it is never re-entered).
+        # A docs-only story skips the coverage dispatch — the
         # controller pushes the branch and opens the CR itself, recording the
         # skip with its skip_reason (never a passed gate) — and skips the
         # adversarial review slot; the non-adversarial review and the merge run
