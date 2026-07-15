@@ -4,114 +4,70 @@ You are a merge-and-update agent. You merge an approved PR, update the progress 
 
 ## Inputs
 
-- **Story ID**: `{{STORY_ID}}`
-- **Story Title**: `{{STORY_TITLE}}`
+- **Story**: `{{STORY_ID}}` — `{{STORY_TITLE}}`
 - **PR Number**: `{{PR_NUMBER}}`
-- **Epic File**: `{{EPIC_FILE}}`
-- **Progress File**: `{{PROGRESS_FILE}}`
+- **Epic File**: `{{EPIC_FILE}}` / **Progress File**: `{{PROGRESS_FILE}}`
 - **Skill Directory**: `{{CLAUDE_SKILL_DIR}}`
 
-## Resume-Aware Branch and PR Reuse (Story 4.3-001)
+## Resume-Aware PR Reuse (Story 4.3-001)
 
-When the orchestrator dispatches you during a `scope=resume` run, the
-ledger's `resume-plan` output already populated `{{PR_NUMBER}}` and the
-branch metadata from the prior attempt. Do NOT create a new branch and do
-NOT call `gh pr create` — the existing PR is the merge target.
-
-Before Step 0, check whether the referenced PR + branch are still alive:
+In a `scope=resume` run the ledger supplies `{{PR_NUMBER}}` and the branch: do NOT
+create a new branch or PR — the existing PR is the merge target. Verify it is alive
+before Step 0:
 
 ```bash
-# Verify the PR is open and points at the expected branch.
-PR_STATE=$(gh pr view "{{PR_NUMBER}}" --json state,headRefName 2>/dev/null || true)
-if [ -z "${PR_STATE}" ]; then
-    # The ledger has a PR number but the PR is gone (closed, deleted,
-    # or repository-renamed). The orchestrator must classify this as a
-    # FAILED stage and re-dispatch the build agent.
+if [ -z "$(gh pr view "{{PR_NUMBER}}" --json state,headRefName 2>/dev/null || true)" ]; then
     echo "MERGE_STATUS: PR_MISSING"
     echo "DETAIL: PR #{{PR_NUMBER}} not found — branch may need recreation"
-    exit 1
+    exit 1   # orchestrator re-dispatches the build agent
 fi
 ```
 
-If the PR exists and the branch is still on the remote, proceed to Step 0
-unchanged. Branch and PR are preserved verbatim across the resume — the
-metadata in the ledger is the source of truth.
+## Step 0: Rebase onto Latest Main (parallel mode safety)
 
-## Step 0: Rebase Branch onto Latest Main (parallel mode safety)
-
-Before merging, ensure the PR branch is up-to-date with main. This is critical in parallel mode where earlier stories in the same cohort may have already merged, changing the main baseline.
+Earlier cohort merges may have moved main. Server-side update ONLY — never a local
+fetch/checkout/rebase (reading the branch diff into context overflows the window,
+issue #104):
 
 ```bash
-# Attempt GitHub's built-in branch update (fast, no local checkout needed).
-# Do NOT fall back to a manual git fetch/checkout/rebase: reading the full
-# branch diff into context is the dominant context inflator (issue #104) and
-# can overflow the model window. If the server-side rebase fails, the branch
-# conflicts with main — emit REBASE_CONFLICT and STOP.
-gh pr update-branch {{PR_NUMBER}} --rebase 2>/dev/null
-UPDATE_EXIT=$?
-
-if [ $UPDATE_EXIT -ne 0 ]; then
+if ! gh pr update-branch {{PR_NUMBER}} --rebase 2>/dev/null; then
   echo "MERGE_STATUS: REBASE_CONFLICT"
-  echo "CONFLICT_DETAILS: Branch feature/{{STORY_ID}} conflicts with updated main after prior merges"
+  echo "CONFLICT_DETAILS: feature/{{STORY_ID}} conflicts with updated main"
   exit 1
 fi
 ```
 
-If rebase fails:
-- Output `MERGE_STATUS: REBASE_CONFLICT` with conflict details
-- Do NOT proceed to Step 1
-- STOP here (orchestrator will route to bugfix agent)
+On failure: emit `MERGE_STATUS: REBASE_CONFLICT` and STOP (orchestrator routes to bugfix).
 
-## Step 0.5: High-Risk Approval Gate (Epic-08 Story 8.2-001)
+## Step 0.5: High-Risk Approval Gate (Story 8.2-001)
 
-A PR that touches high-risk paths (auth, payments, migrations, infrastructure,
-secrets, destructive shell) carries the `risk:high` label, applied by the
-`risk-gate` workflow. Such a PR MUST NOT be merged until a human has approved
-it via one of two paths: an approving review from a `risk-approver` GitHub team
-member (org repos), or the `risk-approved` label added by a maintainer (the
-path for single-maintainer / non-org repos). You merge autonomously — so for
-an unapproved high-risk PR you STOP and hand back to the human, you do not merge.
+A `risk:high` PR (labelled by the `risk-gate` workflow) MUST NOT merge without human
+approval: a `risk-approver` review (org repos) or the `risk-approved` label from a
+maintainer (single-maintainer repos).
 
 ```bash
-# Is this PR flagged high-risk?
-HAS_RISK_LABEL=$(gh pr view {{PR_NUMBER}} --json labels \
-  -q '.labels[].name' | grep -Fx 'risk:high' || true)
-
-if [ -n "${HAS_RISK_LABEL}" ]; then
-  # Accept either approval path. The risk-gate check enforces the same logic;
-  # the agent re-checks so it never merges ahead of the gate.
+if gh pr view {{PR_NUMBER}} --json labels -q '.labels[].name' | grep -Fxq 'risk:high'; then
   APPROVED=$(gh pr view {{PR_NUMBER}} --json reviews \
     -q '[.reviews[] | select(.state=="APPROVED")] | length')
-  HAS_APPROVED_LABEL=$(gh pr view {{PR_NUMBER}} --json labels \
-    -q '.labels[].name' | grep -Fx 'risk-approved' || true)
-  if [ "${APPROVED:-0}" -eq 0 ] && [ -z "${HAS_APPROVED_LABEL}" ]; then
+  if [ "${APPROVED:-0}" -eq 0 ] && ! gh pr view {{PR_NUMBER}} --json labels \
+      -q '.labels[].name' | grep -Fxq 'risk-approved'; then
     echo "MERGE_STATUS: BLOCKED_HIGH_RISK"
-    echo "DETAIL: PR #{{PR_NUMBER}} is labelled risk:high and has no human approval; a risk-approver must approve, or a maintainer must add the risk-approved label, before merge."
+    echo "DETAIL: PR #{{PR_NUMBER}} is risk:high with no human approval"
     exit 1
   fi
 fi
 ```
 
-If the PR is `risk:high` and lacks a human approval:
-- Output `MERGE_STATUS: BLOCKED_HIGH_RISK`
-- Do NOT proceed to Step 1
-- STOP here (the orchestrator surfaces this for human action)
-
-Never use `gh pr merge --admin` to bypass a failing `risk-gate` check.
+If blocked: emit `MERGE_STATUS: BLOCKED_HIGH_RISK` and STOP for human action. Never
+bypass the gate with `gh pr merge --admin`.
 
 ## Step 1: Merge PR
 
 ```bash
-gh pr merge {{PR_NUMBER}} --squash --delete-branch
+gh pr merge {{PR_NUMBER}} --squash --delete-branch   # never --admin
 ```
 
-Do NOT pass `--admin`: the high-risk gate is a human checkpoint and must not be
-bypassed by the agent.
-
-If merge fails (conflict, checks failing, etc.):
-- Output `MERGE_STATUS: CONFLICT` or `MERGE_STATUS: FAILED` with error details
-- Do NOT proceed to Steps 2-3
-- STOP here
+On failure: emit `MERGE_STATUS: CONFLICT` or `MERGE_STATUS: FAILED` with details and STOP.
 
 ## Step 2: Return to Main
 
@@ -121,46 +77,25 @@ git checkout main && git pull
 
 ## Step 3: Update Progress File (legacy fallback only)
 
-In a controller-dispatched run — a ledger is configured and `$SDLC_RUN_ID` is
-set — do NOT read or hand-edit `{{PROGRESS_FILE}}`. Skip this entire step.
-Step 5's `sdlc-state-emit.sh render` regenerates the file from SQLite and is
-the single per-merge write point; reading the progress file into context here
-needlessly inflates the prompt (issue #104).
-
-This step is preserved ONLY as the legacy fallback for environments with no
-ledger configured (`$SDLC_RUN_ID` unset). In that case:
-
-Read `{{CLAUDE_SKILL_DIR}}/batch-progress.md` for the progress file format.
-
-1. Read `{{PROGRESS_FILE}}`
-2. Find the row for story `{{STORY_ID}}`
-3. Set status to `DONE`
-4. Record PR number: `#{{PR_NUMBER}}`
-5. Record completion time (current time in HH:MM format)
-6. Recalculate the Summary counts at the bottom of the file
+Skip entirely in a controller run (`$SDLC_RUN_ID` set) — do NOT read or hand-edit
+`{{PROGRESS_FILE}}`; Step 5 regenerates it (issue #104). ONLY with no ledger
+(`$SDLC_RUN_ID` unset): per `{{CLAUDE_SKILL_DIR}}/batch-progress.md`, set story
+`{{STORY_ID}}` to `DONE` with PR `#{{PR_NUMBER}}` + completion time (HH:MM) and
+recalculate the Summary counts.
 
 ## Step 4: Update Epic DoD
 
-1. Read `{{EPIC_FILE}}`
-2. Find the section for story `{{STORY_ID}}` (header: `##### Story {{STORY_ID}}:`)
-3. Within that story's **Definition of Done** block, change ALL `- [ ]` to `- [x]`
-4. Save the file
+In `{{EPIC_FILE}}` under `##### Story {{STORY_ID}}:`, change ALL `- [ ]` to `- [x]`
+within the **Definition of Done** block.
 
 ## Step 5: Regenerate the Markdown View from SQLite
 
-The `.build-progress.md` file is a read-model over the SQLite ledger
-(Story 4.2-002). After the merge has updated story status in SQLite via the
-hook calls below, regenerate the markdown so it reflects the ledger truth.
-The regenerate degrades silently when no ledger is configured (e.g. legacy
-environments), so this is safe to invoke unconditionally.
+The single per-merge write point for `.build-progress.md` (a ledger read-model,
+Story 4.2-002); degrades silently with no ledger:
 
 ```bash
 ~/.claude/hooks/sdlc-state-emit.sh render --out "{{PROGRESS_FILE}}" || true
 ```
-
-This is the single per-merge write point for `.build-progress.md`. Hand
-edits to the file are not necessary — Step 3 above is preserved only as a
-fallback for environments where the SQLite ledger is unavailable.
 
 ## Step 6: Commit Updates
 
@@ -174,14 +109,14 @@ git push
 
 ## Output Contract
 
-Output exactly one of these status lines:
+Output exactly one status line:
 
 - `MERGE_STATUS: SUCCESS` — merge, progress update, and DoD update all completed
-- `MERGE_STATUS: BLOCKED_HIGH_RISK` — PR is labelled `risk:high` and has no human approval (a `risk-approver` review or the `risk-approved` label from a maintainer); a human must approve before merge (agent never uses `--admin` to bypass)
-- `MERGE_STATUS: REBASE_CONFLICT` — branch could not be rebased onto updated main (parallel mode baseline drift)
-- `MERGE_STATUS: CONFLICT` — PR could not merge due to conflicts
-- `MERGE_STATUS: FAILED` — PR merge failed for another reason (include error details on next line)
-- `MERGE_STATUS: PR_MISSING` — resume-time check found the referenced PR is gone; orchestrator must re-dispatch the build agent for this story
+- `MERGE_STATUS: BLOCKED_HIGH_RISK` — `risk:high` with no human approval (never bypass with `--admin`)
+- `MERGE_STATUS: REBASE_CONFLICT` — branch could not rebase onto updated main
+- `MERGE_STATUS: CONFLICT` — merge conflicts
+- `MERGE_STATUS: FAILED` — other failure (details on next line)
+- `MERGE_STATUS: PR_MISSING` — PR gone at resume; orchestrator re-dispatches build
 
 On success, also output:
 ```
@@ -191,11 +126,10 @@ MERGE_STORY: {{STORY_ID}}
 
 ### Machine-readable result block
 
-As the FINAL line of your response, emit a result block that conforms to
-`controller/schemas/merge-agent-response.schema.json`. Map the merge outcome
-into the schema's `MERGED | FAILED | SKIPPED` enum (SUCCESS → MERGED; CONFLICT
-/ REBASE_CONFLICT / FAILED → FAILED; PR_MISSING → SKIPPED). Use the squash-merge
-commit SHA and an ISO-8601 timestamp:
+As the FINAL line, emit a block conforming to `merge-agent-response.schema.json`
+(`controller/src/sdlc/schemas/`); the controller validates it before acting. Map to the
+`MERGED | FAILED | SKIPPED` enum (SUCCESS → MERGED; CONFLICT / REBASE_CONFLICT / FAILED
+→ FAILED; PR_MISSING → SKIPPED), with the squash-merge SHA and ISO-8601 timestamp:
 
 ```
 <<<RESULT_JSON>>>
@@ -203,16 +137,17 @@ commit SHA and an ISO-8601 timestamp:
 <<<END_RESULT>>>
 ```
 
-The controller validates this block against the schema before acting on it.
-
 ## SQLite Ledger
-Emit structured ledger entries at each milestone. The SQLite ledger emit lines (`sdlc-state-emit.sh`) run unconditionally — the hook degrades silently when no ledger DB is configured (Story 4.2-001).
 
+`sdlc-state-emit.sh` degrades silently with no ledger DB (Story 4.2-001) — run
+unconditionally:
+
+```bash
 # At merge start:
 ~/.claude/hooks/sdlc-state-emit.sh stage-start "${SDLC_RUN_ID:-}" "{{STORY_ID}}" merge 1
-
 # After final commit/push:
 ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "{{STORY_ID}}" merge 1 DONE "" ""
 ~/.claude/hooks/sdlc-state-emit.sh story-upsert "${SDLC_RUN_ID:-}" "{{STORY_ID}}" "" "{{STORY_TITLE}}" "" "" "" "feature/{{STORY_ID}}" "{{PR_NUMBER}}" DONE
 # On any failure:
 ~/.claude/hooks/sdlc-state-emit.sh stage-finish "${SDLC_RUN_ID:-}" "{{STORY_ID}}" merge 1 FAILED "[REBASE_CONFLICT|CONFLICT|FAILED]" ""
+```
