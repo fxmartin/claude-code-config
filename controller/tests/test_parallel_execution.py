@@ -714,11 +714,12 @@ def test_resume_parallel_story_credited_live_before_cohort_barrier(tmp_path) -> 
     assert final["in_progress"] == 0
 
 
-def test_dispatch_cohort_on_terminal_credits_each_outcome() -> None:
-    """``_dispatch_cohort`` invokes ``on_terminal`` once per *terminal* outcome —
-    the resolved status on a normal finish and ``FAILED`` on an unexpected raise —
-    but never for a parked (resumable) outcome (Story 19.2-002)."""
-    from sdlc.build import _dispatch_cohort, _StoryRunOutcome
+def test_dispatch_ready_queue_on_terminal_credits_each_outcome() -> None:
+    """``_dispatch_ready_queue`` invokes ``on_terminal`` once per *terminal*
+    outcome — the resolved status on a normal finish and ``FAILED`` on an
+    unexpected raise — but never for a parked (resumable) outcome
+    (Story 19.2-002, executor continuous since 24.1-001)."""
+    from sdlc.build import _dispatch_ready_queue, _StoryRunOutcome
 
     done = Story("s-done", "Done", "99", "sample", "epic-99.md", "P1", 1, "py", [])
     parked = Story("s-park", "Parked", "99", "sample", "epic-99.md", "P1", 1, "py", [])
@@ -738,7 +739,7 @@ def test_dispatch_cohort_on_terminal_credits_each_outcome() -> None:
         with lock:
             credited.append((story.id, status))
 
-    results = _dispatch_cohort(
+    results = _dispatch_ready_queue(
         [done, parked, boom], max_workers=3, run_one=_run_one,
         on_terminal=_on_terminal,
     )
@@ -751,13 +752,13 @@ def test_dispatch_cohort_on_terminal_credits_each_outcome() -> None:
     assert dict(credited) == {"s-done": "DONE", "s-boom": "FAILED"}
 
 
-def test_dispatch_cohort_on_terminal_falls_back_to_failed_when_status_blank() -> None:
+def test_dispatch_ready_queue_on_terminal_falls_back_to_failed_when_status_blank() -> None:
     """A *non-parked* terminal outcome whose ``status`` is falsy (None/empty) is
     credited ``FAILED`` via the ``outcome.status or "FAILED"`` fallback — distinct
     from the unexpected-raise path, which also credits ``FAILED`` (Story 19.2-002).
     A blank-status outcome is still a finished, non-resumable worker, so it must
     be credited terminally rather than silently dropped."""
-    from sdlc.build import _dispatch_cohort, _StoryRunOutcome
+    from sdlc.build import _dispatch_ready_queue, _StoryRunOutcome
 
     blank = Story("s-blank", "Blank", "99", "sample", "epic-99.md", "P1", 1, "py", [])
 
@@ -770,7 +771,7 @@ def test_dispatch_cohort_on_terminal_falls_back_to_failed_when_status_blank() ->
     def _on_terminal(story, status) -> None:
         credited.append((story.id, status))
 
-    results = _dispatch_cohort(
+    results = _dispatch_ready_queue(
         [blank], max_workers=1, run_one=_run_one, on_terminal=_on_terminal,
     )
 
@@ -779,11 +780,11 @@ def test_dispatch_cohort_on_terminal_falls_back_to_failed_when_status_blank() ->
     assert credited == [("s-blank", "FAILED")]  # fallback, not a dropped credit
 
 
-def test_dispatch_cohort_without_on_terminal_still_isolates_failures() -> None:
+def test_dispatch_ready_queue_without_on_terminal_still_isolates_failures() -> None:
     """Default ``on_terminal=None``: a worker that raises is captured (failure
     isolation) and no callback path runs — the live-credit hook is opt-in
     (Story 19.2-002)."""
-    from sdlc.build import _dispatch_cohort, _StoryRunOutcome
+    from sdlc.build import _dispatch_ready_queue, _StoryRunOutcome
 
     ok = Story("s-ok", "Ok", "99", "sample", "epic-99.md", "P1", 1, "py", [])
     boom = Story("s-boom", "Boom", "99", "sample", "epic-99.md", "P1", 1, "py", [])
@@ -793,7 +794,7 @@ def test_dispatch_cohort_without_on_terminal_still_isolates_failures() -> None:
             raise RuntimeError("worker blew up")
         return _StoryRunOutcome(status="DONE")
 
-    results = _dispatch_cohort([ok, boom], max_workers=2, run_one=_run_one)
+    results = _dispatch_ready_queue([ok, boom], max_workers=2, run_one=_run_one)
 
     by_id = {r.story.id: r for r in results}
     assert by_id["s-ok"].outcome.status == "DONE"
@@ -986,3 +987,273 @@ def test_effective_worker_limit_non_numeric_config_falls_back_to_default() -> No
     assert _effective_worker_limit("parallel", {"concurrency": "lots"}) == (
         BuildOptions.concurrency
     )
+
+
+# ---------------------------------------------------------------------------
+# Story 24.1-001: continuous ready-queue dispatch — the cohort barrier is gone
+# ---------------------------------------------------------------------------
+
+
+class _CrossWaveDispatcher(ConcurrencyProbeDispatcher):
+    """Holds a slow wave-1 story's build stage until a next-wave story is seen.
+
+    ``crossed`` records whether the next-wave story dispatched while the slow
+    story was still in flight — True only when the scheduler crosses the wave
+    boundary without waiting for the whole cohort (Story 24.1-001). Under the
+    retired barrier the wait could only ever time out, because the next-wave
+    story was not submitted until every wave-1 worker (this one included) had
+    returned.
+    """
+
+    def __init__(self, slow_id: str, next_wave_id: str) -> None:
+        super().__init__(hold=0.01)
+        self.slow_id = slow_id
+        self.next_wave_id = next_wave_id
+        self.next_wave_started = threading.Event()
+        self.crossed = False
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        sid = getattr(story, "id", "")
+        if sid == self.next_wave_id:
+            self.next_wave_started.set()
+        if sid == self.slow_id and agent_type == "build":
+            self.crossed = self.next_wave_started.wait(timeout=10)
+        return super().__call__(agent_type, prompt, story, **kwargs)
+
+
+def test_ready_story_dispatches_before_slow_sibling_finishes(tmp_path) -> None:
+    """AC1/AC2: a wave-2 story whose only dependency is DONE starts straight
+    away, while an unrelated slow wave-1 sibling is still in flight."""
+    queue = [
+        Story("w1-001", "Slow sibling", "99", "sample", "epic-99.md", "P1", 2, "py", []),
+        Story("w1-002", "Fast dependency", "99", "sample", "epic-99.md", "P1", 2, "py", []),
+        Story("w2-001", "Ready dependent", "99", "sample", "epic-99.md", "P1", 2, "py", ["w1-002"]),
+    ]
+    dispatcher = _CrossWaveDispatcher(slow_id="w1-001", next_wave_id="w2-001")
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, concurrency=3),
+        queue=queue,
+        ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert result.completed == 3
+    assert dispatcher.crossed is True, "wave-2 story idled behind the slow wave-1 sibling"
+
+
+def test_failed_dependency_blocks_across_waves_without_stalling_others(tmp_path) -> None:
+    """AC3: a story whose dependency FAILED is held BLOCKED — transitively — and
+    never dispatched, while the independent branch still completes."""
+    def fail_build():
+        return {
+            "branch_name": "feature/w1-001",
+            "build_status": "FAILED",
+            "commit_sha": "0",
+            "error_summary": "boom",
+        }
+
+    queue = [
+        Story("w1-001", "Root fails", "99", "sample", "epic-99.md", "P1", 2, "py", []),
+        Story("w1-002", "Independent", "99", "sample", "epic-99.md", "P1", 2, "py", []),
+        Story("w2-001", "Dependent", "99", "sample", "epic-99.md", "P1", 2, "py", ["w1-001"]),
+        Story("w3-001", "Transitive", "99", "sample", "epic-99.md", "P1", 2, "py", ["w2-001"]),
+    ]
+    dispatcher = ConcurrencyProbeDispatcher(overrides={("build", "w1-001"): fail_build})
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, auto=True, concurrency=5),
+        queue=queue,
+        ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert result.story_status == {
+        "w1-001": "FAILED",
+        "w1-002": "DONE",
+        "w2-001": "BLOCKED",
+        "w3-001": "BLOCKED",
+    }
+
+
+def test_ready_set_dispatches_in_ascending_id_order(tmp_path) -> None:
+    """AC4: with more ready stories than free workers, ties break by ascending
+    story id so the schedule stays deterministic."""
+    dispatcher = ConcurrencyProbeDispatcher(hold=0.01)
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, concurrency=2),
+        queue=_independent(3),  # p0-001, p1-001, p2-001 — all ready at once
+        ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    build_order = [sid for agent, sid in dispatcher.calls if agent == "build"]
+    assert set(build_order[:2]) == {"p0-001", "p1-001"}  # two lowest ids first
+    assert build_order[2] == "p2-001"  # highest id only once a worker freed
+
+
+_CHAINED_RESUME_EPIC = """# Epic 89
+
+##### Story 89.1-001: Slow sibling
+**Priority**: P1
+**Points**: 1
+**Dependencies**: None.
+
+##### Story 89.1-002: Fast dependency
+**Priority**: P1
+**Points**: 1
+**Dependencies**: None.
+
+##### Story 89.1-003: Ready dependent
+**Priority**: P1
+**Points**: 1
+**Dependencies**: Story 89.1-002.
+"""
+
+
+def _seed_chained_resume(tmp_path):
+    """A 2-wave parallel run crashed before any of its three stories built."""
+    import json
+
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-89-sample.md").write_text(_CHAINED_RESUME_EPIC, encoding="utf-8")
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    rid = ledger.run_create("epic-89", "parallel")
+    ledger.set_total(rid, 3)
+    ledger.event_log(rid, "", "info", "controller", "run started: scope=epic-89 mode=parallel")
+    ledger.event_log(
+        rid, "", "info", "config",
+        json.dumps({"skip_coverage": True, "coverage_threshold": 90, "concurrency": 3}),
+    )
+    for sid, title in (
+        ("89.1-001", "Slow sibling"),
+        ("89.1-002", "Fast dependency"),
+        ("89.1-003", "Ready dependent"),
+    ):
+        ledger.story_upsert(rid, sid, "89", title, "P1", 1, "general-purpose", "", None, "TODO")
+    return db
+
+
+def test_resume_rebuilds_ready_set_and_dispatches_across_waves(tmp_path) -> None:
+    """AC6: resume rebuilds the ready set from the ledger and honours the same
+    dispatch semantics — a re-entered wave-2 story starts the moment its own
+    dependency is DONE, while a slow wave-1 sibling is still in flight."""
+    from sdlc.resume import run_resume
+
+    db = _seed_chained_resume(tmp_path)
+    dispatcher = _CrossWaveDispatcher(slow_id="89.1-001", next_wave_id="89.1-003")
+    result = run_resume("epic-89", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+    assert result.completed == 3
+    assert dispatcher.crossed is True, "resumed wave-2 story idled behind the slow sibling"
+
+
+# ---------------------------------------------------------------------------
+# Story 24.1-001: _dispatch_ready_queue scheduler unit behaviour
+# ---------------------------------------------------------------------------
+
+
+def _unit_story(sid: str, deps: list[str] | None = None) -> Story:
+    return Story(sid, sid, "99", "sample", "epic-99.md", "P1", 1, "py", deps or [])
+
+
+def test_dispatch_ready_queue_orders_ready_stories_by_id() -> None:
+    """AC4: with one worker the ready set drains in ascending story id even when
+    the input arrives shuffled."""
+    from sdlc.build import _dispatch_ready_queue, _StoryRunOutcome
+
+    order: list[str] = []
+
+    def _run_one(story):
+        order.append(story.id)
+        return _StoryRunOutcome(status="DONE")
+
+    _dispatch_ready_queue(
+        [_unit_story("s-3"), _unit_story("s-1"), _unit_story("s-2")],
+        max_workers=1, run_one=_run_one,
+    )
+    assert order == ["s-1", "s-2", "s-3"]
+
+
+def test_dispatch_ready_queue_holds_story_until_dependency_done() -> None:
+    """A held story is re-evaluated on each completion and dispatched only once
+    its dependency's result has been applied (deps ⊆ done)."""
+    from sdlc.build import _dispatch_ready_queue, _StoryRunOutcome
+
+    done: set[str] = set()
+    order: list[str] = []
+
+    def _triage(story):
+        return "ready" if set(story.dependencies) <= done else "hold"
+
+    def _run_one(story):
+        order.append(story.id)
+        return _StoryRunOutcome(status="DONE")
+
+    def _apply(result):
+        done.add(result.story.id)
+        return True
+
+    _dispatch_ready_queue(
+        [_unit_story("s-1"), _unit_story("s-2", ["s-1"])],
+        max_workers=4, run_one=_run_one, triage=_triage, on_result=_apply,
+    )
+    assert order == ["s-1", "s-2"]
+
+
+def test_dispatch_ready_queue_dropped_story_never_dispatches() -> None:
+    """A story triaged "drop" (blocked/skipped by the caller) is never run."""
+    from sdlc.build import _dispatch_ready_queue, _StoryRunOutcome
+
+    ran: list[str] = []
+
+    def _triage(story):
+        return "drop" if story.id == "s-2" else "ready"
+
+    def _run_one(story):
+        ran.append(story.id)
+        return _StoryRunOutcome(status="DONE")
+
+    results = _dispatch_ready_queue(
+        [_unit_story("s-1"), _unit_story("s-2")],
+        max_workers=2, run_one=_run_one, triage=_triage,
+    )
+    assert ran == ["s-1"]
+    assert [r.story.id for r in results] == ["s-1"]
+
+
+def test_dispatch_ready_queue_gate_false_halts_new_submissions() -> None:
+    """``before_dispatch`` returning False (the budget gate) stops scheduling:
+    the refused story and everything after it stay undispatched."""
+    from sdlc.build import _dispatch_ready_queue, _StoryRunOutcome
+
+    ran: list[str] = []
+
+    def _run_one(story):
+        ran.append(story.id)
+        return _StoryRunOutcome(status="DONE")
+
+    _dispatch_ready_queue(
+        [_unit_story("s-1"), _unit_story("s-2")],
+        max_workers=1, run_one=_run_one,
+        before_dispatch=lambda story: story.id == "s-1",
+    )
+    assert ran == ["s-1"]
+
+
+def test_dispatch_ready_queue_on_result_false_stops_new_submissions() -> None:
+    """``on_result`` returning False (park/cost-gate) halts scheduling while the
+    already-running workers drain."""
+    from sdlc.build import _dispatch_ready_queue, _StoryRunOutcome
+
+    ran: list[str] = []
+
+    def _run_one(story):
+        ran.append(story.id)
+        return _StoryRunOutcome(status="DONE")
+
+    _dispatch_ready_queue(
+        [_unit_story("s-1"), _unit_story("s-2")],
+        max_workers=1, run_one=_run_one, on_result=lambda result: False,
+    )
+    assert ran == ["s-1"]

@@ -675,7 +675,7 @@ class _CostGatePause(Exception):
 
     Raised from :func:`_run_story` when an over-threshold estimate must gate a
     stage in interactive mode. It propagates *past* :func:`_run_story_rate_limited`
-    (which catches only :class:`_RateLimitPark`) up to the cohort loop in
+    (which catches only :class:`_RateLimitPark`) up to the scheduler loop in
     ``run_build`` / ``run_resume``, which pauses the run **resumably** — leaving it
     IN_PROGRESS like a budget pause rather than stamping a NEEDS_ATTENTION terminal
     that :meth:`Ledger.latest_resumable_run` would never surface. Carrying the
@@ -944,7 +944,7 @@ def authoritative_mode(opts: BuildOptions) -> str:
 
 @dataclass
 class _StoryDispatch:
-    """One story's result from a concurrent cohort dispatch (Story 17.1-001).
+    """One story's result from a concurrent dispatch (Story 17.1-001).
 
     Exactly one of ``outcome`` / ``cost_gate`` / ``error`` is set. ``outcome``
     is the normal :class:`_StoryRunOutcome` (terminal status or a rate-limit
@@ -959,59 +959,132 @@ class _StoryDispatch:
     error: BaseException | None = None
 
 
-def _dispatch_cohort(
-    dispatchable: list[Story],
+def _dispatch_ready_queue(
+    stories: list[Story],
     *,
     max_workers: int,
     run_one: Callable[[Story], _StoryRunOutcome],
+    triage: Callable[[Story], str] | None = None,
+    before_dispatch: Callable[[Story], bool] | None = None,
+    before_batch: Callable[[], None] | None = None,
+    on_result: Callable[[_StoryDispatch], bool] | None = None,
     on_terminal: Callable[[Story, str], None] | None = None,
 ) -> list[_StoryDispatch]:
-    """Drive a cohort's ready stories through a bounded thread pool (Story 17.1-001).
+    """Drive stories through a bounded pool as each becomes ready (Story 24.1-001).
 
-    Each story is run by ``run_one`` (which prepares its isolated worktree and
-    drives the full build→coverage→review→merge sequence via
-    :func:`_run_story_rate_limited`) on its own worker thread, at most
-    ``max_workers`` at once. Work is I/O-bound on the agent subprocesses, so
-    threads suffice — exactly the model :mod:`sdlc.adversarial` already uses.
+    Continuous ready-queue (list) scheduling: this retires the Epic-17 cohort
+    **barrier** — a story is submitted the moment its own dependencies are
+    satisfied, regardless of which wave it sits in, so a ready story never idles
+    behind an unrelated slow or parked sibling. Each story is run by ``run_one``
+    (which prepares its isolated worktree and drives the full
+    build→coverage→review→merge sequence via :func:`_run_story_rate_limited`) on
+    its own worker thread, at most ``max_workers`` at once. Work is I/O-bound on
+    the agent subprocesses, so threads suffice — exactly the model
+    :mod:`sdlc.adversarial` already uses.
 
-    The call is a **barrier**: it returns only once every story finishes, with
-    results in the cohort's submission order so the caller applies outcomes
-    deterministically. A worker that raises an unexpected exception is captured
-    on its :class:`_StoryDispatch` (``error``) rather than propagated, so the
-    other workers run to completion (failure isolation, AC4). ``_CostGatePause``
-    — a deliberate run-level pause signal — is captured separately so the caller
-    can halt the run after the barrier, exactly as the serial path does.
+    The scheduler loop, all on the calling thread:
+
+    - ``triage(story)`` classifies each not-yet-dispatched story: ``"ready"``
+      (deps satisfied — dispatch), ``"hold"`` (a dep is still pending/in-flight —
+      re-evaluated after every completion), or ``"drop"`` (the caller resolved
+      the story itself, e.g. marked it BLOCKED — forget it). ``stories`` must be
+      topologically ordered (a flattened :func:`compute_cohorts` result), so a
+      freshly-blocked chain cascades in a single triage pass. Default: all ready.
+    - Ready stories are submitted in **ascending story id** (the deterministic
+      tie-break) while a worker slot is free; ``before_dispatch(story)`` gates
+      each submission (the budget check) — False halts all further scheduling.
+      ``before_batch()`` runs once before a tick's submissions (base-ref refresh).
+    - Completed workers are applied via ``on_result`` in ascending story id
+      within each completion batch; returning False (a run-level pause: cost
+      gate, rate-limit park) halts new submissions while in-flight workers
+      drain to completion.
+
+    A worker that raises an unexpected exception is captured on its
+    :class:`_StoryDispatch` (``error``) rather than propagated, so the other
+    workers run to completion (failure isolation, 17.1-001 AC4).
+    ``_CostGatePause`` — a deliberate run-level pause signal — is captured
+    separately so the caller can halt the run, exactly as the serial path does.
 
     Story 19.2-002: ``on_terminal(story, status)`` — when supplied — fires the
     instant a worker reaches a *terminal* outcome (a non-parked status, or an
     unexpected raise → ``FAILED``), so the caller can persist that story's status
-    live rather than waiting for the barrier. A parked outcome is a resumable
-    run-pause, not a terminal story state, so it is never credited here.
-    """
-    results = {story.id: _StoryDispatch(story=story) for story in dispatchable}
+    live. A parked outcome is a resumable run-pause, not a terminal story state,
+    so it is never credited here.
 
-    def _worker(story: Story) -> None:
+    Returns every dispatched story's :class:`_StoryDispatch` in submission order.
+    """
+    results: list[_StoryDispatch] = []
+    pending = list(stories)
+    in_flight: dict[concurrent.futures.Future, _StoryDispatch] = {}
+    halted = False  # stop submitting new work; in-flight workers still drain
+
+    def _worker(dispatch: _StoryDispatch) -> None:
+        story = dispatch.story
         try:
             outcome = run_one(story)
         except _CostGatePause as gate:
-            results[story.id].cost_gate = gate
+            dispatch.cost_gate = gate
             return
         except Exception as exc:  # noqa: BLE001 — failure isolation (AC4)
-            results[story.id].error = exc
+            dispatch.error = exc
             if on_terminal is not None:
                 on_terminal(story, "FAILED")
             return
-        results[story.id].outcome = outcome
+        dispatch.outcome = outcome
         if on_terminal is not None and not outcome.parked:
             on_terminal(story, outcome.status or "FAILED")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_worker, story) for story in dispatchable]
-        # Barrier: wait for the whole cohort before the caller proceeds. Each
-        # _worker swallows its own exception, so .result() never raises here.
-        concurrent.futures.wait(futures)
+        while True:
+            if not halted and pending:
+                held: list[Story] = []
+                ready: list[Story] = []
+                for story in pending:
+                    verdict = triage(story) if triage is not None else "ready"
+                    if verdict == "ready":
+                        ready.append(story)
+                    elif verdict == "hold":
+                        held.append(story)
+                    # "drop": triage resolved the story itself — forget it.
 
-    return [results[story.id] for story in dispatchable]
+                ready.sort(key=lambda s: s.id)  # deterministic tie-break (AC4)
+                submit: list[Story] = []
+                for story in ready:
+                    if len(in_flight) + len(submit) >= max_workers:
+                        break  # no free worker — leftovers stay ready next tick
+                    if before_dispatch is not None and not before_dispatch(story):
+                        halted = True
+                        break
+                    submit.append(story)
+
+                if submit and before_batch is not None:
+                    before_batch()
+                submitted = {s.id for s in submit}
+                # Held stories keep their topological order (the cascade
+                # property); leftover ready stories can never regress, so
+                # re-appending them after the held set is safe.
+                pending = held + [s for s in ready if s.id not in submitted]
+                for story in submit:
+                    dispatch = _StoryDispatch(story=story)
+                    results.append(dispatch)
+                    in_flight[pool.submit(_worker, dispatch)] = dispatch
+
+            if not in_flight:
+                # Nothing running and nothing submittable: done, halted, or
+                # every remaining story is held/dropped — never spin.
+                break
+
+            done, _ = concurrent.futures.wait(
+                in_flight, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            # Each _worker swallows its own exception, so the futures never
+            # raise here; apply outcomes in ascending story id per batch.
+            for future in sorted(done, key=lambda f: in_flight[f].story.id):
+                dispatch = in_flight.pop(future)
+                if on_result is not None and on_result(dispatch) is False:
+                    halted = True
+
+    return results
 
 
 def notional_cost_label(cost_usd: float | None) -> str:
@@ -3364,16 +3437,16 @@ def _origin_default_ref(root: Path) -> str:
 
 
 def _refresh_base_ref(root: Path) -> None:
-    """Advance the local ``origin/*`` tracking refs before a cohort dispatches (#231).
+    """Advance the local ``origin/*`` tracking refs before stories dispatch (#231).
 
     Story worktrees are created detached at :func:`_base_ref` — ``origin/main``
-    when ``origin/HEAD`` is set. In a long parallel run, earlier cohorts merge and
+    when ``origin/HEAD`` is set. In a long parallel run, earlier stories merge and
     push to ``main`` while the run is still in flight, but the *local* ``origin/main``
-    ref only moves when something fetches. Without this refresh, a cohort dispatched
+    ref only moves when something fetches. Without this refresh, a story dispatched
     after an earlier merge would branch from the pre-merge tip — re-introducing the
     avoidable merge conflicts, stale sibling trees, and review noise of #231. A
-    guarded ``git fetch origin`` at each cohort boundary pulls the ref up to the
-    current remote tip so the cohort's worktrees branch from the latest merged state.
+    guarded ``git fetch origin`` before each submission batch pulls the ref up to
+    the current remote tip so new worktrees branch from the latest merged state.
 
     Best-effort and never fatal (mirrors :func:`reconcile_run`'s fetch contract):
     offline — or any git/OS failure — degrades silently to the current local ref
@@ -4053,7 +4126,7 @@ def run_build(
     persist_cohort_structure(ledger, run_id, cohorts)
     status: dict[str, str] = {s.id: "TODO" for s in buildable}
 
-    # --- Phase 2: cohort-by-cohort execution ---------------------------------
+    # --- Phase 2: story dispatch ----------------------------------------------
     # Story 14.1-001: the budget gate is checked *before* dispatching each story
     # (the prior story's stages are already finished/committed, so R10 holds). A
     # crossed ceiling halts further dispatch and hands off to the policy-aware
@@ -4091,9 +4164,10 @@ def run_build(
         )
 
     # Story 19.2-002: credit a parallel story's terminal status the instant its
-    # worker finishes — not at the cohort barrier — so status_snapshot's derived
-    # done/total counts (and the dashboard's top bar) move live as each story
-    # completes. The post-barrier loop re-applies the same status as part of its
+    # worker finishes — before the scheduler applies the outcome — so
+    # status_snapshot's derived done/total counts (and the dashboard's top bar)
+    # move live as each story completes. The scheduler's outcome application
+    # re-applies the same status as part of its
     # control-flow bookkeeping; set_story_status is a by-value UPDATE on the
     # single story row, so the repeat write can never double-count, keeping the
     # barrier finalize idempotent. Serial mode never routes through here.
@@ -4104,104 +4178,97 @@ def run_build(
         build_issue.announce_terminal(ledger, story.id, outcome_status)
 
     workers = effective_concurrency(opts)
-    for cohort in cohorts:
-        if budget_stopped or rate_limit_park is not None or cost_gated is not None:
-            break
 
+    # Statuses that make a dependent ineligible: the dependency's work did not
+    # cleanly land. NEEDS_ATTENTION counts as not-done: the dependency's work is
+    # committed but unmerged (parked for manual push/MR or a commit-message fix),
+    # so a dependent built on top of it would race incomplete work — block it
+    # like any other non-DONE dependency.
+    dep_blocking = {"FAILED", "BLOCKED", "SKIPPED", "NEEDS_ATTENTION", "AWAITING_APPROVAL"}
+
+    if workers == 1:
         # --- Serial path (--sequential / --concurrency=1) ---------------------
-        # Byte-for-byte today's one-at-a-time behaviour (AC3): the budget gate is
-        # re-checked before *every* story, and a park/gate breaks mid-cohort.
-        if workers == 1:
-            for story in cohort:
-                if _budget_exceeded(ledger, run_id, opts.budget):
-                    budget_stopped = True
-                    break
-                # A story whose dependency did not cleanly finish cannot proceed.
-                # NEEDS_ATTENTION counts as not-done: the dependency's work is
-                # committed but unmerged (parked for manual push/MR or a
-                # commit-message fix), so a dependent built on top of it would race
-                # incomplete work — block it like any other non-DONE dependency.
-                blocked_by = [
-                    dep
-                    for dep in story.dependencies
-                    if status.get(dep)
-                    in {"FAILED", "BLOCKED", "SKIPPED", "NEEDS_ATTENTION", "AWAITING_APPROVAL"}
-                ]
-                if blocked_by:
-                    status[story.id] = "BLOCKED"
-                    ledger.set_story_status(run_id, story.id, "BLOCKED")
-                    ledger.event_log(
-                        run_id,
-                        story.id,
-                        "warn",
-                        "controller",
-                        f"blocked: dependency not done ({', '.join(blocked_by)})",
-                    )
-                    continue
-
-                try:
-                    sr = _run_one(story)
-                except _CostGatePause as gate:
-                    # Story 14.1-002: the interactive cost gate halted a stage.
-                    # Park the story NEEDS_ATTENTION but leave the run resumable.
-                    status[story.id] = "NEEDS_ATTENTION"
-                    ledger.set_story_status(run_id, story.id, "NEEDS_ATTENTION")
-                    cost_gated = gate
-                    break
-                if sr.parked:
-                    # Reset is beyond the auto-wait cap: leave the in-flight story
-                    # RATE_LIMITED (resumable, distinct from NEEDS_ATTENTION) and
-                    # hand off to the durable park close-out below.
-                    status[story.id] = "RATE_LIMITED"
-                    ledger.set_story_status(run_id, story.id, "RATE_LIMITED")
-                    rate_limit_park = sr
-                    break
-                outcome = sr.status or "FAILED"  # non-parked always carries a status
-                status[story.id] = outcome
-                ledger.set_story_status(run_id, story.id, outcome)
-                # Story 22.4-002: mirror a parked terminal status onto the issue
-                # (best-effort; no-op for DONE / unmapped stories).
-                build_issue.announce_terminal(ledger, story.id, outcome)
-                if outcome == "FAILED":
-                    try:  # best-effort; terminal FAILED only (no bugfix-retry noise)
-                        notify("story_failed", run=run_id, story_id=story.id)
-                    except Exception:
-                        pass
-                # Story 17.2-002: a terminal story closes out — remove its isolated
-                # worktree (branch/PR preserved). Resumable holds above `break`d out
-                # first, so they keep their worktree for re-entry.
-                _teardown_story_workdir(
-                    ledger, run_id, story.id, real_run=dispatcher is None
-                )
-
-                # Story 12.4-001: reposition HEAD back to the base between stories
-                # so a parked/blocked story's feature branch (the merge agent only
-                # returns to main on its success path) is never the base the next
-                # story's branch stacks on. Real runs only — injected fakes operate
-                # on the test's cwd and must not touch the real repo, exactly like
-                # the close-out reconcile guard below. Best-effort, never fatal.
-                if dispatcher is None:
-                    _reposition_head(Path.cwd())
-            continue
-
-        # --- Parallel path (Story 17.1-001) -----------------------------------
-        # Dispatch the cohort's ready stories through a bounded worker pool, then
-        # a barrier waits for the whole cohort before the next begins. The budget
-        # gate is checked once at the cohort boundary (mid-cohort spend is bounded
-        # by the barrier, not by a per-story check the pool cannot interleave).
-        if _budget_exceeded(ledger, run_id, opts.budget):
-            budget_stopped = True
-            break
-
-        # Dependency-block check stays *before* dispatch (AC4): a story whose dep
-        # did not cleanly finish is marked BLOCKED and never submitted.
-        dispatchable: list[Story] = []
-        for story in cohort:
+        # Byte-for-byte today's one-at-a-time behaviour (17.1-001 AC3, preserved
+        # by 24.1-001 AC5): stories run in cohort order, the budget gate is
+        # re-checked before *every* story, and a park/gate breaks the loop.
+        for story in (s for cohort in cohorts for s in cohort):
+            if _budget_exceeded(ledger, run_id, opts.budget):
+                budget_stopped = True
+                break
+            # A story whose dependency did not cleanly finish cannot proceed.
             blocked_by = [
-                dep
-                for dep in story.dependencies
-                if status.get(dep)
-                in {"FAILED", "BLOCKED", "SKIPPED", "NEEDS_ATTENTION", "AWAITING_APPROVAL"}
+                dep for dep in story.dependencies if status.get(dep) in dep_blocking
+            ]
+            if blocked_by:
+                status[story.id] = "BLOCKED"
+                ledger.set_story_status(run_id, story.id, "BLOCKED")
+                ledger.event_log(
+                    run_id,
+                    story.id,
+                    "warn",
+                    "controller",
+                    f"blocked: dependency not done ({', '.join(blocked_by)})",
+                )
+                continue
+
+            try:
+                sr = _run_one(story)
+            except _CostGatePause as gate:
+                # Story 14.1-002: the interactive cost gate halted a stage.
+                # Park the story NEEDS_ATTENTION but leave the run resumable.
+                status[story.id] = "NEEDS_ATTENTION"
+                ledger.set_story_status(run_id, story.id, "NEEDS_ATTENTION")
+                cost_gated = gate
+                break
+            if sr.parked:
+                # Reset is beyond the auto-wait cap: leave the in-flight story
+                # RATE_LIMITED (resumable, distinct from NEEDS_ATTENTION) and
+                # hand off to the durable park close-out below.
+                status[story.id] = "RATE_LIMITED"
+                ledger.set_story_status(run_id, story.id, "RATE_LIMITED")
+                rate_limit_park = sr
+                break
+            outcome = sr.status or "FAILED"  # non-parked always carries a status
+            status[story.id] = outcome
+            ledger.set_story_status(run_id, story.id, outcome)
+            # Story 22.4-002: mirror a parked terminal status onto the issue
+            # (best-effort; no-op for DONE / unmapped stories).
+            build_issue.announce_terminal(ledger, story.id, outcome)
+            if outcome == "FAILED":
+                try:  # best-effort; terminal FAILED only (no bugfix-retry noise)
+                    notify("story_failed", run=run_id, story_id=story.id)
+                except Exception:
+                    pass
+            # Story 17.2-002: a terminal story closes out — remove its isolated
+            # worktree (branch/PR preserved). Resumable holds above `break`d out
+            # first, so they keep their worktree for re-entry.
+            _teardown_story_workdir(
+                ledger, run_id, story.id, real_run=dispatcher is None
+            )
+
+            # Story 12.4-001: reposition HEAD back to the base between stories
+            # so a parked/blocked story's feature branch (the merge agent only
+            # returns to main on its success path) is never the base the next
+            # story's branch stacks on. Real runs only — injected fakes operate
+            # on the test's cwd and must not touch the real repo, exactly like
+            # the close-out reconcile guard below. Best-effort, never fatal.
+            if dispatcher is None:
+                _reposition_head(Path.cwd())
+    else:
+        # --- Parallel path: continuous ready-queue dispatch (Story 24.1-001) --
+        # Retires the Epic-17 cohort barrier: a story is submitted the moment its
+        # own dependencies are DONE (or out-of-queue), regardless of wave, so a
+        # ready story never idles behind an unrelated slow or parked sibling.
+        # `compute_cohorts` above still feeds the dashboard's wave view via
+        # persist_cohort_structure; it no longer gates execution.
+
+        def _triage(story: Story) -> str:
+            # Dependency-block check stays *before* dispatch (17.1-001 AC4): a
+            # story whose dep did not cleanly finish is marked BLOCKED and never
+            # submitted; one whose dep is still pending/in-flight is held and
+            # re-evaluated on each completion.
+            blocked_by = [
+                dep for dep in story.dependencies if status.get(dep) in dep_blocking
             ]
             if blocked_by:
                 status[story.id] = "BLOCKED"
@@ -4210,39 +4277,50 @@ def run_build(
                     run_id, story.id, "warn", "controller",
                     f"blocked: dependency not done ({', '.join(blocked_by)})",
                 )
-                continue
-            dispatchable.append(story)
-        if not dispatchable:
-            continue
+                return "drop"
+            if any(dep in status and status[dep] != "DONE" for dep in story.dependencies):
+                return "hold"
+            return "ready"
 
-        # Story #231: refresh origin/main before this cohort's worktrees are cut so
-        # they branch from the latest merged state, not the main captured at run
-        # start. Earlier cohorts merge and push during a long run, so without this
-        # a later cohort would build against a stale base — avoidable conflicts and
-        # missing just-merged sibling changes. Real runs only (injected fakes must
-        # not touch the real repo, like the close-out reconcile/reposition guards);
-        # guarded and best-effort — offline degrades to the current local ref. This
-        # moves only the ref future create_story_worktree calls read; in-flight
-        # worktrees from earlier cohorts are never rebased.
-        if dispatcher is None:
-            _refresh_base_ref(Path.cwd())
+        def _budget_gate(story: Story) -> bool:
+            # Story 14.1-001: with no barrier bounding mid-cohort spend, the
+            # ceiling is re-checked before *each* submission instead of once per
+            # cohort — the scheduler thread owns dispatch, so the continuous
+            # path can afford the per-story check the pool could not interleave.
+            nonlocal budget_stopped
+            if _budget_exceeded(ledger, run_id, opts.budget):
+                budget_stopped = True
+                return False
+            return True
 
-        # Apply outcomes in cohort (submission) order so the result is
-        # deterministic regardless of which worker finished first.
-        for result in _dispatch_cohort(
-            dispatchable, max_workers=workers, run_one=_run_one,
-            on_terminal=_credit_terminal,
-        ):
+        def _refresh_base() -> None:
+            # Story #231: refresh origin/main before new worktrees are cut so
+            # they branch from the latest merged state, not the main captured at
+            # run start. Earlier stories merge and push during a long run, so
+            # without this a later story would build against a stale base —
+            # avoidable conflicts and missing just-merged sibling changes. Real
+            # runs only (injected fakes must not touch the real repo, like the
+            # close-out reconcile/reposition guards); guarded and best-effort —
+            # offline degrades to the current local ref. This moves only the ref
+            # future create_story_worktree calls read; in-flight worktrees are
+            # never rebased.
+            if dispatcher is None:
+                _refresh_base_ref(Path.cwd())
+
+        def _apply(result: _StoryDispatch) -> bool:
+            # Outcomes are applied on the scheduler thread, in ascending story
+            # id per completion batch, so the end state stays deterministic.
+            nonlocal cost_gated, rate_limit_park
             story = result.story
             if result.cost_gate is not None:
                 status[story.id] = "NEEDS_ATTENTION"
                 ledger.set_story_status(run_id, story.id, "NEEDS_ATTENTION")
-                if cost_gated is None:  # first gate in cohort order wins
+                if cost_gated is None:  # first gate applied wins
                     cost_gated = result.cost_gate
-                continue
+                return False  # deliberate run pause — drain in-flight, submit nothing
             if result.error is not None:
                 # Failure isolation (AC4): an unexpected raise is recorded FAILED
-                # for this story; its peers already ran to completion in the pool.
+                # for this story; its in-flight peers run to completion.
                 status[story.id] = "FAILED"
                 ledger.set_story_status(run_id, story.id, "FAILED")
                 ledger.event_log(
@@ -4258,15 +4336,15 @@ def run_build(
                 _teardown_story_workdir(
                     ledger, run_id, story.id, real_run=dispatcher is None
                 )
-                continue
+                return True
             sr = result.outcome
             assert sr is not None  # exactly one of outcome/cost_gate/error is set
             if sr.parked:
                 status[story.id] = "RATE_LIMITED"
                 ledger.set_story_status(run_id, story.id, "RATE_LIMITED")
-                if rate_limit_park is None:  # first park in cohort order wins
+                if rate_limit_park is None:  # first park applied wins
                     rate_limit_park = sr
-                continue
+                return False  # run-level park — drain in-flight, submit nothing
             outcome = sr.status or "FAILED"
             status[story.id] = outcome
             ledger.set_story_status(run_id, story.id, outcome)
@@ -4275,16 +4353,28 @@ def run_build(
                     notify("story_failed", run=run_id, story_id=story.id)
                 except Exception:
                     pass
-            # Story 17.2-002: terminal story → remove its isolated worktree once
-            # the cohort barrier has it in hand (single-threaded here, so this
-            # never races a live worker); parked holds above `continue`d first.
+            # Story 17.2-002: terminal story → remove its isolated worktree
+            # (applied on the scheduler thread, so this never races a live
+            # worker); parked holds returned above keep theirs for re-entry.
             _teardown_story_workdir(
                 ledger, run_id, story.id, real_run=dispatcher is None
             )
+            return True
 
-        # Reposition HEAD once after the cohort barrier (real runs only). Each
+        _dispatch_ready_queue(
+            [story for cohort in cohorts for story in cohort],
+            max_workers=workers,
+            run_one=_run_one,
+            triage=_triage,
+            before_dispatch=_budget_gate,
+            before_batch=_refresh_base,
+            on_result=_apply,
+            on_terminal=_credit_terminal,
+        )
+
+        # Reposition HEAD once after the scheduler drains (real runs only). Each
         # concurrent story committed in its own worktree, so the shared root only
-        # needs returning to base once the whole cohort is done.
+        # needs returning to base once dispatch is over.
         if dispatcher is None:
             _reposition_head(Path.cwd())
 
@@ -4842,7 +4932,7 @@ def _run_story(
                         "paused for review (R10: no work started, nothing discarded)",
                     )
                     # Pause the *run* resumably (IN_PROGRESS), not a terminal park:
-                    # propagate to the cohort loop so `sdlc resume --cost-threshold`
+                    # propagate to the scheduler loop so `sdlc resume --cost-threshold`
                     # can raise the gate and continue the gated stage.
                     raise _CostGatePause(
                         story_id=story.id, stage=stage, estimate=estimate
