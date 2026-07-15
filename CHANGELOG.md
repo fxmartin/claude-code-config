@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.28.0] - 2026-07-15
+
+### Added
+
+- feat(performance-token-optimization): change-class (#27.2-001)
+
+### Fixed
+
+- fix(performance-token-optimization): change-class (#27.2-001)
+
+
 ## [v2.27.0] - 2026-07-15
 
 ### Added
