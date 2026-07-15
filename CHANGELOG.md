@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.19.0] - 2026-07-15
+
+### Added
+
+- feat(continuous-scheduling): ready-queue dispatch — retire the cohort barrier (#24.1-001) (#460)
+
+
 ## [v2.18.3] - 2026-07-15
 
 ### Fixed
