@@ -144,13 +144,23 @@ def test_coverage_gate_keeps_threshold_and_status_enums() -> None:
     for line in (
         "COVERAGE_PCT:",
         "TESTS_ADDED:",
-        "PR_NUMBER:",
-        "PR_URL:",
         "COVERAGE_STATUS: PASS | WARN",
         "SAST_STATUS: CLEAN | WARN | BLOCK | SKIPPED",
         "DEP_SCAN_STATUS: CLEAN | WARN | BLOCK | SKIPPED",
     ):
         assert line in text, f"coverage gate lost output-contract line: {line!r}"
+
+
+def test_coverage_gate_dropped_pr_creation_instructions() -> None:
+    """Story 27.3-001: the controller pushes the branch and opens the PR/MR
+    deterministically — the agent-side push and `gh pr create` steps (and the
+    PR_NUMBER/PR_URL output lines they fed) must be gone from the template."""
+    text = _coverage_gate()
+    assert "gh pr create" not in text
+    assert "git push" not in text
+    assert "PR_NUMBER:" not in text
+    assert "PR_URL:" not in text
+    assert "controller pushes" in text
 
 
 def test_coverage_gate_keeps_security_scan_gate_criteria() -> None:

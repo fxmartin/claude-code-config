@@ -30,13 +30,12 @@ Single-sourced template (Story 27.1-003), dispatched by both orchestrators. On t
    fix-issue path the original bug scenario needs a regression test.
 4. **Add tests** for the uncovered paths and **fix any failing tests**.
 5. **Iterate** until new-code coverage ≥ {{COVERAGE_THRESHOLD}}% (aim for 100% if achievable).
-6. **Commit** (`git add -A`), message `test({{EPIC_NAME}}): add coverage for {{STORY_TITLE}}`
+6. **Commit locally** (`git add -A`), message `test({{EPIC_NAME}}): add coverage for {{STORY_TITLE}}`
    (fix-issue path: `test: add coverage for fix #{{ISSUE_NUMBER}}`), with the
    `Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>` trailer.
-7. **Push**: `git push -u origin {{BRANCH_NAME}}`.
-8. **Create the PR**: `gh pr create` titled `feat: {{STORY_TITLE}} (#{{STORY_ID}})`
-   (fix-issue path: `fix: {{ISSUE_TITLE}} (#{{ISSUE_NUMBER}})`), body summarizing the
-   new-code coverage %, tests added, and test plan.
+   Do NOT push and do NOT create the PR/MR — the controller pushes the branch
+   and opens the change request deterministically once this gate completes
+   (Story 27.3-001).
 
 ### Security scans (Stories 9.1-001 / 9.1-002 — skip both if `{{SECURITY_SCAN}}` is `off`)
 
@@ -71,8 +70,6 @@ Return these exact lines at the end of your response:
 ```
 COVERAGE_PCT: [number]%
 TESTS_ADDED: [count]
-PR_NUMBER: [number]
-PR_URL: [url]
 COVERAGE_STATUS: PASS | WARN
 SAST_STATUS: CLEAN | WARN | BLOCK | SKIPPED
 DEP_SCAN_STATUS: CLEAN | WARN | BLOCK | SKIPPED
@@ -91,7 +88,7 @@ BLOCK → FAIL, SKIPPED → PASS.
 
 ```
 <<<RESULT_JSON>>>
-{"pr_number": [number], "pr_url": "[url]", "coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "sast_status": "PASS", "dep_scan_status": "PASS"}
+{"coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "sast_status": "PASS", "dep_scan_status": "PASS"}
 <<<END_RESULT>>>
 ```
 

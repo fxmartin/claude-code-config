@@ -3478,18 +3478,23 @@ def test_coverage_prompt_without_section_is_unchanged() -> None:
     assert "Story Specification" not in prompt
 
 
-def test_coverage_prompt_gitlab_opens_a_merge_request() -> None:
-    """The coverage agent opens an MR on a GitLab target (AC1/AC2)."""
+def test_coverage_prompt_gitlab_names_the_merge_request() -> None:
+    """The controller-owned hand-off keeps the host noun (PR vs MR) (AC1/AC2).
+
+    Story 27.3-001: the coverage agent no longer pushes or opens the change
+    request — the controller does, deterministically — but the prompt still
+    names the host-correct noun so the agent's summary language matches.
+    """
     from sdlc.build import render_coverage_prompt
     from sdlc.issue_host import GITLAB_CR_TERMS
 
     gh = render_coverage_prompt(_story("23.2-001"), BuildOptions())
-    assert "Push, open the PR, then emit the result block." in gh
+    assert "Commit locally; the controller pushes and opens the PR." in gh
 
     gl = render_coverage_prompt(
         _story("23.2-001"), BuildOptions(), cr_terms=GITLAB_CR_TERMS,
     )
-    assert "Push, open the MR (`glab mr create`), then emit the result block." in gl
+    assert "Commit locally; the controller pushes and opens the MR." in gl
 
 
 class _PromptCapturingDispatcher(FakeDispatcher):
@@ -3529,9 +3534,10 @@ def test_build_on_gitlab_target_opens_an_mr_and_records_cr_ref(tmp_path) -> None
 
     build_prompt = next(p for a, p in disp.prompts if a == "build")
     coverage_prompt = next(p for a, p in disp.prompts if a == "coverage")
-    # The coverage agent (the default PR-opener) is told to open an MR via glab.
-    assert "open the MR (`glab mr create`)" in coverage_prompt
-    assert "open the PR" not in coverage_prompt
+    # The coverage agent's hand-off names the MR (the controller opens it —
+    # Story 27.3-001); the PR noun never leaks into a GitLab prompt.
+    assert "the controller pushes and opens the MR" in coverage_prompt
+    assert "opens the PR" not in coverage_prompt
     # The build agent's hand-off references the MR, never a PR.
     assert "opens the MR" in build_prompt
     # The MR iid (cr_ref) reported by the coverage agent is recorded in the ledger.

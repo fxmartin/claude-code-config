@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterable, Iterator, Protocol
 from sdlc.capability import preflight_harness, resolve_capabilities
 from sdlc import build_issue
 from sdlc import change_class
+from sdlc import coverage_precheck
 from sdlc.degradation import evaluate_degradations
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.commitlint import (
@@ -3090,7 +3091,10 @@ def render_build_prompt(
         f"6. Push and create {cr_terms.abbr}{cr_terms.cli_hint}; "
         f"include the {cr_terms.ref_noun} in the result block."
         if opts.skip_coverage
-        else f"6. Commit locally; the coverage agent pushes and opens the {cr_terms.abbr}."
+        # Story 27.3-001: the controller pushes and opens the change request
+        # deterministically once the coverage gate completes — no agent does.
+        else f"6. Commit locally; the controller pushes and opens the {cr_terms.abbr} "
+        "after the coverage gate."
     )
     # Story 18.3-001: keep user-facing docs current with each story. When the
     # documentation-currency lens is enabled (the default), instruct the build
@@ -3188,6 +3192,7 @@ def render_coverage_prompt(
     close_link: str | None = None,
     *,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+    precheck: "coverage_precheck.PrecheckResult | None" = None,
 ) -> str:
     # Story 12.2-004: the coverage agent authors a commit too (it is linted via
     # the build/coverage success gate), so supply a commitlint-compliant header
@@ -3198,22 +3203,41 @@ def render_coverage_prompt(
         subject=story.title,
         trailer=f" (#{story.id})",
     )
-    # Story 22.4-002: the coverage agent opens the change request on the default
-    # path, so the close-link rides here; empty when the story has no mapped issue.
-    # Story 23.2-001: ``cr_terms`` picks the host noun/CLI (PR via gh / MR via glab).
+    # Story 27.3-001: the controller pushes the branch and opens the change
+    # request itself once this stage completes — the agent only commits, and
+    # the close-link (22.4-002) now rides in the controller-opened CR body, so
+    # ``close_link`` is accepted for signature stability but never rendered.
+    del close_link
+    # Story 23.2-001: ``cr_terms`` picks the host noun (PR via gh / MR via glab).
     # Story 27.3-002: embed the story's own epic section (same treatment as the
     # build prompt) so the coverage agent has the spec without re-reading the
     # epic; empty/oversized sections leave the prompt unchanged.
     section_block = _story_section_block(story)
+    # Story 27.3-001: when the deterministic pre-check ran, hand the agent its
+    # measured numbers so it starts from the real gap instead of re-deriving it.
+    precheck_block = ""
+    if precheck is not None:
+        measured = (
+            f"changed-file coverage {precheck.coverage_pct:.1f}%"
+            if precheck.coverage_pct is not None
+            else "changed-file coverage not measurable"
+        )
+        precheck_block = (
+            "Controller pre-check (already run in the worktree via "
+            f"`{precheck.command}`): tests "
+            f"{'passed' if precheck.tests_passed else 'FAILED'}; {measured} "
+            f"(threshold {opts.coverage_threshold}%).\n"
+        )
     return (
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
         + section_block
+        + precheck_block
         + "Fetch the branch, fill coverage gaps, then commit with this exact, "
         "conventional-commit-compliant message — do not alter it:\n"
         f"   {commit_header}\n"
-        f"Push, open the {cr_terms.abbr}{cr_terms.cli_hint}, then emit the result block.\n"
-        + _close_link_instruction(close_link, cr_terms=cr_terms)
+        f"Commit locally; the controller pushes and opens the {cr_terms.abbr}. "
+        "Then emit the result block.\n"
         + _result_wrapper("coverage-agent-response.schema.json")
     )
 
@@ -3466,7 +3490,7 @@ def _story_change_class(
     return verdict
 
 
-def _open_docs_only_cr(
+def _open_story_cr(
     story: Story,
     ledger: Ledger,
     run_id: str,
@@ -3474,15 +3498,18 @@ def _open_docs_only_cr(
     base_ref: str,
     close_link: str | None,
     cr_terms: ChangeRequestTerms,
+    *,
+    body: str,
+    context: str,
 ) -> int | None:
     """Push the story branch and open its change request deterministically.
 
-    On the docs-only skip path the coverage agent — which normally pushes the
-    branch and opens the PR/MR — is never dispatched, so the controller does
-    both itself via plain git and the Epic-22/23 host adapter. Returns the CR
-    number/iid, or ``None`` on any failure; the caller then falls back to the
-    full coverage dispatch, so a push/host hiccup can never strand a story
-    without a change request.
+    The coverage agent no longer pushes the branch or opens the PR/MR (Story
+    27.3-001) — the controller does both itself via plain git and the
+    Epic-22/23 host adapter, on every coverage path: the docs-only skip
+    (27.2-001), the green pre-check skip, and after a dispatched coverage
+    agent commits. Returns the CR number/iid, or ``None`` on any failure; the
+    warn event names ``context`` so the run log says which path degraded.
     """
     root = workdir or Path.cwd()
     branch = f"feature/{story.id}"
@@ -3504,23 +3531,43 @@ def _open_docs_only_cr(
             subject=story.title,
             trailer=f" (#{story.id})",
         )
-        body = (
-            f"Docs-only change for story {story.id} — coverage gate skipped "
-            "(skip_reason=docs-only, Story 27.2-001)."
-        )
         if close_link:
             body += f"\n\n{close_link}"
         cr = adapter.cr_create(
             branch, title, body, target_branch=base_ref.removeprefix("origin/")
         )
         return int(cr.ref)
-    except Exception as exc:  # noqa: BLE001 — any failure degrades to the full dispatch
+    except Exception as exc:  # noqa: BLE001 — the caller owns the degradation path
         ledger.event_log(
             run_id, story.id, "warn", "controller",
-            f"docs-only skip: deterministic {cr_terms.abbr} open failed ({exc}) — "
-            "falling back to the full coverage dispatch",
+            f"{context}: deterministic {cr_terms.abbr} open failed ({exc})",
         )
         return None
+
+
+def _open_docs_only_cr(
+    story: Story,
+    ledger: Ledger,
+    run_id: str,
+    workdir: Path | None,
+    base_ref: str,
+    close_link: str | None,
+    cr_terms: ChangeRequestTerms,
+) -> int | None:
+    """The docs-only skip's deterministic CR open (Story 27.2-001).
+
+    A thin wrapper over :func:`_open_story_cr` kept as its own seam: on this
+    path a ``None`` makes the caller fall back to the full coverage dispatch,
+    so a push/host hiccup can never strand a story without a change request.
+    """
+    return _open_story_cr(
+        story, ledger, run_id, workdir, base_ref, close_link, cr_terms,
+        body=(
+            f"Docs-only change for story {story.id} — coverage gate skipped "
+            "(skip_reason=docs-only, Story 27.2-001)."
+        ),
+        context="docs-only skip (falling back to the full coverage dispatch)",
+    )
 
 
 def _review_is_adversarial_slot(opts: BuildOptions) -> bool:
@@ -5221,6 +5268,62 @@ def _run_story(
                 continue
             # The deterministic CR open failed — never strand the story without
             # a change request: fall through to the full coverage dispatch.
+        # Story 27.3-001: deterministic coverage pre-check. Before paying for
+        # the coverage dispatch on a code story, run the project's own test +
+        # coverage command in the worktree. Tests green AND changed-file
+        # coverage >= threshold means there is no gap for the agent to fill:
+        # skip the dispatch (recorded SKIPPED with its skip_reason — never a
+        # passed gate) and open the change request deterministically, exactly
+        # like the docs-only path. Anything else — red tests, a gap, or an
+        # unmeasurable repo (pre-check None) — dispatches the agent as before,
+        # with the measured numbers injected into its prompt. The 90% criterion
+        # itself is unchanged.
+        precheck: coverage_precheck.PrecheckResult | None = None
+        if stage == "coverage" and story_class != change_class.DOCS_ONLY:
+            precheck = coverage_precheck.run_precheck(
+                workdir or Path.cwd(), base_ref, f"feature/{story.id}",
+                timeout=opts.preflight_timeout,
+            )
+            if precheck is not None and coverage_precheck.passes(
+                precheck, opts.coverage_threshold
+            ):
+                pr = pr_number if pr_number is not None else _open_story_cr(
+                    story, ledger, run_id, workdir, base_ref, close_link, cr_terms,
+                    body=(
+                        f"Coverage pre-check passed for story {story.id} — "
+                        f"coverage agent skipped (skip_reason="
+                        f"{coverage_precheck.SKIP_REASON}, Story 27.3-001): tests "
+                        f"green, changed-file coverage {precheck.coverage_pct:.1f}% "
+                        f">= {opts.coverage_threshold}%."
+                    ),
+                    context=(
+                        "coverage pre-check skip (falling back to the full "
+                        "coverage dispatch)"
+                    ),
+                )
+                if pr is not None:
+                    pr_number = pr
+                    ledger.set_story_pr(run_id, story.id, pr_number)
+                    ledger.stage_start(
+                        run_id, story.id, stage, attempt,
+                        harness=_stage_harness(stage, opts), model=None,
+                    )
+                    ledger.stage_finish(
+                        run_id, story.id, stage, attempt, "SKIPPED",
+                        coverage_precheck.SKIP_REASON,
+                    )
+                    ledger.event_log(
+                        run_id, story.id, "info", "controller",
+                        f"coverage skipped (skip_reason="
+                        f"{coverage_precheck.SKIP_REASON}): tests green and "
+                        f"changed-file coverage {precheck.coverage_pct:.1f}% >= "
+                        f"{opts.coverage_threshold}%; {cr_terms.abbr} #{pr_number} "
+                        "opened by the controller",
+                    )
+                    continue
+                # The deterministic CR open failed — never strand the story:
+                # fall through to the full coverage dispatch (the post-stage
+                # CR open below then gets a second chance).
         if (
             stage == "review"
             and story_class == change_class.DOCS_ONLY
@@ -5332,6 +5435,7 @@ def _run_story(
                         stage, story, opts, pr_number, dispatch, tpath,
                         on_progress=sink, escalation_steps=escalation_steps,
                         close_link=close_link, cr_terms=cr_terms, base_ref=base_ref,
+                        precheck=precheck,
                     )
                 if ok:
                     ledger.stage_finish(
@@ -5528,6 +5632,33 @@ def _run_story(
                     )
                 attempt += 1
                 continue
+
+        # Story 27.3-001: the change request is opened by deterministic
+        # controller code once the coverage stage completes — the agent no
+        # longer pushes or runs `gh pr create`/`glab mr create`. Runs after the
+        # success-path commit lint above, so an amended commit message is what
+        # gets pushed. A legacy agent that still reports a pr_number keeps it
+        # (no double-open). If the deterministic open fails, park the story
+        # rather than advance to review without a change request — the
+        # committed branch is preserved (R10).
+        if stage == "coverage" and pr_number is None:
+            pr_number = _open_story_cr(
+                story, ledger, run_id, workdir, base_ref, close_link, cr_terms,
+                body=(
+                    f"Coverage gate passed for story {story.id} — change "
+                    "request opened by the controller (Story 27.3-001)."
+                ),
+                context="post-coverage",
+            )
+            if pr_number is None:
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    f"coverage done but the deterministic {cr_terms.abbr} open "
+                    f"failed — parking NEEDS_ATTENTION; work preserved on "
+                    f"feature/{story.id}",
+                )
+                return "NEEDS_ATTENTION"
+            ledger.set_story_pr(run_id, story.id, pr_number)
 
     return "DONE"
 
@@ -5839,6 +5970,7 @@ def _dispatch_stage(
     close_link: str | None = None,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
     base_ref: str = "origin/main",
+    precheck: "coverage_precheck.PrecheckResult | None" = None,
 ) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one stage's agent and classify the outcome.
 
@@ -5849,11 +5981,14 @@ def _dispatch_stage(
     ``"reported"`` (empty on success) — so the caller can treat an unparseable
     result that nonetheless committed work as recoverable rather than discard it
     (R10). ``on_progress`` (Story 11.1-002) is forwarded to the dispatcher so the
-    streamed stage emits sub-stage progress to the ledger.
+    streamed stage emits sub-stage progress to the ledger. ``precheck`` (Story
+    27.3-001) carries the deterministic pre-check numbers into a dispatched
+    coverage agent's prompt; ``None`` for every other stage or an inconclusive
+    pre-check.
     """
     prompt = _render_stage_prompt(
         stage, story, opts, pr_number, close_link=close_link,
-        cr_terms=cr_terms, base_ref=base_ref,
+        cr_terms=cr_terms, base_ref=base_ref, precheck=precheck,
     )
     # Issue #427: resolve the effective model through the shared helper so
     # dispatch and the pre-dispatch estimate/ledger write can never diverge. For
@@ -5914,13 +6049,16 @@ def _render_stage_prompt(
     *,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
     base_ref: str = "origin/main",
+    precheck: "coverage_precheck.PrecheckResult | None" = None,
 ) -> str:
     if stage == "build":
         return render_build_prompt(
             story, opts, close_link=close_link, cr_terms=cr_terms, base_ref=base_ref
         )
     if stage == "coverage":
-        return render_coverage_prompt(story, opts, close_link=close_link, cr_terms=cr_terms)
+        return render_coverage_prompt(
+            story, opts, close_link=close_link, cr_terms=cr_terms, precheck=precheck
+        )
     if stage == "review":
         return render_review_prompt(story, pr_number)
     return render_merge_prompt(story, pr_number, cr_terms=cr_terms)
