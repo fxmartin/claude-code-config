@@ -350,18 +350,24 @@ def build(ctx: typer.Context) -> None:
 
 _FIX_EPILOG = """\
 \b
-Target (positional):
+Target (positional — pass exactly one):
   <issue-number>   a single open GitHub issue, e.g. `sdlc fix 123`
+  all              every open issue (bugs first, then enhancements by priority)
+  next             the highest-priority open bug (see --limit for the top N)
 
 \b
 Flags:
+  --limit=N                 batch only: cap the issue set (`next` defaults to 1)
+  --sequential              batch only: one issue fully completes before the next
+  --concurrency=N           batch only: issue-level worker cap (default 5)
   --skip-coverage           build agent opens the PR directly (no coverage gate)
   --coverage-threshold=N    required new-code coverage % (default 90)
   --skip-preflight          skip the preflight quality gate
 
 \b
-Batch mode (`all`, `next --limit=N`) is coming in a later release; PR1 fixes one
-issue at a time. The run appears in `sdlc dashboard` beside `sdlc build` runs.
+Batch runs investigate every issue first, then serialize only issues that touch
+overlapping files while independent ones run concurrently. The run appears in
+`sdlc dashboard` beside `sdlc build` runs.
 """
 
 
@@ -371,14 +377,21 @@ issue at a time. The run appears in `sdlc dashboard` beside `sdlc build` runs.
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
 def fix(ctx: typer.Context) -> None:
-    """Autonomously fix a single GitHub issue end-to-end.
+    """Autonomously fix one or many GitHub issues end-to-end.
 
-    Fetches the issue, investigates the root cause, then drives the reused
+    Fetches the issue(s), investigates the root cause, then drives the reused
     build → coverage → review → merge pipeline (with the bounded bugfix loop and
     high-risk merge parking) before a best-effort summary — mirroring the
-    fix-issue skill's single-issue path in the controller (issue #436).
+    fix-issue skill in the controller (issue #436). ``all`` / ``next`` fan the
+    pipeline out across many issues, serializing only those with overlapping files.
     """
-    from sdlc.fix_issue import FixConfigError, parse_fix_args, run_fix
+    from sdlc.fix_issue import (
+        FixBatchOptions,
+        FixConfigError,
+        parse_fix_args,
+        run_fix,
+        run_fix_batch,
+    )
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
 
     try:
@@ -389,6 +402,11 @@ def fix(ctx: typer.Context) -> None:
 
     ledger = Ledger(default_db_path())
     ledger.ensure_migrated()
+
+    if isinstance(opts, FixBatchOptions):
+        _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view)
+        return
+
     result = run_fix(
         opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
     )
@@ -414,6 +432,33 @@ def fix(ctx: typer.Context) -> None:
     pr = f" (PR #{result.pr_number})" if result.pr_number else ""
     typer.echo(f"fix finished for issue #{result.issue}: {result.status}{pr}.")
     raise typer.Exit(code=0 if result.status == "DONE" else 1)
+
+
+def _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view) -> None:
+    """Drive a batch fix run and translate its outcome into output + an exit code.
+
+    Exit 0 only when every issue landed cleanly (run terminal DONE and nothing
+    failed); any failed/blocked/parked issue, a preflight failure, or a batch that
+    could not even select issues exits non-zero.
+    """
+    result = run_fix_batch(
+        opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
+    )
+
+    if result.preflight_failed:
+        typer.echo(
+            "PRE_FLIGHT_FAILURE: test suite is red on main — fix before running `sdlc fix`.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if result.no_issues:
+        typer.echo(result.summary or "no issues matched the batch target.")
+        raise typer.Exit(code=0 if result.status == "DONE" else 1)
+
+    typer.echo(result.summary)
+    clean = result.status == "DONE" and result.failed == 0
+    raise typer.Exit(code=0 if clean else 1)
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["resume"])
