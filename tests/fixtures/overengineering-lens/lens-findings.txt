@@ -1,0 +1,29 @@
+Delete-list pass complete. Two findings, one of them file-level.
+
+Some interim prose with a stray fenced block the parser must skip:
+
+```json
+{"note": "not the final verdict"}
+```
+
+Final verdict:
+
+```json
+{
+  "summary": "Two over-built spots: an unused retry knob and a hand-rolled deep-merge.",
+  "findings": [
+    {
+      "category": "unused_code",
+      "file": "controller/src/sdlc/build.py",
+      "line": 42,
+      "reason": "retry_backoff parameter is never passed by any caller — delete it"
+    },
+    {
+      "category": "bogus_category",
+      "file": "controller/src/sdlc/util.py",
+      "line": null,
+      "reason": "hand-rolled deep_merge duplicates dict union semantics available in the stdlib"
+    }
+  ]
+}
+```

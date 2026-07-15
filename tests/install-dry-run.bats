@@ -58,7 +58,7 @@ _snapshot() {
     for target in \
         CLAUDE.md agents commands settings.json statusline-command.sh \
         keybindings.json reference-docs docs skills hooks fx-claude-config \
-        codex-build-adapter.sh qwen-build-adapter.sh
+        codex-build-adapter.sh qwen-build-adapter.sh overengineering-lens.sh
     do
         [[ "$output" == *"[dry-run]"*"${target}"* ]]
     done
@@ -68,10 +68,11 @@ _snapshot() {
     run env HOME="${FAKE_HOME}" bash "${INSTALL}" --dry-run --skip-tools --skip-mcp
     [ "$status" -eq 0 ]
     # install.sh links 10 config items + the local marketplace + 2 build-harness
-    # adapters (codex/qwen, Story 21.3-001) = 13 symlinks. Shared skills (ADR-002)
+    # adapters (codex/qwen, Story 21.3-001) + the over-engineering lens wrapper
+    # (issue #445) = 14 symlinks. Shared skills (ADR-002)
     # are committed relative symlinks inside commands/, carried in by the commands
     # directory symlink, so they are not linked separately (doing so would rewrite
     # them as absolute and dirty the repo).
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 13 ]
+    [ "$ln_lines" -eq 14 ]
 }

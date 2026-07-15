@@ -58,16 +58,16 @@ _run_install() {
     for target in \
         CLAUDE.md agents commands settings.json statusline-command.sh \
         keybindings.json reference-docs docs skills hooks fx-claude-config \
-        codex-build-adapter.sh qwen-build-adapter.sh
+        codex-build-adapter.sh qwen-build-adapter.sh overengineering-lens.sh
     do
         [[ "$output" == *"[dry-run]"*"${target}"* ]]
     done
-    # 13 ln -s lines expected (10 config items + 1 marketplace + 2 build
+    # 14 ln -s lines expected (10 config items + 1 marketplace + 3 build
     # adapters onto PATH, Story 21.3-001). Shared skills are committed relative
     # symlinks inside commands/, so the installer no longer links them in
     # separately (they would dirty the repo).
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 13 ]
+    [ "$ln_lines" -eq 14 ]
 }
 
 @test "--core --dry-run previews git submodule init" {
@@ -264,7 +264,7 @@ _run_install() {
     [ "$status" -eq 0 ]
     all_ln="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
     # 13 = the --core symlink set (tools/shell modes create no symlinks).
-    [ "$all_ln" -eq 13 ]
+    [ "$all_ln" -eq 14 ]
 }
 
 # ─── Backward-compat flags ───────────────────────────────────────────
@@ -282,12 +282,12 @@ _run_install() {
     _run_install --core --tools --shell --dry-run
     [ "$status" -eq 0 ]
     out_new="$output"
-    # Both should perform the same number of ln operations (13 core)
+    # Both should perform the same number of ln operations (14 core)
     # and neither should attempt the MCP jq merge.
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 13 ]
-    [ "$new_ln" -eq 13 ]
+    [ "$legacy_ln" -eq 14 ]
+    [ "$new_ln" -eq 14 ]
     # Neither should mention writing to ~/.claude.json
     [[ "$out_legacy" != *"Merged MCP"* ]]
     [[ "$out_new" != *"Merged MCP"* ]]
@@ -308,8 +308,8 @@ _run_install() {
     out_new="$output"
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 13 ]
-    [ "$new_ln" -eq 13 ]
+    [ "$legacy_ln" -eq 14 ]
+    [ "$new_ln" -eq 14 ]
 }
 
 # ─── --uninstall ─────────────────────────────────────────────────────

@@ -94,6 +94,16 @@ placeholders; the wrapper fetches the PR diff, runs a `simplify`/`roast`-style
 delete-list pass, and emits the schema JSON above. Swapping the lens runtime is
 a config change here, not orchestrator code.
 
+The default command is implemented by `scripts/overengineering-lens.sh`, the
+Codex reference wrapper: it fetches the diff via `gh pr diff` (or
+`glab mr diff` on GitLab, auto-detected from the `origin` remote), runs a
+delete-list pass through `codex exec`, and normalises the final fenced JSON
+block to the schema (unknown categories coerce to `other`). It needs the
+`codex` CLI plus the host CLI on `PATH`. `install.sh --core` symlinks the
+wrapper into `~/.local/bin` alongside the build-harness adapters, so the
+controller's bare-name dispatch resolves it; tested in
+`tests/overengineering-lens.bats`.
+
 ## Disable switch
 
 `enabled: false` (the default) short-circuits `dispatch_overengineering_lens`
