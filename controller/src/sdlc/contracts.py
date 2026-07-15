@@ -289,6 +289,87 @@ def validate_response(agent_type: str, data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+# ---------------------------------------------------------------------------
+# Result-block wrapper (relocated from build.py — issue #435)
+# ---------------------------------------------------------------------------
+#
+# The literal, schema-derived result-block skeleton every dispatched agent is
+# told to emit. Moved here from build.py so the eval harness can append the same
+# contract instruction to its bare ticket prompts without importing the build
+# pipeline (issue #435). build.py re-exports :func:`_result_wrapper`, so its
+# prompt rendering and test_build.py call sites stay byte-for-byte unchanged.
+
+# Reverse of ``AGENT_SCHEMAS`` (agent type -> schema filename) so the result
+# wrapper can resolve a schema filename back through the cached package loader.
+_SCHEMA_FILE_TO_AGENT: dict[str, str] = {
+    filename: agent for agent, filename in AGENT_SCHEMAS.items()
+}
+
+
+def _field_hint(prop: dict[str, Any]) -> str:
+    """Render the value hint for one schema property.
+
+    Enum properties advertise their literals (``"A|B"``) so the agent copies an
+    exact allowed value; otherwise the JSON ``type`` drives a typed placeholder.
+    """
+    enum = prop.get("enum")
+    if enum:
+        return '"' + "|".join(str(value) for value in enum) + '"'
+    json_type = prop.get("type")
+    if json_type == "string":
+        return '"<string>"'
+    if json_type == "integer":
+        return "<integer>"
+    if json_type == "number":
+        return "<number>"
+    if json_type == "boolean":
+        return "true|false"
+    # Unknown/compound types: fall back to a generic string placeholder so the
+    # skeleton stays well-formed rather than emitting a bare key with no hint.
+    return '"<value>"'
+
+
+def _required_field_skeleton(schema_filename: str) -> str:
+    """Build a literal required-field skeleton from the named schema.
+
+    Emits ``{"key": <hint>, ...}`` for every name in the schema's ``required``
+    array, IN ORDER, so the agent sees the exact field names (and enum literals)
+    it must produce instead of a pointer to a file it cannot read.
+    """
+    schema = load_schema(_SCHEMA_FILE_TO_AGENT[schema_filename])
+    properties = schema.get("properties", {})
+    pairs = [
+        f'"{name}": {_field_hint(properties.get(name, {}))}'
+        for name in schema.get("required", [])
+    ]
+    return "{" + ", ".join(pairs) + "}"
+
+
+def _result_wrapper(schema_filename: str) -> str:
+    """The exact result-block wrapper every agent must emit (R10).
+
+    Shows a literal, schema-derived required-field skeleton (keys + enum
+    literals) between the sentinel markers rather than pointing at a schema file
+    the agent cannot read. Capable models otherwise paraphrase the required keys
+    (``branch`` vs ``branch_name``, ``PASSED`` vs ``SUCCESS``), producing a
+    schema-invalid block that fails an otherwise-green committed stage. Mirrors
+    the gate prompts, which embed literal examples and never drift.
+    """
+    return (
+        "End your reply with EXACTLY this wrapper — the literal marker lines, "
+        "no markdown code fences (do not wrap it in ```json), and nothing after "
+        "the closing marker:\n"
+        + RESULT_START_MARKER
+        + "\n"
+        + _required_field_skeleton(schema_filename)
+        + "\n"
+        + RESULT_END_MARKER
+        + "\nUse these exact keys. Enum fields must be one of the literals shown. "
+        "Extra keys are allowed, but the keys above are required and must use "
+        "these exact names."
+    )
+
+
 def parse_and_validate(agent_type: str, response: str) -> dict[str, Any]:
     """Extract the result block from ``response`` and validate it.
 

@@ -1,5 +1,5 @@
 {
-  "_note": "Placeholder baseline for `sdlc eval-baseline` (Story 18.1-002). Regenerate from a real run with `uv run sdlc eval --json > eval/baseline.json` so the figures reflect live model output, then commit. The numbers below are illustrative, not measured.",
+  "_note": "PLACEHOLDER baseline for `sdlc eval-baseline` (Story 18.1-002). The harness is now fixed (issue #435): live runs carry the result-block contract, a pinned model, and record tokens/cost even on a contract miss. These numbers remain illustrative, NOT measured — regenerate from a real run with `uv run sdlc eval --json > eval/baseline.json` so the figures reflect live model output, then commit.",
   "config_name": "strutils-baseline",
   "tickets": [
     {

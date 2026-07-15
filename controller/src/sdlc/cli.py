@@ -1768,6 +1768,7 @@ def eval_cmd(
             seed=config.seed,
             agent_type=config.agent_type,
             usd_per_million_tokens=config.usd_per_million_tokens,
+            model=config.model,
         )
 
     if dry_run:
