@@ -27,7 +27,9 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import json
+import os
 import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1083,6 +1085,14 @@ def _list_open_issues(runner: Runner, *, limit: int = 50) -> list[_Candidate]:
         data = json.loads(res.stdout)
     except (json.JSONDecodeError, ValueError) as exc:
         raise FixIssueError(f"gh returned malformed JSON for issue list: {exc}") from exc
+    if len(data) >= limit:
+        # No silent caps: gh returned a full page, so the open-issue set may be
+        # truncated. Warn now (the run isn't open yet, so there's no ledger row).
+        print(
+            f"warning: `gh issue list` hit the {limit}-issue cap; some open issues "
+            "may be excluded from this batch (narrow with `next --limit=N`).",
+            file=sys.stderr,
+        )
     return [
         _Candidate(
             number=int(d.get("number")),
@@ -1156,9 +1166,12 @@ def build_overlap_dependencies(
     file_owner: dict[str, int] = {}
     for n in numbers:
         for path in files_by_issue[n]:
-            norm = path.strip()
-            if not norm:
+            stripped = path.strip()
+            if not stripped:
                 continue
+            # Normalize so free-form investigation paths that denote the same
+            # file (e.g. "./pkg/mod.py" vs "pkg/mod.py") overlap, not race.
+            norm = os.path.normpath(stripped)
             if norm in file_owner:
                 union(file_owner[norm], n)
             else:
@@ -1300,12 +1313,28 @@ def _investigate_all(
             cand.number, "FAILED", drop_reason="investigation failed"
         )
 
+    def _guarded(cand: _Candidate) -> None:
+        # Failure isolation (parity with the pipeline phase): an unexpected error
+        # on one candidate drops it as FAILED instead of wedging the whole batch.
+        try:
+            _one(cand)
+        except Exception as exc:  # noqa: BLE001
+            story_id = f"issue-{cand.number}"
+            ledger.set_story_status(run_id, story_id, "FAILED")
+            ledger.event_log(
+                run_id, story_id, "error", "controller",
+                f"dropped from batch: unexpected investigation error ({exc})",
+            )
+            dropped[story_id] = FixIssueOutcome(
+                cand.number, "FAILED", drop_reason=f"unexpected error: {exc}"
+            )
+
     if workers == 1:
         for cand in candidates:
-            _one(cand)
+            _guarded(cand)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(_one, candidates))
+            list(pool.map(_guarded, candidates))
     return ready, dropped
 
 

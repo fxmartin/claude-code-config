@@ -404,8 +404,8 @@ def fix(ctx: typer.Context) -> None:
     ledger.ensure_migrated()
 
     if isinstance(opts, FixBatchOptions):
+        # _run_fix_batch_cli always raises typer.Exit — it never returns here.
         _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view)
-        return
 
     result = run_fix(
         opts, ledger=ledger, render_view=make_render_view(ledger.db_path)

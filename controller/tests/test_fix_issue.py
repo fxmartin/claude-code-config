@@ -26,6 +26,7 @@ from sdlc.fix_issue import (
     _batch_summary,
     _batch_workers,
     _neutralize_untrusted,
+    _list_open_issues,
     build_overlap_dependencies,
     detect_agent_type,
     fetch_issue,
@@ -1872,3 +1873,85 @@ def test_batch_summary_other_count_for_non_standard_status() -> None:
         [FixIssueOutcome(1, "DONE"), FixIssueOutcome(2, "RATE_LIMITED")]
     )
     assert "1 fixed, 0 failed, 0 skipped, 1 other" in summary
+
+
+# ---------------------------------------------------------------------------
+# Review-gate additions (#462): path normalization, cap warning, failure isolation
+# ---------------------------------------------------------------------------
+
+
+def test_overlap_normalizes_equivalent_paths() -> None:
+    # Free-form investigation paths that denote the same file must overlap even
+    # when spelled differently ("./a.py" vs "a.py", "b/../a.py" vs "a.py").
+    deps = build_overlap_dependencies({1: {"./a.py"}, 2: {"a.py"}, 3: {"b/../a.py"}})
+    assert deps[2] == [1]
+    assert deps[3] == [2]  # all three collapse to one serial component
+
+
+def test_list_open_issues_warns_when_cap_hit(capsys) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    _list_open_issues(gh, limit=2)  # the fake returns exactly the cap
+    assert "cap" in capsys.readouterr().err
+
+
+def test_list_open_issues_no_warning_below_cap(capsys) -> None:
+    gh = FakeBatchGh([_batch_issue(1)])
+    _list_open_issues(gh, limit=50)
+    assert capsys.readouterr().err == ""
+
+
+def test_batch_failed_predecessor_does_not_block_successor(tmp_path) -> None:
+    # issue-1 and issue-2 overlap on "shared.py" so issue-2 serializes after
+    # issue-1. issue-1's build fails unrecoverably; issue-2 must still run to DONE
+    # — the overlap dependency is for serialization only, never a failure cascade.
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["shared.py"], "issue-2": ["shared.py"]},
+        overrides={
+            ("build", "issue-1"): {
+                "branch_name": "feature/issue-1", "build_status": "FAILED",
+                "commit_sha": "x", "error_summary": "boom",
+            },
+            ("bugfix", "issue-1"): {
+                "failure_category": "REAL_BUG", "root_cause": "deep",
+                "fix_status": "UNFIXED", "tests_passing": False,
+                "bugs_fixed": 0, "tests_fixed": 0,
+            },
+        },
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert _story_status(db, "issue-1") == "FAILED"
+    assert _story_status(db, "issue-2") == "DONE"  # successor ran despite the failure
+    assert dispatch.counts[("build", "issue-2")] >= 1
+    assert frozenset({"issue-1", "issue-2"}) not in dispatch.concurrent_pairs
+    assert result.fixed == 1 and result.failed == 1
+
+
+def test_batch_unexpected_investigation_error_drops_issue_not_batch(tmp_path) -> None:
+    # An investigation error outside the handled dispatch-error family must drop
+    # just that issue (FAILED), never wedge the concurrent investigate-all pool.
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-2": ["b.py"]},
+        overrides={("investigation", "issue-1"): ValueError("kaboom")},
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert _story_status(db, "issue-1") == "FAILED"
+    assert _story_status(db, "issue-2") == "DONE"
+    assert result.fixed == 1 and result.failed == 1
