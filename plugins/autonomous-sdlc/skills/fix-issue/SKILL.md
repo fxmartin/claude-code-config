@@ -43,11 +43,10 @@ fi
 ## Flag surface (forwarded to the controller)
 
 - **Target** (positional, pass exactly one): `<issue-number>` (a single open
-  issue), `all` (every open issue — bugs first, then enhancements by priority),
-  or `next` (the highest-priority open bug; see `--limit`).
-- `--limit=N` — batch only: cap the issue set (`next` defaults to 1).
-- `--sequential` — batch only: one issue fully completes before the next.
-- `--concurrency=N` — batch only: issue-level worker cap (default 5).
+  issue), `all` (every open issue), or `next` (the highest-priority open bug).
+- **Batch mode** — only when the target is `all` or `next` with `--limit=N`,
+  read `${CLAUDE_SKILL_DIR}/batch-mode.md` for the batch-only flags and batch
+  behavior; the single-issue path never needs it.
 - `--skip-coverage` — the build agent opens the PR directly (no coverage gate).
 - `--coverage-threshold=N` — required new-code coverage % (default 90).
 - `--skip-preflight` — skip the preflight quality gate.
@@ -89,14 +88,11 @@ The controller (`controller/src/sdlc/fix_issue.py`) owns the full lifecycle:
 6. **Bugfix loop** — bounded retries per stage before marking the issue FAILED.
 7. **Merge** — rebases, squash-merges, closes the issue; a `risk:high` PR with no
    approval parks the run `AWAITING_APPROVAL` rather than force-merging.
-8. **Summary + batch doc-update** — a best-effort per-fix summary, and (batch
-   only, when ≥1 issue merged) a single best-effort doc-update agent that opens a
-   docs PR. Both are non-blocking.
+8. **Summary** — a best-effort, non-blocking per-fix summary (batch runs add a
+   doc-update phase; see `batch-mode.md`).
 9. **Ledger writes** — every stage transition is persisted to the SQLite ledger
    (`.sdlc-state.db`) before the next begins, so a `fix` run shows up in
-   `sdlc dashboard` beside `sdlc build` runs. Batch mode investigates every issue
-   first, then serializes only issues that touch overlapping files while
-   independent ones run concurrently.
+   `sdlc dashboard` beside `sdlc build` runs.
 
 The `*-agent-prompt.md` / `*-gate-prompt.md` template files in this skill
 directory are **retained for reference only** — the controller now renders every

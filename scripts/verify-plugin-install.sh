@@ -205,10 +205,13 @@ while IFS=$'\t' read -r plugin_name plugin_source; do
   record "[$plugin_name] skills/ directory exists" pass
 
   # Count skill subdirectories that contain a SKILL.md, and flag dirs missing one.
+  # Underscore-prefixed dirs (e.g. _shared/) hold snippets shared across skills,
+  # not skills — Claude Code ignores them (no SKILL.md), and so do we.
   skill_count=0
   missing_skill_md=""
   for skill_path in "$skills_dir"/*/; do
     [ -d "$skill_path" ] || continue
+    case "$(basename "$skill_path")" in _*) continue ;; esac
     if [ -f "$skill_path/SKILL.md" ]; then
       skill_count=$((skill_count + 1))
       all_skill_dirs+=("$skill_path")

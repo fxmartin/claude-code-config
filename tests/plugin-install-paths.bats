@@ -137,6 +137,9 @@ PLUGIN_SKILLS_DIR="${REPO_ROOT}/plugins/autonomous-sdlc/skills"
     fail=0
     for skill_dir in "${PLUGIN_SKILLS_DIR}"/*/; do
         skill="$(basename "$skill_dir")"
+        # Underscore-prefixed dirs (e.g. _shared/) hold cross-skill snippets,
+        # not skills — Claude Code's auto-discovery ignores them (no SKILL.md).
+        case "$skill" in _*) continue ;; esac
         skill_md="${skill_dir}SKILL.md"
         if [ ! -f "$skill_md" ]; then
             echo "missing SKILL.md in $skill_dir" >&2
@@ -321,6 +324,69 @@ JSON
     [ "$status" -ne 0 ]
     # Error output should mention the missing skill directory.
     [[ "${output}" == *"broken-skill"* ]]
+}
+
+@test "verify-plugin-install.sh skips underscore-prefixed snippet dirs (no SKILL.md required)" {
+    # _shared/-style dirs hold cross-skill snippets, not skills (Story 27.1-004):
+    # a missing SKILL.md there must not fail the run.
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/good-skill"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/_shared"
+    mkdir -p "${fake_root}/agents"  # phase 3 requires agents/ in the repo root
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": [
+    {"name": "test-plugin", "source": "./plugins/test-plugin", "version": "0.1.0"}
+  ]
+}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/.claude-plugin/plugin.json" <<'JSON'
+{"name": "test-plugin", "version": "0.0.1", "description": "test plugin"}
+JSON
+    printf -- '---\nname: good-skill\n---\nbody\n' \
+        > "${fake_root}/plugins/test-plugin/skills/good-skill/SKILL.md"
+    printf '# snippet, deliberately no SKILL.md\n' \
+        > "${fake_root}/plugins/test-plugin/skills/_shared/notifications.md"
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -eq 0 ]
+    # The snippet dir must not be reported as a missing/broken skill.
+    [[ "${output}" != *"_shared"* ]]
+}
+
+@test "verify-plugin-install.sh excludes underscore dirs from the skill count" {
+    # Even an underscore dir that DOES contain a SKILL.md is not a skill:
+    # the skip happens before counting.
+    fake_root="$(mktemp -d)"
+    mkdir -p "${fake_root}/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/.claude-plugin"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/good-skill"
+    mkdir -p "${fake_root}/plugins/test-plugin/skills/_snippets"
+    mkdir -p "${fake_root}/agents"  # phase 3 requires agents/ in the repo root
+    cat > "${fake_root}/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "fx-claude-config",
+  "owner": {"name": "FX"},
+  "plugins": [
+    {"name": "test-plugin", "source": "./plugins/test-plugin", "version": "0.1.0"}
+  ]
+}
+JSON
+    cat > "${fake_root}/plugins/test-plugin/.claude-plugin/plugin.json" <<'JSON'
+{"name": "test-plugin", "version": "0.0.1", "description": "test plugin"}
+JSON
+    printf -- '---\nname: good-skill\n---\nbody\n' \
+        > "${fake_root}/plugins/test-plugin/skills/good-skill/SKILL.md"
+    printf -- '---\nname: _snippets\n---\nnot a skill\n' \
+        > "${fake_root}/plugins/test-plugin/skills/_snippets/SKILL.md"
+    run env VERIFY_PLUGIN_ROOT_OVERRIDE="${fake_root}" "${VERIFY}"
+    rm -rf "${fake_root}"
+    [ "$status" -eq 0 ]
+    [[ "${output}" == *"has 1 skill(s) with SKILL.md"* ]]
 }
 
 @test "verify-plugin-install.sh error for missing SKILL.md points at the unresolved path" {
