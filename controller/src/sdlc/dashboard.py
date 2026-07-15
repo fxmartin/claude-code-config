@@ -809,9 +809,14 @@ function renderMain(d){
   const durLine = run.duration_seconds!=null
     ? " &middot; "+(running?"elapsed":"took")+" <span id='runtime'>"+esc(humanDuration(run.duration_seconds))+"</span>"
     : "";
+  // Rate-limit stall time (Story 27.3-004): shown apart from the duration so
+  // quota backoff never reads as agent runtime. Silent when the run never stalled.
+  const stallLine = run.stall_seconds
+    ? " &middot; <span title='time waited on rate limits — not agent runtime'>stalled "+esc(humanDuration(run.stall_seconds))+"</span>"
+    : "";
   document.getElementById("head").innerHTML =
     "run <code>"+esc(run.id.slice(0,8))+"</code> &middot; "+badge(run.status)
-    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode) + durLine + cfgline + usageLine;
+    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode) + durLine + stallLine + cfgline + usageLine;
   // Anchor the local ticker: while running, count up from the server-computed
   // elapsed at fetch using the browser clock, so the value advances smoothly
   // even when the ledger (and the SSE transport) is momentarily quiet.
@@ -859,7 +864,9 @@ function renderMain(d){
     + stageCells
     + "<td>"+pr+"</td>"
     + "<td class='muted small'>"+tok+"</td>"
-    + "<td class='muted small'>"+humanDuration(s.duration_seconds)+"</td></tr>"
+    + "<td class='muted small'>"+humanDuration(s.duration_seconds)
+    + (s.stall_seconds ? " <span title='time waited on rate limits — not agent runtime'>(stalled "+humanDuration(s.stall_seconds)+")</span>" : "")
+    + "</td></tr>"
     + activityRow(s);
   }).join("");
   document.getElementById("stories").innerHTML = rows

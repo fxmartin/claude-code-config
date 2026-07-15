@@ -239,9 +239,29 @@ CREATE TABLE IF NOT EXISTS story_inventory (
 );
 """
 
+# stalls: Story 27.3-004 rate-limit stall telemetry — one row per in-process
+# rate-limit wait, recording the seconds the controller stalled *outside* agent
+# runtime so stage durations stop being polluted by quota backoff. ``story_id``
+# is NULL for a run-level wait (a resume honouring a persisted window reset);
+# ``stage`` is NULL when the stall happened between dispatches (the proactive
+# window gate). Kept as a standalone constant so it can be both embedded in
+# ``_SCHEMA_DDL`` (fresh DB) and run by Migration 12 (upgrade an existing
+# ledger), guaranteeing both paths are identical.
+_STALLS_DDL = """
+CREATE TABLE IF NOT EXISTS stalls (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL,
+    story_id    TEXT,                            -- NULL for a run-level wait.
+    stage       TEXT,                            -- NULL for a between-dispatch wait.
+    source      TEXT,                            -- the throttle signal source.
+    waited_s    INTEGER NOT NULL,
+    ts          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 # The base DDL plus every standalone table constant, run as one script by
 # ``Ledger.init()`` on a fresh DB (each statement is ``IF NOT EXISTS``).
-_SCHEMA_DDL = _SCHEMA_DDL + _STORY_INVENTORY_DDL
+_SCHEMA_DDL = _SCHEMA_DDL + _STORY_INVENTORY_DDL + _STALLS_DDL
 
 _TERMINAL_RUN_STATES = {
     "DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION", "AWAITING_APPROVAL",
@@ -416,6 +436,19 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
             ("model", "TEXT"),
         ],
         None,
+    ),
+    # Migration 12 adds the Story 27.3-004 `stalls` rate-limit stall table to a
+    # pre-existing ledger. Like Migration 7 the table is wholly new, so it
+    # carries a ``CREATE TABLE IF NOT EXISTS`` rather than an ALTER column list.
+    # Additive and back-compatible: rows in every other table are untouched;
+    # runs that predate the capture simply have no stall rows and read as "no
+    # stalls recorded". A fresh DB created from the up-to-date DDL is a no-op.
+    (
+        12,
+        "rate-limit stalls table",
+        "stalls",
+        [],
+        _STALLS_DDL,
     ),
 ]
 
@@ -731,6 +764,8 @@ def _rate_limit_wait(
     wait_s: int,
     *,
     sleep_fn: Callable[[float], None],
+    story_id: str = "",
+    stage: str | None = None,
 ) -> int:
     """Wait in-process for the window to reopen, logging a periodic countdown.
 
@@ -739,6 +774,11 @@ def _rate_limit_wait(
     ``IN_PROGRESS`` before dispatch resumes. The loop is driven by the accumulated
     sleep (not the wall clock) so an injected no-op ``sleep_fn`` terminates
     deterministically under test. Returns the total seconds waited.
+
+    Story 27.3-004: the waited seconds are also recorded in the ``stalls`` table
+    against ``story_id``/``stage`` (empty for a run-level or between-dispatch
+    wait) — a ledger dimension of its own, distinct from agent runtime, so stage
+    durations stay honest and quota-backoff outliers are diagnosable at a glance.
     """
     ledger.run_update_status(run_id, "RATE_LIMITED")
     ledger.event_log(
@@ -757,6 +797,7 @@ def _rate_limit_wait(
                 run_id, "", "info", "controller",
                 f"rate-limit wait: ~{remaining}s until the window reopens.",
             )
+    ledger.stall_log(run_id, story_id, stage, signal.source, waited)
     ledger.run_update_status(run_id, "IN_PROGRESS")
     ledger.event_log(
         run_id, "", "success", "controller",
@@ -897,6 +938,7 @@ def _run_story_rate_limited(
                 )
             waited_total += _rate_limit_wait(
                 ledger, run_id, signal, wait_s, sleep_fn=ctx.sleep_fn,
+                story_id=story.id,
             )
             ctx.window.reopen(ctx.clock(), ledger.run_usage_totals(run_id)["tokens"])
 
@@ -1763,6 +1805,62 @@ class Ledger:
                 (run_id or None, story_id or None, message, stage or None, kind or None),
             )
 
+    def stall_log(
+        self,
+        run_id: str,
+        story_id: str,
+        stage: str | None,
+        source: str | None,
+        waited_s: int,
+    ) -> None:
+        """Record one rate-limit stall as its own ledger dimension (Story 27.3-004).
+
+        ``waited_s`` is the time the controller waited in-process for a window
+        to reopen — quota backoff, not agent runtime — so stage durations stay
+        unpolluted and outlier runs are diagnosable at a glance. ``story_id`` is
+        empty for a run-level wait (a resume honouring a persisted reset);
+        ``stage`` is None when the stall happened between dispatches.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO stalls(run_id, story_id, stage, source, waited_s) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (run_id, story_id or None, stage or None, source or None, int(waited_s)),
+            )
+
+    def run_stall_totals(self, run_id: str) -> dict:
+        """Aggregate stall seconds for ``run_id`` (Story 27.3-004).
+
+        Returns ``{"total_s": int, "by_story": {story_id: seconds}}`` — the
+        run-wide stall total (including run-level waits with no story) and the
+        per-story breakdown. Degrades to zeros when the DB is absent or the
+        ledger predates the stalls table (read-only viewers never migrate), so
+        the status/dashboard read side can never crash on an old ledger.
+        """
+        zero = {"total_s": 0, "by_story": {}}
+        if not self.db_path.exists():
+            return zero
+        with self._connect_ro() as conn:
+            tables = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "stalls" not in tables:
+                return zero
+            rows = conn.execute(
+                "SELECT story_id, SUM(waited_s) AS waited FROM stalls "
+                "WHERE run_id = ? GROUP BY story_id",
+                (run_id,),
+            ).fetchall()
+        return {
+            "total_s": sum(int(r["waited"] or 0) for r in rows),
+            "by_story": {
+                r["story_id"]: int(r["waited"] or 0)
+                for r in rows if r["story_id"]
+            },
+        }
+
     # --- Story inventory (Epic-22) -----------------------------------------
     # The cross-backlog cache the MD-spec projector (Story 22.1-002) fills and
     # the host issue mirror + portfolio dashboard read. The projector owns the
@@ -2556,6 +2654,9 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
     config = ledger.run_config(rid)
     breakdown = ledger.stage_breakdown(rid)
     activity = ledger.latest_progress(rid)
+    # Story 27.3-004: rate-limit stall time is its own dimension, kept apart
+    # from stage durations so quota backoff never masquerades as agent runtime.
+    stalls = ledger.run_stall_totals(rid)
     # One "now" anchor so the run's elapsed and every in-flight story's
     # elapsed-so-far are measured against the same instant in this snapshot.
     now = datetime.now(timezone.utc)
@@ -2605,6 +2706,9 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         # latest stage finish, elapsed-so-far while in flight. From the same
         # attempts above, before PENDING/SKIPPED placeholders were appended.
         s["duration_seconds"] = _story_duration_seconds(attempts, now=now)
+        # Rate-limit stall time for the story (Story 27.3-004), shown apart
+        # from the duration; None (not 0) when the story never stalled.
+        s["stall_seconds"] = stalls["by_story"].get(s["story_id"])
 
     # Run-level usage rollup across every stage attempt of every story.
     run_usage = _aggregate_run_usage(breakdown)
@@ -2632,6 +2736,7 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "config": config,
         "concurrency": concurrency,
         "usage": run_usage,
+        "stall_seconds": stalls["total_s"],
     }
     payload["counts"] = {
         "total": run_row.get("total_stories") or len(stories),
@@ -5196,7 +5301,8 @@ def _run_story(
                 if not within_wait_cap(wait_s, rl_ctx.opts.rate_limit_max_wait_s):
                     raise _RateLimitPark(signal=exc.signal, waited_s=rl_waited) from exc
                 rl_waited += _rate_limit_wait(
-                    ledger, run_id, exc.signal, wait_s, sleep_fn=rl_ctx.sleep_fn
+                    ledger, run_id, exc.signal, wait_s, sleep_fn=rl_ctx.sleep_fn,
+                    story_id=story.id, stage=stage,
                 )
                 if rl_ctx.window is not None:
                     rl_ctx.window.reopen(

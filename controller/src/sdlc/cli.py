@@ -704,6 +704,13 @@ def status(
         f"{counts['blocked']} blocked, {counts['in_progress']} in progress  "
         f"(scope={snap['run'].get('scope', '?')}, {snap['run'].get('mode', '?')}{workers})"
     )
+    # Story 27.3-004: rate-limit stall time, kept apart from stage durations so
+    # quota backoff is diagnosable at a glance. Silent when the run never stalled.
+    stall_s = snap["run"].get("stall_seconds") or 0
+    if stall_s:
+        typer.echo(
+            f"rate-limit stalls: {stall_s}s waited (not counted as agent runtime)"
+        )
     if stories:
         typer.echo(f"  {'STORY':<14}{'STATUS':<13}{'STAGE':<11}PR")
         for s in stories:
@@ -723,6 +730,10 @@ def status(
                 act_stage = activity.get("stage") or stage
                 if msg:
                     typer.echo(f"    ↳ {act_stage}: {msg}")
+            # Per-story stall time (Story 27.3-004): only stories that actually
+            # waited on a rate limit carry the line.
+            if s.get("stall_seconds"):
+                typer.echo(f"    ⏸ stalled {s['stall_seconds']}s on rate limits")
     if events:
         typer.echo("recent:")
         for e in events:
