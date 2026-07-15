@@ -1,9 +1,10 @@
 # ABOUTME: Tests for per-task model routing (Story 14.2-001) — the Balanced default map.
-# ABOUTME: Covers map selection, risk/points escalation, the adversarial Opus pin, and overrides.
+# ABOUTME: Covers map selection, risk/points escalation, the adversarial floor (27.2-002), and overrides.
 
 from __future__ import annotations
 
 import textwrap
+from dataclasses import replace
 
 import pytest
 
@@ -61,7 +62,7 @@ def test_unknown_profile_raises() -> None:
         ("build", SONNET),
         ("coverage", SONNET),
         ("review", SONNET),
-        ("adversarial", OPUS),
+        ("adversarial", SONNET),  # 27.2-002: tiered down for a low-risk story
         ("merge", HAIKU),
     ],
 )
@@ -109,24 +110,56 @@ def test_non_escalatable_stages_do_not_escalate() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The adversarial pin — always Opus, never downgraded, in every profile
+# The adversarial slot — tierable floor (Story 27.2-002)
+#
+# The skeptic is no longer pinned to Opus: a low-risk story tiers it down to
+# Sonnet, but a high-risk or large story keeps the Opus floor. Tiering can never
+# downgrade high-risk — the floor is always preserved.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cfg", [BALANCED, QUALITY_FIRST, QUOTA_MAX])
-def test_adversarial_is_always_opus(cfg) -> None:
-    assert select_model("adversarial", cfg, points=1, high_risk=False) == OPUS
-    # Even with a low points / no risk, even in the cheapest profile.
-    assert select_model("adversarial", cfg, points=0, high_risk=False) == OPUS
+def test_adversarial_low_risk_runs_on_sonnet() -> None:
+    """A small, low-risk story tiers the skeptic down to Sonnet (AC1)."""
+    assert select_model("adversarial", BALANCED, points=1, high_risk=False) == SONNET
+    below = BALANCED.points_threshold - 1
+    assert select_model("adversarial", BALANCED, points=below, high_risk=False) == SONNET
 
 
-def test_adversarial_pin_survives_a_cheap_override() -> None:
-    """A per-repo override cannot cheapen the pinned adversarial slot."""
+def test_adversarial_escalates_to_opus_when_high_risk() -> None:
+    """The Opus floor is preserved for a high-risk story — never downgraded (AC2)."""
+    assert select_model("adversarial", BALANCED, points=1, high_risk=True) == OPUS
+
+
+def test_adversarial_escalates_to_opus_when_large() -> None:
+    """A large story (points ≥ threshold) keeps the skeptic on the Opus floor (AC2)."""
+    at = BALANCED.points_threshold
+    assert select_model("adversarial", BALANCED, points=at, high_risk=False) == OPUS
+    assert select_model("adversarial", BALANCED, points=at + 1, high_risk=False) == OPUS
+
+
+def test_adversarial_floor_holds_even_with_a_cheap_override() -> None:
+    """A per-repo override may tier the low-risk skeptic down, but the Opus floor
+    still holds for a high-risk story — tiering can never downgrade high-risk."""
     cfg = load_routing_config(
-        "quota-max",
+        "balanced",
         override_text="model_routing:\n  stages:\n    adversarial: haiku\n",
     )
+    # Low-risk honours the override (tierable downward for low-risk only)...
+    assert select_model("adversarial", cfg, points=1, high_risk=False) == HAIKU
+    # ...but a high-risk story still escalates to the Opus floor.
+    assert select_model("adversarial", cfg, points=1, high_risk=True) == OPUS
+
+
+def test_pinned_stage_always_runs_on_escalation_model() -> None:
+    """A pinned stage ignores profile map and signals — the still-supported
+    mechanism 27.2-002 left in place, though no shipped profile pins a stage."""
+    cfg = replace(BALANCED, pinned_stages=frozenset({"adversarial"}))
+    # Low-risk, small story: an escalatable stage would tier down, a pin never does.
     assert select_model("adversarial", cfg, points=1, high_risk=False) == OPUS
+    # High-risk agrees with the pin — still the escalation model.
+    assert select_model("adversarial", cfg, points=1, high_risk=True) == OPUS
+    # The pin wins even over the stage's mapped base tier (Sonnet in Balanced).
+    assert cfg.stage_models["adversarial"] == SONNET
 
 
 # ---------------------------------------------------------------------------
@@ -139,10 +172,15 @@ def test_quality_first_is_opus_everywhere() -> None:
         assert select_model(stage, QUALITY_FIRST, points=1, high_risk=False) == OPUS
 
 
-def test_quota_max_is_cheap_but_pins_adversarial() -> None:
+def test_quota_max_is_cheap_but_keeps_the_adversarial_floor() -> None:
     assert select_model("build", QUOTA_MAX, points=1, high_risk=False) == HAIKU
     assert select_model("merge", QUOTA_MAX, points=1, high_risk=False) == HAIKU
-    assert select_model("adversarial", QUOTA_MAX, points=1, high_risk=False) == OPUS
+    # 27.2-002: the low-risk skeptic tiers down to Sonnet even in the cheapest
+    # profile, but never below it — its floor is Opus on high-risk / large work.
+    assert select_model("adversarial", QUOTA_MAX, points=1, high_risk=False) == SONNET
+    assert select_model("adversarial", QUOTA_MAX, points=1, high_risk=True) == OPUS
+    at = QUOTA_MAX.points_threshold
+    assert select_model("adversarial", QUOTA_MAX, points=at, high_risk=False) == OPUS
     # Quota-max still protects genuinely high-stakes build/review work.
     assert select_model("build", QUOTA_MAX, points=1, high_risk=True) == OPUS
 
@@ -242,7 +280,10 @@ def test_override_can_change_escalation_model() -> None:
         "balanced",
         override_text="model_routing:\n  escalation_model: claude-opus-4-8\n",
     )
-    assert select_model("adversarial", cfg, points=1, high_risk=False) == "claude-opus-4-8"
+    # The adversarial floor uses the overridden escalation model on a high-risk
+    # story; a low-risk one stays on its cheap Sonnet base.
+    assert select_model("adversarial", cfg, points=1, high_risk=True) == "claude-opus-4-8"
+    assert select_model("adversarial", cfg, points=1, high_risk=False) == SONNET
     assert select_model("build", cfg, points=99, high_risk=True) == "claude-opus-4-8"
 
 

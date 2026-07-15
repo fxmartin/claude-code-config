@@ -2140,11 +2140,13 @@ class Ledger:
         """Every persisted stage-machine row for ``run_id`` for `sdlc state`.
 
         Each row is ``{story_id, stage_name, status, attempt, branch,
-        pr_number, harness}`` in a stable, chronological order (by story, then
-        start time) — a greppable dump of the state machine for debugging.
+        pr_number, harness, model}`` in a stable, chronological order (by story,
+        then start time) — a greppable dump of the state machine for debugging.
         ``harness`` (Story 20.2-002) is the harness that ran the stage; a
         pre-migration ledger (no ``harness`` column) and old NULL rows both read
-        as the built-in default ``claude``.
+        as the built-in default ``claude``. ``model`` (Story 27.2-002 AC4) is
+        the resolved model the stage ran on; pre-migration ledgers and unrouted
+        rows read as None (CLI default).
         """
         if not self.db_path.exists():
             return []
@@ -2155,10 +2157,12 @@ class Ledger:
             harness_sel = (
                 "COALESCE(st.harness, ?)" if "harness" in cols else "?"
             )
+            model_sel = "st.model" if "model" in cols else "NULL"
             rows = conn.execute(
                 f"""
                 SELECT st.story_id, st.stage_name, st.status, st.attempt,
-                       s.branch, s.pr_number, {harness_sel} AS harness
+                       s.branch, s.pr_number, {harness_sel} AS harness,
+                       {model_sel} AS model
                 FROM stages st
                 JOIN stories s
                   ON st.run_id = s.run_id AND st.story_id = s.story_id
@@ -2332,8 +2336,10 @@ class Ledger:
 
         Each entry is ``{name, attempt, status, started_at, finished_at,
         failure_category, output_path, session_id, input_tokens, output_tokens,
-        cache_read_tokens, cache_creation_tokens, cost_usd, tokens}`` where
-        ``tokens`` is the summed token count (None when no usage was recorded).
+        cache_read_tokens, cache_creation_tokens, cost_usd, tokens, model}``
+        where ``tokens`` is the summed token count (None when no usage was
+        recorded) and ``model`` (Story 27.2-002 AC4) is the resolved model the
+        stage ran on (None when routing was off / un-recorded).
         Powers the dashboard's per-stage view and its token tooltips.
         """
         if not self.db_path.exists():
@@ -2353,9 +2359,14 @@ class Ledger:
                 f", COALESCE(harness, '{DEFAULT_HARNESS}') AS harness"
                 if "harness" in cols else f", '{DEFAULT_HARNESS}' AS harness"
             )
+            # Story 27.2-002 AC4: surface the resolved per-stage model so the
+            # tier a stage ran on is auditable; pre-migration rows read as NULL
+            # (routing off), matching stage_start's un-recorded default.
+            model_sel = ", model" if "model" in cols else ", NULL AS model"
             rows = conn.execute(
                 "SELECT story_id, stage_name AS name, attempt, status, started_at, "
-                "finished_at, failure_category, output_path" + usage_sel + harness_sel +
+                "finished_at, failure_category, output_path"
+                + usage_sel + harness_sel + model_sel +
                 " FROM stages WHERE run_id = ? ORDER BY story_id, started_at, rowid",
                 (run_id,),
             ).fetchall()
@@ -2690,6 +2701,15 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
             else:
                 pipeline.append({"name": name, "status": "PENDING"})
         s["stages"] = pipeline
+        # Story 27.2-002 AC4: the tier used is visible per story — the distinct
+        # resolved models across the story's attempts, in first-use order. Empty
+        # when routing was off (every stage ran on the CLI default).
+        models: list[str] = []
+        for a in attempts:
+            m = a.get("model")
+            if m and m not in models:
+                models.append(m)
+        s["models"] = models
         s["bugfix_attempts"] = sum(1 for a in attempts if a["name"] == "bugfix")
         story_tok = [a.get("tokens") for a in attempts]
         s["tokens"] = (
@@ -5586,7 +5606,7 @@ def _make_progress_sink(
 # `discovery` and `adversarial` are dispatched outside this pipeline (the
 # discovery agent and the standalone adversarial-reviewer slot), so they are
 # deliberately excluded here even though the profile map still defines their
-# tiers for `select_model` / the adversarial Opus pin.
+# tiers for `select_model` / the adversarial Opus floor (27.2-002).
 _ROUTABLE_STAGES = frozenset(
     {"build", "coverage", "review", "merge", "bugfix", "reask"}
 )

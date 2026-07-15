@@ -119,7 +119,8 @@ Flags:
   --model-routing=PROFILE   per-stage model map: balanced | quality-first |
                             quota-max | off (default off = CLI default for all
                             stages). Balanced cuts quota burn; the adversarial
-                            skeptic is always Opus
+                            skeptic keeps an Opus floor on high-risk / large
+                            stories and tiers down to Sonnet on low-risk ones
   --model-<stage>=MODEL     pin one stage's model, winning over the map (escape
                             hatch), e.g. --model-build=opus --model-merge=haiku
   --harness ROLE=NAME,...   route pipeline roles to harnesses from the registry
@@ -712,14 +713,18 @@ def status(
             f"rate-limit stalls: {stall_s}s waited (not counted as agent runtime)"
         )
     if stories:
-        typer.echo(f"  {'STORY':<14}{'STATUS':<13}{'STAGE':<11}PR")
+        # Story 27.2-002 AC4: MODEL shows the tier(s) the story's stages ran on
+        # (first-use order); "-" when routing was off (CLI default everywhere).
+        typer.echo(f"  {'STORY':<14}{'STATUS':<13}{'STAGE':<11}{'PR':<7}MODEL")
         for s in stories:
             stage = s.get("current_stage") or "-"
             pr = s.get("pr_number")
             pr_disp = f"#{pr}" if pr else "-"
+            models_disp = ",".join(s.get("models") or []) or "-"
             typer.echo(
                 f"  {str(s.get('story_id', '?')):<14}"
-                f"{str(s.get('status', '?')):<13}{str(stage):<11}{pr_disp}"
+                f"{str(s.get('status', '?')):<13}{str(stage):<11}"
+                f"{pr_disp:<7}{models_disp}"
             )
             # Sub-stage activity for an in-flight story (Story 11.1-002): the
             # latest progress milestone, e.g. "↳ build: editing cli.py". Absent

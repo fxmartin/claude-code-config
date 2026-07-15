@@ -780,12 +780,18 @@ ledger alone is enough to recover an interrupted run — no separate journal.
   so the export is secret-free. `--markdown` is an *added* format: plain `status`
   and `status --json` are byte-for-byte unchanged.
 - **`sdlc state`** (`sdlc/status.py` + `Ledger.state_rows`) dumps every stage
-  row (story id, stage, status, attempt, harness, PR, branch) in a stable,
-  greppable format for debugging. The `HARNESS` column (Story 20.2-002) records
-  which harness ran each stage so a heterogeneous `--harness` run is auditable;
-  the ledger's nullable `stages.harness` column defaults to `claude` for rows
-  that predate harness routing (an existing pre-migration ledger still loads via
-  the additive Migration 6).
+  row (story id, stage, status, attempt, harness, model, PR, branch) in a
+  stable, greppable format for debugging. The `HARNESS` column (Story 20.2-002)
+  records which harness ran each stage so a heterogeneous `--harness` run is
+  auditable; the ledger's nullable `stages.harness` column defaults to `claude`
+  for rows that predate harness routing (an existing pre-migration ledger still
+  loads via the additive Migration 6). The `MODEL` column (Story 27.2-002 AC4)
+  shows the resolved model tier each stage ran on (from `stages.model`, written
+  at dispatch since Issue #427); `-` when routing was off / un-recorded. `sdlc
+  status` likewise shows a per-story `MODEL` roll-up (the distinct tiers used,
+  first-use order), and `status --json` carries it as each story's `models`
+  list — so the tier the adversarial/review work actually ran on is visible per
+  story without opening the ledger.
 
 ## Rollback
 
@@ -1847,12 +1853,20 @@ The shipped default profile is **Balanced**:
 | `build` | Sonnet | points ≥ threshold (8) — see the resume-determinism note below |
 | `coverage` | Sonnet | — (tests need correctness) |
 | `review` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold |
-| `adversarial` | **Opus** | **pinned — never downgraded, in any profile** |
+| `adversarial` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold — an Opus **floor**, not a pin (Story 27.2-002) |
 | `merge` | Haiku | — (mechanical) |
+
+The adversarial skeptic's Opus is a **floor tierable downward for low-risk only**
+(Story 27.2-002): a low-risk story (points below threshold, no high-risk flag)
+runs it on Sonnet, but a high-risk or large story keeps Opus. Tiering can never
+downgrade a high-risk story below the floor. When the review slot resolves to an
+external reviewer (the Codex CLI backend in `config/adversarial-reviewers.yaml`)
+there is no model choice to tier — the reviewer owns its own runtime.
 
 Two documented alternatives ship alongside it: **Quality-first** (Opus
 everywhere) and **Quota-max** (cheapest everywhere, with the adversarial skeptic
-still pinned to Opus and a higher escalation bar). A per-repo
+tiered to Sonnet on low-risk work but keeping its Opus floor on high-risk / large
+stories, and a higher escalation bar). A per-repo
 `.sdlc-model-routing.yaml` additively overrides the chosen profile's stage map,
 points threshold, or escalation model — mirroring `risk_gate.py`'s
 `.sdlc-risk-config.yaml` convention. A missing file is a silent no-op; a
@@ -1870,7 +1884,7 @@ override is accepted for — is exactly this routed set (`build`, `coverage`,
 `review`, `merge`, `bugfix`, `reask`); `discovery` and `adversarial` are
 dispatched outside this pipeline, so an override for them is a hard error rather
 than a silent no-op (the profile map still defines their tiers for `select_model`
-and the adversarial Opus pin). Precedence, highest first:
+and the adversarial Opus floor). Precedence, highest first:
 
 1. an explicit per-stage `--model-<stage>=<model>` flag (the escape hatch);
 2. a `SDLC_AGENT_CMD` override — the custom command owns its own model, so the
