@@ -1,0 +1,11 @@
+I reviewed the diff for over-engineering across all four categories.
+
+The change is a focused, minimal fix: one helper with no speculative
+parameters, no unused branches, and no hand-rolled reimplementations.
+
+```json
+{
+  "summary": "The diff is already minimal — no over-engineering findings.",
+  "findings": []
+}
+```
