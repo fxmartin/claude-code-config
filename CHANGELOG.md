@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.23.0] - 2026-07-15
+
+### Added
+
+- feat: explicit model frontmatter on repo code agents (#27.1-002) (#466)
+
+
 ## [v2.22.0] - 2026-07-15
 
 ### Added
