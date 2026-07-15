@@ -35,7 +35,13 @@ from sdlc.contracts import (
     ContractError,
     _result_wrapper,  # re-exported for build.py prompt rendering (issue #435 move)
 )
-from sdlc.cost_estimate import StageEstimate, estimate_stage
+from sdlc.cost_estimate import (
+    DEFAULT_USD_PER_MILLION_TOKENS,
+    MODEL_USD_PER_MILLION_TOKENS,
+    CostEstimateConfig,
+    StageEstimate,
+    estimate_stage,
+)
 from sdlc.discovery import canonical_scope
 from sdlc.doc_currency import doc_currency_enabled
 from sdlc.dispatch import (
@@ -177,6 +183,7 @@ CREATE TABLE IF NOT EXISTS stages (
     estimated_tokens    INTEGER,
     estimated_cost_usd  REAL,
     harness             TEXT,
+    model               TEXT,
     PRIMARY KEY (run_id, story_id, stage_name, attempt),
     FOREIGN KEY (run_id, story_id) REFERENCES stories(run_id, story_id) ON DELETE CASCADE
 );
@@ -391,6 +398,22 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         "stories",
         [
             ("merge_sha", "TEXT"),
+        ],
+        None,
+    ),
+    # Migration 11 adds the per-stage resolved model (Issue #427) to a
+    # pre-existing ledger's `stages` table, mirroring Migration 6's harness
+    # column. Additive and back-compatible: old stage rows keep NULL model and
+    # the harness-aware history ladder treats them as the widest (any) cohort
+    # only, never polluting the harness+model bucket; only stages dispatched
+    # after this migration populate it. A fresh DB created from the up-to-date
+    # DDL is a no-op.
+    (
+        11,
+        "stage model column",
+        "stages",
+        [
+            ("model", "TEXT"),
         ],
         None,
     ),
@@ -1453,19 +1476,24 @@ class Ledger:
         stage_name: str,
         attempt: int = 1,
         harness: str = DEFAULT_HARNESS,
+        model: str | None = None,
     ) -> None:
         """Append an IN_PROGRESS stage attempt row.
 
         ``harness`` (Story 20.2-002) records which harness ran this stage so a
         heterogeneous run is auditable; it defaults to the built-in ``claude``,
-        keeping a run that passes no ``--harness`` map unchanged.
+        keeping a run that passes no ``--harness`` map unchanged. ``model`` (Issue
+        #427) records the resolved model id so history can be segmented per model;
+        it is nullable and defaults to None (routing off / un-recorded), leaving
+        old rows and the default path unchanged.
         """
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO stages "
-                "(run_id, story_id, stage_name, attempt, status, started_at, harness) "
-                "VALUES (?, ?, ?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP, ?)",
-                (run_id, story_id, stage_name, attempt, harness),
+                "(run_id, story_id, stage_name, attempt, status, started_at, "
+                "harness, model) "
+                "VALUES (?, ?, ?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP, ?, ?)",
+                (run_id, story_id, stage_name, attempt, harness, model),
             )
 
     def stage_finish(
@@ -1556,30 +1584,60 @@ class Ledger:
                 ),
             )
 
-    def historical_stage_tokens(self, stage_name: str) -> float | None:
-        """Average recorded total tokens for ``stage_name`` across DONE attempts.
+    def historical_stage_tokens(
+        self,
+        stage_name: str,
+        *,
+        harness: str | None = None,
+        model: str | None = None,
+    ) -> tuple[float, str] | None:
+        """Average recorded total tokens for ``stage_name``, segmented by harness+model.
 
-        Story 14.1-002: calibrates the pre-dispatch estimate against the per-stage
-        usage already in the ledger. Averages the four token components over every
-        DONE attempt of this stage *that recorded usage* (rows with all-NULL token
-        columns are excluded so un-instrumented stages do not drag the mean toward
-        zero). Returns None when no calibration data exists, so the caller falls
-        back to the crude heuristic.
+        Story 14.1-002 calibrates the pre-dispatch estimate against the per-stage
+        usage already in the ledger. Issue #427 makes it harness-aware so a Codex
+        dispatch is not calibrated from predominantly-Claude history. Tries three
+        progressively looser cohorts and returns the first with data, tagged with
+        which tier matched:
+
+          1. ``harness+model`` — same harness *and* model as the pending dispatch.
+          2. ``harness``       — same harness, any model.
+          3. ``any``           — every DONE attempt of the stage (the pre-#427 query).
+
+        Each cohort averages the four token components over DONE attempts *that
+        recorded usage* (all-NULL-token rows excluded so un-instrumented stages do
+        not drag the mean toward zero). A tier whose ``harness``/``model`` filter is
+        unknown (``None``) is skipped, so a caller that passes neither collapses to
+        the ``any`` rung — today's behaviour. Pre-migration rows (NULL harness/model)
+        never match the ``harness``/``harness+model`` filters, so they cannot pollute
+        those cohorts; they still serve the ``any`` rung. Returns ``(avg, tier)``, or
+        ``None`` when even the widest cohort has no data (caller falls back to the
+        crude heuristic).
         """
+        tiers: list[tuple[str, str, tuple[object, ...]]] = []
+        if harness is not None and model is not None:
+            tiers.append(
+                ("harness+model", "harness = ? AND model = ?", (harness, model))
+            )
+        if harness is not None:
+            tiers.append(("harness", "harness = ?", (harness,)))
+        tiers.append(("any", "", ()))
+
+        base = (
+            "SELECT AVG("
+            "  COALESCE(input_tokens,0) + COALESCE(output_tokens,0) + "
+            "  COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)"
+            ") AS avg_tokens "
+            "FROM stages WHERE stage_name = ? AND status = 'DONE' AND ("
+            "  input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR "
+            "  cache_read_tokens IS NOT NULL OR cache_creation_tokens IS NOT NULL)"
+        )
         with self._connect_ro() as conn:
-            row = conn.execute(
-                "SELECT AVG("
-                "  COALESCE(input_tokens,0) + COALESCE(output_tokens,0) + "
-                "  COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)"
-                ") AS avg_tokens "
-                "FROM stages WHERE stage_name = ? AND status = 'DONE' AND ("
-                "  input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR "
-                "  cache_read_tokens IS NOT NULL OR cache_creation_tokens IS NOT NULL)",
-                (stage_name,),
-            ).fetchone()
-        if row is None or row["avg_tokens"] is None:
-            return None
-        return float(row["avg_tokens"])
+            for tier, extra, params in tiers:
+                sql = base + (f" AND {extra}" if extra else "")
+                row = conn.execute(sql, (stage_name, *params)).fetchone()
+                if row is not None and row["avg_tokens"] is not None:
+                    return float(row["avg_tokens"]), tier
+        return None
 
     def reset_story(self, run_id: str, story_id: str) -> None:
         """Roll a story back to a fresh, unbuilt state (Story 10.2-001).
@@ -4734,16 +4792,30 @@ def _run_story(
         # is unchanged, preserving its existing per-resume reset semantics.
         stage_escalation_base = start_escalation if idx == 0 else 0
         while True:
+            # Issue #427: resolve the (harness, model) for this dispatch *before*
+            # the ledger write and the estimate, so both record the identical
+            # resolution the dispatch will use. escalation_steps (the cheap-first
+            # retry lever, Story 14.2-003) drives model selection, so it must be
+            # known here — see the block below where it is also consumed for the
+            # retry-escalation log.
+            escalation_steps = stage_escalation_base + bugfix_attempts
+            stage_harness = _stage_harness(stage, opts)
+            resolved_model = _resolved_stage_model(
+                stage, story, opts, escalation_steps=escalation_steps
+            )
             ledger.stage_start(
-                run_id, story.id, stage, attempt, harness=_stage_harness(stage, opts)
+                run_id, story.id, stage, attempt,
+                harness=stage_harness, model=resolved_model,
             )
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             sink = _make_progress_sink(ledger, run_id, story.id, stage, attempt)
             # Story 14.1-002: estimate this stage's usage before dispatch, record
             # it on the row, and (when a threshold is configured) warn — gating
-            # the stage before any spend in interactive mode.
+            # the stage before any spend in interactive mode. Issue #427: the
+            # estimate is harness+model-aware via the resolved (harness, model).
             estimate = _estimate_stage_cost(
-                stage, story, opts, pr_number, ledger, run_id, attempt
+                stage, story, opts, pr_number, ledger, run_id, attempt,
+                harness=stage_harness, model=resolved_model,
             )
             if estimate is not None and _over_cost_threshold(estimate, opts):
                 gated = not opts.auto
@@ -4775,14 +4847,14 @@ def _run_story(
                     raise _CostGatePause(
                         story_id=story.id, stage=stage, estimate=estimate
                     )
-            # Story 14.2-003: the cheap-first escalation level for this dispatch is
-            # the bugfix attempts already spent on this stage — 0 on the first
-            # (cheap) pass, +1 per retry — plus any tier already reached before a
+            # Story 14.2-003: ``escalation_steps`` (computed above, before the
+            # ledger write) is the cheap-first escalation level for this dispatch —
+            # the bugfix attempts already spent on this stage (0 on the first,
+            # cheap pass, +1 per retry) plus any tier already reached before a
             # resume (``stage_escalation_base``). A passing first attempt on a
             # fresh run therefore never escalates (the common path stays cheap);
             # only a stage that failed into the bugfix loop (or resumed mid-climb)
             # is retried one tier stronger.
-            escalation_steps = stage_escalation_base + bugfix_attempts
             if escalation_steps > 0:
                 esc_model = _select_stage_model(
                     stage, story, opts, escalation_steps=escalation_steps
@@ -5253,6 +5325,56 @@ def _select_stage_model(
     return escalate_model(base, escalation_steps)
 
 
+def _resolved_stage_model(
+    stage: str, story: Story, opts: BuildOptions, *, escalation_steps: int = 0
+) -> str | None:
+    """The model id the harness that runs ``stage`` will actually use (Issue #427).
+
+    For the built-in/env Claude slot this is the routed tier alias from
+    :func:`_select_stage_model`; a registry harness (e.g. ``codex``) owns its own
+    per-stage model map, so :meth:`HarnessConfig.resolve_model` wins there. Shared
+    by dispatch (:func:`_dispatch_stage`) and the pre-dispatch estimate/ledger
+    write so the two can never resolve a different model for the same stage. The
+    common Claude-only path (no ``--harness`` map) never touches the registry.
+    Best-effort on the registry path: any resolve error degrades to the routed
+    Claude model rather than failing a build.
+    """
+    claude_model = _select_stage_model(
+        stage, story, opts, escalation_steps=escalation_steps
+    )
+    if not opts.harness_map:
+        return claude_model
+    try:
+        from sdlc.role_routing import default_registry_path
+
+        harness = resolve_harness(
+            _stage_harness(stage, opts), config_path=default_registry_path()
+        )
+    except Exception:  # noqa: BLE001 - registry resolution is best-effort
+        return claude_model
+    if harness.source in ("builtin", "env"):
+        return claude_model
+    return harness.resolve_model(stage)
+
+
+def _model_price_key(model: str | None) -> str:
+    """Normalise a resolved model id to a ``MODEL_USD_PER_MILLION_TOKENS`` key.
+
+    Routing yields the Claude tier aliases (``haiku``/``sonnet``/``opus``)
+    directly, but an operator pin or per-repo override can name a full id (e.g.
+    ``claude-opus-4-8``); match those by the tier substring. A registry harness's
+    own model id (e.g. a Codex ``gpt-*``) matches no tier and returns unchanged,
+    so the rate lookup falls through to ``DEFAULT_USD_PER_MILLION_TOKENS``.
+    """
+    if not model:
+        return ""
+    lowered = model.lower()
+    for tier in ("haiku", "sonnet", "opus"):
+        if tier in lowered:
+            return tier
+    return model
+
+
 def _dispatch_stage(
     stage: str,
     story: Story,
@@ -5282,7 +5404,13 @@ def _dispatch_stage(
         stage, story, opts, pr_number, close_link=close_link,
         cr_terms=cr_terms, base_ref=base_ref,
     )
-    model = _select_stage_model(stage, story, opts, escalation_steps=escalation_steps)
+    # Issue #427: resolve the effective model through the shared helper so
+    # dispatch and the pre-dispatch estimate/ledger write can never diverge. For
+    # the built-in/env Claude slot this is the routed tier alias (identical to the
+    # prior _select_stage_model call); a registry harness's own model id is inert
+    # here — to_argv (registry branch) and resolve_agent_cmd (agent_cmd present)
+    # both ignore the passed model — so dispatch stays byte-identical.
+    model = _resolved_stage_model(stage, story, opts, escalation_steps=escalation_steps)
     # Story 20.7-001: route this stage to its mapped harness's argv/parser when a
     # `--harness` map is set; empty (the default path) leaves dispatch unchanged.
     harness_kwargs = _harness_dispatch_kwargs(stage, opts, model)
@@ -5515,29 +5643,49 @@ def _estimate_stage_cost(
     ledger: Ledger,
     run_id: str,
     attempt: int,
+    *,
+    harness: str | None = None,
+    model: str | None = None,
 ) -> StageEstimate | None:
     """Estimate + record a stage's usage before dispatch (Story 14.1-002).
 
     Renders the same prompt the dispatcher will send, estimates its total usage
     (calibrating against the ledger's historical per-stage average when present),
     records the estimate on the stage row, and logs a notional-$ info event.
-    Entirely best-effort: any failure (render/DB error) degrades to None so a
-    bad estimate never breaks a build — the stage dispatches exactly as today.
+    Issue #427: the token forecast calibrates from same-``harness``+``model``
+    history via :meth:`Ledger.historical_stage_tokens`'s fallback ladder, and the
+    notional dollar figure uses the resolved model's blended rate instead of the
+    flat default. Entirely best-effort: any failure (render/DB error) degrades to
+    None so a bad estimate never breaks a build — the stage dispatches exactly as
+    today.
     """
     try:
         prompt = _render_stage_prompt(stage, story, opts, pr_number)
-        historical = ledger.historical_stage_tokens(stage)
-        est = estimate_stage(stage, prompt, historical_tokens=historical)
+        calibration = ledger.historical_stage_tokens(
+            stage, harness=harness, model=model
+        )
+        historical = calibration[0] if calibration is not None else None
+        rate = MODEL_USD_PER_MILLION_TOKENS.get(
+            _model_price_key(model), DEFAULT_USD_PER_MILLION_TOKENS
+        )
+        est = estimate_stage(
+            stage, prompt,
+            config=CostEstimateConfig(usd_per_million_tokens=rate),
+            historical_tokens=historical,
+        )
         ledger.stage_set_estimate(
             run_id, story.id, stage, attempt,
             estimated_tokens=est.estimated_tokens,
             estimated_cost_usd=est.estimated_cost_usd,
         )
+        suffix = ""
+        if est.calibrated and calibration is not None:
+            suffix = f" [calibrated from history: {calibration[1]}]"
         ledger.event_log(
             run_id, story.id, "info", "controller",
             f"{stage} pre-dispatch estimate: ~{est.estimated_tokens} tokens "
             f"({notional_cost_label(est.estimated_cost_usd)})"
-            + (" [calibrated from history]" if est.calibrated else ""),
+            + suffix,
         )
         return est
     except Exception:  # noqa: BLE001 - estimation is best-effort, never fatal

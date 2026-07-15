@@ -18,6 +18,18 @@ CHARS_PER_TOKEN = 4
 # the conversion easy to reason about ($15 ⇒ 1M tokens).
 DEFAULT_USD_PER_MILLION_TOKENS = 15.0
 
+# Blended notional list-price equivalents per Claude tier alias (simple average
+# of published input/output USD per Mtok, 2026-07: haiku $1/$5, sonnet $3/$15,
+# opus $5/$25). Guidance only — both harnesses bill by subscription, so this
+# stays an API-equivalent signal, never real spend. Unknown/unlabeled model ids
+# (Codex free-form ids, routing-off None) fall back to the opus-equivalent
+# DEFAULT_USD_PER_MILLION_TOKENS, preserving pre-#427 behavior.
+MODEL_USD_PER_MILLION_TOKENS: dict[str, float] = {
+    "haiku": 3.0,
+    "sonnet": 9.0,
+    "opus": 15.0,
+}
+
 # Per-stage multiplier: estimated *total* tokens (assembled prompt + the agent's
 # generated output + its tool round-trips) as a multiple of the prompt's own
 # tokens. A `build` turns a short prompt into a long edit/test session with many

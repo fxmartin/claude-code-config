@@ -10,6 +10,8 @@ import pytest
 from sdlc.build import (
     BuildOptions,
     Ledger,
+    _estimate_stage_cost,
+    _model_price_key,
     _reconcile_estimate,
     _result_total_tokens,
     parse_build_args,
@@ -20,6 +22,7 @@ from sdlc.cost_estimate import (
     DEFAULT_STAGE_FACTOR,
     DEFAULT_STAGE_FACTORS,
     DEFAULT_USD_PER_MILLION_TOKENS,
+    MODEL_USD_PER_MILLION_TOKENS,
     CostEstimateConfig,
     StageEstimate,
     estimate_prompt_tokens,
@@ -157,7 +160,10 @@ def test_historical_stage_tokens_averages_done_usage(tmp_path: Path) -> None:
             session_id="s", input_tokens=out, output_tokens=0,
             cache_read_tokens=0, cache_creation_tokens=0, cost_usd=0.01,
         )
-    assert ledger.historical_stage_tokens("build") == pytest.approx(200.0)
+    # No harness/model filter → the widest "any" cohort (the pre-#427 average).
+    avg, tier = ledger.historical_stage_tokens("build")
+    assert avg == pytest.approx(200.0)
+    assert tier == "any"
 
 
 def test_historical_stage_tokens_none_without_usage(tmp_path: Path) -> None:
@@ -170,6 +176,214 @@ def test_historical_stage_tokens_none_without_usage(tmp_path: Path) -> None:
     ledger.stage_finish(run_id, "s1-001", "build", 1, "DONE")  # no usage recorded
     assert ledger.historical_stage_tokens("build") is None
     assert ledger.historical_stage_tokens("review") is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #427: harness+model-aware calibration ladder
+# ---------------------------------------------------------------------------
+
+def _done_stage(
+    ledger: Ledger,
+    run_id: str,
+    story_id: str,
+    stage: str,
+    attempt: int,
+    total_tokens: int,
+    *,
+    harness: str = "claude",
+    model: str | None = None,
+) -> None:
+    """Record one DONE stage attempt with a single-component usage total."""
+    ledger.stage_start(run_id, story_id, stage, attempt, harness=harness, model=model)
+    ledger.stage_finish(run_id, story_id, stage, attempt, "DONE")
+    ledger.stage_set_usage(
+        run_id, story_id, stage, attempt,
+        session_id="s", input_tokens=total_tokens, output_tokens=0,
+        cache_read_tokens=0, cache_creation_tokens=0, cost_usd=0.01,
+    )
+
+
+def _ledger_with_story(tmp_path: Path) -> tuple[Ledger, str]:
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1-001", "99", "One", "P1", 1, "py", "", None, "TODO")
+    return ledger, run_id
+
+
+def test_historical_tokens_harness_model_tier_wins(tmp_path: Path) -> None:
+    # A same-harness+model cohort exists → it wins over the looser cohorts, and the
+    # matched tier is reported.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    # Matching cohort: claude+opus.
+    _done_stage(ledger, run_id, "s1-001", "build", 1, 500, harness="claude", model="opus")
+    _done_stage(ledger, run_id, "s1-001", "build", 2, 700, harness="claude", model="opus")
+    # Noise in other cohorts that must NOT dilute the harness+model average.
+    _done_stage(ledger, run_id, "s1-001", "build", 3, 9000, harness="claude", model="haiku")
+    _done_stage(ledger, run_id, "s1-001", "build", 4, 9000, harness="codex", model="gpt-5")
+    avg, tier = ledger.historical_stage_tokens("build", harness="claude", model="opus")
+    assert avg == pytest.approx(600.0)
+    assert tier == "harness+model"
+
+
+def test_historical_tokens_harness_only_fallback(tmp_path: Path) -> None:
+    # No row matches the requested model, but the harness has history → fall back to
+    # the harness cohort (any model).
+    ledger, run_id = _ledger_with_story(tmp_path)
+    _done_stage(ledger, run_id, "s1-001", "build", 1, 400, harness="claude", model="sonnet")
+    _done_stage(ledger, run_id, "s1-001", "build", 2, 600, harness="claude", model="haiku")
+    _done_stage(ledger, run_id, "s1-001", "build", 3, 9000, harness="codex", model="gpt-5")
+    avg, tier = ledger.historical_stage_tokens("build", harness="claude", model="opus")
+    assert avg == pytest.approx(500.0)  # sonnet+haiku claude rows, codex excluded
+    assert tier == "harness"
+
+
+def test_historical_tokens_any_history_fallback(tmp_path: Path) -> None:
+    # Neither the harness nor the model match, but the stage has *some* history →
+    # the widest "any" cohort serves it.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    _done_stage(ledger, run_id, "s1-001", "build", 1, 100, harness="codex", model="gpt-5")
+    _done_stage(ledger, run_id, "s1-001", "build", 2, 300, harness="codex", model="gpt-5")
+    avg, tier = ledger.historical_stage_tokens("build", harness="claude", model="opus")
+    assert avg == pytest.approx(200.0)
+    assert tier == "any"
+
+
+def test_historical_tokens_empty_ledger_is_none(tmp_path: Path) -> None:
+    ledger, run_id = _ledger_with_story(tmp_path)
+    assert ledger.historical_stage_tokens("build", harness="claude", model="opus") is None
+
+
+def test_historical_tokens_backward_compat_null_rows(tmp_path: Path) -> None:
+    # Pre-Migration-11 rows carry NULL harness/model. They must neither crash nor
+    # pollute the (harness+model)/(harness) cohorts, yet still serve the any rung.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    _done_stage(ledger, run_id, "s1-001", "build", 1, 1000, harness=None, model=None)  # type: ignore[arg-type]
+    _done_stage(ledger, run_id, "s1-001", "build", 2, 3000, harness=None, model=None)  # type: ignore[arg-type]
+    # Harness+model and harness cohorts see no matching (non-NULL) rows → fall to any.
+    avg, tier = ledger.historical_stage_tokens("build", harness="claude", model="opus")
+    assert avg == pytest.approx(2000.0)
+    assert tier == "any"
+
+
+# ---------------------------------------------------------------------------
+# Issue #427: per-model blended rate table
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        ("haiku", MODEL_USD_PER_MILLION_TOKENS["haiku"]),
+        ("sonnet", MODEL_USD_PER_MILLION_TOKENS["sonnet"]),
+        ("opus", MODEL_USD_PER_MILLION_TOKENS["opus"]),
+        ("claude-opus-4-8", MODEL_USD_PER_MILLION_TOKENS["opus"]),  # full id normalises
+        ("gpt-5-codex", DEFAULT_USD_PER_MILLION_TOKENS),  # unknown → default
+        (None, DEFAULT_USD_PER_MILLION_TOKENS),  # routing off → default
+        ("", DEFAULT_USD_PER_MILLION_TOKENS),
+    ],
+)
+def test_model_rate_lookup(model, expected) -> None:
+    rate = MODEL_USD_PER_MILLION_TOKENS.get(
+        _model_price_key(model), DEFAULT_USD_PER_MILLION_TOKENS
+    )
+    assert rate == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# Issue #427: _estimate_stage_cost drives the resolved rate + names the tier
+# ---------------------------------------------------------------------------
+
+def _story() -> object:
+    from test_build import _sample_queue
+
+    return _sample_queue()[0]
+
+
+def test_estimate_stage_cost_uses_model_rate(tmp_path: Path) -> None:
+    # A haiku dispatch prices its estimate at the haiku blended rate, not the flat
+    # opus-equivalent default — proving a non-default config reaches estimate_stage.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    est = _estimate_stage_cost(
+        "build", _story(), opts, None, ledger, run_id, 1,
+        harness="claude", model="haiku",
+    )
+    assert est is not None
+    assert est.estimated_cost_usd == pytest.approx(
+        notional_cost(
+            est.estimated_tokens,
+            usd_per_million_tokens=MODEL_USD_PER_MILLION_TOKENS["haiku"],
+        )
+    )
+
+
+def test_estimate_stage_cost_logs_matched_tier(tmp_path: Path) -> None:
+    # With same-harness+model history present, the calibration suffix names the
+    # matched cohort tier.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    _done_stage(ledger, run_id, "s1-001", "build", 1, 5000, harness="claude", model="opus")
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    est = _estimate_stage_cost(
+        "build", _story(), opts, None, ledger, run_id, 2,
+        harness="claude", model="opus",
+    )
+    assert est is not None and est.calibrated is True
+    with ledger._connect_ro() as conn:  # noqa: SLF001 — test reads the audit trail
+        msgs = [
+            r["message"]
+            for r in conn.execute(
+                "SELECT message FROM events WHERE run_id=?", (run_id,)
+            ).fetchall()
+        ]
+    assert any("[calibrated from history: harness+model]" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Issue #427: Migration 11 — the stages.model column
+# ---------------------------------------------------------------------------
+
+def _stage_columns(ledger: Ledger) -> set[str]:
+    with ledger._connect_ro() as conn:  # noqa: SLF001 — test inspects the schema
+        return {r["name"] for r in conn.execute("PRAGMA table_info(stages)").fetchall()}
+
+
+def test_fresh_db_has_model_column(tmp_path: Path) -> None:
+    ledger, _ = _ledger_with_story(tmp_path)
+    assert "model" in _stage_columns(ledger)
+
+
+def test_stage_start_persists_model(tmp_path: Path) -> None:
+    ledger, run_id = _ledger_with_story(tmp_path)
+    ledger.stage_start(run_id, "s1-001", "build", 1, harness="codex", model="gpt-5-codex")
+    with ledger._connect_ro() as conn:  # noqa: SLF001 — test reads the row
+        row = conn.execute(
+            "SELECT harness, model FROM stages WHERE run_id=? AND story_id=?",
+            (run_id, "s1-001"),
+        ).fetchone()
+    assert row["harness"] == "codex"
+    assert row["model"] == "gpt-5-codex"
+
+
+def test_existing_db_migrates_model_column_additively(tmp_path: Path) -> None:
+    # A ledger created without the model column (simulated by dropping it) gains it
+    # via ensure_migrated without disturbing existing rows.
+    import sqlite3
+
+    ledger, run_id = _ledger_with_story(tmp_path)
+    _done_stage(ledger, run_id, "s1-001", "build", 1, 1234, harness="claude", model=None)
+    db = tmp_path / "ledger.db"
+    # Simulate a pre-Migration-11 ledger: physically remove the column + its record.
+    with sqlite3.connect(db) as conn:
+        conn.execute("ALTER TABLE stages DROP COLUMN model")
+        conn.execute("DELETE FROM _migrations WHERE version = 11")
+    assert "model" not in _stage_columns(Ledger(db))
+    reopened = Ledger(db)
+    reopened.ensure_migrated()
+    assert "model" in _stage_columns(reopened)
+    # The pre-existing usage row survives the additive migration.
+    avg, _tier = reopened.historical_stage_tokens("build")
+    assert avg == pytest.approx(1234.0)
 
 
 # ---------------------------------------------------------------------------
