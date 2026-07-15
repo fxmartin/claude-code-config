@@ -12,6 +12,11 @@ stage to `build → coverage → review → merge`.
 
 Introduced in Story 18.2-001 (Epic-18). Disabled by default.
 
+Dispatched by the build loop's `_dispatch_overengineering_advisory` after a
+successful review stage (issue #445): when enabled, findings are recorded as
+an advisory ledger event only — the lens can never fail the review stage or
+block the merge that follows, whatever the configured policy.
+
 ## What it flags
 
 The lens returns a delete-list of genuinely over-built code, each with a
@@ -74,13 +79,15 @@ timeout_sec: 300
 |------------------------------------|----------------------|--------|
 | `enabled: false`                   | `disabled`           | Lens never runs; findings dropped; behaviour unchanged. |
 | Enabled, no findings               | `clean`              | Stay quiet — no PR comment on an already-lean diff. |
-| Enabled, findings, `advisory`      | `advisory`           | Record the delete-list as an advisory PR comment; **never blocks shipping**. |
-| Enabled, findings, `route_to_simplify` | `route_to_simplify` | Hand the cuts to the bounded bugfix loop; the agent applies them and the gates re-run. |
+| Enabled, findings, `advisory`      | `advisory`           | Record the delete-list as an advisory ledger event; **never blocks shipping**. |
+| Enabled, findings, `route_to_simplify` | `route_to_simplify` | Computed and labelled in the ledger event, but the build loop's dispatch does not yet act on it — the cuts are logged advisory-only, same as `advisory`. Actually routing them into the bounded bugfix loop is a future story. |
 
 `advisory` is the default so the lens never gates shipping on style. The
-`route_to_simplify` path reuses the bounded bugfix loop — `LensOutcome`'s
-`simplify_directive()` renders the cuts as a failure-style directive the loop
-acts on, exactly as a failed gate would.
+`route_to_simplify` policy is accepted in config and `LensOutcome`'s
+`simplify_directive()` can render the cuts as a failure-style directive, but
+the build loop's dispatch (`_dispatch_overengineering_advisory`, issue #445)
+deliberately does not wire that directive into the bugfix loop yet — it only
+labels the ledger log line with the resolved action.
 
 The command template accepts `{pr_number}`, `{pr_url}`, and `{story_id}`
 placeholders; the wrapper fetches the PR diff, runs a `simplify`/`roast`-style
