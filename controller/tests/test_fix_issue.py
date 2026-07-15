@@ -1271,6 +1271,19 @@ def test_overlap_blank_path_is_ignored() -> None:
     assert deps[2] == [1]  # only "a.py" creates the edge
 
 
+def test_overlap_merging_two_components_chains_all_members() -> None:
+    # Two pre-formed components ({1,2} via "a", {3,4} via "b") merged by a
+    # bridging issue 5 sharing a file with each. The merge re-parents one
+    # component root under the other, leaving a depth-2 node in the union-find
+    # tree — whichever file of issue 5 is processed first — so this also
+    # exercises the path-compression walk inside ``find``. The chain must still
+    # come out in ascending issue order across the whole merged component.
+    deps = build_overlap_dependencies(
+        {1: {"a"}, 2: {"a", "c"}, 3: {"b"}, 4: {"b", "d"}, 5: {"c", "d"}}
+    )
+    assert deps == {1: [], 2: [1], 3: [2], 4: [3], 5: [4]}
+
+
 # ---------------------------------------------------------------------------
 # Issue selection + ordering
 # ---------------------------------------------------------------------------
