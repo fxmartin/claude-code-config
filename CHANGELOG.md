@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.17.2] - 2026-07-15
+
+### Fixed
+
+- fix(harness): label default-slot preflight and log per-role routing (#454)
+- fix(contracts): drop unread security_status from coverage contract (#453)
+
+
 ## [v2.17.1] - 2026-07-15
 
 ### Fixed
