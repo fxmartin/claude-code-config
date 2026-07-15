@@ -74,6 +74,44 @@ skill_body() {
     done
 }
 
+@test "batch-mode.md preserves the prose moved out of the core" {
+    # The split must be lossless: the batch semantics that left SKILL.md have
+    # to survive in batch-mode.md, not just the bare flag names.
+    grep -qi 'bugs first' "${BATCH_MODE}"          # `all` ordering
+    grep -q 'defaults to 1' "${BATCH_MODE}"        # `next` --limit default
+    grep -qi 'overlapping files' "${BATCH_MODE}"   # investigate-first scheduling
+    grep -q 'issues-all' "${BATCH_MODE}"           # batch ledger scope
+    grep -qi 'doc-update' "${BATCH_MODE}"          # batch doc-update phase
+    grep -qi 'never affects' "${BATCH_MODE}"       # doc-update is non-blocking
+    grep -q 'ABOUTME' "${BATCH_MODE}"              # repo file-header convention
+}
+
+@test "moved scheduling prose does not creep back into the core body" {
+    for phrase in 'bugs first' 'overlapping files' 'investigates every issue'; do
+        if skill_body "${FIX_ISSUE_SKILL}" | grep -qi "$phrase"; then
+            echo "core SKILL.md body re-documents batch prose: ${phrase}" >&2
+            return 1
+        fi
+    done
+}
+
+@test "batch-mode reference uses the runtime-resolvable CLAUDE_SKILL_DIR form" {
+    # A bare relative path would not resolve from an installed plugin.
+    grep -qF '${CLAUDE_SKILL_DIR}/batch-mode.md' "${FIX_ISSUE_SKILL}"
+}
+
+@test "fix-issue frontmatter argument-hint still advertises the batch flags" {
+    # The split's deal: prose moves out, flags stay discoverable in the hint.
+    local fm
+    fm="$(awk '/^---$/{n++; next} n==1{print}' "${FIX_ISSUE_SKILL}")"
+    for flag in '--limit' '--sequential' '--concurrency'; do
+        echo "$fm" | grep -q -- "$flag" || {
+            echo "argument-hint lost ${flag}" >&2
+            return 1
+        }
+    done
+}
+
 # ─── Shared notification boilerplate ─────────────────────────────────────────
 
 @test "shared notifications snippet exists under skills/_shared/" {
@@ -85,6 +123,16 @@ skill_body() {
     grep -qi 'no-op' "${SHARED_SNIPPET}"
 }
 
+@test "shared snippet states the full contract rules" {
+    # The snippet is now the single source of the contract — losing a rule
+    # here silently loses it for every notifying skill at once.
+    grep -qF '~/.claude/hooks/notify-telegram.sh' "${SHARED_SNIPPET}"
+    grep -qi 'unconditionally' "${SHARED_SNIPPET}"
+    grep -qi 'best-effort' "${SHARED_SNIPPET}"
+    grep -qi 'never block' "${SHARED_SNIPPET}"
+    grep -q 'ABOUTME' "${SHARED_SNIPPET}"
+}
+
 @test "every notifying skill references the shared snippet" {
     for skill in "${NOTIFYING_SKILLS[@]}"; do
         grep -q '_shared/notifications\.md' "${SKILLS_DIR}/${skill}/SKILL.md" || {
@@ -94,14 +142,44 @@ skill_body() {
     done
 }
 
+@test "shared-snippet references use the runtime-resolvable CLAUDE_PLUGIN_ROOT form" {
+    for skill in "${NOTIFYING_SKILLS[@]}"; do
+        grep -qF '${CLAUDE_PLUGIN_ROOT}/skills/_shared/notifications.md' \
+            "${SKILLS_DIR}/${skill}/SKILL.md" || {
+            echo "${skill}/SKILL.md reference is not the CLAUDE_PLUGIN_ROOT form" >&2
+            return 1
+        }
+    done
+}
+
+@test "every notifying skill still marks at least one milestone call" {
+    # The blockquote promises pings "at the milestones marked below" — an
+    # empty body below would break the contract without failing any test.
+    for skill in "${NOTIFYING_SKILLS[@]}"; do
+        skill_body "${SKILLS_DIR}/${skill}/SKILL.md" | grep -q 'notify-telegram\.sh' || {
+            echo "${skill}/SKILL.md lost its milestone notify-telegram.sh call" >&2
+            return 1
+        }
+    done
+}
+
 @test "notification boilerplate is not duplicated across skills" {
-    # The full boilerplate sentence must live in exactly one file: the snippet.
-    local phrase='There are no sidebar or desktop notifications'
-    local carriers
-    carriers="$(grep -rl "$phrase" "${SKILLS_DIR}" | sort)"
-    [ "$carriers" = "${SHARED_SNIPPET}" ] || {
-        echo "boilerplate found outside the shared snippet:" >&2
-        echo "$carriers" >&2
-        return 1
-    }
+    # Each full boilerplate sentence must live in exactly one file: the snippet.
+    local phrase carriers
+    for phrase in \
+        'There are no sidebar or desktop notifications' \
+        'silent no-op when unconfigured'; do
+        carriers="$(grep -rl "$phrase" "${SKILLS_DIR}" | sort)"
+        [ "$carriers" = "${SHARED_SNIPPET}" ] || {
+            echo "boilerplate '${phrase}' found outside the shared snippet:" >&2
+            echo "$carriers" >&2
+            return 1
+        }
+    done
+}
+
+# ─── CI wiring ───────────────────────────────────────────────────────────────
+
+@test "ci.yml bats job runs the fix-issue skill-split suite" {
+    grep -q 'tests/fix-issue-skill-split\.bats' "${REPO_ROOT}/.github/workflows/ci.yml"
 }
