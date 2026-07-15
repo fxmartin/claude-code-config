@@ -4819,6 +4819,14 @@ def _run_story(
                         )
                         if not lint_ok:
                             return "NEEDS_ATTENTION"
+                    # Issue #445: the over-engineering lens (Story 18.2-001) shipped
+                    # but was never dispatched. Wire it here, advisory-only, right
+                    # after a successful review — a best-effort side note that can
+                    # never fail the stage or block the merge that follows.
+                    if stage == "review":
+                        _dispatch_overengineering_advisory(
+                            story, pr_number, ledger, run_id
+                        )
                     break
 
                 # Stage failed: record it, then attempt a bounded bugfix.
@@ -5610,6 +5618,67 @@ def _record_merge_landing(
     ledger.event_log(
         run_id, story.id, "info", "controller",
         f"merge landed: story DONE at {sha}{cr}",
+    )
+
+
+def _dispatch_overengineering_advisory(
+    story: Story, pr_number: int | None, ledger: Ledger, run_id: str
+) -> None:
+    """Advisory-only over-engineering lens dispatch after a successful review (#445).
+
+    Story 18.2-001 shipped the lens (config, prompt, schema, policy routing) but
+    nothing dispatched it. This wires it in: disabled by default (the bundled
+    ``overengineering-lens.yaml``'s ``enabled: false``), so an un-opted-in run is
+    byte-for-byte unchanged — :func:`dispatch_overengineering_lens` itself
+    short-circuits without spending any quota when disabled. When enabled, a
+    non-empty delete-list is recorded as a ledger event only; it is *never*
+    surfaced as a stage failure and never gates the merge that follows,
+    regardless of the configured policy (``route_to_simplify`` is honoured only
+    as far as labelling the log line — routing cuts into the bugfix loop is
+    deliberately left for a future story, not done here).
+
+    A no-op when there is no PR yet (nothing for the lens to review) or the
+    bundled config is missing. Any error loading the config, invoking the lens,
+    or parsing its response is caught and logged rather than raised — this is a
+    best-effort side note, not a gate, so it must never fail the review stage.
+    """
+    if pr_number is None:
+        return
+    from sdlc.role_routing import bundled_config_path
+
+    config_path = bundled_config_path("overengineering-lens.yaml")
+    if config_path is None:
+        return
+
+    from sdlc.overengineering import (
+        OverEngineeringContractError,
+        OverEngineeringError,
+        dispatch_overengineering_lens,
+    )
+
+    try:
+        outcome = dispatch_overengineering_lens(
+            pr_number=pr_number, story_id=story.id, diff="", config_path=config_path,
+        )
+    except (OverEngineeringError, OverEngineeringContractError) as exc:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"over-engineering lens failed (advisory-only, ignored): {exc}",
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 - advisory-only, must never fail the stage
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"over-engineering lens raised an unexpected error (advisory-only, "
+            f"ignored): {exc}",
+        )
+        return
+
+    if not outcome.has_findings:
+        return  # disabled or clean — stay quiet, no ledger noise
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"over-engineering lens ({outcome.action}): {outcome.advisory_comment()}",
     )
 
 

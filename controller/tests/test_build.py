@@ -1942,6 +1942,113 @@ def test_review_prompt_distrust_survives_doc_currency_off(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Over-engineering lens advisory dispatch (issue #445)
+# ---------------------------------------------------------------------------
+
+def _lens_config(tmp_path: Path, *, enabled: bool, command: str) -> Path:
+    p = tmp_path / "overengineering-lens.yaml"
+    p.write_text(
+        f"enabled: {'true' if enabled else 'false'}\n"
+        "policy: advisory\n"
+        f"command: {command}\n",
+        encoding="utf-8",
+    )
+    return p
+
+
+def test_overengineering_lens_disabled_by_default_no_dispatch(tmp_path) -> None:
+    """Disabled (the bundled default) ⇒ no lens event, no subprocess spend."""
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE message LIKE '%over-engineering lens%'"
+    ).fetchall()
+    assert rows == []
+
+
+def test_overengineering_lens_enabled_surfaces_findings_advisory_only(
+    tmp_path, monkeypatch
+) -> None:
+    """Enabled ⇒ dispatched after review, findings logged, story still merges."""
+    script = tmp_path / "lens.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        'printf \'{"summary": "found a cut", "findings": '
+        '[{"category": "unused_code", "file": "src/x.py", "line": 3, '
+        '"reason": "dead branch"}]}\'\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    config_path = _lens_config(tmp_path, enabled=True, command=str(script))
+    monkeypatch.setattr(
+        "sdlc.role_routing.bundled_config_path", lambda name: config_path
+    )
+
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    # Advisory only — never blocks: every story still reaches merge.
+    assert result.completed == 3
+    assert result.failed == 0
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT level, message FROM events WHERE message LIKE '%over-engineering lens%'"
+    ).fetchall()
+    assert rows, "expected an advisory ledger event per reviewed story"
+    assert all(level == "info" for level, _ in rows)
+    joined = "\n".join(m for _, m in rows)
+    assert "src/x.py:3" in joined
+    assert "dead branch" in joined
+
+
+def test_overengineering_lens_failure_never_fails_the_review_stage(
+    tmp_path, monkeypatch
+) -> None:
+    """A lens that errors out is logged as a warning, not a stage failure."""
+    config_path = _lens_config(
+        tmp_path, enabled=True, command="definitely-not-a-real-binary-xyz"
+    )
+    monkeypatch.setattr(
+        "sdlc.role_routing.bundled_config_path", lambda name: config_path
+    )
+
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    assert result.completed == 3
+    assert result.failed == 0
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT level, message FROM events WHERE message LIKE '%over-engineering lens%'"
+    ).fetchall()
+    assert rows, "expected the lens error to be logged"
+    assert all(level == "warn" for level, _ in rows)
+    assert all("ignored" in m for _, m in rows)
+
+
+# ---------------------------------------------------------------------------
 # bugfix stage rows must use distinct attempt numbers (no UNIQUE collision)
 # ---------------------------------------------------------------------------
 
