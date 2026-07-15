@@ -88,6 +88,16 @@ def test_malformed_override_raises(tmp_path: Path) -> None:
         load_docs_patterns(root=tmp_path)
 
 
+def test_invalid_yaml_override_raises(tmp_path: Path) -> None:
+    # A syntactically broken allowlist fails loudly (ChangeClassError), never
+    # silently — the caller then conservatively classifies as code.
+    (tmp_path / OVERRIDE_FILENAME).write_text(
+        "docs_patterns: [unclosed\n", encoding="utf-8"
+    )
+    with pytest.raises(ChangeClassError):
+        load_docs_patterns(root=tmp_path)
+
+
 def test_override_missing_key_raises(tmp_path: Path) -> None:
     (tmp_path / OVERRIDE_FILENAME).write_text("wrong_key: []\n", encoding="utf-8")
     with pytest.raises(ChangeClassError):

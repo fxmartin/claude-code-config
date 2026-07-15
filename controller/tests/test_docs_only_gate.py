@@ -204,6 +204,25 @@ def test_review_slot_detection_against_checked_in_registries() -> None:
     assert is_slot(BuildOptions(harness_map={"review": "qwen"})) is False
 
 
+def test_review_slot_detection_degrades_to_false_on_registry_error(
+    monkeypatch,
+) -> None:
+    # A broken registry must never fail a build: the slot check returns False
+    # and the review dispatches exactly as routed.
+    import sdlc.role_routing as role_routing_mod
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("registry unreadable")
+
+    monkeypatch.setattr(role_routing_mod, "resolve_role_routing", _boom)
+    assert (
+        build_mod._review_is_adversarial_slot(
+            BuildOptions(harness_map={"review": "codex"})
+        )
+        is False
+    )
+
+
 # ---------------------------------------------------------------------------
 # _story_change_class — classification wrapper (best-effort, evented)
 # ---------------------------------------------------------------------------
