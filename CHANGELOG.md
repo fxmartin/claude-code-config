@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.30.0] - 2026-07-15
+
+### Added
+
+- feat(performance-token-optimization): adversarial slot (#27.2-002)
+
+### Fixed
+
+- fix(performance-token-optimization): adversarial slot risk (#27.2-002)
+
+
 ## [v2.29.0] - 2026-07-15
 
 ### Added
