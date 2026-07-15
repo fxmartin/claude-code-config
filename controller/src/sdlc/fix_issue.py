@@ -1,5 +1,5 @@
 # ABOUTME: `sdlc fix` controller pipeline — single issue (PR1) + batch (PR2), issue #436.
-# ABOUTME: Issue→Story adapter, investigation contract, reused stage loop, opus-parity routing.
+# ABOUTME: Issue→Story adapter, investigation contract, reused stage loop, Balanced-aligned routing.
 
 """Deterministic fix orchestration, ported from the fix-issue skill.
 
@@ -16,10 +16,12 @@ independent ones run concurrently through the Epic-24 ready queue. The E2E gate,
 the batch doc-update phase, and the skill collapse land in PR3; the fix-issue
 skill stays fully intact until then.
 
-Model routing is opus-parity with the skill (investigation=sonnet, build=opus,
-coverage=sonnet, review=opus, bugfix=opus, merge=haiku, summary=haiku), expressed
-as a fix-specific per-stage default map that a future ``--model`` override can beat.
-It deliberately does NOT route through the Balanced build profile.
+Model routing mirrors the Balanced build profile (Story 27.1-001): every stage
+defaults to the cheapest tier that holds quality (investigation/build/coverage/
+review/bugfix=sonnet, merge/summary=haiku), and the code-producing/reviewing
+stages (build, review, bugfix) escalate to opus when the investigation reports
+HIGH complexity or the issue carries a high-risk/security label. A per-stage
+``model_overrides`` pin still beats both the defaults and the escalation.
 """
 
 from __future__ import annotations
@@ -64,27 +66,41 @@ from sdlc.dispatch import (
 from sdlc.issue_host import RunResult, Runner, _default_runner
 from sdlc.notify import notify
 
-# --- Model routing: opus parity with the fix-issue skill --------------------
+# --- Model routing: aligned with the Balanced build profile -----------------
 #
-# A fix-specific per-stage default map (issue #436 maintainer decision). Each
-# stage runs on the model the skill assigns it. A per-stage ``model_overrides``
-# entry wins over this map — the escape hatch a later ``--model-<stage>`` flag
-# fills in — so these are *defaults* the operator can beat, not hard pins. This
-# is intentionally NOT the Balanced build profile: a fix run is short and
-# high-stakes, so it pays for Opus on the code-producing/reviewing stages.
+# A fix-specific per-stage default map, aligned with the Balanced profile
+# (``model_routing.py``) by Story 27.1-001 — the measured baseline showed the
+# old opus defaults on build/review/bugfix dominated interactive token spend
+# while Balanced already proves Sonnet-with-escalation holds quality. Build,
+# review, and bugfix escalate to :data:`FIX_ESCALATION_MODEL` when the
+# investigation reports HIGH complexity or the issue carries a high-risk/
+# security label (see :func:`_fix_escalates`). A per-stage ``model_overrides``
+# entry wins over both — the escape hatch a later ``--model-<stage>`` flag
+# fills in — so these are *defaults* the operator can beat, not hard pins.
 FIX_STAGE_MODELS: dict[str, str] = {
     "investigation": "sonnet",
-    "build": "opus",
+    "build": "sonnet",     # → opus on HIGH complexity / high-risk label
     "coverage": "sonnet",
-    "review": "opus",
+    "review": "sonnet",    # → opus on HIGH complexity / high-risk label
     "merge": "haiku",
-    "bugfix": "opus",
+    "bugfix": "sonnet",    # → opus on HIGH complexity / high-risk label
     "summary": "haiku",
     # PR3 phases (issue #436): the optional E2E warn-gate and the batch doc-update
     # phase both run on sonnet, matching the skill's qa-engineer / doc-update models.
     "e2e": "sonnet",
     "doc_update": "sonnet",
 }
+
+# The stages that escalate on a high-risk signal — the code-producing and
+# code-reviewing agents. Coverage stays sonnet (tests need correctness, not
+# opus) and merge/summary stay haiku (mechanical), mirroring Balanced.
+FIX_ESCALATABLE_STAGES: frozenset[str] = frozenset({"build", "review", "bugfix"})
+FIX_ESCALATION_MODEL = "opus"
+
+# Issue labels that force escalation regardless of assessed complexity —
+# matched case-insensitively against the stripped label names. `risk:high` is
+# the repo's high-risk merge-gate label; the rest are common spellings.
+_ESCALATION_LABELS = {"risk:high", "high-risk", "risk-high", "security"}
 
 # Valid --e2e-gate values. ``off`` (default) never dispatches the gate; ``warn``
 # runs it after review as an advisory step that logs a FAIL and continues (the
@@ -426,6 +442,10 @@ def render_investigation_prompt(issue: FixIssue) -> str:
         "3. Determine the exact root cause (not just the symptom) and which files "
         "must change.\n"
         "4. Assess regression risk and whether the fix needs a human decision.\n\n"
+        "Rate complexity LOW (small, contained change), MEDIUM (a few files, "
+        "clear approach), or HIGH (wide blast radius, architectural change, or "
+        "intricate logic) — HIGH escalates the build and review agents to a "
+        "stronger model.\n\n"
         "Set investigation_status to READY when the root cause is identified and "
         "the fix plan is clear; BLOCKED when you cannot determine the root cause or "
         "the fix requires a human decision (ambiguous requirements, a design call, "
@@ -634,13 +654,35 @@ def render_doc_update_prompt(scope: str, merged: list[FixIssueOutcome]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def fix_model(stage: str, opts: FixOptions) -> str | None:
-    """The model for ``stage`` (issue #436): a ``model_overrides`` pin beats the map.
+def _fix_escalates(inv: dict | None, labels: Iterable[str]) -> bool:
+    """True when the fix warrants opus on the escalatable stages (27.1-001).
 
-    Returns None only for a stage absent from both — the dispatcher then adds no
-    ``--model`` and the CLI default stands. In practice every fix stage is mapped.
+    Two signals, either sufficient: the investigation assessed the fix as HIGH
+    complexity, or the issue carries a high-risk/security label. Both checks are
+    case-insensitive; a missing investigation result never escalates.
     """
-    return opts.model_overrides.get(stage) or FIX_STAGE_MODELS.get(stage)
+    complexity = str((inv or {}).get("complexity", "")).strip().upper()
+    if complexity == "HIGH":
+        return True
+    return bool(_labels_lower(labels) & _ESCALATION_LABELS)
+
+
+def fix_model(stage: str, opts: FixOptions, *, escalate: bool = False) -> str | None:
+    """The model for ``stage`` (issue #436): a ``model_overrides`` pin beats all.
+
+    With ``escalate`` (a high-risk signal from :func:`_fix_escalates`), the
+    escalatable stages run on :data:`FIX_ESCALATION_MODEL` instead of their
+    Balanced default — unless the operator pinned the stage explicitly, which is
+    always the final word. Returns None only for a stage absent from every map —
+    the dispatcher then adds no ``--model`` and the CLI default stands. In
+    practice every fix stage is mapped.
+    """
+    override = opts.model_overrides.get(stage)
+    if override:
+        return override
+    if escalate and stage in FIX_ESCALATABLE_STAGES:
+        return FIX_ESCALATION_MODEL
+    return FIX_STAGE_MODELS.get(stage)
 
 
 # ---------------------------------------------------------------------------
@@ -705,7 +747,7 @@ def _run_bugfix(
     ``bugfix`` stage rows). A dispatch/contract error, or a non-FIXED / tests-red
     response, returns False so the caller exhausts into a terminal status.
     """
-    model = fix_model("bugfix", opts)
+    model = fix_model("bugfix", opts, escalate=_fix_escalates(inv, issue.labels))
     ledger.stage_start(run_id, story.id, "bugfix", seq, model=model)
     prompt = render_bugfix_prompt(issue, inv, stage, failure)
     try:
@@ -794,12 +836,13 @@ def _run_stage_loop(
     ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
     pr_number: int | None = None
     bugfix_seq = 0
+    escalate = _fix_escalates(inv, issue.labels)
 
     for stage in stages:
         attempt = 1
         bugfix_attempts = 0
         while True:
-            model = fix_model(stage, opts)
+            model = fix_model(stage, opts, escalate=escalate)
             ledger.stage_start(run_id, story.id, stage, attempt, model=model)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             prompt = _render_core_prompt(stage, issue, inv, opts, pr_number)

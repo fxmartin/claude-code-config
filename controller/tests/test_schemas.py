@@ -57,7 +57,7 @@ VALID_RESPONSES: dict[str, dict] = {
     },
     "investigation": {
         "root_cause": "off-by-one in the retry loop upper bound",
-        "complexity": "simple",
+        "complexity": "LOW",
         "fix_approach": "clamp the loop bound to len(items) - 1",
         "files_to_modify": ["src/retry.py"],
         "risk": "low — isolated change with a regression test",
@@ -189,6 +189,20 @@ def test_build_optional_fields_accepted() -> None:
     data["error_summary"] = "tests failed in module x"
     data["pr_number"] = 7
     assert validate_response("build", data) == data
+
+
+def test_investigation_complexity_enum_is_low_medium_high() -> None:
+    """The complexity vocabulary is LOW|MEDIUM|HIGH (Story 27.1-001)."""
+    schema = load_schema("investigation")
+    assert schema["properties"]["complexity"]["enum"] == ["LOW", "MEDIUM", "HIGH"]
+
+
+def test_investigation_legacy_complexity_vocabulary_rejected() -> None:
+    """The pre-27.1-001 simple/moderate/complex values fail validation."""
+    data = dict(VALID_RESPONSES["investigation"])
+    data["complexity"] = "simple"
+    with pytest.raises(SchemaValidationError):
+        validate_response("investigation", data)
 
 
 def test_bugfix_optional_issue_number_accepted() -> None:
