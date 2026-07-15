@@ -138,6 +138,42 @@ def test_story_metadata_still_parsed_after_section_ends(tmp_path) -> None:
     assert "Definition of Done" not in story.section
 
 
+def test_story_section_survives_headings_inside_code_fences(tmp_path) -> None:
+    """A `# heading`-looking line inside a fenced code block never ends capture.
+
+    Real regression: epic-05 story 5.3-001 embeds a ```markdown example whose
+    first line is `# Changelog` — the pre-fix parser stopped there and silently
+    injected a spec truncated mid-code-block, exactly what the size-cap fallback
+    exists to prevent (Story 27.3-002 AC2: no truncated specs ever injected).
+    """
+    stories_dir = tmp_path / "docs" / "stories"
+    stories_dir.mkdir(parents=True)
+    epic = stories_dir / "epic-96-sample.md"
+    epic.write_text(
+        "# Epic 96: Sample\n\n"
+        "##### Story 96.1-001: Only story\n"
+        "**Priority**: P1\n\n"
+        "Format example:\n\n"
+        "```markdown\n"
+        "# Changelog\n"
+        "## [Unreleased]\n"
+        "```\n\n"
+        "```bash\n"
+        "# a shell comment, not a heading\n"
+        "echo ok\n"
+        "```\n\n"
+        "**Risk Level**: Low\n\n"
+        "## Verification\n\n"
+        "Epic-level prose.\n",
+        encoding="utf-8",
+    )
+    (story,) = parse_epic_file(epic)
+    assert "# Changelog" in story.section
+    assert "# a shell comment, not a heading" in story.section
+    assert story.section.endswith("**Risk Level**: Low")
+    assert "Epic-level prose" not in story.section
+
+
 # --- R5: Story Points, and R4: done-detection -------------------------------
 
 _EPIC_34_LIKE = """# Epic 34: User Management

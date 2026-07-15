@@ -39,6 +39,12 @@ _EPIC_FILE_NUM = re.compile(r"^epic-0*([0-9]+)")
 # `### Feature 27.3` or `## Verification`) ends the current story's *section*
 # capture (Story 27.3-002) while metadata parsing continues unchanged.
 _ANY_HEADING = re.compile(r"^#{1,6}\s")
+# A fenced-code-block delimiter. Lines inside a fence never end section
+# capture — a spec's ```markdown/```bash example can open with `# Changelog`
+# or a shell comment, which would otherwise read as a heading and silently
+# truncate the embedded spec mid-block (the exact failure AC2's "no truncated
+# specs ever injected" forbids; regression: epic-05 story 5.3-001).
+_CODE_FENCE = re.compile(r"^\s*(```|~~~)")
 
 _STORY_DIR_CANDIDATES = ("docs/stories", "stories")
 
@@ -171,8 +177,11 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
             continue
         # Story 27.3-002: capture the section verbatim until the next heading
         # (the next story, or a feature/epic-level heading ending this story's
-        # block). Metadata parsing below is deliberately untouched.
-        if _ANY_HEADING.match(line):
+        # block). Heading-looking lines inside a code fence are spec content,
+        # not structure. Metadata parsing below is deliberately untouched.
+        if _CODE_FENCE.match(line):
+            current["in_fence"] = not current.get("in_fence", False)
+        if _ANY_HEADING.match(line) and not current.get("in_fence"):
             current["section_done"] = True
         elif not current.get("section_done"):
             current["section_lines"].append(line)
