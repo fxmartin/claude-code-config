@@ -77,17 +77,25 @@ class HarnessPreflight:
     def degraded(self) -> bool:
         return self.effective_mode != self.requested_mode
 
-    def log_lines(self) -> list[str]:
-        """Human-readable preflight lines for stderr / the ledger event log."""
+    def log_lines(self, *, label: str | None = None) -> list[str]:
+        """Human-readable preflight lines for stderr / the ledger event log.
+
+        ``label`` (Story 25.1 UX fix, issue #426) optionally tags every
+        ``harness {name!r}`` prefix, e.g. ``label="default slot"`` renders
+        ``harness 'claude' (default slot): ...``. This is purely cosmetic — it
+        exists so a per-role-routed run's default-slot preflight line is never
+        mistaken for the harness actually dispatching a stage's work.
+        """
+        tag = f" ({label})" if label else ""
         summary = " ".join(
             f"{key}={'yes' if value else 'no'}"
             for key, value in self.capabilities.items()
         )
-        lines = [f"harness {self.harness!r}: capabilities {summary}"]
+        lines = [f"harness {self.harness!r}{tag}: capabilities {summary}"]
         if self.probe.status is not ProbeStatus.UNKNOWN:
-            lines.append(f"harness {self.harness!r}: probe {self.probe.status.value}")
+            lines.append(f"harness {self.harness!r}{tag}: probe {self.probe.status.value}")
         lines.append(
-            f"harness {self.harness!r}: mode={self.effective_mode}"
+            f"harness {self.harness!r}{tag}: mode={self.effective_mode}"
             + (f" (requested {self.requested_mode})" if self.degraded else "")
         )
         lines.extend(self.warnings)
