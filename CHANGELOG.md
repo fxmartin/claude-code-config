@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.32.0] - 2026-07-15
+
+### Added
+
+- feat(performance-token-optimization): single-source shared (#27.1-003)
+
+### Fixed
+
+- fix(performance-token-optimization): single-source shared (#27.1-003)
+
+
 ## [v2.31.0] - 2026-07-15
 
 ### Added
