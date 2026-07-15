@@ -3395,6 +3395,26 @@ def test_build_prompt_oversized_section_falls_back_untruncated() -> None:
     assert "xxxx" not in prompt
 
 
+def test_build_prompt_section_exactly_at_cap_is_embedded() -> None:
+    """The cap is exclusive: a section of exactly the max size still embeds."""
+    from sdlc.build import STORY_SECTION_MAX_CHARS, render_build_prompt
+
+    head = "##### Story 27.3-002: Boundary\n"
+    exact = head + "x" * (STORY_SECTION_MAX_CHARS - len(head))
+    assert len(exact) == STORY_SECTION_MAX_CHARS
+    prompt = render_build_prompt(_sectioned_story(exact), BuildOptions())
+    assert exact in prompt
+    assert "do not re-read the epic file" in prompt
+
+
+def test_build_prompt_section_block_names_source_epic() -> None:
+    """The injected block cites the epic file it was captured from."""
+    from sdlc.build import render_build_prompt
+
+    prompt = render_build_prompt(_sectioned_story(), BuildOptions())
+    assert "## Story Specification (from docs/stories/epic-27.md)" in prompt
+
+
 def test_build_prompt_without_section_keeps_read_instruction() -> None:
     """A story with no captured section renders today's prompt unchanged."""
     from sdlc.build import render_build_prompt

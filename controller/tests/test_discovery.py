@@ -113,6 +113,31 @@ def test_story_section_stops_at_non_story_heading(tmp_path) -> None:
     assert "Post-epic prose" not in story.section
 
 
+def test_story_metadata_still_parsed_after_section_ends(tmp_path) -> None:
+    """Metadata after a section-ending heading still feeds the Story record.
+
+    Section capture stops at the first non-story heading, but done-detection
+    (DoD boxes) keeps scanning until the next story header — the two loops are
+    deliberately independent (Story 27.3-002).
+    """
+    stories_dir = tmp_path / "docs" / "stories"
+    stories_dir.mkdir(parents=True)
+    epic = stories_dir / "epic-97-sample.md"
+    epic.write_text(
+        "# Epic 97: Sample\n\n"
+        "##### Story 97.1-001: Only story\n"
+        "**Priority**: P1\n\n"
+        "###### Definition of Done\n"
+        "- [x] Shipped\n"
+        "- [x] Verified\n",
+        encoding="utf-8",
+    )
+    (story,) = parse_epic_file(epic)
+    assert story.done is True
+    assert story.section.endswith("**Priority**: P1")
+    assert "Definition of Done" not in story.section
+
+
 # --- R5: Story Points, and R4: done-detection -------------------------------
 
 _EPIC_34_LIKE = """# Epic 34: User Management
