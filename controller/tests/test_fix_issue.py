@@ -1,10 +1,13 @@
-# ABOUTME: Tests for the single-issue `sdlc fix` controller pipeline (issue #436, PR1).
+# ABOUTME: Tests for the `sdlc fix` controller pipeline — single (PR1) + batch (PR2), #436.
 # ABOUTME: Agent dispatch + gh are mocked; the ledger is a real temp SQLite DB.
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -12,11 +15,19 @@ import pytest
 from sdlc.dispatch import AgentDispatchError, AgentResult, ContextOverflowError, RateLimitError
 from sdlc.fix_issue import (
     FIX_STAGE_MODELS,
+    FixBatchOptions,
     FixConfigError,
     FixIssue,
     FixIssueError,
+    FixIssueOutcome,
     FixOptions,
+    WorktreeError,
+    _batch_scope,
+    _batch_summary,
+    _batch_workers,
     _neutralize_untrusted,
+    _list_open_issues,
+    build_overlap_dependencies,
     detect_agent_type,
     fetch_issue,
     fix_model,
@@ -30,6 +41,8 @@ from sdlc.fix_issue import (
     render_review_prompt,
     render_summary_prompt,
     run_fix,
+    run_fix_batch,
+    select_batch_issues,
     stop_reason,
 )
 from sdlc.issue_host import RunResult
@@ -638,13 +651,6 @@ def test_parse_fix_args_flags() -> None:
     assert opts.skip_preflight is True
 
 
-def test_parse_fix_args_batch_target_is_coming_later() -> None:
-    with pytest.raises(FixConfigError, match="later release"):
-        parse_fix_args(["all"])
-    with pytest.raises(FixConfigError, match="later release"):
-        parse_fix_args(["next"])
-
-
 def test_parse_fix_args_non_numeric_issue() -> None:
     with pytest.raises(FixConfigError, match="invalid issue"):
         parse_fix_args(["frobnicate"])
@@ -991,3 +997,961 @@ def test_hostile_title_not_in_trusted_header() -> None:
     header = prompt.split("<untrusted_input>", 1)[0]
     assert _INJECTION_PHRASE not in header
     assert "</untrusted_input>" not in header
+
+
+# ===========================================================================
+# Batch mode (issue #436, PR2): all / next --limit=N
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing — batch targets + flags + invalid combos
+# ---------------------------------------------------------------------------
+
+
+def test_parse_fix_args_all_target() -> None:
+    opts = parse_fix_args(["all"])
+    assert isinstance(opts, FixBatchOptions)
+    assert opts.target == "all"
+    assert opts.limit is None
+    assert opts.concurrency == 5
+    assert opts.sequential is False
+
+
+def test_parse_fix_args_next_defaults_to_one() -> None:
+    opts = parse_fix_args(["next"])
+    assert isinstance(opts, FixBatchOptions)
+    assert opts.target == "next"
+    assert opts.limit == 1  # skill parity: next == single highest-priority bug
+
+
+def test_parse_fix_args_next_with_limit() -> None:
+    opts = parse_fix_args(["next", "--limit=3"])
+    assert opts.target == "next"
+    assert opts.limit == 3
+
+
+def test_parse_fix_args_all_with_limit_and_concurrency() -> None:
+    opts = parse_fix_args(["all", "--limit=5", "--concurrency=2"])
+    assert opts.limit == 5
+    assert opts.concurrency == 2
+
+
+def test_parse_fix_args_sequential_flag() -> None:
+    opts = parse_fix_args(["all", "--sequential"])
+    assert isinstance(opts, FixBatchOptions)
+    assert opts.sequential is True
+
+
+def test_parse_fix_args_batch_propagates_quality_flags() -> None:
+    opts = parse_fix_args(["all", "--skip-coverage", "--coverage-threshold=80", "--skip-preflight"])
+    assert opts.skip_coverage is True
+    assert opts.coverage_threshold == 80
+    assert opts.skip_preflight is True
+
+
+def test_parse_fix_args_opened_alias_maps_to_all() -> None:
+    assert parse_fix_args(["opened"]).target == "all"
+    assert parse_fix_args(["opened-issues"]).target == "all"
+
+
+def test_parse_fix_args_single_issue_still_returns_fixoptions() -> None:
+    opts = parse_fix_args(["123"])
+    assert isinstance(opts, FixOptions)
+    assert opts.issue == 123
+
+
+def test_parse_fix_args_cannot_combine_target_and_issue() -> None:
+    with pytest.raises(FixConfigError, match="cannot combine"):
+        parse_fix_args(["all", "1"])
+    with pytest.raises(FixConfigError, match="cannot combine"):
+        parse_fix_args(["1", "all"])
+
+
+def test_parse_fix_args_cannot_combine_two_targets() -> None:
+    with pytest.raises(FixConfigError, match="cannot combine"):
+        parse_fix_args(["all", "next"])
+
+
+def test_parse_fix_args_concurrency_below_one_rejected() -> None:
+    with pytest.raises(FixConfigError, match="concurrency"):
+        parse_fix_args(["all", "--concurrency=0"])
+
+
+def test_parse_fix_args_batch_only_flags_rejected_on_single_issue() -> None:
+    with pytest.raises(FixConfigError, match="limit"):
+        parse_fix_args(["1", "--limit=3"])
+    with pytest.raises(FixConfigError, match="concurrency"):
+        parse_fix_args(["1", "--concurrency=2"])
+    with pytest.raises(FixConfigError, match="sequential"):
+        parse_fix_args(["1", "--sequential"])
+
+
+# ---------------------------------------------------------------------------
+# Overlap graph → synthetic dependencies
+# ---------------------------------------------------------------------------
+
+
+def test_overlap_shared_file_serializes() -> None:
+    deps = build_overlap_dependencies({1: {"a.py"}, 2: {"a.py"}})
+    assert deps[1] == []
+    assert deps[2] == [1]  # 2 depends on the lower-numbered peer it overlaps
+
+
+def test_overlap_disjoint_files_are_parallel_eligible() -> None:
+    deps = build_overlap_dependencies({1: {"a.py"}, 2: {"b.py"}})
+    assert deps[1] == []
+    assert deps[2] == []  # no shared file → no synthetic edge
+
+
+def test_overlap_three_issue_chain_component() -> None:
+    # 1&2 share "a", 2&3 share "b" → one connected component chained 1→2→3.
+    deps = build_overlap_dependencies({1: {"a"}, 2: {"a", "b"}, 3: {"b"}})
+    assert deps[1] == []
+    assert deps[2] == [1]
+    assert deps[3] == [2]
+
+
+def test_overlap_no_self_dependency() -> None:
+    deps = build_overlap_dependencies({5: {"a.py"}, 9: {"a.py"}})
+    for number, dep_list in deps.items():
+        assert number not in dep_list
+
+
+def test_overlap_deterministic_ordering() -> None:
+    # Two independent overlapping pairs; each chains by ascending number, and the
+    # result is identical regardless of input dict ordering.
+    a = build_overlap_dependencies({3: {"x"}, 1: {"x"}, 8: {"y"}, 5: {"y"}})
+    b = build_overlap_dependencies({8: {"y"}, 5: {"y"}, 1: {"x"}, 3: {"x"}})
+    assert a == b
+    assert a[3] == [1] and a[8] == [5]
+    assert a[1] == [] and a[5] == []
+
+
+def test_overlap_empty_files_never_overlap() -> None:
+    deps = build_overlap_dependencies({1: set(), 2: set()})
+    assert deps[1] == [] and deps[2] == []
+
+
+def test_overlap_blank_path_is_ignored() -> None:
+    # A blank/whitespace-only path (a malformed investigation payload) must never
+    # register as a shared file — it is skipped rather than falsely serializing.
+    deps = build_overlap_dependencies({1: {"a.py", "  "}, 2: {"a.py", "\t"}})
+    assert deps[2] == [1]  # only "a.py" creates the edge
+
+
+# ---------------------------------------------------------------------------
+# Issue selection + ordering
+# ---------------------------------------------------------------------------
+
+
+class FakeBatchGh:
+    """Fake gh for batch: serves `issue list`, `issue view`, and `api user`.
+
+    ``issues`` is a list of dicts, each with number/title/labels and optionally
+    body/state/assignees, so a single fake drives both selection and per-issue
+    investigation.
+    """
+
+    def __init__(self, issues, *, user="me", list_rc=0, list_err="", view_fail=None):
+        self.issues = {i["number"]: i for i in issues}
+        self.user = user
+        self.list_rc = list_rc
+        self.list_err = list_err
+        # Issue numbers whose `gh issue view` call fails (simulates a fetch error
+        # dropped from the batch mid-investigation, distinct from a bad `issue list`).
+        self.view_fail = set(view_fail or ())
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, timeout=None):
+        self.calls.append(list(argv))
+        joined = " ".join(argv)
+        if "issue list" in joined:
+            if self.list_rc != 0:
+                return RunResult(self.list_rc, "", self.list_err)
+            arr = [
+                {
+                    "number": i["number"],
+                    "title": i.get("title", ""),
+                    "labels": [{"name": n} for n in i.get("labels", [])],
+                }
+                for i in self.issues.values()
+            ]
+            return RunResult(0, json.dumps(arr), "")
+        if "issue view" in joined:
+            number = int(argv[argv.index("view") + 1])
+            if number in self.view_fail:
+                return RunResult(1, "", f"gh: issue #{number} not found")
+            i = self.issues[number]
+            return RunResult(
+                0,
+                json.dumps(
+                    {
+                        "number": i["number"],
+                        "title": i.get("title", f"Issue {i['number']}"),
+                        "body": i.get("body", "boom"),
+                        "state": i.get("state", "OPEN"),
+                        "assignees": [{"login": a} for a in i.get("assignees", [])],
+                        "labels": [{"name": n} for n in i.get("labels", [])],
+                    }
+                ),
+                "",
+            )
+        if "api user" in joined:
+            return RunResult(0, self.user, "")
+        return RunResult(0, "", "")
+
+
+def test_select_all_orders_bugs_before_enhancements_by_priority() -> None:
+    gh = FakeBatchGh(
+        [
+            {"number": 10, "labels": ["enhancement", "high"]},
+            {"number": 11, "labels": ["bug", "low"]},
+            {"number": 12, "labels": ["bug", "critical"]},
+            {"number": 13, "labels": ["chore"]},
+        ]
+    )
+    ordered = [c.number for c in select_batch_issues("all", None, runner=gh)]
+    # bugs first (critical before low), then enhancement, then other.
+    assert ordered == [12, 11, 10, 13]
+
+
+def test_select_next_filters_to_bugs_and_limits() -> None:
+    gh = FakeBatchGh(
+        [
+            {"number": 10, "labels": ["enhancement", "critical"]},
+            {"number": 11, "labels": ["bug", "low"]},
+            {"number": 12, "labels": ["bug", "high"]},
+        ]
+    )
+    ordered = [c.number for c in select_batch_issues("next", 1, runner=gh)]
+    assert ordered == [12]  # top open bug only (high beats low; enhancement excluded)
+
+
+def test_select_list_error_raises() -> None:
+    gh = FakeBatchGh([], list_rc=1, list_err="gh boom")
+    with pytest.raises(FixIssueError, match="gh issue list failed"):
+        select_batch_issues("all", None, runner=gh)
+
+
+def test_select_all_malformed_json_raises() -> None:
+    class _BadJsonGh:
+        def __call__(self, argv, timeout=None):
+            return RunResult(0, "not json", "")
+
+    with pytest.raises(FixIssueError, match="malformed JSON"):
+        select_batch_issues("all", None, runner=_BadJsonGh())
+
+
+def test_select_all_orders_by_p_code_priority() -> None:
+    # P0/P1 codes (not the severity words) must rank exactly like their word
+    # equivalents — P0 (most urgent) sorts before P1.
+    gh = FakeBatchGh(
+        [
+            {"number": 20, "labels": ["bug", "P1"]},
+            {"number": 21, "labels": ["bug", "P0"]},
+        ]
+    )
+    ordered = [c.number for c in select_batch_issues("all", None, runner=gh)]
+    assert ordered == [21, 20]
+
+
+# ---------------------------------------------------------------------------
+# Batch dispatcher probe (tracks per-issue pipeline concurrency)
+# ---------------------------------------------------------------------------
+
+
+class BatchProbeDispatcher:
+    """Records agent calls and tracks which issues run pipeline stages together.
+
+    Investigation is excluded from the concurrency probe (it always fans out in
+    the investigate-all phase); only build/coverage/review/merge — the isolated
+    per-issue pipeline — are tracked, so the probe measures exactly the overlap
+    the synthetic dependencies are meant to serialize.
+
+    ``inv_files`` maps a story id to that issue's investigation ``files_to_modify``.
+    ``overrides`` maps ``(agent_type, story_id)`` (or bare ``agent_type``) to a
+    payload dict, a callable ``(n)->dict``, or an Exception to raise.
+    """
+
+    PIPELINE = {"build", "coverage", "review", "merge"}
+
+    def __init__(self, inv_files=None, *, hold=0.03, overrides=None):
+        self._lock = threading.Lock()
+        self.inv_files = inv_files or {}
+        self.hold = hold
+        self.overrides = overrides or {}
+        self.active_pipeline: set[str] = set()
+        self.max_pipeline_active = 0
+        self.concurrent_pairs: set[frozenset] = set()
+        self.counts: dict[tuple[str, str], int] = defaultdict(int)
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, agent_type, prompt, *, story=None, model=None,
+                 transcript_path=None, on_progress=None, **kwargs):
+        sid = getattr(story, "id", "")
+        pipeline = agent_type in self.PIPELINE
+        with self._lock:
+            self.counts[(agent_type, sid)] += 1
+            self.calls.append((agent_type, sid))
+            if pipeline:
+                for other in self.active_pipeline:
+                    self.concurrent_pairs.add(frozenset((sid, other)))
+                self.active_pipeline.add(sid)
+                self.max_pipeline_active = max(self.max_pipeline_active, len(self.active_pipeline))
+        try:
+            time.sleep(self.hold)
+            payload = self._payload(agent_type, sid)
+            if isinstance(payload, Exception):
+                raise payload
+            return AgentResult(agent_type=agent_type, data=payload, raw="")
+        finally:
+            if pipeline:
+                with self._lock:
+                    self.active_pipeline.discard(sid)
+
+    def _payload(self, agent_type, sid):
+        key = (agent_type, sid)
+        if key in self.overrides:
+            payload = self.overrides[key]
+        elif agent_type in self.overrides:
+            payload = self.overrides[agent_type]
+        elif agent_type == "investigation":
+            files = self.inv_files.get(sid, [])
+            return {
+                "root_cause": "rc", "complexity": "simple", "fix_approach": "fa",
+                "files_to_modify": files, "risk": "low",
+                "investigation_status": "READY",
+            }
+        else:
+            return _default_payload(agent_type)
+        if callable(payload):
+            payload = payload(self.counts[key] - 1)
+        return payload
+
+    def agent_counts(self) -> dict[str, int]:
+        out: dict[str, int] = defaultdict(int)
+        for (agent, _sid), n in self.counts.items():
+            out[agent] += n
+        return out
+
+
+def _batch_issue(number, labels=("bug",), title=None, body="boom"):
+    return {"number": number, "labels": list(labels), "title": title or f"Issue {number}", "body": body}
+
+
+# ---------------------------------------------------------------------------
+# Ready-queue integration: overlap serialization + concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_batch_overlapping_issues_never_in_flight_together(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    # Both investigations name the same file → they must serialize.
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["shared.py"], "issue-2": ["shared.py"]})
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert result.fixed == 2
+    assert frozenset({"issue-1", "issue-2"}) not in dispatch.concurrent_pairs
+
+
+def test_batch_independent_issues_dispatch_concurrently(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]})
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert dispatch.max_pipeline_active >= 2  # genuine overlap for disjoint files
+
+
+def test_batch_three_issue_chain_serializes_all(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2), _batch_issue(3)])
+    # 1&2 share "a", 2&3 share "b" → one component, chained 1→2→3.
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a"], "issue-2": ["a", "b"], "issue-3": ["b"]}
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert result.fixed == 3
+    assert dispatch.max_pipeline_active == 1  # the whole component is serial
+    assert dispatch.concurrent_pairs == set()
+
+
+def test_batch_sequential_forces_serial_execution(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2), _batch_issue(3)])
+    # Disjoint files would otherwise run concurrently — --sequential forbids it.
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a"], "issue-2": ["b"], "issue-3": ["c"]}
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", sequential=True),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert result.fixed == 3
+    assert dispatch.max_pipeline_active == 1
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED / dropped investigation
+# ---------------------------------------------------------------------------
+
+
+def test_batch_blocked_investigation_drops_issue_and_continues(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]},
+        overrides={("investigation", "issue-1"): {"investigation_status": "BLOCKED"}},
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.fixed == 1  # issue 2 still fixed
+    assert result.skipped == 1  # issue 1 dropped as BLOCKED
+    assert _story_status(db, "issue-1") == "BLOCKED"
+    assert _story_status(db, "issue-2") == "DONE"
+    # issue 1 never entered the pipeline.
+    assert ("build", "issue-1") not in dispatch.counts
+
+
+def test_batch_stop_condition_drops_issue(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh(
+        [_batch_issue(1), dict(_batch_issue(2), state="CLOSED")]
+    )
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]})
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.fixed == 1
+    assert result.skipped == 1
+    assert _story_status(db, "issue-2") == "SKIPPED"
+    # a stopped issue is never investigated.
+    assert ("investigation", "issue-2") not in dispatch.counts
+
+
+def test_batch_fetch_error_drops_issue_and_continues(tmp_path) -> None:
+    """A `gh issue view` failure mid-investigation drops just that issue SKIPPED."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)], view_fail={1})
+    dispatch = BatchProbeDispatcher(inv_files={"issue-2": ["b.py"]})
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.fixed == 1
+    assert result.skipped == 1
+    assert _story_status(db, "issue-1") == "SKIPPED"
+    outcome1 = next(o for o in result.outcomes if o.issue == 1)
+    assert "fetch failed" in outcome1.drop_reason
+    # a fetch failure never reaches investigation.
+    assert ("investigation", "issue-1") not in dispatch.counts
+
+
+def test_batch_investigation_dispatch_error_drops_issue_as_failed(tmp_path) -> None:
+    """A dispatch/contract error during investigation drops that issue FAILED
+    (distinct from BLOCKED, which needs a human decision)."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-2": ["b.py"]},
+        overrides={("investigation", "issue-1"): AgentDispatchError("agent crashed")},
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.fixed == 1
+    assert _story_status(db, "issue-1") == "FAILED"
+    outcome1 = next(o for o in result.outcomes if o.issue == 1)
+    assert outcome1.status == "FAILED"
+    assert outcome1.drop_reason == "investigation failed"
+
+
+def test_batch_all_blocked_exits_cleanly(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        overrides={"investigation": {"investigation_status": "BLOCKED"}}
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.fixed == 0
+    assert result.skipped == 2
+    # a batch with no buildable issues is FAILED (blocked stories) but never crashes.
+    assert result.status == "FAILED"
+    assert _run_count(db) == 1
+
+
+# ---------------------------------------------------------------------------
+# One run row + per-issue statuses + summary + no-issues
+# ---------------------------------------------------------------------------
+
+
+def test_batch_creates_exactly_one_run_row(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]})
+    run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert _run_count(db) == 1
+
+
+def test_batch_records_per_issue_story_statuses(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]},
+        overrides={
+            ("build", "issue-2"): {
+                "branch_name": "feature/issue-2", "build_status": "FAILED",
+                "commit_sha": "x", "error_summary": "boom",
+            },
+            ("bugfix", "issue-2"): {
+                "failure_category": "REAL_BUG", "root_cause": "deep",
+                "fix_status": "UNFIXED", "tests_passing": False,
+                "bugs_fixed": 0, "tests_fixed": 0,
+            },
+        },
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert _story_status(db, "issue-1") == "DONE"
+    assert _story_status(db, "issue-2") == "FAILED"
+    assert result.status == "FAILED"  # any failed issue makes the run FAILED
+
+
+def test_batch_summary_counts_and_pr_links(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]})
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert "2 fixed, 0 failed, 0 skipped" in result.summary
+    assert "#1: DONE (PR #100)" in result.summary
+    assert "#2: DONE (PR #100)" in result.summary
+
+
+def test_batch_scope_reflects_target(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(7), _batch_issue(3)])
+    run_fix_batch(
+        FixBatchOptions(target="next", limit=2),
+        ledger=Ledger(db),
+        dispatcher=BatchProbeDispatcher(inv_files={"issue-7": ["a"], "issue-3": ["b"]}),
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    conn = sqlite3.connect(db)
+    try:
+        scope = conn.execute("SELECT scope FROM runs").fetchone()[0]
+    finally:
+        conn.close()
+    assert scope == "issues-3,7"  # sorted, comma-joined
+
+
+def test_batch_no_open_issues_creates_no_run_row(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([])
+    result = run_fix_batch(
+        FixBatchOptions(target="all"),
+        ledger=Ledger(db),
+        dispatcher=BatchProbeDispatcher(),
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.no_issues is True
+    assert not db.exists()
+
+
+def test_batch_selection_error_aborts_with_no_run_row(tmp_path) -> None:
+    """A broken `gh issue list` aborts the whole batch cleanly (no run row) rather
+    than crashing — distinct from `no_issues` meaning "selection found nothing"."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([], list_rc=1, list_err="gh boom")
+    result = run_fix_batch(
+        FixBatchOptions(target="all"),
+        ledger=Ledger(db),
+        dispatcher=BatchProbeDispatcher(),
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.no_issues is True
+    assert result.status == "ABORTED"
+    assert "batch selection failed" in result.summary
+    assert not db.exists()
+
+
+def test_batch_preflight_failure_returns_early(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1)])
+    dispatch = BatchProbeDispatcher()
+    result = run_fix_batch(
+        FixBatchOptions(target="all"),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: False,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.preflight_failed is True
+    assert dispatch.calls == []
+    assert not db.exists()
+
+
+def test_batch_notify_run_started_failure_is_non_fatal(tmp_path, monkeypatch) -> None:
+    """A crashing `run_started` notify call never blocks the batch."""
+    import sdlc.fix_issue as fix_issue_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(fix_issue_module, "notify", boom)
+    gh = FakeBatchGh([_batch_issue(1)])
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]})
+    result = run_fix_batch(
+        FixBatchOptions(target="all"),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+
+
+def test_batch_story_failed_notify_failure_is_non_fatal(tmp_path, monkeypatch) -> None:
+    """A crashing `story_failed` notify call never blocks the rest of the batch."""
+    import sdlc.fix_issue as fix_issue_module
+
+    def boom(event, **kwargs):
+        if event == "story_failed":
+            raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(fix_issue_module, "notify", boom)
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"]},
+        overrides={
+            ("build", "issue-1"): {
+                "branch_name": "feature/issue-1", "build_status": "FAILED",
+                "commit_sha": "x", "error_summary": "boom",
+            },
+            ("bugfix", "issue-1"): {
+                "failure_category": "REAL_BUG", "root_cause": "deep",
+                "fix_status": "UNFIXED", "tests_passing": False,
+                "bugs_fixed": 0, "tests_fixed": 0,
+            },
+        },
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=1),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "FAILED"
+    assert result.failed == 1
+
+
+def test_batch_rate_limit_parks_run_and_keeps_worktree(tmp_path, monkeypatch) -> None:
+    """A rate-limited stage parks the whole batch RATE_LIMITED (resumable) rather
+    than failing it, mirroring the single-issue path's rate-limit park. The park's
+    close-out also survives a crashing `run_finished` notify and a crashing
+    render_view — both best-effort, neither may fail an otherwise-clean park."""
+    import sdlc.fix_issue as fix_issue_module
+    from sdlc.rate_limit import RateLimitSignal
+
+    def boom_notify(*args, **kwargs):
+        raise RuntimeError("telegram down")
+
+    def boom_render(run_id):
+        raise RuntimeError("dashboard render failed")
+
+    monkeypatch.setattr(fix_issue_module, "notify", boom_notify)
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"]},
+        overrides={"build": RateLimitError("throttled", signal=RateLimitSignal(source="429"))},
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=1),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+        render_view=boom_render,
+    )
+    assert result.status == "RATE_LIMITED"
+    assert "RATE_LIMITED" in _batch_summary(result.outcomes)  # counted in "other"
+    run_status = sqlite3.connect(db).execute("SELECT status FROM runs").fetchone()[0]
+    assert run_status == "RATE_LIMITED"
+
+
+def test_batch_real_run_isolates_worktrees_and_captures_worker_exception(
+    tmp_path, monkeypatch
+) -> None:
+    """The real-run path (`dispatcher=None`): concurrent issues get isolated
+    worktrees, the base ref is refreshed/repositioned around the ready queue, an
+    unavailable worktree falls back to the shared repo root instead of crashing,
+    and an unexpected exception in an isolated worker still cleans up its
+    worktree (issue #436)."""
+    import sdlc.fix_issue as fix_issue_module
+
+    monkeypatch.chdir(tmp_path)
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2), _batch_issue(3)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"], "issue-3": ["c.py"]},
+        overrides={("build", "issue-2"): RuntimeError("boom")},
+    )
+    monkeypatch.setattr(fix_issue_module, "dispatch_agent", dispatch)
+
+    created: list[str] = []
+    removed: list[Path] = []
+    refreshed: list[Path] = []
+    repositioned: list[Path] = []
+
+    def fake_create(root, story_id, run_id):
+        created.append(story_id)
+        if story_id == "issue-1":
+            # issue-1's worktree isolation is unavailable; it must fall back to
+            # building in the shared repo root rather than crashing the batch.
+            raise WorktreeError("no space left on device")
+        d = tmp_path / f"wt-{story_id}"
+        d.mkdir(exist_ok=True)
+        return d
+
+    class _FakeReconcile:
+        reclassified: list = []
+
+    monkeypatch.setattr(fix_issue_module, "create_story_worktree", fake_create)
+    monkeypatch.setattr(
+        fix_issue_module, "remove_story_worktree", lambda root, wd: removed.append(wd)
+    )
+    monkeypatch.setattr(
+        fix_issue_module, "_refresh_base_ref", lambda root: refreshed.append(root)
+    )
+    monkeypatch.setattr(
+        fix_issue_module, "_reposition_head", lambda root: repositioned.append(root)
+    )
+    monkeypatch.setattr(
+        "sdlc.reconcile.reconcile_run", lambda *a, **k: _FakeReconcile()
+    )
+
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=3),
+        ledger=_ledger(tmp_path),
+        dispatcher=None,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+
+    assert set(created) == {"issue-1", "issue-2", "issue-3"}  # all attempted
+    # issue-1 never got a worktree (WorktreeError fallback); issue-2's raised
+    # mid-pipeline but its isolated worktree is still cleaned up on the error path.
+    assert set(removed) == {tmp_path / "wt-issue-2", tmp_path / "wt-issue-3"}
+    assert refreshed  # before_batch fired the real-run base refresh
+    assert repositioned  # real-run HEAD reposition after the ready queue drains
+    assert result.failed == 1  # issue-2's unexpected exception is captured, not fatal
+    assert result.fixed == 2  # issue-1 and issue-3 still complete normally
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
+def test_batch_workers_sequential_is_one() -> None:
+    assert _batch_workers(FixBatchOptions(target="all", sequential=True, concurrency=5)) == 1
+
+
+def test_batch_workers_honours_concurrency() -> None:
+    assert _batch_workers(FixBatchOptions(target="all", concurrency=3)) == 3
+    assert _batch_workers(FixBatchOptions(target="all", concurrency=0)) == 1  # floored
+
+
+def test_batch_scope_all() -> None:
+    assert _batch_scope("all", [3, 1, 2]) == "issues-all"
+
+
+def test_batch_scope_next_sorted() -> None:
+    assert _batch_scope("next", [9, 2, 5]) == "issues-2,5,9"
+
+
+def test_batch_summary_formats_counts_and_drops() -> None:
+    summary = _batch_summary(
+        [
+            FixIssueOutcome(1, "DONE", pr_number=100),
+            FixIssueOutcome(2, "FAILED"),
+            FixIssueOutcome(3, "SKIPPED", drop_reason="issue is closed"),
+        ]
+    )
+    assert "1 fixed, 1 failed, 1 skipped" in summary
+    assert "#1: DONE (PR #100)" in summary
+    assert "#3: SKIPPED — issue is closed" in summary
+
+
+def test_batch_summary_other_count_for_non_standard_status() -> None:
+    # A RATE_LIMITED park is neither fixed/failed/skipped — it must still be
+    # counted (as "other"), never silently dropped from the summary tally.
+    summary = _batch_summary(
+        [FixIssueOutcome(1, "DONE"), FixIssueOutcome(2, "RATE_LIMITED")]
+    )
+    assert "1 fixed, 0 failed, 0 skipped, 1 other" in summary
+
+
+# ---------------------------------------------------------------------------
+# Review-gate additions (#462): path normalization, cap warning, failure isolation
+# ---------------------------------------------------------------------------
+
+
+def test_overlap_normalizes_equivalent_paths() -> None:
+    # Free-form investigation paths that denote the same file must overlap even
+    # when spelled differently ("./a.py" vs "a.py", "b/../a.py" vs "a.py").
+    deps = build_overlap_dependencies({1: {"./a.py"}, 2: {"a.py"}, 3: {"b/../a.py"}})
+    assert deps[2] == [1]
+    assert deps[3] == [2]  # all three collapse to one serial component
+
+
+def test_list_open_issues_warns_when_cap_hit(capsys) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    _list_open_issues(gh, limit=2)  # the fake returns exactly the cap
+    assert "cap" in capsys.readouterr().err
+
+
+def test_list_open_issues_no_warning_below_cap(capsys) -> None:
+    gh = FakeBatchGh([_batch_issue(1)])
+    _list_open_issues(gh, limit=50)
+    assert capsys.readouterr().err == ""
+
+
+def test_batch_failed_predecessor_does_not_block_successor(tmp_path) -> None:
+    # issue-1 and issue-2 overlap on "shared.py" so issue-2 serializes after
+    # issue-1. issue-1's build fails unrecoverably; issue-2 must still run to DONE
+    # — the overlap dependency is for serialization only, never a failure cascade.
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["shared.py"], "issue-2": ["shared.py"]},
+        overrides={
+            ("build", "issue-1"): {
+                "branch_name": "feature/issue-1", "build_status": "FAILED",
+                "commit_sha": "x", "error_summary": "boom",
+            },
+            ("bugfix", "issue-1"): {
+                "failure_category": "REAL_BUG", "root_cause": "deep",
+                "fix_status": "UNFIXED", "tests_passing": False,
+                "bugs_fixed": 0, "tests_fixed": 0,
+            },
+        },
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert _story_status(db, "issue-1") == "FAILED"
+    assert _story_status(db, "issue-2") == "DONE"  # successor ran despite the failure
+    assert dispatch.counts[("build", "issue-2")] >= 1
+    assert frozenset({"issue-1", "issue-2"}) not in dispatch.concurrent_pairs
+    assert result.fixed == 1 and result.failed == 1
+
+
+def test_batch_unexpected_investigation_error_drops_issue_not_batch(tmp_path) -> None:
+    # An investigation error outside the handled dispatch-error family must drop
+    # just that issue (FAILED), never wedge the concurrent investigate-all pool.
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-2": ["b.py"]},
+        overrides={("investigation", "issue-1"): ValueError("kaboom")},
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert _story_status(db, "issue-1") == "FAILED"
+    assert _story_status(db, "issue-2") == "DONE"
+    assert result.fixed == 1 and result.failed == 1

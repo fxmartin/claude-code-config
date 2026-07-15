@@ -1,16 +1,20 @@
-# ABOUTME: Single-issue `sdlc fix <n>` controller pipeline (issue #436, PR 1 of 3).
+# ABOUTME: `sdlc fix` controller pipeline — single issue (PR1) + batch (PR2), issue #436.
 # ABOUTME: Issue→Story adapter, investigation contract, reused stage loop, opus-parity routing.
 
-"""Deterministic single-issue fix orchestration, ported from the fix-issue skill.
+"""Deterministic fix orchestration, ported from the fix-issue skill.
 
-This migrates the skill's single-issue path into the controller: fetch the issue,
+This migrates the skill's fix path into the controller: fetch the issue(s),
 apply the stop conditions, run an investigation stage, then drive the reused
 build → coverage → review → merge stage loop (with the bounded bugfix loop and
 ``AWAITING_APPROVAL`` parking) before a best-effort summary and the run close-out.
 
-Scope is deliberately single-issue for PR1. Batch mode (``all`` / ``next``), the
-E2E gate, the batch doc-update phase, and the skill collapse land in later PRs;
-the fix-issue skill stays fully intact until then.
+PR1 delivered the single-issue path. PR2 adds batch mode (``all`` / ``next
+--limit=N``): all selected issues are investigated first under bounded
+concurrency, then a file-overlap graph over each issue's ``files_to_modify``
+synthesizes ``Story.dependencies`` so overlapping issues serialize while
+independent ones run concurrently through the Epic-24 ready queue. The E2E gate,
+the batch doc-update phase, and the skill collapse land in PR3; the fix-issue
+skill stays fully intact until then.
 
 Model routing is opus-parity with the skill (investigation=sonnet, build=opus,
 coverage=sonnet, review=opus, bugfix=opus, merge=haiku, summary=haiku), expressed
@@ -20,20 +24,33 @@ It deliberately does NOT route through the Balanced build profile.
 
 from __future__ import annotations
 
+import concurrent.futures
+import functools
 import json
+import os
 import re
-from dataclasses import dataclass, field
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
 from sdlc.build import (
     MAX_BUGFIX_ATTEMPTS,
     Ledger,
+    WorktreeError,
+    _dispatch_ready_queue,
     _extract_pr,
     _merge_awaiting_approval,
+    _refresh_base_ref,
+    _reposition_head,
     _stage_succeeded,
+    _StoryDispatch,
+    _StoryRunOutcome,
+    create_story_worktree,
     default_preflight,
     finalize_run,
+    remove_story_worktree,
 )
 from sdlc.cohort import Story
 from sdlc.contracts import ContractError, _result_wrapper
@@ -103,6 +120,66 @@ class FixOptions:
     # PR1 (no CLI surface yet); the seam is here so a later ``--model-<stage>``
     # flag can beat the fix defaults without touching the routing helper.
     model_overrides: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class FixBatchOptions:
+    """Parsed `sdlc fix all` / `sdlc fix next --limit=N` arguments (PR2, issue #436).
+
+    ``target`` is ``all`` (every open issue, bugs before enhancements by priority)
+    or ``next`` (the top ``limit`` open bugs). ``concurrency`` caps how many issues
+    run their build→merge pipeline at once; ``--sequential`` forces it to 1 (one
+    issue fully completes before the next starts). Per-issue quality-gate knobs
+    mirror :class:`FixOptions` and are threaded down verbatim to each issue.
+    """
+
+    target: str
+    limit: int | None = None
+    skip_coverage: bool = False
+    coverage_threshold: int = 90
+    skip_preflight: bool = False
+    sequential: bool = False
+    concurrency: int = 5
+    model_overrides: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class FixIssueOutcome:
+    """One issue's terminal outcome within a batch fix run."""
+
+    issue: int
+    status: str
+    pr_number: int | None = None
+    # Set when the issue never entered the build pipeline (a stop condition or a
+    # blocked/failed investigation dropped it); carries the human-readable reason.
+    drop_reason: str = ""
+
+
+@dataclass
+class FixBatchResult:
+    """The terminal outcome of a batch fix run."""
+
+    run_id: str | None = None
+    # Run terminal: DONE / FAILED / NEEDS_ATTENTION / AWAITING_APPROVAL /
+    # RATE_LIMITED (a parked batch, resumable).
+    status: str = ""
+    outcomes: list[FixIssueOutcome] = field(default_factory=list)
+    preflight_failed: bool = False
+    # True when selection found nothing to fix (no run row created).
+    no_issues: bool = False
+    summary: str = ""
+
+    @property
+    def fixed(self) -> int:
+        return sum(1 for o in self.outcomes if o.status == "DONE")
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for o in self.outcomes if o.status == "FAILED")
+
+    @property
+    def skipped(self) -> int:
+        return sum(1 for o in self.outcomes if o.status in ("SKIPPED", "BLOCKED"))
 
 
 @dataclass
@@ -920,52 +997,728 @@ def _close_early(
 
 
 # ---------------------------------------------------------------------------
+# Batch mode (issue #436, PR2): all / next --limit=N
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """A lightweight open-issue record from ``gh issue list`` (selection only)."""
+
+    number: int
+    title: str
+    labels: tuple[str, ...]
+
+
+# Priority label vocabularies, ranked best-first. A candidate's rank is the index
+# of the first vocabulary term any of its labels matches (unranked issues sort
+# last). The two families (severity words and ``P0..P3``) are checked in order.
+_PRIORITY_WORDS = ("critical", "high", "medium", "low")
+_PRIORITY_CODES = ("p0", "p1", "p2", "p3")
+
+
+def _labels_lower(labels: Iterable[str]) -> set[str]:
+    return {label.strip().lower() for label in labels}
+
+
+def _is_bug(labels: Iterable[str]) -> bool:
+    return any("bug" in label for label in _labels_lower(labels))
+
+
+def _is_enhancement(labels: Iterable[str]) -> bool:
+    lset = _labels_lower(labels)
+    return any("enhancement" in label or "feature" in label for label in lset)
+
+
+def _category_rank(labels: Iterable[str]) -> int:
+    """0 for a bug, 1 for an enhancement/feature, 2 for anything else.
+
+    Batch selection orders bugs before enhancements before the rest, mirroring the
+    skill's Phase 1 (bugs are the higher-value auto-fix target).
+    """
+    if _is_bug(labels):
+        return 0
+    if _is_enhancement(labels):
+        return 1
+    return 2
+
+
+def _priority_rank(labels: Iterable[str]) -> int:
+    """The priority rank of ``labels`` (lower is more urgent; unranked sorts last).
+
+    Matches both the severity vocabulary (``critical``/``high``/``medium``/``low``,
+    with ``priority/``/``priority:`` prefixes tolerated) and the ``P0..P3`` codes.
+    """
+    lset = _labels_lower(labels)
+    for i, word in enumerate(_PRIORITY_WORDS):
+        if word in lset or f"priority/{word}" in lset or f"priority:{word}" in lset:
+            return i
+    for i, code in enumerate(_PRIORITY_CODES):
+        if code in lset:
+            return i
+    return len(_PRIORITY_WORDS)
+
+
+def _candidate_sort_key(cand: _Candidate) -> tuple[int, int, int]:
+    """Deterministic batch ordering: category, then priority, then issue number."""
+    return (_category_rank(cand.labels), _priority_rank(cand.labels), cand.number)
+
+
+def _list_open_issues(runner: Runner, *, limit: int = 50) -> list[_Candidate]:
+    """List open issues via ``gh issue list`` for batch selection (issue #436).
+
+    Raises :class:`FixIssueError` on a non-zero exit or malformed JSON so the
+    caller aborts the batch cleanly rather than fixing an empty/garbled set.
+    """
+    res = _gh(
+        [
+            "issue", "list", "--state", "open",
+            "--json", "number,title,labels", "--limit", str(limit),
+        ],
+        runner=runner,
+    )
+    if res.returncode != 0:
+        raise FixIssueError(
+            f"gh issue list failed: {res.stderr.strip() or 'non-zero exit'}"
+        )
+    try:
+        data = json.loads(res.stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise FixIssueError(f"gh returned malformed JSON for issue list: {exc}") from exc
+    if len(data) >= limit:
+        # No silent caps: gh returned a full page, so the open-issue set may be
+        # truncated. Warn now (the run isn't open yet, so there's no ledger row).
+        print(
+            f"warning: `gh issue list` hit the {limit}-issue cap; some open issues "
+            "may be excluded from this batch (narrow with `next --limit=N`).",
+            file=sys.stderr,
+        )
+    return [
+        _Candidate(
+            number=int(d.get("number")),
+            title=str(d.get("title", "")),
+            labels=tuple(
+                str(label.get("name", ""))
+                for label in d.get("labels", [])
+                if label.get("name")
+            ),
+        )
+        for d in data
+        if d.get("number") is not None
+    ]
+
+
+def select_batch_issues(
+    target: str, limit: int | None, *, runner: Runner | None = None
+) -> list[_Candidate]:
+    """Select and order the open issues a batch fix run should target (issue #436).
+
+    ``all`` returns every open issue (bugs first, then enhancements, then the
+    rest, each ranked by priority then issue number). ``next`` restricts to open
+    bugs. A positive ``limit`` caps the ordered result — the skill's ``next``
+    default of one highest-priority bug is just ``next`` with ``limit=1``.
+    """
+    runner = runner or _default_runner
+    candidates = _list_open_issues(runner)
+    if target == "next":
+        candidates = [c for c in candidates if _is_bug(c.labels)]
+    candidates.sort(key=_candidate_sort_key)
+    if limit is not None and limit > 0:
+        candidates = candidates[:limit]
+    return candidates
+
+
+def build_overlap_dependencies(
+    files_by_issue: dict[int, set[str]],
+) -> dict[int, list[int]]:
+    """Synthesize serialization dependencies from file overlap (issue #436).
+
+    Two issues touching a common file must not build/merge concurrently — they
+    would race the same paths. This builds the undirected file-overlap graph
+    (issues are nodes; a shared file is an edge), finds its connected components,
+    and within each component chains the issues in ascending issue number so each
+    depends on the previous lower-numbered peer. Feeding those synthetic
+    ``Story.dependencies`` to the Epic-24 ready queue serializes an overlapping
+    component for free while leaving disjoint issues concurrency-eligible.
+
+    Returns ``{issue_number: [dependency_issue_numbers]}`` — at most one edge per
+    issue (the chain predecessor), never a self-dependency. An issue with no
+    ``files_to_modify`` is its own singleton component (no dependency).
+    """
+    numbers = sorted(files_by_issue)
+    parent = {n: n for n in numbers}
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            # Keep the lower number as the component root for determinism.
+            parent[max(ra, rb)] = min(ra, rb)
+
+    # First issue (by number) to claim a file owns it; a later claimant unions in.
+    file_owner: dict[str, int] = {}
+    for n in numbers:
+        for path in files_by_issue[n]:
+            stripped = path.strip()
+            if not stripped:
+                continue
+            # Normalize so free-form investigation paths that denote the same
+            # file (e.g. "./pkg/mod.py" vs "pkg/mod.py") overlap, not race.
+            norm = os.path.normpath(stripped)
+            if norm in file_owner:
+                union(file_owner[norm], n)
+            else:
+                file_owner[norm] = n
+
+    components: dict[int, list[int]] = defaultdict(list)
+    for n in numbers:
+        components[find(n)].append(n)
+
+    deps: dict[int, list[int]] = {n: [] for n in numbers}
+    for members in components.values():
+        chain = sorted(members)
+        for prev, cur in zip(chain, chain[1:]):
+            deps[cur] = [prev]
+    return deps
+
+
+# ---------------------------------------------------------------------------
+# Batch: investigate-all phase
+# ---------------------------------------------------------------------------
+
+
+def _batch_workers(batch: FixBatchOptions) -> int:
+    """The effective issue-level concurrency: 1 under ``--sequential``, else the cap."""
+    if batch.sequential:
+        return 1
+    return max(1, batch.concurrency)
+
+
+def _issue_options(batch: FixBatchOptions, number: int) -> FixOptions:
+    """A per-issue :class:`FixOptions` carrying the batch's quality-gate knobs."""
+    return FixOptions(
+        issue=number,
+        skip_coverage=batch.skip_coverage,
+        coverage_threshold=batch.coverage_threshold,
+        skip_preflight=batch.skip_preflight,
+        model_overrides=dict(batch.model_overrides),
+    )
+
+
+def _batch_scope(target: str, numbers: Iterable[int]) -> str:
+    """The ledger run scope for a batch — ``issues-all`` or ``issues-<n1>,<n2>``.
+
+    Mirrors how a multi-story build run records a canonical, sorted scope label so
+    the dashboard renders the batch like an epic build.
+    """
+    if target == "all":
+        return "issues-all"
+    return "issues-" + ",".join(str(n) for n in sorted(numbers))
+
+
+@dataclass
+class _Investigated:
+    """A READY issue plus its investigation plan, carried into the pipeline phase."""
+
+    issue: FixIssue
+    inv: dict
+
+
+def _investigate_all(
+    candidates: list[_Candidate],
+    batch: FixBatchOptions,
+    ledger: Ledger,
+    run_id: str,
+    dispatch,
+    runner: Runner,
+    logs_dir: Path,
+    root: Path | None,
+    *,
+    agent_type: str,
+    workers: int,
+) -> tuple[dict[str, _Investigated], dict[str, FixIssueOutcome]]:
+    """Investigate every candidate under bounded concurrency (issue #436).
+
+    Each candidate is fetched, screened against the stop conditions, then run
+    through the investigation stage. A stop condition or a BLOCKED / FAILED
+    investigation drops the issue from the batch (logged, the batch continues per
+    the skill); a READY investigation is carried forward. Investigation is
+    read-only, so all workers share the repo root — no per-issue worktree here.
+
+    Returns ``(ready, dropped)`` keyed by story id: ``ready`` maps to the issue +
+    plan for the pipeline phase; ``dropped`` maps to the terminal
+    :class:`FixIssueOutcome` (SKIPPED / BLOCKED / FAILED) already stamped on the
+    ledger story row.
+    """
+    ready: dict[str, _Investigated] = {}
+    dropped: dict[str, FixIssueOutcome] = {}
+
+    def _one(cand: _Candidate) -> None:
+        story_id = f"issue-{cand.number}"
+        try:
+            issue = fetch_issue(cand.number, runner=runner)
+        except FixIssueError as exc:
+            ledger.set_story_status(run_id, story_id, "SKIPPED")
+            ledger.event_log(
+                run_id, story_id, "warn", "controller",
+                f"dropped from batch: could not fetch issue ({exc})",
+            )
+            dropped[story_id] = FixIssueOutcome(
+                cand.number, "SKIPPED", drop_reason=f"fetch failed: {exc}"
+            )
+            return
+        stop = stop_reason(issue, runner=runner)
+        if stop:
+            ledger.set_story_status(run_id, story_id, "SKIPPED")
+            ledger.event_log(
+                run_id, story_id, "info", "controller",
+                f"dropped from batch: {stop}",
+            )
+            dropped[story_id] = FixIssueOutcome(cand.number, "SKIPPED", drop_reason=stop)
+            return
+        story = replace(issue_story(issue, root=root), agent_type=agent_type)
+        opts = _issue_options(batch, cand.number)
+        status, inv = _run_investigation(
+            issue, story, opts, ledger, run_id, dispatch, logs_dir
+        )
+        if status == "READY":
+            assert inv is not None
+            ready[story_id] = _Investigated(issue=issue, inv=inv)
+            return
+        if status == "BLOCKED":
+            reason = _block_reason(inv)
+            ledger.set_story_status(run_id, story_id, "BLOCKED")
+            ledger.event_log(
+                run_id, story_id, "warn", "controller",
+                f"dropped from batch: investigation blocked ({reason})",
+            )
+            dropped[story_id] = FixIssueOutcome(
+                cand.number, "BLOCKED", drop_reason=reason
+            )
+            return
+        # FAILED investigation (dispatch/contract error): drop as FAILED.
+        ledger.set_story_status(run_id, story_id, "FAILED")
+        ledger.event_log(
+            run_id, story_id, "error", "controller",
+            "dropped from batch: investigation failed",
+        )
+        dropped[story_id] = FixIssueOutcome(
+            cand.number, "FAILED", drop_reason="investigation failed"
+        )
+
+    def _guarded(cand: _Candidate) -> None:
+        # Failure isolation (parity with the pipeline phase): an unexpected error
+        # on one candidate drops it as FAILED instead of wedging the whole batch.
+        try:
+            _one(cand)
+        except Exception as exc:  # noqa: BLE001
+            story_id = f"issue-{cand.number}"
+            ledger.set_story_status(run_id, story_id, "FAILED")
+            ledger.event_log(
+                run_id, story_id, "error", "controller",
+                f"dropped from batch: unexpected investigation error ({exc})",
+            )
+            dropped[story_id] = FixIssueOutcome(
+                cand.number, "FAILED", drop_reason=f"unexpected error: {exc}"
+            )
+
+    if workers == 1:
+        for cand in candidates:
+            _guarded(cand)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_guarded, candidates))
+    return ready, dropped
+
+
+# ---------------------------------------------------------------------------
+# Batch: pipeline phase (ready-queue) + orchestration
+# ---------------------------------------------------------------------------
+
+
+def _batch_stories(
+    ready: dict[str, _Investigated],
+    deps_by_issue: dict[int, list[int]],
+    root: Path | None,
+    agent_type: str,
+) -> list[Story]:
+    """Build the READY issues' stories with their synthetic overlap dependencies.
+
+    Sorted by issue number so the list is a valid topological order (a synthetic
+    dependency only ever points to a lower-numbered peer).
+    """
+    stories: list[Story] = []
+    for story_id in sorted(ready, key=lambda sid: int(sid.split("-")[1])):
+        inv_entry = ready[story_id]
+        number = inv_entry.issue.number
+        deps = [f"issue-{d}" for d in deps_by_issue.get(number, [])]
+        stories.append(
+            replace(
+                issue_story(inv_entry.issue, root=root),
+                agent_type=agent_type,
+                dependencies=deps,
+            )
+        )
+    return stories
+
+
+def run_fix_batch(
+    batch: FixBatchOptions,
+    *,
+    ledger: Ledger,
+    dispatcher=None,
+    preflight=None,
+    runner: Runner | None = None,
+    render_view=None,
+    root: Path | None = None,
+    logs_dir: Path | None = None,
+) -> FixBatchResult:
+    """Run the batch fix orchestration deterministically (issue #436, PR2).
+
+    Phases: preflight → select open issues → one ``run_create`` (scope
+    ``issues-all`` / ``issues-<n1>,<n2>``) → investigate every issue under bounded
+    concurrency (dropping stop/blocked/failed ones) → synthesize file-overlap
+    dependencies → drive the per-issue build→coverage→review→merge pipeline through
+    the Epic-24 ready queue (overlapping issues serialize, independent ones run
+    concurrently) → shared close-out + a plain-text batch summary.
+
+    ``dispatcher`` defaults to the real subprocess-backed dispatch; a fake is
+    injected in tests (and, as in ``run_build``, ``dispatcher is None`` marks a
+    real run that may cut per-issue worktrees). ``runner`` is the ``gh`` seam.
+    """
+    dispatch = dispatcher or dispatch_agent
+    runner = runner or _default_runner
+    real_run = dispatcher is None
+    workers = _batch_workers(batch)
+
+    # --- Preflight ------------------------------------------------------------
+    check_preflight = preflight or (lambda: default_preflight())
+    if not batch.skip_preflight and not check_preflight():
+        return FixBatchResult(preflight_failed=True, status="FAILED")
+
+    # --- Selection (no run row when nothing is selectable) --------------------
+    try:
+        candidates = select_batch_issues(batch.target, batch.limit, runner=runner)
+    except FixIssueError as exc:
+        return FixBatchResult(
+            no_issues=True, status="ABORTED",
+            summary=f"batch selection failed: {exc}",
+        )
+    if not candidates:
+        return FixBatchResult(
+            no_issues=True, status="DONE",
+            summary=f"no open issues matched `sdlc fix {batch.target}`",
+        )
+
+    # --- Ledger bootstrap + run open -----------------------------------------
+    ledger.init()
+    numbers = [c.number for c in candidates]
+    scope = _batch_scope(batch.target, numbers)
+    mode = "serial" if workers == 1 else "parallel"
+    run_id = ledger.run_create(scope, mode)
+    ledger.set_total(run_id, len(candidates))
+    agent_type = detect_agent_type(root)
+    for cand in candidates:
+        ledger.story_upsert(
+            run_id, f"issue-{cand.number}", "", cand.title or f"Issue #{cand.number}",
+            "P2", 3, agent_type, "", None, "TODO",
+        )
+    logs_dir = logs_dir or (Path(f"{ledger.db_path}.logs") / run_id)
+    ledger.event_log(
+        run_id, "", "info", "controller",
+        f"fix batch started: scope={scope} mode={mode} ({len(candidates)} issues)",
+    )
+    try:
+        notify("run_started", run=run_id, scope=scope, mode=f"fix-{batch.target}")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- Investigate every issue (bounded concurrency) ------------------------
+    ready, dropped = _investigate_all(
+        candidates, batch, ledger, run_id, dispatch, runner, logs_dir, root,
+        agent_type=agent_type, workers=workers,
+    )
+
+    # --- Overlap graph → synthetic dependencies -------------------------------
+    files_by_issue = {
+        entry.issue.number: {str(f) for f in (entry.inv.get("files_to_modify") or [])}
+        for entry in ready.values()
+    }
+    deps_by_issue = build_overlap_dependencies(files_by_issue)
+    stories = _batch_stories(ready, deps_by_issue, root, agent_type)
+
+    # --- Pipeline phase: drive READY issues through the ready queue ------------
+    # Terminal per-issue statuses accumulate here (dropped issues seed it); the
+    # scheduler callbacks fill in the built ones. The status map is what the shared
+    # finalize tallies into the run terminal.
+    status: dict[str, str] = {sid: o.status for sid, o in dropped.items()}
+    outcomes: dict[str, FixIssueOutcome] = dict(dropped)
+    resolved: set[str] = set()
+    worktrees: dict[str, Path] = {}
+    rate_limited = False
+
+    def _run_one(story: Story) -> _StoryRunOutcome:
+        entry = ready[story.id]
+        opts = _issue_options(batch, entry.issue.number)
+        issue_dispatch = dispatch
+        # Isolate a real concurrent issue in its own worktree so peers never
+        # collide in the shared checkout (mirrors run_build's _prepare_story_workdir).
+        if real_run and workers > 1:
+            try:
+                workdir = create_story_worktree(Path.cwd(), story.id, run_id)
+                worktrees[story.id] = workdir
+                ledger.set_story_worktree(run_id, story.id, str(workdir))
+                issue_dispatch = functools.partial(dispatch, cwd=workdir)
+            except WorktreeError as exc:
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    f"worktree isolation unavailable ({exc}); building in the repo root",
+                )
+        terminal, pr_number = _run_stage_loop(
+            entry.issue, entry.inv, story, opts, ledger, run_id, issue_dispatch, logs_dir
+        )
+        if terminal == "DONE":
+            _run_summary(
+                entry.issue, entry.inv, story, pr_number, opts, ledger, run_id,
+                issue_dispatch, logs_dir,
+            )
+        outcomes[story.id] = FixIssueOutcome(
+            entry.issue.number, terminal, pr_number=pr_number
+        )
+        # RATE_LIMITED is a resumable park, not a terminal story state.
+        if terminal == "RATE_LIMITED":
+            return _StoryRunOutcome(status=None, parked=True)
+        return _StoryRunOutcome(status=terminal)
+
+    def _triage(story: Story) -> str:
+        # File-overlap deps are for serialization only: an issue holds while any
+        # peer it overlaps is still pending/in-flight, then runs regardless of that
+        # peer's outcome (a failed neighbour never blocks an independent fix).
+        if all(dep in resolved for dep in story.dependencies):
+            return "ready"
+        return "hold"
+
+    def _refresh_base() -> None:
+        if real_run:
+            _refresh_base_ref(Path.cwd())
+
+    def _apply(result: "_StoryDispatch") -> bool:
+        nonlocal rate_limited
+        story = result.story
+        workdir = worktrees.pop(story.id, None)
+        if result.error is not None:
+            status[story.id] = "FAILED"
+            resolved.add(story.id)
+            ledger.set_story_status(run_id, story.id, "FAILED")
+            ledger.event_log(
+                run_id, story.id, "error", "controller",
+                f"issue raised during concurrent execution: {result.error}",
+            )
+            outcomes[story.id] = FixIssueOutcome(int(story.id.split("-")[1]), "FAILED")
+            if workdir is not None:
+                remove_story_worktree(Path.cwd(), workdir)
+            return True
+        sr = result.outcome
+        assert sr is not None
+        if sr.parked:
+            status[story.id] = "RATE_LIMITED"
+            ledger.set_story_status(run_id, story.id, "RATE_LIMITED")
+            rate_limited = True
+            # Keep the worktree for a future resume; halt further submissions.
+            return False
+        outcome = sr.status or "FAILED"
+        status[story.id] = outcome
+        resolved.add(story.id)
+        ledger.set_story_status(run_id, story.id, outcome)
+        if outcome == "FAILED":
+            try:
+                notify("story_failed", run=run_id, story_id=story.id)
+            except Exception:  # noqa: BLE001
+                pass
+        if workdir is not None:
+            remove_story_worktree(Path.cwd(), workdir)
+        return True
+
+    if stories:
+        _dispatch_ready_queue(
+            stories,
+            max_workers=workers,
+            run_one=_run_one,
+            triage=_triage,
+            before_batch=_refresh_base,
+            on_result=_apply,
+        )
+        if real_run:
+            _reposition_head(Path.cwd())
+
+    ordered = [outcomes[sid] for sid in sorted(outcomes, key=lambda s: int(s.split("-")[1]))]
+    summary = _batch_summary(ordered)
+
+    # --- Close-out ------------------------------------------------------------
+    # A rate-limit park leaves the run resumable (RATE_LIMITED, non-terminal) and
+    # skips the terminal finalize — committed work is untouched.
+    if rate_limited:
+        completed = sum(1 for v in status.values() if v == "DONE")
+        failed = sum(1 for v in status.values() if v == "FAILED")
+        ledger.run_update_counts(run_id, completed, failed)
+        ledger.event_log(
+            run_id, "", "warn", "controller",
+            "fix batch parked RATE_LIMITED — `sdlc resume` continues it once the "
+            "window reopens",
+        )
+        ledger.run_update_status(run_id, "RATE_LIMITED")
+        try:
+            notify("run_finished", run=run_id, terminal="RATE_LIMITED")
+        except Exception:  # noqa: BLE001
+            pass
+        if render_view is not None:
+            try:
+                render_view(run_id)
+            except Exception:  # noqa: BLE001
+                pass
+        return FixBatchResult(
+            run_id=run_id, status="RATE_LIMITED", outcomes=ordered, summary=summary
+        )
+
+    outcome = finalize_run(
+        ledger, run_id, status,
+        reconcile=real_run, root=Path.cwd(),
+        finish_label="fix batch finished", render_view=render_view,
+    )
+    ledger.event_log(run_id, "", "info", "controller", summary)
+    return FixBatchResult(
+        run_id=run_id, status=outcome.run_terminal, outcomes=ordered, summary=summary
+    )
+
+
+def _batch_summary(outcomes: list[FixIssueOutcome]) -> str:
+    """Format a plain-text batch summary from the per-issue outcomes (issue #436).
+
+    Plain code, not an agent: this is just formatting ledger data (counts + per-issue
+    PR links), so a summary agent would be pure overhead.
+    """
+    fixed = sum(1 for o in outcomes if o.status == "DONE")
+    failed = sum(1 for o in outcomes if o.status == "FAILED")
+    skipped = sum(1 for o in outcomes if o.status in ("SKIPPED", "BLOCKED"))
+    other = len(outcomes) - fixed - failed - skipped
+    head = f"Batch fix summary: {fixed} fixed, {failed} failed, {skipped} skipped"
+    if other:
+        head += f", {other} other"
+    lines = [head]
+    for o in outcomes:
+        pr = f" (PR #{o.pr_number})" if o.pr_number else ""
+        detail = f" — {o.drop_reason}" if o.drop_reason else ""
+        lines.append(f"  #{o.issue}: {o.status}{pr}{detail}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # CLI argument parsing
 # ---------------------------------------------------------------------------
 
-_FIX_BOOL_FLAGS = {"--skip-coverage": "skip_coverage", "--skip-preflight": "skip_preflight"}
-_FIX_BATCH_TARGETS = {"all", "next", "opened", "opened-issues"}
+_FIX_BOOL_FLAGS = {
+    "--skip-coverage": "skip_coverage",
+    "--skip-preflight": "skip_preflight",
+    "--sequential": "sequential",
+}
+_FIX_BATCH_TARGETS = {"all", "next"}
+# Convenience aliases for the ``all`` target.
+_FIX_BATCH_ALIASES = {"opened": "all", "opened-issues": "all"}
 
 
-def parse_fix_args(args: Iterable[str]) -> FixOptions:
-    """Parse the `sdlc fix` argument vector into :class:`FixOptions`.
+def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
+    """Parse the `sdlc fix` argument vector into a single- or batch-mode option.
 
-    PR1 accepts a single positional issue number plus ``--skip-coverage``,
-    ``--coverage-threshold=N``, and ``--skip-preflight``. A batch target
-    (``all`` / ``next``) is a :class:`FixConfigError` that names it as coming in a
-    later release; a missing/non-numeric issue, or an unknown flag, is likewise a
-    hard error so a typo never silently changes behaviour.
+    A single positional issue number yields a :class:`FixOptions` (PR1, byte-for-byte
+    unchanged). A batch target — ``all`` (every open issue) or ``next`` (top open
+    bugs, default one) — yields a :class:`FixBatchOptions`. Shared flags:
+    ``--skip-coverage``, ``--coverage-threshold=N``, ``--skip-preflight``.
+    Batch-only flags: ``--limit=N`` (cap the issue set; the ``next`` default is 1),
+    ``--sequential`` (one issue fully completes before the next), and
+    ``--concurrency=N`` (issue-level worker cap, default 5).
+
+    A missing/non-numeric issue, an unknown flag, mixing a target with an issue
+    number, or a batch-only flag on a single issue is a :class:`FixConfigError` so
+    a typo never silently changes behaviour.
     """
     issue: int | None = None
+    target: str | None = None
+    limit: int | None = None
+    concurrency: int | None = None
     kwargs: dict[str, object] = {}
     for arg in args:
         if arg in _FIX_BOOL_FLAGS:
             kwargs[_FIX_BOOL_FLAGS[arg]] = True
         elif arg.startswith("--coverage-threshold="):
             kwargs["coverage_threshold"] = int(arg.split("=", 1)[1])
+        elif arg.startswith("--limit="):
+            limit = int(arg.split("=", 1)[1])
+        elif arg.startswith("--concurrency="):
+            concurrency = int(arg.split("=", 1)[1])
+            if concurrency < 1:
+                raise FixConfigError(f"--concurrency must be >= 1: {arg}")
         elif arg.startswith("--"):
             raise FixConfigError(f"unknown flag: {arg}")
-        elif arg.lower() in _FIX_BATCH_TARGETS:
-            raise FixConfigError(
-                f"batch mode ('{arg}') is coming in a later release — "
-                "`sdlc fix` currently accepts a single issue number, e.g. `sdlc fix 123`."
-            )
-        elif issue is None:
+        elif arg.lower() in _FIX_BATCH_TARGETS or arg.lower() in _FIX_BATCH_ALIASES:
+            resolved = _FIX_BATCH_ALIASES.get(arg.lower(), arg.lower())
+            if target is not None or issue is not None:
+                raise FixConfigError(
+                    f"cannot combine target {arg!r} with another target or issue "
+                    "number — pass exactly one of `<issue>`, `all`, or `next`."
+                )
+            target = resolved
+        elif issue is None and target is None:
             try:
                 issue = int(arg)
             except ValueError:
                 raise FixConfigError(
-                    f"invalid issue argument: {arg!r} — expected a single issue "
-                    "number, e.g. `sdlc fix 123`."
+                    f"invalid issue argument: {arg!r} — expected an issue number "
+                    "(e.g. `sdlc fix 123`) or a batch target (`all` / `next`)."
                 ) from None
+        elif target is not None:
+            raise FixConfigError(
+                f"cannot combine target with {arg!r} — pass exactly one of "
+                "`<issue>`, `all`, or `next`."
+            )
         else:
             raise FixConfigError(
-                f"unexpected extra argument: {arg!r} — `sdlc fix` takes one issue "
-                "number (batch mode is coming in a later release)."
+                f"unexpected extra argument: {arg!r} — pass exactly one of "
+                "`<issue>`, `all`, or `next`."
             )
+
+    if target is not None:
+        # `next` defaults to the single highest-priority open bug (skill parity).
+        if limit is None and target == "next":
+            limit = 1
+        return FixBatchOptions(
+            target=target,
+            limit=limit,
+            concurrency=concurrency if concurrency is not None else 5,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
     if issue is None:
         raise FixConfigError(
-            "missing issue number — usage: `sdlc fix <issue-number> "
-            "[--skip-coverage] [--coverage-threshold=N] [--skip-preflight]`."
+            "missing issue number — usage: `sdlc fix <issue-number> | all | next "
+            "[--limit=N] [--sequential] [--concurrency=N] [--skip-coverage] "
+            "[--coverage-threshold=N] [--skip-preflight]`."
+        )
+    # Batch-only flags on a single issue are a usage error, not a silent no-op.
+    if limit is not None:
+        raise FixConfigError("--limit applies only to batch targets (`all` / `next`).")
+    if concurrency is not None:
+        raise FixConfigError(
+            "--concurrency applies only to batch targets (`all` / `next`)."
+        )
+    if kwargs.pop("sequential", False):
+        raise FixConfigError(
+            "--sequential applies only to batch targets (`all` / `next`)."
         )
     return FixOptions(issue=issue, **kwargs)  # type: ignore[arg-type]

@@ -7,7 +7,7 @@ from typer.testing import CliRunner
 
 import sdlc.fix_issue as fx
 from sdlc.cli import app
-from sdlc.fix_issue import FixResult
+from sdlc.fix_issue import FixBatchResult, FixIssueOutcome, FixResult
 
 runner = CliRunner()
 
@@ -17,17 +17,67 @@ def _stub_run_fix(monkeypatch, result: FixResult):
     monkeypatch.setattr(fx, "run_fix", lambda opts, **kwargs: result)
 
 
+def _stub_run_fix_batch(monkeypatch, result: FixBatchResult):
+    """Patch run_fix_batch so the CLI exercises only parsing + exit-code translation."""
+    monkeypatch.setattr(fx, "run_fix_batch", lambda opts, **kwargs: result)
+
+
 def test_fix_help_lists_verb() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "fix" in result.output
 
 
-def test_fix_batch_target_coming_later(tmp_path, monkeypatch) -> None:
+def test_fix_batch_all_runs_batch(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    _stub_run_fix_batch(
+        monkeypatch,
+        FixBatchResult(
+            run_id="r", status="DONE",
+            outcomes=[FixIssueOutcome(1, "DONE", pr_number=10)],
+            summary="Batch fix summary: 1 fixed, 0 failed, 0 skipped",
+        ),
+    )
     result = runner.invoke(app, ["fix", "all"])
-    assert result.exit_code == 2
-    assert "later release" in result.output.lower()
+    assert result.exit_code == 0, result.output
+    assert "1 fixed" in result.output
+
+
+def test_fix_batch_failed_exits_one(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _stub_run_fix_batch(
+        monkeypatch,
+        FixBatchResult(
+            run_id="r", status="FAILED",
+            outcomes=[FixIssueOutcome(1, "FAILED")],
+            summary="Batch fix summary: 0 fixed, 1 failed, 0 skipped",
+        ),
+    )
+    result = runner.invoke(app, ["fix", "next", "--limit=3"])
+    assert result.exit_code == 1
+    assert "1 failed" in result.output
+
+
+def test_fix_batch_no_issues_exits_zero(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _stub_run_fix_batch(
+        monkeypatch,
+        FixBatchResult(no_issues=True, status="DONE", summary="no open issues matched"),
+    )
+    result = runner.invoke(app, ["fix", "all"])
+    assert result.exit_code == 0
+    assert "no open issues" in result.output.lower()
+
+
+def test_fix_batch_preflight_failure_exits_one(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _stub_run_fix_batch(
+        monkeypatch,
+        FixBatchResult(preflight_failed=True, status="FAILED"),
+    )
+    result = runner.invoke(app, ["fix", "all"])
+    assert result.exit_code == 1
+    assert "PRE_FLIGHT_FAILURE" in result.output
 
 
 def test_fix_non_numeric_issue(tmp_path, monkeypatch) -> None:
