@@ -802,6 +802,64 @@ def test_dispatch_ready_queue_without_on_terminal_still_isolates_failures() -> N
 
 
 # ---------------------------------------------------------------------------
+# Story 24.1-001: real-run seam — base-ref refresh before continuous dispatch
+# ---------------------------------------------------------------------------
+
+def test_parallel_real_run_refreshes_base_ref_before_dispatch(tmp_path, monkeypatch) -> None:
+    """A real parallel run (``dispatcher=None``) refreshes origin/main via the
+    ready-queue's ``before_batch`` hook, so new worktrees branch from the latest
+    merged state (#231, carried into continuous dispatch by Story 24.1-001).
+
+    Every real-repo seam is neutralized exactly like the serial real-run
+    reconcile test (fake dispatch, no HEAD reposition, worktree creation
+    degrades to the root, reconcile faked); the assertion is that the scheduler
+    routes ``_refresh_base_ref(Path.cwd())`` on the dispatcher-is-None branch —
+    injected-fake runs must never touch the real repo's refs."""
+    from pathlib import Path
+
+    from sdlc.build import WorktreeError
+    from sdlc.reconcile import ReconcileResult
+
+    # dispatcher=None → the real-run branches fire; route dispatch through the
+    # fake so no subprocess agents spawn.
+    monkeypatch.setattr("sdlc.build.dispatch_agent", ConcurrencyProbeDispatcher())
+
+    refreshed: list[Path] = []
+    monkeypatch.setattr(
+        "sdlc.build._refresh_base_ref", lambda root: refreshed.append(root)
+    )
+    # This test runs in the live repo cwd (no chdir): neutralize the remaining
+    # real-run git side effects so nothing touches the actual checkout.
+    monkeypatch.setattr("sdlc.build._reposition_head", lambda root: None)
+
+    def _no_worktree(root, story_id, run_id):
+        raise WorktreeError("worktree isolation disabled in test")
+
+    monkeypatch.setattr("sdlc.build.create_story_worktree", _no_worktree)
+
+    def _fake_reconcile(ledger, run_id, root=None, fetch=True):
+        return ReconcileResult(
+            run_id=run_id, reclassified=[],
+            run_status_before="DONE", run_status_after="DONE", fetched=False,
+        )
+
+    monkeypatch.setattr("sdlc.reconcile.reconcile_run", _fake_reconcile)
+
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, concurrency=2, auto=True)
+    result = run_build(
+        opts,
+        queue=_independent(2),
+        ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=None,
+        preflight=lambda: True,
+    )
+
+    assert result.completed == 2
+    assert refreshed, "before_batch never refreshed the base ref on a real run"
+    assert all(root == Path.cwd() for root in refreshed)
+
+
+# ---------------------------------------------------------------------------
 # Story 17.3-001: truthful `mode` + concurrency observability
 # ---------------------------------------------------------------------------
 
