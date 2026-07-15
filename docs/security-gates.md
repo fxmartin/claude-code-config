@@ -567,8 +567,8 @@ sees them; clean prompts pass through unchanged).
 - Supply-chain scanner module: `controller/src/sdlc/supply_chain_scan.py`
 - Supply-chain CLI: `sdlc supplychain [ROOT] [--allowlist .supply-chain-allowlist.yaml]`
 - Supply-chain allowlist: `.supply-chain-allowlist.yaml` (per-finding, path+line+pattern+sha256)
-- Gate prompt: `plugins/autonomous-sdlc/skills/build-stories/coverage-gate-prompt.md`
-- Bugfix prompt (dep remediation): `plugins/autonomous-sdlc/skills/build-stories/bugfix-agent-prompt.md`
+- Gate prompt: `plugins/autonomous-sdlc/skills/_shared/coverage-gate-prompt.md` (single-sourced, Story 27.1-003; symlinked from `build-stories/` and `fix-issue/`)
+- Bugfix prompt (dep remediation): `plugins/autonomous-sdlc/skills/_shared/bugfix-agent-prompt.md` (single-sourced, symlinked likewise)
 - Bats coverage: `tests/sast-scan.bats` (SAST), `tests/osv-scan.bats` (dependencies), `tests/gitleaks-secrets.bats` (secrets)
 - Stories: `docs/stories/epic-09-security-quality-gates.md` (Stories 9.1-001, 9.1-002, 9.2-001)
 - Deny baseline: `controller/src/sdlc/dispatch.py` (`DENY_BASELINE`, `resolve_deny_rules`, `SDLC_DENY_BASELINE`); story `docs/stories/epic-13-agent-runtime-security.md` (Story 13.1-001)

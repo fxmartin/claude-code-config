@@ -3270,6 +3270,15 @@ def render_merge_prompt(
         f"Merge the {abbr}{cr_terms.merge_cli_hint} for story {story.id}: "
         f"{story.title} ({abbr} #{pr_number}).\n"
         "Rebase before merge to absorb baseline drift, then emit the result block.\n"
+        # Run b8fdbc71 (story 27.1-003, merge attempt 3): the rebase restarted
+        # the PR's required checks; the agent handed the wait to a background
+        # watcher + scheduled wakeup and ended its turn with no result block.
+        # The wait must stay synchronous — a deferred block is a contract
+        # violation in the one-shot dispatch.
+        f"A rebase restarts the {abbr}'s required checks: wait for them with a "
+        "blocking foreground watch. If they are still running when you must "
+        'answer, report merge_status="FAILED" in the result block — never '
+        "hand the wait to a background task or scheduled wakeup.\n"
         # Story 12.3-003: surface a high-risk human-approval block additively so
         # the controller parks AWAITING_APPROVAL instead of entering the bugfix
         # loop (which cannot self-approve). The instruction below is part of the

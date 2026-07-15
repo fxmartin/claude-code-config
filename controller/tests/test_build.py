@@ -1970,6 +1970,34 @@ def test_prompts_show_verbatim_result_wrapper() -> None:
         assert "no markdown code fences" in p
 
 
+def test_result_wrapper_forbids_background_handoff() -> None:
+    """Run b8fdbc71 (story 27.1-003, merge attempt 3): the merge agent parked
+    its CI wait on a background watcher plus a scheduled wakeup and ended the
+    turn with no final text — in a one-shot headless dispatch the wakeup never
+    fires, so the response carried no result block at all and the stage failed
+    on a contract violation. The shared wrapper must spell the session model
+    out to every dispatched agent."""
+    from sdlc.contracts import _result_wrapper
+
+    wrapper = _result_wrapper("merge-agent-response.schema.json")
+    assert "one-shot" in wrapper
+    assert "background" in wrapper
+    assert "scheduled wakeup" in wrapper
+    assert "blocking foreground" in wrapper
+
+
+def test_merge_prompt_requires_synchronous_check_wait() -> None:
+    """The rebase the merge prompt mandates restarts the change request's
+    required checks; the agent must wait for them in the foreground and report
+    FAILED honestly if still pending — never defer to a background wait."""
+    from sdlc.build import render_merge_prompt
+
+    prompt = render_merge_prompt(_story("99.1-001"), 7)
+    assert "restarts" in prompt
+    assert "blocking foreground" in prompt
+    assert 'merge_status="FAILED"' in prompt
+
+
 def test_review_prompt_distrusts_implementer_report() -> None:
     """Story 26.2-002: the review-stage prompt treats the implementer's
     self-report as unverified claims and bounds off-diff exploration to a
