@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.20.0] - 2026-07-15
+
+### Added
+
+- feat: sdlc fix verb — single-issue controller pipeline (#436, pr 1/3) (#461)
+
+
 ## [v2.19.0] - 2026-07-15
 
 ### Added
