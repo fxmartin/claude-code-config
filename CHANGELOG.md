@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.18.1] - 2026-07-15
+
+### Fixed
+
+- fix(lens): ship the overengineering-lens.sh wrapper the config invokes (#457)
+
+
 ## [v2.18.0] - 2026-07-15
 
 ### Added
