@@ -31,6 +31,7 @@ import functools
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
@@ -54,7 +55,9 @@ from sdlc.build import (
     finalize_run,
     remove_story_worktree,
 )
+from sdlc import change_class
 from sdlc.cohort import Story
+from sdlc.commitlint import build_commit_header
 from sdlc.contracts import ContractError, _result_wrapper
 from sdlc.dispatch import (
     AgentDispatchError,
@@ -110,6 +113,11 @@ _E2E_GATE_MODES = {"off", "warn"}
 # The core pipeline stages driven in order after a READY investigation. Mirrors
 # build.py's ``_STAGES`` so the dashboard's pipeline columns line up.
 FIX_CORE_STAGES: tuple[str, ...] = ("build", "coverage", "review", "merge")
+
+# The ref a fix branch is cut from and diffed against (the build agent runs
+# ``git checkout -b feature/issue-<N> origin/main``). Story 27.2-003 classifies
+# the built diff against it to skip the coverage and E2E gates for docs-only fixes.
+_FIX_BASE_REF = "origin/main"
 
 # Labels that mean "do not auto-fix this" — a deliberate stop, not a failure.
 _WONTFIX_LABELS = {"wontfix", "won't fix", "wont-fix", "won't-fix"}
@@ -814,6 +822,98 @@ def _run_investigation(
     return "READY", result.data
 
 
+# ---------------------------------------------------------------------------
+# Story 27.2-003: docs-only change-class gate — skip coverage (Phase 5) and the
+# E2E warn-gate (Phase 7), mirroring the controller's build-stage skip (27.2-001)
+# ---------------------------------------------------------------------------
+
+
+def _fix_change_class(
+    issue: FixIssue, story: Story, ledger: Ledger, run_id: str, root: Path | None
+) -> str:
+    """Classify the built fix branch's diff as ``docs-only`` or ``code`` (27.2-003).
+
+    Deterministic: the changed files come from ``git diff --name-only`` on the
+    already-committed ``feature/issue-<N>`` branch (never the agent's self-report),
+    so the same verdict is reached on the original run and any resume — the same
+    conservative feed the build stage uses (Story 27.2-001), against the shared
+    docs-pattern list in :mod:`sdlc.change_class` (never a forked copy). Anything
+    but a non-empty all-docs diff — an empty/unreadable diff or a malformed
+    per-repo allowlist — classifies as ``code``, so a broken lookup only ever runs
+    *more* gates, never fewer. The verdict is recorded in the run events.
+    """
+    root = root or Path.cwd()
+    try:
+        patterns = change_class.load_docs_patterns(root=root)
+    except change_class.ChangeClassError as exc:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"change-class allowlist ignored ({exc}) — classifying as code",
+        )
+        return change_class.CODE
+    files = change_class.changed_files(
+        root, _FIX_BASE_REF, f"feature/issue-{issue.number}"
+    )
+    verdict = change_class.classify_files(files, patterns=patterns)
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"change class: {verdict} ({len(files)} changed file(s) vs {_FIX_BASE_REF})",
+    )
+    return verdict
+
+
+def _open_docs_only_pr(
+    issue: FixIssue, story: Story, ledger: Ledger, run_id: str, root: Path | None
+) -> int | None:
+    """Push the fix branch and open its PR deterministically for a docs-only skip.
+
+    On the docs-only path the coverage agent — which normally pushes the branch
+    and opens the PR — is never dispatched, so the controller does both itself via
+    plain git and the Epic-22/23 host adapter (GitHub/GitLab parity). The PR body
+    carries ``Closes #<N>`` so merging auto-closes the issue, exactly as the
+    coverage prompt instructs the agent to. Returns the PR number, or ``None`` on
+    any failure — the caller then falls back to the full coverage dispatch, so a
+    push/host hiccup can never strand a fix without a change request.
+    """
+    root = root or Path.cwd()
+    branch = f"feature/issue-{issue.number}"
+    try:
+        push = subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=root, capture_output=True, text=True, timeout=120,
+        )
+        if push.returncode != 0:
+            raise RuntimeError(push.stderr.strip() or "git push failed")
+        # Local import mirrors build.py's docs-only opener — keeps the host
+        # adapter off this module's hot import path.
+        from sdlc import issue_host
+
+        adapter = issue_host.get_adapter(issue_host.resolve_host(root))
+        title = build_commit_header(
+            ctype="docs",
+            scope=None,
+            subject=issue.title or f"fix issue #{issue.number}",
+            trailer=f" (#{issue.number})",
+        )
+        body = (
+            f"Docs-only fix for issue #{issue.number} — coverage gate skipped "
+            "(skip_reason=docs-only, Story 27.2-003).\n\n"
+            f"Closes #{issue.number}"
+        )
+        cr = adapter.cr_create(
+            branch, title, body,
+            target_branch=_FIX_BASE_REF.removeprefix("origin/"),
+        )
+        return int(cr.ref)
+    except Exception as exc:  # noqa: BLE001 — any failure degrades to full coverage
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"docs-only skip: deterministic PR open failed ({exc}) — falling back "
+            "to the full coverage dispatch",
+        )
+        return None
+
+
 def _run_stage_loop(
     issue: FixIssue,
     inv: dict,
@@ -823,6 +923,8 @@ def _run_stage_loop(
     run_id: str,
     dispatch,
     logs_dir: Path,
+    *,
+    root: Path | None = None,
 ) -> tuple[str, int | None]:
     """Drive build → coverage → review → merge with the bounded bugfix loop.
 
@@ -831,14 +933,48 @@ def _run_stage_loop(
     a successful fix; a merge blocked only by the high-risk approval gate
     short-circuits to ``AWAITING_APPROVAL`` before any recovery (it cannot
     self-approve). A rate-limit parks the run; a context overflow fails fast.
+
+    Story 27.2-003: a docs-only fix (every built file matches the shared docs
+    patterns) skips the coverage dispatch — the controller pushes the branch and
+    opens the PR itself, recording the skip with its ``docs-only`` reason — and
+    skips the advisory E2E warn-gate; the review and the merge run unchanged.
+    ``root`` is the checkout the branch was built in (its diff feed and push
+    origin); ``None`` falls back to the current working directory.
     """
     stages = [s for s in FIX_CORE_STAGES if not (s == "coverage" and opts.skip_coverage)]
     ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
     pr_number: int | None = None
     bugfix_seq = 0
     escalate = _fix_escalates(inv, issue.labels)
+    # The fix's change class (docs-only vs code), classified lazily from the built
+    # branch's real diff at the first gated stage. None until build has produced a
+    # branch to classify (so a resume re-derives the same verdict from the same diff).
+    story_class: str | None = None
 
     for stage in stages:
+        # Story 27.2-003: classify once, post-build, when the first gated stage is
+        # reached (coverage, or review when coverage was skipped/absent).
+        if stage in ("coverage", "review") and story_class is None:
+            story_class = _fix_change_class(issue, story, ledger, run_id, root)
+        if stage == "coverage" and story_class == change_class.DOCS_ONLY:
+            pr = pr_number if pr_number is not None else _open_docs_only_pr(
+                issue, story, ledger, run_id, root
+            )
+            if pr is not None:
+                pr_number = pr
+                ledger.set_story_pr(run_id, story.id, pr_number)
+                ledger.stage_start(run_id, story.id, stage, 1, model=None)
+                ledger.stage_finish(
+                    run_id, story.id, stage, 1, "SKIPPED", "docs-only"
+                )
+                ledger.event_log(
+                    run_id, story.id, "info", "controller",
+                    f"coverage skipped (skip_reason=docs-only): every changed file "
+                    f"matches the docs patterns; PR #{pr_number} opened by the controller",
+                )
+                continue
+            # The deterministic PR open failed — never strand the fix without a
+            # PR: fall through to the full coverage dispatch.
         attempt = 1
         bugfix_attempts = 0
         while True:
@@ -875,10 +1011,12 @@ def _run_stage_loop(
                 if pr_number is not None:
                     ledger.set_story_pr(run_id, story.id, pr_number)
                 # The E2E warn-gate runs after review passes and before merge (skill
-                # Phase 7). It is advisory: a miss is logged and merge proceeds.
+                # Phase 7). It is advisory: a miss is logged and merge proceeds. A
+                # docs-only fix skips it (Story 27.2-003), recorded as a skip.
                 if stage == "review":
                     _run_e2e(
-                        issue, story, pr_number, opts, ledger, run_id, dispatch, logs_dir
+                        issue, story, pr_number, opts, ledger, run_id, dispatch, logs_dir,
+                        docs_only=story_class == change_class.DOCS_ONLY,
                     )
                 break
 
@@ -970,6 +1108,8 @@ def _run_e2e(
     run_id: str,
     dispatch,
     logs_dir: Path,
+    *,
+    docs_only: bool = False,
 ) -> None:
     """Advisory E2E warn-gate — a FAIL logs a warning and never blocks (issue #436).
 
@@ -977,11 +1117,24 @@ def _run_e2e(
     gate is deliberately advisory in this migration: a FAIL, a SKIP, or any
     dispatch/contract error is logged and the pipeline proceeds to merge — it never
     routes to the bugfix loop and never changes the run's terminal status.
+
+    Story 27.2-003: a docs-only fix skips the gate — recorded as a ``SKIPPED``
+    stage with its ``docs-only`` reason (never a passed gate), only when the gate
+    was actually enabled (``warn``); with the gate off there is nothing to skip.
     """
     if opts.e2e_gate != "warn":
         return
     model = fix_model("e2e", opts)
     tpath = logs_dir / f"{story.id}-e2e-1.log"
+    if docs_only:
+        ledger.stage_start(run_id, story.id, "e2e", 1, model=None)
+        ledger.stage_finish(run_id, story.id, "e2e", 1, "SKIPPED", "docs-only")
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            "e2e skipped (skip_reason=docs-only): every changed file matches the "
+            "docs patterns",
+        )
+        return
     try:
         ledger.stage_start(run_id, story.id, "e2e", 1, model=model)
         prompt = render_e2e_prompt(issue, pr_number)
@@ -1106,7 +1259,7 @@ def run_fix(
 
     # --- Core stage loop ------------------------------------------------------
     terminal, pr_number = _run_stage_loop(
-        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir
+        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root
     )
 
     # --- Summary (best-effort, only when the fix actually landed) -------------
@@ -1651,6 +1804,7 @@ def run_fix_batch(
         entry = ready[story.id]
         opts = _issue_options(batch, entry.issue.number)
         issue_dispatch = dispatch
+        workdir: Path | None = None
         # Isolate a real concurrent issue in its own worktree so peers never
         # collide in the shared checkout (mirrors run_build's _prepare_story_workdir).
         if real_run and workers > 1:
@@ -1665,7 +1819,8 @@ def run_fix_batch(
                     f"worktree isolation unavailable ({exc}); building in the repo root",
                 )
         terminal, pr_number = _run_stage_loop(
-            entry.issue, entry.inv, story, opts, ledger, run_id, issue_dispatch, logs_dir
+            entry.issue, entry.inv, story, opts, ledger, run_id, issue_dispatch, logs_dir,
+            root=workdir or Path.cwd(),
         )
         if terminal == "DONE":
             _run_summary(

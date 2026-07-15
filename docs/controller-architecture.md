@@ -22,7 +22,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/capability.py` | Harness capability resolution, optional CLI probe, and the preflight mode decision (Story 20.5-001). |
 | `sdlc/degradation.py` | Centralized degradation matrix — maps capability gaps to safe fallbacks (parallel→serial, usage "unavailable", rate-limit skipped) (Story 20.5-002). |
 | `sdlc/role_routing.py` | Per-role harness routing — maps build/coverage/review/merge/docs to harnesses, fails fast on unknown/disabled (Story 20.2-001). |
-| `sdlc/change_class.py` | Deterministic change-class detection — classifies a story's built diff as `docs-only` vs `code` from `git diff --name-only`, so docs-only stories skip the coverage dispatch and the adversarial slot (Story 27.2-001). |
+| `sdlc/change_class.py` | Deterministic change-class detection — classifies a built diff as `docs-only` vs `code` from `git diff --name-only`, so docs-only `build-stories` skip the coverage dispatch and the adversarial slot (Story 27.2-001) and docs-only `sdlc fix` runs skip coverage + the E2E gate (Story 27.2-003). |
 | `sdlc/portability.py` | The in-process-agent boundary — cross-harness vs Claude-only skills, with a fail-fast guard pointing at the boundary doc (Story 20.6-002). |
 | `sdlc/discovery.py` | Reads stories from the markdown epic files into the queue. |
 | `sdlc/contracts.py` | JSON-schema parse + validation (Story 7.2-001). |
@@ -160,6 +160,16 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    conservative: any non-docs file, an empty/unreadable diff, a malformed
    allowlist, or a failed deterministic PR open falls back to the full gate
    chain — a broken lookup can only ever run *more* gates, not fewer.
+
+   **Fix-issue mirror (Story 27.2-003).** `sdlc fix` applies the same tiering
+   from the same shared docs-pattern list (`sdlc/change_class.py`, never a
+   forked copy): after the build stage it classifies the `feature/issue-<N>`
+   diff against `origin/main`, and a `docs-only` fix skips the **coverage
+   dispatch** (Phase 5) — the controller pushes the branch and opens the PR
+   itself with `Closes #<N>` in the body — and the advisory **E2E warn-gate**
+   (Phase 7, only when `--e2e-gate=warn` is set); both are recorded as `SKIPPED`
+   with `failure_category` `docs-only`. The review (Phase 6) and the merge run
+   unchanged, and every failure mode falls back to the full chain identically.
 
    **Branch isolation (Story 12.4-001).** The build prompt
    (`render_build_prompt`) cuts the story branch from a freshly-fetched remote
