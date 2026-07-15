@@ -1847,12 +1847,20 @@ The shipped default profile is **Balanced**:
 | `build` | Sonnet | points ≥ threshold (8) — see the resume-determinism note below |
 | `coverage` | Sonnet | — (tests need correctness) |
 | `review` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold |
-| `adversarial` | **Opus** | **pinned — never downgraded, in any profile** |
+| `adversarial` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold — an Opus **floor**, not a pin (Story 27.2-002) |
 | `merge` | Haiku | — (mechanical) |
+
+The adversarial skeptic's Opus is a **floor tierable downward for low-risk only**
+(Story 27.2-002): a low-risk story (points below threshold, no high-risk flag)
+runs it on Sonnet, but a high-risk or large story keeps Opus. Tiering can never
+downgrade a high-risk story below the floor. When the review slot resolves to an
+external reviewer (the Codex CLI backend in `config/adversarial-reviewers.yaml`)
+there is no model choice to tier — the reviewer owns its own runtime.
 
 Two documented alternatives ship alongside it: **Quality-first** (Opus
 everywhere) and **Quota-max** (cheapest everywhere, with the adversarial skeptic
-still pinned to Opus and a higher escalation bar). A per-repo
+tiered to Sonnet on low-risk work but keeping its Opus floor on high-risk / large
+stories, and a higher escalation bar). A per-repo
 `.sdlc-model-routing.yaml` additively overrides the chosen profile's stage map,
 points threshold, or escalation model — mirroring `risk_gate.py`'s
 `.sdlc-risk-config.yaml` convention. A missing file is a silent no-op; a
@@ -1870,7 +1878,7 @@ override is accepted for — is exactly this routed set (`build`, `coverage`,
 `review`, `merge`, `bugfix`, `reask`); `discovery` and `adversarial` are
 dispatched outside this pipeline, so an override for them is a hard error rather
 than a silent no-op (the profile map still defines their tiers for `select_model`
-and the adversarial Opus pin). Precedence, highest first:
+and the adversarial Opus floor). Precedence, highest first:
 
 1. an explicit per-stage `--model-<stage>=<model>` flag (the escape hatch);
 2. a `SDLC_AGENT_CMD` override — the custom command owns its own model, so the

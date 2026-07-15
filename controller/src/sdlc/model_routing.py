@@ -42,38 +42,42 @@ class ModelRoutingConfig:
     default. ``escalatable_stages`` are the stages that escalate to
     ``escalation_model`` when a story is high-risk or large (points ≥
     ``points_threshold``). ``pinned_stages`` always run on ``escalation_model``
-    regardless of profile or signal — the adversarial skeptic is never cheapened
-    (Story 14.2-001). The dataclass is frozen so a shared profile constant can be
-    handed around without any caller mutating it; overrides build a new instance
-    via :func:`dataclasses.replace`.
+    regardless of profile or signal (Story 14.2-001) — a still-supported
+    mechanism, though no shipped profile pins a stage after Story 27.2-002 moved
+    the adversarial skeptic from pinned to escalatable: its Opus is now a *floor*
+    paid only on high-risk / large stories, so a low-risk story tiers it down.
+    The dataclass is frozen so a shared profile constant can be handed around
+    without any caller mutating it; overrides build a new instance via
+    :func:`dataclasses.replace`.
     """
 
     profile: str
     stage_models: dict[str, str]
     points_threshold: int
     escalation_model: str = OPUS
-    escalatable_stages: frozenset[str] = frozenset({"build", "review"})
-    pinned_stages: frozenset[str] = frozenset({"adversarial"})
+    escalatable_stages: frozenset[str] = frozenset({"build", "review", "adversarial"})
+    pinned_stages: frozenset[str] = frozenset()
 
 
 # --- Built-in profiles ------------------------------------------------------
 #
 # Balanced is the shipped default: each stage on the cheapest tier that holds
-# quality, with build/review escalating to Opus on a high-risk or large story
-# and the adversarial skeptic pinned to Opus. Quality-first and Quota-max are the
-# documented alternatives (all-Opus, and cheapest-everywhere-but-pinned-skeptic).
+# quality, with build/review/adversarial escalating to Opus on a high-risk or
+# large story (the adversarial skeptic's Opus is a *floor*, not a pin — Story
+# 27.2-002 — so a low-risk story runs it on Sonnet). Quality-first and Quota-max
+# are the documented alternatives (all-Opus, and cheapest-everywhere).
 
 BALANCED = ModelRoutingConfig(
     profile="balanced",
     stage_models={
-        "discovery": HAIKU,   # structured extraction (parse epics → queue)
-        "build": SONNET,      # → Opus on high-risk / large (escalatable)
-        "coverage": SONNET,   # tests need correctness
-        "review": SONNET,     # → Opus on high-risk (escalatable)
-        "adversarial": OPUS,  # pinned — never downgraded
-        "merge": HAIKU,       # mechanical: fetch/resolve/PR/merge
-        "bugfix": SONNET,     # base tier; per-attempt escalation is Story 14.2-003
-        "reask": HAIKU,       # cheap envelope-only re-ask
+        "discovery": HAIKU,     # structured extraction (parse epics → queue)
+        "build": SONNET,        # → Opus on high-risk / large (escalatable)
+        "coverage": SONNET,     # tests need correctness
+        "review": SONNET,       # → Opus on high-risk (escalatable)
+        "adversarial": SONNET,  # → Opus floor on high-risk / large (27.2-002)
+        "merge": HAIKU,         # mechanical: fetch/resolve/PR/merge
+        "bugfix": SONNET,       # base tier; per-attempt escalation is Story 14.2-003
+        "reask": HAIKU,         # cheap envelope-only re-ask
     },
     points_threshold=8,
 )
@@ -100,7 +104,8 @@ QUOTA_MAX = ModelRoutingConfig(
         "build": HAIKU,
         "coverage": HAIKU,
         "review": HAIKU,
-        "adversarial": OPUS,  # still pinned — the skeptic is never cheapened
+        "adversarial": SONNET,  # → Opus floor on high-risk / large (27.2-002);
+                                # never below Sonnet — the skeptic's cheap floor
         "merge": HAIKU,
         "bugfix": HAIKU,
         "reask": HAIKU,
@@ -150,10 +155,14 @@ def select_model(
     in the map — in both cases the dispatcher adds no ``--model`` and the CLI
     default (Opus today) stands, so behaviour is unchanged (Story 14.2-001 AC).
 
-    A pinned stage (adversarial) always returns ``escalation_model`` regardless
-    of profile or signal. An escalatable stage (build/review) returns
+    A pinned stage always returns ``escalation_model`` regardless of profile or
+    signal (no shipped profile pins a stage; the mechanism stays for overrides /
+    future profiles). An escalatable stage (build/review/adversarial) returns
     ``escalation_model`` when the story is high-risk or large (``points ≥
-    points_threshold``); otherwise its mapped default tier.
+    points_threshold``); otherwise its mapped default tier. The adversarial
+    skeptic is escalatable so its Opus is a *floor* — paid on high-risk / large
+    stories, tiered down to its cheap base (Sonnet) for a low-risk story (Story
+    27.2-002); tiering can never downgrade a high-risk story below the floor.
     """
     if config is None:
         return None
