@@ -203,6 +203,30 @@ def test_gitlab_cr_view_parses_mr_meta() -> None:
     assert cr.target_branch == "main"
 
 
+def test_base_adapter_cr_view_raises_issue_host_error() -> None:
+    """A backend without a cr_view implementation raises IssueHostError, which
+    the best-effort packet builder degrades to the fetch-it-yourself fallback
+    (deliberately not abstract — mirrors cr_checks, Story 25.1-001)."""
+    runner = _Runner("{}")
+    adapter = ih.GitHubAdapter(runner=runner)
+    with pytest.raises(ih.IssueHostError, match="does not implement cr_view"):
+        ih.IssueHostAdapter.cr_view(adapter, "7")
+    # The base fallback never shells out to the host CLI.
+    assert runner.calls == []
+
+
+def test_github_cr_view_empty_payload_raises() -> None:
+    runner = _Runner("")
+    with pytest.raises(ih.IssueHostError, match="gh pr view 7 returned no change request"):
+        ih.GitHubAdapter(runner=runner).cr_view("7")
+
+
+def test_gitlab_cr_view_empty_payload_raises() -> None:
+    runner = _Runner("")
+    with pytest.raises(ih.IssueHostError, match="glab mr view 5 returned no change request"):
+        ih.GitLabAdapter(runner=runner).cr_view("5")
+
+
 # --- CLI verb ------------------------------------------------------------------
 
 runner = CliRunner()
