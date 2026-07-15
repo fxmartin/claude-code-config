@@ -748,3 +748,14 @@ def test_load_schema_is_cached() -> None:
     schema_a = load_schema("build")
     schema_b = load_schema("build")
     assert schema_a is schema_b
+
+
+# ---------------------------------------------------------------------------
+# QA gate (issue #436): investigation array-field edge case
+# ---------------------------------------------------------------------------
+
+def test_investigation_files_to_modify_empty_array_is_valid() -> None:
+    """An empty files_to_modify (no files pinpointed yet) is a valid response."""
+    data = dict(VALID_RESPONSES["investigation"])
+    data["files_to_modify"] = []
+    assert validate_response("investigation", data) == data

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from sdlc.dispatch import AgentDispatchError, AgentResult, RateLimitError
+from sdlc.dispatch import AgentDispatchError, AgentResult, ContextOverflowError, RateLimitError
 from sdlc.fix_issue import (
     FIX_STAGE_MODELS,
     FixConfigError,
@@ -655,3 +655,253 @@ def test_parse_fix_args_unknown_flag() -> None:
 def test_parse_fix_args_extra_positional() -> None:
     with pytest.raises(FixConfigError, match="extra argument"):
         parse_fix_args(["1", "2"])
+
+
+# ---------------------------------------------------------------------------
+# QA gate (issue #436): additional coverage for stop-condition helper edges,
+# fail-fast paths, best-effort notify/summary phases, and the core-stage
+# contract/dispatch-error branches of the bugfix loop.
+# ---------------------------------------------------------------------------
+
+
+def test_current_gh_user_exception_does_not_block_assignee_check() -> None:
+    """A ``gh api user`` runner exception is swallowed — never blocks the check."""
+    issue = FixIssue(1, "t", "b", "open", ("someone-else",), ())
+
+    def raising_runner(argv, timeout=None):
+        raise RuntimeError("gh not authenticated")
+
+    assert stop_reason(issue, runner=raising_runner) is None
+
+
+def test_current_gh_user_nonzero_exit_does_not_block_assignee_check() -> None:
+    """A non-zero ``gh api user`` exit is swallowed — never blocks the check."""
+    issue = FixIssue(1, "t", "b", "open", ("someone-else",), ())
+
+    def failing_runner(argv, timeout=None):
+        return RunResult(1, "", "not authenticated")
+
+    assert stop_reason(issue, runner=failing_runner) is None
+
+
+def test_detect_agent_type_unreadable_package_json_falls_through(tmp_path, monkeypatch) -> None:
+    """An unreadable package.json is treated as absent, not a crash."""
+    (tmp_path / "package.json").write_text('{"dependencies":{}}', encoding="utf-8")
+
+    def raise_oserror(self, encoding=None, errors=None):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "read_text", raise_oserror)
+    assert detect_agent_type(tmp_path) == "general-purpose"
+
+
+def test_run_fix_context_overflow_fails_fast(tmp_path) -> None:
+    """A context-window overflow fails the stage immediately — no bugfix retry."""
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(
+        overrides={"build": ContextOverflowError("prompt is too long")}
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "FAILED"
+    assert dispatch.counts["build"] == 1
+    assert "bugfix" not in dispatch.agents()
+
+
+def test_run_fix_summary_failure_is_non_fatal(tmp_path) -> None:
+    """A crashing summary agent never fails an otherwise-DONE fix run."""
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(
+        overrides={"summary": AgentDispatchError("summary agent crashed")}
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert dispatch.counts["summary"] == 1
+
+
+def test_run_fix_core_stage_contract_error_enters_bugfix_loop(tmp_path) -> None:
+    """A schema-validation miss on a core stage retries through the bugfix loop."""
+    from sdlc.contracts import SchemaValidationError
+
+    gh = FakeGh(_issue_json())
+
+    def review_script(n):
+        if n == 0:
+            raise SchemaValidationError("review response missing final_status")
+        return _default_payload("review")
+
+    dispatch = RecordingDispatcher(overrides={"review": review_script})
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert dispatch.counts["review"] == 2
+    assert dispatch.counts["bugfix"] == 1
+
+
+def test_run_fix_core_stage_dispatch_error_enters_bugfix_loop(tmp_path) -> None:
+    """An infrastructure dispatch error on a core stage retries through bugfix."""
+    gh = FakeGh(_issue_json())
+
+    def coverage_script(n):
+        if n == 0:
+            raise AgentDispatchError("agent timed out")
+        return _default_payload("coverage")
+
+    dispatch = RecordingDispatcher(overrides={"coverage": coverage_script})
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert dispatch.counts["coverage"] == 2
+    assert dispatch.counts["bugfix"] == 1
+
+
+def test_run_fix_bugfix_dispatch_error_fails(tmp_path) -> None:
+    """The bugfix agent itself crashing exhausts to FAILED, not a retry loop."""
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(
+        overrides={
+            "build": {"branch_name": "feature/issue-1", "build_status": "FAILED",
+                      "commit_sha": "x", "error_summary": "boom"},
+            "bugfix": AgentDispatchError("bugfix agent crashed"),
+        }
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "FAILED"
+    assert dispatch.counts["build"] == 1
+    assert dispatch.counts["bugfix"] == 1
+
+
+def test_run_fix_investigation_blocked_empty_payload_default_reason(tmp_path) -> None:
+    """A BLOCKED investigation with no reason fields falls back to a default."""
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(overrides={"investigation": {}})
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.investigation_blocked is True
+    assert result.block_reason == "no reason reported"
+
+
+def test_run_fix_notify_run_started_failure_is_non_fatal(tmp_path, monkeypatch) -> None:
+    """A crashing ``run_started`` notify call never blocks the fix run."""
+    import sdlc.fix_issue as fix_issue_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(fix_issue_module, "notify", boom)
+    gh = FakeGh(_issue_json())
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+
+
+def test_run_fix_close_early_notify_and_render_failures_are_non_fatal(
+    tmp_path, monkeypatch
+) -> None:
+    """A blocked-investigation close-out survives crashing notify/render_view calls."""
+    import sdlc.fix_issue as fix_issue_module
+
+    def boom_notify(*args, **kwargs):
+        raise RuntimeError("telegram down")
+
+    def boom_render(run_id):
+        raise RuntimeError("dashboard render failed")
+
+    monkeypatch.setattr(fix_issue_module, "notify", boom_notify)
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(
+        overrides={"investigation": {"investigation_status": "BLOCKED"}}
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+        render_view=boom_render,
+    )
+    assert result.investigation_blocked is True
+    assert result.status == "ABORTED"
+
+
+def test_run_fix_summary_failure_ledger_logging_also_fails_is_swallowed(tmp_path) -> None:
+    """A double fault — summary crashes AND logging that failure also crashes —
+    is swallowed too (the inner best-effort guard), never propagating."""
+
+    class _FlakyLedger:
+        """Delegates to a real Ledger, but raises on the summary-FAILED write."""
+
+        def __init__(self, real: Ledger) -> None:
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def stage_finish(self, run_id, story_id, stage_name, attempt, status,
+                          failure_category="", output_path=""):
+            if stage_name == "summary" and status == "FAILED":
+                raise RuntimeError("ledger write failed")
+            return self._real.stage_finish(
+                run_id, story_id, stage_name, attempt, status, failure_category, output_path
+            )
+
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(
+        overrides={"summary": AgentDispatchError("summary agent crashed")}
+    )
+    ledger = _FlakyLedger(_ledger(tmp_path))
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=ledger,
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert dispatch.counts["summary"] == 1
