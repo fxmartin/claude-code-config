@@ -193,7 +193,7 @@ jobs:
         run: |
           bats --version
           jq --version
-          bats tests/notify-telegram.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/fix-issue-skill-split.bats tests/risk-gate.bats tests/codex-adversarial-review.bats tests/codex-build-adapter.bats tests/sast-scan.bats tests/osv-scan.bats tests/gitleaks-secrets.bats tests/supply-chain-scan.bats tests/hook-profile.bats tests/on-pr-merge-docs.bats tests/gitlab-ci-template.bats tests/gitlab-ci-release.bats tests/deploy.bats tests/reviewer-distrust.bats
+          bats tests/notify-telegram.bats tests/install-dry-run.bats tests/smoke-test.bats tests/plugin-install-paths.bats tests/fix-issue-skill-split.bats tests/risk-gate.bats tests/codex-adversarial-review.bats tests/codex-build-adapter.bats tests/sast-scan.bats tests/osv-scan.bats tests/gitleaks-secrets.bats tests/supply-chain-scan.bats tests/hook-profile.bats tests/on-pr-merge-docs.bats tests/gitlab-ci-template.bats tests/gitlab-ci-release.bats tests/deploy.bats tests/reviewer-distrust.bats tests/performance-baseline-doc.bats
 
   controller-smoke:
     name: Controller CLI smoke test (uv tool install)
