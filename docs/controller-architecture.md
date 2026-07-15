@@ -166,6 +166,16 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    means a genuinely-incomplete story now FAILS honestly instead of silently
    shipping, and close-out reconciliation (step 9) is what still rescues work that
    *truly* landed.
+
+   **Story-section injection (Story 27.3-002).** The build and coverage prompts
+   embed the story's own epic section under a `## Story Specification` block —
+   captured verbatim by the discovery parser (`parse_epic_file`, header line
+   through the line before the next heading) and carried on `Story.section` —
+   replacing the "Read the epic file and find the story" instruction, so the
+   agent stops burning turns re-reading and searching the full epic. A section
+   over `STORY_SECTION_MAX_CHARS` (8k chars), or an empty one (synthesized
+   fix-issue stories), falls back to the read-it-yourself instruction — a
+   truncated spec is never injected.
 5. **Envelope re-ask** — a stage that exits cleanly but omits or malforms its
    `<<<RESULT_JSON>>>` block (a `ContractError`) usually means the agent did good
    work and failed only to wrap it. Before any heavier recovery, the controller
