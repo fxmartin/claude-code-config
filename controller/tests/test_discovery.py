@@ -74,6 +74,106 @@ def test_discover_queue_unknown_epic_returns_empty(tmp_path, monkeypatch) -> Non
     assert discover_queue("epic-77") == []
 
 
+# --- Story 27.3-002: section capture for prompt injection --------------------
+
+
+def test_parse_epic_file_captures_story_section_verbatim(tmp_path) -> None:
+    """Each story carries its own markdown section, header line included."""
+    epic = _write_epic(tmp_path)
+    stories = parse_epic_file(epic)
+    assert stories[0].section == (
+        "##### Story 99.1-001: First story\n"
+        "**Priority**: P1\n"
+        "**Points**: 2\n"
+        "**Dependencies**: None.\n"
+        "\n"
+        "Body text."
+    )
+    assert stories[1].section.startswith("##### Story 99.1-002: Second story")
+    assert stories[1].section.endswith("More body.")
+
+
+def test_story_section_stops_at_non_story_heading(tmp_path) -> None:
+    """A feature/epic-level heading ends the section — it never leaks in."""
+    stories_dir = tmp_path / "docs" / "stories"
+    stories_dir.mkdir(parents=True)
+    epic = stories_dir / "epic-98-sample.md"
+    epic.write_text(
+        "# Epic 98: Sample\n\n"
+        "##### Story 98.1-001: Only story\n"
+        "**Priority**: P1\n"
+        "**Risk Level**: Low\n\n"
+        "## Verification & Exit Measurements\n\n"
+        "Post-epic prose that belongs to the epic, not the story.\n",
+        encoding="utf-8",
+    )
+    (story,) = parse_epic_file(epic)
+    assert story.section.endswith("**Risk Level**: Low")
+    assert "Verification" not in story.section
+    assert "Post-epic prose" not in story.section
+
+
+def test_story_metadata_still_parsed_after_section_ends(tmp_path) -> None:
+    """Metadata after a section-ending heading still feeds the Story record.
+
+    Section capture stops at the first non-story heading, but done-detection
+    (DoD boxes) keeps scanning until the next story header — the two loops are
+    deliberately independent (Story 27.3-002).
+    """
+    stories_dir = tmp_path / "docs" / "stories"
+    stories_dir.mkdir(parents=True)
+    epic = stories_dir / "epic-97-sample.md"
+    epic.write_text(
+        "# Epic 97: Sample\n\n"
+        "##### Story 97.1-001: Only story\n"
+        "**Priority**: P1\n\n"
+        "###### Definition of Done\n"
+        "- [x] Shipped\n"
+        "- [x] Verified\n",
+        encoding="utf-8",
+    )
+    (story,) = parse_epic_file(epic)
+    assert story.done is True
+    assert story.section.endswith("**Priority**: P1")
+    assert "Definition of Done" not in story.section
+
+
+def test_story_section_survives_headings_inside_code_fences(tmp_path) -> None:
+    """A `# heading`-looking line inside a fenced code block never ends capture.
+
+    Real regression: epic-05 story 5.3-001 embeds a ```markdown example whose
+    first line is `# Changelog` — the pre-fix parser stopped there and silently
+    injected a spec truncated mid-code-block, exactly what the size-cap fallback
+    exists to prevent (Story 27.3-002 AC2: no truncated specs ever injected).
+    """
+    stories_dir = tmp_path / "docs" / "stories"
+    stories_dir.mkdir(parents=True)
+    epic = stories_dir / "epic-96-sample.md"
+    epic.write_text(
+        "# Epic 96: Sample\n\n"
+        "##### Story 96.1-001: Only story\n"
+        "**Priority**: P1\n\n"
+        "Format example:\n\n"
+        "```markdown\n"
+        "# Changelog\n"
+        "## [Unreleased]\n"
+        "```\n\n"
+        "```bash\n"
+        "# a shell comment, not a heading\n"
+        "echo ok\n"
+        "```\n\n"
+        "**Risk Level**: Low\n\n"
+        "## Verification\n\n"
+        "Epic-level prose.\n",
+        encoding="utf-8",
+    )
+    (story,) = parse_epic_file(epic)
+    assert "# Changelog" in story.section
+    assert "# a shell comment, not a heading" in story.section
+    assert story.section.endswith("**Risk Level**: Low")
+    assert "Epic-level prose" not in story.section
+
+
 # --- R5: Story Points, and R4: done-detection -------------------------------
 
 _EPIC_34_LIKE = """# Epic 34: User Management

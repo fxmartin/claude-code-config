@@ -2906,8 +2906,28 @@ def _record_degradations(ledger: "Ledger", run_id: str, requested_mode: str) -> 
 
 
 # ---------------------------------------------------------------------------
-# Prompt rendering (kept terse — the agent reads the epic file itself)
+# Prompt rendering (kept terse — the story spec is embedded when available)
 # ---------------------------------------------------------------------------
+
+# Story 27.3-002: cap on the embedded story section. A section over this size
+# falls back to the read-it-yourself instruction — a truncated spec is never
+# injected. Real story sections run ~1-3k chars, so the cap only trips on
+# degenerate epics.
+STORY_SECTION_MAX_CHARS = 8_000
+
+
+def _story_section_block(story: Story) -> str:
+    """The embedded story-specification block, or ``""`` when unavailable.
+
+    Empty when the story carries no captured section (synthesized fix-issue
+    stories, hand-built test stories) or when the section exceeds
+    :data:`STORY_SECTION_MAX_CHARS` — both fall back to today's read-the-epic
+    prompt so the agent never works from a truncated spec (Story 27.3-002).
+    """
+    if not story.section or len(story.section) > STORY_SECTION_MAX_CHARS:
+        return ""
+    return f"## Story Specification (from {story.epic_file})\n\n{story.section}\n\n"
+
 
 def render_build_prompt(
     story: Story,
@@ -2972,11 +2992,23 @@ def render_build_prompt(
         subject=story.title,
         trailer=f" (#{story.id})",
     )
+    # Story 27.3-002: embed the story's own epic section (captured at
+    # discovery-parse time) so the build agent stops burning turns re-reading
+    # and searching the full epic file. Oversized/missing sections keep the
+    # read-it-yourself instruction — never a truncated spec.
+    section_block = _story_section_block(story)
+    spec_step = (
+        "2. The full story specification is embedded above — implement exactly "
+        "what it specifies; do not re-read the epic file\n"
+        if section_block
+        else f"2. Read {story.epic_file} and find the full story section for {story.id}\n"
+    )
     return (
         f"You are building story {story.id}: {story.title}\n"
         f"Epic: {story.epic_name} (from {story.epic_file})\n"
         f"Priority: {story.priority}\n\n"
-        "## Instructions\n"
+        + section_block
+        + "## Instructions\n"
         # Story 12.4-001: cut the branch from a freshly-fetched base ref
         # (``base_ref`` — the host default branch, Story 23.2-001 AC3; ``origin/main``
         # by default), not from whatever HEAD happens to be checked out. A base-less
@@ -2989,8 +3021,8 @@ def render_build_prompt(
         # currently checked-out branch (typically main). Fail the build immediately.
         f"   If branch creation fails for any reason, emit BUILD_STATUS: FAILED "
         "immediately and do not commit on the current branch or any other branch.\n"
-        f"2. Read {story.epic_file} and find the full story section for {story.id}\n"
-        "3. Follow TDD: write failing tests first, then implement\n"
+        + spec_step
+        + "3. Follow TDD: write failing tests first, then implement\n"
         "4. Run all quality gates (tests, types, lint, security)\n"
         "5. Commit with this exact, conventional-commit-compliant message — do "
         f"not alter it:\n   {commit_header}\n"
@@ -3043,10 +3075,15 @@ def render_coverage_prompt(
     # Story 22.4-002: the coverage agent opens the change request on the default
     # path, so the close-link rides here; empty when the story has no mapped issue.
     # Story 23.2-001: ``cr_terms`` picks the host noun/CLI (PR via gh / MR via glab).
+    # Story 27.3-002: embed the story's own epic section (same treatment as the
+    # build prompt) so the coverage agent has the spec without re-reading the
+    # epic; empty/oversized sections leave the prompt unchanged.
+    section_block = _story_section_block(story)
     return (
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
-        "Fetch the branch, fill coverage gaps, then commit with this exact, "
+        + section_block
+        + "Fetch the branch, fill coverage gaps, then commit with this exact, "
         "conventional-commit-compliant message — do not alter it:\n"
         f"   {commit_header}\n"
         f"Push, open the {cr_terms.abbr}{cr_terms.cli_hint}, then emit the result block.\n"

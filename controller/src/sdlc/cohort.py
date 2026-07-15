@@ -27,6 +27,12 @@ class Story:
     # checked). The build skips these by default so an epic-scoped run never
     # re-opens merged work — see run_build's done-skip and `--rebuild`.
     done: bool = False
+    # The story's own markdown section (header line through the line before the
+    # next heading), captured at discovery-parse time so the build/coverage
+    # prompts can embed the spec instead of sending the agent to re-read the
+    # epic (Story 27.3-002). Empty for synthesized stories (fix-issue) — the
+    # renderers then fall back to the read-it-yourself instruction.
+    section: str = ""
 
 
 def compute_cohorts(queue: list[Story]) -> list[list[Story]]:

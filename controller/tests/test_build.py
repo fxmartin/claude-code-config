@@ -3348,6 +3348,108 @@ def test_build_prompt_cuts_branch_from_supplied_base_ref() -> None:
     assert "git checkout -b feature/23.2-001 origin/develop" in prompt
 
 
+# Story 27.3-002: the story's own epic section is embedded into the build and
+# coverage prompts (replacing the read-the-epic instruction); oversized or
+# missing sections fall back to today's read-it-yourself prompt — a truncated
+# spec is never injected.
+
+_SECTION_27 = (
+    "##### Story 27.3-002: Story-section injection\n"
+    "**Priority**: Must Have\n"
+    "**Story Points**: 3\n\n"
+    "**Acceptance Criteria**:\n"
+    "- **Given** the parsed epic **Then** the section is embedded verbatim\n\n"
+    "**Dependencies**: None\n"
+    "**Risk Level**: Medium"
+)
+
+
+def _sectioned_story(section: str = _SECTION_27) -> Story:
+    return Story(
+        "27.3-002", "Story-section injection", "27",
+        "performance-token-optimization", "docs/stories/epic-27.md",
+        "Must", 3, "py", [], False, section,
+    )
+
+
+def test_build_prompt_embeds_story_section_verbatim() -> None:
+    """The section replaces the 'Read {epic_file} and find the story' step (AC1)."""
+    from sdlc.build import render_build_prompt
+
+    prompt = render_build_prompt(_sectioned_story(), BuildOptions())
+    assert _SECTION_27 in prompt
+    assert "find the full story section" not in prompt
+    assert "do not re-read the epic file" in prompt
+
+
+def test_build_prompt_oversized_section_falls_back_untruncated() -> None:
+    """A section over the cap falls back — no truncated spec is injected (AC2)."""
+    from sdlc.build import STORY_SECTION_MAX_CHARS, render_build_prompt
+
+    big = "##### Story 27.3-002: Big\n" + "x" * STORY_SECTION_MAX_CHARS
+    prompt = render_build_prompt(_sectioned_story(big), BuildOptions())
+    assert (
+        "2. Read docs/stories/epic-27.md and find the full story section "
+        "for 27.3-002" in prompt
+    )
+    assert "xxxx" not in prompt
+
+
+def test_build_prompt_section_exactly_at_cap_is_embedded() -> None:
+    """The cap is exclusive: a section of exactly the max size still embeds."""
+    from sdlc.build import STORY_SECTION_MAX_CHARS, render_build_prompt
+
+    head = "##### Story 27.3-002: Boundary\n"
+    exact = head + "x" * (STORY_SECTION_MAX_CHARS - len(head))
+    assert len(exact) == STORY_SECTION_MAX_CHARS
+    prompt = render_build_prompt(_sectioned_story(exact), BuildOptions())
+    assert exact in prompt
+    assert "do not re-read the epic file" in prompt
+
+
+def test_build_prompt_section_block_names_source_epic() -> None:
+    """The injected block cites the epic file it was captured from."""
+    from sdlc.build import render_build_prompt
+
+    prompt = render_build_prompt(_sectioned_story(), BuildOptions())
+    assert "## Story Specification (from docs/stories/epic-27.md)" in prompt
+
+
+def test_build_prompt_without_section_keeps_read_instruction() -> None:
+    """A story with no captured section renders today's prompt unchanged."""
+    from sdlc.build import render_build_prompt
+
+    prompt = render_build_prompt(_story("99.1-001"), BuildOptions())
+    assert "2. Read epic-x.md and find the full story section for 99.1-001" in prompt
+    assert "Story Specification" not in prompt
+
+
+def test_coverage_prompt_embeds_story_section_verbatim() -> None:
+    """The coverage prompt receives the same injection treatment (AC3)."""
+    from sdlc.build import render_coverage_prompt
+
+    prompt = render_coverage_prompt(_sectioned_story(), BuildOptions())
+    assert _SECTION_27 in prompt
+
+
+def test_coverage_prompt_oversized_section_falls_back_untruncated() -> None:
+    """Oversized sections never leak (even truncated) into the coverage prompt."""
+    from sdlc.build import STORY_SECTION_MAX_CHARS, render_coverage_prompt
+
+    big = "##### Story 27.3-002: Big\n" + "x" * STORY_SECTION_MAX_CHARS
+    prompt = render_coverage_prompt(_sectioned_story(big), BuildOptions())
+    assert "xxxx" not in prompt
+    assert "Story Specification" not in prompt
+
+
+def test_coverage_prompt_without_section_is_unchanged() -> None:
+    """A sectionless story keeps today's coverage prompt byte-identical."""
+    from sdlc.build import render_coverage_prompt
+
+    prompt = render_coverage_prompt(_story("99.1-001"), BuildOptions())
+    assert "Story Specification" not in prompt
+
+
 def test_coverage_prompt_gitlab_opens_a_merge_request() -> None:
     """The coverage agent opens an MR on a GitLab target (AC1/AC2)."""
     from sdlc.build import render_coverage_prompt
