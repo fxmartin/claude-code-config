@@ -51,6 +51,7 @@ required_jobs=(
   ruff           # lint: python
   json-schema    # JSON-schema / contract checks
   commit-format  # commitlint conventional-commit gate
+  risk-gate      # high-risk file approval gate
   pytest         # tests: controller / python
   bats           # tests: behaviour / shell
 )

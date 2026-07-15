@@ -99,6 +99,92 @@ commit-format:
     - npx commitlint --from "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --to HEAD --verbose
 
 # ---------------------------------------------------------------------------
+# High-risk file approval gate — the GitLab port of .github/workflows/risk-gate.yml
+# (Epic-08 Story 8.2-001; ported in Story 23.5-002). Any MR that touches a
+# high-risk path (auth, payments, migrations, infra, secrets, destructive
+# shell, ...) is flagged `risk:high` and this job FAILS until a maintainer adds
+# the `risk-approved` label — the merge CI gate (Story 23.2-002) then blocks the
+# merge on the red pipeline. GitHub: `risk-gate` (guarded by `if: pull_request`).
+#
+# The detector (scripts/risk-gate-detect.sh) is reused byte-for-byte from the
+# GitHub job. It requires the target repo to vendor both
+# scripts/risk-gate-detect.sh AND controller/src/sdlc/config/high-risk-patterns.yaml
+# at the same relative paths (or point RISK_GATE_CONFIG elsewhere).
+#
+# GitLab Free/Core limitation vs GitHub: a label event does NOT retrigger the
+# pipeline. On GitHub the workflow re-runs on the `labeled` event and turns the
+# check green automatically; on GitLab Free/Core, after a maintainer adds
+# `risk-approved` they must retry THIS job (`glab ci retry` / the pipeline UI) —
+# no new push is needed, but the green flip is a manual retry.
+risk-gate:
+  stage: lint
+  image: alpine:latest
+  # The diff needs the MR base sha in the clone; a shallow clone may omit it.
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  before_script:
+    # alpine ships neither bash (the detector needs it) nor git/curl.
+    - apk add --no-cache bash git curl
+  script:
+    - |
+      set -eu
+      # Diff the MR against its target-branch base and feed the changed paths to
+      # the shared detector. Exit 0 = matched (PATH<TAB>PATTERN on stdout),
+      # 1 = clean, 2 = config error. `|| true` keeps a clean diff from killing
+      # the job (mirrors the GitHub workflow).
+      matches="$(git diff --name-only "$CI_MERGE_REQUEST_DIFF_BASE_SHA" \
+        | bash scripts/risk-gate-detect.sh || true)"
+
+      # Best-effort MR labelling via the REST API. Token priority mirrors the
+      # host-adapter convention: GITLAB_TOKEN → GL_TOKEN → CI_JOB_TOKEN. When no
+      # token is present (or the call fails) the job warns and continues — it
+      # still enforces the gate through its exit code below.
+      token=""
+      if   [ -n "${GITLAB_TOKEN:-}" ]; then token="$GITLAB_TOKEN"
+      elif [ -n "${GL_TOKEN:-}" ];     then token="$GL_TOKEN"
+      elif [ -n "${CI_JOB_TOKEN:-}" ]; then token="$CI_JOB_TOKEN"
+      fi
+      mr_api="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}"
+      set_label() {
+        # $1 = add_labels|remove_labels, $2 = label
+        if [ -z "$token" ]; then
+          echo "risk-gate: no token (GITLAB_TOKEN/GL_TOKEN/CI_JOB_TOKEN) — skipping best-effort $1=$2."
+          return 0
+        fi
+        curl -fsS --request PUT --header "PRIVATE-TOKEN: $token" \
+          --data-urlencode "$1=$2" "$mr_api" >/dev/null \
+          || echo "risk-gate: label API call failed ($1=$2) — continuing (best-effort)."
+      }
+
+      if [ -z "$matches" ]; then
+        echo "risk-gate: no high-risk files in this change set."
+        set_label remove_labels "risk:high"
+        exit 0
+      fi
+
+      echo "risk-gate: high-risk files detected:"
+      echo "$matches"
+      set_label add_labels "risk:high"
+
+      # Approval check: CI_MERGE_REQUEST_LABELS is the MR's comma-separated label
+      # list. The `risk-approved` label (added by a maintainer) satisfies the gate
+      # — the Free/Core equivalent of the GitHub team-review path (Story 23.5-001).
+      case ",${CI_MERGE_REQUEST_LABELS:-}," in
+        *,risk-approved,*)
+          echo "risk-gate: approved via the risk-approved label."
+          exit 0
+          ;;
+      esac
+
+      echo "risk-gate: this high-risk MR needs human approval." >&2
+      echo "A maintainer must add the 'risk-approved' label, then retry this job" >&2
+      echo "(glab ci retry / the pipeline UI). GitLab Free/Core does not retrigger" >&2
+      echo "the pipeline on a label event, so no new push is needed." >&2
+      exit 1
+
+# ---------------------------------------------------------------------------
 # Tests — Python (pytest) and behaviour (bats). GitHub: `controller-smoke`
 # (pytest) + `behavior-tests` (bats). Both gate on the secret scan so a leaked
 # credential fails the build before any test job echoes it (Story 9.2-001).
