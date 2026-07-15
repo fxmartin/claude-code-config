@@ -13,7 +13,9 @@ from sdlc.build import (
     _estimate_stage_cost,
     _model_price_key,
     _reconcile_estimate,
+    _resolved_stage_model,
     _result_total_tokens,
+    _select_stage_model,
     parse_build_args,
     run_build,
 )
@@ -288,6 +290,26 @@ def test_model_rate_lookup(model, expected) -> None:
         _model_price_key(model), DEFAULT_USD_PER_MILLION_TOKENS
     )
     assert rate == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# Issue #427: _resolved_stage_model — the shared dispatch/estimate resolver
+# ---------------------------------------------------------------------------
+
+def test_resolved_stage_model_registry_error_falls_back_to_claude() -> None:
+    # A `--harness` map entry naming a harness absent from the registry must not
+    # blow up the estimate (or dispatch) path: resolve_harness raises HarnessError,
+    # and the best-effort branch degrades to the routed Claude model instead.
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True,
+        harness_map={"build": "not-a-real-harness"},
+        model_overrides={"build": "opus"},  # pins _select_stage_model's return
+    )
+    story = _story()
+    assert _resolved_stage_model("build", story, opts) == "opus"
+    assert _resolved_stage_model("build", story, opts) == _select_stage_model(
+        "build", story, opts
+    )
 
 
 # ---------------------------------------------------------------------------
