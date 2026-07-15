@@ -12,6 +12,9 @@ from pathlib import Path
 
 import pytest
 
+import sdlc.change_class as change_class_mod
+import sdlc.fix_issue as fix_mod
+from sdlc.change_class import CODE, DOCS_ONLY
 from sdlc.dispatch import AgentDispatchError, AgentResult, ContextOverflowError, RateLimitError
 from sdlc.fix_issue import (
     FIX_STAGE_MODELS,
@@ -2365,3 +2368,266 @@ def test_run_fix_e2e_error_ledger_logging_also_fails_is_swallowed(tmp_path) -> N
     assert result.status == "DONE"
     assert "merge" in dispatch.agents()
 
+
+
+# ---------------------------------------------------------------------------
+# Story 27.2-003: docs-only fixes skip coverage (Phase 5) and the E2E gate (7)
+# ---------------------------------------------------------------------------
+
+
+class _PromptDispatcher(RecordingDispatcher):
+    """A RecordingDispatcher that also captures the last prompt per agent_type."""
+
+    def __init__(self, overrides=None):
+        super().__init__(overrides)
+        self.prompts: dict[str, str] = {}
+
+    def __call__(self, agent_type, prompt, *, story=None, model=None,
+                 transcript_path=None, on_progress=None, **kwargs):
+        self.prompts[agent_type] = prompt
+        return super().__call__(
+            agent_type, prompt, story=story, model=model,
+            transcript_path=transcript_path, on_progress=on_progress, **kwargs,
+        )
+
+
+def _stage_rows(db: Path) -> dict[str, tuple[str, str]]:
+    conn = sqlite3.connect(db)
+    try:
+        return {
+            name: (status, category)
+            for name, status, category in conn.execute(
+                "SELECT stage_name, status, failure_category FROM stages ORDER BY rowid"
+            )
+        }
+    finally:
+        conn.close()
+
+
+def _events(db: Path) -> list[str]:
+    conn = sqlite3.connect(db)
+    try:
+        return [r[0] for r in conn.execute("SELECT message FROM events")]
+    finally:
+        conn.close()
+
+
+def _run_fix_class(tmp_path, monkeypatch, *, files, pr=100, opts=None, dispatch=None):
+    """run_fix with a stubbed change-class diff feed + deterministic PR opener.
+
+    The classification's ``git diff`` and the docs-only PR push/open are both
+    seams (as in test_docs_only_gate.py for the build path), so the test never
+    shells out to git or gh — it drives the pure skip/keep control flow.
+    """
+    monkeypatch.setattr(
+        change_class_mod, "changed_files", lambda root, base, branch: list(files)
+    )
+    monkeypatch.setattr(
+        fix_mod, "_open_docs_only_pr",
+        lambda issue, story, ledger, run_id, root: pr,
+    )
+    db = tmp_path / ".sdlc-state.db"
+    dispatch = dispatch if dispatch is not None else RecordingDispatcher()
+    result = run_fix(
+        opts or FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    return result, dispatch, db
+
+
+def test_docs_only_fix_skips_coverage_dispatch(tmp_path, monkeypatch) -> None:
+    result, dispatch, _ = _run_fix_class(
+        tmp_path, monkeypatch, files=["README.md", "docs/guide.md"]
+    )
+    assert result.status == "DONE"
+    # AC1: the coverage agent is never dispatched for a docs-only diff.
+    assert "coverage" not in dispatch.agents()
+    # AC3: the review (Phase 6) and the merge still run.
+    assert "review" in dispatch.agents()
+    assert "merge" in dispatch.agents()
+
+
+def test_docs_only_fix_records_coverage_skip_in_ledger(tmp_path, monkeypatch) -> None:
+    _, _, db = _run_fix_class(tmp_path, monkeypatch, files=["README.md"])
+    rows = _stage_rows(db)
+    # Recorded as SKIPPED with its skip_reason — never displayed as a passed gate.
+    assert rows["coverage"] == ("SKIPPED", "docs-only")
+    assert any("skip_reason=docs-only" in m for m in _events(db))
+
+
+def test_docs_only_fix_review_runs_against_controller_pr(tmp_path, monkeypatch) -> None:
+    disp = _PromptDispatcher()
+    result, _, _ = _run_fix_class(
+        tmp_path, monkeypatch, files=["README.md"], pr=100, dispatch=disp
+    )
+    # The controller-opened PR (#100) is threaded to the review and to merge.
+    assert "#100" in disp.prompts["review"]
+    assert result.pr_number == 100
+    assert result.status == "DONE"
+
+
+def test_docs_only_pr_open_failure_falls_back_to_coverage(tmp_path, monkeypatch) -> None:
+    # A failed deterministic PR open (helper returns None) must never strand the
+    # fix — it falls through to the full coverage dispatch.
+    result, dispatch, db = _run_fix_class(
+        tmp_path, monkeypatch, files=["README.md"], pr=None
+    )
+    assert "coverage" in dispatch.agents()
+    assert _stage_rows(db)["coverage"][0] != "SKIPPED"
+    assert result.status == "DONE"
+
+
+def test_code_fix_runs_full_gate_chain(tmp_path, monkeypatch) -> None:
+    result, dispatch, db = _run_fix_class(
+        tmp_path, monkeypatch, files=["README.md", "src/loop.py"]
+    )
+    # AC2: any code file → the full gate chain runs unchanged, no skips.
+    assert "coverage" in dispatch.agents()
+    assert all(status != "SKIPPED" for status, _ in _stage_rows(db).values())
+    assert result.status == "DONE"
+
+
+def test_docs_only_fix_skips_e2e_when_warn(tmp_path, monkeypatch) -> None:
+    result, dispatch, db = _run_fix_class(
+        tmp_path, monkeypatch, files=["README.md"],
+        opts=FixOptions(issue=1, e2e_gate="warn"),
+    )
+    assert result.status == "DONE"
+    # AC1: Phase 7 (E2E) is skipped for a docs-only fix, recorded as SKIPPED.
+    assert "e2e" not in dispatch.agents()
+    assert _stage_rows(db)["e2e"] == ("SKIPPED", "docs-only")
+    assert any("e2e skipped (skip_reason=docs-only)" in m for m in _events(db))
+    # AC3: the review still ran.
+    assert "review" in dispatch.agents()
+
+
+def test_docs_only_fix_e2e_off_records_no_e2e_stage(tmp_path, monkeypatch) -> None:
+    # With the gate off (default) there is no E2E phase to skip — no row, no noise.
+    _, dispatch, db = _run_fix_class(tmp_path, monkeypatch, files=["README.md"])
+    assert "e2e" not in _stage_rows(db)
+    assert "e2e" not in dispatch.agents()
+
+
+def test_code_fix_e2e_warn_still_dispatches(tmp_path, monkeypatch) -> None:
+    _, dispatch, db = _run_fix_class(
+        tmp_path, monkeypatch, files=["src/loop.py"],
+        opts=FixOptions(issue=1, e2e_gate="warn"),
+    )
+    # A code fix runs the E2E warn-gate exactly as before (not skipped).
+    assert "e2e" in dispatch.agents()
+    assert _stage_rows(db)["e2e"][0] != "SKIPPED"
+
+
+def test_fix_change_class_docs_vs_code(tmp_path, monkeypatch) -> None:
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue, root=tmp_path)
+    monkeypatch.setattr(
+        change_class_mod, "changed_files", lambda r, b, br: ["README.md", "docs/x.md"]
+    )
+    assert fix_mod._fix_change_class(issue, story, ledger, run_id, tmp_path) == DOCS_ONLY
+    monkeypatch.setattr(change_class_mod, "changed_files", lambda r, b, br: ["src/a.py"])
+    assert fix_mod._fix_change_class(issue, story, ledger, run_id, tmp_path) == CODE
+    # An empty/unreadable diff is conservative CODE — a broken lookup runs more gates.
+    monkeypatch.setattr(change_class_mod, "changed_files", lambda r, b, br: [])
+    assert fix_mod._fix_change_class(issue, story, ledger, run_id, tmp_path) == CODE
+
+
+def test_fix_change_class_malformed_allowlist_degrades_to_code(
+    tmp_path, monkeypatch
+) -> None:
+    # A typo'd per-repo allowlist is ignored with a warning and classifies as
+    # CODE — a broken lookup can only ever run MORE gates, never fewer.
+    monkeypatch.setattr(
+        change_class_mod, "changed_files", lambda r, b, br: ["README.md"]
+    )
+    (tmp_path / change_class_mod.OVERRIDE_FILENAME).write_text(
+        "docs_patterns: 42\n", encoding="utf-8"
+    )
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue, root=tmp_path)
+    assert fix_mod._fix_change_class(issue, story, ledger, run_id, tmp_path) == CODE
+    assert any(
+        "change-class allowlist ignored" in m for m in _events(tmp_path / "l.db")
+    )
+
+
+def _fix_repo_with_origin(tmp_path, branch: str) -> Path:
+    import subprocess
+
+    root = tmp_path / "repo"
+    bare = tmp_path / "origin.git"
+    root.mkdir()
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@e.c"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=root, check=True, capture_output=True)
+    (root / "README.md").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", branch], cwd=root, check=True, capture_output=True)
+    return root
+
+
+def test_open_docs_only_pr_pushes_and_opens(tmp_path, monkeypatch) -> None:
+    import subprocess
+
+    import sdlc.issue_host as issue_host_mod
+    from sdlc.issue_host import ChangeRequest
+
+    root = _fix_repo_with_origin(tmp_path, "feature/issue-7")
+    created: list[dict] = []
+
+    class _Adapter:
+        def cr_create(self, source_branch, title, body, target_branch=None, draft=False):
+            created.append({
+                "source_branch": source_branch, "title": title, "body": body,
+                "target_branch": target_branch,
+            })
+            return ChangeRequest(host="github", ref="123", url="https://x/pull/123")
+
+    monkeypatch.setattr(issue_host_mod, "resolve_host", lambda r, override=None: "github")
+    monkeypatch.setattr(issue_host_mod, "get_adapter", lambda host, runner=None: _Adapter())
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-7", "fix")
+    issue = FixIssue(7, "Fix broken README link", "b", "open", (), ())
+    story = issue_story(issue, root=root)
+    pr = fix_mod._open_docs_only_pr(issue, story, ledger, run_id, root)
+    assert pr == 123
+    assert created[0]["source_branch"] == "feature/issue-7"
+    assert created[0]["target_branch"] == "main"
+    # Commitlint-compliant docs title with the issue trailer, Closes auto-close.
+    assert created[0]["title"].startswith("docs: ")
+    assert created[0]["title"].endswith(" (#7)")
+    assert "Closes #7" in created[0]["body"]
+    # The branch actually landed on the remote.
+    out = subprocess.run(
+        ["git", "ls-remote", "--heads", "origin", "feature/issue-7"],
+        cwd=root, capture_output=True, text=True, check=True,
+    )
+    assert "feature/issue-7" in out.stdout
+
+
+def test_open_docs_only_pr_push_failure_returns_none_and_warns(tmp_path) -> None:
+    # No git repo at root → the push fails → None; the caller then falls back
+    # to the full coverage dispatch, so the fix is never stranded without a PR.
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue, root=tmp_path)
+    assert fix_mod._open_docs_only_pr(issue, story, ledger, run_id, tmp_path) is None
+    assert any(
+        "deterministic PR open failed" in m for m in _events(tmp_path / "l.db")
+    )

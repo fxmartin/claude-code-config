@@ -81,10 +81,14 @@ The controller (`controller/src/sdlc/fix_issue.py`) owns the full lifecycle:
    bugfix default to `sonnet` and escalate to `opus` when the investigation
    reports `COMPLEXITY: HIGH` or the issue carries a high-risk/security label
    (`risk:high`, `high-risk`, `security`); coverage stays `sonnet`, merge and
-   summary stay `haiku`.
+   summary stay `haiku`. A **docs-only** fix (every built file matches the shared
+   docs patterns — `**/*.md`, `docs/**`, plus any `.sdlc-change-class.yaml`
+   allowlist) skips the coverage dispatch — the controller pushes the branch and
+   opens the PR itself — recording it `SKIPPED` with `skip_reason=docs-only`
+   (Story 27.2-003); the review still runs.
 5. **E2E warn-gate** (optional) — with `--e2e-gate=warn`, an advisory `qa-engineer`
    pass runs the project's existing E2E suite after review; a FAIL is logged and
-   merge proceeds.
+   merge proceeds. A docs-only fix skips this gate too (recorded `SKIPPED`).
 6. **Bugfix loop** — bounded retries per stage before marking the issue FAILED.
 7. **Merge** — rebases, squash-merges, closes the issue; a `risk:high` PR with no
    approval parks the run `AWAITING_APPROVAL` rather than force-merging.
