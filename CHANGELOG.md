@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.27.0] - 2026-07-15
+
+### Added
+
+- feat(performance-token-optimization): ledger stall telemetry (#27.3-004) (#472)
+
+
 ## [v2.26.0] - 2026-07-15
 
 ### Added
