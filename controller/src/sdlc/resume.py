@@ -15,7 +15,7 @@ from sdlc.build import (
     Ledger,
     _budget_exceeded,
     _CostGatePause,
-    _dispatch_cohort,
+    _dispatch_ready_queue,
     _honor_parked_reset,
     _make_rate_limit_context,
     _prepare_story_workdir,
@@ -242,8 +242,8 @@ def run_resume(
     markdown epics, derives each story's resume point, and re-enters the 4-stage
     loop at the exact stage each story was interrupted in — completed stories are
     never rebuilt. A run with no incomplete stories is a no-op
-    (``nothing_to_resume``). Mirrors :func:`run_build`'s cohort ordering,
-    dependency blocking, and close-out so the end state matches a full build.
+    (``nothing_to_resume``). Mirrors :func:`run_build`'s scheduling, dependency
+    blocking, and close-out so the end state matches a full build.
 
     Story 14.1-001: the run's original token budget is carried in the ledger
     config and **re-enforced** here, so a budget-paused run does not resume
@@ -279,7 +279,7 @@ def run_resume(
         if st.status not in _TERMINAL_STORY_STATES and st.next_stage is not None
     }
     # Story 17.2-002: end-crash stories (all stages done, status never
-    # finalised) own no stage to dispatch yet are *not* finished — the cohort
+    # finalised) own no stage to dispatch yet are *not* finished — the dispatch
     # loop's end-crash branch marks them DONE and tears down their worktree, and
     # the normal close-out finalises the run. So a run is genuinely
     # nothing-to-resume only when it has neither dispatchable work nor an
@@ -413,118 +413,134 @@ def run_resume(
         return _run_one(story, workdir=workdir)
 
     # Story 19.2-002: credit each re-entered story's terminal status the instant
-    # its worker finishes — not at the cohort barrier — so the dashboard's done
-    # counter + top bar move live on a resumed parallel run too, exactly like
-    # run_build. The post-barrier loop re-applies the same status idempotently
-    # (a by-value UPDATE on the single story row), so no double count.
+    # its worker finishes — before the scheduler applies the outcome — so the
+    # dashboard's done counter + top bar move live on a resumed parallel run too,
+    # exactly like run_build. The scheduler's outcome application re-applies the
+    # same status idempotently (a by-value UPDATE on the single story row), so no
+    # double count.
     def _credit_terminal(story: Story, outcome_status: str) -> None:
         ledger.set_story_status(rid, story.id, outcome_status)
 
     workers = effective_concurrency(opts)
-    for cohort in cohorts:
-        if budget_stopped or rate_limit_park is not None or cost_gated is not None:
-            break
 
+    # A dependency that failed/blocked/skipped blocks its dependents (R2/R4).
+    dep_blocking = {"FAILED", "BLOCKED", "SKIPPED", "AWAITING_APPROVAL"}
+
+    if rate_limit_park is not None:
+        # A persisted park whose window is still closed dispatches nothing —
+        # the durable re-park close-out below takes over.
+        pass
+    elif workers == 1:
         # --- Serial path (--sequential / --concurrency=1) — byte-for-byte ----
-        if workers == 1:
-            for story in cohort:
-                st = plan[story.id]
+        for story in (s for cohort in cohorts for s in cohort):
+            st = plan[story.id]
 
-                # Already-finished stories stay put — never rebuilt.
-                if st.status in _TERMINAL_STORY_STATES:
-                    continue
+            # Already-finished stories stay put — never rebuilt.
+            if st.status in _TERMINAL_STORY_STATES:
+                continue
 
-                # Crashed at the very end (all stages DONE, status never
-                # finalised): close it out without dispatching anything.
-                if st.next_stage is None:
-                    status[story.id] = "DONE"
-                    ledger.set_story_status(rid, story.id, "DONE")
-                    ledger.event_log(
-                        rid, story.id, "info", "controller",
-                        "resume: all stages already complete — marked DONE",
-                    )
-                    # Story 17.2-002: this story finishes here without dispatch,
-                    # so the per-story close-out below never runs — tear down the
-                    # worktree the original build recorded or it leaks on resume.
-                    _teardown_story_workdir(
-                        ledger, rid, story.id, real_run=dispatcher is None
-                    )
-                    resumed += 1
-                    continue
-
-                # A dependency that failed/blocked/skipped blocks this story (R2/R4).
-                blocked_by = [
-                    dep
-                    for dep in story.dependencies
-                    if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED", "AWAITING_APPROVAL"}
-                ]
-                if blocked_by:
-                    status[story.id] = "BLOCKED"
-                    ledger.set_story_status(rid, story.id, "BLOCKED")
-                    ledger.event_log(
-                        rid, story.id, "warn", "controller",
-                        f"blocked: dependency not done ({', '.join(blocked_by)})",
-                    )
-                    continue
-
-                # Story 14.1-001: re-enforce the budget ceiling before dispatching.
-                # The accrual carried in the ledger already counts the pre-pause
-                # spend, so an un-raised resume stops here and re-parks immediately.
-                if _budget_exceeded(ledger, rid, opts.budget):
-                    budget_stopped = True
-                    break
-
+            # Crashed at the very end (all stages DONE, status never
+            # finalised): close it out without dispatching anything.
+            if st.next_stage is None:
+                status[story.id] = "DONE"
+                ledger.set_story_status(rid, story.id, "DONE")
                 ledger.event_log(
                     rid, story.id, "info", "controller",
-                    f"resume: re-entering at stage '{st.next_stage}' "
-                    f"(attempt {st.start_attempt})",
+                    "resume: all stages already complete — marked DONE",
                 )
-                try:
-                    sr = _run_one(story, workdir=None)
-                except _CostGatePause as gate:
-                    # Story 14.1-002: the cost gate re-halted this stage on resume.
-                    status[story.id] = "NEEDS_ATTENTION"
-                    ledger.set_story_status(rid, story.id, "NEEDS_ATTENTION")
-                    cost_gated = gate
-                    break
-                if sr.parked:
-                    status[story.id] = "RATE_LIMITED"
-                    ledger.set_story_status(rid, story.id, "RATE_LIMITED")
-                    rate_limit_park = sr
-                    break
-                outcome = sr.status or "FAILED"
-                status[story.id] = outcome
-                ledger.set_story_status(rid, story.id, outcome)
-                resumed += 1
-                # Story 17.2-002: close-out tears down the re-entered story's
-                # worktree (branch/PR preserved); resumable holds `break`d first.
+                # Story 17.2-002: this story finishes here without dispatch,
+                # so the per-story close-out below never runs — tear down the
+                # worktree the original build recorded or it leaks on resume.
                 _teardown_story_workdir(
                     ledger, rid, story.id, real_run=dispatcher is None
                 )
+                resumed += 1
+                continue
 
-                # Story 12.4-001: reposition HEAD back to the base between stories
-                # so a parked story's leftover feature branch is never the base the
-                # next story stacks on. Real runs only (injected fakes operate on
-                # the test's cwd); best-effort and never fatal.
-                if dispatcher is None:
-                    _reposition_head(root or Path.cwd())
-            continue
+            blocked_by = [
+                dep for dep in story.dependencies if status.get(dep) in dep_blocking
+            ]
+            if blocked_by:
+                status[story.id] = "BLOCKED"
+                ledger.set_story_status(rid, story.id, "BLOCKED")
+                ledger.event_log(
+                    rid, story.id, "warn", "controller",
+                    f"blocked: dependency not done ({', '.join(blocked_by)})",
+                )
+                continue
 
-        # --- Parallel path (Story 17.1-001) — same semantics as run_build ----
-        # Budget gate at the cohort boundary (the pool cannot interleave a
-        # per-story check; the barrier bounds mid-cohort spend).
-        if _budget_exceeded(ledger, rid, opts.budget):
-            budget_stopped = True
-            break
+            # Story 14.1-001: re-enforce the budget ceiling before dispatching.
+            # The accrual carried in the ledger already counts the pre-pause
+            # spend, so an un-raised resume stops here and re-parks immediately.
+            if _budget_exceeded(ledger, rid, opts.budget):
+                budget_stopped = True
+                break
 
-        # Resolve each story's pre-dispatch disposition sequentially (terminal
-        # skip, end-crash close-out, dependency block) — only the genuinely
-        # dispatchable stories are submitted to the pool.
-        dispatchable: list[Story] = []
-        for story in cohort:
+            ledger.event_log(
+                rid, story.id, "info", "controller",
+                f"resume: re-entering at stage '{st.next_stage}' "
+                f"(attempt {st.start_attempt})",
+            )
+            try:
+                sr = _run_one(story, workdir=None)
+            except _CostGatePause as gate:
+                # Story 14.1-002: the cost gate re-halted this stage on resume.
+                status[story.id] = "NEEDS_ATTENTION"
+                ledger.set_story_status(rid, story.id, "NEEDS_ATTENTION")
+                cost_gated = gate
+                break
+            if sr.parked:
+                status[story.id] = "RATE_LIMITED"
+                ledger.set_story_status(rid, story.id, "RATE_LIMITED")
+                rate_limit_park = sr
+                break
+            outcome = sr.status or "FAILED"
+            status[story.id] = outcome
+            ledger.set_story_status(rid, story.id, outcome)
+            resumed += 1
+            # Story 17.2-002: close-out tears down the re-entered story's
+            # worktree (branch/PR preserved); resumable holds `break`d first.
+            _teardown_story_workdir(
+                ledger, rid, story.id, real_run=dispatcher is None
+            )
+
+            # Story 12.4-001: reposition HEAD back to the base between stories
+            # so a parked story's leftover feature branch is never the base the
+            # next story stacks on. Real runs only (injected fakes operate on
+            # the test's cwd); best-effort and never fatal.
+            if dispatcher is None:
+                _reposition_head(root or Path.cwd())
+    else:
+        # --- Parallel path: continuous ready-queue dispatch (Story 24.1-001) --
+        # Mirrors run_build: the ready set is rebuilt from the ledger-derived
+        # plan and each re-entered story is submitted the moment its own
+        # dependencies are DONE — no cohort barrier (AC6).
+
+        # Seeded ledger statuses are *stale* for any dependency this resume will
+        # re-enter (a FAILED retry, an interrupted IN_PROGRESS story, ...):
+        # blocking a dependent on the stale value would pre-judge a retry still
+        # in flight, where the barrier always read the post-rerun status. So
+        # triage only treats a dependency as blocking once it is *resolved in
+        # this run* — dropped below (terminal skip, end-crash close-out,
+        # dependency block) or its worker outcome applied — and holds otherwise.
+        # NEEDS_ATTENTION joins the blocking set on this path (run_build's
+        # rationale: committed but unmerged work); without it a dep finishing
+        # NEEDS_ATTENTION mid-run would leave its dependents held forever — the
+        # dep is neither pending nor in-flight, so the hold could never resolve
+        # and the scheduler would drain with them silently stranded TODO. The
+        # serial path above keeps the historical blocking set byte-for-byte.
+        resolved: set[str] = set()
+        parallel_dep_blocking = dep_blocking | {"NEEDS_ATTENTION"}
+
+        def _triage(story: Story) -> str:
+            # Pre-dispatch disposition on the scheduler thread (terminal skip,
+            # end-crash close-out, dependency block) — only genuinely
+            # dispatchable stories reach the pool.
+            nonlocal resumed
             st = plan[story.id]
             if st.status in _TERMINAL_STORY_STATES:
-                continue
+                resolved.add(story.id)
+                return "drop"  # already finished — never rebuilt
             if st.next_stage is None:
                 status[story.id] = "DONE"
                 ledger.set_story_status(rid, story.id, "DONE")
@@ -538,11 +554,11 @@ def run_resume(
                     ledger, rid, story.id, real_run=dispatcher is None
                 )
                 resumed += 1
-                continue
+                resolved.add(story.id)
+                return "drop"
             blocked_by = [
-                dep
-                for dep in story.dependencies
-                if status.get(dep) in {"FAILED", "BLOCKED", "SKIPPED", "AWAITING_APPROVAL"}
+                dep for dep in story.dependencies
+                if dep in resolved and status.get(dep) in parallel_dep_blocking
             ]
             if blocked_by:
                 status[story.id] = "BLOCKED"
@@ -551,30 +567,43 @@ def run_resume(
                     rid, story.id, "warn", "controller",
                     f"blocked: dependency not done ({', '.join(blocked_by)})",
                 )
-                continue
+                resolved.add(story.id)
+                return "drop"
+            if any(
+                dep in status and (dep not in resolved or status[dep] != "DONE")
+                for dep in story.dependencies
+            ):
+                return "hold"
+            return "ready"
+
+        def _gate(story: Story) -> bool:
+            # Story 14.1-001: re-enforce the persisted/overridden ceiling before
+            # each submission — an un-raised resume re-parks before dispatching.
+            nonlocal budget_stopped
+            if _budget_exceeded(ledger, rid, opts.budget):
+                budget_stopped = True
+                return False
+            st = plan[story.id]
             ledger.event_log(
                 rid, story.id, "info", "controller",
                 f"resume: re-entering at stage '{st.next_stage}' "
                 f"(attempt {st.start_attempt})",
             )
-            dispatchable.append(story)
-        if not dispatchable:
-            continue
+            return True
 
-        for result in _dispatch_cohort(
-            dispatchable, max_workers=workers, run_one=_run_one_parallel,
-            on_terminal=_credit_terminal,
-        ):
+        def _apply(result) -> bool:
+            nonlocal cost_gated, rate_limit_park, resumed
             story = result.story
+            resolved.add(story.id)  # this run's fresh outcome now gates dependents
             if result.cost_gate is not None:
                 status[story.id] = "NEEDS_ATTENTION"
                 ledger.set_story_status(rid, story.id, "NEEDS_ATTENTION")
                 if cost_gated is None:
                     cost_gated = result.cost_gate
-                continue
+                return False  # deliberate run pause — drain in-flight workers
             if result.error is not None:
-                # Failure isolation (AC4): an unexpected raise → FAILED here; the
-                # other workers already finished in the pool.
+                # Failure isolation (AC4): an unexpected raise → FAILED here;
+                # its in-flight peers run to completion.
                 status[story.id] = "FAILED"
                 ledger.set_story_status(rid, story.id, "FAILED")
                 ledger.event_log(
@@ -584,7 +613,7 @@ def run_resume(
                 _teardown_story_workdir(
                     ledger, rid, story.id, real_run=dispatcher is None
                 )
-                continue
+                return True
             sr = result.outcome
             assert sr is not None
             if sr.parked:
@@ -592,18 +621,29 @@ def run_resume(
                 ledger.set_story_status(rid, story.id, "RATE_LIMITED")
                 if rate_limit_park is None:
                     rate_limit_park = sr
-                continue
+                return False  # run-level park — drain in-flight workers
             outcome = sr.status or "FAILED"
             status[story.id] = outcome
             ledger.set_story_status(rid, story.id, outcome)
             resumed += 1
-            # Story 17.2-002: terminal story → remove its worktree after the
-            # barrier (single-threaded here, never races a live worker).
+            # Story 17.2-002: terminal story → remove its worktree (applied on
+            # the scheduler thread, never racing a live worker).
             _teardown_story_workdir(
                 ledger, rid, story.id, real_run=dispatcher is None
             )
+            return True
 
-        # Reposition HEAD once after the cohort barrier (real runs only).
+        _dispatch_ready_queue(
+            [story for cohort in cohorts for story in cohort],
+            max_workers=workers,
+            run_one=_run_one_parallel,
+            triage=_triage,
+            before_dispatch=_gate,
+            on_result=_apply,
+            on_terminal=_credit_terminal,
+        )
+
+        # Reposition HEAD once after the scheduler drains (real runs only).
         if dispatcher is None:
             _reposition_head(root or Path.cwd())
 

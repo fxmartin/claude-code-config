@@ -92,31 +92,49 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    a trailing parenthetical/sentence or on a separate `**Sequencing**:` line — the
    parser ignores ids there, but a genuine intended cycle still fails fast with the
    story-named `compute_cohorts` error.
-3. **Cohort scheduling** — `compute_cohorts` groups stories whose dependencies
+3. **Scheduling** — `compute_cohorts` groups stories whose dependencies
    are all satisfied (already merged or in an earlier cohort). A cycle is a hard
-   `ValueError`, never an infinite loop.
+   `ValueError`, never an infinite loop. Since Story 24.1-001 the cohorts are the
+   *display* grouping (the dashboard's wave view, persisted by
+   `persist_cohort_structure`) and the serial ordering — they no longer gate
+   parallel execution.
 
-   **Concurrent cohort execution (Story 17.1-001).** A `parallel` run (the
-   default) dispatches a cohort's *ready* stories through a bounded
-   `ThreadPoolExecutor` — at most `effective_concurrency(opts)` at once (default
-   **5**, set with `--concurrency=N`). Work is I/O-bound on the agent
-   subprocesses, so threads suffice (the same model `adversarial.py` uses). The
-   cohort loop is **cohort-barrier scheduled**: `_dispatch_cohort` blocks until
-   *every* story in the cohort reaches a terminal/parked outcome before the next
-   cohort begins, so dependency ordering is never violated. Within a cohort the
+   **Continuous ready-queue dispatch (Story 24.1-001, retiring the Epic-17
+   cohort barrier).** A `parallel` run (the default) drives stories through a
+   bounded `ThreadPoolExecutor` — at most `effective_concurrency(opts)` at once
+   (default **5**, set with `--concurrency=N`). Work is I/O-bound on the agent
+   subprocesses, so threads suffice (the same model `adversarial.py` uses).
+   `_dispatch_ready_queue` maintains a ready set (deps ⊆ done) plus an in-flight
+   set and submits a story the moment its *own* dependencies are `DONE` (or
+   absent from the queue), regardless of which wave it sits in — readiness is
+   recomputed on every completion, so a ready story never idles behind an
+   unrelated slow or human-gated sibling in the same cohort (previously
+   `_dispatch_cohort` was a **barrier** that waited for the whole wave). The
    dependency-block check still runs **before** a story is submitted — a story
-   whose dependency did not cleanly finish is marked `BLOCKED` and never
-   dispatched — and a worker that raises mid-flight is captured (failure
-   isolation): its story is recorded `FAILED` while its peers run to completion.
-   Outcomes are applied in cohort (submission) order so the end state is
-   deterministic regardless of which worker finished first. `--sequential` (or
-   `--concurrency=1`) forces an effective cap of **1**, taking a separate,
-   byte-for-byte-unchanged serial path: the budget gate is re-checked before
-   every story and a cost-gate/rate-limit park breaks mid-cohort, exactly as
-   before. The budget gate on the parallel path is checked once at each cohort
-   boundary (the pool cannot interleave a per-story check; the barrier bounds
-   mid-cohort spend). `resume` mirrors the same executor and honours the
-   persisted (or `--concurrency`-overridden) worker cap. Concurrent ledger writes
+   whose dependency did not cleanly finish is marked `BLOCKED` (transitively)
+   and never dispatched; one whose dependency is still pending/in-flight is
+   *held* and re-evaluated — and a worker that raises mid-flight is captured
+   (failure isolation): its story is recorded `FAILED` while its peers run to
+   completion. When the ready set outnumbers free workers, ties break by
+   **ascending story id**, and outcomes are applied on the scheduler thread in
+   ascending story id per completion batch, so the schedule stays deterministic
+   regardless of which worker finished first. A run-level pause (cost gate,
+   rate-limit park) halts new submissions while in-flight workers drain.
+   `--sequential` (or `--concurrency=1`) forces an effective cap of **1**,
+   taking a separate, byte-for-byte-unchanged serial path: stories run one at a
+   time in cohort order, the budget gate is re-checked before every story and a
+   cost-gate/rate-limit park breaks the loop, exactly as before. The budget gate
+   on the parallel path is re-checked before **each submission** (the scheduler
+   thread owns dispatch, so the continuous path affords the per-story check the
+   barrier could not interleave). `resume` mirrors the same scheduler — it
+   rebuilds the ready set from the ledger-derived plan, treats a dependency as
+   blocking only once it is *resolved in this run* (the seeded ledger status is
+   stale for a dependency the resume re-enters, e.g. a FAILED retry — a
+   dependent holds for the retry's fresh outcome instead of being pre-judged
+   `BLOCKED`), and adds `NEEDS_ATTENTION` to its blocking set so a dependency
+   parked mid-run resolves its dependents `BLOCKED` rather than holding them
+   forever — and honours the persisted (or `--concurrency`-overridden) worker
+   cap. Concurrent ledger writes
    are kept safe by the WAL + `busy_timeout` work in Story 17.1-002 (see
    *Concurrency-safe writes* below).
 4. **Per-story execution** — each story walks `build → coverage → review →
@@ -255,7 +273,7 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    committed but unmerged (parked for manual push/MR, a commit-message fix, or
    FX's high-risk approval), so a dependent built on top of it would race
    incomplete work.
-9. **Close-out reconciliation** — after the cohort loop and **before** the
+9. **Close-out reconciliation** — after the dispatch loop and **before** the
    terminal tally, the shared `finalize_run` helper (real runs only — injected
    fakes skip it, like the recursion guard) calls `reconcile.reconcile_run` to
    re-check every parked story against the remote. The in-memory tally can lag
@@ -341,7 +359,7 @@ failure never fails an otherwise-good build).
 
 The DDL opens the ledger in **WAL** mode (`PRAGMA journal_mode = WAL`), which
 allows concurrent readers alongside a single writer. Under a `parallel` run
-(Epic-17), several cohort workers drive `_run_story` on separate threads and
+(Epic-17), several concurrent workers drive `_run_story` on separate threads and
 write story/stage/event rows at the same instant, so two writers can contend for
 the one WAL write lock. To keep that contention from surfacing as a
 "database is locked" error, the write connection (`Ledger._connect`) sets an
@@ -1614,9 +1632,10 @@ closes the lifecycle, reusing the merged-worktree-removal semantics of
   so committed work survives (R10); `--force` only discards the worktree's own
   expendable working-tree state. Teardown is **keyed by the story's own recorded
   path**, so it can never race or remove a peer worker's in-flight checkout — and
-  it runs *after* the cohort barrier on the parallel path (single-threaded there)
-  for belt-and-braces. It is best-effort and never fatal: a removal failure is
-  logged (the orphan-sweeper will later reclaim it), not raised.
+  on the parallel path it runs on the scheduler thread as each outcome is applied
+  (never inside a live worker) for belt-and-braces. It is best-effort and never
+  fatal: a removal failure is logged (the orphan-sweeper will later reclaim it),
+  not raised.
 - **Resumable holds keep their worktree.** A rate-limit park (`RATE_LIMITED`) or
   cost-gate pause `break`s/`continue`s *before* teardown, so the in-flight story's
   worktree is preserved for re-entry rather than torn down mid-flight.
@@ -1635,7 +1654,7 @@ closes the lifecycle, reusing the merged-worktree-removal semantics of
 - **Resume close-out of end-crash stories.** A story whose stages are all `DONE`
   but whose status was never finalised ("end-crash") owns no stage to dispatch,
   yet it is **not** nothing-to-resume — it is closed out (`DONE`, no dispatch) and
-  its worktree torn down, both in the cohort loop *and* when it is the only kind
+  its worktree torn down, both in the dispatch loop *and* when it is the only kind
   of work left. (Previously an end-crash-only run short-circuited as a no-op,
   stranding the run `IN_PROGRESS` and leaking its worktree — tearing the worktree
   down while leaving the run resumable would be an incoherent half-state, so the
@@ -1661,7 +1680,8 @@ kept only for display.
 
 The gate reads the live accrual from `Ledger.run_usage_totals(run_id)` — the
 same per-stage token columns the 11.1-003 streaming path writes — and is checked
-in the `run_build` cohort loop **after each story finishes**, never mid-stage.
+in `run_build` **before each story is dispatched** (per submission on the
+continuous parallel scheduler, per story on the serial path), never mid-stage.
 Because the just-finished story's stages are already committed and the unbuilt
 stories are still `TODO`, no committed work is ever discarded (R10 holds). When
 accrued tokens cross the ceiling, `_budget_close_out` applies the
@@ -1736,7 +1756,7 @@ and recorded, but never warns or gates — behaviour is otherwise unchanged.
 
 **Resumable, not a silent bypass.** The interactive gate pauses the *run*
 resumably — mirroring the budget pause, it raises an internal `_CostGatePause`
-that the cohort loop turns into a `cost_gated` close-out which leaves the run
+that the scheduler turns into a `cost_gated` close-out which leaves the run
 `IN_PROGRESS` (never a terminal status `latest_resumable_run` couldn't surface).
 The threshold is **persisted in the run config**, so `sdlc resume`
 **re-enforces** the same gate rather than rebuilding options with `threshold=0`
