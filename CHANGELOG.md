@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.21.0] - 2026-07-15
+
+### Added
+
+- feat: batch mode for sdlc fix via ready-queue scheduling (#436, pr 2/3) (#462)
+
+
 ## [v2.20.0] - 2026-07-15
 
 ### Added
