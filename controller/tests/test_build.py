@@ -3158,6 +3158,7 @@ def test_build_on_gitlab_target_opens_an_mr_and_records_cr_ref(tmp_path) -> None
         ledger=ledger,
         dispatcher=disp,
         preflight=lambda: True,
+        root=tmp_path,  # hermetic: keep the #227 git-landed probe off the real repo
     )
 
     build_prompt = next(p for a, p in disp.prompts if a == "build")
@@ -3769,6 +3770,22 @@ def test_merge_non_gate_failure_still_routes_to_bugfix(tmp_path, monkeypatch) ->
     assert any(a == "bugfix" for a, _ in dispatcher.calls)
     assert result.story_status["s1-001"] == "FAILED"
     assert result.awaiting_approval == 0
+
+
+def test_merge_gate_recheck_skipped_without_cr_ref(tmp_path, monkeypatch) -> None:
+    """A merge failure with no recorded CR ref is never re-checked: there is no
+    CR to consult, so the host is not touched and the failure routing stays
+    unchanged (25.1-001 — the seam is only read when a cr_ref exists)."""
+    from sdlc import build_issue
+    from sdlc.build import _merge_gate_only_block
+
+    monkeypatch.setattr(
+        build_issue, "change_request_checks",
+        lambda *a, **k: pytest.fail("must not consult the host without a cr_ref"),
+    )
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    assert _merge_gate_only_block(ledger, "run-1", _story("25.1-001"), None) is False
 
 
 # ---------------------------------------------------------------------------

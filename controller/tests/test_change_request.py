@@ -341,6 +341,33 @@ def test_github_cr_checks_reads_labels_and_named_checks() -> None:
     assert "--json" in argv and "labels,statusCheckRollup" in argv
 
 
+def test_base_adapter_cr_checks_raises_issue_host_error() -> None:
+    """A backend without a cr_checks implementation raises IssueHostError, which
+    the best-effort caller degrades to None (Story 25.1-001 — deliberately not
+    abstract, so third-party adapters keep loading)."""
+    runner = FakeRunner()
+    adapter = ih.GitHubAdapter(runner=runner)
+    with pytest.raises(ih.IssueHostError, match="does not implement cr_checks"):
+        ih.IssueHostAdapter.cr_checks(adapter, "5")
+    # The base fallback never shells out to the host CLI.
+    assert runner.calls == []
+
+
+def test_github_cr_checks_skips_non_dict_rollup_entries() -> None:
+    """A malformed rollup entry (not an object) is skipped, not crashed on."""
+    payload = json.dumps({
+        "labels": [{"name": "risk:high"}],
+        "statusCheckRollup": [
+            "garbage",
+            {"__typename": "CheckRun", "name": "tests",
+             "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ],
+    })
+    runner = FakeRunner({"pr view": (0, payload, "")})
+    view = ih.GitHubAdapter(runner=runner).cr_checks("123")
+    assert view.checks == (("tests", ih.CR_SUCCESS),)
+
+
 def test_github_cr_checks_empty_rollup() -> None:
     payload = json.dumps({"labels": [], "statusCheckRollup": []})
     runner = FakeRunner({"pr view": (0, payload, "")})
