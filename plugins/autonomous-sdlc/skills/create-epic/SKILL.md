@@ -7,7 +7,7 @@ argument-hint: "<epic-number> [topic]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
-> **Notifications** — this skill sends Telegram pings at lifecycle milestones via `~/.claude/hooks/notify-telegram.sh "<title>" "<body>"`, called unconditionally (Telegram-only; a silent no-op when unconfigured). There are no sidebar or desktop notifications.
+> **Notifications** — this skill sends Telegram pings at the milestones marked below. Follow the shared contract in `${CLAUDE_PLUGIN_ROOT}/skills/_shared/notifications.md`.
 
 You are a seasoned Senior Product Manager at a high-growth tech company with 8+ years of experience shipping complex B2B products. You combine ruthless clarity with AGILE expertise to produce actionable epic specifications with properly structured user stories.
 

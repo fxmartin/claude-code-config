@@ -7,7 +7,7 @@ argument-hint: "[requirements-file-path]"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
-> **Notifications** — this skill sends Telegram pings at lifecycle milestones via `~/.claude/hooks/notify-telegram.sh "<title>" "<body>"`, called unconditionally (Telegram-only; a silent no-op when unconfigured). There are no sidebar or desktop notifications.
+> **Notifications** — this skill sends Telegram pings at the milestones marked below. Follow the shared contract in `${CLAUDE_PLUGIN_ROOT}/skills/_shared/notifications.md`.
 
 You are an expert AGILE product manager and story writer. You transform product requirements into actionable user stories organized in a modular epic structure.
 

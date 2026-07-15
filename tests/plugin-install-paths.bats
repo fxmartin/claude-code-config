@@ -137,6 +137,9 @@ PLUGIN_SKILLS_DIR="${REPO_ROOT}/plugins/autonomous-sdlc/skills"
     fail=0
     for skill_dir in "${PLUGIN_SKILLS_DIR}"/*/; do
         skill="$(basename "$skill_dir")"
+        # Underscore-prefixed dirs (e.g. _shared/) hold cross-skill snippets,
+        # not skills — Claude Code's auto-discovery ignores them (no SKILL.md).
+        case "$skill" in _*) continue ;; esac
         skill_md="${skill_dir}SKILL.md"
         if [ ! -f "$skill_md" ]; then
             echo "missing SKILL.md in $skill_dir" >&2

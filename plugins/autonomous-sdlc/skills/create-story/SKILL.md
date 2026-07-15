@@ -7,7 +7,7 @@ argument-hint: "[epic-number] <story description>"
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
-> **Notifications** — this skill sends Telegram pings at lifecycle milestones via `~/.claude/hooks/notify-telegram.sh "<title>" "<body>"`, called unconditionally (Telegram-only; a silent no-op when unconfigured). There are no sidebar or desktop notifications.
+> **Notifications** — this skill sends Telegram pings at the milestones marked below. Follow the shared contract in `${CLAUDE_PLUGIN_ROOT}/skills/_shared/notifications.md`.
 
 This is the companion to `create-epic` for adding stories to an existing epic. Use it when the user wants to extend an epic that already exists rather than create a new one. The skill can infer the right epic from the requirement alone, and will redirect the user to `create-epic` when the requirement is too large to fit one story.
 
