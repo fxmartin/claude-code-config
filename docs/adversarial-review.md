@@ -231,9 +231,12 @@ default rule is a starting point; pick `unanimous_approve` for stricter repos.
 ## Dispatch
 
 `dispatch_adversarial_review` is a library entry point, not a pipeline stage. The
-build loop never calls it; its callers are `scripts/codex-adversarial-review.sh`
-(invoked manually or from CI) and the Epic-08 test suite. Anyone wiring a new
-manual or CI gate builds on this same function:
+build loop never calls it; today only the Epic-08 test suite does. When invoked it
+reads the registry and runs each enabled reviewer — the `codex` reviewer being
+`scripts/codex-adversarial-review.sh`, which it launches as a subprocess — then
+applies the consensus rule. The standalone stop-gate instead runs that script
+directly (manually or from CI); anyone wiring a new library-driven gate builds on
+this same function:
 
 ```python
 from sdlc.adversarial import ReviewContext, dispatch_adversarial_review
