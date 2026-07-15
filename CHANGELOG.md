@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.16.0] - 2026-07-15
+
+### Added
+
+- feat: enforce the high-risk approval gate on gitlab (#448) (#449)
+
+
 ## [v2.15.0] - 2026-07-11
 
 ### Added
