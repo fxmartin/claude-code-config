@@ -55,6 +55,17 @@ VALID_RESPONSES: dict[str, dict] = {
         "bugs_fixed": 1,
         "tests_fixed": 3,
     },
+    "investigation": {
+        "root_cause": "off-by-one in the retry loop upper bound",
+        "complexity": "simple",
+        "fix_approach": "clamp the loop bound to len(items) - 1",
+        "files_to_modify": ["src/retry.py"],
+        "risk": "low — isolated change with a regression test",
+        "investigation_status": "READY",
+    },
+    "summary": {
+        "summary_markdown": "## Fix Complete\n\nRoot cause: off-by-one. PR #42 merged.",
+    },
 }
 
 ALL_AGENT_TYPES = sorted(AGENT_SCHEMAS)

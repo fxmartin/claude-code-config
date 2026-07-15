@@ -18,6 +18,7 @@ from sdlc.eval_compare import DEFAULT_TOLERANCE
 # from day one. Keep the keys in sync with the Epic-07 success metrics.
 PLANNED_SUBCOMMANDS: dict[str, str] = {
     "build": "Run the full build-stories orchestration for a scope.",
+    "fix": "Autonomously fix a single GitHub issue end-to-end (investigate → merge).",
     "resume": "Resume an interrupted build from the ledger state.",
     "status": "Show the current run status and stage progress.",
     "doctor": "Health-check the install, ledger, runs, config, and dependencies.",
@@ -345,6 +346,74 @@ def build(ctx: typer.Context) -> None:
         and not result.cost_gated
     )
     raise typer.Exit(code=0 if clean else 1)
+
+
+_FIX_EPILOG = """\
+\b
+Target (positional):
+  <issue-number>   a single open GitHub issue, e.g. `sdlc fix 123`
+
+\b
+Flags:
+  --skip-coverage           build agent opens the PR directly (no coverage gate)
+  --coverage-threshold=N    required new-code coverage % (default 90)
+  --skip-preflight          skip the preflight quality gate
+
+\b
+Batch mode (`all`, `next --limit=N`) is coming in a later release; PR1 fixes one
+issue at a time. The run appears in `sdlc dashboard` beside `sdlc build` runs.
+"""
+
+
+@app.command(
+    help=PLANNED_SUBCOMMANDS["fix"],
+    epilog=_FIX_EPILOG,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def fix(ctx: typer.Context) -> None:
+    """Autonomously fix a single GitHub issue end-to-end.
+
+    Fetches the issue, investigates the root cause, then drives the reused
+    build → coverage → review → merge pipeline (with the bounded bugfix loop and
+    high-risk merge parking) before a best-effort summary — mirroring the
+    fix-issue skill's single-issue path in the controller (issue #436).
+    """
+    from sdlc.fix_issue import FixConfigError, parse_fix_args, run_fix
+    from sdlc.ledger_view import Ledger, default_db_path, make_render_view
+
+    try:
+        opts = parse_fix_args(ctx.args)
+    except FixConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    ledger = Ledger(default_db_path())
+    ledger.ensure_migrated()
+    result = run_fix(
+        opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
+    )
+
+    if result.preflight_failed:
+        typer.echo(
+            "PRE_FLIGHT_FAILURE: test suite is red on main — fix before running `sdlc fix`.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if result.aborted:
+        typer.echo(f"fix aborted for issue #{result.issue}: {result.abort_reason}")
+        raise typer.Exit(code=1)
+
+    if result.investigation_blocked:
+        typer.echo(
+            f"fix blocked for issue #{result.issue}: investigation needs a human "
+            f"decision ({result.block_reason})."
+        )
+        raise typer.Exit(code=1)
+
+    pr = f" (PR #{result.pr_number})" if result.pr_number else ""
+    typer.echo(f"fix finished for issue #{result.issue}: {result.status}{pr}.")
+    raise typer.Exit(code=0 if result.status == "DONE" else 1)
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["resume"])

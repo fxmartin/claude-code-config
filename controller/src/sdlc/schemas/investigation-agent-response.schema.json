@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/investigation-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for investigation-agent responses (issue #436, sdlc fix). ABOUTME: Draft 2020-12; extra fields allowed for forward-compat.",
+  "title": "InvestigationAgentResponse",
+  "description": "Structured fix plan returned by the investigation agent dispatched by `sdlc fix`.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "root_cause",
+    "complexity",
+    "fix_approach",
+    "files_to_modify",
+    "risk",
+    "investigation_status"
+  ],
+  "properties": {
+    "root_cause": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One-line description of the issue's root cause (not just symptoms)."
+    },
+    "complexity": {
+      "type": "string",
+      "enum": ["simple", "moderate", "complex"],
+      "description": "Assessed complexity of the fix."
+    },
+    "fix_approach": {
+      "type": "string",
+      "minLength": 1,
+      "description": "1-2 sentence description of the fix strategy."
+    },
+    "files_to_modify": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths the fix is expected to touch."
+    },
+    "risk": {
+      "type": "string",
+      "description": "Regression-risk assessment (e.g. 'low — isolated change')."
+    },
+    "investigation_status": {
+      "type": "string",
+      "enum": ["READY", "BLOCKED"],
+      "description": "READY: root cause found, proceed to build. BLOCKED: needs a human decision."
+    }
+  }
+}

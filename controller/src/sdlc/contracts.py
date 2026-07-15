@@ -34,6 +34,11 @@ AGENT_SCHEMAS: dict[str, str] = {
     "review": "review-agent-response.schema.json",
     "merge": "merge-agent-response.schema.json",
     "bugfix": "bugfix-agent-response.schema.json",
+    # Issue #436 (`sdlc fix`): the investigation stage produces a structured fix
+    # plan; the summary stage a best-effort markdown report. Both go through the
+    # same dispatch+validation seam as the pipeline stages, so they register here.
+    "investigation": "investigation-agent-response.schema.json",
+    "summary": "summary-agent-response.schema.json",
 }
 
 
@@ -336,6 +341,11 @@ def _field_hint(prop: dict[str, Any]) -> str:
         return "<number>"
     if json_type == "boolean":
         return "true|false"
+    if json_type == "array":
+        # Emit a one-element array whose element is the item hint, so an array
+        # field (e.g. investigation's ``files_to_modify``) advertises the array
+        # shape rather than a bare string the agent would emit as the wrong type.
+        return "[" + _field_hint(prop.get("items", {})) + "]"
     # Unknown/compound types: fall back to a generic string placeholder so the
     # skeleton stays well-formed rather than emitting a bare key with no hint.
     return '"<value>"'
