@@ -2,9 +2,17 @@
 
 The adversarial review slot is a vendor-agnostic interface that lets any second
 reviewer — Codex, GPT-5, Gemini, or a deterministic SAST tool — review a PR
-before merge. The orchestrator never names a specific reviewer; it dispatches
-through the slot and acts on a structured verdict. Swapping the reviewer runtime
-(Codex today, something else tomorrow) is a config change, not a code change.
+before merge. A caller never names a specific reviewer; it dispatches through the
+slot and acts on a structured verdict. Swapping the reviewer runtime (Codex
+today, something else tomorrow) is a config change, not a code change.
+
+**Standalone stop-gate, not a pipeline stage.** The controller and the
+`/build-stories` build loop never dispatch this slot. It is invoked manually or
+from CI via `scripts/codex-adversarial-review.sh`, and the library function
+`dispatch_adversarial_review` (in `controller/src/sdlc/adversarial.py`) is the
+contract those callers build on. Do not confuse it with
+`sdlc build --harness review=codex`: that flag routes the ordinary review stage
+to the Codex harness and does **not** invoke this gate.
 
 Introduced in Story 8.1-001 (Epic-08).
 
@@ -118,9 +126,10 @@ reviewers:
   half-run) if the link has diverged: a reviewer that links a harness absent from
   `harnesses.yaml` (a dangling link), or an **enabled** reviewer linked to a
   **disabled** harness (the harness registry's availability switch must win).
-- **Consensus is untouched.** The link is identity-only. `dispatch_adversarial_review`
-  still invokes every enabled reviewer in parallel and applies the same consensus
-  rule — Epic-08 owns that semantics and Story 20.3-002 does not change it.
+- **Consensus is untouched.** The link is identity-only. When a caller invokes
+  `dispatch_adversarial_review`, it runs every enabled reviewer in parallel and
+  applies the same consensus rule — Epic-08 owns that semantics and Story
+  20.3-002 does not change it.
 
 A reviewer with no `harness:` key (e.g. `gemini` above) stays standalone: it is
 not reconciled against the harness registry and carries its own availability.
@@ -199,9 +208,10 @@ reviewers:
     allowed_verdicts: ["approve", "request_changes", "block"]
 ```
 
-With every reviewer disabled the slot is inert and `/build-stories` behaves as it
-did before the gate existed — the Codex reviewer is mandatory only when it is
-configured and enabled, so users without Codex see no behavior change.
+With every reviewer disabled the slot is inert. This has no effect on
+`/build-stories`, which never dispatches the slot regardless of config — the gate
+runs only when a caller invokes `scripts/codex-adversarial-review.sh` manually or
+from CI, so users without Codex simply do not run it.
 
 ## Consensus rules
 
@@ -219,6 +229,14 @@ With two LLM reviewers, three verdicts are possible and they can disagree. The
 default rule is a starting point; pick `unanimous_approve` for stricter repos.
 
 ## Dispatch
+
+`dispatch_adversarial_review` is a library entry point, not a pipeline stage. The
+build loop never calls it; today only the Epic-08 test suite does. When invoked it
+reads the registry and runs each enabled reviewer — the `codex` reviewer being
+`scripts/codex-adversarial-review.sh`, which it launches as a subprocess — then
+applies the consensus rule. The standalone stop-gate instead runs that script
+directly (manually or from CI); anyone wiring a new library-driven gate builds on
+this same function:
 
 ```python
 from sdlc.adversarial import ReviewContext, dispatch_adversarial_review

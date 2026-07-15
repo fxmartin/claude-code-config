@@ -4,9 +4,10 @@
 # adversarial reviewer slot (Story 8.1-002, Epic-08).
 #
 # This is the first concrete plug-in for the vendor-agnostic reviewer slot
-# defined in Story 8.1-001. The controller registers it in
-# controller/config/adversarial-reviewers.yaml as the `codex` reviewer and
-# invokes it with `--pr-number {pr_number}`. The wrapper:
+# defined in Story 8.1-001. It is a standalone stop-gate: the controller and the
+# build loop never invoke it. Instead it is run manually or from CI with
+# `--pr-number {pr_number}`, matching the `codex` reviewer registered in
+# controller/src/sdlc/config/adversarial-reviewers.yaml. The wrapper:
 #
 #   1. Fetches the change-request diff via the host CLI — `gh pr diff` on
 #      GitHub, `glab mr diff` on GitLab (Story 23.5-001). The host comes from
