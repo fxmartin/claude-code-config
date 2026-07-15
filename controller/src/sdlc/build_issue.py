@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from sdlc.issue_host import (
     GITHUB_CR_TERMS,
+    ChangeRequestChecks,
     ChangeRequestTerms,
     IssueHostError,
     Runner,
@@ -24,6 +25,7 @@ __all__ = [
     "close_link",
     "change_request_terms",
     "change_request_status",
+    "change_request_checks",
     "announce_status",
     "announce_terminal",
 ]
@@ -153,6 +155,31 @@ def change_request_status(
         return adapter.cr_status(str(cr_ref))
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
         log.debug("change_request_status failed for %s", story_id, exc_info=True)
+        return None
+
+
+def change_request_checks(
+    ledger: "Ledger", story_id: str, cr_ref: object, *, runner: Runner | None = None
+) -> ChangeRequestChecks | None:
+    """A story CR's labels + named per-check statuses, or None (Story 25.1-001).
+
+    The deterministic feed for gate-only-block recognition: when a merge fails,
+    the controller re-checks the CR itself — the ``risk:high``/``risk-approved``
+    labels plus *which* named check is red — so a merge blocked solely by the
+    high-risk approval gate parks ``AWAITING_APPROVAL`` even when the agent's
+    free text or a pre-dispatch CI-gate block loses the signal. Best-effort: an
+    unmapped story, an unsupported host, or any host failure yields None —
+    never raises — so the caller conservatively treats the failure as a real
+    merge failure (no false-positive parking).
+    """
+    try:
+        got = _adapter_and_ref(ledger, story_id, runner)
+        if got is None:
+            return None
+        adapter, _ = got
+        return adapter.cr_checks(str(cr_ref))
+    except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
+        log.debug("change_request_checks failed for %s", story_id, exc_info=True)
         return None
 
 

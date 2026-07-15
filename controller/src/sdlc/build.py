@@ -65,9 +65,11 @@ from sdlc.issue_host import (
     CR_SUCCESS,
     CR_UNKNOWN,
     GITHUB_CR_TERMS,
+    ChangeRequestChecks,
     ChangeRequestTerms,
     IssueHostAdapter,
 )
+from sdlc.risk_gate import RISK_APPROVED_LABEL, RISK_LABEL
 from sdlc.registry import Registry, RunRecord
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -4901,6 +4903,20 @@ def _run_story(
                     run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
                 )
 
+                # Story 25.1-001: the agent-text detection in _dispatch_stage is
+                # advisory and proved path-dependent — a pre-dispatch CI-gate
+                # block (kind="ci-gate") or an agent that omits block_reason
+                # carries no marker at all (the exact epic-23 resume gap, run
+                # 0541804d). Deterministically re-check any other merge failure
+                # against the CR itself (risk labels + named check states) so a
+                # gate-only block parks identically on build and resume.
+                if (
+                    stage == "merge"
+                    and kind != "awaiting_approval"
+                    and _merge_gate_only_block(ledger, run_id, story, pr_number)
+                ):
+                    kind = "awaiting_approval"
+
                 # Story 12.3-003: a merge blocked only by the high-risk human-approval
                 # gate is parked in a distinct AWAITING_APPROVAL terminal — *before*
                 # any recovery. The bugfix loop cannot self-approve and would only
@@ -5418,6 +5434,65 @@ def _merge_awaiting_approval(stage: str, data: dict) -> bool:
         return True
     haystack = " ".join(str(data.get(k, "")) for k in _BLOCK_TEXT_FIELDS).upper()
     return any(marker in haystack for marker in _AWAITING_APPROVAL_MARKERS)
+
+
+# The check/job name the high-risk gate publishes on a change request, per
+# host: the GitHub workflow job (`.github/workflows/risk-gate.yml` →
+# `name: High-risk file approval gate`) and the GitLab CI template job
+# (`templates/gitlab-ci.yml` → `risk-gate`). Matched case-insensitively.
+_GATE_CHECK_NAMES = frozenset({"high-risk file approval gate", "risk-gate"})
+
+
+def _gate_only_block(view: ChangeRequestChecks) -> bool:
+    """True when a CR's own state says it is blocked *solely* by the high-risk gate.
+
+    Story 25.1-001: the deterministic, host-side complement to
+    :func:`_merge_awaiting_approval`. The agent-text detection proved
+    path-dependent — on the epic-23 resume (run ``0541804d``) the gate check was
+    already red when the merge stage re-entered, so the pre-dispatch CI-gate
+    block (Story 23.2-002) fired first and no agent ``block_reason`` ever
+    existed to parse. The authoritative signal is the CR itself: the
+    ``risk:high`` label with no ``risk-approved`` label, every failing check
+    being the gate's own check, and no *other* check still pending (an
+    in-flight check could yet fail — parking then would be a false positive;
+    the normal failure path re-polls instead).
+    """
+    labels = {label.strip().lower() for label in view.labels}
+    if RISK_LABEL not in labels or RISK_APPROVED_LABEL in labels:
+        return False
+    failing = [name for name, status in view.checks if status == CR_FAILED]
+    if not failing:
+        return False
+    if any(name.strip().lower() not in _GATE_CHECK_NAMES for name in failing):
+        return False
+    return not any(
+        status == CR_PENDING and name.strip().lower() not in _GATE_CHECK_NAMES
+        for name, status in view.checks
+    )
+
+
+def _merge_gate_only_block(
+    ledger: Ledger, run_id: str, story: Story, pr_number: int | None
+) -> bool:
+    """Re-check a failed merge against the CR's own gate state (Story 25.1-001).
+
+    Reads the CR's labels + named check states through the best-effort
+    :func:`build_issue.change_request_checks` seam and applies
+    :func:`_gate_only_block`. An unmapped story or any host failure reads as
+    False, so the existing failure routing is unchanged whenever the CR cannot
+    be consulted.
+    """
+    if pr_number is None:
+        return False
+    view = build_issue.change_request_checks(ledger, story.id, pr_number)
+    if view is None or not _gate_only_block(view):
+        return False
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        "merge re-check: CR blocked solely by the high-risk approval gate "
+        f"(risk:high unapproved, cr=#{pr_number}) — treating as awaiting approval",
+    )
+    return True
 
 
 def _record_stage_usage(

@@ -269,3 +269,42 @@ def test_prompts_unchanged_without_close_link():
     opts = BuildOptions(scope="epic-22", skip_coverage=True)
     assert "Closes #" not in render_build_prompt(story, opts)
     assert "Closes #" not in render_coverage_prompt(story, opts)
+
+
+# --- change_request_checks (Story 25.1-001) ----------------------------------
+
+
+def test_change_request_checks_unmapped_returns_none(tmp_path):
+    """An unmapped story yields None so the merge re-check degrades to a no-op."""
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("25.1-001", "25", "25.1", "t", 5, "Should")])
+    assert bi.change_request_checks(ledger, "25.1-001", 100, runner=FakeRunner()) is None
+
+
+def test_change_request_checks_reads_github_view(tmp_path):
+    import json
+
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, story_id="25.1-001", host=ih.GITHUB, ref="42")
+    payload = json.dumps({
+        "labels": [{"name": "risk:high"}],
+        "statusCheckRollup": [
+            {"__typename": "CheckRun", "name": "High-risk file approval gate",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ],
+    })
+    runner = FakeRunner({"pr view": (0, payload, "")})
+    view = bi.change_request_checks(ledger, "25.1-001", 100, runner=runner)
+    assert view is not None
+    assert view.labels == ("risk:high",)
+    assert view.checks == (("High-risk file approval gate", ih.CR_FAILED),)
+    # It queries the change request (PR #100), not the issue mapping ref.
+    assert "100" in runner.calls[-1]
+
+
+def test_change_request_checks_tolerates_host_failure(tmp_path):
+    """A host error yields None — never raises — so a hiccup never parks a story."""
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, story_id="25.1-001", host=ih.GITHUB, ref="42")
+    runner = FakeRunner(default=(1, "", "boom"))
+    assert bi.change_request_checks(ledger, "25.1-001", 100, runner=runner) is None

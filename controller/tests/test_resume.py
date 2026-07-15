@@ -512,6 +512,46 @@ def test_resume_high_risk_merge_block_parks_awaiting_approval(tmp_path: Path) ->
     assert Ledger(db).run_row(rid)["status"] == "AWAITING_APPROVAL"
 
 
+def test_resume_ci_gate_only_block_parks_awaiting_approval(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Story 25.1-001: the epic-23 run-0541804d regression, resume path.
+
+    On resume the gate check is already concluded red, so the merge CI gate
+    (23.2-002) blocks *before* the merge agent can report BLOCKED_HIGH_RISK.
+    The deterministic CR re-check must park the story AWAITING_APPROVAL —
+    byte-for-byte the build path — never burn the bugfix loop into FAILED.
+    """
+    from sdlc import build_issue
+    from sdlc import issue_host as ih
+
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    rid = _seed_single_interrupted_at_review(db)
+    monkeypatch.setattr(build_issue, "change_request_status", lambda *a, **k: ih.CR_FAILED)
+    monkeypatch.setattr(
+        build_issue, "change_request_checks",
+        lambda *a, **k: ih.ChangeRequestChecks(
+            labels=("risk:high",),
+            checks=(
+                ("High-risk file approval gate", ih.CR_FAILED),
+                ("tests", ih.CR_SUCCESS),
+            ),
+        ),
+    )
+    dispatcher = FakeDispatcher()
+    result = run_resume("epic-99", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    assert result.story_status["99.1-001"] == "AWAITING_APPROVAL"
+    assert result.awaiting_approval == 1
+    assert result.failed == 0
+    # The merge agent was never dispatched (the CI gate blocked pre-dispatch)
+    # and the bugfix loop never ran (it cannot self-approve).
+    assert ("merge", "99.1-001") not in dispatcher.calls
+    assert not any(a == "bugfix" for a, _ in dispatcher.calls)
+    assert Ledger(db).run_row(rid)["status"] == "AWAITING_APPROVAL"
+
+
 def test_resume_real_run_repositions_head_after_each_story(
     tmp_path: Path, monkeypatch
 ) -> None:

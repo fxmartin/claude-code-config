@@ -3634,6 +3634,144 @@ def test_status_snapshot_counts_awaiting_approval(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Story 25.1-001: deterministic gate-only-block recognition (host-side re-check)
+# ---------------------------------------------------------------------------
+
+
+def _gate_checks(
+    labels=("risk:high",),
+    checks=(
+        ("High-risk file approval gate", "failed"),
+        ("tests", "success"),
+    ),
+):
+    """A CR view whose only red check is the high-risk gate (the parked shape)."""
+    return ih.ChangeRequestChecks(labels=tuple(labels), checks=tuple(checks))
+
+
+def test_gate_only_block_predicate_positive_cases() -> None:
+    from sdlc.build import _gate_only_block
+
+    # GitHub: the gate workflow job is the only red check → gate-only block.
+    assert _gate_only_block(_gate_checks()) is True
+    # GitLab: the CI-template job name matches too.
+    assert _gate_only_block(
+        _gate_checks(checks=(("risk-gate", ih.CR_FAILED), ("tests", ih.CR_SUCCESS)))
+    ) is True
+    # Names and labels match case-insensitively.
+    assert _gate_only_block(
+        _gate_checks(
+            labels=("Risk:High",),
+            checks=(("HIGH-RISK FILE APPROVAL GATE", ih.CR_FAILED),),
+        )
+    ) is True
+
+
+def test_gate_only_block_predicate_negative_cases() -> None:
+    from sdlc.build import _gate_only_block
+
+    # A second red check → a real merge failure, never parked (AC4).
+    assert _gate_only_block(
+        _gate_checks(checks=(
+            ("High-risk file approval gate", ih.CR_FAILED),
+            ("tests", ih.CR_FAILED),
+        ))
+    ) is False
+    # No risk:high label → whatever failed, it is not the gate.
+    assert _gate_only_block(_gate_checks(labels=("story",))) is False
+    # risk-approved present → the gate is satisfied; a red check is real.
+    assert _gate_only_block(_gate_checks(labels=("risk:high", "risk-approved"))) is False
+    # Nothing failing → nothing to reclassify.
+    assert _gate_only_block(
+        _gate_checks(checks=(("High-risk file approval gate", ih.CR_SUCCESS),))
+    ) is False
+    # Another check still in flight → ambiguous, never park early.
+    assert _gate_only_block(
+        _gate_checks(checks=(
+            ("High-risk file approval gate", ih.CR_FAILED),
+            ("tests", ih.CR_PENDING),
+        ))
+    ) is False
+    # An empty view (no labels, no checks) is never a gate block.
+    assert _gate_only_block(ih.ChangeRequestChecks()) is False
+
+
+def test_merge_ci_gate_block_gate_only_parks_awaiting_approval(
+    tmp_path, monkeypatch
+) -> None:
+    """The epic-23 run-0541804d gap on the build path: the gate check is already
+    red, so the CI gate blocks *before* the merge agent can report
+    BLOCKED_HIGH_RISK — the deterministic CR re-check must park the story
+    AWAITING_APPROVAL, never route it into the bugfix loop."""
+    from sdlc import build_issue
+
+    monkeypatch.setattr(build_issue, "change_request_status", lambda *a, **k: ih.CR_FAILED)
+    monkeypatch.setattr(build_issue, "change_request_checks", lambda *a, **k: _gate_checks())
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher()
+    opts = BuildOptions(scope="epic-25", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(opts, queue=[_sample_queue()[0]], ledger=Ledger(db),
+                       dispatcher=dispatcher, preflight=lambda: True)
+    # The merge agent was never dispatched (CI gate blocked pre-dispatch) and
+    # the bugfix loop never ran (it cannot self-approve).
+    assert ("merge", "s1-001") not in dispatcher.calls
+    assert not any(a == "bugfix" for a, _ in dispatcher.calls)
+    assert result.story_status["s1-001"] == "AWAITING_APPROVAL"
+    assert result.failed == 0
+    conn = _open(db)
+    assert conn.execute("SELECT status FROM runs").fetchone()[0] == "AWAITING_APPROVAL"
+
+
+def test_merge_agent_failure_reclassified_by_host_recheck(tmp_path, monkeypatch) -> None:
+    """A merge agent that reports FAILED *without* the block_reason marker is
+    still parked when the CR itself shows a gate-only block (25.1-001: the
+    free-text detection is advisory; the check rollup is authoritative)."""
+    from sdlc import build_issue
+
+    monkeypatch.setattr(build_issue, "change_request_checks", lambda *a, **k: _gate_checks())
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher(
+        overrides={("merge", "s1-001"): {
+            "pr_number": 100, "merge_status": "FAILED",
+            "merge_sha": "", "merged_at": "",
+        }}
+    )
+    opts = BuildOptions(scope="epic-25", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(opts, queue=[_sample_queue()[0]], ledger=Ledger(db),
+                       dispatcher=dispatcher, preflight=lambda: True)
+    assert not any(a == "bugfix" for a, _ in dispatcher.calls)
+    assert result.story_status["s1-001"] == "AWAITING_APPROVAL"
+    assert result.failed == 0
+
+
+def test_merge_non_gate_failure_still_routes_to_bugfix(tmp_path, monkeypatch) -> None:
+    """A merge blocked by something other than the gate (a second red check) is
+    a real failure: the re-check must not park it (AC4 — no false positives)."""
+    from sdlc import build_issue
+
+    monkeypatch.setattr(
+        build_issue, "change_request_checks",
+        lambda *a, **k: _gate_checks(checks=(
+            ("High-risk file approval gate", ih.CR_FAILED),
+            ("tests", ih.CR_FAILED),
+        )),
+    )
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher(
+        overrides={("merge", "s1-001"): {
+            "pr_number": 100, "merge_status": "FAILED",
+            "merge_sha": "", "merged_at": "",
+        }}
+    )
+    opts = BuildOptions(scope="epic-25", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(opts, queue=[_sample_queue()[0]], ledger=Ledger(db),
+                       dispatcher=dispatcher, preflight=lambda: True)
+    assert any(a == "bugfix" for a, _ in dispatcher.calls)
+    assert result.story_status["s1-001"] == "FAILED"
+    assert result.awaiting_approval == 0
+
+
+# ---------------------------------------------------------------------------
 # Story 12.4-001: cut story branches from origin/main + reposition HEAD
 # ---------------------------------------------------------------------------
 

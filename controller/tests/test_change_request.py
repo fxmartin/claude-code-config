@@ -314,6 +314,64 @@ def test_gitlab_cr_url_from_change_request_is_offline() -> None:
     assert runner.calls == []
 
 
+# --- cr_checks: labels + named per-check states (Story 25.1-001) -------------
+
+
+def test_github_cr_checks_reads_labels_and_named_checks() -> None:
+    payload = json.dumps({
+        "labels": [{"name": "risk:high"}, {"name": "story"}],
+        "statusCheckRollup": [
+            {"__typename": "CheckRun", "name": "High-risk file approval gate",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"__typename": "CheckRun", "name": "tests",
+             "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "ci/legacy",
+             "state": "SUCCESS"},
+        ],
+    })
+    runner = FakeRunner({"pr view": (0, payload, "")})
+    view = ih.GitHubAdapter(runner=runner).cr_checks("123")
+    assert view.labels == ("risk:high", "story")
+    assert ("High-risk file approval gate", ih.CR_FAILED) in view.checks
+    assert ("tests", ih.CR_SUCCESS) in view.checks
+    # A StatusContext is named by its `context` field.
+    assert ("ci/legacy", ih.CR_SUCCESS) in view.checks
+    argv = runner.calls[-1]
+    assert argv[:4] == ["gh", "pr", "view", "123"]
+    assert "--json" in argv and "labels,statusCheckRollup" in argv
+
+
+def test_github_cr_checks_empty_rollup() -> None:
+    payload = json.dumps({"labels": [], "statusCheckRollup": []})
+    runner = FakeRunner({"pr view": (0, payload, "")})
+    view = ih.GitHubAdapter(runner=runner).cr_checks("123")
+    assert view.labels == ()
+    assert view.checks == ()
+
+
+def test_gitlab_cr_checks_reads_labels_and_pipeline_jobs() -> None:
+    mr = json.dumps({"labels": ["risk:high"], "pipeline": {"id": 77, "status": "failed"}})
+    jobs = json.dumps([
+        {"name": "risk-gate", "status": "failed"},
+        {"name": "tests", "status": "success"},
+    ])
+    runner = FakeRunner({"mr view": (0, mr, ""), "api": (0, jobs, "")})
+    view = ih.GitLabAdapter(runner=runner).cr_checks("5")
+    assert view.labels == ("risk:high",)
+    assert ("risk-gate", ih.CR_FAILED) in view.checks
+    assert ("tests", ih.CR_SUCCESS) in view.checks
+    # The jobs are read off the MR's head pipeline via the API.
+    joined = " ".join(runner.calls[-1])
+    assert "pipelines/77/jobs" in joined
+
+
+def test_gitlab_cr_checks_no_pipeline_has_no_checks() -> None:
+    runner = FakeRunner({"mr view": (0, json.dumps({"labels": ["a"], "pipeline": None}), "")})
+    view = ih.GitLabAdapter(runner=runner).cr_checks("5")
+    assert view.labels == ("a",)
+    assert view.checks == ()
+
+
 # --- normalisation helpers ---------------------------------------------------
 
 

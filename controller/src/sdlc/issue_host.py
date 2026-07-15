@@ -140,6 +140,22 @@ class ChangeRequest:
 
 
 @dataclass(frozen=True)
+class ChangeRequestChecks:
+    """A change request's labels + named per-check statuses (Story 25.1-001).
+
+    The deterministic feed for gate-only-block recognition: ``labels`` are the
+    CR's label names verbatim; ``checks`` pairs each named check/job (a GitHub
+    ``statusCheckRollup`` entry / a GitLab head-pipeline job) with its
+    normalised :data:`CR_SUCCESS`/:data:`CR_FAILED`/:data:`CR_PENDING`/… status,
+    so the merge stage can see *which* check is red rather than only the
+    aggregate :meth:`IssueHostAdapter.cr_status` rollup.
+    """
+
+    labels: tuple[str, ...] = ()
+    checks: tuple[tuple[str, str], ...] = ()  # (check/job name, CR_* status)
+
+
+@dataclass(frozen=True)
 class ChangeRequestTerms:
     """Host-correct phrasing for the change request a build agent opens (Story 23.2-001).
 
@@ -425,6 +441,19 @@ class IssueHostAdapter(ABC):
         :data:`CR_UNKNOWN`. The merge gate (Story 23.2-002) polls this.
         """
 
+    def cr_checks(self, ref: "str | ChangeRequest") -> ChangeRequestChecks:
+        """Return a change request's labels and named per-check statuses.
+
+        Story 25.1-001: the merge stage re-checks a failed merge against the CR
+        itself — the ``risk:high``/``risk-approved`` labels plus *which* named
+        check is red — to recognise a merge blocked solely by the high-risk
+        approval gate. Deliberately **not** abstract: a backend without an
+        implementation raises :class:`IssueHostError`, which the best-effort
+        caller (:func:`sdlc.build_issue.change_request_checks`) degrades to
+        None (no reclassification) rather than a hard failure.
+        """
+        raise IssueHostError(f"{self.host} adapter does not implement cr_checks")
+
     @abstractmethod
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
         """Merge a change request; return it with ``state`` set to ``merged``."""
@@ -644,6 +673,24 @@ class GitHubAdapter(IssueHostAdapter):
         ).stdout
         return _github_rollup_status(_parse_json_object(out).get("statusCheckRollup"))
 
+    def cr_checks(self, ref: "str | ChangeRequest") -> ChangeRequestChecks:
+        out = self._run(
+            "pr", "view", _cr_ref_of(ref), "--json", "labels,statusCheckRollup"
+        ).stdout
+        row = _parse_json_object(out)
+        rollup = row.get("statusCheckRollup")
+        checks: list[tuple[str, str]] = []
+        if isinstance(rollup, list):
+            for item in rollup:
+                if not isinstance(item, dict):
+                    continue
+                # A CheckRun is named by `name`, a StatusContext by `context`.
+                name = str(item.get("name") or item.get("context") or "")
+                checks.append((name, _github_check_status(item)))
+        return ChangeRequestChecks(
+            labels=_label_names(row.get("labels")), checks=tuple(checks)
+        )
+
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
         ref = _cr_ref_of(ref)
         self._run("pr", "merge", ref, "--merge")
@@ -819,6 +866,25 @@ class GitLabAdapter(IssueHostAdapter):
         pipeline = _parse_json_object(out).get("pipeline")
         raw = pipeline.get("status") if isinstance(pipeline, dict) else None
         return _gitlab_pipeline_status(raw)
+
+    def cr_checks(self, ref: "str | ChangeRequest") -> ChangeRequestChecks:
+        out = self._run("mr", "view", _cr_ref_of(ref), "--output", "json").stdout
+        row = _parse_json_object(out)
+        labels = _label_names(row.get("labels"))
+        # The named per-check states are the head pipeline's jobs; an MR with no
+        # pipeline has no checks to name. `:id` is glab's current-project
+        # placeholder, so no explicit project path is needed.
+        pipeline = row.get("pipeline")
+        pipeline_id = pipeline.get("id") if isinstance(pipeline, dict) else None
+        checks: list[tuple[str, str]] = []
+        if pipeline_id is not None:
+            jobs_out = self._run(
+                "api", f"projects/:id/pipelines/{pipeline_id}/jobs?per_page=100"
+            ).stdout
+            for job in _parse_json_array(jobs_out):
+                name = str(job.get("name") or "")
+                checks.append((name, _gitlab_pipeline_status(job.get("status"))))
+        return ChangeRequestChecks(labels=labels, checks=tuple(checks))
 
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
         ref = _cr_ref_of(ref)
