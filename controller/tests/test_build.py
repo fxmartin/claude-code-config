@@ -19,6 +19,7 @@ from sdlc.build import (
     BuildOptions,
     BuildResult,
     Ledger,
+    _dispatch_overengineering_advisory,
     _filter_git_landed,
     _stamp_run_actor,
     default_preflight,
@@ -2004,6 +2005,176 @@ def test_review_prompt_distrust_survives_doc_currency_off(monkeypatch) -> None:
     assert "do not trust" in prompt.lower()
     assert "unverified claims" in prompt
     assert "concrete named risk" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Over-engineering lens advisory dispatch (issue #445)
+# ---------------------------------------------------------------------------
+
+def _lens_config(tmp_path: Path, *, enabled: bool, command: str) -> Path:
+    p = tmp_path / "overengineering-lens.yaml"
+    p.write_text(
+        f"enabled: {'true' if enabled else 'false'}\n"
+        "policy: advisory\n"
+        f"command: {command}\n",
+        encoding="utf-8",
+    )
+    return p
+
+
+def test_overengineering_lens_disabled_by_default_no_dispatch(tmp_path) -> None:
+    """Disabled (the bundled default) ⇒ no lens event, no subprocess spend."""
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE message LIKE '%over-engineering lens%'"
+    ).fetchall()
+    assert rows == []
+
+
+def test_overengineering_lens_enabled_surfaces_findings_advisory_only(
+    tmp_path, monkeypatch
+) -> None:
+    """Enabled ⇒ dispatched after review, findings logged, story still merges."""
+    script = tmp_path / "lens.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        'printf \'{"summary": "found a cut", "findings": '
+        '[{"category": "unused_code", "file": "src/x.py", "line": 3, '
+        '"reason": "dead branch"}]}\'\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    config_path = _lens_config(tmp_path, enabled=True, command=str(script))
+    monkeypatch.setattr(
+        "sdlc.role_routing.bundled_config_path", lambda name: config_path
+    )
+
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    # Advisory only — never blocks: every story still reaches merge.
+    assert result.completed == 3
+    assert result.failed == 0
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT level, message FROM events WHERE message LIKE '%over-engineering lens%'"
+    ).fetchall()
+    assert rows, "expected an advisory ledger event per reviewed story"
+    assert all(level == "info" for level, _ in rows)
+    joined = "\n".join(m for _, m in rows)
+    assert "src/x.py:3" in joined
+    assert "dead branch" in joined
+
+
+def test_overengineering_lens_failure_never_fails_the_review_stage(
+    tmp_path, monkeypatch
+) -> None:
+    """A lens that errors out is logged as a warning, not a stage failure."""
+    config_path = _lens_config(
+        tmp_path, enabled=True, command="definitely-not-a-real-binary-xyz"
+    )
+    monkeypatch.setattr(
+        "sdlc.role_routing.bundled_config_path", lambda name: config_path
+    )
+
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    assert result.completed == 3
+    assert result.failed == 0
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT level, message FROM events WHERE message LIKE '%over-engineering lens%'"
+    ).fetchall()
+    assert rows, "expected the lens error to be logged"
+    assert all(level == "warn" for level, _ in rows)
+    assert all("ignored" in m for _, m in rows)
+
+
+class _RecordingLedger:
+    """Bare event_log recorder — exercises the helper without a real DB."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, str, str, str]] = []
+
+    def event_log(
+        self, run_id: str, story_id: str, level: str, source: str, message: str
+    ) -> None:
+        self.events.append((run_id, story_id, level, source, message))
+
+
+def test_overengineering_advisory_noop_when_no_pr_yet(monkeypatch) -> None:
+    """``pr_number is None`` ⇒ no-op before even resolving the lens config."""
+    monkeypatch.setattr(
+        "sdlc.role_routing.bundled_config_path",
+        lambda name: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+    ledger = _RecordingLedger()
+    story = _sample_queue()[0]
+
+    _dispatch_overengineering_advisory(story, None, ledger, "run-1")
+
+    assert ledger.events == []
+
+
+def test_overengineering_advisory_noop_when_config_unresolvable(monkeypatch) -> None:
+    """Bundled config missing/unresolvable ⇒ no-op, no ledger event."""
+    monkeypatch.setattr("sdlc.role_routing.bundled_config_path", lambda name: None)
+    ledger = _RecordingLedger()
+    story = _sample_queue()[0]
+
+    _dispatch_overengineering_advisory(story, 42, ledger, "run-1")
+
+    assert ledger.events == []
+
+
+def test_overengineering_advisory_unexpected_error_logged_as_warn(
+    tmp_path, monkeypatch
+) -> None:
+    """A non-lens exception (e.g. a bug in dispatch) is caught, never raised."""
+    config_path = _lens_config(tmp_path, enabled=True, command="unused")
+    monkeypatch.setattr(
+        "sdlc.role_routing.bundled_config_path", lambda name: config_path
+    )
+
+    def _boom(*args, **kwargs):
+        raise ValueError("boom")
+
+    monkeypatch.setattr("sdlc.overengineering.dispatch_overengineering_lens", _boom)
+    ledger = _RecordingLedger()
+    story = _sample_queue()[0]
+
+    _dispatch_overengineering_advisory(story, 42, ledger, "run-1")
+
+    assert len(ledger.events) == 1
+    _, _, level, _, message = ledger.events[0]
+    assert level == "warn"
+    assert "unexpected error" in message
+    assert "ignored" in message
+    assert "boom" in message
 
 
 # ---------------------------------------------------------------------------
