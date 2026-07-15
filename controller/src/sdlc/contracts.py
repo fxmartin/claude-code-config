@@ -38,7 +38,19 @@ AGENT_SCHEMAS: dict[str, str] = {
 
 
 class ContractError(Exception):
-    """Base error for any agent-contract problem (parse or validation)."""
+    """Base error for any agent-contract problem (parse or validation).
+
+    Issue #435: a contract miss on a live eval run still burned tokens, so the
+    harness needs the run's telemetry off the exception to score the miss instead
+    of discarding it. These attributes default to ``None`` (an unattached
+    pipeline error carries no telemetry) and are populated by the parser when a
+    usage envelope is present, so a reader never distinguishes "absent" from
+    "None" and type-checkers see a declared attribute rather than a dynamic one.
+    """
+
+    usage: dict[str, Any] | None = None
+    cost_usd: float | None = None
+    usage_available: bool = False
 
 
 class ResultBlockError(ContractError):
