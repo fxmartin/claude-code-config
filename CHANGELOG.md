@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.24.0] - 2026-07-15
+
+### Added
+
+- feat(performance-token-optimization): align fix-issue with Balanced profile (#27.1-001) (#467)
+
+
 ## [v2.23.0] - 2026-07-15
 
 ### Added
