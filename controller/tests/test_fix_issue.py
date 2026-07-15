@@ -25,6 +25,7 @@ from sdlc.fix_issue import (
     _batch_scope,
     _batch_summary,
     _batch_workers,
+    _fix_escalates,
     _neutralize_untrusted,
     _list_open_issues,
     build_overlap_dependencies,
@@ -95,7 +96,7 @@ def _default_payload(agent_type: str) -> dict:
     return {
         "investigation": {
             "root_cause": "off-by-one in loop",
-            "complexity": "simple",
+            "complexity": "LOW",
             "fix_approach": "clamp the index",
             "files_to_modify": ["src/loop.py"],
             "risk": "low",
@@ -292,21 +293,62 @@ def test_detect_agent_type_default(tmp_path) -> None:
     assert detect_agent_type(tmp_path) == "general-purpose"
 
 
-def test_fix_model_map_matches_skill_assignments() -> None:
+def test_fix_model_map_matches_balanced_profile() -> None:
+    # Story 27.1-001: build/review/bugfix default to sonnet (Balanced alignment).
     opts = FixOptions(issue=1)
     assert fix_model("investigation", opts) == "sonnet"
-    assert fix_model("build", opts) == "opus"
+    assert fix_model("build", opts) == "sonnet"
     assert fix_model("coverage", opts) == "sonnet"
-    assert fix_model("review", opts) == "opus"
+    assert fix_model("review", opts) == "sonnet"
     assert fix_model("merge", opts) == "haiku"
-    assert fix_model("bugfix", opts) == "opus"
+    assert fix_model("bugfix", opts) == "sonnet"
     assert fix_model("summary", opts) == "haiku"
 
 
 def test_fix_model_override_beats_map() -> None:
-    opts = FixOptions(issue=1, model_overrides={"build": "sonnet"})
-    assert fix_model("build", opts) == "sonnet"
-    assert fix_model("review", opts) == "opus"  # unaffected
+    opts = FixOptions(issue=1, model_overrides={"build": "opus"})
+    assert fix_model("build", opts) == "opus"
+    assert fix_model("review", opts) == "sonnet"  # unaffected
+
+
+def test_fix_model_escalates_code_stages_to_opus() -> None:
+    opts = FixOptions(issue=1)
+    for stage in ("build", "review", "bugfix"):
+        assert fix_model(stage, opts, escalate=True) == "opus", stage
+
+
+def test_fix_model_escalation_leaves_other_stages_alone() -> None:
+    opts = FixOptions(issue=1)
+    assert fix_model("investigation", opts, escalate=True) == "sonnet"
+    assert fix_model("coverage", opts, escalate=True) == "sonnet"
+    assert fix_model("merge", opts, escalate=True) == "haiku"
+    assert fix_model("summary", opts, escalate=True) == "haiku"
+
+
+def test_fix_model_override_beats_escalation() -> None:
+    # The operator's explicit pin is the final word — even over escalation.
+    opts = FixOptions(issue=1, model_overrides={"build": "haiku"})
+    assert fix_model("build", opts, escalate=True) == "haiku"
+
+
+def test_fix_escalates_on_high_complexity() -> None:
+    assert _fix_escalates({"complexity": "HIGH"}, ()) is True
+    assert _fix_escalates({"complexity": "high"}, ()) is True  # case-insensitive
+
+
+def test_fix_escalates_not_on_low_or_medium() -> None:
+    assert _fix_escalates({"complexity": "LOW"}, ("bug",)) is False
+    assert _fix_escalates({"complexity": "MEDIUM"}, ("bug",)) is False
+
+
+def test_fix_escalates_on_high_risk_or_security_label() -> None:
+    for label in ("risk:high", "high-risk", "security", "Security"):
+        assert _fix_escalates({"complexity": "LOW"}, (label,)) is True, label
+
+
+def test_fix_escalates_handles_missing_investigation() -> None:
+    assert _fix_escalates(None, ()) is False
+    assert _fix_escalates({}, ("bug",)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +373,7 @@ def test_run_fix_happy_path_all_stages_done(tmp_path) -> None:
     assert {"investigation", "build", "coverage", "review", "merge", "summary"}.issubset(agents)
 
 
-def test_run_fix_asserts_opus_parity_models(tmp_path) -> None:
+def test_run_fix_asserts_balanced_default_models(tmp_path) -> None:
     gh = FakeGh(_issue_json())
     dispatch = RecordingDispatcher()
     run_fix(
@@ -342,10 +384,60 @@ def test_run_fix_asserts_opus_parity_models(tmp_path) -> None:
         runner=gh,
         root=tmp_path,
     )
-    # Every stage dispatched on the happy path carries its skill-parity model.
+    # Every stage dispatched on the happy path (LOW complexity, no risk label)
+    # carries its Balanced-aligned default model — no silent Opus.
     # (bugfix runs only on failure — asserted in the bugfix-recovery test.)
     for stage in ("investigation", "build", "coverage", "review", "merge", "summary"):
         assert dispatch.model_for(stage) == FIX_STAGE_MODELS[stage], stage
+    assert dispatch.model_for("build") == "sonnet"
+    assert dispatch.model_for("review") == "sonnet"
+
+
+def test_run_fix_high_complexity_escalates_code_stages_to_opus(tmp_path) -> None:
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(
+        overrides={
+            "investigation": {
+                "root_cause": "cross-module race",
+                "complexity": "HIGH",
+                "fix_approach": "rework the locking",
+                "files_to_modify": ["src/a.py", "src/b.py"],
+                "risk": "medium",
+                "investigation_status": "READY",
+            }
+        }
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert dispatch.model_for("build") == "opus"
+    assert dispatch.model_for("review") == "opus"
+    # Non-escalatable stages keep their Balanced defaults.
+    assert dispatch.model_for("coverage") == "sonnet"
+    assert dispatch.model_for("merge") == "haiku"
+
+
+def test_run_fix_security_label_escalates_code_stages_to_opus(tmp_path) -> None:
+    gh = FakeGh(_issue_json(labels=["security"]))
+    dispatch = RecordingDispatcher()
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert dispatch.model_for("build") == "opus"
+    assert dispatch.model_for("review") == "opus"
+    assert dispatch.model_for("merge") == "haiku"
 
 
 def test_run_fix_exactly_one_run_row(tmp_path) -> None:
@@ -400,7 +492,7 @@ def test_run_fix_investigation_blocked_aborts(tmp_path) -> None:
         overrides={
             "investigation": {
                 "root_cause": "unclear",
-                "complexity": "complex",
+                "complexity": "HIGH",
                 "fix_approach": "needs design decision",
                 "files_to_modify": [],
                 "risk": "high — ambiguous requirements",
@@ -450,7 +542,41 @@ def test_run_fix_bugfix_recovers_and_retries_stage(tmp_path) -> None:
     assert result.status == "DONE"
     assert dispatch.counts["build"] == 2
     assert dispatch.counts["bugfix"] == 1
-    assert dispatch.model_for("bugfix") == "opus"  # skill-parity bugfix model
+    assert dispatch.model_for("bugfix") == "sonnet"  # Balanced base tier (27.1-001)
+
+
+def test_run_fix_bugfix_inherits_escalation_on_high_complexity(tmp_path) -> None:
+    gh = FakeGh(_issue_json())
+
+    def build_script(n):
+        if n == 0:
+            return {"branch_name": "feature/issue-1", "build_status": "FAILED",
+                    "commit_sha": "x", "error_summary": "boom"}
+        return {"branch_name": "feature/issue-1", "build_status": "SUCCESS", "commit_sha": "y"}
+
+    dispatch = RecordingDispatcher(
+        overrides={
+            "build": build_script,
+            "investigation": {
+                "root_cause": "cross-module race",
+                "complexity": "HIGH",
+                "fix_approach": "rework the locking",
+                "files_to_modify": ["src/a.py"],
+                "risk": "medium",
+                "investigation_status": "READY",
+            },
+        }
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert dispatch.model_for("bugfix") == "opus"
 
 
 def test_run_fix_bugfix_bounded_at_two_then_fails(tmp_path) -> None:
@@ -1324,7 +1450,7 @@ class BatchProbeDispatcher:
         elif agent_type == "investigation":
             files = self.inv_files.get(sid, [])
             return {
-                "root_cause": "rc", "complexity": "simple", "fix_approach": "fa",
+                "root_cause": "rc", "complexity": "LOW", "fix_approach": "fa",
                 "files_to_modify": files, "risk": "low",
                 "investigation_status": "READY",
             }
@@ -2138,7 +2264,7 @@ def test_batch_doc_update_not_dispatched_when_none_merged(tmp_path) -> None:
     dispatch = BatchProbeDispatcher(
         overrides={
             ("investigation", "issue-1"): {
-                "root_cause": "rc", "complexity": "simple", "fix_approach": "fa",
+                "root_cause": "rc", "complexity": "LOW", "fix_approach": "fa",
                 "files_to_modify": [], "risk": "needs a human call",
                 "investigation_status": "BLOCKED",
             }

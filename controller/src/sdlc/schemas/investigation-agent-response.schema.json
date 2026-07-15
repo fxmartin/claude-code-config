@@ -22,8 +22,8 @@
     },
     "complexity": {
       "type": "string",
-      "enum": ["simple", "moderate", "complex"],
-      "description": "Assessed complexity of the fix."
+      "enum": ["LOW", "MEDIUM", "HIGH"],
+      "description": "Assessed complexity of the fix; HIGH escalates build/review/bugfix to opus (Story 27.1-001)."
     },
     "fix_approach": {
       "type": "string",

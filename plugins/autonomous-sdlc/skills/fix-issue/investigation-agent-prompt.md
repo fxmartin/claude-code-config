@@ -63,7 +63,7 @@ Return these exact lines at the end of your response:
 
 ```
 ROOT_CAUSE: [one-line description of the root cause]
-COMPLEXITY: simple | moderate | complex
+COMPLEXITY: LOW | MEDIUM | HIGH
 FIX_APPROACH: [1-2 sentence description of the fix strategy]
 FILES_TO_MODIFY: [comma-separated list of file paths]
 RISK: low | medium | high — [brief rationale]

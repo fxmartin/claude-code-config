@@ -78,7 +78,11 @@ The controller (`controller/src/sdlc/fix_issue.py`) owns the full lifecycle:
    and validates every response against its JSON-schema contract
    (`controller/src/sdlc/schemas/`). A missing or schema-invalid result block is
    treated as a failure and routed to the bugfix loop — the next stage never runs
-   on garbage. Model routing is opus-parity with the original skill.
+   on garbage. Model routing mirrors the Balanced profile: build, review, and
+   bugfix default to `sonnet` and escalate to `opus` when the investigation
+   reports `COMPLEXITY: HIGH` or the issue carries a high-risk/security label
+   (`risk:high`, `high-risk`, `security`); coverage stays `sonnet`, merge and
+   summary stay `haiku`.
 5. **E2E warn-gate** (optional) — with `--e2e-gate=warn`, an advisory `qa-engineer`
    pass runs the project's existing E2E suite after review; a FAIL is logged and
    merge proceeds.
