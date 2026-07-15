@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from sdlc.contracts import parse_and_validate
+from sdlc.contracts import ContractError, parse_and_validate
 from sdlc.rate_limit import RateLimitSignal, detect_rate_limit
 
 # Imported from the dispatch boundary rather than redefined here: the typed
@@ -63,6 +63,35 @@ class CollectedOutput:
     envelope: dict[str, Any] | None = None
     streaming: bool = False
     stream_resets_at: float | None = None
+
+
+def _validate_with_telemetry(
+    agent_type: str,
+    response: str,
+    *,
+    usage: dict[str, Any] | None,
+    cost_usd: float | None,
+    usage_available: bool,
+) -> dict[str, Any]:
+    """``parse_and_validate`` but tag a contract miss with the run's telemetry.
+
+    Issue #435: a live eval run that ends in prose fails the result-block
+    contract, and the raised :class:`~sdlc.contracts.ContractError` used to carry
+    no usage — so the harness discarded the run's real tokens/cost. Here the
+    exception is re-raised unchanged in type/message, with ``usage``/``cost_usd``
+    attached as optional attributes so a caller (the eval harness) can still score
+    the miss. The pipeline path is unaffected: it never reads these attributes and
+    the exception type is identical, so ``except ContractError`` behaviour is the
+    same. The attributes are always set (``None`` when a run carried no usage) so
+    a reader never has to distinguish "absent" from "None".
+    """
+    try:
+        return parse_and_validate(agent_type, response)
+    except ContractError as exc:
+        exc.usage = usage
+        exc.cost_usd = cost_usd
+        exc.usage_available = usage_available
+        raise
 
 
 class OutputParser(ABC):
@@ -182,15 +211,21 @@ class ClaudeStreamJsonParser(OutputParser):
             # leave the verbatim stream in place — that is the live tail -f view.
             if not streaming:
                 _write_transcript(transcript_path, agent_text, stderr)
-            data = parse_and_validate(agent_type, agent_text)
+            data = _validate_with_telemetry(
+                agent_type, agent_text,
+                usage=usage, cost_usd=cost, usage_available=True,
+            )
             return AgentResult(
                 agent_type=agent_type, data=data, raw=agent_text,
                 usage=usage, cost_usd=cost, session_id=session_id,
             )
 
         # Fallback: plain-text agent output (custom SDLC_AGENT_CMD / older claude, or
-        # a streamed run that produced no result event).
-        data = parse_and_validate(agent_type, stdout)
+        # a streamed run that produced no result event). No envelope → no usage, so
+        # a contract miss here carries None telemetry (issue #435, None-safe).
+        data = _validate_with_telemetry(
+            agent_type, stdout, usage=None, cost_usd=None, usage_available=True,
+        )
         return AgentResult(agent_type=agent_type, data=data, raw=stdout)
 
 

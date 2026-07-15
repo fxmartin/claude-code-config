@@ -479,3 +479,209 @@ def test_shipped_eval_config_is_valid() -> None:
     assert config.tickets
     assert config.target.exists()
     assert config.seed is not None  # reproducibility provenance is versioned
+
+
+# ---------------------------------------------------------------------------
+# Issue #435 — live runs must not fail contract validation and lose metrics.
+# The eval prompt carries a result-block contract, a concrete model is threaded,
+# and a contract miss still records tokens/cost/quality (status=contract_miss).
+# ---------------------------------------------------------------------------
+
+from sdlc.contracts import (  # noqa: E402 — grouped with the issue-#435 tests
+    RESULT_START_MARKER,
+    ResultBlockError,
+)
+from sdlc.model_routing import BALANCED, select_model  # noqa: E402
+
+
+def _contract_miss(usage: dict | None, cost: float | None) -> ResultBlockError:
+    """A ContractError carrying the telemetry parsers.py attaches on a miss."""
+    exc = ResultBlockError("agent ended with prose, no result block")
+    exc.usage = usage
+    exc.cost_usd = cost
+    exc.usage_available = usage is not None
+    return exc
+
+
+def test_run_ticket_contract_miss_captures_tokens_cost_and_quality(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo",
+        target=target,
+        n=1,
+        tickets=[Ticket(id="t1", prompt="edit", quality_cmd=["true"])],
+    )
+
+    def miss_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        # The agent did edit the workspace but ended with prose — a real diff,
+        # real usage, but a failed contract. Metrics must survive.
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b + 0\n", encoding="utf-8")
+        raise _contract_miss({"input_tokens": 1000, "output_tokens": 200}, 0.05)
+
+    run = run_eval(config, tmp_path / "ws", dispatcher=miss_dispatcher)[0]
+    assert run.status == "contract_miss"
+    assert run.error is None  # a contract miss is scored, not discarded as error
+    assert run.tokens == 1200
+    assert run.cost_usd == 0.05
+    assert run.quality_pass is True  # the quality command still ran
+    assert run.diff.removed >= 1  # the agent's real edit was measured
+
+
+def test_run_ticket_contract_miss_notional_cost_from_usage(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo",
+        target=target,
+        n=1,
+        usd_per_million_tokens=15.0,
+        tickets=[Ticket(id="t1", prompt="edit")],
+    )
+
+    def miss_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        raise _contract_miss({"input_tokens": 1_000_000}, None)  # no envelope cost
+
+    run = run_eval(config, tmp_path / "ws", dispatcher=miss_dispatcher)[0]
+    assert run.status == "contract_miss"
+    assert run.cost_usd == pytest.approx(15.0)  # notional fallback from tokens
+
+
+def test_run_ticket_contract_miss_zero_usage_is_none_safe(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo",
+        target=target,
+        n=1,
+        tickets=[Ticket(id="t1", prompt="edit")],
+    )
+
+    def miss_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        raise _contract_miss(None, None)  # a miss with no telemetry at all
+
+    run = run_eval(config, tmp_path / "ws", dispatcher=miss_dispatcher)[0]
+    assert run.status == "contract_miss"
+    assert run.tokens is None
+    assert run.cost_usd is None
+
+
+def test_run_ticket_contract_miss_failing_quality_stays_contract_miss(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo",
+        target=target,
+        n=1,
+        tickets=[Ticket(id="t1", prompt="edit", quality_cmd=["false"])],
+    )
+
+    def miss_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        raise _contract_miss({"input_tokens": 10}, 0.01)
+
+    run = run_eval(config, tmp_path / "ws", dispatcher=miss_dispatcher)[0]
+    assert run.status == "contract_miss"  # a failing quality check never masks the miss
+    assert run.quality_pass is False
+
+
+def test_run_ticket_non_contract_exception_is_still_error(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo",
+        target=target,
+        n=1,
+        tickets=[Ticket(id="t1", prompt="edit")],
+    )
+
+    def boom_dispatcher(*_a: object, **_k: object) -> AgentResult:
+        raise RuntimeError("infrastructure failure")
+
+    run = run_eval(config, tmp_path / "ws", dispatcher=boom_dispatcher)[0]
+    assert run.status == "error"
+    assert run.error is not None and "infrastructure failure" in run.error
+
+
+def test_eval_prompt_carries_result_block_contract(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo",
+        target=target,
+        n=1,
+        agent_type="build",
+        tickets=[Ticket(id="t1", prompt="add a function")],
+    )
+    seen: dict[str, str] = {}
+
+    def capturing_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        seen["prompt"] = prompt
+        return AgentResult(agent_type=agent_type, data={}, raw="")
+
+    run_eval(config, tmp_path / "ws", dispatcher=capturing_dispatcher)
+    # The bare ticket prompt is now wrapped with the schema-derived result block
+    # so a live agent knows to emit the contract instead of ending with prose.
+    assert "add a function" in seen["prompt"]
+    assert RESULT_START_MARKER in seen["prompt"]
+    assert "branch_name" in seen["prompt"]  # a build-schema required field
+
+
+def test_eval_config_model_defaults_to_balanced_routing() -> None:
+    config = EvalConfig(name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    # A concrete, pinned model — not None — so evals never silently run on the
+    # user's current default model (issue #435).
+    assert config.model is not None
+    assert config.model == select_model("build", BALANCED)
+
+
+def test_run_ticket_threads_model_to_dispatcher(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo",
+        target=target,
+        n=1,
+        model="haiku",
+        tickets=[Ticket(id="t1", prompt="p")],
+    )
+    seen: dict[str, object] = {}
+
+    def capturing_dispatcher(
+        agent_type: str, prompt: str, *, cwd: Path, model: str | None = None, **_: object
+    ) -> AgentResult:
+        seen["model"] = model
+        return AgentResult(agent_type=agent_type, data={}, raw="")
+
+    run_eval(config, tmp_path / "ws", dispatcher=capturing_dispatcher)
+    assert seen["model"] == "haiku"
+
+
+def test_load_config_parses_explicit_model(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\nmodel: opus\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    assert load_config(path).model == "opus"
+
+
+def test_load_config_absent_model_resolves_via_routing(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\ntickets:\n  - id: t1\n    prompt: p\n",
+    )
+    config = load_config(path)
+    assert config.model == select_model(config.agent_type, BALANCED)
+
+
+def test_load_config_rejects_non_string_model(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\nmodel: 123\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="model"):
+        load_config(path)
+
+
+def test_load_config_rejects_empty_string_model(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        'name: d\ntarget: target\nmodel: ""\n'
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="model"):
+        load_config(path)

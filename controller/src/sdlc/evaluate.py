@@ -13,8 +13,10 @@ from typing import Any
 
 import yaml
 
+from sdlc.contracts import AGENT_SCHEMAS, ContractError, _result_wrapper
 from sdlc.cost_estimate import DEFAULT_USD_PER_MILLION_TOKENS, notional_cost
 from sdlc.dispatch import AgentResult, dispatch_agent
+from sdlc.model_routing import BALANCED, select_model
 
 # The four usage keys the agent envelope carries (mirrors build._RESULT_USAGE_KEYS
 # and dispatch's envelope parsing) so eval token counts match ledger metrics.
@@ -72,6 +74,14 @@ class EvalConfig:
     seed: int | None = None
     agent_type: str = "build"
     usd_per_million_tokens: float = DEFAULT_USD_PER_MILLION_TOKENS
+    model: str | None = None
+
+    def __post_init__(self) -> None:
+        # Issue #435: pin a concrete model so an eval never silently runs on the
+        # user's current CLI default. When the config names none, resolve the
+        # Balanced-profile model for the eval's agent role (e.g. build → sonnet).
+        if self.model is None:
+            object.__setattr__(self, "model", select_model(self.agent_type, BALANCED))
 
 
 @dataclass(frozen=True)
@@ -99,6 +109,11 @@ class RunResult:
     cost_usd: float | None = None
     quality_pass: bool | None = None
     error: str | None = None
+    # Issue #435: "ok" for a clean run, "contract_miss" when the agent produced a
+    # real diff/tokens but failed the result-block contract, "error" for an
+    # infrastructure failure that discarded the run. Distinguishes a recoverable,
+    # still-scored miss from a lost run in the scoreboard's provenance.
+    status: str = "ok"
 
 
 @dataclass(frozen=True)
@@ -170,6 +185,13 @@ def load_config(path: Path) -> EvalConfig:
     if not isinstance(agent_type, str) or not agent_type:
         raise EvalConfigError("config 'agent_type' must be a non-empty string")
 
+    # Issue #435: an optional explicit model pin. When absent, EvalConfig resolves
+    # the Balanced-profile model for agent_type so the eval is never run on the
+    # user's silent CLI default.
+    model = raw.get("model")
+    if model is not None and (not isinstance(model, str) or not model):
+        raise EvalConfigError("config 'model' must be a non-empty string when set")
+
     raw_tickets = raw.get("tickets")
     if not isinstance(raw_tickets, list) or not raw_tickets:
         raise EvalConfigError("config 'tickets' is required and must be a non-empty list")
@@ -188,6 +210,7 @@ def load_config(path: Path) -> EvalConfig:
         n=n,
         seed=seed,
         agent_type=agent_type,
+        model=model,
     )
 
 
@@ -253,6 +276,28 @@ def tokens_from_usage(usage: dict[str, Any] | None) -> int | None:
     return sum(int(v or 0) for v in vals)
 
 
+def _cost_from(
+    cost_usd: float | None,
+    usage: dict[str, Any] | None,
+    *,
+    usd_per_million_tokens: float,
+) -> float | None:
+    """Notional cost from an explicit envelope cost or, failing that, token usage.
+
+    The envelope ``cost_usd`` wins when present; otherwise a notional figure is
+    derived from total tokens (the controller's notional-$ convention). ``None``
+    when neither a cost nor any token usage is available. Shared by
+    :func:`result_cost` and the contract-miss path (issue #435), which only has a
+    raw usage dict and cost, not an :class:`AgentResult`.
+    """
+    if cost_usd is not None:
+        return float(cost_usd)
+    tokens = tokens_from_usage(usage)
+    if tokens is None:
+        return None
+    return notional_cost(tokens, usd_per_million_tokens=usd_per_million_tokens)
+
+
 def result_cost(
     result: AgentResult,
     *,
@@ -265,12 +310,9 @@ def result_cost(
     even when the agent envelope omits ``total_cost_usd``. ``None`` when neither a
     cost nor any token usage is available.
     """
-    if result.cost_usd is not None:
-        return float(result.cost_usd)
-    tokens = tokens_from_usage(result.usage)
-    if tokens is None:
-        return None
-    return notional_cost(tokens, usd_per_million_tokens=usd_per_million_tokens)
+    return _cost_from(
+        result.cost_usd, result.usage, usd_per_million_tokens=usd_per_million_tokens
+    )
 
 
 def run_quality_check(cmd: Sequence[str] | None, cwd: Path) -> bool | None:
@@ -466,15 +508,43 @@ def run_ticket(
     workdir = workspace / f"{ticket.id}-{run_index}"
     _init_workspace(config.target, workdir)
 
+    # Issue #435: append the schema-derived result-block contract to the bare
+    # ticket prompt so a live agent ends with the structured block dispatch
+    # validates against — instead of prose that fails validation and discards the
+    # run's tokens/cost/quality. The pinned ``config.model`` (never None by
+    # default) is threaded through so the eval never runs on the CLI default.
+    prompt = ticket.prompt + "\n\n" + _result_wrapper(AGENT_SCHEMAS[config.agent_type])
+
     start = time.monotonic()
     try:
         result = dispatcher(
             config.agent_type,
-            ticket.prompt,
+            prompt,
             cwd=workdir,
+            model=config.model,
             timeout=timeout,
         )
-        error: str | None = None
+    except ContractError as exc:
+        # A contract miss is not a lost run: the agent still edited the workspace
+        # and burned tokens. Score the diff and quality, and recover tokens/cost
+        # from the telemetry parsers.py attached to the exception, under a distinct
+        # status so the scoreboard separates a scored miss from a real error.
+        wall = time.monotonic() - start
+        usage = getattr(exc, "usage", None)
+        return RunResult(
+            ticket_id=ticket.id,
+            run_index=run_index,
+            diff=_measure_diff(workdir),
+            wall_s=wall,
+            tokens=tokens_from_usage(usage),
+            cost_usd=_cost_from(
+                getattr(exc, "cost_usd", None),
+                usage,
+                usd_per_million_tokens=config.usd_per_million_tokens,
+            ),
+            quality_pass=run_quality_check(ticket.quality_cmd, workdir),
+            status="contract_miss",
+        )
     except Exception as exc:  # noqa: BLE001 — record any dispatch failure, keep going
         wall = time.monotonic() - start
         return RunResult(
@@ -483,6 +553,7 @@ def run_ticket(
             diff=_measure_diff(workdir),
             wall_s=wall,
             error=f"{type(exc).__name__}: {exc}",
+            status="error",
         )
     wall = time.monotonic() - start
 
@@ -496,7 +567,7 @@ def run_ticket(
             result, usd_per_million_tokens=config.usd_per_million_tokens
         ),
         quality_pass=run_quality_check(ticket.quality_cmd, workdir),
-        error=error,
+        error=None,
     )
 
 

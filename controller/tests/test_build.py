@@ -4158,6 +4158,30 @@ def test_result_wrapper_skeleton_round_trips_through_contracts(
     assert parse_and_validate(agent_type, response) == obj
 
 
+def test_result_wrapper_reexport_is_byte_identical() -> None:
+    """Issue #435: `_result_wrapper` moved to contracts.py; build.py re-exports
+    it, so a rendered pipeline prompt's tail is byte-identical to the contracts
+    version — the relocation cannot drift the pipeline's prompt output."""
+    from sdlc import contracts
+    from sdlc.build import _result_wrapper, render_build_prompt
+
+    # Same object, not a diverging copy.
+    assert _result_wrapper is contracts._result_wrapper
+
+    expected_tail = contracts._result_wrapper("build-agent-response.schema.json")
+    prompt = render_build_prompt(_story("99.1-001"), BuildOptions())
+    assert prompt.endswith(expected_tail)
+
+
+def test_field_hint_unknown_type_falls_back_to_generic_placeholder() -> None:
+    """A schema property with no/compound type keeps the skeleton well-formed
+    via a generic string placeholder (relocated helper, issue #435)."""
+    from sdlc.contracts import _field_hint
+
+    assert _field_hint({}) == '"<value>"'
+    assert _field_hint({"type": "array"}) == '"<value>"'
+
+
 # --- Story 22.5-001 AC1: the run's actor is stamped from host identity --------
 # These wire the identity helpers (resolved + unit-tested in test_identity.py)
 # into the real run-create path; the reviewer flagged that the primitives existed

@@ -22,6 +22,11 @@ seed: 1801
 # pipeline uses, so eval metrics line up with ledger metrics.
 agent_type: build
 
+# Optional model pin (issue #435). When omitted, the eval resolves the
+# Balanced-profile model for `agent_type` (build → sonnet) so a run never
+# silently uses the current CLI default. Set e.g. `model: opus` to override.
+# model: sonnet
+
 # Fixed ticket set. Each ticket is a small, well-scoped edit on the sample target
 # with a quality_cmd (exit 0 = pass) so "tests pass / no breakage" is measurable.
 tickets:

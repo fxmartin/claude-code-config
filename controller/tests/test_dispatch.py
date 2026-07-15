@@ -113,6 +113,26 @@ def test_dispatch_raises_on_missing_result_block(monkeypatch) -> None:
         dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
 
 
+def test_dispatch_contract_miss_from_envelope_carries_usage(monkeypatch) -> None:
+    """Issue #435: a schema-invalid envelope still raises the SAME ContractError
+    (pipeline behaviour unchanged), now carrying the run's usage/cost as optional
+    attributes so the eval harness can score a miss instead of discarding it."""
+    bad = {"build_status": "SUCCESS", "commit_sha": "abc"}  # no branch_name
+    envelope = {
+        "type": "result",
+        "result": _wrap(bad),
+        "usage": {"input_tokens": 5, "output_tokens": 7},
+        "total_cost_usd": 0.02,
+    }
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted(json.dumps(envelope))
+    )
+    with pytest.raises(SchemaValidationError) as exc:
+        dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert exc.value.usage == {"input_tokens": 5, "output_tokens": 7}
+    assert exc.value.cost_usd == pytest.approx(0.02)
+
+
 def test_dispatch_raises_on_nonzero_exit(monkeypatch) -> None:
     """A non-zero subprocess exit raises AgentDispatchError before parsing."""
     monkeypatch.setattr(

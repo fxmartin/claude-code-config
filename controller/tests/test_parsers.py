@@ -13,6 +13,7 @@ import yaml
 from sdlc.contracts import (
     RESULT_END_MARKER,
     RESULT_START_MARKER,
+    ContractError,
     ResultBlockError,
 )
 from sdlc.dispatch import (
@@ -147,6 +148,40 @@ def test_claude_parser_plain_text_fallback_has_no_usage() -> None:
     assert result.usage is None
     # A claude run that merely lacked usage is still a usage-capable harness.
     assert result.usage_available is True
+
+
+# --- Issue #435: contract misses carry usage telemetry so the eval harness ---
+# can still score tokens/cost on a run that ended in prose.
+
+
+def test_claude_parser_contract_miss_carries_usage_telemetry() -> None:
+    # A successful envelope (usage + cost) whose result text has no result block:
+    # the raised ContractError must carry the run's telemetry so the caller can
+    # still record tokens/cost instead of discarding them.
+    parser = get_parser(CLAUDE_PARSER_ID)
+    env = {
+        "type": "result",
+        "result": "I finished the change but forgot to emit the result block.",
+        "usage": {"input_tokens": 10, "output_tokens": 20},
+        "total_cost_usd": 0.0123,
+        "session_id": "sess-1",
+    }
+    with pytest.raises(ContractError) as exc:
+        parser.parse(_collected(envelope=env, streaming=True))
+    err = exc.value
+    assert err.usage == {"input_tokens": 10, "output_tokens": 20}
+    assert err.cost_usd == pytest.approx(0.0123)
+
+
+def test_claude_parser_contract_miss_without_envelope_is_none_safe() -> None:
+    # A plain-text run (no envelope) that misses the contract has no usage; the
+    # telemetry attributes must be present and None rather than absent.
+    parser = get_parser(CLAUDE_PARSER_ID)
+    with pytest.raises(ContractError) as exc:
+        parser.parse(_collected(stdout="just prose, no result block here"))
+    err = exc.value
+    assert getattr(err, "usage", "missing") is None
+    assert getattr(err, "cost_usd", "missing") is None
 
 
 def test_claude_parser_rate_limit_envelope_raises() -> None:
