@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/summary-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for summary-agent responses (issue #436, sdlc fix). ABOUTME: Minimal + best-effort; a summary miss never fails a fix. Draft 2020-12, extra fields allowed.",
+  "title": "SummaryAgentResponse",
+  "description": "Formatted fix report returned by the summary agent dispatched by `sdlc fix`.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["summary_markdown"],
+  "properties": {
+    "summary_markdown": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The rendered markdown summary of the completed fix."
+    }
+  }
+}

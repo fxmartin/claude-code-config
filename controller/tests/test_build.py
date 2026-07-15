@@ -4415,7 +4415,10 @@ def test_field_hint_unknown_type_falls_back_to_generic_placeholder() -> None:
     from sdlc.contracts import _field_hint
 
     assert _field_hint({}) == '"<value>"'
-    assert _field_hint({"type": "array"}) == '"<value>"'
+    # An array field advertises the array shape; its element uses the item hint,
+    # falling back to the generic placeholder when the items have no known type.
+    assert _field_hint({"type": "array"}) == '["<value>"]'
+    assert _field_hint({"type": "array", "items": {"type": "string"}}) == '["<string>"]'
 
 
 # --- Story 22.5-001 AC1: the run's actor is stamped from host identity --------
