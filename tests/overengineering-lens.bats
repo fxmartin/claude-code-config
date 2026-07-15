@@ -86,6 +86,24 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/overengineering-lens"
     [[ "${output}" == *"array"* ]]
 }
 
+@test "fails closed instead of dropping a finding without file/reason" {
+    # A malformed finding must NOT be silently discarded — an all-malformed
+    # findings list would otherwise emit findings: [] and read as a clean review.
+    printf '```json\n{"summary": "x", "findings": [{"category": "unused_code", "line": 3, "reason": "no file key"}]}\n```\n' \
+        > "${BATS_TMPDIR}/lens-nofile.txt"
+    LENS_RAW_OUTPUT="${BATS_TMPDIR}/lens-nofile.txt" \
+        run bash "${WRAPPER}" --pr-number 1
+    [ "${status}" -eq 1 ]
+    [[ "${output}" == *"file/reason"* ]]
+
+    printf '```json\n{"summary": "x", "findings": [{"category": "unused_code", "file": "a.py", "line": 3, "reason": ""}]}\n```\n' \
+        > "${BATS_TMPDIR}/lens-noreason.txt"
+    LENS_RAW_OUTPUT="${BATS_TMPDIR}/lens-noreason.txt" \
+        run bash "${WRAPPER}" --pr-number 1
+    [ "${status}" -eq 1 ]
+    [[ "${output}" == *"file/reason"* ]]
+}
+
 @test "emitted JSON validates against the lens response schema" {
     # End-to-end contract check against the controller's schema, mirroring the
     # companion pytest for the adversarial wrapper.
