@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.17.1] - 2026-07-15
+
+### Fixed
+
+- fix: eval harness captures metrics from live runs (#435) (#451)
+
+
 ## [v2.17.0] - 2026-07-15
 
 ### Added
