@@ -20,6 +20,7 @@ contracts, or failure-path instructions. These tests pin all three properties:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,19 @@ def test_skill_resolves_shared_template_via_symlink(skill: str, name: str) -> No
     )
     # A dangling symlink would pass is_symlink(); the content must be readable.
     assert _read(link) == _read(_SHARED / name)
+
+
+@pytest.mark.parametrize("skill", _CONSUMER_SKILLS)
+@pytest.mark.parametrize("name", _SHARED_TEMPLATES)
+def test_skill_symlink_target_is_relative_and_in_plugin(skill: str, name: str) -> None:
+    """The raw link target must be the relative in-plugin path ``../_shared/<name>``.
+    An absolute target would resolve fine in this clone (passing the resolution
+    test above) but dangle in every other clone and in installed plugin copies."""
+    target = os.readlink(_SKILLS_ROOT / skill / name)
+    assert not os.path.isabs(target), f"{skill}/{name} symlink target must be relative: {target}"
+    assert target == f"../_shared/{name}", (
+        f"{skill}/{name} must point at ../_shared/{name}, got {target}"
+    )
 
 
 @pytest.mark.parametrize("name", _SHARED_TEMPLATES)
@@ -240,10 +254,82 @@ def test_doc_update_keeps_output_contract() -> None:
         assert status in text, f"doc-update lost contract line: {status!r}"
 
 
+def test_doc_update_serves_both_orchestrators() -> None:
+    """The merged doc-update template carries both dispatch contexts' inputs:
+    completed stories (build-stories) and completed issues (fix-issue)."""
+    text = _doc_update()
+    for placeholder in (
+        "{{SCOPE}}",
+        "{{COMPLETED_STORIES}}",
+        "{{COMPLETED_ISSUES}}",
+        "{{COMPLETED_PRS}}",
+    ):
+        assert placeholder in text, f"doc-update lost input placeholder {placeholder}"
+
+
+def test_doc_update_keeps_doc_only_staging_safety_check() -> None:
+    """The commit step must keep the guard that only documentation files are
+    staged — losing it lets the agent sweep unrelated worktree changes into a
+    docs commit."""
+    text = _doc_update()
+    assert "git diff --cached --name-only" in text
+    assert "never stage unrelated" in text.lower()
+
+
+def _bugfix() -> str:
+    return _read(_SHARED / "bugfix-agent-prompt.md")
+
+
 def test_bugfix_template_serves_both_orchestrators() -> None:
     """The merged bugfix template covers both dispatch contexts (story build
     and issue fix) and keeps the review failure path in its step enum."""
-    text = _read(_SHARED / "bugfix-agent-prompt.md")
+    text = _bugfix()
     assert "{{STORY_ID}}" in text
     assert "{{ISSUE_NUMBER}}" in text
     assert "review" in text.lower()
+
+
+def test_bugfix_keeps_output_contract_enums() -> None:
+    text = _bugfix()
+    for line in (
+        "FAILURE_CATEGORY: CODE_BUG | TEST_BUG | ENV_ISSUE",
+        "FIX_STATUS: FIXED | UNFIXED | N/A",
+        "ROOT_CAUSE:",
+        "TESTS_PASSING: true | false",
+        "BUGS_FIXED:",
+        "TESTS_FIXED:",
+        "DIAGNOSTIC_STEPS:",
+        "ISOLATED_TO:",
+    ):
+        assert line in text, f"bugfix template lost output-contract line: {line!r}"
+
+
+def test_bugfix_keeps_result_block_contract() -> None:
+    """The result block, its schema reference, and the finding-disposition
+    dispute channel (Epic-26 reception discipline) survive the merge."""
+    text = _bugfix()
+    assert RESULT_START_MARKER in text
+    assert RESULT_END_MARKER in text
+    assert "bugfix-agent-response.schema.json" in text
+    assert "finding_dispositions" in text
+    assert '"disputed"' in text and '"implemented"' in text
+    assert '"reasoning"' in text, "disputes without reasoning must stay schema-rejected"
+
+
+def test_bugfix_keeps_iron_law_and_debug_checklist() -> None:
+    """Root-cause discipline survives: the Iron Law and the structured
+    debugging checklist steps the ledger's DIAGNOSTIC_STEPS field reports."""
+    text = _bugfix()
+    assert "NO FIX WITHOUT A ROOT CAUSE" in text
+    lowered = text.lower()
+    for step in ("reproduce", "isolate", "inspect"):
+        assert step in lowered, f"bugfix template lost debug-checklist step {step!r}"
+
+
+def test_bugfix_keeps_dep_scan_remediation_path() -> None:
+    """The Epic-09 dependency-vulnerability remediation path survives:
+    BLOCK trigger, rescan wrapper, and the guarded suppression escape hatch."""
+    text = _bugfix()
+    assert "DEP_SCAN_STATUS: BLOCK" in text
+    assert "scripts/osv-scan.sh" in text
+    assert ".dep-scan-suppressions.yaml" in text
