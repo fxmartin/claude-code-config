@@ -665,3 +665,23 @@ def test_load_config_absent_model_resolves_via_routing(tmp_path: Path) -> None:
     )
     config = load_config(path)
     assert config.model == select_model(config.agent_type, BALANCED)
+
+
+def test_load_config_rejects_non_string_model(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\nmodel: 123\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="model"):
+        load_config(path)
+
+
+def test_load_config_rejects_empty_string_model(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        'name: d\ntarget: target\nmodel: ""\n'
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="model"):
+        load_config(path)

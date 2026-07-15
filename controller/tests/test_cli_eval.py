@@ -134,3 +134,38 @@ def test_eval_full_run_table_output(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.stdout
     assert "eval: cli-demo" in result.stdout
     assert "OVERALL" in result.stdout
+
+
+def test_eval_n_override_preserves_config_model(tmp_path: Path, monkeypatch) -> None:
+    """Issue #435: the --n reconstruction of EvalConfig must carry the config's
+    explicit model pin, not silently fall back to the routing default."""
+    import sdlc.evaluate as evaluate_mod
+
+    target = tmp_path / "sample"
+    target.mkdir()
+    (target / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    config = tmp_path / "eval.yaml"
+    config.write_text(
+        "name: cli-demo\n"
+        "target: sample\n"
+        "n: 1\n"
+        "model: haiku\n"
+        "tickets:\n"
+        "  - id: t1\n"
+        "    prompt: p\n",
+        encoding="utf-8",
+    )
+
+    seen: dict[str, object] = {}
+
+    def fake_run_eval(config, workspace, **kwargs):  # noqa: ANN001 — test double
+        seen["model"] = config.model
+        seen["n"] = config.n
+        return []
+
+    # eval_cmd imports run_eval from sdlc.evaluate at call time, so patching the
+    # module attribute intercepts the dispatch without any live agent.
+    monkeypatch.setattr(evaluate_mod, "run_eval", fake_run_eval)
+    result = runner.invoke(app, ["eval", "--config", str(config), "--n", "2", "--json"])
+    assert result.exit_code == 0, result.stdout
+    assert seen == {"model": "haiku", "n": 2}
