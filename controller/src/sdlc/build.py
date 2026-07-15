@@ -2704,7 +2704,9 @@ def default_preflight(root: Path | None = None, timeout: int = 600) -> bool:
     return completed.returncode == 0
 
 
-def _log_harness_preflight(ledger: "Ledger", run_id: str, requested_mode: str) -> None:
+def _log_harness_preflight(
+    ledger: "Ledger", run_id: str, requested_mode: str, opts: "BuildOptions"
+) -> None:
     """Resolve and log the dispatch harness's capabilities (Story 20.5-001).
 
     Resolves the default-slot harness, decides the safe run mode for
@@ -2712,12 +2714,36 @@ def _log_harness_preflight(ledger: "Ledger", run_id: str, requested_mode: str) -
     stderr and the ledger event log. A degradation downgrades the event level to
     ``warn`` so a capability gap is never silent. Best-effort: a logging failure
     must never fail an otherwise-good build.
+
+    Issue #426 (UX): the default-slot preflight always resolves the built-in
+    ``claude`` harness — it never consulted ``opts.harness_map`` — so a fully
+    per-role-routed Codex run still logged an unlabeled ``harness 'claude': ...``
+    line, making a successful Codex run look like it used Claude. When
+    ``opts.harness_map`` is set (``--harness role=harness,...``), this now emits
+    a ``harness routing: build=... coverage=... review=... merge=... docs=...``
+    line first showing the *effective* per-role map, and the default-slot lines
+    below it are labeled ``(default slot)`` so they are never confused with the
+    harness actually dispatching a stage's work.
     """
     try:
+        if opts.harness_map:
+            # Local import mirrors the existing pattern elsewhere in this module
+            # (e.g. the `--harness` CLI parsing above) — avoids a module-load
+            # import cycle between build.py and role_routing.py.
+            from sdlc.role_routing import PIPELINE_ROLES
+
+            routing = " ".join(
+                f"{role}={opts.harness_map.get(role, DEFAULT_HARNESS)}"
+                for role in PIPELINE_ROLES
+            )
+            line = f"harness routing: {routing}"
+            print(line, file=sys.stderr)
+            ledger.event_log(run_id, "", "info", "harness", line)
+
         harness = resolve_harness()
         preflight = preflight_harness(harness, requested_mode=requested_mode)
         level = "warn" if preflight.degraded else "info"
-        for line in preflight.log_lines():
+        for line in preflight.log_lines(label="default slot"):
             print(line, file=sys.stderr)
             ledger.event_log(run_id, "", level, "harness", line)
     except Exception:
@@ -3881,7 +3907,7 @@ def run_build(
     # heterogeneous run is auditable and any mode downgrade is explicit. The
     # default slot is the built-in Claude harness (no probe, all capabilities),
     # so this is purely additive logging and never alters dispatch behaviour.
-    _log_harness_preflight(ledger, run_id, mode)
+    _log_harness_preflight(ledger, run_id, mode, opts)
     # Story 20.5-002: record any safe fallback the harness's capability gaps force
     # (parallel→serial, usage "unavailable", rate-limit backoff skipped) so a
     # degradation is auditable in the run summary, never silent. Empty (no-op) for

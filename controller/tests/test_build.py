@@ -318,6 +318,71 @@ def test_run_build_logs_harness_capabilities(tmp_path, monkeypatch) -> None:
     assert "worktree_isolation" in joined
 
 
+def test_run_build_default_harness_labels_default_slot_and_skips_routing_line(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #426: a plain run (no --harness) still resolves only the default
+    slot, so its preflight lines are labeled ``(default slot)`` and no
+    ``harness routing:`` line is emitted — nothing to route when every role
+    already collapses to the built-in default."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='harness'"
+    ).fetchall()
+    joined = "\n".join(r[0] for r in rows)
+    assert "(default slot)" in joined
+    assert "harness routing:" not in joined
+
+
+def test_run_build_per_role_harness_map_logs_routing_and_labels_default_slot(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #426: a per-role ``--harness`` run (e.g. every role routed to Codex)
+    must log the *effective* role->harness routing map so the run is auditable
+    as Codex-routed, and the separate default-slot preflight line must be
+    clearly labeled so it is never mistaken for the harness actually dispatching
+    the work."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    opts.harness_map = {
+        "build": "codex",
+        "coverage": "codex",
+        "review": "codex",
+        "merge": "codex",
+    }
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='harness' ORDER BY id"
+    ).fetchall()
+    joined = "\n".join(r[0] for r in rows)
+    assert (
+        "harness routing: build=codex coverage=codex review=codex merge=codex "
+        "docs=claude" in joined
+    )
+    # The default-slot capability lines still resolve `claude` (today's
+    # behaviour, AC3 of Story 20.5-001) but must be labeled so a reader cannot
+    # confuse them with the codex worker actually dispatching the stages.
+    assert "harness 'claude' (default slot)" in joined
+
+
 def test_run_build_records_no_degradation_for_builtin_claude(tmp_path, monkeypatch) -> None:
     """Story 20.5-002 AC3: the fully-capable Claude harness records no degradation."""
     monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
