@@ -7,10 +7,21 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
-from sdlc.build import BuildOptions, Ledger, run_build, status_snapshot
+from sdlc.build import (
+    RATE_LIMIT_POLL_S,
+    BuildOptions,
+    Ledger,
+    _rate_limit_wait,
+    _run_story,
+    apply_rate_limit_park,
+    run_build,
+    status_snapshot,
+)
 from sdlc.cli import app
+from sdlc.dispatch import RateLimitError
 from sdlc.rate_limit import RateLimitSignal
 
 from test_build import FakeDispatcher, _SAMPLE_STAGE_TOKENS, _sample_queue
@@ -244,3 +255,119 @@ def test_dashboard_page_renders_stalls() -> None:
 
     assert "stall_seconds" in _PAGE
     assert "stalled" in _PAGE
+
+
+# ---------------------------------------------------------------------------
+# Coverage gate (27.3-004): residual edges of the wait/park path stall_log
+# threads through — long-wait countdown, reset resolution, notify degradation,
+# and the no-context / window-reopen branches around the stall recording.
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_wait_logs_countdown_across_poll_chunks(tmp_path: Path) -> None:
+    # A wait longer than one poll chunk emits the periodic countdown note and
+    # still records the *total* waited seconds as a single stall row.
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    wait_s = RATE_LIMIT_POLL_S + 60  # two chunks → one mid-wait countdown note
+    waited = _rate_limit_wait(
+        ledger, run_id, RateLimitSignal(source="429"), wait_s,
+        sleep_fn=_Sleeps(), story_id="s1-001", stage="build",
+    )
+    assert waited == wait_s
+    assert _stall_rows(db, run_id) == [
+        {"story_id": "s1-001", "stage": "build", "source": "429", "waited_s": wait_s},
+    ]
+    with ledger._connect_ro() as conn:  # noqa: SLF001 — test inspects the event log
+        msgs = [
+            r["message"] for r in conn.execute(
+                "SELECT message FROM events WHERE run_id = ?", (run_id,)
+            ).fetchall()
+        ]
+    assert any("until the window reopens" in m for m in msgs)
+
+
+def test_park_resolves_reset_from_retry_after(tmp_path: Path) -> None:
+    # A beyond-cap throttle carrying only a relative Retry-After (no reset
+    # epoch) parks with reset_at = now + retry_after so resume honours it.
+    db = tmp_path / "ledger.db"
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", "s1-001"),
+        signal=RateLimitSignal(source="retry-after", retry_after_s=50_000),
+        times=99,
+    )
+    result = run_build(
+        _opts(rate_limit_max_wait_s=300), queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=dispatcher, preflight=lambda: True,
+        sleep_fn=_Sleeps(), clock=lambda: 0.0,
+    )
+    assert result.rate_limited is True
+    assert Ledger(db).run_config(result.run_id)["rate_limit_reset_at"] == 50_000.0
+
+
+def test_park_notify_failure_never_fails_the_park(tmp_path: Path, monkeypatch) -> None:
+    # The lifecycle notification is best-effort: a raising notifier must not
+    # break the park — the run still ends RATE_LIMITED with its reset returned.
+    def boom(*_a, **_k):
+        raise RuntimeError("notifier down")
+
+    monkeypatch.setattr("sdlc.build.notify", boom)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    reset_at = apply_rate_limit_park(
+        ledger, run_id, RateLimitSignal(source="usage-limit", reset_at=999.0),
+        now=0.0, waited_s=60, window_s=18000,
+    )
+    assert reset_at == 999.0
+    assert ledger.run_row(run_id)["status"] == "RATE_LIMITED"
+
+
+def test_rate_limit_without_context_propagates(tmp_path: Path) -> None:
+    # _run_story called without a rate-limit context (rl_ctx=None, the direct /
+    # legacy path) must re-raise the throttle instead of absorbing it — only the
+    # rate-limit-aware runner owns the wait/park (and stall_log) machinery.
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    story = _sample_queue()[0]
+    ledger.story_upsert(
+        run_id, story.id, "99", story.title, "P1", 2, "py", "", None, "PENDING"
+    )
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", story.id),
+        signal=RateLimitSignal(source="429", retry_after_s=60),
+    )
+    with pytest.raises(RateLimitError):
+        _run_story(story, _opts(), ledger, run_id, dispatcher, tmp_path / "logs")
+    assert _stall_rows(db, run_id) == []  # nothing waited, so nothing recorded
+
+
+def test_reactive_429_with_window_budget_reopens_window(tmp_path: Path) -> None:
+    # A within-cap 429 while a window budget is configured reopens the window
+    # after the wait (re-seeding its baseline at the post-wait accrual) and the
+    # run completes with the stall attributed to the throttled story/stage.
+    db = tmp_path / "ledger.db"
+    sleeps = _Sleeps()
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", "s1-001"),
+        signal=RateLimitSignal(source="429", retry_after_s=60),
+    )
+    result = run_build(
+        _opts(
+            window_budget=100 * _SAMPLE_STAGE_TOKENS, window_s=100,
+            rate_limit_max_wait_s=18000,
+        ),
+        queue=_sample_queue(), ledger=Ledger(db), dispatcher=dispatcher,
+        preflight=lambda: True, sleep_fn=sleeps, clock=lambda: 0.0,
+    )
+    assert result.rate_limited is False
+    assert result.completed == 3
+    assert sum(sleeps.calls) == 60  # the ample budget itself never gated
+    assert _stall_rows(db, result.run_id) == [
+        {"story_id": "s1-001", "stage": "build", "source": "429", "waited_s": 60},
+    ]
