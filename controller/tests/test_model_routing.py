@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import textwrap
+from dataclasses import replace
 
 import pytest
 
@@ -147,6 +148,18 @@ def test_adversarial_floor_holds_even_with_a_cheap_override() -> None:
     assert select_model("adversarial", cfg, points=1, high_risk=False) == HAIKU
     # ...but a high-risk story still escalates to the Opus floor.
     assert select_model("adversarial", cfg, points=1, high_risk=True) == OPUS
+
+
+def test_pinned_stage_always_runs_on_escalation_model() -> None:
+    """A pinned stage ignores profile map and signals — the still-supported
+    mechanism 27.2-002 left in place, though no shipped profile pins a stage."""
+    cfg = replace(BALANCED, pinned_stages=frozenset({"adversarial"}))
+    # Low-risk, small story: an escalatable stage would tier down, a pin never does.
+    assert select_model("adversarial", cfg, points=1, high_risk=False) == OPUS
+    # High-risk agrees with the pin — still the escalation model.
+    assert select_model("adversarial", cfg, points=1, high_risk=True) == OPUS
+    # The pin wins even over the stage's mapped base tier (Sonnet in Balanced).
+    assert cfg.stage_models["adversarial"] == SONNET
 
 
 # ---------------------------------------------------------------------------
