@@ -2537,3 +2537,97 @@ def test_fix_change_class_docs_vs_code(tmp_path, monkeypatch) -> None:
     # An empty/unreadable diff is conservative CODE — a broken lookup runs more gates.
     monkeypatch.setattr(change_class_mod, "changed_files", lambda r, b, br: [])
     assert fix_mod._fix_change_class(issue, story, ledger, run_id, tmp_path) == CODE
+
+
+def test_fix_change_class_malformed_allowlist_degrades_to_code(
+    tmp_path, monkeypatch
+) -> None:
+    # A typo'd per-repo allowlist is ignored with a warning and classifies as
+    # CODE — a broken lookup can only ever run MORE gates, never fewer.
+    monkeypatch.setattr(
+        change_class_mod, "changed_files", lambda r, b, br: ["README.md"]
+    )
+    (tmp_path / change_class_mod.OVERRIDE_FILENAME).write_text(
+        "docs_patterns: 42\n", encoding="utf-8"
+    )
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue, root=tmp_path)
+    assert fix_mod._fix_change_class(issue, story, ledger, run_id, tmp_path) == CODE
+    assert any(
+        "change-class allowlist ignored" in m for m in _events(tmp_path / "l.db")
+    )
+
+
+def _fix_repo_with_origin(tmp_path, branch: str) -> Path:
+    import subprocess
+
+    root = tmp_path / "repo"
+    bare = tmp_path / "origin.git"
+    root.mkdir()
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@e.c"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=root, check=True, capture_output=True)
+    (root / "README.md").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", branch], cwd=root, check=True, capture_output=True)
+    return root
+
+
+def test_open_docs_only_pr_pushes_and_opens(tmp_path, monkeypatch) -> None:
+    import subprocess
+
+    import sdlc.issue_host as issue_host_mod
+    from sdlc.issue_host import ChangeRequest
+
+    root = _fix_repo_with_origin(tmp_path, "feature/issue-7")
+    created: list[dict] = []
+
+    class _Adapter:
+        def cr_create(self, source_branch, title, body, target_branch=None, draft=False):
+            created.append({
+                "source_branch": source_branch, "title": title, "body": body,
+                "target_branch": target_branch,
+            })
+            return ChangeRequest(host="github", ref="123", url="https://x/pull/123")
+
+    monkeypatch.setattr(issue_host_mod, "resolve_host", lambda r, override=None: "github")
+    monkeypatch.setattr(issue_host_mod, "get_adapter", lambda host, runner=None: _Adapter())
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-7", "fix")
+    issue = FixIssue(7, "Fix broken README link", "b", "open", (), ())
+    story = issue_story(issue, root=root)
+    pr = fix_mod._open_docs_only_pr(issue, story, ledger, run_id, root)
+    assert pr == 123
+    assert created[0]["source_branch"] == "feature/issue-7"
+    assert created[0]["target_branch"] == "main"
+    # Commitlint-compliant docs title with the issue trailer, Closes auto-close.
+    assert created[0]["title"].startswith("docs: ")
+    assert created[0]["title"].endswith(" (#7)")
+    assert "Closes #7" in created[0]["body"]
+    # The branch actually landed on the remote.
+    out = subprocess.run(
+        ["git", "ls-remote", "--heads", "origin", "feature/issue-7"],
+        cwd=root, capture_output=True, text=True, check=True,
+    )
+    assert "feature/issue-7" in out.stdout
+
+
+def test_open_docs_only_pr_push_failure_returns_none_and_warns(tmp_path) -> None:
+    # No git repo at root → the push fails → None; the caller then falls back
+    # to the full coverage dispatch, so the fix is never stranded without a PR.
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue, root=tmp_path)
+    assert fix_mod._open_docs_only_pr(issue, story, ledger, run_id, tmp_path) is None
+    assert any(
+        "deterministic PR open failed" in m for m in _events(tmp_path / "l.db")
+    )
