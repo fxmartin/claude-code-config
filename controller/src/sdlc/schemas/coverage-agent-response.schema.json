@@ -7,8 +7,6 @@
   "type": "object",
   "additionalProperties": true,
   "required": [
-    "pr_number",
-    "pr_url",
     "coverage_pct",
     "tests_added",
     "coverage_status"
@@ -17,13 +15,13 @@
     "pr_number": {
       "type": "integer",
       "minimum": 1,
-      "description": "Pull request number created by the coverage agent."
+      "description": "Pull request number, when the agent opened one. Optional since Story 27.3-001: the controller opens the change request deterministically after the coverage stage."
     },
     "pr_url": {
       "type": "string",
       "format": "uri",
       "minLength": 1,
-      "description": "URL of the pull request."
+      "description": "URL of the pull request, when the agent opened one. Optional since Story 27.3-001."
     },
     "coverage_pct": {
       "type": "number",

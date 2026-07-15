@@ -252,16 +252,19 @@ def test_build_prompt_includes_close_link_when_it_opens_the_pr():
 def test_build_prompt_omits_close_link_when_coverage_opens_pr():
     story = _story()
     opts = BuildOptions(scope="epic-22", skip_coverage=False)
-    # The build agent commits locally; coverage opens the PR, so no close-link here.
+    # The build agent commits locally; the controller opens the PR after the
+    # coverage gate (27.3-001), so no close-link here.
     prompt = render_build_prompt(story, opts, close_link="Closes #42")
     assert "Closes #42" not in prompt
 
 
-def test_coverage_prompt_includes_close_link():
+def test_coverage_prompt_omits_close_link():
+    # Story 27.3-001: the controller opens the CR itself and injects the
+    # close-link into the CR body — the coverage agent never needs it.
     story = _story()
     opts = BuildOptions(scope="epic-22")
     prompt = render_coverage_prompt(story, opts, close_link="Closes #42")
-    assert "Closes #42" in prompt
+    assert "Closes #42" not in prompt
 
 
 def test_prompts_unchanged_without_close_link():

@@ -243,6 +243,38 @@ def test_resume_treats_docs_only_skipped_coverage_as_done(tmp_path: Path) -> Non
     assert st.start_attempt == 2  # past the crashed review attempt, no PK collision
 
 
+def test_resume_treats_precheck_skipped_coverage_as_done(tmp_path: Path) -> None:
+    """A coverage-pre-check skip is terminal, exactly like docs-only (27.3-001).
+
+    The deterministic pre-check (tests green + changed-file coverage >=
+    threshold) records coverage SKIPPED/coverage-pre-check and continues to
+    review; resume must plan straight from an interrupted review rather than
+    re-entering the skipped stage and colliding on the stages PRIMARY KEY.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"skip_coverage": False}))
+    ledger.story_upsert(
+        run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    ledger.stage_start(run_id, "99.1-001", "build", 1)
+    ledger.stage_finish(run_id, "99.1-001", "build", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-001", "coverage", 1)
+    ledger.stage_finish(run_id, "99.1-001", "coverage", 1, "SKIPPED", "coverage-pre-check")
+    ledger.set_story_pr(run_id, "99.1-001", 100)
+    ledger.stage_start(run_id, "99.1-001", "review", 1)  # left IN_PROGRESS (crashed)
+    ledger.set_story_status(run_id, "99.1-001", "IN_PROGRESS")
+
+    plan = compute_resume_plan(ledger, run_id, skip_coverage=False)
+    st = plan["99.1-001"]
+    assert "coverage" in st.done_pipeline_stages
+    assert st.next_stage == "review"
+    assert st.start_attempt == 2
+
+
 def test_resume_still_reenters_cost_gated_skipped_stage(tmp_path: Path) -> None:
     """A cost-gate SKIPPED stage keeps its pause semantics — resume re-runs it.
 

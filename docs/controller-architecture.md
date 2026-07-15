@@ -161,6 +161,25 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    allowlist, or a failed deterministic PR open falls back to the full gate
    chain — a broken lookup can only ever run *more* gates, not fewer.
 
+   **Coverage pre-check + controller-owned PR creation (Story 27.3-001).**
+   Before dispatching the coverage agent on a *code* story, the controller
+   runs the project's own test + coverage command deterministically in the
+   story worktree (`sdlc/coverage_precheck.py`, reusing the same per-repo
+   command detection as the preflight; only pytest + pytest-cov repos are
+   instrumentable). Tests green **and** changed-file coverage ≥ the threshold
+   (default 90%, unchanged) means there is no gap to fill: the coverage
+   dispatch is skipped — recorded `SKIPPED` with `failure_category`
+   `coverage-pre-check`, never a passed gate — and the controller pushes the
+   branch and opens the PR/MR itself. A red suite or a gap dispatches the
+   agent exactly as before, with the measured numbers injected into its
+   prompt; an unmeasurable repo (gate script/npm/make, no pytest-cov) is
+   *inconclusive* and also dispatches as before. On every coverage path the
+   change request is now opened by deterministic controller code via the host
+   adapter — the coverage agent commits locally and never runs
+   `git push`/`gh pr create`; if the deterministic open fails after a
+   dispatched gate, the story parks `NEEDS_ATTENTION` with the branch
+   preserved rather than advancing without a change request.
+
    **Fix-issue mirror (Story 27.2-003).** `sdlc fix` applies the same tiering
    from the same shared docs-pattern list (`sdlc/change_class.py`, never a
    forked copy): after the build stage it classifies the `feature/issue-<N>`
