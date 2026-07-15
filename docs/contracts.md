@@ -38,7 +38,7 @@ inside the `sdlc` package so they ship in the installed wheel) in
 | Agent type | Schema file | Required fields |
 |------------|-------------|-----------------|
 | `build`    | `build-agent-response.schema.json`    | `branch_name`, `build_status`, `commit_sha` (optional `pr_number`, `error_summary`) |
-| `coverage` | `coverage-agent-response.schema.json` | `pr_number`, `pr_url`, `coverage_pct`, `tests_added`, `coverage_status`, `security_status` |
+| `coverage` | `coverage-agent-response.schema.json` | `pr_number`, `pr_url`, `coverage_pct`, `tests_added`, `coverage_status` |
 | `review`   | `review-agent-response.schema.json`   | `pr_number`, `approval_status`, `change_count`, `final_status` |
 | `merge`    | `merge-agent-response.schema.json`    | `pr_number`, `merge_status`, `merge_sha`, `merged_at` |
 | `bugfix`   | `bugfix-agent-response.schema.json`   | `failure_category`, `root_cause`, `fix_status`, `tests_passing`, `bugs_fixed`, `tests_fixed` (optional `issue_number`, `finding_dispositions`) |
@@ -50,7 +50,7 @@ historically emit a richer vocabulary (e.g. coverage `SECURITY_BLOCK`, merge
 `REBASE_CONFLICT`) map their value into the schema enum in the result block:
 
 - `build_status`: `SUCCESS` | `FAILED`
-- `coverage_status` / `security_status`: `PASS` | `WARN` | `FAIL`
+- `coverage_status`: `PASS` | `WARN` | `FAIL`
 - `approval_status`: `APPROVED` | `CHANGES_NEEDED`; `final_status`: `APPROVED` | `REJECTED`
 - `merge_status`: `MERGED` | `FAILED` | `SKIPPED`
 - `fix_status`: `FIXED` | `UNFIXED` | `N/A`
@@ -102,7 +102,7 @@ Coverage agent:
 
 ```
 <<<RESULT_JSON>>>
-{"pr_number": 42, "pr_url": "https://github.com/fxmartin/repo/pull/42", "coverage_pct": 93.5, "tests_added": 7, "coverage_status": "PASS", "security_status": "PASS"}
+{"pr_number": 42, "pr_url": "https://github.com/fxmartin/repo/pull/42", "coverage_pct": 93.5, "tests_added": 7, "coverage_status": "PASS"}
 <<<END_RESULT>>>
 ```
 

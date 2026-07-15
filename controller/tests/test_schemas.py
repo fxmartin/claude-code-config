@@ -34,7 +34,6 @@ VALID_RESPONSES: dict[str, dict] = {
         "coverage_pct": 93.5,
         "tests_added": 7,
         "coverage_status": "PASS",
-        "security_status": "PASS",
     },
     "review": {
         "pr_number": 42,
@@ -281,6 +280,26 @@ def test_bugfix_finding_disposition_missing_finding_rejected() -> None:
     data["finding_dispositions"] = [{"disposition": "implemented"}]
     with pytest.raises(SchemaValidationError):
         validate_response("bugfix", data)
+
+
+# ---------------------------------------------------------------------------
+# Issue #446: security_status was never read by the controller (CI owns the
+# security signal) and is removed from the coverage contract. It is no longer
+# required, but older agents still emitting it must validate (additionalProperties).
+# ---------------------------------------------------------------------------
+
+def test_coverage_security_status_no_longer_required() -> None:
+    """security_status is dropped from the coverage contract's required fields."""
+    schema = load_schema("coverage")
+    assert "security_status" not in schema["required"]
+    assert "security_status" not in schema.get("properties", {})
+
+
+def test_coverage_legacy_security_status_tolerated() -> None:
+    """A legacy coverage response still carrying security_status validates fine."""
+    data = dict(VALID_RESPONSES["coverage"])
+    data["security_status"] = "PASS"
+    assert validate_response("coverage", data) == data
 
 
 def test_coverage_optional_dep_scan_status_accepted() -> None:

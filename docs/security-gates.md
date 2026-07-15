@@ -11,9 +11,10 @@ security becomes a **gate**, not a follow-up.
 > and `sdlc depscan` classify an externally produced scan report (exit non-zero
 > on `BLOCK`) but do not run semgrep/osv-scanner themselves, and no CI job
 > currently runs those scanners (the GitLab CI template runs gitleaks only).
-> The coverage-agent contract carries a `security_status` field, but the
-> controller does not currently act on it; the "coverage stage runs the scans"
-> flow described below is the Epic-09 design, not the current enforcement path.
+> The coverage-agent contract's unread `security_status` field was removed
+> (issue #446): CI (gitleaks/supply-chain/SAST/dep-scan) is the sole security
+> signal. The "coverage stage runs the scans" flow described below is the
+> Epic-09 design, not the current enforcement path.
 
 This page documents the **SAST gate** (Story 9.1-001), the **dependency gate**
 (`osv-scanner`, Story 9.1-002), the **secrets gate** (Story 9.2-001), and the

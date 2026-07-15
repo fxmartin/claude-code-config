@@ -65,54 +65,6 @@ fi
    )"
    ```
 
-### Step 7b: Security Scan (optional — skip if `{{SECURITY_SCAN}}` is `off`)
-
-Detect available security scanning tools in the project:
-- **Python (code)**: check for `bandit` (`uv tool run bandit --version` or `bandit --version`)
-- **Python (dependencies)**: check for `pip-audit` (`uv tool run pip-audit --version` or `pip-audit --version`)
-- **Node.js**: check for `npm audit` (`npm --version`) or `npx semgrep`
-- **General**: check for `semgrep` (`semgrep --version`)
-
-If a scanner is found, run it:
-```bash
-# Get changed files (for code scanners)
-CHANGED_FILES=$(git diff --name-only main...HEAD)
-
-# Python code analysis (non-blocking)
-uv tool run bandit -r $CHANGED_FILES 2>/dev/null || true
-
-# Python dependency audit (BLOCKING on critical/high)
-# IMPORTANT: audit the PROJECT's own dependencies, not pip-audit's ephemeral
-# tool environment. Bare `uv tool run pip-audit` audits pip-audit's own runtime
-# deps (requests->urllib3/idna, cachecontrol->msgpack, pip), surfacing phantom
-# advisories that have nothing to do with the project (see issue #119). Inject
-# pip-audit into the project venv with `--with` and scope to local deps via `-l`.
-if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
-  PIP_AUDIT_OUTPUT=$(uv run --with pip-audit pip-audit -l --format json 2>/dev/null || pip-audit -l --format json 2>/dev/null || echo '[]')
-
-  # Check for critical or high severity vulnerabilities
-  CRITICAL_HIGH=$(echo "$PIP_AUDIT_OUTPUT" | jq '[.[] | select(.fix_versions != [] and (.aliases[]? // "" | test("CVE")) ) | .vulnerability] | length' 2>/dev/null || echo "0")
-
-  if [ "$CRITICAL_HIGH" -gt 0 ]; then
-    echo "SECURITY_BLOCK: pip-audit found $CRITICAL_HIGH critical/high severity vulnerabilities"
-    echo "$PIP_AUDIT_OUTPUT" | jq -r '.[] | select(.fix_versions != []) | "  - \(.name) \(.version): \(.vulnerability) (fix: \(.fix_versions | join(", ")))"' 2>/dev/null
-  else
-    # Report non-critical findings as warnings
-    echo "$PIP_AUDIT_OUTPUT" | jq -r '.[] | "  [warn] \(.name) \(.version): \(.vulnerability)"' 2>/dev/null || true
-  fi
-fi
-
-# Node.js projects (non-blocking)
-npm audit --production 2>/dev/null || true
-```
-
-**Security scan behavior:**
-- `bandit`, `npm audit`: **Non-blocking** — findings reported as `SECURITY_WARN`
-- `pip-audit` with **critical/high** CVEs: **Blocking** — report as `SECURITY_BLOCK` and fail the gate. The story cannot proceed until vulnerable dependencies are updated.
-- `pip-audit` with **medium/low** findings: **Non-blocking** — reported as `SECURITY_WARN`
-
-If `pip-audit` blocks, include the vulnerable packages and available fix versions in the agent output so the bugfix agent can resolve them.
-
 ### Step 7c: SAST scan with semgrep (Story 9.1-001 — skip if `{{SECURITY_SCAN}}` is `off`)
 
 Run a Static Application Security Testing scan over the repo *after* coverage is
@@ -141,8 +93,8 @@ fi
 - `WARN`: one or more `warning`-severity findings — gate passes, findings reported.
 - `BLOCK`: one or more `error`-severity findings — **gate FAILED**. The
   orchestrator routes a `BLOCK` to the bugfix loop (Step 5d in `build-stories`),
-  the same path as a `SECURITY_BLOCK`. Include each finding's rule ID, file, and
-  line in the agent output so the bugfix agent can remediate.
+  the same path as a dependency-scan `BLOCK`. Include each finding's rule ID,
+  file, and line in the agent output so the bugfix agent can remediate.
 - `SKIPPED`: semgrep is not installed, or `{{SECURITY_SCAN}}` is `off`.
 
 A consumer repo may ship `.sast-config.yaml` to add rulesets or suppress
@@ -211,18 +163,12 @@ TESTS_ADDED: [count]
 PR_NUMBER: [number]
 PR_URL: [url]
 COVERAGE_STATUS: PASS | WARN
-SECURITY_STATUS: CLEAN | SECURITY_WARN | SECURITY_BLOCK | SKIPPED
 SAST_STATUS: CLEAN | WARN | BLOCK | SKIPPED
 DEP_SCAN_STATUS: CLEAN | WARN | BLOCK | SKIPPED
 ```
 
 - `PASS`: New code has ≥{{COVERAGE_THRESHOLD}}% coverage
 - `WARN`: Coverage is below {{COVERAGE_THRESHOLD}}% but no more testable gaps were found (e.g., platform-specific code, generated code)
-- `SECURITY_STATUS`:
-  - `CLEAN`: No security findings or no scanner available
-  - `SECURITY_WARN`: Non-critical findings from any scanner (details in agent output)
-  - `SECURITY_BLOCK`: `pip-audit` found critical/high severity CVEs — gate FAILED (include package names, CVE IDs, and fix versions in agent output)
-  - `SKIPPED`: Security scan was disabled via `{{SECURITY_SCAN}}=off`
 - `SAST_STATUS` (semgrep, Story 9.1-001):
   - `CLEAN`: No SAST findings at `error` or above (or only `info`)
   - `WARN`: One or more `warning`-severity findings — gate passes
@@ -238,14 +184,13 @@ DEP_SCAN_STATUS: CLEAN | WARN | BLOCK | SKIPPED
 
 As the FINAL line of your response, also emit a result block that conforms to
 `controller/schemas/coverage-agent-response.schema.json`. Map the statuses into
-the schema's canonical `PASS | WARN | FAIL` enum (CLEAN → PASS, SECURITY_WARN →
-WARN, SECURITY_BLOCK → FAIL, SKIPPED → PASS). The SAST and dependency-scan
+the schema's canonical `PASS | WARN | FAIL` enum. The SAST and dependency-scan
 verdicts map the same way (CLEAN → PASS, WARN → WARN, BLOCK → FAIL, SKIPPED →
 PASS):
 
 ```
 <<<RESULT_JSON>>>
-{"pr_number": [number], "pr_url": "[url]", "coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "security_status": "PASS", "sast_status": "PASS", "dep_scan_status": "PASS"}
+{"pr_number": [number], "pr_url": "[url]", "coverage_pct": [number], "tests_added": [count], "coverage_status": "PASS", "sast_status": "PASS", "dep_scan_status": "PASS"}
 <<<END_RESULT>>>
 ```
 
