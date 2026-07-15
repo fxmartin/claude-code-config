@@ -432,6 +432,16 @@ class IssueHostAdapter(ABC):
     def cr_diff(self, ref: "str | ChangeRequest") -> str:
         """Return the unified diff of a change request (the adversarial-review feed)."""
 
+    def cr_view(self, ref: "str | ChangeRequest") -> ChangeRequest:
+        """Return a change request's metadata (title, state, url, branches).
+
+        Story 27.3-003: the meta feed for the pre-baked review packet.
+        Deliberately **not** abstract (mirrors :meth:`cr_checks`): a backend
+        without an implementation raises :class:`IssueHostError`, which the
+        best-effort packet builder degrades to the fetch-it-yourself fallback.
+        """
+        raise IssueHostError(f"{self.host} adapter does not implement cr_view")
+
     @abstractmethod
     def cr_status(self, ref: "str | ChangeRequest") -> str:
         """Return the normalised CI status of a change request (one of `CR_*`).
@@ -667,6 +677,25 @@ class GitHubAdapter(IssueHostAdapter):
     def cr_diff(self, ref: "str | ChangeRequest") -> str:
         return self._run("pr", "diff", _cr_ref_of(ref)).stdout
 
+    def cr_view(self, ref: "str | ChangeRequest") -> ChangeRequest:
+        ref = _cr_ref_of(ref)
+        out = self._run(
+            "pr", "view", ref,
+            "--json", "number,url,title,state,headRefName,baseRefName",
+        ).stdout
+        row = _parse_json_object(out)
+        if not row:
+            raise IssueHostError(f"gh pr view {ref} returned no change request")
+        return ChangeRequest(
+            host=self.host,
+            ref=str(row.get("number") or ref),
+            url=row.get("url"),
+            title=row.get("title"),
+            state=_norm_state(row.get("state")),
+            source_branch=row.get("headRefName"),
+            target_branch=row.get("baseRefName"),
+        )
+
     def cr_status(self, ref: "str | ChangeRequest") -> str:
         out = self._run(
             "pr", "view", _cr_ref_of(ref), "--json", "statusCheckRollup"
@@ -860,6 +889,22 @@ class GitLabAdapter(IssueHostAdapter):
 
     def cr_diff(self, ref: "str | ChangeRequest") -> str:
         return self._run("mr", "diff", _cr_ref_of(ref)).stdout
+
+    def cr_view(self, ref: "str | ChangeRequest") -> ChangeRequest:
+        ref = _cr_ref_of(ref)
+        out = self._run("mr", "view", ref, "--output", "json").stdout
+        row = _parse_json_object(out)
+        if not row:
+            raise IssueHostError(f"glab mr view {ref} returned no change request")
+        return ChangeRequest(
+            host=self.host,
+            ref=str(row.get("iid") or ref),
+            url=row.get("web_url"),
+            title=row.get("title"),
+            state=_norm_state(row.get("state")),
+            source_branch=row.get("source_branch"),
+            target_branch=row.get("target_branch"),
+        )
 
     def cr_status(self, ref: "str | ChangeRequest") -> str:
         out = self._run("mr", "view", _cr_ref_of(ref), "--output", "json").stdout

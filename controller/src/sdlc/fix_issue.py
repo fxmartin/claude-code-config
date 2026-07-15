@@ -511,12 +511,28 @@ def render_coverage_prompt(issue: FixIssue, opts: FixOptions) -> str:
     )
 
 
-def render_review_prompt(issue: FixIssue, pr_number: int | None) -> str:
-    """Render the review-gate prompt for a fix run (issue #436)."""
+def render_review_prompt(
+    issue: FixIssue, pr_number: int | None, *, packet: str | None = None
+) -> str:
+    """Render the review-gate prompt for a fix run (issue #436).
+
+    Story 27.3-003: ``packet`` is the pre-baked review packet (CR meta, changed
+    files, diff) — embedded so the reviewer stops re-deriving its inputs with
+    ``gh pr view/diff/checkout``; None keeps today's prompt unchanged.
+    """
+    packet_block = (
+        "Consume the pre-baked Review Packet below instead of re-fetching its "
+        "contents with `gh pr view` / `gh pr diff` / `gh pr checkout`. Fetch "
+        "host-side only for something the packet does not contain.\n\n"
+        f"{packet}\n"
+        if packet
+        else ""
+    )
     return (
         f"Review the PR for the fix of issue #{issue.number} "
         f"(PR #{pr_number}).\n"
         + _untrusted_block(issue)
+        + packet_block
         + "Check architecture, security, performance, coverage, and code quality; "
         "approve when satisfied, then emit the result block.\n"
         "Do NOT trust the implementer's report: the PR description, commit "
@@ -914,6 +930,40 @@ def _open_docs_only_pr(
         return None
 
 
+def _bake_review_packet(
+    issue: FixIssue,
+    story: Story,
+    pr_number: int,
+    root: Path | None,
+    ledger: Ledger,
+    run_id: str,
+) -> str | None:
+    """Bake the pre-baked review packet for the fix's PR, or None (Story 27.3-003).
+
+    The fix-issue mirror of ``build._bake_review_packet``: baked once per review
+    stage entry via the Epic-22/23 host adapter. Best-effort — any host failure
+    or an oversized packet logs an event and returns None, degrading the prompt
+    to today's fetch-it-yourself instructions (never a truncated diff).
+    """
+    root = root or Path.cwd()
+    try:
+        # Local import mirrors _open_docs_only_pr — keeps the host adapter off
+        # this module's hot import path.
+        from sdlc import issue_host, review_packet
+
+        adapter = issue_host.get_adapter(issue_host.resolve_host(root))
+        block = review_packet.packet_block(adapter, str(pr_number))
+    except Exception:  # noqa: BLE001 — best-effort; the prompt has a fallback path
+        block = None
+    if block is None:
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            f"review packet unavailable or oversized for PR #{pr_number} — "
+            "reviewer falls back to host fetch (issue #" + str(issue.number) + ")",
+        )
+    return block
+
+
 def _run_stage_loop(
     issue: FixIssue,
     inv: dict,
@@ -977,11 +1027,22 @@ def _run_stage_loop(
             # PR: fall through to the full coverage dispatch.
         attempt = 1
         bugfix_attempts = 0
+        # Story 27.3-003: bake the review packet once per review stage entry so
+        # the dispatch and every retry reuse the same packet. None (no PR yet,
+        # host failure, oversized) leaves the fetch-it-yourself fallback.
+        review_packet_block: str | None = None
+        if stage == "review" and pr_number is not None:
+            review_packet_block = _bake_review_packet(
+                issue, story, pr_number, root, ledger, run_id
+            )
         while True:
             model = fix_model(stage, opts, escalate=escalate)
             ledger.stage_start(run_id, story.id, stage, attempt, model=model)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
-            prompt = _render_core_prompt(stage, issue, inv, opts, pr_number)
+            prompt = _render_core_prompt(
+                stage, issue, inv, opts, pr_number,
+                review_packet=review_packet_block,
+            )
             try:
                 ok, result, failure, kind = _dispatch_fix_stage(
                     stage, story, prompt, model, dispatch, tpath
@@ -1052,7 +1113,13 @@ def _run_stage_loop(
 
 
 def _render_core_prompt(
-    stage: str, issue: FixIssue, inv: dict, opts: FixOptions, pr_number: int | None
+    stage: str,
+    issue: FixIssue,
+    inv: dict,
+    opts: FixOptions,
+    pr_number: int | None,
+    *,
+    review_packet: str | None = None,
 ) -> str:
     """Render the fix prompt for one core pipeline stage."""
     if stage == "build":
@@ -1060,7 +1127,7 @@ def _render_core_prompt(
     if stage == "coverage":
         return render_coverage_prompt(issue, opts)
     if stage == "review":
-        return render_review_prompt(issue, pr_number)
+        return render_review_prompt(issue, pr_number, packet=review_packet)
     return render_merge_prompt(issue, pr_number)
 
 

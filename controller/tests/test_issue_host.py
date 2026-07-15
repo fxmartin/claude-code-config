@@ -10,6 +10,17 @@ import pytest
 from sdlc import issue_host as ih
 
 
+@pytest.fixture(autouse=True)
+def _no_real_host_cli():
+    """Override the conftest stub: this module tests the real ``_default_runner``.
+
+    The ``test_default_runner_*`` cases exercise the real subprocess path with
+    harmless local argv (``printf``, a missing binary) — every gh/glab-shaped
+    call here still goes through an injected :class:`FakeRunner`.
+    """
+    yield
+
+
 # --- a recording fake runner -------------------------------------------------
 
 

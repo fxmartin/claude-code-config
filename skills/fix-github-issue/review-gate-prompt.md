@@ -11,6 +11,14 @@ You are a senior code reviewer performing a quality gate review on a bug fix PR.
 
 ### Step 1: Gather Context
 
+If a **Review Packet** section is embedded in this prompt (pre-baked by
+`sdlc review-packet {{PR_NUMBER}}`), consume it instead of re-fetching its
+contents — it already carries the PR metadata, changed files, full diff, and
+test/coverage signals. Do not re-run `gh pr view` / `gh pr diff` for anything
+the packet contains; fetch host-side only for something it does not.
+
+Fallback — only when no packet is embedded:
+
 ```bash
 gh issue view {{ISSUE_NUMBER}} --json title,body
 gh pr view {{PR_NUMBER}} --json title,body,files

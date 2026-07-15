@@ -3242,7 +3242,25 @@ def render_coverage_prompt(
     )
 
 
-def render_review_prompt(story: Story, pr_number: int | None) -> str:
+def render_review_prompt(
+    story: Story, pr_number: int | None, *, packet: str | None = None
+) -> str:
+    # Story 27.3-003: ``packet`` is the pre-baked review packet (CR meta, changed
+    # files, diff, test/coverage signals) baked once per review stage entry so
+    # the reviewer — including the adversarial slot, which consumes this same
+    # rendered prompt — stops re-deriving its inputs with `gh pr view/diff/
+    # checkout` round-trips. None (host failure / oversized packet) keeps
+    # today's fetch-it-yourself prompt unchanged.
+    packet_block = (
+        "Consume the pre-baked Review Packet below instead of re-fetching its "
+        "contents with `gh pr view` / `gh pr diff` / `gh pr checkout` — it "
+        "already carries the metadata, changed files, full diff, and pipeline "
+        "test/coverage signals. Fetch host-side only for something the packet "
+        "does not contain.\n\n"
+        f"{packet}\n"
+        if packet
+        else ""
+    )
     # Story 18.3-001: documentation-currency review dimension. When enabled (the
     # default), the reviewer also checks that a behavior-changing diff shipped its
     # doc update; gaps are flagged as advisory findings (never blocks shipping).
@@ -3262,7 +3280,8 @@ def render_review_prompt(story: Story, pr_number: int | None) -> str:
     # rather than accept them (pattern: superpowers task-reviewer-prompt).
     return (
         f"Review the PR for story {story.id}: {story.title} (PR #{pr_number}).\n"
-        "Check architecture, security, performance, coverage, code quality; "
+        + packet_block
+        + "Check architecture, security, performance, coverage, code quality; "
         "approve when satisfied, then emit the result block.\n"
         "Do not trust the implementer's report: the PR description, commit "
         "messages, and any summary are unverified claims — including design "
@@ -3568,6 +3587,57 @@ def _open_docs_only_cr(
         ),
         context="docs-only skip (falling back to the full coverage dispatch)",
     )
+
+
+def _coverage_signals(data: dict) -> str | None:
+    """One line of test/coverage signals from a coverage-stage result (27.3-003).
+
+    Rides the review packet so the reviewer sees the pipeline's own numbers
+    instead of re-running the suite. None when the result carries none of them
+    (e.g. a skipped coverage stage) — the packet then names the gap.
+    """
+    parts = [
+        f"{key}={data[key]}"
+        for key in ("coverage_status", "coverage_pct", "tests_added")
+        if key in data
+    ]
+    return f"coverage stage: {', '.join(parts)}" if parts else None
+
+
+def _bake_review_packet(
+    story: Story,
+    pr_number: int,
+    workdir: Path | None,
+    ledger: Ledger,
+    run_id: str,
+    checks: str | None,
+    cr_terms: ChangeRequestTerms,
+) -> str | None:
+    """Bake the pre-baked review packet for this story's CR, or None (27.3-003).
+
+    Baked once per review stage entry so the review dispatch — and the
+    adversarial slot, which consumes the same rendered prompt — reuses one
+    packet. Best-effort: any host failure or an oversized packet logs an event
+    and returns None, degrading the prompt to today's fetch-it-yourself
+    instructions (never a truncated diff).
+    """
+    root = workdir or Path.cwd()
+    try:
+        # Local import mirrors _open_docs_only_cr — keeps the host adapter off
+        # this module's hot import path.
+        from sdlc import issue_host, review_packet
+
+        adapter = issue_host.get_adapter(issue_host.resolve_host(root))
+        block = review_packet.packet_block(adapter, str(pr_number), checks=checks)
+    except Exception:  # noqa: BLE001 — best-effort; the prompt has a fallback path
+        block = None
+    if block is None:
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            f"review packet unavailable or oversized for {cr_terms.abbr} "
+            f"#{pr_number} — reviewer falls back to host fetch",
+        )
+    return block
 
 
 def _review_is_adversarial_slot(opts: BuildOptions) -> bool:
@@ -5212,6 +5282,10 @@ def _run_story(
     # lazily from the built branch's real diff at the first gated stage. None
     # until the build stage has produced a branch to classify.
     story_class: str | None = None
+    # Story 27.3-003: the coverage stage's reported test/coverage signals, kept
+    # to ride the pre-baked review packet. None until (and unless) a coverage
+    # dispatch reports them — the packet then names the gap.
+    coverage_signals: str | None = None
     for idx, stage in enumerate(pending):
         # Story 22.4-002: post a live status comment/label on the story's issue as
         # the build enters each stage (building → in-review → merging). Deduped
@@ -5344,6 +5418,15 @@ def _run_story(
                 "adversarial slot skipped (skip_reason=docs-only) — review "
                 "dispatched non-adversarially on the default harness",
             )
+        # Story 27.3-003: bake the review packet once per review stage entry so
+        # the review dispatch — adversarial slot included, and every bugfix
+        # retry of it — reuses the same packet. None (no CR yet, host failure,
+        # oversized) leaves the prompt on its fetch-it-yourself fallback.
+        review_packet_block: str | None = None
+        if stage == "review" and pr_number is not None:
+            review_packet_block = _bake_review_packet(
+                story, pr_number, workdir, ledger, run_id, coverage_signals, cr_terms
+            )
         while True:
             # Issue #427: resolve the (harness, model) for this dispatch *before*
             # the ledger write and the estimate, so both record the identical
@@ -5436,6 +5519,7 @@ def _run_story(
                         on_progress=sink, escalation_steps=escalation_steps,
                         close_link=close_link, cr_terms=cr_terms, base_ref=base_ref,
                         precheck=precheck,
+                        review_packet=review_packet_block,
                     )
                 if ok:
                     ledger.stage_finish(
@@ -5450,6 +5534,10 @@ def _run_story(
                     pr_number = _extract_pr(result, pr_number)
                     if pr_number is not None:
                         ledger.set_story_pr(run_id, story.id, pr_number)
+                    # Story 27.3-003: keep the coverage stage's reported signals
+                    # for the review packet baked at the next stage.
+                    if stage == "coverage" and result is not None:
+                        coverage_signals = _coverage_signals(result.data)
                     # Story 23.2-003: a landed merge records its sha so the story
                     # is marked DONE *with* the GitLab/GitHub merge sha (AC3);
                     # no-op for non-merge stages.
@@ -5971,6 +6059,7 @@ def _dispatch_stage(
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
     base_ref: str = "origin/main",
     precheck: "coverage_precheck.PrecheckResult | None" = None,
+    review_packet: str | None = None,
 ) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one stage's agent and classify the outcome.
 
@@ -5989,6 +6078,7 @@ def _dispatch_stage(
     prompt = _render_stage_prompt(
         stage, story, opts, pr_number, close_link=close_link,
         cr_terms=cr_terms, base_ref=base_ref, precheck=precheck,
+        review_packet=review_packet,
     )
     # Issue #427: resolve the effective model through the shared helper so
     # dispatch and the pre-dispatch estimate/ledger write can never diverge. For
@@ -6050,6 +6140,7 @@ def _render_stage_prompt(
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
     base_ref: str = "origin/main",
     precheck: "coverage_precheck.PrecheckResult | None" = None,
+    review_packet: str | None = None,
 ) -> str:
     if stage == "build":
         return render_build_prompt(
@@ -6060,7 +6151,7 @@ def _render_stage_prompt(
             story, opts, close_link=close_link, cr_terms=cr_terms, precheck=precheck
         )
     if stage == "review":
-        return render_review_prompt(story, pr_number)
+        return render_review_prompt(story, pr_number, packet=review_packet)
     return render_merge_prompt(story, pr_number, cr_terms=cr_terms)
 
 
