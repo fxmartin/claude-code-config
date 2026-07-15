@@ -19,6 +19,7 @@ from sdlc.build import (
     BuildOptions,
     BuildResult,
     Ledger,
+    _dispatch_overengineering_advisory,
     _filter_git_landed,
     _stamp_run_actor,
     default_preflight,
@@ -2046,6 +2047,69 @@ def test_overengineering_lens_failure_never_fails_the_review_stage(
     assert rows, "expected the lens error to be logged"
     assert all(level == "warn" for level, _ in rows)
     assert all("ignored" in m for _, m in rows)
+
+
+class _RecordingLedger:
+    """Bare event_log recorder — exercises the helper without a real DB."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, str, str, str]] = []
+
+    def event_log(
+        self, run_id: str, story_id: str, level: str, source: str, message: str
+    ) -> None:
+        self.events.append((run_id, story_id, level, source, message))
+
+
+def test_overengineering_advisory_noop_when_no_pr_yet(monkeypatch) -> None:
+    """``pr_number is None`` ⇒ no-op before even resolving the lens config."""
+    monkeypatch.setattr(
+        "sdlc.role_routing.bundled_config_path",
+        lambda name: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+    ledger = _RecordingLedger()
+    story = _sample_queue()[0]
+
+    _dispatch_overengineering_advisory(story, None, ledger, "run-1")
+
+    assert ledger.events == []
+
+
+def test_overengineering_advisory_noop_when_config_unresolvable(monkeypatch) -> None:
+    """Bundled config missing/unresolvable ⇒ no-op, no ledger event."""
+    monkeypatch.setattr("sdlc.role_routing.bundled_config_path", lambda name: None)
+    ledger = _RecordingLedger()
+    story = _sample_queue()[0]
+
+    _dispatch_overengineering_advisory(story, 42, ledger, "run-1")
+
+    assert ledger.events == []
+
+
+def test_overengineering_advisory_unexpected_error_logged_as_warn(
+    tmp_path, monkeypatch
+) -> None:
+    """A non-lens exception (e.g. a bug in dispatch) is caught, never raised."""
+    config_path = _lens_config(tmp_path, enabled=True, command="unused")
+    monkeypatch.setattr(
+        "sdlc.role_routing.bundled_config_path", lambda name: config_path
+    )
+
+    def _boom(*args, **kwargs):
+        raise ValueError("boom")
+
+    monkeypatch.setattr("sdlc.overengineering.dispatch_overengineering_lens", _boom)
+    ledger = _RecordingLedger()
+    story = _sample_queue()[0]
+
+    _dispatch_overengineering_advisory(story, 42, ledger, "run-1")
+
+    assert len(ledger.events) == 1
+    _, _, level, _, message = ledger.events[0]
+    assert level == "warn"
+    assert "unexpected error" in message
+    assert "ignored" in message
+    assert "boom" in message
 
 
 # ---------------------------------------------------------------------------
