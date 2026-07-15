@@ -170,7 +170,7 @@ For building **one story at a time** with visibility into agent selection and re
 For building **all incomplete stories** across epics with automated error recovery.
 
 ```
-/build-stories [all | resume | epic-NN | epic-name] [--dry-run] [--auto] [--skip-coverage] [--e2e-gate=block|warn|off] [--parallel]
+/build-stories [all | resume | epic-NN | epic-name] [--dry-run] [--auto] [--skip-coverage] [--sequential] [--concurrency=N]
 ```
 
 **Flow per story**:
@@ -183,6 +183,8 @@ For building **all incomplete stories** across epics with automated error recove
 7. **E2E Gate** — runs Playwright tests at epic boundaries
 8. **Summary Agent** — generates batch report with metrics
 
+**Risk-tiered gates (Epic-27)**: gates scale with the change's risk instead of running at full price for every story. Docs-only/chore changes (every changed file matches the docs patterns) skip the coverage dispatch and the adversarial review slot — each skip is recorded in the ledger with a `skip_reason`, never displayed as a passed gate — while the standard review still runs. The coverage gate runs a deterministic pre-check first (the controller executes the project's test + coverage command itself) and dispatches the coverage agent only when there is a real gap below the 90% threshold; the criterion itself never weakens. The adversarial review slot is tiered by risk: Sonnet for low-risk stories, with the Opus floor preserved for high-risk or large ones. Rate-limit backoff is recorded as its own ledger dimension (the `stalls` table), so `sdlc status` and the dashboard show stall time separately from stage durations instead of letting quota waits pollute them.
+
 **Telegram notifications**:
 
 | Moment | Notification |
@@ -191,7 +193,7 @@ For building **all incomplete stories** across epics with automated error recove
 | Story completes | Telegram per story |
 | Build finishes | Telegram with metrics |
 
-**Parallel mode** (`--parallel`): Stories are organized into dependency cohorts. Up to 3 agents run concurrently per cohort, isolated in their own git worktrees that are cleaned up when the cohort completes.
+**Parallel execution** (the default): Stories dispatch through a dependency-aware ready queue — a story starts as soon as its dependencies land. Up to 5 agents run concurrently (the `--concurrency=N` default; `--sequential` or `--concurrency=1` selects the serial path), each isolated in its own git worktree that is cleaned up when the story completes.
 
 **Progress tracking**: `docs/stories/.build-progress.md` maintains per-story status (DONE / IN_PROGRESS / FAILED / SKIPPED / PENDING).
 
@@ -285,8 +287,8 @@ The controller (`sdlc build`/`resume`) emits its own run-lifecycle notifications
 
 # Then choose your build path:
 /resume-build-agents next             # A. One story at a time (controlled)
-/build-stories all                    # B. All stories (autonomous)
-/build-stories all --parallel         # B. All stories (autonomous, parallel worktree-isolated cohorts)
+/build-stories all                    # B. All stories (autonomous, parallel worktree-isolated by default)
+/build-stories all --sequential       # B. All stories, one at a time (serial path)
 /fix-issue 42                         # C. Fix a specific issue (11-phase pipeline)
 /fix-issue next --limit=5             # C. Fix next 5 open bugs sequentially
 
