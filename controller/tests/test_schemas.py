@@ -66,6 +66,13 @@ VALID_RESPONSES: dict[str, dict] = {
     "summary": {
         "summary_markdown": "## Fix Complete\n\nRoot cause: off-by-one. PR #42 merged.",
     },
+    "e2e": {
+        "e2e_result": "PASS",
+        "e2e_summary": "existing Playwright suite green (12 passed)",
+    },
+    "doc_update": {
+        "doc_update_status": "UPDATED",
+    },
 }
 
 ALL_AGENT_TYPES = sorted(AGENT_SCHEMAS)

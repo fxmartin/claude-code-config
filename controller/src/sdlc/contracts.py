@@ -39,6 +39,11 @@ AGENT_SCHEMAS: dict[str, str] = {
     # same dispatch+validation seam as the pipeline stages, so they register here.
     "investigation": "investigation-agent-response.schema.json",
     "summary": "summary-agent-response.schema.json",
+    # Issue #436 PR3: the optional E2E warn-gate (advisory, never blocks a fix) and
+    # the best-effort batch doc-update phase. Both dispatch through the same seam,
+    # so they register their contracts here too.
+    "e2e": "e2e-agent-response.schema.json",
+    "doc_update": "doc-update-agent-response.schema.json",
 }
 
 

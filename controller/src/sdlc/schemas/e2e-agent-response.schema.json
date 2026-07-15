@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/e2e-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for e2e-agent responses (issue #436, sdlc fix). ABOUTME: Warn-only advisory gate; a FAIL never blocks a fix. Draft 2020-12, extra fields allowed.",
+  "title": "E2EAgentResponse",
+  "description": "Existing-suite E2E result returned by the e2e agent dispatched by `sdlc fix` in warn mode.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["e2e_result", "e2e_summary"],
+  "properties": {
+    "e2e_result": {
+      "type": "string",
+      "enum": ["PASS", "FAIL", "SKIP"],
+      "description": "PASS: existing E2E suite green. FAIL: still red after fix attempts. SKIP: no E2E harness / not applicable."
+    },
+    "e2e_summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One-line summary of the E2E outcome."
+    }
+  }
+}
