@@ -393,7 +393,17 @@ def _result_wrapper(schema_filename: str) -> str:
         + RESULT_END_MARKER
         + "\nUse these exact keys. Enum fields must be one of the literals shown. "
         "Extra keys are allowed, but the keys above are required and must use "
-        "these exact names."
+        "these exact names.\n"
+        # Run b8fdbc71 (story 27.1-003, merge attempt 3): the agent parked its
+        # CI wait on a background watcher + scheduled wakeup and ended the turn
+        # with no text — the one-shot session terminated, the wakeup never
+        # fired, and the stage failed on a missing result block. Spell the
+        # session model out so no dispatched agent defers the block.
+        "This is a one-shot headless session: it ends when your turn ends, and "
+        "a background task, monitor, or scheduled wakeup will never re-invoke "
+        "you. Do any waiting with blocking foreground commands; if you are "
+        "still blocked on something external, emit the result block now with "
+        "the honest non-success status instead of deferring it."
     )
 
 
