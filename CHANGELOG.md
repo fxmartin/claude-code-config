@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.26.0] - 2026-07-15
+
+### Added
+
+- feat(performance-token-optimization): story-section injection into build/coverage prompts (#27.3-002) (#470)
+
+
 ## [v2.25.0] - 2026-07-15
 
 ### Added
