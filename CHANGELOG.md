@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.18.2] - 2026-07-15
+
+### Fixed
+
+- fix(lens): fail closed on malformed findings instead of dropping them (#458)
+
+
 ## [v2.18.1] - 2026-07-15
 
 ### Fixed
