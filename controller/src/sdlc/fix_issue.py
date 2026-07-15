@@ -80,7 +80,16 @@ FIX_STAGE_MODELS: dict[str, str] = {
     "merge": "haiku",
     "bugfix": "opus",
     "summary": "haiku",
+    # PR3 phases (issue #436): the optional E2E warn-gate and the batch doc-update
+    # phase both run on sonnet, matching the skill's qa-engineer / doc-update models.
+    "e2e": "sonnet",
+    "doc_update": "sonnet",
 }
+
+# Valid --e2e-gate values. ``off`` (default) never dispatches the gate; ``warn``
+# runs it after review as an advisory step that logs a FAIL and continues (the
+# skill's blocking modes are deliberately out of scope for this migration).
+_E2E_GATE_MODES = {"off", "warn"}
 
 # The core pipeline stages driven in order after a READY investigation. Mirrors
 # build.py's ``_STAGES`` so the dashboard's pipeline columns line up.
@@ -116,6 +125,9 @@ class FixOptions:
     skip_coverage: bool = False
     coverage_threshold: int = 90
     skip_preflight: bool = False
+    # E2E warn-gate mode: ``off`` (default, no dispatch) or ``warn`` (advisory —
+    # runs after review, logs a FAIL, and continues to merge). Issue #436 PR3.
+    e2e_gate: str = "off"
     # A per-stage model override that wins over ``FIX_STAGE_MODELS``. Empty for
     # PR1 (no CLI surface yet); the seam is here so a later ``--model-<stage>``
     # flag can beat the fix defaults without touching the routing helper.
@@ -140,6 +152,8 @@ class FixBatchOptions:
     skip_preflight: bool = False
     sequential: bool = False
     concurrency: int = 5
+    # E2E warn-gate mode, threaded down to each issue's :class:`FixOptions`. Issue #436 PR3.
+    e2e_gate: str = "off"
     model_overrides: dict[str, str] = field(default_factory=dict)
 
 
@@ -551,6 +565,70 @@ def render_summary_prompt(issue: FixIssue, inv: dict, pr_number: int | None) -> 
     )
 
 
+def render_e2e_prompt(issue: FixIssue, pr_number: int | None) -> str:
+    """Render the E2E warn-gate prompt for a fix run (issue #436, PR3).
+
+    A qa-engineer-style prompt that runs the project's EXISTING E2E suite against
+    the fix branch — it never authors new E2E tests. The gate is advisory in this
+    migration: the caller treats a FAIL (or SKIP, or any error) as a logged
+    warning and proceeds to merge, so the prompt is framed as a validation pass.
+    """
+    branch = f"feature/issue-{issue.number}"
+    return (
+        "You are a senior QA engineer running the project's EXISTING end-to-end "
+        f"suite to validate the fix for issue #{issue.number} (PR #{pr_number}) "
+        "before merge.\n\n"
+        + _untrusted_block(issue)
+        + f"Branch: {branch}.\n\n"
+        "## Instructions\n"
+        "1. This is a bug fix — do NOT author new E2E tests. Only run the existing "
+        "suite to confirm the fix does not break established flows.\n"
+        "2. If the project has no E2E harness configured (e.g. no Playwright "
+        "config), report e2e_result SKIP.\n"
+        "3. Otherwise check out the PR branch and run the existing E2E suite. If a "
+        "run is red, decide whether the fix broke a flow (repair the fix), a test "
+        "was already flaky/outdated (repair the test), or the failure is "
+        "pre-existing and unrelated (note it and continue), then re-run until "
+        "green or a reasonable attempt cap is reached.\n"
+        "4. Return to main when done.\n"
+        "Report e2e_result PASS when the existing suite is green, FAIL when it is "
+        "still red, or SKIP when no E2E harness applies, plus a one-line "
+        "e2e_summary.\n\n"
+        + _result_wrapper("e2e-agent-response.schema.json")
+    )
+
+
+def render_doc_update_prompt(scope: str, merged: list[FixIssueOutcome]) -> str:
+    """Render the batch doc-update prompt (issue #436 PR3, skill Phase 10b).
+
+    Best-effort and batch-only: after ≥1 issue merged, the agent reviews the
+    batch's merged fixes and updates README / story docs in one pass on a fresh
+    branch + PR. Non-blocking — the caller ignores any failure, so a FAILED status
+    (or a raised error) never affects the batch's terminal.
+    """
+    issues = ", ".join(f"#{o.issue}" for o in merged)
+    prs = ", ".join(f"#{o.pr_number}" for o in merged if o.pr_number) or "(none recorded)"
+    return (
+        "You are a documentation agent. After a batch of GitHub issues was fixed "
+        "and merged, update the project documentation to reflect the fixes.\n\n"
+        f"Scope: {scope}\n"
+        f"Merged issues: {issues}\n"
+        f"Merged PRs: {prs}\n\n"
+        "## Instructions\n"
+        "1. Review the merged fixes (via `gh pr view <n>` or `git log`) to "
+        "understand what changed.\n"
+        "2. Update README.md and story/tracking docs (STORIES.md, docs/stories/*) "
+        "ONLY where a fix genuinely changed documented behavior, known issues, or "
+        "setup. Preserve the existing style; do not add a changelog.\n"
+        "3. If nothing needs changing, report doc_update_status NO_CHANGES and stop.\n"
+        "4. Otherwise create a fresh branch off the latest main, commit only "
+        "documentation files, push, and open a PR with `gh pr create`. Report "
+        "doc_update_status UPDATED. Report FAILED (never raise) if the update "
+        "cannot complete.\n\n"
+        + _result_wrapper("doc-update-agent-response.schema.json")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Model routing
 # ---------------------------------------------------------------------------
@@ -753,6 +831,12 @@ def _run_stage_loop(
                 pr_number = _extract_pr(result, pr_number)
                 if pr_number is not None:
                     ledger.set_story_pr(run_id, story.id, pr_number)
+                # The E2E warn-gate runs after review passes and before merge (skill
+                # Phase 7). It is advisory: a miss is logged and merge proceeds.
+                if stage == "review":
+                    _run_e2e(
+                        issue, story, pr_number, opts, ledger, run_id, dispatch, logs_dir
+                    )
                 break
 
             ledger.stage_finish(
@@ -829,6 +913,61 @@ def _run_summary(
             ledger.event_log(
                 run_id, story.id, "warn", "controller",
                 f"summary phase failed (best-effort, ignored): {exc}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _run_e2e(
+    issue: FixIssue,
+    story: Story,
+    pr_number: int | None,
+    opts: FixOptions,
+    ledger: Ledger,
+    run_id: str,
+    dispatch,
+    logs_dir: Path,
+) -> None:
+    """Advisory E2E warn-gate — a FAIL logs a warning and never blocks (issue #436).
+
+    Dispatched between review and merge only when ``opts.e2e_gate == "warn"``. The
+    gate is deliberately advisory in this migration: a FAIL, a SKIP, or any
+    dispatch/contract error is logged and the pipeline proceeds to merge — it never
+    routes to the bugfix loop and never changes the run's terminal status.
+    """
+    if opts.e2e_gate != "warn":
+        return
+    model = fix_model("e2e", opts)
+    tpath = logs_dir / f"{story.id}-e2e-1.log"
+    try:
+        ledger.stage_start(run_id, story.id, "e2e", 1, model=model)
+        prompt = render_e2e_prompt(issue, pr_number)
+        result = dispatch(
+            "e2e", prompt, story=story, model=model,
+            transcript_path=tpath, on_progress=None,
+        )
+        e2e_result = str(result.data.get("e2e_result", "")).upper()
+        passed = e2e_result == "PASS"
+        ledger.stage_finish(
+            run_id, story.id, "e2e", 1,
+            "DONE" if passed else "FAILED",
+            "" if passed else "e2e-warn",
+            str(tpath),
+        )
+        if not passed:
+            ledger.event_log(
+                run_id, story.id, "warn", "controller",
+                f"e2e gate {e2e_result or 'reported no result'} (warn mode — "
+                f"continuing to merge): {result.data.get('e2e_summary', '')}",
+            )
+    except Exception as exc:  # noqa: BLE001 — warn-gate is advisory, never fatal
+        try:
+            ledger.stage_finish(
+                run_id, story.id, "e2e", 1, "FAILED", "e2e-error", str(tpath)
+            )
+            ledger.event_log(
+                run_id, story.id, "warn", "controller",
+                f"e2e gate errored (warn mode — ignored, continuing to merge): {exc}",
             )
         except Exception:  # noqa: BLE001
             pass
@@ -1208,6 +1347,7 @@ def _issue_options(batch: FixBatchOptions, number: int) -> FixOptions:
         skip_coverage=batch.skip_coverage,
         coverage_threshold=batch.coverage_threshold,
         skip_preflight=batch.skip_preflight,
+        e2e_gate=batch.e2e_gate,
         model_overrides=dict(batch.model_overrides),
     )
 
@@ -1587,6 +1727,11 @@ def run_fix_batch(
             run_id=run_id, status="RATE_LIMITED", outcomes=ordered, summary=summary
         )
 
+    # --- Doc-update (best-effort, only when ≥1 issue merged) ------------------
+    # Runs once per completed batch, before the terminal finalize. Non-blocking:
+    # a failure is logged and never changes the batch's terminal (skill Phase 10b).
+    _run_doc_update(ordered, scope, batch, ledger, run_id, dispatch, logs_dir)
+
     outcome = finalize_run(
         ledger, run_id, status,
         reconcile=real_run, root=Path.cwd(),
@@ -1596,6 +1741,46 @@ def run_fix_batch(
     return FixBatchResult(
         run_id=run_id, status=outcome.run_terminal, outcomes=ordered, summary=summary
     )
+
+
+def _run_doc_update(
+    outcomes: list[FixIssueOutcome],
+    scope: str,
+    batch: FixBatchOptions,
+    ledger: Ledger,
+    run_id: str,
+    dispatch,
+    logs_dir: Path,
+) -> None:
+    """Best-effort batch doc-update phase — reviews merged fixes on a fresh PR.
+
+    Dispatched once after a batch when ≥1 issue merged (skill Phase 10b). Purely
+    advisory: any failure (dispatch, contract, git) is logged and the batch's
+    terminal is untouched. Single-issue fixes never reach here — the PostToolUse
+    hook covers those, per the skill. A no-op when nothing merged.
+    """
+    merged = [o for o in outcomes if o.status == "DONE"]
+    if not merged:
+        return
+    model = batch.model_overrides.get("doc_update") or FIX_STAGE_MODELS.get("doc_update")
+    tpath = logs_dir / "doc-update-1.log"
+    try:
+        prompt = render_doc_update_prompt(scope, merged)
+        # No per-issue story: doc-update runs in the shared checkout and cuts its
+        # own branch, so ``story`` is left None (dispatch_agent ignores it).
+        dispatch(
+            "doc_update", prompt, story=None, model=model,
+            transcript_path=tpath, on_progress=None,
+        )
+        ledger.event_log(
+            run_id, "", "info", "controller",
+            f"doc-update dispatched for {len(merged)} merged fix(es)",
+        )
+    except Exception as exc:  # noqa: BLE001 — doc-update is advisory, never fatal
+        ledger.event_log(
+            run_id, "", "warn", "controller",
+            f"doc-update phase failed (best-effort, ignored): {exc}",
+        )
 
 
 def _batch_summary(outcomes: list[FixIssueOutcome]) -> str:
@@ -1639,7 +1824,8 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
     A single positional issue number yields a :class:`FixOptions` (PR1, byte-for-byte
     unchanged). A batch target — ``all`` (every open issue) or ``next`` (top open
     bugs, default one) — yields a :class:`FixBatchOptions`. Shared flags:
-    ``--skip-coverage``, ``--coverage-threshold=N``, ``--skip-preflight``.
+    ``--skip-coverage``, ``--coverage-threshold=N``, ``--skip-preflight``,
+    ``--e2e-gate=warn|off`` (default off), and its ``--skip-e2e`` alias.
     Batch-only flags: ``--limit=N`` (cap the issue set; the ``next`` default is 1),
     ``--sequential`` (one issue fully completes before the next), and
     ``--concurrency=N`` (issue-level worker cap, default 5).
@@ -1656,6 +1842,16 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
     for arg in args:
         if arg in _FIX_BOOL_FLAGS:
             kwargs[_FIX_BOOL_FLAGS[arg]] = True
+        elif arg == "--skip-e2e":
+            # Shorthand for --e2e-gate=off (the default; explicit for symmetry).
+            kwargs["e2e_gate"] = "off"
+        elif arg.startswith("--e2e-gate="):
+            mode = arg.split("=", 1)[1].lower()
+            if mode not in _E2E_GATE_MODES:
+                raise FixConfigError(
+                    f"--e2e-gate must be one of {', '.join(sorted(_E2E_GATE_MODES))}: {arg}"
+                )
+            kwargs["e2e_gate"] = mode
         elif arg.startswith("--coverage-threshold="):
             kwargs["coverage_threshold"] = int(arg.split("=", 1)[1])
         elif arg.startswith("--limit="):

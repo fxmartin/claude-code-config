@@ -36,6 +36,8 @@ from sdlc.fix_issue import (
     render_build_prompt,
     render_bugfix_prompt,
     render_coverage_prompt,
+    render_doc_update_prompt,
+    render_e2e_prompt,
     render_investigation_prompt,
     render_merge_prompt,
     render_review_prompt,
@@ -132,6 +134,8 @@ def _default_payload(agent_type: str) -> dict:
             "tests_fixed": 1,
         },
         "summary": {"summary_markdown": "## Fix complete"},
+        "e2e": {"e2e_result": "PASS", "e2e_summary": "existing suite green"},
+        "doc_update": {"doc_update_status": "NO_CHANGES"},
     }[agent_type]
 
 
@@ -955,6 +959,7 @@ def _render_all_prompts(issue: FixIssue) -> dict[str, str]:
         "merge": render_merge_prompt(issue, 100),
         "bugfix": render_bugfix_prompt(issue, inv, "build", "boom"),
         "summary": render_summary_prompt(issue, inv, 100),
+        "e2e": render_e2e_prompt(issue, 100),
     }
 
 
@@ -968,7 +973,7 @@ def test_neutralize_untrusted_strips_envelope_tags() -> None:
 
 @pytest.mark.parametrize(
     "stage",
-    ["investigation", "build", "coverage", "review", "merge", "bugfix", "summary"],
+    ["investigation", "build", "coverage", "review", "merge", "bugfix", "summary", "e2e"],
 )
 def test_hostile_title_is_quarantined_in_every_prompt(stage: str) -> None:
     """Each fix prompt fences the hostile title as DATA — no breakout, no
@@ -1955,3 +1960,269 @@ def test_batch_unexpected_investigation_error_drops_issue_not_batch(tmp_path) ->
     assert _story_status(db, "issue-1") == "FAILED"
     assert _story_status(db, "issue-2") == "DONE"
     assert result.fixed == 1 and result.failed == 1
+
+
+# ---------------------------------------------------------------------------
+# PR3: E2E warn-gate + batch doc-update (issue #436)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_fix_args_e2e_gate_warn() -> None:
+    opts = parse_fix_args(["1", "--e2e-gate=warn"])
+    assert isinstance(opts, FixOptions)
+    assert opts.e2e_gate == "warn"
+
+
+def test_parse_fix_args_e2e_gate_defaults_off() -> None:
+    assert parse_fix_args(["1"]).e2e_gate == "off"
+
+
+def test_parse_fix_args_issue_url_rejected_with_actionable_message() -> None:
+    """Issue #436's migration dropped URL parsing (skill parity narrowing) — a
+    URL target now fails loud with a message pointing at the bare number, never
+    silently misbehaving."""
+    with pytest.raises(FixConfigError, match="invalid issue argument"):
+        parse_fix_args(["https://github.com/owner/repo/issues/123"])
+
+
+def test_parse_fix_args_skip_e2e_sets_off() -> None:
+    opts = parse_fix_args(["1", "--e2e-gate=warn", "--skip-e2e"])
+    assert opts.e2e_gate == "off"  # the alias wins as the later flag
+
+
+def test_parse_fix_args_e2e_gate_invalid_rejected() -> None:
+    with pytest.raises(FixConfigError, match="--e2e-gate must be"):
+        parse_fix_args(["1", "--e2e-gate=block"])
+
+
+def test_parse_fix_args_e2e_gate_batch_target() -> None:
+    opts = parse_fix_args(["all", "--e2e-gate=warn"])
+    assert isinstance(opts, FixBatchOptions)
+    assert opts.e2e_gate == "warn"
+
+
+def test_fix_model_e2e_and_doc_update_are_sonnet() -> None:
+    opts = FixOptions(issue=1)
+    assert fix_model("e2e", opts) == "sonnet"
+    assert FIX_STAGE_MODELS["doc_update"] == "sonnet"
+
+
+def test_run_fix_e2e_off_never_dispatches(tmp_path) -> None:
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher()
+    run_fix(
+        FixOptions(issue=1, e2e_gate="off"),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert "e2e" not in dispatch.agents()
+
+
+def test_run_fix_e2e_warn_dispatches_between_review_and_merge(tmp_path) -> None:
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher()
+    result = run_fix(
+        FixOptions(issue=1, e2e_gate="warn"),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    agents = dispatch.agents()
+    assert "e2e" in agents
+    # E2E runs after review passes and before merge (skill Phase 7 ordering).
+    assert agents.index("review") < agents.index("e2e") < agents.index("merge")
+    # Opus-parity: the advisory gate runs on sonnet.
+    assert dispatch.model_for("e2e") == FIX_STAGE_MODELS["e2e"] == "sonnet"
+
+
+def test_run_fix_e2e_warn_fail_continues_to_merge(tmp_path) -> None:
+    gh = FakeGh(_issue_json())
+    # E2E reports FAIL — warn mode logs it and proceeds; the fix still merges.
+    dispatch = RecordingDispatcher(
+        overrides={"e2e": {"e2e_result": "FAIL", "e2e_summary": "flow broke"}}
+    )
+    result = run_fix(
+        FixOptions(issue=1, e2e_gate="warn"),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert result.pr_number == 100
+    assert "merge" in dispatch.agents()  # a FAIL never blocks the merge
+
+
+def test_run_fix_e2e_warn_error_is_non_fatal(tmp_path) -> None:
+    gh = FakeGh(_issue_json())
+    # A dispatch error inside the advisory gate must not fail the run.
+    dispatch = RecordingDispatcher(
+        overrides={"e2e": AgentDispatchError("e2e agent crashed")}
+    )
+    result = run_fix(
+        FixOptions(issue=1, e2e_gate="warn"),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert "merge" in dispatch.agents()
+
+
+def test_e2e_schema_accepts_valid_and_rejects_missing_field() -> None:
+    from sdlc.contracts import SchemaValidationError, validate_response
+
+    validate_response("e2e", {"e2e_result": "PASS", "e2e_summary": "green"})
+    with pytest.raises(SchemaValidationError):
+        validate_response("e2e", {"e2e_result": "PASS"})  # missing e2e_summary
+    with pytest.raises(SchemaValidationError):
+        validate_response("e2e", {"e2e_result": "MAYBE", "e2e_summary": "x"})  # bad enum
+
+
+def test_doc_update_schema_accepts_valid_and_rejects_bad_enum() -> None:
+    from sdlc.contracts import SchemaValidationError, validate_response
+
+    validate_response("doc_update", {"doc_update_status": "UPDATED"})
+    with pytest.raises(SchemaValidationError):
+        validate_response("doc_update", {"doc_update_status": "MERGED"})
+
+
+def test_render_e2e_prompt_quarantines_issue_and_names_pr() -> None:
+    issue = FixIssue(
+        number=7, title="boom", body="b", state="open", assignees=(), labels=()
+    )
+    prompt = render_e2e_prompt(issue, 100)
+    assert "<untrusted_input>" in prompt
+    assert "PR #100" in prompt
+    assert "e2e_result" in prompt
+
+
+def test_render_doc_update_prompt_lists_merged_issues_and_prs() -> None:
+    merged = [
+        FixIssueOutcome(1, "DONE", pr_number=100),
+        FixIssueOutcome(2, "DONE", pr_number=101),
+    ]
+    prompt = render_doc_update_prompt("issues-all", merged)
+    assert "#1" in prompt and "#2" in prompt
+    assert "#100" in prompt and "#101" in prompt
+    assert "doc_update_status" in prompt
+
+
+def test_batch_doc_update_dispatched_when_any_merged(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]})
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.fixed == 2
+    assert ("doc_update", "") in dispatch.counts  # dispatched once, story-less
+
+
+def test_batch_doc_update_not_dispatched_when_none_merged(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1)])
+    # Investigation blocks the only issue → nothing merges → no doc-update.
+    dispatch = BatchProbeDispatcher(
+        overrides={
+            ("investigation", "issue-1"): {
+                "root_cause": "rc", "complexity": "simple", "fix_approach": "fa",
+                "files_to_modify": [], "risk": "needs a human call",
+                "investigation_status": "BLOCKED",
+            }
+        }
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.fixed == 0
+    assert not any(agent == "doc_update" for agent, _sid in dispatch.counts)
+
+
+def test_batch_doc_update_failure_is_non_fatal(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]},
+        overrides={"doc_update": AgentDispatchError("doc agent crashed")},
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    # The batch still reports success despite the doc-update failure.
+    assert result.status == "DONE"
+    assert result.fixed == 2
+
+
+def test_single_fix_never_dispatches_doc_update(tmp_path) -> None:
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher()
+    run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert "doc_update" not in dispatch.agents()
+
+def test_run_fix_e2e_error_ledger_logging_also_fails_is_swallowed(tmp_path) -> None:
+    """A double fault in the e2e warn-gate — dispatch crashes AND logging that
+    failure also crashes — is swallowed too (the inner best-effort guard at
+    fix_issue.py's e2e except-handler), never propagating past the gate."""
+
+    class _FlakyLedger:
+        """Delegates to a real Ledger, but raises on the e2e-FAILED write."""
+
+        def __init__(self, real: Ledger) -> None:
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def stage_finish(self, run_id, story_id, stage_name, attempt, status,
+                          failure_category="", output_path=""):
+            if stage_name == "e2e" and status == "FAILED":
+                raise RuntimeError("ledger write failed")
+            return self._real.stage_finish(
+                run_id, story_id, stage_name, attempt, status, failure_category, output_path
+            )
+
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(
+        overrides={"e2e": AgentDispatchError("e2e agent crashed")}
+    )
+    ledger = _FlakyLedger(_ledger(tmp_path))
+    result = run_fix(
+        FixOptions(issue=1, e2e_gate="warn"),
+        ledger=ledger,
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert "merge" in dispatch.agents()
+

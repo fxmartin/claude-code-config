@@ -888,6 +888,12 @@ announces itself in a host-level **registry** (`sdlc/registry.py`).
 
 ## Run-logging CLI for non-controller pipelines (Story 11.2-013)
 
+> **Superseded for `fix-issue` (2026-07-15, issue #436):** `fix-issue` was
+> migrated into the controller (`sdlc fix` / `sdlc/fix_issue.py`) and now calls
+> `Ledger`/`Registry` in-process exactly like `run_build`, so the run-logging
+> shim below is legacy for it. The minimal CLI is retained for any remaining
+> markdown pipeline that still shells out.
+
 The `fix-issue` skill is a **markdown skill** (bash + `Agent` sub-agents), not the
 controller, so it cannot call `Ledger`/`Registry` in-process the way `run_build`
 does. To let a `fix-issue` session show up in the same dashboard as a `sdlc build`
@@ -1414,7 +1420,16 @@ Epic-20 makes the controller's dispatch path **cross-harness**: `build-stories`
 assembles a prompt and shells out through the dispatch seam (`sdlc/dispatch.py`),
 so a role can be routed to any registry harness (`claude`, `codex`, …) via
 `--harness`. Two skills deliberately stay **Claude-only**: `fix-issue` and
-`resume-build-agents` spawn their sub-agents **in-process** with the Claude Code
+`resume-build-agents`.
+
+> **Update (2026-07-15, issue #436):** `fix-issue` was migrated into the
+> controller (`sdlc fix`) and now dispatches through the same seam as
+> `build-stories`, so it is no longer in-process. It stays **Claude-only by
+> policy** (not by mechanism): `sdlc fix` exposes no `--harness` flag, and
+> `portability.py` keeps it in `CLAUDE_ONLY_SKILLS`. `resume-build-agents` is the
+> only skill that still spawns its sub-agents in-process.
+
+`resume-build-agents` spawns its sub-agents **in-process** with the Claude Code
 `Agent` tool (`subagent_type` / `model` / `isolation="worktree"`). That tool is a
 Claude Code primitive with **no CLI-harness equivalent** — there is no prompt to
 hand to `codex exec`, so there is nothing to port. This is a design boundary, not
@@ -1423,7 +1438,7 @@ a gap to be closed later.
 | Skill | Dispatch mechanism | Harness support |
 |-------|--------------------|-----------------|
 | `build-stories` | controller dispatch seam (`sdlc/dispatch.py`) | **Any registry harness** (`--harness build=claude,review=codex,…`) |
-| `fix-issue` | in-process `Agent` tool (`subagent_type` / `isolation`) | **Claude only** |
+| `fix-issue` | controller dispatch seam (`sdlc fix` / `sdlc/fix_issue.py`) | **Claude only** (by policy — no `--harness` wiring yet) |
 | `resume-build-agents` | in-process `Agent` tool (`subagent_type` / `isolation`) | **Claude only** |
 
 `sdlc/portability.py` encodes this matrix as the single source of truth

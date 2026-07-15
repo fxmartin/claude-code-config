@@ -363,6 +363,8 @@ Flags:
   --skip-coverage           build agent opens the PR directly (no coverage gate)
   --coverage-threshold=N    required new-code coverage % (default 90)
   --skip-preflight          skip the preflight quality gate
+  --e2e-gate=warn|off       run the advisory E2E gate after review (default off)
+  --skip-e2e                alias for --e2e-gate=off
 
 \b
 Batch runs investigate every issue first, then serialize only issues that touch

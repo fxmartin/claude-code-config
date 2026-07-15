@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxmartin.me/sdlc/schemas/doc-update-agent-response.schema.json",
+  "$comment": "ABOUTME: JSON-schema contract for doc-update-agent responses (issue #436, sdlc fix). ABOUTME: Best-effort batch phase; a failure never affects batch success. Draft 2020-12, extra fields allowed.",
+  "title": "DocUpdateAgentResponse",
+  "description": "Batch documentation-update result returned by the doc-update agent dispatched by `sdlc fix` after a batch.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["doc_update_status"],
+  "properties": {
+    "doc_update_status": {
+      "type": "string",
+      "enum": ["UPDATED", "NO_CHANGES", "FAILED"],
+      "description": "UPDATED: docs changed and a PR was opened. NO_CHANGES: nothing needed. FAILED: the update could not complete."
+    }
+  }
+}

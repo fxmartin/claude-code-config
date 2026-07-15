@@ -303,8 +303,10 @@ canonical real-world examples to copy from.
 
 ## Where the boundary stays Claude-only
 
-The controller-driven `build-stories` path above is cross-harness. The in-process
-`fix-issue` / `resume-build-agents` skills are **not** — they use Claude Code's
+The controller-driven `build-stories` and `fix-issue` paths above are both
+controller-backed (issue #436 migrated `fix-issue` into `sdlc fix`). `fix-issue`
+stays Claude-only **by policy** — it exposes no `--harness` flag yet — while
+`resume-build-agents` stays Claude-only **by mechanism**: it uses Claude Code's
 in-process `Agent` tool (`subagent_type`, `isolation="worktree"`), which has no
 CLI equivalent. See [`docs/controller-architecture.md`](controller-architecture.md)
 for the controller module map.
