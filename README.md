@@ -442,6 +442,8 @@ The roster is split into two scopes (Story 6.2-001). **SDLC plugin agents** live
 | `senior-code-reviewer` | Architecture validation, security audits, best practices |
 | `meta-agent` | Generates new agent definitions |
 
+All code agents above (except `meta-agent`) pin `model: sonnet` in their frontmatter so Agent-tool dispatches don't inherit the session default (typically Opus). An orchestrator can still escalate by passing an explicit `model` at dispatch, which overrides the frontmatter — see `WORKFLOW-v2.md`.
+
 #### Personal extras
 
 | Agent | Specialization |
