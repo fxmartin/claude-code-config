@@ -122,7 +122,21 @@ def compute_resume_plan(
     for row in ledger.story_rows(run_id):
         sid = row["story_id"]
         attempts = breakdown.get(sid, [])
-        done_stages = {a["name"] for a in attempts if a["status"] == "DONE"}
+        # A docs-only coverage skip (Story 27.2-001) is terminal: the verdict is
+        # deterministic (re-derived from the same diff), so re-planning from the
+        # skipped stage would only restart the *later* interrupted stage at
+        # attempt 1 and collide on the stages PRIMARY KEY. Keyed off the
+        # skip_reason so a cost-gate SKIPPED (14.1-002) keeps its pause
+        # semantics — that skip exists precisely to be re-entered on resume.
+        done_stages = {
+            a["name"]
+            for a in attempts
+            if a["status"] == "DONE"
+            or (
+                a["status"] == "SKIPPED"
+                and a.get("failure_category") == "docs-only"
+            )
+        }
         done_pipeline = frozenset(s for s in pipeline if s in done_stages)
 
         next_stage = next((s for s in pipeline if s not in done_stages), None)
