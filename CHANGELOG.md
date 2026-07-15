@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.18.0] - 2026-07-15
+
+### Added
+
+- feat: dispatch the over-engineering lens as a review advisory (#445) (#455)
+
+
 ## [v2.17.2] - 2026-07-15
 
 ### Fixed
