@@ -186,6 +186,26 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    (`reconcile_run`) flips the story to `DONE` once FX approves and the PR
    merges. `AWAITING_APPROVAL` is orthogonal to epic-14's `PAUSED`/`RATE_LIMITED`
    (waiting on a *person* vs. waiting on *time*); none of these is `FAILED`.
+
+   **Deterministic gate-block recognition (Story 25.1-001).** The agent-text
+   detection above is advisory and proved path-dependent: on the epic-23 resume
+   (run `0541804d`) the gate check was already concluded red when the merge
+   stage re-entered, so the pre-dispatch merge CI gate (Story 23.2-002) blocked
+   with `kind="ci-gate"` before any merge agent could emit `block_reason` — the
+   story burned the bugfix loop and read `FAILED`. Any merge failure not
+   already tagged `awaiting_approval` is therefore deterministically re-checked
+   against the change request itself (`_merge_gate_only_block` →
+   `build_issue.change_request_checks` → the adapter's `cr_checks`, i.e. the
+   PR's labels + named check rollup on GitHub / the MR's labels + head-pipeline
+   jobs on GitLab). `_gate_only_block` reclassifies to `awaiting_approval` only
+   when the CR carries `risk:high` without `risk-approved`, **every** failing
+   check is the gate's own check (`High-risk file approval gate` / `risk-gate`),
+   and no other check is still pending — so a real conflict, a failing test, or
+   a non-gate CI red still routes to the bugfix loop (no false-positive
+   parking). Because the re-check runs inside `_run_story`, the shared path for
+   `build` and `resume`, a gate-only block parks `AWAITING_APPROVAL` identically
+   on both entry points; an unmapped story or any host hiccup reads as "not a
+   gate block" and leaves today's routing untouched.
 7. **Commit-message lint** — after any **commit-authoring** stage succeeds
    (build, coverage, a confirmed bugfix, and an *envelope-recovered* build/
    coverage stage), the controller lints the HEAD commit of `feature/<story>`
