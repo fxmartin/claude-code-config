@@ -163,6 +163,8 @@ For building **one story at a time** with visibility into agent selection and re
 
 **Available agents**: `backend-typescript-architect`, `python-backend-engineer`, `ui-engineer`, `bash-zsh-macos-engineer`, `podman-container-architect`, `qa-engineer`
 
+**Model routing**: every code agent above (plus `senior-code-reviewer`) pins `model: sonnet` in its frontmatter, so interactive Agent-tool dispatches no longer inherit the session default (typically Opus). Escalation stays available: an orchestrator that passes an explicit `model` at dispatch (e.g. `model: opus` for high-risk or security-sensitive work) overrides the frontmatter.
+
 ### Path B: `/build-stories` (Fully Autonomous)
 
 For building **all incomplete stories** across epics with automated error recovery.

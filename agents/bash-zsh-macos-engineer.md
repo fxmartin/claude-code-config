@@ -1,6 +1,7 @@
 ---
 name: bash-zsh-macos-engineer
 description: Use this agent when you need to develop, optimize, or debug bash/zsh scripts specifically for macOS environments. This includes system automation, development workflow scripts, CI/CD pipelines, file processing, system administration, and integration with macOS-specific tools and APIs. Examples: <example>Context: User needs to automate their development workflow on macOS. user: 'I need a script that sets up my development environment with Homebrew packages and configures my git settings' assistant: 'I'll use the bash-zsh-macos-engineer agent to create a comprehensive macOS environment setup script with proper error handling and macOS-specific optimizations' <commentary>Since this involves macOS-specific system automation and development workflow setup, use the bash-zsh-macos-engineer agent to create robust shell scripts.</commentary></example> <example>Context: User has shell scripts that need macOS compatibility fixes. user: 'These Linux scripts aren't working properly on my Mac. Can you help fix the compatibility issues?' assistant: 'Let me use the bash-zsh-macos-engineer agent to analyze and adapt your scripts for macOS, handling BSD vs GNU tool differences and macOS-specific requirements' <commentary>Since this involves macOS shell script compatibility and optimization, use the bash-zsh-macos-engineer agent to resolve platform-specific issues.</commentary></example>
+model: sonnet
 color: blue
 ---
 
