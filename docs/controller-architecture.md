@@ -780,12 +780,18 @@ ledger alone is enough to recover an interrupted run — no separate journal.
   so the export is secret-free. `--markdown` is an *added* format: plain `status`
   and `status --json` are byte-for-byte unchanged.
 - **`sdlc state`** (`sdlc/status.py` + `Ledger.state_rows`) dumps every stage
-  row (story id, stage, status, attempt, harness, PR, branch) in a stable,
-  greppable format for debugging. The `HARNESS` column (Story 20.2-002) records
-  which harness ran each stage so a heterogeneous `--harness` run is auditable;
-  the ledger's nullable `stages.harness` column defaults to `claude` for rows
-  that predate harness routing (an existing pre-migration ledger still loads via
-  the additive Migration 6).
+  row (story id, stage, status, attempt, harness, model, PR, branch) in a
+  stable, greppable format for debugging. The `HARNESS` column (Story 20.2-002)
+  records which harness ran each stage so a heterogeneous `--harness` run is
+  auditable; the ledger's nullable `stages.harness` column defaults to `claude`
+  for rows that predate harness routing (an existing pre-migration ledger still
+  loads via the additive Migration 6). The `MODEL` column (Story 27.2-002 AC4)
+  shows the resolved model tier each stage ran on (from `stages.model`, written
+  at dispatch since Issue #427); `-` when routing was off / un-recorded. `sdlc
+  status` likewise shows a per-story `MODEL` roll-up (the distinct tiers used,
+  first-use order), and `status --json` carries it as each story's `models`
+  list — so the tier the adversarial/review work actually ran on is visible per
+  story without opening the ledger.
 
 ## Rollback
 

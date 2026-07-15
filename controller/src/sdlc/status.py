@@ -15,7 +15,7 @@ def state_report(ledger: Ledger, run_id: str) -> list[dict]:
 
     A thin pass-through to :meth:`Ledger.state_rows` so the CLI and any future
     consumer share one shape: ``{story_id, stage_name, status, attempt, branch,
-    pr_number, harness}``.
+    pr_number, harness, model}``.
     """
     return ledger.state_rows(run_id)
 
@@ -28,10 +28,12 @@ def format_state(rows: list[dict]) -> list[str]:
     ``feature/<story_id>`` the build state machine uses; a missing PR renders
     as ``-``. The ``HARNESS`` column (Story 20.2-002) shows which harness ran
     each stage, defaulting to ``claude`` for rows that predate harness routing.
+    The ``MODEL`` column (Story 27.2-002 AC4) shows the resolved model tier the
+    stage ran on; ``-`` when routing was off / un-recorded (CLI default).
     """
     lines = [
         f"{'STORY':<16}{'STAGE':<11}{'STATUS':<13}{'ATT':<5}"
-        f"{'HARNESS':<9}{'PR':<7}BRANCH"
+        f"{'HARNESS':<9}{'MODEL':<9}{'PR':<7}BRANCH"
     ]
     for r in rows:
         pr = r.get("pr_number")
@@ -43,6 +45,7 @@ def format_state(rows: list[dict]) -> list[str]:
             f"{str(r.get('status', '?')):<13}"
             f"{str(r.get('attempt', '?')):<5}"
             f"{str(r.get('harness') or 'claude'):<9}"
+            f"{str(r.get('model') or '-'):<9}"
             f"{pr_disp:<7}{branch}"
         )
     return lines
