@@ -16,12 +16,13 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from sdlc.capability import preflight_harness, resolve_capabilities
 from sdlc import build_issue
+from sdlc import change_class
 from sdlc.degradation import evaluate_degradations
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.commitlint import (
@@ -3399,6 +3400,135 @@ def _run_merge_ci_gate(
     )
 
 
+# ---------------------------------------------------------------------------
+# Story 27.2-001: change-class detection + docs-only gate skip
+# ---------------------------------------------------------------------------
+
+
+def _story_change_class(
+    story: Story, ledger: Ledger, run_id: str, workdir: Path | None, base_ref: str
+) -> str:
+    """Classify the story's built diff as ``docs-only`` or ``code`` (Story 27.2-001).
+
+    Deterministic: the changed files come from ``git diff --name-only`` on the
+    already-committed story branch in the worktree — never from the agent's
+    self-reported result — so the same verdict is reached on the original run
+    and on a resume (the same stability argument as ``_RISK_AWARE_STAGES``).
+    Conservative throughout: an empty/unreadable diff or a malformed per-repo
+    allowlist classifies as ``code`` (full gate chain), so a broken lookup can
+    only ever run *more* gates, not fewer. The verdict is recorded in the run
+    events for the audit trail.
+    """
+    root = workdir or Path.cwd()
+    try:
+        patterns = change_class.load_docs_patterns(root=root)
+    except change_class.ChangeClassError as exc:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"change-class allowlist ignored ({exc}) — classifying as code",
+        )
+        return change_class.CODE
+    files = change_class.changed_files(root, base_ref, f"feature/{story.id}")
+    verdict = change_class.classify_files(files, patterns=patterns)
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"change class: {verdict} ({len(files)} changed file(s) vs {base_ref})",
+    )
+    return verdict
+
+
+def _open_docs_only_cr(
+    story: Story,
+    ledger: Ledger,
+    run_id: str,
+    workdir: Path | None,
+    base_ref: str,
+    close_link: str | None,
+    cr_terms: ChangeRequestTerms,
+) -> int | None:
+    """Push the story branch and open its change request deterministically.
+
+    On the docs-only skip path the coverage agent — which normally pushes the
+    branch and opens the PR/MR — is never dispatched, so the controller does
+    both itself via plain git and the Epic-22/23 host adapter. Returns the CR
+    number/iid, or ``None`` on any failure; the caller then falls back to the
+    full coverage dispatch, so a push/host hiccup can never strand a story
+    without a change request.
+    """
+    root = workdir or Path.cwd()
+    branch = f"feature/{story.id}"
+    try:
+        push = subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=root, capture_output=True, text=True, timeout=120,
+        )
+        if push.returncode != 0:
+            raise RuntimeError(push.stderr.strip() or "git push failed")
+        # Local import mirrors build_issue's adapter usage — keeps the host
+        # adapter off this module's hot import path.
+        from sdlc import issue_host
+
+        adapter = issue_host.get_adapter(issue_host.resolve_host(root))
+        title = build_commit_header(
+            ctype="feat",
+            scope=story.epic_name,
+            subject=story.title,
+            trailer=f" (#{story.id})",
+        )
+        body = (
+            f"Docs-only change for story {story.id} — coverage gate skipped "
+            "(skip_reason=docs-only, Story 27.2-001)."
+        )
+        if close_link:
+            body += f"\n\n{close_link}"
+        cr = adapter.cr_create(
+            branch, title, body, target_branch=base_ref.removeprefix("origin/")
+        )
+        return int(cr.ref)
+    except Exception as exc:  # noqa: BLE001 — any failure degrades to the full dispatch
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"docs-only skip: deterministic {cr_terms.abbr} open failed ({exc}) — "
+            "falling back to the full coverage dispatch",
+        )
+        return None
+
+
+def _review_is_adversarial_slot(opts: BuildOptions) -> bool:
+    """True when the run routes the review role to an adversarial reviewer.
+
+    The adversarial slot is the review role running on a registry harness that
+    an *enabled* reviewer in ``adversarial-reviewers.yaml`` claims (Story
+    20.3-002's ``review_reviewer_for``). The built-in ``claude`` review is the
+    standard pipeline reviewer — there is no slot to skip. Best-effort: any
+    registry/reviewer resolution error returns False so the docs-only path can
+    never fail a build over registry state (the review then simply dispatches
+    exactly as routed).
+    """
+    review = opts.harness_map.get("review")
+    if not review or review == DEFAULT_HARNESS:
+        return False
+    try:
+        # Local imports keep the routing/reviewer loaders off the hot path,
+        # mirroring role_routing's own convention.
+        from sdlc.role_routing import (
+            default_registry_path,
+            default_reviewers_path,
+            resolve_role_routing,
+            review_reviewer_for,
+        )
+
+        resolved = resolve_role_routing(
+            opts.harness_map, config_path=default_registry_path()
+        )
+        return (
+            review_reviewer_for(resolved, reviewers_path=default_reviewers_path())
+            is not None
+        )
+    except Exception:  # noqa: BLE001 — never fail a build on registry state
+        return False
+
+
 def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
     # Story 12.2-004: the bugfix agent commits its fix (linted mid-loop), so give
     # it a commitlint-compliant header by construction too.
@@ -5002,6 +5132,10 @@ def _run_story(
 
     rl_waited = 0  # cumulative in-process auto-wait across reactive pauses (14.1-003)
     last_status: str | None = None  # last status slug announced on the issue (22.4-002)
+    # Story 27.2-001: the story's change class (docs-only vs code), classified
+    # lazily from the built branch's real diff at the first gated stage. None
+    # until the build stage has produced a branch to classify.
+    story_class: str | None = None
     for idx, stage in enumerate(pending):
         # Story 22.4-002: post a live status comment/label on the story's issue as
         # the build enters each stage (building → in-review → merging). Deduped
@@ -5023,6 +5157,59 @@ def _run_story(
         # display/routing offset only — the bounded bugfix budget (``bugfix_attempts``)
         # is unchanged, preserving its existing per-resume reset semantics.
         stage_escalation_base = start_escalation if idx == 0 else 0
+        # Story 27.2-001: deterministic change-class gate. Classify once, from
+        # the committed branch's real diff, when the first gated stage is
+        # reached (post-build, so a resume re-derives the same verdict from the
+        # same diff). A docs-only story skips the coverage dispatch — the
+        # controller pushes the branch and opens the CR itself, recording the
+        # skip with its skip_reason (never a passed gate) — and skips the
+        # adversarial review slot; the non-adversarial review and the merge run
+        # unchanged. Any other class leaves the full gate chain untouched.
+        if stage in ("coverage", "review") and story_class is None:
+            story_class = _story_change_class(story, ledger, run_id, workdir, base_ref)
+        if stage == "coverage" and story_class == change_class.DOCS_ONLY:
+            pr = pr_number if pr_number is not None else _open_docs_only_cr(
+                story, ledger, run_id, workdir, base_ref, close_link, cr_terms
+            )
+            if pr is not None:
+                pr_number = pr
+                ledger.set_story_pr(run_id, story.id, pr_number)
+                ledger.stage_start(
+                    run_id, story.id, stage, attempt,
+                    harness=_stage_harness(stage, opts), model=None,
+                )
+                ledger.stage_finish(
+                    run_id, story.id, stage, attempt, "SKIPPED", "docs-only"
+                )
+                ledger.event_log(
+                    run_id, story.id, "info", "controller",
+                    f"coverage skipped (skip_reason=docs-only): every changed "
+                    f"file matches the docs patterns; {cr_terms.abbr} "
+                    f"#{pr_number} opened by the controller",
+                )
+                continue
+            # The deterministic CR open failed — never strand the story without
+            # a change request: fall through to the full coverage dispatch.
+        if (
+            stage == "review"
+            and story_class == change_class.DOCS_ONLY
+            and _review_is_adversarial_slot(opts)
+        ):
+            # Drop only the review role from the harness map so this story's
+            # review (and any bugfix retry of it) collapses to the built-in
+            # default reviewer; build/coverage already ran and merge/docs
+            # routings are untouched.
+            opts = replace(
+                opts,
+                harness_map={
+                    r: h for r, h in opts.harness_map.items() if r != "review"
+                },
+            )
+            ledger.event_log(
+                run_id, story.id, "info", "controller",
+                "adversarial slot skipped (skip_reason=docs-only) — review "
+                "dispatched non-adversarially on the default harness",
+            )
         while True:
             # Issue #427: resolve the (harness, model) for this dispatch *before*
             # the ledger write and the estimate, so both record the identical
