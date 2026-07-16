@@ -37,6 +37,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "run-open": "Register a fix-issue run so the dashboard surfaces it.",
     "run-stage": "Log a fix-issue phase start/finish to the ledger.",
     "run-close": "Finalize a fix-issue run (DONE/FAILED) in ledger + registry.",
+    "review-packet": "Bake the deterministic review packet (CR meta, files, diff) for a PR/MR.",
     "eval": "Run the agentic eval harness over a fixed ticket set and emit a scoreboard.",
     "eval-compare": "Compare two eval scoreboards (A/B) with a per-metric delta + verdict.",
     "eval-baseline": "Check an eval scoreboard against a committed baseline; flag regressions.",
@@ -1182,6 +1183,58 @@ def validate(
         raise typer.Exit(code=1) from exc
 
     typer.echo(json.dumps(data, indent=2, sort_keys=True))
+
+
+@app.command(name="review-packet", help=PLANNED_SUBCOMMANDS["review-packet"])
+def review_packet(
+    cr_ref: str = typer.Argument(
+        ..., help="Change-request ref to bake: the PR number (GitHub) / MR iid (GitLab)."
+    ),
+    repo_root: Path = typer.Option(
+        Path("."), "--repo-root",
+        help="Repository whose origin remote decides the host adapter (gh/glab).",
+    ),
+    host: str | None = typer.Option(
+        None, "--host", help="Override host auto-detection: github or gitlab."
+    ),
+    checks: str | None = typer.Option(
+        None, "--checks",
+        help="Test/coverage signals to embed verbatim in the packet's signals section.",
+    ),
+    max_chars: int | None = typer.Option(
+        None, "--max-chars",
+        help="Rendered-size cap; an oversized packet exits 3 (fallback) instead of truncating.",
+        show_default="review_packet.PACKET_MAX_CHARS",
+    ),
+) -> None:
+    """Bake the pre-baked review packet for one change request (Story 27.3-003).
+
+    Prints the markdown packet — CR metadata, changed files, the full unified
+    diff, and optional test/coverage signals — that the controller embeds into
+    review prompts, so a reviewer (or FX) can produce the same artifact by
+    hand. Exits 1 on a host failure and 3 when the rendered packet exceeds the
+    cap: the consumer must then fall back to fetch-it-yourself review, never a
+    truncated diff.
+    """
+    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.review_packet import PACKET_MAX_CHARS, build_review_packet
+
+    cap = max_chars if max_chars is not None else PACKET_MAX_CHARS
+    try:
+        adapter = get_adapter(resolve_host(repo_root, host))
+        packet = build_review_packet(adapter, cr_ref, checks=checks)
+    except IssueHostError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    rendered = packet.render()
+    if len(rendered) > cap:
+        typer.echo(
+            f"error: rendered packet is {len(rendered)} chars (cap {cap}) — "
+            "fall back to fetch-it-yourself review (gh pr view/diff or glab mr view/diff)",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+    typer.echo(rendered)
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["rollback"])
