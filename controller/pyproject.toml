@@ -3,7 +3,7 @@
 
 [project]
 name = "sdlc-controller"
-version = "2.33.0"
+version = "2.34.0"
 description = "External controller for the autonomous-SDLC state machine (Epic-07)."
 readme = "README.md"
 requires-python = ">=3.11"

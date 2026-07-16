@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.34.0] - 2026-07-16
+
+### Added
+
+- feat(performance-token-optimization): pre-baked review (#27.3-003)
+
+
 ## [v2.33.0] - 2026-07-15
 
 ### Added
