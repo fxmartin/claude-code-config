@@ -1855,6 +1855,106 @@ def test_envelope_recovery_records_each_attempt(tmp_path, monkeypatch) -> None:
     assert any("re-ask" in m for m in msgs)
 
 
+class _EnvelopeReaskUsageDispatcher:
+    """Like ``_EnvelopeReaskDispatcher`` but the original stage dispatch's
+    ``ResultBlockError`` carries telemetry — exactly as
+    ``parsers.py:_validate_with_telemetry`` (Issue #435) attaches it — and the
+    successful re-ask returns its OWN, distinct usage.
+
+    Lets a test assert (Issue #480 defect 1) that the original ``(stage, attempt)``
+    row keeps the ORIGINAL session's tokens/cost and its own log path, while the
+    separate ``reask`` row carries the reask's usage — two distinct, non-identical
+    rows, not the reask's usage smeared over both.
+    """
+
+    ORIG_USAGE = {
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "cache_read_input_tokens": 50,
+        "cache_creation_input_tokens": 10,
+    }
+    ORIG_COST = 0.42
+    REASK_USAGE = {
+        "input_tokens": 30,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    REASK_COST = 0.01
+
+    def __init__(self, stage: str = "build") -> None:
+        self.stage = stage
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.contracts import ResultBlockError
+        from sdlc.dispatch import AgentResult
+
+        is_reask = _REASK_SENTINEL in prompt
+        self.calls.append((agent_type, "reask" if is_reask else "stage"))
+        if agent_type == self.stage and not is_reask:
+            exc = ResultBlockError("missing <<<RESULT_JSON>>> marker")
+            # Mirror parsers.py:_validate_with_telemetry: the real original
+            # session's tokens/cost ride on the exception.
+            exc.usage = dict(self.ORIG_USAGE)
+            exc.cost_usd = self.ORIG_COST
+            exc.usage_available = True
+            raise exc
+        if is_reask:
+            return AgentResult(
+                agent_type=agent_type,
+                data=_default_payload(agent_type, story),
+                raw="",
+                usage=dict(self.REASK_USAGE),
+                cost_usd=self.REASK_COST,
+            )
+        return AgentResult(
+            agent_type=agent_type, data=_default_payload(agent_type, story), raw=""
+        )
+
+
+def test_reask_preserves_original_session_usage(tmp_path) -> None:
+    """Issue #480 defect 1: an envelope re-ask must not overwrite the original
+    session's usage. The original ``(stage, attempt)`` row keeps the ORIGINAL
+    dispatch's telemetry and its own log; the ``reask`` row carries the reask's
+    own, distinct usage."""
+    disp = _EnvelopeReaskUsageDispatcher(stage="build")
+    db = tmp_path / "l.db"
+    result = run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=[_story("99.1-001")],
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+    )
+    assert result.story_status["99.1-001"] == "DONE"
+    conn = _open(db)
+    orig = conn.execute(
+        "SELECT input_tokens, output_tokens, cache_read_tokens, "
+        "cache_creation_tokens, cost_usd, output_path "
+        "FROM stages WHERE story_id='99.1-001' AND stage_name='build' AND attempt=1"
+    ).fetchone()
+    reask = conn.execute(
+        "SELECT input_tokens, output_tokens, cache_read_tokens, "
+        "cache_creation_tokens, cost_usd "
+        "FROM stages WHERE story_id='99.1-001' AND stage_name='reask'"
+    ).fetchone()
+    # The original row carries the ORIGINAL session's telemetry, not the reask's.
+    assert orig[0] == 1000
+    assert orig[1] == 200
+    assert orig[2] == 50
+    assert orig[3] == 10
+    assert orig[4] == pytest.approx(0.42)
+    # The original row still points at its own stage log, not the reask log.
+    assert Path(orig[5]).name == "99.1-001-build-1.log"
+    assert "reask" not in Path(orig[5]).name
+    # The reask row carries its OWN, distinct usage.
+    assert reask[0] == 30
+    assert reask[4] == pytest.approx(0.01)
+    # The two rows are non-identical (the defect made them carry identical usage).
+    assert orig[0] != reask[0]
+
+
 def test_envelope_reask_prompt_is_envelope_only() -> None:
     """The re-ask prompt asks only for the result block — not a rebuild (AC1)."""
     from sdlc.build import render_envelope_reask_prompt

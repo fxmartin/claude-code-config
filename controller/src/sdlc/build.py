@@ -5622,12 +5622,14 @@ def _run_story(
                         rpath, bugfix_seq,
                     )
                     if ok_r:
+                        # Issue #480 (defect 1): keep the original row pointing at
+                        # its own (expensive) log — not the reask log — and do NOT
+                        # re-record usage here. The original session's usage was
+                        # already persisted from the contract-error result above,
+                        # and the reask's own usage lives on its "reask" row.
                         ledger.stage_finish(
                             run_id, story.id, stage, attempt, "DONE",
-                            output_path=str(rpath),
-                        )
-                        _record_stage_usage(
-                            ledger, run_id, story.id, stage, attempt, result_r
+                            output_path=str(tpath),
                         )
                         pr_number = _extract_pr(result_r, pr_number)
                         if pr_number is not None:
@@ -6110,8 +6112,23 @@ def _dispatch_stage(
         # Re-raised before the AgentDispatchError catch since it subclasses it.
         raise
     except ContractError as exc:
-        # Malformed / schema-invalid agent output is a build failure.
-        return False, None, f"contract violation: {exc}", "contract"
+        # Malformed / schema-invalid agent output is a build failure. Issue #480
+        # (defect 1): the original session still burned tokens/cost — parsers.py
+        # _validate_with_telemetry (#435) tags them onto the exception. Carry them
+        # back on a data-less AgentResult so the caller's terminal
+        # _record_stage_usage persists the ORIGINAL session's usage on this
+        # (stage, attempt) row instead of orphaning it. ``data={}`` / empty raw
+        # keep the FAILED path from mistaking this for a valid envelope — the
+        # contract path only reads ``result`` for usage, never ``.data``.
+        failed = AgentResult(
+            agent_type=stage,
+            data={},
+            raw="",
+            usage=getattr(exc, "usage", None),
+            cost_usd=getattr(exc, "cost_usd", None),
+            usage_available=getattr(exc, "usage_available", True),
+        )
+        return False, failed, f"contract violation: {exc}", "contract"
     except AgentDispatchError as exc:
         return False, None, f"dispatch error: {exc}", "dispatch"
 
@@ -6561,10 +6578,18 @@ def _reask_envelope(
     falls through to the bugfix path (AC2). The attempt is recorded as a
     ``reask`` stage row and logged to the ledger events (AC3).
     """
+    # Story 14.2-001: the envelope-only re-ask is cheap reformatting work, so it
+    # routes on the map's `reask` tier (its own override beats it) rather than the
+    # stage's — and never the unconfigured CLI default under an active profile.
+    # Issue #480 (defect 3): resolve the model BEFORE stage_start so it lands on
+    # the reask row (stage_start records `model`); otherwise the recovery row's
+    # model column is NULL.
+    model = _select_stage_model("reask", story, opts)
     # The re-ask re-dispatches the originating `stage` agent, so record it on the
     # harness that runs that stage (Story 20.2-002), not a notional "reask" role.
     ledger.stage_start(
-        run_id, story.id, "reask", seq, harness=_stage_harness(stage, opts)
+        run_id, story.id, "reask", seq,
+        harness=_stage_harness(stage, opts), model=model,
     )
     out = str(transcript_path) if transcript_path is not None else ""
     ledger.event_log(
@@ -6573,10 +6598,6 @@ def _reask_envelope(
     )
     prompt = render_envelope_reask_prompt(stage, story, opts, pr_number)
     sink = _make_progress_sink(ledger, run_id, story.id, "reask", seq)
-    # Story 14.2-001: the envelope-only re-ask is cheap reformatting work, so it
-    # routes on the map's `reask` tier (its own override beats it) rather than the
-    # stage's — and never the unconfigured CLI default under an active profile.
-    model = _select_stage_model("reask", story, opts)
     # The re-ask re-dispatches the originating `stage` agent, so route it to that
     # stage's harness too (Story 20.7-001) — the ledger and reality stay in sync.
     harness_kwargs = _harness_dispatch_kwargs(stage, opts, model)
@@ -6773,15 +6794,6 @@ def _run_bugfix(
     stage recurs across retries and stages and would otherwise collide on the
     stages UNIQUE key).
     """
-    # The bugfix re-dispatches the originating `failed_stage` agent, so record it
-    # on that stage's harness (Story 20.2-002).
-    ledger.stage_start(
-        run_id, story.id, "bugfix", attempt,
-        harness=_stage_harness(failed_stage, opts),
-    )
-    out = str(transcript_path) if transcript_path is not None else ""
-    prompt = render_bugfix_prompt(story, failed_stage, failure)
-    sink = _make_progress_sink(ledger, run_id, story.id, "bugfix", attempt)
     # Story 14.2-001: route the bugfix agent on the map's `bugfix` tier (its own
     # override beats it) instead of the unconfigured CLI default.
     # Story 14.2-003: ``escalation_steps`` bumps that tier one rung per bugfix
@@ -6789,7 +6801,19 @@ def _run_bugfix(
     # toward Opus rather than re-running on the model that just failed. Record the
     # chosen model per attempt so the eval harness (Epic-18) can see cheap-first's
     # success rate.
+    # Issue #480 (defect 3): resolve the model BEFORE stage_start so it lands on
+    # the bugfix row (stage_start records `model`); otherwise the recovery row's
+    # model column is NULL.
     model = _select_stage_model("bugfix", story, opts, escalation_steps=escalation_steps)
+    # The bugfix re-dispatches the originating `failed_stage` agent, so record it
+    # on that stage's harness (Story 20.2-002).
+    ledger.stage_start(
+        run_id, story.id, "bugfix", attempt,
+        harness=_stage_harness(failed_stage, opts), model=model,
+    )
+    out = str(transcript_path) if transcript_path is not None else ""
+    prompt = render_bugfix_prompt(story, failed_stage, failure)
+    sink = _make_progress_sink(ledger, run_id, story.id, "bugfix", attempt)
     ledger.event_log(
         run_id, story.id, "info", "controller",
         f"bugfix attempt {attempt} for {failed_stage} on "
