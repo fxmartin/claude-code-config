@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import sdlc.build as build_mod
 from sdlc.build import (
     BuildOptions,
@@ -548,3 +550,78 @@ def test_story_high_risk_degrades_to_false_on_error(monkeypatch) -> None:
     monkeypatch.setattr(build_mod.subprocess, "run", _raise)
     opts = BuildOptions(model_profile="balanced")
     assert build_mod._story_high_risk(_story(), opts) is False
+
+
+# ---------------------------------------------------------------------------
+# Recovery-row model is persisted, not just dispatched (Issue #480 defect 3)
+# ---------------------------------------------------------------------------
+
+
+class _ReaskModelRecordingDispatcher:
+    """Build omits its envelope (``ResultBlockError``); the envelope-only re-ask
+    succeeds. Records every dispatch's ``(agent_type, is_reask, model)``."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, bool, str | None]] = []
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        from sdlc.contracts import ResultBlockError
+
+        is_reask = "envelope-only re-ask" in prompt
+        self.calls.append((agent_type, is_reask, kwargs.get("model")))
+        if agent_type == "build" and not is_reask:
+            raise ResultBlockError("missing <<<RESULT_JSON>>> marker")
+        return AgentResult(agent_type=agent_type, data=_PAYLOADS[agent_type], raw="")
+
+
+def _stage_models(db, stage_name: str) -> list[str | None]:
+    conn = sqlite3.connect(db)
+    try:
+        return [
+            r[0]
+            for r in conn.execute(
+                "SELECT model FROM stages WHERE stage_name = ?", (stage_name,)
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def test_reask_stage_records_routed_model(tmp_path, monkeypatch) -> None:
+    """Issue #480 defect 3: the reask recovery row persists its routed model
+    (balanced's HAIKU reask tier), not NULL."""
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    disp = _ReaskModelRecordingDispatcher()
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced",
+    )
+    db = tmp_path / "ledger.db"
+    run_build(
+        opts, queue=[_story(points=1)], ledger=Ledger(db),
+        dispatcher=disp, preflight=lambda: True, root=tmp_path,
+    )
+    # The reask was dispatched with balanced's HAIKU reask tier ...
+    reask_models = [m for (a, r, m) in disp.calls if r]
+    assert reask_models == [HAIKU]
+    # ... and that model is persisted on the reask stage row (not NULL).
+    assert _stage_models(db, "reask") == [HAIKU]
+
+
+def test_bugfix_stage_records_routed_model(tmp_path, monkeypatch) -> None:
+    """Issue #480 defect 3: the bugfix recovery row persists its routed model
+    (balanced's Sonnet escalated one tier → Opus), not NULL."""
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    disp = _BugfixRecordingDispatcher()
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced",
+    )
+    db = tmp_path / "ledger.db"
+    run_build(
+        opts, queue=[_story(points=1)], ledger=Ledger(db),
+        dispatcher=disp, preflight=lambda: True, root=tmp_path,
+    )
+    models = _stage_models(db, "bugfix")
+    assert models, "no bugfix stage row was recorded"
+    assert models[0] == OPUS
