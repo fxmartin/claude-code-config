@@ -48,7 +48,12 @@ session logs, a ledger-vs-logs agreement doctor check, and verified per-attempt 
 recording), then computes a per-story predicted-token and predicted-rework-probability
 signal from ledger history, and finally switches the consumers (model routing, the budget
 gate, pre-dispatch warnings, and the batch planner) from raw points to the calibrated
-prediction. Points remain, demoted to descriptive scope metadata.
+prediction. Points remain, demoted to descriptive scope metadata. A fourth concern runs
+alongside: model routing must actually engage by default and announce itself when it does
+not. The Balanced profile Epic-14 shipped silently defaulted to off (an unset profile
+meant CLI-default-for-everything), so the entire prediction-to-routing chain is moot if
+routing never turns on, and a cost-governance control that fails silent-and-expensive is
+not a control.
 
 **Business Value**: FX runs long unattended batches on a Claude Max subscription where the
 binding constraint is the rate-limit window, and the stories that exhaust it are the
@@ -84,7 +89,7 @@ comparisons (Epic-11, Epic-18) stop working from numbers that are quietly low.
 
 ## Epic Scope
 
-**Total Stories**: 6 | **Total Points**: 29 | **MVP Stories**: 0 (post-MVP roadmap epic)
+**Total Stories**: 7 | **Total Points**: 34 | **MVP Stories**: 0 (post-MVP roadmap epic)
 
 ## Out of Scope (Non-Goals)
 
@@ -430,6 +435,91 @@ predictor's measured error.
 **Dependencies**: 28.2-002 (prediction signal); coordinates Epic-14 14.1-001, 14.1-002, 14.1-003
 **Risk Level**: Medium
 
+### Feature 28.4: Routing Engagement and Visibility
+
+Make the Balanced routing from Epic-14 (Story 14.2-001) actually engage by default and be
+impossible to leave silently off. This is the prerequisite that makes Feature 28.3
+meaningful: keying escalation on predictions is moot if routing never turns on. A
+cost-governance control that fails silent-and-expensive is not a control.
+
+#### Stories
+
+##### Story 28.4-001: Engage Balanced routing by default and surface the routing state
+**User Story**: As FX, who believed model routing was on for months while every stage
+silently ran the CLI default, I want the Balanced profile to be the effective default when
+no profile is configured and the resolved routing state printed and ledger-logged at run
+start, so that a cost-governance control cannot fail silent-and-expensive and I can see
+which profile governed any run.
+**Priority**: Must Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** no `model_profile` is configured **When** a run starts **Then** the Balanced
+  map is the effective default (Haiku discovery/merge, Sonnet build/coverage/review, Opus
+  adversarial and high-risk escalation), a startup banner names the resolved profile and
+  prints the per-stage model map after all overrides plus the escalation thresholds in
+  effect, and each dispatched stage carries the mapped `--model`, verifiable in the ledger
+  stage rows and the session logs.
+- **Given** `model_profile: off` (an explicit opt-out value, never an absent key) **When** a
+  run starts **Then** all stages use the CLI default model AND the banner and a ledger event
+  state this loudly, for example "MODEL ROUTING OFF: CLI default <model> used for ALL
+  stages", so the state is visible live and post-hoc.
+- **Given** an existing explicit override (`SDLC_AGENT_CMD` or a per-stage `--model`)
+  **When** routing resolves **Then** the override keeps precedence exactly as today, and the
+  banner shows the effective per-stage model after the override is applied.
+- **Given** any completed run **When** I view `sdlc status` or the dashboard **Then** the
+  profile that governed the run is shown (persisted on the run row), and each stage's chosen
+  model is shown (persisted on the stage row by Story 28.1-002, surfaced here, not
+  re-implemented).
+- **Given** routing is off AND the invocation looks unattended (a batch size above one, or a
+  `--budget` flag set) **When** `sdlc doctor` or the run preflight executes **Then** a
+  warning is raised: doctor warns strongly, or fails, when routing-off meets an
+  unattended-looking run.
+- **Given** the default flip **When** the change ships **Then** the behavior change is called
+  out in the changelog and `docs/controller-architecture.md`.
+
+**Technical Notes**: The 14.2-001 implementation made an empty `model_profile` mean "routing
+off, CLI default for every stage", and empty was the state of every run. The 2026-07-19
+dataset (336 session logs, 374 stage attempts) contains **zero Sonnet sessions**; merge ran
+37 times on Opus 4.8 and 33 on Fable 5 (premium models doing Haiku-grade mechanical work,
+11.6 percent of spend); and the model tracked the CLI default of the day (all Opus in June,
+all Fable 5 in July), the signature of no `--model` flag being passed. Flip the default in
+profile resolution (`controller/src/sdlc/model_routing.py`, `role_routing.py`) so an unset
+`model_profile` resolves to Balanced and only an explicit `off` disables routing; keep the
+`SDLC_AGENT_CMD` and per-stage `--model` precedence unchanged. Emit the banner from the
+`run_build` cohort loop in `build.py` before the first dispatch (resolved profile name,
+per-stage map after overrides, escalation thresholds) and write it to the run's events via
+`event_log` so `status.py` and `dashboard.py` can surface it post-hoc; persist the resolved
+profile on the run row, and rely on Story 28.1-002 for the per-stage `model` column rather
+than duplicating that write. Add the check in `doctor.py`. The `--model` plumbing already
+exists in `dispatch.py`. The escalation thresholds shown in the banner reflect the Epic-14
+points/risk basis today and the prediction basis once Story 28.3-001 lands.
+
+**Definition of Done**:
+- [ ] Unset `model_profile` resolves to Balanced (effective default); only explicit
+      `model_profile: off` disables routing; `SDLC_AGENT_CMD` and per-stage `--model`
+      precedence unchanged
+- [ ] Startup banner (printed and written as a ledger event) names the resolved profile, the
+      per-stage model map after overrides, and the escalation thresholds; the off state
+      prints loudly
+- [ ] Resolved profile persisted on the run row; per-stage chosen model persisted via Story
+      28.1-002 (coordinated, not duplicated); both surfaced in `sdlc status` and the dashboard
+- [ ] `sdlc doctor` / run preflight warns when routing is off, and warns strongly or fails
+      when routing-off meets an unattended-looking invocation (batch size above one or
+      `--budget` set)
+- [ ] Tests: default-on resolution, explicit off, override precedence unchanged, banner
+      content, ledger persistence of the profile
+- [ ] Changelog entry stating the default flip and why (cite: zero Sonnet sessions across 374
+      attempts while the operator believed routing was on); `docs/controller-architecture.md`
+      updated (routing states, banner, doctor check)
+
+**Dependencies**: 28.1-002 (persists the per-stage chosen model in the v11 column; this story
+surfaces it, does not re-implement it). Prerequisite for 28.3-001 (routing must engage before
+its escalation can key on predictions). Fixes the Epic-14 Story 14.2-001 default.
+**Risk Level**: Medium (an intended behavior change: the default flip alters model selection
+for every run; mitigated by the loud banner, the doctor check, the changelog note, and
+unchanged override precedence)
+
 ## Story Dependencies (within Epic-28)
 
 ```
@@ -437,7 +527,8 @@ predictor's measured error.
 28.1-002 (verified model recording)     needs 28.1-001 (shared log-parse/doctor); consumes PRs #482, #484
 28.2-001 (discovery features)           independent (a discovery-side data change; can run alongside Feature 28.1)
 28.2-002 (predictor)                    needs 28.1-001 + 28.1-002 (reconciled telemetry) + 28.2-001 (discovery features)
-28.3-001 (routing on prediction)        needs 28.2-002; preserves Epic-08 risk_gate + Epic-14 map
+28.4-001 (routing engages + visible)    needs 28.1-002 (surfaces the per-stage model column); fixes Epic-14 14.2-001
+28.3-001 (routing on prediction)        needs 28.2-002 + 28.4-001 (routing must be engaged before it can key on predictions); preserves Epic-08 risk_gate + Epic-14 map
 28.3-002 (budget/batch on prediction)   needs 28.2-002; coordinates Epic-14 14.1-001/002/003
 ```
 
@@ -449,12 +540,14 @@ predictor's measured error.
   verified. 28.2-001 (discovery features) shares this wave for a different reason: it has no
   intra-epic dependency and touches no telemetry, so it runs alongside the integrity work
   rather than waiting behind it.
-- **Cohort 2 (prediction)**: 28.2-002 (the predictor) alone, once all of its inputs exist:
-  the reconciled telemetry from 28.1-001/28.1-002 and the discovery features from 28.2-001.
-  The producer (28.2-001, Cohort 1) precedes this consumer.
-- **Cohort 3 (consumers, parallelizable once the predictor exists)**: 28.3-001 and 28.3-002
-  both depend only on 28.2-002 and touch different consumers (routing vs budget/batch), so
-  they can run in parallel after the predictor lands.
+- **Cohort 2 (prediction and routing engagement)**: 28.2-002 (the predictor) and 28.4-001
+  (routing engages and becomes visible) run in parallel. Each needs only Cohort 1 outputs
+  and not the other: 28.2-002 needs the reconciled telemetry (28.1-001/28.1-002) and the
+  discovery features (28.2-001); 28.4-001 needs the per-stage model column from 28.1-002.
+- **Cohort 3 (consumers)**: 28.3-002 depends only on 28.2-002; 28.3-001 depends on both
+  28.2-002 and 28.4-001 (routing must be engaged before its escalation can key on
+  predictions). They touch different consumers (routing vs budget/batch) and can run in
+  parallel once their inputs land.
 
 ## Epic Complete When
 
@@ -471,6 +564,11 @@ predictor's measured error.
   size and the single-repo caveat.
 - The discovery agent emits the predictor's features and points is demoted to a descriptive
   scope label, no longer read as a decision input.
+- Model routing engages by default: an unset `model_profile` resolves to the Balanced map,
+  only an explicit `off` disables it, every run prints and ledger-logs a routing banner
+  (resolved profile, per-stage map after overrides, escalation thresholds), the off state
+  prints loudly, the governing profile is visible in `sdlc status` and the dashboard, and
+  `sdlc doctor` warns when routing is off on an unattended-looking run.
 - Model escalation keys on predicted tokens or rework probability (Epic-08 risk and the
   Epic-14 adversarial Opus floor unchanged), and the budget gate, pre-dispatch warnings,
   and batch planner consume the calibrated prediction, with a logged fallback to Epic-14
