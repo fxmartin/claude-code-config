@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.34.1] - 2026-07-19
+
+### Fixed
+
+- fix(fix-issue): record per-stage token/cost usage in ledger (#478)
+
+
 ## [v2.34.0] - 2026-07-16
 
 ### Added
