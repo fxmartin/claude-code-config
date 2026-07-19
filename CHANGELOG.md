@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.34.3] - 2026-07-19
+
+### Fixed
+
+- fix(ledger): record resolved harness model on recovery rows (#483) (#484)
+
+
 ## [v2.34.2] - 2026-07-19
 
 ### Fixed
