@@ -143,6 +143,16 @@ def _default_payload(agent_type: str) -> dict:
     }[agent_type]
 
 
+# A representative usage envelope (the four token counts an agent emits under the
+# real `--output-format json` dispatch). Mirrors test_build.py's `_SAMPLE_USAGE`.
+_SAMPLE_USAGE = {
+    "input_tokens": 100,
+    "output_tokens": 20,
+    "cache_read_input_tokens": 4000,
+    "cache_creation_input_tokens": 300,
+}
+
+
 class RecordingDispatcher:
     """Record (agent_type, model) and return canned responses.
 
@@ -151,10 +161,15 @@ class RecordingDispatcher:
     fail its first attempt and pass the retry).
     """
 
-    def __init__(self, overrides=None):
+    def __init__(self, overrides=None, *, usage=None, cost_usd=None):
         self.calls: list[tuple[str, str | None]] = []
         self.counts: dict[str, int] = {}
         self.overrides = overrides or {}
+        # Optional token/cost envelope attached to every AgentResult, mirroring
+        # the real `--output-format json` dispatch. Defaults to None so the ~40
+        # existing tests using this dispatcher keep their no-usage behavior.
+        self.usage = usage
+        self.cost_usd = cost_usd
 
     def __call__(self, agent_type, prompt, *, story=None, model=None,
                  transcript_path=None, on_progress=None, **kwargs):
@@ -171,7 +186,12 @@ class RecordingDispatcher:
             payload = _default_payload(agent_type)
         if isinstance(payload, Exception):
             raise payload
-        return AgentResult(agent_type=agent_type, data=payload, raw="")
+        return AgentResult(
+            agent_type=agent_type, data=payload, raw="",
+            usage=dict(self.usage) if self.usage is not None else None,
+            cost_usd=self.cost_usd,
+            session_id=f"sess-{agent_type}" if self.usage is not None else None,
+        )
 
     def agents(self) -> list[str]:
         return [a for a, _ in self.calls]
@@ -374,6 +394,125 @@ def test_run_fix_happy_path_all_stages_done(tmp_path) -> None:
     assert result.pr_number == 100
     agents = dispatch.agents()
     assert {"investigation", "build", "coverage", "review", "merge", "summary"}.issubset(agents)
+
+
+# ---------------------------------------------------------------------------
+# Issue #477: per-stage token/cost usage must be persisted for `sdlc fix` runs
+# (parity with `sdlc build`), so the dashboard renders tokens/cost, not "—".
+# ---------------------------------------------------------------------------
+
+
+def _stage_usage_cols(db: Path, run_id: str, story_id: str, stage: str, attempt: int = 1):
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, "
+            "cache_creation_tokens, cost_usd, session_id FROM stages "
+            "WHERE run_id=? AND story_id=? AND stage_name=? AND attempt=?",
+            (run_id, story_id, stage, attempt),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_run_fix_records_usage_on_stage_rows(tmp_path) -> None:
+    """A fix run persists each stage's token/cost envelope to its ledger row (#477)."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(usage=_SAMPLE_USAGE, cost_usd=0.05)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    # Every dispatched stage row carries the recorded usage (was NULL pre-fix).
+    for stage in ("investigation", "build", "coverage", "review", "merge", "summary"):
+        row = _stage_usage_cols(db, result.run_id, "issue-1", stage)
+        assert row is not None, stage
+        assert (
+            row["input_tokens"], row["output_tokens"],
+            row["cache_read_tokens"], row["cache_creation_tokens"],
+            row["cost_usd"], row["session_id"],
+        ) == (100, 20, 4000, 300, 0.05, f"sess-{stage}"), stage
+
+
+def test_run_fix_without_usage_leaves_columns_null(tmp_path) -> None:
+    """A dispatcher that carries no usage leaves the token/cost columns NULL (no error)."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher()  # default: no usage envelope
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    row = _stage_usage_cols(db, result.run_id, "issue-1", "build")
+    assert row is not None
+    assert row["input_tokens"] is None
+    assert row["cost_usd"] is None
+    assert row["session_id"] is None
+
+
+def test_run_fix_bugfix_retry_records_usage(tmp_path) -> None:
+    """The bugfix row (and the retried stage's attempt-2 row) record usage (#477)."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+
+    def build_script(n):
+        if n == 0:
+            return {"branch_name": "feature/issue-1", "build_status": "FAILED",
+                    "commit_sha": "x", "error_summary": "boom"}
+        return {"branch_name": "feature/issue-1", "build_status": "SUCCESS", "commit_sha": "y"}
+
+    dispatch = RecordingDispatcher(
+        overrides={"build": build_script}, usage=_SAMPLE_USAGE, cost_usd=0.05
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    # The failed build attempt (attempt 1), the bugfix (seq 1), and the retried
+    # build attempt (attempt 2) all carry the recorded token/cost usage.
+    for stage, attempt in (("build", 1), ("bugfix", 1), ("build", 2)):
+        row = _stage_usage_cols(db, result.run_id, "issue-1", stage, attempt)
+        assert row is not None, (stage, attempt)
+        assert row["input_tokens"] == 100, (stage, attempt)
+        assert row["cost_usd"] == 0.05, (stage, attempt)
+
+
+def test_run_fix_e2e_warn_gate_records_usage(tmp_path) -> None:
+    """The advisory E2E warn-gate stage records its token/cost usage (#477)."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher(usage=_SAMPLE_USAGE, cost_usd=0.05)
+    result = run_fix(
+        FixOptions(issue=1, e2e_gate="warn"),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    row = _stage_usage_cols(db, result.run_id, "issue-1", "e2e")
+    assert row is not None
+    assert row["input_tokens"] == 100
+    assert row["cost_usd"] == 0.05
+    assert row["session_id"] == "sess-e2e"
 
 
 def test_run_fix_asserts_balanced_default_models(tmp_path) -> None:

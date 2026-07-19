@@ -45,6 +45,7 @@ from sdlc.build import (
     _dispatch_ready_queue,
     _extract_pr,
     _merge_awaiting_approval,
+    _record_stage_usage,
     _refresh_base_ref,
     _reposition_head,
     _stage_succeeded,
@@ -792,6 +793,7 @@ def _run_bugfix(
         "" if fixed else "bugfix-unfixed",
         str(transcript_path),
     )
+    _record_stage_usage(ledger, run_id, story.id, "bugfix", seq, result)
     ledger.event_log(
         run_id, story.id, "info" if fixed else "warn", "controller",
         f"bugfix for {stage}: {result.data.get('fix_status', 'UNFIXED')} "
@@ -833,8 +835,10 @@ def _run_investigation(
         ledger.stage_finish(
             run_id, story.id, "investigation", 1, "FAILED", "investigation-blocked", str(tpath)
         )
+        _record_stage_usage(ledger, run_id, story.id, "investigation", 1, result)
         return "BLOCKED", result.data
     ledger.stage_finish(run_id, story.id, "investigation", 1, "DONE", output_path=str(tpath))
+    _record_stage_usage(ledger, run_id, story.id, "investigation", 1, result)
     return "READY", result.data
 
 
@@ -1068,6 +1072,7 @@ def _run_stage_loop(
 
             if ok:
                 ledger.stage_finish(run_id, story.id, stage, attempt, "DONE", output_path=str(tpath))
+                _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
                 pr_number = _extract_pr(result, pr_number)
                 if pr_number is not None:
                     ledger.set_story_pr(run_id, story.id, pr_number)
@@ -1084,6 +1089,7 @@ def _run_stage_loop(
             ledger.stage_finish(
                 run_id, story.id, stage, attempt, "FAILED", f"{stage}-error", str(tpath)
             )
+            _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
             ledger.event_log(run_id, story.id, "error", "controller", f"{stage} failed: {failure}")
 
             # A merge blocked only by the high-risk approval gate is parked in a
@@ -1145,19 +1151,22 @@ def _run_summary(
     """Best-effort summary phase — a miss never fails the fix (issue #436)."""
     model = fix_model("summary", opts)
     tpath = logs_dir / f"{story.id}-summary-1.log"
+    result: AgentResult | None = None
     try:
         ledger.stage_start(run_id, story.id, "summary", 1, model=model)
         prompt = render_summary_prompt(issue, inv, pr_number)
-        dispatch(
+        result = dispatch(
             "summary", prompt, story=story, model=model,
             transcript_path=tpath, on_progress=None,
         )
         ledger.stage_finish(run_id, story.id, "summary", 1, "DONE", output_path=str(tpath))
+        _record_stage_usage(ledger, run_id, story.id, "summary", 1, result)
     except Exception as exc:  # noqa: BLE001 — summary is best-effort, never fatal
         try:
             ledger.stage_finish(
                 run_id, story.id, "summary", 1, "FAILED", "summary-error", str(tpath)
             )
+            _record_stage_usage(ledger, run_id, story.id, "summary", 1, result)
             ledger.event_log(
                 run_id, story.id, "warn", "controller",
                 f"summary phase failed (best-effort, ignored): {exc}",
@@ -1202,6 +1211,7 @@ def _run_e2e(
             "docs patterns",
         )
         return
+    result: AgentResult | None = None
     try:
         ledger.stage_start(run_id, story.id, "e2e", 1, model=model)
         prompt = render_e2e_prompt(issue, pr_number)
@@ -1217,6 +1227,7 @@ def _run_e2e(
             "" if passed else "e2e-warn",
             str(tpath),
         )
+        _record_stage_usage(ledger, run_id, story.id, "e2e", 1, result)
         if not passed:
             ledger.event_log(
                 run_id, story.id, "warn", "controller",
@@ -1228,6 +1239,7 @@ def _run_e2e(
             ledger.stage_finish(
                 run_id, story.id, "e2e", 1, "FAILED", "e2e-error", str(tpath)
             )
+            _record_stage_usage(ledger, run_id, story.id, "e2e", 1, result)
             ledger.event_log(
                 run_id, story.id, "warn", "controller",
                 f"e2e gate errored (warn mode — ignored, continuing to merge): {exc}",
