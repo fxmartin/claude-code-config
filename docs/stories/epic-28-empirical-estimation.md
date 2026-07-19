@@ -468,18 +468,25 @@ which profile governed any run.
   **When** routing resolves **Then** the override keeps precedence exactly as today, and the
   banner shows the effective per-stage model after the override is applied.
 - **Given** any completed run **When** I view `sdlc status` or the dashboard **Then** the
-  profile that governed the run is shown (persisted on the run row), and each stage's chosen
-  model is shown (persisted on the stage row by Story 28.1-002, surfaced here, not
-  re-implemented).
+  resolved routing config that governed the run is shown (the profile name and its effective
+  per-stage map after overrides, persisted on the run row), and each stage's chosen model is
+  shown (persisted on the stage row by Story 28.1-002, surfaced here, not re-implemented).
 - **Given** routing is off AND the invocation looks unattended (a batch size above one, or a
   `--budget` flag set) **When** `sdlc doctor` or the run preflight executes **Then** a
   warning is raised: doctor warns strongly, or fails, when routing-off meets an
   unattended-looking run.
-- **Given** any run **When** it starts **Then** its effective profile is resolved once and
-  frozen on the run row, and every subsequent `sdlc resume` reads that persisted profile
-  verbatim rather than re-resolving against the current config or default, so routing is
-  identical across the original run and all of its resumes (the Epic-10/Epic-12 resume
-  identically contract).
+- **Given** any run **When** it starts **Then** its **fully-resolved routing config** (the
+  profile name plus the effective per-stage model map and escalation thresholds after all
+  overrides) is resolved once and snapshotted on the run row, and every subsequent
+  `sdlc resume` **replays that snapshot** rather than re-resolving against the current config,
+  default, or overrides, so routing is identical across the original run and all of its
+  resumes (the Epic-10/Epic-12 resume identically contract).
+- **Given** a run is resumed after `.sdlc-model-routing.yaml`, an `SDLC_AGENT_CMD`, or a
+  per-stage `--model` override has changed since the run was created **When** the resume
+  dispatches its remaining stages **Then** they use the routing from the run's frozen
+  snapshot, not the changed config, so an unrelated edit between a run and its resume can
+  never alter that run's routing. A deliberate routing change on resume is out of scope for a
+  plain resume: it would require an explicit re-resolve flag, documented as such.
 - **Given** a run created **before** this change, whose persisted state predates the default
   flip (an empty or absent `model_profile` meant routing off under the old semantics) **When**
   it is resumed after the flip **Then** it continues to route exactly as it originally did
@@ -500,8 +507,9 @@ profile resolution (`controller/src/sdlc/model_routing.py`, `role_routing.py`) s
 `SDLC_AGENT_CMD` and per-stage `--model` precedence unchanged. Emit the banner from the
 `run_build` cohort loop in `build.py` before the first dispatch (resolved profile name,
 per-stage map after overrides, escalation thresholds) and write it to the run's events via
-`event_log` so `status.py` and `dashboard.py` can surface it post-hoc; persist the resolved
-profile on the run row, and rely on Story 28.1-002 for the per-stage `model` column rather
+`event_log` so `status.py` and `dashboard.py` can surface it post-hoc; persist the fully-resolved routing
+config (profile name plus the effective per-stage map and thresholds after overrides) as a
+snapshot on the run row, and rely on Story 28.1-002 for the per-stage `model` column rather
 than duplicating that write. Add the check in `doctor.py`. The `--model` plumbing already
 exists in `dispatch.py`. The escalation thresholds shown in the banner reflect the Epic-14
 points/risk basis today and the prediction basis once Story 28.3-001 lands.
@@ -509,10 +517,14 @@ points/risk basis today and the prediction basis once Story 28.3-001 lands.
 **Resume identity is the subtle part of the default flip.** The controller guarantees a
 resumed run behaves identically to the original (Epic-10 resume machinery, Epic-12 resume
 discipline), so the flip must never reach an in-flight run. Two rules enforce this. First,
-**resolve-and-freeze**: the effective profile is resolved once at run creation and persisted
-on the run row (the same write the visibility half already needs), and `run_resume` reads
-that persisted value rather than re-resolving against the now-differently-defaulted config.
-Second, **legacy migration**: runs created before this change persist `model_profile: ""`,
+**resolve-and-freeze the whole config**: the fully-resolved routing config (profile name plus
+the effective per-stage map and thresholds after overrides) is resolved once at run creation
+and snapshotted on the run row (the same write the visibility half already needs), and
+`run_resume` replays that snapshot rather than reloading `.sdlc-model-routing.yaml` or
+re-reading the overrides. Freezing only the profile *name* would be insufficient: a resume
+that re-derived the map from the name could still pick up an edited config file or a changed
+override and route differently from the original run. Second, **legacy migration**: runs
+created before this change persist `model_profile: ""`,
 which meant routing off under the old semantics but would re-resolve to Balanced under the
 new default. A versioned ledger migration (auto-applied at launch, the Epic-12 pattern)
 backfills existing run rows, stamping any pre-change run's resolved profile as `off` so its
@@ -526,19 +538,21 @@ at creation, so only the one legacy backfill is ever needed.
 - [ ] Startup banner (printed and written as a ledger event) names the resolved profile, the
       per-stage model map after overrides, and the escalation thresholds; the off state
       prints loudly
-- [ ] Resolved profile persisted on the run row; per-stage chosen model persisted via Story
-      28.1-002 (coordinated, not duplicated); both surfaced in `sdlc status` and the dashboard
-- [ ] Effective profile resolved once and frozen on the run row at creation; `run_resume`
-      reads the persisted profile and never re-resolves, so routing is identical across a run
-      and all of its resumes
+- [ ] Fully-resolved routing config (profile name + effective per-stage map + thresholds)
+      snapshotted on the run row; per-stage chosen model persisted via Story 28.1-002
+      (coordinated, not duplicated); both surfaced in `sdlc status` and the dashboard
+- [ ] Routing config resolved once and snapshotted on the run row at creation; `run_resume`
+      replays the snapshot and never reloads the config file or overrides, so routing is
+      identical across a run and all of its resumes
 - [ ] Versioned ledger migration (auto-applied at launch) stamps pre-change run rows as
       routing `off`, freezing legacy runs at their original routing-off behavior
 - [ ] `sdlc doctor` / run preflight warns when routing is off, and warns strongly or fails
       when routing-off meets an unattended-looking invocation (batch size above one or
       `--budget` set)
 - [ ] Tests: default-on resolution, explicit off, override precedence unchanged, banner
-      content, ledger persistence of the profile, and a **pre-change run resumes routing-off
-      (not Balanced)** after the flip
+      content, snapshot persistence, a **pre-change run resumes routing-off (not Balanced)**
+      after the flip, and a **run resumed after its config or override changed replays the
+      frozen snapshot** (routing unchanged)
 - [ ] Changelog entry stating the default flip and why (cite: zero Sonnet sessions across 374
       attempts while the operator believed routing was on); `docs/controller-architecture.md`
       updated (routing states, banner, doctor check, the resume/migration rule)
