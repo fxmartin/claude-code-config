@@ -9,6 +9,7 @@ import sdlc.build as build_mod
 from sdlc.build import (
     BuildOptions,
     Ledger,
+    _resolved_recovery_model,
     _select_stage_model,
     parse_build_args,
     run_build,
@@ -721,3 +722,35 @@ def test_bugfix_row_records_registry_model_not_claude_alias(
     models = _stage_models(db, "bugfix")
     assert models, "no bugfix stage row was recorded"
     assert models[0] == CODEX_BUILD_MODEL
+
+
+def test_resolved_recovery_model_registry_error_falls_back_to_claude() -> None:
+    """Issue #483: a --harness map entry naming a harness absent from the
+    registry must not blow up the recovery-row resolve — resolve_harness
+    raises HarnessError, and the best-effort branch degrades to the routed
+    Claude model, mirroring _resolved_stage_model's exception path
+    (test_resolved_stage_model_registry_error_falls_back_to_claude)."""
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True,
+        harness_map={"build": "not-a-real-harness"},
+        model_overrides={"reask": "opus"},
+    )
+    story = _story()
+    assert (
+        _resolved_recovery_model("reask", "build", story, opts) == "opus"
+    )
+
+
+def test_resolved_recovery_model_builtin_harness_returns_claude_model() -> None:
+    """Issue #483: a --harness map entry that resolves to the built-in Claude
+    slot (source='builtin') must still record the routed Claude model — that
+    slot has no per-stage model map of its own, unlike a registry harness."""
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True,
+        harness_map={"build": "claude"},
+        model_overrides={"bugfix": "opus"},
+    )
+    story = _story()
+    assert (
+        _resolved_recovery_model("bugfix", "build", story, opts) == "opus"
+    )
