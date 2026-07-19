@@ -475,6 +475,17 @@ which profile governed any run.
   `--budget` flag set) **When** `sdlc doctor` or the run preflight executes **Then** a
   warning is raised: doctor warns strongly, or fails, when routing-off meets an
   unattended-looking run.
+- **Given** any run **When** it starts **Then** its effective profile is resolved once and
+  frozen on the run row, and every subsequent `sdlc resume` reads that persisted profile
+  verbatim rather than re-resolving against the current config or default, so routing is
+  identical across the original run and all of its resumes (the Epic-10/Epic-12 resume
+  identically contract).
+- **Given** a run created **before** this change, whose persisted state predates the default
+  flip (an empty or absent `model_profile` meant routing off under the old semantics) **When**
+  it is resumed after the flip **Then** it continues to route exactly as it originally did
+  (routing off, CLI default for every stage), never silently upgraded to Balanced. A ledger
+  migration stamps such legacy run rows with an explicit `off` so their routing is frozen at
+  their original behavior.
 - **Given** the default flip **When** the change ships **Then** the behavior change is called
   out in the changelog and `docs/controller-architecture.md`.
 
@@ -495,6 +506,19 @@ than duplicating that write. Add the check in `doctor.py`. The `--model` plumbin
 exists in `dispatch.py`. The escalation thresholds shown in the banner reflect the Epic-14
 points/risk basis today and the prediction basis once Story 28.3-001 lands.
 
+**Resume identity is the subtle part of the default flip.** The controller guarantees a
+resumed run behaves identically to the original (Epic-10 resume machinery, Epic-12 resume
+discipline), so the flip must never reach an in-flight run. Two rules enforce this. First,
+**resolve-and-freeze**: the effective profile is resolved once at run creation and persisted
+on the run row (the same write the visibility half already needs), and `run_resume` reads
+that persisted value rather than re-resolving against the now-differently-defaulted config.
+Second, **legacy migration**: runs created before this change persist `model_profile: ""`,
+which meant routing off under the old semantics but would re-resolve to Balanced under the
+new default. A versioned ledger migration (auto-applied at launch, the Epic-12 pattern)
+backfills existing run rows, stamping any pre-change run's resolved profile as `off` so its
+resume is frozen at its original routing-off behavior. New runs stamp their resolved profile
+at creation, so only the one legacy backfill is ever needed.
+
 **Definition of Done**:
 - [ ] Unset `model_profile` resolves to Balanced (effective default); only explicit
       `model_profile: off` disables routing; `SDLC_AGENT_CMD` and per-stage `--model`
@@ -504,21 +528,30 @@ points/risk basis today and the prediction basis once Story 28.3-001 lands.
       prints loudly
 - [ ] Resolved profile persisted on the run row; per-stage chosen model persisted via Story
       28.1-002 (coordinated, not duplicated); both surfaced in `sdlc status` and the dashboard
+- [ ] Effective profile resolved once and frozen on the run row at creation; `run_resume`
+      reads the persisted profile and never re-resolves, so routing is identical across a run
+      and all of its resumes
+- [ ] Versioned ledger migration (auto-applied at launch) stamps pre-change run rows as
+      routing `off`, freezing legacy runs at their original routing-off behavior
 - [ ] `sdlc doctor` / run preflight warns when routing is off, and warns strongly or fails
       when routing-off meets an unattended-looking invocation (batch size above one or
       `--budget` set)
 - [ ] Tests: default-on resolution, explicit off, override precedence unchanged, banner
-      content, ledger persistence of the profile
+      content, ledger persistence of the profile, and a **pre-change run resumes routing-off
+      (not Balanced)** after the flip
 - [ ] Changelog entry stating the default flip and why (cite: zero Sonnet sessions across 374
       attempts while the operator believed routing was on); `docs/controller-architecture.md`
-      updated (routing states, banner, doctor check)
+      updated (routing states, banner, doctor check, the resume/migration rule)
 
 **Dependencies**: 28.1-002 (persists the per-stage chosen model in the v11 column; this story
-surfaces it, does not re-implement it). Prerequisite for 28.3-001 (routing must engage before
-its escalation can key on predictions). Fixes the Epic-14 Story 14.2-001 default.
+surfaces it, does not re-implement it). Reuses the Epic-10 resume machinery and the Epic-12
+resume-migration pattern for resolve-and-freeze and the legacy backfill (both COMPLETE, so
+context not a blocking intra-epic dependency). Prerequisite for 28.3-001 (routing must engage
+before its escalation can key on predictions). Fixes the Epic-14 Story 14.2-001 default.
 **Risk Level**: Medium (an intended behavior change: the default flip alters model selection
-for every run; mitigated by the loud banner, the doctor check, the changelog note, and
-unchanged override precedence)
+for every run; mitigated by the loud banner, the doctor check, the changelog note, unchanged
+override precedence, and resolve-and-freeze plus the legacy migration so in-flight and
+pre-change runs resume identically)
 
 ## Story Dependencies (within Epic-28)
 
