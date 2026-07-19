@@ -6029,6 +6029,44 @@ def _resolved_stage_model(
     return harness.resolve_model(stage)
 
 
+def _resolved_recovery_model(
+    role_stage: str,
+    harness_stage: str,
+    story: Story,
+    opts: BuildOptions,
+    *,
+    escalation_steps: int = 0,
+) -> str | None:
+    """Model the recovery dispatch actually runs on, for the ledger row (Issue #483).
+
+    The Claude slot routes recovery on its own cheap ``role_stage`` tier, but a
+    registry harness (Story 20.7) ignores that alias and runs ``harness_stage``'s
+    own mapped model — so the ledger must record the registry model for that
+    stage, mirroring _dispatch_stage / _harness_dispatch_kwargs. This splits the
+    two stage args that :func:`_resolved_stage_model` collapses into one: recovery
+    routes Claude on ``role_stage`` (``reask``/``bugfix``) but re-dispatches the
+    *originating* stage's harness (``harness_stage``). Best-effort on the registry
+    path: any resolve error degrades to the routed Claude model, never failing a
+    build.
+    """
+    claude_model = _select_stage_model(
+        role_stage, story, opts, escalation_steps=escalation_steps
+    )
+    if not opts.harness_map:
+        return claude_model
+    try:
+        from sdlc.role_routing import default_registry_path
+
+        harness = resolve_harness(
+            _stage_harness(harness_stage, opts), config_path=default_registry_path()
+        )
+    except Exception:  # noqa: BLE001 - registry resolution is best-effort
+        return claude_model
+    if harness.source in ("builtin", "env"):
+        return claude_model
+    return harness.resolve_model(harness_stage)
+
+
 def _model_price_key(model: str | None) -> str:
     """Normalise a resolved model id to a ``MODEL_USD_PER_MILLION_TOKENS`` key.
 
@@ -6584,12 +6622,17 @@ def _reask_envelope(
     # Issue #480 (defect 3): resolve the model BEFORE stage_start so it lands on
     # the reask row (stage_start records `model`); otherwise the recovery row's
     # model column is NULL.
+    # Issue #483: the dispatch keeps the cheap Claude `reask` alias, but the row
+    # records the RESOLVED (registry-aware) model — under a --harness map routing
+    # `stage` to a registry harness, that harness runs its OWN model and ignores
+    # the alias, so the alias would misreport what actually ran.
     model = _select_stage_model("reask", story, opts)
     # The re-ask re-dispatches the originating `stage` agent, so record it on the
     # harness that runs that stage (Story 20.2-002), not a notional "reask" role.
     ledger.stage_start(
         run_id, story.id, "reask", seq,
-        harness=_stage_harness(stage, opts), model=model,
+        harness=_stage_harness(stage, opts),
+        model=_resolved_recovery_model("reask", stage, story, opts),
     )
     out = str(transcript_path) if transcript_path is not None else ""
     ledger.event_log(
@@ -6804,12 +6847,19 @@ def _run_bugfix(
     # Issue #480 (defect 3): resolve the model BEFORE stage_start so it lands on
     # the bugfix row (stage_start records `model`); otherwise the recovery row's
     # model column is NULL.
+    # Issue #483: the dispatch keeps the cheap Claude `bugfix` alias, but the row
+    # records the RESOLVED (registry-aware) model — under a --harness map routing
+    # `failed_stage` to a registry harness, that harness runs its OWN model and
+    # ignores the alias, so the alias would misreport what actually ran.
     model = _select_stage_model("bugfix", story, opts, escalation_steps=escalation_steps)
     # The bugfix re-dispatches the originating `failed_stage` agent, so record it
     # on that stage's harness (Story 20.2-002).
     ledger.stage_start(
         run_id, story.id, "bugfix", attempt,
-        harness=_stage_harness(failed_stage, opts), model=model,
+        harness=_stage_harness(failed_stage, opts),
+        model=_resolved_recovery_model(
+            "bugfix", failed_stage, story, opts, escalation_steps=escalation_steps
+        ),
     )
     out = str(transcript_path) if transcript_path is not None else ""
     prompt = render_bugfix_prompt(story, failed_stage, failure)
