@@ -441,9 +441,12 @@ predictor's measured error.
 28.3-002 (budget/batch on prediction)   needs 28.2-002; coordinates Epic-14 14.1-001/002/003
 ```
 
-- **Cohort 1 (integrity, must land first)**: 28.1-001 then 28.1-002. Calibration on top of
-  corrupted telemetry would train on lies, so no Feature 28.2 or 28.3 story starts until
-  the meter agrees with the logs and the model column is verified.
+- **Cohort 1 (integrity, gates every telemetry consumer)**: 28.1-001 then 28.1-002.
+  Calibration on top of corrupted telemetry would train on lies, so no story that **reads
+  the meter** (the predictor 28.2-002 and the Feature 28.3 consumers) starts until the
+  meter agrees with the logs and the model column is verified. Story 28.2-001 (discovery
+  features) is the one exception: it produces discovery-side data and touches no telemetry,
+  so it can run alongside Feature 28.1.
 - **Cohort 2 (prediction)**: 28.2-001 (discovery features, no intra-epic deps, can start
   alongside Feature 28.1), then 28.2-002 (the predictor, which needs both reconciled
   telemetry from Feature 28.1 and the discovery features from 28.2-001). The producer

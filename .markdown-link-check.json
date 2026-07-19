@@ -5,6 +5,7 @@
     { "pattern": "^https?://127\\.0\\.0\\.1" },
     { "pattern": "^https?://([^/]+\\.)?example\\.(com|org|net)" },
     { "comment": "t.me refuses requests from CI runners (Status 0), so the link cannot be validated headlessly.", "pattern": "^https://t\\.me/" },
+    { "comment": "shields.io badges return Status 0 to CI runners (as t.me does), so the image endpoint cannot be validated headlessly.", "pattern": "^https://img\\.shields\\.io/" },
     { "comment": "Planned deliverable of Epic-06, not yet created; forward-referenced by epic planning docs.", "pattern": "(^|/)docs/onboarding\\.md$" }
   ],
   "httpHeaders": [
