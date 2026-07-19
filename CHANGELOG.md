@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.34.2] - 2026-07-19
+
+### Fixed
+
+- fix(ledger): record original session usage on reask + recovery model (#482)
+
+
 ## [v2.34.1] - 2026-07-19
 
 ### Fixed
