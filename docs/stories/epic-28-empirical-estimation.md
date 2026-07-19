@@ -441,16 +441,17 @@ predictor's measured error.
 28.3-002 (budget/batch on prediction)   needs 28.2-002; coordinates Epic-14 14.1-001/002/003
 ```
 
-- **Cohort 1 (integrity, gates every telemetry consumer)**: 28.1-001 then 28.1-002.
-  Calibration on top of corrupted telemetry would train on lies, so no story that **reads
-  the meter** (the predictor 28.2-002 and the Feature 28.3 consumers) starts until the
-  meter agrees with the logs and the model column is verified. Story 28.2-001 (discovery
-  features) is the one exception: it produces discovery-side data and touches no telemetry,
-  so it can run alongside Feature 28.1.
-- **Cohort 2 (prediction)**: 28.2-001 (discovery features, no intra-epic deps, can start
-  alongside Feature 28.1), then 28.2-002 (the predictor, which needs both reconciled
-  telemetry from Feature 28.1 and the discovery features from 28.2-001). The producer
-  precedes the consumer.
+- **Cohort 1 (first wave, no intra-epic dependencies)**: 28.1-001 and 28.2-001 both start
+  immediately, and 28.1-002 follows 28.1-001. 28.1-001/28.1-002 are the integrity stories
+  that **gate every telemetry consumer**: calibration on top of corrupted telemetry would
+  train on lies, so no story that reads the meter (the predictor 28.2-002 and the Feature
+  28.3 consumers) starts until the meter agrees with the logs and the model column is
+  verified. 28.2-001 (discovery features) shares this wave for a different reason: it has no
+  intra-epic dependency and touches no telemetry, so it runs alongside the integrity work
+  rather than waiting behind it.
+- **Cohort 2 (prediction)**: 28.2-002 (the predictor) alone, once all of its inputs exist:
+  the reconciled telemetry from 28.1-001/28.1-002 and the discovery features from 28.2-001.
+  The producer (28.2-001, Cohort 1) precedes this consumer.
 - **Cohort 3 (consumers, parallelizable once the predictor exists)**: 28.3-001 and 28.3-002
   both depend only on 28.2-002 and touch different consumers (routing vs budget/batch), so
   they can run in parallel after the predictor lands.
