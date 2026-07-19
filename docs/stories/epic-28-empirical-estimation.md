@@ -229,63 +229,12 @@ history. Crude first, honest about error, reconciled after every run so it impro
 
 #### Stories
 
-##### Story 28.2-001: Per-story token and rework-probability predictor from ledger history
-**User Story**: As FX, I want each story to carry a predicted token cost and a predicted
-rework probability computed from the factory's own reconciled history, recorded before the
-run and reconciled against actuals after, so that downstream decisions rest on a
-measured-and-improving signal instead of a story-point guess.
-**Priority**: Should Have
-**Story Points**: 8
-
-**Acceptance Criteria**:
-- **Given** reconciled ledger history (Feature 28.1) **When** a story is about to run
-  **Then** the controller computes and records, before dispatch, a **predicted token
-  cost** and a **predicted rework probability** (probability the story enters a review
-  retry or bugfix loop) from a crude, inspectable model: per-stage historical means keyed
-  by points band and risk flag, adjusted by a small set of story features (acceptance-
-  criteria count, dependency depth, and files-touched or diff-size proxy where available).
-- **Given** a story completes **When** its actual tokens and actual rework are known
-  **Then** the prediction-vs-actual is reconciled and persisted (extending the estimate-
-  vs-actual reconciliation already persisted by Story 14.1-002), building the training set
-  for the next prediction.
-- **Given** a run of predictions and their reconciled actuals **When** I ask for
-  prediction quality **Then** the controller reports the **median absolute error of
-  predicted vs actual tokens** and a calibration summary for the rework probability, each
-  with its sample size, so quality is measured, not asserted.
-- **Given** insufficient history for a story's band or feature combination **When** the
-  predictor runs **Then** it falls back to the global historical mean and marks the
-  prediction **low-confidence**, rather than emitting a confident number from no data.
-- **Given** the predictor is disabled or unconfigured **When** a run executes **Then**
-  behavior degrades to today's point-keyed estimate (14.1-002), with a logged note, so the
-  epic is safe to roll out incrementally.
-
-**Technical Notes**: Extend `controller/src/sdlc/cost_estimate.py` (the 14.1-002 heuristic
-already has a calibration hook and persists estimate-vs-actual, the natural training
-store). Training data reads the reconciled `stages` usage and the run/story history in the
-`Ledger` (`build.py`: `stage_set_usage`, `run_usage_totals`, per-stage historical
-averages). Keep the model inspectable (means + adjustments), version the predictor so a
-recalibration is auditable, and record predictions on the story/run rows so post-run
-reconciliation is a join, not a re-computation. Honor the n=76 caveat: report error with
-sample size and never suppress the low-confidence flag.
-
-**Definition of Done**:
-- [ ] Predicted tokens + predicted rework probability computed and recorded pre-run from
-      reconciled history with the documented crude feature set
-- [ ] Prediction-vs-actual reconciled and persisted post-run (extends 14.1-002 store)
-- [ ] Prediction quality reported as median absolute error (tokens) + rework calibration,
-      each with sample size
-- [ ] Low-confidence fallback to global mean on thin history; disabled path unchanged
-- [ ] Tests: prediction record/reconcile round-trip, thin-history fallback, error metric
-- [ ] Documented in `docs/controller-architecture.md`
-
-**Dependencies**: 28.1-001, 28.1-002 (a predictor must train on reconciled telemetry)
-**Risk Level**: Medium
-
-##### Story 28.2-002: Extend discovery output with predictor features; demote points to metadata
-**User Story**: As the predictor, I want the discovery agent to emit the story features I
-need (acceptance-criteria count, dependency depth, and a scope proxy) alongside the points
-value, with points recorded as descriptive metadata rather than a decision input, so that
-predictions have real features to key on instead of a near-constant point label.
+##### Story 28.2-001: Extend discovery output with predictor features; demote points to metadata
+**User Story**: As the person building the predictor, I want the discovery agent to emit
+the story features the predictor needs (acceptance-criteria count, dependency depth, and a
+scope proxy) alongside the points value, with points recorded as descriptive metadata
+rather than a decision input, so that the predictor has real features to key on instead of
+a near-constant point label.
 **Priority**: Should Have
 **Story Points**: 3
 
@@ -299,8 +248,8 @@ predictions have real features to key on instead of a near-constant point label.
   as no longer an escalation or budget input.
 - **Given** the discovery output schema changes **When** a downstream consumer reads a
   story **Then** the result contract and existing story fields remain backward compatible
-  (new fields are additive; absent features degrade to the predictor's low-confidence
-  path).
+  (new fields are additive; absent features are recorded as unknown for the predictor to
+  treat as missing).
 - **Given** an epic that does not state enough to compute a feature **When** discovery runs
   **Then** the feature is recorded as unknown (not zero), so the predictor can treat it as
   missing rather than as a real low value.
@@ -309,7 +258,10 @@ predictions have real features to key on instead of a near-constant point label.
 emit the additional features, and thread them through the story record the ledger and
 story renderer persist. Keep the change additive so Epic-22/Epic-11 story consumers are
 unaffected. This is the story that operationalizes "points demoted to metadata": the label
-survives everywhere it is human-facing, but the machine reads features instead.
+survives everywhere it is human-facing, but the machine reads features instead. It has no
+intra-epic dependency (a discovery-side data change), so it can land early, in parallel
+with Feature 28.1, and it **must precede** Story 28.2-002, whose predictor keys on these
+features.
 
 **Definition of Done**:
 - [ ] Discovery emits acceptance-criteria count, dependency depth, and a scope proxy per
@@ -319,8 +271,64 @@ survives everywhere it is human-facing, but the machine reads features instead.
 - [ ] Tests: feature extraction, missing-feature handling, backward compatibility
 - [ ] Documented in `docs/controller-architecture.md`
 
-**Dependencies**: 28.2-001 (defines the feature contract the predictor consumes)
+**Dependencies**: None (a discovery-side data change; produces the feature set 28.2-002 consumes)
 **Risk Level**: Low
+
+##### Story 28.2-002: Per-story token and rework-probability predictor from ledger history
+**User Story**: As FX, I want each story to carry a predicted token cost and a predicted
+rework probability computed from the factory's own reconciled history and the discovery
+features, recorded before the run and reconciled against actuals after, so that downstream
+decisions rest on a measured-and-improving signal instead of a story-point guess.
+**Priority**: Should Have
+**Story Points**: 8
+
+**Acceptance Criteria**:
+- **Given** reconciled ledger history (Feature 28.1) and the discovery features (Story
+  28.2-001) **When** a story is about to run **Then** the controller computes and records,
+  before dispatch, a **predicted token cost** and a **predicted rework probability**
+  (probability the story enters a review retry or bugfix loop) from a crude, inspectable
+  model: per-stage historical means keyed by points band and risk flag, adjusted by the
+  discovery features (acceptance-criteria count, dependency depth, and a files-touched or
+  diff-size proxy where available).
+- **Given** a story completes **When** its actual tokens and actual rework are known
+  **Then** the prediction-vs-actual is reconciled and persisted (extending the estimate-
+  vs-actual reconciliation already persisted by Story 14.1-002), building the training set
+  for the next prediction.
+- **Given** a run of predictions and their reconciled actuals **When** I ask for
+  prediction quality **Then** the controller reports the **median absolute error of
+  predicted vs actual tokens** and a calibration summary for the rework probability, each
+  with its sample size, so quality is measured, not asserted.
+- **Given** insufficient history for a story's band or feature combination, or a discovery
+  feature recorded as unknown **When** the predictor runs **Then** it falls back to the
+  global historical mean and marks the prediction **low-confidence**, rather than emitting
+  a confident number from no data.
+- **Given** the predictor is disabled or unconfigured **When** a run executes **Then**
+  behavior degrades to today's point-keyed estimate (14.1-002), with a logged note, so the
+  epic is safe to roll out incrementally.
+
+**Technical Notes**: Extend `controller/src/sdlc/cost_estimate.py` (the 14.1-002 heuristic
+already has a calibration hook and persists estimate-vs-actual, the natural training
+store). Training data reads the reconciled `stages` usage and the run/story history in the
+`Ledger` (`build.py`: `stage_set_usage`, `run_usage_totals`, per-stage historical
+averages), keyed by the discovery features from Story 28.2-001. Keep the model inspectable
+(means + adjustments), version the predictor so a recalibration is auditable, and record
+predictions on the story/run rows so post-run reconciliation is a join, not a
+re-computation. Honor the n=76 caveat: report error with sample size and never suppress the
+low-confidence flag.
+
+**Definition of Done**:
+- [ ] Predicted tokens + predicted rework probability computed and recorded pre-run from
+      reconciled history and the discovery features, with the documented crude model
+- [ ] Prediction-vs-actual reconciled and persisted post-run (extends 14.1-002 store)
+- [ ] Prediction quality reported as median absolute error (tokens) + rework calibration,
+      each with sample size
+- [ ] Low-confidence fallback to global mean on thin history or unknown features; disabled
+      path unchanged
+- [ ] Tests: prediction record/reconcile round-trip, thin-history fallback, error metric
+- [ ] Documented in `docs/controller-architecture.md`
+
+**Dependencies**: 28.1-001, 28.1-002 (reconciled telemetry to train on); 28.2-001 (the discovery features it keys on)
+**Risk Level**: Medium
 
 ### Feature 28.3: Consumers Switch to Predictions
 
@@ -357,7 +365,7 @@ inflated.
 
 **Technical Notes**: Change the escalation input in
 `controller/src/sdlc/model_routing.py` and `role_routing.py` (the points-keyed escalation
-today) to consume the 28.2-001 prediction; preserve the Epic-14 Balanced tier map and the
+today) to consume the 28.2-002 prediction; preserve the Epic-14 Balanced tier map and the
 Epic-08 `risk_gate.py` high-risk path unchanged. This directly retires Non-Goal-adjacent
 finding #4 from the dataset (routing about to be enabled would key model choice to noise).
 Validate with the Epic-18 eval harness that prediction-keyed escalation holds quality
@@ -372,7 +380,7 @@ versus the points-keyed baseline before trusting it broadly.
 - [ ] Tests: prediction-keyed escalation, risk path preserved, fallback; eval-harness check
 - [ ] Documented in `docs/controller-architecture.md`
 
-**Dependencies**: 28.2-001 (prediction signal); preserves Epic-08 risk_gate, Epic-14 map
+**Dependencies**: 28.2-002 (prediction signal); preserves Epic-08 risk_gate, Epic-14 map
 **Risk Level**: Medium
 
 ##### Story 28.3-002: Budget gate, pre-dispatch warnings, and batch planner consume the prediction
@@ -385,7 +393,7 @@ consumption and the batch's fit against the window are honest.
 
 **Acceptance Criteria**:
 - **Given** a pre-dispatch check (Story 14.1-002) **When** a stage or story is about to run
-  **Then** the warning and any interactive gate use the 28.2-001 predicted tokens, and the
+  **Then** the warning and any interactive gate use the 28.2-002 predicted tokens, and the
   surfaced estimate is labelled with its confidence.
 - **Given** the token budget gate (Story 14.1-001) **When** a run executes **Then** its
   projected-remaining computation uses summed predictions for not-yet-run stories, so a
@@ -398,10 +406,10 @@ consumption and the batch's fit against the window are honest.
   runs **Then** it falls back to the Epic-14 point-based estimate, logged, so the batch
   never blocks on a missing prediction.
 - **Given** the actuals after the run **When** the batch's projected-vs-actual window fit is
-  reconciled **Then** the miss is recorded, feeding the 28.2-001 error metric so planning
+  reconciled **Then** the miss is recorded, feeding the 28.2-002 error metric so planning
   accuracy is tracked over time.
 
-**Technical Notes**: Wire the 28.2-001 prediction into the budget/estimate path in
+**Technical Notes**: Wire the 28.2-002 prediction into the budget/estimate path in
 `controller/src/sdlc/cost_estimate.py` and the `run_build` budget enforcement in
 `build.py` (Story 14.1-001), and into the rate-limit-window planning of Story 14.1-003.
 Keep the notional-dollar labelling from Epic-14 (the primitive stays tokens on a Max
@@ -415,11 +423,11 @@ predictor's measured error.
 - [ ] Batch planner paces against summed predicted tokens vs the rate-limit window and
       reports projected fit with confidence
 - [ ] Low-confidence/disabled fallback to Epic-14 estimate, logged
-- [ ] Projected-vs-actual window fit reconciled and fed to the 28.2-001 error metric
+- [ ] Projected-vs-actual window fit reconciled and fed to the 28.2-002 error metric
 - [ ] Tests: gate/warning prediction path, batch pacing, fallback, reconciliation
 - [ ] Documented in `docs/controller-architecture.md`
 
-**Dependencies**: 28.2-001 (prediction signal); coordinates Epic-14 14.1-001, 14.1-002, 14.1-003
+**Dependencies**: 28.2-002 (prediction signal); coordinates Epic-14 14.1-001, 14.1-002, 14.1-003
 **Risk Level**: Medium
 
 ## Story Dependencies (within Epic-28)
@@ -427,19 +435,21 @@ predictor's measured error.
 ```
 28.1-001 (reconcile backfill + doctor)  needs Issue #481; consumes PR #482. FIRST.
 28.1-002 (verified model recording)     needs 28.1-001 (shared log-parse/doctor); consumes PRs #482, #484
-28.2-001 (predictor)                    needs 28.1-001 + 28.1-002 (reconciled telemetry to train on)
-28.2-002 (discovery features)           needs 28.2-001 (defines the feature contract)
-28.3-001 (routing on prediction)        needs 28.2-001; preserves Epic-08 risk_gate + Epic-14 map
-28.3-002 (budget/batch on prediction)   needs 28.2-001; coordinates Epic-14 14.1-001/002/003
+28.2-001 (discovery features)           independent (a discovery-side data change; can run alongside Feature 28.1)
+28.2-002 (predictor)                    needs 28.1-001 + 28.1-002 (reconciled telemetry) + 28.2-001 (discovery features)
+28.3-001 (routing on prediction)        needs 28.2-002; preserves Epic-08 risk_gate + Epic-14 map
+28.3-002 (budget/batch on prediction)   needs 28.2-002; coordinates Epic-14 14.1-001/002/003
 ```
 
 - **Cohort 1 (integrity, must land first)**: 28.1-001 then 28.1-002. Calibration on top of
   corrupted telemetry would train on lies, so no Feature 28.2 or 28.3 story starts until
   the meter agrees with the logs and the model column is verified.
-- **Cohort 2 (prediction)**: 28.2-001 (the predictor), then 28.2-002 (the features it
-  consumes; 28.2-002 can start once 28.2-001 fixes the feature contract).
+- **Cohort 2 (prediction)**: 28.2-001 (discovery features, no intra-epic deps, can start
+  alongside Feature 28.1), then 28.2-002 (the predictor, which needs both reconciled
+  telemetry from Feature 28.1 and the discovery features from 28.2-001). The producer
+  precedes the consumer.
 - **Cohort 3 (consumers, parallelizable once the predictor exists)**: 28.3-001 and 28.3-002
-  both depend only on 28.2-001 and touch different consumers (routing vs budget/batch), so
+  both depend only on 28.2-002 and touch different consumers (routing vs budget/batch), so
   they can run in parallel after the predictor lands.
 
 ## Epic Complete When
