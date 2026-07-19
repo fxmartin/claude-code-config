@@ -9,6 +9,7 @@ import sdlc.build as build_mod
 from sdlc.build import (
     BuildOptions,
     Ledger,
+    _resolved_recovery_model,
     _select_stage_model,
     parse_build_args,
     run_build,
@@ -625,3 +626,131 @@ def test_bugfix_stage_records_routed_model(tmp_path, monkeypatch) -> None:
     models = _stage_models(db, "bugfix")
     assert models, "no bugfix stage row was recorded"
     assert models[0] == OPUS
+
+
+# ---------------------------------------------------------------------------
+# Recovery row records the REGISTRY-resolved model, not the Claude alias
+# (Issue #483). Under a --harness map routing the originating stage to a
+# registry harness (Story 20.7), the dispatch actually runs that harness's own
+# per-stage model — the recovery row must record THAT, not the inert Claude
+# recovery-tier alias the dispatch model arg still carries.
+# ---------------------------------------------------------------------------
+
+# A registry harness's own per-stage model id — deliberately distinct from every
+# Claude tier alias (HAIKU/SONNET/OPUS) so a row recording it can never be
+# confused with the Claude recovery tier the dispatch model arg still carries.
+CODEX_BUILD_MODEL = "gpt-5.5-codex"
+
+
+def _fake_codex_harness():
+    """A registry-source HarnessConfig whose `build` model is a sentinel id."""
+    from sdlc.harness import HarnessConfig
+
+    return HarnessConfig(
+        name="codex",
+        command="codex-build-adapter.sh",
+        parser="codex-exec",
+        source="registry",
+        models={"default": CODEX_BUILD_MODEL, "build": CODEX_BUILD_MODEL},
+    )
+
+
+def _patch_registry_codex(monkeypatch) -> None:
+    """Route the `codex` name to a fake registry harness; delegate the rest.
+
+    Keeps the built-in/env slots (and any other name) on the real resolver so
+    only the registry branch under test is faked.
+    """
+    real = build_mod.resolve_harness
+
+    def _fake(name=None, *, config_path=None, env=None):
+        if name == "codex":
+            return _fake_codex_harness()
+        return real(name, config_path=config_path, env=env)
+
+    monkeypatch.setattr(build_mod, "resolve_harness", _fake)
+
+
+def test_reask_row_records_registry_model_not_claude_alias(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #483: with the build role routed to a registry harness, the reask
+    row records the harness's own resolved model (the sentinel), NOT the Claude
+    `reask` tier alias (HAIKU) that still decorates the dispatch model arg."""
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    _patch_registry_codex(monkeypatch)
+    disp = _ReaskModelRecordingDispatcher()
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced", harness_map={"build": "codex"},
+    )
+    db = tmp_path / "ledger.db"
+    run_build(
+        opts, queue=[_story(points=1)], ledger=Ledger(db),
+        dispatcher=disp, preflight=lambda: True, root=tmp_path,
+    )
+    # The dispatch still carries the Claude recovery-tier alias (HAIKU) — the
+    # registry harness ignores it, but the split is real: dispatch arg vs row.
+    reask_models = [m for (a, r, m) in disp.calls if r]
+    assert reask_models == [HAIKU]
+    # The row must record the model the registry harness ACTUALLY ran on.
+    assert _stage_models(db, "reask") == [CODEX_BUILD_MODEL]
+
+
+def test_bugfix_row_records_registry_model_not_claude_alias(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #483: with the build role routed to a registry harness, the bugfix
+    row records the harness's own resolved model (the sentinel), NOT the Claude
+    `bugfix` tier alias (OPUS after escalation) the dispatch model arg carries."""
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    _patch_registry_codex(monkeypatch)
+    disp = _BugfixRecordingDispatcher()
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True,
+        model_profile="balanced", harness_map={"build": "codex"},
+    )
+    db = tmp_path / "ledger.db"
+    run_build(
+        opts, queue=[_story(points=1)], ledger=Ledger(db),
+        dispatcher=disp, preflight=lambda: True, root=tmp_path,
+    )
+    # The dispatch still carries the escalated Claude bugfix tier (OPUS).
+    bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
+    assert bugfix_models[0] == OPUS
+    # The row must record the registry harness's own resolved model.
+    models = _stage_models(db, "bugfix")
+    assert models, "no bugfix stage row was recorded"
+    assert models[0] == CODEX_BUILD_MODEL
+
+
+def test_resolved_recovery_model_registry_error_falls_back_to_claude() -> None:
+    """Issue #483: a --harness map entry naming a harness absent from the
+    registry must not blow up the recovery-row resolve — resolve_harness
+    raises HarnessError, and the best-effort branch degrades to the routed
+    Claude model, mirroring _resolved_stage_model's exception path
+    (test_resolved_stage_model_registry_error_falls_back_to_claude)."""
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True,
+        harness_map={"build": "not-a-real-harness"},
+        model_overrides={"reask": "opus"},
+    )
+    story = _story()
+    assert (
+        _resolved_recovery_model("reask", "build", story, opts) == "opus"
+    )
+
+
+def test_resolved_recovery_model_builtin_harness_returns_claude_model() -> None:
+    """Issue #483: a --harness map entry that resolves to the built-in Claude
+    slot (source='builtin') must still record the routed Claude model — that
+    slot has no per-stage model map of its own, unlike a registry harness."""
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True,
+        harness_map={"build": "claude"},
+        model_overrides={"bugfix": "opus"},
+    )
+    story = _story()
+    assert (
+        _resolved_recovery_model("bugfix", "build", story, opts) == "opus"
+    )
