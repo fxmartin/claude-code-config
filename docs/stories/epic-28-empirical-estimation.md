@@ -154,7 +154,11 @@ percent it was under-reporting.
   doctor check runs **Then** it degrades gracefully to "unverifiable" for those rows and
   says so, rather than reporting false agreement.
 
-**Technical Notes**: Builds on Issue #481 (crash-session recovery) and completes the
+**Technical Notes**: Absorbs Issue #481 (crash-session recovery) rather than depending on
+it — #481 specifies the same `usage_reconcile.py` sweep, the same tokens-only/no-fabricated-cost
+rule, the same `reask`/`bugfix`/`commitlint` matching and the same idempotency guarantee, and this
+story is a strict superset of it (adding completed-session backfill and the doctor agreement
+rate). Building both would collide on the same new module. It also completes the
 reconciliation the PR #482 overwrite-fix implied but did not deliver for pre-fix history.
 Session logs are raw `stream-json`; the terminal `result` event is the only authoritative
 cost line (per-turn events carry tokens but no cost), so cost is recoverable only for
@@ -177,7 +181,8 @@ and prevents future drift, so it precedes all calibration.
       no-log degradation
 - [ ] Documented in `docs/controller-architecture.md` and the `sdlc doctor` help
 
-**Dependencies**: Issue #481 (crash-session recovery); consumes PR #482 (overwrite fix)
+**Dependencies**: none — Issue #481 is absorbed into this story, not a prerequisite (see
+Technical Notes); consumes PR #482 (overwrite fix)
 **Risk Level**: Medium
 
 ##### Story 28.1-002: Verified per-attempt model recording and NULL backfill
@@ -570,7 +575,7 @@ pre-change runs resume identically)
 ## Story Dependencies (within Epic-28)
 
 ```
-28.1-001 (reconcile backfill + doctor)  needs Issue #481; consumes PR #482. FIRST.
+28.1-001 (reconcile backfill + doctor)  absorbs Issue #481; consumes PR #482. FIRST.
 28.1-002 (verified model recording)     needs 28.1-001 (shared log-parse/doctor); consumes PRs #482, #484
 28.2-001 (discovery features)           independent (a discovery-side data change; can run alongside Feature 28.1)
 28.2-002 (predictor)                    needs 28.1-001 + 28.1-002 (reconciled telemetry) + 28.2-001 (discovery features)
