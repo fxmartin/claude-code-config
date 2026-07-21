@@ -1,6 +1,6 @@
 # Epic 28: Empirical Estimation and Telemetry Integrity
 
-> **Status: PLANNED (0/6)** created 2026-07-19 from the 2026-07-19 cost dataset: a
+> **Status: PLANNED (0/7)** created 2026-07-19 from the 2026-07-19 cost dataset: a
 > 76-story priced dataset built from this controller's own ledgers on local-code-bench
 > (June 25 to July 18, 2026). Thesis: the factory should stop *estimating* from story
 > points and start *calibrating* from its own ledger history. Points stay as a

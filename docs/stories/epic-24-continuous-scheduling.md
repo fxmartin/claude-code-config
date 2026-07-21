@@ -1,6 +1,7 @@
 # Epic 24: Continuous Ready-Queue Scheduling
 
-> **Status: PLANNED (0/1)** — created 2026-06-30 from a live observation of the epic-23 run.
+> **Status: COMPLETE (1/1)** — 24.1-001 implemented, tested, and merged 2026-07-15 (PR #460).
+> Created 2026-06-30 from a live observation of the epic-23 run.
 > Epic-17 delivered concurrent cohort execution but deliberately kept a **barrier between
 > cohorts**, listing the alternative as an explicit Non-Goal: *"starting a story the instant its
 > individual deps finish is a deliberate future enhancement, not this epic."* This epic is that
