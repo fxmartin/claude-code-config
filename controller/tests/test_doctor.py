@@ -16,6 +16,7 @@ from sdlc.doctor import (
     MANAGED_PATHS,
     DoctorReport,
     Finding,
+    check_model_coverage,
     check_usage_agreement,
     run_doctor,
     worst_status,
@@ -561,3 +562,109 @@ def test_cli_doctor_json(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["status"] in {"CLEAN", "WARN", "FAIL"}
     assert any(f["check"] == "install" for f in payload["findings"])
+
+
+# --- per-attempt model coverage (Story 28.1-002) ----------------------------
+
+
+def _model_ledger(
+    tmp_path: Path,
+    *,
+    model: str | None,
+    status: str = "DONE",
+    log: str | None = None,
+) -> Path:
+    """A ledger with one finished stage attempt and a chosen model attribution."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "auto")
+    ledger.story_upsert(
+        run_id, "28.1-002", "epic-28", "t", "Must", 3, "python-backend-engineer",
+        "feature/28.1-002", None, "DONE",
+    )
+    ledger.stage_start(run_id, "28.1-002", "build", 1, model=model)
+    ledger.stage_finish(run_id, "28.1-002", "build", 1, status)
+    if log is not None:
+        logs_dir = Path(f"{db}.logs") / run_id
+        logs_dir.mkdir(parents=True)
+        (logs_dir / "28.1-002-build-1.log").write_text(log, encoding="utf-8")
+    return db
+
+
+_MODEL_RESULT_LINE = json.dumps(
+    {
+        "type": "result",
+        "result": "ok",
+        "session_id": "s",
+        "modelUsage": {"claude-opus-4-8": {"costUSD": 1.5, "outputTokens": 200}},
+    }
+) + "\n"
+
+
+def test_model_coverage_clean_when_every_dispatched_row_is_attributed(
+    tmp_path: Path,
+) -> None:
+    finding = check_model_coverage(_model_ledger(tmp_path, model="claude-opus-4-8"))
+    assert finding.check == "model" and finding.status == "CLEAN"
+    assert "1/1" in finding.detail and "100%" in finding.detail
+
+
+def test_model_coverage_fails_on_a_fresh_run_null(tmp_path: Path) -> None:
+    """AC3: a DONE stage with no model on the latest run is a recording defect."""
+    finding = check_model_coverage(_model_ledger(tmp_path, model=None))
+    assert finding.status == "FAIL"
+    assert "28.1-002/build#1" in finding.detail
+    assert "regress" in finding.detail.lower()
+    assert "model-backfill" in finding.remedy
+
+
+def test_model_coverage_warns_when_the_null_is_only_recoverable_history(
+    tmp_path: Path,
+) -> None:
+    """A NULL on a FAILED attempt is a gap to backfill, not a fresh-run defect."""
+    finding = check_model_coverage(
+        _model_ledger(tmp_path, model=None, status="FAILED", log=_MODEL_RESULT_LINE)
+    )
+    assert finding.status == "WARN"
+    assert "recoverable=1" in finding.detail
+    assert "model-backfill" in finding.remedy
+
+
+def test_model_coverage_reports_unrecoverable_rows_without_coercing_them(
+    tmp_path: Path,
+) -> None:
+    finding = check_model_coverage(
+        _model_ledger(tmp_path, model=None, status="FAILED", log="plain text\n")
+    )
+    assert finding.status == "WARN"
+    assert "unrecoverable=1" in finding.detail
+    assert "0/1" in finding.detail
+
+
+def test_model_coverage_ignores_rows_that_never_dispatched(tmp_path: Path) -> None:
+    """A SKIPPED (docs-only / cost-gated) row has a NULL model by design."""
+    finding = check_model_coverage(_model_ledger(tmp_path, model=None, status="SKIPPED"))
+    assert finding.status == "CLEAN"
+    assert "no dispatched stage attempts" in finding.detail
+
+
+def test_model_coverage_clean_without_a_ledger(tmp_path: Path) -> None:
+    finding = check_model_coverage(tmp_path / "absent.db")
+    assert finding.status == "CLEAN"
+
+
+def test_model_coverage_is_read_only(tmp_path: Path) -> None:
+    """Doctor reports; `sdlc model-backfill` is the verb that writes."""
+    db = _model_ledger(tmp_path, model=None, status="FAILED", log=_MODEL_RESULT_LINE)
+    check_model_coverage(db)
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT model FROM stages").fetchone()[0] is None
+    finally:
+        conn.close()
+
+
+def test_run_doctor_includes_the_model_coverage_finding(tmp_path: Path) -> None:
+    report = _doctor(tmp_path, db_path=_model_ledger(tmp_path, model="claude-opus-4-8"))
+    assert any(f.check == "model" for f in report.findings)

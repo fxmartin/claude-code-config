@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from sdlc.contracts import ContractError, parse_and_validate
+from sdlc.progress import dominant_model
 from sdlc.rate_limit import RateLimitSignal, detect_rate_limit
 
 # Imported from the dispatch boundary rather than redefined here: the typed
@@ -218,6 +219,10 @@ class ClaudeStreamJsonParser(OutputParser):
             return AgentResult(
                 agent_type=agent_type, data=data, raw=agent_text,
                 usage=usage, cost_usd=cost, session_id=session_id,
+                # Story 28.1-002: the model the session actually ran on, so the
+                # ledger records fact rather than the pre-dispatch prediction
+                # (which is None whenever model routing is off).
+                model=dominant_model(envelope.get("modelUsage")),
             )
 
         # Fallback: plain-text agent output (custom SDLC_AGENT_CMD / older claude, or

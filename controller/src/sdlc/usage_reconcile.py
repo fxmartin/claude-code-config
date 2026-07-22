@@ -27,6 +27,7 @@ __all__ = [
     "parse_log_usage",
     "reconcile_usage",
     "resolve_stage_log",
+    "select_runs",
 ]
 
 # The ledger's usage columns, in the order the four token components are summed.
@@ -440,7 +441,7 @@ def _audit_row(
     return StageAudit(**base, reason=AGREE, updated=True)
 
 
-def _select_runs(
+def select_runs(
     ledger: Ledger,
     run_id: str | None,
     all_runs: bool,
@@ -497,7 +498,7 @@ def reconcile_usage(
     if not ledger.db_path.exists():
         return result
 
-    result.run_ids = _select_runs(ledger, run_id, all_runs, run_limit)
+    result.run_ids = select_runs(ledger, run_id, all_runs, run_limit)
     for rid in result.run_ids:
         logs_dir = logs_root / rid
         # An IN_PROGRESS stage row under a *terminal* run is not running — it is a

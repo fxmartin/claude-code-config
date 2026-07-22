@@ -28,6 +28,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "rollback": "Roll a run back to a prior ledger checkpoint.",
     "reconcile": "Re-check a run against origin/main and correct the ledger.",
     "usage-reconcile": "Backfill per-stage usage from the session logs and score agreement.",
+    "model-backfill": "Backfill per-stage model attribution from the session logs.",
     "clean": "Garbage-collect build leftovers (orphan worktrees, merged branches, stale logs).",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
     "generate-skills": "Generate Claude + Codex skill files from the neutral sources.",
@@ -790,9 +791,17 @@ def doctor(
     Runs read-only health-checks across install integrity (managed symlinks),
     ledger schema currency + integrity, stuck/stale runs (an IN_PROGRESS run with
     a dead pid or no recent activity), config validity (settings/schemas parse),
-    ledger-vs-logs usage agreement, and dependency availability (gh, claude,
-    semgrep, osv-scanner). Each finding reports CLEAN/WARN/FAIL plus the command
-    or doc that fixes it.
+    ledger-vs-logs usage agreement, per-stage model attribution, and dependency
+    availability (gh, claude, semgrep, osv-scanner). Each finding reports
+    CLEAN/WARN/FAIL plus the command or doc that fixes it.
+
+    The **model attribution** check (Story 28.1-002) reports the share of
+    dispatched stage attempts across the same window carrying a non-NULL
+    `stages.model` — the column cost-by-model reads. A completed stage on the
+    *latest* run with no model FAILs (the live recording regressed); older or
+    non-DONE NULLs WARN and are fixable with `sdlc model-backfill --all` where
+    the transcript survives. Rows whose model is genuinely unrecoverable are
+    counted as such, never coerced to a placeholder.
 
     The **usage agreement** check (Story 28.1-001) scores the share of verifiable
     stage attempts across the last 5 runs whose recorded token/cost usage matches
@@ -1479,6 +1488,100 @@ def usage_reconcile(
         summary += f"; {result.unverifiable} unverifiable (no readable session log)"
     if result.skipped_in_progress:
         summary += f"; {result.skipped_in_progress} in-progress row(s) skipped"
+    typer.echo(summary + ".")
+    raise typer.Exit(code=0)
+
+
+@app.command(name="model-backfill", help=PLANNED_SUBCOMMANDS["model-backfill"])
+def model_backfill(
+    run: str | None = typer.Argument(
+        None, help="Run id to backfill (default: the most recent run)."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    all_runs: bool = typer.Option(
+        False, "--all", help="Sweep every run in the ledger, not just the latest."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would change without writing to the ledger."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the backfill report as a JSON object."
+    ),
+) -> None:
+    """Backfill the ledger's per-stage `model` from the session logs (Story 28.1-002).
+
+    ``stages.model`` is what makes cost-by-model a fact in the ledger rather than
+    something re-derived by parsing logs — but every attempt recorded before the
+    verified per-attempt recording landed reads NULL. This pass re-reads each
+    attempt's own transcript under ``.sdlc-state.db.logs/<run>/`` and writes the
+    model the session actually ran on onto that exact row.
+
+    The transcript's terminal ``{"type":"result"}`` envelope carries a
+    ``modelUsage`` map — the authoritative record of every model the session
+    touched; the one that carried the session (by cost, then output tokens) is
+    what lands. A session that crashed before that envelope falls back to the
+    model its assistant turns name.
+
+    **Never coerced.** A row whose transcript was pruned, or which only ever held
+    plain-text output, stays NULL and is *counted* as unrecoverable, so the
+    column's true coverage is known instead of papered over with a placeholder. A
+    row that already attributes a model is never overwritten.
+
+    Idempotent: a second run finds every backfilled row already recorded and
+    writes nothing. ``sdlc doctor`` reports the resulting coverage on every
+    health check and fails on a fresh-run regression to NULL.
+    """
+    from sdlc.ledger_view import Ledger, default_db_path
+    from sdlc.model_backfill import backfill_models
+
+    db_path = db or default_db_path()
+    ledger = Ledger(db_path)
+    # Migrate a pre-existing ledger before the pass reads/writes `model`. No-op
+    # when no DB exists, so a never-built repo keeps a clean absence.
+    ledger.ensure_migrated()
+
+    if run is not None and ledger.run_row(run) is None:
+        typer.echo(f"error: no such run '{run}' in ledger: {db_path}", err=True)
+        raise typer.Exit(code=2)
+
+    result = backfill_models(ledger, run, all_runs=all_runs, apply=not dry_run)
+
+    if as_json:
+        typer.echo(json.dumps(result.to_dict(), default=str))
+        raise typer.Exit(code=0)
+
+    if not result.run_ids:
+        typer.echo(f"no build run found in ledger: {db_path}")
+        raise typer.Exit(code=0)
+
+    for audit in result.updated:
+        typer.echo(f"  {audit.label}: model={audit.log_model} [{audit.reason}]")
+    pending = [a for a in result.residual if not a.updated]
+    for audit in pending[:_USAGE_RESIDUAL_LIST_CAP]:
+        typer.echo(f"  {audit.label}: {audit.reason}")
+    if len(pending) > _USAGE_RESIDUAL_LIST_CAP:
+        typer.echo(
+            f"  … +{len(pending) - _USAGE_RESIDUAL_LIST_CAP} more row(s) without a "
+            "model (use --json for the full list)"
+        )
+
+    if dry_run:
+        # Nothing was written, so "updated" is always empty — report the rows the
+        # pass *would* attribute instead of a misleading zero.
+        summary = (
+            f"model-backfill (dry-run): {len(result.residual)} row(s) without a model"
+        )
+    else:
+        summary = f"model-backfill: {len(result.updated)} row(s) updated"
+    if result.coverage is not None:
+        summary += (
+            f"; coverage {result.populated}/{result.dispatched} "
+            f"({result.coverage:.0%})"
+        )
+    if result.unrecoverable:
+        summary += f"; {result.unrecoverable} unrecoverable (no model in the session log)"
     typer.echo(summary + ".")
     raise typer.Exit(code=0)
 

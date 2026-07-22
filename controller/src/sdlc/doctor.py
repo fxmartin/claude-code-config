@@ -21,6 +21,7 @@ __all__ = [
     "DEPENDENCIES",
     "Finding",
     "DoctorReport",
+    "check_model_coverage",
     "check_usage_agreement",
     "run_doctor",
     "worst_status",
@@ -460,6 +461,100 @@ def check_usage_agreement(
     return Finding("usage", name, "CLEAN", detail)
 
 
+def check_model_coverage(
+    db_path: Path,
+    *,
+    run_limit: int = _AGREEMENT_RUN_LIMIT,
+    logs_root: Path | None = None,
+) -> Finding:
+    """Score how much of ``stages.model`` is populated (Story 28.1-002).
+
+    Model attribution is what makes cost-by-model a *fact* in the ledger instead
+    of something re-derived by parsing logs, so a NULL there is a measurement
+    gap. This reports the share of **dispatched** stage attempts (SKIPPED and
+    still-running rows never ran an agent, so they owe no model) carrying one,
+    across the same recent-run window as the usage-agreement check.
+
+    Severity follows what the NULL *means*:
+
+    * **FAIL** — a ``DONE`` attempt on the most recent run has no model. That
+      stage produced a result envelope, so the recording regressed (AC3).
+    * **WARN** — older or non-DONE NULLs: a genuine history gap, fixable with
+      ``sdlc model-backfill`` where the transcript survives.
+    * **CLEAN** — every dispatched attempt is attributed.
+
+    Read-only, like every other doctor check: rows are *reported*, never coerced
+    to a placeholder, so the column's true coverage is what is shown.
+    """
+    from sdlc.model_backfill import (
+        RECOVERABLE,
+        UNRECOVERABLE,
+        VERIFIED_STATUSES,
+        backfill_models,
+    )
+
+    name = "Per-stage model attribution"
+    if not db_path.exists():
+        return Finding(
+            "model", name, "CLEAN", "no ledger yet — no stage attributions to verify"
+        )
+
+    try:
+        audit = backfill_models(
+            Ledger(db_path), run_limit=run_limit, logs_root=logs_root, apply=False
+        )
+    except sqlite3.DatabaseError as exc:
+        # A corrupt/unreadable ledger is already a FAIL from check_ledger.
+        return Finding(
+            "model", name, "WARN",
+            f"model coverage could not be computed: {exc}",
+            "fix the ledger first (see the ledger finding above)",
+        )
+
+    if audit.coverage is None:
+        return Finding(
+            "model", name, "CLEAN",
+            "no dispatched stage attempts to attribute",
+        )
+
+    scope = f"over the last {len(audit.run_ids)} run(s)"
+    detail = (
+        f"model recorded on {audit.populated}/{audit.dispatched} dispatched stage "
+        f"attempt(s) ({audit.coverage:.0%}) {scope}"
+    )
+    counts = audit.counts()
+    residual_counts = ", ".join(
+        f"{reason}={counts[reason]}"
+        for reason in (UNRECOVERABLE, RECOVERABLE)
+        if counts.get(reason)
+    )
+    if residual_counts:
+        detail += f"; residual: {residual_counts}"
+        listed = audit.residual[:_AGREEMENT_MAX_LISTED]
+        detail += " — " + ", ".join(f"{a.label} ({a.reason})" for a in listed)
+        if len(audit.residual) > len(listed):
+            detail += f", +{len(audit.residual) - len(listed)} more"
+
+    remedy = "`sdlc model-backfill --all` to backfill model from the session logs"
+    # The most recent run is the "fresh run" the AC guards: a completed stage
+    # there with no model means the live recording path regressed, not that
+    # history is merely thin.
+    fresh = audit.run_ids[0] if audit.run_ids else None
+    regressions = audit.nulls_in(fresh, VERIFIED_STATUSES) if fresh else []
+    if regressions:
+        return Finding(
+            "model", name, "FAIL",
+            detail + (
+                f"; regression: {len(regressions)} completed stage(s) on the latest "
+                "run recorded no model"
+            ),
+            remedy,
+        )
+    if audit.residual:
+        return Finding("model", name, "WARN", detail, remedy)
+    return Finding("model", name, "CLEAN", detail)
+
+
 def _default_dep_probe(tool: str) -> bool:
     """True when ``tool`` is on PATH and answers ``--version`` with exit 0.
 
@@ -553,6 +648,7 @@ def run_doctor(
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
         check_config(repo_root),
         check_usage_agreement(db_path),
+        check_model_coverage(db_path),
     ]
     findings.extend(check_dependencies(dep_probe))
     return DoctorReport(findings=findings)
