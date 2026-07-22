@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.0] - 2026-07-22
+
+### Added
+
+- feat(empirical-estimation): route model escalation on (#28.3-001) (#526)
+
+
 ## [v2.41.0] - 2026-07-22
 
 ### Added
