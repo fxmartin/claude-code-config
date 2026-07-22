@@ -55,7 +55,6 @@ from sdlc.dispatch import (
 )
 from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.predictor import (
-    PREDICTOR_VERSION,
     PredictorHistory,
     StoryFeatures,
     StoryPrediction,
@@ -292,11 +291,23 @@ _TERMINAL_RUN_STATES = {
     "DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION", "AWAITING_APPROVAL",
 }
 
-# Story statuses that mean "this story is finished being worked on", so its
-# measured usage is complete and it is a valid training row for the Story
-# 28.2-002 predictor. BLOCKED and SKIPPED are excluded deliberately: no agent
-# ever ran, so they carry no cost signal at all.
-_TERMINAL_STORY_STATES = ("DONE", "FAILED", "NEEDS_ATTENTION", "AWAITING_APPROVAL")
+# Story statuses whose measured usage is a story's *complete* cost, so the row is
+# a valid training example for the Story 28.2-002 predictor. Deliberately not
+# named ``_TERMINAL_*``: `resume.py` already owns a `_TERMINAL_STORY_STATES` with
+# the opposite membership ({DONE, SKIPPED} — "never re-run"), and it imports a
+# long list of private names from this module, so the collision was a live
+# footgun.
+#
+# DONE is the only status that qualifies. Every other post-dispatch status is
+# *parked*, not finished (`reconcile._PARKED`): `compute_resume_plan` owes a next
+# stage to any story whose pipeline is incomplete, and `run_resume` re-enters
+# everything outside its own {DONE, SKIPPED}, so a FAILED / NEEDS_ATTENTION /
+# AWAITING_APPROVAL story can still accrue usage. Training on one presents a
+# partial total as the story's full cost and biases the cohort mean low. BLOCKED
+# and SKIPPED are excluded for the opposite reason: no agent ever ran, so they
+# carry no cost signal at all. On the factory's own ledger this costs 2 rows out
+# of 153 — a rounding error against scoring the model on truncated totals.
+_TRAINABLE_STORY_STATES = ("DONE",)
 
 def _stage_token_sum(prefix: str = "") -> str:
     """SQL fragment summing one `stages` row's four token components.
@@ -321,10 +332,23 @@ def _stage_rework_predicate(prefix: str = "") -> str:
     Story 28.2-002 defines rework as a review retry or a bugfix loop: a ``bugfix``
     dispatch, a retried stage attempt, or a FAILED attempt. ``prefix`` qualifies
     the columns so ``status`` can never bind to ``stories.status`` by accident.
+
+    The retry clauses are scoped to :data:`_STAGES` because ``attempt`` only means
+    "retry number" on a pipeline row. The ``bugfix``/``reask``/``commitlint`` rows
+    share one *monotonic per-story* sequence (``bugfix_seq``) so their inserts
+    cannot collide on the stages primary key — so a second **successful**
+    commit-lint amend lands at ``attempt = 2`` with nothing having been retried,
+    and reading it as rework would contaminate the predictor's own target
+    variable. A failed recovery dispatch is excluded for the same reason: the
+    pipeline stage it serves reports the retry on its own row. (``_STAGES`` is
+    defined further down the module; this is a function body, so the name is
+    resolved at call time.)
     """
+    pipeline = ", ".join(f"'{stage}'" for stage in _STAGES)
     return (
-        f"{prefix}stage_name = 'bugfix' OR {prefix}attempt > 1 "
-        f"OR {prefix}status = 'FAILED'"
+        f"{prefix}stage_name = 'bugfix' "
+        f"OR ({prefix}stage_name IN ({pipeline}) "
+        f"AND ({prefix}attempt > 1 OR {prefix}status = 'FAILED'))"
     )
 
 # Schema migrations applied by Ledger.init() after the base DDL. Each entry is
@@ -1023,6 +1047,30 @@ def _honor_parked_reset(
     return None
 
 
+def _log_predictor_posture(
+    ledger: "Ledger", run_id: str, opts: BuildOptions
+) -> None:
+    """Note the run's predictor posture once, at run start (Story 28.2-002).
+
+    AC5 asks for a logged note when the predictor is disabled or unconfigured, and
+    the posture is a property of the *run* — it is decided once and persisted in
+    the run config. Emitting the note per story instead added one advisory
+    `events` row per story to every build, since `--predict` is off by default,
+    which is noise in `sdlc status` and the dashboard timeline for a feature
+    nobody enabled. Advisory, so a ledger that cannot log must never fail a run.
+    """
+    if opts.predict:
+        return
+    try:
+        ledger.event_log(
+            run_id, "", "info", "controller",
+            "predictor disabled (--predict off): stories use the point-keyed "
+            "stage estimate (14.1-002)",
+        )
+    except Exception:  # noqa: BLE001 - the note is advisory, never fatal
+        pass
+
+
 def _predict_story_cost(
     ledger: "Ledger", run_id: str, story: Story, opts: BuildOptions
 ) -> StoryPrediction | None:
@@ -1035,20 +1083,13 @@ def _predict_story_cost(
     the cohort, its sample size and the applied adjustment.
 
     Returns ``None`` — behaviour degrades to the Story 14.1-002 point-keyed stage
-    estimate, with the reason logged — in three cases: the predictor is disabled
-    (the default), the ledger holds no reconciled history to train on yet, or
-    anything at all goes wrong. Like the stage estimate this is strictly
-    best-effort: a predictor fault must never fail a build.
+    estimate — in three cases: the predictor is disabled (the default, noted once
+    per run by :func:`_log_predictor_posture` rather than once per story), the
+    ledger holds no reconciled history to train on yet, or anything at all goes
+    wrong. Like the stage estimate this is strictly best-effort: a predictor fault
+    must never fail a build.
     """
     if not opts.predict:
-        try:
-            ledger.event_log(
-                run_id, story.id, "info", "controller",
-                "predictor disabled (--predict off): using the point-keyed stage "
-                "estimate (14.1-002)",
-            )
-        except Exception:  # noqa: BLE001 - the note is advisory, never fatal
-            pass
         return None
     try:
         features = StoryFeatures(
@@ -2156,14 +2197,16 @@ class Ledger:
     def prediction_training_rows(self) -> list[dict]:
         """The reconciled per-story history the predictor trains on (Story 28.2-002).
 
-        One row per **terminal** story across every run that actually recorded
+        One row per **completed** story across every run that actually recorded
         usage: its discovery features, its inventory risk flag, the measured token
         total across all its stages, and whether it entered rework. Derived from
         the existing `stories`/`stages` tables rather than the prediction columns,
         so history accumulates whether or not the predictor was ever enabled — a
         first run with the flag on still has something to learn from.
 
-        Stories still in flight are excluded (their usage is incomplete), as are
+        Stories still in flight are excluded (their usage is incomplete) — which
+        includes every *parked* status, not just IN_PROGRESS, because `sdlc
+        resume` re-enters those too; see :data:`_TRAINABLE_STORY_STATES`. So are
         stories no stage recorded usage for (they would drag the mean toward zero
         — the same all-NULL exclusion :meth:`historical_stage_tokens` applies).
         """
@@ -2172,7 +2215,7 @@ class Ledger:
         with self._connect_ro() as conn:
             if not self._has_columns(conn, "stories", ("ac_count",)):
                 return []
-            placeholders = ", ".join("?" for _ in _TERMINAL_STORY_STATES)
+            placeholders = ", ".join("?" for _ in _TRAINABLE_STORY_STATES)
             rows = conn.execute(
                 f"""
                 SELECT s.run_id, s.story_id, s.ac_count, s.dep_depth, s.scope_proxy,
@@ -2197,7 +2240,7 @@ class Ledger:
                 WHERE s.status IN ({placeholders})
                 ORDER BY s.rowid
                 """,
-                tuple(_TERMINAL_STORY_STATES),
+                tuple(_TRAINABLE_STORY_STATES),
             ).fetchall()
         return [dict(r) for r in rows if r["measured"]]
 
@@ -5098,6 +5141,8 @@ def run_build(
         opts, clock=clock, sleep_fn=sleep_fn,
         baseline=ledger.run_usage_totals(run_id)["tokens"],
     )
+    # Story 28.2-002: note a disabled predictor once here, before any story runs.
+    _log_predictor_posture(ledger, run_id, opts)
     budget_stopped = False
     rate_limit_park: _StoryRunOutcome | None = None
     cost_gated: _CostGatePause | None = None

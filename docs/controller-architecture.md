@@ -1076,16 +1076,27 @@ the metrics per version is a follow-up, not something the report does today.
   together. Otherwise the report would score a discarded attempt as the story's
   real outcome. The 28.2-001 discovery features describe the spec, not the
   attempt, and survive the reset.
-- **Rework is defined observably**: any `bugfix` stage row, any stage attempt
-  beyond the first, or any FAILED attempt. The envelope re-ask and the commit-lint
-  amend are recovery *dispatches*, not review retries, and do not count alone.
+- **Rework is defined observably**: any `bugfix` stage row, or a **pipeline**
+  stage (`build`/`coverage`/`review`/`merge`) with an attempt beyond the first or
+  a FAILED attempt. The retry clauses are scoped to the pipeline stages on
+  purpose: `bugfix`/`reask`/`commitlint` rows share one monotonic per-story
+  sequence in `attempt` (`bugfix_seq`, so their inserts cannot collide on the
+  stages primary key), so a second *successful* commit-lint amend sits at
+  `attempt = 2` with nothing having been retried. The envelope re-ask and the
+  commit-lint amend are recovery *dispatches*, not review retries, and do not
+  count alone — including when they themselves fail, since the pipeline stage
+  they serve records that retry on its own row.
 - **Training reads the tables, not the prediction columns.**
   `Ledger.prediction_training_rows` derives history from `stories` + `stages`
   directly, so it accumulates whether or not the predictor was ever enabled — the
-  first run with `--predict` on still has something to learn from. Stories still
-  in flight are excluded (incomplete usage), as are stories no stage recorded
-  usage for (they would drag the mean toward zero — the same all-NULL exclusion
-  `historical_stage_tokens` applies).
+  first run with `--predict` on still has something to learn from. Only `DONE`
+  stories are trainable (`_TRAINABLE_STORY_STATES`): every other post-dispatch
+  status is *parked*, not finished — `run_resume` re-enters anything outside
+  `{DONE, SKIPPED}` that still owes a stage — so a `FAILED` /
+  `NEEDS_ATTENTION` / `AWAITING_APPROVAL` row would present a partial token total
+  as the story's full cost and bias the cohort mean low. Stories no stage recorded
+  usage for are excluded too (they would drag the mean toward zero — the same
+  all-NULL exclusion `historical_stage_tokens` applies).
 
 ### Low confidence is never suppressed
 
@@ -1126,7 +1137,11 @@ model, and the report must not let it read as one.
 
 `--predict` (persisted in the run config, so a resume keeps the posture) enables
 the whole path. Without it the controller behaves exactly as today — the 14.1-002
-stage estimate and gate, unchanged — and logs a note saying so. Everything on the
+stage estimate and gate, unchanged — and logs a note saying so **once per run**
+(`_log_predictor_posture`, at run start). Per run, not per story: the posture is a
+property of the run, and the flag is off by default, so a per-story note would add
+an advisory `events` row per story to every build for a feature nobody enabled.
+Everything on the
 enabled path is best-effort too: a predictor or ledger fault degrades to `None`
 and the story dispatches exactly as it would have.
 

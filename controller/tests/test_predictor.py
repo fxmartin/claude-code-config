@@ -11,6 +11,7 @@ import pytest
 from sdlc.build import (
     BuildOptions,
     Ledger,
+    _log_predictor_posture,
     _predict_story_cost,
     _reconcile_story_prediction,
     parse_build_args,
@@ -485,6 +486,66 @@ def test_reconcile_detects_rework(tmp_path: Path, stage, attempt, status) -> Non
     assert outcome["actual_rework"] == 1
 
 
+@pytest.mark.parametrize(
+    "stage,attempt,status",
+    [
+        # `bugfix`/`reask`/`commitlint` share one monotonic per-story sequence in
+        # `attempt` (build.py's bugfix_seq; see resume.py's reconstruction of it),
+        # so a second *successful* recovery dispatch anywhere in the story lands
+        # at attempt 2 without any stage ever having been retried.
+        ("commitlint", 2, "DONE"),
+        ("reask", 3, "DONE"),
+        # A recovery dispatch that fails is a failed *recovery*, not a review
+        # retry: the pipeline stage it serves reports the rework on its own row.
+        ("commitlint", 1, "FAILED"),
+        ("reask", 2, "FAILED"),
+    ],
+)
+def test_reconcile_ignores_recovery_dispatch_sequence_numbers(
+    tmp_path: Path, stage, attempt, status
+) -> None:
+    """Recovery dispatches must not be read as rework (Story 28.2-002).
+
+    `attempt` is a per-stage retry counter only for the pipeline stages. Reading
+    it on a recovery row labels a clean story as reworked, and that label is the
+    predictor's own target variable — it would train and score against noise it
+    manufactured itself.
+    """
+    ledger, run_id = _ledger_with_story(tmp_path, ac_count=6, dep_depth=1, scope_proxy=4)
+    ledger.story_set_prediction(
+        run_id, "s1-001", predicted_tokens=1_000, predicted_rework_prob=0.1,
+        predictor_version=PREDICTOR_VERSION, low_confidence=False,
+    )
+    for pipeline_stage in ("build", "review"):
+        ledger.stage_start(run_id, "s1-001", pipeline_stage, 1)
+        ledger.stage_finish(run_id, "s1-001", pipeline_stage, 1, "DONE")
+    ledger.stage_start(run_id, "s1-001", stage, attempt)
+    ledger.stage_finish(run_id, "s1-001", stage, attempt, status)
+
+    outcome = ledger.story_reconcile_prediction(run_id, "s1-001")
+    assert outcome is not None
+    assert outcome["actual_rework"] == 0
+
+
+def test_training_rows_ignore_recovery_dispatch_sequence_numbers(
+    tmp_path: Path,
+) -> None:
+    """The same contamination, at the training end of the same predicate."""
+    ledger, run_id = _ledger_with_story(tmp_path, ac_count=6, dep_depth=1, scope_proxy=4)
+    for stage, attempt in (("build", 1), ("commitlint", 1), ("commitlint", 2)):
+        ledger.stage_start(run_id, "s1-001", stage, attempt)
+        ledger.stage_set_usage(
+            run_id, "s1-001", stage, attempt, session_id="s", input_tokens=100,
+            output_tokens=0, cache_read_tokens=0, cache_creation_tokens=0,
+            cost_usd=0.1,
+        )
+        ledger.stage_finish(run_id, "s1-001", stage, attempt, "DONE")
+    ledger.set_story_status(run_id, "s1-001", "DONE")
+
+    rows = ledger.prediction_training_rows()
+    assert [r["actual_rework"] for r in rows] == [0]
+
+
 def test_reconcile_is_a_noop_without_a_recorded_prediction(tmp_path: Path) -> None:
     ledger, run_id = _ledger_with_story(tmp_path)
     ledger.stage_start(run_id, "s1-001", "build", 1)
@@ -521,6 +582,28 @@ def test_training_rows_skip_stories_still_in_flight(tmp_path: Path) -> None:
         output_tokens=0, cache_read_tokens=0, cache_creation_tokens=0, cost_usd=0.1,
     )
     ledger.set_story_status(run_id, "s1-001", "IN_PROGRESS")
+    assert ledger.prediction_training_rows() == []
+
+
+@pytest.mark.parametrize("status", ["NEEDS_ATTENTION", "AWAITING_APPROVAL", "FAILED"])
+def test_training_rows_skip_resumable_parked_stories(
+    tmp_path: Path, status
+) -> None:
+    """A parked story is not finished — `sdlc resume` re-enters it (Story 28.2-002).
+
+    ``compute_resume_plan`` owes a next stage to any story whose pipeline is
+    incomplete, and ``run_resume`` re-enters everything outside ``{DONE,
+    SKIPPED}``. Training on a parked story presents a partial token total as the
+    story's complete cost and biases the cohort mean low.
+    """
+    ledger, run_id = _ledger_with_story(tmp_path, ac_count=6, dep_depth=1, scope_proxy=4)
+    ledger.stage_start(run_id, "s1-001", "build", 1)
+    ledger.stage_set_usage(
+        run_id, "s1-001", "build", 1, session_id="s", input_tokens=40_000,
+        output_tokens=0, cache_read_tokens=0, cache_creation_tokens=0, cost_usd=0.1,
+    )
+    ledger.stage_finish(run_id, "s1-001", "build", 1, "DONE")
+    ledger.set_story_status(run_id, "s1-001", status)
     assert ledger.prediction_training_rows() == []
 
 
@@ -619,6 +702,19 @@ def test_disabled_predictor_records_no_prediction_and_logs_the_note(tmp_path: Pa
     assert any("predictor disabled" in m for m in _events(db, result.run_id))
 
 
+def test_disabled_predictor_logs_the_note_once_per_run(tmp_path: Path) -> None:
+    """AC5's note is per *run*, not per story — the default path must stay quiet.
+
+    `--predict` is off by default, so a per-story note would add one advisory
+    `events` row per story to every existing build, for a feature nobody enabled.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    result = _run(db, predict=False)
+    notes = [m for m in _events(db, result.run_id) if "predictor disabled" in m]
+    assert len(_sample_queue()) > 1  # the run really does hold several stories
+    assert len(notes) == 1
+
+
 def test_enabled_predictor_records_and_reconciles_each_story(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     result = _run(db, predict=True)
@@ -650,8 +746,18 @@ def test_disabled_predictor_survives_a_ledger_that_cannot_log(tmp_path: Path) ->
         def event_log(self, *args, **kwargs):
             raise RuntimeError("events table gone")
 
+    _log_predictor_posture(NoEvents(), "run", BuildOptions(predict=False))  # no raise
     story = Story("s1-001", "t", "99", "sample", "epic-99.md", "P1", 2, "py", [])
     assert _predict_story_cost(NoEvents(), "run", story, BuildOptions(predict=False)) is None
+
+
+def test_enabled_predictor_notes_no_posture(tmp_path: Path) -> None:
+    """An enabled predictor speaks through its per-story predictions, not a banner."""
+    class Boom:
+        def __getattr__(self, name):
+            raise RuntimeError("ledger exploded")
+
+    _log_predictor_posture(Boom(), "run", BuildOptions(predict=True))  # never touches it
 
 
 def test_predictor_never_breaks_a_build_when_the_ledger_misbehaves(tmp_path: Path) -> None:
