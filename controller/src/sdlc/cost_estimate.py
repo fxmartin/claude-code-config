@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 # Heuristic: ~4 characters per token for mixed English+code prompts. Deliberately
@@ -139,4 +141,80 @@ def estimate_stage(
         estimated_tokens=estimated,
         estimated_cost_usd=cost,
         calibrated=calibrated,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Story 28.3-002: batch projection — summed per-story predictions for the
+# budget gate's projected-remaining view and the rate-limit window planner
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BatchProjection:
+    """Summed 28.2-002 predictions over a batch of not-yet-run stories.
+
+    The figure the budget gate (14.1-001) projects remaining spend from and the
+    batch planner (14.1-003) checks against the rate-limit window budget.
+    ``fallback_stories`` counts stories the predictor produced nothing for —
+    they contribute zero tokens to the sum, so any fallback makes the projection
+    partial and forces ``confidence`` to ``low`` rather than letting an
+    undercount read as a tight forecast.
+    """
+
+    predicted_tokens: int
+    predicted_stories: int
+    fallback_stories: int
+    low_confidence_stories: int
+
+    @property
+    def usable(self) -> bool:
+        """Whether any story at all carries a prediction to project from."""
+        return self.predicted_stories > 0
+
+    @property
+    def confidence(self) -> str:
+        """``high`` only when every story predicted with high confidence."""
+        if (
+            not self.predicted_stories
+            or self.fallback_stories
+            or self.low_confidence_stories
+        ):
+            return "low"
+        return "high"
+
+    def fits_window(self, window_budget: int) -> bool:
+        """Whether the summed prediction fits one rate-limit window (inclusive)."""
+        return self.predicted_tokens <= window_budget
+
+    def windows_needed(self, window_budget: int) -> int:
+        """Rolling windows the batch is projected to span (0 = no window set)."""
+        if window_budget <= 0:
+            return 0
+        return max(1, math.ceil(self.predicted_tokens / window_budget))
+
+
+def project_batch(predictions: Iterable[object | None]) -> BatchProjection:
+    """Sum per-story predictions into a :class:`BatchProjection` (Story 28.3-002).
+
+    ``predictions`` holds one entry per story in the batch: a 28.2-002
+    ``StoryPrediction``-shaped object (``predicted_tokens`` +
+    ``low_confidence``), or ``None`` for a story the predictor degraded on.
+    Duck-typed on those two attributes so this module stays free of an
+    ``sdlc.predictor`` import — the estimate side consumes the prediction, it
+    does not depend on how it was modelled.
+    """
+    total = predicted = fallback = low = 0
+    for prediction in predictions:
+        if prediction is None:
+            fallback += 1
+            continue
+        predicted += 1
+        total += int(prediction.predicted_tokens)  # type: ignore[attr-defined]
+        if prediction.low_confidence:  # type: ignore[attr-defined]
+            low += 1
+    return BatchProjection(
+        predicted_tokens=total,
+        predicted_stories=predicted,
+        fallback_stories=fallback,
+        low_confidence_stories=low,
     )

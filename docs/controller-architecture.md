@@ -1145,6 +1145,54 @@ Everything on the
 enabled path is best-effort too: a predictor or ledger fault degrades to `None`
 and the story dispatches exactly as it would have.
 
+## Prediction consumers: budget gate, pre-dispatch gate, batch planner (Story 28.3-002)
+
+Story 28.2-002 produces the calibrated per-story forecast; this story makes the
+three Epic-14 consumers that made points load-bearing read it instead. All three
+are `--predict`-gated, advisory-first, and degrade to the exact Epic-14
+behaviour — the batch never blocks on a missing prediction (AC4), and every
+fallback is logged.
+
+- **Pre-dispatch warning/gate (14.1-002).** `_prediction_cost_gate` runs on the
+  shared build/resume path right after `_predict_story_cost`: the story's
+  predicted tokens are compared against the same `--cost-threshold`, and the
+  warn event carries the forecast's confidence label. Interactive mode raises
+  the same `_CostGatePause` the stage gate uses — but *before any stage row
+  exists*, so a gated story resumes cleanly at build attempt 1 with nothing
+  discarded (R10). A re-entered story has no fresh forecast, so the gate
+  re-reads the committed row (`Ledger.story_prediction`) — re-enforcing the
+  gate until `sdlc resume --cost-threshold` raises it, exactly like the stage
+  gate. With no forecast at all the per-stage 14.1-002 estimate gate below
+  remains the fallback.
+- **Budget gate projection (14.1-001).** `_plan_batch` predicts every buildable
+  story once at dispatch start (planning forecasts are *not* recorded — the
+  committed pre-dispatch forecast stays `_predict_story_cost`'s) and
+  `_flag_budget_projection` checks, at the same pre-dispatch seam as the hard
+  gate, whether **accrued + summed predictions for still-TODO stories** crosses
+  `--budget`. It warns once per run, labelled with the batch confidence, so a
+  run heading for the ceiling is flagged earlier than the accrued-only view —
+  but the pause/abort decision itself stays on accrued tokens, so a pessimistic
+  forecast can never halt real work.
+- **Batch planner window fit (14.1-003).** With `--window-budget` configured,
+  the same batch projection is reported against the rolling window: summed
+  predicted tokens vs the window budget, "projected to fit" (info) or
+  "projected to exceed (~k windows needed)" (warn), with confidence. The pacing
+  primitive was already tokens — the `WindowQuota` paces dispatch on the actual
+  accrual — so this is the forward-looking half; nothing points-shaped remains
+  in the loop. After a normally-finished run, `_reconcile_batch_plan` logs the
+  projected-vs-actual window fit (AC5); the *measured* error metric stays
+  per-story, where each reconciled prediction row feeds `sdlc predict-quality`.
+
+A batch with no usable prediction (predictor off, empty history, or every story
+degraded) logs `batch plan: no usable story prediction — … fall back to the
+Epic-14 accrued-tokens view` and leaves all three consumers on their shipped
+Epic-14 behaviour. The `BatchProjection` sum lives in `sdlc/cost_estimate.py`
+(`project_batch`), duck-typed on `predicted_tokens`/`low_confidence` so the
+estimate side consumes the prediction without importing the model. Confidence is
+`high` only when **every** story in the batch predicted with high confidence —
+any fallback story contributes zero tokens to the sum, so a partial projection
+always reads `low` rather than letting an undercount look tight.
+
 ## Clean (workspace garbage collection)
 
 `sdlc clean` makes build-leftover cleanup a safe, repeatable verb instead of a

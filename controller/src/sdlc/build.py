@@ -40,9 +40,12 @@ from sdlc.contracts import (
 from sdlc.cost_estimate import (
     DEFAULT_USD_PER_MILLION_TOKENS,
     MODEL_USD_PER_MILLION_TOKENS,
+    BatchProjection,
     CostEstimateConfig,
     StageEstimate,
     estimate_stage,
+    notional_cost,
+    project_batch,
 )
 from sdlc.discovery import canonical_scope
 from sdlc.doc_currency import doc_currency_enabled
@@ -1191,6 +1194,214 @@ def _predict_story_cost(
         return None
 
 
+def _prediction_cost_gate(
+    ledger: "Ledger",
+    run_id: str,
+    story: Story,
+    prediction: StoryPrediction | None,
+    opts: BuildOptions,
+) -> None:
+    """Warn/gate on the story's predicted cost before any dispatch (Story 28.3-002).
+
+    The 14.1-002 pre-dispatch check, moved up to the calibrated signal: when the
+    story carries a 28.2-002 forecast, the warning and the interactive gate
+    compare *it* against ``--cost-threshold``, labelled with the prediction's
+    confidence. ``prediction`` is the forecast just committed by
+    :func:`_predict_story_cost`; a re-entered story (resume) has none, so the
+    gate re-reads the committed row — re-enforcing the same gate until the
+    threshold is raised, exactly like the stage-level gate. With no forecast at
+    all the story falls through to the 14.1-002 stage estimate (the Epic-14
+    fallback, whose degradation is already logged by the predictor path).
+
+    The gate raises :class:`_CostGatePause` *before* any stage row exists, so a
+    gated story stays a clean resume-at-build-attempt-1 re-entry (R10: no work
+    started, nothing discarded). The warn event is best-effort; the pause is not.
+    """
+    if opts.cost_estimate_threshold <= 0:
+        return
+    if prediction is not None:
+        tokens = prediction.predicted_tokens
+        confidence = "low" if prediction.low_confidence else "high"
+    elif opts.predict:
+        try:
+            committed = ledger.story_prediction(run_id, story.id)
+        except Exception:  # noqa: BLE001 - the lookup is best-effort
+            committed = None
+        if committed is None:
+            return
+        tokens = committed["predicted_tokens"]
+        confidence = committed["confidence"]
+    else:
+        return
+    if tokens < opts.cost_estimate_threshold:
+        return
+    cost = notional_cost(tokens)
+    gated = not opts.auto
+    try:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"story predicted ~{tokens:,} tokens [confidence: {confidence}] "
+            f"exceeds --cost-threshold={opts.cost_estimate_threshold} "
+            f"({notional_cost_label(cost)}) — "
+            + (
+                "gating before dispatch; raise --cost-threshold or pass "
+                "--auto to proceed"
+                if gated
+                else "proceeding (--auto)"
+            ),
+        )
+    except Exception:  # noqa: BLE001 - the warn is advisory, the pause is not
+        pass
+    if gated:
+        raise _CostGatePause(
+            story_id=story.id,
+            stage="story",
+            estimate=StageEstimate(
+                stage="story", prompt_tokens=0, estimated_tokens=tokens,
+                estimated_cost_usd=cost,
+            ),
+        )
+
+
+def _plan_batch(
+    ledger: "Ledger", run_id: str, buildable: list[Story], opts: BuildOptions
+) -> tuple[dict[str, StoryPrediction], BatchProjection | None]:
+    """Project the batch's predicted cost for budget/window planning (28.3-002).
+
+    Runs once at dispatch start, only when the predictor is on *and* a consumer
+    is configured (``--budget`` or ``--window-budget``). Predicts every buildable
+    story from the ledger's reconciled history — these planning forecasts are
+    **not** recorded; the committed pre-dispatch forecast stays
+    :func:`_predict_story_cost`'s, written when the story genuinely runs — and
+    sums them into a :class:`BatchProjection`.
+
+    With a window budget configured, logs the projected window fit with its
+    confidence: the batch planner's pacing primitive is already tokens (the
+    14.1-003 ``WindowQuota`` paces on the actual accrual), so this is the
+    forward-looking half — summed *predicted* tokens against the window, in
+    place of any points-shaped guess. Returns ``({}, None)`` — the Epic-14
+    accrued-tokens view, with the fallback logged — when no story yields a
+    usable prediction. Best-effort throughout: a planner fault never fails a run.
+    """
+    if not opts.predict or not (opts.budget or opts.window_budget):
+        return {}, None
+    try:
+        history = PredictorHistory.from_rows(ledger.prediction_training_rows())
+        predictions: dict[str, StoryPrediction] = {}
+        for story in buildable:
+            features = StoryFeatures(
+                ac_count=story.ac_count,
+                dep_depth=story.dep_depth,
+                scope_proxy=story.scope_proxy,
+                risk=ledger.story_risk(story.id),
+            )
+            prediction = predict_story(features, history)
+            if prediction is not None:
+                predictions[story.id] = prediction
+        projection = project_batch(predictions.get(s.id) for s in buildable)
+        if not projection.usable:
+            ledger.event_log(
+                run_id, "", "info", "controller",
+                "batch plan: no usable story prediction — budget/window "
+                "projections fall back to the Epic-14 accrued-tokens view "
+                "(14.1-001/14.1-003)",
+            )
+            return {}, None
+        if opts.window_budget > 0:
+            fits = projection.fits_window(opts.window_budget)
+            windows = projection.windows_needed(opts.window_budget)
+            ledger.event_log(
+                run_id, "", "info" if fits else "warn", "controller",
+                f"batch plan: ~{projection.predicted_tokens:,} predicted tokens "
+                f"across {projection.predicted_stories} stories vs window "
+                f"budget {opts.window_budget:,} — "
+                + (
+                    "projected to fit the current window"
+                    if fits
+                    else f"projected to exceed the window (~{windows} windows "
+                         "needed)"
+                )
+                + f" [confidence: {projection.confidence}]",
+            )
+        return predictions, projection
+    except Exception:  # noqa: BLE001 - planning is best-effort, never fatal
+        return {}, None
+
+
+def _flag_budget_projection(
+    ledger: "Ledger",
+    run_id: str,
+    opts: BuildOptions,
+    pending: list[Story],
+    predictions: dict[str, StoryPrediction],
+    projection: BatchProjection | None,
+) -> bool:
+    """Flag a run whose projection crosses the budget ceiling (Story 28.3-002).
+
+    The forward-looking half of the 14.1-001 gate: accrued tokens *plus* the
+    summed predictions for not-yet-run stories, checked at the same pre-dispatch
+    seam as the hard gate. Advisory only — the pause/abort decision stays on the
+    accrued figure, so a pessimistic forecast can never halt real work — and
+    fired once per run (the caller latches the returned flag). ``pending`` may
+    include in-flight parallel stories (their status is still TODO); counting
+    their full prediction while part is already accrued overstates slightly,
+    which is the safe direction for an early warning. Returns True when flagged.
+    """
+    if projection is None or not opts.budget:
+        return False
+    try:
+        accrued = ledger.run_usage_totals(run_id)["tokens"]
+        pending_predicted = sum(
+            predictions[s.id].predicted_tokens
+            for s in pending
+            if s.id in predictions
+        )
+        if accrued + pending_predicted < opts.budget:
+            return False
+        ledger.event_log(
+            run_id, "", "warn", "controller",
+            f"budget projection: accrued {accrued:,} + predicted "
+            f"~{pending_predicted:,} tokens for {len(pending)} pending stories "
+            f"≥ --budget={opts.budget:,} — run projected to cross the "
+            f"ceiling [confidence: {projection.confidence}] (the gate itself "
+            "still trips on accrued tokens)",
+        )
+        return True
+    except Exception:  # noqa: BLE001 - the flag is advisory, never fatal
+        return False
+
+
+def _reconcile_batch_plan(
+    ledger: "Ledger",
+    run_id: str,
+    opts: BuildOptions,
+    projection: BatchProjection | None,
+) -> None:
+    """Log the batch's projected-vs-actual window fit after the run (28.3-002).
+
+    The batch-level counterpart of :func:`_reconcile_story_prediction`: the
+    planning miss is recorded next to the plan it audits. The *measured* error
+    metric stays per-story — every story's prediction row is reconciled
+    individually and scored by `sdlc predict-quality` — so this event is the
+    window-fit summary, not a second bookkeeping channel. Only fires when a
+    window plan was actually reported. Best-effort, never fatal.
+    """
+    if projection is None or opts.window_budget <= 0:
+        return
+    try:
+        actual = ledger.run_usage_totals(run_id)["tokens"]
+        predicted = projection.predicted_tokens
+        pct = ((actual - predicted) / predicted * 100.0) if predicted else 0.0
+        ledger.event_log(
+            run_id, "", "info", "controller",
+            f"batch plan reconciled: projected ~{predicted:,} vs actual "
+            f"{actual:,} tokens ({pct:+.0f}%) — per-story misses feed "
+            "`sdlc predict-quality`",
+        )
+    except Exception:  # noqa: BLE001 - reconciliation is best-effort, never fatal
+        return
+
+
 def _reconcile_story_prediction(
     ledger: "Ledger", run_id: str, story_id: str
 ) -> None:
@@ -1267,7 +1478,12 @@ def _run_story_rate_limited(
     # the story genuinely about to run, and before the first dispatch — so the
     # forecast can never be quietly fitted to the outcome. Shared by build and
     # resume, exactly like the dispatch it precedes.
-    _predict_story_cost(ledger, run_id, story, opts)
+    prediction = _predict_story_cost(ledger, run_id, story, opts)
+    # Story 28.3-002: the pre-dispatch warning/gate consumes that forecast —
+    # predicted story tokens vs --cost-threshold, labelled with confidence —
+    # before any stage runs. Without a forecast the per-stage 14.1-002 estimate
+    # gate below remains the fallback.
+    _prediction_cost_gate(ledger, run_id, story, prediction, opts)
 
     try:
         status = _run_story(
@@ -2171,6 +2387,32 @@ class Ledger:
                 (run_id, story_id),
             ).fetchone()
         return row is not None and (row[0] is not None or row[1] is not None)
+
+    def story_prediction(self, run_id: str, story_id: str) -> dict | None:
+        """A story's committed forecast — ``{predicted_tokens, confidence}`` (28.3-002).
+
+        The read the pre-dispatch cost gate re-enforces on: a re-entered story
+        (resume) carries no *fresh* prediction, so the gate compares its
+        committed one against the threshold instead. ``None`` when the story was
+        never token-predicted (or the ledger predates the prediction columns),
+        so the caller degrades to the 14.1-002 stage estimate.
+        """
+        if not self.db_path.exists():
+            return None
+        with self._connect_ro() as conn:
+            if not self._has_columns(conn, "stories", ("predicted_tokens",)):
+                return None
+            row = conn.execute(
+                "SELECT predicted_tokens, prediction_confidence FROM stories "
+                "WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            ).fetchone()
+        if row is None or row["predicted_tokens"] is None:
+            return None
+        return {
+            "predicted_tokens": int(row["predicted_tokens"]),
+            "confidence": row["prediction_confidence"] or "low",
+        }
 
     def story_set_prediction(
         self,
@@ -5291,6 +5533,12 @@ def run_build(
     )
     # Story 28.2-002: note a disabled predictor once here, before any story runs.
     _log_predictor_posture(ledger, run_id, opts)
+    # Story 28.3-002: project the batch's predicted cost once, up front — the
+    # summed forecast the budget gate's projected-remaining flag and the
+    # window-fit report read. Empty/None when the predictor is off, no consumer
+    # is configured, or no story yields a usable prediction (fallback logged).
+    batch_predictions, batch_projection = _plan_batch(ledger, run_id, buildable, opts)
+    projection_flagged = batch_projection is None  # nothing to flag when unusable
     budget_stopped = False
     rate_limit_park: _StoryRunOutcome | None = None
     cost_gated: _CostGatePause | None = None
@@ -5342,6 +5590,15 @@ def run_build(
             if _budget_exceeded(ledger, run_id, opts.budget):
                 budget_stopped = True
                 break
+            # Story 28.3-002: the projected view of the same ceiling — accrued
+            # plus summed predictions for the stories still TODO — flags a run
+            # heading for the budget before the accrued-only gate would.
+            if not projection_flagged:
+                projection_flagged = _flag_budget_projection(
+                    ledger, run_id, opts,
+                    [s for s in buildable if status.get(s.id) == "TODO"],
+                    batch_predictions, batch_projection,
+                )
             # A story whose dependency did not cleanly finish cannot proceed.
             blocked_by = [
                 dep for dep in story.dependencies if status.get(dep) in dep_blocking
@@ -5434,10 +5691,18 @@ def run_build(
             # ceiling is re-checked before *each* submission instead of once per
             # cohort — the scheduler thread owns dispatch, so the continuous
             # path can afford the per-story check the pool could not interleave.
-            nonlocal budget_stopped
+            nonlocal budget_stopped, projection_flagged
             if _budget_exceeded(ledger, run_id, opts.budget):
                 budget_stopped = True
                 return False
+            # Story 28.3-002: same projected-ceiling flag as the serial path,
+            # checked on the scheduler thread before each submission.
+            if not projection_flagged:
+                projection_flagged = _flag_budget_projection(
+                    ledger, run_id, opts,
+                    [s for s in buildable if status.get(s.id) == "TODO"],
+                    batch_predictions, batch_projection,
+                )
             return True
 
         def _refresh_base() -> None:
@@ -5552,6 +5817,10 @@ def run_build(
             opts, ledger, run_id, status, done_skips, buildable,
             cost_gated, render_view,
         )
+
+    # Story 28.3-002: the run finished normally — reconcile the batch's projected
+    # window fit against the actual accrual (only when a window plan was made).
+    _reconcile_batch_plan(ledger, run_id, opts, batch_projection)
 
     # --- Phase 3: close out via the shared finalize helper (12.3-004) --------
     # finalize_run runs reconciliation against origin/main (real runs only, hence
