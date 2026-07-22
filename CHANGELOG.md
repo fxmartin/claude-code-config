@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.36.0] - 2026-07-22
+
+### Added
+
+- feat(empirical-estimation): extend discovery output with (#28.2-001) (#520)
+
+
 ## [v2.35.0] - 2026-07-22
 
 ### Added
