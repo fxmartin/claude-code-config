@@ -2020,6 +2020,14 @@ def run_fix_batch(
     )
 
 
+# Status of the story-less anchor row a run-level phase hangs its stage on
+# (Story 28.1-003). Deliberately *not* one of the nine story statuses
+# ``status_snapshot`` tallies (DONE/FAILED/BLOCKED/IN_PROGRESS/SKIPPED/TODO/
+# NEEDS_ATTENTION/AWAITING_APPROVAL/RATE_LIMITED), so the anchor satisfies the
+# ``stages`` → ``stories`` foreign key without ever being counted as a story.
+_BATCH_PHASE_STATUS = "PHASE"
+
+
 def _run_doc_update(
     outcomes: list[FixIssueOutcome],
     scope: str,
@@ -2035,29 +2043,53 @@ def _run_doc_update(
     advisory: any failure (dispatch, contract, git) is logged and the batch's
     terminal is untouched. Single-issue fixes never reach here — the PostToolUse
     hook covers those, per the skill. A no-op when nothing merged.
+
+    Story 28.1-003: the phase opens a real ``doc-update`` stage row so its tokens
+    and cost are metered like every other dispatch — ``stage_set_usage`` is an
+    ``UPDATE``, so without a row the spend would be structurally invisible. The
+    row is story-less (``story_id`` ``""``), matching what ``event_log`` already
+    records for this phase. ``stages`` has a composite FK onto ``stories``, so an
+    anchor row is upserted first; its ``PHASE`` status is deliberately outside the
+    story-status vocabulary ``status_snapshot`` counts, so a batch-level phase can
+    never inflate the run's done/failed tallies (see `_BATCH_PHASE_STATUS`).
     """
     merged = [o for o in outcomes if o.status == "DONE"]
     if not merged:
         return
     model = batch.model_overrides.get("doc_update") or FIX_STAGE_MODELS.get("doc_update")
     tpath = logs_dir / "doc-update-1.log"
+    result: AgentResult | None = None
     try:
+        ledger.story_upsert(
+            run_id, "", "", "batch doc-update", "", None, "", "", None,
+            _BATCH_PHASE_STATUS,
+        )
+        ledger.stage_start(run_id, "", "doc-update", 1, model=model)
         prompt = render_doc_update_prompt(scope, merged)
         # No per-issue story: doc-update runs in the shared checkout and cuts its
         # own branch, so ``story`` is left None (dispatch_agent ignores it).
-        dispatch(
+        result = dispatch(
             "doc_update", prompt, story=None, model=model,
             transcript_path=tpath, on_progress=None,
         )
+        ledger.stage_finish(run_id, "", "doc-update", 1, "DONE", output_path=str(tpath))
+        _record_stage_usage(ledger, run_id, "", "doc-update", 1, result)
         ledger.event_log(
             run_id, "", "info", "controller",
             f"doc-update dispatched for {len(merged)} merged fix(es)",
         )
     except Exception as exc:  # noqa: BLE001 — doc-update is advisory, never fatal
-        ledger.event_log(
-            run_id, "", "warn", "controller",
-            f"doc-update phase failed (best-effort, ignored): {exc}",
-        )
+        try:
+            ledger.stage_finish(
+                run_id, "", "doc-update", 1, "FAILED", "doc-update-error", str(tpath)
+            )
+            _record_stage_usage(ledger, run_id, "", "doc-update", 1, result)
+            ledger.event_log(
+                run_id, "", "warn", "controller",
+                f"doc-update phase failed (best-effort, ignored): {exc}",
+            )
+        except Exception:  # noqa: BLE001 — a ledger fault here is never fatal either
+            pass
 
 
 def _batch_summary(outcomes: list[FixIssueOutcome]) -> str:

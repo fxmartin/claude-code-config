@@ -1478,6 +1478,28 @@ not carried per turn in `stream-json`, so it lands only at this reconciliation
 and per-story/stage breakdowns surface through the existing query path
 (`stage_breakdown`, `_aggregate_run_usage`, `status_snapshot`) with no new schema.
 
+**Run-level phases are metered too (Story 28.1-003).** The batch `sdlc fix`
+doc-update phase (skill Phase 10b) dispatches a full agent once per batch, but
+originally called only `event_log` — no `stage_start`/`stage_finish` — and dropped
+the `AgentResult`, so its spend was *structurally* invisible: `stage_set_usage` is
+an `UPDATE ... WHERE run_id/story_id/stage_name/attempt`, a 0-row no-op without a
+pre-existing row, so no recording call alone could fix it and reconciliation had
+nothing to repair. `_run_doc_update` now mirrors the same
+`stage_start` → dispatch → `stage_finish` → `_record_stage_usage` shape every other
+stage uses, writing a `doc-update` stage row whose tokens/cost are non-NULL. It
+stays **advisory**: a dispatch failure closes the stage `FAILED` with
+`failure_category` `doc-update-error` and whatever usage was available, and every
+ledger call is wrapped so a ledger/DB fault in this path can never change the
+batch's terminal. The stage is story-less (`story_id` `""`, matching what
+`event_log` already records for the phase). Because `stages` carries a composite
+foreign key onto `stories`, the phase first upserts a story-less **anchor row**
+whose status is `PHASE` — deliberately outside the story-status vocabulary
+`status_snapshot` tallies, so a batch-level phase satisfies the FK without ever
+inflating the run's done/failed counts. `doc-update` is not one of the fixed
+`build`/`coverage`/`review`/`merge` dashboard columns, so it renders in the run's
+stage history. A single-issue `sdlc fix` never reaches this phase (the PostToolUse
+hook covers those) and its telemetry is unchanged.
+
 ### The in-process-agent boundary (Story 20.6-002)
 
 Epic-20 makes the controller's dispatch path **cross-harness**: `build-stories`

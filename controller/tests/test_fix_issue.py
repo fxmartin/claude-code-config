@@ -1562,11 +1562,17 @@ class BatchProbeDispatcher:
 
     PIPELINE = {"build", "coverage", "review", "merge"}
 
-    def __init__(self, inv_files=None, *, hold=0.03, overrides=None):
+    def __init__(self, inv_files=None, *, hold=0.03, overrides=None,
+                 usage=None, cost_usd=None):
         self._lock = threading.Lock()
         self.inv_files = inv_files or {}
         self.hold = hold
         self.overrides = overrides or {}
+        # Optional token/cost envelope attached to every AgentResult, mirroring
+        # RecordingDispatcher. Defaults to None so existing batch tests keep
+        # their no-usage behavior.
+        self.usage = usage
+        self.cost_usd = cost_usd
         self.active_pipeline: set[str] = set()
         self.max_pipeline_active = 0
         self.concurrent_pairs: set[frozenset] = set()
@@ -1590,7 +1596,12 @@ class BatchProbeDispatcher:
             payload = self._payload(agent_type, sid)
             if isinstance(payload, Exception):
                 raise payload
-            return AgentResult(agent_type=agent_type, data=payload, raw="")
+            return AgentResult(
+                agent_type=agent_type, data=payload, raw="",
+                usage=dict(self.usage) if self.usage is not None else None,
+                cost_usd=self.cost_usd,
+                session_id=f"sess-{agent_type}" if self.usage is not None else None,
+            )
         finally:
             if pipeline:
                 with self._lock:
@@ -2457,17 +2468,139 @@ def test_batch_doc_update_failure_is_non_fatal(tmp_path) -> None:
 
 
 def test_single_fix_never_dispatches_doc_update(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
     gh = FakeGh(_issue_json())
-    dispatch = RecordingDispatcher()
-    run_fix(
+    dispatch = RecordingDispatcher(usage=_SAMPLE_USAGE, cost_usd=0.05)
+    result = run_fix(
         FixOptions(issue=1),
-        ledger=_ledger(tmp_path),
+        ledger=Ledger(db),
         dispatcher=dispatch,
         preflight=lambda: True,
         runner=gh,
         root=tmp_path,
     )
     assert "doc_update" not in dispatch.agents()
+    # Story 28.1-003: no dispatch → no stage row, and the single-issue telemetry
+    # of PR #477 is untouched.
+    assert _stage_usage_cols(db, result.run_id, "", "doc-update") is None
+    assert _stage_usage_cols(db, result.run_id, "issue-1", "build")["cost_usd"] == 0.05
+
+
+# ---------------------------------------------------------------------------
+# Story 28.1-003 (issue #479): the batch doc-update phase must open a real
+# ledger stage so its tokens/cost are counted, not structurally invisible.
+# ---------------------------------------------------------------------------
+
+
+def test_batch_doc_update_records_usage_on_stage_row(tmp_path) -> None:
+    """A merged batch's doc-update writes a DONE, non-NULL-usage stage row."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]},
+        usage=_SAMPLE_USAGE,
+        cost_usd=0.07,
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.fixed == 2
+    # story_id is empty for this phase — it runs per batch, not per issue.
+    row = _stage_usage_cols(db, result.run_id, "", "doc-update")
+    assert row is not None
+    assert (
+        row["input_tokens"], row["output_tokens"],
+        row["cache_read_tokens"], row["cache_creation_tokens"],
+        row["cost_usd"], row["session_id"],
+    ) == (100, 20, 4000, 300, 0.07, "sess-doc_update")
+    assert _stage_rows(db)["doc-update"][0] == "DONE"
+
+
+def test_batch_doc_update_anchor_never_counts_as_a_story(tmp_path) -> None:
+    """The FK anchor row the phase needs stays out of the run's story tallies."""
+    from sdlc.build import status_snapshot
+
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]}
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    snap = status_snapshot(Ledger(db), result.run_id)
+    assert snap["counts"]["total"] == 2
+    assert snap["counts"]["done"] == 2  # not 3 — the anchor is never a story
+    assert sum(v for k, v in snap["counts"].items() if k != "total") == 2
+
+
+def test_batch_doc_update_failure_finishes_stage_failed(tmp_path) -> None:
+    """A doc-update dispatch error still closes the stage FAILED, non-fatally."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]},
+        overrides={"doc_update": AgentDispatchError("doc agent crashed")},
+        usage=_SAMPLE_USAGE,
+        cost_usd=0.07,
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"  # advisory phase never changes the terminal
+    assert _stage_rows(db)["doc-update"] == ("FAILED", "doc-update-error")
+
+
+def test_batch_doc_update_ledger_error_is_non_fatal(tmp_path) -> None:
+    """A ledger/DB fault inside the doc-update phase never fails the batch."""
+
+    class _FlakyLedger:
+        """Delegates to a real Ledger, but raises on every doc-update stage write."""
+
+        def __init__(self, real: Ledger) -> None:
+            self._real = real
+
+        def __getattr__(self, name):
+            attr = getattr(self._real, name)
+            if name not in ("stage_start", "stage_finish", "stage_set_usage"):
+                return attr
+
+            def _guarded(*args, **kwargs):
+                if len(args) >= 3 and args[2] == "doc-update":
+                    raise sqlite3.OperationalError("database is locked")
+                return attr(*args, **kwargs)
+
+            return _guarded
+
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    dispatch = BatchProbeDispatcher(
+        inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]}
+    )
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=_FlakyLedger(_ledger(tmp_path)),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert result.fixed == 2
 
 def test_run_fix_e2e_error_ledger_logging_also_fails_is_swallowed(tmp_path) -> None:
     """A double fault in the e2e warn-gate — dispatch crashes AND logging that
