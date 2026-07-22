@@ -252,6 +252,53 @@ def test_historical_tokens_any_history_fallback(tmp_path: Path) -> None:
     assert tier == "any"
 
 
+def test_historical_tokens_harness_model_tier_matches_served_id(tmp_path: Path) -> None:
+    # Story 28.1-002 overwrites `stages.model` with the *served* id the agent
+    # reported ("claude-opus-4-8"), while the estimator still asks by the routed
+    # tier alias ("opus"). Both sides normalise to the tier, so the finest cohort
+    # must still match rather than silently degrading to the harness rung.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    for attempt, tokens in ((1, 500), (2, 700)):
+        _done_stage(
+            ledger, run_id, "s1-001", "build", attempt, tokens,
+            harness="claude", model="opus",
+        )
+        ledger.stage_set_model(run_id, "s1-001", "build", attempt, "claude-opus-4-8")
+    # A different tier's served id must not join the opus cohort.
+    _done_stage(
+        ledger, run_id, "s1-001", "build", 3, 9000, harness="claude", model="sonnet",
+    )
+    ledger.stage_set_model(run_id, "s1-001", "build", 3, "claude-sonnet-5")
+    avg, tier = ledger.historical_stage_tokens("build", harness="claude", model="opus")
+    assert avg == pytest.approx(600.0)
+    assert tier == "harness+model"
+
+
+def test_historical_tokens_harness_model_tier_query_by_served_id(tmp_path: Path) -> None:
+    # The symmetric case: an operator pin names the full id, while history was
+    # recorded under the tier alias. Normalising both sides matches either way.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    _done_stage(ledger, run_id, "s1-001", "build", 1, 800, harness="claude", model="opus")
+    avg, tier = ledger.historical_stage_tokens(
+        "build", harness="claude", model="claude-opus-4-8"
+    )
+    assert avg == pytest.approx(800.0)
+    assert tier == "harness+model"
+
+
+def test_historical_tokens_registry_model_still_matches_exactly(tmp_path: Path) -> None:
+    # A registry harness's own id matches no Claude tier and normalises to itself,
+    # so the cohort stays an exact match and two distinct models never merge.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    _done_stage(ledger, run_id, "s1-001", "build", 1, 400, harness="codex", model="gpt-5")
+    _done_stage(
+        ledger, run_id, "s1-001", "build", 2, 9000, harness="codex", model="gpt-5-mini",
+    )
+    avg, tier = ledger.historical_stage_tokens("build", harness="codex", model="gpt-5")
+    assert avg == pytest.approx(400.0)
+    assert tier == "harness+model"
+
+
 def test_historical_tokens_empty_ledger_is_none(tmp_path: Path) -> None:
     ledger, run_id = _ledger_with_story(tmp_path)
     assert ledger.historical_stage_tokens("build", harness="claude", model="opus") is None
