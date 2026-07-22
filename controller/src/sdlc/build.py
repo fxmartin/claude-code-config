@@ -54,6 +54,13 @@ from sdlc.dispatch import (
     dispatch_agent,
 )
 from sdlc.harness import DEFAULT_HARNESS, resolve_harness
+from sdlc.predictor import (
+    PREDICTOR_VERSION,
+    PredictorHistory,
+    StoryFeatures,
+    StoryPrediction,
+    predict_story,
+)
 from sdlc.model_routing import (
     ModelRoutingConfig,
     OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
@@ -167,6 +174,16 @@ CREATE TABLE IF NOT EXISTS stories (
     ac_count        INTEGER,                        -- acceptance criteria stated.
     dep_depth       INTEGER,                        -- longest dependency chain.
     scope_proxy     INTEGER,                        -- distinct files/areas named.
+    -- Story 28.2-002 prediction-vs-actual reconciliation. The predicted columns
+    -- are written before dispatch, the actual ones after the story reaches a
+    -- terminal status, so the post-run reconciliation is a join on this row and
+    -- never a re-computation. NULL means not-predicted / not-yet-reconciled.
+    predicted_tokens      INTEGER,                  -- pre-dispatch token forecast.
+    predicted_rework_prob REAL,                     -- pre-dispatch P(review retry | bugfix).
+    predictor_version     TEXT,                     -- model version that produced them.
+    prediction_confidence TEXT,                     -- 'high' | 'low' (thin history/unknown feature).
+    actual_tokens         INTEGER,                  -- measured total across the story's stages.
+    actual_rework         INTEGER,                  -- 1 when the story entered retry/bugfix.
     PRIMARY KEY (run_id, story_id),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
@@ -274,6 +291,41 @@ _SCHEMA_DDL = _SCHEMA_DDL + _STORY_INVENTORY_DDL + _STALLS_DDL
 _TERMINAL_RUN_STATES = {
     "DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION", "AWAITING_APPROVAL",
 }
+
+# Story statuses that mean "this story is finished being worked on", so its
+# measured usage is complete and it is a valid training row for the Story
+# 28.2-002 predictor. BLOCKED and SKIPPED are excluded deliberately: no agent
+# ever ran, so they carry no cost signal at all.
+_TERMINAL_STORY_STATES = ("DONE", "FAILED", "NEEDS_ATTENTION", "AWAITING_APPROVAL")
+
+def _stage_token_sum(prefix: str = "") -> str:
+    """SQL fragment summing one `stages` row's four token components.
+
+    NULL components are absent measurements, so they contribute 0 rather than
+    voiding the whole sum; callers separately check that *some* row recorded usage
+    before trusting the total. ``prefix`` qualifies the columns (``"st."``) when
+    the fragment sits in a correlated subquery alongside another table.
+    """
+    return " + ".join(
+        f"COALESCE({prefix}{col},0)"
+        for col in (
+            "input_tokens", "output_tokens",
+            "cache_read_tokens", "cache_creation_tokens",
+        )
+    )
+
+
+def _stage_rework_predicate(prefix: str = "") -> str:
+    """SQL predicate for "this stage row is evidence the story entered rework".
+
+    Story 28.2-002 defines rework as a review retry or a bugfix loop: a ``bugfix``
+    dispatch, a retried stage attempt, or a FAILED attempt. ``prefix`` qualifies
+    the columns so ``status`` can never bind to ``stories.status`` by accident.
+    """
+    return (
+        f"{prefix}stage_name = 'bugfix' OR {prefix}attempt > 1 "
+        f"OR {prefix}status = 'FAILED'"
+    )
 
 # Schema migrations applied by Ledger.init() after the base DDL. Each entry is
 # ``(version, name, table, columns, create_sql)``. Most entries add missing
@@ -492,6 +544,28 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         ],
         None,
     ),
+    # Migration 15 adds the Story 28.2-002 prediction-vs-actual columns to a
+    # pre-existing ledger's `stories` table. The predicted trio is written before
+    # dispatch and the actual pair after the story reaches a terminal status, so
+    # the reconciliation is a join on one row. Additive and back-compatible: rows
+    # written before this migration keep NULL (never predicted / never
+    # reconciled), which the quality report *excludes* from its sample rather than
+    # scoring as a zero-error hit. A fresh DB created from the up-to-date DDL is a
+    # no-op.
+    (
+        15,
+        "story prediction columns",
+        "stories",
+        [
+            ("predicted_tokens", "INTEGER"),
+            ("predicted_rework_prob", "REAL"),
+            ("predictor_version", "TEXT"),
+            ("prediction_confidence", "TEXT"),
+            ("actual_tokens", "INTEGER"),
+            ("actual_rework", "INTEGER"),
+        ],
+        None,
+    ),
 ]
 
 
@@ -551,6 +625,8 @@ _BOOL_FLAGS = {
     "--rebuild": "rebuild",
     # Story 13.4-002: run dispatched agents inside the container sandbox.
     "--sandbox": "sandbox",
+    # Story 28.2-002: compute + record the per-story cost/rework prediction.
+    "--predict": "predict",
 }
 
 
@@ -654,6 +730,14 @@ class BuildOptions:
     ci_gate_timeout_s: int = 1800
     ci_gate_poll_s: int = 30
     ci_gate_no_ci: str = "allow"
+    # Story 28.2-002: compute + record a per-story predicted token cost and
+    # predicted rework probability before dispatch, from the ledger's own
+    # reconciled history keyed on the Story 28.2-001 discovery features, and
+    # reconcile prediction-vs-actual once the story finishes. Off by default so
+    # the epic rolls out incrementally: an unconfigured run degrades to today's
+    # point-keyed stage estimate (Story 14.1-002) with a logged note. Persisted
+    # per run so a resume keeps the same posture.
+    predict: bool = False
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -939,6 +1023,95 @@ def _honor_parked_reset(
     return None
 
 
+def _predict_story_cost(
+    ledger: "Ledger", run_id: str, story: Story, opts: BuildOptions
+) -> StoryPrediction | None:
+    """Predict + record a story's cost and rework risk before dispatch (28.2-002).
+
+    Trains on the ledger's own reconciled per-story history
+    (:meth:`Ledger.prediction_training_rows`), keys on the Story 28.2-001
+    discovery features plus the inventory risk flag, writes the forecast onto the
+    story row *before* the first stage runs, and logs an inspectable note naming
+    the cohort, its sample size and the applied adjustment.
+
+    Returns ``None`` — behaviour degrades to the Story 14.1-002 point-keyed stage
+    estimate, with the reason logged — in three cases: the predictor is disabled
+    (the default), the ledger holds no reconciled history to train on yet, or
+    anything at all goes wrong. Like the stage estimate this is strictly
+    best-effort: a predictor fault must never fail a build.
+    """
+    if not opts.predict:
+        try:
+            ledger.event_log(
+                run_id, story.id, "info", "controller",
+                "predictor disabled (--predict off): using the point-keyed stage "
+                "estimate (14.1-002)",
+            )
+        except Exception:  # noqa: BLE001 - the note is advisory, never fatal
+            pass
+        return None
+    try:
+        features = StoryFeatures(
+            ac_count=story.ac_count,
+            dep_depth=story.dep_depth,
+            scope_proxy=story.scope_proxy,
+            risk=ledger.story_risk(story.id),
+        )
+        history = PredictorHistory.from_rows(ledger.prediction_training_rows())
+        prediction = predict_story(features, history)
+        if prediction is None:
+            ledger.event_log(
+                run_id, story.id, "info", "controller",
+                "predictor: no reconciled story history yet — using the "
+                "point-keyed stage estimate (14.1-002)",
+            )
+            return None
+        ledger.story_set_prediction(
+            run_id, story.id,
+            predicted_tokens=prediction.predicted_tokens,
+            predicted_rework_prob=prediction.predicted_rework_probability,
+            predictor_version=prediction.version,
+            low_confidence=prediction.low_confidence,
+        )
+        confidence = " [low-confidence]" if prediction.low_confidence else ""
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            f"prediction [{prediction.version}]: ~{prediction.predicted_tokens:,} "
+            f"tokens, rework {prediction.predicted_rework_probability:.0%} "
+            f"({prediction.basis}){confidence}",
+        )
+        return prediction
+    except Exception:  # noqa: BLE001 - prediction is best-effort, never fatal
+        return None
+
+
+def _reconcile_story_prediction(
+    ledger: "Ledger", run_id: str, story_id: str
+) -> None:
+    """Stamp a finished story's actuals next to its prediction (Story 28.2-002).
+
+    The post-run half of the reconciliation, extending the Story 14.1-002
+    estimate-vs-actual store from the stage row to the story row: the actuals land
+    on the *same* row the prediction was written to, so scoring quality later is a
+    join rather than a re-computation, and the pair becomes a training row for the
+    next prediction. A no-op when the story carries no recorded prediction, and
+    best-effort throughout — never fatal.
+    """
+    try:
+        outcome = ledger.story_reconcile_prediction(run_id, story_id)
+        if outcome is None:
+            return
+        tokens = outcome["actual_tokens"]
+        actual = f"{tokens:,} tokens" if tokens is not None else "tokens unavailable"
+        rework = "rework" if outcome["actual_rework"] else "no rework"
+        ledger.event_log(
+            run_id, story_id, "info", "controller",
+            f"prediction reconciled: actual {actual}, {rework}",
+        )
+    except Exception:  # noqa: BLE001 - reconciliation is best-effort, never fatal
+        return
+
+
 def _run_story_rate_limited(
     ctx: _RateLimitContext,
     story: Story,
@@ -984,16 +1157,25 @@ def _run_story_rate_limited(
             )
             ctx.window.reopen(ctx.clock(), ledger.run_usage_totals(run_id)["tokens"])
 
+    # Story 28.2-002: the prediction is committed *here* — past every gate, with
+    # the story genuinely about to run, and before the first dispatch — so the
+    # forecast can never be quietly fitted to the outcome. Shared by build and
+    # resume, exactly like the dispatch it precedes.
+    _predict_story_cost(ledger, run_id, story, opts)
+
     try:
         status = _run_story(
             story, opts, ledger, run_id, dispatch, logs_dir,
             rl_ctx=ctx, **run_story_kwargs,
         )
     except _RateLimitPark as park:
+        # Parked, not finished: the story's usage is still accruing, so leave the
+        # prediction un-reconciled for the resume that completes it.
         return _StoryRunOutcome(
             status=None, parked=True, signal=park.signal,
             waited_s=waited_total + park.waited_s,
         )
+    _reconcile_story_prediction(ledger, run_id, story.id)
     return _StoryRunOutcome(status=status, waited_s=waited_total)
 
 
@@ -1862,6 +2044,183 @@ class Ledger:
                 if row is not None and row["avg_tokens"] is not None:
                     return float(row["avg_tokens"]), tier
         return None
+
+    def story_set_prediction(
+        self,
+        run_id: str,
+        story_id: str,
+        *,
+        predicted_tokens: int | None,
+        predicted_rework_prob: float | None,
+        predictor_version: str,
+        low_confidence: bool,
+    ) -> None:
+        """Record a story's pre-dispatch prediction (Story 28.2-002).
+
+        Written *before* the story's first stage dispatches, so the forecast is
+        committed ahead of the work it forecasts and cannot be quietly fitted to
+        the outcome. ``low_confidence`` persists as the ``prediction_confidence``
+        flag (``low``/``high``) — the quality report never suppresses it.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stories SET predicted_tokens = ?, predicted_rework_prob = ?, "
+                "predictor_version = ?, prediction_confidence = ? "
+                "WHERE run_id = ? AND story_id = ?",
+                (
+                    predicted_tokens,
+                    predicted_rework_prob,
+                    predictor_version,
+                    "low" if low_confidence else "high",
+                    run_id,
+                    story_id,
+                ),
+            )
+
+    def story_reconcile_prediction(
+        self, run_id: str, story_id: str
+    ) -> dict | None:
+        """Stamp a finished story's measured actuals onto its row (Story 28.2-002).
+
+        The post-run half of the prediction-vs-actual reconciliation: sums the
+        story's recorded per-stage usage and derives whether it entered rework,
+        then writes both onto the same row the prediction was recorded on — so
+        scoring quality later is a join, not a re-computation.
+
+        **Rework** is "the story entered a review retry or a bugfix loop": any
+        ``bugfix`` stage row, any stage attempt beyond the first, or any FAILED
+        stage attempt. The envelope re-ask and the commit-lint amend are recovery
+        *dispatches*, not review retries, so they do not count on their own.
+
+        Returns ``None`` — a deliberate no-op — when the row carries no recorded
+        prediction (the predictor was off, or the story never reached dispatch),
+        so the caller can invoke it unconditionally. Idempotent: both figures are
+        absolute assignments, never accumulations. ``actual_tokens`` stays NULL
+        when no stage recorded usage at all, so an un-instrumented story reads as
+        unknown rather than as a genuinely free one.
+        """
+        # ``_connect`` yields tuple rows (no row_factory), so these reads index
+        # positionally — the column order in each SELECT is the contract.
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT predicted_tokens, predicted_rework_prob FROM stories "
+                "WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            ).fetchone()
+            if row is None or (row[0] is None and row[1] is None):
+                return None
+            usage = conn.execute(
+                f"SELECT SUM({_stage_token_sum()}), "
+                "SUM(CASE WHEN input_tokens IS NOT NULL OR output_tokens IS NOT NULL "
+                "  OR cache_read_tokens IS NOT NULL "
+                "  OR cache_creation_tokens IS NOT NULL THEN 1 ELSE 0 END), "
+                f"MAX(CASE WHEN {_stage_rework_predicate()} THEN 1 ELSE 0 END) "
+                "FROM stages WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            ).fetchone()
+            tokens = int(usage[0] or 0) if usage is not None and usage[1] else None
+            rework = int(usage[2] or 0) if usage is not None else 0
+            conn.execute(
+                "UPDATE stories SET actual_tokens = ?, actual_rework = ? "
+                "WHERE run_id = ? AND story_id = ?",
+                (tokens, rework, run_id, story_id),
+            )
+        return {"actual_tokens": tokens, "actual_rework": rework}
+
+    def story_prediction_rows(self, run_id: str | None = None) -> list[dict]:
+        """Every recorded prediction with its reconciled actuals (Story 28.2-002).
+
+        The join the quality report scores. Restricted to ``run_id`` when given,
+        otherwise every run in the ledger. Rows never predicted are excluded; rows
+        predicted but not yet reconciled are included with NULL actuals so the
+        report can exclude them from *its* sample explicitly.
+        """
+        if not self.db_path.exists():
+            return []
+        clause = " AND s.run_id = ?" if run_id else ""
+        params: tuple[object, ...] = (run_id,) if run_id else ()
+        with self._connect_ro() as conn:
+            if not self._has_columns(conn, "stories", ("predicted_tokens",)):
+                return []
+            rows = conn.execute(
+                "SELECT s.run_id, s.story_id, s.title, s.status, s.ac_count, "
+                "       s.dep_depth, s.scope_proxy, s.predicted_tokens, "
+                "       s.predicted_rework_prob, s.predictor_version, "
+                "       s.prediction_confidence, s.actual_tokens, s.actual_rework "
+                "FROM stories s WHERE s.predicted_tokens IS NOT NULL" + clause
+                + " ORDER BY s.rowid",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def prediction_training_rows(self) -> list[dict]:
+        """The reconciled per-story history the predictor trains on (Story 28.2-002).
+
+        One row per **terminal** story across every run that actually recorded
+        usage: its discovery features, its inventory risk flag, the measured token
+        total across all its stages, and whether it entered rework. Derived from
+        the existing `stories`/`stages` tables rather than the prediction columns,
+        so history accumulates whether or not the predictor was ever enabled — a
+        first run with the flag on still has something to learn from.
+
+        Stories still in flight are excluded (their usage is incomplete), as are
+        stories no stage recorded usage for (they would drag the mean toward zero
+        — the same all-NULL exclusion :meth:`historical_stage_tokens` applies).
+        """
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            if not self._has_columns(conn, "stories", ("ac_count",)):
+                return []
+            placeholders = ", ".join("?" for _ in _TERMINAL_STORY_STATES)
+            rows = conn.execute(
+                f"""
+                SELECT s.run_id, s.story_id, s.ac_count, s.dep_depth, s.scope_proxy,
+                       (SELECT i.risk FROM story_inventory i
+                          WHERE i.story_id = s.story_id) AS risk,
+                       (SELECT SUM({_stage_token_sum("st.")}) FROM stages st
+                          WHERE st.run_id = s.run_id AND st.story_id = s.story_id
+                        ) AS actual_tokens,
+                       (SELECT MAX(CASE WHEN {_stage_rework_predicate("st.")}
+                                        THEN 1 ELSE 0 END)
+                          FROM stages st
+                          WHERE st.run_id = s.run_id AND st.story_id = s.story_id
+                        ) AS actual_rework,
+                       (SELECT COUNT(*) FROM stages st
+                          WHERE st.run_id = s.run_id AND st.story_id = s.story_id
+                            AND (st.input_tokens IS NOT NULL
+                                 OR st.output_tokens IS NOT NULL
+                                 OR st.cache_read_tokens IS NOT NULL
+                                 OR st.cache_creation_tokens IS NOT NULL)
+                        ) AS measured
+                FROM stories s
+                WHERE s.status IN ({placeholders})
+                ORDER BY s.rowid
+                """,
+                tuple(_TERMINAL_STORY_STATES),
+            ).fetchall()
+        return [dict(r) for r in rows if r["measured"]]
+
+    def story_risk(self, story_id: str) -> str | None:
+        """The inventory's ``**Risk Level**:`` for a story, or None when unknown.
+
+        The predictor's cohort key reads this; an unsynced repo simply has no
+        inventory row, which resolves to the ``unknown`` risk flag rather than an
+        assumed default.
+        """
+        return self._inventory_get_column(story_id, "risk")
+
+    @staticmethod
+    def _has_columns(
+        conn: sqlite3.Connection, table: str, columns: tuple[str, ...]
+    ) -> bool:
+        """Whether ``table`` carries every column in ``columns``.
+
+        Read-only callers never migrate, so an un-migrated ledger must degrade to
+        a clean empty result rather than raising on a missing column.
+        """
+        present = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        return all(col in present for col in columns)
 
     def reset_story(self, run_id: str, story_id: str) -> None:
         """Roll a story back to a fresh, unbuilt state (Story 10.2-001).
@@ -4669,6 +5028,10 @@ def run_build(
             # keeps the same isolation posture (and the dashboard can show it).
             # False keeps the host path — unchanged for runs that predate this.
             "sandbox": opts.sandbox,
+            # Story 28.2-002: persist the predictor flag so a resumed run keeps
+            # predicting (and reconciling) rather than silently degrading to the
+            # point-keyed estimate halfway through a run's story set.
+            "predict": opts.predict,
         }),
     )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of

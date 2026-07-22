@@ -232,6 +232,10 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         # the same isolation. Defaults to the host path for runs that predate the
         # field. (``SDLC_SANDBOX`` also covers resume directly at dispatch time.)
         sandbox=bool(config.get("sandbox", False)),
+        # Story 28.2-002: carry the predictor flag so a resumed run keeps
+        # predicting + reconciling its remaining stories. Defaults to off for
+        # runs that predate the field — unchanged behaviour.
+        predict=bool(config.get("predict", False)),
     )
 
 

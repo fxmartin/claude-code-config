@@ -182,6 +182,7 @@ Claude Code). The plugin half needs a Claude Code restart to take effect.
 | `sdlc clean` · `sdlc repair` · `sdlc rollback` · `sdlc reconcile` | Workspace GC · ledger repair · checkpoint unwind · terminal-status reconciliation vs `origin/main` |
 | `sdlc usage-reconcile [--all]` | Backfill per-stage token/cost usage from the session logs and score ledger-vs-logs agreement (`sdlc doctor` reports the rate) |
 | `sdlc model-backfill [--all]` | Backfill per-stage model attribution (`stages.model`) from the session logs; unrecoverable rows are counted, never coerced (`sdlc doctor` reports the coverage) |
+| `sdlc predict-quality [run] [--json]` | Score the per-story predictions `sdlc build --predict` recorded against their reconciled actuals — median absolute token error + rework calibration, each with its sample size |
 | `sdlc sast` · `sdlc depscan` · `sdlc supplychain` | Classify SAST/dependency scan reports · scan hooks/skills/MCP/settings for dangerous patterns — all exit non-zero on `BLOCK` for CI gating |
 | `sdlc eval` · `sdlc eval-compare` · `sdlc eval-baseline` | Agent-output evaluation harness (A/B, regression baselines) |
 | `sdlc validate <agent-type> <file>` | Validate an agent response against its JSON schema |

@@ -29,6 +29,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "reconcile": "Re-check a run against origin/main and correct the ledger.",
     "usage-reconcile": "Backfill per-stage usage from the session logs and score agreement.",
     "model-backfill": "Backfill per-stage model attribution from the session logs.",
+    "predict-quality": "Score recorded story predictions against their reconciled actuals.",
     "clean": "Garbage-collect build leftovers (orphan worktrees, merged branches, stale logs).",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
     "generate-skills": "Generate Claude + Codex skill files from the neutral sources.",
@@ -141,6 +142,12 @@ Flags:
                             mounted (recommended for untrusted repos); fails fast
                             if no container runtime is present. SDLC_SANDBOX=1 is
                             the per-repo config equivalent
+  --predict                 compute + record a per-story predicted token cost and
+                            rework probability before dispatch, from the ledger's
+                            own reconciled history, and reconcile prediction-vs-
+                            actual after. Off by default (stage estimates then use
+                            the 14.1-002 heuristic); score it with
+                            `sdlc predict-quality`
 """
 
 
@@ -1586,6 +1593,89 @@ def model_backfill(
     if result.unrecoverable:
         summary += f"; {result.unrecoverable} unrecoverable (no model in the session log)"
     typer.echo(summary + ".")
+    raise typer.Exit(code=0)
+
+
+@app.command(name="predict-quality", help=PLANNED_SUBCOMMANDS["predict-quality"])
+def predict_quality(
+    run: str | None = typer.Argument(
+        None, help="Run id to score (default: every run in the ledger)."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the quality report as a JSON object."
+    ),
+) -> None:
+    """Score recorded story predictions against their actuals (Story 28.2-002).
+
+    Reports the **median absolute error** of predicted vs actual tokens and a
+    **calibration summary** for the predicted rework probability — each with its
+    own sample size, so prediction quality is measured rather than asserted. A
+    ledger with nothing reconciled reports "no sample", never a vacuous zero
+    error, and the share of low-confidence predictions is always printed
+    alongside: a small error over three low-confidence guesses is not a
+    calibrated model.
+    """
+    from sdlc.ledger_view import Ledger, default_db_path
+    from sdlc.predictor import prediction_quality
+
+    db_path = db or default_db_path()
+    ledger = Ledger(db_path)
+    ledger.ensure_migrated()
+
+    if run is not None and ledger.run_row(run) is None:
+        typer.echo(f"error: no such run '{run}' in ledger: {db_path}", err=True)
+        raise typer.Exit(code=2)
+
+    records = ledger.story_prediction_rows(run)
+    report = prediction_quality(records)
+
+    if as_json:
+        typer.echo(json.dumps(report.to_dict(), default=str))
+        raise typer.Exit(code=0)
+
+    if not records:
+        typer.echo(
+            f"predict-quality: no recorded predictions in ledger: {db_path} "
+            "(run `sdlc build --predict` to start recording)."
+        )
+        raise typer.Exit(code=0)
+
+    if report.token_median_abs_error is None:
+        typer.echo("tokens: no reconciled prediction yet (n=0)")
+    else:
+        pct = (
+            f", {report.token_median_abs_pct_error:.0f}%"
+            if report.token_median_abs_pct_error is not None
+            else ""
+        )
+        typer.echo(
+            f"tokens: median absolute error {report.token_median_abs_error:,.0f}"
+            f"{pct} (n={report.token_sample})"
+        )
+
+    if not report.rework_bins:
+        typer.echo("rework: no reconciled prediction yet (n=0)")
+    else:
+        typer.echo(f"rework calibration (n={report.rework_sample}):")
+        for bucket in report.rework_bins:
+            typer.echo(
+                f"  p {bucket.lower:.2f}–{bucket.upper:.2f}: "
+                f"predicted {bucket.predicted_mean:.0%} vs observed "
+                f"{bucket.observed_rate:.0%} (n={bucket.sample})"
+            )
+        if report.rework_brier is not None:
+            typer.echo(f"  brier score {report.rework_brier:.3f}")
+
+    if report.low_confidence_share is not None:
+        typer.echo(
+            f"low-confidence share: {report.low_confidence_share:.0%} "
+            f"of {len(records)} recorded prediction(s)"
+        )
+    if report.versions:
+        typer.echo(f"predictor version(s) in sample: {', '.join(report.versions)}")
     raise typer.Exit(code=0)
 
 
