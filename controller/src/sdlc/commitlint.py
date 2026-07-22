@@ -15,6 +15,16 @@ _HEADER_RE = re.compile(
     r"^(?P<type>[^(!:]*?)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?: (?P<subject>.*)$"
 )
 
+# conventional-commits-parser opens the footer at the first body line whose
+# trimmed form matches ``<token>: `` or ``<token> #``, where the token is
+# ``[\w-]+`` or the literal ``BREAKING CHANGE``. Crucially this is *not* limited
+# to the last paragraph: a wrapped bullet whose continuation line happens to
+# start ``guarantee: `` mid-body opens the footer right there, and
+# ``footer-leading-blank`` then flunks it because the line above is prose rather
+# than a blank (Story 28.4-001 — that message passed this gate and failed PR CI).
+# Pattern and edge cases verified against @commitlint/parse v21.
+_FOOTER_TOKEN_RE = re.compile(r"^(?:BREAKING[ -]CHANGE|[\w-]+)(?:: | #)")
+
 # Config filenames commitlint itself searches, in the order we honour them. The
 # ``package.json`` ``commitlint`` key is handled separately.
 _CONFIG_FILENAMES = (
@@ -65,7 +75,8 @@ def lint_commit_message(message: str, config: dict) -> list[str]:
     Implements the faithful subset of conventional rules the controller can apply
     deterministically without running Node: ``type-empty``, ``type-enum``,
     ``type-case``, ``scope-case``, ``subject-empty``, ``subject-case``,
-    ``subject-full-stop``, ``header-max-length`` and ``body-leading-blank``. Only
+    ``subject-full-stop``, ``header-max-length``, ``body-leading-blank`` and
+    ``footer-leading-blank``. Only
     rules at error level (``2``) are enforced; disabled (``0``) and warn (``1``)
     levels, and any rule name not in the subset, are ignored — so an
     as-yet-unsupported rule never produces a spurious re-ask. An empty rule set
@@ -111,8 +122,34 @@ def lint_commit_message(message: str, config: dict) -> list[str]:
             )
     if enforced("body-leading-blank") and len(lines) > 1 and lines[1].strip():
         violations.append("body-leading-blank: leave a blank line after the header")
+    if enforced("footer-leading-blank"):
+        idx = _footer_start(lines)
+        # commitlint compares the preceding raw line to "" exactly, so a
+        # whitespace-only separator is a violation too.
+        if idx is not None and lines[idx - 1] != "":
+            violations.append(
+                "footer-leading-blank: "
+                f"{lines[idx].strip()!r} starts the footer (a '<word>: ' or "
+                "'<word> #' line opens it anywhere in the body) — put a blank "
+                "line before it, or reword the line so it does not begin with "
+                "a bare word followed by a colon"
+            )
 
     return violations
+
+
+def _footer_start(lines: list[str]) -> int | None:
+    """Return the index of the line that opens the footer, or ``None`` if there is none.
+
+    Mirrors conventional-commits-parser: scan the body (everything after the
+    header) for the first line matching :data:`_FOOTER_TOKEN_RE` once leading and
+    trailing whitespace are ignored — the parser matches an indented continuation
+    line just as readily as a flush-left one.
+    """
+    for idx, line in enumerate(lines[1:], start=1):
+        if _FOOTER_TOKEN_RE.match(line.strip()):
+            return idx
+    return None
 
 
 def header_max_length(config: dict | None) -> int:
