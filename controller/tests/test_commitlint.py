@@ -22,6 +22,7 @@ _RULES = {
         "subject-full-stop": [2, "never", "."],
         "header-max-length": [2, "always", 72],
         "body-leading-blank": [2, "always"],
+        "footer-leading-blank": [2, "always"],
     }
 }
 
@@ -114,6 +115,99 @@ def test_missing_type_and_subject_flagged() -> None:
 def test_body_not_blank_separated_flagged() -> None:
     violations = lint_commit_message("feat: do a thing\nno blank line", _RULES)
     assert any("body-leading-blank" in v for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# footer-leading-blank (Story 28.4-001 regression)
+# ---------------------------------------------------------------------------
+#
+# conventional-commits-parser opens the footer at the *first* body line whose
+# trimmed form matches ``<token>: `` or ``<token> #`` — anywhere in the body, not
+# only after the last blank line. A wrapped bullet whose continuation happens to
+# start ``word: `` therefore becomes the footer, and commitlint flunks it for
+# having no leading blank line. Every expectation below was verified against
+# @commitlint/parse + @commitlint/rules v21, not inferred from the docs.
+
+def test_footer_with_leading_blank_passes() -> None:
+    msg = (
+        "test(x): do a thing\n"
+        "\n"
+        "The body explains why.\n"
+        "\n"
+        "Co-Authored-By: Someone <someone@example.com>\n"
+    )
+    assert lint_commit_message(msg, _RULES) == []
+
+
+def test_body_line_reading_as_a_footer_token_is_flagged() -> None:
+    msg = (
+        "test(x): do a thing\n"
+        "\n"
+        "- a wrapped bullet whose continuation is pinned to its actual\n"
+        "  guarantee: the build still dispatches every stage\n"
+    )
+    violations = lint_commit_message(msg, _RULES)
+    assert any("footer-leading-blank" in v for v in violations)
+    # The message must name the offending line so the amend re-ask is actionable.
+    assert any("guarantee:" in v for v in violations)
+
+
+def test_the_28_4_001_regression_message_is_flagged() -> None:
+    # The original defect: this exact message passed the controller's gate and
+    # then failed PR CI on footer-leading-blank, blocking the merge stage.
+    msg = (
+        "test(empirical-estimation): engage balanced routing by (#28.4-001)\n"
+        "\n"
+        "Close the coverage gaps the story's diff left behind.\n"
+        "\n"
+        "- `_log_routing_banner`'s blanket except is pinned to its actual\n"
+        "  guarantee: with `routing_banner` raising, the build still dispatches\n"
+        "  every stage on the frozen Balanced map and simply logs no banner.\n"
+        "\n"
+        "Co-Authored-By: Claude <noreply@anthropic.com>\n"
+    )
+    assert any("footer-leading-blank" in v for v in lint_commit_message(msg, _RULES))
+
+
+def test_hash_separated_footer_token_is_flagged() -> None:
+    # ``<token> #`` is the parser's other footer form (``Closes #12``).
+    msg = "test(x): do a thing\n\nthe body says why\nCloses #12\n"
+    assert any("footer-leading-blank" in v for v in lint_commit_message(msg, _RULES))
+
+
+def test_breaking_change_footer_without_blank_is_flagged() -> None:
+    msg = "test(x): do a thing\n\nthe body says why\nBREAKING CHANGE: boom\n"
+    assert any("footer-leading-blank" in v for v in lint_commit_message(msg, _RULES))
+
+
+def test_whitespace_only_line_is_not_a_blank_leading_line() -> None:
+    # commitlint compares the leading line to "" exactly, so three spaces flunk.
+    msg = "test(x): do a thing\n\nthe body says why\n   \nRefs #12\n"
+    assert any("footer-leading-blank" in v for v in lint_commit_message(msg, _RULES))
+
+
+def test_multi_word_prefix_is_not_a_footer_token() -> None:
+    # The token is ``[\w-]+``: a phrase with a space never opens the footer, so
+    # ordinary prose with a colon must not produce a spurious re-ask.
+    msg = "test(x): do a thing\n\nintro line\ntwo words: not a footer at all\n"
+    assert lint_commit_message(msg, _RULES) == []
+
+
+def test_colon_without_space_is_not_a_footer_token() -> None:
+    msg = "test(x): do a thing\n\nintro line\nword:novalue is prose\n"
+    assert lint_commit_message(msg, _RULES) == []
+
+
+def test_footer_as_the_first_body_line_passes() -> None:
+    # The blank line after the header is the footer's leading blank.
+    msg = "test(x): do a thing\n\nCloses #12\n"
+    assert lint_commit_message(msg, _RULES) == []
+
+
+def test_footer_leading_blank_not_enforced_when_disabled() -> None:
+    rules = {"rules": dict(_RULES["rules"], **{"footer-leading-blank": [0, "always"]})}
+    msg = "test(x): do a thing\n\nintro line\nCloses #12\n"
+    assert lint_commit_message(msg, rules) == []
 
 
 def test_the_10_2_001_regression_message_is_flagged() -> None:
