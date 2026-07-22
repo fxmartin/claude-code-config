@@ -99,6 +99,31 @@ def test_predict_quality_reports_clean_absence(tmp_path: Path) -> None:
     assert not db.exists()
 
 
+def test_predict_quality_reports_an_honest_zero_sample_before_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Predicted but never reconciled scores as "no sample", not a vacuous 0 error."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "auto")
+    ledger.story_upsert(
+        run_id, "s1-001", "99", "Story one", "P1", 2, "py", "", None, "IN_PROGRESS",
+        ac_count=5, dep_depth=1, scope_proxy=4,
+    )
+    ledger.story_set_prediction(
+        run_id, "s1-001",
+        predicted_tokens=1_000, predicted_rework_prob=0.1,
+        predictor_version=PREDICTOR_VERSION, low_confidence=False,
+    )
+    result = runner.invoke(app, ["predict-quality", "--db", str(db)])
+    assert result.exit_code == 0
+    assert "tokens: no reconciled prediction yet (n=0)" in result.stdout
+    assert "rework: no reconciled prediction yet (n=0)" in result.stdout
+    # The prediction itself is still on the books — absent actuals, not absent rows.
+    assert "median absolute error" not in result.stdout
+
+
 def test_predict_quality_rejects_an_unknown_run(tmp_path: Path) -> None:
     db, _ = _seed(tmp_path, _SAMPLE)
     result = runner.invoke(app, ["predict-quality", "nope", "--db", str(db)])

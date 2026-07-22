@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -532,6 +533,44 @@ def test_training_rows_skip_stories_with_no_measured_usage(tmp_path: Path) -> No
     assert ledger.prediction_training_rows() == []
 
 
+def _unmigrated_ledger(db: Path) -> Ledger:
+    """A ledger predating both the 28.2-001 discovery columns and Migration 15.
+
+    Built with raw sqlite rather than :meth:`Ledger.init`, precisely so the
+    read-only prediction queries meet a `stories` table that lacks the columns
+    they name. A real ledger reaches this state whenever a read verb runs against
+    a DB written by an older controller and no migration has been applied yet.
+    """
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE stories (run_id TEXT, story_id TEXT, status TEXT NOT NULL, "
+            "  PRIMARY KEY(run_id, story_id))"
+        )
+        conn.execute(
+            "INSERT INTO stories(run_id, story_id, status) VALUES ('r1', 's1-001', 'DONE')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return Ledger(db)
+
+
+def test_prediction_reads_degrade_cleanly_on_an_unmigrated_ledger(tmp_path: Path) -> None:
+    # Read-only callers never migrate, so a missing column must read as "no
+    # history" rather than raising OperationalError mid-build.
+    ledger = _unmigrated_ledger(tmp_path / ".sdlc-state.db")
+    assert ledger.story_prediction_rows() == []
+    assert ledger.prediction_training_rows() == []
+
+
+def test_training_rows_are_empty_without_a_ledger_file(tmp_path: Path) -> None:
+    db = tmp_path / "absent.db"
+    assert Ledger(db).prediction_training_rows() == []
+    # Never materialises a spurious empty ledger just to answer the question.
+    assert not db.exists()
+
+
 def test_prediction_history_reads_the_inventory_risk_flag(tmp_path: Path) -> None:
     ledger, _ = _ledger_with_story(tmp_path, ac_count=6, dep_depth=1, scope_proxy=4)
     assert ledger.story_risk("s1-001") is None
@@ -603,6 +642,16 @@ def test_enabled_predictor_persists_the_flag_for_resume(tmp_path: Path) -> None:
     db = tmp_path / ".sdlc-state.db"
     result = _run(db, predict=True)
     assert Ledger(db).run_config(result.run_id).get("predict") is True
+
+
+def test_disabled_predictor_survives_a_ledger_that_cannot_log(tmp_path: Path) -> None:
+    """The disabled-path note is advisory — a failing event_log must not fail a build."""
+    class NoEvents:
+        def event_log(self, *args, **kwargs):
+            raise RuntimeError("events table gone")
+
+    story = Story("s1-001", "t", "99", "sample", "epic-99.md", "P1", 2, "py", [])
+    assert _predict_story_cost(NoEvents(), "run", story, BuildOptions(predict=False)) is None
 
 
 def test_predictor_never_breaks_a_build_when_the_ledger_misbehaves(tmp_path: Path) -> None:
