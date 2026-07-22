@@ -27,10 +27,21 @@ from sdlc.model_routing import (
 # ---------------------------------------------------------------------------
 
 
-def test_routing_off_when_profile_blank_or_none() -> None:
-    """An unset / off profile disables routing (returns None → CLI default)."""
-    for name in ("", "off", "none", None):
+def test_routing_off_only_on_an_explicit_opt_out() -> None:
+    """Only an explicit off/none disables routing (returns None → CLI default)."""
+    for name in ("off", "none"):
         assert routing_config(name) is None
+
+
+def test_unset_profile_resolves_to_balanced() -> None:
+    """Story 28.4-001: an absent profile is the *unset* state, not an opt-out.
+
+    Under the Story 14.2-001 semantics an empty profile meant routing off, and
+    empty was the state of every run — so the cost control silently never
+    engaged. An unset profile now resolves to the Balanced default map.
+    """
+    for name in ("", "   ", None):
+        assert routing_config(name) is BALANCED
 
 
 def test_routing_off_is_case_insensitive() -> None:
@@ -244,7 +255,18 @@ def test_missing_override_file_is_ignored(tmp_path) -> None:
 
 def test_load_routing_config_off_returns_none() -> None:
     assert load_routing_config("off") is None
-    assert load_routing_config("") is None
+    assert load_routing_config("none") is None
+
+
+def test_load_routing_config_unset_returns_the_balanced_default() -> None:
+    """Story 28.4-001: unset resolves to Balanced, per-repo override still applies."""
+    assert load_routing_config("") is BALANCED
+    cfg = load_routing_config(
+        "", override_text="model_routing:\n  stages:\n    merge: sonnet\n"
+    )
+    assert cfg is not None
+    assert cfg.profile == "balanced"
+    assert cfg.stage_models["merge"] == "sonnet"
 
 
 def test_malformed_override_raises() -> None:

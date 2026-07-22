@@ -17,6 +17,7 @@ from sdlc.build import (
     _CostGatePause,
     _dispatch_ready_queue,
     _honor_parked_reset,
+    _log_routing_banner,
     _make_rate_limit_context,
     _prepare_story_workdir,
     _reposition_head,
@@ -35,6 +36,8 @@ from sdlc.build import (
 from sdlc.cohort import Story, compute_cohorts
 from sdlc.discovery import canonical_scope, discover_queue
 from sdlc.dispatch import dispatch_agent
+from sdlc.model_routing import OFF as MODEL_ROUTING_OFF
+from sdlc.model_routing import routing_snapshot
 from sdlc.notify import notify
 from sdlc.registry import Registry
 
@@ -42,6 +45,12 @@ __all__ = ["StoryResumeState", "ResumeResult", "compute_resume_plan", "run_resum
 
 # Story statuses the controller treats as already finished — never re-run.
 _TERMINAL_STORY_STATES = {"DONE", "SKIPPED"}
+
+# Story 28.4-001: the routing a run with no frozen snapshot is resumed under.
+# Only runs created before the default flip lack one, and every one of them ran
+# with routing off — so resuming them off is not a conservative guess, it is
+# their original behaviour, preserved. Never mutated: callers copy it.
+ROUTING_OFF_SNAPSHOT = routing_snapshot(None)
 
 
 @dataclass
@@ -185,12 +194,25 @@ def compute_resume_plan(
     return plan
 
 
-def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOptions:
+def _options_from_config(
+    scope: str, run_row: dict, config: dict, routing: dict | None = None
+) -> BuildOptions:
     """Reconstruct the build options a resume needs from the persisted run.
 
     Only the fields that affect stage rendering and the pipeline shape matter:
     scope, the coverage gate, the coverage threshold, and serial vs parallel.
+
+    ``routing`` is the run's frozen routing snapshot (Story 28.4-001). It — not
+    the persisted ``model_profile`` string and not the current
+    `.sdlc-model-routing.yaml` — decides how a resumed run routes, so an edit to
+    the config or a changed ``--model-<stage>`` pin between a run and its resume
+    can never alter that run's routing. An **absent** snapshot means the run
+    predates the freeze, and every such run routed off (an empty
+    ``model_profile`` meant "CLI default everywhere" under the Story 14.2-001
+    semantics), so it is frozen at ``off`` rather than silently upgraded to the
+    new Balanced default.
     """
+    snapshot = dict(routing or ROUTING_OFF_SNAPSHOT)
     return BuildOptions(
         scope=scope,
         skip_coverage=bool(config.get("skip_coverage")),
@@ -212,10 +234,13 @@ def _options_from_config(scope: str, run_row: dict, config: dict) -> BuildOption
         window_budget=int(config.get("window_budget", 0) or 0),
         window_s=int(config.get("window_s", 18000) or 18000),
         rate_limit_threshold=float(config.get("rate_limit_threshold", 1.0) or 1.0),
-        # Story 14.2-001: carry the model-routing profile + overrides so a resumed
-        # run dispatches each stage on the same model the original run chose.
-        model_profile=str(config.get("model_profile") or ""),
-        model_overrides=dict(config.get("model_overrides") or {}),
+        # Story 14.2-001 / 28.4-001: replay the run's frozen routing snapshot so a
+        # resumed run dispatches each stage on the same model the original run
+        # chose. The profile and overrides are read *out of the snapshot*, never
+        # re-resolved, so all three stay consistent with what actually ran.
+        model_profile=str(snapshot.get("profile") or MODEL_ROUTING_OFF),
+        model_overrides=dict(snapshot.get("overrides") or {}),
+        model_routing_snapshot=snapshot,
         # Story 14.1-002: carry the per-stage cost-estimate threshold so a resume
         # re-enforces the same gate rather than silently dispatching a stage the
         # original run gated. `sdlc resume --cost-threshold` overrides it.
@@ -310,7 +335,12 @@ def run_resume(
     if not incomplete and not end_crash:
         return ResumeResult(run_id=rid, nothing_to_resume=True)
 
-    opts = _options_from_config(scope, run_row, config)
+    # Story 28.4-001: the routing this resume runs under comes from the snapshot
+    # the original run froze, never from a fresh resolve — so an unrelated edit
+    # to `.sdlc-model-routing.yaml` or an override between the run and its resume
+    # cannot change which model a remaining stage gets.
+    routing = ledger.run_routing(rid)
+    opts = _options_from_config(scope, run_row, config, routing)
     # A caller-supplied --budget raises (or overrides) the persisted ceiling; an
     # explicit --budget-policy likewise. Absent overrides keep the original.
     if budget is not None:
@@ -342,6 +372,13 @@ def run_resume(
     ledger.event_log(
         rid, "", "info", "config",
         json.dumps({**config, "mode": resumed_mode, "concurrency": opts.concurrency}),
+    )
+    # Story 28.4-001: re-announce the (frozen) routing so the resume's own logs
+    # state which profile governed it, exactly as the original run's did. The
+    # unattended warning uses the work this resume still owes.
+    _log_routing_banner(
+        ledger, rid, opts.model_routing_snapshot,
+        unattended=len(incomplete) > 1 or bool(opts.budget),
     )
 
     # Story 14.2-002: bind the persisted thinking-token cap onto the real dispatch

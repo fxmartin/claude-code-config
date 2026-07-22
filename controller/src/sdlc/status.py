@@ -6,8 +6,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from sdlc.build import Ledger
+from sdlc.model_routing import is_routing_off
 
-__all__ = ["state_report", "format_state", "format_markdown"]
+__all__ = ["state_report", "format_state", "format_markdown", "format_routing"]
 
 
 def state_report(ledger: Ledger, run_id: str) -> list[dict]:
@@ -54,6 +55,41 @@ def format_state(rows: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 # Story 15.1-002: portable markdown handoff (`sdlc status --markdown`)
 # ---------------------------------------------------------------------------
+
+
+def format_routing(routing: dict) -> list[str]:
+    """Render a run's frozen routing snapshot as markdown lines (Story 28.4-001).
+
+    Answers "which profile governed this run" from the snapshot persisted on the
+    run row, so the answer survives the run: the profile name plus the effective
+    per-stage map and escalation thresholds *after* every override. Routing off
+    is stated loudly — it means every stage billed at the CLI default model.
+    Returns ``[]`` for a run created before the snapshot existed, so older runs
+    render exactly as they did rather than claiming a routing they never had.
+    """
+    if not routing:
+        return []
+    if is_routing_off(routing):
+        return [
+            "**MODEL ROUTING OFF** — the CLI default model was used for ALL stages.",
+            "",
+        ]
+    mapping = " ".join(
+        f"{s}={m}" for s, m in sorted((routing.get("stage_models") or {}).items())
+    )
+    lines = [
+        f"**Model routing: `{routing.get('profile')}`** — {mapping}",
+        "",
+        f"Escalates to {routing.get('escalation_model')} on high-risk or points ≥ "
+        f"{routing.get('points_threshold')} "
+        f"({', '.join(routing.get('escalatable_stages') or [])}).",
+        "",
+    ]
+    overrides = routing.get("overrides") or {}
+    if overrides:
+        pins = " ".join(f"{s}={m}" for s, m in sorted(overrides.items()))
+        lines.extend([f"Explicit `--model` overrides applied: {pins}.", ""])
+    return lines
 
 
 def _scrub(text: str, home: Path) -> str:
@@ -151,17 +187,22 @@ def format_markdown(
             f"{counts.get('awaiting_approval', 0)} awaiting approval"
         )
         lines.append("")
+        lines.extend(format_routing(snapshot.get("run", {}).get("routing") or {}))
         stories = snapshot.get("stories", [])
         if stories:
-            lines.append("| Story | Status | Stage | PR |")
-            lines.append("| --- | --- | --- | --- |")
+            lines.append("| Story | Status | Stage | Models | PR |")
+            lines.append("| --- | --- | --- | --- | --- |")
             for s in stories:
                 stage = s.get("current_stage") or "-"
                 pr = s.get("pr_number")
                 pr_disp = f"#{pr}" if pr else "-"
+                # Story 28.4-001 surfaces the per-stage models Story 28.1-002
+                # persists — the *actual* models, next to the routing config that
+                # asked for them, so intent and outcome are read together.
+                models = ", ".join(s.get("models") or []) or "-"
                 lines.append(
                     f"| {s.get('story_id', '?')} | {s.get('status', '?')} "
-                    f"| {stage} | {pr_disp} |"
+                    f"| {stage} | {models} | {pr_disp} |"
                 )
             lines.append("")
 

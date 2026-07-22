@@ -30,8 +30,21 @@ ROUTING_KEY = "model_routing"
 # mirroring `risk_gate.py`'s `.sdlc-risk-config.yaml` convention.
 OVERRIDE_FILENAME = ".sdlc-model-routing.yaml"
 
-# Profile names that mean "routing disabled — keep today's CLI-default behaviour".
-_OFF_NAMES = {"", "off", "none"}
+# Profile names that mean "routing disabled — every stage on the CLI default".
+# Story 28.4-001 removed the empty string from this set: an *absent* profile is
+# no longer an opt-out, it is the unset state that resolves to the default map
+# below. Only an explicit `off` / `none` disables routing, so a cost-governance
+# control can no longer fail silent-and-expensive.
+_OFF_NAMES = {"off", "none"}
+
+# The canonical explicit opt-out value, persisted on a run row whose routing is
+# off so "off" is a stated fact rather than an absent key.
+OFF = "off"
+
+# The profile an unset `model_profile` resolves to (Story 28.4-001). Balanced is
+# the effective default: cheap tiers for mechanical stages, Sonnet for the ones
+# that need correctness, Opus only where a high-risk / large story earns it.
+DEFAULT_PROFILE = "balanced"
 
 
 @dataclass(frozen=True)
@@ -125,14 +138,23 @@ _PROFILES: dict[str, ModelRoutingConfig] = {
 def routing_config(profile: str | None) -> ModelRoutingConfig | None:
     """Resolve a built-in profile by name, or ``None`` when routing is off.
 
-    A blank / ``off`` / ``none`` name (case-insensitive) disables routing so the
-    run keeps today's CLI-default behaviour. An unknown name is a hard error
-    rather than a silent fallback — a typo must never quietly change which model
-    a high-stakes stage runs on.
+    An **unset** profile (``None`` / blank) resolves to :data:`DEFAULT_PROFILE`
+    — Balanced — because routing that is off by default is a cost control that
+    fails silent-and-expensive: under the Story 14.2-001 semantics every run in
+    the 2026-07-19 dataset (374 stage attempts) ran the CLI default of the day,
+    with zero Sonnet sessions, while the operator believed routing was on
+    (Story 28.4-001).
+
+    Only an explicit ``off`` / ``none`` (case-insensitive) disables routing, in
+    which case every stage falls back to the CLI default model. An unknown name
+    is a hard error rather than a silent fallback — a typo must never quietly
+    change which model a high-stakes stage runs on.
     """
     name = (profile or "").strip().lower()
     if name in _OFF_NAMES:
         return None
+    if not name:
+        name = DEFAULT_PROFILE
     try:
         return _PROFILES[name]
     except KeyError:
@@ -228,7 +250,16 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
 
     cfg = base
     if "profile" in section:
-        rebased = routing_config(section["profile"])
+        raw_profile = section["profile"]
+        # YAML 1.1 parses a bare `off` as the boolean False, so normalise before
+        # resolving. Since Story 28.4-001 a blank profile resolves to Balanced
+        # rather than to None, so `rebased is None` alone no longer catches an
+        # empty value — an override must always *name* a profile.
+        if isinstance(raw_profile, bool):
+            raw_profile = "off" if raw_profile is False else "on"
+        if not str(raw_profile or "").strip():
+            raise ValueError("override 'profile' must name a profile, not be blank")
+        rebased = routing_config(raw_profile)
         if rebased is None:
             raise ValueError("override profile cannot be 'off' (omit the file instead)")
         cfg = rebased
@@ -292,3 +323,144 @@ def load_routing_config(
     except yaml.YAMLError as exc:
         raise ValueError(f"model-routing override is not valid YAML: {exc}") from exc
     return _coerce_override(base, raw)
+
+
+# ---------------------------------------------------------------------------
+# Story 28.4-001: resolve-and-freeze — the run's routing snapshot
+# ---------------------------------------------------------------------------
+#
+# The snapshot is the *fully-resolved* routing config: the profile name plus the
+# effective per-stage map and escalation thresholds after every override. It is
+# resolved once at run creation, persisted on the run row, and replayed verbatim
+# by every resume — so an edit to `.sdlc-model-routing.yaml`, `SDLC_AGENT_CMD`,
+# or a per-stage `--model` between a run and its resume can never alter that
+# run's routing (the Epic-10 / Epic-12 "resume identically" contract).
+#
+# It is plain JSON-able data (never a dataclass) because it round-trips through
+# a TEXT ledger column, and it is the same object the startup banner renders, so
+# what is printed live and what is replayed on resume cannot drift.
+
+
+def routing_snapshot(
+    config: ModelRoutingConfig | None,
+    *,
+    overrides: dict[str, str] | None = None,
+    agent_cmd: str | None = None,
+) -> dict:
+    """Freeze ``config`` (plus its overrides) into a JSON-able routing snapshot.
+
+    ``config`` is the resolved profile (``None`` when routing is off);
+    ``overrides`` are the explicit per-stage ``--model-<stage>`` pins, which win
+    over the map and are therefore merged into ``stage_models`` so the snapshot
+    states the *effective* model each stage starts on; ``agent_cmd`` records a
+    ``SDLC_AGENT_CMD`` override so the banner can say the whole command was
+    replaced. A routing-off snapshot keeps an empty map and an explicit ``off``
+    profile — never an absent key, so "off" is always a stated fact.
+    """
+    overrides = dict(overrides or {})
+    if config is None:
+        return {
+            "profile": OFF,
+            "stage_models": {},
+            "overrides": overrides,
+            "agent_cmd": agent_cmd or "",
+        }
+    stage_models = dict(config.stage_models)
+    stage_models.update(overrides)
+    return {
+        "profile": config.profile,
+        "stage_models": stage_models,
+        "points_threshold": config.points_threshold,
+        "escalation_model": config.escalation_model,
+        "escalatable_stages": sorted(config.escalatable_stages),
+        "pinned_stages": sorted(config.pinned_stages),
+        "overrides": overrides,
+        "agent_cmd": agent_cmd or "",
+    }
+
+
+def is_routing_off(snapshot: dict | None) -> bool:
+    """Is ``snapshot`` a routing-off snapshot (or an absent/legacy one)?
+
+    An absent snapshot reads as off: only a run created after Story 28.4-001
+    carries one, and a run that predates the default flip routed off, so the
+    conservative reading is also the historically accurate one.
+    """
+    if not snapshot:
+        return True
+    return str(snapshot.get("profile") or "").strip().lower() in _OFF_NAMES
+
+
+def config_from_snapshot(snapshot: dict | None) -> ModelRoutingConfig | None:
+    """Rebuild the routing config a snapshot froze, or ``None`` when it is off.
+
+    The inverse of :func:`routing_snapshot`, used by resume to replay a run's
+    original routing *without* re-reading the profile table, the per-repo
+    override file, or the overrides — the snapshot alone decides. Missing
+    escalation fields fall back to the Balanced defaults so a hand-written or
+    partially-populated snapshot still yields a usable config rather than
+    raising mid-run.
+    """
+    if is_routing_off(snapshot):
+        return None
+    assert snapshot is not None  # narrowed by is_routing_off
+    stage_models = {
+        str(k): str(v) for k, v in (snapshot.get("stage_models") or {}).items()
+    }
+    escalatable = snapshot.get("escalatable_stages")
+    pinned = snapshot.get("pinned_stages")
+    return ModelRoutingConfig(
+        profile=str(snapshot.get("profile")),
+        stage_models=stage_models,
+        points_threshold=int(snapshot.get("points_threshold", BALANCED.points_threshold)),
+        escalation_model=str(snapshot.get("escalation_model") or OPUS),
+        escalatable_stages=(
+            frozenset(escalatable) if escalatable is not None
+            else BALANCED.escalatable_stages
+        ),
+        pinned_stages=frozenset(pinned or ()),
+    )
+
+
+def routing_banner(snapshot: dict) -> list[str]:
+    """Render the run-start routing banner for ``snapshot`` (one string per line).
+
+    Names the resolved profile, the effective per-stage map after overrides, and
+    the escalation thresholds in effect — the three things that decide what a run
+    spends. The off state prints **loudly** (an upper-case ``MODEL ROUTING OFF``
+    line) because it is the expensive state: every stage falls back to the CLI
+    default, which is whatever the CLI ships that day.
+    """
+    agent_cmd = str(snapshot.get("agent_cmd") or "")
+    if is_routing_off(snapshot):
+        lines = [
+            "MODEL ROUTING OFF: CLI default model used for ALL stages "
+            "(set --model-routing=balanced, or model_profile, to engage routing)"
+        ]
+    else:
+        stage_models = snapshot.get("stage_models") or {}
+        mapping = " ".join(f"{s}={m}" for s, m in sorted(stage_models.items()))
+        lines = [
+            f"model routing: profile={snapshot.get('profile')}",
+            f"model routing: map {mapping}",
+            "model routing: escalation → "
+            f"{snapshot.get('escalation_model')} on high-risk or points >= "
+            f"{snapshot.get('points_threshold')} "
+            f"(stages: {','.join(snapshot.get('escalatable_stages') or [])})",
+        ]
+        pinned = snapshot.get("pinned_stages") or []
+        if pinned:
+            lines.append(
+                f"model routing: pinned to {snapshot.get('escalation_model')}: "
+                f"{','.join(pinned)}"
+            )
+    overrides = snapshot.get("overrides") or {}
+    if overrides:
+        pins = " ".join(f"{s}={m}" for s, m in sorted(overrides.items()))
+        lines.append(f"model routing: explicit --model overrides win: {pins}")
+    if agent_cmd:
+        lines.append(
+            f"model routing: SDLC_AGENT_CMD overrides the whole agent command "
+            f"({agent_cmd}) — its own model selection wins"
+        )
+    return lines
