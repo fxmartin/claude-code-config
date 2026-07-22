@@ -175,6 +175,28 @@ def test_registry_harness_model_survives_a_telemetry_free_result(
     assert _stage_models(db)[("build", 1)] == "acme-pro"
 
 
+def test_stage_set_model_never_overwrites_a_resolved_model_with_empty(
+    tmp_path,
+) -> None:
+    """An empty observed model leaves the resolved one alone.
+
+    The AC forbids coercing an unknown model to a placeholder — and it must not
+    blank out a model `stage_start` already resolved either, or a harness run
+    with no telemetry would regress to NULL.
+    """
+    ledger = Ledger(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "serial")
+    ledger.story_upsert(
+        run_id, "28.1-002", "28", "t", "must", 1, "python", "", None, "TODO"
+    )
+    ledger.stage_start(run_id, "28.1-002", "build", 1, model="acme-pro")
+
+    ledger.stage_set_model(run_id, "28.1-002", "build", 1, "")
+
+    assert _stage_models(ledger.db_path)[("build", 1)] == "acme-pro"
+
+
 # ---------------------------------------------------------------------------
 # The stream-json helpers the recording is built on
 # ---------------------------------------------------------------------------
