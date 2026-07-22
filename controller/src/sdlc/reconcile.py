@@ -364,7 +364,16 @@ def reconcile_run(
             {"story_id": sid, "from_status": r.get("status"), "signal": signal, "sha": sha}
         )
 
-    statuses = {row["story_id"]: row["status"] for row in ledger.story_rows(rid)}
+    # Story 28.1-003: a batch run's run-level phases (e.g. doc-update) hang their
+    # stage on a story-less anchor row so their spend can be metered. That anchor
+    # is not a story, and its status is outside the story vocabulary, so counting
+    # it here would read as a permanent leftover and pin a fully-landed run to
+    # NEEDS_ATTENTION. Real stories always carry an id; anchors never do.
+    statuses = {
+        row["story_id"]: row["status"]
+        for row in ledger.story_rows(rid)
+        if row["story_id"]
+    }
     after = _compute_terminal(statuses)
     completed = sum(1 for v in statuses.values() if v == "DONE")
     failed = sum(1 for v in statuses.values() if v == "FAILED")

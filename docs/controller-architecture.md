@@ -1500,6 +1500,15 @@ inflating the run's done/failed counts. `doc-update` is not one of the fixed
 stage history. A single-issue `sdlc fix` never reaches this phase (the PostToolUse
 hook covers those) and its telemetry is unchanged.
 
+Reconciliation treats the anchor the same way. `reconcile_run` derives the run
+terminal from the per-story statuses, and `PHASE` is neither `DONE` nor `SKIPPED`,
+so an unfiltered pass would read the anchor as a permanent leftover and pin an
+otherwise fully-landed batch to `NEEDS_ATTENTION` — the exact "residual
+disagreement" Story 28.1-003 rules out. The terminal and the completed/failed
+tallies therefore skip story-less rows: real stories always carry an id, run-level
+phase anchors never do. The anchor is also outside `_PARKED`, so it is never a
+reclassification candidate.
+
 ### The in-process-agent boundary (Story 20.6-002)
 
 Epic-20 makes the controller's dispatch path **cross-harness**: `build-stories`
