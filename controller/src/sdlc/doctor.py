@@ -480,10 +480,11 @@ def check_model_coverage(
     * **FAIL** — a ``DONE`` attempt on the most recent run has no model *and its
       own transcript names one*. The recording had the model in hand and dropped
       it, so that is a live regression (AC3).
-    * **WARN** — older or non-DONE NULLs, and DONE NULLs with no recoverable
-      model: a genuine history gap, fixable with ``sdlc model-backfill`` where
-      the transcript survives.
-    * **CLEAN** — every dispatched attempt is attributed.
+    * **WARN** — older or non-DONE NULLs whose transcript still names a model: a
+      genuine history gap, and ``sdlc model-backfill`` closes it.
+    * **CLEAN** — every dispatched attempt is attributed, or the only NULLs left
+      are ones no pass can attribute. Those stay *counted* in the detail; the
+      coverage share, not the severity, is what reports them.
 
     Read-only, like every other doctor check: rows are *reported*, never coerced
     to a placeholder, so the column's true coverage is what is shown.
@@ -566,7 +567,15 @@ def check_model_coverage(
             ),
             remedy,
         )
-    if audit.residual:
+    # Same narrowing, one severity down: WARN only where the remedy can act.
+    # An UNRECOVERABLE row has no attribution to recover anywhere, so warning on
+    # it prints a `model-backfill` that updates 0 rows and leaves the check WARN
+    # forever — a permanent `sdlc doctor --exit-code` 1 nothing can clear. It
+    # stays counted in `detail` above, which is what AC2 ("counted and reported,
+    # never coerced") asks for. This matches `check_usage_agreement`, which
+    # WARNs on STILL_DIVERGENT alone and leaves its structurally-unverifiable
+    # NO_LOG / NO_USAGE rows clean.
+    if counts.get(RECOVERABLE):
         return Finding("model", name, "WARN", detail, remedy)
     return Finding("model", name, "CLEAN", detail)
 
