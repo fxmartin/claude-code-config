@@ -389,6 +389,31 @@ def test_ledger_story_prediction_accessor(tmp_path) -> None:
     }
 
 
+def test_story_prediction_missing_db_reads_as_no_forecast(tmp_path) -> None:
+    """A ledger whose file was never created reads as "no forecast"."""
+    ledger = Ledger(tmp_path / "never-created.db")
+    assert ledger.story_prediction("run", "28.3-001") is None
+
+
+def test_story_prediction_pre_migration_ledger_reads_as_no_forecast(
+    tmp_path,
+) -> None:
+    """A pre-28.2-002 ledger (stories table without prediction columns)
+    degrades to "no forecast" instead of raising, so routing falls back
+    cleanly to the points-keyed path."""
+    import sqlite3
+
+    db = tmp_path / "ledger.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE stories (run_id TEXT, story_id TEXT, status TEXT NOT NULL, "
+        "  PRIMARY KEY(run_id, story_id))"
+    )
+    conn.commit()
+    conn.close()
+    assert Ledger(db).story_prediction("run", "28.3-001") is None
+
+
 def test_low_confidence_fallback_is_logged(tmp_path, monkeypatch) -> None:
     """AC3: the fallback to points-keyed escalation is stated, not silent."""
     ledger = Ledger(tmp_path / "ledger.db")
