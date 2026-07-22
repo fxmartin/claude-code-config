@@ -1,6 +1,7 @@
 # Epic 25: Reliable High-Risk-Block Recognition
 
-> **Status: PLANNED (0/1)** — created 2026-06-30 from a live observation of the epic-23 resume run.
+> **Status: COMPLETE (1/1)** — 25.1-001 implemented, tested, and merged 2026-07-15 (PR #450).
+> Created 2026-06-30 from a live observation of the epic-23 resume run.
 > Story 12.3-003 added the `AWAITING_APPROVAL` terminal state so a merge blocked *only* by the
 > high-risk human-approval gate is reported honestly (parked, work preserved) instead of burning the
 > bugfix loop and reading FAILED. That detection fired correctly on the first epic-23 run (23.3-001

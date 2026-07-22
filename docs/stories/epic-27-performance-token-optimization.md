@@ -1,6 +1,7 @@
 # Epic 27: Performance & Token Optimization
 
-> **Status: PLANNED (0/12)** — created 2026-07-11 from a data-verified analysis of past runs: live
+> **Status: COMPLETE (12/12)** — all 12 stories implemented, tested, and merged 2026-07-15/16
+> (27.0-001 → 27.3-004, PRs #465-#476). Created 2026-07-11 from a data-verified analysis of past runs: live
 > ledgers (nix-install clone + local-code-bench), 212 stage logs with usage/cost, and 472 session
 > transcripts since 2026-06-10. Headline findings: the controller path is already well-routed
 > (≈ $9/story, build 58% of cost), but the **interactive/Agent-tool path runs 94% of its token
