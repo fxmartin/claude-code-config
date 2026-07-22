@@ -121,10 +121,13 @@ Flags:
                             stage before spend. A $-value converts to a notional
                             token ceiling; 0 = estimate only, no gate (default)
   --model-routing=PROFILE   per-stage model map: balanced | quality-first |
-                            quota-max | off (default off = CLI default for all
-                            stages). Balanced cuts quota burn; the adversarial
-                            skeptic keeps an Opus floor on high-risk / large
-                            stories and tiers down to Sonnet on low-risk ones
+                            quota-max | off. DEFAULT: balanced — routing is on
+                            unless you pass an explicit `off`, which falls back
+                            to the CLI default model for every stage. Balanced
+                            cuts quota burn; the adversarial skeptic keeps an
+                            Opus floor on high-risk / large stories and tiers
+                            down to Sonnet on low-risk ones. Every run prints
+                            and ledger-logs the routing it resolved
   --model-<stage>=MODEL     pin one stage's model, winning over the map (escape
                             hatch), e.g. --model-build=opus --model-merge=haiku
   --harness ROLE=NAME,...   route pipeline roles to harnesses from the registry

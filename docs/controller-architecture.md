@@ -1061,7 +1061,7 @@ the metrics per version is a follow-up, not something the report does today.
   `run_resume`, exactly like the dispatch it precedes.
   `Ledger.story_set_prediction` writes `predicted_tokens`,
   `predicted_rework_prob`, `predictor_version` and `prediction_confidence` onto
-  the story row (Migration 15).
+  the story row (Migration 16).
 - **After the story finishes.** `_reconcile_story_prediction` calls
   `Ledger.story_reconcile_prediction`, which sums the story's recorded per-stage
   usage and derives whether it entered rework, writing `actual_tokens` /
@@ -2206,7 +2206,7 @@ actual Y tokens (±Z%)` event. The persisted reconciliation is the
 usage columns on the same stage row (ledger Migration 3), which is also what
 feeds the next run's historical calibration.
 
-## Per-task model routing (Story 14.2-001)
+## Per-task model routing (Story 14.2-001, engaged by default in Story 28.4-001)
 
 Not every stage needs Opus. `sdlc build --model-routing=<profile>` dispatches
 each pipeline stage on a model matched to its cognitive load, cutting quota burn
@@ -2214,6 +2214,72 @@ where quality is not at stake while pinning the strong tier where it is. The map
 lives in `sdlc/model_routing.py` as a frozen `ModelRoutingConfig` (per-stage map
 + escalation policy), and `select_model(stage, config, *, points, high_risk)` is
 the single chooser.
+
+### Routing states
+
+There are exactly two, and the difference is what an **absent** setting means:
+
+| `model_profile` | Effective routing |
+|---|---|
+| unset (absent / empty) | **Balanced** — the shipped default map below |
+| `balanced` / `quality-first` / `quota-max` | that profile |
+| `off` / `none` (explicit only) | no `--model` on any stage; the CLI default model runs everything |
+| anything else | hard error (a typo must never quietly re-route a high-stakes stage) |
+
+**Story 28.4-001 flipped the default.** Under the original Story 14.2-001
+semantics an empty `model_profile` meant "routing off" — and empty was the state
+of every run, so the cost control never actually engaged. The 2026-07-19 dataset
+(336 session logs, 374 stage attempts) shows the signature: zero Sonnet sessions
+anywhere, `merge` — mechanical fetch/resolve/PR work — running 37 times on Opus
+4.8 and 33 on Fable 5 (11.6% of spend), and the model tracking whatever the CLI
+default of the day was (all Opus in June, all Fable 5 in July), which is what no
+`--model` flag being passed looks like. A governance control that fails
+silent-and-expensive is worse than no control, so an unset profile now resolves
+to Balanced and only an explicit `off` disables routing.
+
+**Every run announces its routing.** Before the first dispatch, `run_build`
+prints a banner to stderr and writes the same lines to the run's events with
+`source='routing'`: the resolved profile, the effective per-stage map *after*
+every override, and the escalation thresholds in effect. Routing off logs at
+`warn` and prints loudly —
+`MODEL ROUTING OFF: CLI default model used for ALL stages` — so the expensive
+state is never mistaken for routine. `sdlc status --markdown` and the dashboard
+render the same facts post-hoc from the run row (below), alongside the per-stage
+model each attempt actually ran on (the `stages.model` column, Story 28.1-002).
+
+**`sdlc doctor` guards against the regression** (`check_model_routing`): it
+reports the routing that governed the most recent run — CLEAN with the profile
+name when engaged, **WARN** when off on an attended single-story run, and
+**FAIL** when off on an *unattended-looking* one (a batch of more than one story,
+or a `--budget` ceiling set — nobody is watching those, and a budget means cost
+was explicitly a concern). `run_build` raises the same warning in its preflight
+banner.
+
+### Resolve-and-freeze (resume identity)
+
+The controller guarantees a resumed run behaves identically to the original
+(Epic-10 resume machinery, Epic-12 resume discipline), so the flip must never
+reach an in-flight run. Two rules enforce that:
+
+1. **The whole resolved config is frozen, not just the profile name.**
+   `_resolve_run_routing` resolves once at run creation — profile, effective
+   per-stage map after overrides, escalation thresholds, and whether
+   `SDLC_AGENT_CMD` replaced the agent command — and `Ledger.run_set_routing`
+   persists it as JSON on the `runs.model_routing` column (Migration 15).
+   `run_resume` reads it back with `Ledger.run_routing` and replays it via
+   `config_from_snapshot`, never re-reading `.sdlc-model-routing.yaml` or the
+   overrides. Freezing only the *name* would be insufficient: a resume that
+   re-derived the map from the name could still pick up an edited config file.
+   A deliberate routing change on resume is out of scope for a plain resume — it
+   would need an explicit re-resolve flag.
+2. **Legacy runs are migrated, not reinterpreted.** Runs created before the flip
+   persisted `model_profile: ""`, which meant off then and would mean Balanced
+   now. Migration 15 carries a data backfill (`_MIGRATION_BACKFILLS`) stamping
+   every pre-existing run row with an explicit `off` snapshot, so resuming one
+   keeps its original routing-off behaviour rather than being silently upgraded.
+   A run row with no snapshot at all reads as off for the same reason.
+
+### The Balanced map
 
 The shipped default profile is **Balanced**:
 
@@ -2259,9 +2325,10 @@ and the adversarial Opus floor). Precedence, highest first:
 1. an explicit per-stage `--model-<stage>=<model>` flag (the escape hatch);
 2. a `SDLC_AGENT_CMD` override — the custom command owns its own model, so the
    routed model never decorates it (`resolve_agent_cmd` returns it untouched);
-3. the routing profile's `select_model`;
-4. routing off (`--model-routing` unset / `off`) → **no `--model`**, so the CLI
-   default (Opus today) stands and behaviour is byte-for-byte unchanged.
+3. the routing profile's `select_model` — which, since Story 28.4-001, is
+   reached on an unset `--model-routing` too (it resolves to Balanced);
+4. routing explicitly off (`--model-routing=off`) → **no `--model`**, so the CLI
+   default model stands for every stage.
 
 The high-risk signal (`_story_high_risk`) matches the story branch's changed
 files against the Epic-08 risk-gate patterns, best-effort (any git/import error

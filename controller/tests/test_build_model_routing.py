@@ -16,7 +16,7 @@ from sdlc.build import (
 )
 from sdlc.cohort import Story
 from sdlc.dispatch import AgentResult
-from sdlc.model_routing import HAIKU, OPUS, SONNET
+from sdlc.model_routing import BALANCED, HAIKU, OPUS, SONNET
 
 _PAYLOADS = {
     "build": {"branch_name": "feature/x", "build_status": "SUCCESS", "commit_sha": "a"},
@@ -63,12 +63,15 @@ def _run(opts: BuildOptions, story: Story, tmp_path) -> _ModelRecordingDispatche
 
 
 # ---------------------------------------------------------------------------
-# Routing off (default) = unchanged behaviour: no --model on any stage
+# Routing off = the CLI default on every stage. Since Story 28.4-001 this is
+# reached only by an *explicit* `off`; an unset profile now routes Balanced.
 # ---------------------------------------------------------------------------
 
 
-def test_routing_off_by_default_dispatches_no_model(tmp_path) -> None:
-    opts = BuildOptions(scope="epic-14", skip_preflight=True, sequential=True)
+def test_explicit_routing_off_dispatches_no_model(tmp_path) -> None:
+    opts = BuildOptions(
+        scope="epic-14", skip_preflight=True, sequential=True, model_profile="off",
+    )
     disp = _run(opts, _story(), tmp_path)
     assert disp.models == {"build": None, "coverage": None, "review": None, "merge": None}
 
@@ -156,15 +159,15 @@ def test_explicit_per_stage_override_wins_over_map(tmp_path, monkeypatch) -> Non
 
 
 def test_override_works_even_with_routing_off(tmp_path, monkeypatch) -> None:
-    """An explicit per-stage --model is honoured even when no profile is set."""
+    """An explicit per-stage --model is honoured even with routing explicitly off."""
     monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
     opts = BuildOptions(
         scope="epic-14", skip_preflight=True, sequential=True,
-        model_overrides={"build": "haiku"},
+        model_profile="off", model_overrides={"build": "haiku"},
     )
     disp = _run(opts, _story(points=1), tmp_path)
     assert disp.models["build"] == HAIKU
-    assert disp.models["coverage"] is None  # unset stage stays CLI-default
+    assert disp.models["coverage"] is None  # unrouted stage stays CLI-default
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +176,15 @@ def test_override_works_even_with_routing_off(tmp_path, monkeypatch) -> None:
 
 
 def test_select_stage_model_off_returns_none() -> None:
-    opts = BuildOptions()
+    opts = BuildOptions(model_profile="off")
     assert _select_stage_model("build", _story(), opts) is None
+
+
+def test_select_stage_model_defaults_to_the_balanced_map() -> None:
+    """Story 28.4-001: with no profile configured, the Balanced map governs."""
+    opts = BuildOptions()
+    assert _select_stage_model("build", _story(points=1), opts) == SONNET
+    assert _select_stage_model("merge", _story(points=1), opts) == HAIKU
 
 
 def test_select_stage_model_override_beats_profile() -> None:
@@ -211,10 +221,13 @@ def test_parse_unknown_stage_override_raises() -> None:
         parse_build_args(["--model-bogus=opus"])
 
 
-def test_parse_routing_off_is_default() -> None:
+def test_parse_leaves_profile_unset_which_now_means_balanced() -> None:
+    """No `--model-routing` leaves the profile unset — which Story 28.4-001
+    resolves to Balanced, not to routing-off."""
     opts = parse_build_args(["epic-14"])
     assert opts.model_profile == ""
     assert opts.model_overrides == {}
+    assert build_mod._routing_config_for(opts) is BALANCED
 
 
 def test_parse_rejects_overrides_for_unrouted_stages() -> None:
@@ -503,7 +516,8 @@ def test_story_high_risk_off_short_circuits(monkeypatch) -> None:
         raise AssertionError("subprocess.run must not be called when routing is off")
 
     monkeypatch.setattr(build_mod.subprocess, "run", _must_not_run)
-    for profile in ("", "off", "none", "  OFF  "):
+    # Story 28.4-001: "" is no longer an off value — only an explicit off/none is.
+    for profile in ("off", "none", "  OFF  "):
         opts = BuildOptions(model_profile=profile)
         assert build_mod._story_high_risk(_story(), opts) is False
 

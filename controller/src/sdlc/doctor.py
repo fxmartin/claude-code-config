@@ -14,6 +14,7 @@ from typing import Callable
 
 from sdlc.build import _MIGRATIONS, Ledger, status_snapshot
 from sdlc.ledger_view import default_db_path
+from sdlc.model_routing import is_routing_off
 from sdlc.registry import Registry, derive_state
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "Finding",
     "DoctorReport",
     "check_model_coverage",
+    "check_model_routing",
     "check_usage_agreement",
     "run_doctor",
     "worst_status",
@@ -602,6 +604,75 @@ def _default_dep_probe(tool: str) -> bool:
     return proc.returncode == 0
 
 
+def check_model_routing(db_path: Path) -> Finding:
+    """Report whether model routing was engaged on the most recent run (28.4-001).
+
+    Routing off is not a neutral setting: every stage falls back to the CLI
+    default model, so mechanical work (merge, reask) bills at whatever the CLI
+    ships that day. That is precisely how the control failed before this story —
+    374 stage attempts, zero Sonnet sessions, while the operator believed routing
+    was on — so doctor states the routing that actually governed the last run
+    rather than leaving it to be inferred.
+
+    Severity follows how unsupervised the off state was:
+
+    * **FAIL** — routing off on an *unattended-looking* run: a batch of more than
+      one story, or a ``--budget`` ceiling set. Nobody is watching those, and a
+      budget ceiling means cost was explicitly a concern.
+    * **WARN** — routing off on a single-story, unbudgeted run (attended).
+    * **CLEAN** — routing engaged; the finding names the governing profile.
+
+    Read-only, like every other doctor check.
+    """
+    name = "Model routing engaged"
+    if not db_path.exists():
+        return Finding(
+            "routing", name, "CLEAN", "no ledger yet — no run to report routing for"
+        )
+    ledger = Ledger(db_path)
+    try:
+        rid = ledger.latest_run_id()
+        routing = ledger.run_routing(rid) if rid else {}
+        config = ledger.run_config(rid) if rid else {}
+        run_row = ledger.run_row(rid) if rid else None
+    except sqlite3.DatabaseError as exc:
+        # A corrupt/unreadable ledger is already a FAIL from check_ledger.
+        return Finding(
+            "routing", name, "WARN",
+            f"model routing could not be read: {exc}",
+            "fix the ledger first (see the ledger finding above)",
+        )
+    if rid is None:
+        return Finding("routing", name, "CLEAN", "no runs yet")
+
+    if not is_routing_off(routing):
+        return Finding(
+            "routing", name, "CLEAN",
+            f"last run routed on profile '{routing.get('profile')}'",
+        )
+
+    batch = int((run_row or {}).get("total_stories") or 0)
+    budget = int(config.get("budget") or 0)
+    where = f"last run {rid[:8]}"
+    remedy = (
+        "engage routing: `sdlc build --model-routing=balanced` (or unset "
+        "`model_profile` — it now defaults to balanced)"
+    )
+    if batch > 1 or budget:
+        why = f"batch of {batch} stories" if batch > 1 else f"--budget={budget}"
+        return Finding(
+            "routing", name, "FAIL",
+            f"MODEL ROUTING OFF on {where}, which looks unattended ({why}) — "
+            "every stage billed at the CLI default model",
+            remedy,
+        )
+    return Finding(
+        "routing", name, "WARN",
+        f"MODEL ROUTING OFF on {where} — every stage billed at the CLI default model",
+        remedy,
+    )
+
+
 def check_dependencies(probe: Callable[[str], bool]) -> list[Finding]:
     """One finding per external dependency: CLEAN when present, WARN when absent."""
     findings: list[Finding] = []
@@ -674,6 +745,7 @@ def run_doctor(
         check_config(repo_root),
         check_usage_agreement(db_path),
         check_model_coverage(db_path),
+        check_model_routing(db_path),
     ]
     findings.extend(check_dependencies(dep_probe))
     return DoctorReport(findings=findings)

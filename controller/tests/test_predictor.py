@@ -617,7 +617,7 @@ def test_training_rows_skip_stories_with_no_measured_usage(tmp_path: Path) -> No
 
 
 def _unmigrated_ledger(db: Path) -> Ledger:
-    """A ledger predating both the 28.2-001 discovery columns and Migration 15.
+    """A ledger predating both the 28.2-001 discovery columns and Migration 16.
 
     Built with raw sqlite rather than :meth:`Ledger.init`, precisely so the
     read-only prediction queries meet a `stories` table that lacks the columns
