@@ -17,6 +17,7 @@ from sdlc.build import (
     _CostGatePause,
     _dispatch_ready_queue,
     _honor_parked_reset,
+    _log_predictor_posture,
     _log_routing_banner,
     _make_rate_limit_context,
     _prepare_story_workdir,
@@ -257,6 +258,10 @@ def _options_from_config(
         # the same isolation. Defaults to the host path for runs that predate the
         # field. (``SDLC_SANDBOX`` also covers resume directly at dispatch time.)
         sandbox=bool(config.get("sandbox", False)),
+        # Story 28.2-002: carry the predictor flag so a resumed run keeps
+        # predicting + reconciling its remaining stories. Defaults to off for
+        # runs that predate the field — unchanged behaviour.
+        predict=bool(config.get("predict", False)),
     )
 
 
@@ -432,6 +437,9 @@ def run_resume(
         opts, clock=clock, sleep_fn=sleep_fn,
         baseline=ledger.run_usage_totals(rid)["tokens"],
     )
+    # Story 28.2-002: a resume re-establishes the run's predictor posture from the
+    # persisted config, so it re-notes a disabled predictor once — same as build.
+    _log_predictor_posture(ledger, rid, opts)
     # Honour a persisted park reset time before dispatching anything: a run
     # resumed *before* its window reopens must wait (within cap) or re-park,
     # never dispatch early into a still-closed window.

@@ -33,6 +33,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/reconcile.py` | Verifies parked stories against `origin/main` and recomputes the run terminal — shared by close-out and `sdlc reconcile` (Stories 12.3-001/12.3-002). |
 | `sdlc/usage_reconcile.py` | Ledger-vs-logs usage reconciliation — re-derives per-stage token/cost usage from the session transcripts, backfills the correct attempt row, and scores the agreement rate (Story 28.1-001). |
 | `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
+| `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
@@ -1005,6 +1006,144 @@ value onto a NULL row, so a second pass finds it `recorded` and writes nothing.
 
 `--json` emits `{run_ids, applied, dispatched, populated, unrecoverable,
 coverage, counts, updated, residual}`.
+
+## Per-story cost + rework prediction (Story 28.2-002)
+
+The Story 14.1-002 estimate answers "how big is *this stage's prompt*". It cannot
+answer "what will this whole story cost, and is it likely to bounce through
+review". `sdlc/predictor.py` does, by training on the factory's own reconciled
+history — the usage Story 28.1-001 fixed and the discovery features Story
+28.2-001 extracted — instead of on a story-point guess.
+
+### The model, deliberately crude
+
+Two numbers per story, both derived from one inspectable formula:
+
+1. **Cohort mean.** Walk a three-rung ladder — `band+risk` → `band` → `global` —
+   and take the first rung holding at least `MIN_COHORT_SAMPLE` (5) reconciled
+   stories. `band` is the scope proxy bucketed `s`/`m`/`l` (≤3 / ≤8 / >8 distinct
+   files-or-areas named); `risk` is the story inventory's `**Risk Level**:`
+   normalised to `low`/`med`/`high`. This mirrors `historical_stage_tokens`'
+   harness+model ladder, one level up at the story.
+2. **Feature adjustment.** Nudge that mean by the discovery features relative to
+   their reference values: `±15%` per acceptance-criterion-count doubling, `±20%`
+   per scope-proxy doubling, `+5%` per dependency-depth level, clamped to
+   `[0.5×, 2×]`. Rework probability starts at the cohort's *observed* rework rate
+   and takes the same three features additively, clamped to `[2%, 95%]`.
+
+The weights are **priors, not fitted coefficients** — the reconciled dataset was
+n=76 when this shipped, far too thin to fit on, and the clamps exist so a crude
+linear nudge cannot produce an absurd number for an outlier. The measured part is
+the cohort mean; the adjustment is deliberately small so the measurement
+dominates. Every prediction carries an inspectable `basis` string naming the
+cohort, its sample size and the applied multiplier.
+
+**Why not the points band the AC names.** Story 28.2-001 established that points
+are near-constant on this factory's work (172 of 193 builds carried one of two
+values), so a points band is effectively a single bucket and would key every
+story into the same cohort. The band is therefore cut from the scope proxy — a
+files-touched proxy the AC itself names as an input — and points stay the
+descriptive label 28.2-001 demoted them to.
+
+**Versioned.** `PREDICTOR_VERSION` is stamped onto every recorded prediction and
+must be bumped alongside any weight, band edge or ladder change. `predict-quality`
+pools every scored row into one median regardless of version and reports the
+distinct versions in the sample next to it, so a sample straddling a re-tuning is
+*visible* — read it as a mixed sample, not as the new model's error. Segmenting
+the metrics per version is a follow-up, not something the report does today.
+
+### Record before, reconcile after
+
+- **Before dispatch.** `_predict_story_cost` runs in `_run_story_rate_limited` —
+  past every gate, with the story genuinely about to run, and before the first
+  stage dispatch — so the forecast is committed ahead of the work it forecasts
+  and can never be quietly fitted to the outcome. It is shared by `run_build` and
+  `run_resume`, exactly like the dispatch it precedes.
+  `Ledger.story_set_prediction` writes `predicted_tokens`,
+  `predicted_rework_prob`, `predictor_version` and `prediction_confidence` onto
+  the story row (Migration 16).
+- **After the story finishes.** `_reconcile_story_prediction` calls
+  `Ledger.story_reconcile_prediction`, which sums the story's recorded per-stage
+  usage and derives whether it entered rework, writing `actual_tokens` /
+  `actual_rework` onto the **same** row. This extends the 14.1-002
+  estimate-vs-actual store from the stage row up to the story row: scoring quality
+  later is a join, not a re-computation. A parked (rate-limited) story is *not*
+  reconciled — its usage is still accruing — so the resume that finishes it does
+  the reconciliation. Idempotent: both figures are absolute assignments.
+- **A rolled-back story is un-predicted.** `sdlc rollback` → `Ledger.reset_story`
+  deletes the story's stage rows, and `actual_tokens`/`actual_rework` are derived
+  from exactly those rows — so the reset clears the prediction *and* the actuals
+  together. Otherwise the report would score a discarded attempt as the story's
+  real outcome. The 28.2-001 discovery features describe the spec, not the
+  attempt, and survive the reset.
+- **Rework is defined observably**: any `bugfix` stage row, or a **pipeline**
+  stage (`build`/`coverage`/`review`/`merge`) with an attempt beyond the first or
+  a FAILED attempt. The retry clauses are scoped to the pipeline stages on
+  purpose: `bugfix`/`reask`/`commitlint` rows share one monotonic per-story
+  sequence in `attempt` (`bugfix_seq`, so their inserts cannot collide on the
+  stages primary key), so a second *successful* commit-lint amend sits at
+  `attempt = 2` with nothing having been retried. The envelope re-ask and the
+  commit-lint amend are recovery *dispatches*, not review retries, and do not
+  count alone — including when they themselves fail, since the pipeline stage
+  they serve records that retry on its own row.
+- **Training reads the tables, not the prediction columns.**
+  `Ledger.prediction_training_rows` derives history from `stories` + `stages`
+  directly, so it accumulates whether or not the predictor was ever enabled — the
+  first run with `--predict` on still has something to learn from. Only `DONE`
+  stories are trainable (`_TRAINABLE_STORY_STATES`): every other post-dispatch
+  status is *parked*, not finished — `run_resume` re-enters anything outside
+  `{DONE, SKIPPED}` that still owes a stage — so a `FAILED` /
+  `NEEDS_ATTENTION` / `AWAITING_APPROVAL` row would present a partial token total
+  as the story's full cost and bias the cohort mean low. Stories no stage recorded
+  usage for are excluded too (they would drag the mean toward zero — the same
+  all-NULL exclusion `historical_stage_tokens` applies).
+
+### Low confidence is never suppressed
+
+A prediction is flagged `low` — and the flag is reported everywhere the numbers
+are — when **any** of:
+
+- it fell back to the **global** mean (its band, or its band+risk pair, was too
+  thin);
+- the whole ledger holds fewer than `MIN_GLOBAL_SAMPLE` (10) reconciled stories;
+- any *discovery* feature is unknown. A story whose scope proxy the epic never
+  stated has no band to key on, so both band rungs are skipped entirely rather
+  than pooled into a fake "unknown" bucket — unknown is not zero, and it is not a
+  cohort either.
+
+With **no** reconciled history at all the predictor returns nothing and logs why;
+the run degrades to the 14.1-002 point-keyed stage estimate rather than inventing
+a number from an empty ledger.
+
+### Measuring the predictor
+
+**`sdlc predict-quality [run] [--db PATH] [--json]`** scores every recorded
+prediction against its reconciled actual:
+
+- **median absolute error** of predicted vs actual tokens (and the median
+  absolute *percentage* error), with its sample size;
+- a **rework calibration summary** — predicted-probability buckets (0–.25, …,
+  .75–1) each showing predicted mean vs observed rate and its own `n` — plus a
+  Brier score;
+- the **low-confidence share** and every predictor version in the sample.
+
+Rows whose actual is still unknown are excluded from *that* metric rather than
+scored as agreement, so an unreconciled ledger reports an honest "no sample"
+instead of a vacuous zero error. Every figure carries its `n` for the same
+reason: a small error over three low-confidence predictions is not a calibrated
+model, and the report must not let it read as one.
+
+### Off by default, safe to roll out
+
+`--predict` (persisted in the run config, so a resume keeps the posture) enables
+the whole path. Without it the controller behaves exactly as today — the 14.1-002
+stage estimate and gate, unchanged — and logs a note saying so **once per run**
+(`_log_predictor_posture`, at run start). Per run, not per story: the posture is a
+property of the run, and the flag is off by default, so a per-story note would add
+an advisory `events` row per story to every build for a feature nobody enabled.
+Everything on the
+enabled path is best-effort too: a predictor or ledger fault degrades to `None`
+and the story dispatches exactly as it would have.
 
 ## Clean (workspace garbage collection)
 
