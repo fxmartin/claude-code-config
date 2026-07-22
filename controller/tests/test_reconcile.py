@@ -953,3 +953,85 @@ def test_reconcile_registry_oserror_is_best_effort(tmp_path: Path) -> None:
 
     assert result.run_status_after == "DONE"
     assert [r["story_id"] for r in result.reclassified] == ["99.1-202"]
+
+
+# --- Story 28.1-003: the batch doc-update phase anchor is not a story -------
+
+
+def _seed_phase_anchor(db_path: Path, run_id: str) -> None:
+    """Add the story-less ``doc-update`` anchor row a batch run writes.
+
+    Mirrors ``_run_doc_update``: a ``PHASE``-status row with an empty
+    ``story_id`` that exists only to satisfy the ``stages`` → ``stories``
+    foreign key so the phase's tokens/cost can be metered.
+    """
+    from sdlc.fix_issue import _BATCH_PHASE_STATUS
+
+    ledger = Ledger(db_path)
+    ledger.story_upsert(
+        run_id, "", "", "batch doc-update", "", None, "", "", None,
+        _BATCH_PHASE_STATUS,
+    )
+    ledger.stage_start(run_id, "", "doc-update", 1)
+    ledger.stage_finish(run_id, "", "doc-update", 1, "DONE")
+
+
+def test_doc_update_anchor_does_not_block_done_terminal(tmp_path: Path) -> None:
+    """A reconciled batch run terminals DONE despite the doc-update anchor.
+
+    Story 28.1-003 AC4: the anchor row must reconcile like any other stage
+    rather than surfacing as a residual disagreement. It is neither DONE nor
+    SKIPPED, so an unfiltered ``_compute_terminal`` would read it as a leftover
+    and pin an otherwise fully-landed run to NEEDS_ATTENTION.
+    """
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-301", new=True)
+    _commit(root, "land.py", "x = 1\n", "feat: land (#99.1-301)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-301")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-301", "FAILED", 301)])
+    _seed_phase_anchor(db, run_id)
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-301"]
+    assert result.run_status_after == "DONE"
+    # The anchor is left exactly as written — never reclassified, never parked.
+    assert _status(db, run_id, "") == "PHASE"
+
+
+def test_doc_update_anchor_excluded_from_reconciled_counts(tmp_path: Path) -> None:
+    """The anchor inflates neither the completed nor the failed run tally."""
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-302", new=True)
+    _commit(root, "land.py", "x = 1\n", "feat: land (#99.1-302)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-302")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-302", "FAILED", 302)])
+    _seed_phase_anchor(db, run_id)
+
+    reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    run_row = Ledger(db).run_row(run_id)
+    assert run_row["completed"] == 1  # not 2 — the anchor is not a story
+    assert run_row["failed"] == 0
+
+
+def test_doc_update_anchor_alone_is_nothing_to_reconcile(tmp_path: Path) -> None:
+    """An all-DONE batch plus the anchor has nothing parked → untouched no-op."""
+    root = _init_repo(tmp_path)
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-303", "DONE", 303)])
+    _seed_phase_anchor(db, run_id)
+    Ledger(db).run_update_status(run_id, "DONE")
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert result.reclassified == []
+    assert result.run_status_after == "DONE"
+    assert not result.changed
