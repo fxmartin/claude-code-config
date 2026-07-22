@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 
 from sdlc.cohort import Story
@@ -45,6 +46,24 @@ _ANY_HEADING = re.compile(r"^#{1,6}\s")
 # truncate the embedded spec mid-block (the exact failure AC2's "no truncated
 # specs ever injected" forbids; regression: epic-05 story 5.3-001).
 _CODE_FENCE = re.compile(r"^\s*(```|~~~)")
+
+# --- Story 28.2-001: predictor features -------------------------------------
+# The `**Acceptance Criteria**:` label opening the AC block, and the generic
+# `**Label**:` form of the *next* metadata block that closes it (Technical Notes,
+# Definition of Done, Dependencies, ...). Bullets are counted at column 0 only —
+# a criterion that wraps onto an indented continuation line is one criterion.
+_AC_HEADER = re.compile(r"^\*\*Acceptance\s+Criteria\*\*", re.IGNORECASE)
+_BOLD_LABEL = re.compile(r"^\*\*[^*]+\*\*\s*:")
+_TOP_BULLET = re.compile(r"^[-*]\s+")
+# Inline-code spans; the ones that look like a path become the scope proxy.
+_CODE_SPAN = re.compile(r"`([^`\n]+)`")
+# A path-ish token: no whitespace, and either directory-qualified or carrying a
+# source/doc file extension. Keeps `controller/src/sdlc/build.py` and `README.md`
+# while rejecting prose spans like `points`, `story.points`, or `12.3-001`.
+_PATH_EXT = (
+    ".py", ".md", ".sh", ".nix", ".ts", ".tsx", ".js", ".json",
+    ".yaml", ".yml", ".toml", ".sql", ".cfg", ".ini",
+)
 
 _STORY_DIR_CANDIDATES = ("docs/stories", "stories")
 
@@ -99,6 +118,93 @@ def _parse_dependency_edges(content: str, self_id: str) -> list[str]:
     return [d for d in _DEP_ID.findall(head) if d != self_id]
 
 
+def _acceptance_criteria_count(section_lines: list[str]) -> int | None:
+    """Count the acceptance criteria a story states, or ``None`` when unknown.
+
+    Reads the top-level bullets between the ``**Acceptance Criteria**:`` label
+    and the next ``**Label**:`` metadata block (Technical Notes, Definition of
+    Done, ...) or heading. Continuation lines are indented, so a criterion that
+    wraps stays one criterion.
+
+    Returns ``None`` — *unknown*, never ``0`` — when the story states no AC block
+    or an empty one (Story 28.2-001 AC4): a missing feature must reach the
+    predictor as missing, not as a real "this story has zero criteria".
+    """
+    count = 0
+    in_block = False
+    for line in section_lines:
+        if _AC_HEADER.match(line):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        if _ANY_HEADING.match(line) or _BOLD_LABEL.match(line):
+            break
+        if _TOP_BULLET.match(line):
+            count += 1
+    return count or None
+
+
+def _scope_proxy(section_lines: list[str]) -> int | None:
+    """Count the distinct files/areas a story names, or ``None`` when unknown.
+
+    The scope proxy is the number of distinct path-like inline-code spans in the
+    story's section — the closest thing an epic states about how much surface a
+    story touches. Repeats collapse (a file named in both the AC and the
+    Technical Notes is one area).
+
+    Returns ``None`` when the story names none (Story 28.2-001 AC4): the epic did
+    not state the feature, so it is unknown rather than a real zero-file story.
+    """
+    paths = {
+        span
+        for line in section_lines
+        for span in _CODE_SPAN.findall(line)
+        if not any(ch.isspace() for ch in span)
+        and ("/" in span or span.endswith(_PATH_EXT))
+    }
+    return len(paths) or None
+
+
+def _dependency_depths(records: list[dict]) -> dict[str, int | None]:
+    """Longest dependency chain per story id, or ``None`` when unknowable.
+
+    A story that states ``**Dependencies**: None`` is a root (depth 0); one that
+    depends on a depth-``d`` story is ``d + 1``. Two cases resolve to *unknown*
+    rather than a number (Story 28.2-001 AC4):
+
+    * the story states **no** ``**Dependencies**:`` line at all — the epic did
+      not say, so the depth is missing, not zero;
+    * the story sits on a dependency cycle — the chain has no length. Discovery
+      records that as unknown and never raises; a genuine cycle is still a hard
+      error where it matters, at :func:`~sdlc.cohort.compute_cohorts`.
+
+    A dependency on a story outside this epic counts as one level (the edge is
+    real even though the predecessor's own chain is not visible here), as does a
+    dependency on a story whose depth is itself unknown.
+    """
+    edges: dict[str, list[str] | None] = {
+        r["id"]: (list(r["dependencies"]) if "dependencies" in r else None)
+        for r in records
+    }
+    # Only stories that stated a Dependencies line are resolvable; the rest stay
+    # unknown and count as depth-0 predecessors for anything depending on them.
+    pending = {sid: deps for sid, deps in edges.items() if deps is not None}
+    resolved: dict[str, int] = {}
+    while pending:
+        ready = [
+            sid
+            for sid, deps in pending.items()
+            if all(dep not in pending for dep in deps)
+        ]
+        if not ready:
+            break  # every remaining story is on a cycle → unknown, not a crash
+        for sid in ready:
+            deps = pending.pop(sid)
+            resolved[sid] = max((resolved.get(d, 0) + 1 for d in deps), default=0)
+    return {sid: resolved.get(sid) for sid in edges}
+
+
 def _epic_id_from_story(story_id: str) -> str:
     """`7.3-001` → `07` style epic id (the leading major number, zero-padded)."""
     major = story_id.split(".", 1)[0]
@@ -127,10 +233,20 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
     the leading edge list of a ``Dependencies`` line is read (story ids in
     parenthetical/sentence prose are ignored) so explanatory prose cannot create
     a phantom dependency cycle — see :func:`_parse_dependency_edges`.
+
+    Story 28.2-001: each record additionally carries the predictor features —
+    ``ac_count``, ``dep_depth``, and ``scope_proxy`` — extracted from the same
+    parse. A feature the epic does not state enough to compute is ``None``
+    (unknown), never ``0``. ``points`` is unchanged and stays a descriptive scope
+    label, not a machine input.
     """
     text = epic_path.read_text(encoding="utf-8")
     epic_name = _epic_name(epic_path)
     stories: list[Story] = []
+    # The raw per-story dicts, kept alongside the Story records so dependency
+    # depth can be computed across the whole epic once parsing finishes (it needs
+    # the other stories' edges, and whether each stated a Dependencies line).
+    records: list[dict] = []
 
     current: dict | None = None
 
@@ -146,6 +262,7 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
         if current is None:
             return
         sid = current["id"]
+        records.append(current)
         stories.append(
             Story(
                 id=sid,
@@ -160,6 +277,10 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
                 done=_is_done(current),
                 # Trailing blank lines are noise between stories, not spec.
                 section="\n".join(current["section_lines"]).rstrip(),
+                # Story 28.2-001 predictor features. `dep_depth` needs the whole
+                # epic's graph, so it is patched in after the parse loop.
+                ac_count=_acceptance_criteria_count(current["section_lines"]),
+                scope_proxy=_scope_proxy(current["section_lines"]),
             )
         )
 
@@ -199,7 +320,11 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
             current["dependencies"] = _parse_dependency_edges(m.group(1), current["id"])
 
     _flush()
-    return stories
+
+    # Story 28.2-001: dependency depth is a whole-graph feature, so it is
+    # resolved once the epic is fully parsed and grafted onto the frozen records.
+    depths = _dependency_depths(records)
+    return [replace(s, dep_depth=depths.get(s.id)) for s in stories]
 
 
 def _story_dir(root: Path) -> Path | None:

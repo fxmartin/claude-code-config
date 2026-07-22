@@ -173,6 +173,11 @@ def story_labels(
     Always: the `story` marker label, ``epic:NN`` and ``feature:NN.F``. Adds
     ``points:N`` and ``risk:*`` only when known, so a malformed/unpointed story
     still carries the structural labels rather than ``points:None``.
+
+    Story 28.2-001: ``points:N`` is a **descriptive scope label** for humans
+    reading the issue — a size hint, not a machine input. The predictor keys on
+    the features discovery extracts (``ac_count`` / ``dep_depth`` /
+    ``scope_proxy``), never on this label.
     """
     labels = [STORY_LABEL, f"epic:{epic}", f"feature:{feature}"]
     if points is not None:

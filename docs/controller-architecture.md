@@ -76,8 +76,8 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    stubbed-`run_build`, and fake-dispatcher tests all still pass with the sentinel
    set (Story 12.1-002).
 2. **Discovery** — `discover_queue(scope)` parses `##### Story X.Y-NNN:` headers
-   from `docs/stories/epic-*.md`, extracting priority, points, and intra-project
-   dependencies.
+   from `docs/stories/epic-*.md`, extracting priority, points, intra-project
+   dependencies, and the [predictor features](#predictor-features-and-points-as-metadata-story-282-001).
 
    **Dependencies-line convention (Story 12.5-001).** Edge extraction reads only
    the *leading edge list* of a `**Dependencies**:` line — the run of bare
@@ -470,6 +470,45 @@ registry-discovery mode (`sdlc dashboard` with no `--db`) migrates *every*
 discovered run's own ledger up front (`_migrate_registry_ledgers`), best-effort
 — a missing/corrupt ledger is skipped rather than failing startup, since the
 read paths already tolerate an unreachable ledger.
+
+### Predictor features, and points as metadata (Story 28.2-001)
+
+The 2026-07-19 dataset showed story points do **not** predict a story's cost on
+this factory's own work: 172 of 193 builds carried one of two point values, so
+the label is near-constant and carries almost no signal. Epic-28 replaces it with
+features the predictor can actually key on. Discovery extracts three, per story,
+from the same `parse_epic_file` pass, and they ride the `Story` record into the
+ledger's `stories` table (Migration 13):
+
+| Feature | Column | Extracted from |
+|---------|--------|----------------|
+| `ac_count` | `ac_count` | Top-level bullets under the story's `**Acceptance Criteria**:` block, up to the next `**Label**:` block or heading. A criterion that wraps onto an indented continuation line stays one criterion. |
+| `dep_depth` | `dep_depth` | Longest dependency chain reaching the story, resolved across the epic's graph. `**Dependencies**: None` is depth 0; a dependency on a depth-`d` story is `d + 1`; an edge to a story outside the epic counts as one level. |
+| `scope_proxy` | `scope_proxy` | Count of **distinct** path-like inline-code spans in the story's section (`controller/src/sdlc/build.py`, `README.md`, …) — the epic's own statement of how much surface the story touches. A file named twice counts once. |
+
+**Unknown is not zero.** A feature the epic does not state enough to compute is
+recorded as `None` / SQL `NULL`, never `0`, so the predictor treats it as
+*missing* rather than as a genuinely tiny story. That covers a story with no
+acceptance-criteria block, one naming no files, one stating no `**Dependencies**:`
+line at all, and — defensively — one sitting on a dependency cycle (discovery
+records unknown depth and never raises; a real cycle is still a hard error where
+it matters, in `compute_cohorts`).
+
+**Points survive, demoted.** `**Story Points**:` is still parsed, still written
+to `Story.points` and the `stories.points` column, and still rendered as the
+human-facing `points:N` issue label, the story doc's own line, and the dashboard
+size hint. It is a **descriptive scope label**: the machine reads the features
+above (and, from Story 28.2-002, the prediction derived from them), not the
+label. (The one remaining machine reader of `story.points` is the Epic-14
+model-escalation threshold, which Story 28.3-001 re-keys onto predicted tokens
+and rework risk.)
+
+**Additive and backward compatible.** The three `Story` fields default to unknown,
+so a synthesized story (`fix-issue`, `sdlc runlog`) and every pre-28.2 caller stay
+valid unchanged; `Ledger.story_upsert`'s new arguments are keyword-only with
+`None` defaults, so existing positional call sites are untouched; and Migration 13
+leaves every pre-existing story row — `points` included — exactly as it was, with
+NULL (unknown) features. Epic-22/Epic-11 story consumers see only new columns.
 
 ### Story inventory: projecting the MD specs (Story 22.1-002)
 

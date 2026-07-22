@@ -121,7 +121,7 @@ def test_ensure_migrated_ledger_predating_migrations_table(tmp_path: Path) -> No
 
     assert _USAGE_COLS <= _columns(db, "stages")
     assert _EVENT_COLS <= _columns(db, "events")
-    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
 
 def test_ensure_migrated_no_db_is_noop_and_creates_nothing(tmp_path: Path) -> None:
@@ -135,7 +135,7 @@ def test_ensure_migrated_is_idempotent(tmp_path: Path) -> None:
     _old_schema_db(db)
     Ledger(db).ensure_migrated()
     Ledger(db).ensure_migrated()  # second pass must not raise (no duplicate ALTER)
-    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
 
 def test_ensure_migrated_on_fresh_db_is_noop(tmp_path: Path) -> None:
@@ -179,7 +179,7 @@ def test_ensure_migrated_concurrent_launches_are_safe(tmp_path: Path) -> None:
 
     assert errors == []  # no double-apply ALTER crash, no busy-timeout failure
     assert _USAGE_COLS <= _columns(db, "stages")
-    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # each migration recorded exactly once
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # each migration recorded exactly once
 
 
 # --- auto-migrate at verb launch -------------------------------------------
@@ -329,7 +329,7 @@ def test_migrate_registry_ledgers_dedupes_shared_db(tmp_path: Path) -> None:
     _migrate_registry_ledgers(registry)  # must not raise on the duplicate db
 
     assert _USAGE_COLS <= _columns(shared_db, "stages")  # migrated exactly once
-    assert _versions(shared_db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # no double-apply via the dupe record
+    assert _versions(shared_db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # no double-apply via the dupe record
 
 
 def test_migrate_registry_ledgers_skips_corrupt_existing_db(tmp_path: Path) -> None:
@@ -359,3 +359,30 @@ def test_migrate_registry_ledgers_skips_corrupt_existing_db(tmp_path: Path) -> N
     _migrate_registry_ledgers(registry)  # corrupt db must not abort the loop
 
     assert _USAGE_COLS <= _columns(good_db, "stages")  # the valid ledger migrated
+
+
+# --- Story 28.2-001: predictor-feature columns -------------------------------
+
+# The three predictor-feature columns Story 28.2-001 adds to `stories`.
+_FEATURE_COLS = {"ac_count", "dep_depth", "scope_proxy"}
+
+
+def test_ensure_migrated_adds_predictor_feature_columns(tmp_path: Path) -> None:
+    """AC3: a pre-28.2 ledger gains the feature columns; its rows are untouched."""
+    db = tmp_path / "old.db"
+    _old_schema_db(db, with_run=True)
+    assert not (_FEATURE_COLS & _columns(db, "stories"))
+
+    Ledger(db).ensure_migrated()
+
+    assert _FEATURE_COLS <= _columns(db, "stories")
+    conn = sqlite3.connect(db)
+    try:
+        row = conn.execute(
+            "SELECT status, ac_count, dep_depth, scope_proxy FROM stories "
+            "WHERE run_id='r1' AND story_id='s1'"
+        ).fetchone()
+    finally:
+        conn.close()
+    # Pre-existing rows keep their data and read as unknown (NULL), not zero.
+    assert row == ("IN_PROGRESS", None, None, None)

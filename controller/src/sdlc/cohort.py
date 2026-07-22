@@ -20,6 +20,12 @@ class Story:
     epic_name: str
     epic_file: str
     priority: str
+    # Story 28.2-001: `points` is a **descriptive scope label** — a human-facing
+    # size hint carried onto the story doc, the issue (`points:N`) and the
+    # dashboard. It is not a predictor feature: the 2026-07-19 dataset showed
+    # points do not predict cost on this factory's own work, and 172/193 builds
+    # carried the same two values. Machine decisions read the features below (and,
+    # from Story 28.2-002, the prediction derived from them) instead.
     points: int
     agent_type: str
     dependencies: list[str] = field(default_factory=list)
@@ -33,6 +39,19 @@ class Story:
     # epic (Story 27.3-002). Empty for synthesized stories (fix-issue) — the
     # renderers then fall back to the read-it-yourself instruction.
     section: str = ""
+    # Story 28.2-001: predictor features extracted at discovery time — the inputs
+    # the cost/rework predictor (Story 28.2-002) keys on instead of `points`.
+    # ``None`` means **unknown**, never zero: the epic did not state enough to
+    # compute the feature, so the predictor must treat it as missing rather than
+    # as a genuinely small story. All three default to unknown so a synthesized
+    # story (fix-issue, runlog) and any pre-28.2 caller stay valid unchanged.
+    #
+    # * ``ac_count``    — acceptance criteria the story states.
+    # * ``dep_depth``   — longest dependency chain reaching this story.
+    # * ``scope_proxy`` — distinct files/areas the story names (scope proxy).
+    ac_count: int | None = None
+    dep_depth: int | None = None
+    scope_proxy: int | None = None
 
 
 def compute_cohorts(queue: list[Story]) -> list[list[Story]]:
