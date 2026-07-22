@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.38.0] - 2026-07-22
+
+### Added
+
+- feat(empirical-estimation): verified per-attempt model (#28.1-002)
+
+### Fixed
+
+- fix(empirical-estimation): verified per-attempt model (#28.1-002)
+- fix(estimation): key harness+model cohort on the normalized model tier
+- fix(empirical-estimation): verified per-attempt model (#28.1-002)
+- fix(empirical-estimation): verified per-attempt model (#28.1-002)
+
+
 ## [v2.37.0] - 2026-07-22
 
 ### Added
