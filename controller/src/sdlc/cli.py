@@ -1569,8 +1569,10 @@ def model_backfill(
         )
 
     if dry_run:
-        # Nothing was written, so "updated" is always empty — report the rows the
-        # pass *would* attribute instead of a misleading zero.
+        # Nothing was written, so "updated" is always empty — report the rows
+        # still missing a model instead of a misleading zero. That count spans
+        # both residual reasons, so it is the size of the gap, not a promise of
+        # what a real pass would attribute (the unrecoverable share never will).
         summary = (
             f"model-backfill (dry-run): {len(result.residual)} row(s) without a model"
         )

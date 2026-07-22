@@ -21,6 +21,7 @@ from sdlc.doctor import (
     run_doctor,
     worst_status,
 )
+from sdlc.model_backfill import backfill_models
 from sdlc.registry import Registry, RunRecord
 
 runner = CliRunner()
@@ -639,7 +640,7 @@ def test_model_coverage_does_not_fail_a_reconcile_synthesized_done_row(
     `sdlc doctor --exit-code` would then exit 2 forever.
     """
     finding = check_model_coverage(_model_ledger(tmp_path, model=None))
-    assert finding.status == "WARN"
+    assert finding.status == "CLEAN"
     assert "unrecoverable=1" in finding.detail
     assert "regress" not in finding.detail.lower()
 
@@ -662,9 +663,49 @@ def test_model_coverage_reports_unrecoverable_rows_without_coercing_them(
     finding = check_model_coverage(
         _model_ledger(tmp_path, model=None, status="FAILED", log="plain text\n")
     )
-    assert finding.status == "WARN"
+    assert finding.status == "CLEAN"
     assert "unrecoverable=1" in finding.detail
     assert "0/1" in finding.detail
+
+
+def test_model_coverage_stays_clean_when_the_remedy_would_change_nothing(
+    tmp_path: Path,
+) -> None:
+    """An unrecoverable-only residual is not a WARN: no remedy can clear it.
+
+    A plain-text `SDLC_AGENT_CMD` transcript names no model anywhere, so
+    `model-backfill` updates zero rows against it. WARNing would print a remedy
+    that provably does nothing and pin `sdlc doctor --exit-code` to 1 forever —
+    the same argument the FAIL branch already makes one severity up. The rows
+    stay *counted* in the detail (AC2: reported, never coerced), which is what
+    the coverage number is for.
+    """
+    db = _model_ledger(tmp_path, model=None, status="FAILED", log="plain text\n")
+
+    applied = backfill_models(Ledger(db), all_runs=True, apply=True)
+
+    assert applied.updated == []  # the remedy is a provable no-op here
+    assert check_model_coverage(db).status == "CLEAN"
+
+
+def test_model_coverage_warns_on_the_recoverable_share_of_a_mixed_residual(
+    tmp_path: Path,
+) -> None:
+    """One backfillable row is enough to warn, even beside unrecoverable ones."""
+    db = _model_ledger(tmp_path, model=None, status="FAILED", log="plain text\n")
+    ledger = Ledger(db)
+    run_id = ledger.list_runs(limit=1)[0]["id"]
+    ledger.stage_start(run_id, "28.1-002", "review", 1, model=None)
+    ledger.stage_finish(run_id, "28.1-002", "review", 1, "FAILED")
+    (Path(f"{db}.logs") / run_id / "28.1-002-review-1.log").write_text(
+        _MODEL_RESULT_LINE, encoding="utf-8"
+    )
+
+    finding = check_model_coverage(db)
+
+    assert finding.status == "WARN"
+    assert "recoverable=1" in finding.detail and "unrecoverable=1" in finding.detail
+    assert "model-backfill" in finding.remedy
 
 
 def test_model_coverage_ignores_rows_that_never_dispatched(tmp_path: Path) -> None:
@@ -695,7 +736,7 @@ def test_model_coverage_caps_the_listed_residual_rows(tmp_path: Path) -> None:
 
     finding = check_model_coverage(db)
 
-    assert finding.status == "WARN"
+    assert finding.status == "CLEAN"
     assert "0/7" in finding.detail
     assert "unrecoverable=7" in finding.detail
     assert "+2 more" in finding.detail

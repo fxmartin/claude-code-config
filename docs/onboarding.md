@@ -154,7 +154,7 @@ If you installed the controller CLI (`bash scripts/install-controller.sh`), `sdl
 sdlc doctor
 ```
 
-It checks install integrity (managed `~/.claude` symlinks), the ledger schema + integrity, stuck/stale runs, config validity, and dependency availability (`gh`, `claude`, `semgrep`, `osv-scanner`). Each line is `[CLEAN|WARN|FAIL] <check> — <detail>` with a `↳ remedy:` for anything that is not clean — follow the remedy to fix it yourself. `sdlc doctor --exit-code` exits non-zero (1 for WARN, 2 for FAIL) for use in scripts, and `--json` emits a machine-readable report.
+It checks install integrity (managed `~/.claude` symlinks), the ledger schema + integrity, stuck/stale runs, config validity, dependency availability (`gh`, `claude`, `semgrep`, `osv-scanner`), and two telemetry-quality scores over your recent runs: ledger-vs-logs usage agreement (remedy `sdlc usage-reconcile --all`) and per-stage model attribution (remedy `sdlc model-backfill --all`). Those two only warn about rows a remedy can actually repair — history nothing can attribute is counted in the detail and left `CLEAN`, so `--exit-code` stays usable in scripts. Each line is `[CLEAN|WARN|FAIL] <check> — <detail>` with a `↳ remedy:` for anything that is not clean — follow the remedy to fix it yourself. `sdlc doctor --exit-code` exits non-zero (1 for WARN, 2 for FAIL) for use in scripts, and `--json` emits a machine-readable report.
 
 ### Share your state when asking for help
 

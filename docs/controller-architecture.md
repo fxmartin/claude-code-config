@@ -1083,10 +1083,13 @@ it on the next real run).
     model in hand and dropped it. A `DONE` NULL with *no* recoverable model is
     not a regression — `reconcile_run` synthesizes DONE stage rows for a
     parked-then-landed story without dispatching an agent, and a plain-text
-    `SDLC_AGENT_CMD` harness names no model — so those, like older or non-`DONE`
-    NULLs, are a `WARN`, remedy `sdlc model-backfill --all`. Rows whose model is
-    genuinely unrecoverable are
-    counted as such — never coerced to a placeholder. Read-only:
+    `SDLC_AGENT_CMD` harness names no model. Severity then follows the same rule
+    as the usage check: only the `recoverable` share — NULLs whose transcript
+    still names a model — is a `WARN`, remedy `sdlc model-backfill --all`. Rows
+    whose model is genuinely `unrecoverable` stay `CLEAN`, because no pass can
+    attribute them and warning would print a remedy that updates nothing; they
+    remain counted in the coverage share and listed in the detail — never
+    coerced to a placeholder. Read-only:
     [`model-backfill`](#per-stage-model-attribution-story-281-002) is the verb
     that writes.
   - **Dependencies** — one finding per external tool (`gh`, `claude`, `semgrep`,
