@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sdlc.build import Ledger
-from sdlc.model_routing import is_routing_off
+from sdlc.model_routing import BALANCED, is_routing_off
 
 __all__ = ["state_report", "format_state", "format_markdown", "format_routing"]
 
@@ -77,12 +77,19 @@ def format_routing(routing: dict) -> list[str]:
     mapping = " ".join(
         f"{s}={m}" for s, m in sorted((routing.get("stage_models") or {}).items())
     )
+    # Legacy (pre-28.3-001) snapshots carry no prediction thresholds; render the
+    # Balanced defaults config_from_snapshot replays for them.
+    tokens_bar = routing.get(
+        "predicted_tokens_threshold", BALANCED.predicted_tokens_threshold
+    )
+    rework_bar = routing.get("rework_threshold", BALANCED.rework_threshold)
     lines = [
         f"**Model routing: `{routing.get('profile')}`** — {mapping}",
         "",
-        f"Escalates to {routing.get('escalation_model')} on high-risk or points ≥ "
-        f"{routing.get('points_threshold')} "
-        f"({', '.join(routing.get('escalatable_stages') or [])}).",
+        f"Escalates to {routing.get('escalation_model')} on high-risk, predicted "
+        f"tokens ≥ {tokens_bar:,}, or predicted rework ≥ {rework_bar} "
+        f"({', '.join(routing.get('escalatable_stages') or [])}; predictor "
+        f"fallback: points ≥ {routing.get('points_threshold')}).",
         "",
     ]
     overrides = routing.get("overrides") or {}

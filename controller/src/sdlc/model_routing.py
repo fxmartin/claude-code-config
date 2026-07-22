@@ -1,5 +1,5 @@
 # ABOUTME: Per-task model routing (Story 14.2-001) — pick a model per pipeline stage.
-# ABOUTME: Ships a Balanced default map with risk/points escalation and a pinned Opus skeptic.
+# ABOUTME: Balanced default map; escalates on risk + predicted cost/rework (28.3-001), points as fallback.
 
 from __future__ import annotations
 
@@ -46,6 +46,48 @@ OFF = "off"
 # that need correctness, Opus only where a high-risk / large story earns it.
 DEFAULT_PROFILE = "balanced"
 
+# Story 28.3-001: default prediction-keyed escalation thresholds. Escalation now
+# keys on the Story 28.2-002 forecast — predicted story-total tokens (all stages,
+# cache reads included, the same figure the predictor reconciles against) or
+# predicted rework probability — instead of `story.points`, which the 2026-07-19
+# dataset showed carries almost no cost signal (172/193 builds on one of two
+# values). Like the predictor's own weights these defaults are documented
+# **priors anchored to that dataset's scale**, not fitted cut points — n=76
+# reconciled stories is far too thin to fit thresholds on. 2M predicted tokens
+# (~$30 notional at the documented $15/Mtok rate) marks a story predicted to sit
+# in the heavy tail of the factory's own story totals, and an even-odds rework
+# forecast means the cheap tier is more likely than not to pay for a retry. Both
+# are per-repo overridable via `.sdlc-model-routing.yaml`
+# (`predicted_tokens_threshold` / `rework_threshold`) — the calibration lever as
+# a repo's own reconciled history accumulates.
+DEFAULT_PREDICTED_TOKENS_THRESHOLD = 2_000_000
+DEFAULT_REWORK_THRESHOLD = 0.5
+
+
+@dataclass(frozen=True)
+class EscalationSignal:
+    """The Story 28.2-002 prediction, shaped as routing input (Story 28.3-001).
+
+    Deliberately a tiny local mirror of the predictor's committed figures rather
+    than an import of :class:`sdlc.predictor.StoryPrediction` — routing stays
+    decoupled from the predictor module, and the signal a resume replays comes
+    from the ledger row, not a live re-prediction. ``None`` figures mean the
+    predictor did not state that number; ``low_confidence`` mirrors the
+    committed ``prediction_confidence`` flag.
+    """
+
+    predicted_tokens: int | None = None
+    rework_probability: float | None = None
+    low_confidence: bool = False
+
+    @property
+    def confident(self) -> bool:
+        """Usable as the escalation input: confident and carrying ≥1 figure."""
+        return not self.low_confidence and (
+            self.predicted_tokens is not None
+            or self.rework_probability is not None
+        )
+
 
 @dataclass(frozen=True)
 class ModelRoutingConfig:
@@ -53,15 +95,18 @@ class ModelRoutingConfig:
 
     ``stage_models`` maps a pipeline stage name to the model alias it runs on by
     default. ``escalatable_stages`` are the stages that escalate to
-    ``escalation_model`` when a story is high-risk or large (points ≥
-    ``points_threshold``). ``pinned_stages`` always run on ``escalation_model``
-    regardless of profile or signal (Story 14.2-001) — a still-supported
-    mechanism, though no shipped profile pins a stage after Story 27.2-002 moved
-    the adversarial skeptic from pinned to escalatable: its Opus is now a *floor*
-    paid only on high-risk / large stories, so a low-risk story tiers it down.
-    The dataclass is frozen so a shared profile constant can be handed around
-    without any caller mutating it; overrides build a new instance via
-    :func:`dataclasses.replace`.
+    ``escalation_model`` when a story is high-risk or, since Story 28.3-001,
+    when a confident 28.2-002 prediction crosses ``predicted_tokens_threshold``
+    or ``rework_threshold``. ``points_threshold`` survives as the Epic-14
+    **fallback** bar, applied only when no confident prediction is available
+    (predictor disabled / no history / low-confidence). ``pinned_stages`` always
+    run on ``escalation_model`` regardless of profile or signal (Story 14.2-001)
+    — a still-supported mechanism, though no shipped profile pins a stage after
+    Story 27.2-002 moved the adversarial skeptic from pinned to escalatable: its
+    Opus is now a *floor* paid only on high-risk / predicted-heavy stories, so a
+    low-risk story tiers it down. The dataclass is frozen so a shared profile
+    constant can be handed around without any caller mutating it; overrides
+    build a new instance via :func:`dataclasses.replace`.
     """
 
     profile: str
@@ -70,6 +115,10 @@ class ModelRoutingConfig:
     escalation_model: str = OPUS
     escalatable_stages: frozenset[str] = frozenset({"build", "review", "adversarial"})
     pinned_stages: frozenset[str] = frozenset()
+    # Story 28.3-001: the prediction-keyed escalation bars (see the module-level
+    # DEFAULT_* rationale). A confident prediction at/above either escalates.
+    predicted_tokens_threshold: int = DEFAULT_PREDICTED_TOKENS_THRESHOLD
+    rework_threshold: float = DEFAULT_REWORK_THRESHOLD
 
 
 # --- Built-in profiles ------------------------------------------------------
@@ -107,7 +156,11 @@ QUALITY_FIRST = ModelRoutingConfig(
         "bugfix": OPUS,
         "reask": OPUS,
     },
-    points_threshold=1,  # always already at the top tier; escalation is a no-op
+    # Always already at the top tier; escalation (points fallback or
+    # prediction-keyed) is a no-op, so the bars are set trivially low.
+    points_threshold=1,
+    predicted_tokens_threshold=1,
+    rework_threshold=0.0,
 )
 
 QUOTA_MAX = ModelRoutingConfig(
@@ -124,8 +177,11 @@ QUOTA_MAX = ModelRoutingConfig(
         "reask": HAIKU,
     },
     # Escalate only the genuinely large/high-stakes build/review so the cheap
-    # path stays the common path; a higher bar than Balanced.
+    # path stays the common path; a higher bar than Balanced on both the
+    # prediction-keyed thresholds (28.3-001) and the points fallback.
     points_threshold=13,
+    predicted_tokens_threshold=2 * DEFAULT_PREDICTED_TOKENS_THRESHOLD,
+    rework_threshold=0.75,
 )
 
 _PROFILES: dict[str, ModelRoutingConfig] = {
@@ -168,8 +224,9 @@ def select_model(
     stage: str,
     config: ModelRoutingConfig | None,
     *,
-    points: int = 0,
+    fallback_points: int = 0,
     high_risk: bool = False,
+    signal: EscalationSignal | None = None,
 ) -> str | None:
     """Choose the model for ``stage`` under ``config``, or ``None`` for CLI-default.
 
@@ -180,9 +237,20 @@ def select_model(
     A pinned stage always returns ``escalation_model`` regardless of profile or
     signal (no shipped profile pins a stage; the mechanism stays for overrides /
     future profiles). An escalatable stage (build/review/adversarial) returns
-    ``escalation_model`` when the story is high-risk or large (``points ≥
-    points_threshold``); otherwise its mapped default tier. The adversarial
-    skeptic is escalatable so its Opus is a *floor* — paid on high-risk / large
+    ``escalation_model`` when the story is high-risk (the Epic-08 ``risk_gate``
+    input, unchanged by Story 28.3-001) or when its escalation signal fires:
+
+    * with a **confident** ``signal`` (the story's committed 28.2-002
+      prediction), escalation keys on predicted cost — ``predicted_tokens ≥
+      predicted_tokens_threshold`` or ``rework_probability ≥ rework_threshold``.
+      ``fallback_points`` is deliberately ignored on this path: the calibrated
+      forecast, not the noisy point label, decides (Story 28.3-001).
+    * with no signal, or a low-confidence one, the Epic-14 fallback applies —
+      ``fallback_points ≥ points_threshold`` — so a disabled/uncalibrated
+      predictor degrades to today's behaviour (the caller logs the fallback).
+
+    Otherwise the stage runs its mapped default tier. The adversarial skeptic is
+    escalatable so its Opus is a *floor* — paid on high-risk / predicted-heavy
     stories, tiered down to its cheap base (Sonnet) for a low-risk story (Story
     27.2-002); tiering can never downgrade a high-risk story below the floor.
     """
@@ -193,9 +261,20 @@ def select_model(
     base = config.stage_models.get(stage)
     if base is None:
         return None
-    if stage in config.escalatable_stages and (
-        high_risk or points >= config.points_threshold
-    ):
+    if stage not in config.escalatable_stages:
+        return base
+    if high_risk:
+        return config.escalation_model
+    if signal is not None and signal.confident:
+        heavy = (
+            signal.predicted_tokens is not None
+            and signal.predicted_tokens >= config.predicted_tokens_threshold
+        ) or (
+            signal.rework_probability is not None
+            and signal.rework_probability >= config.rework_threshold
+        )
+        return config.escalation_model if heavy else base
+    if fallback_points >= config.points_threshold:
         return config.escalation_model
     return base
 
@@ -235,7 +314,11 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
 
     * ``profile`` — re-select the base built-in profile (applied first);
     * ``stages`` — a mapping of stage → model alias, merged over the base map;
-    * ``points_threshold`` — an int that replaces the escalation threshold;
+    * ``points_threshold`` — an int that replaces the Epic-14 fallback threshold;
+    * ``predicted_tokens_threshold`` — an int replacing the predicted-token
+      escalation bar (Story 28.3-001);
+    * ``rework_threshold`` — a number in [0, 1] replacing the predicted-rework
+      escalation bar (Story 28.3-001);
     * ``escalation_model`` — the model a stage escalates / is pinned to.
 
     The override is additive: any stage it omits keeps the base profile's value,
@@ -280,6 +363,20 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
             raise ValueError("'points_threshold' must be an integer")
         threshold = raw_threshold
 
+    tokens_threshold = cfg.predicted_tokens_threshold
+    if "predicted_tokens_threshold" in section:
+        raw_tokens = section["predicted_tokens_threshold"]
+        if not isinstance(raw_tokens, int) or isinstance(raw_tokens, bool):
+            raise ValueError("'predicted_tokens_threshold' must be an integer")
+        tokens_threshold = raw_tokens
+
+    rework_threshold = cfg.rework_threshold
+    if "rework_threshold" in section:
+        raw_rework = section["rework_threshold"]
+        if not isinstance(raw_rework, (int, float)) or isinstance(raw_rework, bool):
+            raise ValueError("'rework_threshold' must be a number")
+        rework_threshold = float(raw_rework)
+
     escalation_model = cfg.escalation_model
     if "escalation_model" in section:
         if not isinstance(section["escalation_model"], str):
@@ -290,6 +387,8 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
         cfg,
         stage_models=stage_models,
         points_threshold=threshold,
+        predicted_tokens_threshold=tokens_threshold,
+        rework_threshold=rework_threshold,
         escalation_model=escalation_model,
     )
 
@@ -371,6 +470,8 @@ def routing_snapshot(
         "profile": config.profile,
         "stage_models": stage_models,
         "points_threshold": config.points_threshold,
+        "predicted_tokens_threshold": config.predicted_tokens_threshold,
+        "rework_threshold": config.rework_threshold,
         "escalation_model": config.escalation_model,
         "escalatable_stages": sorted(config.escalatable_stages),
         "pinned_stages": sorted(config.pinned_stages),
@@ -413,6 +514,14 @@ def config_from_snapshot(snapshot: dict | None) -> ModelRoutingConfig | None:
         profile=str(snapshot.get("profile")),
         stage_models=stage_models,
         points_threshold=int(snapshot.get("points_threshold", BALANCED.points_threshold)),
+        predicted_tokens_threshold=int(
+            snapshot.get(
+                "predicted_tokens_threshold", BALANCED.predicted_tokens_threshold
+            )
+        ),
+        rework_threshold=float(
+            snapshot.get("rework_threshold", BALANCED.rework_threshold)
+        ),
         escalation_model=str(snapshot.get("escalation_model") or OPUS),
         escalatable_stages=(
             frozenset(escalatable) if escalatable is not None
@@ -440,13 +549,21 @@ def routing_banner(snapshot: dict) -> list[str]:
     else:
         stage_models = snapshot.get("stage_models") or {}
         mapping = " ".join(f"{s}={m}" for s, m in sorted(stage_models.items()))
+        # Legacy (pre-28.3-001) snapshots carry no prediction thresholds; render
+        # them from the Balanced defaults config_from_snapshot would replay.
+        tokens_bar = snapshot.get(
+            "predicted_tokens_threshold", BALANCED.predicted_tokens_threshold
+        )
+        rework_bar = snapshot.get("rework_threshold", BALANCED.rework_threshold)
         lines = [
             f"model routing: profile={snapshot.get('profile')}",
             f"model routing: map {mapping}",
             "model routing: escalation → "
-            f"{snapshot.get('escalation_model')} on high-risk or points >= "
-            f"{snapshot.get('points_threshold')} "
-            f"(stages: {','.join(snapshot.get('escalatable_stages') or [])})",
+            f"{snapshot.get('escalation_model')} on high-risk, predicted tokens >= "
+            f"{tokens_bar:,}, or predicted rework >= {rework_bar} "
+            f"(stages: {','.join(snapshot.get('escalatable_stages') or [])}; "
+            "predictor fallback: points >= "
+            f"{snapshot.get('points_threshold')})",
         ]
         pinned = snapshot.get("pinned_stages") or []
         if pinned:

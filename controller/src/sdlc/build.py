@@ -64,6 +64,7 @@ from sdlc.predictor import (
     predict_story,
 )
 from sdlc.model_routing import (
+    EscalationSignal,
     ModelRoutingConfig,
     OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
     config_from_snapshot,
@@ -818,6 +819,13 @@ class BuildOptions:
     # point-keyed stage estimate (Story 14.1-002) with a logged note. Persisted
     # per run so a resume keeps the same posture.
     predict: bool = False
+    # Story 28.3-001: per-story escalation signal cache — the *committed*
+    # 28.2-002 prediction, keyed by story id, that `_select_stage_model` feeds
+    # into `select_model` in place of `story.points`. Populated on the shared
+    # build/resume path by `_predict_story_cost` (a fresh forecast, or the
+    # ledger's committed row on re-entry, so routing is identical across a run
+    # and its resumes). Empty when the predictor is off → points-keyed fallback.
+    _story_predictions: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 # Story 14.1-001: notional API-equivalent rate for converting a ``$``-budget into
@@ -1121,7 +1129,8 @@ def _log_predictor_posture(
         ledger.event_log(
             run_id, "", "info", "controller",
             "predictor disabled (--predict off): stories use the point-keyed "
-            "stage estimate (14.1-002)",
+            "stage estimate (14.1-002) and model escalation falls back to "
+            "points-keyed (14.2-001)",
         )
     except Exception:  # noqa: BLE001 - the note is advisory, never fatal
         pass
@@ -1144,6 +1153,15 @@ def _predict_story_cost(
     ledger holds no reconciled history to train on yet, or anything at all goes
     wrong. Like the stage estimate this is strictly best-effort: a predictor fault
     must never fail a build.
+
+    Story 28.3-001: whichever forecast governs the story — freshly computed here,
+    or the committed row a re-entered story already carries — is also mirrored
+    into ``opts._story_predictions`` as the :class:`EscalationSignal` that
+    ``_select_stage_model`` keys model escalation on. Replaying the *committed*
+    row (never re-predicting) is what keeps routing identical across a run and
+    its resumes. A low-confidence signal is cached too, but ``select_model``
+    refuses to escalate on it — the points-keyed Epic-14 fallback applies, and
+    the event line below says so.
     """
     if not opts.predict:
         return None
@@ -1158,7 +1176,15 @@ def _predict_story_cost(
         # longest stories. The committed row stands. `sdlc rollback` is the one
         # legitimate reset: it NULLs these columns with the discarded attempt, so
         # a genuine rebuild predicts afresh.
-        if ledger.story_has_prediction(run_id, story.id):
+        committed = ledger.story_prediction(run_id, story.id)
+        if committed is not None:
+            opts._story_predictions[story.id] = EscalationSignal(
+                predicted_tokens=committed["predicted_tokens"],
+                rework_probability=committed["predicted_rework_prob"],
+                low_confidence=(
+                    str(committed["prediction_confidence"] or "") == "low"
+                ),
+            )
             return None
         features = StoryFeatures(
             ac_count=story.ac_count,
@@ -1172,7 +1198,8 @@ def _predict_story_cost(
             ledger.event_log(
                 run_id, story.id, "info", "controller",
                 "predictor: no reconciled story history yet — using the "
-                "point-keyed stage estimate (14.1-002)",
+                "point-keyed stage estimate (14.1-002) and points-keyed "
+                "model escalation (14.2-001)",
             )
             return None
         ledger.story_set_prediction(
@@ -1182,7 +1209,17 @@ def _predict_story_cost(
             predictor_version=prediction.version,
             low_confidence=prediction.low_confidence,
         )
-        confidence = " [low-confidence]" if prediction.low_confidence else ""
+        opts._story_predictions[story.id] = EscalationSignal(
+            predicted_tokens=prediction.predicted_tokens,
+            rework_probability=prediction.predicted_rework_probability,
+            low_confidence=prediction.low_confidence,
+        )
+        confidence = (
+            " [low-confidence — model escalation falls back to points-keyed "
+            "(14.2-001)]"
+            if prediction.low_confidence
+            else ""
+        )
         ledger.event_log(
             run_id, story.id, "info", "controller",
             f"prediction [{prediction.version}]: ~{prediction.predicted_tokens:,} "
@@ -2367,26 +2404,36 @@ class Ledger:
                     return float(row["avg_tokens"]), tier
         return None
 
-    def story_has_prediction(self, run_id: str, story_id: str) -> bool:
-        """Whether a story already carries a committed forecast (Story 28.2-002).
+    def story_prediction(self, run_id: str, story_id: str) -> dict | None:
+        """A story's committed pre-dispatch forecast, or ``None`` (Story 28.3-001).
 
-        The guard that keeps the prediction *pre*-dispatch on the shared
-        build/resume path: a re-entered story must keep the forecast it was given
-        before its first stage ran. Read-only and tolerant of a pre-migration
-        ledger — no prediction columns means nothing was ever committed, so the
-        caller predicts as usual rather than seeing an error.
+        Subsumes 28.2-002's boolean ``story_has_prediction`` guard: the shared
+        build/resume path both *checks* for a committed forecast (a re-entered
+        story must keep the forecast it was given before its first stage ran)
+        and *replays* it into the model-escalation signal — never re-predicting,
+        so routing is identical across a run and its resumes. Read-only and
+        tolerant of a pre-migration ledger: returns ``None`` when the story
+        carries no forecast (predictor off, or no prediction columns yet), which
+        the caller reads as "predict afresh / fall back to points-keyed".
         """
         if not self.db_path.exists():
-            return False
+            return None
         with self._connect_ro() as conn:
             if not self._has_columns(conn, "stories", ("predicted_tokens",)):
-                return False
+                return None
             row = conn.execute(
-                "SELECT predicted_tokens, predicted_rework_prob FROM stories "
+                "SELECT predicted_tokens, predicted_rework_prob, "
+                "prediction_confidence FROM stories "
                 "WHERE run_id = ? AND story_id = ?",
                 (run_id, story_id),
             ).fetchone()
-        return row is not None and (row[0] is not None or row[1] is not None)
+        if row is None or (row[0] is None and row[1] is None):
+            return None
+        return {
+            "predicted_tokens": row[0],
+            "predicted_rework_prob": row[1],
+            "prediction_confidence": row[2],
+        }
 
     def story_prediction(self, run_id: str, story_id: str) -> dict | None:
         """A story's committed forecast — ``{predicted_tokens, confidence}`` (28.3-002).
@@ -6910,9 +6957,11 @@ def _harness_dispatch_kwargs(
 # resume. `build` is deliberately excluded: its branch does not yet exist when
 # its model is chosen on a fresh run, so a live-git lookup would return False on
 # first build but True on resume (the branch now exists), silently changing the
-# routed model between the two. `build` therefore escalates on **points** only —
-# a spec-derived signal identical across build and resume — keeping routing
-# deterministic. `review` escalation still uses the risk signal (stable there).
+# routed model between the two. `build` therefore escalates on resume-stable
+# signals only: the story's *committed* 28.2-002 prediction (frozen on the
+# ledger before the first dispatch and replayed verbatim on re-entry — Story
+# 28.3-001), with points as the spec-derived Epic-14 fallback. `review`
+# escalation still uses the risk signal (stable there).
 _RISK_AWARE_STAGES = frozenset({"review"})
 
 
@@ -7032,10 +7081,20 @@ def _select_stage_model(
 
     Precedence: an explicit ``--model-<stage>`` override wins over the map (and is
     an operator pin — never escalated); then the routing profile's
-    :func:`select_model` (with the story's points and a best-effort high-risk
-    signal driving build/review escalation); else None when routing is off — in
-    which case the dispatcher adds no ``--model`` and behaviour is unchanged from
-    today.
+    :func:`select_model` (with the story's committed 28.2-002 prediction and a
+    best-effort high-risk signal driving build/review escalation); else None when
+    routing is off — in which case the dispatcher adds no ``--model`` and
+    behaviour is unchanged from today.
+
+    Story 28.3-001: escalation keys on the story's **committed** prediction (the
+    ``EscalationSignal`` cached by ``_predict_story_cost`` — a fresh pre-dispatch
+    forecast, or the ledger row a re-entered story already carries). The
+    committed signal is resume-stable by construction, so *build* may escalate on
+    it deterministically — unlike the live-git risk signal it deliberately
+    ignores (see ``_RISK_AWARE_STAGES``). ``story.points`` is passed only as the
+    labelled Epic-14 **fallback** for a disabled / uncalibrated / low-confidence
+    predictor; with a confident prediction present it is never read as an
+    escalation input.
 
     ``escalation_steps`` (Story 14.2-003) bumps the mapped tier up the ladder by
     that many steps, capped at the strongest tier — the cheap-first retry lever.
@@ -7051,10 +7110,15 @@ def _select_stage_model(
     if config is None:
         return None
     # The file-based risk signal is consulted only where the diff is stable at
-    # decision time (review), so a resume routes identically to the original run;
-    # build escalates on points alone. See _RISK_AWARE_STAGES.
+    # decision time (review), so a resume routes identically to the original run.
     high_risk = _story_high_risk(story, opts) if stage in _RISK_AWARE_STAGES else False
-    base = select_model(stage, config, points=story.points, high_risk=high_risk)
+    base = select_model(
+        stage,
+        config,
+        fallback_points=story.points,
+        high_risk=high_risk,
+        signal=opts._story_predictions.get(story.id),
+    )
     return escalate_model(base, escalation_steps)
 
 
