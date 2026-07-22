@@ -150,6 +150,39 @@ def test_claude_parser_plain_text_fallback_has_no_usage() -> None:
     assert result.usage_available is True
 
 
+# --- Story 28.1-002: the model the session actually ran on ------------------
+# The ledger's `stages.model` is written from `AgentResult.model`, so the
+# envelope→result wiring here is the whole live-recording path.
+
+_MODEL_USAGE = {
+    "claude-haiku-4-5": {"costUSD": 0.01, "outputTokens": 500},
+    "claude-opus-4-8": {"costUSD": 11.5, "outputTokens": 74189},
+}
+
+
+def test_claude_parser_records_the_envelope_model() -> None:
+    parser = get_parser(CLAUDE_PARSER_ID)
+    env = _claude_success_envelope(_VALID_BUILD)
+    env["modelUsage"] = dict(_MODEL_USAGE)
+    result = parser.parse(_collected(envelope=env, streaming=True))
+    # The session that carried the stage, not the cheap sub-agent inside it.
+    assert result.model == "claude-opus-4-8"
+
+
+def test_claude_parser_model_is_none_without_model_usage() -> None:
+    # An older CLI (no `modelUsage`) must record nothing rather than guess, so
+    # the model `stage_start` resolved stays in place.
+    parser = get_parser(CLAUDE_PARSER_ID)
+    result = parser.parse(_collected(envelope=_claude_success_envelope(_VALID_BUILD)))
+    assert result.model is None
+
+
+def test_plain_result_parser_reports_no_model() -> None:
+    # A no-telemetry harness names no model; the registry-resolved one wins.
+    result = get_parser("codex-exec").parse(_collected(stdout=_wrap(_VALID_BUILD)))
+    assert result.model is None
+
+
 # --- Issue #435: contract misses carry usage telemetry so the eval harness ---
 # can still score tokens/cost on a run that ended in prose.
 
@@ -171,6 +204,25 @@ def test_claude_parser_contract_miss_carries_usage_telemetry() -> None:
     err = exc.value
     assert err.usage == {"input_tokens": 10, "output_tokens": 20}
     assert err.cost_usd == pytest.approx(0.0123)
+
+
+def test_claude_parser_contract_miss_carries_the_session_model() -> None:
+    # Story 28.1-002: the same run that burned those tokens ran on a model. The
+    # envelope re-ask finishes this exact row DONE and keeps its usage (Issue
+    # #480 defect 1), so a model dropped here lands a DONE row with NULL model —
+    # the fresh-run regression `sdlc doctor` FAILs on.
+    parser = get_parser(CLAUDE_PARSER_ID)
+    env = {
+        "type": "result",
+        "result": "I finished the change but forgot to emit the result block.",
+        "usage": {"input_tokens": 10, "output_tokens": 20},
+        "total_cost_usd": 0.0123,
+        "session_id": "sess-1",
+        "modelUsage": dict(_MODEL_USAGE),
+    }
+    with pytest.raises(ContractError) as exc:
+        parser.parse(_collected(envelope=env, streaming=True))
+    assert exc.value.model == "claude-opus-4-8"
 
 
 def test_claude_parser_contract_miss_without_envelope_is_none_safe() -> None:
