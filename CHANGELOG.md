@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.39.0] - 2026-07-22
+
+### Added
+
+- feat(empirical-estimation): engage balanced routing by (#28.4-001)
+
+### Fixed
+
+- fix(empirical-estimation): engage balanced routing by (#28.4-001)
+
+
 ## [v2.38.0] - 2026-07-22
 
 ### Added
