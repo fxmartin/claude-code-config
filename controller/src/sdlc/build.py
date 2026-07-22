@@ -1825,8 +1825,21 @@ class Ledger:
         """
         tiers: list[tuple[str, str, tuple[object, ...]]] = []
         if harness is not None and model is not None:
+            # Story 28.1-002 overwrites `model` with the *served* id the agent
+            # reported ("claude-opus-4-8"), while callers ask by the routed tier
+            # alias ("opus"). Normalise both sides through `_model_price_key` so
+            # the cohort keys on the tier: an exact match would miss forever and
+            # silently degrade to the `harness` rung, merging escalated-Opus and
+            # base-Sonnet history into one average. A registry model (`gpt-5`)
+            # matches no tier and normalises to itself, so those cohorts stay
+            # exact. NULL models are excluded explicitly — they normalise to ""
+            # and must keep serving only the `any` rung.
             tiers.append(
-                ("harness+model", "harness = ? AND model = ?", (harness, model))
+                (
+                    "harness+model",
+                    "harness = ? AND model IS NOT NULL AND _model_key(model) = ?",
+                    (harness, _model_price_key(model)),
+                )
             )
         if harness is not None:
             tiers.append(("harness", "harness = ?", (harness,)))
@@ -1842,6 +1855,7 @@ class Ledger:
             "  cache_read_tokens IS NOT NULL OR cache_creation_tokens IS NOT NULL)"
         )
         with self._connect_ro() as conn:
+            conn.create_function("_model_key", 1, _model_price_key, deterministic=True)
             for tier, extra, params in tiers:
                 sql = base + (f" AND {extra}" if extra else "")
                 row = conn.execute(sql, (stage_name, *params)).fetchone()
@@ -2827,9 +2841,11 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
             else:
                 pipeline.append({"name": name, "status": "PENDING"})
         s["stages"] = pipeline
-        # Story 27.2-002 AC4: the tier used is visible per story — the distinct
-        # resolved models across the story's attempts, in first-use order. Empty
-        # when routing was off (every stage ran on the CLI default).
+        # Story 27.2-002 AC4: the model used is visible per story — the distinct
+        # models across the story's attempts, in first-use order. Since Story
+        # 28.1-002 these are the served ids the agents reported, so the list is
+        # populated whether or not routing was on; empty only when no attempt
+        # recorded a model.
         models: list[str] = []
         for a in attempts:
             m = a.get("model")

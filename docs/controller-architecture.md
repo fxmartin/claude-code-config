@@ -846,9 +846,12 @@ ledger alone is enough to recover an interrupted run — no separate journal.
   auditable; the ledger's nullable `stages.harness` column defaults to `claude`
   for rows that predate harness routing (an existing pre-migration ledger still
   loads via the additive Migration 6). The `MODEL` column (Story 27.2-002 AC4)
-  shows the resolved model tier each stage ran on (from `stages.model`, written
-  at dispatch since Issue #427); `-` when routing was off / un-recorded. `sdlc
-  status` likewise shows a per-story `MODEL` roll-up (the distinct tiers used,
+  shows the model each stage attempt actually ran on: `stages.model` is seeded
+  at dispatch with the resolved tier (Issue #427) and then overwritten with the
+  served id the agent's own result envelope reported (Story 28.1-002), so the
+  column is populated whether or not routing is on; `-` only when the harness
+  reported no model telemetry and no backfill has run. `sdlc status` likewise
+  shows a per-story `MODEL` roll-up (the distinct models used,
   first-use order), and `status --json` carries it as each story's `models`
   list — so the tier the adversarial/review work actually ran on is visible per
   story without opening the ledger.
