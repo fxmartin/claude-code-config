@@ -1092,6 +1092,18 @@ def _predict_story_cost(
     if not opts.predict:
         return None
     try:
+        # A story that already carries a forecast is being *re-entered*, not
+        # dispatched for the first time: `sdlc resume` shares this path, and a
+        # parked story arrives here with part of its cost already spent and more
+        # history on the ledger to train on. Re-predicting would fit the number
+        # to work already done — precisely what committing it pre-dispatch
+        # exists to prevent — and `predict-quality` would then score a mid-flight
+        # estimate as the pre-dispatch forecast, understating error worst for the
+        # longest stories. The committed row stands. `sdlc rollback` is the one
+        # legitimate reset: it NULLs these columns with the discarded attempt, so
+        # a genuine rebuild predicts afresh.
+        if ledger.story_has_prediction(run_id, story.id):
+            return None
         features = StoryFeatures(
             ac_count=story.ac_count,
             dep_depth=story.dep_depth,
@@ -2085,6 +2097,27 @@ class Ledger:
                 if row is not None and row["avg_tokens"] is not None:
                     return float(row["avg_tokens"]), tier
         return None
+
+    def story_has_prediction(self, run_id: str, story_id: str) -> bool:
+        """Whether a story already carries a committed forecast (Story 28.2-002).
+
+        The guard that keeps the prediction *pre*-dispatch on the shared
+        build/resume path: a re-entered story must keep the forecast it was given
+        before its first stage ran. Read-only and tolerant of a pre-migration
+        ledger — no prediction columns means nothing was ever committed, so the
+        caller predicts as usual rather than seeing an error.
+        """
+        if not self.db_path.exists():
+            return False
+        with self._connect_ro() as conn:
+            if not self._has_columns(conn, "stories", ("predicted_tokens",)):
+                return False
+            row = conn.execute(
+                "SELECT predicted_tokens, predicted_rework_prob FROM stories "
+                "WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            ).fetchone()
+        return row is not None and (row[0] is not None or row[1] is not None)
 
     def story_set_prediction(
         self,

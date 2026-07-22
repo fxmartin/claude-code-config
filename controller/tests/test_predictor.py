@@ -760,6 +760,79 @@ def test_enabled_predictor_notes_no_posture(tmp_path: Path) -> None:
     _log_predictor_posture(Boom(), "run", BuildOptions(predict=True))  # never touches it
 
 
+def _seed_training_history(
+    ledger: Ledger, *, count: int, tokens: int, prefix: str = "s2"
+) -> None:
+    """``count`` DONE stories with measured usage — history the predictor can train on."""
+    run_id = ledger.run_create("epic-98", "auto")
+    for n in range(count):
+        story_id = f"{prefix}-{n:03d}"
+        ledger.story_upsert(
+            run_id, story_id, "98", "Seed", "P1", 2, "py", "", None, "TODO",
+            ac_count=6, dep_depth=1, scope_proxy=4,
+        )
+        ledger.stage_start(run_id, story_id, "build", 1)
+        ledger.stage_set_usage(
+            run_id, story_id, "build", 1, session_id="s", input_tokens=tokens,
+            output_tokens=0, cache_read_tokens=0, cache_creation_tokens=0,
+            cost_usd=0.1,
+        )
+        ledger.stage_finish(run_id, story_id, "build", 1, "DONE")
+        ledger.set_story_status(run_id, story_id, "DONE")
+
+
+def test_resume_keeps_the_forecast_committed_before_the_first_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A resumed story keeps its pre-dispatch forecast — never one refitted mid-flight.
+
+    ``_predict_story_cost`` runs on the shared build/resume path, so a story parked
+    by a rate limit re-enters it with part of its cost already spent and more
+    history on the ledger. Re-predicting there would fit the forecast to work
+    already done, which is exactly what committing it pre-dispatch prevents.
+    """
+    ledger, run_id = _ledger_with_story(tmp_path, ac_count=6, dep_depth=1, scope_proxy=4)
+    opts = BuildOptions(predict=True)
+    story = Story("s1-001", "t", "99", "Story one", "epic-99.md", "P1", 2, "py", [])
+    # Enough reconciled history for the predictor to train on.
+    _seed_training_history(ledger, count=12, tokens=10_000)
+
+    assert _predict_story_cost(ledger, run_id, story, opts) is not None
+    committed = ledger.story_prediction_rows(run_id)[0]["predicted_tokens"]
+
+    # The story burns most of its cost, then parks; more history accrues meanwhile.
+    ledger.stage_start(run_id, "s1-001", "build", 1)
+    ledger.stage_set_usage(
+        run_id, "s1-001", "build", 1,
+        session_id="s", input_tokens=90_000, output_tokens=0,
+        cache_read_tokens=0, cache_creation_tokens=0, cost_usd=1.0,
+    )
+    ledger.stage_finish(run_id, "s1-001", "build", 1, "DONE")
+    _seed_training_history(ledger, count=8, tokens=10_000, prefix="s3")
+
+    # Resume re-enters the same path — the committed forecast must stand.
+    assert _predict_story_cost(ledger, run_id, story, opts) is None
+    assert ledger.story_prediction_rows(run_id)[0]["predicted_tokens"] == committed
+
+
+def test_rollback_clears_the_prediction_so_a_rebuild_predicts_afresh(
+    tmp_path: Path,
+) -> None:
+    """The guard respects the one legitimate reset: `sdlc rollback`.
+
+    Rollback discards the attempt and NULLs the prediction columns, so the story
+    is genuinely unbuilt again and its next dispatch must commit a fresh forecast.
+    """
+    ledger, run_id = _ledger_with_story(tmp_path, ac_count=6, dep_depth=1, scope_proxy=4)
+    opts = BuildOptions(predict=True)
+    story = Story("s1-001", "t", "99", "Story one", "epic-99.md", "P1", 2, "py", [])
+    _seed_training_history(ledger, count=12, tokens=10_000)
+
+    assert _predict_story_cost(ledger, run_id, story, opts) is not None
+    ledger.reset_story(run_id, "s1-001")
+    assert _predict_story_cost(ledger, run_id, story, opts) is not None
+
+
 def test_predictor_never_breaks_a_build_when_the_ledger_misbehaves(tmp_path: Path) -> None:
     class Boom:
         def __getattr__(self, name):
