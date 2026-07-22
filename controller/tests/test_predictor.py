@@ -663,3 +663,80 @@ def test_predictor_never_breaks_a_build_when_the_ledger_misbehaves(tmp_path: Pat
     opts = BuildOptions(predict=True)
     assert _predict_story_cost(Boom(), "run", story, opts) is None
     _reconcile_story_prediction(Boom(), "run", "s1-001")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Rollback: a discarded attempt must not survive as prediction-vs-actual data
+# ---------------------------------------------------------------------------
+
+def _reconciled_story_with_stages(tmp_path: Path) -> tuple[Ledger, str]:
+    """A story carrying a recorded prediction reconciled against real stage usage."""
+    ledger, run_id = _ledger_with_story(
+        tmp_path, ac_count=6, dep_depth=1, scope_proxy=4
+    )
+    ledger.story_set_prediction(
+        run_id, "s1-001", predicted_tokens=1_000, predicted_rework_prob=0.1,
+        predictor_version=PREDICTOR_VERSION, low_confidence=False,
+    )
+    for stage, attempt in (("build", 1), ("review", 1), ("bugfix", 1)):
+        ledger.stage_start(run_id, "s1-001", stage, attempt)
+        ledger.stage_set_usage(
+            run_id, "s1-001", stage, attempt,
+            session_id="s", input_tokens=100, output_tokens=200,
+            cache_read_tokens=300, cache_creation_tokens=400, cost_usd=0.1,
+        )
+        ledger.stage_finish(run_id, "s1-001", stage, attempt, "DONE")
+    assert ledger.story_reconcile_prediction(run_id, "s1-001") == {
+        "actual_tokens": 3_000, "actual_rework": 1,
+    }
+    return ledger, run_id
+
+
+def test_reset_story_clears_the_discarded_attempts_prediction(tmp_path: Path) -> None:
+    """`sdlc rollback` deletes the stage rows, so the actuals derived from them go too.
+
+    Otherwise the story row keeps `actual_tokens` measured from stages that no
+    longer exist, and `predict-quality` scores a discarded attempt as if it were
+    the story's real outcome.
+    """
+    ledger, run_id = _reconciled_story_with_stages(tmp_path)
+
+    ledger.reset_story(run_id, "s1-001")
+
+    # Back to a fresh, unbuilt state: never-predicted, never-reconciled.
+    assert ledger.story_prediction_rows() == []
+
+
+def test_reset_story_keeps_the_discovery_features(tmp_path: Path) -> None:
+    """The features describe the *spec*, not the attempt — a rollback must keep them."""
+    ledger, run_id = _reconciled_story_with_stages(tmp_path)
+
+    ledger.reset_story(run_id, "s1-001")
+
+    rows = ledger.prediction_training_rows()
+    assert rows == []  # TODO is not terminal, and its stages are gone
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT ac_count, dep_depth, scope_proxy, title, status FROM stories "
+            "WHERE run_id = ? AND story_id = ?",
+            (run_id, "s1-001"),
+        ).fetchone()
+    assert (row["ac_count"], row["dep_depth"], row["scope_proxy"]) == (6, 1, 4)
+    assert row["title"] == "Story one"
+    assert row["status"] == "TODO"
+
+
+def test_quality_report_ignores_a_rolled_back_story(tmp_path: Path) -> None:
+    """The end-to-end consequence: a rolled-back attempt contributes no sample."""
+    ledger, run_id = _reconciled_story_with_stages(tmp_path)
+    scored = prediction_quality(ledger.story_prediction_rows())
+    assert (scored.token_sample, scored.rework_sample) == (1, 1)
+
+    ledger.reset_story(run_id, "s1-001")
+
+    cleared = prediction_quality(ledger.story_prediction_rows())
+    assert cleared.token_sample == 0
+    assert cleared.token_median_abs_error is None
+    assert cleared.rework_sample == 0
+    assert cleared.low_confidence_share is None

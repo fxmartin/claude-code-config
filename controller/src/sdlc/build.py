@@ -2231,6 +2231,16 @@ class Ledger:
         is preserved (title/epic/priority stay) so the queue is unaffected. Used
         only by ``sdlc rollback``, which guards merged stories before calling
         this.
+
+        Story 28.2-002: the prediction-vs-actual pair goes with the attempt.
+        ``actual_tokens``/``actual_rework`` are *derived from* the stage rows this
+        method just deleted, so leaving them would have `predict-quality` score a
+        discarded attempt as the story's real outcome; and the prediction was
+        recorded for that same discarded dispatch, so keeping it would pair a
+        stale forecast with whatever the rebuild goes on to cost. Both halves are
+        cleared together — the row reads as never-predicted, which is what "a
+        fresh, unbuilt state" means. The discovery features (28.2-001) describe
+        the *spec*, not the attempt, so they stay.
         """
         with self._connect() as conn:
             conn.execute(
@@ -2239,7 +2249,10 @@ class Ledger:
             )
             conn.execute(
                 "UPDATE stories SET status = 'TODO', pr_number = NULL, "
-                "branch = NULL, current_stage = NULL "
+                "branch = NULL, current_stage = NULL, "
+                "predicted_tokens = NULL, predicted_rework_prob = NULL, "
+                "predictor_version = NULL, prediction_confidence = NULL, "
+                "actual_tokens = NULL, actual_rework = NULL "
                 "WHERE run_id = ? AND story_id = ?",
                 (run_id, story_id),
             )

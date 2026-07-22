@@ -1046,9 +1046,11 @@ files-touched proxy the AC itself names as an input — and points stay the
 descriptive label 28.2-001 demoted them to.
 
 **Versioned.** `PREDICTOR_VERSION` is stamped onto every recorded prediction and
-must be bumped alongside any weight, band edge or ladder change, so
-`predict-quality` reports error *per version* rather than blending a re-tuned
-model into the old model's history.
+must be bumped alongside any weight, band edge or ladder change. `predict-quality`
+pools every scored row into one median regardless of version and reports the
+distinct versions in the sample next to it, so a sample straddling a re-tuning is
+*visible* — read it as a mixed sample, not as the new model's error. Segmenting
+the metrics per version is a follow-up, not something the report does today.
 
 ### Record before, reconcile after
 
@@ -1068,6 +1070,12 @@ model into the old model's history.
   later is a join, not a re-computation. A parked (rate-limited) story is *not*
   reconciled — its usage is still accruing — so the resume that finishes it does
   the reconciliation. Idempotent: both figures are absolute assignments.
+- **A rolled-back story is un-predicted.** `sdlc rollback` → `Ledger.reset_story`
+  deletes the story's stage rows, and `actual_tokens`/`actual_rework` are derived
+  from exactly those rows — so the reset clears the prediction *and* the actuals
+  together. Otherwise the report would score a discarded attempt as the story's
+  real outcome. The 28.2-001 discovery features describe the spec, not the
+  attempt, and survive the reset.
 - **Rework is defined observably**: any `bugfix` stage row, any stage attempt
   beyond the first, or any FAILED attempt. The envelope re-ask and the commit-lint
   amend are recovery *dispatches*, not review retries, and do not count alone.

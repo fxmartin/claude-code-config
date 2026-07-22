@@ -9,8 +9,12 @@ from statistics import fmean, median
 
 # Version stamped onto every recorded prediction. Bump it whenever the cohort
 # ladder, the band edges, or any weight in :class:`PredictorConfig` changes, so a
-# recalibration is auditable: `sdlc predict-quality` reports error *per version*
-# rather than blending a re-tuned model's numbers into the old model's history.
+# recalibration is auditable. Note what that auditability currently is: the
+# quality report pools *every* scored row into one median regardless of version,
+# and reports the distinct versions it drew from alongside it — so a sample that
+# straddles a re-tuning is visible, not silently blended. Segmenting the metrics
+# per version is a follow-up; until then, read a multi-version sample as a mixed
+# one rather than as the new model's error.
 PREDICTOR_VERSION = "v1"
 
 # The label a feature the epic did not state resolves to. Kept distinct from any
