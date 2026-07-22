@@ -1,6 +1,6 @@
 # Epic 28: Empirical Estimation and Telemetry Integrity
 
-> **Status: PLANNED (0/7)** created 2026-07-19 from the 2026-07-19 cost dataset: a
+> **Status: PLANNED (0/8)** created 2026-07-19 from the 2026-07-19 cost dataset: a
 > 76-story priced dataset built from this controller's own ledgers on local-code-bench
 > (June 25 to July 18, 2026). Thesis: the factory should stop *estimating* from story
 > points and start *calibrating* from its own ledger history. Points stay as a
@@ -118,7 +118,8 @@ comparisons (Epic-11, Epic-18) stop working from numbers that are quietly low.
 Harden the meter before anything trains on it. The acute overwrite and model-column
 point-defects already shipped (PRs #482, #484); these stories close the gap those fixes
 left: reconcile the ledger against the session logs, make the agreement a health check,
-and verify per-attempt model recording end to end.
+verify per-attempt model recording end to end, and close the one gap reconciliation cannot
+reach — a dispatch that never opens a stage row at all.
 
 #### Stories
 
@@ -230,6 +231,50 @@ for history. No schema change (the column exists); backfill writes through the l
 - [ ] Documented in `docs/controller-architecture.md`
 
 **Dependencies**: 28.1-001 (shares the log-parsing and doctor surface); consumes PRs #482, #484
+**Risk Level**: Low
+
+##### Story 28.1-003: Batch doc-update records its spend as a real ledger stage
+**User Story**: As the person calibrating cost from ledger history, I want the batch
+doc-update phase to open a ledger stage like every other dispatch, so that its tokens and
+cost are counted rather than structurally invisible to both the dashboard and the predictor.
+**Priority**: Must Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** a batch `sdlc fix` run in which at least one issue merged **When** the
+  doc-update phase dispatches **Then** it opens a `doc-update` stage row, captures the
+  dispatch result, finishes the stage, and records usage, so the row carries non-NULL
+  tokens and cost.
+- **Given** the doc-update dispatch raises **When** the advisory phase handles it **Then**
+  the stage is finished as FAILED with whatever usage is available, and the batch still
+  terminates normally — a ledger or DB error in this path must never make the advisory
+  phase fatal.
+- **Given** a single-issue `sdlc fix` run **When** it completes **Then** behaviour is
+  unchanged: it never reaches doc-update, and its telemetry stays complete as of PR #477.
+- **Given** the reconciliation pass from 28.1-001 **When** it runs over a batch run
+  **Then** doc-update rows reconcile like any other stage rather than being reported as a
+  residual disagreement.
+
+**Technical Notes**: From Issue #479. `_run_doc_update` in `controller/src/sdlc/fix_issue.py`
+dispatches a full agent but calls only `ledger.event_log(...)` — no `stage_start` /
+`stage_finish` — and discards the `AgentResult` carrying `.usage` / `.cost_usd`. Because
+`stage_set_usage` is an `UPDATE ... WHERE run_id/story_id/stage_name/attempt`, it is a
+0-row no-op without a pre-existing row, so this cannot be fixed by a recording call alone
+and is genuinely out of 28.1-001's reach: reconciliation repairs rows that exist, and here
+no row is ever created. Mirror the `stage_start` → `dispatch` → `stage_finish` →
+`_record_stage_usage` pattern the other stages use after PR #477, keeping every ledger call
+inside the existing try/except-and-log discipline. `story_id` is empty for this phase, as
+`event_log` already does. The stage falls outside the fixed `build`/`coverage`/`review`/
+`merge` dashboard columns and renders in the run's stage history, which is expected.
+
+**Definition of Done**:
+- [ ] Batch doc-update opens, finishes, and records usage on a `doc-update` stage row
+- [ ] Failure path finishes the stage as FAILED and stays non-fatal to the batch
+- [ ] Batch-mode test asserts a merged-batch doc-update writes a non-NULL-usage row;
+      single-issue behaviour covered as unchanged
+- [ ] Documented in `docs/controller-architecture.md`
+
+**Dependencies**: none (independent of 28.1-001; touches a different code path)
 **Risk Level**: Low
 
 ### Feature 28.2: Calibrated Prediction
@@ -577,6 +622,7 @@ pre-change runs resume identically)
 ```
 28.1-001 (reconcile backfill + doctor)  absorbs Issue #481; consumes PR #482. FIRST.
 28.1-002 (verified model recording)     needs 28.1-001 (shared log-parse/doctor); consumes PRs #482, #484
+28.1-003 (doc-update stage row)         independent (different code path); from Issue #479
 28.2-001 (discovery features)           independent (a discovery-side data change; can run alongside Feature 28.1)
 28.2-002 (predictor)                    needs 28.1-001 + 28.1-002 (reconciled telemetry) + 28.2-001 (discovery features)
 28.4-001 (routing engages + visible)    needs 28.1-002 (surfaces the per-stage model column); fixes Epic-14 14.2-001
@@ -584,8 +630,10 @@ pre-change runs resume identically)
 28.3-002 (budget/batch on prediction)   needs 28.2-002; coordinates Epic-14 14.1-001/002/003
 ```
 
-- **Cohort 1 (first wave, no intra-epic dependencies)**: 28.1-001 and 28.2-001 both start
-  immediately, and 28.1-002 follows 28.1-001. 28.1-001/28.1-002 are the integrity stories
+- **Cohort 1 (first wave, no intra-epic dependencies)**: 28.1-001, 28.2-001 and 28.1-003 all
+  start immediately, and 28.1-002 follows 28.1-001. 28.1-003 joins this wave because it
+  touches a different code path (`fix_issue.py`) from the reconciliation work and so cannot
+  conflict with it, while still landing before anything trains on the meter. 28.1-001/28.1-002 are the integrity stories
   that **gate every telemetry consumer**: calibration on top of corrupted telemetry would
   train on lies, so no story that reads the meter (the predictor 28.2-002 and the Feature
   28.3 consumers) starts until the meter agrees with the logs and the model column is
