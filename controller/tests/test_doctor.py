@@ -611,12 +611,37 @@ def test_model_coverage_clean_when_every_dispatched_row_is_attributed(
 
 
 def test_model_coverage_fails_on_a_fresh_run_null(tmp_path: Path) -> None:
-    """AC3: a DONE stage with no model on the latest run is a recording defect."""
-    finding = check_model_coverage(_model_ledger(tmp_path, model=None))
+    """AC3: a DONE stage whose own log names a model it failed to record.
+
+    The transcript is what makes this a *regression* rather than an unknowable
+    gap: the session emitted a `modelUsage` map, so the live recording had the
+    model in hand and dropped it.
+    """
+    finding = check_model_coverage(
+        _model_ledger(tmp_path, model=None, log=_MODEL_RESULT_LINE)
+    )
     assert finding.status == "FAIL"
     assert "28.1-002/build#1" in finding.detail
     assert "regress" in finding.detail.lower()
     assert "model-backfill" in finding.remedy
+
+
+def test_model_coverage_does_not_fail_a_reconcile_synthesized_done_row(
+    tmp_path: Path,
+) -> None:
+    """A DONE row that never dispatched an agent is not a recording regression.
+
+    `reconcile_run` — which runs on *every* close-out, not just the standalone
+    verb — synthesizes DONE `build`/`coverage`/`review`/`merge` rows for a
+    parked-then-landed story (`_ensure_stages_done`). No agent ran, so there is
+    no transcript and no model to record. FAILing on those asserts a regression
+    that did not happen and prints a remedy `model-backfill` cannot apply — and
+    `sdlc doctor --exit-code` would then exit 2 forever.
+    """
+    finding = check_model_coverage(_model_ledger(tmp_path, model=None))
+    assert finding.status == "WARN"
+    assert "unrecoverable=1" in finding.detail
+    assert "regress" not in finding.detail.lower()
 
 
 def test_model_coverage_warns_when_the_null_is_only_recoverable_history(

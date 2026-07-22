@@ -477,10 +477,12 @@ def check_model_coverage(
 
     Severity follows what the NULL *means*:
 
-    * **FAIL** — a ``DONE`` attempt on the most recent run has no model. That
-      stage produced a result envelope, so the recording regressed (AC3).
-    * **WARN** — older or non-DONE NULLs: a genuine history gap, fixable with
-      ``sdlc model-backfill`` where the transcript survives.
+    * **FAIL** — a ``DONE`` attempt on the most recent run has no model *and its
+      own transcript names one*. The recording had the model in hand and dropped
+      it, so that is a live regression (AC3).
+    * **WARN** — older or non-DONE NULLs, and DONE NULLs with no recoverable
+      model: a genuine history gap, fixable with ``sdlc model-backfill`` where
+      the transcript survives.
     * **CLEAN** — every dispatched attempt is attributed.
 
     Read-only, like every other doctor check: rows are *reported*, never coerced
@@ -539,8 +541,22 @@ def check_model_coverage(
     # The most recent run is the "fresh run" the AC guards: a completed stage
     # there with no model means the live recording path regressed, not that
     # history is merely thin.
+    #
+    # Narrowed to RECOVERABLE rows — the transcript proves a model *was*
+    # available and the recording dropped it. An UNRECOVERABLE DONE row cannot
+    # be a recording regression: not every DONE row dispatched an agent.
+    # `reconcile_run` (which runs on every close-out, not just the standalone
+    # verb) synthesizes DONE build/coverage/review/merge rows for a
+    # parked-then-landed story, and a plain-text `SDLC_AGENT_CMD` harness names
+    # no model at all. FAILing those would assert a regression that never
+    # happened and print a remedy `model-backfill` cannot apply — a permanent
+    # `sdlc doctor --exit-code` 2. They stay a WARN, counted, never coerced.
     fresh = audit.run_ids[0] if audit.run_ids else None
-    regressions = audit.nulls_in(fresh, VERIFIED_STATUSES) if fresh else []
+    regressions = [
+        a
+        for a in (audit.nulls_in(fresh, VERIFIED_STATUSES) if fresh else [])
+        if a.reason == RECOVERABLE
+    ]
     if regressions:
         return Finding(
             "model", name, "FAIL",

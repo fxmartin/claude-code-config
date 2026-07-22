@@ -42,9 +42,11 @@ NOT_DISPATCHED = "not-dispatched"
 # actually holds, not what a later pass could recover.
 _POPULATED = frozenset({RECORDED, BACKFILLED})
 
-# A DONE stage always produced a result envelope, so a NULL model on one is a
-# *recording* defect rather than an unknowable attribution — the status set
-# `sdlc doctor` flags as a fresh-run regression (AC3).
+# The statuses whose NULL model `sdlc doctor` can hold against the recording
+# path (AC3). Necessary but not sufficient on its own: not every DONE row
+# dispatched an agent (`reconcile._ensure_stages_done` synthesizes DONE rows for
+# a parked-then-landed story), so doctor pairs this with a RECOVERABLE reason —
+# a transcript that names a model the ledger failed to record.
 VERIFIED_STATUSES = frozenset({"DONE"})
 
 
