@@ -32,6 +32,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/rollback.py` | Returns a run to a prior checkpoint by resetting the later stories (Story 10.2-001). |
 | `sdlc/reconcile.py` | Verifies parked stories against `origin/main` and recomputes the run terminal — shared by close-out and `sdlc reconcile` (Stories 12.3-001/12.3-002). |
 | `sdlc/usage_reconcile.py` | Ledger-vs-logs usage reconciliation — re-derives per-stage token/cost usage from the session transcripts, backfills the correct attempt row, and scores the agreement rate (Story 28.1-001). |
+| `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
@@ -949,6 +950,59 @@ story *status* against `origin/main` and has no usage awareness.
   `{run_ids, applied, verifiable, matched, unverifiable, agreement_rate, counts,
   updated, residual}`.
 
+## Per-stage model attribution (Story 28.1-002)
+
+`stages.model` exists since schema v11 (Story 14.2-003) so cost can be segmented
+per model, but the 2026-07-19 dataset found it NULL on **all 374 rows**. Two
+causes, both now closed:
+
+- **The recovery rows** (`reask` / `bugfix`) resolved their model *after*
+  `stage_start` had already written the row — fixed in PRs #482 and #484.
+- **The primary path** (`build`/`coverage`/`review`/`merge`) wrote whatever
+  `_resolved_stage_model` predicted *before* dispatch, and that is `None`
+  whenever model routing is off (the default). A NULL was therefore the correct
+  prediction, and the column stayed empty on every fresh run.
+
+The fix makes the column a record of **what actually ran**, not a prediction:
+
+- **The parser reads the served model.** `ClaudeStreamJsonParser` extracts the
+  result envelope's `modelUsage` map — Claude reports usage *per model*, because
+  one session can touch several — and `progress.dominant_model` picks the one
+  that carried it (by dollars, then output tokens, then name for a deterministic
+  tie). It lands on `AgentResult.model`.
+- **One terminal hook writes it.** `_record_stage_usage` — the single point every
+  dispatched stage passes through, primary (on success *and* on a schema-valid
+  failure), `reask`, `commitlint` and `bugfix` — calls `Ledger.stage_set_model`,
+  overwriting the pre-dispatch prediction with the observed id. So the row
+  records `claude-opus-4-8`, not the `opus` tier alias and not NULL.
+- **A registry harness keeps its own model.** `codex`-style harnesses parse with
+  `PlainResultParser`, which reports no model telemetry, so nothing overwrites
+  the model `stage_start` resolved from the harness's `models` map (Story
+  20.7-004). `stage_set_model` ignores an empty model precisely so this holds.
+- **SKIPPED rows keep a NULL model, by design.** The docs-only, cost-gate and
+  coverage-pre-check paths write their rows with `model=None` because no agent
+  ran; they are excluded from coverage rather than counted as gaps.
+
+### Backfilling history
+
+**`sdlc model-backfill [run] [--db PATH] [--all] [--dry-run] [--json]`**
+(`sdlc/model_backfill.py`) re-reads each NULL row's own transcript — located by
+the same naming convention `usage-reconcile` uses — and writes the model it
+finds. The terminal `result` envelope's `modelUsage` is authoritative; a session
+that crashed before emitting one falls back to the most frequent `message.model`
+across its assistant turns.
+
+Per-row outcomes: `recorded` (already attributed — never overwritten, the live
+recording outranks a later re-read), `backfilled`, `recoverable` (`--dry-run`
+only), `unrecoverable`, and `not-dispatched` (SKIPPED / still-running). A row
+whose transcript was pruned, or which only ever held plain-text output, **stays
+NULL and is counted** — the coverage of the column is reported rather than
+papered over with a placeholder. Idempotent: every write assigns an absolute
+value onto a NULL row, so a second pass finds it `recorded` and writes nothing.
+
+`--json` emits `{run_ids, applied, dispatched, populated, unrecoverable,
+coverage, counts, updated, residual}`.
+
 ## Clean (workspace garbage collection)
 
 `sdlc clean` makes build-leftover cleanup a safe, repeatable verb instead of a
@@ -1018,6 +1072,16 @@ it on the next real run).
     counted as **unverifiable** and excluded from the rate — never reported as
     agreement. Read-only like every other check: it *reports* drift,
     [`usage-reconcile`](#usage-reconciliation-ledger-vs-session-logs) fixes it.
+  - **Per-stage model attribution** (Story 28.1-002) — the share of *dispatched*
+    stage attempts across the same window carrying a non-NULL `stages.model`
+    (SKIPPED and still-running rows never ran an agent, so they owe no model and
+    are excluded). A **`DONE` attempt on the latest run with no model is a
+    `FAIL`**: that stage produced a result envelope, so the live recording
+    regressed. Older or non-`DONE` NULLs are a `WARN`, remedy
+    `sdlc model-backfill --all`. Rows whose model is genuinely unrecoverable are
+    counted as such — never coerced to a placeholder. Read-only:
+    [`model-backfill`](#per-stage-model-attribution-story-281-002) is the verb
+    that writes.
   - **Dependencies** — one finding per external tool (`gh`, `claude`, `semgrep`,
     `osv-scanner`), each probed via `<tool> --version`. A missing tool is a `WARN`
     (it degrades a feature, not the install) with an install remedy.

@@ -625,6 +625,12 @@ class AgentResult:
     usage (the value reflects the run, the flag reflects the harness). A parser
     for a harness with no usage/rate-limit semantics (e.g. ``codex-exec``) sets it
     ``False`` so usage is recorded as *unavailable* rather than fabricated as zero.
+
+    ``model`` (Story 28.1-002) is the model the session *actually* ran on, read
+    out of the envelope's ``modelUsage`` rather than predicted before dispatch —
+    so ``stages.model`` records observed fact even when routing is off and the
+    controller passed no ``--model``. None when the harness reports no model
+    telemetry, which leaves the pre-dispatch resolution on the row untouched.
     """
 
     agent_type: str
@@ -634,6 +640,7 @@ class AgentResult:
     cost_usd: float | None = None
     session_id: str | None = None
     usage_available: bool = True
+    model: str | None = None
 
 
 def _parse_envelope(stdout: str) -> dict[str, Any] | None:

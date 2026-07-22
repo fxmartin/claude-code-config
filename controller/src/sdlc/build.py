@@ -1670,6 +1670,33 @@ class Ledger:
                 (run_id, story_id, stage_name, attempt, harness, model),
             )
 
+    def stage_set_model(
+        self,
+        run_id: str,
+        story_id: str,
+        stage_name: str,
+        attempt: int,
+        model: str,
+    ) -> None:
+        """Record the model a stage attempt *actually* ran on (Story 28.1-002).
+
+        ``stage_start`` writes the model the controller *resolved* before
+        dispatching — which is None whenever routing is off, and a tier alias
+        (``opus``) rather than the served id otherwise. This overwrites it with
+        the observed model from the agent's own result envelope, so the column is
+        a fact the estimator can segment on rather than a prediction. An empty
+        ``model`` is never written: an unknown model stays NULL and is *counted*
+        (see :mod:`sdlc.model_backfill`), never coerced to a placeholder.
+        """
+        if not model:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stages SET model = ? "
+                "WHERE run_id = ? AND story_id = ? AND stage_name = ? AND attempt = ?",
+                (model, run_id, story_id, stage_name, attempt),
+            )
+
     def stage_finish(
         self,
         run_id: str,
@@ -2450,16 +2477,17 @@ class Ledger:
         The flat, reconciliation-facing counterpart to :meth:`stage_breakdown`:
         one dict per attempt keyed by the ledger's own primary key
         (``run_id, story_id, stage_name, attempt``) plus ``status``,
-        ``output_path``, the four token columns, ``cost_usd`` and
-        ``usage_source``. Read-only and tolerant of a pre-migration ledger — a DB
-        without the usage columns reports them as None rather than raising "no
-        such column", so a read-side viewer never has to migrate first.
+        ``output_path``, the four token columns, ``cost_usd``, ``usage_source``
+        and ``model`` (the attempt's recorded model attribution, Story 28.1-002).
+        Read-only and tolerant of a pre-migration ledger — a DB without the usage
+        columns reports them as None rather than raising "no such column", so a
+        read-side viewer never has to migrate first.
         """
         if not self.db_path.exists():
             return []
         usage_cols = (
             "session_id", "input_tokens", "output_tokens", "cache_read_tokens",
-            "cache_creation_tokens", "cost_usd", "usage_source",
+            "cache_creation_tokens", "cost_usd", "usage_source", "model",
         )
         with self._connect_ro() as conn:
             present = {r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()}
@@ -6444,13 +6472,25 @@ def _record_stage_usage(
     attempt: int,
     result: AgentResult | None,
 ) -> None:
-    """Persist a stage's token/cost usage from its AgentResult (no-op if absent).
+    """Persist a stage's token/cost usage — and its verified model — from its result.
 
     Maps the agent envelope's usage keys (``cache_read_input_tokens`` etc.) to
     the ledger's column names. Skipped entirely when the agent emitted plain
     text (custom ``SDLC_AGENT_CMD``) and carried no usage.
+
+    Story 28.1-002: the envelope's observed model is written first, and
+    independently of usage. It is the single terminal hook every dispatched stage
+    passes through — primary (success *and* schema-valid failure), ``reask``,
+    ``commitlint`` and ``bugfix`` — so recording it here lands a non-NULL
+    ``stages.model`` on every stage type without threading the model through each
+    call site. A harness with no model telemetry writes nothing, leaving the
+    model ``stage_start`` resolved from the registry / routing profile in place.
     """
-    if result is None or (result.usage is None and result.cost_usd is None):
+    if result is None:
+        return
+    if result.model:
+        ledger.stage_set_model(run_id, story_id, stage, attempt, result.model)
+    if result.usage is None and result.cost_usd is None:
         return
     u = result.usage or {}
     ledger.stage_set_usage(

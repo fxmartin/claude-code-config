@@ -161,6 +161,54 @@ def usage_of(event: Any) -> dict[str, int] | None:
     return mapped or None
 
 
+def model_of(event: Any) -> str | None:
+    """The model id an assistant stream-json event ran on, or None (28.1-002).
+
+    Reads ``message.model``, which every assistant turn carries. Used to recover
+    the model of a session that crashed before emitting its terminal ``result``
+    envelope — the only per-turn record of what actually served the request.
+    Defensive like :func:`usage_of`: any other event shape reads as None.
+    """
+    if not isinstance(event, dict):
+        return None
+    message = event.get("message")
+    model = message.get("model") if isinstance(message, dict) else None
+    return model if isinstance(model, str) and model else None
+
+
+def dominant_model(model_usage: Any) -> str | None:
+    """The model that did most of the work in a ``modelUsage`` map (28.1-002).
+
+    Claude's result envelope reports usage *per model*, because one session can
+    touch more than one (a Haiku sub-agent inside an Opus stage). The stage's
+    model is the one that carried the session: ranked by dollars, then by output
+    tokens when the entry carries no cost, then by name so a tie is deterministic
+    rather than dict-order-dependent. None for an absent/empty/malformed map, so
+    a caller records nothing rather than guessing.
+    """
+    if not isinstance(model_usage, dict):
+        return None
+
+    def _number(value: Any) -> float:
+        """``value`` as a number, or 0 for an absent/non-numeric one (never a bool)."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        return float(value)
+
+    ranked: list[tuple[float, float, str]] = []
+    for model, stats in model_usage.items():
+        if not isinstance(model, str) or not model or not isinstance(stats, dict):
+            continue
+        ranked.append(
+            (_number(stats.get("costUSD")), _number(stats.get("outputTokens")), model)
+        )
+    if not ranked:
+        return None
+    # Sort by (cost, output tokens) descending, then name ascending for the tie.
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return ranked[0][2]
+
+
 @dataclass
 class RunningUsage:
     """Accrued token totals (+ the captured session id) for one stage attempt."""
