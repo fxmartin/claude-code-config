@@ -4762,3 +4762,63 @@ def test_build_done_story_ids_empty_when_no_runs(tmp_path) -> None:
     ledger = Ledger(tmp_path / "ledger.db")
     ledger.init()
     assert ledger.build_done_story_ids() == set()
+
+
+# --- Story 28.2-001: predictor features on the story row ---------------------
+
+
+def _features(db: Path, run_id: str, story_id: str) -> tuple:
+    conn = _open(db)
+    try:
+        return conn.execute(
+            "SELECT ac_count, dep_depth, scope_proxy FROM stories "
+            "WHERE run_id=? AND story_id=?",
+            (run_id, story_id),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_story_upsert_persists_predictor_features(tmp_path) -> None:
+    """AC1: the features discovery extracted reach the ledger alongside points."""
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "serial")
+    ledger.story_upsert(
+        run_id, "28.2-001", "28", "Features", "P2", 3, "py", "", None, "TODO",
+        ac_count=4, dep_depth=2, scope_proxy=5,
+    )
+    assert _features(db, run_id, "28.2-001") == (4, 2, 5)
+
+
+def test_story_upsert_records_unknown_features_as_null(tmp_path) -> None:
+    """AC4: an unknown feature persists as NULL — missing, not a real zero."""
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "serial")
+    ledger.story_upsert(
+        run_id, "28.2-001", "28", "Features", "P2", 3, "py", "", None, "TODO",
+        ac_count=None, dep_depth=0, scope_proxy=None,
+    )
+    assert _features(db, run_id, "28.2-001") == (None, 0, None)
+
+
+def test_story_upsert_without_features_stays_backward_compatible(tmp_path) -> None:
+    """AC3: the pre-28.2 positional call still works; features read as unknown."""
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-07", "serial")
+    ledger.story_upsert(run_id, "7.3-001", "07", "Port", "P2", 8, "py", "", None, "TODO")
+    assert _features(db, run_id, "7.3-001") == (None, None, None)
+    conn = _open(db)
+    try:
+        row = conn.execute(
+            "SELECT points, status FROM stories WHERE run_id=? AND story_id=?",
+            (run_id, "7.3-001"),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (8, "TODO")  # points preserved, untouched by the new columns

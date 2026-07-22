@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS stories (
     epic_id         TEXT,
     title           TEXT,
     priority        TEXT,
-    points          INTEGER,
+    points          INTEGER,                        -- descriptive scope label only (Story 28.2-001).
     agent_type      TEXT,
     branch          TEXT,
     pr_number       INTEGER,
@@ -162,6 +162,11 @@ CREATE TABLE IF NOT EXISTS stories (
     dependencies    TEXT,
     worktree_path   TEXT,
     merge_sha       TEXT,
+    -- Story 28.2-001 predictor features, extracted at discovery time. NULL means
+    -- unknown (the epic did not state enough to compute it), never a real zero.
+    ac_count        INTEGER,                        -- acceptance criteria stated.
+    dep_depth       INTEGER,                        -- longest dependency chain.
+    scope_proxy     INTEGER,                        -- distinct files/areas named.
     PRIMARY KEY (run_id, story_id),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
@@ -451,6 +456,23 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         "stalls",
         [],
         _STALLS_DDL,
+    ),
+    # Migration 13 adds the Story 28.2-001 predictor features (acceptance-criteria
+    # count, dependency depth, scope proxy) to a pre-existing ledger's `stories`
+    # table. Additive and back-compatible: rows written before this migration keep
+    # NULL features, which the predictor reads as *unknown* (missing) rather than
+    # as a real zero, and every existing column — `points` included — is untouched.
+    # A fresh DB created from the up-to-date DDL is a no-op.
+    (
+        13,
+        "story predictor feature columns",
+        "stories",
+        [
+            ("ac_count", "INTEGER"),
+            ("dep_depth", "INTEGER"),
+            ("scope_proxy", "INTEGER"),
+        ],
+        None,
     ),
 ]
 
@@ -1467,28 +1489,42 @@ class Ledger:
         branch: str,
         pr_number: int | None,
         status: str,
+        *,
+        ac_count: int | None = None,
+        dep_depth: int | None = None,
+        scope_proxy: int | None = None,
     ) -> None:
         """INSERT-or-patch a story row, preserving its stage history.
 
         Uses ``ON CONFLICT DO UPDATE`` (not ``INSERT OR REPLACE``) so the FK
         cascade never wipes per-attempt stage rows when a story transitions.
+
+        Story 28.2-001: the three predictor features discovery extracted are
+        keyword-only and default to ``None`` — *unknown*, never zero — so every
+        pre-28.2 positional call site stays valid and a synthesized story (a
+        fix-issue run, `sdlc runlog`) simply records no features. ``points`` is
+        still written, as the descriptive scope label it now is.
         """
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO stories
                   (run_id, story_id, epic_id, title, priority, points,
-                   agent_type, branch, pr_number, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   agent_type, branch, pr_number, status,
+                   ac_count, dep_depth, scope_proxy)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, story_id) DO UPDATE SET
-                    epic_id    = excluded.epic_id,
-                    title      = excluded.title,
-                    priority   = excluded.priority,
-                    points     = excluded.points,
-                    agent_type = excluded.agent_type,
-                    branch     = excluded.branch,
-                    pr_number  = excluded.pr_number,
-                    status     = excluded.status
+                    epic_id     = excluded.epic_id,
+                    title       = excluded.title,
+                    priority    = excluded.priority,
+                    points      = excluded.points,
+                    agent_type  = excluded.agent_type,
+                    branch      = excluded.branch,
+                    pr_number   = excluded.pr_number,
+                    status      = excluded.status,
+                    ac_count    = excluded.ac_count,
+                    dep_depth   = excluded.dep_depth,
+                    scope_proxy = excluded.scope_proxy
                 """,
                 (
                     run_id,
@@ -1501,6 +1537,9 @@ class Ledger:
                     branch or None,
                     pr_number,
                     status,
+                    ac_count,
+                    dep_depth,
+                    scope_proxy,
                 ),
             )
 
@@ -4267,6 +4306,19 @@ def _registry_finish(
         pass
 
 
+def _story_features(story: Story) -> dict[str, int | None]:
+    """The Story 28.2-001 predictor features as ``story_upsert`` keyword args.
+
+    A feature discovery could not compute is ``None`` (unknown) and persists as
+    NULL, so the predictor treats it as missing rather than as a real low value.
+    """
+    return {
+        "ac_count": story.ac_count,
+        "dep_depth": story.dep_depth,
+        "scope_proxy": story.scope_proxy,
+    }
+
+
 def persist_cohort_structure(
     ledger: Ledger, run_id: str, cohorts: list[list[Story]]
 ) -> None:
@@ -4521,10 +4573,15 @@ def run_build(
     # the build and deliberately stay out of the cohort `status` map below, so a
     # buildable story that depends on a shipped one is treated as satisfied, not
     # blocked (R2/R4).
+    # Story 28.2-001: every story row also carries the predictor features
+    # discovery extracted (unknown ones stay NULL), so the ledger accumulates the
+    # feature history the cost/rework predictor keys on — including for skipped
+    # stories, whose spec is just as much a training row as a built one's.
     for story in done_skips:
         ledger.story_upsert(
             run_id, story.id, story.epic_id, story.title, story.priority,
             story.points, story.agent_type, "", None, "SKIPPED",
+            **_story_features(story),
         )
         ledger.event_log(
             run_id, story.id, "info", "controller",
@@ -4534,6 +4591,7 @@ def run_build(
         ledger.story_upsert(
             run_id, story.id, story.epic_id, story.title, story.priority,
             story.points, story.agent_type, "", None, "TODO",
+            **_story_features(story),
         )
 
     cohorts = compute_cohorts(buildable)

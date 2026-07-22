@@ -500,3 +500,135 @@ def test_canonical_scope_single_scope_unchanged() -> None:
     """A single scope round-trips to its lowercased self (backward compatible)."""
     assert canonical_scope("epic-99") == "epic-99"
     assert canonical_scope("34.5-003") == "34.5-003"
+
+
+# --- Story 28.2-001: predictor features (points demoted to metadata) ---------
+
+_FEATURE_EPIC = """# Epic 98: Predictor features
+
+##### Story 98.1-001: Root story
+**Priority**: P1
+**Story Points**: 3
+**Acceptance Criteria**:
+- **Given** a thing **When** it happens **Then** it works.
+- **Given** another thing **When** it happens **Then** it also works,
+  even when the criterion wraps onto a continuation line.
+
+**Technical Notes**: Touch `controller/src/sdlc/discovery.py` and
+`controller/src/sdlc/cohort.py`, then re-read `controller/src/sdlc/discovery.py`.
+**Dependencies**: None
+
+##### Story 98.1-002: Middle story
+**Priority**: P2
+**Story Points**: 5
+**Acceptance Criteria**:
+- **Given** x **When** y **Then** z.
+
+**Dependencies**: 98.1-001
+
+##### Story 98.1-003: Leaf story
+**Priority**: P2
+**Story Points**: 2
+**Dependencies**: 98.1-002
+
+##### Story 98.1-004: Story with no dependencies line
+**Priority**: P3
+**Story Points**: 1
+
+Body only.
+"""
+
+_CYCLE_EPIC = """# Epic 97: Cycle
+
+##### Story 97.1-001: A
+**Priority**: P1
+**Dependencies**: 97.1-002
+
+##### Story 97.1-002: B
+**Priority**: P1
+**Dependencies**: 97.1-001
+"""
+
+
+def _write_feature_epic(tmp_path, text: str = _FEATURE_EPIC, name: str = "epic-98-features.md"):
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True, exist_ok=True)
+    epic = stories / name
+    epic.write_text(text, encoding="utf-8")
+    return epic
+
+
+def _by_id(stories) -> dict:
+    return {s.id: s for s in stories}
+
+
+def test_features_acceptance_criteria_count(tmp_path) -> None:
+    """AC1: the story record carries the acceptance-criteria count."""
+    stories = _by_id(parse_epic_file(_write_feature_epic(tmp_path)))
+    assert stories["98.1-001"].ac_count == 2
+    assert stories["98.1-002"].ac_count == 1
+
+
+def test_features_acceptance_criteria_unknown_when_absent(tmp_path) -> None:
+    """AC4: no Acceptance Criteria block → unknown (None), never a real 0."""
+    stories = _by_id(parse_epic_file(_write_feature_epic(tmp_path)))
+    assert stories["98.1-003"].ac_count is None
+
+
+def test_features_dependency_depth_from_graph(tmp_path) -> None:
+    """AC1: dependency depth is the longest chain through the epic's graph."""
+    stories = _by_id(parse_epic_file(_write_feature_epic(tmp_path)))
+    assert stories["98.1-001"].dep_depth == 0
+    assert stories["98.1-002"].dep_depth == 1
+    assert stories["98.1-003"].dep_depth == 2
+
+
+def test_features_dependency_depth_unknown_without_dependencies_line(tmp_path) -> None:
+    """AC4: a story that states no Dependencies line has unknown depth, not 0."""
+    stories = _by_id(parse_epic_file(_write_feature_epic(tmp_path)))
+    assert stories["98.1-004"].dep_depth is None
+
+
+def test_features_dependency_depth_unknown_for_cycle_members(tmp_path) -> None:
+    """A dependency cycle yields unknown depth and never crashes discovery."""
+    epic = _write_feature_epic(tmp_path, _CYCLE_EPIC, "epic-97-cycle.md")
+    stories = _by_id(parse_epic_file(epic))
+    assert stories["97.1-001"].dep_depth is None
+    assert stories["97.1-002"].dep_depth is None
+
+
+def test_features_scope_proxy_counts_distinct_paths(tmp_path) -> None:
+    """AC1: the scope proxy counts the distinct files/areas the epic states."""
+    stories = _by_id(parse_epic_file(_write_feature_epic(tmp_path)))
+    # discovery.py is named twice; the proxy counts distinct paths.
+    assert stories["98.1-001"].scope_proxy == 2
+
+
+def test_features_scope_proxy_unknown_when_epic_states_none(tmp_path) -> None:
+    """AC4: a story that names no files/areas has an unknown scope proxy."""
+    stories = _by_id(parse_epic_file(_write_feature_epic(tmp_path)))
+    assert stories["98.1-002"].scope_proxy is None
+
+
+def test_features_do_not_disturb_existing_fields(tmp_path) -> None:
+    """AC2/AC3: points and every pre-existing field survive unchanged."""
+    stories = _by_id(parse_epic_file(_write_feature_epic(tmp_path)))
+    story = stories["98.1-002"]
+    assert story.points == 5  # descriptive scope label, still parsed
+    assert story.priority == "P2"
+    assert story.dependencies == ["98.1-001"]
+    assert story.title == "Middle story"
+    assert story.epic_id == "98"
+
+
+def test_features_default_to_unknown_on_synthesized_stories() -> None:
+    """AC3: the new fields are additive — a Story built the old way still works."""
+    from sdlc.cohort import Story
+
+    story = Story(
+        id="1.1-001", title="t", epic_id="01", epic_name="e", epic_file="f",
+        priority="P1", points=3, agent_type="general-purpose",
+    )
+    assert story.ac_count is None
+    assert story.dep_depth is None
+    assert story.scope_proxy is None
