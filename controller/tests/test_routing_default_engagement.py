@@ -464,3 +464,63 @@ def test_banner_lists_pinned_stages_when_a_profile_pins_one() -> None:
 @pytest.mark.parametrize("profile", ["off", "none", "OFF", "  None  "])
 def test_is_routing_off_recognises_every_opt_out_spelling(profile: str) -> None:
     assert is_routing_off({"profile": profile})
+
+
+# ---------------------------------------------------------------------------
+# Degradation — an unreadable snapshot reads as off, and the banner is optional
+# ---------------------------------------------------------------------------
+
+
+def test_run_routing_is_empty_when_the_ledger_file_is_absent(tmp_path) -> None:
+    """No ledger at all is the same "nothing stated" as a pre-flip row."""
+    assert Ledger(tmp_path / "absent.db").run_routing("nope") == {}
+
+
+def _run_row_with_routing(db: Path, raw: str) -> tuple[Ledger, str]:
+    """A ledger holding one run whose model_routing column is exactly ``raw``."""
+    ledger = Ledger(db)
+    ledger.init()
+    rid = ledger.run_create("epic-28", "serial")
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE runs SET model_routing = ? WHERE id = ?", (raw, rid))
+    return ledger, rid
+
+
+def test_run_routing_degrades_to_off_on_a_corrupt_snapshot(tmp_path) -> None:
+    """Unparseable JSON reads as routing-off, not as a crash mid-resume."""
+    ledger, rid = _run_row_with_routing(tmp_path / "ledger.db", "{not json")
+    assert ledger.run_routing(rid) == {}
+    assert is_routing_off(ledger.run_routing(rid))
+
+
+def test_run_routing_degrades_to_off_on_a_snapshot_that_is_not_an_object(
+    tmp_path,
+) -> None:
+    """Valid JSON of the wrong shape is rejected rather than handed downstream."""
+    ledger, rid = _run_row_with_routing(
+        tmp_path / "ledger.db", json.dumps(["balanced"])
+    )
+    assert ledger.run_routing(rid) == {}
+    assert config_from_snapshot(ledger.run_routing(rid)) is None
+
+
+def test_a_broken_banner_never_fails_an_otherwise_good_build(
+    tmp_path, monkeypatch
+) -> None:
+    """Routing visibility is best-effort: it must not take the run down with it."""
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+
+    def _boom(snapshot):
+        raise RuntimeError("banner exploded")
+
+    monkeypatch.setattr(build_mod, "routing_banner", _boom)
+    opts = BuildOptions(scope="epic-28", skip_preflight=True, sequential=True)
+    disp, ledger = _run(opts, tmp_path)
+
+    # Every stage still dispatched on the Balanced map the run froze...
+    assert disp.models == {
+        "build": SONNET, "coverage": SONNET, "review": SONNET, "merge": HAIKU,
+    }
+    assert ledger.run_routing(ledger.latest_run_id())["profile"] == "balanced"
+    # ...the run simply has no banner to show for it.
+    assert _routing_events(ledger, ledger.latest_run_id()) == []
