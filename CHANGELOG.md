@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.41.0] - 2026-07-22
+
+### Added
+
+- feat(empirical-estimation): budget gate, pre-dispatch (#28.3-002) (#525)
+
+
 ## [v2.40.0] - 2026-07-22
 
 ### Added
