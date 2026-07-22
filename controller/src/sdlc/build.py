@@ -1264,10 +1264,10 @@ def _prediction_cost_gate(
             committed = ledger.story_prediction(run_id, story.id)
         except Exception:  # noqa: BLE001 - the lookup is best-effort
             committed = None
-        if committed is None:
+        if committed is None or committed["predicted_tokens"] is None:
             return
-        tokens = committed["predicted_tokens"]
-        confidence = committed["confidence"]
+        tokens = int(committed["predicted_tokens"])
+        confidence = committed["prediction_confidence"] or "low"
     else:
         return
     if tokens < opts.cost_estimate_threshold:
@@ -2411,7 +2411,10 @@ class Ledger:
         build/resume path both *checks* for a committed forecast (a re-entered
         story must keep the forecast it was given before its first stage ran)
         and *replays* it into the model-escalation signal — never re-predicting,
-        so routing is identical across a run and its resumes. Read-only and
+        so routing is identical across a run and its resumes. Also the read the
+        28.3-002 pre-dispatch cost gate re-enforces on a re-entered story (a
+        resume carries no fresh prediction, so the gate compares the committed
+        ``predicted_tokens``/``prediction_confidence`` instead). Read-only and
         tolerant of a pre-migration ledger: returns ``None`` when the story
         carries no forecast (predictor off, or no prediction columns yet), which
         the caller reads as "predict afresh / fall back to points-keyed".
@@ -2433,32 +2436,6 @@ class Ledger:
             "predicted_tokens": row[0],
             "predicted_rework_prob": row[1],
             "prediction_confidence": row[2],
-        }
-
-    def story_prediction(self, run_id: str, story_id: str) -> dict | None:
-        """A story's committed forecast — ``{predicted_tokens, confidence}`` (28.3-002).
-
-        The read the pre-dispatch cost gate re-enforces on: a re-entered story
-        (resume) carries no *fresh* prediction, so the gate compares its
-        committed one against the threshold instead. ``None`` when the story was
-        never token-predicted (or the ledger predates the prediction columns),
-        so the caller degrades to the 14.1-002 stage estimate.
-        """
-        if not self.db_path.exists():
-            return None
-        with self._connect_ro() as conn:
-            if not self._has_columns(conn, "stories", ("predicted_tokens",)):
-                return None
-            row = conn.execute(
-                "SELECT predicted_tokens, prediction_confidence FROM stories "
-                "WHERE run_id = ? AND story_id = ?",
-                (run_id, story_id),
-            ).fetchone()
-        if row is None or row["predicted_tokens"] is None:
-            return None
-        return {
-            "predicted_tokens": int(row["predicted_tokens"]),
-            "confidence": row["prediction_confidence"] or "low",
         }
 
     def story_set_prediction(
