@@ -798,10 +798,11 @@ def doctor(
     The **model attribution** check (Story 28.1-002) reports the share of
     dispatched stage attempts across the same window carrying a non-NULL
     `stages.model` — the column cost-by-model reads. A completed stage on the
-    *latest* run with no model FAILs (the live recording regressed); older or
-    non-DONE NULLs WARN and are fixable with `sdlc model-backfill --all` where
-    the transcript survives. Rows whose model is genuinely unrecoverable are
-    counted as such, never coerced to a placeholder.
+    *latest* run whose own transcript names a model it did not record FAILs (the
+    live recording had it and dropped it); older, non-DONE, or unrecoverable
+    NULLs WARN and are fixable with `sdlc model-backfill --all` where the
+    transcript survives. Rows whose model is genuinely unrecoverable are counted
+    as such, never coerced to a placeholder.
 
     The **usage agreement** check (Story 28.1-001) scores the share of verifiable
     stage attempts across the last 5 runs whose recorded token/cost usage matches

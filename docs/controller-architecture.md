@@ -1075,10 +1075,14 @@ it on the next real run).
   - **Per-stage model attribution** (Story 28.1-002) — the share of *dispatched*
     stage attempts across the same window carrying a non-NULL `stages.model`
     (SKIPPED and still-running rows never ran an agent, so they owe no model and
-    are excluded). A **`DONE` attempt on the latest run with no model is a
-    `FAIL`**: that stage produced a result envelope, so the live recording
-    regressed. Older or non-`DONE` NULLs are a `WARN`, remedy
-    `sdlc model-backfill --all`. Rows whose model is genuinely unrecoverable are
+    are excluded). A **`DONE` attempt on the latest run whose own transcript
+    names a model it did not record is a `FAIL`**: the live recording had the
+    model in hand and dropped it. A `DONE` NULL with *no* recoverable model is
+    not a regression — `reconcile_run` synthesizes DONE stage rows for a
+    parked-then-landed story without dispatching an agent, and a plain-text
+    `SDLC_AGENT_CMD` harness names no model — so those, like older or non-`DONE`
+    NULLs, are a `WARN`, remedy `sdlc model-backfill --all`. Rows whose model is
+    genuinely unrecoverable are
     counted as such — never coerced to a placeholder. Read-only:
     [`model-backfill`](#per-stage-model-attribution-story-281-002) is the verb
     that writes.
