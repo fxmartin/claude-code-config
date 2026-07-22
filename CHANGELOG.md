@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.35.0] - 2026-07-22
+
+### Added
+
+- feat(empirical-estimation): batch doc-update records its (#28.1-003) (#519)
+
+
 ## [v2.34.3] - 2026-07-19
 
 ### Fixed
