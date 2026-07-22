@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -4822,3 +4823,99 @@ def test_story_upsert_without_features_stays_backward_compatible(tmp_path) -> No
     finally:
         conn.close()
     assert row == (8, "TODO")  # points preserved, untouched by the new columns
+
+
+def test_story_upsert_conflict_refreshes_predictor_features(tmp_path) -> None:
+    """The ON CONFLICT arm updates the features, not just the insert arm.
+
+    A story is upserted many times per run (TODO → each stage transition). The
+    features must track the latest discovery parse, and a later call that omits
+    them must not silently keep stale values from an earlier one.
+    """
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "serial")
+    ledger.story_upsert(
+        run_id, "28.2-001", "28", "Features", "P2", 3, "py", "", None, "TODO",
+        ac_count=4, dep_depth=0, scope_proxy=5,
+    )
+    ledger.story_upsert(
+        run_id, "28.2-001", "28", "Features", "P2", 3, "py", "feature/x", 7, "DONE",
+        ac_count=6, dep_depth=1, scope_proxy=2,
+    )
+    assert _features(db, run_id, "28.2-001") == (6, 1, 2)
+
+    # A pre-28.2 positional caller re-upserting the same story resets the
+    # features to unknown rather than leaving a stale, now-unsourced value.
+    ledger.story_upsert(
+        run_id, "28.2-001", "28", "Features", "P2", 3, "py", "feature/x", 7, "MERGED",
+    )
+    assert _features(db, run_id, "28.2-001") == (None, None, None)
+
+    conn = _open(db)
+    try:
+        rows = conn.execute(
+            "SELECT points, status FROM stories WHERE run_id=?", (run_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [(3, "MERGED")]  # one row, points intact — a patch, not an insert
+
+
+def test_run_build_persists_predictor_features_for_scheduled_stories(tmp_path) -> None:
+    """AC1: features reach the ledger for every story run_build schedules.
+
+    The queue is what discovery produced, so this is the seam where the feature
+    history the predictor (Story 28.2-002) trains on actually accumulates.
+    """
+    db = tmp_path / "ledger.db"
+    queue = _sample_queue()
+    queue[0] = replace(queue[0], ac_count=4, dep_depth=0, scope_proxy=3)
+    queue[1] = replace(queue[1], ac_count=None, dep_depth=0, scope_proxy=None)
+
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=queue,
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+
+    conn = _open(db)
+    try:
+        rows = dict(
+            (r[0], r[1:])
+            for r in conn.execute(
+                "SELECT story_id, ac_count, dep_depth, scope_proxy, points FROM stories"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+    assert rows["s1-001"] == (4, 0, 3, 2)
+    # Unknown features stay NULL — missing, not a real zero — while points, the
+    # descriptive label, is written exactly as before.
+    assert rows["s1-002"] == (None, 0, None, 2)
+    assert rows["s1-003"] == (None, None, None, 3)
+
+
+def test_story_rows_contract_unchanged_by_predictor_features(tmp_path) -> None:
+    """AC3: the new columns are additive — the dashboard's read contract is intact.
+
+    `story_rows` is the downstream consumer of the `stories` table; it must keep
+    returning exactly the keys it returned before, so the dashboard and any
+    Epic-22/Epic-11 reader are unaffected by the schema change.
+    """
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "serial")
+    ledger.story_upsert(
+        run_id, "28.2-001", "28", "Features", "P2", 3, "py", "", None, "TODO",
+        ac_count=4, dep_depth=1, scope_proxy=2,
+    )
+    (row,) = ledger.story_rows(run_id)
+    assert set(row) == {
+        "story_id", "title", "priority", "status", "pr_number",
+        "wave", "dependencies", "current_stage", "stage_status",
+    }
