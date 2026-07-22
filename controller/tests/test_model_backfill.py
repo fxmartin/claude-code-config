@@ -129,6 +129,22 @@ def test_parse_log_model_none_on_a_missing_file(tmp_path: Path) -> None:
     assert parse_log_model(tmp_path / "nope.log") is None
 
 
+def test_parse_log_model_none_on_a_pretty_printed_non_result_object(
+    tmp_path: Path,
+) -> None:
+    """A whole-file JSON object that is not a result envelope carries no model.
+
+    The multi-line fallback must not mistake an arbitrary object (an error
+    payload, a config dump) for an envelope and read a model out of it.
+    """
+    log = tmp_path / "s-build-1.log"
+    log.write_text(
+        json.dumps({"type": "error", "message": "dispatch refused"}, indent=2),
+        encoding="utf-8",
+    )
+    assert parse_log_model(log) is None
+
+
 # ---------------------------------------------------------------------------
 # backfill_models — the NULL backfill itself
 # ---------------------------------------------------------------------------

@@ -649,6 +649,33 @@ def test_model_coverage_ignores_rows_that_never_dispatched(tmp_path: Path) -> No
     assert "no dispatched stage attempts" in finding.detail
 
 
+def test_model_coverage_caps_the_listed_residual_rows(tmp_path: Path) -> None:
+    """Doctor lists a few offenders then says how many it elided.
+
+    The detail line has to stay readable when history is thin across many
+    attempts, without under-reporting the size of the gap.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "auto")
+    ledger.story_upsert(
+        run_id, "28.1-002", "epic-28", "t", "Must", 3, "python-backend-engineer",
+        "feature/28.1-002", None, "DONE",
+    )
+    # FAILED, so these are history to backfill rather than a fresh-run regression.
+    for attempt in range(1, 8):
+        ledger.stage_start(run_id, "28.1-002", "build", attempt, model=None)
+        ledger.stage_finish(run_id, "28.1-002", "build", attempt, "FAILED")
+
+    finding = check_model_coverage(db)
+
+    assert finding.status == "WARN"
+    assert "0/7" in finding.detail
+    assert "unrecoverable=7" in finding.detail
+    assert "+2 more" in finding.detail
+
+
 def test_model_coverage_clean_without_a_ledger(tmp_path: Path) -> None:
     finding = check_model_coverage(tmp_path / "absent.db")
     assert finding.status == "CLEAN"

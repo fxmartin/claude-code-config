@@ -115,6 +115,34 @@ def test_model_backfill_rejects_an_unknown_run(tmp_path: Path) -> None:
     assert result.exit_code == 2
 
 
+def test_model_backfill_caps_the_residual_list_and_says_how_many_it_hid(
+    tmp_path: Path,
+) -> None:
+    """A long residual list is truncated, but the hidden count stays visible.
+
+    AC2 requires unrecoverable rows to be *counted and reported*; truncating the
+    per-row listing must not silently drop the tail.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "auto")
+    ledger.story_upsert(
+        run_id, "28.1-002", "epic-28", "t", "Must", 3, "python-backend-engineer",
+        "feature/28.1-002", None, "DONE",
+    )
+    # 22 dispatched attempts, no logs on disk → all unrecoverable, over the cap.
+    for attempt in range(1, 23):
+        ledger.stage_start(run_id, "28.1-002", "build", attempt, model=None)
+        ledger.stage_finish(run_id, "28.1-002", "build", attempt, "DONE")
+
+    result = runner.invoke(app, ["model-backfill", "--db", str(db)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "+2 more row(s) without a model" in result.stdout
+    assert "coverage 0/22" in result.stdout
+
+
 def test_model_backfill_without_a_ledger_is_clean(tmp_path: Path) -> None:
     result = runner.invoke(app, ["model-backfill", "--db", str(tmp_path / "absent.db")])
 
