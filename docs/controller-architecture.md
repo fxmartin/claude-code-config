@@ -31,6 +31,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/status.py` | Read-side `state` helpers — a greppable state-machine dump (Story 10.1-001). |
 | `sdlc/rollback.py` | Returns a run to a prior checkpoint by resetting the later stories (Story 10.2-001). |
 | `sdlc/reconcile.py` | Verifies parked stories against `origin/main` and recomputes the run terminal — shared by close-out and `sdlc reconcile` (Stories 12.3-001/12.3-002). |
+| `sdlc/usage_reconcile.py` | Ledger-vs-logs usage reconciliation — re-derives per-stage token/cost usage from the session transcripts, backfills the correct attempt row, and scores the agreement rate (Story 28.1-001). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
@@ -891,6 +892,63 @@ longer shows FAILED days after the work actually shipped.
   spurious empty ledger; only a genuinely-unknown *explicit* run id exits
   non-zero (CLI exit 2).
 
+## Usage reconciliation (ledger vs session logs)
+
+The ledger is the cost record the estimator calibrates against
+([pre-dispatch cost estimate](#pre-dispatch-cost-estimate-and-warning-story-141-002)),
+so a stage attempt whose usage was never written — or was overwritten by a cheap
+recovery attempt — leaves the meter permanently wrong. `sdlc usage-reconcile`
+(`sdlc/usage_reconcile.py`, Story 28.1-001) re-derives each attempt's usage from
+its **own** transcript and writes it back through `Ledger.stage_set_usage`. It is
+deliberately a separate module from `reconcile.py`, which reclassifies parked
+story *status* against `origin/main` and has no usage awareness.
+
+- **`sdlc usage-reconcile [run] [--db PATH] [--all] [--dry-run] [--json]`**.
+  Defaults to the latest run; `--all` sweeps every run in the ledger.
+- **Ground truth is the transcript.** Session logs under
+  `.sdlc-state.db.logs/<run_id>/` are raw `stream-json`. The terminal
+  `{"type":"result"}` event is the *only* authoritative cost line — per-turn
+  events carry token counts but no dollars — so cost is recoverable only for
+  sessions that actually completed. A transcript that is instead one whole
+  (possibly pretty-printed) `--output-format json` envelope, as the non-streaming
+  dispatch path writes, is read too.
+- **Crashed sessions recover tokens only** (absorbs Issue #481). With no terminal
+  `result` line the per-turn `message.usage` blocks are summed via the shared
+  `progress.UsageAccumulator`, written as **tokens with cost left unavailable**,
+  and stamped `usage_source='log-recovered'` so the provenance is auditable. A
+  dollar figure is never fabricated.
+- **The right row, not the recovery row.** Logs are located from the row's own
+  key via build.py's naming convention (`<story>-<stage>-<attempt>.log`, and
+  `<story>-{reask,bugfix}-<stage>-<seq>.log` / `<story>-commitlint-<seq>.log` for
+  the recovery roles, whose ledger rows key on `(role, sequence)`), **not** from
+  the row's recorded `output_path`. Overwrite-era rows had `output_path` rewritten
+  to the cheap re-ask transcript when a contract-error recovery fired (the defect
+  PR #482 fixed going forward), so trusting it would copy the *recovery's* cheap
+  usage onto the original expensive session — precisely the ~17% under-reporting
+  this pass exists to undo. `output_path` is consulted only as a fallback for a
+  transcript outside the convention.
+- **Idempotent by construction.** Every write *assigns* the log's absolute
+  totals; nothing is ever accumulated, so a second pass finds the row already
+  matching and writes nothing — no double-counting, no re-summing. An attempt
+  still `IN_PROGRESS` under a **live** run is skipped entirely: its transcript is
+  not final and the controller may still write the authoritative usage itself.
+  The same row under a *terminal* run is skipped by nothing — it *is* the crashed
+  attempt (build.py deliberately leaves an interrupted row `IN_PROGRESS`), so
+  blanket-skipping would make crash recovery inert.
+- **Never fabricates, never guesses.** A row whose transcript was pruned is
+  reported `no-log` and left completely untouched; a transcript that carries no
+  usage at all (a plain-text custom `SDLC_AGENT_CMD`) reports `no-usage`. Both
+  count as **unverifiable** and are excluded from the agreement rate, so a repo
+  with no logs left reports "unknown" rather than a vacuous 100%.
+- **Provenance column.** Migration 14 adds `stages.usage_source`: NULL means the
+  usage was measured live by dispatch, `log-result` means it was backfilled from
+  an authoritative terminal `result` line, and `log-recovered` means it was summed
+  from a crashed session's stream (tokens only).
+- **`--dry-run`** audits without writing — the same read-only mode `sdlc doctor`
+  uses to score agreement. `--json` emits
+  `{run_ids, applied, verifiable, matched, unverifiable, agreement_rate, counts,
+  updated, residual}`.
+
 ## Clean (workspace garbage collection)
 
 `sdlc clean` makes build-leftover cleanup a safe, repeatable verb instead of a
@@ -950,6 +1008,16 @@ it on the next real run).
     no registry liveness and no activity for >6h → `WARN`.
   - **Config validity** — the packaged JSON schemas and the managed
     `settings.json` parse. A malformed file → `FAIL`.
+  - **Ledger-vs-logs usage agreement** (Story 28.1-001) — the share of
+    *verifiable* stage attempts across the last 5 runs whose recorded usage
+    matches its session log within tolerance, plus every residual disagreement
+    and its reason (`still-divergent`, `log-recovered`, `no-log`, `no-usage`).
+    Actionable drift (`still-divergent`) → `WARN`, remedy
+    `sdlc usage-reconcile --all`; the rest is reported at `CLEAN` so the metric
+    is visible on every health check. Attempts whose transcript was pruned are
+    counted as **unverifiable** and excluded from the rate — never reported as
+    agreement. Read-only like every other check: it *reports* drift,
+    [`usage-reconcile`](#usage-reconciliation-ledger-vs-session-logs) fixes it.
   - **Dependencies** — one finding per external tool (`gh`, `claude`, `semgrep`,
     `osv-scanner`), each probed via `<tool> --version`. A missing tool is a `WARN`
     (it degrades a feature, not the install) with an install remedy.

@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS stages (
     cache_read_tokens   INTEGER,
     cache_creation_tokens INTEGER,
     cost_usd            REAL,
+    usage_source        TEXT,
     estimated_tokens    INTEGER,
     estimated_cost_usd  REAL,
     harness             TEXT,
@@ -471,6 +472,23 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
             ("ac_count", "INTEGER"),
             ("dep_depth", "INTEGER"),
             ("scope_proxy", "INTEGER"),
+        ],
+        None,
+    ),
+    # Migration 14 adds the per-stage `usage_source` provenance flag (Story
+    # 28.1-001) to a pre-existing ledger's `stages` table. NULL means the usage
+    # was recorded live by dispatch (or not at all); the ledger-vs-logs
+    # reconciliation stamps `log-result` / `log-recovered` on the rows it
+    # backfills, so a token figure summed from a crashed session's stream (cost
+    # unavailable) is never mistaken for an authoritative, costed measurement.
+    # Additive and back-compatible; a fresh DB created from the up-to-date DDL is
+    # a no-op.
+    (
+        14,
+        "stage usage source column",
+        "stages",
+        [
+            ("usage_source", "TEXT"),
         ],
         None,
     ),
@@ -1692,22 +1710,31 @@ class Ledger:
         cache_read_tokens: int | None,
         cache_creation_tokens: int | None,
         cost_usd: float | None,
+        usage_source: str | None = None,
     ) -> None:
         """Record an agent's token/cost usage on a stage attempt row.
 
         Called after a dispatch returns the ``--output-format json`` envelope.
         Skipped by the caller when the agent emitted plain text and carried no
         usage, so old rows keep NULL usage and render as "—".
+
+        ``usage_source`` (Story 28.1-001) records the *provenance* of the figures.
+        The live dispatch path leaves it None — usage measured as it happened. The
+        ledger-vs-logs reconciliation stamps ``log-result`` when it backfilled
+        from a session log's authoritative terminal ``result`` line, and
+        ``log-recovered`` when it summed a crashed session's streamed turns (token
+        counts only; ``cost_usd`` stays NULL because stream-json carries no
+        per-turn cost, and a fabricated dollar figure would be worse than none).
         """
         with self._connect() as conn:
             conn.execute(
                 "UPDATE stages SET session_id = ?, input_tokens = ?, "
                 "output_tokens = ?, cache_read_tokens = ?, "
-                "cache_creation_tokens = ?, cost_usd = ? "
+                "cache_creation_tokens = ?, cost_usd = ?, usage_source = ? "
                 "WHERE run_id = ? AND story_id = ? AND stage_name = ? AND attempt = ?",
                 (
                     session_id, input_tokens, output_tokens, cache_read_tokens,
-                    cache_creation_tokens, cost_usd,
+                    cache_creation_tokens, cost_usd, usage_source,
                     run_id, story_id, stage_name, attempt,
                 ),
             )
@@ -2416,6 +2443,37 @@ class Ledger:
             d["tokens"] = _sum_tokens(d)
             out.setdefault(d.pop("story_id"), []).append(d)
         return out
+
+    def stage_usage_rows(self, run_id: str) -> list[dict]:
+        """Every stage attempt of ``run_id`` with its recorded usage (28.1-001).
+
+        The flat, reconciliation-facing counterpart to :meth:`stage_breakdown`:
+        one dict per attempt keyed by the ledger's own primary key
+        (``run_id, story_id, stage_name, attempt``) plus ``status``,
+        ``output_path``, the four token columns, ``cost_usd`` and
+        ``usage_source``. Read-only and tolerant of a pre-migration ledger — a DB
+        without the usage columns reports them as None rather than raising "no
+        such column", so a read-side viewer never has to migrate first.
+        """
+        if not self.db_path.exists():
+            return []
+        usage_cols = (
+            "session_id", "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_creation_tokens", "cost_usd", "usage_source",
+        )
+        with self._connect_ro() as conn:
+            present = {r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()}
+            selects = ", ".join(
+                col if col in present else f"NULL AS {col}" for col in usage_cols
+            )
+            rows = conn.execute(
+                "SELECT run_id, story_id, stage_name, attempt, status, output_path, "
+                + selects
+                + " FROM stages WHERE run_id = ? "
+                "ORDER BY story_id, started_at, rowid",
+                (run_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def change_token(self) -> str:
         """An opaque token that changes whenever a dashboard-visible field does.

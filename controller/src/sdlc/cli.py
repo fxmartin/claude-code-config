@@ -27,6 +27,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "validate": "Validate an agent response against its JSON schema.",
     "rollback": "Roll a run back to a prior ledger checkpoint.",
     "reconcile": "Re-check a run against origin/main and correct the ledger.",
+    "usage-reconcile": "Backfill per-stage usage from the session logs and score agreement.",
     "clean": "Garbage-collect build leftovers (orphan worktrees, merged branches, stale logs).",
     "sync-check": "Verify the Codex mirror's shared-skills submodule is in sync.",
     "generate-skills": "Generate Claude + Codex skill files from the neutral sources.",
@@ -789,8 +790,18 @@ def doctor(
     Runs read-only health-checks across install integrity (managed symlinks),
     ledger schema currency + integrity, stuck/stale runs (an IN_PROGRESS run with
     a dead pid or no recent activity), config validity (settings/schemas parse),
-    and dependency availability (gh, claude, semgrep, osv-scanner). Each finding
-    reports CLEAN/WARN/FAIL plus the command or doc that fixes it.
+    ledger-vs-logs usage agreement, and dependency availability (gh, claude,
+    semgrep, osv-scanner). Each finding reports CLEAN/WARN/FAIL plus the command
+    or doc that fixes it.
+
+    The **usage agreement** check (Story 28.1-001) scores the share of verifiable
+    stage attempts across the last 5 runs whose recorded token/cost usage matches
+    its session log's ground truth, and enumerates the residual disagreements with
+    their reason — `still-divergent` (WARN; run `sdlc usage-reconcile --all` to
+    backfill), `log-recovered` (a crashed session: tokens recovered, cost genuinely
+    unavailable), or `no-log`/`no-usage` (the transcript was pruned or carried no
+    usage — reported as *unverifiable* and excluded from the rate, never counted
+    as agreement).
 
     ``--gitlab`` additionally runs the GitLab adoption preflight against
     ``--target`` (default: cwd): glab installed/authenticated, the project +
@@ -1363,6 +1374,112 @@ def reconcile(
         f"run {result.run_id[:8]} {result.run_status_before} → "
         f"{result.run_status_after}."
     )
+    raise typer.Exit(code=0)
+
+
+# How many residual (non-updated) rows `usage-reconcile` names individually. A
+# repo whose transcripts were pruned by `sdlc clean` can carry hundreds of
+# unverifiable rows; dumping them all would bury the summary. `--json` always
+# carries the complete list.
+_USAGE_RESIDUAL_LIST_CAP = 20
+
+
+@app.command(name="usage-reconcile", help=PLANNED_SUBCOMMANDS["usage-reconcile"])
+def usage_reconcile(
+    run: str | None = typer.Argument(
+        None, help="Run id to reconcile (default: the most recent run)."
+    ),
+    db: Path | None = typer.Option(
+        None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
+    ),
+    all_runs: bool = typer.Option(
+        False, "--all", help="Sweep every run in the ledger, not just the latest."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would change without writing to the ledger."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the reconciliation report as a JSON object."
+    ),
+) -> None:
+    """Backfill per-stage token/cost usage from the session logs (Story 28.1-001).
+
+    The ledger is the cost record the estimator trains on, but it under-reported:
+    a stage whose usage was never written (or was overwritten by a cheap recovery
+    attempt) leaves the meter wrong forever. This pass re-derives each stage
+    attempt's usage from its own transcript under ``.sdlc-state.db.logs/<run>/``
+    and writes the log-derived figures onto the correct attempt row.
+
+    The transcript's terminal ``{"type":"result"}`` line is the only authoritative
+    cost record — per-turn stream-json events carry tokens but no dollars. A
+    crashed or interrupted session therefore recovers **tokens only**, flagged
+    ``log-recovered`` with cost left unavailable rather than fabricated.
+
+    Idempotent: every write assigns the log's absolute totals (never accumulates),
+    so re-running changes nothing. Stages still ``IN_PROGRESS`` are skipped, and a
+    row whose transcript was pruned is reported *unverifiable* and left untouched
+    — never counted as agreement. ``sdlc doctor`` reports the resulting agreement
+    rate on every health check.
+    """
+    from sdlc.ledger_view import Ledger, default_db_path
+    from sdlc.usage_reconcile import reconcile_usage
+
+    db_path = db or default_db_path()
+    ledger = Ledger(db_path)
+    # Migrate a pre-existing ledger before the pass reads/writes `usage_source`.
+    # No-op when no DB exists, so a never-built repo keeps a clean absence.
+    ledger.ensure_migrated()
+
+    if run is not None and ledger.run_row(run) is None:
+        typer.echo(f"error: no such run '{run}' in ledger: {db_path}", err=True)
+        raise typer.Exit(code=2)
+
+    result = reconcile_usage(ledger, run, all_runs=all_runs, apply=not dry_run)
+
+    if as_json:
+        typer.echo(json.dumps(result.to_dict(), default=str))
+        raise typer.Exit(code=0)
+
+    if not result.run_ids:
+        typer.echo(f"no build run found in ledger: {db_path}")
+        raise typer.Exit(code=0)
+
+    for audit in result.updated:
+        cost = "cost unavailable (crashed session)"
+        if audit.log_cost_usd is not None:
+            cost = f"${audit.log_cost_usd:.2f}"
+        typer.echo(
+            f"  {audit.label}: backfilled {audit.log_tokens:,} tokens, {cost} "
+            f"[{audit.reason}]"
+        )
+    pending = [a for a in result.residual if not a.updated]
+    for audit in pending[:_USAGE_RESIDUAL_LIST_CAP]:
+        typer.echo(f"  {audit.label}: {audit.reason}")
+    if len(pending) > _USAGE_RESIDUAL_LIST_CAP:
+        typer.echo(
+            f"  … +{len(pending) - _USAGE_RESIDUAL_LIST_CAP} more residual row(s) "
+            "(use --json for the full list)"
+        )
+
+    if dry_run:
+        # Nothing was written, so "updated" is always empty — report the residual
+        # disagreements the pass *would* act on instead of a misleading zero.
+        summary = (
+            f"usage-reconcile (dry-run): {len(result.residual)} "
+            "residual disagreement(s)"
+        )
+    else:
+        summary = f"usage-reconcile: {len(result.updated)} row(s) updated"
+    if result.agreement_rate is not None:
+        summary += (
+            f"; agreement {result.matched}/{result.verifiable} "
+            f"({result.agreement_rate:.0%})"
+        )
+    if result.unverifiable:
+        summary += f"; {result.unverifiable} unverifiable (no readable session log)"
+    if result.skipped_in_progress:
+        summary += f"; {result.skipped_in_progress} in-progress row(s) skipped"
+    typer.echo(summary + ".")
     raise typer.Exit(code=0)
 
 
