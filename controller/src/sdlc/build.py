@@ -57,9 +57,13 @@ from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.model_routing import (
     ModelRoutingConfig,
     OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
+    config_from_snapshot,
     escalate_model,
+    is_routing_off,
     load_routing_config,
+    routing_banner,
     routing_config,
+    routing_snapshot,
     select_model,
 )
 from sdlc.notify import notify
@@ -143,7 +147,11 @@ CREATE TABLE IF NOT EXISTS runs (
     completed       INTEGER DEFAULT 0,
     failed          INTEGER DEFAULT 0,
     status          TEXT NOT NULL,
-    actor           TEXT                            -- host login that drove the run (Story 22.5-001).
+    actor           TEXT,                           -- host login that drove the run (Story 22.5-001).
+    -- Story 28.4-001: the run's fully-resolved routing config (profile + effective
+    -- per-stage map + escalation thresholds after every override), frozen as JSON
+    -- at run creation and replayed verbatim by every resume.
+    model_routing   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stories (
@@ -492,7 +500,40 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         ],
         None,
     ),
+    # Migration 15 adds the per-run frozen routing snapshot (Story 28.4-001) to a
+    # pre-existing ledger's `runs` table, and — uniquely among these migrations —
+    # carries a *data* backfill (see `_MIGRATION_BACKFILLS`). The column add alone
+    # would be unsafe: every run created before this migration persisted
+    # `model_profile: ""`, which meant "routing off, CLI default everywhere" under
+    # the Story 14.2-001 semantics but resolves to Balanced under the new default.
+    # Resuming such a run must not silently upgrade it, so the backfill stamps
+    # each existing run with an explicit routing-off snapshot, freezing it at the
+    # behaviour it originally ran with. New runs stamp their own snapshot at
+    # creation, so this backfill is needed exactly once.
+    (
+        15,
+        "run model routing snapshot column",
+        "runs",
+        [
+            ("model_routing", "TEXT"),
+        ],
+        None,
+    ),
 ]
+
+# Data backfills keyed by migration version, executed *after* that migration's
+# column adds and inside the same transaction, so a migration can correct the
+# meaning of existing rows and not just widen them. Keyed rather than inlined in
+# `_MIGRATIONS` so the common (schema-only) entries keep their 5-tuple shape.
+_MIGRATION_BACKFILLS: dict[int, str] = {
+    # Story 28.4-001: freeze every pre-flip run at routing-off (see Migration 15).
+    15: (
+        "UPDATE runs SET model_routing = "
+        "'{\"profile\": \"off\", \"stage_models\": {}, \"overrides\": {}, "
+        "\"agent_cmd\": \"\", \"legacy\": true}' "
+        "WHERE model_routing IS NULL"
+    ),
+}
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -534,6 +575,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             for col, col_type in columns:
                 if col not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            # A data backfill runs only once its table exists and its columns have
+            # been added — it corrects the *meaning* of pre-existing rows (Story
+            # 28.4-001's routing-off freeze), so it is scoped to rows the new
+            # column left NULL and is a no-op on a fresh DB with no rows.
+            backfill = _MIGRATION_BACKFILLS.get(version)
+            if backfill:
+                conn.execute(backfill)
         conn.execute(
             "INSERT OR IGNORE INTO _migrations(version, name) VALUES (?, ?)",
             (version, name),
@@ -604,14 +652,19 @@ class BuildOptions:
     window_s: int = 18000
     rate_limit_threshold: float = 1.0
     # Story 14.2-001: per-task model routing. ``model_profile`` selects the
-    # per-stage model map — "" / "off" keeps today's behaviour (no ``--model``,
-    # CLI default = Opus for every stage); "balanced" is the shipped default map,
-    # with "quality-first" / "quota-max" as documented alternatives.
-    # ``model_overrides`` maps a stage to an explicit model that *wins* over the
-    # map (the per-stage escape hatch). ``_model_config`` memoizes the resolved
-    # config (profile + per-repo override) so it is read at most once per run.
+    # per-stage model map. Story 28.4-001 flipped its default: **unset** ("") now
+    # resolves to the shipped "balanced" map, and only an explicit "off" / "none"
+    # falls back to the CLI default model for every stage. "quality-first" /
+    # "quota-max" are the documented alternatives. ``model_overrides`` maps a
+    # stage to an explicit model that *wins* over the map (the per-stage escape
+    # hatch). ``model_routing_snapshot`` is the run's frozen, fully-resolved
+    # routing config (Story 28.4-001): when set it is replayed verbatim and the
+    # profile/override file are never re-read, which is how a resume routes
+    # identically to the run it resumes. ``_model_config`` memoizes the resolved
+    # config so the per-repo override file is read at most once per run.
     model_profile: str = ""
     model_overrides: dict[str, str] = field(default_factory=dict)
+    model_routing_snapshot: dict = field(default_factory=dict)
     _model_config: object = field(default=_UNRESOLVED, repr=False, compare=False)
     # Story 14.1-002: pre-dispatch cost-estimate gate. ``cost_estimate_threshold``
     # is a per-stage token ceiling for the *estimate* (0 = off → estimate is still
@@ -2289,6 +2342,47 @@ class Ledger:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
 
+    def run_set_routing(self, run_id: str, snapshot: dict) -> None:
+        """Freeze the run's fully-resolved routing config on its row (28.4-001).
+
+        Written once, at run creation, *before* the first dispatch. Every resume
+        replays this snapshot instead of re-resolving against the current config
+        file or overrides, so routing is identical across a run and all of its
+        resumes even if `.sdlc-model-routing.yaml` or a `--model-<stage>` pin
+        changed in between.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET model_routing = ? WHERE id = ?",
+                (json.dumps(snapshot), run_id),
+            )
+
+    def run_routing(self, run_id: str) -> dict:
+        """The run's frozen routing snapshot, or ``{}`` when it has none.
+
+        ``{}`` means the run predates Story 28.4-001's resolve-and-freeze (the
+        Migration 15 backfill stamps such rows explicitly, so this is only the
+        belt-and-braces path for a row written by a code path that does not
+        snapshot). Consumers read an absent snapshot as *routing off*, which is
+        both the conservative reading and what those runs actually did.
+        """
+        if not self.db_path.exists():
+            return {}
+        with self._connect_ro() as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+            if "model_routing" not in cols:
+                return {}  # ledger predates Migration 15
+            row = conn.execute(
+                "SELECT model_routing FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if row is None or not row["model_routing"]:
+            return {}
+        try:
+            snapshot = json.loads(row["model_routing"])
+        except (ValueError, TypeError):
+            return {}
+        return snapshot if isinstance(snapshot, dict) else {}
+
     def run_usage_totals(self, run_id: str) -> dict:
         """Running token + notional-cost accrual for ``run_id`` (Story 14.1-001).
 
@@ -2897,6 +2991,13 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
             run_row.get("started_at"), run_row.get("finished_at"), now=now
         ),
         "config": config,
+        # Story 28.4-001: the fully-resolved routing config that *governed* this
+        # run — profile plus the effective per-stage map and escalation
+        # thresholds after every override — read from the frozen run-row
+        # snapshot. `{}` for a run created before the freeze existed (it routed
+        # off). The per-stage model each attempt actually ran on is on the stage
+        # rows (Story 28.1-002), surfaced above as each story's `models`.
+        "routing": ledger.run_routing(rid),
         "concurrency": concurrency,
         "usage": run_usage,
         "stall_seconds": stalls["total_s"],
@@ -4611,6 +4712,20 @@ def run_build(
     # default slot is the built-in Claude harness (no probe, all capabilities),
     # so this is purely additive logging and never alters dispatch behaviour.
     _log_harness_preflight(ledger, run_id, mode, opts)
+    # Story 28.4-001: resolve the run's model routing **once**, freeze it on the
+    # run row, and announce it before the first dispatch. Freezing the whole
+    # resolved config (not just the profile name) is what makes a resume route
+    # identically: a later edit to `.sdlc-model-routing.yaml` or a changed
+    # `--model-<stage>` pin cannot reach this run. The banner makes the state
+    # visible live (stderr) and post-hoc (a `routing` event), so routing can no
+    # longer fail silent-and-expensive.
+    routing = _resolve_run_routing(opts)
+    opts.model_routing_snapshot = routing
+    ledger.run_set_routing(run_id, routing)
+    _log_routing_banner(
+        ledger, run_id, routing,
+        unattended=len(buildable) > 1 or bool(opts.budget),
+    )
     # Story 20.5-002: record any safe fallback the harness's capability gaps force
     # (parallel→serial, usage "unavailable", rate-limit backoff skipped) so a
     # degradation is auditable in the run summary, never silent. Empty (no-op) for
@@ -6081,19 +6196,79 @@ _RISK_AWARE_STAGES = frozenset({"review"})
 def _routing_config_for(opts: BuildOptions) -> ModelRoutingConfig | None:
     """Resolve (and memoize) the run's model-routing config (Story 14.2-001).
 
-    Returns None when routing is off. The per-repo override file
+    Returns None when routing is off (an explicit ``off`` profile — since Story
+    28.4-001 an *unset* profile resolves to Balanced instead).
+
+    A frozen ``model_routing_snapshot`` short-circuits resolution entirely: a
+    resume replays the snapshot its original run persisted, so neither the
+    profile table, the per-repo override file, nor a changed ``--model-<stage>``
+    pin can move a resumed run's routing. Otherwise the override file
     (``.sdlc-model-routing.yaml`` at the working tree root) is read at most once
     per run — the result is cached on ``opts._model_config`` — so per-stage
-    selection stays cheap. A run with no profile never touches disk.
+    selection stays cheap.
     """
     cached = opts._model_config
     if cached is not _UNRESOLVED:
         return cached  # type: ignore[return-value]
-    config = load_routing_config(
-        opts.model_profile, override_path=Path(MODEL_ROUTING_OVERRIDE_FILENAME)
-    )
+    if opts.model_routing_snapshot:
+        config = config_from_snapshot(opts.model_routing_snapshot)
+    else:
+        config = load_routing_config(
+            opts.model_profile, override_path=Path(MODEL_ROUTING_OVERRIDE_FILENAME)
+        )
     opts._model_config = config
     return config
+
+
+def _resolve_run_routing(opts: BuildOptions) -> dict:
+    """Resolve the run's routing **once** and return the snapshot to freeze (28.4-001).
+
+    Called at run creation, before the first dispatch. Captures the profile, the
+    effective per-stage map after the explicit ``--model-<stage>`` pins, the
+    escalation thresholds, and whether ``SDLC_AGENT_CMD`` replaced the agent
+    command wholesale — everything that decides which model a stage runs on. The
+    resolved config is memoized onto ``opts`` by :func:`_routing_config_for`, so
+    the rest of the run reuses this single resolution rather than re-reading the
+    override file.
+    """
+    config = _routing_config_for(opts)
+    return routing_snapshot(
+        config,
+        overrides=opts.model_overrides,
+        agent_cmd=os.environ.get("SDLC_AGENT_CMD", ""),
+    )
+
+
+def _log_routing_banner(
+    ledger: "Ledger", run_id: str, snapshot: dict, *, unattended: bool = False
+) -> None:
+    """Print and ledger-log the run-start routing banner (Story 28.4-001).
+
+    The banner is the answer to "which profile governed this run": it is written
+    to stderr for the live operator and to the run's events as ``source=routing``
+    so ``sdlc status`` and the dashboard can show it post-hoc. Routing-off logs at
+    ``warn`` — the state is expensive, so it must not read as routine info — and
+    an *unattended-looking* routing-off invocation (a multi-story batch or a
+    ``--budget`` ceiling, i.e. exactly the runs nobody watches) adds an explicit
+    preflight warning, mirroring the ``sdlc doctor`` check.
+
+    Best-effort: a logging failure must never fail an otherwise-good build.
+    """
+    try:
+        off = is_routing_off(snapshot)
+        lines = list(routing_banner(snapshot))
+        if off and unattended:
+            lines.append(
+                "WARNING: routing is off on an unattended-looking run "
+                "(batch > 1 story or --budget set) — every stage will bill at the "
+                "CLI default model; engage a profile or run it attended"
+            )
+        level = "warn" if off else "info"
+        for line in lines:
+            print(line, file=sys.stderr)
+            ledger.event_log(run_id, "", level, "routing", line)
+    except Exception:  # noqa: BLE001 - visibility must never fail a build
+        pass
 
 
 def _story_high_risk(story: Story, opts: BuildOptions) -> bool:
@@ -6107,7 +6282,10 @@ def _story_high_risk(story: Story, opts: BuildOptions) -> bool:
     best-effort: any git/import error degrades to False so routing never fails a
     build, and it is a no-op when routing is off.
     """
-    if opts.model_profile.strip().lower() in {"", "off", "none"}:
+    # Asks the resolved config (memoized) rather than re-reading the profile
+    # string: since Story 28.4-001 an unset profile means Balanced, not off, and
+    # a resumed run's routing comes from its frozen snapshot, not its profile.
+    if _routing_config_for(opts) is None:
         return False
     try:
         from sdlc.risk_gate import match_high_risk

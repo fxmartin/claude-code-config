@@ -795,6 +795,26 @@ function renderMain(d){
       + (cfg.rebuild ? " &middot; rebuild" : "")
       + (cfg.limit ? (" &middot; limit "+esc(cfg.limit)) : "") + "</div>";
   }
+  // Story 28.4-001: the routing config that *governed* this run, read from the
+  // run row's frozen snapshot. Off is called out loudly (it means every stage
+  // billed at the CLI default); on shows the profile and the effective per-stage
+  // map after overrides, so which map ran is never guesswork after the fact.
+  const rt = run.routing || {};
+  const rtOff = !rt.profile || rt.profile === "off" || rt.profile === "none";
+  let rtline = "";
+  if(Object.keys(rt).length){
+    if(rtOff){
+      rtline = "<div class='muted small'><b>MODEL ROUTING OFF</b> — CLI default model on every stage</div>";
+    } else {
+      const map = Object.keys(rt.stage_models||{}).sort()
+        .map(s => esc(s)+"="+esc(rt.stage_models[s])).join(" ");
+      rtline = "<div class='muted small'>model routing: <code>"+esc(rt.profile)+"</code>"
+        + " &middot; "+map
+        + " &middot; → "+esc(rt.escalation_model)+" on high-risk or points &ge; "+esc(rt.points_threshold)
+        + "</div>";
+    }
+  }
+  cfgline += rtline;
   const u = run.usage;
   const usageLine = u
     ? "<div class='muted small'>tokens "+humanTokens(u.total_tokens)
