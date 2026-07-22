@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +13,10 @@ from sdlc.build import (
     BuildOptions,
     Ledger,
     _CostGatePause,
+    _flag_budget_projection,
+    _plan_batch,
     _prediction_cost_gate,
+    _reconcile_batch_plan,
     run_build,
 )
 from sdlc.cost_estimate import project_batch
@@ -230,6 +234,37 @@ def test_prediction_gate_still_gates_when_the_ledger_cannot_log() -> None:
         _prediction_cost_gate(Boom(), "run", story, prediction, opts)
 
 
+def test_prediction_gate_survives_a_failing_committed_lookup() -> None:
+    """A best-effort committed-forecast read that raises must not block dispatch."""
+    class Boom:
+        def __getattr__(self, name):
+            raise RuntimeError("ledger exploded")
+
+    story = _sample_queue()[0]
+    opts = BuildOptions(predict=True, auto=False, cost_estimate_threshold=5_000)
+    # No fresh prediction and a broken lookup → treated as no forecast at all.
+    _prediction_cost_gate(Boom(), "run", story, None, opts)  # no raise
+
+
+def test_story_prediction_is_none_without_a_ledger_db(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "absent.db")
+    assert ledger.story_prediction("run", "s1-001") is None
+
+
+def test_story_prediction_is_none_on_a_pre_prediction_schema(tmp_path: Path) -> None:
+    """A ledger predating the 28.2-002 columns degrades to the stage estimate."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(
+        run_id, "s1-001", "99", "Story one", "P1", 2, "py", "", None, "TODO",
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute("ALTER TABLE stories DROP COLUMN predicted_tokens")
+    assert ledger.story_prediction(run_id, "s1-001") is None
+
+
 # ---------------------------------------------------------------------------
 # Consumer 2 — budget gate projects remaining from summed predictions
 # ---------------------------------------------------------------------------
@@ -274,6 +309,42 @@ def test_budget_projection_never_blocks_dispatch(tmp_path: Path) -> None:
     assert result.completed == 1
 
 
+def test_budget_projection_flags_on_the_parallel_scheduler_path(
+    tmp_path: Path,
+) -> None:
+    """The continuous scheduler re-checks the projected ceiling per submission."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_history(db)
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, predict=True, auto=True,
+        budget=40_000, concurrency=2,
+    )
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), preflight=lambda: True,
+    )
+    assert result.completed == 3
+    flags = [
+        m for m in _events(db, result.run_id)
+        if "projected to cross the ceiling" in m
+    ]
+    assert len(flags) == 1  # latched after the first firing, same as serial
+
+
+def test_flag_budget_projection_is_best_effort_on_a_ledger_fault() -> None:
+    """A usage-totals read that raises must never fail (or halt) the run."""
+    class Boom:
+        def __getattr__(self, name):
+            raise RuntimeError("ledger exploded")
+
+    projection = project_batch([_p(30_000)])
+    opts = BuildOptions(predict=True, budget=10_000)
+    flagged = _flag_budget_projection(
+        Boom(), "run", opts, _sample_queue(), {}, projection,
+    )
+    assert flagged is False
+
+
 # ---------------------------------------------------------------------------
 # Consumer 3 — batch planner: summed predicted tokens vs the rate-limit window
 # ---------------------------------------------------------------------------
@@ -299,6 +370,16 @@ def test_batch_plan_warns_when_the_batch_exceeds_the_window(tmp_path: Path) -> N
     assert len(plans) == 1
     assert "projected to exceed the window" in plans[0]
     assert "~3 windows" in plans[0]
+
+
+def test_plan_batch_is_best_effort_on_a_ledger_fault() -> None:
+    """A planner fault degrades to the Epic-14 accrued view, never fails the run."""
+    class Boom:
+        def __getattr__(self, name):
+            raise RuntimeError("ledger exploded")
+
+    opts = BuildOptions(predict=True, window_budget=40_000)
+    assert _plan_batch(Boom(), "run", _sample_queue(), opts) == ({}, None)
 
 
 def test_batch_plan_falls_back_without_a_usable_prediction(tmp_path: Path) -> None:
@@ -338,3 +419,14 @@ def test_no_batch_reconciliation_without_a_window_plan(tmp_path: Path) -> None:
     assert not any(
         "batch plan reconciled" in m for m in _events(db, result.run_id)
     )
+
+
+def test_batch_reconciliation_is_best_effort_on_a_ledger_fault() -> None:
+    """A reconciliation fault is swallowed — the run's close-out never breaks."""
+    class Boom:
+        def __getattr__(self, name):
+            raise RuntimeError("ledger exploded")
+
+    projection = project_batch([_p(30_000)])
+    opts = BuildOptions(predict=True, window_budget=40_000)
+    _reconcile_batch_plan(Boom(), "run", opts, projection)  # no raise
