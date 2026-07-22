@@ -21,6 +21,7 @@ __all__ = [
     "DEPENDENCIES",
     "Finding",
     "DoctorReport",
+    "check_usage_agreement",
     "run_doctor",
     "worst_status",
 ]
@@ -71,6 +72,16 @@ _SEVERITY = {"CLEAN": 0, "WARN": 1, "FAIL": 2}
 # longer than this is reported stale (seconds). Generous so a slow stage that is
 # genuinely still running is never mislabelled stuck.
 _STALE_AFTER_S = 6 * 3600
+
+# How many recent runs the ledger-vs-logs agreement check reads (Story 28.1-001).
+# Bounded because the check parses every stage attempt's transcript, and those can
+# be megabytes each; the most recent runs are also the ones whose logs survive
+# `sdlc clean`, so a wider sweep would mostly add unverifiable rows.
+_AGREEMENT_RUN_LIMIT = 5
+
+# At most this many residual disagreements are named individually in the finding's
+# detail; the rest are summarised as "+N more" so the line stays readable.
+_AGREEMENT_MAX_LISTED = 5
 
 
 def worst_status(statuses: list[str]) -> str:
@@ -361,6 +372,94 @@ def check_config(repo_root: Path) -> Finding:
     )
 
 
+def check_usage_agreement(
+    db_path: Path,
+    *,
+    run_limit: int = _AGREEMENT_RUN_LIMIT,
+    logs_root: Path | None = None,
+) -> Finding:
+    """Score the ledger's per-stage usage against the session logs (Story 28.1-001).
+
+    The ledger is the cost record the estimator trains on, so silent drift between
+    it and the transcripts that actually ran is a calibration bug, not a cosmetic
+    one. This reports the **agreement rate** — the share of *verifiable* stage
+    attempts whose recorded usage matches its log's ground truth within tolerance
+    — plus every residual disagreement and its reason, so drift shows up on every
+    health check rather than only when someone goes looking.
+
+    Read-only, like every other doctor check: divergence is *reported*, and
+    ``sdlc usage-reconcile`` is the verb that fixes it. Attempts whose transcript
+    was pruned (or which never carried usage) are counted as **unverifiable** and
+    excluded from the rate, so a repo with no logs left reports "unknown" instead
+    of a vacuous 100%.
+    """
+    from sdlc.usage_reconcile import (
+        LOG_RECOVERED,
+        NO_LOG,
+        NO_USAGE,
+        STILL_DIVERGENT,
+        reconcile_usage,
+    )
+
+    name = "Ledger-vs-logs usage agreement"
+    if not db_path.exists():
+        return Finding(
+            "usage", name, "CLEAN", "no ledger yet — no stage usage to verify"
+        )
+
+    try:
+        audit = reconcile_usage(
+            Ledger(db_path), run_limit=run_limit, logs_root=logs_root, apply=False
+        )
+    except sqlite3.DatabaseError as exc:
+        # A corrupt/unreadable ledger is already a FAIL from check_ledger; do not
+        # double-report it as a usage problem.
+        return Finding(
+            "usage", name, "WARN",
+            f"usage agreement could not be computed: {exc}",
+            "fix the ledger first (see the ledger finding above)",
+        )
+
+    if not audit.audits:
+        return Finding(
+            "usage", name, "CLEAN", "no completed stage attempts to verify"
+        )
+
+    counts = audit.counts()
+    residual_counts = ", ".join(
+        f"{reason}={counts[reason]}"
+        for reason in (STILL_DIVERGENT, LOG_RECOVERED, NO_LOG, NO_USAGE)
+        if counts.get(reason)
+    )
+
+    scope = f"over the last {len(audit.run_ids)} run(s)"
+    if audit.agreement_rate is None:
+        detail = (
+            f"unverifiable {scope}: none of the {len(audit.audits)} stage attempt(s) "
+            "has a readable session log (transcripts pruned)"
+        )
+    else:
+        detail = (
+            f"agreement {audit.matched}/{audit.verifiable} "
+            f"({audit.agreement_rate:.0%}) {scope}"
+        )
+        if audit.unverifiable:
+            detail += f"; {audit.unverifiable} unverifiable (no readable session log)"
+    if residual_counts:
+        detail += f"; residual: {residual_counts}"
+        listed = audit.residual[:_AGREEMENT_MAX_LISTED]
+        detail += " — " + ", ".join(f"{a.label} ({a.reason})" for a in listed)
+        if len(audit.residual) > len(listed):
+            detail += f", +{len(audit.residual) - len(listed)} more"
+
+    if counts.get(STILL_DIVERGENT):
+        return Finding(
+            "usage", name, "WARN", detail,
+            "`sdlc usage-reconcile --all` to backfill usage from the session logs",
+        )
+    return Finding("usage", name, "CLEAN", detail)
+
+
 def _default_dep_probe(tool: str) -> bool:
     """True when ``tool`` is on PATH and answers ``--version`` with exit 0.
 
@@ -453,6 +552,7 @@ def run_doctor(
         check_ledger(db_path),
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
         check_config(repo_root),
+        check_usage_agreement(db_path),
     ]
     findings.extend(check_dependencies(dep_probe))
     return DoctorReport(findings=findings)
