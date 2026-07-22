@@ -61,6 +61,10 @@ class ContractError(Exception):
     usage: dict[str, Any] | None = None
     cost_usd: float | None = None
     usage_available: bool = False
+    # Story 28.1-002: the model that burned those tokens. Carried for the same
+    # reason as the usage — the caller records the miss on the attempt's ledger
+    # row, and the envelope re-ask can finish that exact row DONE.
+    model: str | None = None
 
 
 class ResultBlockError(ContractError):

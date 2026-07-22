@@ -73,6 +73,7 @@ def _validate_with_telemetry(
     usage: dict[str, Any] | None,
     cost_usd: float | None,
     usage_available: bool,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """``parse_and_validate`` but tag a contract miss with the run's telemetry.
 
@@ -85,6 +86,11 @@ def _validate_with_telemetry(
     the exception type is identical, so ``except ContractError`` behaviour is the
     same. The attributes are always set (``None`` when a run carried no usage) so
     a reader never has to distinguish "absent" from "None".
+
+    Story 28.1-002 attaches ``model`` for the same reason: the miss is recorded
+    on the attempt's own ledger row (and the envelope re-ask finishes that exact
+    row DONE), so dropping the model here would land a DONE row with a NULL
+    ``stages.model`` — the fresh-run regression ``sdlc doctor`` flags.
     """
     try:
         return parse_and_validate(agent_type, response)
@@ -92,6 +98,7 @@ def _validate_with_telemetry(
         exc.usage = usage
         exc.cost_usd = cost_usd
         exc.usage_available = usage_available
+        exc.model = model
         raise
 
 
@@ -212,17 +219,21 @@ class ClaudeStreamJsonParser(OutputParser):
             # leave the verbatim stream in place — that is the live tail -f view.
             if not streaming:
                 _write_transcript(transcript_path, agent_text, stderr)
+            # Story 28.1-002: the model the session actually ran on, so the
+            # ledger records fact rather than the pre-dispatch prediction (which
+            # is None whenever model routing is off). Resolved before validation
+            # so a contract miss carries it too — that attempt burned tokens on
+            # this model just as much as a valid one did.
+            observed_model = dominant_model(envelope.get("modelUsage"))
             data = _validate_with_telemetry(
                 agent_type, agent_text,
                 usage=usage, cost_usd=cost, usage_available=True,
+                model=observed_model,
             )
             return AgentResult(
                 agent_type=agent_type, data=data, raw=agent_text,
                 usage=usage, cost_usd=cost, session_id=session_id,
-                # Story 28.1-002: the model the session actually ran on, so the
-                # ledger records fact rather than the pre-dispatch prediction
-                # (which is None whenever model routing is off).
-                model=dominant_model(envelope.get("modelUsage")),
+                model=observed_model,
             )
 
         # Fallback: plain-text agent output (custom SDLC_AGENT_CMD / older claude, or

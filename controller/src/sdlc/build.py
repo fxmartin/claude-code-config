@@ -6309,6 +6309,10 @@ def _dispatch_stage(
             usage=getattr(exc, "usage", None),
             cost_usd=getattr(exc, "cost_usd", None),
             usage_available=getattr(exc, "usage_available", True),
+            # Story 28.1-002: and the model that burned them. The envelope re-ask
+            # below finishes *this* row DONE while keeping its usage, so without
+            # the model here a recovered stage lands DONE with `model` NULL.
+            model=getattr(exc, "model", None),
         )
         return False, failed, f"contract violation: {exc}", "contract"
     except AgentDispatchError as exc:
@@ -6480,10 +6484,10 @@ def _record_stage_usage(
 
     Story 28.1-002: the envelope's observed model is written first, and
     independently of usage. It is the single terminal hook every dispatched stage
-    passes through — primary (success *and* schema-valid failure), ``reask``,
-    ``commitlint`` and ``bugfix`` — so recording it here lands a non-NULL
-    ``stages.model`` on every stage type without threading the model through each
-    call site. A harness with no model telemetry writes nothing, leaving the
+    passes through — primary (success, schema-valid failure *and* contract
+    violation), ``reask``, ``commitlint`` and ``bugfix`` — so recording it here
+    lands a non-NULL ``stages.model`` on every stage type without threading the
+    model through each call site. A harness with no model telemetry writes nothing, leaving the
     model ``stage_start`` resolved from the registry / routing profile in place.
     """
     if result is None:

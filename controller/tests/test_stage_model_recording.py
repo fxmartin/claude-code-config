@@ -11,6 +11,7 @@ import pytest
 import sdlc.build as build_mod
 from sdlc.build import BuildOptions, Ledger, run_build
 from sdlc.cohort import Story
+from sdlc.contracts import ContractError
 from sdlc.dispatch import AgentResult
 from sdlc.harness import HarnessConfig
 from sdlc.progress import dominant_model, model_of
@@ -133,6 +134,35 @@ def test_no_stage_row_is_null_on_a_fresh_run(tmp_path, monkeypatch) -> None:
     )
     nulls = [key for key, model in _stage_models(db).items() if model is None]
     assert nulls == []
+
+
+def test_envelope_recovered_stage_records_the_contract_session_model(tmp_path) -> None:
+    """A contract-violating attempt still ran on a model — its row must say which.
+
+    The envelope re-ask (Story 12.1-001) finishes the *original* row DONE and
+    deliberately keeps that session's usage on it (Issue #480 defect 1). A model
+    dropped on the contract path therefore lands a **DONE row with a NULL model**
+    on a fresh run — the exact regression `sdlc doctor` FAILs on (AC3).
+    """
+    calls = {"n": 0}
+
+    def dispatcher(agent_type, prompt, story=None, **kwargs):
+        if agent_type == "build":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                exc = ContractError("build result envelope missing")
+                exc.model = _OBSERVED
+                raise exc
+        return AgentResult(
+            agent_type=agent_type, data=_PAYLOADS[agent_type], raw="", model=_OBSERVED
+        )
+
+    db = _run(
+        BuildOptions(scope="epic-28", skip_preflight=True, sequential=True),
+        tmp_path, dispatcher,
+    )
+    assert calls["n"] == 2, "the envelope re-ask never re-dispatched build"
+    assert _stage_models(db)[("build", 1)] == _OBSERVED
 
 
 # ---------------------------------------------------------------------------
