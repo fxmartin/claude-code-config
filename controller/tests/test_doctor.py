@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -186,6 +187,17 @@ def test_ledger_pre_migration_framework_warns(tmp_path: Path) -> None:
     assert _finding(report, "ledger").status == "WARN"
 
 
+def test_ledger_that_cannot_be_opened_fails(tmp_path: Path) -> None:
+    """A path that exists but is not an openable database is a FAIL, not a crash."""
+    db = tmp_path / "ledger-is-a-directory.db"
+    db.mkdir()
+    report = _doctor(tmp_path, db_path=db)
+    ledger = _finding(report, "ledger")
+    assert ledger.status == "FAIL"
+    assert "could not be opened" in ledger.detail
+    assert ledger.remedy
+
+
 def test_ledger_corrupt_fails(tmp_path: Path) -> None:
     db = tmp_path / "corrupt.db"
     db.write_bytes(b"this is not a sqlite database at all")
@@ -222,6 +234,47 @@ def test_stuck_run_dead_pid_fails(tmp_path: Path) -> None:
     assert runs.status == "FAIL"
     assert "run-dead"[:8] in runs.detail
     assert runs.remedy  # points at resume/reconcile/prune
+
+
+def test_stale_in_progress_run_warns(tmp_path: Path) -> None:
+    """A run left IN_PROGRESS with no registry entry and no recent activity is stale.
+
+    This is the orphan shape the usage reconciliation has to cope with too: the
+    registry record was pruned, so liveness can only be inferred from the
+    ledger's own last activity.
+    """
+    db = _fresh_ledger(tmp_path)
+    Ledger(db).run_create("epic-28", "auto")  # IN_PROGRESS, unknown to the registry
+
+    report = _doctor(
+        tmp_path,
+        db_path=db,
+        now=datetime.now(timezone.utc) + timedelta(hours=48),
+    )
+
+    runs = _finding(report, "runs")
+    assert runs.status == "WARN"
+    assert "no activity" in runs.detail
+    assert runs.remedy  # points at status/resume/reconcile
+
+
+def test_run_with_an_unparseable_timestamp_is_not_reported_stale(tmp_path: Path) -> None:
+    """An unreadable `started_at` yields no staleness verdict, not a false one."""
+    db = _fresh_ledger(tmp_path)
+    ledger = Ledger(db)
+    run_id = ledger.run_create("epic-28", "auto")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE runs SET started_at = 'not-a-timestamp' WHERE id = ?", (run_id,)
+        )
+
+    report = _doctor(
+        tmp_path,
+        db_path=db,
+        now=datetime.now(timezone.utc) + timedelta(hours=48),
+    )
+
+    assert _finding(report, "runs").status == "CLEAN"
 
 
 def test_live_run_is_clean(tmp_path: Path) -> None:
@@ -382,6 +435,66 @@ def test_usage_agreement_is_read_only(tmp_path: Path) -> None:
 def test_run_doctor_includes_the_usage_agreement_check(tmp_path: Path) -> None:
     report = _doctor(tmp_path)
     assert _finding(report, "usage").status == "CLEAN"
+
+
+def _usage_ledger_rows(tmp_path: Path, *, logged: dict[str, str]) -> Path:
+    """A ledger with a `build` and a `review` attempt; only `logged` keeps a log."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "auto")
+    ledger.story_upsert(
+        run_id, "28.1-001", "epic-28", "t", "Must", 5, "python-backend-engineer",
+        "feature/28.1-001", None, "DONE",
+    )
+    logs_dir = Path(f"{db}.logs") / run_id
+    logs_dir.mkdir(parents=True)
+    for stage in ("build", "review"):
+        ledger.stage_start(run_id, "28.1-001", stage, 1)
+        ledger.stage_finish(run_id, "28.1-001", stage, 1, "DONE")
+        ledger.stage_set_usage(
+            run_id, "28.1-001", stage, 1, session_id="s",
+            input_tokens=100, output_tokens=200, cache_read_tokens=0,
+            cache_creation_tokens=0, cost_usd=1.5,
+        )
+    for stage, body in logged.items():
+        (logs_dir / f"28.1-001-{stage}-1.log").write_text(body, encoding="utf-8")
+    return db
+
+
+def test_usage_agreement_reports_pruned_rows_alongside_a_real_rate(tmp_path: Path) -> None:
+    """AC5: a partially-pruned repo scores only what it can actually verify.
+
+    The rate is over the rows with a readable log; the pruned one is named as
+    unverifiable rather than silently inflating the denominator (or the rate).
+    """
+    db = _usage_ledger_rows(tmp_path, logged={"build": _RESULT_LINE})
+    finding = check_usage_agreement(db)
+    assert finding.status == "CLEAN"
+    assert "1/1" in finding.detail and "100%" in finding.detail
+    assert "1 unverifiable" in finding.detail
+    assert "no-log=1" in finding.detail
+
+
+def test_usage_agreement_truncates_a_long_residual_list(tmp_path: Path) -> None:
+    """Residuals stay readable: at most five are named, the rest counted."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-28", "auto")
+    ledger.story_upsert(
+        run_id, "28.1-001", "epic-28", "t", "Must", 5, "python-backend-engineer",
+        "feature/28.1-001", None, "DONE",
+    )
+    for attempt in range(1, 8):  # seven pruned attempts
+        ledger.stage_start(run_id, "28.1-001", "build", attempt)
+        ledger.stage_finish(run_id, "28.1-001", "build", attempt, "DONE")
+
+    finding = check_usage_agreement(db)
+
+    assert "no-log=7" in finding.detail
+    assert finding.detail.count("28.1-001/build#") == 5
+    assert "+2 more" in finding.detail
 
 
 # --- report serialization ---------------------------------------------------

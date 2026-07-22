@@ -158,6 +158,26 @@ def test_parse_log_usage_returns_none_for_a_missing_file(tmp_path):
     assert parse_log_usage(tmp_path / "gone.log") is None
 
 
+def test_parse_log_usage_ignores_a_non_numeric_cost_field(tmp_path):
+    """A malformed `total_cost_usd` reads as *no* cost, never as a coerced figure.
+
+    The whole point of the pass is that the ledger stops carrying invented
+    dollars, so a transcript whose cost field is a string (or a bool, which
+    Python would otherwise happily treat as 1.0) must degrade to "cost
+    unavailable" while its token counts still land.
+    """
+    event = _result(_turn(10, 20), 0.0)
+    event["total_cost_usd"] = "1.25"  # a string, not a number
+    usage = parse_log_usage(_write_log(tmp_path / "a.log", turns=[], result=event))
+    assert usage is not None and usage.complete is True
+    assert usage.total_tokens == 30
+    assert usage.cost_usd is None
+
+    event["total_cost_usd"] = True  # a bool is not a dollar figure either
+    boolish = parse_log_usage(_write_log(tmp_path / "b.log", turns=[], result=event))
+    assert boolish is not None and boolish.cost_usd is None
+
+
 # --- log resolution ---------------------------------------------------------
 
 
@@ -185,6 +205,32 @@ def test_resolve_stage_log_falls_back_to_the_recorded_output_path(tmp_path):
     elsewhere.write_text("", encoding="utf-8")
     found = resolve_stage_log(logs, "28.1-001", "build", 1, output_path=str(elsewhere))
     assert found == elsewhere
+
+
+def test_resolve_stage_log_disambiguates_an_ambiguous_glob_by_output_path(tmp_path):
+    """Two recovery logs can share `(role, attempt)`; output_path breaks the tie.
+
+    A `bugfix` row keys only on its sequence number, so two bugfixes recovering
+    different originating stages at the same sequence both match the glob. The
+    recorded output_path is trustworthy *here* — it only ever mis-points across
+    the row boundary the overwrite bug touched — so it picks the right one, and
+    resolution stays deterministic (first sorted match) when it cannot help.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    build = logs / "28.1-001-bugfix-build-1.log"
+    review = logs / "28.1-001-bugfix-review-1.log"
+    for path in (build, review):
+        path.write_text("", encoding="utf-8")
+
+    assert resolve_stage_log(
+        logs, "28.1-001", "bugfix", 1, output_path=str(review)
+    ) == review
+    # No hint, or a hint pointing outside the match set → first sorted match.
+    assert resolve_stage_log(logs, "28.1-001", "bugfix", 1) == build
+    assert resolve_stage_log(
+        logs, "28.1-001", "bugfix", 1, output_path=str(tmp_path / "unrelated.log")
+    ) == build
 
 
 # --- backfill ---------------------------------------------------------------
@@ -399,6 +445,37 @@ def test_reconcile_leaves_an_already_agreeing_row_alone(tmp_path):
     assert result.updated == [] and result.agreement_rate == 1.0
     # A live-recorded row keeps its NULL source — it was never log-derived.
     assert _row(ledger, run_id, "build", 1)["usage_source"] is None
+
+
+def test_reconcile_backfills_a_row_whose_cost_was_never_recorded(tmp_path):
+    """Matching tokens are not agreement when the ledger has no cost at all.
+
+    A row can carry the right token counts and still be missing the dollars the
+    completed session actually cost — the estimator trains on cost, so an absent
+    figure is drift, not a match, and the log's authoritative cost is written.
+    """
+    ledger, run_id, logs = _seed(tmp_path)
+    _write_log(
+        logs / "28.1-001-build-1.log",
+        turns=[],
+        result=_result(_turn(100, 200, 300, 400), 2.5),
+    )
+    ledger.stage_start(run_id, "28.1-001", "build", 1)
+    ledger.stage_finish(run_id, "28.1-001", "build", 1, "DONE")
+    ledger.stage_set_usage(
+        run_id, "28.1-001", "build", 1, session_id="sess-1",
+        input_tokens=100, output_tokens=200, cache_read_tokens=300,
+        cache_creation_tokens=400, cost_usd=None,
+    )
+
+    result = reconcile_usage(ledger, run_id)
+
+    row = _row(ledger, run_id, "build", 1)
+    assert row["cost_usd"] == 2.5
+    assert row["input_tokens"] == 100  # tokens untouched — they already agreed
+    assert row["usage_source"] == SOURCE_LOG_RESULT
+    assert _audit(result, "build", 1).updated is True
+    assert reconcile_usage(ledger, run_id).updated == []  # and it settles
 
 
 def test_reconcile_defaults_to_the_latest_run_and_spans_all_with_all_runs(tmp_path):
