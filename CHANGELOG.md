@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.40.0] - 2026-07-22
+
+### Added
+
+- feat(empirical-estimation): per-story token and (#28.2-002) (#523)
+
+
 ## [v2.39.0] - 2026-07-22
 
 ### Added
