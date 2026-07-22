@@ -148,9 +148,15 @@ Flags:
   --predict                 compute + record a per-story predicted token cost and
                             rework probability before dispatch, from the ledger's
                             own reconciled history, and reconcile prediction-vs-
-                            actual after. Off by default (stage estimates then use
-                            the 14.1-002 heuristic); score it with
-                            `sdlc predict-quality`
+                            actual after. With it on, --cost-threshold gates on
+                            the predicted story cost (confidence-labelled),
+                            --budget flags a run whose accrued + predicted-
+                            remaining tokens project past the ceiling, and
+                            --window-budget reports the batch's projected window
+                            fit; each falls back to the point-keyed estimate,
+                            logged, when no usable prediction exists. Off by
+                            default (stage estimates then use the 14.1-002
+                            heuristic); score it with `sdlc predict-quality`
 """
 
 
