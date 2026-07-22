@@ -810,7 +810,12 @@ function renderMain(d){
         .map(s => esc(s)+"="+esc(rt.stage_models[s])).join(" ");
       rtline = "<div class='muted small'>model routing: <code>"+esc(rt.profile)+"</code>"
         + " &middot; "+map
-        + " &middot; → "+esc(rt.escalation_model)+" on high-risk or points &ge; "+esc(rt.points_threshold)
+        + " &middot; → "+esc(rt.escalation_model)
+        + (rt.predicted_tokens_threshold!=null
+            ? (" on high-risk / predicted tokens &ge; "+esc(rt.predicted_tokens_threshold)
+               +" / rework &ge; "+esc(rt.rework_threshold)
+               +" (fallback points &ge; "+esc(rt.points_threshold)+")")
+            : (" on high-risk or points &ge; "+esc(rt.points_threshold)))
         + "</div>";
     }
   }

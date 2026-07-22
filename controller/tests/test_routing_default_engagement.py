@@ -228,7 +228,11 @@ def test_format_routing_states_profile_map_and_thresholds() -> None:
     text = "\n".join(lines)
     assert "**Model routing: `balanced`**" in text
     assert "merge=haiku" in text
-    assert "Escalates to opus on high-risk or points ≥ 8" in text
+    # Story 28.3-001: escalation is prediction-keyed; points are the stated
+    # fallback for a disabled / low-confidence predictor.
+    assert "Escalates to opus on high-risk, predicted tokens ≥ 2,000,000" in text
+    assert "predicted rework ≥ 0.5" in text
+    assert "predictor fallback: points ≥ 8" in text
 
 
 def test_format_routing_names_the_explicit_overrides() -> None:

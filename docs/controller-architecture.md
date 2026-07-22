@@ -502,9 +502,10 @@ to `Story.points` and the `stories.points` column, and still rendered as the
 human-facing `points:N` issue label, the story doc's own line, and the dashboard
 size hint. It is a **descriptive scope label**: the machine reads the features
 above (and, from Story 28.2-002, the prediction derived from them), not the
-label. (The one remaining machine reader of `story.points` is the Epic-14
-model-escalation threshold, which Story 28.3-001 re-keys onto predicted tokens
-and rework risk.)
+label. (Story 28.3-001 retired the last machine reader: the Epic-14
+model-escalation threshold now keys on predicted tokens and rework risk, with
+points surviving only as the labelled fallback for a disabled / low-confidence
+predictor — see the model-routing section.)
 
 **Additive and backward compatible.** The three `Story` fields default to unknown,
 so a synthesized story (`fix-issue`, `sdlc runlog`) and every pre-28.2 caller stay
@@ -2260,8 +2261,11 @@ Not every stage needs Opus. `sdlc build --model-routing=<profile>` dispatches
 each pipeline stage on a model matched to its cognitive load, cutting quota burn
 where quality is not at stake while pinning the strong tier where it is. The map
 lives in `sdlc/model_routing.py` as a frozen `ModelRoutingConfig` (per-stage map
-+ escalation policy), and `select_model(stage, config, *, points, high_risk)` is
-the single chooser.
++ escalation policy), and
+`select_model(stage, config, *, fallback_points, high_risk, signal)` is the
+single chooser. Since Story 28.3-001 the escalation input is the story's
+committed 28.2-002 prediction (`signal`, an `EscalationSignal`), not its point
+label — see "Prediction-keyed escalation" below.
 
 ### Routing states
 
@@ -2334,27 +2338,84 @@ The shipped default profile is **Balanced**:
 | Stage | Default | Escalates to Opus when… |
 |---|---|---|
 | `discovery` | Haiku | — (structured extraction) |
-| `build` | Sonnet | points ≥ threshold (8) — see the resume-determinism note below |
+| `build` | Sonnet | predicted-heavy (28.3-001) — see the resume-determinism note below |
 | `coverage` | Sonnet | — (tests need correctness) |
-| `review` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold |
-| `adversarial` | Sonnet | high-risk (`risk_gate`) **or** points ≥ threshold — an Opus **floor**, not a pin (Story 27.2-002) |
+| `review` | Sonnet | high-risk (`risk_gate`) **or** predicted-heavy |
+| `adversarial` | Sonnet | high-risk (`risk_gate`) **or** predicted-heavy — an Opus **floor**, not a pin (Story 27.2-002) |
 | `merge` | Haiku | — (mechanical) |
 
 The adversarial skeptic's Opus is a **floor tierable downward for low-risk only**
-(Story 27.2-002): a low-risk story (points below threshold, no high-risk flag)
-runs it on Sonnet, but a high-risk or large story keeps Opus. Tiering can never
+(Story 27.2-002): a low-risk story (predicted cheap, no high-risk flag) runs it
+on Sonnet, but a high-risk or predicted-heavy story keeps Opus. Tiering can never
 downgrade a high-risk story below the floor. When the review slot resolves to an
 external reviewer (the Codex CLI backend in `config/adversarial-reviewers.yaml`)
 there is no model choice to tier — the reviewer owns its own runtime.
 
 Two documented alternatives ship alongside it: **Quality-first** (Opus
 everywhere) and **Quota-max** (cheapest everywhere, with the adversarial skeptic
-tiered to Sonnet on low-risk work but keeping its Opus floor on high-risk / large
-stories, and a higher escalation bar). A per-repo
+tiered to Sonnet on low-risk work but keeping its Opus floor on high-risk /
+predicted-heavy stories, and a higher escalation bar). A per-repo
 `.sdlc-model-routing.yaml` additively overrides the chosen profile's stage map,
-points threshold, or escalation model — mirroring `risk_gate.py`'s
+escalation thresholds, or escalation model — mirroring `risk_gate.py`'s
 `.sdlc-risk-config.yaml` convention. A missing file is a silent no-op; a
 malformed one is a hard error.
+
+### Prediction-keyed escalation (Story 28.3-001)
+
+**"Predicted-heavy" replaces "points ≥ threshold" as the escalation input.**
+The 2026-07-19 dataset showed points are near-constant noise on this factory's
+own work (172/193 builds on one of two values), so keying model escalation on
+them — with routing about to be engaged by default — would have keyed model
+choice to noise. `select_model` now escalates an escalatable stage when the
+story's **committed 28.2-002 prediction** is confident and crosses either bar:
+
+| Threshold | Balanced | Quota-max | Override key (`.sdlc-model-routing.yaml`) |
+|---|---|---|---|
+| Predicted story-total tokens | 2,000,000 | 4,000,000 | `predicted_tokens_threshold` (int) |
+| Predicted rework probability | 0.5 | 0.75 | `rework_threshold` (number in [0, 1]) |
+
+Like the predictor's own weights these defaults are documented **priors anchored
+to the dataset's scale**, not fitted cut points — n=76 reconciled stories is far
+too thin to fit thresholds on. 2M predicted tokens (~$30 notional at the
+documented $15/Mtok rate) marks a story forecast to sit in the heavy tail of the
+factory's own story totals; an even-odds rework forecast means the cheap tier is
+more likely than not to pay for a retry. The per-repo override is the
+calibration lever as a repo's own reconciled history accumulates.
+
+The plumbing: `_predict_story_cost` (the shared build/resume pre-dispatch hook)
+mirrors whichever forecast governs the story — a fresh prediction, or the
+committed ledger row a re-entered story already carries (`Ledger.story_prediction`)
+— into a per-story `EscalationSignal` cache on the run's options, and
+`_select_stage_model` feeds it to `select_model`. Because the signal is
+**committed before the first dispatch and replayed verbatim on re-entry**, it is
+resume-stable by construction — which is why `build` may escalate on it
+deterministically even though it still ignores the live-git risk signal.
+
+**The Epic-08 risk input is unchanged.** `high_risk` (from `risk_gate.py`) still
+escalates build/review and still holds the adversarial slot's Opus floor,
+regardless of what the prediction says — 28.3-001 replaced the *points* input,
+not the risk input.
+
+**Fallback (safe rollout).** When the predictor is disabled (`--predict` off,
+the default), has no reconciled history, or the prediction is low-confidence,
+escalation falls back to today's Epic-14 behaviour — `fallback_points ≥
+points_threshold` (or the CLI default when routing is off) — and the fallback is
+logged (the run-start predictor-posture note, the per-story "no reconciled
+story history" note, and the `[low-confidence — model escalation falls back to
+points-keyed]` suffix on the prediction event). `story.points` is **never read
+as an escalation input on the prediction path**: with a confident forecast
+present, points can neither escalate nor de-escalate a stage (enforced by
+`test_prediction_routing.py`'s source-level check on `_select_stage_model`).
+The `points_threshold` field and its override key survive for exactly this
+fallback. The 28.4-001 routing snapshot freezes both new thresholds, so a
+resume escalates identically to its original run even if the override file
+changes in between.
+
+**Validation before broad trust.** Compare prediction-keyed escalation against
+the points-keyed baseline with the Epic-18 eval harness (`sdlc eval` + `sdlc
+eval-compare`) — run the same ticket set under a profile with the prediction
+thresholds engaged vs one with the predictor off, and check the quality gate
+pass-rate holds before relying on the new bars beyond this repo.
 
 **Where the `--model` is applied.** Every dispatch this controller makes routes:
 the four pipeline stages via `_dispatch_stage`, plus the two recovery agents —
@@ -2383,11 +2444,12 @@ files against the Epic-08 risk-gate patterns, best-effort (any git/import error
 → `False`). It is consulted **only for `review`** (`_RISK_AWARE_STAGES`), where
 the branch is already pushed so the same diff — and the same verdict — is seen on
 the original run and on a resume. `build` deliberately ignores it and escalates
-on **points** alone: build's branch does not exist when its model is chosen on a
-fresh run, so a live-git lookup would return `False` on first build but `True` on
-a resume (branch now present), silently changing the routed model across the
-resume. Routing build off points (a spec-derived, resume-stable signal) keeps it
-deterministic. The resolved config is memoized on `opts` so the override file is
+on **resume-stable signals** alone — the committed prediction, with points as
+the Epic-14 fallback (Story 28.3-001): build's branch does not exist when its
+model is chosen on a fresh run, so a live-git lookup would return `False` on
+first build but `True` on a resume (branch now present), silently changing the
+routed model across the resume. Routing build off signals frozen before the
+first dispatch keeps it deterministic. The resolved config is memoized on `opts` so the override file is
 read at most once per run. The profile and per-stage overrides are persisted in
 the run's config event and rehydrated by `run_resume`, so a resumed run routes
 identically. The `<<<RESULT_JSON>>>`

@@ -79,12 +79,12 @@ def test_unknown_profile_raises() -> None:
 )
 def test_balanced_default_map(stage, expected) -> None:
     """The Balanced default matches the story's per-stage table for a small, low-risk story."""
-    assert select_model(stage, BALANCED, points=1, high_risk=False) == expected
+    assert select_model(stage, BALANCED, fallback_points=1, high_risk=False) == expected
 
 
 def test_unknown_stage_returns_none() -> None:
     """A stage not in the map adds no --model (graceful: CLI default)."""
-    assert select_model("nonexistent", BALANCED, points=1, high_risk=False) is None
+    assert select_model("nonexistent", BALANCED, fallback_points=1, high_risk=False) is None
 
 
 # ---------------------------------------------------------------------------
@@ -93,31 +93,31 @@ def test_unknown_stage_returns_none() -> None:
 
 
 def test_build_escalates_to_opus_when_high_risk() -> None:
-    assert select_model("build", BALANCED, points=1, high_risk=True) == OPUS
+    assert select_model("build", BALANCED, fallback_points=1, high_risk=True) == OPUS
 
 
 def test_review_escalates_to_opus_when_high_risk() -> None:
-    assert select_model("review", BALANCED, points=1, high_risk=True) == OPUS
+    assert select_model("review", BALANCED, fallback_points=1, high_risk=True) == OPUS
 
 
 def test_build_escalates_to_opus_when_points_at_or_above_threshold() -> None:
     assert BALANCED.points_threshold > 0
     at = BALANCED.points_threshold
-    assert select_model("build", BALANCED, points=at, high_risk=False) == OPUS
-    assert select_model("build", BALANCED, points=at + 1, high_risk=False) == OPUS
+    assert select_model("build", BALANCED, fallback_points=at, high_risk=False) == OPUS
+    assert select_model("build", BALANCED, fallback_points=at + 1, high_risk=False) == OPUS
 
 
 def test_build_stays_sonnet_below_threshold_and_low_risk() -> None:
     below = BALANCED.points_threshold - 1
-    assert select_model("build", BALANCED, points=below, high_risk=False) == SONNET
+    assert select_model("build", BALANCED, fallback_points=below, high_risk=False) == SONNET
 
 
 def test_non_escalatable_stages_do_not_escalate() -> None:
     """coverage / merge / discovery never escalate on risk or points."""
     big = BALANCED.points_threshold + 5
-    assert select_model("coverage", BALANCED, points=big, high_risk=True) == SONNET
-    assert select_model("merge", BALANCED, points=big, high_risk=True) == HAIKU
-    assert select_model("discovery", BALANCED, points=big, high_risk=True) == HAIKU
+    assert select_model("coverage", BALANCED, fallback_points=big, high_risk=True) == SONNET
+    assert select_model("merge", BALANCED, fallback_points=big, high_risk=True) == HAIKU
+    assert select_model("discovery", BALANCED, fallback_points=big, high_risk=True) == HAIKU
 
 
 # ---------------------------------------------------------------------------
@@ -131,21 +131,21 @@ def test_non_escalatable_stages_do_not_escalate() -> None:
 
 def test_adversarial_low_risk_runs_on_sonnet() -> None:
     """A small, low-risk story tiers the skeptic down to Sonnet (AC1)."""
-    assert select_model("adversarial", BALANCED, points=1, high_risk=False) == SONNET
+    assert select_model("adversarial", BALANCED, fallback_points=1, high_risk=False) == SONNET
     below = BALANCED.points_threshold - 1
-    assert select_model("adversarial", BALANCED, points=below, high_risk=False) == SONNET
+    assert select_model("adversarial", BALANCED, fallback_points=below, high_risk=False) == SONNET
 
 
 def test_adversarial_escalates_to_opus_when_high_risk() -> None:
     """The Opus floor is preserved for a high-risk story — never downgraded (AC2)."""
-    assert select_model("adversarial", BALANCED, points=1, high_risk=True) == OPUS
+    assert select_model("adversarial", BALANCED, fallback_points=1, high_risk=True) == OPUS
 
 
 def test_adversarial_escalates_to_opus_when_large() -> None:
     """A large story (points ≥ threshold) keeps the skeptic on the Opus floor (AC2)."""
     at = BALANCED.points_threshold
-    assert select_model("adversarial", BALANCED, points=at, high_risk=False) == OPUS
-    assert select_model("adversarial", BALANCED, points=at + 1, high_risk=False) == OPUS
+    assert select_model("adversarial", BALANCED, fallback_points=at, high_risk=False) == OPUS
+    assert select_model("adversarial", BALANCED, fallback_points=at + 1, high_risk=False) == OPUS
 
 
 def test_adversarial_floor_holds_even_with_a_cheap_override() -> None:
@@ -156,9 +156,9 @@ def test_adversarial_floor_holds_even_with_a_cheap_override() -> None:
         override_text="model_routing:\n  stages:\n    adversarial: haiku\n",
     )
     # Low-risk honours the override (tierable downward for low-risk only)...
-    assert select_model("adversarial", cfg, points=1, high_risk=False) == HAIKU
+    assert select_model("adversarial", cfg, fallback_points=1, high_risk=False) == HAIKU
     # ...but a high-risk story still escalates to the Opus floor.
-    assert select_model("adversarial", cfg, points=1, high_risk=True) == OPUS
+    assert select_model("adversarial", cfg, fallback_points=1, high_risk=True) == OPUS
 
 
 def test_pinned_stage_always_runs_on_escalation_model() -> None:
@@ -166,9 +166,9 @@ def test_pinned_stage_always_runs_on_escalation_model() -> None:
     mechanism 27.2-002 left in place, though no shipped profile pins a stage."""
     cfg = replace(BALANCED, pinned_stages=frozenset({"adversarial"}))
     # Low-risk, small story: an escalatable stage would tier down, a pin never does.
-    assert select_model("adversarial", cfg, points=1, high_risk=False) == OPUS
+    assert select_model("adversarial", cfg, fallback_points=1, high_risk=False) == OPUS
     # High-risk agrees with the pin — still the escalation model.
-    assert select_model("adversarial", cfg, points=1, high_risk=True) == OPUS
+    assert select_model("adversarial", cfg, fallback_points=1, high_risk=True) == OPUS
     # The pin wins even over the stage's mapped base tier (Sonnet in Balanced).
     assert cfg.stage_models["adversarial"] == SONNET
 
@@ -180,20 +180,20 @@ def test_pinned_stage_always_runs_on_escalation_model() -> None:
 
 def test_quality_first_is_opus_everywhere() -> None:
     for stage in ("discovery", "build", "coverage", "review", "merge", "adversarial"):
-        assert select_model(stage, QUALITY_FIRST, points=1, high_risk=False) == OPUS
+        assert select_model(stage, QUALITY_FIRST, fallback_points=1, high_risk=False) == OPUS
 
 
 def test_quota_max_is_cheap_but_keeps_the_adversarial_floor() -> None:
-    assert select_model("build", QUOTA_MAX, points=1, high_risk=False) == HAIKU
-    assert select_model("merge", QUOTA_MAX, points=1, high_risk=False) == HAIKU
+    assert select_model("build", QUOTA_MAX, fallback_points=1, high_risk=False) == HAIKU
+    assert select_model("merge", QUOTA_MAX, fallback_points=1, high_risk=False) == HAIKU
     # 27.2-002: the low-risk skeptic tiers down to Sonnet even in the cheapest
     # profile, but never below it — its floor is Opus on high-risk / large work.
-    assert select_model("adversarial", QUOTA_MAX, points=1, high_risk=False) == SONNET
-    assert select_model("adversarial", QUOTA_MAX, points=1, high_risk=True) == OPUS
+    assert select_model("adversarial", QUOTA_MAX, fallback_points=1, high_risk=False) == SONNET
+    assert select_model("adversarial", QUOTA_MAX, fallback_points=1, high_risk=True) == OPUS
     at = QUOTA_MAX.points_threshold
-    assert select_model("adversarial", QUOTA_MAX, points=at, high_risk=False) == OPUS
+    assert select_model("adversarial", QUOTA_MAX, fallback_points=at, high_risk=False) == OPUS
     # Quota-max still protects genuinely high-stakes build/review work.
-    assert select_model("build", QUOTA_MAX, points=1, high_risk=True) == OPUS
+    assert select_model("build", QUOTA_MAX, fallback_points=1, high_risk=True) == OPUS
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +210,9 @@ def test_override_remaps_a_stage_model() -> None:
         "balanced",
         override_text="model_routing:\n  stages:\n    build: opus\n",
     )
-    assert select_model("build", cfg, points=1, high_risk=False) == OPUS
+    assert select_model("build", cfg, fallback_points=1, high_risk=False) == OPUS
     # Other stages keep the base profile's value.
-    assert select_model("coverage", cfg, points=1, high_risk=False) == SONNET
+    assert select_model("coverage", cfg, fallback_points=1, high_risk=False) == SONNET
 
 
 def test_override_can_change_points_threshold() -> None:
@@ -221,7 +221,7 @@ def test_override_can_change_points_threshold() -> None:
         override_text="model_routing:\n  points_threshold: 3\n",
     )
     assert cfg.points_threshold == 3
-    assert select_model("build", cfg, points=3, high_risk=False) == OPUS
+    assert select_model("build", cfg, fallback_points=3, high_risk=False) == OPUS
 
 
 def test_override_can_select_base_profile() -> None:
@@ -229,7 +229,7 @@ def test_override_can_select_base_profile() -> None:
         "balanced",
         override_text="model_routing:\n  profile: quota-max\n",
     )
-    assert select_model("build", cfg, points=1, high_risk=False) == HAIKU
+    assert select_model("build", cfg, fallback_points=1, high_risk=False) == HAIKU
 
 
 def test_override_reads_from_file(tmp_path) -> None:
@@ -245,7 +245,7 @@ def test_override_reads_from_file(tmp_path) -> None:
         encoding="utf-8",
     )
     cfg = load_routing_config("balanced", override_path=path)
-    assert select_model("merge", cfg, points=1, high_risk=False) == SONNET
+    assert select_model("merge", cfg, fallback_points=1, high_risk=False) == SONNET
 
 
 def test_missing_override_file_is_ignored(tmp_path) -> None:
@@ -304,9 +304,9 @@ def test_override_can_change_escalation_model() -> None:
     )
     # The adversarial floor uses the overridden escalation model on a high-risk
     # story; a low-risk one stays on its cheap Sonnet base.
-    assert select_model("adversarial", cfg, points=1, high_risk=True) == "claude-opus-4-8"
-    assert select_model("adversarial", cfg, points=1, high_risk=False) == SONNET
-    assert select_model("build", cfg, points=99, high_risk=True) == "claude-opus-4-8"
+    assert select_model("adversarial", cfg, fallback_points=1, high_risk=True) == "claude-opus-4-8"
+    assert select_model("adversarial", cfg, fallback_points=1, high_risk=False) == SONNET
+    assert select_model("build", cfg, fallback_points=99, high_risk=True) == "claude-opus-4-8"
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +320,7 @@ def test_config_is_frozen() -> None:
 
 
 def test_select_model_with_none_config_is_routing_off() -> None:
-    assert select_model("build", None, points=99, high_risk=True) is None
+    assert select_model("build", None, fallback_points=99, high_risk=True) is None
 
 
 # ---------------------------------------------------------------------------
