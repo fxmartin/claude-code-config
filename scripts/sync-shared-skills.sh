@@ -42,6 +42,10 @@ NEUTRAL_DIR="${SHARED_DIR}/neutral"
 # Pipeline skills (build-stories) ship a full SKILL.md into the Claude plugin
 # tree, checked alongside the body-only shared-skills mirror (Story 20.7-002).
 CLAUDE_SKILLS_BASE="${REPO_ROOT}/plugins/autonomous-sdlc/skills"
+# The Codex mirror lives in the `nix-install` parent (this repo is the
+# `config/claude-code-config` submodule). Overridable so a different checkout
+# layout — or a test — can point the gate elsewhere.
+CODEX_SKILLS_BASE="${CODEX_SKILLS_BASE:-${REPO_ROOT}/../../plugins/autonomous-sdlc/skills}"
 
 usage() {
   sed -n '4,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -82,6 +86,26 @@ cmd_verify_generated() {
   sdlc sync-check "${generated_dir}" \
     --neutral "${neutral_dir}" \
     --skill-base "${CLAUDE_SKILLS_BASE}"
+
+  # Issue #529: the Codex mirror lives in the parent `nix-install` repo, so it
+  # is present only when this repo is checked out as a submodule. Checking it
+  # is pipeline-only — the body-mirror gate compares `shared-skills/` bodies,
+  # which are Claude-rendered, so pairing it with `--harness codex` would
+  # report drift that is not real.
+  #
+  # When the mirror is absent (standalone CI clone) say so on stderr rather
+  # than passing silently: a quiet skip is exactly how the Codex build-stories
+  # skill sat three months stale without anything noticing.
+  if [[ -d "${CODEX_SKILLS_BASE}" ]]; then
+    sdlc sync-check "${generated_dir}" \
+      --neutral "${neutral_dir}" \
+      --skill-base "${CODEX_SKILLS_BASE}" \
+      --harness codex \
+      --pipeline-only
+  else
+    echo "warning: codex mirror not found at ${CODEX_SKILLS_BASE}" >&2
+    echo "         codex pipeline parity NOT verified this run" >&2
+  fi
 }
 
 cmd_regenerate() {
