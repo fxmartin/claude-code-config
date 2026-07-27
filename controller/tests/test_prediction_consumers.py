@@ -333,6 +333,40 @@ def test_budget_projection_flags_on_the_parallel_scheduler_path(
     assert len(flags) == 1  # latched after the first firing, same as serial
 
 
+def test_budget_projection_flags_at_the_first_parallel_pre_dispatch_check(
+    tmp_path: Path,
+) -> None:
+    """The pre-dispatch seam stays a live warning point in its own right.
+
+    The issue #539 completion re-checks would mask a lost pre-dispatch check:
+    a run crossing the ceiling gets flagged either way, so a count assertion
+    alone cannot tell the two seams apart. This pins the *first* one. With the
+    ceiling set to the batch's whole predicted total, accrued 0 plus the three
+    still-TODO predictions already crosses at the very first submission gate —
+    reached before any worker has run, so no completion check can precede it
+    and the assertion is independent of scheduling order (unlike an assertion
+    about *which* later check fires, which is what made the test above flaky).
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed_history(db)  # 10k predicted per story → 30k for the three-story batch
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, predict=True, auto=True,
+        budget=30_000, concurrency=2,
+    )
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), preflight=lambda: True,
+    )
+    flags = [
+        m for m in _events(db, result.run_id)
+        if "projected to cross the ceiling" in m
+    ]
+    assert len(flags) == 1
+    # Nothing had run yet: any completion check would show accrued > 0 and
+    # fewer than three pending stories.
+    assert "accrued 0 + predicted ~30,000 tokens for 3 pending stories" in flags[0]
+
+
 class _LateSiblingDispatcher(FakeDispatcher):
     """Holds ``s1-002`` at its first stage until ``s1-003`` has been dispatched.
 
