@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Protocol
+from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
 from sdlc.capability import preflight_harness, resolve_capabilities
 from sdlc import build_issue
@@ -96,6 +96,14 @@ from sdlc.registry import Registry, RunRecord
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
 # "max 2 bugfix iterations" rule (Step 5d2) so behaviour matches the playbook.
 MAX_BUGFIX_ATTEMPTS = 2
+
+# Issue #527: a review rejection whose findings spread across several changes
+# needs more rounds than a single-line one — the cellar stories that never
+# converged all carried multi-file findings. A review that reported at least this
+# many requested changes gets `MAX_BUGFIX_ATTEMPTS_SPREAD` rounds instead of the
+# flat constant; every other stage (and every narrow rejection) is unchanged.
+BUGFIX_SPREAD_THRESHOLD = 3
+MAX_BUGFIX_ATTEMPTS_SPREAD = 3
 
 # Story 12.1-002: recursion-guard sentinel. The controller exports this in the
 # environment of any test suite it runs during preflight; the `build`/`dashboard`
@@ -1974,6 +1982,52 @@ class Ledger:
             )
         return run_id
 
+    def parked_story_runs(self, story_ids: Sequence[str]) -> dict[str, dict]:
+        """Prior runs that parked one of ``story_ids`` on an open change request (#527).
+
+        For each story id, the most recent run whose story row is terminal-but-
+        unfinished (``FAILED`` / ``NEEDS_ATTENTION``), carries a ``pr_number``,
+        and actually executed at least one stage. Those three together are what
+        make a plain ``sdlc build`` re-run collide: it re-cuts ``feature/<id>``
+        from the base ref and re-opens a CR, so the push is a non-fast-forward
+        and the CR is a duplicate — silently discarding any manual fix already on
+        the branch. ``sdlc resume --run <full-run-id>`` is the path that respects
+        that state.
+
+        Returns ``{story_id: {"run_id", "status", "pr_number"}}``, empty when the
+        ledger does not exist yet (a first run on this machine).
+        """
+        ids = list(story_ids)
+        if not ids or not self.db_path.exists():
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT s.story_id, s.run_id, s.status, s.pr_number
+                FROM stories s
+                JOIN runs r ON r.id = s.run_id
+                WHERE s.story_id IN ({placeholders})
+                  AND s.status IN ('FAILED', 'NEEDS_ATTENTION')
+                  AND s.pr_number IS NOT NULL
+                  AND EXISTS (
+                        SELECT 1 FROM stages st
+                        WHERE st.run_id = s.run_id AND st.story_id = s.story_id
+                  )
+                ORDER BY r.started_at ASC, s.rowid ASC
+                """,
+                ids,
+            ).fetchall()
+        # Ascending order means the last write per story wins — the newest run.
+        return {
+            r["story_id"]: {
+                "run_id": r["run_id"],
+                "status": r["status"],
+                "pr_number": r["pr_number"],
+            }
+            for r in rows
+        }
+
     def run_update_status(self, run_id: str, status: str) -> None:
         """Transition a run's status; terminal states stamp ``finished_at``."""
         with self._connect() as conn:
@@ -3824,6 +3878,11 @@ class BuildResult:
     # run is left IN_PROGRESS (resumable, not terminal); raise ``--cost-threshold``
     # on ``sdlc resume`` to continue the gated stage.
     cost_gated: bool = False
+    # Issue #527: stories a prior run parked (FAILED / NEEDS_ATTENTION) on an
+    # open change request. A plain rebuild would collide with that branch/CR (and
+    # any manual fix on it), so the run refuses to start and names the resume
+    # path instead. Each entry is ``{story_id, run_id, status, pr_number}``.
+    resume_required: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -4668,6 +4727,17 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
         "Classify (CODE_BUG/TEST_BUG/ENV_ISSUE), fix where possible. If you "
         "commit the fix, use this exact, conventional-commit-compliant message "
         f"— do not alter it:\n   {commit_header}\n"
+        # Issue #527: the cellar responsive-layout story fixed the CSS correctly
+        # and left ~12 tests asserting the old values, so the suite stayed red and
+        # the loop could never turn the gate green. A fix is not done until the
+        # tests coupled to it move with it, in the same commit.
+        "A fix is incomplete until the tests coupled to it move with it: update "
+        "every test whose assertions depend on the values, strings, selectors or "
+        "behaviour you just changed, in the SAME commit as the fix — a code fix "
+        "that leaves its coupled tests asserting the old values keeps the suite "
+        "red and can never turn the gate green. Then re-run the project's FULL "
+        "test suite (not the subset you touched, and not a single file) before "
+        "reporting tests_passing: only a green full suite may report true.\n"
         "Then emit the result block.\n"
         + _result_wrapper("bugfix-agent-response.schema.json")
     )
@@ -4777,6 +4847,65 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=10,
     )
+
+
+def _git_push(root: Path, branch: str) -> subprocess.CompletedProcess[str]:
+    """Push ``branch`` to ``origin`` from ``root`` (issue #527).
+
+    Kept apart from :func:`_git` because a push is network-bound: the 10s ceiling
+    there is sized for local plumbing, so this mirrors :func:`_open_story_cr`'s
+    120s push instead. It is also the seam tests replace.
+    """
+    return subprocess.run(
+        ["git", "push", "origin", branch],
+        cwd=root, capture_output=True, text=True, timeout=120,
+    )
+
+
+def _push_bugfix_commit(
+    story: Story, workdir: Path | None, ledger: Ledger, run_id: str
+) -> bool:
+    """Push the story branch so the retried stage scores the *fixed* head (#527).
+
+    The review packet is baked from the change request's remote diff
+    (``adapter.cr_diff``), never from the local worktree — so a bugfix that
+    commits without pushing leaves review re-scoring the stale remote head, and
+    the loop burns every attempt on a diff that never changed. The only other
+    push in this module is :func:`_open_story_cr`'s one-shot at CR-open time, so
+    nothing else carries a mid-loop commit to the remote.
+
+    Degrades to a no-op (True) when ``feature/<id>`` does not exist locally: the
+    bugfix authored no branch commit, so there is nothing to publish. Returns
+    False only on a real push failure — the caller then parks the story
+    NEEDS_ATTENTION (work preserved on the branch, R10) rather than retrying the
+    stage against a head that cannot have changed.
+    """
+    root = workdir or Path.cwd()
+    branch = f"feature/{story.id}"
+    try:
+        exists = _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        if exists.returncode != 0:
+            return True
+        push = _git_push(root, branch)
+    except (OSError, subprocess.SubprocessError) as exc:
+        ledger.event_log(
+            run_id, story.id, "error", "controller",
+            f"bugfix commit push to origin/{branch} failed ({exc})",
+        )
+        return False
+    if push.returncode != 0:
+        ledger.event_log(
+            run_id, story.id, "error", "controller",
+            f"bugfix commit push to origin/{branch} failed: "
+            f"{push.stderr.strip() or 'git push failed'}",
+        )
+        return False
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"bugfix commit pushed to origin/{branch} — the retried stage scores "
+        "the fixed head",
+    )
+    return True
 
 
 def _base_ref(root: Path) -> str | None:
@@ -5303,6 +5432,53 @@ def _filter_git_landed(
     return still_buildable, done_skips + landed
 
 
+def _parked_story_conflicts(ledger: Ledger, buildable: list[Story]) -> list[dict]:
+    """Queued stories a prior run parked on an open change request (issue #527).
+
+    ``sdlc build`` skips a story only when its markdown says ``Status: Done`` or
+    :func:`_filter_git_landed` sees its work on the base branch. A story a prior
+    run left FAILED / NEEDS_ATTENTION satisfies neither, so a re-run re-cuts
+    ``feature/<id>`` from the base ref and re-opens a CR — a non-fast-forward
+    push over, and a duplicate CR beside, whatever (possibly hand-patched) state
+    that branch already holds. Rather than rebuild it silently, the run refuses
+    and names ``sdlc resume --run <full-run-id>``, which re-enters the story at
+    its first non-DONE stage on the branch and CR it already has.
+
+    Deliberately a guard-rail, not an auto-delegation: nothing here calls
+    ``compute_resume_plan`` — the operator chooses resume or ``--rebuild``.
+    """
+    found = ledger.parked_story_runs([s.id for s in buildable])
+    return [
+        {"story_id": s.id, **found[s.id]} for s in buildable if s.id in found
+    ]
+
+
+def format_resume_required(conflicts: list[dict]) -> str:
+    """The operator-facing message for a build blocked by parked stories (#527)."""
+    noun = "story" if len(conflicts) == 1 else "stories"
+    lines = [
+        f"build refused: {len(conflicts)} queued {noun} already parked by a "
+        "prior run with an open change request. Rebuilding would re-cut the "
+        "branch and duplicate the change request, discarding any manual fix "
+        "already on it.",
+    ]
+    for c in conflicts:
+        lines.append(
+            f"  - {c['story_id']}: {c['status']} in run {c['run_id']} "
+            f"(CR #{c['pr_number']})"
+        )
+    runs = sorted({c["run_id"] for c in conflicts})
+    lines.append("")
+    lines.append("Resume each prior run at its first unfinished stage instead:")
+    lines.extend(f"  sdlc resume --run {r}" for r in runs)
+    lines.append(
+        "The run id must be the FULL uuid — a shortened id silently reports "
+        "\"nothing to resume\". Pass --rebuild to build these stories from "
+        "scratch anyway."
+    )
+    return "\n".join(lines)
+
+
 def _stamp_run_actor(
     ledger: Ledger, run_id: str, adapter: IssueHostAdapter | None
 ) -> str:
@@ -5393,6 +5569,17 @@ def run_build(
     # real path, not unit coverage (AC3).
     if dispatcher is None and preflight is None and in_test_sentinel():
         return BuildResult(skipped_in_test=True, planned=len(buildable))
+
+    # --- Parked-story guard-rail (issue #527) --------------------------------
+    # A story a prior run left FAILED/NEEDS_ATTENTION on an open CR is invisible
+    # to both done-skip filters, so a plain re-run would rebuild it from scratch
+    # and collide with the branch/CR it already owns (and any manual fix on it).
+    # Refuse before preflight burns a test run, and point at `sdlc resume`.
+    # `--rebuild` is explicit operator intent and passes through unchanged.
+    if not opts.rebuild:
+        conflicts = _parked_story_conflicts(ledger, buildable)
+        if conflicts:
+            return BuildResult(resume_required=conflicts, planned=len(buildable))
 
     # --- Phase 1: Preflight (real runs only) ---------------------------------
     if not opts.skip_preflight:
@@ -6674,7 +6861,11 @@ def _run_story(
                                 return "NEEDS_ATTENTION"
                         break
 
-                if bugfix_attempts >= MAX_BUGFIX_ATTEMPTS:
+                # Issue #527: the budget scales with the finding spread the
+                # reviewer reported (`change_count`) — a cross-file rejection gets
+                # one more round than a single-line one. Every other stage keeps
+                # the flat MAX_BUGFIX_ATTEMPTS.
+                if bugfix_attempts >= _bugfix_budget(stage, result):
                     # Recovery exhausted (AC2). R10: never discard committed work —
                     # if the agent already committed the story branch, park it for
                     # manual push/MR rather than reporting an outright failure.
@@ -6701,6 +6892,33 @@ def _run_story(
                     "bugfix", story, opts, pr_number, ledger, run_id, dispatch,
                     logs_dir, bugfix_seq,
                 )
+                # Issue #527: publish the (now linted) bugfix commit before the
+                # retry. Review scores the remote CR diff, so an unpushed fix
+                # would have the stage re-run against the identical stale head
+                # and exhaust the budget on a diff that never moved. A failed
+                # push is not silently retried — the story parks NEEDS_ATTENTION
+                # with the work preserved on the branch (R10).
+                if not _push_bugfix_commit(story, workdir, ledger, run_id):
+                    ledger.event_log(
+                        run_id, story.id, "warn", "controller",
+                        f"bugfix fix could not reach origin/feature/{story.id} — "
+                        f"parking NEEDS_ATTENTION instead of retrying {stage} "
+                        "against a stale head; commits preserved on the branch",
+                    )
+                    return "NEEDS_ATTENTION"
+                # Issue #527: the packet baked at stage entry embeds the CR diff
+                # as it stood *before* this bugfix. Pushing the fix (above) only
+                # moves the remote head — the retry would still be handed that
+                # pre-fix snapshot and re-reject the diff it already rejected,
+                # defeating the push guarantee. Re-bake so the retry scores what
+                # the bugfix actually published. None (host failure, oversized)
+                # leaves the prompt on its fetch-it-yourself fallback, which is
+                # strictly fresher than a known-stale packet.
+                if stage == "review" and pr_number is not None:
+                    review_packet_block = _bake_review_packet(
+                        story, pr_number, workdir, ledger, run_id,
+                        coverage_signals, cr_terms,
+                    )
                 # Bugfix succeeded — retry the same stage as a new attempt.
                 attempt += 1
             except ContextOverflowError as exc:
@@ -6773,6 +6991,37 @@ def _run_story(
             ledger.set_story_pr(run_id, story.id, pr_number)
 
     return "DONE"
+
+
+def _bugfix_budget(stage: str, result: AgentResult | None) -> int:
+    """Bugfix rounds allowed before recovery is declared exhausted (issue #527).
+
+    The flat :data:`MAX_BUGFIX_ATTEMPTS` everywhere except a *review* rejection
+    that reported ``change_count >= BUGFIX_SPREAD_THRESHOLD``. Findings spanning
+    several files rarely close in two rounds — each round tends to land one
+    cluster of coupled edits — so the budget scales with the spread the reviewer
+    already measured (the review schema requires ``change_count``, so this reads
+    a field that is always present on a schema-valid rejection).
+
+    Every other stage keeps the constant: build/coverage/merge failures carry no
+    finding spread, so their behaviour is unchanged. Anything unreadable (no
+    result, a contract error's empty ``data``, a non-integer count) also falls
+    back to the constant — the budget never grows on a guess.
+    """
+    if stage != "review" or result is None:
+        return MAX_BUGFIX_ATTEMPTS
+    data = getattr(result, "data", None)
+    if not isinstance(data, dict):
+        return MAX_BUGFIX_ATTEMPTS
+    count = data.get("change_count")
+    # `bool` is an `int` subclass — a True here is malformed, not a count of 1.
+    if isinstance(count, bool) or not isinstance(count, int):
+        return MAX_BUGFIX_ATTEMPTS
+    return (
+        MAX_BUGFIX_ATTEMPTS_SPREAD
+        if count >= BUGFIX_SPREAD_THRESHOLD
+        else MAX_BUGFIX_ATTEMPTS
+    )
 
 
 def _exhausted_status(
