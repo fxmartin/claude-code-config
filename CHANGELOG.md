@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.8] - 2026-07-27
+
+### Fixed
+
+- fix(build): re-check budget projection after each completion (#539) (#542)
+
+
 ## [v2.42.7] - 2026-07-27
 
 ### Fixed
