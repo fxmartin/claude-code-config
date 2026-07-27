@@ -6,16 +6,22 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from typer.testing import CliRunner
+
 from sdlc import build as build_mod
 from sdlc.build import (
     MAX_BUGFIX_ATTEMPTS,
     BuildOptions,
+    BuildResult,
     Ledger,
     render_bugfix_prompt,
     run_build,
 )
+from sdlc.cli import app
 from sdlc.cohort import Story
 from sdlc.dispatch import AgentResult
+
+runner = CliRunner()
 
 
 # ---------------------------------------------------------------------------
@@ -418,3 +424,34 @@ def test_rebuild_flag_overrides_the_parked_guard(tmp_path) -> None:
     )
     assert result.resume_required == []
     assert result.completed == 1
+
+
+def test_bugfix_budget_non_dict_result_data_keeps_default() -> None:
+    """A contract error can leave ``result.data`` as ``None`` (not even ``{}``)."""
+    broken = AgentResult(agent_type="review", data=None, raw="")
+    assert build_mod._bugfix_budget("review", broken) == MAX_BUGFIX_ATTEMPTS
+
+
+def test_cli_build_resume_required_exits_1_and_prints_resume_path(
+    tmp_path, monkeypatch
+) -> None:
+    """`sdlc build` refuses and names the resume path for a parked story (#527)."""
+    stories_dir = tmp_path / "docs" / "stories"
+    stories_dir.mkdir(parents=True)
+    (stories_dir / "epic-99-sample.md").write_text(
+        "##### Story 99.1-001: One\n**Priority**: P1\n**Points**: 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    conflicts = [
+        {"story_id": "99.1-001", "run_id": "abc-123", "status": "FAILED",
+         "pr_number": 42}
+    ]
+    monkeypatch.setattr(
+        build_mod, "run_build", lambda *a, **k: BuildResult(resume_required=conflicts)
+    )
+    result = runner.invoke(app, ["build", "epic-99"])
+    assert result.exit_code == 1
+    assert "sdlc resume --run" in result.output
+    assert "abc-123" in result.output
