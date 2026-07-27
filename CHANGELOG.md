@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.1] - 2026-07-27
+
+### Fixed
+
+- fix: bugfix loop convergence — push guarantee, budget scaling, resume guard (#527) (#528)
+
+
 ## [v2.42.0] - 2026-07-22
 
 ### Added
