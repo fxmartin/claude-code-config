@@ -1949,6 +1949,13 @@ def sync_check(
         help="Harness whose generated body to compare against the neutral "
         "source (default: claude).",
     ),
+    pipeline_only: bool = typer.Option(
+        False,
+        "--pipeline-only",
+        help="Run only the --skill-base pipeline gate, skipping the body-mirror "
+        "gate on SOURCE_DIR. Use for the Codex mirror, whose shared-skill "
+        "bodies are Claude-rendered (issue #529).",
+    ),
     fix: bool = typer.Option(
         False,
         "--fix",
@@ -2000,9 +2007,13 @@ def sync_check(
         typer.echo("error: --fix requires --neutral.", err=True)
         raise typer.Exit(code=2)
 
+    if pipeline_only and skill_base is None:
+        typer.echo("error: --pipeline-only requires --skill-base.", err=True)
+        raise typer.Exit(code=2)
+
     exit_code = 0
 
-    if neutral_dir is not None:
+    if neutral_dir is not None and not pipeline_only:
         try:
             if fix:
                 written = write_generated_skills(

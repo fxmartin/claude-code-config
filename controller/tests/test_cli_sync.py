@@ -258,3 +258,121 @@ def test_sync_check_fix_without_neutral_exits_two(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "--fix requires --neutral" in result.output
+
+
+# --- pipeline-only mode for the Codex mirror gate (issue #529) ---------------
+#
+# The Codex mirror lives in the parent `nix-install` repo, so its pipeline
+# SKILL.md is the artefact that silently rotted for three months. Checking it
+# means running the pipeline gate alone: the body-mirror gate compares
+# `shared-skills/` bodies, which are Claude-rendered, so pairing it with
+# `--harness codex` would report drift that is not real.
+
+_PIPE_NAME = "build-stories"
+_PIPE_SRC = (
+    "---\n"
+    f"name: {_PIPE_NAME}\n"
+    "description: Use when batch-building stories via the controller.\n"
+    "allowed_tools:\n"
+    "- Bash\n"
+    "model_invocation: disabled\n"
+    "---\n\n"
+    "Run the controller.\n\n"
+    "```bash\n"
+    "sdlc build {{ARGUMENTS}}\n"
+    "```\n"
+)
+
+
+def _seed_neutral_pipeline(root: Path) -> Path:
+    neutral = root / "neutral"
+    neutral.mkdir(parents=True, exist_ok=True)
+    (neutral / f"{_PIPE_NAME}.skill.md").write_text(_PIPE_SRC, encoding="utf-8")
+    return neutral
+
+
+def _seed_codex_base(root: Path, body: str) -> Path:
+    base = root / "codex-skills"
+    d = base / _PIPE_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(body, encoding="utf-8")
+    return base
+
+
+def _codex_rendered() -> str:
+    from sdlc.skill_generator import generate_codex_skill, parse_neutral_skill
+
+    return generate_codex_skill(parse_neutral_skill(_PIPE_SRC))
+
+
+def test_pipeline_only_codex_in_sync_exits_zero(tmp_path: Path) -> None:
+    neutral = _seed_neutral_pipeline(tmp_path)
+    base = _seed_codex_base(tmp_path, _codex_rendered())
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-check", str(tmp_path / "unused"),
+            "--neutral", str(neutral),
+            "--skill-base", str(base),
+            "--harness", "codex",
+            "--pipeline-only",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "codex" in result.output.lower()
+
+
+def test_pipeline_only_codex_drift_exits_one_and_names_skill(tmp_path: Path) -> None:
+    neutral = _seed_neutral_pipeline(tmp_path)
+    base = _seed_codex_base(tmp_path, "stale pre-controller port\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-check", str(tmp_path / "unused"),
+            "--neutral", str(neutral),
+            "--skill-base", str(base),
+            "--harness", "codex",
+            "--pipeline-only",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert _PIPE_NAME in result.output
+
+
+def test_pipeline_only_requires_skill_base(tmp_path: Path) -> None:
+    neutral = _seed_neutral_pipeline(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-check", str(tmp_path / "unused"),
+            "--neutral", str(neutral),
+            "--pipeline-only",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--skill-base" in result.output
+
+
+def test_pipeline_only_skips_the_body_gate(tmp_path: Path) -> None:
+    """A missing/garbage SOURCE_DIR must not matter when the body gate is off."""
+    neutral = _seed_neutral_pipeline(tmp_path)
+    base = _seed_codex_base(tmp_path, _codex_rendered())
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-check", str(tmp_path / "does-not-exist"),
+            "--neutral", str(neutral),
+            "--skill-base", str(base),
+            "--harness", "codex",
+            "--pipeline-only",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
