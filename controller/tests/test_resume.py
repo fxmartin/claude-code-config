@@ -492,6 +492,118 @@ def _seed_skipped_dep_blocks(db_path: Path) -> str:
     return run_id
 
 
+# Issue #536: an epic whose first stories the markdown already marks shipped.
+# run_build records those as SKIPPED for the audit trail only — they never enter
+# the cohorts or the status map, so a dependent of theirs is *satisfied*, not
+# blocked. Resume has to reconstruct the same partition from the same signal.
+_DONE_DEP_EPIC = """# Epic 98
+
+##### Story 98.1-001: Shipped one
+**Priority**: P1
+**Points**: 1
+**Status**: Done
+**Dependencies**: None.
+
+##### Story 98.2-001: Shipped two
+**Priority**: P1
+**Points**: 1
+**Status**: Done
+**Dependencies**: Story 98.1-001.
+
+##### Story 98.3-001: Unfinished
+**Priority**: P1
+**Points**: 2
+**Dependencies**: Story 98.1-001, Story 98.2-001.
+"""
+
+
+def _make_done_dep_project(tmp_path: Path) -> Path:
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True, exist_ok=True)
+    (stories / "epic-98-shipped.md").write_text(_DONE_DEP_EPIC, encoding="utf-8")
+    return tmp_path
+
+
+def _seed_done_dep_parked(db_path: Path, *, mode: str = "serial") -> str:
+    """The Issue #536 shape: the two deps were already Done in the epic when the
+    build started (persisted SKIPPED for audit, exactly as run_build's pre-loop
+    does — no stages, never dispatched), and the dependent parked mid-review with
+    an open PR. Resume must re-enter it, not cascade-block on the shipped deps."""
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("epic-98", mode)
+    ledger.set_total(run_id, 1)
+    ledger.event_log(
+        run_id, "", "info", "config",
+        json.dumps({"skip_coverage": True, "concurrency": 3}),
+    )
+    for sid, title in (("98.1-001", "Shipped one"), ("98.2-001", "Shipped two")):
+        ledger.story_upsert(
+            run_id, sid, "98", title, "P1", 1, "general-purpose", "", None, "SKIPPED",
+        )
+    ledger.story_upsert(
+        run_id, "98.3-001", "98", "Unfinished", "P1", 2,
+        "general-purpose", "", None, "TODO",
+    )
+    ledger.stage_start(run_id, "98.3-001", "build", 1)
+    ledger.stage_finish(run_id, "98.3-001", "build", 1, "DONE")
+    ledger.set_story_pr(run_id, "98.3-001", 1)
+    ledger.stage_start(run_id, "98.3-001", "review", 1)  # left IN_PROGRESS
+    ledger.set_story_status(run_id, "98.3-001", "NEEDS_ATTENTION")
+    return run_id
+
+
+def test_resume_dispatches_story_whose_deps_were_done_in_epic(tmp_path: Path) -> None:
+    """Issue #536: dependencies the epic already marked ``Status: Done`` are
+    recorded SKIPPED for the audit trail, not because their work failed — they
+    must not block the unfinished story that depends on them. `sdlc build` sends
+    the operator here, so resume returning ``0 resumed`` strands the epic."""
+    _make_done_dep_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    rid = _seed_done_dep_parked(db)
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-98", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+    )
+
+    assert ("review", "98.3-001") in dispatcher.calls  # actually re-entered
+    assert result.resumed == 1
+    assert result.blocked == 0
+    assert result.story_status["98.3-001"] == "DONE"
+    rows = {r["story_id"]: r for r in Ledger(db).story_rows(rid)}
+    assert rows["98.3-001"]["status"] == "DONE"
+    # The shipped stories stay SKIPPED in the ledger and are still tallied as
+    # skipped in the summary (counted outside `status`, via `extra_skipped`).
+    assert rows["98.1-001"]["status"] == "SKIPPED"
+    assert rows["98.2-001"]["status"] == "SKIPPED"
+    assert result.skipped == 2
+    assert result.completed == 1
+    # They are not part of this resume's schedule, so they carry no status entry.
+    assert "98.1-001" not in result.story_status
+    assert "98.2-001" not in result.story_status
+
+
+def test_resume_parallel_dispatches_story_whose_deps_were_done_in_epic(
+    tmp_path: Path,
+) -> None:
+    """Issue #536 on the parallel path: `_triage`'s hold check treats any
+    ``status[dep] != "DONE"`` as unresolved, so a shipped dep left in the status
+    map would hold the dependent forever rather than merely block it."""
+    _make_done_dep_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_done_dep_parked(db, mode="parallel")
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-98", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+    )
+
+    assert ("review", "98.3-001") in dispatcher.calls
+    assert result.resumed == 1
+    assert result.blocked == 0
+    assert result.skipped == 2
+    assert result.story_status["98.3-001"] == "DONE"
+
+
 def test_resume_all_stages_done_unfinalised_closes_out(tmp_path: Path) -> None:
     """A resumable run whose only story has every stage DONE (just not finalised)
     has no stage to dispatch, but it is *not* a no-op: leaving it stranded

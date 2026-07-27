@@ -407,7 +407,22 @@ def run_resume(
     # title/epic_file/dependencies (the ledger stores progress, not the spec).
     queue = discover_queue(scope, root)
     by_id = {s.id: s for s in queue}
-    run_queue: list[Story] = [by_id[sid] for sid in plan if sid in by_id]
+    # Issue #536: mirror run_build's done-skip partition. Stories the epic already
+    # marks shipped are persisted SKIPPED for the audit trail only — run_build
+    # keeps them out of its cohorts and status map entirely, which is what makes a
+    # dependent of theirs *satisfied* rather than blocked. Rebuilding the schedule
+    # from every ledger row instead would leave them in `status` as SKIPPED, where
+    # the dependency check below (and the parallel hold check) reads them as
+    # not-done and cascade-blocks the epic. Exclusion — not a status exemption — is
+    # the mechanism, so a SKIPPED row the epic does *not* mark Done (a cost-gate
+    # skip, say) still blocks its dependents exactly as before.
+    done_skip_ids = {
+        sid for sid, st in plan.items()
+        if st.status == "SKIPPED" and by_id.get(sid) is not None and by_id[sid].done
+    }
+    run_queue: list[Story] = [
+        by_id[sid] for sid in plan if sid in by_id and sid not in done_skip_ids
+    ]
 
     # Mark the run live again and announce the resume.
     ledger.run_update_status(rid, "IN_PROGRESS")
@@ -731,7 +746,9 @@ def run_resume(
             blocked=sum(1 for v in status.values() if v == "BLOCKED"),
             needs_attention=sum(1 for v in status.values() if v == "NEEDS_ATTENTION"),
             awaiting_approval=sum(1 for v in status.values() if v == "AWAITING_APPROVAL"),
-            skipped=sum(1 for v in status.values() if v == "SKIPPED"),
+            skipped=len(done_skip_ids) + sum(
+                1 for v in status.values() if v == "SKIPPED"
+            ),
             nothing_to_resume=False,
             story_status=dict(status),
             rate_limited=True,
@@ -758,7 +775,9 @@ def run_resume(
             blocked=sum(1 for v in status.values() if v == "BLOCKED"),
             needs_attention=sum(1 for v in status.values() if v == "NEEDS_ATTENTION"),
             awaiting_approval=sum(1 for v in status.values() if v == "AWAITING_APPROVAL"),
-            skipped=sum(1 for v in status.values() if v == "SKIPPED"),
+            skipped=len(done_skip_ids) + sum(
+                1 for v in status.values() if v == "SKIPPED"
+            ),
             nothing_to_resume=False,
             story_status=dict(status),
             budget_stopped=True,
@@ -785,7 +804,9 @@ def run_resume(
             blocked=sum(1 for v in status.values() if v == "BLOCKED"),
             needs_attention=sum(1 for v in status.values() if v == "NEEDS_ATTENTION"),
             awaiting_approval=sum(1 for v in status.values() if v == "AWAITING_APPROVAL"),
-            skipped=sum(1 for v in status.values() if v == "SKIPPED"),
+            skipped=len(done_skip_ids) + sum(
+                1 for v in status.values() if v == "SKIPPED"
+            ),
             nothing_to_resume=False,
             story_status=dict(status),
             cost_gated=True,
@@ -804,6 +825,10 @@ def run_resume(
         reconcile=dispatcher is None,
         root=root,
         registry=registry,
+        # Issue #536: the epic's already-shipped stories are excluded from
+        # `status`, so their skip count is carried in here — the same way
+        # run_build's pre-loop done_skips are.
+        extra_skipped=len(done_skip_ids),
         finish_label="resume finished",
         finish_suffix=f" ({resumed} resumed)",
         render_view=render_view,
