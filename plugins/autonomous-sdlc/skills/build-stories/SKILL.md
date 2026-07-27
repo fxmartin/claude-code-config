@@ -61,10 +61,15 @@ The controller (`controller/src/sdlc/`) owns the full lifecycle:
 7. **Markdown view** — regenerates `docs/stories/.build-progress.md` from the
    ledger via `sdlc-state.sh render`.
 
-The worker agent prompts are rendered **in Python** by the controller
+The build pipeline's agent prompts are rendered **in Python** by the controller
 (`render_build_prompt`, `render_review_prompt`, `render_bugfix_prompt` and
-friends in `controller/src/sdlc/build.py`). The `*-agent-prompt.md`,
-`coverage-gate-prompt.md`, `merge-update-prompt.md` and `e2e-gate.md` files
-alongside this skill are historical reference from the pre-controller port:
-they document intent, but the controller never reads them, so editing one
-changes nothing at dispatch time. Change the Python renderer instead.
+friends in `controller/src/sdlc/build.py`). The controller never reads the
+`.md` files in this skill directory, so editing one does not change what
+`sdlc build` dispatches — change the renderer instead.
+
+Those files are not dead, though. `bugfix-agent-prompt.md`,
+`coverage-gate-prompt.md` and `doc-update-prompt.md` are symlinks into
+`skills/_shared/`, single-sourced with the `fix-issue` skill (Story 27.1-003),
+which *does* read them at dispatch; they and `merge-update-prompt.md` carry
+CI-enforced byte budgets. Edit those for `fix-issue` behaviour, and keep them
+small. The remaining files are leftovers from the pre-controller port.
