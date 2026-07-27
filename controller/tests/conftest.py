@@ -66,3 +66,34 @@ def _no_real_host_cli(monkeypatch):
     # fix_issue imports the runner by value, so its module global needs the
     # same stub for its `runner or _default_runner` defaults.
     monkeypatch.setattr(fix_issue, "_default_runner", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_git_push(monkeypatch):
+    """Block a real ``git push`` for every test by default (issue #527).
+
+    The bugfix loop publishes its commit with ``build._git_push`` before
+    retrying the stage. On the sequential path the push root is ``workdir or
+    Path.cwd()`` — and under pytest that cwd is *this* repository, where story
+    ids the suite invents (28.1-002, …) collide with real local
+    ``feature/<id>`` branches left by earlier `sdlc build` runs. An un-stubbed
+    push therefore reaches the network, and on a checkout whose matching branch
+    carries unpushed commits it would publish them to origin: running the test
+    suite must never write to a remote. Same rationale, and same seam-stubbing
+    shape, as :func:`_no_real_host_cli` above.
+
+    Returns a *successful* CompletedProcess so the block is transparent — the
+    loop proceeds exactly as it does when a real push lands, rather than being
+    diverted into the park-on-push-failure branch. ``_push_bugfix_commit``'s own
+    tests monkeypatch this same seam explicitly, which overrides the fixture.
+    """
+    import subprocess
+
+    import sdlc.build as build_mod
+
+    def _blocked_push(root, branch):
+        return subprocess.CompletedProcess(
+            ["git", "push", "origin", branch], 0, "", ""
+        )
+
+    monkeypatch.setattr(build_mod, "_git_push", _blocked_push)
