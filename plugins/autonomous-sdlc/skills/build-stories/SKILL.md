@@ -61,7 +61,10 @@ The controller (`controller/src/sdlc/`) owns the full lifecycle:
 7. **Markdown view** — regenerates `docs/stories/.build-progress.md` from the
    ledger via `sdlc-state.sh render`.
 
-The worker agent prompts (`*-agent-prompt.md`, `coverage-gate-prompt.md`,
-`merge-update-prompt.md`, `e2e-gate.md`, etc.) in this skill directory remain
-the source of truth for what each dispatched agent does — the controller renders
-them when it dispatches.
+The worker agent prompts are rendered **in Python** by the controller
+(`render_build_prompt`, `render_review_prompt`, `render_bugfix_prompt` and
+friends in `controller/src/sdlc/build.py`). The `*-agent-prompt.md`,
+`coverage-gate-prompt.md`, `merge-update-prompt.md` and `e2e-gate.md` files
+alongside this skill are historical reference from the pre-controller port:
+they document intent, but the controller never reads them, so editing one
+changes nothing at dispatch time. Change the Python renderer instead.
