@@ -6,8 +6,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sdlc.build import Ledger, run_build
+from sdlc.build import BuildOptions, Ledger, run_build
 from sdlc.cohort import Story
+from sdlc.discovery import discover_queue
 from sdlc.registry import Registry, RunRecord
 from sdlc.resume import ResumeResult, compute_resume_plan, run_resume
 
@@ -602,6 +603,195 @@ def test_resume_parallel_dispatches_story_whose_deps_were_done_in_epic(
     assert result.blocked == 0
     assert result.skipped == 2
     assert result.story_status["98.3-001"] == "DONE"
+
+
+# Issue #536 coverage gate: the three early-return tallies (rate-limit park,
+# budget stop, cost gate) each fold `len(done_skip_ids)` into `skipped` — none
+# of the pre-existing budget/rate-limit/cost-gate suites exercise a run whose
+# ledger also carries shipped (done-in-epic) dependencies, so the fold itself
+# was never exercised with a non-zero count.
+
+
+def _seed_done_dep_budget_stopped(db_path: Path) -> str:
+    """Same shipped-deps shape as `_seed_done_dep_parked`, but the completed
+    build stage already carries enough accrued tokens to trip a tiny budget
+    ceiling before the unfinished story's review stage is re-entered —
+    exercising the budget-stop early return's `len(done_skip_ids)` fold. (A
+    fresh `run_build` cannot reproduce this: the budget gate there is checked
+    once per *story*, so a single-story queue always finishes its first story
+    before the ceiling is ever re-read.)"""
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("epic-98", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(
+        run_id, "", "info", "config",
+        json.dumps({"skip_coverage": True, "budget": 1}),
+    )
+    for sid, title in (("98.1-001", "Shipped one"), ("98.2-001", "Shipped two")):
+        ledger.story_upsert(
+            run_id, sid, "98", title, "P1", 1, "general-purpose", "", None, "SKIPPED",
+        )
+    ledger.story_upsert(
+        run_id, "98.3-001", "98", "Unfinished", "P1", 2,
+        "general-purpose", "", None, "TODO",
+    )
+    ledger.stage_start(run_id, "98.3-001", "build", 1)
+    ledger.stage_finish(run_id, "98.3-001", "build", 1, "DONE")
+    ledger.stage_set_usage(
+        run_id, "98.3-001", "build", 1,
+        session_id=None, input_tokens=100, output_tokens=0,
+        cache_read_tokens=0, cache_creation_tokens=0, cost_usd=None,
+    )
+    ledger.set_story_pr(run_id, "98.3-001", 1)
+    return run_id
+
+
+def test_resume_budget_stop_tallies_done_deps_as_skipped(tmp_path: Path) -> None:
+    """Issue #536: the budget-stop early return folds `len(done_skip_ids)` into
+    `skipped` exactly like the normal close-out — the ceiling is already tripped
+    before the unfinished story dispatches, but its shipped deps must still be
+    counted rather than silently dropped."""
+    _make_done_dep_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_done_dep_budget_stopped(db)
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-98", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+    )
+
+    assert result.budget_stopped is True
+    assert result.resumed == 0
+    assert dispatcher.calls == []
+    assert result.skipped == 2
+    assert "98.1-001" not in result.story_status
+    assert "98.2-001" not in result.story_status
+
+
+def _build_done_dep_cost_gated(tmp_path: Path):
+    """Build epic-98 (two shipped deps + one unfinished story) interactively with
+    a trivially-low cost-estimate threshold so the unfinished story's first stage
+    gates before ever dispatching — mirrors `_build_cost_gated` in
+    test_cost_estimate.py, seeded with Issue #536's shipped-deps shape."""
+    _make_done_dep_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    queue = discover_queue("epic-98", tmp_path)
+    assert len(queue) == 3
+    opts = BuildOptions(
+        scope="epic-98", skip_preflight=True, sequential=True,
+        skip_coverage=True, auto=False, cost_estimate_threshold=1,
+    )
+    result = run_build(
+        opts, queue=queue, ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), preflight=lambda: True,
+    )
+    assert result.cost_gated is True
+    assert result.skipped == 2
+    return db, result
+
+
+def test_resume_cost_gate_tallies_done_deps_as_skipped(tmp_path: Path) -> None:
+    """Issue #536: the interactive cost-gate early return must fold
+    `len(done_skip_ids)` into `skipped` too — an un-raised resume re-gates before
+    the unfinished story dispatches, but its shipped deps must still be counted."""
+    db, result = _build_done_dep_cost_gated(tmp_path)
+    dispatcher = FakeDispatcher()
+    resumed = run_resume(
+        "epic-98", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+    )
+
+    assert resumed.run_id == result.run_id
+    assert resumed.cost_gated is True
+    assert dispatcher.calls == []
+    assert resumed.skipped == 2
+    assert "98.1-001" not in resumed.story_status
+    assert "98.2-001" not in resumed.story_status
+
+
+def _seed_done_dep_rate_limit_parked(db_path: Path) -> str:
+    """Same shipped-deps shape as `_seed_done_dep_parked`, but the ledger already
+    carries a persisted `rate_limit_reset_at` far beyond the auto-wait cap, so
+    resume must durably re-park before ever touching the unfinished story —
+    exercising the rate-limit early return's `len(done_skip_ids)` fold."""
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("epic-98", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(
+        run_id, "", "info", "config",
+        json.dumps({
+            "skip_coverage": True,
+            "rate_limit_reset_at": 999_999.0,
+            "rate_limit_max_wait_s": 300,
+        }),
+    )
+    for sid, title in (("98.1-001", "Shipped one"), ("98.2-001", "Shipped two")):
+        ledger.story_upsert(
+            run_id, sid, "98", title, "P1", 1, "general-purpose", "", None, "SKIPPED",
+        )
+    ledger.story_upsert(
+        run_id, "98.3-001", "98", "Unfinished", "P1", 2,
+        "general-purpose", "", None, "TODO",
+    )
+    return run_id
+
+
+def test_resume_rate_limit_park_tallies_done_deps_as_skipped(tmp_path: Path) -> None:
+    """Issue #536: the rate-limit re-park early return must fold
+    `len(done_skip_ids)` into `skipped` too — the persisted park short-circuits
+    before the unfinished story is ever touched, but its shipped deps must still
+    be counted."""
+    _make_done_dep_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_done_dep_rate_limit_parked(db)
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-98", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        clock=lambda: 0.0, sleep_fn=lambda _s: None,
+    )
+
+    assert result.rate_limited is True
+    assert result.resumed == 0
+    assert dispatcher.calls == []
+    assert result.skipped == 2
+    assert "98.1-001" not in result.story_status
+    assert "98.2-001" not in result.story_status
+
+
+def _seed_done_dep_parked_with_orphan_row(db_path: Path, *, mode: str = "serial") -> str:
+    """Same shape as `_seed_done_dep_parked`, plus one extra ledger row
+    (`98.0-000`) for a story id that no longer exists in the epic markdown at
+    all — e.g. renumbered/removed between the interrupted build and the resume.
+    The `by_id.get(sid) is not None` guard in `done_skip_ids` must keep this
+    orphan from raising or being folded into the shipped-dep count."""
+    run_id = _seed_done_dep_parked(db_path, mode=mode)
+    ledger = Ledger(db_path)
+    ledger.story_upsert(
+        run_id, "98.0-000", "98", "Orphan", "P1", 1,
+        "general-purpose", "", None, "SKIPPED",
+    )
+    return run_id
+
+
+def test_resume_ignores_orphan_ledger_row_not_in_epic(tmp_path: Path) -> None:
+    """Issue #536: a ledger row for a story id no longer present in the epic
+    markdown (renamed/removed) must not crash or be folded into `done_skip_ids`
+    — `by_id.get(sid)` is None for it, so the guard must simply drop it, leaving
+    the genuinely shipped deps' count (2) unaffected."""
+    _make_done_dep_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_done_dep_parked_with_orphan_row(db)
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-98", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+    )
+
+    assert ("review", "98.3-001") in dispatcher.calls
+    assert result.resumed == 1
+    # Only the two genuinely shipped deps are folded into `skipped` — the
+    # orphan row is neither dispatched nor double-counted.
+    assert result.skipped == 2
+    assert "98.0-000" not in result.story_status
 
 
 def test_resume_all_stages_done_unfinalised_closes_out(tmp_path: Path) -> None:
