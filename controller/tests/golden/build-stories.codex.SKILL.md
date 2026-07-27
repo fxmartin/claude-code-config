@@ -45,8 +45,9 @@ if command -v sdlc >/dev/null 2>&1; then
 elif [ -d controller ]; then
     ( cd controller && uv run sdlc build <arguments from the Use invocation> )
 else
-    echo "error: sdlc controller not found. Install it with:" >&2
-    echo "  uv tool install ./controller" >&2
+    echo "error: sdlc not on PATH and no ./controller in this repo." >&2
+    echo "Install it from a claude-code-config checkout:" >&2
+    echo "  uv tool install /path/to/claude-code-config/controller" >&2
     exit 1
 fi
 ```
