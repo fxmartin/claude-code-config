@@ -35,10 +35,20 @@ the orchestration here.
 sdlc build <arguments from the Use invocation>
 ```
 
-If `sdlc` is not on `PATH`, run it from the controller checkout instead:
+If `sdlc` is not on `PATH`, use the guarded fallback below rather than assuming
+a `controller/` checkout is present — most target repos do not have one, and a
+bare `cd controller` fails with an unhelpful `no such file or directory`:
 
 ```bash
-( cd controller && uv run sdlc build <arguments from the Use invocation> )
+if command -v sdlc >/dev/null 2>&1; then
+    sdlc build <arguments from the Use invocation>
+elif [ -d controller ]; then
+    ( cd controller && uv run sdlc build <arguments from the Use invocation> )
+else
+    echo "error: sdlc controller not found. Install it with:" >&2
+    echo "  uv tool install ./controller" >&2
+    exit 1
+fi
 ```
 
 ## What the controller does (reference only)
