@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.3] - 2026-07-27
+
+### Fixed
+
+- fix(skills): give the codex wrapper a guarded sdlc fallback (#532)
+
+### Shared skills
+
+Codex mirror artifact: bump the `shared-skills` submodule to this tag and run `git submodule update --remote` (see ADR-002).
+
+- fix(skills): give the codex wrapper a guarded sdlc fallback (#532)
+
+
 ## [v2.42.2] - 2026-07-27
 
 ### Fixed
