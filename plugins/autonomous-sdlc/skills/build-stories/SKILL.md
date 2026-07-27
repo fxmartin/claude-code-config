@@ -61,7 +61,20 @@ The controller (`controller/src/sdlc/`) owns the full lifecycle:
 7. **Markdown view** — regenerates `docs/stories/.build-progress.md` from the
    ledger via `sdlc-state.sh render`.
 
-The worker agent prompts (`*-agent-prompt.md`, `coverage-gate-prompt.md`,
-`merge-update-prompt.md`, `e2e-gate.md`, etc.) in this skill directory remain
-the source of truth for what each dispatched agent does — the controller renders
-them when it dispatches.
+The build pipeline's agent prompts are rendered **in Python** by the controller
+(`render_build_prompt`, `render_review_prompt`, `render_bugfix_prompt` and
+friends in `controller/src/sdlc/build.py`). The controller never reads the
+`.md` files in this skill directory, so editing one does not change what
+`sdlc build` dispatches — change the renderer instead.
+
+`sdlc fix` works the same way — its prompts are rendered by `render_*_prompt`
+functions in `controller/src/sdlc/fix_issue.py`, not loaded from disk.
+
+The files are still maintained, though, so do not treat them as dead.
+`bugfix-agent-prompt.md`, `coverage-gate-prompt.md` and `doc-update-prompt.md`
+are symlinks into `skills/_shared/`, single-sourced across the `build-stories`
+and `fix-issue` skill directories (Story 27.1-003), and a structural test fails
+the build if one stops resolving. Separately, `coverage-gate-prompt.md` and
+`merge-update-prompt.md` carry byte ceilings that fail on regrowth. Keep all of
+them in step with the Python renderers they mirror; the remaining `.md` files
+here carry neither guarantee.
