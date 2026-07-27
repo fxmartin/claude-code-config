@@ -306,6 +306,14 @@ def build(ctx: typer.Context) -> None:
         )
         raise typer.Exit(code=1)
 
+    if result.resume_required:
+        # Issue #527: a queued story is already parked on an open change request
+        # from a prior run — rebuilding it would collide with that branch/CR.
+        from sdlc.build import format_resume_required
+
+        typer.echo(format_resume_required(result.resume_required), err=True)
+        raise typer.Exit(code=1)
+
     if result.dry_run:
         typer.echo(f"dry run: {result.planned} stories queued (not building).")
         raise typer.Exit(code=0)
