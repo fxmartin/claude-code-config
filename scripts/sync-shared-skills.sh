@@ -163,3 +163,5 @@ main() {
 }
 
 main "$@"
+
+# risk-gate verification probe — this PR is never merged (issue #534)
