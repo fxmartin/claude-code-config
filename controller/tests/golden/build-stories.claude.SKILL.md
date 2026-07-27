@@ -73,7 +73,8 @@ functions in `controller/src/sdlc/fix_issue.py`, not loaded from disk.
 The files are still maintained, though, so do not treat them as dead.
 `bugfix-agent-prompt.md`, `coverage-gate-prompt.md` and `doc-update-prompt.md`
 are symlinks into `skills/_shared/`, single-sourced across the `build-stories`
-and `fix-issue` skill directories (Story 27.1-003); those three plus
-`merge-update-prompt.md` carry CI-enforced byte budgets that fail the build on
-regrowth. Keep them in step with the Python renderers they mirror. The
-remaining files are leftovers from the pre-controller port.
+and `fix-issue` skill directories (Story 27.1-003), and a structural test fails
+the build if one stops resolving. Separately, `coverage-gate-prompt.md` and
+`merge-update-prompt.md` carry byte ceilings that fail on regrowth. Keep all of
+them in step with the Python renderers they mirror; the remaining `.md` files
+here carry neither guarantee.
