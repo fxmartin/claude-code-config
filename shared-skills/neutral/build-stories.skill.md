@@ -83,9 +83,13 @@ friends in `controller/src/sdlc/build.py`). The controller never reads the
 `.md` files in this skill directory, so editing one does not change what
 `sdlc build` dispatches — change the renderer instead.
 
-Those files are not dead, though. `bugfix-agent-prompt.md`,
-`coverage-gate-prompt.md` and `doc-update-prompt.md` are symlinks into
-`skills/_shared/`, single-sourced with the `fix-issue` skill (Story 27.1-003),
-which *does* read them at dispatch; they and `merge-update-prompt.md` carry
-CI-enforced byte budgets. Edit those for `fix-issue` behaviour, and keep them
-small. The remaining files are leftovers from the pre-controller port.
+`sdlc fix` works the same way — its prompts are rendered by `render_*_prompt`
+functions in `controller/src/sdlc/fix_issue.py`, not loaded from disk.
+
+The files are still maintained, though, so do not treat them as dead.
+`bugfix-agent-prompt.md`, `coverage-gate-prompt.md` and `doc-update-prompt.md`
+are symlinks into `skills/_shared/`, single-sourced across the `build-stories`
+and `fix-issue` skill directories (Story 27.1-003); those three plus
+`merge-update-prompt.md` carry CI-enforced byte budgets that fail the build on
+regrowth. Keep them in step with the Python renderers they mirror. The
+remaining files are leftovers from the pre-controller port.
