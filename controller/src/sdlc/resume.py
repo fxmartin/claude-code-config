@@ -31,6 +31,7 @@ from sdlc.build import (
     apply_rate_limit_park,
     authoritative_mode,
     effective_concurrency,
+    _filter_git_landed,
     finalize_run,
     persist_cohort_structure,
 )
@@ -420,6 +421,20 @@ def run_resume(
         sid for sid, st in plan.items()
         if st.status == "SKIPPED" and by_id.get(sid) is not None and by_id[sid].done
     }
+    # Issue #537: run_build's partition also moves *git-landed* stories into
+    # done_skips (#227) — work already merged on the base branch whose markdown
+    # was never flipped to Status: Done. Those carry ``.done == False``, so the
+    # markdown signal above misses them and they would cascade-block exactly as
+    # #536 described. Re-probe with the same helper run_build used, so the two
+    # schedulers keep agreeing. It is offline-safe: a missing base ref or any
+    # git error leaves the story out of ``landed``, degrading to markdown-only.
+    unresolved = [
+        by_id[sid] for sid, st in plan.items()
+        if st.status == "SKIPPED" and sid in by_id and sid not in done_skip_ids
+    ]
+    if unresolved:
+        _, landed = _filter_git_landed(unresolved, [], root)
+        done_skip_ids |= {s.id for s in landed}
     run_queue: list[Story] = [
         by_id[sid] for sid in plan if sid in by_id and sid not in done_skip_ids
     ]
