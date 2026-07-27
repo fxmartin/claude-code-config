@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.4] - 2026-07-27
+
+### Fixed
+
+- fix(sync): verify the codex mirror in verify-generated (#533)
+
+
 ## [v2.42.3] - 2026-07-27
 
 ### Fixed
