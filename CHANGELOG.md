@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.5] - 2026-07-27
+
+### Fixed
+
+- fix(skills): make the controller-missing hint reachable (#535)
+
+### Shared skills
+
+Codex mirror artifact: bump the `shared-skills` submodule to this tag and run `git submodule update --remote` (see ADR-002).
+
+- fix(skills): make the controller-missing hint reachable (#535)
+
+
 ## [v2.42.4] - 2026-07-27
 
 ### Fixed
