@@ -5897,23 +5897,41 @@ def run_build(
                 return "hold"
             return "ready"
 
-        def _budget_gate(story: Story) -> bool:
-            # Story 14.1-001: with no barrier bounding mid-cohort spend, the
-            # ceiling is re-checked before *each* submission instead of once per
-            # cohort — the scheduler thread owns dispatch, so the continuous
-            # path can afford the per-story check the pool could not interleave.
-            nonlocal budget_stopped, projection_flagged
-            if _budget_exceeded(ledger, run_id, opts.budget):
-                budget_stopped = True
-                return False
-            # Story 28.3-002: same projected-ceiling flag as the serial path,
-            # checked on the scheduler thread before each submission.
+        def _check_projection() -> None:
+            # Story 28.3-002 / issue #539: re-check the projected ceiling.
+            #
+            # Called both before each submission (_budget_gate) and after each
+            # completion (_apply). A submission-only check can miss a run that
+            # only crosses the ceiling once an in-flight sibling's usage lands
+            # — once the last story is submitted there is no further
+            # submission event left to catch up, so a pessimistic snapshot at
+            # that last pre-dispatch check would silently never be revisited.
+            # Re-checking on every completion closes that gap: accrued always
+            # reflects this story's real usage there, and by the final
+            # completion `pending` is empty, so the check degrades to
+            # accrued-alone — guaranteed to fire if the run really did cross
+            # the ceiling. Idempotent (latches once) and best-effort, like the
+            # flag itself.
+            nonlocal projection_flagged
             if not projection_flagged:
                 projection_flagged = _flag_budget_projection(
                     ledger, run_id, opts,
                     [s for s in buildable if status.get(s.id) == "TODO"],
                     batch_predictions, batch_projection,
                 )
+
+        def _budget_gate(story: Story) -> bool:
+            # Story 14.1-001: with no barrier bounding mid-cohort spend, the
+            # ceiling is re-checked before *each* submission instead of once per
+            # cohort — the scheduler thread owns dispatch, so the continuous
+            # path can afford the per-story check the pool could not interleave.
+            nonlocal budget_stopped
+            if _budget_exceeded(ledger, run_id, opts.budget):
+                budget_stopped = True
+                return False
+            # Story 28.3-002: same projected-ceiling flag as the serial path,
+            # checked on the scheduler thread before each submission.
+            _check_projection()
             return True
 
         def _refresh_base() -> None:
@@ -5940,6 +5958,7 @@ def run_build(
                 ledger.set_story_status(run_id, story.id, "NEEDS_ATTENTION")
                 if cost_gated is None:  # first gate applied wins
                     cost_gated = result.cost_gate
+                _check_projection()
                 return False  # deliberate run pause — drain in-flight, submit nothing
             if result.error is not None:
                 # Failure isolation (AC4): an unexpected raise is recorded FAILED
@@ -5959,6 +5978,7 @@ def run_build(
                 _teardown_story_workdir(
                     ledger, run_id, story.id, real_run=dispatcher is None
                 )
+                _check_projection()
                 return True
             sr = result.outcome
             assert sr is not None  # exactly one of outcome/cost_gate/error is set
@@ -5967,6 +5987,7 @@ def run_build(
                 ledger.set_story_status(run_id, story.id, "RATE_LIMITED")
                 if rate_limit_park is None:  # first park applied wins
                     rate_limit_park = sr
+                _check_projection()
                 return False  # run-level park — drain in-flight, submit nothing
             outcome = sr.status or "FAILED"
             status[story.id] = outcome
@@ -5982,6 +6003,11 @@ def run_build(
             _teardown_story_workdir(
                 ledger, run_id, story.id, real_run=dispatcher is None
             )
+            # Story 28.3-002 / issue #539: re-check right after this story's
+            # real usage lands — see _check_projection for why the pre-dispatch
+            # check alone can miss a run that only crosses the ceiling once an
+            # in-flight sibling's usage is applied after the last submission.
+            _check_projection()
             return True
 
         _dispatch_ready_queue(

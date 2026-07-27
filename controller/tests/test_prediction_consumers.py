@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -329,6 +331,328 @@ def test_budget_projection_flags_on_the_parallel_scheduler_path(
         if "projected to cross the ceiling" in m
     ]
     assert len(flags) == 1  # latched after the first firing, same as serial
+
+
+def test_budget_projection_flags_at_the_first_parallel_pre_dispatch_check(
+    tmp_path: Path,
+) -> None:
+    """The pre-dispatch seam stays a live warning point in its own right.
+
+    The issue #539 completion re-checks would mask a lost pre-dispatch check:
+    a run crossing the ceiling gets flagged either way, so a count assertion
+    alone cannot tell the two seams apart. This pins the *first* one. With the
+    ceiling set to the batch's whole predicted total, accrued 0 plus the three
+    still-TODO predictions already crosses at the very first submission gate —
+    reached before any worker has run, so no completion check can precede it
+    and the assertion is independent of scheduling order (unlike an assertion
+    about *which* later check fires, which is what made the test above flaky).
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed_history(db)  # 10k predicted per story → 30k for the three-story batch
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, predict=True, auto=True,
+        budget=30_000, concurrency=2,
+    )
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), preflight=lambda: True,
+    )
+    flags = [
+        m for m in _events(db, result.run_id)
+        if "projected to cross the ceiling" in m
+    ]
+    assert len(flags) == 1
+    # Nothing had run yet: any completion check would show accrued > 0 and
+    # fewer than three pending stories.
+    assert "accrued 0 + predicted ~30,000 tokens for 3 pending stories" in flags[0]
+
+
+class _LateSiblingDispatcher(FakeDispatcher):
+    """Holds ``s1-002`` at its first stage until ``s1-003`` has been dispatched.
+
+    Forces the interleaving of issue #539 deterministically. Only one worker
+    thread ever runs a given story, so the ``_held`` latch needs no lock.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.s1_003_dispatched = threading.Event()
+        self._held = False
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        sid = getattr(story, "id", "")
+        if sid == "s1-003":
+            # s1-003 can only reach the dispatcher *after* its pre-dispatch
+            # budget check ran — the exact moment the snapshot is pessimistic.
+            self.s1_003_dispatched.set()
+        elif sid == "s1-002" and not self._held:
+            self._held = True
+            # Bounded: a regression that never dispatches s1-003 fails the
+            # assertions below instead of hanging the suite.
+            self.s1_003_dispatched.wait(timeout=10)
+        return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+
+def test_budget_projection_flags_when_a_sibling_completes_after_the_last_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #539: the projected ceiling is re-checked on completions, not only
+    on submissions.
+
+    With ``concurrency=2`` the sample queue offers only *two* submission events
+    (``s1-003`` depends on ``s1-001``), so a check wired to submissions alone
+    can miss the ceiling outright. If ``s1-001`` is applied before its in-flight
+    sibling ``s1-002`` has posted any stage usage, the pre-dispatch snapshot for
+    ``s1-003`` sees 17,680 accrued + 20,000 predicted for the two still-TODO
+    stories = 37,680 — under the 40,000 ceiling — and ``s1-003`` is the last
+    story ever submitted, so nothing revisits it. The run still accrues 53,040.
+
+    That interleaving is legal and common, not a test artefact: it is what made
+    the parallel-path test above fail intermittently under CI contention. Here
+    it is *forced* — ``s1-002`` parks on its first stage until ``s1-003`` has
+    actually been dispatched — so the pessimistic snapshot is guaranteed on
+    every platform, and the flag can only come from a post-completion check.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed_history(db)  # 10k predicted per story; ~17.7k actually accrued each
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, predict=True, auto=True,
+        budget=40_000, concurrency=2,
+    )
+    dispatcher = _LateSiblingDispatcher()
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=dispatcher, preflight=lambda: True,
+    )
+    assert dispatcher.s1_003_dispatched.is_set()  # the interleaving really happened
+    assert result.completed == 3
+    assert result.budget_stopped is False  # advisory only — never halts real work
+    flags = [
+        m for m in _events(db, result.run_id)
+        if "projected to cross the ceiling" in m
+    ]
+    assert len(flags) == 1  # fires despite no submission event left to catch it
+    # The accrued figure pins the firing to a *completion* check: the last
+    # pre-dispatch check could only ever have seen s1-001's 17,680 alone.
+    accrued = int(re.search(r"accrued ([\d,]+)", flags[0]).group(1).replace(",", ""))
+    assert accrued >= 2 * _TOKENS_PER_STORY
+
+
+def test_budget_projection_flags_when_an_error_is_the_last_event(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Issue #539: the projection must also fire when the run's last event is an
+    unexpected mid-story error, not a normal completion.
+
+    Same shape as the sibling-completion regression above (s1-002 held until
+    s1-003 — the dependent, last-submitted story — is checked), but s1-003's
+    first three stages (build/coverage/review) land real usage — 13,260
+    tokens, *more* than its 10,000-token prediction — before its merge attempt
+    raises. s1-002 stays held (contributing only its *predicted* 10,000, never
+    real usage) until s1-003's own check has run, so every earlier check
+    (pre-dispatch and s1-001's own completion) sees the same 37,680 the
+    original regression relies on; only s1-003's own error check, with its
+    real partial usage replacing its prediction, crosses the ceiling.
+    """
+    import sdlc.build as build_mod
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed_history(db)
+    c_checked = threading.Event()
+    real_flag = build_mod._flag_budget_projection
+
+    def _wrapped_flag(ledger, run_id, opts, pending, predictions, projection):
+        flagged = real_flag(ledger, run_id, opts, pending, predictions, projection)
+        if len(pending) == 1 and pending[0].id == "s1-002":
+            # s1-003 has just been marked terminal and checked — the one and
+            # only point at which s1-002 is the sole story left pending.
+            c_checked.set()
+        return flagged
+
+    monkeypatch.setattr(build_mod, "_flag_budget_projection", _wrapped_flag)
+
+    class _HeldSiblingErrorDispatcher(FakeDispatcher):
+        def __init__(self) -> None:
+            super().__init__()
+            self._held = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            sid = getattr(story, "id", "")
+            if sid == "s1-003" and agent_type == "merge":
+                raise RuntimeError("worker exploded on merge")
+            if sid == "s1-002" and not self._held:
+                self._held = True
+                # Bounded: a regression that never checks s1-003 fails the
+                # assertions below instead of hanging the suite.
+                c_checked.wait(timeout=10)
+            return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, predict=True, auto=True,
+        budget=39_000, concurrency=2,
+    )
+    dispatcher = _HeldSiblingErrorDispatcher()
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=dispatcher, preflight=lambda: True,
+    )
+    assert c_checked.is_set()  # the forced interleaving really happened
+    assert result.story_status["s1-001"] == "DONE"
+    assert result.story_status["s1-003"] == "FAILED"
+    assert result.story_status["s1-002"] == "DONE"  # released, ran to completion
+    flags = [
+        m for m in _events(db, result.run_id)
+        if "projected to cross the ceiling" in m
+    ]
+    assert len(flags) == 1  # only s1-003's own check catches it
+    accrued = int(re.search(r"accrued ([\d,]+)", flags[0]).group(1).replace(",", ""))
+    # Pins the firing to the error check: every earlier check (pre-dispatch,
+    # s1-001's own completion) stays at 37,680 — under the 39,000 budget.
+    assert accrued >= _TOKENS_PER_STORY + 3 * _SAMPLE_STAGE_TOKENS
+
+
+def test_budget_projection_flags_when_a_rate_limit_park_is_the_last_event(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Issue #539: the projection must also fire when the run's last event is a
+    durable rate-limit park, not a normal completion.
+
+    Same forced interleaving as the error case above — s1-003's merge attempt
+    throttles with a reset beyond the auto-wait cap, parking the story
+    RATE_LIMITED, after its first three stages landed real usage.
+    """
+    import sdlc.build as build_mod
+    from sdlc.dispatch import RateLimitError
+    from sdlc.rate_limit import RateLimitSignal
+    from test_rate_limit_gate import _Sleeps
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed_history(db)
+    c_checked = threading.Event()
+    real_flag = build_mod._flag_budget_projection
+    signal = RateLimitSignal(source="usage-limit", reset_at=999_999.0)
+
+    def _wrapped_flag(ledger, run_id, opts, pending, predictions, projection):
+        flagged = real_flag(ledger, run_id, opts, pending, predictions, projection)
+        if len(pending) == 1 and pending[0].id == "s1-002":
+            c_checked.set()
+        return flagged
+
+    monkeypatch.setattr(build_mod, "_flag_budget_projection", _wrapped_flag)
+
+    class _HeldSiblingParkDispatcher(FakeDispatcher):
+        def __init__(self) -> None:
+            super().__init__()
+            self._held = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            sid = getattr(story, "id", "")
+            if sid == "s1-003" and agent_type == "merge":
+                raise RateLimitError("synthetic throttle", signal=signal)
+            if sid == "s1-002" and not self._held:
+                self._held = True
+                c_checked.wait(timeout=10)
+            return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, predict=True, auto=True,
+        budget=39_000, concurrency=2, rate_limit_max_wait_s=300, window_s=18_000,
+    )
+    dispatcher = _HeldSiblingParkDispatcher()
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=dispatcher, preflight=lambda: True,
+        sleep_fn=_Sleeps(), clock=lambda: 0.0,
+    )
+    assert c_checked.is_set()  # the forced interleaving really happened
+    assert result.rate_limited is True
+    assert result.story_status["s1-001"] == "DONE"
+    assert result.story_status["s1-002"] == "DONE"  # released, ran to completion
+    ledger = Ledger(db)
+    statuses = {r["story_id"]: r["status"] for r in ledger.story_rows(result.run_id)}
+    assert statuses["s1-003"] == "RATE_LIMITED"
+    flags = [
+        m for m in _events(db, result.run_id)
+        if "projected to cross the ceiling" in m
+    ]
+    assert len(flags) == 1  # only s1-003's own check catches it
+    accrued = int(re.search(r"accrued ([\d,]+)", flags[0]).group(1).replace(",", ""))
+    assert accrued >= _TOKENS_PER_STORY + 3 * _SAMPLE_STAGE_TOKENS
+
+
+def test_budget_projection_flags_when_a_cost_gate_is_the_last_event(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Issue #539: the projection must also fire when the run's last event is a
+    cost-gate pause, not a normal completion.
+
+    Same forced interleaving again, but the terminal outcome is the 14.1-002
+    per-stage cost gate: s1-003's merge-stage estimate is forced over
+    threshold (the interactive gate halts before any *further* dispatch, but
+    its first three stages already landed real usage — 13,260 tokens, more
+    than the 10,000 predicted for the whole story).
+    """
+    import sdlc.build as build_mod
+    from sdlc.cost_estimate import StageEstimate
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed_history(db)
+    c_checked = threading.Event()
+    real_flag = build_mod._flag_budget_projection
+    real_estimate = build_mod._estimate_stage_cost
+
+    def _wrapped_flag(ledger, run_id, opts, pending, predictions, projection):
+        flagged = real_flag(ledger, run_id, opts, pending, predictions, projection)
+        if len(pending) == 1 and pending[0].id == "s1-002":
+            c_checked.set()
+        return flagged
+
+    def _fake_estimate(stage, story, opts, pr_number, ledger, run_id, attempt, **kwargs):
+        if stage == "merge" and story.id == "s1-003":
+            return StageEstimate(
+                stage="merge", prompt_tokens=1,
+                estimated_tokens=999_999, estimated_cost_usd=1.0,
+            )
+        return real_estimate(
+            stage, story, opts, pr_number, ledger, run_id, attempt, **kwargs
+        )
+
+    monkeypatch.setattr(build_mod, "_flag_budget_projection", _wrapped_flag)
+    monkeypatch.setattr(build_mod, "_estimate_stage_cost", _fake_estimate)
+
+    class _HeldSiblingDispatcher(FakeDispatcher):
+        def __init__(self) -> None:
+            super().__init__()
+            self._held = False
+
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            sid = getattr(story, "id", "")
+            if sid == "s1-002" and not self._held:
+                self._held = True
+                c_checked.wait(timeout=10)
+            return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, predict=True, auto=False,
+        budget=39_000, concurrency=2, cost_estimate_threshold=50_000,
+    )
+    dispatcher = _HeldSiblingDispatcher()
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=dispatcher, preflight=lambda: True,
+    )
+    assert c_checked.is_set()  # the forced interleaving really happened
+    assert result.cost_gated is True
+    assert result.story_status["s1-001"] == "DONE"
+    assert result.story_status["s1-003"] == "NEEDS_ATTENTION"
+    assert result.story_status["s1-002"] == "DONE"  # released, ran to completion
+    flags = [
+        m for m in _events(db, result.run_id)
+        if "projected to cross the ceiling" in m
+    ]
+    assert len(flags) == 1  # only s1-003's own check catches it
+    accrued = int(re.search(r"accrued ([\d,]+)", flags[0]).group(1).replace(",", ""))
+    assert accrued >= _TOKENS_PER_STORY + 3 * _SAMPLE_STAGE_TOKENS
 
 
 def test_flag_budget_projection_is_best_effort_on_a_ledger_fault() -> None:
