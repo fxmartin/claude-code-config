@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.7] - 2026-07-27
+
+### Fixed
+
+- fix(resume): don't block on deps skipped as git-landed (#540)
+
+
 ## [v2.42.6] - 2026-07-27
 
 ### Fixed
