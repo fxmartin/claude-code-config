@@ -10,6 +10,7 @@ from sdlc.build import BuildOptions, Ledger, run_build
 from sdlc.cohort import Story
 from sdlc.discovery import discover_queue
 from sdlc.registry import Registry, RunRecord
+import sdlc.resume as resume_mod
 from sdlc.resume import ResumeResult, compute_resume_plan, run_resume
 
 from test_build import (  # reuse the canned dispatchers
@@ -1204,3 +1205,106 @@ def test_resume_cli_accepts_multiple_positionals(tmp_path: Path, monkeypatch) ->
     result = CliRunner().invoke(app, ["resume", "epic-18", "epic-15"])
     assert result.exit_code == 0, result.output
     assert captured["scope"] == "epic-15,epic-18"
+
+
+# --- Issue #537: git-landed done-skips must not block on resume -------------
+#
+# `_filter_git_landed` (#227) also feeds run_build's done_skips: work already
+# merged on the base branch whose markdown was never flipped to Status: Done.
+# Those stories carry `.done == False`, so #536's markdown signal misses them
+# and they cascade-block their dependents exactly as #536 described.
+
+_GIT_LANDED_EPIC = """# Epic 97
+
+##### Story 97.1-001: Landed but not marked
+**Priority**: P1
+**Points**: 1
+**Dependencies**: None.
+
+##### Story 97.2-001: Unfinished
+**Priority**: P1
+**Points**: 2
+**Dependencies**: Story 97.1-001.
+"""
+
+
+def _make_git_landed_project(tmp_path: Path) -> Path:
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True, exist_ok=True)
+    (stories / "epic-97-landed.md").write_text(_GIT_LANDED_EPIC, encoding="utf-8")
+    return tmp_path
+
+
+def _seed_git_landed_parked(db_path: Path, *, mode: str = "serial") -> str:
+    """97.1-001 is SKIPPED but its markdown is NOT ``Status: Done`` — the shape
+    `_filter_git_landed` produces. 97.2-001 depends on it and parked mid-review."""
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("epic-97", mode)
+    ledger.set_total(run_id, 1)
+    ledger.event_log(
+        run_id, "", "info", "config",
+        json.dumps({"skip_coverage": True, "concurrency": 3}),
+    )
+    ledger.story_upsert(
+        run_id, "97.1-001", "97", "Landed but not marked", "P1", 1,
+        "general-purpose", "", None, "SKIPPED",
+    )
+    ledger.story_upsert(
+        run_id, "97.2-001", "97", "Unfinished", "P1", 2,
+        "general-purpose", "", None, "TODO",
+    )
+    ledger.stage_start(run_id, "97.2-001", "build", 1)
+    ledger.stage_finish(run_id, "97.2-001", "build", 1, "DONE")
+    ledger.set_story_pr(run_id, "97.2-001", 1)
+    ledger.stage_start(run_id, "97.2-001", "review", 1)
+    ledger.set_story_status(run_id, "97.2-001", "NEEDS_ATTENTION")
+    return run_id
+
+
+def test_resume_dispatches_story_whose_dep_was_git_landed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #537: a dependency skipped because git shows it landed must not
+    block, even though its markdown never said ``Status: Done``."""
+    _make_git_landed_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_git_landed_parked(db)
+
+    def fake_landed(buildable, done_skips, root=None):
+        landed = [s for s in buildable if s.id == "97.1-001"]
+        rest = [s for s in buildable if s.id != "97.1-001"]
+        return rest, done_skips + landed
+
+    monkeypatch.setattr(resume_mod, "_filter_git_landed", fake_landed)
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-97", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+    )
+
+    assert ("review", "97.2-001") in dispatcher.calls
+    assert result.blocked == 0
+    assert result.skipped == 1  # the landed dep still tallied via extra_skipped
+    assert "97.1-001" not in result.story_status
+
+
+def test_resume_git_probe_failure_leaves_dep_blocking(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Offline-safe: when the probe reports nothing landed, the SKIPPED dep keeps
+    its pre-#537 blocking behaviour rather than being silently treated as done."""
+    _make_git_landed_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_git_landed_parked(db)
+
+    monkeypatch.setattr(
+        resume_mod, "_filter_git_landed",
+        lambda buildable, done_skips, root=None: (buildable, done_skips),
+    )
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-97", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+    )
+
+    assert ("review", "97.2-001") not in dispatcher.calls
+    assert result.blocked == 1
