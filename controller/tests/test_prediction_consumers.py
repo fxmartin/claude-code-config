@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -329,6 +331,77 @@ def test_budget_projection_flags_on_the_parallel_scheduler_path(
         if "projected to cross the ceiling" in m
     ]
     assert len(flags) == 1  # latched after the first firing, same as serial
+
+
+class _LateSiblingDispatcher(FakeDispatcher):
+    """Holds ``s1-002`` at its first stage until ``s1-003`` has been dispatched.
+
+    Forces the interleaving of issue #539 deterministically. Only one worker
+    thread ever runs a given story, so the ``_held`` latch needs no lock.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.s1_003_dispatched = threading.Event()
+        self._held = False
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        sid = getattr(story, "id", "")
+        if sid == "s1-003":
+            # s1-003 can only reach the dispatcher *after* its pre-dispatch
+            # budget check ran — the exact moment the snapshot is pessimistic.
+            self.s1_003_dispatched.set()
+        elif sid == "s1-002" and not self._held:
+            self._held = True
+            # Bounded: a regression that never dispatches s1-003 fails the
+            # assertions below instead of hanging the suite.
+            self.s1_003_dispatched.wait(timeout=10)
+        return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+
+def test_budget_projection_flags_when_a_sibling_completes_after_the_last_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #539: the projected ceiling is re-checked on completions, not only
+    on submissions.
+
+    With ``concurrency=2`` the sample queue offers only *two* submission events
+    (``s1-003`` depends on ``s1-001``), so a check wired to submissions alone
+    can miss the ceiling outright. If ``s1-001`` is applied before its in-flight
+    sibling ``s1-002`` has posted any stage usage, the pre-dispatch snapshot for
+    ``s1-003`` sees 17,680 accrued + 20,000 predicted for the two still-TODO
+    stories = 37,680 — under the 40,000 ceiling — and ``s1-003`` is the last
+    story ever submitted, so nothing revisits it. The run still accrues 53,040.
+
+    That interleaving is legal and common, not a test artefact: it is what made
+    the parallel-path test above fail intermittently under CI contention. Here
+    it is *forced* — ``s1-002`` parks on its first stage until ``s1-003`` has
+    actually been dispatched — so the pessimistic snapshot is guaranteed on
+    every platform, and the flag can only come from a post-completion check.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed_history(db)  # 10k predicted per story; ~17.7k actually accrued each
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, predict=True, auto=True,
+        budget=40_000, concurrency=2,
+    )
+    dispatcher = _LateSiblingDispatcher()
+    result = run_build(
+        opts, queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=dispatcher, preflight=lambda: True,
+    )
+    assert dispatcher.s1_003_dispatched.is_set()  # the interleaving really happened
+    assert result.completed == 3
+    assert result.budget_stopped is False  # advisory only — never halts real work
+    flags = [
+        m for m in _events(db, result.run_id)
+        if "projected to cross the ceiling" in m
+    ]
+    assert len(flags) == 1  # fires despite no submission event left to catch it
+    # The accrued figure pins the firing to a *completion* check: the last
+    # pre-dispatch check could only ever have seen s1-001's 17,680 alone.
+    accrued = int(re.search(r"accrued ([\d,]+)", flags[0]).group(1).replace(",", ""))
+    assert accrued >= 2 * _TOKENS_PER_STORY
 
 
 def test_flag_budget_projection_is_best_effort_on_a_ledger_fault() -> None:
