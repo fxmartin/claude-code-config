@@ -78,11 +78,13 @@ class _Dispatcher:
 
     def __init__(self, overrides: dict | None = None) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.prompts: list[tuple[str, str]] = []
         self.overrides = overrides or {}
 
     def __call__(self, agent_type, prompt, story=None, **kwargs):
         sid = getattr(story, "id", "")
         self.calls.append((agent_type, sid))
+        self.prompts.append((agent_type, prompt or ""))
         payload = self.overrides.get(agent_type, _PAYLOADS[agent_type])
         if callable(payload):
             payload = payload()
@@ -159,6 +161,47 @@ def test_bugfix_push_failure_parks_needs_attention(tmp_path, monkeypatch) -> Non
     assert result.completed == 0
     # The stage was not retried against the stale head.
     assert disp.count("review") == 1
+
+
+def test_review_packet_rebaked_after_bugfix_push(tmp_path, monkeypatch) -> None:
+    """The retry must score the pushed fix, not the packet baked before it (#527).
+
+    The packet is baked once at review-stage entry, so pushing the bugfix moves
+    only the remote head — without a re-bake the retry is still handed the
+    pre-fix diff snapshot and re-rejects the diff it already rejected, which
+    defeats the push guarantee the tests above assert.
+    """
+    monkeypatch.setattr(
+        build_mod, "_push_bugfix_commit",
+        lambda story, workdir, ledger, run_id: True,
+    )
+    bakes = {"n": 0}
+
+    def fake_bake(story, pr_number, workdir, ledger, run_id, signals, cr_terms):
+        bakes["n"] += 1
+        return f"PACKET-{bakes['n']}"
+
+    monkeypatch.setattr(build_mod, "_bake_review_packet", fake_bake)
+    state = {"n": 0}
+
+    def flaky_review():
+        state["n"] += 1
+        return _PAYLOADS["review"] if state["n"] > 1 else _rejecting_review(2)
+
+    disp = _Dispatcher(overrides={"review": flaky_review})
+    result = run_build(
+        _opts(), queue=_queue(), ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=disp, preflight=lambda: True, root=tmp_path,
+    )
+    assert result.completed == 1
+    # Once at stage entry, once more after the bugfix reached the remote head.
+    assert bakes["n"] == 2
+    prompts = [p for a, p in disp.prompts if a == "review"]
+    assert len(prompts) == 2
+    assert "PACKET-1" in prompts[0]
+    # The retry sees the fresh packet and no trace of the stale one.
+    assert "PACKET-2" in prompts[1]
+    assert "PACKET-1" not in prompts[1]
 
 
 def test_push_bugfix_commit_no_local_branch_is_noop(tmp_path, monkeypatch) -> None:

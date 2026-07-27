@@ -6906,6 +6906,19 @@ def _run_story(
                         "against a stale head; commits preserved on the branch",
                     )
                     return "NEEDS_ATTENTION"
+                # Issue #527: the packet baked at stage entry embeds the CR diff
+                # as it stood *before* this bugfix. Pushing the fix (above) only
+                # moves the remote head — the retry would still be handed that
+                # pre-fix snapshot and re-reject the diff it already rejected,
+                # defeating the push guarantee. Re-bake so the retry scores what
+                # the bugfix actually published. None (host failure, oversized)
+                # leaves the prompt on its fetch-it-yourself fallback, which is
+                # strictly fresher than a known-stale packet.
+                if stage == "review" and pr_number is not None:
+                    review_packet_block = _bake_review_packet(
+                        story, pr_number, workdir, ledger, run_id,
+                        coverage_signals, cr_terms,
+                    )
                 # Bugfix succeeded — retry the same stage as a new attempt.
                 attempt += 1
             except ContextOverflowError as exc:
