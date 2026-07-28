@@ -13,7 +13,6 @@
     ],
     "defaultMode": "auto"
   },
-  "model": "fable",
   "hooks": {
     "SessionStart": [
       {
@@ -71,7 +70,8 @@
     "pyright-lsp@claude-plugins-official": true,
     "example-skills@anthropic-agent-skills": true,
     "codex@openai-codex": true,
-    "autonomous-sdlc@fx-claude-config": true
+    "autonomous-sdlc@fx-claude-config": true,
+    "frontend-design@claude-plugins-official": true
   },
   "extraKnownMarketplaces": {
     "anthropic-agent-skills": {
