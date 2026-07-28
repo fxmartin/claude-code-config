@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -52,6 +53,7 @@ from sdlc.fix_issue import (
     stop_reason,
 )
 from sdlc.issue_host import RunResult
+from sdlc.registry import Registry
 from sdlc.ledger_view import Ledger
 
 
@@ -2903,3 +2905,489 @@ def test_open_docs_only_pr_push_failure_returns_none_and_warns(tmp_path) -> None
     assert any(
         "deterministic PR open failed" in m for m in _events(tmp_path / "l.db")
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #545: a fix run must reach the *host registry*, not only the ledger.
+#
+# The dashboard resolves the current run exclusively from `~/.sdlc/registry.json`
+# and falls back to `max(started_at)` over whatever is registered — so an
+# unregistered fix run does not merely go missing, it lets a stale completed run
+# be presented as current with no error and no empty state.
+# ---------------------------------------------------------------------------
+
+
+def _reg(tmp_path: Path) -> Registry:
+    """A path-scoped registry so a test never touches the host's real cache."""
+    return Registry(tmp_path / "registry.json")
+
+
+class _BrokenRegistry(Registry):
+    """Every write raises, standing in for an unwritable host cache."""
+
+    def register(self, record) -> None:  # noqa: D102
+        raise OSError("registry is read-only")
+
+    def mark_finished(self, run_id, status, *, completed=None) -> None:  # noqa: D102
+        raise OSError("registry is read-only")
+
+
+def test_run_fix_registers_the_run_in_the_host_registry(tmp_path) -> None:
+    """The run the dashboard must discover beside `sdlc build` runs."""
+    registry = _reg(tmp_path)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    records = registry.records()
+    assert [r.run_id for r in records] == [result.run_id]
+    record = records[0]
+    assert record.scope == "issue-1"
+    assert Path(record.db) == (tmp_path / ".sdlc-state.db").resolve()
+    assert Path(record.repo) == tmp_path.resolve()
+    assert record.total == 1
+    assert record.started_at  # the registry stamps it at register time
+
+
+def test_run_fix_registers_with_a_live_pid_so_a_crash_derives_dead(tmp_path) -> None:
+    """A crashed fix must be detectable by dead pid, like a controller build.
+
+    Asserted mid-run — after registration, before close-out — because the record
+    is terminal by the time `run_fix` returns and an IN_PROGRESS row with this
+    process's pid could no longer be distinguished from one never written.
+    """
+    registry = _reg(tmp_path)
+    seen: list[tuple[str, int]] = []
+
+    dispatch = RecordingDispatcher()
+    inner = dispatch.__call__
+
+    def spy(agent_type, prompt, **kwargs):
+        if agent_type == "investigation":
+            for record in registry.records():
+                seen.append((record.status, record.pid))
+        return inner(agent_type, prompt, **kwargs)
+
+    run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=spy,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert seen == [("IN_PROGRESS", os.getpid())]
+
+
+def test_run_fix_finalizes_the_registry_record_on_a_clean_finish(tmp_path) -> None:
+    """A finished fix must not linger IN_PROGRESS and derive DEAD later."""
+    registry = _reg(tmp_path)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "DONE"
+
+    record = registry.records()[0]
+    assert record.status == "DONE"
+    assert record.completed == 1
+    assert record.finished_at
+
+
+def test_run_fix_finalizes_the_registry_record_on_an_early_abort(tmp_path) -> None:
+    """The pre-stage-loop exit closes the registry too, not just the ledger.
+
+    A BLOCKED investigation returns through `_close_early`, which bypasses the
+    shared `finalize_run` — so it needs its own registry stamp or a blocked fix
+    stays IN_PROGRESS in the cache forever.
+    """
+    registry = _reg(tmp_path)
+    dispatch = RecordingDispatcher(
+        overrides={
+            "investigation": {
+                "root_cause": "unclear",
+                "complexity": "HIGH",
+                "fix_approach": "",
+                "files_to_modify": [],
+                "risk": "high",
+                "investigation_status": "BLOCKED — needs a product decision",
+            }
+        }
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "ABORTED"
+
+    record = registry.records()[0]
+    assert record.status == "ABORTED"
+    assert record.finished_at
+
+
+def test_run_fix_survives_an_unwritable_registry(tmp_path) -> None:
+    """Registration is a discovery cache, never a gate on the fix (#323 AC4)."""
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=_BrokenRegistry(tmp_path / "registry.json"),
+    )
+    assert result.status == "DONE"
+    assert result.pr_number == 100
+
+
+def test_run_fix_leaves_a_rate_limit_park_registered_in_progress(tmp_path) -> None:
+    """A park is resumable, not terminal — the registry must still show it live.
+
+    Stamping it terminal here would hide a run that is waiting to continue, which
+    is the same disappearance #545 is about, just with the opposite sign.
+    """
+    from sdlc.rate_limit import RateLimitSignal
+
+    registry = _reg(tmp_path)
+    dispatch = RecordingDispatcher(
+        overrides={
+            "build": RateLimitError("throttled", signal=RateLimitSignal(source="429"))
+        }
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "RATE_LIMITED"
+
+    record = registry.records()[0]
+    assert record.status == "IN_PROGRESS"
+    assert record.finished_at is None
+
+
+def test_run_fix_batch_registers_and_finalizes_the_run(tmp_path) -> None:
+    """The batch path opens its own run row and has the same #545 defect.
+
+    `sdlc fix all` / `sdlc fix next` create a run via `run_create` exactly like the
+    single-issue path, so registering only `run_fix` would leave every batch run
+    invisible to the dashboard.
+    """
+    registry = _reg(tmp_path)
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=BatchProbeDispatcher(
+            inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]}
+        ),
+        preflight=lambda: True,
+        runner=FakeBatchGh([_batch_issue(1), _batch_issue(2)]),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "DONE"
+
+    records = registry.records()
+    assert [r.run_id for r in records] == [result.run_id]
+    record = records[0]
+    assert record.total == 2
+    assert record.status == "DONE"
+    assert record.completed == 2
+    assert record.finished_at
+
+
+# ---------------------------------------------------------------------------
+# Issue #547: an interrupted `sdlc fix` run must be resumable.
+#
+# `run_resume` derived the right resume point from the ledger, then intersected
+# it with a queue rebuilt from the markdown epics — where a fix scope has no
+# story. The queue came out empty, nothing dispatched, and the close-out marked
+# the run DONE. Silent, exit 0, and *destructive*: the run became terminal, so it
+# could never be resumed even once the bug was fixed.
+# ---------------------------------------------------------------------------
+
+
+def _fix_run_interrupted_at(
+    tmp_path, *, dispatcher, stop_before: str = "", stop_during: str = ""
+):
+    """A real fix run killed at a stage boundary (`stop_before`) or mid-stage.
+
+    Built by dispatching for real rather than hand-seeding rows, so the resume is
+    exercised against exactly what `run_fix` leaves behind — including whatever it
+    persists for its own recovery.
+
+    `stop_before` kills before that stage dispatches, leaving every earlier stage
+    DONE and no row for this one. `stop_during` kills after the agent returned but
+    before `stage_finish`, leaving the IN_PROGRESS row a real host crash leaves —
+    the shape of the incident that motivated #547.
+    """
+    class _Stop(Exception):
+        pass
+
+    def killer(agent_type, prompt, **kwargs):
+        if agent_type == stop_before:
+            raise _Stop()
+        result = dispatcher(agent_type, prompt, **kwargs)
+        if agent_type == stop_during:
+            raise _Stop()
+        return result
+
+    try:
+        run_fix(
+            FixOptions(issue=1),
+            ledger=Ledger(tmp_path / ".sdlc-state.db"),
+            dispatcher=killer,
+            preflight=lambda: True,
+            runner=FakeGh(_issue_json()),
+            root=tmp_path,
+        )
+    except _Stop:
+        pass
+    return Ledger(tmp_path / ".sdlc-state.db").latest_run_id()
+
+
+def _stage_names(db: Path, run_id: str) -> dict[str, str]:
+    conn = sqlite3.connect(db)
+    try:
+        return {
+            name: status
+            for name, status in conn.execute(
+                "SELECT stage_name, status FROM stages WHERE run_id = ?", (run_id,)
+            )
+        }
+    finally:
+        conn.close()
+
+
+def test_run_fix_persists_its_options_for_a_resume(tmp_path) -> None:
+    """A resume cannot honour the gate settings it never recorded."""
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1, skip_coverage=True, coverage_threshold=75, e2e_gate="warn"),
+        ledger=Ledger(db),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    config = Ledger(db).run_config(result.run_id)
+    assert config["issue"] == 1
+    assert config["skip_coverage"] is True
+    assert config["coverage_threshold"] == 75
+    assert config["e2e_gate"] == "warn"
+
+
+def test_run_fix_persists_the_investigation_plan_for_a_resume(tmp_path) -> None:
+    """The plan is dispatch output, not ledger state — replay needs it recorded.
+
+    Every later stage prompt (build, bugfix, summary) embeds the root cause and
+    fix approach, so a resume that could not recover the plan would have to
+    re-investigate and might proceed on a *different* plan than the one the
+    completed build already acted on.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    plan = fix_mod._recover_fix_plan(Ledger(db), result.run_id)
+    assert plan is not None
+    assert plan["root_cause"] == "off-by-one in loop"
+    assert plan["files_to_modify"] == ["src/loop.py"]
+
+
+def test_resume_fix_re_enters_at_the_interrupted_stage(tmp_path) -> None:
+    """The reported case: build landed, the host died, the rest must still run."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    assert _stage_names(db, run_id)["build"] == "DONE"
+
+    resumed = RecordingDispatcher()
+    result = fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=resumed,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+
+    assert result.status == "DONE"
+    # Completed stages are never re-dispatched...
+    assert "investigation" not in resumed.agents()
+    assert "build" not in resumed.agents()
+    # ...and the rest of the pipeline runs.
+    assert {"coverage", "review", "merge"}.issubset(resumed.agents())
+
+
+def test_resume_fix_replays_the_recorded_plan(tmp_path) -> None:
+    """The resumed stages act on the same plan the original build did."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+
+    prompts: list[str] = []
+
+    def spy(agent_type, prompt, **kwargs):
+        prompts.append(prompt)
+        return RecordingDispatcher()(agent_type, prompt, **kwargs)
+
+    fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=spy,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert any("off-by-one in loop" in p for p in prompts)
+
+
+def test_resume_fix_carries_the_pr_number_forward(tmp_path) -> None:
+    """A resume must not open a second PR for work that already has one."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_during="coverage"
+    )
+
+    result = fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=RecordingDispatcher(),
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert result.pr_number == 100
+
+
+def test_resume_fix_refuses_a_run_with_no_recorded_plan(tmp_path) -> None:
+    """A pre-upgrade run cannot be replayed — say so, never invent a plan.
+
+    Re-investigating would produce a plan the completed build never saw, so the
+    remaining stages would review and merge work against the wrong rationale.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "DELETE FROM events WHERE run_id = ? AND source = 'fix-plan'", (run_id,)
+        )
+
+    dispatch = RecordingDispatcher()
+    result = fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert result.aborted is True
+    assert "plan" in (result.abort_reason or "")
+    assert not dispatch.agents()
+    # Refusing leaves the run resumable, never terminal.
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "IN_PROGRESS"
+
+
+def test_recover_fix_plan_skips_a_malformed_event(tmp_path) -> None:
+    """A corrupt plan event must not shadow the real one recorded after it."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    ledger.event_log(run_id, "", "info", "fix-plan", "{not json")
+    ledger.event_log(run_id, "", "info", "fix-plan", json.dumps({"root_cause": "x"}))
+
+    assert fix_mod._recover_fix_plan(ledger, run_id) == {"root_cause": "x"}
+
+
+def test_recover_fix_plan_is_empty_without_a_ledger_file(tmp_path) -> None:
+    assert fix_mod._recover_fix_plan(Ledger(tmp_path / "absent.db"), "nope") is None
+
+
+def test_record_fix_plan_never_fails_the_run(tmp_path) -> None:
+    """Plan capture is for a *future* resume — it cannot break the run recording it."""
+    class _Exploding(Ledger):
+        def event_log(self, *args, **kwargs):
+            raise RuntimeError("ledger is on fire")
+
+    ledger = _Exploding(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    fix_mod._record_fix_plan(ledger, "run", {"root_cause": "x"})  # must not raise
+
+
+def test_resume_fix_refuses_a_non_issue_scope(tmp_path) -> None:
+    """`resume_fix` is the single-issue path; a batch/epic run is not its business."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("issues-all", "fix")
+
+    result = fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+        runner=FakeGh(_issue_json()), root=tmp_path,
+    )
+    assert result.aborted is True
+    assert "not a single-issue fix run" in (result.abort_reason or "")
+
+
+def test_resume_fix_aborts_when_the_issue_cannot_be_fetched(tmp_path) -> None:
+    """No issue, no prompts — and the run stays resumable for a later retry."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    dispatch = RecordingDispatcher()
+
+    result = fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=dispatch,
+        runner=FakeGh("", issue_rc=1, issue_err="gh: not found"), root=tmp_path,
+    )
+    assert result.aborted is True
+    assert not dispatch.agents()
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "IN_PROGRESS"
+
+
+def test_resume_fix_re_registers_the_run_in_the_registry(tmp_path) -> None:
+    """A resumed run is live again — the dashboard must see it, not its old terminal."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    registry = _reg(tmp_path)
+
+    fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+        runner=FakeGh(_issue_json()), root=tmp_path, registry=registry,
+    )
+    record = registry.records()[0]
+    assert record.run_id == run_id
+    assert record.status == "DONE"

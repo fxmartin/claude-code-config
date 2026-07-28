@@ -110,6 +110,55 @@ class ResumeResult:
     cost_gated: bool = False
 
 
+# The run modes that mark a fix-issue run (Issue #547). ``fix`` is what the
+# controller's `run_fix` writes; ``fix-issue`` is the legacy value the retired
+# markdown skill's `sdlc run-open` used, and those runs are in existing ledgers.
+_FIX_RUN_MODES = frozenset({"fix", "fix-issue"})
+
+
+def _resume_fix_run(
+    run_id: str,
+    *,
+    ledger: Ledger,
+    dispatcher=None,
+    render_view: Callable[[str], None] | None = None,
+    root: Path | None = None,
+    registry: "Registry | None" = None,
+    runner=None,
+) -> ResumeResult:
+    """Delegate a fix-issue run to :func:`sdlc.fix_issue.resume_fix` (#547).
+
+    Imported at call time: `fix_issue` imports `build`, and keeping this out of
+    the module import graph avoids coupling the build resume path to the fix one.
+
+    A refusal (no recorded plan, unfetchable issue) comes back ``aborted`` and is
+    reported as ``nothing_to_resume`` — deliberately *without* a close-out, so the
+    run stays IN_PROGRESS and recoverable. That is the whole point: the old path's
+    sin was not failing to dispatch, it was marking the run terminal on its way
+    out.
+    """
+    from sdlc.fix_issue import resume_fix
+
+    result = resume_fix(
+        run_id, ledger=ledger, dispatcher=dispatcher, runner=runner,
+        render_view=render_view, root=root, registry=registry,
+    )
+    if result.aborted:
+        return ResumeResult(run_id=run_id, nothing_to_resume=True)
+    story_id = f"issue-{result.issue}"
+    return ResumeResult(
+        run_id=run_id,
+        resumed=1,
+        completed=1 if result.status == "DONE" else 0,
+        failed=1 if result.status == "FAILED" else 0,
+        blocked=1 if result.status == "BLOCKED" else 0,
+        needs_attention=1 if result.status == "NEEDS_ATTENTION" else 0,
+        awaiting_approval=1 if result.status == "AWAITING_APPROVAL" else 0,
+        rate_limited=result.status == "RATE_LIMITED",
+        story_status={story_id: result.status},
+    )
+
+
 def _pipeline(skip_coverage: bool) -> list[str]:
     """The active stage pipeline, honouring this run's coverage-gate setting."""
     return [s for s in _STAGES if not (s == "coverage" and skip_coverage)]
@@ -297,6 +346,7 @@ def run_resume(
     concurrency: int | None = None,
     clock: Callable[[], float] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
+    runner=None,
 ) -> ResumeResult:
     """Resume the most recent interrupted run for ``scope`` from the ledger.
 
@@ -323,6 +373,10 @@ def run_resume(
     is canonicalised once here so the run lookup, queue recomputation, and event
     logs all use the same sorted label a composite build persisted — resume then
     matches regardless of the order the scopes were typed.
+
+    Issue #547: a run whose mode marks it a fix-issue run is handed straight to
+    :func:`sdlc.fix_issue.resume_fix`; ``runner`` is that pipeline's ``gh`` seam
+    and is unused on the build path.
     """
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
@@ -330,6 +384,19 @@ def run_resume(
         return ResumeResult(run_id=None, nothing_to_resume=True)
 
     run_row = ledger.run_row(rid) or {}
+    # Issue #547: a fix-issue run belongs to a different pipeline entirely. Its
+    # queue does not come from the markdown epics — an `issue-<N>` scope has no
+    # story there — so everything below would compute an empty queue, dispatch
+    # nothing, and then *close the run out DONE*, making it permanently
+    # unresumable. Hand it to the pipeline that owns it before any of that runs,
+    # and in particular before the `run_set_mode` re-stamp below, which would
+    # otherwise overwrite the `fix` lineage marker with `serial`/`parallel`.
+    if str(run_row.get("mode") or "") in _FIX_RUN_MODES:
+        return _resume_fix_run(
+            rid, ledger=ledger, dispatcher=dispatcher, render_view=render_view,
+            root=root, registry=registry, runner=runner,
+        )
+
     config = ledger.run_config(rid)
     skip_coverage = bool(config.get("skip_coverage"))
     plan = compute_resume_plan(ledger, rid, skip_coverage=skip_coverage)

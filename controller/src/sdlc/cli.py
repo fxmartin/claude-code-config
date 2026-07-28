@@ -73,6 +73,46 @@ def main(
     """sdlc — deterministic controller for autonomous SDLC runs."""
 
 
+def _resolve_run_option(ledger, value: str | None, *, strict: bool = True) -> str | None:
+    """Resolve a ``--run`` value (full id or prefix) to a real run id (#546).
+
+    Every ``--run`` consumer matched on ``WHERE run_id = ?``, so a truncated id —
+    the short form ``sdlc status`` and ``sdlc runs`` actually *print* — selected
+    no rows and then surfaced as a plausible result: "no incomplete stories" from
+    ``resume``, "0 stage rows" from ``state``. Both are indistinguishable from a
+    genuinely finished or empty run, which is the worst available failure for
+    commands whose purpose is recovering work after a crash.
+
+    ``None`` passes through so each command keeps its own default (latest run).
+    An ambiguous prefix always exits 2 — silently picking one of several runs is
+    never recoverable by the operator.
+
+    ``strict=False`` returns an unmatched value unchanged instead of exiting, for
+    the ``run-stage``/``run-close`` verbs: those document "exit 1 when the ledger
+    write failed" and are driven by external skills, so a miss must stay their own
+    failure rather than becoming a new exit code. They gain the prefix
+    convenience without a contract change.
+    """
+    if value is None:
+        return None
+    matches = ledger.run_ids_with_prefix(value)
+    if not matches:
+        if not strict:
+            return value
+        typer.echo(f"error: unknown run id: {value}", err=True)
+        raise typer.Exit(code=2)
+    if len(matches) > 1:
+        listed = ", ".join(m[:12] for m in matches[:5])
+        more = f" (+{len(matches) - 5} more)" if len(matches) > 5 else ""
+        typer.echo(
+            f"error: ambiguous run id: {value} matches {len(matches)} runs: "
+            f"{listed}{more}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return matches[0]
+
+
 # Note: there is no `init` verb. Epic-07 scaffolded one as a stub, but `build`
 # already creates the SQLite ledger on first use (`Ledger.init()` runs inside
 # `run_build`), so a separate workspace-scaffold command had no distinct job.
@@ -545,6 +585,13 @@ def resume(
     Story 14.1-001: a budget-paused run carries its token ceiling, so resuming
     without raising it re-pauses immediately. Pass ``--budget`` to raise it and
     continue.
+
+    Issue #547: an interrupted ``sdlc fix`` run resumes here too — it is handed to
+    the fix pipeline, which re-enters at the stage it died in rather than being
+    run through the markdown-queue path (which used to dispatch nothing and then
+    close the run out DONE). A fix run that recorded no investigation plan — one
+    started before that plan was persisted — is refused and left resumable rather
+    than continued on a freshly invented plan.
     """
     from sdlc.build import _parse_budget_value
     from sdlc.discovery import canonical_scope
@@ -581,6 +628,7 @@ def resume(
     ledger = Ledger(db_path)
     # Migrate a pre-existing (possibly stale) ledger before resume reads it.
     ledger.ensure_migrated()
+    run = _resolve_run_option(ledger, run)
     result = run_resume(
         scope_label,
         ledger=ledger,
@@ -683,7 +731,7 @@ def status(
     # snapshot, so a stale ledger never crashes the query with "no such column".
     # No-op when the DB does not exist — absence stays "not started".
     ledger.ensure_migrated()
-    snap = status_snapshot(ledger, run)
+    snap = status_snapshot(ledger, _resolve_run_option(ledger, run))
 
     # The markdown handoff (Story 15.1-002) renders even with no run — readiness
     # and "no active run" are exactly what a colleague needs to share.
@@ -1021,8 +1069,10 @@ def run_stage_cmd(
         typer.echo("run-stage: action must be 'start' or 'finish'.", err=True)
         raise typer.Exit(code=2)
 
+    from sdlc.ledger_view import Ledger, default_db_path
     from sdlc.runlog import run_stage
 
+    run = _resolve_run_option(Ledger(db or default_db_path()), run, strict=False) or run
     ok = run_stage(
         action=action,
         run_id=run,
@@ -1058,8 +1108,10 @@ def run_close_cmd(
     registry so a clean finish stops deriving as DEAD. Exits 1 when the ledger
     write failed; the registry mirror is best-effort.
     """
+    from sdlc.ledger_view import Ledger, default_db_path
     from sdlc.runlog import run_close
 
+    run = _resolve_run_option(Ledger(db or default_db_path()), run, strict=False) or run
     ok = run_close(
         run_id=run, db=db, status=status, completed=completed, story_id=story_id
     )
@@ -1170,7 +1222,7 @@ def state(
     ledger = Ledger(db_path)
     # Migrate a pre-existing (possibly stale) ledger before the read-only dump.
     ledger.ensure_migrated()
-    rid = run or ledger.latest_run_id()
+    rid = _resolve_run_option(ledger, run) or ledger.latest_run_id()
 
     if rid is None:
         if as_json:

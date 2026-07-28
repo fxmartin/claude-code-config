@@ -3223,6 +3223,31 @@ class Ledger:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def run_ids_with_prefix(self, prefix: str) -> list[str]:
+        """Every run id starting with ``prefix`` (Issue #546).
+
+        An exact id short-circuits to itself, so a full id can never be reported
+        ambiguous by a run that happens to extend it. Otherwise this is the raw
+        candidate list and the *caller* decides what 0 or 2+ matches mean — the
+        CLI turns them into "unknown run id" and "ambiguous run id" errors rather
+        than letting a miss masquerade as an empty result.
+        """
+        if not self.db_path.exists() or not prefix:
+            return []
+        with self._connect_ro() as conn:
+            exact = conn.execute(
+                "SELECT id FROM runs WHERE id = ?", (prefix,)
+            ).fetchone()
+            if exact is not None:
+                return [exact["id"]]
+            # LIKE would treat `%`/`_` in the prefix as wildcards; compare on a
+            # substring of the same length instead so the match stays literal.
+            rows = conn.execute(
+                "SELECT id FROM runs WHERE substr(id, 1, ?) = ? ORDER BY id",
+                (len(prefix), prefix),
+            ).fetchall()
+        return [r["id"] for r in rows]
+
     def run_row(self, run_id: str) -> dict | None:
         """The `runs` row for ``run_id`` as a dict, or None when absent."""
         if not self.db_path.exists():
@@ -3472,6 +3497,24 @@ class Ledger:
             return json.loads(row["message"])
         except (ValueError, TypeError):
             return {}
+
+    def events_by_source(self, run_id: str, source: str) -> list[str]:
+        """Every event message for ``run_id`` from ``source``, earliest first.
+
+        Insertion-ordered by the events table's autoincrement id, so the caller
+        can rely on "the first one wins" for a write-once record — which is how
+        Issue #547 recovers the plan a fix run actually proceeded on rather than
+        any later duplicate.
+        """
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                "SELECT message FROM events WHERE run_id = ? AND source = ? "
+                "ORDER BY id",
+                (run_id, source),
+            ).fetchall()
+        return [r["message"] for r in rows]
 
     def stage_breakdown(self, run_id: str) -> dict[str, list[dict]]:
         """All stage attempts for ``run_id``, grouped by story id (chronological).
@@ -5493,14 +5536,21 @@ def _commit_message(ref: str, root: Path | None = None) -> str | None:
 
 
 def _registry_register(
-    registry: Registry, run_id: str, scope: str, db_path: Path, total: int
+    registry: Registry, run_id: str, scope: str, db_path: Path, total: int,
+    repo: Path | None = None,
 ) -> None:
-    """Register a starting run; swallow any cache IO error (never fails a build)."""
+    """Register a starting run; swallow any cache IO error (never fails a build).
+
+    ``repo`` is the checkout the run belongs to, defaulting to the process cwd —
+    which is what ``run_build`` has always registered. ``run_fix`` passes its
+    explicit ``root`` instead (Issue #545), so a fix driven against another
+    checkout is discovered under that repo rather than wherever it was launched.
+    """
     try:
         registry.register(
             RunRecord(
                 run_id=run_id,
-                repo=str(Path.cwd().resolve()),
+                repo=str(Path(repo or Path.cwd()).resolve()),
                 db=str(Path(db_path).resolve()),
                 scope=scope,
                 pid=os.getpid(),

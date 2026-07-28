@@ -47,6 +47,8 @@ from sdlc.build import (
     _merge_awaiting_approval,
     _record_stage_usage,
     _refresh_base_ref,
+    _registry_finish,
+    _registry_register,
     _reposition_head,
     _stage_succeeded,
     _StoryDispatch,
@@ -69,6 +71,7 @@ from sdlc.dispatch import (
 )
 from sdlc.issue_host import RunResult, Runner, _default_runner
 from sdlc.notify import notify
+from sdlc.registry import Registry
 
 # --- Model routing: aligned with the Balanced build profile -----------------
 #
@@ -968,6 +971,67 @@ def _bake_review_packet(
     return block
 
 
+# The event source carrying a fix run's investigation plan (Issue #547). An event
+# rather than a column: the plan is small, write-once, and recovering it needs no
+# schema change on a ledger that may predate the feature.
+_FIX_PLAN_SOURCE = "fix-plan"
+
+
+def _fix_config(opts: FixOptions) -> dict:
+    """The fix options a resume must replay, as the run's ``config`` event."""
+    return {
+        "issue": opts.issue,
+        "skip_coverage": opts.skip_coverage,
+        "coverage_threshold": opts.coverage_threshold,
+        "skip_preflight": opts.skip_preflight,
+        "e2e_gate": opts.e2e_gate,
+        "model_overrides": dict(opts.model_overrides or {}),
+    }
+
+
+def _options_from_fix_config(config: dict, issue_number: int) -> FixOptions:
+    """Rebuild :class:`FixOptions` from a run's persisted ``config`` event.
+
+    Each field falls back to the dataclass default, so a run recorded before a
+    given option existed resumes exactly as it originally dispatched.
+    """
+    overrides = config.get("model_overrides")
+    return FixOptions(
+        issue=int(config.get("issue") or issue_number),
+        skip_coverage=bool(config.get("skip_coverage", False)),
+        coverage_threshold=int(config.get("coverage_threshold", 90)),
+        skip_preflight=bool(config.get("skip_preflight", False)),
+        e2e_gate=str(config.get("e2e_gate", "off")),
+        model_overrides=dict(overrides) if isinstance(overrides, dict) else {},
+    )
+
+
+def _record_fix_plan(ledger: Ledger, run_id: str, inv: dict) -> None:
+    """Persist the investigation plan for a later resume; never fail the run."""
+    try:
+        ledger.event_log(run_id, "", "info", _FIX_PLAN_SOURCE, json.dumps(inv))
+    except Exception:  # noqa: BLE001 - a logging failure must not abort the fix
+        pass
+
+
+def _recover_fix_plan(ledger: Ledger, run_id: str) -> dict | None:
+    """The plan a fix run recorded, or None when it recorded none (Issue #547).
+
+    Earliest-first, so the plan the run actually proceeded on wins over any later
+    duplicate. None means the run predates the freeze (or its event was lost) —
+    the caller must refuse rather than re-investigate, because a fresh plan is not
+    the one the completed stages already acted on.
+    """
+    for event in ledger.events_by_source(run_id, _FIX_PLAN_SOURCE):
+        try:
+            plan = json.loads(event)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(plan, dict) and plan:
+            return plan
+    return None
+
+
 def _run_stage_loop(
     issue: FixIssue,
     inv: dict,
@@ -979,6 +1043,10 @@ def _run_stage_loop(
     logs_dir: Path,
     *,
     root: Path | None = None,
+    done_stages: frozenset[str] = frozenset(),
+    pr_number: int | None = None,
+    bugfix_seq: int = 0,
+    start_attempts: dict[str, int] | None = None,
 ) -> tuple[str, int | None]:
     """Drive build → coverage → review → merge with the bounded bugfix loop.
 
@@ -996,9 +1064,11 @@ def _run_stage_loop(
     origin); ``None`` falls back to the current working directory.
     """
     stages = [s for s in FIX_CORE_STAGES if not (s == "coverage" and opts.skip_coverage)]
+    # Issue #547: a resume re-enters here with the stages that already completed,
+    # so they are never re-dispatched and their side effects (the branch, the PR)
+    # are not duplicated. Empty on a fresh run — the loop below is unchanged.
+    stages = [s for s in stages if s not in done_stages]
     ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
-    pr_number: int | None = None
-    bugfix_seq = 0
     escalate = _fix_escalates(inv, issue.labels)
     # The fix's change class (docs-only vs code), classified lazily from the built
     # branch's real diff at the first gated stage. None until build has produced a
@@ -1029,7 +1099,11 @@ def _run_stage_loop(
                 continue
             # The deterministic PR open failed — never strand the fix without a
             # PR: fall through to the full coverage dispatch.
-        attempt = 1
+        # Issue #547: a stage interrupted mid-dispatch left an IN_PROGRESS row at
+        # this attempt number, and `stage_start` is a plain INSERT — so a resume
+        # must continue past it rather than collide on the stages primary key (and
+        # rather than overwrite the record of the crash).
+        attempt = (start_attempts or {}).get(stage, 1)
         bugfix_attempts = 0
         # Story 27.3-003: bake the review packet once per review stage entry so
         # the dispatch and every retry reuse the same packet. None (no PR yet,
@@ -1263,6 +1337,7 @@ def run_fix(
     render_view=None,
     root: Path | None = None,
     logs_dir: Path | None = None,
+    registry: Registry | None = None,
 ) -> FixResult:
     """Run the single-issue fix orchestration deterministically (issue #436).
 
@@ -1275,9 +1350,20 @@ def run_fix(
     ``dispatcher`` defaults to the real subprocess-backed dispatch; tests inject a
     fake. ``preflight`` defaults to the detected quality gate. ``runner`` is the
     ``gh`` seam for the issue adapter (a fake in tests).
+
+    Issue #545: the run is also registered in the host registry — at creation and
+    on every terminal path — because the dashboard resolves runs *only* from there
+    and falls back to `max(started_at)`, so an unregistered fix does not merely go
+    missing, it lets a stale completed run be shown as current. Registration is a
+    discovery cache and stays strictly best-effort: an unwritable registry leaves
+    the run logged in its own ledger and never fails the fix. ``registry`` is
+    resolved like :func:`run_resume`'s — a real one only on a real run, so the
+    injected-fake orchestration tests never touch host state.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
+    if registry is None and dispatcher is None:
+        registry = Registry()
 
     # --- Fetch + stop conditions (no run row for a deliberate pre-run stop) ---
     try:
@@ -1308,6 +1394,18 @@ def run_fix(
         story.agent_type, "", None, "TODO",
     )
     logs_dir = logs_dir or (Path(f"{ledger.db_path}.logs") / run_id)
+    # Issue #545: register before the first dispatch, so a fix that crashes during
+    # investigation is still discoverable and derives DEAD from its pid — the same
+    # liveness contract `sdlc build` runs have.
+    if registry is not None:
+        _registry_register(
+            registry, run_id, scope, ledger.db_path, 1, repo=root or Path.cwd()
+        )
+    # Issue #547: freeze the run's options so a resume re-enters under the same
+    # gates. Without this a resumed run would fall back to the defaults and could
+    # dispatch a coverage stage the original run was told to skip (or apply a
+    # different threshold to the same diff).
+    ledger.event_log(run_id, "", "info", "config", json.dumps(_fix_config(opts)))
     ledger.event_log(run_id, "", "info", "controller", f"fix started: scope={scope}")
     try:
         notify("run_started", run=run_id, scope=scope, mode="fix")
@@ -1324,23 +1422,59 @@ def run_fix(
         ledger.event_log(
             run_id, story.id, "warn", "controller", f"investigation blocked: {reason}"
         )
-        _close_early(ledger, run_id, "ABORTED", render_view)
+        _close_early(ledger, run_id, "ABORTED", render_view, registry)
         return FixResult(
             issue=opts.issue, run_id=run_id, status="ABORTED",
             investigation_blocked=True, block_reason=reason,
         )
     if inv_status == "FAILED":
         ledger.set_story_status(run_id, story.id, "FAILED")
-        _close_early(ledger, run_id, "FAILED", render_view)
+        _close_early(ledger, run_id, "FAILED", render_view, registry)
         return FixResult(issue=opts.issue, run_id=run_id, status="FAILED")
 
     assert inv is not None  # READY carries the plan
+
+    # Issue #547: record the plan the rest of the run acts on. It is dispatch
+    # output, not ledger state, yet every later prompt (build, bugfix, summary)
+    # embeds its root cause and fix approach — so a resume that could not recover
+    # it would have to re-investigate and might carry the remaining stages on a
+    # *different* plan than the one the completed build already acted on.
+    _record_fix_plan(ledger, run_id, inv)
 
     # --- Core stage loop ------------------------------------------------------
     terminal, pr_number = _run_stage_loop(
         issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root
     )
 
+    return _finish_fix_run(
+        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir,
+        terminal=terminal, pr_number=pr_number,
+        render_view=render_view, registry=registry,
+    )
+
+
+def _finish_fix_run(
+    issue: FixIssue,
+    inv: dict,
+    story: Story,
+    opts: FixOptions,
+    ledger: Ledger,
+    run_id: str,
+    dispatch,
+    logs_dir: Path,
+    *,
+    terminal: str,
+    pr_number: int | None,
+    render_view=None,
+    registry: Registry | None = None,
+) -> FixResult:
+    """Summary, rate-limit park, and close-out for a finished stage loop.
+
+    Shared by :func:`run_fix` and :func:`resume_fix` (Issue #547) so a resumed run
+    reaches exactly the same terminal, counts and events a straight-through run
+    would — the drift between those two paths is what made resume dangerous in the
+    first place.
+    """
     # --- Summary (best-effort, only when the fix actually landed) -------------
     if terminal == "DONE":
         _run_summary(issue, inv, story, pr_number, opts, ledger, run_id, dispatch, logs_dir)
@@ -1366,10 +1500,144 @@ def run_fix(
     outcome = finalize_run(
         ledger, run_id, {story.id: terminal},
         reconcile=False, finish_label="fix finished", render_view=render_view,
+        registry=registry,
     )
     return FixResult(
         issue=opts.issue, run_id=run_id, status=outcome.run_terminal, pr_number=pr_number
     )
+
+
+def resume_fix(
+    run_id: str,
+    *,
+    ledger: Ledger,
+    dispatcher=None,
+    runner: Runner | None = None,
+    render_view=None,
+    root: Path | None = None,
+    logs_dir: Path | None = None,
+    registry: Registry | None = None,
+) -> FixResult:
+    """Re-enter an interrupted `sdlc fix` run at the stage it died in (Issue #547).
+
+    `sdlc resume` could not do this: it rebuilt its dispatch queue from the
+    markdown epics, where a ``issue-<N>`` scope has no story, so the queue came out
+    empty, nothing dispatched, and the close-out marked the run DONE — silently,
+    exit 0, and destructively, because the run then became terminal and could
+    never be resumed at all.
+
+    The resume point comes from the ledger (which stages have a DONE attempt, the
+    story's PR number, the recovery-stage sequence) and the plan from the run's own
+    ``fix-plan`` event. A run with no recorded plan is **refused**, not
+    re-investigated: a fresh investigation would produce a plan the completed build
+    never saw, so the remaining stages would review and merge work against a
+    rationale nothing in the run actually followed. Refusing leaves the run
+    resumable — the one thing the old behaviour destroyed.
+    """
+    dispatch = dispatcher or dispatch_agent
+    runner = runner or _default_runner
+    if registry is None and dispatcher is None:
+        registry = Registry()
+
+    run_row = ledger.run_row(run_id) or {}
+    scope = str(run_row.get("scope") or "")
+    match = re.fullmatch(r"issue-(\d+)", scope)
+    if not match:
+        return FixResult(
+            issue=0, run_id=run_id, aborted=True, status="ABORTED",
+            abort_reason=f"not a single-issue fix run: scope={scope or '<none>'}",
+        )
+    issue_number = int(match.group(1))
+    opts = _options_from_fix_config(ledger.run_config(run_id), issue_number)
+
+    plan = _recover_fix_plan(ledger, run_id)
+    if plan is None:
+        reason = (
+            f"run {run_id[:8]} recorded no investigation plan (it predates the "
+            f"Issue #547 freeze) — re-run `sdlc fix {issue_number}` instead; the "
+            f"run is left resumable"
+        )
+        ledger.event_log(run_id, "", "warn", "controller", f"resume refused: {reason}")
+        return FixResult(
+            issue=issue_number, run_id=run_id, aborted=True, status="ABORTED",
+            abort_reason=reason,
+        )
+
+    try:
+        issue = fetch_issue(issue_number, runner=runner)
+    except FixIssueError as exc:
+        return FixResult(
+            issue=issue_number, run_id=run_id, aborted=True, status="ABORTED",
+            abort_reason=str(exc),
+        )
+
+    story = issue_story(issue, root=root)
+    logs_dir = logs_dir or (Path(f"{ledger.db_path}.logs") / run_id)
+    done_stages, start_attempts, bugfix_seq = _fix_resume_point(
+        ledger, run_id, story.id
+    )
+    story_row = next(
+        (r for r in ledger.story_rows(run_id) if r["story_id"] == story.id), {}
+    )
+    pr_number = story_row.get("pr_number")
+
+    ledger.run_update_status(run_id, "IN_PROGRESS")
+    ledger.event_log(
+        run_id, "", "info", "controller",
+        f"fix resumed: scope={scope} done={','.join(sorted(done_stages)) or '-'}",
+    )
+    if registry is not None:
+        _registry_register(
+            registry, run_id, scope, ledger.db_path, 1, repo=root or Path.cwd()
+        )
+
+    terminal, pr_number = _run_stage_loop(
+        issue, plan, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
+        done_stages=done_stages, pr_number=pr_number, bugfix_seq=bugfix_seq,
+        start_attempts=start_attempts,
+    )
+    return _finish_fix_run(
+        issue, plan, story, opts, ledger, run_id, dispatch, logs_dir,
+        terminal=terminal, pr_number=pr_number,
+        render_view=render_view, registry=registry,
+    )
+
+
+def _fix_resume_point(
+    ledger: Ledger, run_id: str, story_id: str
+) -> tuple[frozenset[str], dict[str, int], int]:
+    """``(done stages, per-stage start attempt, recovery seq)`` for a resume (#547).
+
+    A stage counts as done when it has a DONE attempt or a deterministic SKIPPED
+    one (the docs-only coverage skip re-derives the same verdict from the same
+    diff, so replaying it would only churn).
+
+    Each remaining stage restarts one past its highest recorded attempt, so the
+    IN_PROGRESS row a crash left behind is preserved rather than overwritten — and
+    `stage_start`'s plain INSERT cannot collide on the stages primary key. The
+    recovery sequence continues past the highest ``bugfix``/``reask``/
+    ``commitlint`` attempt for the same reason, exactly as
+    :func:`sdlc.resume.compute_resume_plan` does for builds.
+    """
+    attempts = ledger.stage_breakdown(run_id).get(story_id, [])
+    done = {
+        a["name"]
+        for a in attempts
+        if a["status"] == "DONE"
+        or (a["status"] == "SKIPPED" and a.get("failure_category") == "docs-only")
+    }
+    start_attempts: dict[str, int] = {}
+    for a in attempts:
+        if a["name"] in done:
+            continue
+        start_attempts[a["name"]] = max(
+            start_attempts.get(a["name"], 0), int(a["attempt"]) + 1
+        )
+    recovery = [
+        a["attempt"] for a in attempts
+        if a["name"] in ("bugfix", "reask", "commitlint")
+    ]
+    return frozenset(done), start_attempts, (max(recovery) if recovery else 0)
 
 
 def _block_reason(inv: dict | None) -> str:
@@ -1383,13 +1651,18 @@ def _block_reason(inv: dict | None) -> str:
 
 
 def _close_early(
-    ledger: Ledger, run_id: str, run_status: str, render_view
+    ledger: Ledger, run_id: str, run_status: str, render_view,
+    registry: Registry | None = None,
 ) -> None:
     """Close a fix run that stopped before the stage loop (blocked / failed).
 
     Stamps zero counts and the terminal ``run_status`` directly (a shared
     :func:`finalize_run` would map BLOCKED→FAILED and never yield ABORTED), logs
     the finish, and emits the best-effort ``run_finished`` notification.
+
+    Issue #545: this path bypasses :func:`finalize_run`, so it carries its own
+    registry stamp — otherwise a blocked or failed fix stays IN_PROGRESS in the
+    host cache and later derives DEAD once its pid is gone.
     """
     ledger.run_update_counts(run_id, 0, 0)
     ledger.event_log(
@@ -1403,6 +1676,8 @@ def _close_early(
         notify("run_finished", run=run_id, terminal=run_status)
     except Exception:  # noqa: BLE001
         pass
+    if registry is not None:
+        _registry_finish(registry, run_id, run_status, 0)
     if render_view is not None:
         try:
             render_view(run_id)
@@ -1794,6 +2069,7 @@ def run_fix_batch(
     render_view=None,
     root: Path | None = None,
     logs_dir: Path | None = None,
+    registry: Registry | None = None,
 ) -> FixBatchResult:
     """Run the batch fix orchestration deterministically (issue #436, PR2).
 
@@ -1807,10 +2083,16 @@ def run_fix_batch(
     ``dispatcher`` defaults to the real subprocess-backed dispatch; a fake is
     injected in tests (and, as in ``run_build``, ``dispatcher is None`` marks a
     real run that may cut per-issue worktrees). ``runner`` is the ``gh`` seam.
+
+    ``registry`` mirrors :func:`run_fix` — a batch opens its own run row, so it
+    carries the same Issue #545 registration and would otherwise be just as
+    invisible to the dashboard.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
     real_run = dispatcher is None
+    if registry is None and real_run:
+        registry = Registry()
     workers = _batch_workers(batch)
 
     # --- Preflight ------------------------------------------------------------
@@ -1839,6 +2121,11 @@ def run_fix_batch(
     mode = "serial" if workers == 1 else "parallel"
     run_id = ledger.run_create(scope, mode)
     ledger.set_total(run_id, len(candidates))
+    if registry is not None:
+        _registry_register(
+            registry, run_id, scope, ledger.db_path, len(candidates),
+            repo=root or Path.cwd(),
+        )
     agent_type = detect_agent_type(root)
     for cand in candidates:
         ledger.story_upsert(
@@ -2013,6 +2300,7 @@ def run_fix_batch(
         ledger, run_id, status,
         reconcile=real_run, root=Path.cwd(),
         finish_label="fix batch finished", render_view=render_view,
+        registry=registry,
     )
     ledger.event_log(run_id, "", "info", "controller", summary)
     return FixBatchResult(
