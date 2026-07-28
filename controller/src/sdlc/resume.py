@@ -222,8 +222,9 @@ def _options_from_config(
     it the reconstructed options carried the dataclass's empty ``harness_map``, so
     every remaining stage of a Codex-routed run collapsed back onto the built-in
     Claude harness — and the ledger recorded that wrong harness too. An **absent**
-    map means the run either routed nothing per-role or predates the freeze; both
-    dispatched on the built-in default, so ``{}`` is the faithful replay.
+    map means the run routed nothing per-role (a run predating the freeze has its
+    map recovered by Migration 17's backfill first), so ``{}`` replays the
+    built-in default those runs actually dispatched on.
     """
     snapshot = dict(routing or ROUTING_OFF_SNAPSHOT)
     return BuildOptions(

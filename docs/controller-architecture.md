@@ -1737,9 +1737,25 @@ Migration 17) before the first dispatch, and `run_resume` reads it back with
 `BuildOptions.harness_map` — the same discipline Story 28.4-001 applies to model
 routing. Without the freeze, resume rebuilt options with the dataclass's *empty*
 map, so every remaining stage of a Codex-routed run silently collapsed onto the
-built-in Claude harness and the ledger recorded Claude for it. Unlike Migration 15
-there is **no** data backfill: a run predating the column reads as `{}`, which is
-exactly the unrouted map it originally dispatched with.
+built-in Claude harness and the ledger recorded Claude for it.
+
+Migration 17 carries a **data backfill** (`_backfill_harness_routing`), because a
+run interrupted *before* the upgrade resolved a map and dispatched on it but
+persisted it nowhere — leaving that column NULL would read as "unrouted" and
+resume it onto Claude, which is the defect itself. Recovery uses two sources, in
+order of fidelity:
+
+1. **The run's `harness routing: …` event** (primary, lossless). Every routed run
+   logs the effective per-role map at run creation (Issue #426/#454), *before* the
+   first dispatch, so a resume already damaged by #543 cannot have corrupted it. A
+   run with no such event never had a map, so it is correctly left unrouted.
+2. **Unanimous recorded stage harnesses** (fallback, for the ~two-release window of
+   runs predating that event line). Applied only when every stage the run recorded
+   names the same non-`claude` harness — a whole-repo `.sdlc-harness.yaml` default,
+   so every role is restored to it, including roles the interrupted run had not
+   reached. Any `claude` row makes the original map ambiguous (a genuinely mixed
+   map is indistinguishable from a run already damaged by #543), so that run is
+   left alone rather than guessed at.
 
 ### Codex build/QA adapter (Story 20.3-001)
 

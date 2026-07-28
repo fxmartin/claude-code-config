@@ -1550,3 +1550,208 @@ def test_run_build_freezes_an_empty_map_for_an_unrouted_run(tmp_path: Path) -> N
         root=tmp_path,
     )
     assert ledger.run_harness_routing(ledger.latest_run_id()) == {}
+
+
+# --- Migration 17 backfill (Issue #543) --------------------------------------
+#
+# A run created *before* the freeze resolved a map and dispatched on it but
+# persisted it nowhere. Leaving the new column NULL would read as "unrouted" and
+# resume a Codex repo's in-flight run onto Claude — the reported defect itself.
+# The backfill recovers the map from the run's own `harness routing:` event
+# (written at run creation, before any dispatch), falling back to unanimous
+# recorded stage harnesses for runs predating that event line.
+
+
+def _seed_pre_migration_run(
+    db_path: Path,
+    *,
+    routing_event: str | None = None,
+    stage_harnesses: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """A `runs` row on a ledger whose schema predates Migration 17."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE runs ("
+            "id TEXT PRIMARY KEY, scope TEXT, started_at TIMESTAMP, "
+            "finished_at TIMESTAMP, mode TEXT, total_stories INTEGER DEFAULT 0, "
+            "completed INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, "
+            "status TEXT NOT NULL, actor TEXT, model_routing TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, story_id TEXT, "
+            "ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, level TEXT NOT NULL, "
+            "source TEXT, message TEXT NOT NULL, stage TEXT, kind TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE stages ("
+            "run_id TEXT NOT NULL, story_id TEXT NOT NULL, stage_name TEXT NOT NULL, "
+            "attempt INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL, "
+            "started_at TIMESTAMP, harness TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO runs(id, scope, mode, status, started_at) "
+            "VALUES ('old', 'epic-96', 'serial', 'IN_PROGRESS', CURRENT_TIMESTAMP)"
+        )
+        if routing_event is not None:
+            conn.execute(
+                "INSERT INTO events(run_id, story_id, level, source, message) "
+                "VALUES ('old', '', 'info', 'harness', ?)",
+                (routing_event,),
+            )
+        for i, (stage_name, harness) in enumerate(stage_harnesses, start=1):
+            conn.execute(
+                "INSERT INTO stages(run_id, story_id, stage_name, attempt, status, "
+                "harness) VALUES ('old', '96.1-001', ?, ?, 'DONE', ?)",
+                (stage_name, i, harness),
+            )
+    return "old"
+
+
+def test_backfill_recovers_the_map_from_the_runs_routing_event(
+    tmp_path: Path,
+) -> None:
+    """The reported shape: a repo defaulting to codex, interrupted pre-upgrade."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_pre_migration_run(
+        db,
+        routing_event=(
+            "harness routing: build=codex coverage=codex review=codex "
+            "merge=codex docs=codex"
+        ),
+    )
+    Ledger(db).ensure_migrated()
+
+    assert Ledger(db).run_harness_routing("old") == {
+        "build": "codex", "coverage": "codex", "review": "codex",
+        "merge": "codex", "docs": "codex",
+    }
+
+
+def test_backfill_recovers_a_mixed_per_role_map_from_the_event(tmp_path: Path) -> None:
+    """A partly-Codex run is restored per role, not flattened onto one harness."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_pre_migration_run(
+        db,
+        routing_event=(
+            "harness routing: build=claude coverage=claude review=codex "
+            "merge=claude docs=claude"
+        ),
+    )
+    Ledger(db).ensure_migrated()
+
+    recovered = Ledger(db).run_harness_routing("old")
+    assert recovered["review"] == "codex"
+    assert recovered["build"] == "claude"
+
+
+def test_backfill_prefers_the_event_over_damaged_stage_rows(tmp_path: Path) -> None:
+    """A pre-fix resume that mis-dispatched on Claude cannot corrupt the recovery.
+
+    The routing event is written at run creation, before any dispatch, so it still
+    states codex even though the damaged resume recorded a claude stage row.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed_pre_migration_run(
+        db,
+        routing_event=(
+            "harness routing: build=codex coverage=codex review=codex "
+            "merge=codex docs=codex"
+        ),
+        stage_harnesses=(("build", "codex"), ("review", "claude")),
+    )
+    Ledger(db).ensure_migrated()
+
+    assert Ledger(db).run_harness_routing("old")["review"] == "codex"
+
+
+def test_backfill_falls_back_to_unanimous_stage_harnesses(tmp_path: Path) -> None:
+    """A run predating the routing event is recovered from what it demonstrably ran."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_pre_migration_run(
+        db, stage_harnesses=(("build", "codex"), ("coverage", "codex")),
+    )
+    Ledger(db).ensure_migrated()
+
+    recovered = Ledger(db).run_harness_routing("old")
+    # The unanimous evidence is a whole-repo default, so every role is restored —
+    # including `review`, the role the interrupted run had not reached yet.
+    assert recovered["review"] == "codex"
+    assert recovered["build"] == "codex"
+
+
+def test_backfill_leaves_an_ambiguous_legacy_run_alone(tmp_path: Path) -> None:
+    """Mixed stage rows with no event are indistinguishable from #543 damage.
+
+    Guessing "all codex" could move a role the run deliberately ran on Claude, so
+    such a run keeps today's behaviour rather than being rewritten on a hunch.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed_pre_migration_run(
+        db, stage_harnesses=(("build", "codex"), ("review", "claude")),
+    )
+    Ledger(db).ensure_migrated()
+
+    assert Ledger(db).run_harness_routing("old") == {}
+
+
+def test_backfill_leaves_a_genuinely_unrouted_run_unrouted(tmp_path: Path) -> None:
+    """No event and only claude stages → the empty-map fast path is preserved."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_pre_migration_run(
+        db, stage_harnesses=(("build", "claude"), ("review", "claude")),
+    )
+    Ledger(db).ensure_migrated()
+
+    assert Ledger(db).run_harness_routing("old") == {}
+
+
+def test_backfill_ignores_a_malformed_routing_event(tmp_path: Path) -> None:
+    """A partially-parsed map would freeze a run onto a subset of its routing."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_pre_migration_run(db, routing_event="harness routing: build=codex review")
+    Ledger(db).ensure_migrated()
+
+    assert Ledger(db).run_harness_routing("old") == {}
+
+
+def test_backfill_never_overwrites_an_already_frozen_map(tmp_path: Path) -> None:
+    """Idempotent: re-running migrations leaves a stamped map untouched."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-96", "serial")
+    ledger.run_set_harness_routing(run_id, {"review": "codex"})
+    ledger.event_log(
+        run_id, "", "info", "harness",
+        "harness routing: build=qwen coverage=qwen review=qwen merge=qwen docs=qwen",
+    )
+    ledger.ensure_migrated()
+
+    assert ledger.run_harness_routing(run_id) == {"review": "codex"}
+
+
+def test_resume_of_a_backfilled_pre_upgrade_run_dispatches_on_codex(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: the upgrade path the issue reports, from ledger to dispatch."""
+    _make_harness_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    # A pre-Migration-17 ledger carrying a routed, interrupted run.
+    run_id = _seed_harness_interrupted(db, None)
+    ledger = Ledger(db)
+    ledger.event_log(
+        run_id, "", "info", "harness",
+        "harness routing: build=codex coverage=codex review=codex "
+        "merge=codex docs=codex",
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE runs SET harness_routing = NULL WHERE id = ?", (run_id,))
+        conn.execute("DELETE FROM _migrations WHERE version = 17")
+    ledger.ensure_migrated()
+
+    dispatcher = _HarnessRecordingDispatcher()
+    run_resume("epic-96", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    assert "codex-build-adapter.sh" in dispatcher.agent_cmds["review"][0]
+    assert _stage_harness_rows(Ledger(db), run_id)["review"] == "codex"
