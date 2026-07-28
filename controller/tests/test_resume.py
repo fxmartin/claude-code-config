@@ -7,7 +7,12 @@ import json
 import sqlite3
 from pathlib import Path
 
-from sdlc.build import BuildOptions, Ledger, run_build
+from sdlc.build import (
+    BuildOptions,
+    Ledger,
+    _parse_harness_routing_event,
+    run_build,
+)
 from sdlc.cohort import Story
 from sdlc.discovery import discover_queue
 from sdlc.registry import Registry, RunRecord
@@ -1468,6 +1473,27 @@ def test_run_harness_routing_degrades_to_empty_on_a_corrupt_snapshot(
     assert ledger.run_harness_routing(run_id) == {}
 
 
+def test_run_harness_routing_degrades_to_empty_on_a_non_mapping_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Valid JSON of the wrong shape degrades like corrupt JSON, not by raising.
+
+    `'not json'` is caught by the decode guard; a JSON list decodes cleanly and
+    would reach the dict comprehension, so it needs its own guard — otherwise a
+    hand-edited snapshot turns every resume of that run into a crash.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-96", "serial")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE runs SET harness_routing = ? WHERE id = ?",
+            (json.dumps(["build=codex"]), run_id),
+        )
+    assert ledger.run_harness_routing(run_id) == {}
+
+
 def test_run_harness_routing_drops_non_string_entries(tmp_path: Path) -> None:
     """A hand-edited snapshot cannot inject a non-name into dispatch routing."""
     db = tmp_path / ".sdlc-state.db"
@@ -1728,6 +1754,47 @@ def test_backfill_never_overwrites_an_already_frozen_map(tmp_path: Path) -> None
     ledger.ensure_migrated()
 
     assert ledger.run_harness_routing(run_id) == {"review": "codex"}
+
+
+def test_backfill_takes_the_earliest_routing_event_for_a_run(tmp_path: Path) -> None:
+    """The run-creation line wins over any later duplicate.
+
+    Only the first line is written before the first dispatch, so only the first
+    is guaranteed uncorrupted by a resume this bug already mis-routed. A later
+    line naming a different map must not overwrite it.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed_pre_migration_run(
+        db,
+        routing_event=(
+            "harness routing: build=codex coverage=codex review=codex "
+            "merge=codex docs=codex"
+        ),
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO events(run_id, story_id, level, source, message) "
+            "VALUES ('old', '', 'info', 'harness', ?)",
+            (
+                "harness routing: build=claude coverage=claude review=claude "
+                "merge=claude docs=claude",
+            ),
+        )
+    Ledger(db).ensure_migrated()
+
+    assert Ledger(db).run_harness_routing("old")["review"] == "codex"
+
+
+def test_parse_harness_routing_event_ignores_a_non_routing_line() -> None:
+    """The prefix guard, exercised directly.
+
+    The backfill's SQL pre-filters on the same prefix, so this branch is not
+    reachable through the migration — but the parser is a module-level helper and
+    a future caller without that filter must get `{}`, not a map parsed out of an
+    unrelated `harness` event such as the preflight capability lines.
+    """
+    assert _parse_harness_routing_event("harness 'claude': ok (default slot)") == {}
+    assert _parse_harness_routing_event("") == {}
 
 
 def test_resume_of_a_backfilled_pre_upgrade_run_dispatches_on_codex(
