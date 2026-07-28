@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.9] - 2026-07-28
+
+### Fixed
+
+- fix(resume): recover harness routing only from the routing event (#543)
+- fix(resume): backfill harness routing for pre-upgrade runs (#543)
+- fix(resume): freeze and replay the run's harness routing (#543)
+
+
 ## [v2.42.8] - 2026-07-27
 
 ### Fixed
