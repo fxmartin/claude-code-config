@@ -3116,3 +3116,202 @@ def test_run_fix_batch_registers_and_finalizes_the_run(tmp_path) -> None:
     assert record.status == "DONE"
     assert record.completed == 2
     assert record.finished_at
+
+
+# ---------------------------------------------------------------------------
+# Issue #547: an interrupted `sdlc fix` run must be resumable.
+#
+# `run_resume` derived the right resume point from the ledger, then intersected
+# it with a queue rebuilt from the markdown epics — where a fix scope has no
+# story. The queue came out empty, nothing dispatched, and the close-out marked
+# the run DONE. Silent, exit 0, and *destructive*: the run became terminal, so it
+# could never be resumed even once the bug was fixed.
+# ---------------------------------------------------------------------------
+
+
+def _fix_run_interrupted_at(
+    tmp_path, *, dispatcher, stop_before: str = "", stop_during: str = ""
+):
+    """A real fix run killed at a stage boundary (`stop_before`) or mid-stage.
+
+    Built by dispatching for real rather than hand-seeding rows, so the resume is
+    exercised against exactly what `run_fix` leaves behind — including whatever it
+    persists for its own recovery.
+
+    `stop_before` kills before that stage dispatches, leaving every earlier stage
+    DONE and no row for this one. `stop_during` kills after the agent returned but
+    before `stage_finish`, leaving the IN_PROGRESS row a real host crash leaves —
+    the shape of the incident that motivated #547.
+    """
+    class _Stop(Exception):
+        pass
+
+    def killer(agent_type, prompt, **kwargs):
+        if agent_type == stop_before:
+            raise _Stop()
+        result = dispatcher(agent_type, prompt, **kwargs)
+        if agent_type == stop_during:
+            raise _Stop()
+        return result
+
+    try:
+        run_fix(
+            FixOptions(issue=1),
+            ledger=Ledger(tmp_path / ".sdlc-state.db"),
+            dispatcher=killer,
+            preflight=lambda: True,
+            runner=FakeGh(_issue_json()),
+            root=tmp_path,
+        )
+    except _Stop:
+        pass
+    return Ledger(tmp_path / ".sdlc-state.db").latest_run_id()
+
+
+def _stage_names(db: Path, run_id: str) -> dict[str, str]:
+    conn = sqlite3.connect(db)
+    try:
+        return {
+            name: status
+            for name, status in conn.execute(
+                "SELECT stage_name, status FROM stages WHERE run_id = ?", (run_id,)
+            )
+        }
+    finally:
+        conn.close()
+
+
+def test_run_fix_persists_its_options_for_a_resume(tmp_path) -> None:
+    """A resume cannot honour the gate settings it never recorded."""
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1, skip_coverage=True, coverage_threshold=75, e2e_gate="warn"),
+        ledger=Ledger(db),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    config = Ledger(db).run_config(result.run_id)
+    assert config["issue"] == 1
+    assert config["skip_coverage"] is True
+    assert config["coverage_threshold"] == 75
+    assert config["e2e_gate"] == "warn"
+
+
+def test_run_fix_persists_the_investigation_plan_for_a_resume(tmp_path) -> None:
+    """The plan is dispatch output, not ledger state — replay needs it recorded.
+
+    Every later stage prompt (build, bugfix, summary) embeds the root cause and
+    fix approach, so a resume that could not recover the plan would have to
+    re-investigate and might proceed on a *different* plan than the one the
+    completed build already acted on.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    plan = fix_mod._recover_fix_plan(Ledger(db), result.run_id)
+    assert plan is not None
+    assert plan["root_cause"] == "off-by-one in loop"
+    assert plan["files_to_modify"] == ["src/loop.py"]
+
+
+def test_resume_fix_re_enters_at_the_interrupted_stage(tmp_path) -> None:
+    """The reported case: build landed, the host died, the rest must still run."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    assert _stage_names(db, run_id)["build"] == "DONE"
+
+    resumed = RecordingDispatcher()
+    result = fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=resumed,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+
+    assert result.status == "DONE"
+    # Completed stages are never re-dispatched...
+    assert "investigation" not in resumed.agents()
+    assert "build" not in resumed.agents()
+    # ...and the rest of the pipeline runs.
+    assert {"coverage", "review", "merge"}.issubset(resumed.agents())
+
+
+def test_resume_fix_replays_the_recorded_plan(tmp_path) -> None:
+    """The resumed stages act on the same plan the original build did."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+
+    prompts: list[str] = []
+
+    def spy(agent_type, prompt, **kwargs):
+        prompts.append(prompt)
+        return RecordingDispatcher()(agent_type, prompt, **kwargs)
+
+    fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=spy,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert any("off-by-one in loop" in p for p in prompts)
+
+
+def test_resume_fix_carries_the_pr_number_forward(tmp_path) -> None:
+    """A resume must not open a second PR for work that already has one."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_during="coverage"
+    )
+
+    result = fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=RecordingDispatcher(),
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert result.pr_number == 100
+
+
+def test_resume_fix_refuses_a_run_with_no_recorded_plan(tmp_path) -> None:
+    """A pre-upgrade run cannot be replayed — say so, never invent a plan.
+
+    Re-investigating would produce a plan the completed build never saw, so the
+    remaining stages would review and merge work against the wrong rationale.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "DELETE FROM events WHERE run_id = ? AND source = 'fix-plan'", (run_id,)
+        )
+
+    dispatch = RecordingDispatcher()
+    result = fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert result.aborted is True
+    assert "plan" in (result.abort_reason or "")
+    assert not dispatch.agents()
+    # Refusing leaves the run resumable, never terminal.
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "IN_PROGRESS"

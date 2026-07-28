@@ -585,6 +585,13 @@ def resume(
     Story 14.1-001: a budget-paused run carries its token ceiling, so resuming
     without raising it re-pauses immediately. Pass ``--budget`` to raise it and
     continue.
+
+    Issue #547: an interrupted ``sdlc fix`` run resumes here too — it is handed to
+    the fix pipeline, which re-enters at the stage it died in rather than being
+    run through the markdown-queue path (which used to dispatch nothing and then
+    close the run out DONE). A fix run that recorded no investigation plan — one
+    started before that plan was persisted — is refused and left resumable rather
+    than continued on a freshly invented plan.
     """
     from sdlc.build import _parse_budget_value
     from sdlc.discovery import canonical_scope

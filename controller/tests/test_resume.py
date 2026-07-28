@@ -1821,3 +1821,162 @@ def test_resume_of_a_backfilled_pre_upgrade_run_dispatches_on_codex(
 
     assert "codex-build-adapter.sh" in dispatcher.agent_cmds["review"][0]
     assert _stage_harness_rows(Ledger(db), run_id)["review"] == "codex"
+
+
+# --- fix-issue runs (#547) ---------------------------------------------------
+#
+# `run_resume` derived the correct resume point from the ledger, then intersected
+# it with a queue rebuilt from the markdown epics — where an `issue-<N>` scope has
+# no story. The queue came out empty, nothing dispatched, and the close-out marked
+# the run DONE: silent, exit 0, and destructive, since the run became terminal and
+# could never be resumed even after the bug was fixed.
+
+
+def _fix_payload(agent_type: str) -> dict:
+    return {
+        "investigation": {
+            "root_cause": "off-by-one", "complexity": "LOW",
+            "fix_approach": "clamp", "files_to_modify": ["a.py"],
+            "risk": "low", "investigation_status": "READY",
+        },
+        "build": {
+            "branch_name": "feature/issue-7", "build_status": "SUCCESS",
+            "commit_sha": "deadbeef",
+        },
+        "coverage": {
+            "pr_number": 100, "pr_url": "https://example/pull/100",
+            "coverage_pct": 95.0, "tests_added": 2, "coverage_status": "PASS",
+        },
+        "review": {
+            "pr_number": 100, "approval_status": "APPROVED",
+            "change_count": 0, "final_status": "APPROVED",
+        },
+        "merge": {
+            "pr_number": 100, "merge_status": "MERGED",
+            "merge_sha": "cafef00d", "merged_at": "2026-07-15T00:00:00Z",
+        },
+        "summary": {"summary_markdown": "## done"},
+    }[agent_type]
+
+
+class _FixDispatcher:
+    """A fix-pipeline dispatcher (its call shape differs from the build one)."""
+
+    def __init__(self) -> None:
+        self.agents: list[str] = []
+
+    def __call__(self, agent_type, prompt, *, story=None, model=None,
+                 transcript_path=None, on_progress=None, **kwargs):
+        from sdlc.dispatch import AgentResult
+
+        self.agents.append(agent_type)
+        if transcript_path is not None:
+            Path(transcript_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(transcript_path).write_text("{}", encoding="utf-8")
+        return AgentResult(
+            agent_type=agent_type, data=_fix_payload(agent_type), raw=""
+        )
+
+
+def _seed_fix_run_interrupted(tmp_path: Path) -> str:
+    """A real `sdlc fix` run killed at the coverage boundary (build DONE)."""
+    from sdlc.fix_issue import FixOptions, run_fix
+    from sdlc.issue_host import RunResult
+
+    class _Stop(Exception):
+        pass
+
+    def gh(argv, timeout=None):
+        joined = " ".join(argv)
+        if "issue view" in joined:
+            return RunResult(0, json.dumps({
+                "number": 7, "title": "Bug", "body": "boom", "state": "OPEN",
+                "assignees": [], "labels": [{"name": "bug"}],
+            }), "")
+        return RunResult(0, "me", "")
+
+    inner = _FixDispatcher()
+
+    def killer(agent_type, prompt, **kwargs):
+        if agent_type == "coverage":
+            raise _Stop()
+        return inner(agent_type, prompt, **kwargs)
+
+    db = tmp_path / ".sdlc-state.db"
+    try:
+        run_fix(
+            FixOptions(issue=7), ledger=Ledger(db), dispatcher=killer,
+            preflight=lambda: True, runner=gh, root=tmp_path,
+        )
+    except _Stop:
+        pass
+    return Ledger(db).latest_run_id()
+
+
+def _fix_gh(argv, timeout=None):
+    from sdlc.issue_host import RunResult
+
+    if "issue view" in " ".join(argv):
+        return RunResult(0, json.dumps({
+            "number": 7, "title": "Bug", "body": "boom", "state": "OPEN",
+            "assignees": [], "labels": [{"name": "bug"}],
+        }), "")
+    return RunResult(0, "me", "")
+
+
+def test_resume_drives_a_fix_run_instead_of_closing_it_out(tmp_path: Path) -> None:
+    """The reported defect: `sdlc resume` must continue the fix, not bury it."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_fix_run_interrupted(tmp_path)
+    dispatcher = _FixDispatcher()
+
+    result = run_resume(
+        "issue-7", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        run_id=run_id, runner=_fix_gh,
+    )
+
+    assert result.nothing_to_resume is False
+    assert {"coverage", "review", "merge"}.issubset(set(dispatcher.agents))
+    assert "build" not in dispatcher.agents  # already DONE, never redone
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "DONE"
+
+
+def test_resume_never_closes_out_an_undispatchable_fix_run(tmp_path: Path) -> None:
+    """A fix run resume cannot drive must stay resumable, never be marked DONE.
+
+    This is the destructive half of #547: the old path closed the run terminal on
+    an empty queue, so the work could not be recovered later even by a fixed
+    resume. Simulated by removing the recorded plan, which `resume_fix` refuses on.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_fix_run_interrupted(tmp_path)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "DELETE FROM events WHERE run_id = ? AND source = 'fix-plan'", (run_id,)
+        )
+
+    dispatcher = _FixDispatcher()
+    run_resume(
+        "issue-7", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        run_id=run_id, runner=_fix_gh,
+    )
+
+    assert dispatcher.agents == []
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "IN_PROGRESS"
+
+
+def test_resume_preserves_a_fix_runs_mode(tmp_path: Path) -> None:
+    """Resume re-stamps `runs.mode` for builds; a fix run must keep its lineage.
+
+    Overwriting `fix` with `serial`/`parallel` erases the marker that tells the
+    dashboard — and any later resume — which pipeline the run belongs to.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_fix_run_interrupted(tmp_path)
+
+    run_resume(
+        "issue-7", ledger=Ledger(db), dispatcher=_FixDispatcher(), root=tmp_path,
+        run_id=run_id, runner=_fix_gh,
+    )
+
+    assert (Ledger(db).run_row(run_id) or {})["mode"] == "fix"

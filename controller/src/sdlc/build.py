@@ -3498,6 +3498,24 @@ class Ledger:
         except (ValueError, TypeError):
             return {}
 
+    def events_by_source(self, run_id: str, source: str) -> list[str]:
+        """Every event message for ``run_id`` from ``source``, earliest first.
+
+        Insertion-ordered by the events table's autoincrement id, so the caller
+        can rely on "the first one wins" for a write-once record — which is how
+        Issue #547 recovers the plan a fix run actually proceeded on rather than
+        any later duplicate.
+        """
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                "SELECT message FROM events WHERE run_id = ? AND source = ? "
+                "ORDER BY id",
+                (run_id, source),
+            ).fetchall()
+        return [r["message"] for r in rows]
+
     def stage_breakdown(self, run_id: str) -> dict[str, list[dict]]:
         """All stage attempts for ``run_id``, grouped by story id (chronological).
 
