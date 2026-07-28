@@ -1728,6 +1728,37 @@ dispatch passes no `agent_cmd`/`parser` and is byte-identical to today's default
 preserved). A registry harness owns its own argv, so the routed `--model` decorates
 only the built-in/`env` Claude slots — a codex stage ignores it.
 
+**Resolve-and-freeze on the run row (Issue #543).** The effective map is resolved
+**once**, in `cli.py`, layering `--harness` > the repo `.sdlc-harness.yaml` > the
+registry `default:`. `run_build` then persists that resolved `opts.harness_map` as
+JSON on the `runs.harness_routing` column (`Ledger.run_set_harness_routing`,
+Migration 17) before the first dispatch, and `run_resume` reads it back with
+`Ledger.run_harness_routing` and replays it into the reconstructed
+`BuildOptions.harness_map` — the same discipline Story 28.4-001 applies to model
+routing. Without the freeze, resume rebuilt options with the dataclass's *empty*
+map, so every remaining stage of a Codex-routed run silently collapsed onto the
+built-in Claude harness and the ledger recorded Claude for it.
+
+Migration 17 carries a **data backfill** (`_backfill_harness_routing`), because a
+run interrupted *before* the upgrade resolved a map and dispatched on it but
+persisted it nowhere — leaving that column NULL would read as "unrouted" and
+resume it onto Claude, which is the defect itself.
+
+Recovery is **exact or nothing**, from one source: the `harness routing: …` event
+every routed run logs at run creation (Issue #426/#454). That line is written
+before the first dispatch and states the whole effective map, so it is lossless
+and a resume already damaged by #543 cannot have corrupted it. A run with no such
+event never had a map and is correctly left unrouted.
+
+Recorded stage harnesses are deliberately **not** a second source. "Every stage
+ran on codex, so the run was codex" cannot distinguish a whole-repo default from
+a mixed `build=codex,review=claude` map whose Claude roles had not run yet, so
+inferring it would silently reroute a role the run deliberately ran on Claude —
+the same class of harm this issue reports. Runs the event cannot vouch for are
+confined to the two releases between the `.sdlc-harness.yaml` feature and the
+event line (v2.16.0–v2.17.1); resume one with `SDLC_AGENT_CMD` set, or start a
+fresh run, to put it back on Codex.
+
 ### Codex build/QA adapter (Story 20.3-001)
 
 The `codex` registry entry is the first concrete **non-Claude** adapter, proving

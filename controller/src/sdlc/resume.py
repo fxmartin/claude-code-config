@@ -197,7 +197,11 @@ def compute_resume_plan(
 
 
 def _options_from_config(
-    scope: str, run_row: dict, config: dict, routing: dict | None = None
+    scope: str,
+    run_row: dict,
+    config: dict,
+    routing: dict | None = None,
+    harness_routing: dict[str, str] | None = None,
 ) -> BuildOptions:
     """Reconstruct the build options a resume needs from the persisted run.
 
@@ -213,6 +217,14 @@ def _options_from_config(
     ``model_profile`` meant "CLI default everywhere" under the Story 14.2-001
     semantics), so it is frozen at ``off`` rather than silently upgraded to the
     new Balanced default.
+
+    ``harness_routing`` is the run's frozen role->harness map (Issue #543). Without
+    it the reconstructed options carried the dataclass's empty ``harness_map``, so
+    every remaining stage of a Codex-routed run collapsed back onto the built-in
+    Claude harness — and the ledger recorded that wrong harness too. An **absent**
+    map means the run routed nothing per-role (a run predating the freeze has its
+    map recovered by Migration 17's backfill first), so ``{}`` replays the
+    built-in default those runs actually dispatched on.
     """
     snapshot = dict(routing or ROUTING_OFF_SNAPSHOT)
     return BuildOptions(
@@ -243,6 +255,10 @@ def _options_from_config(
         model_profile=str(snapshot.get("profile") or MODEL_ROUTING_OFF),
         model_overrides=dict(snapshot.get("overrides") or {}),
         model_routing_snapshot=snapshot,
+        # Issue #543: replay the run's frozen role->harness map so a resumed stage
+        # dispatches on the harness the original run resolved (repo default or
+        # per-role), and the ledger attributes the attempt to that harness.
+        harness_map=dict(harness_routing or {}),
         # Story 14.1-002: carry the per-stage cost-estimate threshold so a resume
         # re-enforces the same gate rather than silently dispatching a stage the
         # original run gated. `sdlc resume --cost-threshold` overrides it.
@@ -346,7 +362,11 @@ def run_resume(
     # to `.sdlc-model-routing.yaml` or an override between the run and its resume
     # cannot change which model a remaining stage gets.
     routing = ledger.run_routing(rid)
-    opts = _options_from_config(scope, run_row, config, routing)
+    # Issue #543: same freeze-and-replay for harness routing — the map the original
+    # run resolved from `--harness` / `.sdlc-harness.yaml` / the registry default,
+    # never a fresh resolve against the current files.
+    harness_routing = ledger.run_harness_routing(rid)
+    opts = _options_from_config(scope, run_row, config, routing, harness_routing)
     # A caller-supplied --budget raises (or overrides) the persisted ceiling; an
     # explicit --budget-policy likewise. Absent overrides keep the original.
     if budget is not None:
