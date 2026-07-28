@@ -3315,3 +3315,79 @@ def test_resume_fix_refuses_a_run_with_no_recorded_plan(tmp_path) -> None:
     assert not dispatch.agents()
     # Refusing leaves the run resumable, never terminal.
     assert (Ledger(db).run_row(run_id) or {})["status"] == "IN_PROGRESS"
+
+
+def test_recover_fix_plan_skips_a_malformed_event(tmp_path) -> None:
+    """A corrupt plan event must not shadow the real one recorded after it."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    ledger.event_log(run_id, "", "info", "fix-plan", "{not json")
+    ledger.event_log(run_id, "", "info", "fix-plan", json.dumps({"root_cause": "x"}))
+
+    assert fix_mod._recover_fix_plan(ledger, run_id) == {"root_cause": "x"}
+
+
+def test_recover_fix_plan_is_empty_without_a_ledger_file(tmp_path) -> None:
+    assert fix_mod._recover_fix_plan(Ledger(tmp_path / "absent.db"), "nope") is None
+
+
+def test_record_fix_plan_never_fails_the_run(tmp_path) -> None:
+    """Plan capture is for a *future* resume — it cannot break the run recording it."""
+    class _Exploding(Ledger):
+        def event_log(self, *args, **kwargs):
+            raise RuntimeError("ledger is on fire")
+
+    ledger = _Exploding(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    fix_mod._record_fix_plan(ledger, "run", {"root_cause": "x"})  # must not raise
+
+
+def test_resume_fix_refuses_a_non_issue_scope(tmp_path) -> None:
+    """`resume_fix` is the single-issue path; a batch/epic run is not its business."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("issues-all", "fix")
+
+    result = fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+        runner=FakeGh(_issue_json()), root=tmp_path,
+    )
+    assert result.aborted is True
+    assert "not a single-issue fix run" in (result.abort_reason or "")
+
+
+def test_resume_fix_aborts_when_the_issue_cannot_be_fetched(tmp_path) -> None:
+    """No issue, no prompts — and the run stays resumable for a later retry."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    dispatch = RecordingDispatcher()
+
+    result = fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=dispatch,
+        runner=FakeGh("", issue_rc=1, issue_err="gh: not found"), root=tmp_path,
+    )
+    assert result.aborted is True
+    assert not dispatch.agents()
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "IN_PROGRESS"
+
+
+def test_resume_fix_re_registers_the_run_in_the_registry(tmp_path) -> None:
+    """A resumed run is live again — the dashboard must see it, not its old terminal."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    registry = _reg(tmp_path)
+
+    fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+        runner=FakeGh(_issue_json()), root=tmp_path, registry=registry,
+    )
+    record = registry.records()[0]
+    assert record.run_id == run_id
+    assert record.status == "DONE"
