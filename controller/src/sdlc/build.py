@@ -5493,14 +5493,21 @@ def _commit_message(ref: str, root: Path | None = None) -> str | None:
 
 
 def _registry_register(
-    registry: Registry, run_id: str, scope: str, db_path: Path, total: int
+    registry: Registry, run_id: str, scope: str, db_path: Path, total: int,
+    repo: Path | None = None,
 ) -> None:
-    """Register a starting run; swallow any cache IO error (never fails a build)."""
+    """Register a starting run; swallow any cache IO error (never fails a build).
+
+    ``repo`` is the checkout the run belongs to, defaulting to the process cwd —
+    which is what ``run_build`` has always registered. ``run_fix`` passes its
+    explicit ``root`` instead (Issue #545), so a fix driven against another
+    checkout is discovered under that repo rather than wherever it was launched.
+    """
     try:
         registry.register(
             RunRecord(
                 run_id=run_id,
-                repo=str(Path.cwd().resolve()),
+                repo=str(Path(repo or Path.cwd()).resolve()),
                 db=str(Path(db_path).resolve()),
                 scope=scope,
                 pid=os.getpid(),

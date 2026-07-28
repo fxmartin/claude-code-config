@@ -47,6 +47,8 @@ from sdlc.build import (
     _merge_awaiting_approval,
     _record_stage_usage,
     _refresh_base_ref,
+    _registry_finish,
+    _registry_register,
     _reposition_head,
     _stage_succeeded,
     _StoryDispatch,
@@ -69,6 +71,7 @@ from sdlc.dispatch import (
 )
 from sdlc.issue_host import RunResult, Runner, _default_runner
 from sdlc.notify import notify
+from sdlc.registry import Registry
 
 # --- Model routing: aligned with the Balanced build profile -----------------
 #
@@ -1263,6 +1266,7 @@ def run_fix(
     render_view=None,
     root: Path | None = None,
     logs_dir: Path | None = None,
+    registry: Registry | None = None,
 ) -> FixResult:
     """Run the single-issue fix orchestration deterministically (issue #436).
 
@@ -1275,9 +1279,20 @@ def run_fix(
     ``dispatcher`` defaults to the real subprocess-backed dispatch; tests inject a
     fake. ``preflight`` defaults to the detected quality gate. ``runner`` is the
     ``gh`` seam for the issue adapter (a fake in tests).
+
+    Issue #545: the run is also registered in the host registry — at creation and
+    on every terminal path — because the dashboard resolves runs *only* from there
+    and falls back to `max(started_at)`, so an unregistered fix does not merely go
+    missing, it lets a stale completed run be shown as current. Registration is a
+    discovery cache and stays strictly best-effort: an unwritable registry leaves
+    the run logged in its own ledger and never fails the fix. ``registry`` is
+    resolved like :func:`run_resume`'s — a real one only on a real run, so the
+    injected-fake orchestration tests never touch host state.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
+    if registry is None and dispatcher is None:
+        registry = Registry()
 
     # --- Fetch + stop conditions (no run row for a deliberate pre-run stop) ---
     try:
@@ -1308,6 +1323,13 @@ def run_fix(
         story.agent_type, "", None, "TODO",
     )
     logs_dir = logs_dir or (Path(f"{ledger.db_path}.logs") / run_id)
+    # Issue #545: register before the first dispatch, so a fix that crashes during
+    # investigation is still discoverable and derives DEAD from its pid — the same
+    # liveness contract `sdlc build` runs have.
+    if registry is not None:
+        _registry_register(
+            registry, run_id, scope, ledger.db_path, 1, repo=root or Path.cwd()
+        )
     ledger.event_log(run_id, "", "info", "controller", f"fix started: scope={scope}")
     try:
         notify("run_started", run=run_id, scope=scope, mode="fix")
@@ -1324,14 +1346,14 @@ def run_fix(
         ledger.event_log(
             run_id, story.id, "warn", "controller", f"investigation blocked: {reason}"
         )
-        _close_early(ledger, run_id, "ABORTED", render_view)
+        _close_early(ledger, run_id, "ABORTED", render_view, registry)
         return FixResult(
             issue=opts.issue, run_id=run_id, status="ABORTED",
             investigation_blocked=True, block_reason=reason,
         )
     if inv_status == "FAILED":
         ledger.set_story_status(run_id, story.id, "FAILED")
-        _close_early(ledger, run_id, "FAILED", render_view)
+        _close_early(ledger, run_id, "FAILED", render_view, registry)
         return FixResult(issue=opts.issue, run_id=run_id, status="FAILED")
 
     assert inv is not None  # READY carries the plan
@@ -1366,6 +1388,7 @@ def run_fix(
     outcome = finalize_run(
         ledger, run_id, {story.id: terminal},
         reconcile=False, finish_label="fix finished", render_view=render_view,
+        registry=registry,
     )
     return FixResult(
         issue=opts.issue, run_id=run_id, status=outcome.run_terminal, pr_number=pr_number
@@ -1383,13 +1406,18 @@ def _block_reason(inv: dict | None) -> str:
 
 
 def _close_early(
-    ledger: Ledger, run_id: str, run_status: str, render_view
+    ledger: Ledger, run_id: str, run_status: str, render_view,
+    registry: Registry | None = None,
 ) -> None:
     """Close a fix run that stopped before the stage loop (blocked / failed).
 
     Stamps zero counts and the terminal ``run_status`` directly (a shared
     :func:`finalize_run` would map BLOCKED→FAILED and never yield ABORTED), logs
     the finish, and emits the best-effort ``run_finished`` notification.
+
+    Issue #545: this path bypasses :func:`finalize_run`, so it carries its own
+    registry stamp — otherwise a blocked or failed fix stays IN_PROGRESS in the
+    host cache and later derives DEAD once its pid is gone.
     """
     ledger.run_update_counts(run_id, 0, 0)
     ledger.event_log(
@@ -1403,6 +1431,8 @@ def _close_early(
         notify("run_finished", run=run_id, terminal=run_status)
     except Exception:  # noqa: BLE001
         pass
+    if registry is not None:
+        _registry_finish(registry, run_id, run_status, 0)
     if render_view is not None:
         try:
             render_view(run_id)
@@ -1794,6 +1824,7 @@ def run_fix_batch(
     render_view=None,
     root: Path | None = None,
     logs_dir: Path | None = None,
+    registry: Registry | None = None,
 ) -> FixBatchResult:
     """Run the batch fix orchestration deterministically (issue #436, PR2).
 
@@ -1807,10 +1838,16 @@ def run_fix_batch(
     ``dispatcher`` defaults to the real subprocess-backed dispatch; a fake is
     injected in tests (and, as in ``run_build``, ``dispatcher is None`` marks a
     real run that may cut per-issue worktrees). ``runner`` is the ``gh`` seam.
+
+    ``registry`` mirrors :func:`run_fix` — a batch opens its own run row, so it
+    carries the same Issue #545 registration and would otherwise be just as
+    invisible to the dashboard.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
     real_run = dispatcher is None
+    if registry is None and real_run:
+        registry = Registry()
     workers = _batch_workers(batch)
 
     # --- Preflight ------------------------------------------------------------
@@ -1839,6 +1876,11 @@ def run_fix_batch(
     mode = "serial" if workers == 1 else "parallel"
     run_id = ledger.run_create(scope, mode)
     ledger.set_total(run_id, len(candidates))
+    if registry is not None:
+        _registry_register(
+            registry, run_id, scope, ledger.db_path, len(candidates),
+            repo=root or Path.cwd(),
+        )
     agent_type = detect_agent_type(root)
     for cand in candidates:
         ledger.story_upsert(
@@ -2013,6 +2055,7 @@ def run_fix_batch(
         ledger, run_id, status,
         reconcile=real_run, root=Path.cwd(),
         finish_label="fix batch finished", render_view=render_view,
+        registry=registry,
     )
     ledger.event_log(run_id, "", "info", "controller", summary)
     return FixBatchResult(

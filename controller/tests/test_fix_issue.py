@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -52,6 +53,7 @@ from sdlc.fix_issue import (
     stop_reason,
 )
 from sdlc.issue_host import RunResult
+from sdlc.registry import Registry
 from sdlc.ledger_view import Ledger
 
 
@@ -2903,3 +2905,214 @@ def test_open_docs_only_pr_push_failure_returns_none_and_warns(tmp_path) -> None
     assert any(
         "deterministic PR open failed" in m for m in _events(tmp_path / "l.db")
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #545: a fix run must reach the *host registry*, not only the ledger.
+#
+# The dashboard resolves the current run exclusively from `~/.sdlc/registry.json`
+# and falls back to `max(started_at)` over whatever is registered — so an
+# unregistered fix run does not merely go missing, it lets a stale completed run
+# be presented as current with no error and no empty state.
+# ---------------------------------------------------------------------------
+
+
+def _reg(tmp_path: Path) -> Registry:
+    """A path-scoped registry so a test never touches the host's real cache."""
+    return Registry(tmp_path / "registry.json")
+
+
+class _BrokenRegistry(Registry):
+    """Every write raises, standing in for an unwritable host cache."""
+
+    def register(self, record) -> None:  # noqa: D102
+        raise OSError("registry is read-only")
+
+    def mark_finished(self, run_id, status, *, completed=None) -> None:  # noqa: D102
+        raise OSError("registry is read-only")
+
+
+def test_run_fix_registers_the_run_in_the_host_registry(tmp_path) -> None:
+    """The run the dashboard must discover beside `sdlc build` runs."""
+    registry = _reg(tmp_path)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    records = registry.records()
+    assert [r.run_id for r in records] == [result.run_id]
+    record = records[0]
+    assert record.scope == "issue-1"
+    assert Path(record.db) == (tmp_path / ".sdlc-state.db").resolve()
+    assert Path(record.repo) == tmp_path.resolve()
+    assert record.total == 1
+    assert record.started_at  # the registry stamps it at register time
+
+
+def test_run_fix_registers_with_a_live_pid_so_a_crash_derives_dead(tmp_path) -> None:
+    """A crashed fix must be detectable by dead pid, like a controller build.
+
+    Asserted mid-run — after registration, before close-out — because the record
+    is terminal by the time `run_fix` returns and an IN_PROGRESS row with this
+    process's pid could no longer be distinguished from one never written.
+    """
+    registry = _reg(tmp_path)
+    seen: list[tuple[str, int]] = []
+
+    dispatch = RecordingDispatcher()
+    inner = dispatch.__call__
+
+    def spy(agent_type, prompt, **kwargs):
+        if agent_type == "investigation":
+            for record in registry.records():
+                seen.append((record.status, record.pid))
+        return inner(agent_type, prompt, **kwargs)
+
+    run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=spy,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert seen == [("IN_PROGRESS", os.getpid())]
+
+
+def test_run_fix_finalizes_the_registry_record_on_a_clean_finish(tmp_path) -> None:
+    """A finished fix must not linger IN_PROGRESS and derive DEAD later."""
+    registry = _reg(tmp_path)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "DONE"
+
+    record = registry.records()[0]
+    assert record.status == "DONE"
+    assert record.completed == 1
+    assert record.finished_at
+
+
+def test_run_fix_finalizes_the_registry_record_on_an_early_abort(tmp_path) -> None:
+    """The pre-stage-loop exit closes the registry too, not just the ledger.
+
+    A BLOCKED investigation returns through `_close_early`, which bypasses the
+    shared `finalize_run` — so it needs its own registry stamp or a blocked fix
+    stays IN_PROGRESS in the cache forever.
+    """
+    registry = _reg(tmp_path)
+    dispatch = RecordingDispatcher(
+        overrides={
+            "investigation": {
+                "root_cause": "unclear",
+                "complexity": "HIGH",
+                "fix_approach": "",
+                "files_to_modify": [],
+                "risk": "high",
+                "investigation_status": "BLOCKED — needs a product decision",
+            }
+        }
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "ABORTED"
+
+    record = registry.records()[0]
+    assert record.status == "ABORTED"
+    assert record.finished_at
+
+
+def test_run_fix_survives_an_unwritable_registry(tmp_path) -> None:
+    """Registration is a discovery cache, never a gate on the fix (#323 AC4)."""
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=_BrokenRegistry(tmp_path / "registry.json"),
+    )
+    assert result.status == "DONE"
+    assert result.pr_number == 100
+
+
+def test_run_fix_leaves_a_rate_limit_park_registered_in_progress(tmp_path) -> None:
+    """A park is resumable, not terminal — the registry must still show it live.
+
+    Stamping it terminal here would hide a run that is waiting to continue, which
+    is the same disappearance #545 is about, just with the opposite sign.
+    """
+    from sdlc.rate_limit import RateLimitSignal
+
+    registry = _reg(tmp_path)
+    dispatch = RecordingDispatcher(
+        overrides={
+            "build": RateLimitError("throttled", signal=RateLimitSignal(source="429"))
+        }
+    )
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "RATE_LIMITED"
+
+    record = registry.records()[0]
+    assert record.status == "IN_PROGRESS"
+    assert record.finished_at is None
+
+
+def test_run_fix_batch_registers_and_finalizes_the_run(tmp_path) -> None:
+    """The batch path opens its own run row and has the same #545 defect.
+
+    `sdlc fix all` / `sdlc fix next` create a run via `run_create` exactly like the
+    single-issue path, so registering only `run_fix` would leave every batch run
+    invisible to the dashboard.
+    """
+    registry = _reg(tmp_path)
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=BatchProbeDispatcher(
+            inv_files={"issue-1": ["a.py"], "issue-2": ["b.py"]}
+        ),
+        preflight=lambda: True,
+        runner=FakeBatchGh([_batch_issue(1), _batch_issue(2)]),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "DONE"
+
+    records = registry.records()
+    assert [r.run_id for r in records] == [result.run_id]
+    record = records[0]
+    assert record.total == 2
+    assert record.status == "DONE"
+    assert record.completed == 2
+    assert record.finished_at
