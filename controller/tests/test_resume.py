@@ -1665,27 +1665,26 @@ def test_backfill_prefers_the_event_over_damaged_stage_rows(tmp_path: Path) -> N
     assert Ledger(db).run_harness_routing("old")["review"] == "codex"
 
 
-def test_backfill_falls_back_to_unanimous_stage_harnesses(tmp_path: Path) -> None:
-    """A run predating the routing event is recovered from what it demonstrably ran."""
+def test_backfill_never_reroutes_a_run_from_stage_rows_alone(tmp_path: Path) -> None:
+    """Recovery is exact-or-nothing: recorded stage harnesses are not evidence.
+
+    Every recorded stage here ran on codex, which *looks* like a whole-repo default
+    — but it is indistinguishable from a mixed ``build=codex,review=claude`` map
+    whose Claude roles simply had not run yet. Inferring "all codex" would silently
+    move `review` onto a different agent and permissions posture, so a run with no
+    routing event keeps today's behaviour instead.
+    """
     db = tmp_path / ".sdlc-state.db"
     _seed_pre_migration_run(
         db, stage_harnesses=(("build", "codex"), ("coverage", "codex")),
     )
     Ledger(db).ensure_migrated()
 
-    recovered = Ledger(db).run_harness_routing("old")
-    # The unanimous evidence is a whole-repo default, so every role is restored —
-    # including `review`, the role the interrupted run had not reached yet.
-    assert recovered["review"] == "codex"
-    assert recovered["build"] == "codex"
+    assert Ledger(db).run_harness_routing("old") == {}
 
 
 def test_backfill_leaves_an_ambiguous_legacy_run_alone(tmp_path: Path) -> None:
-    """Mixed stage rows with no event are indistinguishable from #543 damage.
-
-    Guessing "all codex" could move a role the run deliberately ran on Claude, so
-    such a run keeps today's behaviour rather than being rewritten on a hunch.
-    """
+    """Mixed stage rows with no event are likewise never guessed at."""
     db = tmp_path / ".sdlc-state.db"
     _seed_pre_migration_run(
         db, stage_harnesses=(("build", "codex"), ("review", "claude")),

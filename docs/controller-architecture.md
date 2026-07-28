@@ -1742,20 +1742,22 @@ built-in Claude harness and the ledger recorded Claude for it.
 Migration 17 carries a **data backfill** (`_backfill_harness_routing`), because a
 run interrupted *before* the upgrade resolved a map and dispatched on it but
 persisted it nowhere — leaving that column NULL would read as "unrouted" and
-resume it onto Claude, which is the defect itself. Recovery uses two sources, in
-order of fidelity:
+resume it onto Claude, which is the defect itself.
 
-1. **The run's `harness routing: …` event** (primary, lossless). Every routed run
-   logs the effective per-role map at run creation (Issue #426/#454), *before* the
-   first dispatch, so a resume already damaged by #543 cannot have corrupted it. A
-   run with no such event never had a map, so it is correctly left unrouted.
-2. **Unanimous recorded stage harnesses** (fallback, for the ~two-release window of
-   runs predating that event line). Applied only when every stage the run recorded
-   names the same non-`claude` harness — a whole-repo `.sdlc-harness.yaml` default,
-   so every role is restored to it, including roles the interrupted run had not
-   reached. Any `claude` row makes the original map ambiguous (a genuinely mixed
-   map is indistinguishable from a run already damaged by #543), so that run is
-   left alone rather than guessed at.
+Recovery is **exact or nothing**, from one source: the `harness routing: …` event
+every routed run logs at run creation (Issue #426/#454). That line is written
+before the first dispatch and states the whole effective map, so it is lossless
+and a resume already damaged by #543 cannot have corrupted it. A run with no such
+event never had a map and is correctly left unrouted.
+
+Recorded stage harnesses are deliberately **not** a second source. "Every stage
+ran on codex, so the run was codex" cannot distinguish a whole-repo default from
+a mixed `build=codex,review=claude` map whose Claude roles had not run yet, so
+inferring it would silently reroute a role the run deliberately ran on Claude —
+the same class of harm this issue reports. Runs the event cannot vouch for are
+confined to the two releases between the `.sdlc-harness.yaml` feature and the
+event line (v2.16.0–v2.17.1); resume one with `SDLC_AGENT_CMD` set, or start a
+fresh run, to put it back on Codex.
 
 ### Codex build/QA adapter (Story 20.3-001)
 

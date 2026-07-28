@@ -684,33 +684,37 @@ def _backfill_harness_routing(conn: sqlite3.Connection) -> None:
 
     Those runs resolved a map at build time and dispatched on it, but persisted it
     nowhere — so leaving the new column NULL would read as "unrouted" and resume a
-    Codex repo's in-flight run onto Claude, which is Issue #543 itself. Two
-    sources of evidence, in order of fidelity, and only ever for a run whose column
-    is still NULL:
+    Codex repo's in-flight run onto Claude, which is Issue #543 itself.
 
-    1. **The routing event** (primary, lossless). Every routed run logs
-       ``harness routing: <role>=<harness> …`` at run creation (Issue #426/#454),
-       *before* the first dispatch — so it states the effective map exactly, and a
-       later resume that mis-dispatched on Claude cannot have corrupted it. A run
-       with **no** such event had an empty map (the line is only written when one
-       is set), so it is correctly left NULL and keeps the unrouted fast path.
-    2. **Unanimous recorded stage harnesses** (fallback, for runs predating the
-       event line — a ~two-release window). Applied only when every stage the run
-       recorded names the *same* non-``claude`` harness: that run demonstrably ran
-       wholly on it, which is the whole-repo `.sdlc-harness.yaml` default, so every
-       pipeline role is restored to it. Any ``claude`` row makes the original map
-       ambiguous (a genuinely mixed map is indistinguishable from a run already
-       damaged by the #543 defect), so such a run is left alone rather than guessed
-       at.
+    Recovery is **exact or nothing**, from exactly one source: the
+    ``harness routing: <role>=<harness> …`` event every routed run logs at run
+    creation (Issue #426/#454). That line is written *before* the first dispatch and
+    states the whole effective map, so it is lossless and a later resume that
+    mis-dispatched on Claude cannot have corrupted it. A run with **no** such event
+    had no map (the line is only written when one is set), so it is correctly left
+    NULL and keeps the unrouted fast path.
 
-    Best-effort by construction: an unparseable line or a missing `events`/`stages`
-    table simply recovers nothing. Idempotent — it only ever writes NULL columns.
+    Recorded stage harnesses are deliberately **not** used as a second source.
+    Inferring "every stage ran on codex, so the whole run was codex" cannot
+    distinguish a whole-repo default from a mixed map (``build=codex,
+    review=claude``) whose Claude roles simply had not run yet — so it would
+    silently reroute a role the run deliberately ran on Claude. A wrong guess here
+    changes the executing agent and permissions posture, which is the very harm
+    this issue is about, so a run the event cannot vouch for keeps today's
+    behaviour. Those runs are limited to the two releases between the
+    ``.sdlc-harness.yaml`` feature and the event line (v2.16.0–v2.17.1); resume one
+    with ``SDLC_AGENT_CMD`` set, or start a fresh run, to put it back on Codex.
+
+    Best-effort by construction: an unparseable line or a missing `events` table
+    simply recovers nothing. Idempotent — it only ever writes NULL columns.
     """
     tables = {
         r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
     }
+    if "events" not in tables:
+        return
     unrouted = {
         r[0] for r in conn.execute(
             "SELECT id FROM runs WHERE harness_routing IS NULL"
@@ -720,44 +724,18 @@ def _backfill_harness_routing(conn: sqlite3.Connection) -> None:
         return
 
     recovered: dict[str, dict[str, str]] = {}
-    if "events" in tables:
-        # Earliest first, so the run-creation line wins over any later duplicate.
-        rows = conn.execute(
-            "SELECT run_id, message FROM events "
-            "WHERE source = 'harness' AND message LIKE ? ORDER BY id",
-            (f"{_HARNESS_ROUTING_EVENT_PREFIX}%",),
-        ).fetchall()
-        for run_id, message in rows:
-            if run_id not in unrouted or run_id in recovered:
-                continue
-            parsed = _parse_harness_routing_event(message or "")
-            if parsed:
-                recovered[run_id] = parsed
-
-    stage_cols = {
-        r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()
-    }
-    if "stages" in tables and "harness" in stage_cols:
-        # Local import mirrors this module's existing role_routing convention and
-        # keeps the routing loader off the import path.
-        from sdlc.role_routing import PIPELINE_ROLES
-
-        rows = conn.execute(
-            "SELECT run_id, harness FROM stages "
-            "WHERE harness IS NOT NULL AND harness != '' GROUP BY run_id, harness"
-        ).fetchall()
-        seen: dict[str, set[str]] = {}
-        for run_id, harness in rows:
-            seen.setdefault(run_id, set()).add(harness)
-        for run_id, harnesses in seen.items():
-            if run_id not in unrouted or run_id in recovered:
-                continue
-            if len(harnesses) != 1:
-                continue
-            only = next(iter(harnesses))
-            if only == DEFAULT_HARNESS:
-                continue
-            recovered[run_id] = {role: only for role in PIPELINE_ROLES}
+    # Earliest first, so the run-creation line wins over any later duplicate.
+    rows = conn.execute(
+        "SELECT run_id, message FROM events "
+        "WHERE source = 'harness' AND message LIKE ? ORDER BY id",
+        (f"{_HARNESS_ROUTING_EVENT_PREFIX}%",),
+    ).fetchall()
+    for run_id, message in rows:
+        if run_id not in unrouted or run_id in recovered:
+            continue
+        parsed = _parse_harness_routing_event(message or "")
+        if parsed:
+            recovered[run_id] = parsed
 
     for run_id, harness_map in recovered.items():
         conn.execute(
