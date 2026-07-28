@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.10] - 2026-07-28
+
+### Fixed
+
+- fix(resume): resume fix-issue runs instead of closing them out (#547)
+- fix(cli): resolve run-id prefixes and reject unknown ids (#546)
+- fix(fix-issue): register fix runs in the host registry (#545)
+
+
 ## [v2.42.9] - 2026-07-28
 
 ### Fixed
