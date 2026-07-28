@@ -169,7 +169,11 @@ CREATE TABLE IF NOT EXISTS runs (
     -- Story 28.4-001: the run's fully-resolved routing config (profile + effective
     -- per-stage map + escalation thresholds after every override), frozen as JSON
     -- at run creation and replayed verbatim by every resume.
-    model_routing   TEXT
+    model_routing   TEXT,
+    -- Issue #543: the run's fully-resolved role->harness map (after --harness, the
+    -- repo `.sdlc-harness.yaml`, and the registry `default:`), frozen as JSON at
+    -- run creation and replayed verbatim by every resume.
+    harness_routing TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stories (
@@ -626,6 +630,22 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
             ("prediction_confidence", "TEXT"),
             ("actual_tokens", "INTEGER"),
             ("actual_rework", "INTEGER"),
+        ],
+        None,
+    ),
+    # Migration 17 adds the per-run frozen harness map (Issue #543) to a
+    # pre-existing ledger's `runs` table, mirroring Migration 15's model-routing
+    # snapshot. Additive and back-compatible with **no** data backfill: NULL reads
+    # as `{}`, which is exactly the empty `harness_map` those runs dispatched with
+    # (every role on the built-in `claude` default), so a pre-migration run resumes
+    # on precisely the harness it originally ran. A fresh DB created from the
+    # up-to-date DDL is a no-op.
+    (
+        17,
+        "run harness routing column",
+        "runs",
+        [
+            ("harness_routing", "TEXT"),
         ],
         None,
     ),
@@ -3151,6 +3171,56 @@ class Ledger:
             return {}
         return snapshot if isinstance(snapshot, dict) else {}
 
+    def run_set_harness_routing(self, run_id: str, harness_map: dict) -> None:
+        """Freeze the run's effective role->harness map on its row (Issue #543).
+
+        Written once, at run creation, *before* the first dispatch — mirroring
+        :meth:`run_set_routing` for models. The CLI has by then layered
+        ``--harness`` over the repo ``.sdlc-harness.yaml`` over the registry
+        ``default:``, so what is frozen here is the routing the run actually
+        dispatches with. Every resume replays it instead of re-resolving, so an
+        edit to `.sdlc-harness.yaml` between a run and its resume cannot silently
+        move an in-progress run onto a different harness.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET harness_routing = ? WHERE id = ?",
+                (json.dumps(harness_map or {}), run_id),
+            )
+
+    def run_harness_routing(self, run_id: str) -> dict[str, str]:
+        """The run's frozen role->harness map, or ``{}`` when it has none.
+
+        ``{}`` means "no per-role routing" — every role on the built-in ``claude``
+        default. That is both the conservative reading and what a run predating
+        Migration 17 actually did (its ``harness_map`` was never persisted and
+        those runs dispatched with whatever the CLI resolved at build time), so no
+        data backfill is needed. Non-string entries in a hand-edited or corrupt
+        snapshot are dropped rather than propagated into dispatch.
+        """
+        if not self.db_path.exists():
+            return {}
+        with self._connect_ro() as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+            if "harness_routing" not in cols:
+                return {}  # ledger predates Migration 17
+            row = conn.execute(
+                "SELECT harness_routing FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if row is None or not row["harness_routing"]:
+            return {}
+        try:
+            snapshot = json.loads(row["harness_routing"])
+        except (ValueError, TypeError):
+            return {}
+        if not isinstance(snapshot, dict):
+            return {}
+        return {
+            str(role): harness
+            for role, harness in snapshot.items()
+            if isinstance(role, str) and isinstance(harness, str) and harness
+        }
+
     def run_usage_totals(self, run_id: str) -> dict:
         """Running token + notional-cost accrual for ``run_id`` (Story 14.1-001).
 
@@ -5613,6 +5683,13 @@ def run_build(
     # default slot is the built-in Claude harness (no probe, all capabilities),
     # so this is purely additive logging and never alters dispatch behaviour.
     _log_harness_preflight(ledger, run_id, mode, opts)
+    # Issue #543: freeze the run's effective role->harness map on the run row, the
+    # same resolve-once discipline Story 28.4-001 applies to models. The CLI has
+    # already layered `--harness` > repo `.sdlc-harness.yaml` > registry `default:`
+    # into `opts.harness_map`, so this captures what the run actually dispatches
+    # with — and a resume replays it instead of reconstructing an empty map and
+    # silently collapsing every remaining stage onto the built-in Claude harness.
+    ledger.run_set_harness_routing(run_id, opts.harness_map)
     # Story 28.4-001: resolve the run's model routing **once**, freeze it on the
     # run row, and announce it before the first dispatch. Freezing the whole
     # resolved config (not just the profile name) is what makes a resume route

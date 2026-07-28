@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 from sdlc.build import BuildOptions, Ledger, run_build
@@ -1308,3 +1309,244 @@ def test_resume_git_probe_failure_leaves_dep_blocking(
 
     assert ("review", "97.2-001") not in dispatcher.calls
     assert result.blocked == 1
+
+
+# --- frozen harness routing (Issue #543) ------------------------------------
+#
+# The run's effective role->harness map (`--harness` > repo `.sdlc-harness.yaml` >
+# registry `default:`) is frozen on the run row at creation, exactly as Story
+# 28.4-001 freezes model routing. Before the freeze, resume reconstructed
+# BuildOptions with the dataclass's empty `harness_map`, so a Codex-routed run
+# silently finished on the built-in Claude harness and the ledger recorded Claude.
+
+_HARNESS_EPIC = """# Epic 96
+
+##### Story 96.1-001: One
+**Priority**: P1
+**Points**: 1
+**Dependencies**: None.
+"""
+
+
+class _HarnessRecordingDispatcher(FakeDispatcher):
+    """FakeDispatcher that also records the routed ``agent_cmd`` per stage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.agent_cmds: dict[str, list[str] | None] = {}
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        self.agent_cmds[agent_type] = kwargs.get("agent_cmd")
+        return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+
+def _make_harness_project(tmp_path: Path) -> Path:
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    (stories / "epic-96-sample.md").write_text(_HARNESS_EPIC, encoding="utf-8")
+    return tmp_path
+
+
+def _seed_harness_interrupted(db_path: Path, harness_map: dict | None) -> str:
+    """One story with build DONE and review interrupted — resume owes review."""
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("epic-96", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.event_log(
+        run_id, "", "info", "config", json.dumps({"skip_coverage": True})
+    )
+    ledger.story_upsert(
+        run_id, "96.1-001", "96", "One", "P1", 1, "general-purpose", "", None, "TODO"
+    )
+    ledger.stage_start(run_id, "96.1-001", "build", 1)
+    ledger.stage_finish(run_id, "96.1-001", "build", 1, "DONE")
+    ledger.set_story_pr(run_id, "96.1-001", 100)
+    ledger.stage_start(run_id, "96.1-001", "review", 1)  # left IN_PROGRESS
+    ledger.set_story_status(run_id, "96.1-001", "IN_PROGRESS")
+    if harness_map is not None:
+        ledger.run_set_harness_routing(run_id, harness_map)
+    return run_id
+
+
+def _stage_harness_rows(ledger: Ledger, run_id: str) -> dict[str, str]:
+    """The harness recorded for each stage's *latest* attempt."""
+    return {
+        row["stage_name"]: row["harness"] for row in ledger.state_rows(run_id)
+    }
+
+
+def test_resume_dispatches_on_the_runs_frozen_repo_default_harness(
+    tmp_path: Path,
+) -> None:
+    """Issue #543: a repo defaulting every role to codex must resume on codex."""
+    _make_harness_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    every_role_codex = {
+        role: "codex"
+        for role in ("build", "coverage", "review", "merge", "docs")
+    }
+    run_id = _seed_harness_interrupted(db, every_role_codex)
+
+    dispatcher = _HarnessRecordingDispatcher()
+    run_resume("epic-96", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    # The owed stages actually ran the codex adapter's argv, not `claude -p`.
+    assert dispatcher.agent_cmds["review"] is not None
+    assert "codex-build-adapter.sh" in dispatcher.agent_cmds["review"][0]
+    # ...and the ledger attributes the resumed attempts to codex, not claude.
+    assert _stage_harness_rows(Ledger(db), run_id)["review"] == "codex"
+
+
+def test_resume_honours_a_frozen_per_role_harness_map(tmp_path: Path) -> None:
+    """A per-role map replays per role: codex review, built-in claude merge."""
+    _make_harness_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_harness_interrupted(db, {"review": "codex"})
+
+    dispatcher = _HarnessRecordingDispatcher()
+    run_resume("epic-96", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    rows = _stage_harness_rows(Ledger(db), run_id)
+    assert rows["review"] == "codex"
+    assert rows["merge"] == "claude"  # unmapped role keeps the built-in default
+    assert "codex-build-adapter.sh" in dispatcher.agent_cmds["review"][0]
+    assert "claude" in dispatcher.agent_cmds["merge"][0]
+
+
+def test_resume_replays_the_frozen_map_over_a_changed_repo_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An edit to `.sdlc-harness.yaml` cannot move an in-progress run's routing."""
+    _make_harness_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_harness_interrupted(db, {"review": "codex"})
+
+    monkeypatch.chdir(tmp_path)
+    Path(".sdlc-harness.yaml").write_text(
+        "harness:\n  default: qwen\n", encoding="utf-8"
+    )
+    dispatcher = _HarnessRecordingDispatcher()
+    run_resume("epic-96", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    assert _stage_harness_rows(Ledger(db), run_id)["review"] == "codex"
+
+
+def test_resume_of_a_run_with_no_frozen_map_stays_on_the_default_harness(
+    tmp_path: Path,
+) -> None:
+    """Back-compat: a run created before the freeze resumes exactly as it ran."""
+    _make_harness_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_harness_interrupted(db, None)
+
+    dispatcher = _HarnessRecordingDispatcher()
+    run_resume("epic-96", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path)
+
+    # No map → no agent_cmd override at all (byte-identical to the pre-#543 path).
+    assert dispatcher.agent_cmds["review"] is None
+    assert _stage_harness_rows(Ledger(db), run_id)["review"] == "claude"
+
+
+def test_run_harness_routing_is_empty_when_the_ledger_file_is_absent(
+    tmp_path: Path,
+) -> None:
+    assert Ledger(tmp_path / "absent.db").run_harness_routing("nope") == {}
+
+
+def test_run_harness_routing_degrades_to_empty_on_a_corrupt_snapshot(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-96", "serial")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE runs SET harness_routing = 'not json' WHERE id = ?", (run_id,)
+        )
+    assert ledger.run_harness_routing(run_id) == {}
+
+
+def test_run_harness_routing_drops_non_string_entries(tmp_path: Path) -> None:
+    """A hand-edited snapshot cannot inject a non-name into dispatch routing."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-96", "serial")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE runs SET harness_routing = ? WHERE id = ?",
+            (json.dumps({"review": "codex", "merge": None, "build": 7}), run_id),
+        )
+    assert ledger.run_harness_routing(run_id) == {"review": "codex"}
+
+
+def test_run_harness_routing_is_empty_on_a_pre_migration_ledger(
+    tmp_path: Path,
+) -> None:
+    """A `runs` table without the column reads as "no routing", never crashes."""
+    db = tmp_path / ".sdlc-state.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE runs ("
+            "id TEXT PRIMARY KEY, scope TEXT, started_at TIMESTAMP, "
+            "finished_at TIMESTAMP, mode TEXT, total_stories INTEGER DEFAULT 0, "
+            "completed INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, "
+            "status TEXT NOT NULL, actor TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO runs(id, scope, mode, status, started_at) "
+            "VALUES ('legacy', 'epic-96', 'serial', 'IN_PROGRESS', CURRENT_TIMESTAMP)"
+        )
+    assert Ledger(db).run_harness_routing("legacy") == {}
+
+    # Migration 17 adds the column; the row stays unrouted (no backfill needed —
+    # that run genuinely dispatched on the built-in default).
+    Ledger(db).ensure_migrated()
+    assert Ledger(db).run_harness_routing("legacy") == {}
+
+
+def test_run_build_freezes_the_effective_harness_map_on_the_run_row(
+    tmp_path: Path,
+) -> None:
+    """The other half of the round-trip: build freezes what resume replays.
+
+    `sdlc build` resolves `--harness` > repo `.sdlc-harness.yaml` > registry
+    `default:` into ``opts.harness_map`` before dispatch; run creation stamps that
+    resolved map on the run row so the resume has something to restore.
+    """
+    _make_harness_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    opts = BuildOptions(
+        scope="epic-96", skip_coverage=True, skip_preflight=True, sequential=True,
+        harness_map={"review": "codex"},
+    )
+    run_build(
+        opts,
+        queue=discover_queue("epic-96", tmp_path),
+        ledger=ledger,
+        dispatcher=_HarnessRecordingDispatcher(),
+        preflight=lambda: True,
+        root=tmp_path,
+    )
+    assert ledger.run_harness_routing(ledger.latest_run_id()) == {"review": "codex"}
+
+
+def test_run_build_freezes_an_empty_map_for_an_unrouted_run(tmp_path: Path) -> None:
+    """No routing stays no routing — the frozen `{}` is not mistaken for a map."""
+    _make_harness_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    run_build(
+        BuildOptions(
+            scope="epic-96", skip_coverage=True, skip_preflight=True, sequential=True
+        ),
+        queue=discover_queue("epic-96", tmp_path),
+        ledger=ledger,
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+        root=tmp_path,
+    )
+    assert ledger.run_harness_routing(ledger.latest_run_id()) == {}

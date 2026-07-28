@@ -1728,6 +1728,19 @@ dispatch passes no `agent_cmd`/`parser` and is byte-identical to today's default
 preserved). A registry harness owns its own argv, so the routed `--model` decorates
 only the built-in/`env` Claude slots — a codex stage ignores it.
 
+**Resolve-and-freeze on the run row (Issue #543).** The effective map is resolved
+**once**, in `cli.py`, layering `--harness` > the repo `.sdlc-harness.yaml` > the
+registry `default:`. `run_build` then persists that resolved `opts.harness_map` as
+JSON on the `runs.harness_routing` column (`Ledger.run_set_harness_routing`,
+Migration 17) before the first dispatch, and `run_resume` reads it back with
+`Ledger.run_harness_routing` and replays it into the reconstructed
+`BuildOptions.harness_map` — the same discipline Story 28.4-001 applies to model
+routing. Without the freeze, resume rebuilt options with the dataclass's *empty*
+map, so every remaining stage of a Codex-routed run silently collapsed onto the
+built-in Claude harness and the ledger recorded Claude for it. Unlike Migration 15
+there is **no** data backfill: a run predating the column reads as `{}`, which is
+exactly the unrouted map it originally dispatched with.
+
 ### Codex build/QA adapter (Story 20.3-001)
 
 The `codex` registry entry is the first concrete **non-Claude** adapter, proving
