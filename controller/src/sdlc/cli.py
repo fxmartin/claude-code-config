@@ -73,6 +73,37 @@ def main(
     """sdlc — deterministic controller for autonomous SDLC runs."""
 
 
+def _effective_harness_map(cli_map: dict[str, str] | None) -> dict[str, str]:
+    """The run's effective role->harness map, from every configured source.
+
+    Precedence: ``--harness`` flag > repo ``.sdlc-harness.yaml`` (Story 20.7-005)
+    > the registry's top-level ``default:`` (Story 21.2-001) > built-in ``claude``.
+    A malformed file, an unknown role, or a ``default:`` naming an undefined
+    harness exits 2 here rather than surfacing a traceback mid-run.
+
+    Shared by ``build`` and ``fix`` (Issue #551): the fix pipeline resolved none
+    of this, so a repo declaring ``default: codex`` silently ran `sdlc fix` on
+    Claude. One helper is what keeps the two from drifting apart again.
+    """
+    from sdlc.harness import HarnessError
+    from sdlc.role_routing import (
+        RoleRoutingError,
+        apply_registry_default,
+        apply_repo_harness_defaults,
+        default_registry_path,
+        registry_default_harness,
+    )
+
+    try:
+        resolved = apply_repo_harness_defaults(cli_map)
+        return apply_registry_default(
+            resolved, registry_default_harness(default_registry_path())
+        )
+    except (RoleRoutingError, HarnessError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+
 def _resolve_run_option(ledger, value: str | None, *, strict: bool = True) -> str | None:
     """Resolve a ``--run`` value (full id or prefix) to a real run id (#546).
 
@@ -230,33 +261,13 @@ def build(ctx: typer.Context) -> None:
     # `--harness` map (precedence: CLI flag > repo file > built-in default) so the
     # preflight below and every stage dispatch see one effective role->harness map.
     # A malformed file or an unknown role fails fast here, the same path as the flag.
-    from sdlc.harness import HarnessError
-    from sdlc.role_routing import (
-        RoleRoutingError,
-        apply_registry_default,
-        apply_repo_harness_defaults,
-        default_registry_path,
-        registry_default_harness,
-    )
-
-    try:
-        opts.harness_map = apply_repo_harness_defaults(opts.harness_map)
-        # The harness registry's top-level `default:` is the global default
-        # harness: it routes every role left unmapped by `--harness` and the repo
-        # `.sdlc-harness.yaml`. Precedence: --harness flag > repo file > registry
-        # default > built-in claude. A registry default of `claude` (or a missing
-        # registry) is a no-op, so the empty-map fast path below still skips
-        # routing and behaviour is byte-identical to today.
-        reg_default = registry_default_harness(default_registry_path())
-        opts.harness_map = apply_registry_default(opts.harness_map, reg_default)
-    except (RoleRoutingError, HarnessError) as exc:
-        # registry_default_harness delegates registry validation to the harness
-        # loader, which raises HarnessError (not RoleRoutingError) on a malformed
-        # registry or a `default:` naming an undefined harness — the most likely
-        # typo on the new toggle. Catch it here so it exits cleanly (2) like every
-        # other config error rather than surfacing a traceback.
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+    # The harness registry's top-level `default:` is the global default harness: it
+    # routes every role left unmapped by `--harness` and the repo
+    # `.sdlc-harness.yaml`. Precedence: --harness flag > repo file > registry
+    # default > built-in claude. A registry default of `claude` (or a missing
+    # registry) is a no-op, so the empty-map fast path below still skips routing
+    # and behaviour is byte-identical to today.
+    opts.harness_map = _effective_harness_map(opts.harness_map)
 
     # Story 20.2-001: resolve and validate per-role harness routing before any
     # stage runs. An unknown/disabled harness, a missing registry, or a conflict
@@ -265,6 +276,7 @@ def build(ctx: typer.Context) -> None:
     # unchanged.
     if opts.harness_map:
         from sdlc.role_routing import (
+            RoleRoutingError,
             check_review_bridge,
             default_registry_path,
             default_reviewers_path,
@@ -469,6 +481,11 @@ def fix(ctx: typer.Context) -> None:
     except FixConfigError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+    # Issue #551: resolve the same role->harness map `sdlc build` does, so a repo
+    # configured for another harness stops silently running its fixes on Claude.
+    # An empty map (no config anywhere) leaves dispatch byte-identical.
+    opts.harness_map = _effective_harness_map(opts.harness_map)
 
     ledger = Ledger(default_db_path())
     ledger.ensure_migrated()

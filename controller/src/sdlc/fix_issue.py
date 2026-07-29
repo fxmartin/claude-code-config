@@ -69,6 +69,7 @@ from sdlc.dispatch import (
     RateLimitError,
     dispatch_agent,
 )
+from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.issue_host import RunResult, Runner, _default_runner
 from sdlc.notify import notify
 from sdlc.registry import Registry
@@ -160,6 +161,11 @@ class FixOptions:
     # PR1 (no CLI surface yet); the seam is here so a later ``--model-<stage>``
     # flag can beat the fix defaults without touching the routing helper.
     model_overrides: dict[str, str] = field(default_factory=dict)
+    # Issue #551: the run's effective role->harness map, resolved by the CLI from
+    # `--harness` > the repo `.sdlc-harness.yaml` > the registry `default:` — the
+    # same precedence `sdlc build` uses. Empty means "every role on the built-in
+    # claude harness", which is what every fix run did unconditionally before.
+    harness_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -183,6 +189,9 @@ class FixBatchOptions:
     # E2E warn-gate mode, threaded down to each issue's :class:`FixOptions`. Issue #436 PR3.
     e2e_gate: str = "off"
     model_overrides: dict[str, str] = field(default_factory=dict)
+    # Issue #551: the run's effective role->harness map, threaded down to each
+    # issue exactly like the quality-gate knobs above.
+    harness_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -695,6 +704,83 @@ def _fix_escalates(inv: dict | None, labels: Iterable[str]) -> bool:
     return bool(_labels_lower(labels) & _ESCALATION_LABELS)
 
 
+# Issue #551: which pipeline role runs each fix stage, so the run's role->harness
+# map routes them. `build.py`'s `_STAGE_ROLE` covers the four core stages; these
+# are the fix-only ones. `investigation` and `bugfix` are build-role work (they
+# reason about and change the code), `e2e` is a coverage-role gate, and `summary`
+# and `doc-update` write prose, so they take the docs role.
+_FIX_STAGE_ROLE: dict[str, str] = {
+    "investigation": "build",
+    "build": "build",
+    "bugfix": "build",
+    "coverage": "coverage",
+    "e2e": "coverage",
+    "review": "review",
+    "merge": "merge",
+    "summary": "docs",
+    "doc_update": "docs",
+    "doc-update": "docs",
+}
+
+
+def fix_stage_harness(stage: str, opts: FixOptions) -> str:
+    """The harness name that runs ``stage`` (Issue #551).
+
+    A role absent from the map — and an empty map, the default — collapses to the
+    built-in ``claude``, which is what every fix stage ran before this existed.
+    """
+    role = _FIX_STAGE_ROLE.get(stage, "build")
+    return opts.harness_map.get(role) or DEFAULT_HARNESS
+
+
+def _fix_dispatch_kwargs(stage: str, opts: FixOptions, model: str | None) -> dict:
+    """Route ``stage``'s dispatch to its harness (Issue #551).
+
+    Mirrors :func:`sdlc.build._harness_dispatch_kwargs`: resolves the harness for
+    the stage's role and returns the ``agent_cmd``/``parser`` that make the
+    dispatch *actually run* it, rather than merely labelling the ledger — the
+    distinction Story 20.7-001 had to fix for builds.
+
+    Returns an **empty dict** when the run has no map, so the default path passes
+    no extra kwargs and dispatch stays byte-identical to before.
+    """
+    if not opts.harness_map:
+        return {}
+    from sdlc.role_routing import default_registry_path
+
+    harness = resolve_harness(
+        fix_stage_harness(stage, opts), config_path=default_registry_path()
+    )
+    return {
+        "agent_cmd": harness.to_argv(model=model, stage=stage),
+        "parser": None if harness.source in ("builtin", "env") else harness.parser,
+    }
+
+
+def _log_fix_harness_routing(ledger: Ledger, run_id: str, opts: FixOptions) -> None:
+    """Announce the run's effective map before the first dispatch (Issue #551).
+
+    The same ``harness routing: <role>=<harness> …`` line ``sdlc build`` writes —
+    deliberately identical, because Migration 17's backfill
+    (:func:`sdlc.build._backfill_harness_routing`) recovers a pre-freeze run's map
+    from exactly this event. Emitting it here is what lets a fix run interrupted
+    across an upgrade be recovered at all. Best-effort: logging must never fail a
+    fix.
+    """
+    if not opts.harness_map:
+        return
+    try:
+        from sdlc.role_routing import PIPELINE_ROLES
+
+        routing = " ".join(
+            f"{role}={opts.harness_map.get(role, DEFAULT_HARNESS)}"
+            for role in PIPELINE_ROLES
+        )
+        ledger.event_log(run_id, "", "info", "harness", f"harness routing: {routing}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def fix_model(stage: str, opts: FixOptions, *, escalate: bool = False) -> str | None:
     """The model for ``stage`` (issue #436): a ``model_overrides`` pin beats all.
 
@@ -725,6 +811,7 @@ def _dispatch_fix_stage(
     model: str | None,
     dispatch,
     transcript_path: Path,
+    opts: FixOptions | None = None,
 ) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one fix stage's agent and classify the outcome.
 
@@ -738,6 +825,7 @@ def _dispatch_fix_stage(
         result = dispatch(
             stage, prompt, story=story, model=model,
             transcript_path=transcript_path, on_progress=None,
+            **_fix_dispatch_kwargs(stage, opts or FixOptions(issue=0), model),
         )
     except (RateLimitError, ContextOverflowError):
         raise
@@ -776,12 +864,16 @@ def _run_bugfix(
     response, returns False so the caller exhausts into a terminal status.
     """
     model = fix_model("bugfix", opts, escalate=_fix_escalates(inv, issue.labels))
-    ledger.stage_start(run_id, story.id, "bugfix", seq, model=model)
+    ledger.stage_start(
+        run_id, story.id, "bugfix", seq,
+        harness=fix_stage_harness("bugfix", opts), model=model,
+    )
     prompt = render_bugfix_prompt(issue, inv, stage, failure)
     try:
         result = dispatch(
             "bugfix", prompt, story=story, model=model,
             transcript_path=transcript_path, on_progress=None,
+            **_fix_dispatch_kwargs("bugfix", opts, model),
         )
     except (AgentDispatchError, ContractError) as exc:
         ledger.stage_finish(
@@ -820,13 +912,17 @@ def _run_investigation(
     the single-issue run aborts cleanly), or ``FAILED`` (dispatch/contract error).
     """
     model = fix_model("investigation", opts)
-    ledger.stage_start(run_id, story.id, "investigation", 1, model=model)
+    ledger.stage_start(
+        run_id, story.id, "investigation", 1,
+        harness=fix_stage_harness("investigation", opts), model=model,
+    )
     tpath = logs_dir / f"{story.id}-investigation-1.log"
     prompt = render_investigation_prompt(issue)
     try:
         result = dispatch(
             "investigation", prompt, story=story, model=model,
             transcript_path=tpath, on_progress=None,
+            **_fix_dispatch_kwargs("investigation", opts, model),
         )
     except (RateLimitError, ContextOverflowError, AgentDispatchError, ContractError) as exc:
         ledger.stage_finish(
@@ -986,6 +1082,7 @@ def _fix_config(opts: FixOptions) -> dict:
         "skip_preflight": opts.skip_preflight,
         "e2e_gate": opts.e2e_gate,
         "model_overrides": dict(opts.model_overrides or {}),
+        "harness_map": dict(opts.harness_map or {}),
     }
 
 
@@ -1087,7 +1184,10 @@ def _run_stage_loop(
             if pr is not None:
                 pr_number = pr
                 ledger.set_story_pr(run_id, story.id, pr_number)
-                ledger.stage_start(run_id, story.id, stage, 1, model=None)
+                ledger.stage_start(
+                    run_id, story.id, stage, 1,
+                    harness=fix_stage_harness(stage, opts), model=None,
+                )
                 ledger.stage_finish(
                     run_id, story.id, stage, 1, "SKIPPED", "docs-only"
                 )
@@ -1115,7 +1215,10 @@ def _run_stage_loop(
             )
         while True:
             model = fix_model(stage, opts, escalate=escalate)
-            ledger.stage_start(run_id, story.id, stage, attempt, model=model)
+            ledger.stage_start(
+                run_id, story.id, stage, attempt,
+                harness=fix_stage_harness(stage, opts), model=model,
+            )
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             prompt = _render_core_prompt(
                 stage, issue, inv, opts, pr_number,
@@ -1123,7 +1226,7 @@ def _run_stage_loop(
             )
             try:
                 ok, result, failure, kind = _dispatch_fix_stage(
-                    stage, story, prompt, model, dispatch, tpath
+                    stage, story, prompt, model, dispatch, tpath, opts
                 )
             except ContextOverflowError as exc:
                 ledger.stage_finish(
@@ -1227,11 +1330,15 @@ def _run_summary(
     tpath = logs_dir / f"{story.id}-summary-1.log"
     result: AgentResult | None = None
     try:
-        ledger.stage_start(run_id, story.id, "summary", 1, model=model)
+        ledger.stage_start(
+            run_id, story.id, "summary", 1,
+            harness=fix_stage_harness("summary", opts), model=model,
+        )
         prompt = render_summary_prompt(issue, inv, pr_number)
         result = dispatch(
             "summary", prompt, story=story, model=model,
             transcript_path=tpath, on_progress=None,
+            **_fix_dispatch_kwargs("summary", opts, model),
         )
         ledger.stage_finish(run_id, story.id, "summary", 1, "DONE", output_path=str(tpath))
         _record_stage_usage(ledger, run_id, story.id, "summary", 1, result)
@@ -1277,7 +1384,10 @@ def _run_e2e(
     model = fix_model("e2e", opts)
     tpath = logs_dir / f"{story.id}-e2e-1.log"
     if docs_only:
-        ledger.stage_start(run_id, story.id, "e2e", 1, model=None)
+        ledger.stage_start(
+            run_id, story.id, "e2e", 1,
+            harness=fix_stage_harness("e2e", opts), model=None,
+        )
         ledger.stage_finish(run_id, story.id, "e2e", 1, "SKIPPED", "docs-only")
         ledger.event_log(
             run_id, story.id, "info", "controller",
@@ -1287,11 +1397,15 @@ def _run_e2e(
         return
     result: AgentResult | None = None
     try:
-        ledger.stage_start(run_id, story.id, "e2e", 1, model=model)
+        ledger.stage_start(
+            run_id, story.id, "e2e", 1,
+            harness=fix_stage_harness("e2e", opts), model=model,
+        )
         prompt = render_e2e_prompt(issue, pr_number)
         result = dispatch(
             "e2e", prompt, story=story, model=model,
             transcript_path=tpath, on_progress=None,
+            **_fix_dispatch_kwargs("e2e", opts, model),
         )
         e2e_result = str(result.data.get("e2e_result", "")).upper()
         passed = e2e_result == "PASS"
@@ -1406,6 +1520,13 @@ def run_fix(
     # dispatch a coverage stage the original run was told to skip (or apply a
     # different threshold to the same diff).
     ledger.event_log(run_id, "", "info", "config", json.dumps(_fix_config(opts)))
+    # Issue #551: announce and freeze the run's effective role->harness map before
+    # the first dispatch, the same resolve-once discipline `run_build` applies
+    # (#543). The event comes first so Migration 17's backfill can recover the map
+    # of a run interrupted across an upgrade; the run-row freeze is what every
+    # resume replays instead of re-resolving against the current config.
+    _log_fix_harness_routing(ledger, run_id, opts)
+    ledger.run_set_harness_routing(run_id, opts.harness_map)
     ledger.event_log(run_id, "", "info", "controller", f"fix started: scope={scope}")
     try:
         notify("run_started", run=run_id, scope=scope, mode="fix")
@@ -1549,6 +1670,11 @@ def resume_fix(
         )
     issue_number = int(match.group(1))
     opts = _options_from_fix_config(ledger.run_config(run_id), issue_number)
+    # Issue #551: replay the run's frozen role->harness map rather than resolving
+    # afresh, so an edit to `.sdlc-harness.yaml` between a run and its resume
+    # cannot finish the run on a different agent than it started on. A run frozen
+    # before this existed reads `{}` — the unrouted map it actually dispatched with.
+    opts.harness_map = ledger.run_harness_routing(run_id)
 
     plan = _recover_fix_plan(ledger, run_id)
     if plan is None:
@@ -1899,6 +2025,7 @@ def _issue_options(batch: FixBatchOptions, number: int) -> FixOptions:
         skip_preflight=batch.skip_preflight,
         e2e_gate=batch.e2e_gate,
         model_overrides=dict(batch.model_overrides),
+        harness_map=dict(batch.harness_map),
     )
 
 
