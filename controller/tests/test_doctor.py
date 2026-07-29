@@ -849,3 +849,38 @@ def test_run_doctor_includes_the_harness_pin_finding(tmp_path: Path) -> None:
         dep_probe=lambda _tool: True,
     )
     assert any(f.check == "harness" for f in report.findings)
+
+
+def test_harness_pin_reads_the_real_registry_default_when_not_injected(
+    tmp_path: Path,
+) -> None:
+    """Uninjected, the check resolves the shipped registry's own `default:`."""
+    finding = check_harness_pin(tmp_path)
+    assert finding.status == "WARN"
+    # The bundled registry ships `default: claude`.
+    assert "claude" in finding.detail
+
+
+def test_harness_pin_degrades_when_the_registry_cannot_be_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Doctor is a diagnostic: an unreadable registry must not make it raise.
+
+    An unreadable registry is already the config check's business, and an
+    unverifiable harness name must not be reported as undefined — doctor should
+    never invent a failure the operator cannot act on.
+    """
+    import sdlc.role_routing as rr
+
+    def boom(*args, **kwargs):
+        raise OSError("registry unreadable")
+
+    monkeypatch.setattr(rr, "registry_default_harness", boom)
+    monkeypatch.setattr(rr, "default_registry_path", boom)
+
+    # Unpinned: falls back to the built-in default rather than raising.
+    assert check_harness_pin(tmp_path).status == "WARN"
+
+    # Pinned to something unverifiable: trusted, not failed.
+    _pin(tmp_path, "harness:\n  default: something-exotic\n")
+    assert check_harness_pin(tmp_path).status == "CLEAN"
