@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.43.0] - 2026-07-29
+
+### Added
+
+- feat(doctor): surface repos whose harness routing is unpinned (#554)
+
+
 ## [v2.42.11] - 2026-07-29
 
 ### Fixed
