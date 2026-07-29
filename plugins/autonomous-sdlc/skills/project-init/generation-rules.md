@@ -192,10 +192,46 @@ This is the **handoff file** that `/brainstorm` reads to skip already-answered q
 <Content from "Anything else?" question, or "None" if skipped>
 ```
 
+## Step 6b: Generate .sdlc-harness.yaml (Harness Pin)
+
+Pin the repo's agent harness so its routing is **declared, not inherited**.
+
+Without this file a repo has no "default routing" — it silently follows the
+`default:` inside the *installed* controller's registry
+(`sdlc/config/harnesses.yaml`). That registry ships inside the wheel, so every
+`install-controller.sh` / `uv tool install --force` resets it, and a colleague's
+differently-configured install resolves differently again. The repo file is the
+only declaration that survives a redeploy.
+
+Resolve the value the machine is actually configured for, so a host already set up
+for another harness bootstraps consistently instead of silently reverting new
+repos to `claude`:
+
+```bash
+HARNESS="$(sdlc doctor --json 2>/dev/null \
+  | jq -r '.findings[] | select(.check=="harness") | .detail' \
+  | grep -oE '(claude|codex|qwen)' | head -1)"
+HARNESS="${HARNESS:-claude}"   # sdlc absent or unreadable → the built-in default
+```
+
+Write a **minimal** file — the pin plus one pointer. Do not reproduce the full
+capability commentary here; a fresh repo's author has not met roles, adapters, or
+capability flags yet, and `/project-init` is measured on time-to-first-PR.
+
+```yaml
+# Agent harness for this repo. Precedence: --harness flag > this file >
+# installed registry default > built-in claude. See `sdlc doctor`.
+harness:
+  default: <HARNESS>
+```
+
+Keep it to `default:`. Per-role routing (`roles: {review: codex, ...}`) is a
+deliberate later choice, not a bootstrap decision.
+
 ## Step 7: Initial Commit
 
 ```bash
-git add .gitignore CLAUDE.md PROJECT-SEED.md
+git add .gitignore CLAUDE.md PROJECT-SEED.md .sdlc-harness.yaml
 git commit -m "chore: initialize repository with CLAUDE.md and PROJECT-SEED.md
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
@@ -212,5 +248,5 @@ git push -u origin main
 Show the user:
 - GitHub repo URL
 - Number of labels created (base + project-specific)
-- Files created: `.gitignore`, `CLAUDE.md`, `PROJECT-SEED.md`
+- Files created: `.gitignore`, `CLAUDE.md`, `PROJECT-SEED.md`, `.sdlc-harness.yaml`
 - **Next step**: "Run `/brainstorm` to define product requirements. It will pick up your PROJECT-SEED.md automatically."

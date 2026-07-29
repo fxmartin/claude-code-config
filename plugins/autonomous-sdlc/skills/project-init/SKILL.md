@@ -54,6 +54,8 @@ Summary:
 4. Apply the standard label set (26 base + project-specific labels)
 5. Generate `CLAUDE.md` (lightweight — placeholders for sections filled later)
 6. Generate `PROJECT-SEED.md` (structured handoff file for brainstorm)
+6b. Generate `.sdlc-harness.yaml` (pins the agent harness so routing is declared,
+    not inherited from whatever registry the installed controller happens to ship)
 7. Create initial commit
 8. Push to remote
 9. Display summary and suggest: **"Run `/brainstorm` to define product requirements"**
