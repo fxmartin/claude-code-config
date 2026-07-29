@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from sdlc.build import _MIGRATIONS, Ledger, status_snapshot
+from sdlc.harness import DEFAULT_HARNESS
 from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
 from sdlc.registry import Registry, derive_state
@@ -22,6 +23,7 @@ __all__ = [
     "DEPENDENCIES",
     "Finding",
     "DoctorReport",
+    "check_harness_pin",
     "check_model_coverage",
     "check_model_routing",
     "check_usage_agreement",
@@ -341,6 +343,37 @@ def _parse_ts(raw: str) -> datetime | None:
     return dt
 
 
+# Sentinel so `check_harness_pin(root, registry_default=None)` can mean "no
+# registry default" rather than "read it from the bundled registry".
+_UNSET: str = "\x00unset"
+
+
+def _registry_default_or_claude() -> str:
+    """The registry's ``default:``, degrading to ``claude`` if it cannot be read.
+
+    Doctor is a diagnostic: an unreadable registry is already reported by the
+    config check, and must not make this one raise.
+    """
+    try:
+        from sdlc.role_routing import default_registry_path, registry_default_harness
+
+        return registry_default_harness(default_registry_path()) or DEFAULT_HARNESS
+    except Exception:  # noqa: BLE001
+        return DEFAULT_HARNESS
+
+
+def _harness_defined(name: str) -> bool:
+    """True when the registry defines ``name`` (unknown names are a FAIL)."""
+    try:
+        from sdlc.harness import load_harnesses_config
+        from sdlc.role_routing import default_registry_path
+
+        return name in load_harnesses_config(default_registry_path())
+    except Exception:  # noqa: BLE001
+        # Cannot verify — do not invent a failure the operator cannot act on.
+        return True
+
+
 def check_config(repo_root: Path) -> Finding:
     """Verify packaged JSON schemas and the managed settings.json parse cleanly."""
     bad: list[str] = []
@@ -372,6 +405,92 @@ def check_config(repo_root: Path) -> Finding:
         "Config validity",
         "CLEAN",
         "settings + packaged schemas parse",
+    )
+
+
+def check_harness_pin(
+    repo_root: Path, *, registry_default: str | None = _UNSET
+) -> Finding:
+    """Report whether this repo pins its agent harness (#551 follow-up).
+
+    A repo with no ``.sdlc-harness.yaml`` does not have "no routing" — it has
+    *implicit* routing that follows the installed controller's registry
+    ``default:``. That registry ships inside the wheel, so every
+    ``install-controller.sh`` resets it. This is the same class of silent drift
+    #543 and #551 fixed *inside* a run (freeze the map, replay it), observed one
+    level up: nothing in the repo records which agent its work was done by, so a
+    reinstall or a differently-configured colleague can move it without a trace.
+
+    * **FAIL** — a file exists but is malformed, or names a harness the registry
+      does not define. That is not a missing pin, it is a broken one: the CLI
+      preflight exits 2 on it, so *every* run in this repo is blocked until fixed.
+    * **WARN** — no pin. The detail names the harness the repo currently follows,
+      and says so more pointedly when that is not ``claude`` (a reinstall would
+      silently move the repo back to the built-in default).
+    * **CLEAN** — pinned; the finding names what it is pinned to.
+
+    ``registry_default`` is injectable for tests; by default it is read from the
+    bundled registry, and an unreadable registry degrades to ``claude`` rather
+    than failing the check.
+    """
+    name = "Harness routing pinned"
+    from sdlc.role_routing import (
+        HARNESS_OVERRIDE_FILENAME,
+        RoleRoutingError,
+        load_repo_harness_defaults,
+    )
+
+    if registry_default is _UNSET:
+        registry_default = _registry_default_or_claude()
+    effective_default = registry_default or DEFAULT_HARNESS
+
+    path = repo_root / HARNESS_OVERRIDE_FILENAME
+    if not path.is_file():
+        detail = (
+            f"no {HARNESS_OVERRIDE_FILENAME}; this repo follows the installed "
+            f"registry default ({effective_default})"
+        )
+        if effective_default != DEFAULT_HARNESS:
+            detail += (
+                " — which a reinstall resets to "
+                f"{DEFAULT_HARNESS}, silently moving this repo off "
+                f"{effective_default} with nothing in the repo recording it"
+            )
+        else:
+            detail += ", which a reinstall or another machine can change"
+        return Finding(
+            "harness", name, "WARN", detail,
+            f"pin it: printf 'harness:\\n  default: {effective_default}\\n' > "
+            f"{HARNESS_OVERRIDE_FILENAME}",
+        )
+
+    try:
+        file_default, roles = load_repo_harness_defaults(override_path=path)
+    except RoleRoutingError as exc:
+        return Finding(
+            "harness", name, "FAIL",
+            f"{HARNESS_OVERRIDE_FILENAME} is invalid: {exc}",
+            f"fix {HARNESS_OVERRIDE_FILENAME} — every run here exits 2 until it parses",
+        )
+
+    named = {h for h in ([file_default] if file_default else []) + list(roles.values())}
+    unknown = sorted(h for h in named if not _harness_defined(h))
+    if unknown:
+        return Finding(
+            "harness", name, "FAIL",
+            f"{HARNESS_OVERRIDE_FILENAME} names undefined harness(es): "
+            f"{', '.join(unknown)}",
+            "use a harness the registry defines, or add it to "
+            "`sdlc/config/harnesses.yaml`",
+        )
+
+    parts = []
+    if file_default:
+        parts.append(f"default={file_default}")
+    parts.extend(f"{role}={harness}" for role, harness in sorted(roles.items()))
+    return Finding(
+        "harness", name, "CLEAN",
+        f"pinned by {HARNESS_OVERRIDE_FILENAME} ({', '.join(parts)})",
     )
 
 
@@ -743,6 +862,7 @@ def run_doctor(
         check_ledger(db_path),
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
         check_config(repo_root),
+        check_harness_pin(repo_root),
         check_usage_agreement(db_path),
         check_model_coverage(db_path),
         check_model_routing(db_path),
