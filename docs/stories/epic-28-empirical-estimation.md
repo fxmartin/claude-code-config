@@ -1,6 +1,14 @@
 # Epic 28: Empirical Estimation and Telemetry Integrity
 
-> **Status: PLANNED (0/8)** created 2026-07-19 from the 2026-07-19 cost dataset: a
+> **Status: COMPLETE (8/8)** — all 8 stories implemented, tested, and merged
+> 2026-07-22 (PRs #519-#526): telemetry integrity (28.1-001 ledger-vs-logs
+> reconciliation + `sdlc doctor` agreement check, 28.1-002 verified per-attempt model
+> recording with historical backfill, 28.1-003 batch doc-update as a real ledger
+> stage), calibrated prediction (28.2-001 predictor features with points demoted to
+> metadata, 28.2-002 the per-story token/rework predictor), consumers off raw points
+> (28.3-001 model escalation, 28.3-002 budget gate + pre-dispatch warnings + batch
+> planner), and routing engagement (28.4-001 Balanced by default with a routing
+> banner). Created 2026-07-19 from the 2026-07-19 cost dataset: a
 > 76-story priced dataset built from this controller's own ledgers on local-code-bench
 > (June 25 to July 18, 2026). Thesis: the factory should stop *estimating* from story
 > points and start *calibrating* from its own ledger history. Points stay as a
@@ -89,7 +97,7 @@ comparisons (Epic-11, Epic-18) stop working from numbers that are quietly low.
 
 ## Epic Scope
 
-**Total Stories**: 7 | **Total Points**: 34 | **MVP Stories**: 0 (post-MVP roadmap epic)
+**Total Stories**: 8 | **Total Points**: 36 | **MVP Stories**: 0 (post-MVP roadmap epic)
 
 ## Out of Scope (Non-Goals)
 
