@@ -16,6 +16,7 @@ from sdlc.doctor import (
     MANAGED_PATHS,
     DoctorReport,
     Finding,
+    check_harness_pin,
     check_model_coverage,
     check_usage_agreement,
     run_doctor,
@@ -39,6 +40,12 @@ def _healthy_install(tmp_path: Path) -> tuple[Path, Path]:
     repo_root.mkdir()
     # A valid settings.json so the config check passes.
     (repo_root / "settings.json").write_text("{}\n", encoding="utf-8")
+    # A harness pin, so the healthy fixture is healthy under the #551 follow-up
+    # check too: an unpinned repo follows whatever registry a reinstall leaves
+    # behind, which is a WARN, not a clean bill of health.
+    (repo_root / ".sdlc-harness.yaml").write_text(
+        "harness:\n  default: claude\n", encoding="utf-8"
+    )
     claude_dir = tmp_path / "claude"
     claude_dir.mkdir()
     for name in MANAGED_PATHS:
@@ -761,3 +768,84 @@ def test_model_coverage_is_read_only(tmp_path: Path) -> None:
 def test_run_doctor_includes_the_model_coverage_finding(tmp_path: Path) -> None:
     report = _doctor(tmp_path, db_path=_model_ledger(tmp_path, model="claude-opus-4-8"))
     assert any(f.check == "model" for f in report.findings)
+
+
+# ---------------------------------------------------------------------------
+# Harness pin (#551 follow-up)
+#
+# A repo with no `.sdlc-harness.yaml` does not have "no routing" — it has
+# *implicit* routing that follows the installed controller's registry `default:`.
+# That registry ships inside the wheel, so `uv tool install --force` resets it:
+# the same class of silent drift #543 and #551 fixed inside a run, one level up.
+# ---------------------------------------------------------------------------
+
+
+def _pin(root: Path, body: str) -> Path:
+    path = root / ".sdlc-harness.yaml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_harness_pin_clean_when_the_repo_pins_itself(tmp_path: Path) -> None:
+    _pin(tmp_path, "harness:\n  default: codex\n")
+    finding = check_harness_pin(tmp_path)
+    assert finding.status == "CLEAN"
+    assert "codex" in finding.detail
+    assert finding.remedy == ""
+
+
+def test_harness_pin_clean_names_a_per_role_map(tmp_path: Path) -> None:
+    """A roles-only file is a pin too — it just doesn't cover every role."""
+    _pin(tmp_path, "harness:\n  roles:\n    review: codex\n")
+    finding = check_harness_pin(tmp_path)
+    assert finding.status == "CLEAN"
+    assert "review=codex" in finding.detail
+
+
+def test_harness_pin_warns_when_unpinned(tmp_path: Path) -> None:
+    """The common case: no file, so routing follows whatever is installed."""
+    finding = check_harness_pin(tmp_path)
+    assert finding.status == "WARN"
+    assert ".sdlc-harness.yaml" in finding.detail
+    assert "sdlc-harness.yaml" in finding.remedy
+
+
+def test_harness_pin_warns_harder_when_the_registry_default_is_not_claude(
+    tmp_path: Path,
+) -> None:
+    """Unpinned *and* following a non-default harness is the dangerous variant.
+
+    A reinstall resets the registry to `claude`, so this repo would silently move
+    off codex — with nothing in the repo recording that it ever ran on codex.
+    """
+    finding = check_harness_pin(tmp_path, registry_default="codex")
+    assert finding.status == "WARN"
+    assert "codex" in finding.detail
+    assert "reinstall" in finding.detail.lower() or "reset" in finding.detail.lower()
+
+
+def test_harness_pin_fails_on_a_malformed_file(tmp_path: Path) -> None:
+    """A broken pin is not a missing pin — it exits 2 on every run until fixed."""
+    _pin(tmp_path, "harness:\n  default: []\n")
+    finding = check_harness_pin(tmp_path)
+    assert finding.status == "FAIL"
+    assert "default" in finding.detail
+
+
+def test_harness_pin_fails_on_an_unknown_harness_name(tmp_path: Path) -> None:
+    """Parses fine, but the registry preflight would reject it mid-adoption."""
+    _pin(tmp_path, "harness:\n  default: gpt9\n")
+    finding = check_harness_pin(tmp_path)
+    assert finding.status == "FAIL"
+    assert "gpt9" in finding.detail
+
+
+def test_run_doctor_includes_the_harness_pin_finding(tmp_path: Path) -> None:
+    report = run_doctor(
+        repo_root=tmp_path,
+        claude_dir=tmp_path / "claude",
+        db_path=tmp_path / ".sdlc-state.db",
+        registry=Registry(tmp_path / "registry.json"),
+        dep_probe=lambda _tool: True,
+    )
+    assert any(f.check == "harness" for f in report.findings)
