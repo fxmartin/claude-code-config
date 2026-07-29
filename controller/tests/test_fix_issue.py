@@ -3551,3 +3551,21 @@ def test_run_fix_without_a_harness_map_is_unchanged(tmp_path) -> None:
     assert set(dispatch.parsers.values()) == {None}
     assert _harness_rows(db, result.run_id)["build"] == "claude"
     assert Ledger(db).run_harness_routing(result.run_id) == {}
+
+
+def test_log_fix_harness_routing_never_fails_the_run(tmp_path) -> None:
+    """Announcing the map is for a *future* recovery — it cannot break the run.
+
+    Mirrors `_log_harness_preflight`'s contract on the build side: the routing
+    line is an audit/recovery aid, so a ledger failure while writing it must not
+    take down a fix that is otherwise fine.
+    """
+    class _Exploding(Ledger):
+        def event_log(self, *args, **kwargs):
+            raise RuntimeError("ledger is on fire")
+
+    ledger = _Exploding(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    fix_mod._log_fix_harness_routing(
+        ledger, "run", FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX))
+    )  # must not raise
