@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.42.11] - 2026-07-29
+
+### Fixed
+
+- fix(fix-issue): route fix runs through the repo harness config (#551)
+
+
 ## [v2.42.10] - 2026-07-28
 
 ### Fixed
