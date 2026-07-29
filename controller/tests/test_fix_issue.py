@@ -3130,7 +3130,7 @@ def test_run_fix_batch_registers_and_finalizes_the_run(tmp_path) -> None:
 
 
 def _fix_run_interrupted_at(
-    tmp_path, *, dispatcher, stop_before: str = "", stop_during: str = ""
+    tmp_path, *, dispatcher, stop_before: str = "", stop_during: str = "", opts=None
 ):
     """A real fix run killed at a stage boundary (`stop_before`) or mid-stage.
 
@@ -3156,7 +3156,7 @@ def _fix_run_interrupted_at(
 
     try:
         run_fix(
-            FixOptions(issue=1),
+            opts or FixOptions(issue=1),
             ledger=Ledger(tmp_path / ".sdlc-state.db"),
             dispatcher=killer,
             preflight=lambda: True,
@@ -3391,3 +3391,181 @@ def test_resume_fix_re_registers_the_run_in_the_registry(tmp_path) -> None:
     record = registry.records()[0]
     assert record.run_id == run_id
     assert record.status == "DONE"
+
+
+# ---------------------------------------------------------------------------
+# Issue #551: fix runs must honour harness routing and record what actually ran.
+#
+# `.sdlc-harness.yaml` and `--harness` were build-only: `FixOptions` had no
+# harness map, no fix dispatch passed `agent_cmd`, and every `stage_start` omitted
+# `harness=` so the column defaulted to "claude". A repo declaring `default: codex`
+# therefore ran `sdlc fix` on Claude and recorded Claude for every stage.
+# ---------------------------------------------------------------------------
+
+
+_ALL_ROLES_CODEX = {
+    role: "codex" for role in ("build", "coverage", "review", "merge", "docs")
+}
+
+
+class _HarnessRecordingFixDispatcher(RecordingDispatcher):
+    """RecordingDispatcher that also captures the routed argv per stage."""
+
+    def __init__(self, overrides=None) -> None:
+        super().__init__(overrides=overrides)
+        self.agent_cmds: dict[str, list[str] | None] = {}
+        self.parsers: dict[str, str | None] = {}
+
+    def __call__(self, agent_type, prompt, **kwargs):
+        self.agent_cmds[agent_type] = kwargs.get("agent_cmd")
+        self.parsers[agent_type] = kwargs.get("parser")
+        return super().__call__(agent_type, prompt, **kwargs)
+
+
+def _harness_rows(db: Path, run_id: str) -> dict[str, str]:
+    """The harness recorded on each stage row."""
+    conn = sqlite3.connect(db)
+    try:
+        return {
+            name: harness
+            for name, harness in conn.execute(
+                "SELECT stage_name, harness FROM stages WHERE run_id = ?", (run_id,)
+            )
+        }
+    finally:
+        conn.close()
+
+
+def test_run_fix_dispatches_on_the_repo_configured_harness(tmp_path) -> None:
+    """The reported defect: a codex-routed repo ran `sdlc fix` on Claude."""
+    dispatch = _HarnessRecordingFixDispatcher()
+    run_fix(
+        FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+
+    # Every dispatched stage carried the codex adapter's argv, not `claude -p`.
+    for stage in ("investigation", "build", "coverage", "review", "merge"):
+        argv = dispatch.agent_cmds[stage]
+        assert argv is not None, stage
+        assert any("codex" in part for part in argv), (stage, argv)
+
+
+def test_run_fix_records_the_harness_that_actually_ran(tmp_path) -> None:
+    """The ledger asserted `claude` on every fix stage regardless of dispatch."""
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        ledger=Ledger(db),
+        dispatcher=_HarnessRecordingFixDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+
+    rows = _harness_rows(db, result.run_id)
+    assert rows["build"] == "codex"
+    assert rows["review"] == "codex"
+    assert rows["merge"] == "codex"
+
+
+def test_run_fix_freezes_the_harness_map_on_the_run(tmp_path) -> None:
+    """Frozen at creation, exactly as `run_build` does (#543's mechanism)."""
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        ledger=Ledger(db),
+        dispatcher=_HarnessRecordingFixDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert Ledger(db).run_harness_routing(result.run_id) == _ALL_ROLES_CODEX
+
+
+def test_run_fix_logs_the_harness_routing_event(tmp_path) -> None:
+    """The event #543's migration-17 backfill recovers a pre-freeze map from.
+
+    Without it a fix run is invisible to that recovery path, so a run in flight at
+    an upgrade could never have its map reconstructed.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        ledger=Ledger(db),
+        dispatcher=_HarnessRecordingFixDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    events = Ledger(db).events_by_source(result.run_id, "harness")
+    assert any(e.startswith("harness routing: ") and "codex" in e for e in events)
+
+
+def test_resume_fix_replays_the_frozen_map_not_the_current_config(tmp_path) -> None:
+    """An edit between a run and its resume cannot move it onto another harness.
+
+    This is #543's guarantee, which fix runs never had — and which only became
+    reachable once #547 made them resumable.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path,
+        dispatcher=RecordingDispatcher(),
+        stop_before="coverage",
+        opts=FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+    )
+
+    # The resume is handed a *claude* map; the frozen codex one must win.
+    dispatch = _HarnessRecordingFixDispatcher()
+    fix_mod.resume_fix(
+        run_id,
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    for stage in ("coverage", "review", "merge"):
+        argv = dispatch.agent_cmds[stage]
+        assert argv is not None, stage
+        assert any("codex" in part for part in argv), (stage, argv)
+
+
+def test_run_fix_without_a_harness_map_is_unchanged(tmp_path) -> None:
+    """The empty-map fast path stays byte-identical: no argv, no parser, claude."""
+    db = tmp_path / ".sdlc-state.db"
+    dispatch = _HarnessRecordingFixDispatcher()
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert set(dispatch.agent_cmds.values()) == {None}
+    assert set(dispatch.parsers.values()) == {None}
+    assert _harness_rows(db, result.run_id)["build"] == "claude"
+    assert Ledger(db).run_harness_routing(result.run_id) == {}
+
+
+def test_log_fix_harness_routing_never_fails_the_run(tmp_path) -> None:
+    """Announcing the map is for a *future* recovery — it cannot break the run.
+
+    Mirrors `_log_harness_preflight`'s contract on the build side: the routing
+    line is an audit/recovery aid, so a ledger failure while writing it must not
+    take down a fix that is otherwise fine.
+    """
+    class _Exploding(Ledger):
+        def event_log(self, *args, **kwargs):
+            raise RuntimeError("ledger is on fire")
+
+    ledger = _Exploding(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    fix_mod._log_fix_harness_routing(
+        ledger, "run", FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX))
+    )  # must not raise
