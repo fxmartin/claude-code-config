@@ -97,7 +97,7 @@ comparisons (Epic-11, Epic-18) stop working from numbers that are quietly low.
 
 ## Epic Scope
 
-**Total Stories**: 7 | **Total Points**: 34 | **MVP Stories**: 0 (post-MVP roadmap epic)
+**Total Stories**: 8 | **Total Points**: 36 | **MVP Stories**: 0 (post-MVP roadmap epic)
 
 ## Out of Scope (Non-Goals)
 
