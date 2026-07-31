@@ -69,6 +69,25 @@ def _no_real_host_cli(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_registry(monkeypatch, tmp_path):
+    """Point the host-level registry at a per-test tmp file (issue #556).
+
+    Real-run code paths (``dispatcher=None``) in ``run_fix``/``run_build``/
+    ``run_fix_batch`` instantiate ``Registry()`` with no explicit path, which
+    resolves ``default_registry_path()`` — ``~/.sdlc/registry.json`` on a dev
+    machine when ``SDLC_REGISTRY_PATH`` is unset. Under pytest that env var is
+    unset unless a test sets it explicitly, so any test exercising a real-run
+    path (e.g. ``test_batch_real_run_isolates_worktrees_and_captures_worker_exception``)
+    wrote its fake run into the developer's real host registry, surfacing as a
+    FAILED project card on the dashboard. ``SDLC_REGISTRY_PATH`` is the
+    registry's designed test seam (registry.py); per-test
+    ``monkeypatch.setenv``/``delenv`` calls in test_cli_runs.py, test_registry.py,
+    and test_runlog.py run after fixture setup and override this default.
+    """
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(tmp_path / "registry.json"))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_git_push(monkeypatch):
     """Block a real ``git push`` for every test by default (issue #527).
 
