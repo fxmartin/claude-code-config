@@ -53,7 +53,7 @@ from sdlc.fix_issue import (
     stop_reason,
 )
 from sdlc.issue_host import RunResult
-from sdlc.registry import Registry
+from sdlc.registry import Registry, default_registry_path
 from sdlc.ledger_view import Ledger
 
 
@@ -2130,6 +2130,51 @@ def test_batch_real_run_isolates_worktrees_and_captures_worker_exception(
     assert result.fixed == 2  # issue-1 and issue-3 still complete normally
 
 
+def test_batch_real_run_registers_to_env_registry_not_default_home(
+    tmp_path, monkeypatch
+) -> None:
+    """The real-run path (`dispatcher=None`, `registry=None`) must never touch
+    the developer's real host registry (issue #556). `run_fix_batch`
+    instantiates `Registry()` itself on this path, which resolves
+    `SDLC_REGISTRY_PATH` if set — this asserts that resolution lands on the
+    test-owned path, not a host default, even if `HOME` were a real machine.
+    """
+    import sdlc.fix_issue as fix_issue_module
+
+    fake_home = tmp_path / "fake_home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    gh = FakeBatchGh([_batch_issue(1)])
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]})
+    monkeypatch.setattr(fix_issue_module, "dispatch_agent", dispatch)
+    monkeypatch.setattr(fix_issue_module, "_refresh_base_ref", lambda root: None)
+    monkeypatch.setattr(fix_issue_module, "_reposition_head", lambda root: None)
+    monkeypatch.setattr("sdlc.reconcile.reconcile_run", lambda *a, **k: None)
+
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=None,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+
+    assert result.fixed == 1
+
+    resolved_path = default_registry_path()
+    env_path = os.environ.get("SDLC_REGISTRY_PATH")
+    assert env_path is not None, "SDLC_REGISTRY_PATH must be set for every test"
+    assert resolved_path == Path(env_path)
+    assert resolved_path.exists()
+    assert json.loads(resolved_path.read_text())  # at least one run record written
+
+    default_home_path = fake_home / ".sdlc" / "registry.json"
+    assert not default_home_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -3058,6 +3103,43 @@ def test_run_fix_survives_an_unwritable_registry(tmp_path) -> None:
     assert result.pr_number == 100
 
 
+def test_run_fix_registers_to_env_registry_not_default_home(
+    tmp_path, monkeypatch
+) -> None:
+    """The real-run path (`dispatcher=None`, `registry=None`) must never touch
+    the developer's real host registry (issue #556). `run_fix` instantiates
+    `Registry()` itself on this path, same as `run_fix_batch` — this asserts
+    that resolution lands on the test-owned path, not a host default, even if
+    `HOME` were a real machine.
+    """
+    import sdlc.fix_issue as fix_issue_module
+
+    fake_home = tmp_path / "fake_home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(fix_issue_module, "dispatch_agent", RecordingDispatcher())
+
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=None,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+
+    resolved_path = default_registry_path()
+    env_path = os.environ.get("SDLC_REGISTRY_PATH")
+    assert env_path is not None, "SDLC_REGISTRY_PATH must be set for every test"
+    assert resolved_path == Path(env_path)
+    assert resolved_path.exists()
+    assert json.loads(resolved_path.read_text())  # at least one run record written
+
+    default_home_path = fake_home / ".sdlc" / "registry.json"
+    assert not default_home_path.exists()
+
+
 def test_run_fix_leaves_a_rate_limit_park_registered_in_progress(tmp_path) -> None:
     """A park is resumable, not terminal — the registry must still show it live.
 
@@ -3391,6 +3473,42 @@ def test_resume_fix_re_registers_the_run_in_the_registry(tmp_path) -> None:
     record = registry.records()[0]
     assert record.run_id == run_id
     assert record.status == "DONE"
+
+
+def test_resume_fix_registers_to_env_registry_not_default_home(
+    tmp_path, monkeypatch
+) -> None:
+    """The real-run path (`dispatcher=None`, `registry=None`) must never touch
+    the developer's real host registry (issue #556). `resume_fix` instantiates
+    `Registry()` itself on this path, same as `run_fix`/`run_fix_batch` — this
+    asserts that resolution lands on the test-owned path, not a host default,
+    even if `HOME` were a real machine.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+
+    fake_home = tmp_path / "fake_home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(fix_mod, "dispatch_agent", RecordingDispatcher())
+
+    result = fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=None,
+        runner=FakeGh(_issue_json()), root=tmp_path,
+    )
+    assert result.status == "DONE"
+
+    resolved_path = default_registry_path()
+    env_path = os.environ.get("SDLC_REGISTRY_PATH")
+    assert env_path is not None, "SDLC_REGISTRY_PATH must be set for every test"
+    assert resolved_path == Path(env_path)
+    assert resolved_path.exists()
+    assert json.loads(resolved_path.read_text())  # at least one run record written
+
+    default_home_path = fake_home / ".sdlc" / "registry.json"
+    assert not default_home_path.exists()
 
 
 # ---------------------------------------------------------------------------
