@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.43.1] - 2026-08-02
+
+### Fixed
+
+- fix(fix-issue): exclude story-mirror issues from batch selection (#558) (#559)
+
+
 ## [v2.43.0] - 2026-07-29
 
 ### Added
