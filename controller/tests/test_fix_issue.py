@@ -1544,6 +1544,50 @@ def test_select_all_orders_by_p_code_priority() -> None:
     assert ordered == [21, 20]
 
 
+def test_select_all_excludes_story_mirror_issues(capsys) -> None:
+    # Issue #558: `sdlc issues init` backfills one story-mirror issue per story,
+    # labeled `story` plus `epic:NN`/`feature:NN.F` taxonomy. `fix all` must never
+    # select those — they are planning artifacts for `sdlc build`, not defects.
+    gh = FakeBatchGh(
+        [
+            {"number": 10, "labels": ["enhancement", "high"]},
+            {"number": 11, "labels": ["bug", "low"]},
+            {
+                "number": 305,
+                "labels": ["story", "epic:9", "feature:9.3", "points:2"],
+            },
+        ]
+    )
+    ordered = [c.number for c in select_batch_issues("all", None, runner=gh)]
+    assert ordered == [11, 10]
+    assert 305 not in ordered
+    assert "skipped 1 story issue" in capsys.readouterr().err
+
+
+def test_select_next_excludes_story_labeled_bug() -> None:
+    # A story mirror labeled `bug` by hand must still be excluded from `next` —
+    # the plain bug filter alone doesn't catch it.
+    gh = FakeBatchGh(
+        [
+            {"number": 11, "labels": ["bug", "low"]},
+            {"number": 305, "labels": ["story", "bug", "epic:9", "feature:9.3"]},
+        ]
+    )
+    ordered = [c.number for c in select_batch_issues("next", None, runner=gh)]
+    assert ordered == [11]
+
+
+def test_select_all_no_story_issues_no_skip_message(capsys) -> None:
+    gh = FakeBatchGh(
+        [
+            {"number": 10, "labels": ["enhancement", "high"]},
+            {"number": 11, "labels": ["bug", "low"]},
+        ]
+    )
+    select_batch_issues("all", None, runner=gh)
+    assert "skipped" not in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Batch dispatcher probe (tracks per-issue pipeline concurrency)
 # ---------------------------------------------------------------------------

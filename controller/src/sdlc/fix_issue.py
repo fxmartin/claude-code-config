@@ -73,6 +73,7 @@ from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.issue_host import RunResult, Runner, _default_runner
 from sdlc.notify import notify
 from sdlc.registry import Registry
+from sdlc.story_render import STORY_LABEL
 
 # --- Model routing: aligned with the Balanced build profile -----------------
 #
@@ -1840,6 +1841,15 @@ def _is_bug(labels: Iterable[str]) -> bool:
     return any("bug" in label for label in _labels_lower(labels))
 
 
+def _is_story_mirror(labels: Iterable[str]) -> bool:
+    """True when ``labels`` carries the exact ``sdlc issues init`` story marker.
+
+    Exact match against :data:`STORY_LABEL` (not substring) so a real issue
+    incidentally labeled e.g. ``storytelling`` never false-positives.
+    """
+    return STORY_LABEL in _labels_lower(labels)
+
+
 def _is_enhancement(labels: Iterable[str]) -> bool:
     lset = _labels_lower(labels)
     return any("enhancement" in label or "feature" in label for label in lset)
@@ -1932,9 +1942,21 @@ def select_batch_issues(
     rest, each ranked by priority then issue number). ``next`` restricts to open
     bugs. A positive ``limit`` caps the ordered result — the skill's ``next``
     default of one highest-priority bug is just ``next`` with ``limit=1``.
+
+    Story-mirror issues (``sdlc issues init`` backfill, carrying the exact
+    :data:`STORY_LABEL` marker) are never candidates for either target —
+    issue #558. They are planning artifacts for ``sdlc build``, not defects.
     """
     runner = runner or _default_runner
     candidates = _list_open_issues(runner)
+    story_count = sum(1 for c in candidates if _is_story_mirror(c.labels))
+    if story_count:
+        plural = "s" if story_count != 1 else ""
+        print(
+            f"skipped {story_count} story issue{plural} — use `sdlc build` for stories",
+            file=sys.stderr,
+        )
+    candidates = [c for c in candidates if not _is_story_mirror(c.labels)]
     if target == "next":
         candidates = [c for c in candidates if _is_bug(c.labels)]
     candidates.sort(key=_candidate_sort_key)
