@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.43.2] - 2026-08-04
+
+### Fixed
+
+- fix(controller): re-probe live api before honouring parked reset (#564) (#566)
+
+
 ## [v2.43.1] - 2026-08-02
 
 ### Fixed
