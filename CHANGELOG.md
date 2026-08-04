@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.43.4] - 2026-08-04
+
+### Fixed
+
+- fix(controller): evaluate routed harnesses in the parallel-mode gate (#569)
+
+
 ## [v2.43.3] - 2026-08-04
 
 ### Fixed
