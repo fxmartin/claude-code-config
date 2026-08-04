@@ -4324,10 +4324,32 @@ def default_preflight(root: Path | None = None, timeout: int = 600) -> bool:
     return completed.returncode == 0
 
 
+def _routed_roles_by_harness(opts: "BuildOptions") -> dict[str, list[str]]:
+    """Group ``opts.harness_map``'s roles by their routed, non-default harness.
+
+    Issue #563: the default-slot preflight/degradation gate only ever saw the
+    built-in ``claude`` harness, even when a role was routed elsewhere (e.g.
+    ``--harness build=codex``), so a codex-routed stage's missing ``parallel`` /
+    ``worktree_isolation`` capabilities never surfaced. This resolves each
+    distinct routed harness name once — deduping roles that share a harness —
+    so the caller can preflight/evaluate every harness that will actually
+    dispatch work, not just the default slot.
+    """
+    from sdlc.role_routing import PIPELINE_ROLES
+
+    roles_by_harness: dict[str, list[str]] = {}
+    for role in PIPELINE_ROLES:
+        name = opts.harness_map.get(role, DEFAULT_HARNESS)
+        if name == DEFAULT_HARNESS:
+            continue
+        roles_by_harness.setdefault(name, []).append(role)
+    return roles_by_harness
+
+
 def _log_harness_preflight(
     ledger: "Ledger", run_id: str, requested_mode: str, opts: "BuildOptions"
 ) -> None:
-    """Resolve and log the dispatch harness's capabilities (Story 20.5-001).
+    """Resolve and log every dispatch harness's capabilities (Story 20.5-001).
 
     Resolves the default-slot harness, decides the safe run mode for
     ``requested_mode``, and records each capability/probe/degradation line to
@@ -4344,13 +4366,17 @@ def _log_harness_preflight(
     line first showing the *effective* per-role map, and the default-slot lines
     below it are labeled ``(default slot)`` so they are never confused with the
     harness actually dispatching a stage's work.
+
+    Issue #563 (gate gap): #426 only fixed the labeling — the capability check
+    itself still only ever preflighted the default slot, so a role routed to a
+    harness lacking ``parallel``/``worktree_isolation`` passed silently. This now
+    also preflights every distinct harness named in ``opts.harness_map``,
+    labeled by the role(s) routed to it (e.g. ``role=build``), so a routed
+    harness's own capability gap is logged just as loudly as the default slot's.
     """
     try:
         if opts.harness_map:
-            # Local import mirrors the existing pattern elsewhere in this module
-            # (e.g. the `--harness` CLI parsing above) — avoids a module-load
-            # import cycle between build.py and role_routing.py.
-            from sdlc.role_routing import PIPELINE_ROLES
+            from sdlc.role_routing import PIPELINE_ROLES, default_registry_path
 
             routing = " ".join(
                 f"{role}={opts.harness_map.get(role, DEFAULT_HARNESS)}"
@@ -4359,6 +4385,18 @@ def _log_harness_preflight(
             line = f"harness routing: {routing}"
             print(line, file=sys.stderr)
             ledger.event_log(run_id, "", "info", "harness", line)
+
+            registry_path = default_registry_path()
+            for name, roles in _routed_roles_by_harness(opts).items():
+                routed_harness = resolve_harness(name, config_path=registry_path)
+                routed_preflight = preflight_harness(
+                    routed_harness, requested_mode=requested_mode
+                )
+                routed_level = "warn" if routed_preflight.degraded else "info"
+                label = f"role={','.join(roles)}"
+                for routed_line in routed_preflight.log_lines(label=label):
+                    print(routed_line, file=sys.stderr)
+                    ledger.event_log(run_id, "", routed_level, "harness", routed_line)
 
         harness = resolve_harness()
         preflight = preflight_harness(harness, requested_mode=requested_mode)
@@ -4370,8 +4408,10 @@ def _log_harness_preflight(
         pass
 
 
-def _record_degradations(ledger: "Ledger", run_id: str, requested_mode: str) -> None:
-    """Record the dispatch harness's degradation plan in the ledger (Story 20.5-002).
+def _record_degradations(
+    ledger: "Ledger", run_id: str, requested_mode: str, opts: "BuildOptions"
+) -> None:
+    """Record every dispatch harness's degradation plan in the ledger (Story 20.5-002).
 
     Resolves the default-slot harness, evaluates the centralized degradation
     matrix for ``requested_mode``, and writes one ``warn`` event per applied
@@ -4380,6 +4420,12 @@ def _record_degradations(ledger: "Ledger", run_id: str, requested_mode: str) -> 
     summary (AC3). For the built-in Claude harness the plan is empty, so this is
     purely additive and writes nothing. Best-effort: a logging failure must never
     fail an otherwise-good build.
+
+    Issue #563: when ``opts.harness_map`` routes a role to a non-default
+    harness, that harness's own degradation plan is evaluated too (the same
+    role-grouped, deduped resolution as :func:`_log_harness_preflight`), so a
+    routed harness that cannot honour ``requested_mode`` is recorded even
+    though the default slot passes.
     """
     try:
         harness = resolve_harness()
@@ -4390,6 +4436,24 @@ def _record_degradations(ledger: "Ledger", run_id: str, requested_mode: str) -> 
         for record in plan.to_records():
             print(record["message"], file=sys.stderr)
             ledger.event_log(run_id, "", "warn", "degradation", record["message"])
+
+        if opts.harness_map:
+            from sdlc.role_routing import default_registry_path
+
+            registry_path = default_registry_path()
+            for name, roles in _routed_roles_by_harness(opts).items():
+                routed_harness = resolve_harness(name, config_path=registry_path)
+                routed_capabilities = resolve_capabilities(routed_harness)
+                routed_plan = evaluate_degradations(
+                    routed_harness.name,
+                    routed_capabilities,
+                    requested_mode=requested_mode,
+                )
+                role_label = ",".join(roles)
+                for record in routed_plan.to_records():
+                    message = f"{record['message']} (role={role_label})"
+                    print(message, file=sys.stderr)
+                    ledger.event_log(run_id, "", "warn", "degradation", message)
     except Exception:
         pass
 
@@ -5997,7 +6061,7 @@ def run_build(
     # (parallel→serial, usage "unavailable", rate-limit backoff skipped) so a
     # degradation is auditable in the run summary, never silent. Empty (no-op) for
     # the built-in Claude harness, which has every capability.
-    _record_degradations(ledger, run_id, mode)
+    _record_degradations(ledger, run_id, mode, opts)
     try:  # best-effort lifecycle notification; never fail a build
         notify("run_started", run=run_id, scope=opts.scope, mode=mode)
     except Exception:

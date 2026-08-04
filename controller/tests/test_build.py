@@ -22,6 +22,8 @@ from sdlc.build import (
     Ledger,
     _dispatch_overengineering_advisory,
     _filter_git_landed,
+    _log_harness_preflight,
+    _record_degradations,
     _stamp_run_actor,
     default_preflight,
     detect_test_command,
@@ -469,6 +471,171 @@ def test_run_build_degradation_recording_is_best_effort(tmp_path, monkeypatch) -
         "SELECT message FROM events WHERE source='degradation'"
     ).fetchall()
     assert rows == [], "a recorder failure must write nothing, not crash the build"
+
+
+# ---------------------------------------------------------------------------
+# Issue #563: the preflight/degradation gate must consult every harness a
+# routed role dispatches to, not just the default slot (#426 fixed only the
+# labeling half of this; the capability-evaluation half was left as a gap).
+# ---------------------------------------------------------------------------
+
+def test_record_degradations_evaluates_routed_harness_not_just_default_slot(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #563 case (a): claude-default + a role routed to codex (which lacks
+    ``parallel``/``worktree_isolation`` in the bundled registry) must degrade
+    parallel->serial for that role and name codex — not silently pass because
+    the always-capable default slot resolved instead."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {"build": "codex"}
+
+    _record_degradations(ledger, run_id, "parallel", opts)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='degradation' ORDER BY id"
+    ).fetchall()
+    joined = "\n".join(r[0] for r in rows)
+    assert "harness 'codex' cannot run mode=parallel" in joined
+    assert "role=build" in joined
+    # The default slot (claude) is fully capable and must not also degrade.
+    assert "harness 'claude' cannot run mode=parallel" not in joined
+
+
+def test_record_degradations_fully_claude_routing_stays_parallel(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #563 case (b): every role explicitly routed to the built-in
+    ``claude`` harness must behave identically to no routing at all — claude is
+    fully capable, so no degradation event fires."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {
+        "build": "claude",
+        "coverage": "claude",
+        "review": "claude",
+        "merge": "claude",
+    }
+
+    _record_degradations(ledger, run_id, "parallel", opts)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='degradation'"
+    ).fetchall()
+    assert rows == []
+
+
+def test_record_degradations_serial_request_never_degrades_mode_regardless_of_routing(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #563 case (c): a serial-requested run never emits a
+    parallel_to_serial degradation for a routed harness either — only the
+    always-present usage/rate-limit telemetry gaps are recorded, since serial
+    was already the requested mode."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {"build": "codex"}
+
+    _record_degradations(ledger, run_id, "serial", opts)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='degradation' ORDER BY id"
+    ).fetchall()
+    joined = "\n".join(r[0] for r in rows)
+    assert "cannot run mode=parallel" not in joined
+    assert "unavailable" in joined
+    assert "role=build" in joined
+
+
+def test_record_degradations_dedupes_two_roles_routed_to_same_harness(
+    tmp_path, monkeypatch
+) -> None:
+    """Two roles routed to the same non-default harness must be evaluated once,
+    with both role names in the single labeled degradation message — not
+    evaluated (and logged) twice."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {"build": "codex", "coverage": "codex"}
+
+    _record_degradations(ledger, run_id, "parallel", opts)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='degradation' AND "
+        "message LIKE '%cannot run mode=parallel%'"
+    ).fetchall()
+    assert len(rows) == 1, "one routed harness must produce one mode-degradation line"
+    assert "role=build,coverage" in rows[0][0]
+
+
+def test_record_degradations_unknown_routed_harness_is_best_effort(
+    tmp_path, monkeypatch
+) -> None:
+    """A role routed to an unregistered harness name must not crash the build —
+    the recorder is best-effort, so an unresolvable routed harness is swallowed
+    just like an unresolvable default-slot harness already is."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {"build": "no-such-harness"}
+
+    _record_degradations(ledger, run_id, "parallel", opts)  # must not raise
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='degradation'"
+    ).fetchall()
+    assert rows == [], "an unresolvable routed harness records nothing, not a crash"
+
+
+def test_log_harness_preflight_logs_routed_harness_capabilities(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #563: the preflight log must also show the routed harness's own
+    capability/mode line labeled by role — not only the always-passing default
+    slot's — so a codex-routed build role's missing worktree_isolation is
+    visible in the same event stream."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {"build": "codex"}
+
+    _log_harness_preflight(ledger, run_id, "parallel", opts)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message, level FROM events WHERE source='harness' ORDER BY id"
+    ).fetchall()
+    joined = "\n".join(r[0] for r in rows)
+    assert "harness 'codex' (role=build)" in joined
+    assert "worktree_isolation=no" in joined
+    assert "mode=serial (requested parallel)" in joined
+    assert any(level == "warn" for _msg, level in rows)
 
 
 def test_run_build_writes_ledger_after_every_stage(tmp_path) -> None:
