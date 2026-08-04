@@ -3999,6 +3999,17 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
     events = ledger.recent_events(rid, limit=10)
     config = ledger.run_config(rid)
     breakdown = ledger.stage_breakdown(rid)
+    # Issue #565: a fix run's ledger stage rows include ``investigation`` ahead of
+    # the standard build pipeline, but that name is not in ``_STAGES`` so it was
+    # silently dropped from every story's rendered pipeline. Union it in — in its
+    # canonical (pre-build) position, and only when actually recorded — so a build
+    # run's snapshot is unaffected and any future non-``_STAGES`` stage surfaces
+    # the same way without another hardcoded branch.
+    recorded_stage_names = {a["name"] for attempts in breakdown.values() for a in attempts}
+    stage_names = tuple(
+        name for name in _CANONICAL_STAGE_ORDER
+        if name in _STAGES or name in recorded_stage_names
+    )
     activity = ledger.latest_progress(rid)
     # Story 27.3-004: rate-limit stall time is its own dimension, kept apart
     # from stage durations so quota backoff never masquerades as agent runtime.
@@ -4024,7 +4035,7 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         # A story skipped wholesale (already Done in a prior run) writes no stage
         # rows, so its cells would otherwise render PENDING; surface them SKIPPED.
         story_skipped = s.get("status") == "SKIPPED"
-        for name in _STAGES:
+        for name in stage_names:
             row = latest.get(name)
             if row is not None:
                 pipeline.append(row)
@@ -4101,6 +4112,10 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "concurrency": concurrency,
         "usage": run_usage,
         "stall_seconds": stalls["total_s"],
+        # Issue #565: the ordered stage columns this run's snapshot actually
+        # populated (see ``stage_names`` above), so the dashboard renders its
+        # header/colspan from the data instead of a hardcoded 4-column string.
+        "stage_columns": list(stage_names),
     }
     payload["counts"] = {
         "total": run_row.get("total_stories") or len(stories),
@@ -5138,6 +5153,11 @@ def render_commit_lint_reask_prompt(
 
 # Stage pipeline. Coverage is conditionally skipped via --skip-coverage.
 _STAGES = ("build", "coverage", "review", "merge")
+# Issue #565: every stage name a snapshot may need to surface, in pipeline
+# order. ``investigation`` (the `sdlc fix` pipeline's pre-build stage, see
+# fix_issue.py) is the only entry outside ``_STAGES`` today; status_snapshot
+# includes it only for runs that actually recorded it.
+_CANONICAL_STAGE_ORDER = ("investigation",) + _STAGES
 
 
 def _ensure_repo_ignores(db_path: Path) -> None:

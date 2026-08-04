@@ -913,6 +913,11 @@ def _run_investigation(
     the single-issue run aborts cleanly), or ``FAILED`` (dispatch/contract error).
     """
     model = fix_model("investigation", opts)
+    # Issue #565: flip the story out of TODO the moment investigation opens, not
+    # when the post-investigation build pipeline starts (that left the dashboard
+    # showing an all-PENDING, still-TODO story for the entire investigation
+    # stage, which is silent and can run for several minutes).
+    ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
     ledger.stage_start(
         run_id, story.id, "investigation", 1,
         harness=fix_stage_harness("investigation", opts), model=model,
@@ -1166,6 +1171,10 @@ def _run_stage_loop(
     # so they are never re-dispatched and their side effects (the branch, the PR)
     # are not duplicated. Empty on a fresh run — the loop below is unchanged.
     stages = [s for s in stages if s not in done_stages]
+    # Issue #565: a fresh run already flipped IN_PROGRESS when investigation
+    # opened (`_run_investigation`); this re-stamp is for `resume_fix`, which
+    # re-enters here directly from a recovered plan without re-investigating
+    # (e.g. out of RATE_LIMITED) — it stays needed there.
     ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
     escalate = _fix_escalates(inv, issue.labels)
     # The fix's change class (docs-only vs code), classified lazily from the built

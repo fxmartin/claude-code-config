@@ -399,6 +399,96 @@ def test_run_fix_happy_path_all_stages_done(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #565: the story must flip IN_PROGRESS when investigation opens, not
+# when the post-investigation build pipeline starts — otherwise the dashboard
+# shows a fix run's story stuck on TODO for the entire (silent, can run several
+# minutes) investigation stage.
+# ---------------------------------------------------------------------------
+
+
+def test_run_fix_story_in_progress_during_investigation(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher()
+    observed: dict[str, str] = {}
+
+    def spy(agent_type, prompt, **kwargs):
+        if agent_type == "investigation":
+            observed["status"] = _story_status(db, "issue-1")
+        return dispatch(agent_type, prompt, **kwargs)
+
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=spy,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert observed["status"] == "IN_PROGRESS"
+
+
+def test_run_fix_batch_story_in_progress_during_investigation(tmp_path) -> None:
+    """The same IN_PROGRESS-at-investigation-open contract holds for a batch
+    fix run, which shares `_run_investigation` with the single-issue path."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeBatchGh([_batch_issue(1)])
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]})
+    observed: dict[str, str] = {}
+
+    def spy(agent_type, prompt, **kwargs):
+        if agent_type == "investigation":
+            observed["status"] = _story_status(db, "issue-1")
+        return dispatch(agent_type, prompt, **kwargs)
+
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=1),
+        ledger=Ledger(db),
+        dispatcher=spy,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert observed["status"] == "IN_PROGRESS"
+
+
+def test_run_fix_investigation_blocked_story_was_in_progress_first(tmp_path) -> None:
+    """A BLOCKED investigation still passes through IN_PROGRESS on its way to the
+    terminal BLOCKED status — the early stamp must not get skipped or reordered."""
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+    observed: dict[str, str] = {}
+
+    def spy(agent_type, prompt, **kwargs):
+        if agent_type == "investigation":
+            observed["status"] = _story_status(db, "issue-1")
+        return RecordingDispatcher(
+            overrides={
+                "investigation": {
+                    "root_cause": "unclear", "complexity": "HIGH",
+                    "fix_approach": "needs design decision", "files_to_modify": [],
+                    "risk": "high — ambiguous requirements",
+                    "investigation_status": "BLOCKED",
+                }
+            }
+        )(agent_type, prompt, **kwargs)
+
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=spy,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "ABORTED"
+    assert observed["status"] == "IN_PROGRESS"
+    assert _story_status(db, "issue-1") == "BLOCKED"
+
+
+# ---------------------------------------------------------------------------
 # Issue #477: per-stage token/cost usage must be persisted for `sdlc fix` runs
 # (parity with `sdlc build`), so the dashboard renders tokens/cost, not "—".
 # ---------------------------------------------------------------------------

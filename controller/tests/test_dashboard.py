@@ -351,6 +351,30 @@ def test_api_status_has_stage_breakdown(tmp_path: Path) -> None:
     assert "bugfix_attempts" in story
 
 
+def test_api_status_fix_run_includes_investigation_stage_column(tmp_path: Path) -> None:
+    """Issue #565: a fix run's `/api/status` payload surfaces the investigation
+    stage (both `run.stage_columns` and the story's own pipeline) while it is
+    live, so the dashboard has what it needs to render the extra column."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("issue-565", "fix")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(run_id, "issue-565", "", "Fix it", "P1", 2, "backend", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "issue-565", "investigation", 1)
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/status")
+    payload = json.loads(body)
+    assert payload["run"]["stage_columns"] == [
+        "investigation", "build", "coverage", "review", "merge",
+    ]
+    story = payload["stories"][0]
+    assert story["status"] == "IN_PROGRESS"
+    by_name = {st["name"]: st["status"] for st in story["stages"]}
+    assert by_name["investigation"] == "IN_PROGRESS"
+    assert by_name["build"] == "PENDING"
+
+
 def test_api_status_carries_story_title(tmp_path: Path) -> None:
     """Story 11.2-012: the snapshot threads each story's ledger title to the client."""
     db = tmp_path / ".sdlc-state.db"
@@ -399,9 +423,11 @@ def test_page_renders_story_as_stacked_block() -> None:
     # The two new block rows.
     assert "story-title" in _PAGE             # full-width title row class
     assert "story-stages" in _PAGE            # step-columns row class
-    # The title row spans the full 8-column width.
-    assert "<td colspan='8'>" in _PAGE
-    # The header drops the story column and starts at status (8 columns).
+    # The title row spans the full column width — dynamic since Issue #565
+    # (stage columns vary per run mode), derived from the same `totalCols` the
+    # header uses.
+    assert "colspan='\"+totalCols+\"'" in _PAGE
+    # The header drops the story column and starts at status.
     assert "<th>story</th>" not in _PAGE
     assert "<tr><th>status</th>" in _PAGE
     # Block-separation CSS: a border-top on the title row sets one block apart.
@@ -414,10 +440,11 @@ def test_activity_row_spans_full_block_width() -> None:
     cell — it spans the full 8-column width as a single `.substage` cell."""
     from sdlc.dashboard import _PAGE
 
-    # The activity row is emitted with no leading <td></td> spacer and spans 8.
+    # The activity row is emitted with no leading <td></td> spacer and spans the
+    # full (dynamic, Issue #565) column width.
     assert "<tr class='substage'><td></td>" not in _PAGE   # leading spacer gone
     assert "<tr class='substage'>" in _PAGE                # row still emitted
-    assert "colspan='8' class='small'" in _PAGE            # full-width activity cell
+    assert "colspan='\"+totalCols+\"' class='small'" in _PAGE  # full-width activity cell
 
 
 def test_block_rows_have_no_inner_borders() -> None:
@@ -456,10 +483,17 @@ def test_log_endpoint_serves_within_root_and_confines(tmp_path: Path) -> None:
 
 
 def test_page_has_stage_columns() -> None:
+    """Issue #565: the header is built client-side from the server's
+    `run.stage_columns` (a fix run's investigation column, or the plain
+    build/QA/review/merge pipeline), not a hardcoded `<th>` string — assert the
+    label map and fallback default carry the same four build-run labels, and
+    that the header row is actually built from them."""
     from sdlc.dashboard import _PAGE
 
-    for header in ("build", "QA", "review", "merge"):
-        assert f"<th>{header}</th>" in _PAGE
+    assert "const STAGE_LABELS = {investigation: \"investigate\", build: \"build\"," in _PAGE
+    assert "coverage: \"QA\", review: \"review\", merge: \"merge\"};" in _PAGE
+    assert 'const DEFAULT_STAGE_COLUMNS = ["build", "coverage", "review", "merge"];' in _PAGE
+    assert "stageCols.map(s =>" in _PAGE
 
 
 # --- in-dashboard transcript viewer (Story 11.2-010) -----------------------
