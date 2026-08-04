@@ -563,6 +563,16 @@ def render_merge_prompt(issue: FixIssue, pr_number: int | None) -> str:
     return (
         f"Merge the PR for the fix of issue #{issue.number} "
         f"(PR #{pr_number}).\n"
+        # Run 6212933d (issue #565, merge attempt 1): the merge agent `cd`'d into
+        # this repo's git superproject before every gh/git call, ran every command
+        # against the wrong GitHub repository, concluded the PR did not exist, and
+        # reported merge_status="SKIPPED". Your current working directory is
+        # already the correct repository and branch for this PR — do not `cd` out
+        # of it (e.g. into a parent or sibling directory) before running gh/git.
+        "Run every command from your current working directory — it is already "
+        "the repository and branch this PR belongs to. Do not `cd` into a parent "
+        "or sibling directory (e.g. a git superproject) before running gh/git "
+        "commands: doing so queries the wrong GitHub repository.\n"
         + _untrusted_block(issue)
         + "1. Rebase the branch onto the latest origin/main first to absorb "
         "baseline drift (`gh pr update-branch --rebase`, or a manual rebase). If "
@@ -913,6 +923,11 @@ def _run_investigation(
     the single-issue run aborts cleanly), or ``FAILED`` (dispatch/contract error).
     """
     model = fix_model("investigation", opts)
+    # Issue #565: flip the story out of TODO the moment investigation opens, not
+    # when the post-investigation build pipeline starts (that left the dashboard
+    # showing an all-PENDING, still-TODO story for the entire investigation
+    # stage, which is silent and can run for several minutes).
+    ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
     ledger.stage_start(
         run_id, story.id, "investigation", 1,
         harness=fix_stage_harness("investigation", opts), model=model,
@@ -1166,6 +1181,10 @@ def _run_stage_loop(
     # so they are never re-dispatched and their side effects (the branch, the PR)
     # are not duplicated. Empty on a fresh run — the loop below is unchanged.
     stages = [s for s in stages if s not in done_stages]
+    # Issue #565: a fresh run already flipped IN_PROGRESS when investigation
+    # opened (`_run_investigation`); this re-stamp is for `resume_fix`, which
+    # re-enters here directly from a recovered plan without re-investigating
+    # (e.g. out of RATE_LIMITED) — it stays needed there.
     ledger.set_story_status(run_id, story.id, "IN_PROGRESS")
     escalate = _fix_escalates(inv, issue.labels)
     # The fix's change class (docs-only vs code), classified lazily from the built

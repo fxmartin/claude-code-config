@@ -570,6 +570,14 @@ function esc(s){return String(s==null?"":s).replace(/[&<>'"]/g,c=>({"&":"&amp;",
 // The CSS class stays the raw status, so colours/styling are unchanged.
 const LABELS = {"IN_PROGRESS": "STARTED"};
 function statusLabel(s){return LABELS[s] || s;}
+// Issue #565: header text for each stage column the server reports in
+// `run.stage_columns` (build.py's status_snapshot) — a fix run's investigation
+// stage renders as "investigate" ahead of the standard build/QA/review/merge
+// pipeline; a build run's columns are unaffected. Falls back to the stage name
+// for anything not in the map (forward-compatible with a future stage).
+const STAGE_LABELS = {investigation: "investigate", build: "build", coverage: "QA", review: "review", merge: "merge"};
+const DEFAULT_STAGE_COLUMNS = ["build", "coverage", "review", "merge"];
+function stageLabel(s){return STAGE_LABELS[s] || s;}
 function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(statusLabel(s))+"</span>";}
 function humanTokens(n){
   if(n==null) return "—";
@@ -664,19 +672,20 @@ function stageCell(st){
 // A small glyph hints the kind; absent activity (older runs / captured-mode
 // fallback) returns "" so the detail view degrades to the stage-level pipeline.
 const KIND_GLYPH = {agent_started:"▸", tool_use:"⚙", file_changed:"✎", test_run:"✓", message:"💬"};
-function activityRow(s){
+function activityRow(s, totalCols){
   const a = s.activity;
   if(!a) return "";  // no streamed sub-stage data → stay stage-level
   const glyph = KIND_GLYPH[a.kind] || "▸";
   const stage = a.stage ? "<code>"+esc(a.stage)+"</code> " : "";
-  // Story 11.2-014: span the full 8-column width as the third row of the story's
-  // stacked block (the leading story column is gone). The colspan is hard-coupled
-  // to the header column count — keep it in sync with renderMain's <th> row.
+  // Story 11.2-014: span the full column width as the third row of the story's
+  // stacked block (the leading story column is gone). `totalCols` is derived
+  // from the same stage-column list renderMain uses for the header row (Issue
+  // #565), so it always matches regardless of how many stage columns render.
   // Story 11.2-011: the content rides in a `.act` element clamped to one
   // ellipsized line (full message on hover) so a refresh/SSE tick never grows
   // this row from 1 to 2–3 lines and reflows the table below it.
   return "<tr class='substage'>"
-    + "<td colspan='8' class='small'><div class='act' title='"+esc(a.message)+"'><span class='kind'>"+glyph+"</span>"
+    + "<td colspan='"+totalCols+"' class='small'><div class='act' title='"+esc(a.message)+"'><span class='kind'>"+glyph+"</span>"
     + stage + esc(a.message)
     + (a.ts ? " <span class='muted' title='"+esc(a.ts)+"'>"+esc(fmtLocal(a.ts))+"</span>" : "") + "</div></td></tr>";
 }
@@ -856,6 +865,13 @@ function renderMain(d){
     .filter(k => (c[k.toLowerCase()]||0) > 0 || k==="DONE")
     .map(k => "<span class='chip'><b class='"+k+"'>"+(c[k.toLowerCase()]||0)+"</b> "+statusLabel(k).toLowerCase().replace("_"," ")+"</span>")
     .join("");
+  // Issue #565: the stage columns this run's snapshot populated (build.py's
+  // status_snapshot) — a fix run's investigation stage adds a column ahead of
+  // build/QA/review/merge; a build run's columns are the unchanged default.
+  // `totalCols` is these stage columns plus status/PR/tokens/duration, and
+  // drives every colspan below so the header and spanning rows never drift.
+  const stageCols = run.stage_columns || DEFAULT_STAGE_COLUMNS;
+  const totalCols = stageCols.length + 4;
   const prBase = d.pr_base;
   const rows = (d.stories||[]).map(s => {
     let pr = "-";
@@ -876,14 +892,15 @@ function renderMain(d){
     // full (no ellipsis: the title is static per render, so wrapping never
     // reflows on an SSE tick), (2) a step-columns row aligned under the headers,
     // and (3) the existing live activity line spanning the full width below.
-    // The `story` header column is dropped → 8 columns; the title and activity
-    // rows span them with colspan='8' (hard-coupled to the column count — update
-    // both this and the header together). Supersedes the 11.2-012 truncation.
+    // The `story` header column is dropped; the title and activity rows span
+    // the rest via `totalCols` (Issue #565 — derived from `stageCols` above, so
+    // it always matches the header regardless of how many stage columns render).
+    // Supersedes the 11.2-012 truncation.
     // Story 11.2-012: a null/empty title degrades to just the ID.
     const stitle = s.title
       ? " <span class='sep muted'>\\u00b7</span> <span class='stitle' title='"+esc(s.title)+"'>"+esc(s.title)+"</span>"
       : "";
-    return "<tr class='story-title'><td colspan='8'><code>"+esc(s.story_id)+"</code>"+stitle
+    return "<tr class='story-title'><td colspan='"+totalCols+"'><code>"+esc(s.story_id)+"</code>"+stitle
     + "<a class='view-session' data-story='"+esc(s.story_id)+"' title='read this story\\u2019s agent transcripts here'>view session</a></td></tr>"
     + "<tr class='story-stages'><td>"+badge(s.status)+bug+"</td>"
     + stageCells
@@ -892,11 +909,15 @@ function renderMain(d){
     + "<td class='muted small'>"+humanDuration(s.duration_seconds)
     + (s.stall_seconds ? " <span title='time waited on rate limits — not agent runtime'>(stalled "+humanDuration(s.stall_seconds)+")</span>" : "")
     + "</td></tr>"
-    + activityRow(s);
+    + activityRow(s, totalCols);
   }).join("");
+  // Issue #565: header built from `stageCols` instead of a hardcoded 4-column
+  // string, so a fix run's investigation column (and any future stage) renders
+  // without another client-side special case.
+  const stageHeader = stageCols.map(s => "<th>"+esc(stageLabel(s))+"</th>").join("");
   document.getElementById("stories").innerHTML = rows
-    ? "<table><tr><th>status</th><th>build</th><th>QA</th>"
-      + "<th>review</th><th>merge</th><th>PR</th><th>tokens</th><th>duration</th></tr>"+rows+"</table>"
+    ? "<table><tr><th>status</th>"+stageHeader
+      + "<th>PR</th><th>tokens</th><th>duration</th></tr>"+rows+"</table>"
     : "<p class='muted'>no stories yet…</p>";
   renderDag(d);
   document.getElementById("events").innerHTML = (d.events||[]).slice().reverse().map(e =>

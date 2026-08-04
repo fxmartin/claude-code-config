@@ -2562,6 +2562,71 @@ def test_status_snapshot_skipped_story_cells_render_skipped(tmp_path) -> None:
     assert built_stages["merge"] == "PENDING"
 
 
+def test_status_snapshot_build_run_stage_columns_unchanged(tmp_path) -> None:
+    """Issue #565 regression: a plain build run's stage columns are the
+    unchanged 4-stage pipeline — no investigation column leaks in."""
+    from sdlc.build import status_snapshot
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "s1", "build", 1)
+    ledger.stage_finish(run_id, "s1", "build", 1, "DONE")
+
+    snap = status_snapshot(ledger, run_id)
+    assert snap["run"]["stage_columns"] == ["build", "coverage", "review", "merge"]
+    stages = {st["name"]: st["status"] for st in snap["stories"][0]["stages"]}
+    assert stages == {
+        "build": "DONE", "coverage": "PENDING", "review": "PENDING", "merge": "PENDING",
+    }
+
+
+def test_status_snapshot_fix_run_includes_live_investigation_stage(tmp_path) -> None:
+    """Issue #565: a fix run's snapshot surfaces the investigation stage — both
+    on the run's stage_columns and each story's pipeline — while it is still
+    in flight, so the dashboard no longer sits all-PENDING/TODO through it."""
+    from sdlc.build import status_snapshot
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-565", "fix")
+    ledger.story_upsert(run_id, "issue-565", "", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "issue-565", "investigation", 1)  # still open, no finish
+
+    snap = status_snapshot(ledger, run_id)
+    assert snap["run"]["stage_columns"] == [
+        "investigation", "build", "coverage", "review", "merge",
+    ]
+    stages = {st["name"]: st["status"] for st in snap["stories"][0]["stages"]}
+    assert stages["investigation"] == "IN_PROGRESS"
+    assert stages["build"] == "PENDING"
+
+
+def test_status_snapshot_fix_run_skipped_story_includes_investigation_skipped(
+    tmp_path,
+) -> None:
+    """A wholesale-skipped story in a fix-shaped run renders SKIPPED across every
+    column the run's snapshot surfaces, including the extra investigation one."""
+    from sdlc.build import status_snapshot
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("issues-all", "serial")
+    ledger.story_upsert(run_id, "issue-1", "", "S1", "P1", 2, "py", "", None, "SKIPPED")
+    ledger.story_upsert(run_id, "issue-2", "", "S2", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "issue-2", "investigation", 1)
+    ledger.stage_finish(run_id, "issue-2", "investigation", 1, "DONE")
+
+    snap = status_snapshot(ledger, run_id)
+    by_id = {s["story_id"]: s for s in snap["stories"]}
+    skipped_stages = {st["name"]: st["status"] for st in by_id["issue-1"]["stages"]}
+    assert skipped_stages == {
+        "investigation": "SKIPPED", "build": "SKIPPED",
+        "coverage": "SKIPPED", "review": "SKIPPED", "merge": "SKIPPED",
+    }
+
+
 def test_status_snapshot_exposes_run_and_story_durations(tmp_path) -> None:
     """Durations come from the persisted stage/run timestamps (Story 11.2-005)."""
     import sqlite3
