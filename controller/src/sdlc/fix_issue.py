@@ -563,6 +563,16 @@ def render_merge_prompt(issue: FixIssue, pr_number: int | None) -> str:
     return (
         f"Merge the PR for the fix of issue #{issue.number} "
         f"(PR #{pr_number}).\n"
+        # Run 6212933d (issue #565, merge attempt 1): the merge agent `cd`'d into
+        # this repo's git superproject before every gh/git call, ran every command
+        # against the wrong GitHub repository, concluded the PR did not exist, and
+        # reported merge_status="SKIPPED". Your current working directory is
+        # already the correct repository and branch for this PR — do not `cd` out
+        # of it (e.g. into a parent or sibling directory) before running gh/git.
+        "Run every command from your current working directory — it is already "
+        "the repository and branch this PR belongs to. Do not `cd` into a parent "
+        "or sibling directory (e.g. a git superproject) before running gh/git "
+        "commands: doing so queries the wrong GitHub repository.\n"
         + _untrusted_block(issue)
         + "1. Rebase the branch onto the latest origin/main first to absorb "
         "baseline drift (`gh pr update-branch --rebase`, or a manual rebase). If "
