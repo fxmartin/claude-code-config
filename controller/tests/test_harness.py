@@ -71,6 +71,21 @@ def test_codex_probe_loaded_from_yaml() -> None:
     assert registry[DEFAULT_HARNESS].probe is None
 
 
+def test_rate_limit_probe_loaded_from_yaml() -> None:
+    """Issue #564: the live-API re-probe command round-trips from the registry."""
+    registry = load_harnesses_config(CONFIG_PATH)
+    assert registry[DEFAULT_HARNESS].rate_limit_probe == "claude -p ok --model haiku"
+    # The non-Claude adapters declare none — they are simply not re-probed.
+    assert registry["codex"].rate_limit_probe is None
+    assert registry["qwen"].rate_limit_probe is None
+
+
+def test_load_omitted_rate_limit_probe_is_none(tmp_path: Path) -> None:
+    cfg = tmp_path / "harnesses.yaml"
+    cfg.write_text("harnesses:\n  foo:\n    command: foo run\n    parser: plain\n", encoding="utf-8")
+    assert load_harnesses_config(cfg)["foo"].rate_limit_probe is None
+
+
 def test_load_omitted_probe_is_none(tmp_path: Path) -> None:
     cfg = tmp_path / "harnesses.yaml"
     cfg.write_text("harnesses:\n  foo:\n    command: foo run\n    parser: plain\n", encoding="utf-8")

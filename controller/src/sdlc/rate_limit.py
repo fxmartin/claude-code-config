@@ -9,6 +9,7 @@ from dataclasses import dataclass
 __all__ = [
     "RateLimitSignal",
     "detect_rate_limit",
+    "is_connection_failure",
     "seconds_until_reset",
     "within_wait_cap",
     "WindowQuota",
@@ -45,6 +46,36 @@ _RETRY_AFTER = re.compile(r"retry[\s_-]?after['\"]?\s*[:=]\s*['\"]?(\d+)", re.I)
 # wait. The optional ``s`` matches both ``reset_at`` and ``resetsAt``.
 _RESET_AT = re.compile(r"(?:ratelimit[\w-]*reset|reset(?:s)?[\s_-]?at)['\"]?\s*[:=]\s*['\"]?(\d+)", re.I)
 
+# Markers of a *transport* failure — DNS resolution, connect timeout, refused /
+# reset connection, unreachable network. Issue #564: a wifi drop mid-dispatch
+# surfaces as a non-zero ``claude -p`` exit whose stderr can still carry
+# limit-shaped words (the CLI prints its own "limit"/API wording around the
+# connection error), so the controller classified a dead network as a Max-plan
+# rate limit, persisted the *weekly* window reset as the run's reset epoch, and
+# froze the run for days. A request that never reached the API is evidence of
+# nothing about the quota, so these are checked FIRST and win: no rate-limit
+# signal is derived from text carrying one of them. A genuine limit still
+# detects on its own — either the text names it without any transport marker, or
+# the response envelope carries the structured 429 fields the parser checks when
+# :func:`detect_rate_limit` returns ``None`` (issue #109's envelope-shape lesson,
+# applied in the opposite direction).
+_CONNECTION_FAILURE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:econnrefused|econnreset|econnaborted|enotfound|etimedout|eai_again"
+        r"|enetunreach|enetdown|ehostunreach|epipe)\b",
+        re.I,
+    ),
+    re.compile(r"connection (?:refused|reset|closed|aborted|error|failure|timed out)", re.I),
+    re.compile(r"(?:could not|couldn't|cannot|can't|unable to|failed to) (?:resolve|connect|reach)", re.I),
+    re.compile(r"\bgetaddrinfo\b", re.I),
+    re.compile(r"temporary failure in name resolution|name or service not known", re.I),
+    re.compile(r"network is (?:unreachable|down)|no route to host", re.I),
+    re.compile(r"\bdns\b[^\n]{0,40}\b(?:fail(?:ed|ure)?|error|resolution)\b", re.I),
+    re.compile(r"\bnetwork (?:error|failure|unreachable|is offline)\b", re.I),
+    re.compile(r"fetch failed|socket hang up|connect(?:ion)? timeout|request timed out", re.I),
+    re.compile(r"\b(?:offline|no internet connection)\b", re.I),
+)
+
 
 @dataclass(frozen=True)
 class RateLimitSignal:
@@ -63,6 +94,18 @@ class RateLimitSignal:
     reset_at: float | None = None
 
 
+def is_connection_failure(text: str | None) -> bool:
+    """Whether ``text`` describes a transport failure rather than an API verdict.
+
+    Issue #564: DNS failures, connect timeouts, refused/reset connections and
+    unreachable networks all mean the request never reached the API — so they say
+    nothing about the plan's quota and must never seed a rate-limit park.
+    """
+    if not text:
+        return False
+    return any(p.search(text) for p in _CONNECTION_FAILURE_PATTERNS)
+
+
 def detect_rate_limit(text: str | None) -> RateLimitSignal | None:
     """Classify agent stderr/result ``text`` as a rate-limit signal, or ``None``.
 
@@ -70,8 +113,16 @@ def detect_rate_limit(text: str | None) -> RateLimitSignal | None:
     exhaustion (or carries an explicit ``retry-after``), else ``None`` so the
     caller treats the failure as today's generic dispatch error (graceful
     degradation when no rate-limit signal is present — AC7).
+
+    Issue #564: text carrying a transport-failure marker
+    (:func:`is_connection_failure`) is never a rate-limit signal, whatever else
+    it says — a request that died on the network carries no quota verdict, and
+    treating one as a limit durably parked runs against a reset epoch days away.
     """
     if not text:
+        return None
+
+    if is_connection_failure(text):
         return None
 
     retry_after: int | None = None

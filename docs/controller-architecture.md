@@ -2621,6 +2621,27 @@ window is treated as freshly reopened — the `WindowQuota` baseline is seeded w
 the run's *current* accrual (not 0), so the resumed run makes forward progress
 rather than re-parking forever on pre-park spend.
 
+**A stored epoch is re-probed, never trusted blind (issue #564).** Wall-clock
+arithmetic alone once froze runs for days: a network outage was classified as a
+rate limit, the park recorded the *weekly* reset boundary, and every later resume
+re-parked in about a second without touching the API. Two guards close that.
+First, classification — `rate_limit.is_connection_failure` recognises transport
+failures (DNS, connect timeout, refused/reset connection, unreachable network)
+and `detect_rate_limit` returns `None` for any text carrying one, so a request
+that never reached the API can no longer seed a park; a genuine limit still
+detects on its own wording or on the parser's structured 429 envelope fields
+(issue #109's lesson, applied in reverse). Second, the gate — before honouring a
+persisted epoch, `_honor_parked_reset` runs one cheap live request through the
+harness's `rate_limit_probe` (`capability.probe_rate_limit`; the built-in Claude
+slot declares `claude -p ok --model haiku`). Only an `AVAILABLE` verdict — zero
+exit *and* no rate-limit wording in the output — clears `rate_limit_reset_at` via
+a corrected config event and lets the run proceed. `UNAVAILABLE` (still closed)
+and `UNKNOWN` (no probe declared, or the probe itself errored) both keep the
+epoch: the gate protects a possibly still-closed quota window, so it never fails
+open. The probe is injectable (`run_resume(rate_limit_probe=…)`) and only a real
+run (`dispatcher is None`) probes by default, so the test suite never shells out
+to a CLI. `sdlc resume`'s re-park line states which of the three verdicts applied.
+
 **Configured window budget (proactive).** When no live rate-limit header is
 available, a configured per-window token budget gates dispatch instead:
 `--window-budget=<N|$>` (tokens, or a `$` convenience converted via the same

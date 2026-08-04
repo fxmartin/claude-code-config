@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from sdlc.harness import HarnessConfig
+from sdlc.rate_limit import detect_rate_limit
 
 # Canonical capability flags the controller gates run modes on. Resolution fills
 # any undeclared key as ``False`` — an undeclared capability is assumed ABSENT,
@@ -33,6 +34,13 @@ MODE_PARALLEL = "parallel"
 # How long a probe command may run before it is treated as unavailable. A probe
 # is a cheap "is the CLI installed/authenticated?" check, so this is short.
 _PROBE_TIMEOUT_SECONDS = 10
+
+# The rate-limit re-probe (issue #564) makes a real API round-trip through the
+# harness CLI, so it needs a far more generous ceiling than the local
+# availability probe above — a CLI cold start plus one small completion. Still
+# bounded: a probe that hangs must degrade to "unavailable" (keep the run
+# parked), never hold the resume open.
+_RATE_LIMIT_PROBE_TIMEOUT_SECONDS = 120
 
 # A probe runner takes the probe argv and returns ``(returncode, detail)``.
 # Injected by tests; the default shells out via :func:`_default_probe_runner`.
@@ -115,14 +123,16 @@ def resolve_capabilities(harness: HarnessConfig) -> dict[str, bool]:
     return resolved
 
 
-def _default_probe_runner(argv: list[str]) -> tuple[int, str]:
+def _default_probe_runner(
+    argv: list[str], *, timeout_s: int = _PROBE_TIMEOUT_SECONDS
+) -> tuple[int, str]:
     """Run a probe command, returning ``(returncode, detail)`` (best effort)."""
     try:
         proc = subprocess.run(
             argv,
             capture_output=True,
             text=True,
-            timeout=_PROBE_TIMEOUT_SECONDS,
+            timeout=timeout_s,
         )
     except FileNotFoundError:
         return 127, f"command not found: {argv[0] if argv else ''}"
@@ -150,6 +160,46 @@ def probe_harness(
     run = runner or _default_probe_runner
     returncode, detail = run(shlex.split(command))
     status = ProbeStatus.AVAILABLE if returncode == 0 else ProbeStatus.UNAVAILABLE
+    return ProbeResult(status=status, command=command, detail=detail)
+
+
+def probe_rate_limit(
+    harness: HarnessConfig,
+    *,
+    runner: ProbeRunner | None = None,
+) -> ProbeResult:
+    """Ask the harness's API whether its rate-limit window is open right now (#564).
+
+    Unlike :func:`probe_harness` — a local "is the CLI installed?" check — this
+    runs the harness's ``rate_limit_probe``, which costs one tiny real request.
+    That is the point: only a request that actually reaches the API can tell a
+    stale persisted reset epoch (the window reopened, or was never closed) from a
+    window that is genuinely still shut.
+
+    :attr:`ProbeStatus.AVAILABLE` requires a zero exit **and** output free of any
+    rate-limit signal — some CLIs report a throttle on a zero exit, and reading
+    that as "window open" would dispatch straight into a closed quota window. A
+    non-zero exit, a throttled response, a missing CLI or a timeout are all
+    :attr:`ProbeStatus.UNAVAILABLE`; a harness declaring no probe command is
+    :attr:`ProbeStatus.UNKNOWN` (not probed — the caller keeps today's behaviour).
+    """
+    command = harness.rate_limit_probe
+    if not command:
+        return ProbeResult(status=ProbeStatus.UNKNOWN)
+
+    def _run(argv: list[str]) -> tuple[int, str]:
+        return _default_probe_runner(
+            argv, timeout_s=_RATE_LIMIT_PROBE_TIMEOUT_SECONDS
+        )
+
+    run = runner or _run
+    returncode, detail = run(shlex.split(command))
+    limited = detect_rate_limit(detail) is not None
+    status = (
+        ProbeStatus.AVAILABLE
+        if returncode == 0 and not limited
+        else ProbeStatus.UNAVAILABLE
+    )
     return ProbeResult(status=status, command=command, detail=detail)
 
 

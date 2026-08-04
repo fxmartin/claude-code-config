@@ -38,6 +38,15 @@ DEFAULT_HARNESS = "claude"
 # Story 20.1-002; here it is metadata so the registry abstraction is complete.
 _CLAUDE_PARSER = "claude-stream-json"
 
+# Issue #564: the cheap live-API probe the resume gate runs before it honours a
+# persisted rate-limit reset epoch. It deliberately hits the API — a
+# `claude --version`-style check succeeds while offline *and* while genuinely
+# throttled, so it could not tell a stale epoch from a real one — and it is kept
+# as small as possible: one two-token prompt on the cheapest model. Declared
+# only for the Claude slots, whose CLI this is; a harness without one is simply
+# not probed (the gate then behaves exactly as it does today).
+CLAUDE_RATE_LIMIT_PROBE = "claude -p ok --model haiku"
+
 # Capability flags assumed for the built-in Claude harness (and an `SDLC_AGENT_CMD`
 # override, which is Claude under the hood for FX's environment). A registry-defined
 # harness declares its own flags in `harnesses.yaml`; these are the defaults for the
@@ -89,6 +98,12 @@ class HarnessConfig:
     # Consumed by the capability preflight (Story 20.5-001); ``None`` means the
     # harness is not probed (status "unknown").
     probe: str | None = None
+    # Optional command that confirms the harness's *API* is reachable and not
+    # throttled right now (issue #564). Distinct from ``probe``: that one is a
+    # local "is the CLI there?" check run at preflight, this one costs a real
+    # (tiny) request and is run only by the resume gate, to tell a stale
+    # persisted reset epoch from a window that is genuinely still closed.
+    rate_limit_probe: str | None = None
     # Optional per-stage model map (Story 20.7-004): stage name -> this harness's
     # own model id, with a ``default`` key for stages it does not list. It feeds
     # the ``{model}`` placeholder in ``command`` so a registry harness routes a
@@ -198,6 +213,11 @@ def load_harnesses_config(path: str | Path) -> dict[str, HarnessConfig]:
             enabled=bool(settings.get("enabled", True)),
             source="registry",
             probe=(str(settings["probe"]) if settings.get("probe") else None),
+            rate_limit_probe=(
+                str(settings["rate_limit_probe"])
+                if settings.get("rate_limit_probe")
+                else None
+            ),
             models=models,
         )
 
@@ -217,6 +237,11 @@ def _builtin_harness() -> HarnessConfig:
         parser=_CLAUDE_PARSER,
         capabilities=dict(_BUILTIN_CAPABILITIES),
         source="builtin",
+        # Issue #564: the default slot IS the Claude CLI, so it can be probed
+        # for a live window. The `env` slot below deliberately declares none —
+        # an `SDLC_AGENT_CMD` override may front a different CLI entirely, and
+        # probing `claude` for it would report on the wrong API.
+        rate_limit_probe=CLAUDE_RATE_LIMIT_PROBE,
     )
 
 

@@ -287,6 +287,36 @@ def test_claude_parser_nonzero_exit_rate_limit_text_raises_rate_limit() -> None:
         )
 
 
+def test_claude_parser_network_failure_is_a_plain_dispatch_error() -> None:
+    # Issue #564: a wifi drop mid-dispatch exits non-zero with a transport error
+    # whose text still carries limit-flavoured wording. Classifying that as a
+    # throttle parked the run against a reset epoch days out, so it must fall
+    # through to the ordinary dispatch error instead.
+    parser = get_parser(CLAUDE_PARSER_ID)
+    with pytest.raises(AgentDispatchError) as exc:
+        parser.parse(
+            _collected(
+                returncode=1,
+                stderr="API Error: Connection error. rate_limit_error? fetch failed",
+            )
+        )
+    assert not isinstance(exc.value, RateLimitError)
+
+
+def test_claude_parser_network_failure_envelope_is_a_plain_dispatch_error() -> None:
+    # Same for the zero-exit error-envelope path: a transport failure is not a
+    # quota verdict. A structured 429 field would still win (tested above).
+    parser = get_parser(CLAUDE_PARSER_ID)
+    env = {
+        "type": "result",
+        "result": "Connection error: getaddrinfo ENOTFOUND api.anthropic.com",
+        "is_error": True,
+    }
+    with pytest.raises(AgentDispatchError) as exc:
+        parser.parse(_collected(envelope=env, streaming=True))
+    assert not isinstance(exc.value, RateLimitError)
+
+
 def test_claude_parser_fills_reset_at_from_stream_when_text_lacks_epoch() -> None:
     # Issue #120 follow-up: the session-limit text matches but carries no parseable
     # epoch, so the signal's reset_at is None. With a stream-captured resetsAt, the

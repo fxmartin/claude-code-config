@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import pytest
+
 from sdlc.rate_limit import (
     RateLimitSignal,
     WindowQuota,
     detect_rate_limit,
+    is_connection_failure,
     seconds_until_reset,
     within_wait_cap,
 )
@@ -70,6 +73,60 @@ def test_detect_reset_at_camelcase_resets_at() -> None:
     sig = detect_rate_limit("rate_limit_info resetsAt:1782066000")
     assert sig is not None
     assert sig.reset_at == 1782066000.0
+
+
+# ---------------------------------------------------------------------------
+# Issue #564: a network outage is NOT a rate limit
+# ---------------------------------------------------------------------------
+
+_NETWORK_FAILURES = [
+    "Error: getaddrinfo ENOTFOUND api.anthropic.com",
+    "connect ECONNREFUSED 160.79.104.10:443",
+    "TypeError: fetch failed",
+    "curl: (6) Could not resolve host: api.anthropic.com",
+    "Temporary failure in name resolution",
+    "connect: Network is unreachable",
+    "Error: Connection error.",
+    "request timed out while contacting the API",
+    "you appear to be offline",
+]
+
+
+@pytest.mark.parametrize("text", _NETWORK_FAILURES)
+def test_is_connection_failure_recognises_transport_errors(text: str) -> None:
+    assert is_connection_failure(text) is True
+
+
+def test_is_connection_failure_false_for_limit_and_empty_text() -> None:
+    assert is_connection_failure("Claude AI usage limit reached") is False
+    assert is_connection_failure("") is False
+    assert is_connection_failure(None) is False
+
+
+@pytest.mark.parametrize("text", _NETWORK_FAILURES)
+def test_network_failure_is_not_a_rate_limit(text: str) -> None:
+    # Issue #564: a dead network says nothing about the plan's quota. Classifying
+    # one as a throttle parked the run against the *weekly* reset epoch, and every
+    # later resume honoured that epoch — a 30-second wifi drop froze a run for days.
+    assert detect_rate_limit(text) is None
+
+
+def test_network_failure_wins_over_limit_wording() -> None:
+    # The CLI wraps a connection error in its own API/limit-flavoured prose. The
+    # transport marker is the decisive one: the request never reached the API.
+    assert detect_rate_limit(
+        "API Error: Connection error. (rate_limit_error?) — fetch failed"
+    ) is None
+    assert detect_rate_limit(
+        "getaddrinfo ENOTFOUND api.anthropic.com; retry_after: 60"
+    ) is None
+
+
+def test_genuine_limit_still_detected_without_transport_marker() -> None:
+    # The #564 guard must not blunt #109: a real limit with no transport marker
+    # is still a rate-limit signal.
+    assert detect_rate_limit("Claude AI usage limit reached. Try again later.") is not None
+    assert detect_rate_limit("HTTP 429 Too Many Requests") is not None
 
 
 # ---------------------------------------------------------------------------

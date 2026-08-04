@@ -51,6 +51,11 @@
           "minLength": 1,
           "description": "Optional command run in preflight to confirm the harness CLI is installed/authenticated (Story 20.5-001). A zero exit means available; omit to skip probing (status 'unknown')."
         },
+        "rate_limit_probe": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional cheap live-API command the resume gate runs before honouring a persisted rate-limit reset epoch (issue #564). A zero exit whose output carries no rate-limit signal means the window is open, so a stale epoch is cleared; anything else keeps the run parked. Omit to skip the re-probe."
+        },
         "enabled": {
           "type": "boolean",
           "description": "Whether this harness may be dispatched to. Defaults to true."
