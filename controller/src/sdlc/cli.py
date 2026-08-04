@@ -685,9 +685,17 @@ def resume(
         )
     # Story 14.1-003: a resume that re-hit the window beyond the cap re-parks.
     if result.rate_limited:
+        # Issue #564: say whether the persisted reset epoch was re-checked against
+        # the live API, so a re-park nobody verified is never mistaken for one a
+        # probe confirmed (the symptom that hid a week-long freeze).
+        probed = {
+            "unavailable": " (live re-probe confirmed the window is still closed)",
+            "unknown": " (no live re-probe available — the stored reset epoch was "
+                       "honoured unchecked)",
+        }.get(result.rate_limit_probe_status or "", "")
         typer.echo(
-            "rate limit still in effect — run re-parked RATE_LIMITED; `sdlc resume` "
-            "again once the Max plan's window reopens."
+            f"rate limit still in effect{probed} — run re-parked RATE_LIMITED; "
+            "`sdlc resume` again once the Max plan's window reopens."
         )
     # Story 14.1-002: an un-raised resume re-trips the cost gate (still IN_PROGRESS).
     if result.cost_gated:

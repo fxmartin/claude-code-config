@@ -41,6 +41,13 @@ harnesses:
     command: "claude -p --output-format stream-json --verbose --dangerously-skip-permissions"
     parser: claude-stream-json
     enabled: true
+    # Issue #564: the cheap live-API check `sdlc resume` runs before honouring a
+    # persisted rate-limit reset epoch — one two-token prompt on the cheapest
+    # model. A zero exit with no rate-limit wording means the window is open, so
+    # a reset epoch left behind by (say) a network blip is cleared and the run
+    # continues; anything else keeps it parked. Mirrors the built-in slot's
+    # `harness.CLAUDE_RATE_LIMIT_PROBE`.
+    rate_limit_probe: "claude -p ok --model haiku"
     capabilities:
       worktree_isolation: true
       parallel: true

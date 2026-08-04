@@ -20,7 +20,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
-from sdlc.capability import preflight_harness, resolve_capabilities
+from sdlc.capability import (
+    ProbeStatus,
+    preflight_harness,
+    probe_rate_limit,
+    resolve_capabilities,
+)
 from sdlc import build_issue
 from sdlc import change_class
 from sdlc import coverage_precheck
@@ -1005,12 +1010,20 @@ class _RateLimitContext:
     only reactive 429 signals gate). ``clock`` / ``sleep_fn`` are injected so the
     in-process auto-wait is deterministic and instant under test (the per-agent
     dispatch timeout bounds the agent subprocess, not this controller-side wait).
+
+    ``probe`` (issue #564) is the live-API check :func:`_honor_parked_reset` runs
+    before honouring a *persisted* reset epoch, returning a
+    :class:`~sdlc.capability.ProbeStatus`. ``None`` means "do not probe" — the
+    gate then behaves exactly as it did before the probe existed (honour the
+    epoch), which is also what an injected-dispatcher run gets so the test suite
+    never shells out to a real CLI.
     """
 
     opts: BuildOptions
     window: "WindowQuota | None"
     clock: Callable[[], float]
     sleep_fn: Callable[[float], None]
+    probe: "Callable[[], ProbeStatus] | None" = None
 
 
 @dataclass
@@ -1022,12 +1035,18 @@ class _StoryRunOutcome:
     story is left for `sdlc resume`: ``parked`` is True, ``status`` is None, and
     ``signal`` carries the pause cause. ``waited_s`` is the total time auto-waited
     in-process across any within-cap pauses before this outcome.
+
+    ``probe_status`` (issue #564) is set only by :func:`_honor_parked_reset` — the
+    outcome of the live re-probe that decided a persisted reset epoch was still
+    real — so the CLI can say whether the re-park was confirmed by a probe or
+    merely inherited from the stored epoch. ``None`` on every dispatch-time park.
     """
 
     status: str | None
     parked: bool = False
     signal: "RateLimitSignal | None" = None
     waited_s: int = 0
+    probe_status: str | None = None
 
 
 class _RateLimitPark(Exception):
@@ -1072,6 +1091,7 @@ def _make_rate_limit_context(
     clock: Callable[[], float] | None,
     sleep_fn: Callable[[float], None] | None,
     baseline: int = 0,
+    probe: "Callable[[], ProbeStatus] | None" = None,
 ) -> _RateLimitContext:
     """Build the rate-limit context, defaulting the clock/sleep to wall-clock.
 
@@ -1097,7 +1117,25 @@ def _make_rate_limit_context(
         )
     return _RateLimitContext(
         opts=opts, window=window, clock=the_clock, sleep_fn=sleep_fn or time.sleep,
+        probe=probe,
     )
+
+
+def default_rate_limit_probe() -> ProbeStatus:
+    """Probe the resolved default harness for a live, unthrottled API (#564).
+
+    The real-run implementation of :attr:`_RateLimitContext.probe`: it runs the
+    harness's declared ``rate_limit_probe`` (one tiny request) and reports
+    whether the window is actually open. Never raises — an unresolvable harness,
+    a missing CLI or any other error degrades to
+    :attr:`~sdlc.capability.ProbeStatus.UNKNOWN`, which the gate treats as "no
+    evidence" and so keeps the persisted epoch. This gate protects a possibly
+    still-closed quota window, so every failure path must stay closed.
+    """
+    try:
+        return probe_rate_limit(resolve_harness()).status
+    except Exception:  # noqa: BLE001 - a probe failure must never fail a resume
+        return ProbeStatus.UNKNOWN
 
 
 def _rate_limit_wait(
@@ -1224,20 +1262,99 @@ def _honor_parked_reset(
     proceeds with a fresh window. (The fresh-window baseline is seeded by
     :func:`_make_rate_limit_context`, so progress is then unbounded by pre-park
     spend.)
+
+    Issue #564: the stored epoch is an *approximation*, and a park seeded by a
+    signal that was never an API verdict (a network outage misread as a throttle)
+    could pin it days out — every later resume then re-parked in a second on
+    wall-clock arithmetic alone, freezing the run until the weekly boundary. So
+    before honouring the epoch the gate re-probes the live API once
+    (``rl_ctx.probe``). Only an ``AVAILABLE`` verdict clears the epoch and lets
+    the run proceed; ``UNAVAILABLE`` (still throttled / unreachable) and
+    ``UNKNOWN`` (not probed, or the probe itself errored) both keep today's
+    behaviour. The gate protects a possibly still-closed quota window, so it
+    never fails open.
     """
     if reset_at is None:
         return None
     now = rl_ctx.clock()
     if now >= reset_at:
         return None  # the window has already reopened — proceed
+    probe_status = _probe_parked_reset(ledger, run_id, rl_ctx, float(reset_at))
+    if probe_status is ProbeStatus.AVAILABLE:
+        _clear_parked_reset(ledger, run_id)
+        return None  # the stored epoch was stale — proceed on a fresh window
     signal = RateLimitSignal(source="window-reset", reset_at=float(reset_at))
     wait_s = seconds_until_reset(signal, now=now, window_s=opts.window_s)
     if not within_wait_cap(wait_s, opts.rate_limit_max_wait_s):
-        return _StoryRunOutcome(status=None, parked=True, signal=signal, waited_s=0)
+        return _StoryRunOutcome(
+            status=None, parked=True, signal=signal, waited_s=0,
+            probe_status=probe_status.value,
+        )
     _rate_limit_wait(ledger, run_id, signal, wait_s, sleep_fn=rl_ctx.sleep_fn)
     if rl_ctx.window is not None:
         rl_ctx.window.reopen(rl_ctx.clock(), ledger.run_usage_totals(run_id)["tokens"])
     return None
+
+
+def _probe_parked_reset(
+    ledger: "Ledger",
+    run_id: str,
+    rl_ctx: _RateLimitContext,
+    reset_at: float,
+) -> ProbeStatus:
+    """Re-probe the live API behind a persisted reset epoch, logging the verdict.
+
+    Issue #564. Returns :attr:`~sdlc.capability.ProbeStatus.UNKNOWN` — "no
+    evidence, keep the epoch" — when no probe is wired or the probe itself
+    raised, so the caller's conservative path is the default in every failure
+    mode. The verdict is written to the ledger either way: a re-park that was
+    never checked and one a live probe confirmed must be told apart when
+    diagnosing a stuck run.
+    """
+    if rl_ctx.probe is None:
+        return ProbeStatus.UNKNOWN
+    try:
+        status = rl_ctx.probe()
+    except Exception:  # noqa: BLE001 - a probe failure must never fail a resume
+        status = ProbeStatus.UNKNOWN
+    if status is ProbeStatus.AVAILABLE:
+        message = (
+            f"rate-limit re-probe succeeded: the API answered normally, so the "
+            f"persisted reset epoch {int(reset_at)} is stale (issue #564) — "
+            "clearing it and resuming dispatch."
+        )
+        level = "success"
+    elif status is ProbeStatus.UNAVAILABLE:
+        message = (
+            f"rate-limit re-probe found the window still closed — honouring the "
+            f"persisted reset epoch {int(reset_at)}."
+        )
+        level = "info"
+    else:
+        message = (
+            f"rate-limit re-probe unavailable (harness declares none, or it "
+            f"errored) — honouring the persisted reset epoch {int(reset_at)} "
+            "unchecked."
+        )
+        level = "info"
+    try:  # advisory: a ledger write must never fail a resume
+        ledger.event_log(run_id, "", level, "controller", message)
+    except Exception:  # noqa: BLE001
+        pass
+    return status
+
+
+def _clear_parked_reset(ledger: "Ledger", run_id: str) -> None:
+    """Drop a stale ``rate_limit_reset_at`` from the run config (issue #564).
+
+    Appends a corrected config event with the key removed — the same latest-wins
+    mechanism :func:`apply_rate_limit_park` writes it with (and the same one the
+    manual sqlite workaround in the issue used), so no schema surgery and no
+    other config key is disturbed.
+    """
+    cfg = ledger.run_config(run_id)
+    cfg.pop("rate_limit_reset_at", None)
+    ledger.event_log(run_id, "", "info", "config", json.dumps(cfg))
 
 
 def _log_predictor_posture(

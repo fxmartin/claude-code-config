@@ -30,11 +30,13 @@ from sdlc.build import (
     apply_cost_gate_pause,
     apply_rate_limit_park,
     authoritative_mode,
+    default_rate_limit_probe,
     effective_concurrency,
     _filter_git_landed,
     finalize_run,
     persist_cohort_structure,
 )
+from sdlc.capability import ProbeStatus
 from sdlc.cohort import Story, compute_cohorts
 from sdlc.discovery import canonical_scope, discover_queue
 from sdlc.dispatch import dispatch_agent
@@ -105,6 +107,11 @@ class ResumeResult:
     rate_limited: bool = False
     rate_limit_reset_at: float | None = None
     rate_limit_waited_s: int = 0
+    # Issue #564: the live re-probe's verdict when the re-park came from the
+    # *persisted* reset epoch ("available"/"unavailable"/"unknown"), so the CLI
+    # can say whether the window was actually re-checked. None when the re-park
+    # came from a fresh throttle raised mid-dispatch instead.
+    rate_limit_probe_status: str | None = None
     # Story 14.1-002: set when the interactive cost gate re-halted the resume. The
     # run is left IN_PROGRESS (resumable); raise --cost-threshold to continue.
     cost_gated: bool = False
@@ -346,6 +353,7 @@ def run_resume(
     concurrency: int | None = None,
     clock: Callable[[], float] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
+    rate_limit_probe: Callable[[], ProbeStatus] | None = None,
     runner=None,
 ) -> ResumeResult:
     """Resume the most recent interrupted run for ``scope`` from the ledger.
@@ -377,6 +385,14 @@ def run_resume(
     Issue #547: a run whose mode marks it a fix-issue run is handed straight to
     :func:`sdlc.fix_issue.resume_fix`; ``runner`` is that pipeline's ``gh`` seam
     and is unused on the build path.
+
+    Issue #564: a run parked ``RATE_LIMITED`` is re-checked against the live API
+    before its persisted reset epoch is honoured, so an epoch a transient network
+    outage seeded cannot freeze the run until the next window boundary.
+    ``rate_limit_probe`` injects that check; absent one, a real run
+    (``dispatcher is None``) probes the resolved harness and a run driven by an
+    injected dispatcher does not probe at all — the same ``real_run`` seam the
+    worktree/HEAD side effects use, so the test suite never shells out to a CLI.
     """
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
@@ -553,6 +569,11 @@ def run_resume(
     rl_ctx = _make_rate_limit_context(
         opts, clock=clock, sleep_fn=sleep_fn,
         baseline=ledger.run_usage_totals(rid)["tokens"],
+        # Issue #564: only a real run probes the live API by default; an injected
+        # dispatcher means a test/simulated run, which must not shell out.
+        probe=rate_limit_probe or (
+            default_rate_limit_probe if dispatcher is None else None
+        ),
     )
     # Story 28.2-002: a resume re-establishes the run's predictor posture from the
     # persisted config, so it re-notes a disabled predictor once — same as build.
@@ -856,6 +877,7 @@ def run_resume(
             rate_limited=True,
             rate_limit_reset_at=reset_at,
             rate_limit_waited_s=rate_limit_park.waited_s,
+            rate_limit_probe_status=rate_limit_park.probe_status,
         )
 
     # Story 14.1-001: the budget gate re-halted the resume — apply the same

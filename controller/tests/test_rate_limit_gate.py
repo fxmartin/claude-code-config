@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from sdlc.build import BuildOptions, Ledger, parse_build_args, run_build
+from sdlc.capability import ProbeStatus
 from sdlc.dispatch import RateLimitError
 from sdlc.rate_limit import RateLimitSignal
 from sdlc.resume import run_resume
@@ -516,6 +517,170 @@ def test_fallback_window_park_persists_reset_and_resume_honours_it(tmp_path: Pat
     )
     assert r_done.rate_limited is False
     assert Ledger(db).run_row(result.run_id)["status"] == "DONE"
+
+
+# ---------------------------------------------------------------------------
+# Issue #564: resume re-probes the live API before honouring a stored epoch
+# ---------------------------------------------------------------------------
+
+def test_resume_reprobe_clears_stale_reset_and_dispatches(tmp_path: Path) -> None:
+    # Regression (#564): the persisted reset epoch is an approximation, and one
+    # seeded by a network outage can sit days out. When a live re-probe shows the
+    # API answering normally, the stale epoch is cleared and the run continues —
+    # instead of re-parking in ~1s on wall-clock arithmetic alone, week after week.
+    db, result = _build_window_parked(tmp_path)
+    dispatcher = FakeDispatcher()
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        sleep_fn=_Sleeps(), clock=lambda: 100.0,  # far before reset_at=999_999
+        rate_limit_probe=lambda: ProbeStatus.AVAILABLE,
+    )
+    assert resumed.rate_limited is False
+    assert dispatcher.calls, "a cleared window must actually dispatch work"
+    ledger = Ledger(db)
+    assert ledger.run_row(result.run_id)["status"] == "DONE"
+    # The stale epoch is gone from the effective config, so the next resume is
+    # not gated by it either.
+    assert "rate_limit_reset_at" not in ledger.run_config(result.run_id)
+
+
+def test_resume_reprobe_logs_the_cleared_epoch(tmp_path: Path) -> None:
+    db, result = _build_window_parked(tmp_path)
+    run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        sleep_fn=_Sleeps(), clock=lambda: 100.0,
+        rate_limit_probe=lambda: ProbeStatus.AVAILABLE,
+    )
+    ledger = Ledger(db)
+    with ledger._connect_ro() as conn:  # noqa: SLF001 — test inspects the audit trail
+        msgs = [
+            r["message"] for r in conn.execute(
+                "SELECT message FROM events WHERE run_id = ?", (result.run_id,)
+            ).fetchall()
+        ]
+    assert any("re-probe succeeded" in m for m in msgs)
+
+
+def test_resume_reprobe_unavailable_still_reparks(tmp_path: Path) -> None:
+    # The gate must never fail open: a probe that finds the window still closed
+    # keeps the run parked and dispatches nothing.
+    db, result = _build_window_parked(tmp_path)
+    dispatcher = FakeDispatcher()
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        sleep_fn=_Sleeps(), clock=lambda: 100.0,
+        rate_limit_probe=lambda: ProbeStatus.UNAVAILABLE,
+    )
+    assert resumed.rate_limited is True
+    assert resumed.rate_limit_probe_status == "unavailable"
+    assert dispatcher.calls == [], "must not dispatch into a still-closed window"
+    ledger = Ledger(db)
+    assert ledger.run_row(result.run_id)["status"] == "RATE_LIMITED"
+    assert ledger.run_config(result.run_id)["rate_limit_reset_at"] == 999_999.0
+
+
+def test_resume_reprobe_error_defaults_to_repark(tmp_path: Path) -> None:
+    # A probe that blows up is "no evidence", not "window open" — the epoch stands.
+    def _boom() -> ProbeStatus:
+        raise RuntimeError("probe exploded")
+
+    db, result = _build_window_parked(tmp_path)
+    dispatcher = FakeDispatcher()
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        sleep_fn=_Sleeps(), clock=lambda: 100.0, rate_limit_probe=_boom,
+    )
+    assert resumed.rate_limited is True
+    assert resumed.rate_limit_probe_status == "unknown"
+    assert dispatcher.calls == []
+    assert Ledger(db).run_row(result.run_id)["status"] == "RATE_LIMITED"
+
+
+def test_resume_without_a_probe_keeps_todays_behaviour(tmp_path: Path) -> None:
+    # No probe wired (an injected-dispatcher run never shells out to a CLI) →
+    # the persisted epoch is honoured exactly as before, and the re-park says so.
+    db, result = _build_window_parked(tmp_path)
+    dispatcher = FakeDispatcher()
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        sleep_fn=_Sleeps(), clock=lambda: 100.0,
+    )
+    assert resumed.rate_limited is True
+    assert resumed.rate_limit_probe_status == "unknown"
+    assert dispatcher.calls == []
+    assert Ledger(db).run_row(result.run_id)["status"] == "RATE_LIMITED"
+
+
+def test_resume_within_cap_probe_clears_instead_of_waiting(tmp_path: Path) -> None:
+    # A within-cap remaining wait is also skipped when the probe says the window
+    # is open — no needless in-process sleep on a stale epoch.
+    db, _result = _build_window_parked(tmp_path)
+    sleeps = _Sleeps()
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        sleep_fn=sleeps, clock=lambda: 999_799.0,  # 200s before reset (cap 300)
+        rate_limit_probe=lambda: ProbeStatus.AVAILABLE,
+    )
+    assert sleeps.calls == []
+    assert resumed.rate_limited is False
+
+
+def test_resume_probe_not_run_once_the_window_has_reopened(tmp_path: Path) -> None:
+    # The probe costs a real request, so it only runs while the epoch is still
+    # in the future — a reopened window needs no evidence.
+    db, _result = _build_window_parked(tmp_path)
+    probes: list[int] = []
+
+    def _probe() -> ProbeStatus:
+        probes.append(1)
+        return ProbeStatus.AVAILABLE
+
+    resumed = run_resume(
+        "epic-88", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        sleep_fn=_Sleeps(), clock=lambda: 1_000_000.0, rate_limit_probe=_probe,
+    )
+    assert probes == []
+    assert resumed.rate_limited is False
+
+
+def test_cli_resume_reports_probe_status(tmp_path: Path, monkeypatch) -> None:
+    # Issue #564: the re-park message says whether the window was actually
+    # re-checked, so an unverified re-park is never mistaken for a confirmed one.
+    from typer.testing import CliRunner
+
+    import sdlc.cli as cli_mod
+    from sdlc.resume import ResumeResult
+
+    def fake_resume(*_a, **_k):
+        return ResumeResult(
+            run_id="run-1234abcd", resumed=0, completed=0, rate_limited=True,
+            rate_limit_reset_at=999_999.0, rate_limit_probe_status="unavailable",
+        )
+
+    monkeypatch.setattr("sdlc.resume.run_resume", fake_resume)
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    result = CliRunner().invoke(cli_mod.app, ["resume", "epic-88", "--db", str(db)])
+    assert "re-probe confirmed the window is still closed" in result.output
+
+
+def test_cli_resume_reports_unprobed_repark(tmp_path: Path, monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    import sdlc.cli as cli_mod
+    from sdlc.resume import ResumeResult
+
+    def fake_resume(*_a, **_k):
+        return ResumeResult(
+            run_id="run-1234abcd", resumed=0, completed=0, rate_limited=True,
+            rate_limit_reset_at=999_999.0, rate_limit_probe_status="unknown",
+        )
+
+    monkeypatch.setattr("sdlc.resume.run_resume", fake_resume)
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    result = CliRunner().invoke(cli_mod.app, ["resume", "epic-88", "--db", str(db)])
+    assert "no live re-probe available" in result.output
 
 
 def test_cli_resume_reports_rate_limit(tmp_path: Path, monkeypatch) -> None:

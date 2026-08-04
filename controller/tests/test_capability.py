@@ -17,6 +17,7 @@ from sdlc.capability import (
     _default_probe_runner,
     preflight_harness,
     probe_harness,
+    probe_rate_limit,
     resolve_capabilities,
 )
 from sdlc.harness import HarnessConfig, resolve_harness
@@ -279,6 +280,82 @@ def test_preflight_builtin_claude_supports_parallel(monkeypatch) -> None:
     assert pf.degraded is False
     # The builtin claude harness declares no probe command.
     assert pf.probe.status is ProbeStatus.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Issue #564: the live rate-limit re-probe
+# ---------------------------------------------------------------------------
+
+
+def _rl_harness(command: str | None) -> HarnessConfig:
+    return HarnessConfig(
+        name="claude", command="claude -p", parser="claude-stream-json",
+        rate_limit_probe=command,
+    )
+
+
+def test_probe_rate_limit_unknown_without_a_declared_command() -> None:
+    # No probe declared → not probed, so the caller keeps honouring the epoch.
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, ""
+
+    result = probe_rate_limit(_rl_harness(None), runner=runner)
+    assert result.status is ProbeStatus.UNKNOWN
+    assert calls == []
+
+
+def test_probe_rate_limit_available_on_clean_zero_exit() -> None:
+    result = probe_rate_limit(
+        _rl_harness("claude -p ok --model haiku"), runner=lambda argv: (0, "ok")
+    )
+    assert result.status is ProbeStatus.AVAILABLE
+    assert result.command == "claude -p ok --model haiku"
+
+
+def test_probe_rate_limit_unavailable_on_nonzero_exit() -> None:
+    result = probe_rate_limit(
+        _rl_harness("claude -p ok"), runner=lambda argv: (1, "Connection error.")
+    )
+    assert result.status is ProbeStatus.UNAVAILABLE
+    assert result.detail == "Connection error."
+
+
+def test_probe_rate_limit_unavailable_when_zero_exit_reports_a_throttle() -> None:
+    # Some CLI paths report a throttle on a *successful* exit; reading that as
+    # "window open" would dispatch straight into a still-closed quota window.
+    result = probe_rate_limit(
+        _rl_harness("claude -p ok"),
+        runner=lambda argv: (0, "Claude AI usage limit reached. Try again later."),
+    )
+    assert result.status is ProbeStatus.UNAVAILABLE
+
+
+def test_probe_rate_limit_splits_the_command_into_argv() -> None:
+    seen: list[list[str]] = []
+
+    def runner(argv):
+        seen.append(argv)
+        return 0, ""
+
+    probe_rate_limit(_rl_harness("claude -p ok --model haiku"), runner=runner)
+    assert seen == [["claude", "-p", "ok", "--model", "haiku"]]
+
+
+def test_builtin_claude_declares_a_rate_limit_probe(monkeypatch) -> None:
+    # The default slot must be probeable, or the resume gate has nothing to
+    # re-check a persisted reset epoch against (issue #564).
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    assert resolve_harness().rate_limit_probe
+
+
+def test_env_override_harness_declares_no_rate_limit_probe(monkeypatch) -> None:
+    # An SDLC_AGENT_CMD override may front a different CLI entirely — probing
+    # `claude` would report on the wrong API, so it is left unprobed.
+    monkeypatch.setenv("SDLC_AGENT_CMD", "my-agent run")
+    assert resolve_harness().rate_limit_probe is None
 
 
 def test_probe_result_is_frozen() -> None:
