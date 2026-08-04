@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.43.3] - 2026-08-04
+
+### Fixed
+
+- fix(dashboard): surface fix-run investigation stage and status (#567)
+
+
 ## [v2.43.2] - 2026-08-04
 
 ### Fixed
