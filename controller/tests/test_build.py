@@ -638,6 +638,99 @@ def test_log_harness_preflight_logs_routed_harness_capabilities(
     assert any(level == "warn" for _msg, level in rows)
 
 
+def test_log_harness_preflight_dedupes_two_roles_routed_to_same_harness(
+    tmp_path, monkeypatch
+) -> None:
+    """Two roles routed to the same non-default harness must be preflighted
+    once, with both role names in the single labeled capability line — not
+    preflighted (and logged) twice."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {"build": "codex", "coverage": "codex"}
+
+    _log_harness_preflight(ledger, run_id, "parallel", opts)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='harness' AND "
+        "message LIKE \"harness 'codex'%\""
+    ).fetchall()
+    messages = [r[0] for r in rows]
+    labeled = [m for m in messages if "(role=" in m]
+    assert labeled, "the routed codex harness must still be preflighted"
+    assert all("role=build,coverage" in m for m in labeled), (
+        "both roles must share a single labeled capability line, not be "
+        f"preflighted (and logged) separately: {labeled}"
+    )
+    assert not any("role=build)" in m or "role=coverage)" in m for m in messages)
+
+
+def test_log_harness_preflight_unknown_routed_harness_is_best_effort(
+    tmp_path, monkeypatch
+) -> None:
+    """A role routed to an unregistered harness name must not crash the
+    build — the preflight logger is best-effort, so a resolution failure for
+    the routed harness aborts the rest of the (whole try/except-wrapped)
+    logging call, just like an unresolvable default-slot harness already
+    does, instead of raising out of ``run_build``."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {"build": "no-such-harness"}
+
+    _log_harness_preflight(ledger, run_id, "parallel", opts)  # must not raise
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='harness'"
+    ).fetchall()
+    messages = [r[0] for r in rows]
+    # The routing summary line is unconditionally logged before any harness is
+    # resolved; the routed-harness resolution failure then aborts everything
+    # after it in the same best-effort try/except, so no capability, probe,
+    # mode, or default-slot line follows.
+    assert messages == [
+        "harness routing: build=no-such-harness coverage=claude review=claude "
+        "merge=claude docs=claude"
+    ]
+
+
+def test_log_harness_preflight_fully_claude_routing_has_no_warn_level(
+    tmp_path, monkeypatch
+) -> None:
+    """Every role explicitly routed to the built-in ``claude`` harness must
+    behave identically to no routing at all — claude is fully capable, so no
+    routed-harness line is ever logged at ``warn`` level."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+    opts = BuildOptions(scope="epic-99")
+    opts.harness_map = {
+        "build": "claude",
+        "coverage": "claude",
+        "review": "claude",
+        "merge": "claude",
+    }
+
+    _log_harness_preflight(ledger, run_id, "parallel", opts)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT level FROM events WHERE source='harness'"
+    ).fetchall()
+    assert rows, "the routing summary and default-slot lines must still log"
+    assert all(level == "info" for (level,) in rows)
+
+
 def test_run_build_writes_ledger_after_every_stage(tmp_path) -> None:
     db = tmp_path / "ledger.db"
     opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
