@@ -7,6 +7,7 @@ import pytest
 
 import subprocess
 
+from sdlc import capability as capability_module
 from sdlc.capability import (
     CAPABILITY_KEYS,
     MODE_PARALLEL,
@@ -342,6 +343,32 @@ def test_probe_rate_limit_splits_the_command_into_argv() -> None:
 
     probe_rate_limit(_rl_harness("claude -p ok --model haiku"), runner=runner)
     assert seen == [["claude", "-p", "ok", "--model", "haiku"]]
+
+
+def test_probe_rate_limit_uses_the_default_runner_with_its_own_timeout(
+    monkeypatch,
+) -> None:
+    # Issue #564: with no `runner` injected (the real-run path), probe_rate_limit
+    # must still wire `_default_probe_runner` — and with the rate-limit probe's
+    # own generous timeout, not the short local-availability one, since this
+    # probe makes a real API round-trip instead of a local CLI check.
+    calls: list[tuple[list[str], int]] = []
+
+    def fake_default_runner(argv, *, timeout_s=capability_module._PROBE_TIMEOUT_SECONDS):
+        calls.append((argv, timeout_s))
+        return 0, "ok"
+
+    monkeypatch.setattr(
+        capability_module, "_default_probe_runner", fake_default_runner
+    )
+    result = probe_rate_limit(_rl_harness("claude -p ok --model haiku"))
+    assert result.status is ProbeStatus.AVAILABLE
+    assert calls == [
+        (
+            ["claude", "-p", "ok", "--model", "haiku"],
+            capability_module._RATE_LIMIT_PROBE_TIMEOUT_SECONDS,
+        )
+    ]
 
 
 def test_builtin_claude_declares_a_rate_limit_probe(monkeypatch) -> None:

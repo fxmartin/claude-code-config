@@ -683,6 +683,43 @@ def test_cli_resume_reports_unprobed_repark(tmp_path: Path, monkeypatch) -> None
     assert "no live re-probe available" in result.output
 
 
+# ---------------------------------------------------------------------------
+# Issue #564: default_rate_limit_probe — the real-run probe implementation
+# ---------------------------------------------------------------------------
+
+
+def test_default_rate_limit_probe_forwards_the_harness_verdict(monkeypatch) -> None:
+    # The real-run wiring for `_RateLimitContext.probe`: resolve the default
+    # harness and return whatever `probe_rate_limit` reports for it, untouched.
+    from sdlc.build import default_rate_limit_probe
+    from sdlc.capability import ProbeResult
+
+    sentinel_harness = object()
+    monkeypatch.setattr("sdlc.build.resolve_harness", lambda: sentinel_harness)
+    monkeypatch.setattr(
+        "sdlc.build.probe_rate_limit",
+        lambda harness: ProbeResult(status=ProbeStatus.AVAILABLE)
+        if harness is sentinel_harness
+        else ProbeResult(status=ProbeStatus.UNAVAILABLE),
+    )
+    assert default_rate_limit_probe() is ProbeStatus.AVAILABLE
+
+
+def test_default_rate_limit_probe_degrades_to_unknown_on_any_error(
+    monkeypatch,
+) -> None:
+    # Issue #564: an unresolvable harness, a missing CLI, or any other error must
+    # never raise into the resume gate — it degrades to UNKNOWN ("no evidence,
+    # keep the epoch"), the same conservative default as no probe wired at all.
+    from sdlc.build import default_rate_limit_probe
+
+    def _boom():
+        raise RuntimeError("no harness resolvable")
+
+    monkeypatch.setattr("sdlc.build.resolve_harness", _boom)
+    assert default_rate_limit_probe() is ProbeStatus.UNKNOWN
+
+
 def test_cli_resume_reports_rate_limit(tmp_path: Path, monkeypatch) -> None:
     # The `sdlc resume` CLI renders the rate-limit summary and exits non-zero when
     # the resumed run re-parked RATE_LIMITED (rendering tested in isolation).
