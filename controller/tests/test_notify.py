@@ -289,6 +289,41 @@ def test_story_failed_falls_back_to_bare_id_without_subject(monkeypatch):
     assert "FAILED" in text
 
 
+def test_story_failed_without_story_id_or_subject_uses_bare_label(monkeypatch):
+    """Neither ``story_id`` nor ``subject`` supplied: falls back to the plain
+    "story ... FAILED" label rather than crashing on the missing fields."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify("story_failed", run="abc123", sender=sender)
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "story FAILED" in text
+
+
+def test_run_finished_reports_tally_without_pr(monkeypatch):
+    """``done``/``total`` supplied but no ``pr``: the title reports the merged
+    tally instead of a PR reference."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "run_finished",
+        run="abc123",
+        subject="fix #583",
+        terminal="DONE",
+        done=2,
+        total=3,
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "2/3 merged" in text
+    assert "PR #" not in text
+
+
 def test_run_started_truncates_long_subject(monkeypatch):
     """An oversized issue/epic title is shortened so one message stays one line."""
     captured: list[bytes] = []
