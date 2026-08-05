@@ -1549,7 +1549,11 @@ def run_fix(
     ledger.run_set_harness_routing(run_id, opts.harness_map)
     ledger.event_log(run_id, "", "info", "controller", f"fix started: scope={scope}")
     try:
-        notify("run_started", run=run_id, scope=scope, mode="fix")
+        notify(
+            "run_started", run=run_id, scope=scope, mode="fix",
+            repo=(root or Path.cwd()).name,
+            subject=f"fix #{issue.number}: {issue.title}",
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -1563,14 +1567,14 @@ def run_fix(
         ledger.event_log(
             run_id, story.id, "warn", "controller", f"investigation blocked: {reason}"
         )
-        _close_early(ledger, run_id, "ABORTED", render_view, registry)
+        _close_early(ledger, run_id, "ABORTED", render_view, registry, subject=story.title)
         return FixResult(
             issue=opts.issue, run_id=run_id, status="ABORTED",
             investigation_blocked=True, block_reason=reason,
         )
     if inv_status == "FAILED":
         ledger.set_story_status(run_id, story.id, "FAILED")
-        _close_early(ledger, run_id, "FAILED", render_view, registry)
+        _close_early(ledger, run_id, "FAILED", render_view, registry, subject=story.title)
         return FixResult(issue=opts.issue, run_id=run_id, status="FAILED")
 
     assert inv is not None  # READY carries the plan
@@ -1641,7 +1645,7 @@ def _finish_fix_run(
     outcome = finalize_run(
         ledger, run_id, {story.id: terminal},
         reconcile=False, finish_label="fix finished", render_view=render_view,
-        registry=registry,
+        registry=registry, subject=f"fix #{issue.number}", pr_number=pr_number,
     )
     return FixResult(
         issue=opts.issue, run_id=run_id, status=outcome.run_terminal, pr_number=pr_number
@@ -1798,7 +1802,7 @@ def _block_reason(inv: dict | None) -> str:
 
 def _close_early(
     ledger: Ledger, run_id: str, run_status: str, render_view,
-    registry: Registry | None = None,
+    registry: Registry | None = None, *, subject: str | None = None,
 ) -> None:
     """Close a fix run that stopped before the stage loop (blocked / failed).
 
@@ -1819,7 +1823,7 @@ def _close_early(
     )
     ledger.run_update_status(run_id, run_status)
     try:
-        notify("run_finished", run=run_id, terminal=run_status)
+        notify("run_finished", run=run_id, terminal=run_status, subject=subject)
     except Exception:  # noqa: BLE001
         pass
     if registry is not None:
@@ -2306,7 +2310,12 @@ def run_fix_batch(
         f"fix batch started: scope={scope} mode={mode} ({len(candidates)} issues)",
     )
     try:
-        notify("run_started", run=run_id, scope=scope, mode=f"fix-{batch.target}")
+        notify(
+            "run_started", run=run_id, scope=scope, mode=f"fix-{batch.target}",
+            repo=(root or Path.cwd()).name,
+            subject=f"fix batch {batch.target}",
+            detail=f"{len(candidates)} issues",
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -2411,7 +2420,9 @@ def run_fix_batch(
         ledger.set_story_status(run_id, story.id, outcome)
         if outcome == "FAILED":
             try:
-                notify("story_failed", run=run_id, story_id=story.id)
+                notify(
+                    "story_failed", run=run_id, story_id=story.id, subject=story.title
+                )
             except Exception:  # noqa: BLE001
                 pass
         if workdir is not None:
@@ -2447,7 +2458,12 @@ def run_fix_batch(
         )
         ledger.run_update_status(run_id, "RATE_LIMITED")
         try:
-            notify("run_finished", run=run_id, terminal="RATE_LIMITED")
+            notify(
+                "run_finished", run=run_id, terminal="RATE_LIMITED",
+                subject=f"fix batch {batch.target}",
+                repo=Path.cwd().name, done=completed, failed=failed,
+                total=len(status),
+            )
         except Exception:  # noqa: BLE001
             pass
         if render_view is not None:
@@ -2468,7 +2484,7 @@ def run_fix_batch(
         ledger, run_id, status,
         reconcile=real_run, root=Path.cwd(),
         finish_label="fix batch finished", render_view=render_view,
-        registry=registry,
+        registry=registry, subject=f"fix batch {batch.target}",
     )
     ledger.event_log(run_id, "", "info", "controller", summary)
     return FixBatchResult(

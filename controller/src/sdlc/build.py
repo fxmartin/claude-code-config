@@ -1235,7 +1235,7 @@ def apply_rate_limit_park(
     try:  # best-effort lifecycle notification; never fail a run
         notify(
             "rate_limited", run=run_id, source=signal.source,
-            reset_at=int(reset_at), waited_s=waited_s,
+            reset_at=int(reset_at), waited_s=waited_s, repo=Path.cwd().name,
         )
     except Exception:
         pass
@@ -6063,7 +6063,13 @@ def run_build(
     # the built-in Claude harness, which has every capability.
     _record_degradations(ledger, run_id, mode, opts)
     try:  # best-effort lifecycle notification; never fail a build
-        notify("run_started", run=run_id, scope=opts.scope, mode=mode)
+        epic_name = buildable[0].epic_name if buildable else None
+        subject = f"build {opts.scope}" + (f' "{epic_name}"' if epic_name else "")
+        notify(
+            "run_started", run=run_id, scope=opts.scope, mode=mode,
+            repo=Path.cwd().name, subject=subject,
+            detail=f"{len(buildable)} stories, {mode}",
+        )
     except Exception:
         pass
     # Persist the run's options as an immutable config marker (read back by the
@@ -6281,7 +6287,7 @@ def run_build(
             build_issue.announce_terminal(ledger, story.id, outcome)
             if outcome == "FAILED":
                 try:  # best-effort; terminal FAILED only (no bugfix-retry noise)
-                    notify("story_failed", run=run_id, story_id=story.id)
+                    notify("story_failed", run=run_id, story_id=story.id, subject=story.title)
                 except Exception:
                     pass
             # Story 17.2-002: a terminal story closes out — remove its isolated
@@ -6400,7 +6406,7 @@ def run_build(
                     f"story raised during concurrent execution: {result.error}",
                 )
                 try:
-                    notify("story_failed", run=run_id, story_id=story.id)
+                    notify("story_failed", run=run_id, story_id=story.id, subject=story.title)
                 except Exception:
                     pass
                 # Story 17.2-002: failure isolation still closes the story out —
@@ -6424,7 +6430,7 @@ def run_build(
             ledger.set_story_status(run_id, story.id, outcome)
             if outcome == "FAILED":
                 try:
-                    notify("story_failed", run=run_id, story_id=story.id)
+                    notify("story_failed", run=run_id, story_id=story.id, subject=story.title)
                 except Exception:
                     pass
             # Story 17.2-002: terminal story → remove its isolated worktree
@@ -6505,6 +6511,7 @@ def run_build(
         extra_skipped=len(done_skips),
         finish_label="run finished",
         render_view=render_view,
+        subject=f"build {opts.scope}",
     )
 
     # The returned per-story map includes the shipped skips for visibility,
@@ -6776,6 +6783,8 @@ def finalize_run(
     finish_label: str = "run finished",
     finish_suffix: str = "",
     render_view: Callable[[str], None] | None = None,
+    subject: str | None = None,
+    pr_number: int | None = None,
 ) -> FinalizeOutcome:
     """The single close-out shared by ``run_build`` and ``run_resume`` (12.3-004).
 
@@ -6789,7 +6798,10 @@ def finalize_run(
     real-run-only reconciliation pass (callers pass ``dispatcher is None``);
     ``extra_skipped`` folds in shipped skips counted outside ``status`` (build's
     pre-loop ``done_skips``); ``finish_label``/``finish_suffix`` shape the event
-    text; ``registry`` is stamped only on the build path that owns one.
+    text; ``registry`` is stamped only on the build path that owns one. ``subject``
+    and ``pr_number`` are optional human-context passthroughs for the
+    ``run_finished`` notification (issue/epic label, delivered PR); omitted by
+    callers that have neither.
     """
     # --- Reconcile parked stories against origin/main (single shared point) ---
     # Only on real runs (it does network/git I/O); injected fakes — the
@@ -6831,9 +6843,11 @@ def finalize_run(
     try:  # best-effort lifecycle notification; never fail a run
         notify(
             "run_finished", run=run_id, terminal=run_terminal,
+            repo=(root or Path.cwd()).name, subject=subject, pr=pr_number,
             done=completed, failed=failed, blocked=blocked,
             needs_attention=needs_attention, awaiting_approval=awaiting_approval,
             skipped=skipped,
+            total=completed + failed + blocked + needs_attention + awaiting_approval + skipped,
         )
     except Exception:
         pass

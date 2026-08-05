@@ -114,6 +114,126 @@ _TITLES = {
     "story_failed": "Story failed",
 }
 
+# Terminal run status → emoji, for the run_finished title. Unrecognised (or
+# absent) terminals fall back to a neutral checkered flag.
+_TERMINAL_EMOJI = {
+    "DONE": "✅",
+    "FAILED": "❌",
+    "ABORTED": "⚠️",
+    "NEEDS_ATTENTION": "⚠️",
+    "AWAITING_APPROVAL": "⏳",
+    "RATE_LIMITED": "⏸",
+}
+
+# Count fields folded into the run_finished tally line, in display order.
+_COUNT_KEYS = ("done", "failed", "blocked", "needs_attention", "awaiting_approval", "skipped")
+
+_SUBJECT_MAX = 80
+
+
+def _truncate(text: object, limit: int = _SUBJECT_MAX) -> str:
+    """Shorten ``text`` to ``limit`` chars (ellipsis) so one message stays one line."""
+    text = str(text)
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _repo_prefix(fields: dict[str, object]) -> str:
+    repo = fields.get("repo")
+    return f"{repo} — " if repo else ""
+
+
+def _subject(fields: dict[str, object]) -> str | None:
+    """The human label for a run: ``subject`` (rich) or ``scope`` (legacy id)."""
+    subject = fields.get("subject") or fields.get("scope")
+    return _truncate(subject) if subject else None
+
+
+def _run_started_title(fields: dict[str, object]) -> str:
+    label = _subject(fields) or "run"
+    tail = fields.get("detail") or fields.get("mode")
+    if tail:
+        label = f"{label} ({tail})"
+    return f"🚀 {_repo_prefix(fields)}{label}"
+
+
+def _run_finished_title(fields: dict[str, object]) -> str:
+    terminal = fields.get("terminal")
+    emoji = _TERMINAL_EMOJI.get(str(terminal), "🏁")
+    core = _subject(fields) or "run"
+    if terminal:
+        core = f"{core} {terminal}"
+    pr = fields.get("pr")
+    done, total = fields.get("done"), fields.get("total")
+    if pr is not None:
+        core = f"{core} → PR #{pr}"
+    elif done is not None and total is not None:
+        core = f"{core}: {done}/{total} merged"
+    duration = fields.get("duration")
+    if duration:
+        core = f"{core} ({duration})"
+    return f"{emoji} {_repo_prefix(fields)}{core}"
+
+
+def _rate_limited_title(fields: dict[str, object]) -> str:
+    label = _subject(fields)
+    suffix = f" ({label})" if label else ""
+    return f"⏸ {_repo_prefix(fields)}run parked (rate-limited){suffix}"
+
+
+def _story_failed_title(fields: dict[str, object]) -> str:
+    story_id = fields.get("story_id")
+    subject = fields.get("subject")
+    if story_id and subject:
+        label = f'story {story_id} "{_truncate(subject)}"'
+    elif story_id:
+        label = f"story {story_id}"
+    else:
+        label = "story"
+    return f"❌ {_repo_prefix(fields)}{label} FAILED"
+
+
+# Per-event formatters producing the rich title. Events not listed here (and
+# any formatter that raises) fall back to the legacy generic title/body.
+_FORMATTERS: dict[str, Callable[[dict[str, object]], str]] = {
+    "run_started": _run_started_title,
+    "run_finished": _run_finished_title,
+    "rate_limited": _rate_limited_title,
+    "story_failed": _story_failed_title,
+}
+
+# Fields each formatter already renders into the title, so the generic body
+# builder does not repeat them as raw ``key=value`` pairs.
+_TITLE_FIELDS: dict[str, set[str]] = {
+    "run_started": {"repo", "subject", "scope", "detail", "mode"},
+    "run_finished": {"repo", "subject", "scope", "terminal", "pr", "done", "total", "duration"},
+    "rate_limited": {"repo", "subject", "scope"},
+    "story_failed": {"repo", "subject", "story_id"},
+}
+
+
+def _rich_body(event: str, fields: dict[str, object]) -> str:
+    """Body for a formatted event: count tally, leftover fields, run id.
+
+    Any field the title formatter did not consume degrades to the legacy
+    ``key=value`` rendering here, so a call site passing extra or unexpected
+    fields (or omitting the new ones entirely) can never lose information or
+    crash the notifier.
+    """
+    lines = []
+    tally = " ".join(f"{key}={fields[key]}" for key in _COUNT_KEYS if key in fields)
+    if tally:
+        lines.append(tally)
+    consumed = _TITLE_FIELDS.get(event, set()) | set(_COUNT_KEYS) | {"run"}
+    leftover = " ".join(
+        f"{key}={value}" for key, value in fields.items() if key not in consumed
+    )
+    if leftover:
+        lines.append(leftover)
+    run_id = fields.get("run")
+    if run_id:
+        lines.append(f"run {str(run_id)[:8]}")
+    return "\n".join(lines)
+
 
 def _enabled() -> bool:
     """Whether notifications are on. ``off``/``false`` mute; default is on."""
@@ -123,15 +243,31 @@ def _enabled() -> bool:
 def notify(event: str, *, sender: Sender | None = None, **fields: object) -> None:
     """Emit a best-effort lifecycle notification. Never raises.
 
-    ``event`` selects the title; ``fields`` are formatted into the body as
-    ``key=value`` pairs. No-ops when muted (``SDLC_NOTIFY`` off/false) or when
-    credentials are absent. ``sender`` is injectable for tests.
+    Known events (``run_started``, ``run_finished``, ``rate_limited``,
+    ``story_failed``) render a human-readable one-line title from whichever
+    optional structured fields (``repo``, ``subject``, ``detail``, ``pr``,
+    ``duration``, ...) the call site supplied; missing ones are simply omitted.
+    Unknown events, and any formatter failure, fall back to the legacy
+    title-cased slug plus a generic ``key=value`` body — so a new or malformed
+    call site can never crash the notifier. No-ops when muted (``SDLC_NOTIFY``
+    off/false) or when credentials are absent. ``sender`` is injectable for
+    tests.
     """
     try:
         if not _enabled():
             return
-        title = _TITLES.get(event, event.replace("_", " ").title())
-        body = " ".join(f"{key}={value}" for key, value in fields.items())
+        formatter = _FORMATTERS.get(event)
+        title: str | None = None
+        if formatter is not None:
+            try:
+                title = formatter(fields)
+            except Exception:
+                title = None
+        if title is not None:
+            body = _rich_body(event, fields)
+        else:
+            title = _TITLES.get(event, event.replace("_", " ").title())
+            body = " ".join(f"{key}={value}" for key, value in fields.items())
         _send_telegram(title, body, sender=sender)
     except Exception:
         # Belt-and-suspenders: a broken notifier can never fail a build.

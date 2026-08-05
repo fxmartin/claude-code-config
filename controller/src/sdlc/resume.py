@@ -546,7 +546,13 @@ def run_resume(
     ledger.run_update_status(rid, "IN_PROGRESS")
     ledger.event_log(rid, "", "info", "controller", f"run resumed: scope={scope}")
     try:  # best-effort lifecycle notification; never fail a resume
-        notify("run_started", run=rid, scope=scope, mode="resume")
+        epic_name = run_queue[0].epic_name if run_queue else None
+        subject = f"resume {scope}" + (f' "{epic_name}"' if epic_name else "")
+        notify(
+            "run_started", run=rid, scope=scope, mode="resume",
+            repo=(root or Path.cwd()).name, subject=subject,
+            detail=f"{len(run_queue)} stories",
+        )
     except Exception:
         pass
 
@@ -956,6 +962,7 @@ def run_resume(
         finish_label="resume finished",
         finish_suffix=f" ({resumed} resumed)",
         render_view=render_view,
+        subject=f"resume {scope}",
     )
 
     return ResumeResult(
