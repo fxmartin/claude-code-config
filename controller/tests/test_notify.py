@@ -179,6 +179,148 @@ def test_notify_never_raises_on_unknown_event(monkeypatch):
     assert len(sent) == 1
 
 
+# --- rich per-event formatting (issue #583) ------------------------------------
+
+
+def test_run_started_includes_repo_subject_and_run_prefix(monkeypatch):
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "run_started",
+        run="a7493b3d-4135-4076-8190-139fefb2dcb9",
+        repo="claude-code-config",
+        subject="#564: network outage misclassified as rate limit",
+        mode="fix",
+        sender=sender,
+    )
+    data = json.loads(captured[0].decode("utf-8"))
+    text = data["text"]
+    assert "claude-code-config" in text
+    assert "#564: network outage misclassified as rate limit" in text
+    # The run id is demoted to a short-prefix trailing line, not the headline.
+    assert "a7493b3d-4135-4076-8190-139fefb2dcb9" not in text
+    assert "a7493b3d" in text
+    assert text.index("claude-code-config") < text.index("a7493b3d")
+
+
+def test_run_finished_reports_pr_and_duration(monkeypatch):
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "run_finished",
+        run="a7493b3d",
+        repo="claude-code-config",
+        subject="fix #564",
+        terminal="DONE",
+        pr=566,
+        duration="14m",
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "PR #566" in text
+    assert "14m" in text
+    assert "DONE" in text
+
+
+def test_story_failed_includes_title_when_provided(monkeypatch):
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "story_failed",
+        run="a7493b3d",
+        story_id="29.2-001",
+        subject="OpenCode adapter",
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "29.2-001" in text
+    assert "OpenCode adapter" in text
+    assert "FAILED" in text
+
+
+def test_run_started_degrades_gracefully_without_new_fields(monkeypatch):
+    """A call site that only passes the legacy ``scope``/``mode`` fields still
+    gets a sensible message — the new fields are optional, not required."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify("run_started", scope="epic-09", mode="auto", sender=sender)
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "epic-09" in text
+    assert "auto" in text
+
+
+def test_run_finished_degrades_to_tally_when_subject_missing(monkeypatch):
+    """No ``subject``/``pr``/``total`` at all: still a sensible, non-crashing
+    message built from whatever fields the call site did supply."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify("run_finished", run="abc123", terminal="FAILED", sender=sender)
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "FAILED" in text
+    assert "abc123" in text
+
+
+def test_story_failed_falls_back_to_bare_id_without_subject(monkeypatch):
+    """A call site that never learned the story title (no ledger read) still
+    gets a usable message keyed off the story id alone."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify("story_failed", run="abc123", story_id="7.3-001", sender=sender)
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "7.3-001" in text
+    assert "FAILED" in text
+
+
+def test_run_started_truncates_long_subject(monkeypatch):
+    """An oversized issue/epic title is shortened so one message stays one line."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    long_title = "x" * 200
+    notify_mod.notify("run_started", subject=long_title, sender=sender)
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert long_title not in text
+    assert "x" * 79 in text  # truncated to the configured max, ellipsis appended
+
+
+def test_formatter_failure_falls_back_to_legacy_body(monkeypatch):
+    """A formatter that raises on a malformed field must not silently drop the
+    notification — it degrades to the legacy generic title/body instead."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    def boom(_fields):
+        raise ValueError("bad field")
+
+    monkeypatch.setitem(notify_mod._FORMATTERS, "run_started", boom)
+    notify_mod.notify("run_started", scope="epic-09", sender=sender)
+    assert len(captured) == 1
+    data = json.loads(captured[0].decode("utf-8"))
+    assert "epic-09" in data["text"]
+
+
 # --- .env fallback parsing ----------------------------------------------------
 
 
