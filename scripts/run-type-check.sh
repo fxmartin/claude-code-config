@@ -84,8 +84,11 @@ trap 'rm -f "${report_path}"' EXIT
 # mypy exits 1 when it finds errors, which is the expected normal path here, so
 # the call must not trip `set -e`. Exit 2 is a genuine failure (bad config,
 # missing files, crash) and there is no trustworthy report to ratchet against.
+# mypy and the type stubs live in the controller's `dev` extra, so `--extra dev`
+# is part of the invocation rather than a precondition on the caller — the gate
+# has to work from any job or shell that merely has uv on PATH.
 mypy_status=0
-(cd "${controller_dir}" && uv run mypy --no-color-output --no-error-summary) \
+(cd "${controller_dir}" && uv run --extra dev mypy --no-color-output --no-error-summary) \
   > "${report_path}" 2>&1 || mypy_status=$?
 
 if [ "${mypy_status}" -gt 1 ]; then
@@ -96,4 +99,6 @@ fi
 
 # Paths in the report are relative to controller/, which is where the baseline
 # signatures were captured — gate from there so the two always agree.
-ratchet "${report_path}" "${update_args[@]}"
+# The `[@]+` guard keeps the empty-array expansion from tripping `set -u` under
+# macOS system bash 3.2, which is the default `/bin/bash` developers here have.
+ratchet "${report_path}" ${update_args[@]+"${update_args[@]}"}

@@ -187,15 +187,40 @@ def test_ci_runs_the_type_check_gate() -> None:
     ), "no CI job invokes the type-check gate"
 
 
-def test_ci_type_check_job_installs_the_dev_extra() -> None:
+def test_the_gate_asks_for_the_dev_extra_itself() -> None:
+    # mypy lives in the `dev` extra, so a bare `uv run mypy` dies with "Failed to
+    # spawn: mypy" in any environment that was not pre-synced with it. The gate
+    # must carry that requirement rather than push it onto every caller.
+    script = _SCRIPT.read_text(encoding="utf-8")
+    assert "uv run --extra dev mypy" in script, (
+        "the gate must resolve mypy from the dev extra, not assume a synced venv"
+    )
+
+
+def _jobs_running_the_gate() -> list[dict]:
+    # Every job that reaches the gate, whether it calls the script directly or
+    # gets there through the bats suite that exercises it end-to-end.
     workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
-    job = next(
+    return [
         job
         for job in workflow["jobs"].values()
-        if any("run-type-check.sh" in step.get("run", "") for step in job.get("steps", []))
-    )
-    steps = " ".join(str(step) for step in job["steps"])
-    assert "astral-sh/setup-uv" in steps, "the gate runs mypy through uv"
+        if any(
+            "run-type-check.sh" in step.get("run", "")
+            or "tests/type-check.bats" in step.get("run", "")
+            for step in job.get("steps", [])
+        )
+    ]
+
+
+def test_every_ci_job_that_reaches_the_gate_has_uv() -> None:
+    jobs = _jobs_running_the_gate()
+    # Two of them today: the dedicated type-check job and behavior-tests via bats.
+    assert len(jobs) >= 2, "expected both the type-check job and the bats job"
+    for job in jobs:
+        steps = " ".join(str(step) for step in job["steps"])
+        assert "astral-sh/setup-uv" in steps, (
+            f"{job.get('name', '?')} reaches the gate but never installs uv"
+        )
 
 
 # ---------------------------------------------------------------------------
