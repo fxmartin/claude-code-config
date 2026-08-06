@@ -11,3 +11,9 @@
 .sdlc-state.db-shm
 # Per-run agent log directories written alongside the ledger; machine-local.
 .sdlc-state.db.logs/
+
+# Tool caches. Note .mypy-baseline.json is NOT a cache — it is the committed
+# ratchet snapshot the type-check gate compares against (Issue #586).
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

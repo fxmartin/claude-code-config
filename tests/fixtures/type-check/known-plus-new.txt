@@ -1,0 +1,2 @@
+src/sdlc/known.py:120: error: Missing type parameters for generic type "dict"  [type-arg]
+src/sdlc/fresh.py:12: error: Incompatible return value type (got "str", expected "int")  [return-value]

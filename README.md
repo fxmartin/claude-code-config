@@ -184,6 +184,7 @@ Claude Code). The plugin half needs a Claude Code restart to take effect.
 | `sdlc model-backfill [--all]` | Backfill per-stage model attribution (`stages.model`) from the session logs; unrecoverable rows are counted, never coerced (`sdlc doctor` reports the coverage) |
 | `sdlc predict-quality [run] [--json]` | Score the per-story predictions `sdlc build --predict` recorded against their reconciled actuals — median absolute token error + rework calibration, each with its sample size |
 | `sdlc sast` · `sdlc depscan` · `sdlc supplychain` | Classify SAST/dependency scan reports · scan hooks/skills/MCP/settings for dangerous patterns — all exit non-zero on `BLOCK` for CI gating |
+| `sdlc typecheck` | Gate a mypy report against `controller/.mypy-baseline.json` — new type violations `BLOCK`, the known backlog does not. Driven by `scripts/run-type-check.sh`; ladder documented in [`docs/python-best-practices.md`](docs/python-best-practices.md) |
 | `sdlc eval` · `sdlc eval-compare` · `sdlc eval-baseline` | Agent-output evaluation harness (A/B, regression baselines) |
 | `sdlc validate <agent-type> <file>` | Validate an agent response against its JSON schema |
 | `sdlc sync-check <src> <dst>` | Verify shared-skills parity between repos |

@@ -352,7 +352,7 @@ The autonomous build agents generate commit messages in this format automaticall
 `main` is protected by a repository ruleset — **direct pushes are rejected for everyone, including the maintainer**. Day-to-day this means: branch, commit, `gh pr create`, wait for green, merge.
 
 - Every change lands through a **pull request**. No approval count is enforced, so a maintainer can self-merge once CI is green.
-- These CI checks are **required** before a PR can merge: `Static checks`, `Contract checks`, `Commit format (commitlint)`, `Behavior tests (bats)`, and both `Smoke test (clean-machine install)` matrix legs (macOS + Ubuntu).
+- These CI checks are **required** before a PR can merge: `Static checks`, `Contract checks`, `Commit format (commitlint)`, `Behavior tests (bats)`, and both `Smoke test (clean-machine install)` matrix legs (macOS + Ubuntu). `Type check (mypy ratchet)` also runs on every PR — add it to the required set once the ruleset is next edited.
 - Force-pushes to and deletion of `main` are blocked.
 - The one direct-push exception is the **release pipeline**: it pushes its `chore(release): vX.Y.Z` bump commit and tag using a deploy key, which the ruleset lists as a bypass actor. (Personal GitHub repos cannot grant the Actions app a ruleset bypass, hence the deploy key.)
 
