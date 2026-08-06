@@ -193,6 +193,12 @@ def test_message_line_references_are_normalized_in_the_signature() -> None:
     assert a.signature == b.signature
 
 
+def test_location_formats_path_and_line() -> None:
+    (diagnostic,) = parse_mypy_output(_KNOWN)
+
+    assert diagnostic.location() == "src/sdlc/build.py:120"
+
+
 # ---------------------------------------------------------------------------
 # Baseline file round-trip
 # ---------------------------------------------------------------------------
@@ -248,6 +254,17 @@ def test_baseline_that_is_not_an_object_raises(tmp_path: Path) -> None:
     path.write_text("[]", encoding="utf-8")
 
     with pytest.raises(TypeCheckBaselineError, match="JSON object"):
+        load_baseline(path)
+
+
+def test_baseline_violations_field_not_a_mapping_raises(tmp_path: Path) -> None:
+    path = tmp_path / ".mypy-baseline.json"
+    path.write_text(
+        json.dumps({"version": BASELINE_VERSION, "violations": ["a|b|c"]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TypeCheckBaselineError, match="signature -> count"):
         load_baseline(path)
 
 
