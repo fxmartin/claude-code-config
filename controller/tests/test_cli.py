@@ -398,3 +398,91 @@ def test_sast_suppressed_finding_is_printed(tmp_path) -> None:
     assert "SAST_STATUS: CLEAN" in result.output
     assert "[suppressed]" in result.output
     assert "rules.example" in result.output
+
+
+# ---------------------------------------------------------------------------
+# typecheck subcommand (Issue #586)
+# ---------------------------------------------------------------------------
+
+from sdlc.type_check import build_baseline, parse_mypy_output, render_baseline
+
+_KNOWN_TYPE_ERROR = (
+    'src/sdlc/build.py:120: error: Missing type parameters for generic type "dict"'
+    "  [type-arg]"
+)
+_NEW_TYPE_ERROR = (
+    'src/sdlc/cli.py:498: error: Argument 1 to "run_fix" has incompatible type '
+    '"FixOptions"; expected "FixBatchOptions"  [arg-type]'
+)
+
+
+def _write_baseline(tmp_path: Path, *lines: str) -> Path:
+    baseline_file = tmp_path / ".mypy-baseline.json"
+    baseline = build_baseline(parse_mypy_output("\n".join(lines)))
+    baseline_file.write_text(render_baseline(baseline), encoding="utf-8")
+    return baseline_file
+
+
+def test_typecheck_clean_exits_zero(tmp_path: Path) -> None:
+    baseline_file = _write_baseline(tmp_path, _KNOWN_TYPE_ERROR)
+    result = runner.invoke(
+        app,
+        ["typecheck", "--baseline", str(baseline_file)],
+        input=_KNOWN_TYPE_ERROR + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "TYPE_CHECK_STATUS: CLEAN" in result.output
+
+
+def test_typecheck_block_exits_one_and_lists_new_violation(tmp_path: Path) -> None:
+    baseline_file = _write_baseline(tmp_path, _KNOWN_TYPE_ERROR)
+    result = runner.invoke(
+        app,
+        ["typecheck", "--baseline", str(baseline_file)],
+        input=_KNOWN_TYPE_ERROR + "\n" + _NEW_TYPE_ERROR + "\n",
+    )
+    assert result.exit_code == 1
+    assert "TYPE_CHECK_STATUS: BLOCK" in result.output
+    assert "[new] src/sdlc/cli.py:498" in result.output
+    assert "arg-type" in result.output
+
+
+def test_typecheck_warn_exits_zero_when_a_known_violation_is_fixed(
+    tmp_path: Path,
+) -> None:
+    baseline_file = _write_baseline(tmp_path, _KNOWN_TYPE_ERROR)
+    result = runner.invoke(
+        app,
+        ["typecheck", "--baseline", str(baseline_file)],
+        input="",
+    )
+    assert result.exit_code == 0
+    assert "TYPE_CHECK_STATUS: WARN" in result.output
+    assert "[fixed] 1 baselined violation" in result.output
+
+
+def test_typecheck_update_writes_baseline(tmp_path: Path) -> None:
+    baseline_file = tmp_path / ".mypy-baseline.json"
+    result = runner.invoke(
+        app,
+        ["typecheck", "--baseline", str(baseline_file), "--update"],
+        input=_KNOWN_TYPE_ERROR + "\n",
+    )
+    assert result.exit_code == 0
+    assert "TYPE_CHECK_STATUS: UPDATED (1 violations)" in result.output
+    assert baseline_file.is_file()
+    written = _json.loads(baseline_file.read_text(encoding="utf-8"))
+    assert written["violations"]
+
+
+def test_typecheck_malformed_baseline_exits_two(tmp_path: Path) -> None:
+    baseline_file = tmp_path / ".mypy-baseline.json"
+    baseline_file.write_text("{not json", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["typecheck", "--baseline", str(baseline_file)], input=""
+    )
+
+    assert result.exit_code == 2
+    assert "error:" in result.output
+    assert "not valid JSON" in result.output

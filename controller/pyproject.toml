@@ -22,6 +22,12 @@ sdlc = "sdlc.cli:app"
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    # Type-check gate (Issue #586). The stub packages are pinned as ordinary
+    # dev deps so `uv sync --extra dev` resolves them from uv.lock — the gate
+    # itself never fetches stubs, which keeps it usable on an offline runner.
+    "mypy>=2.3",
+    "types-PyYAML>=6",
+    "types-jsonschema>=4.21",
 ]
 
 [build-system]
@@ -36,6 +42,94 @@ packages = ["src/sdlc"]
 # config-packaging fix). importlib.resources resolves them as
 # `sdlc/schemas/*.schema.json` and `sdlc/config/*.yaml`.
 artifacts = ["src/sdlc/schemas/*.schema.json", "src/sdlc/config/*.yaml"]
+
+# ---------------------------------------------------------------------------
+# Static type checking — ratcheted rollout (Issue #586)
+# ---------------------------------------------------------------------------
+# Two rungs, documented in docs/python-best-practices.md:
+#
+#   Rung 0 (here) — every module. Permissive about *annotation coverage*
+#     (untyped defs are tolerated) but strict about checks that catch real
+#     defects. Whatever this level still reports is frozen in
+#     .mypy-baseline.json; `scripts/run-type-check.sh` fails the build on any
+#     violation beyond that snapshot, so the backlog can only shrink.
+#
+#   Rung 1 (tool.mypy.overrides) — the strict allowlist. Full `strict = true`
+#     on modules that already pass it. Promote a module here as soon as it is
+#     clean; that is how the ratchet advances.
+#
+# Deliberately NOT set: ignore_missing_imports. A blanket ignore turns whole
+# dependencies into Any and hollows out the gate — jsonschema and PyYAML get
+# real stubs from the pinned dev extra instead.
+[tool.mypy]
+files = ["src"]
+python_version = "3.11"
+# Pydantic v2 ships a mypy plugin; without it every model's synthesized
+# __init__ is invisible and the I/O boundary goes unchecked (ADR-001).
+plugins = ["pydantic.mypy"]
+
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+strict_equality = true
+extra_checks = true
+
+pretty = false
+show_error_codes = true
+
+# Rung 1: strict allowlist. Every module listed here passes `mypy --strict`
+# today and must keep doing so. Grow this list; never shrink it.
+[[tool.mypy.overrides]]
+module = [
+    "sdlc.capability",
+    "sdlc.change_class",
+    "sdlc.cohort",
+    "sdlc.cost_estimate",
+    "sdlc.degradation",
+    "sdlc.dependency_scan",
+    "sdlc.dispatch",
+    "sdlc.doc_currency",
+    "sdlc.eval_compare",
+    "sdlc.evaluate",
+    "sdlc.host_auth",
+    "sdlc.identity",
+    "sdlc.ledger_view",
+    "sdlc.notify",
+    "sdlc.parsers",
+    "sdlc.portability",
+    "sdlc.progress",
+    "sdlc.rate_limit",
+    "sdlc.repair",
+    "sdlc.review_packet",
+    "sdlc.risk_gate",
+    "sdlc.runlog",
+    "sdlc.sanitize",
+    "sdlc.security_scan",
+    "sdlc.skill_generator",
+    "sdlc.story_assign",
+    "sdlc.story_init",
+    "sdlc.story_mirror",
+    "sdlc.story_sync",
+    "sdlc.supply_chain_scan",
+    "sdlc.sync",
+    "sdlc.type_check",
+]
+# `strict = true` is a global-only flag — setting it in a per-module override
+# silently applies it to the whole tree, which would put every module at rung 1
+# at once. Expand it into the per-module flags it stands for instead.
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_decorators = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+strict_equality = true
+extra_checks = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

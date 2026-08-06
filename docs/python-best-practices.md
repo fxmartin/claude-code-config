@@ -16,11 +16,59 @@ Every commit must pass all gates. Run in this order:
 
 | Gate | Command | Blocks on |
 |------|---------|-----------|
-| Type check | `uv run mypy .` | Any error |
+| Type check | `scripts/run-type-check.sh` | Any violation beyond the baseline |
 | Lint | `uv run ruff check .` | Any violation |
 | Format | `uv run ruff format --check .` | Any diff |
 | Security | `uv tool run bandit -r src/` | Medium+ finding |
 | Tests | `uv run pytest` | Any failure |
+
+## The Strictness Ladder (type checking)
+
+The controller is checked by **mypy**, configured in `controller/pyproject.toml`.
+A 27k-line tree cannot go red-to-green in one commit, so the rollout is
+**ratcheted**: the known backlog is frozen and only *new* violations block.
+
+| Rung | Applies to | Enforces |
+|------|-----------|----------|
+| **0 — floor** | every module | Real-defect checks: `check_untyped_defs`, `strict_equality`, `extra_checks`, `warn_redundant_casts`, `warn_unused_ignores`. Annotation coverage is *not* required. |
+| **1 — strict** | the `[[tool.mypy.overrides]]` allowlist | Full `strict`: every def annotated, no implicit `Any` generics, no untyped calls, no `Any` returns. |
+
+`ignore_missing_imports` is deliberately **off** — a blanket ignore turns whole
+dependencies into `Any` and hollows out the gate. Stubs (`types-PyYAML`,
+`types-jsonschema`) are pinned in the `dev` extra and resolved from `uv.lock`,
+so the gate never fetches anything at check time.
+
+### The ratchet
+
+`controller/.mypy-baseline.json` records the accepted backlog as
+`file|error-code|message → count`. It deliberately excludes line numbers, so a
+baselined violation survives unrelated edits that shift it up or down the file.
+
+```bash
+scripts/run-type-check.sh            # gate: BLOCK on anything beyond the baseline
+scripts/run-type-check.sh --update   # prune the baseline after draining backlog
+```
+
+- `CLEAN` — matches the baseline exactly.
+- `WARN` — you *fixed* something baselined. Passes, but rerun with `--update`
+  and commit the smaller baseline so the ratchet tightens.
+- `BLOCK` — a violation the baseline does not cover. Exit 1.
+
+**`--update` is for pruning, never for waving a fresh violation through.** The
+baseline may only shrink; a PR that grows it needs an explicit reason in review.
+
+### Moving a module up
+
+The allowlist is how the ladder advances. When a module passes `strict`, add it:
+
+```bash
+cd controller && uv run mypy --strict src/sdlc/<module>.py   # must be clean
+# then add "sdlc.<module>" to the [[tool.mypy.overrides]] module list
+```
+
+Grow that list; never shrink it. Note `strict = true` is a **global-only** flag —
+setting it inside an override silently promotes the whole tree — so the
+allowlist spells out the individual per-module flags instead.
 
 ## Project Setup
 

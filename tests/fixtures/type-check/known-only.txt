@@ -1,0 +1,1 @@
+src/sdlc/known.py:120: error: Missing type parameters for generic type "dict"  [type-arg]

@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "violations": {
+    "src/sdlc/known.py|type-arg|Missing type parameters for generic type \"dict\"": 1
+  }
+}

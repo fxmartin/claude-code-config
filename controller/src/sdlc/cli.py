@@ -37,6 +37,7 @@ PLANNED_SUBCOMMANDS: dict[str, str] = {
     "sast": "Classify a semgrep report into a CLEAN | WARN | BLOCK gate verdict.",
     "depscan": "Classify an osv-scanner report into a CLEAN | WARN | BLOCK gate verdict.",
     "supplychain": "Scan hooks/skills/MCP/settings for dangerous patterns (CLEAN | WARN | BLOCK).",
+    "typecheck": "Gate a mypy report against the committed baseline (new violations only).",
     "run-open": "Register a fix-issue run so the dashboard surfaces it.",
     "run-stage": "Log a fix-issue phase start/finish to the ledger.",
     "run-close": "Finalize a fix-issue run (DONE/FAILED) in ledger + registry.",
@@ -1986,6 +1987,83 @@ def supplychain(
             f"  [suppressed] {finding.location()} {finding.pattern_id}"
             f" sha256:{finding.digest}"
         )
+
+    raise typer.Exit(code=1 if result.status == "BLOCK" else 0)
+
+
+@app.command(help=PLANNED_SUBCOMMANDS["typecheck"])
+def typecheck(
+    report_file: Path | None = typer.Argument(
+        None,
+        help="mypy text output. Reads stdin when omitted.",
+    ),
+    baseline_file: Path = typer.Option(
+        Path(".mypy-baseline.json"),
+        "--baseline",
+        help="Committed snapshot of the accepted type-violation backlog.",
+    ),
+    update: bool = typer.Option(
+        False,
+        "--update",
+        help="Rewrite the baseline from this report instead of gating on it.",
+    ),
+) -> None:
+    """Gate a mypy run against the committed baseline.
+
+    Reads mypy's text output (from a file or stdin) and compares it to the
+    accepted backlog in ``.mypy-baseline.json``. Prints the verdict as
+    ``TYPE_CHECK_STATUS: CLEAN | WARN | BLOCK`` followed by one line per new
+    violation. Exits 0 for CLEAN/WARN and 1 for BLOCK so a shell gate can
+    branch on the exit code; a malformed baseline exits 2.
+
+    ``--update`` regenerates the baseline — use it to prune entries after
+    draining backlog, never to wave through a fresh violation.
+    """
+    from sdlc.type_check import (
+        TypeCheckBaselineError,
+        build_baseline,
+        compare_to_baseline,
+        load_baseline,
+        parse_mypy_output,
+        render_baseline,
+    )
+
+    report = (
+        report_file.read_text(encoding="utf-8") if report_file else sys.stdin.read()
+    )
+    diagnostics = parse_mypy_output(report)
+
+    if update:
+        baseline = build_baseline(diagnostics)
+        baseline_file.write_text(render_baseline(baseline), encoding="utf-8")
+        typer.echo(f"TYPE_CHECK_STATUS: UPDATED ({baseline.total} violations)")
+        typer.echo(f"  wrote {baseline_file}")
+        raise typer.Exit(code=0)
+
+    try:
+        baseline = load_baseline(baseline_file)
+    except TypeCheckBaselineError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    result = compare_to_baseline(diagnostics, baseline)
+
+    typer.echo(
+        f"TYPE_CHECK_STATUS: {result.status} "
+        f"({result.total} violations, baseline {result.baseline_total})"
+    )
+    for diagnostic in result.new_violations:
+        typer.echo(
+            f"  [new] {diagnostic.location()}: {diagnostic.message}"
+            f"  [{diagnostic.code}]"
+        )
+    if result.fixed:
+        typer.echo(
+            f"  [fixed] {result.fixed_total} baselined violation(s) no longer "
+            "reported — regenerate with --update to tighten the ratchet:"
+        )
+        for signature, count in sorted(result.fixed.items()):
+            typer.echo(f"    -{count} {signature}")
 
     raise typer.Exit(code=1 if result.status == "BLOCK" else 0)
 
