@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.0] - 2026-08-06
+
+### Added
+
+- feat(ci): add a ratcheted mypy type-check gate (#586)
+
+### Fixed
+
+- fix(type-check): resolve mypy from the dev extra and survive bash 3.2
+
+
 ## [v2.44.0] - 2026-08-05
 
 ### Added
