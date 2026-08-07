@@ -4774,6 +4774,14 @@ def render_merge_prompt(
         "`risk-approver` review), do NOT force-merge or override the gate: "
         'report merge_status="FAILED" and set the extra field "block_reason" to '
         '"BLOCKED_HIGH_RISK" so the run is parked awaiting human approval.\n'
+        # Issue #586: a retried earlier stage (or a resume) can re-enter merge
+        # after the CR already landed. That is the goal state, so it must be
+        # reported *with* the landing sha — a bare SKIPPED is indistinguishable
+        # from an agent that merged nothing and fails the stage.
+        f"If the {abbr} has already been merged, do not merge again: report "
+        'merge_status="SKIPPED" and set merge_sha to the sha it landed at (and '
+        "merged_at to when) so the controller records the landing instead of "
+        "treating the stage as failed.\n"
         + _result_wrapper("merge-agent-response.schema.json")
     )
 
@@ -8061,8 +8069,31 @@ def _stage_succeeded(stage: str, data: dict) -> bool:
     if stage == "review":
         return data.get("final_status") == "APPROVED"
     if stage == "merge":
-        return data.get("merge_status") == "MERGED"
+        return _merge_landed(data)
     return False
+
+
+def _merge_landed(data: dict) -> bool:
+    """True when a merge response means the change request is on the base branch.
+
+    ``MERGED`` is the agent merging it here. ``SKIPPED`` *carrying a merge_sha*
+    is the idempotent case: the PR had already landed (a retried earlier stage
+    re-entered merge, or a resume replayed it), so the agent verified the merge
+    and reported the landing sha instead of merging again. Both leave the stage
+    at its goal state (issue #586, run 570d5db3 — PR #588 was already merged, so
+    the MERGED-only check logged ``merge-error`` and dropped a landed fix into
+    the bugfix loop).
+
+    A SKIPPED response with no sha stays a failure: that is an agent that merged
+    nothing and knows of no merge — e.g. run 6212933d (story 27.1-003), where it
+    ``cd``'d into the wrong directory and skipped. So does a high-risk approval
+    block, which reports FAILED with an empty sha (Story 12.3-003).
+    """
+    status = data.get("merge_status")
+    if status == "MERGED":
+        return True
+    sha = data.get("merge_sha")
+    return status == "SKIPPED" and isinstance(sha, str) and bool(sha.strip())
 
 
 def _stage_failure_summary(stage: str, data: dict) -> str:

@@ -20,7 +20,7 @@
     },
     "merge_sha": {
       "type": "string",
-      "description": "SHA of the resulting merge commit; empty when nothing merged (FAILED/SKIPPED)."
+      "description": "SHA the change request landed at. Required non-empty on MERGED. On SKIPPED it is the sha of an already-merged CR when the agent verified one (which the controller treats as landed), and empty otherwise. Always empty on FAILED."
     },
     "merged_at": {
       "type": "string",
