@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.3] - 2026-08-07
+
+### Fixed
+
+- fix(sdlc): refuse runs on a dirty checkout to stop stash orphans (#590)
+
+
 ## [v2.45.2] - 2026-08-07
 
 ### Fixed
