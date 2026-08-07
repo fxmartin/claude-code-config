@@ -3821,3 +3821,165 @@ def test_log_fix_harness_routing_never_fails_the_run(tmp_path) -> None:
     fix_mod._log_fix_harness_routing(
         ledger, "run", FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX))
     )  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Issue #589: a retried stage must never reuse an attempt number, and a
+# collision on `stage_start`'s primary key must park the run instead of
+# crashing it.
+# ---------------------------------------------------------------------------
+
+
+def _seed_story(ledger: Ledger, run_id: str, story_id: str) -> None:
+    ledger.story_upsert(
+        run_id, story_id, "", "t", "P1", None, "backend",
+        f"feature/{story_id}", None, "IN_PROGRESS",
+    )
+
+
+def test_stage_next_attempt_reproduces_the_589_ledger_state(tmp_path) -> None:
+    """review FAILED@1 -> bugfix DONE@1 -> review IN_PROGRESS@2 -> next is 3.
+
+    The exact ledger state reported at the crash in run `570d5db3`: the next
+    retry must target attempt 3, never re-collide on the IN_PROGRESS attempt 2
+    row a concurrent writer already left behind.
+    """
+    ledger = Ledger(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-586", "fix")
+    story_id = "issue-586"
+    _seed_story(ledger, run_id, story_id)
+    for stage in ("investigation", "build", "coverage"):
+        ledger.stage_start(run_id, story_id, stage, 1)
+        ledger.stage_finish(run_id, story_id, stage, 1, "DONE")
+    ledger.stage_start(run_id, story_id, "review", 1)
+    ledger.stage_finish(run_id, story_id, "review", 1, "FAILED", "review-error")
+    ledger.stage_start(run_id, story_id, "bugfix", 1)
+    ledger.stage_finish(run_id, story_id, "bugfix", 1, "DONE")
+    ledger.stage_start(run_id, story_id, "review", 2)  # left IN_PROGRESS, as at the crash
+
+    assert ledger.stage_next_attempt(run_id, story_id, "review") == 3
+
+
+def test_stage_next_attempt_is_one_for_a_never_attempted_stage(tmp_path) -> None:
+    """A fresh stage with no ledger rows starts at attempt 1, unchanged."""
+    ledger = Ledger(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    _seed_story(ledger, run_id, "issue-1")
+    assert ledger.stage_next_attempt(run_id, "issue-1", "build") == 1
+
+
+def test_stage_next_attempt_is_scoped_to_its_own_run_and_stage(tmp_path) -> None:
+    """A collision-prone query must not leak across runs, stories, or stages."""
+    ledger = Ledger(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    run_a = ledger.run_create("issue-1", "fix")
+    run_b = ledger.run_create("issue-1", "fix")
+    _seed_story(ledger, run_a, "issue-1")
+    _seed_story(ledger, run_b, "issue-1")
+    ledger.stage_start(run_a, "issue-1", "review", 1)
+    ledger.stage_finish(run_a, "issue-1", "review", 1, "DONE")
+    ledger.stage_start(run_a, "issue-1", "build", 1)
+    ledger.stage_finish(run_a, "issue-1", "build", 1, "DONE")
+
+    # A different run, and a different stage within the same run, are untouched.
+    assert ledger.stage_next_attempt(run_b, "issue-1", "review") == 1
+    assert ledger.stage_next_attempt(run_a, "issue-1", "coverage") == 1
+    assert ledger.stage_next_attempt(run_a, "issue-1", "review") == 2
+
+
+class _RacingLedger(Ledger):
+    """Simulates a second writer racing this run for the same stage attempt (#589).
+
+    On the first call matching ``race_stage``/``race_attempt``, sneaks in a
+    competing INSERT (as an unrelated overlapping writer would) immediately
+    before delegating to the real ``stage_start`` — reproducing the exact
+    TOCTOU window an authoritative-attempt read cannot close on its own:
+    another writer can still win the race between the read and the write.
+    """
+
+    def __init__(self, db_path, *, race_stage: str, race_attempt: int) -> None:
+        super().__init__(db_path)
+        self._race_stage = race_stage
+        self._race_attempt = race_attempt
+        self._raced = False
+
+    def stage_start(self, run_id, story_id, stage_name, attempt=1, **kwargs):
+        if (
+            not self._raced
+            and stage_name == self._race_stage
+            and attempt == self._race_attempt
+        ):
+            self._raced = True
+            Ledger(self.db_path).stage_start(run_id, story_id, stage_name, attempt, **kwargs)
+        super().stage_start(run_id, story_id, stage_name, attempt, **kwargs)
+
+
+def _review_changes_then_approves(n: int) -> dict:
+    if n == 0:
+        return {
+            "pr_number": 100, "approval_status": "CHANGES_REQUESTED",
+            "change_count": 1, "final_status": "CHANGES_REQUESTED",
+        }
+    return {
+        "pr_number": 100, "approval_status": "APPROVED",
+        "change_count": 0, "final_status": "APPROVED",
+    }
+
+
+def test_run_fix_stage_start_collision_parks_needs_attention_not_a_crash(
+    tmp_path,
+) -> None:
+    """A concurrent writer racing the retried review attempt must not crash the run.
+
+    Reproduces the reported traceback (`sqlite3.IntegrityError` on the
+    ``stages`` primary key) by injecting a competing writer at the exact
+    window between the loop's authoritative-attempt read and its own insert.
+    The run must park resumable (NEEDS_ATTENTION), never die on a raw
+    exception.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    ledger = _RacingLedger(db, race_stage="review", race_attempt=2)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=ledger,
+        dispatcher=RecordingDispatcher(overrides={"review": _review_changes_then_approves}),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert result.status == "NEEDS_ATTENTION"
+    assert any(
+        "collided with a concurrent ledger writer" in m for m in _events(db)
+    )
+
+
+def test_run_fix_stage_start_collision_leaves_the_earlier_attempt_recorded(
+    tmp_path,
+) -> None:
+    """The collision must not corrupt or roll back the stages already recorded."""
+    db = tmp_path / ".sdlc-state.db"
+    ledger = _RacingLedger(db, race_stage="review", race_attempt=2)
+    run_fix(
+        FixOptions(issue=1),
+        ledger=ledger,
+        dispatcher=RecordingDispatcher(overrides={"review": _review_changes_then_approves}),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    run_id = Ledger(db).latest_run_id()
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT stage_name, attempt, status FROM stages "
+            "WHERE run_id = ? ORDER BY stage_name, attempt",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert ("review", 1, "FAILED") in rows
+    assert ("bugfix", 1, "DONE") in rows
+    # The competing writer's row is what it is — untouched by our failed insert.
+    assert ("review", 2, "IN_PROGRESS") in rows

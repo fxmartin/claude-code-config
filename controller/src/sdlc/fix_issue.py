@@ -31,6 +31,7 @@ import functools
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from collections import defaultdict
@@ -1235,10 +1236,29 @@ def _run_stage_loop(
             )
         while True:
             model = fix_model(stage, opts, escalate=escalate)
-            ledger.stage_start(
-                run_id, story.id, stage, attempt,
-                harness=fix_stage_harness(stage, opts), model=model,
-            )
+            # Issue #589: re-derive the attempt from the ledger's own
+            # highest-recorded row rather than trusting the in-memory counter
+            # alone — a second writer touching this run/story/stage (e.g. an
+            # overlapping resume) can advance it past what this loop computed
+            # last. `max()` keeps the loop's own bookkeeping as a floor so a
+            # fresh stage still starts at 1.
+            attempt = max(attempt, ledger.stage_next_attempt(run_id, story.id, stage))
+            try:
+                ledger.stage_start(
+                    run_id, story.id, stage, attempt,
+                    harness=fix_stage_harness(stage, opts), model=model,
+                )
+            except sqlite3.IntegrityError as exc:
+                # A concurrent writer won the race for this exact attempt
+                # number between our read and our insert. The ledger write
+                # path must not be the one place a run dies on a raw
+                # traceback (#589) — park it resumable instead.
+                ledger.event_log(
+                    run_id, story.id, "error", "controller",
+                    f"{stage} attempt {attempt} collided with a concurrent "
+                    f"ledger writer — parking NEEDS_ATTENTION: {exc}",
+                )
+                return "NEEDS_ATTENTION", pr_number
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             prompt = _render_core_prompt(
                 stage, issue, inv, opts, pr_number,

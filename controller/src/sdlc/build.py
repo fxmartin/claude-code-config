@@ -2503,6 +2503,23 @@ class Ledger:
                 (run_id, story_id, stage_name, attempt, harness, model),
             )
 
+    def stage_next_attempt(self, run_id: str, story_id: str, stage_name: str) -> int:
+        """The next unused attempt number for this stage (one past the highest recorded).
+
+        Mirrors :func:`sdlc.fix_issue._fix_resume_point`'s "one past the highest
+        recorded attempt" rule, but as a live query rather than a snapshot taken
+        once at resume time — so a retry loop always targets an attempt number
+        the ledger has not seen yet, even when another writer (e.g. an overlapping
+        resume) advanced it since the loop last checked (Issue #589).
+        """
+        with self._connect_ro() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(attempt), 0) AS max_attempt FROM stages "
+                "WHERE run_id = ? AND story_id = ? AND stage_name = ?",
+                (run_id, story_id, stage_name),
+            ).fetchone()
+        return int(row["max_attempt"]) + 1
+
     def stage_set_model(
         self,
         run_id: str,
