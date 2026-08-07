@@ -8,7 +8,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sdlc.build import Ledger, _git, remove_story_worktree
+from sdlc.build import Ledger, _git, list_stashes, remove_story_worktree
 from sdlc.ledger_view import default_db_path
 from sdlc.registry import Registry, pid_alive
 
@@ -27,12 +27,14 @@ _LEDGER_LIVE_STATUSES = {"IN_PROGRESS", "RATE_LIMITED"}
 
 @dataclass
 class CleanItem:
-    """One thing ``clean`` considered: a worktree, a branch, or a log dir.
+    """One thing ``clean`` considered: a worktree, a branch, a log dir, or a stash.
 
-    ``kind`` is ``worktree`` | ``branch`` | ``logs``; ``name`` is the human label
-    (branch name, worktree directory name, or run id); ``path`` is the filesystem
-    target where one applies; ``reason`` explains why it is a candidate or why it
-    was protected; ``removed`` flips True only after an actual ``--force`` removal.
+    ``kind`` is ``worktree`` | ``branch`` | ``logs`` | ``stash``; ``name`` is the
+    human label (branch name, worktree directory name, run id, or ``stash@{N}``
+    ref); ``path`` is the filesystem target where one applies; ``reason`` explains
+    why it is a candidate or why it was protected; ``removed`` flips True only
+    after an actual ``--force`` removal. A ``stash`` is only ever *reported* — see
+    :func:`_collect_stashes`.
     """
 
     kind: str
@@ -75,6 +77,11 @@ class CleanPlan:
     @property
     def logs(self) -> list[CleanItem]:
         return self.by_kind("logs")
+
+    @property
+    def stashes(self) -> list[CleanItem]:
+        """Leftover stash entries (issue #590) — always protected, never candidates."""
+        return [p for p in self.protected if p.kind == "stash"]
 
     @property
     def total(self) -> int:
@@ -407,6 +414,34 @@ def _collect_branches(
             )
 
 
+# --- stashes ----------------------------------------------------------------
+
+
+def _collect_stashes(root: Path, plan: CleanPlan) -> None:
+    """Report leftover stash entries — reported only, never removed (issue #590).
+
+    A crashed run used to leave the user's uncommitted changes in a stash an agent
+    made to unblock its own ``git checkout -b``: ``git status`` read clean and
+    nothing named the stash. ``clean`` is where a user looks for that kind of
+    leftover, so every entry is surfaced here with its exact ``git stash apply``
+    recovery command.
+
+    They land in ``protected``, never ``candidates``, and that is deliberate: only
+    candidates are removed under ``--force``, and dropping a stash would destroy
+    the very un-backed-up work this reports. Deleting it stays the user's call.
+    """
+    for ref, subject in list_stashes(root):
+        plan.protected.append(
+            CleanItem(
+                "stash",
+                ref,
+                f"stashed work invisible to `git status` ({subject}) — "
+                f"recover with `git stash apply {ref}`",
+                None,
+            )
+        )
+
+
 # --- transcript logs --------------------------------------------------------
 
 
@@ -448,7 +483,8 @@ def plan_clean(
     """Compute (but never apply) the clean plan for ``root``.
 
     Gathers reclaimable orphan ``agent-*`` worktrees, squash-merged
-    ``feature/<id>`` branches, and stale transcript log dirs — each cross-checked
+    ``feature/<id>`` branches, stale transcript log dirs, and (report-only, issue
+    #590) leftover stash entries — each cross-checked
     against the run registry + live-pid so a build active here or in another
     session is never disturbed. Pure: it reads git, the ledger, the registry and
     (optionally) ``gh``; it removes nothing and never touches the remote.
@@ -475,6 +511,7 @@ def plan_clean(
     _collect_worktrees(root, live_prefixes, plan)
     _collect_branches(root, done_sids, live_sids, gh_merged_fn, plan)
     _collect_logs(db_path, live_run_ids, plan)
+    _collect_stashes(root, plan)
     return plan
 
 
