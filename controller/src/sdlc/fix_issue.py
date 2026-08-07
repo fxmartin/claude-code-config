@@ -589,7 +589,15 @@ def render_merge_prompt(issue: FixIssue, pr_number: int | None) -> str:
         "`risk:high` label with no `risk-approved` label and no `risk-approver` "
         'review), do NOT force-merge: report merge_status FAILED and set '
         'block_reason to "BLOCKED_HIGH_RISK" so the run parks awaiting human '
-        "approval.\n\n"
+        "approval.\n"
+        # Run 570d5db3 (issue #586): a review retry re-entered merge a day after
+        # PR #588 had landed. Already-merged is the goal state, but it must be
+        # reported *with* the landing sha — a bare SKIPPED is indistinguishable
+        # from the wrong-directory skip above and fails the stage.
+        "If the PR has already been merged, do not merge again: report "
+        "merge_status SKIPPED and set merge_sha to the sha it landed at (and "
+        "merged_at to when) so the controller records the landing instead of "
+        "treating the stage as failed.\n\n"
         + _result_wrapper("merge-agent-response.schema.json")
     )
 

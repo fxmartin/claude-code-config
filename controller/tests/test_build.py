@@ -4243,6 +4243,52 @@ def test_commit_lint_unreadable_after_reask_parks(tmp_path, monkeypatch) -> None
 
 
 # ---------------------------------------------------------------------------
+# Idempotent merge: an already-merged PR is a success, not a merge-error (#586)
+# ---------------------------------------------------------------------------
+
+def test_already_merged_pr_reported_as_skipped_with_sha_succeeds() -> None:
+    """A re-dispatched merge over an already-merged PR must not fail the stage.
+
+    Regression for run 570d5db3 (issue #586): a review retry re-entered the
+    merge stage a day after PR #588 had already landed. The merge agent
+    correctly reported ``merge_status="SKIPPED"`` *with* the landing
+    ``merge_sha``, but ``_stage_succeeded`` demanded MERGED, so the controller
+    logged ``merge-error`` and dropped a fully-merged issue into the bugfix
+    loop. An already-merged PR is the merge stage's goal state.
+    """
+    from sdlc.build import _stage_succeeded
+
+    already_merged = {
+        "pr_number": 588,
+        "merge_status": "SKIPPED",
+        "merge_sha": "3a043df3a84c24c5b68d6764e09bb249f21b9a02",
+        "merged_at": "2026-08-06T17:19:17+02:00",
+    }
+    assert _stage_succeeded("merge", already_merged) is True
+    # The response a real merge agent emits must also pass schema validation.
+    from sdlc.contracts import validate_response
+
+    assert validate_response("merge", already_merged) == already_merged
+
+
+def test_skipped_merge_without_sha_still_fails() -> None:
+    """SKIPPED with no SHA is still a failure — the agent merged nothing.
+
+    Guards the narrowness of the fix above. Run 6212933d (story 27.1-003) saw a
+    merge agent ``cd`` into the wrong directory and report SKIPPED having done
+    no work; that response carries no ``merge_sha`` and must keep failing so the
+    bugfix loop still runs.
+    """
+    from sdlc.build import _stage_succeeded
+
+    assert _stage_succeeded("merge", {"merge_status": "SKIPPED", "merge_sha": ""}) is False
+    assert _stage_succeeded("merge", {"merge_status": "SKIPPED"}) is False
+    assert _stage_succeeded("merge", {"merge_status": "SKIPPED", "merge_sha": "   "}) is False
+    # A high-risk approval block reports FAILED with no SHA — unchanged.
+    assert _stage_succeeded("merge", _high_risk_merge_block()) is False
+
+
+# ---------------------------------------------------------------------------
 # AWAITING_APPROVAL: a high-risk merge block is parked, not failed (12.3-003)
 # ---------------------------------------------------------------------------
 
