@@ -352,6 +352,16 @@ def build(ctx: typer.Context) -> None:
         )
         raise typer.Exit(code=0)
 
+    if result.dirty_tree:
+        # Issue #590: refused before any dispatch — nothing was stashed, moved, or
+        # committed, so the changes below are still exactly where FX left them.
+        from sdlc.build import format_dirty_tree
+
+        typer.echo(
+            format_dirty_tree(Path.cwd(), result.dirty_tree, "sdlc build"), err=True
+        )
+        raise typer.Exit(code=1)
+
     if result.preflight_failed:
         typer.echo(
             "PRE_FLIGHT_FAILURE: test suite is red on main — fix before building.",
@@ -444,6 +454,7 @@ Flags:
   --skip-coverage           build agent opens the PR directly (no coverage gate)
   --coverage-threshold=N    required new-code coverage % (default 90)
   --skip-preflight          skip the preflight quality gate
+  --allow-dirty             start even with uncommitted changes (issue #590)
   --e2e-gate=warn|off       run the advisory E2E gate after review (default off)
   --skip-e2e                alias for --e2e-gate=off
 
@@ -499,6 +510,15 @@ def fix(ctx: typer.Context) -> None:
         opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
     )
 
+    if result.dirty_tree:
+        # Issue #590: refused before any dispatch — nothing was stashed or moved.
+        from sdlc.build import format_dirty_tree
+
+        typer.echo(
+            format_dirty_tree(Path.cwd(), result.dirty_tree, "sdlc fix"), err=True
+        )
+        raise typer.Exit(code=1)
+
     if result.preflight_failed:
         typer.echo(
             "PRE_FLIGHT_FAILURE: test suite is red on main — fix before running `sdlc fix`.",
@@ -532,6 +552,15 @@ def _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view) -> None:
     result = run_fix_batch(
         opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
     )
+
+    if result.dirty_tree:
+        # Issue #590: refused before any dispatch — nothing was stashed or moved.
+        from sdlc.build import format_dirty_tree
+
+        typer.echo(
+            format_dirty_tree(Path.cwd(), result.dirty_tree, "sdlc fix"), err=True
+        )
+        raise typer.Exit(code=1)
 
     if result.preflight_failed:
         typer.echo(
@@ -1797,6 +1826,12 @@ def clean(
     default** — it reports what it *would* remove and removes nothing until
     ``--force``/``--yes`` is passed.
 
+    Leftover **stash** entries are reported too (issue #590) but are never
+    candidates: a crashed run could strand the user's uncommitted work in a
+    stash that ``git status`` does not show, and dropping it would destroy the
+    only copy. Each is listed with its exact ``git stash apply`` recovery
+    command; removing it stays a deliberate manual act.
+
     Safe to run beside a live build: every candidate is cross-checked against the
     host run registry + a live-pid probe, so a worktree or branch an
     ``IN_PROGRESS`` run owns (here or in another session/clone) is never touched.
@@ -1816,6 +1851,14 @@ def clean(
         raise typer.Exit(code=0)
 
     verb = "removed" if force else "would remove"
+
+    # Issue #590: leftover stashes are reported *before* the early "nothing to do"
+    # return and are never candidates — dropping one would destroy the very
+    # un-backed-up work this exists to surface. Printing them unconditionally is
+    # the point: a stash a crashed run left behind is invisible to `git status`.
+    for item in plan.stashes:
+        typer.echo(f"  ! leftover: {item.name} — {item.reason}")
+
     if not plan.candidates:
         typer.echo("clean: nothing to do — workspace already tidy.")
         raise typer.Exit(code=0)

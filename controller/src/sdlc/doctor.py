@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from sdlc.build import _MIGRATIONS, Ledger, status_snapshot
+from sdlc.build import _MIGRATIONS, Ledger, list_stashes, status_snapshot
 from sdlc.harness import DEFAULT_HARNESS
 from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
@@ -26,6 +26,7 @@ __all__ = [
     "check_harness_pin",
     "check_model_coverage",
     "check_model_routing",
+    "check_stashes",
     "check_usage_agreement",
     "run_doctor",
     "worst_status",
@@ -87,6 +88,10 @@ _AGREEMENT_RUN_LIMIT = 5
 # At most this many residual disagreements are named individually in the finding's
 # detail; the rest are summarised as "+N more" so the line stays readable.
 _AGREEMENT_MAX_LISTED = 5
+
+# At most this many stash entries are named individually in the leftover-stash
+# finding (issue #590); the rest are summarised as "+N more".
+_STASH_MAX_LISTED = 5
 
 
 def worst_status(statuses: list[str]) -> str:
@@ -792,6 +797,41 @@ def check_model_routing(db_path: Path) -> Finding:
     )
 
 
+def check_stashes(repo_root: Path) -> Finding:
+    """Surface stash entries as recoverable-but-invisible work (issue #590).
+
+    A crashed run used to leave the user's uncommitted changes in a stash nothing
+    announced: ``git status`` reported a clean tree, the traceback never mentioned
+    the stash, and one ``git stash clear`` would have destroyed the work for good.
+    Doctor is the natural place to make that leftover visible again.
+
+    Every entry is reported, not only controller-shaped ones: the stashes this
+    hazard produced were bare ``WIP on <branch>`` entries with nothing tying them
+    to a run, so a name filter would miss exactly the cases that matter. A stash
+    the user made deliberately is still worth one WARN line naming the exact
+    recovery command — doctor never drops anything itself.
+    """
+    entries = list_stashes(repo_root)
+    if not entries:
+        return Finding(
+            "stash", "Stashed work", "CLEAN", f"no stash entries in {repo_root}"
+        )
+    listed = entries[:_STASH_MAX_LISTED]
+    shown = "; ".join(f"{ref} {subject}" for ref, subject in listed)
+    more = len(entries) - len(listed)
+    if more > 0:
+        shown += f"; +{more} more"
+    return Finding(
+        "stash",
+        "Stashed work",
+        "WARN",
+        f"{len(entries)} stash entr{'y' if len(entries) == 1 else 'ies'} in "
+        f"{repo_root} — uncommitted work invisible to `git status`: {shown}",
+        f"inspect with `git stash list`, recover with "
+        f"`git stash apply {entries[0][0]}`; drop only once you have the work back",
+    )
+
+
 def check_dependencies(probe: Callable[[str], bool]) -> list[Finding]:
     """One finding per external dependency: CLEAN when present, WARN when absent."""
     findings: list[Finding] = []
@@ -866,6 +906,7 @@ def run_doctor(
         check_usage_agreement(db_path),
         check_model_coverage(db_path),
         check_model_routing(db_path),
+        check_stashes(repo_root),
     ]
     findings.extend(check_dependencies(dep_probe))
     return DoctorReport(findings=findings)

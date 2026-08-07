@@ -1600,6 +1600,10 @@ def test_run_build_applies_reconcile_reclassifications(tmp_path, monkeypatch) ->
         ledger=Ledger(db),
         dispatcher=None,
         preflight=lambda: True,
+        # Issue #590: the real-run branch also probes the live checkout for
+        # uncommitted changes. Neutralize that seam like the git side effects
+        # above — this test is about reconcile, not the dirty-tree guard.
+        dirty_check=lambda: [],
     )
 
     assert calls and calls[0][1] is True  # reconcile ran with fetch=True

@@ -837,6 +837,8 @@ _BOOL_FLAGS = {
     "--sandbox": "sandbox",
     # Story 28.2-002: compute + record the per-story cost/rework prediction.
     "--predict": "predict",
+    # Issue #590: start anyway on a dirty shared checkout (opt-out of the guard).
+    "--allow-dirty": "allow_dirty",
 }
 
 
@@ -869,6 +871,11 @@ class BuildOptions:
     skip_preflight: bool = False
     rebuild: bool = False
     preflight_timeout: int = 600
+    # Issue #590: opt out of the dirty-shared-checkout guard. Default False =
+    # refuse to start when the repo root carries uncommitted tracked changes,
+    # because an agent that hits the resulting failed `git checkout -b` has been
+    # seen stashing them itself — an untracked stash a crash then strands.
+    allow_dirty: bool = False
     # Story 14.1-001: per-run token budget gate. ``budget`` is the token ceiling
     # (the governance primitive — 0 means no ceiling, today's behaviour). A
     # ``$``-denominated budget is accepted as a convenience and converted to the
@@ -2001,6 +2008,7 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
     Accepts the exact flags the skill documents:
     ``[scope...] [--dry-run] [--auto] [--skip-coverage] [--limit=N]
     [--sequential] [--concurrency=N] [--coverage-threshold=N] [--skip-preflight]
+    [--allow-dirty]
     [--rebuild] [--preflight-timeout=SEC]``. Each ``scope`` is ``all``,
     ``epic-NN``, an epic name, or a single story id ``X.Y-NNN`` (default ``all``).
     Several scopes may be given (space- or comma-separated); they are collapsed
@@ -4247,6 +4255,10 @@ class BuildResult:
     # any manual fix on it), so the run refuses to start and names the resume
     # path instead. Each entry is ``{story_id, run_id, status, pr_number}``.
     resume_required: list[dict] = field(default_factory=list)
+    # Issue #590: tracked paths with uncommitted changes that made the run refuse
+    # to start on the shared checkout. Non-empty means nothing was dispatched and
+    # no run row exists — the user's work is still exactly where they left it.
+    dirty_tree: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -4594,6 +4606,16 @@ def render_build_prompt(
         # currently checked-out branch (typically main). Fail the build immediately.
         f"   If branch creation fails for any reason, emit BUILD_STATUS: FAILED "
         "immediately and do not commit on the current branch or any other branch.\n"
+        # Issue #590: git answers a checkout on a dirty tree with "commit your
+        # changes or stash them", and agents have taken the hint — a bare
+        # `git stash` the controller never created, tracks, or restores. When the
+        # run then dies, the user's uncommitted work is stranded in stash@{0}
+        # while `git status` reads clean. The controller already refuses to start
+        # on a dirty checkout; this closes the same door from the agent's side.
+        "   Never run `git stash` (or otherwise shelve someone else's "
+        "uncommitted changes) to work around a failed checkout: that work is not "
+        "yours, nothing here tracks the stash, and an interrupted run strands it "
+        "invisibly. Fail instead.\n"
         + spec_step
         + "3. Follow TDD: write failing tests first, then implement\n"
         "4. Run all quality gates (tests, types, lint, security)\n"
@@ -5290,6 +5312,100 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+# --- shared-checkout dirty-tree guard (issue #590) --------------------------
+#
+# Both `sdlc build` and `sdlc fix` open their run by telling an agent to run
+# ``git fetch origin && git checkout -b <branch> <base>`` in the *shared* repo
+# root (per-story worktrees are cut later, and a fix run never cuts one). On a
+# dirty tree that checkout fails with git's own "commit your changes or stash
+# them" hint, and the agent has been observed taking the hint: it runs a bare
+# ``git stash`` to unblock itself. The controller neither creates nor tracks
+# that stash, so nothing restores it — and when the run then dies (an unhandled
+# exception, a kill, power loss) the user's uncommitted work is left in
+# ``stash@{0}`` while ``git status`` reports a clean tree. The work is
+# recoverable but undiscoverable, and one ``git stash clear`` from gone.
+#
+# The controller therefore refuses to start a run on a dirty shared checkout,
+# before anything is dispatched: the user commits or stashes deliberately (and
+# so knows where their work went), rather than an agent doing it invisibly.
+# ``--allow-dirty`` is the explicit opt-out. Resumes are deliberately *not*
+# gated: a resumed run legitimately re-enters a checkout its interrupted
+# predecessor left dirty, so gating it would make resume impossible.
+
+# At most this many paths are named individually in the refusal message; the
+# rest are summarised as "+N more" so the line stays readable.
+_DIRTY_TREE_MAX_LISTED = 10
+
+
+def dirty_tree_paths(root: Path) -> list[str]:
+    """Tracked paths with uncommitted changes in ``root`` (issue #590).
+
+    Untracked files are excluded (``--untracked-files=no``): they neither block
+    ``git checkout -b`` nor land in a default ``git stash``, so counting them
+    would refuse runs in any repo carrying scratch files. Returns ``[]`` when the
+    check cannot run at all (git missing, not a repo, timeout) — an
+    un-inspectable tree degrades to today's behaviour rather than blocking every
+    run.
+    """
+    try:
+        res = _git(root, "status", "--porcelain", "--untracked-files=no")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if res.returncode != 0:
+        return []
+    # Porcelain v1 lines are ``XY <path>`` — two status columns, a space, then
+    # the path (a rename reads ``old -> new``, which is kept verbatim).
+    return [line[3:].strip() for line in res.stdout.splitlines() if line.strip()]
+
+
+def format_dirty_tree(root: Path, paths: list[str], command: str) -> str:
+    """The operator-facing refusal for a dirty shared checkout (issue #590)."""
+    listed = paths[:_DIRTY_TREE_MAX_LISTED]
+    more = len(paths) - len(listed)
+    lines = [
+        f"DIRTY_WORKING_TREE: {root} has {len(paths)} uncommitted change(s):",
+        *(f"  - {path}" for path in listed),
+    ]
+    if more > 0:
+        lines.append(f"  - (+{more} more)")
+    lines.extend(
+        [
+            "",
+            "Commit or stash them yourself before starting a run. The controller "
+            "refuses to start here because the build agent, hit by a failed "
+            "`git checkout -b`, has been seen stashing this work itself "
+            "(issue #590) — a stash no run tracks, and one an unexpected exit "
+            "strands while `git status` reports a clean tree.",
+            f"Bypass with `{command} --allow-dirty` once you have decided the "
+            "changes are safe to carry into the run.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def list_stashes(root: Path) -> list[tuple[str, str]]:
+    """``(ref, subject)`` for every entry on ``root``'s stash stack (issue #590).
+
+    ``ref`` is the addressable ``stash@{N}`` and ``subject`` its message, so a
+    caller can print the exact ``git stash apply <ref>`` recovery command.
+    Returns ``[]`` when the stack is empty *or* unreadable — this only ever feeds
+    advisory reporting, so it must never raise.
+    """
+    try:
+        res = _git(root, "stash", "list", "--format=%gd\t%gs")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if res.returncode != 0:
+        return []
+    out: list[tuple[str, str]] = []
+    for line in res.stdout.splitlines():
+        if not line.strip():
+            continue
+        ref, _, subject = line.partition("\t")
+        out.append((ref.strip(), subject.strip()))
+    return out
+
+
 def _git_push(root: Path, branch: str) -> subprocess.CompletedProcess[str]:
     """Push ``branch`` to ``origin`` from ``root`` (issue #527).
 
@@ -5961,6 +6077,7 @@ def run_build(
     sleep_fn: Callable[[float], None] | None = None,
     root: Path | None = None,
     actor_adapter: "IssueHostAdapter | None" = None,
+    dirty_check: Callable[[], list[str]] | None = None,
 ) -> BuildResult:
     """Run the build-stories orchestration deterministically.
 
@@ -5976,9 +6093,20 @@ def run_build(
     hook that regenerates the markdown progress view from the ledger. ``root``
     is the git project root the git-landed partition probe (#227) consults;
     it defaults to the cwd in production and lets tests point at a non-repo dir.
+
+    ``dirty_check`` is the issue #590 shared-checkout guard's seam: it returns the
+    tracked paths with uncommitted changes, and a non-empty result refuses the run
+    before anything is dispatched. It defaults to the real git probe only on a
+    *real* run — a run given an injected dispatcher launches no agent, so there is
+    no shared checkout for one to stash behind the controller's back.
     """
     dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
     check_preflight = preflight or (lambda: default_preflight(timeout=opts.preflight_timeout))
+    check_dirty = dirty_check or (
+        (lambda: dirty_tree_paths(root or Path.cwd()))
+        if dispatcher is None
+        else (lambda: [])
+    )
 
     # --- Partition: shipped (Done) stories are skipped unless --rebuild ------
     if opts.rebuild:
@@ -6028,6 +6156,17 @@ def run_build(
         conflicts = _parked_story_conflicts(ledger, buildable)
         if conflicts:
             return BuildResult(resume_required=conflicts, planned=len(buildable))
+
+    # --- Dirty shared-checkout guard (issue #590) ----------------------------
+    # Refuse before preflight burns a test run, and — critically — before any
+    # agent is dispatched into a checkout whose failed `git checkout -b` would
+    # tempt it into an untracked `git stash`. Nothing is written yet (no run row,
+    # no registry entry), so the user's uncommitted work stays exactly where they
+    # left it. `--allow-dirty` is the explicit opt-out.
+    if not opts.allow_dirty:
+        dirty = check_dirty()
+        if dirty:
+            return BuildResult(dirty_tree=dirty, planned=len(buildable))
 
     # --- Phase 1: Preflight (real runs only) ---------------------------------
     if not opts.skip_preflight:

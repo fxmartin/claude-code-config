@@ -37,7 +37,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from sdlc.build import (
     MAX_BUGFIX_ATTEMPTS,
@@ -56,6 +56,7 @@ from sdlc.build import (
     _StoryRunOutcome,
     create_story_worktree,
     default_preflight,
+    dirty_tree_paths,
     finalize_run,
     remove_story_worktree,
 )
@@ -156,6 +157,11 @@ class FixOptions:
     skip_coverage: bool = False
     coverage_threshold: int = 90
     skip_preflight: bool = False
+    # Issue #590: opt out of the dirty-shared-checkout guard. Default False =
+    # refuse to start when the repo root carries uncommitted tracked changes,
+    # because the build agent, hit by the resulting failed `git checkout -b`, has
+    # been seen stashing them itself — a stash a crashed run then strands.
+    allow_dirty: bool = False
     # E2E warn-gate mode: ``off`` (default, no dispatch) or ``warn`` (advisory —
     # runs after review, logs a FAIL, and continues to merge). Issue #436 PR3.
     e2e_gate: str = "off"
@@ -186,6 +192,9 @@ class FixBatchOptions:
     skip_coverage: bool = False
     coverage_threshold: int = 90
     skip_preflight: bool = False
+    # Issue #590: mirrors :class:`FixOptions` — the batch shares one checkout, so
+    # the guard is checked once for the whole batch and threaded down per issue.
+    allow_dirty: bool = False
     sequential: bool = False
     concurrency: int = 5
     # E2E warn-gate mode, threaded down to each issue's :class:`FixOptions`. Issue #436 PR3.
@@ -218,6 +227,10 @@ class FixBatchResult:
     status: str = ""
     outcomes: list[FixIssueOutcome] = field(default_factory=list)
     preflight_failed: bool = False
+    # Issue #590: tracked paths with uncommitted changes that made the batch
+    # refuse to start on the shared checkout. Non-empty means nothing was
+    # dispatched and no run row exists.
+    dirty_tree: list[str] = field(default_factory=list)
     # True when selection found nothing to fix (no run row created).
     no_issues: bool = False
     summary: str = ""
@@ -250,6 +263,10 @@ class FixResult:
     aborted: bool = False
     abort_reason: str = ""
     preflight_failed: bool = False
+    # Issue #590: tracked paths with uncommitted changes that made the run refuse
+    # to start on the shared checkout. Non-empty means nothing was dispatched and
+    # no run row exists — the user's work is still exactly where they left it.
+    dirty_tree: list[str] = field(default_factory=list)
     investigation_blocked: bool = False
     block_reason: str = ""
 
@@ -498,6 +515,16 @@ def render_build_prompt(issue: FixIssue, inv: dict, opts: FixOptions) -> str:
         f"1. Create branch: git fetch origin && git checkout -b {branch} origin/main\n"
         "   If branch creation fails for any reason, emit build_status FAILED "
         "immediately and do NOT commit on the current branch.\n"
+        # Issue #590: git answers a checkout on a dirty tree with "commit your
+        # changes or stash them", and agents have taken the hint — a bare
+        # `git stash` the controller never created, tracks, or restores. When the
+        # run then dies, the user's uncommitted work is stranded in stash@{0}
+        # while `git status` reads clean. The controller already refuses to start
+        # on a dirty checkout; this closes the same door from the agent's side.
+        "   Never run `git stash` (or otherwise shelve someone else's "
+        "uncommitted changes) to work around a failed checkout: that work is not "
+        "yours, nothing here tracks the stash, and an interrupted run strands it "
+        "invisibly. Fail instead.\n"
         "2. Write a failing regression test that reproduces the bug (it must fail "
         "before the fix, pass after).\n"
         "3. Implement the minimal fix for the root cause only — do not refactor "
@@ -1500,6 +1527,7 @@ def run_fix(
     root: Path | None = None,
     logs_dir: Path | None = None,
     registry: Registry | None = None,
+    dirty_check: Callable[[], list[str]] | None = None,
 ) -> FixResult:
     """Run the single-issue fix orchestration deterministically (issue #436).
 
@@ -1521,11 +1549,22 @@ def run_fix(
     the run logged in its own ledger and never fails the fix. ``registry`` is
     resolved like :func:`run_resume`'s — a real one only on a real run, so the
     injected-fake orchestration tests never touch host state.
+
+    Issue #590: ``dirty_check`` is the shared-checkout guard's seam — it returns
+    the tracked paths with uncommitted changes, and a non-empty result refuses the
+    run before anything is dispatched. It defaults to the real git probe only on a
+    *real* run; a run given an injected dispatcher launches no agent, so there is
+    no shared checkout for one to stash behind the controller's back.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
     if registry is None and dispatcher is None:
         registry = Registry()
+    check_dirty = dirty_check or (
+        (lambda: dirty_tree_paths(root or Path.cwd()))
+        if dispatcher is None
+        else (lambda: [])
+    )
 
     # --- Fetch + stop conditions (no run row for a deliberate pre-run stop) ---
     try:
@@ -1539,6 +1578,18 @@ def run_fix(
         return FixResult(
             issue=opts.issue, aborted=True, abort_reason=stop, status="ABORTED"
         )
+
+    # --- Dirty shared-checkout guard (issue #590) -----------------------------
+    # A fix run never cuts a worktree: every stage runs against the repo root. If
+    # that root is dirty the agent's opening `git checkout -b` fails with git's
+    # "commit your changes or stash them" hint, and agents have taken it — an
+    # untracked stash a crashed run then strands while `git status` reads clean.
+    # Refuse here, before preflight burns a test run and before any dispatch, so
+    # the user's work is still exactly where they left it. `--allow-dirty` opts out.
+    if not opts.allow_dirty:
+        dirty = check_dirty()
+        if dirty:
+            return FixResult(issue=opts.issue, dirty_tree=dirty, status="ABORTED")
 
     # --- Preflight ------------------------------------------------------------
     check_preflight = preflight or (lambda: default_preflight())
@@ -2096,6 +2147,10 @@ def _issue_options(batch: FixBatchOptions, number: int) -> FixOptions:
         skip_coverage=batch.skip_coverage,
         coverage_threshold=batch.coverage_threshold,
         skip_preflight=batch.skip_preflight,
+        # Issue #590: the batch already ran the guard once for the shared
+        # checkout; a per-issue re-check would trip on the batch's own in-flight
+        # edits, so the decision is inherited rather than repeated.
+        allow_dirty=True,
         e2e_gate=batch.e2e_gate,
         model_overrides=dict(batch.model_overrides),
         harness_map=dict(batch.harness_map),
@@ -2270,6 +2325,7 @@ def run_fix_batch(
     root: Path | None = None,
     logs_dir: Path | None = None,
     registry: Registry | None = None,
+    dirty_check: Callable[[], list[str]] | None = None,
 ) -> FixBatchResult:
     """Run the batch fix orchestration deterministically (issue #436, PR2).
 
@@ -2294,6 +2350,23 @@ def run_fix_batch(
     if registry is None and real_run:
         registry = Registry()
     workers = _batch_workers(batch)
+
+    # --- Dirty shared-checkout guard (issue #590) -----------------------------
+    # Every issue in the batch runs against the same repo root, so one check for
+    # the whole batch — before selection, preflight, or any dispatch — protects
+    # all of them from an agent stashing the user's uncommitted work to unblock
+    # its own `git checkout -b`. See :func:`run_fix` for the full rationale.
+    check_dirty = dirty_check or (
+        (lambda: dirty_tree_paths(root or Path.cwd())) if real_run else (lambda: [])
+    )
+    if not batch.allow_dirty:
+        dirty = check_dirty()
+        if dirty:
+            return FixBatchResult(
+                dirty_tree=dirty,
+                status="ABORTED",
+                summary="refused to start: uncommitted changes in the working tree",
+            )
 
     # --- Preflight ------------------------------------------------------------
     check_preflight = preflight or (lambda: default_preflight())
@@ -2620,6 +2693,8 @@ def _batch_summary(outcomes: list[FixIssueOutcome]) -> str:
 _FIX_BOOL_FLAGS = {
     "--skip-coverage": "skip_coverage",
     "--skip-preflight": "skip_preflight",
+    # Issue #590: start anyway on a dirty shared checkout (opt-out of the guard).
+    "--allow-dirty": "allow_dirty",
     "--sequential": "sequential",
 }
 _FIX_BATCH_TARGETS = {"all", "next"}
@@ -2634,6 +2709,7 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
     unchanged). A batch target — ``all`` (every open issue) or ``next`` (top open
     bugs, default one) — yields a :class:`FixBatchOptions`. Shared flags:
     ``--skip-coverage``, ``--coverage-threshold=N``, ``--skip-preflight``,
+    ``--allow-dirty`` (issue #590: start despite uncommitted changes),
     ``--e2e-gate=warn|off`` (default off), and its ``--skip-e2e`` alias.
     Batch-only flags: ``--limit=N`` (cap the issue set; the ``next`` default is 1),
     ``--sequential`` (one issue fully completes before the next), and
@@ -2713,7 +2789,7 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
         raise FixConfigError(
             "missing issue number — usage: `sdlc fix <issue-number> | all | next "
             "[--limit=N] [--sequential] [--concurrency=N] [--skip-coverage] "
-            "[--coverage-threshold=N] [--skip-preflight]`."
+            "[--coverage-threshold=N] [--skip-preflight] [--allow-dirty]`."
         )
     # Batch-only flags on a single issue are a usage error, not a silent no-op.
     if limit is not None:

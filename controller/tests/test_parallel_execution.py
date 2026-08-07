@@ -853,6 +853,9 @@ def test_parallel_real_run_refreshes_base_ref_before_dispatch(tmp_path, monkeypa
         ledger=Ledger(tmp_path / "ledger.db"),
         dispatcher=None,
         preflight=lambda: True,
+        # Issue #590: the real-run branch also probes the live checkout for
+        # uncommitted changes — neutralized here with the other git side effects.
+        dirty_check=lambda: [],
     )
 
     assert result.completed == 2
