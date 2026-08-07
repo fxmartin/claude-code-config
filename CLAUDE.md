@@ -38,6 +38,32 @@
 - **End-to-end tests**: Verify user workflows
 - Authorization required: "I AUTHORIZE YOU TO SKIP WRITING TESTS THIS TIME"
 
+### CI Compatibility — tests must pass in local GitLab job containers
+Repos run CI on the local-ci-cd platform: ephemeral **Linux/arm64 container VMs, running as
+root, on minimal digest-pinned images, with no network**. Tests that only pass on a developer
+Mac are defects. Write to this contract:
+
+- **Root user**: permission-based fault injection (`chmod`, read-only files/dirs) silently
+  no-ops as root. Inject failures through seams (interfaces, fakes, injected errors) instead.
+  If a filesystem-permission test is unavoidable, guard it: skip with an explicit message when
+  `euid == 0`.
+- **Process semantics**: PID 1 is a bare `sh` keep-alive — no init reaper, container-specific
+  session/signal behavior. Tests that signal processes must kill the process *group*, escalate
+  SIGTERM→SIGKILL, and wait with headroom; never assert a child died promptly.
+- **Offline**: the platform's release gate runs with networking disabled. No test may reach the
+  public internet; use local fixtures and fakes.
+- **`localhost` is the job container**, never the host. Don't probe host services on 127.0.0.1.
+- **Case-sensitive ext4** vs the Mac's case-insensitive APFS: paths/imports differing only by
+  case fail only in CI.
+- **Modest resources** (default 2 CPUs / 4 GB, sharing a host with GitLab): tight timeouts and
+  wall-clock assertions flake. Prefer event-based waits over sleeps; give timeouts headroom.
+- **Clean environment**: no dotfiles (`~/.gitconfig` etc.), no state from prior runs, only `sh`
+  guaranteed (`bash` optional), `git` from the image or the platform's toolbox volume.
+- **Triage rule**: a job failing with the *system-failure* exit code is a platform problem; a
+  *build-failure* exit code is your code or tests. Don't relabel one as the other.
+- **Local repro before blaming CI**: run the suite inside a container on the pinned job image
+  (root + Linux + case-sensitive fs reproduces most of the above).
+
 ## Workflow & Agents
 
 Story-driven development (`/generate-epics`, `REQUIREMENTS.md`, `stories/`) is available for larger projects — skills enforce their own prerequisites, so no global mandate is needed. See `WORKFLOW-v2.md` for the full multi-agent development lifecycle.
