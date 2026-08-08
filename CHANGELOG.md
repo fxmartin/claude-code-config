@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.4] - 2026-08-08
+
+### Fixed
+
+- fix(model-shelf): point submodule at fork with managed-config init fix
+
+
 ## [v2.45.3] - 2026-08-07
 
 ### Fixed
