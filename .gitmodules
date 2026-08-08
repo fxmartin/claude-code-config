@@ -1,3 +1,5 @@
 [submodule "skills/model-shelf"]
 	path = skills/model-shelf
-	url = https://github.com/alexziskind1/model-shelf.git
+	# fxmartin fork carrying the managed-config init fix until upstream PR #10
+	# (alexziskind1/model-shelf) lands; repoint back after merge.
+	url = https://github.com/fxmartin/model-shelf.git
