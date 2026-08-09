@@ -260,6 +260,38 @@ def test_gitlab_issue_create() -> None:
     assert "--assignee" in argv and "fx" in argv
 
 
+def test_gitlab_issue_create_accepts_work_item_url() -> None:
+    """GitLab now returns work-item URLs for issues; the iid still has to parse.
+
+    `glab issue create` against a modern GitLab (confirmed on 19.2.1) prints
+    `.../-/work_items/<iid>` rather than `.../-/issues/<iid>`. The issue is created either
+    way, so failing to parse the ref strands a real issue with no inventory mapping.
+    """
+    runner = FakeRunner(
+        {"issue create": (0, "http://gitlab.test/root/llmbench/-/work_items/1\n", "")}
+    )
+    issue = ih.GitLabAdapter(runner=runner).issue_create(
+        title="t", body="d", labels=["story"], assignee="fx"
+    )
+    assert issue.ref == "1"
+    assert issue.host == ih.GITLAB
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://github.com/fx/r/issues/9", "9"),
+        ("https://gitlab.com/g/r/-/issues/5", "5"),
+        ("http://gitlab.test/root/llmbench/-/work_items/1", "1"),
+        ("https://gitlab.corp.internal/team/r/-/work_items/88", "88"),
+        ("https://github.com/fx/r/pull/123", None),  # a CR, not an issue
+        ("no url at all", None),
+    ],
+)
+def test_issue_ref_from_url(url, expected) -> None:
+    assert ih._ref_from_url(url) == expected
+
+
 def test_gitlab_issue_update() -> None:
     runner = FakeRunner({"issue update": (0, "", "")})
     ih.GitLabAdapter(runner=runner).issue_update("5", title="t", body="d", labels=["risk:high"])

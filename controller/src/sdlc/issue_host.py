@@ -49,9 +49,15 @@ SUPPORTED_HOSTS = (GITHUB, GITLAB)
 _CLI_TIMEOUT = 30.0
 
 # Parse the issue *ref* out of a created-issue URL — GitHub `.../issues/123`,
-# GitLab `.../-/issues/5`. The ref is the GitHub issue *number* or the GitLab
-# per-project *iid*, normalised to a string behind `issue_ref` (Story 22.1-001).
-_ISSUE_REF_RE = re.compile(r"/issues/(\d+)")
+# GitLab `.../-/issues/5` or `.../-/work_items/5`. The ref is the GitHub issue
+# *number* or the GitLab per-project *iid*, normalised to a string behind
+# `issue_ref` (Story 22.1-001).
+#
+# `work_items` is GitLab's newer issue URL form (confirmed on 19.2.1): `glab issue
+# create` creates the issue and then prints a work-item URL, so matching only
+# `/issues/` left a real issue on the board with no inventory mapping and failed every
+# story of a backfill.
+_ISSUE_REF_RE = re.compile(r"/(?:issues|work_items)/(\d+)")
 
 # Parse the change-request *ref* out of a created-CR URL — GitHub PR
 # `.../pull/123`, GitLab MR `.../-/merge_requests/5`. The ref is the PR *number*
