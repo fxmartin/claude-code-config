@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.6] - 2026-08-10
+
+### Fixed
+
+- fix(sdlc): write Status: Done back to story markdown on landing (#603)
+
+
 ## [v2.45.5] - 2026-08-10
 
 ### Fixed
