@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sdlc.build import _STAGES, Ledger, _base_ref, _git
+from sdlc.story_markdown import find_epic_file, mark_story_done
 
 if TYPE_CHECKING:
     from sdlc.registry import Registry
@@ -344,6 +345,20 @@ def reconcile_run(
             continue
         signal, sha = landing
         ledger.set_story_status(rid, sid, "DONE")
+        # Issue #598: stamp the epic markdown too, not just the ledger — the
+        # ledger row carries no epic_file, so resolve it by story-id major
+        # number. Best-effort: no matching epic file is a silent no-op, and a
+        # write failure logs a warning rather than breaking reconciliation
+        # (this function's "never fails an otherwise-good run" contract).
+        epic_file = find_epic_file(sid, root)
+        if epic_file is not None:
+            try:
+                mark_story_done(epic_file, sid)
+            except OSError as exc:
+                ledger.event_log(
+                    rid, sid, "warn", "reconcile",
+                    f"epic markdown write-back failed (non-fatal): {exc}",
+                )
         # Backfill the PR best-effort: keep an already-recorded number, else
         # resolve the merged PR behind the landing via gh. A failed/empty lookup
         # leaves pr_number as-is and never crashes (reconcile's contract).
