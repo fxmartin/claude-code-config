@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.7] - 2026-08-10
+
+### Fixed
+
+- fix(sdlc): add host-aware glab check to sdlc doctor (#599) (#604)
+
+
 ## [v2.45.6] - 2026-08-10
 
 ### Fixed
