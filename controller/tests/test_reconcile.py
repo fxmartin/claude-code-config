@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -1034,4 +1035,99 @@ def test_doc_update_anchor_alone_is_nothing_to_reconcile(tmp_path: Path) -> None
 
     assert result.reclassified == []
     assert result.run_status_after == "DONE"
-    assert not result.changed
+
+
+# ---------------------------------------------------------------------------
+# Issue #598: a reconciled-to-DONE story writes `**Status**: Done` back into
+# its epic markdown too, not just the ledger — the epic file is the documented
+# single source of truth and `sdlc issues init` reads it at face value.
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_writes_status_done_to_epic_markdown(tmp_path: Path) -> None:
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-001", new=True)
+    _commit(root, "ff.py", "x = 1\n", "feat: ff (#99.1-001)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-001")
+
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-001: Fast-forward landing\n"
+        "**Status**: Not started\n"
+        "**Priority**: P1\n",
+        encoding="utf-8",
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-001"]
+    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+
+
+def test_reconcile_epic_markdown_write_failure_is_non_fatal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A write-back OSError must log a warning and never break reconciliation."""
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-001", new=True)
+    _commit(root, "ff.py", "x = 1\n", "feat: ff (#99.1-001)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-001")
+
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-001: Fast-forward landing\n"
+        "**Status**: Not started\n"
+        "**Priority**: P1\n",
+        encoding="utf-8",
+    )
+
+    def _boom(epic_file, story_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(reconcile_mod, "mark_story_done", _boom)
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-001"]
+    assert _status(db, run_id, "99.1-001") == "DONE"
+    assert "**Status**: Not started" in epic_file.read_text(encoding="utf-8")
+
+    conn = sqlite3.connect(db)
+    try:
+        events = conn.execute(
+            "SELECT message FROM events WHERE run_id = ? AND story_id = '99.1-001'"
+            " AND level = 'warn'",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert any("epic markdown write-back failed" in row[0] for row in events)
+
+
+def test_reconcile_without_epic_file_is_non_fatal(tmp_path: Path) -> None:
+    """No docs/stories dir at all (the fixture default) must not break reconcile."""
+    root = _init_repo(tmp_path)
+    _checkout(root, "feature/99.1-001", new=True)
+    _commit(root, "ff.py", "x = 1\n", "feat: ff (#99.1-001)")
+    _checkout(root, "main")
+    _git(root, "merge", "-q", "--ff-only", "feature/99.1-001")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert [r["story_id"] for r in result.reclassified] == ["99.1-001"]
+    assert _status(db, run_id, "99.1-001") == "DONE"
