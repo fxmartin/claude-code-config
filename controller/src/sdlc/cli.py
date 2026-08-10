@@ -919,8 +919,10 @@ def doctor(
     ledger schema currency + integrity, stuck/stale runs (an IN_PROGRESS run with
     a dead pid or no recent activity), config validity (settings/schemas parse),
     ledger-vs-logs usage agreement, per-stage model attribution, and dependency
-    availability (gh, claude, semgrep, osv-scanner). Each finding reports
-    CLEAN/WARN/FAIL plus the command or doc that fixes it.
+    availability (gh, claude, semgrep, osv-scanner, and a host-aware check for
+    glab — WARN when the repo's origin targets GitLab, or is undetectable, and
+    glab is missing; not-applicable on a GitHub-targeted repo). Each finding
+    reports CLEAN/WARN/FAIL plus the command or doc that fixes it.
 
     The **model attribution** check (Story 28.1-002) reports the share of
     dispatched stage attempts across the same window carrying a non-NULL

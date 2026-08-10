@@ -114,8 +114,8 @@ def test_run_doctor_all_clean(tmp_path: Path) -> None:
     # Every check category present.
     checks = {f.check for f in report.findings}
     assert {"install", "ledger", "runs", "config"} <= checks
-    # A dependency finding per tool.
-    assert sum(1 for f in report.findings if f.check == "dependency") == 4
+    # A dependency finding per tool (gh, claude, semgrep, osv-scanner, glab).
+    assert sum(1 for f in report.findings if f.check == "dependency") == 5
     # CLEAN findings carry no remedy noise.
     assert all(f.remedy == "" for f in report.findings if f.status == "CLEAN")
 
@@ -345,6 +345,75 @@ def test_dependency_missing_warns(tmp_path: Path) -> None:
         if f.check == "dependency" and "osv-scanner" not in f.name
     ]
     assert all(f.status == "CLEAN" for f in others)
+
+
+# --- glab host-aware dependency check (issue #599 / 23.6-002 follow-through) -
+
+
+def test_run_doctor_warns_when_glab_missing_and_host_undetectable(
+    tmp_path: Path,
+) -> None:
+    """Issue #599 regression: a repo with no glab must never report fully CLEAN.
+
+    `_healthy_install` builds a plain directory with no git remote, so the host
+    is undetectable — doctor must still surface the gap instead of staying
+    silent about it (the WARN fallback for the ambiguous case).
+    """
+
+    def probe(tool: str) -> bool:
+        return tool != "glab"
+
+    report = _doctor(tmp_path, dep_probe=probe)
+    assert report.status != "CLEAN"
+    glab = next(f for f in report.findings if f.check == "dependency" and "glab" in f.name)
+    assert glab.status == "WARN"
+    assert glab.remedy
+
+
+def test_glab_dependency_clean_and_not_applicable_on_github_host(tmp_path: Path) -> None:
+    from sdlc.doctor import check_glab_dependency
+
+    finding = check_glab_dependency(tmp_path, lambda _tool: False, host="github")
+    assert finding.status == "CLEAN"
+    assert "not applicable" in finding.detail
+    assert finding.remedy == ""
+
+
+def test_glab_dependency_warns_missing_on_gitlab_host(tmp_path: Path) -> None:
+    from sdlc.doctor import check_glab_dependency
+
+    finding = check_glab_dependency(tmp_path, lambda _tool: False, host="gitlab")
+    assert finding.status == "WARN"
+    assert "GitLab" in finding.detail
+    assert finding.remedy
+
+
+def test_glab_dependency_clean_when_present_on_gitlab_host(tmp_path: Path) -> None:
+    from sdlc.doctor import check_glab_dependency
+
+    finding = check_glab_dependency(tmp_path, lambda _tool: True, host="gitlab")
+    assert finding.status == "CLEAN"
+    assert finding.remedy == ""
+
+
+def test_glab_dependency_warns_on_undetectable_host(tmp_path: Path) -> None:
+    from sdlc.doctor import check_glab_dependency
+
+    finding = check_glab_dependency(tmp_path, lambda _tool: False, host=None)
+    assert finding.status == "WARN"
+    assert "undetected" in finding.detail
+    assert finding.remedy
+
+
+def test_glab_dependency_detects_host_from_repo_root(monkeypatch, tmp_path: Path) -> None:
+    """Default host resolution reads the repo's real remote (issue_host.detect_host)."""
+    from sdlc import doctor as doctor_mod
+    from sdlc import issue_host as issue_host_mod
+
+    monkeypatch.setattr(issue_host_mod, "detect_host", lambda root: issue_host_mod.GITHUB)
+    finding = doctor_mod.check_glab_dependency(tmp_path, lambda _tool: False)
+    assert finding.status == "CLEAN"
+    assert "not applicable" in finding.detail
 
 
 # --- ledger-vs-logs usage agreement (Story 28.1-001) ------------------------
