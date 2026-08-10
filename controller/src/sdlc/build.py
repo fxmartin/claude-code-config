@@ -97,6 +97,7 @@ from sdlc.issue_host import (
 )
 from sdlc.risk_gate import RISK_APPROVED_LABEL, RISK_LABEL
 from sdlc.registry import Registry, RunRecord
+from sdlc.story_markdown import mark_story_done
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
 # "max 2 bugfix iterations" rule (Step 5d2) so behaviour matches the playbook.
@@ -8540,6 +8541,12 @@ def _record_merge_landing(
     here (AC1); branch teardown is handled by the existing worktree/branch GC
     (``hooks/worktree-gc.sh`` / :func:`remove_story_worktree`), host-agnostic
     local git, so it works unchanged on a GitLab target (AC2).
+
+    Issue #598: also stamps ``**Status**: Done`` onto the story's own block in
+    its epic markdown — the documented single source of truth, which every
+    other consumer (``issues init``, progress reporting) reads at face value.
+    Best-effort: a missing/unparseable epic file logs a warning and never
+    fails the merge landing.
     """
     if stage != "merge":
         return
@@ -8552,6 +8559,13 @@ def _record_merge_landing(
         run_id, story.id, "info", "controller",
         f"merge landed: story DONE at {sha}{cr}",
     )
+    try:
+        mark_story_done(story.epic_file, story.id)
+    except OSError as exc:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"epic markdown write-back failed (non-fatal): {exc}",
+        )
 
 
 def _dispatch_overengineering_advisory(

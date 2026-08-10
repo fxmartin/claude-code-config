@@ -234,6 +234,67 @@ def test_record_merge_landing_stamps_sha_and_logs_event(tmp_path) -> None:
     assert landings == ["merge landed: story DONE at cafef00d (cr=#7)"]
 
 
+# ---------------------------------------------------------------------------
+# Issue #598: a landed merge writes `**Status**: Done` back into the epic
+# markdown, not just the ledger — the epic file is the documented single
+# source of truth and every other consumer (issues init, progress reporting)
+# reads it at face value.
+# ---------------------------------------------------------------------------
+
+
+def test_record_merge_landing_writes_status_done_to_epic_markdown(tmp_path) -> None:
+    epic_file = tmp_path / "epic-23-pipeline-on-gitlab.md"
+    epic_file.write_text(
+        "##### Story 23.2-003: Land the story change\n"
+        "**Status**: Not started\n"
+        "**Priority**: Should\n",
+        encoding="utf-8",
+    )
+    story = Story(
+        id="23.2-003",
+        title="Land the story change",
+        epic_id="epic-23",
+        epic_name="pipeline-on-gitlab",
+        epic_file=str(epic_file),
+        priority="Should",
+        points=3,
+        agent_type="merge",
+    )
+
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = _seed_story_row(ledger)
+
+    merged = AgentResult(
+        agent_type="merge",
+        data={"merge_status": "MERGED", "merge_sha": "cafef00d", "merged_at": "x"},
+        raw="",
+    )
+    _record_merge_landing("merge", merged, ledger, run_id, story, 7)
+
+    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+
+
+def test_record_merge_landing_missing_epic_file_is_non_fatal(tmp_path) -> None:
+    """A landed merge whose epic_file does not exist on disk must not raise (AC3 stays intact)."""
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = _seed_story_row(ledger)
+
+    merged = AgentResult(
+        agent_type="merge",
+        data={"merge_status": "MERGED", "merge_sha": "cafef00d", "merged_at": "x"},
+        raw="",
+    )
+    # _story()'s epic_file ("docs/stories/epic-23-pipeline-on-gitlab.md") does not
+    # exist relative to the test's cwd — the write-back must degrade quietly.
+    _record_merge_landing("merge", merged, ledger, run_id, _story(), 7)
+
+    assert ledger.story_merge_sha(run_id, "23.2-003") == "cafef00d"
+
+
 def test_run_build_records_merge_sha_when_story_lands(tmp_path) -> None:
     """AC3: a merged story is DONE and carries the merge sha the merge agent reported."""
     from test_build import FakeDispatcher, _sample_queue
