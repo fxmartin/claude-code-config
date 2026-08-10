@@ -23,6 +23,7 @@ __all__ = [
     "DEPENDENCIES",
     "Finding",
     "DoctorReport",
+    "check_glab_dependency",
     "check_harness_pin",
     "check_model_coverage",
     "check_model_routing",
@@ -851,6 +852,51 @@ def check_dependencies(probe: Callable[[str], bool]) -> list[Finding]:
     return findings
 
 
+def check_glab_dependency(
+    repo_root: Path, probe: Callable[[str], bool], *, host: str | None = _UNSET
+) -> Finding:
+    """Host-aware presence check for the GitLab CLI (issue #599).
+
+    `gh` and `glab` are alternatives, not both-required: `DEPENDENCIES` above
+    only probes `gh`, so a machine with no `glab` reported a fully CLEAN doctor
+    run seconds before every GitLab code-host operation failed (#599). But
+    flagging a missing `glab` on a GitHub-only repo would just be noise, so this
+    resolves the repo's host the same way `issues init` does (`issue_host.
+    detect_host`, injectable here as ``host`` for tests) and only warns when it
+    matters:
+
+    * host is GitHub — `glab` is not applicable; CLEAN, no remedy.
+    * host is GitLab, or undetectable (e.g. a self-hosted origin `detect_host`
+      cannot classify) — WARN when missing, matching the WARN-for-missing-
+      optional-tool severity `DEPENDENCIES` uses for `gh`. The ambiguous case is
+      not skipped: reporting the gap beats guessing it away.
+    """
+    from sdlc.issue_host import GITHUB, GITLAB, detect_host
+
+    if host is _UNSET:
+        host = detect_host(repo_root)
+
+    label = "GitLab CLI (glab)"
+    if host == GITHUB:
+        return Finding(
+            "dependency", label, "CLEAN",
+            "not applicable — repo remote targets GitHub",
+        )
+    if probe("glab"):
+        return Finding("dependency", label, "CLEAN", "glab available")
+    if host == GITLAB:
+        detail = "glab not found (repo remote targets GitLab — GitLab operations will fail)"
+    else:
+        detail = (
+            "glab not found (repo host undetected — install glab if this repo "
+            "targets GitLab)"
+        )
+    return Finding(
+        "dependency", label, "WARN", detail,
+        "install glab — https://gitlab.com/gitlab-org/cli (`brew install glab`)",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -909,4 +955,5 @@ def run_doctor(
         check_stashes(repo_root),
     ]
     findings.extend(check_dependencies(dep_probe))
+    findings.append(check_glab_dependency(repo_root, dep_probe))
     return DoctorReport(findings=findings)
