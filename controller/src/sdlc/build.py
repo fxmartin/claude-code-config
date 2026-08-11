@@ -91,6 +91,7 @@ from sdlc.issue_host import (
     CR_SUCCESS,
     CR_UNKNOWN,
     GITHUB_CR_TERMS,
+    SUPPORTED_HOSTS,
     ChangeRequestChecks,
     ChangeRequestTerms,
     IssueHostAdapter,
@@ -861,6 +862,11 @@ class BuildOptions:
     dry_run: bool = False
     auto: bool = False
     skip_coverage: bool = False
+    # Issue #608: override host auto-detection for the deterministic CR open —
+    # the escape hatch `sdlc issues init --host` already has. Unset (None)
+    # leaves the resolution order (this -> the story's own `story_inventory`
+    # mapping -> URL auto-detect) untouched.
+    host: str | None = None
     limit: int = 0
     sequential: bool = False
     # Story 17.1-001: bounded concurrent cohort execution. ``concurrency`` is the
@@ -2029,6 +2035,16 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
             opts.limit = int(arg.split("=", 1)[1])
         elif arg.startswith("--coverage-threshold="):
             opts.coverage_threshold = int(arg.split("=", 1)[1])
+        elif arg.startswith("--host="):
+            # Issue #608: override host auto-detection for the deterministic
+            # CR open, mirroring `sdlc issues init --host`.
+            host_value = arg.split("=", 1)[1].lower()
+            if host_value not in SUPPORTED_HOSTS:
+                raise ValueError(
+                    f"invalid --host: {host_value} (expected one of "
+                    f"{', '.join(SUPPORTED_HOSTS)})"
+                )
+            opts.host = host_value
         elif arg.startswith("--concurrency="):
             # Story 17.1-001: cap on a parallel cohort's concurrent workers.
             # Must be >= 1 — `--concurrency=1` is the explicit serial path.
@@ -4983,6 +4999,22 @@ def _story_change_class(
     return verdict
 
 
+def _story_cr_host_override(story: Story, ledger: Ledger, opts: BuildOptions) -> str | None:
+    """Resolve the host override for ``story``'s deterministic CR open (issue #608).
+
+    Priority: an explicit ``--host`` always wins; otherwise the story's own
+    ``story_inventory`` mapping — recorded by ``sdlc issues init`` and
+    authoritative, since it was explicitly chosen for this repo — is
+    consulted. ``None`` (unset flag, unmapped story) leaves
+    :func:`issue_host.resolve_host` to fall back to its URL heuristics, which
+    is today's behaviour.
+    """
+    if opts.host:
+        return opts.host
+    mapping = ledger.inventory_get_mapping(story.id)
+    return mapping[0] if mapping else None
+
+
 def _open_story_cr(
     story: Story,
     ledger: Ledger,
@@ -4991,6 +5023,7 @@ def _open_story_cr(
     base_ref: str,
     close_link: str | None,
     cr_terms: ChangeRequestTerms,
+    opts: BuildOptions,
     *,
     body: str,
     context: str,
@@ -5017,7 +5050,10 @@ def _open_story_cr(
         # adapter off this module's hot import path.
         from sdlc import issue_host
 
-        adapter = issue_host.get_adapter(issue_host.resolve_host(root))
+        host = issue_host.resolve_host(
+            root, override=_story_cr_host_override(story, ledger, opts)
+        )
+        adapter = issue_host.get_adapter(host)
         title = build_commit_header(
             ctype="feat",
             scope=story.epic_name,
@@ -5046,6 +5082,7 @@ def _open_docs_only_cr(
     base_ref: str,
     close_link: str | None,
     cr_terms: ChangeRequestTerms,
+    opts: BuildOptions,
 ) -> int | None:
     """The docs-only skip's deterministic CR open (Story 27.2-001).
 
@@ -5054,7 +5091,7 @@ def _open_docs_only_cr(
     so a push/host hiccup can never strand a story without a change request.
     """
     return _open_story_cr(
-        story, ledger, run_id, workdir, base_ref, close_link, cr_terms,
+        story, ledger, run_id, workdir, base_ref, close_link, cr_terms, opts,
         body=(
             f"Docs-only change for story {story.id} — coverage gate skipped "
             "(skip_reason=docs-only, Story 27.2-001)."
@@ -5086,6 +5123,7 @@ def _bake_review_packet(
     run_id: str,
     checks: str | None,
     cr_terms: ChangeRequestTerms,
+    opts: BuildOptions,
 ) -> str | None:
     """Bake the pre-baked review packet for this story's CR, or None (27.3-003).
 
@@ -5101,7 +5139,10 @@ def _bake_review_packet(
         # this module's hot import path.
         from sdlc import issue_host, review_packet
 
-        adapter = issue_host.get_adapter(issue_host.resolve_host(root))
+        host = issue_host.resolve_host(
+            root, override=_story_cr_host_override(story, ledger, opts)
+        )
+        adapter = issue_host.get_adapter(host)
         block = review_packet.packet_block(adapter, str(pr_number), checks=checks)
     except Exception:  # noqa: BLE001 — best-effort; the prompt has a fallback path
         block = None
@@ -7165,7 +7206,7 @@ def _run_story(
             story_class = _story_change_class(story, ledger, run_id, workdir, base_ref)
         if stage == "coverage" and story_class == change_class.DOCS_ONLY:
             pr = pr_number if pr_number is not None else _open_docs_only_cr(
-                story, ledger, run_id, workdir, base_ref, close_link, cr_terms
+                story, ledger, run_id, workdir, base_ref, close_link, cr_terms, opts
             )
             if pr is not None:
                 pr_number = pr
@@ -7207,6 +7248,7 @@ def _run_story(
             ):
                 pr = pr_number if pr_number is not None else _open_story_cr(
                     story, ledger, run_id, workdir, base_ref, close_link, cr_terms,
+                    opts,
                     body=(
                         f"Coverage pre-check passed for story {story.id} — "
                         f"coverage agent skipped (skip_reason="
@@ -7269,7 +7311,8 @@ def _run_story(
         review_packet_block: str | None = None
         if stage == "review" and pr_number is not None:
             review_packet_block = _bake_review_packet(
-                story, pr_number, workdir, ledger, run_id, coverage_signals, cr_terms
+                story, pr_number, workdir, ledger, run_id, coverage_signals, cr_terms,
+                opts,
             )
         while True:
             # Issue #427: resolve the (harness, model) for this dispatch *before*
@@ -7552,7 +7595,7 @@ def _run_story(
                 if stage == "review" and pr_number is not None:
                     review_packet_block = _bake_review_packet(
                         story, pr_number, workdir, ledger, run_id,
-                        coverage_signals, cr_terms,
+                        coverage_signals, cr_terms, opts,
                     )
                 # Bugfix succeeded — retry the same stage as a new attempt.
                 attempt += 1
@@ -7609,6 +7652,7 @@ def _run_story(
         if stage == "coverage" and pr_number is None:
             pr_number = _open_story_cr(
                 story, ledger, run_id, workdir, base_ref, close_link, cr_terms,
+                opts,
                 body=(
                     f"Coverage gate passed for story {story.id} — change "
                     "request opened by the controller (Story 27.3-001)."

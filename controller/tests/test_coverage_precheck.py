@@ -64,7 +64,7 @@ class _CrOpener:
         self.calls: list[str] = []
 
     def __call__(self, story, ledger, run_id, workdir, base_ref, close_link,
-                 cr_terms, *, body, context):
+                 cr_terms, opts, *, body, context):
         self.calls.append(context)
         return self.results.pop(0) if self.results else None
 
@@ -249,7 +249,7 @@ def test_docs_only_story_never_runs_precheck(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(precheck_mod, "run_precheck", _boom)
     monkeypatch.setattr(
         build_mod, "_open_docs_only_cr",
-        lambda story, ledger, run_id, workdir, base_ref, close_link, cr_terms: 100,
+        lambda story, ledger, run_id, workdir, base_ref, close_link, cr_terms, opts: 100,
     )
     monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
     disp = _RecordingDispatcher()

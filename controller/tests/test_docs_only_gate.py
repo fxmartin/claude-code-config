@@ -59,7 +59,7 @@ def _run(tmp_path, monkeypatch, *, files: list[str], cr: int | None = 100,
     )
     monkeypatch.setattr(
         build_mod, "_open_docs_only_cr",
-        lambda story, ledger, run_id, workdir, base_ref, close_link, cr_terms: cr,
+        lambda story, ledger, run_id, workdir, base_ref, close_link, cr_terms, opts: cr,
     )
     monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
     disp = _RecordingDispatcher()
@@ -310,7 +310,8 @@ def test_open_docs_only_cr_pushes_and_opens(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(issue_host_mod, "get_adapter", lambda host, runner=None: _fake_adapter(created))
     ledger = _EventLedger()
     pr = build_mod._open_docs_only_cr(
-        _story(), ledger, "run-1", root, "origin/main", "Closes #7", GITHUB_CR_TERMS
+        _story(), ledger, "run-1", root, "origin/main", "Closes #7", GITHUB_CR_TERMS,
+        BuildOptions(host="github"),
     )
     assert pr == 123
     assert created[0]["source_branch"] == "feature/27.2-001"
@@ -333,7 +334,8 @@ def test_open_docs_only_cr_failure_returns_none_and_warns(tmp_path) -> None:
 
     ledger = _EventLedger()
     pr = build_mod._open_docs_only_cr(
-        _story(), ledger, "run-1", tmp_path, "origin/main", None, GITHUB_CR_TERMS
+        _story(), ledger, "run-1", tmp_path, "origin/main", None, GITHUB_CR_TERMS,
+        BuildOptions(host="github"),
     )
     assert pr is None
     assert any("falling back" in m for m in ledger.events)
