@@ -5378,16 +5378,26 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 # rest are summarised as "+N more" so the line stays readable.
 _DIRTY_TREE_MAX_LISTED = 10
 
+# Where `make_render_view` (ledger_view.py) regenerates the markdown read-model
+# on every run, without ever committing it. Issue #610: because that render is
+# tracked, a successful run leaves it as the one dirty file in an otherwise
+# clean tree — which then trips this very guard on the *next* invocation. The
+# path is excluded from the guard rather than the guard being weakened
+# generally; ledger_view.py imports this constant so the two can't drift.
+_PROGRESS_VIEW_PATH = "docs/stories/.build-progress.md"
+
 
 def dirty_tree_paths(root: Path) -> list[str]:
     """Tracked paths with uncommitted changes in ``root`` (issue #590).
 
     Untracked files are excluded (``--untracked-files=no``): they neither block
     ``git checkout -b`` nor land in a default ``git stash``, so counting them
-    would refuse runs in any repo carrying scratch files. Returns ``[]`` when the
-    check cannot run at all (git missing, not a repo, timeout) — an
-    un-inspectable tree degrades to today's behaviour rather than blocking every
-    run.
+    would refuse runs in any repo carrying scratch files. The controller's own
+    ``_PROGRESS_VIEW_PATH`` render is excluded too (issue #610): it is
+    regenerated, never committed, by every run, so counting it would make the
+    controller refuse its own next invocation. Returns ``[]`` when the check
+    cannot run at all (git missing, not a repo, timeout) — an un-inspectable
+    tree degrades to today's behaviour rather than blocking every run.
     """
     try:
         res = _git(root, "status", "--porcelain", "--untracked-files=no")
@@ -5397,7 +5407,15 @@ def dirty_tree_paths(root: Path) -> list[str]:
         return []
     # Porcelain v1 lines are ``XY <path>`` — two status columns, a space, then
     # the path (a rename reads ``old -> new``, which is kept verbatim).
-    return [line[3:].strip() for line in res.stdout.splitlines() if line.strip()]
+    paths = [line[3:].strip() for line in res.stdout.splitlines() if line.strip()]
+
+    def _is_progress_view(path: str) -> bool:
+        # A rename ("old -> new") is never expected for this path, but compare
+        # against its new-side defensively rather than let it slip through.
+        target = path.rsplit(" -> ", 1)[-1]
+        return target == _PROGRESS_VIEW_PATH
+
+    return [path for path in paths if not _is_progress_view(path)]
 
 
 def format_dirty_tree(root: Path, paths: list[str], command: str) -> str:
