@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
+from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence, TypeVar
 
 from sdlc.capability import (
     ProbeStatus,
@@ -5418,6 +5418,164 @@ def dirty_tree_paths(root: Path) -> list[str]:
     return [path for path in paths if not _is_progress_view(path)]
 
 
+def _controller_owned(path: str) -> bool:
+    """Whether ``path`` is churn the controller produces, not agent escape (#607).
+
+    Two sources: the per-story worktrees (gitignored in a real repo, but listed
+    by ``--untracked-files=all`` in one without the ignore rule) and the ledger
+    render ``render_view`` regenerates between stories. ``_WORKTREE_SUBDIR`` is
+    read at call time — it is defined further down this module.
+    """
+    target = path.rsplit(" -> ", 1)[-1].strip('"')
+    if target == _PROGRESS_VIEW_PATH:
+        return True
+    return target.startswith("/".join(_WORKTREE_SUBDIR) + "/")
+
+
+def primary_checkout_fingerprint(root: Path) -> str | None:
+    """A digest of the operator's checkout state, for escape detection (#607).
+
+    Worktree isolation is supposed to mean the primary checkout stays the
+    operator's for the duration of a build. It held on paper and failed in
+    practice: an agent `cd`'d into the primary checkout by absolute path, wrote
+    the story there, then "corrected" itself with a destructive revert — which
+    restores to *HEAD*, not to the operator's uncommitted state. Nothing
+    surfaced above ``progress``, so the run carried on silently.
+
+    This is the detector for that. Two `git` probes are folded into one digest:
+
+    * ``status --porcelain --untracked-files=all`` — the *set* of dirty and
+      untracked paths. Untracked files count here, deliberately unlike
+      :func:`dirty_tree_paths`: an agent depositing new files in the operator's
+      tree is precisely the escape being caught. It also catches the dangerous
+      direction — an operator's edit *vanishing* from the set is a revert.
+    * ``diff HEAD`` — tracked *content*, so overwriting an already-dirty file
+      moves the digest too (a path-set comparison alone would miss it).
+
+    Untracked *content* edits are the known gap: a scratch file's presence is
+    covered, later edits to it are not. Closing that would mean hashing arbitrary
+    untracked bytes on every story boundary, which is not worth the cost.
+
+    Returns ``None`` when the tree cannot be inspected (git missing, not a repo)
+    — the check then disables itself rather than accusing every story, matching
+    :func:`dirty_tree_paths`'s degrade-to-permissive posture.
+    """
+    try:
+        status = _git(root, "status", "--porcelain", "--untracked-files=all")
+        diff = _git(root, "diff", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if status.returncode != 0 or diff.returncode != 0:
+        return None
+    entries = sorted(
+        line for line in status.stdout.splitlines()
+        if line.strip() and not _controller_owned(line[3:])
+    )
+    payload = "\n".join(entries) + "\0" + diff.stdout
+    return hashlib.sha256(payload.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _changed_primary_paths(root: Path) -> list[str]:
+    """The dirty/untracked paths in ``root``, for naming them in the event (#607)."""
+    try:
+        res = _git(root, "status", "--porcelain", "--untracked-files=all")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if res.returncode != 0:
+        return []
+    return [
+        line[3:].strip() for line in res.stdout.splitlines()
+        if line.strip() and not _controller_owned(line[3:])
+    ]
+
+
+def check_primary_checkout_unchanged(
+    ledger: "Ledger",
+    run_id: str,
+    story_id: str,
+    root: Path,
+    baseline: str | None,
+) -> bool:
+    """Assert the operator's checkout is where the story left it (issue #607).
+
+    Called at a story's close-out when it ran isolated in its own worktree, with
+    the ``baseline`` fingerprint taken before its first agent was dispatched.
+    Returns ``True`` when the checkout is untouched (or the check is disabled by
+    a ``None`` baseline / un-inspectable tree), ``False`` when it moved.
+
+    A mismatch is logged at ``error`` — the level is the point. #607's specific
+    complaint was that the escape produced nothing above ``progress``, so it
+    never reached ``sdlc status``.
+
+    This function deliberately **does not** repair anything. Reverting the
+    operator's tree is the data-loss step at the heart of the issue: a restore
+    goes to HEAD, discarding whatever uncommitted work the operator had sitting
+    there. Detection is the safe half; what to do about contamination is the
+    operator's call.
+    """
+    if baseline is None:
+        return True
+    current = primary_checkout_fingerprint(root)
+    if current is None or current == baseline:
+        return True
+    paths = _changed_primary_paths(root)
+    if paths:
+        listed = paths[:_DIRTY_TREE_MAX_LISTED]
+        more = len(paths) - len(listed)
+        detail = ", ".join(listed) + (f" (+{more} more)" if more > 0 else "")
+        what = f"now dirty: {detail}"
+    else:
+        # The checkout moved yet nothing is dirty — it was *cleaned* during the
+        # story. That is the destructive direction (#607's revert step) and the
+        # one that eats uncommitted operator work, so it is called out by name
+        # rather than reported as "no paths".
+        what = (
+            "the tree is now clean, so uncommitted work present at story start "
+            "was reverted or discarded — check `git fsck --lost-found` and "
+            "`git stash list`"
+        )
+    ledger.event_log(
+        run_id, story_id, "error", "controller",
+        f"primary checkout changed while {story_id} built in its own worktree "
+        f"(issue #607): {what}. The controller changed nothing — inspect the "
+        "tree before trusting this story's diff.",
+    )
+    return False
+
+
+# The bracketed story's return value flows through `guard_primary_checkout`
+# untouched — the guard observes, it never substitutes an outcome.
+_T = TypeVar("_T")
+
+
+def guard_primary_checkout(
+    ledger: "Ledger",
+    run_id: str,
+    story_id: str,
+    workdir: Path | None,
+    run: Callable[[], _T],
+) -> _T:
+    """Run ``run()`` bracketed by the #607 primary-checkout escape check.
+
+    ``workdir`` is the story's isolated worktree, or ``None`` when it builds in
+    the shared root. Only an isolated story is bracketed: a shared-root story
+    (``--sequential``, or a fake-dispatcher test) is *supposed* to edit the root,
+    so fingerprinting it would report every legitimate build as an escape.
+
+    The check runs in a ``finally`` so a story that raises still reports
+    contamination — a crashed story is if anything more likely to have left the
+    operator's tree dirty. The check never raises on its own account and never
+    changes the story's outcome: it is a detector, and its whole contribution is
+    an ``error``-level ledger event where previously there was silence.
+    """
+    root = Path.cwd()
+    baseline = primary_checkout_fingerprint(root) if workdir is not None else None
+    try:
+        return run()
+    finally:
+        check_primary_checkout_unchanged(ledger, run_id, story_id, root, baseline)
+
+
 def format_dirty_tree(root: Path, paths: list[str], command: str) -> str:
     """The operator-facing refusal for a dirty shared checkout (issue #590)."""
     listed = paths[:_DIRTY_TREE_MAX_LISTED]
@@ -6425,8 +6583,14 @@ def run_build(
         workdir = _prepare_story_workdir(
             opts, story, ledger, run_id, real_run=dispatcher is None
         )
-        return _run_story_rate_limited(
-            rl_ctx, story, ledger, run_id, dispatch, logs_dir, workdir=workdir,
+        # Issue #607: bracket the story so an agent that escapes its worktree
+        # into the operator's checkout is caught at close-out (see
+        # :func:`guard_primary_checkout`).
+        return guard_primary_checkout(
+            ledger, run_id, story.id, workdir,
+            lambda: _run_story_rate_limited(
+                rl_ctx, story, ledger, run_id, dispatch, logs_dir, workdir=workdir,
+            ),
         )
 
     # Story 19.2-002: credit a parallel story's terminal status the instant its
