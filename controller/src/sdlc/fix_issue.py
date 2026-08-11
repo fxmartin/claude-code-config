@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
+from sdlc import change_class, issue_host
 from sdlc.build import (
     MAX_BUGFIX_ATTEMPTS,
     Ledger,
@@ -60,7 +61,6 @@ from sdlc.build import (
     finalize_run,
     remove_story_worktree,
 )
-from sdlc import change_class
 from sdlc.cohort import Story
 from sdlc.commitlint import build_commit_header
 from sdlc.contracts import ContractError, _result_wrapper
@@ -72,7 +72,13 @@ from sdlc.dispatch import (
     dispatch_agent,
 )
 from sdlc.harness import DEFAULT_HARNESS, resolve_harness
-from sdlc.issue_host import RunResult, Runner, _default_runner
+from sdlc.issue_host import (
+    GITHUB_CR_TERMS,
+    ChangeRequestTerms,
+    IssueHostError,
+    Runner,
+    _default_runner,
+)
 from sdlc.notify import notify
 from sdlc.registry import Registry, format_live_owner_refusal
 from sdlc.story_render import STORY_LABEL
@@ -179,6 +185,11 @@ class FixOptions:
     # as "only if that pid is gone": a genuine takeover of an abandoned run, not
     # a routine flag. Default False = refuse (see `find_live_owner`).
     force: bool = False
+    # Issue #606: override host auto-detection (github|gitlab) — the escape
+    # hatch a self-hosted GitLab origin needs when its hostname carries no
+    # `gitlab` substring for `issue_host.detect_host` to key on. None = auto
+    # (today's behaviour). Validated against SUPPORTED_HOSTS at parse time.
+    host: str | None = None
 
 
 @dataclass
@@ -212,6 +223,9 @@ class FixBatchOptions:
     # for the whole selection, so the live-owner guard is checked once, here,
     # before that `run_create`.
     force: bool = False
+    # Issue #606: mirrors :class:`FixOptions` — resolved once for the whole
+    # batch and threaded down per issue.
+    host: str | None = None
 
 
 @dataclass
@@ -302,67 +316,67 @@ class FixIssue:
     labels: tuple[str, ...]
 
 
-def _gh(args: list[str], *, runner: Runner) -> RunResult:
-    """Run a ``gh`` argv through the injected runner."""
-    return runner(["gh", *args])
+def _resolve_fix_host(root: Path | None, override: str | None) -> str:
+    """The code host a fix run targets (issue #606): ``--host`` wins, else the
+    ``origin`` remote's auto-detected host, else GitHub.
 
-
-def fetch_issue(number: int, *, runner: Runner | None = None) -> FixIssue:
-    """Fetch a GitHub issue's metadata via ``gh issue view`` (issue #436).
-
-    Raises :class:`FixIssueError` on a non-zero ``gh`` exit (missing issue, auth
-    problem) or malformed JSON so the caller can abort cleanly rather than run a
-    fix against nothing.
+    Unlike :func:`issue_host.resolve_host`, this never raises: an undetectable
+    remote (a non-git ``root``, e.g. most unit-test fixtures, or a self-hosted
+    origin ``host_from_remote`` cannot classify) falls back to GitHub — today's
+    behaviour for every caller that never resolved a host. A bad explicit
+    ``--host`` value is validated once at CLI-parse time (:func:`parse_fix_args`),
+    so it is never silently swallowed here.
     """
-    runner = runner or _default_runner
-    res = _gh(
-        [
-            "issue",
-            "view",
-            str(number),
-            "--json",
-            "number,title,body,state,assignees,labels",
-        ],
-        runner=runner,
-    )
-    if res.returncode != 0:
-        raise FixIssueError(
-            f"gh issue view {number} failed: {res.stderr.strip() or 'non-zero exit'}"
-        )
+    return override or issue_host.detect_host(root or Path.cwd()) or issue_host.GITHUB
+
+
+def fetch_issue(
+    number: int, *, runner: Runner | None = None, host: str = issue_host.GITHUB
+) -> FixIssue:
+    """Fetch a code-host issue's metadata via the resolved host adapter (#436, #606).
+
+    Routes through :mod:`sdlc.issue_host` — ``gh issue view`` on GitHub,
+    ``glab issue view`` on GitLab — the same abstraction ``sdlc build`` already
+    drives, so a fix run targets whichever host ``host`` resolves to instead of
+    always shelling out to ``gh``. ``host`` defaults to GitHub so a caller that
+    never resolved one keeps today's behaviour.
+
+    Raises :class:`FixIssueError` when the issue cannot be fetched (missing
+    issue, auth problem, an unparseable host response) so the caller can abort
+    cleanly rather than run a fix against nothing.
+    """
+    adapter = issue_host.get_adapter(host, runner=runner or _default_runner)
     try:
-        data = json.loads(res.stdout)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise FixIssueError(f"gh returned malformed JSON for issue {number}: {exc}") from exc
+        fetched = adapter.issue_view(str(number))
+    except IssueHostError as exc:
+        raise FixIssueError(str(exc)) from exc
+    ref = fetched.ref
     return FixIssue(
-        number=int(data.get("number", number)),
-        title=str(data.get("title", "")),
-        body=str(data.get("body") or ""),
-        state=str(data.get("state", "")).lower(),
-        assignees=tuple(
-            str(a.get("login", "")) for a in data.get("assignees", []) if a.get("login")
-        ),
-        labels=tuple(
-            str(label.get("name", "")) for label in data.get("labels", []) if label.get("name")
-        ),
+        number=int(ref) if ref.isdigit() else number,
+        title=fetched.title or "",
+        body=fetched.body or "",
+        state=(fetched.state or "").lower(),
+        assignees=tuple(fetched.assignees),
+        labels=tuple(fetched.labels),
     )
 
 
-def _current_gh_user(runner: Runner) -> str | None:
-    """The authenticated ``gh`` login, or None when it cannot be resolved."""
+def _current_host_user(host: str, runner: Runner) -> str | None:
+    """The authenticated host-CLI login, or None when it cannot be resolved."""
     try:
-        res = _gh(["api", "user", "--jq", ".login"], runner=runner)
+        who = issue_host.get_adapter(host, runner=runner).whoami()
     except Exception:  # noqa: BLE001 — identity is best-effort; never crash a stop-check
         return None
-    if res.returncode != 0:
-        return None
-    return res.stdout.strip() or None
+    return who.strip() or None
 
 
-def stop_reason(issue: FixIssue, *, runner: Runner | None = None) -> str | None:
+def stop_reason(
+    issue: FixIssue, *, runner: Runner | None = None, host: str = issue_host.GITHUB
+) -> str | None:
     """The deliberate-stop reason for ``issue``, or None to proceed (issue #436).
 
     STOP conditions (mirroring the skill's Phase 2): the issue is closed, is
-    assigned to someone other than the current ``gh`` user, or carries a
+    assigned to someone other than the current host-CLI user, or carries a
     ``wontfix`` label. An assignee check that cannot resolve the current user
     (offline / no auth) does not block — the closed/wontfix checks are still
     authoritative, and a fix run guards its own git/auth state downstream.
@@ -373,7 +387,7 @@ def stop_reason(issue: FixIssue, *, runner: Runner | None = None) -> str | None:
     if {label.strip().lower() for label in issue.labels} & _WONTFIX_LABELS:
         return "issue is labelled wontfix"
     if issue.assignees:
-        me = _current_gh_user(runner)
+        me = _current_host_user(host, runner)
         if me is not None and me not in issue.assignees:
             return f"issue is assigned to {', '.join(issue.assignees)} (not {me})"
     return None
@@ -479,6 +493,33 @@ def _investigation_context(inv: dict) -> str:
     )
 
 
+# Host-correct CLI phrasing the fix prompts spell out step-by-step (issue #606).
+# `ChangeRequestTerms` (Story 23.2-001) covers the noun/ref the prompts already
+# thread through; these cover the literal verbs the merge/review/doc-update
+# prompts name explicitly, which `cr_terms` does not carry.
+_CR_CLI: dict[str, dict[str, str]] = {
+    issue_host.GITHUB: {
+        "create": "gh pr create",
+        "merge": "gh pr merge --squash --delete-branch",
+        "view": "gh pr view",
+        "diff": "gh pr diff",
+        "checkout": "gh pr checkout",
+    },
+    issue_host.GITLAB: {
+        "create": "glab mr create",
+        "merge": "glab mr merge --squash --remove-source-branch",
+        "view": "glab mr view",
+        "diff": "glab mr diff",
+        "checkout": "glab mr checkout",
+    },
+}
+
+
+def _cr_cli(cr_terms: ChangeRequestTerms, verb: str) -> str:
+    """The host-correct CLI invocation for ``verb`` (``create``/``merge``/…)."""
+    return _CR_CLI[cr_terms.host][verb]
+
+
 def render_investigation_prompt(issue: FixIssue) -> str:
     """Render the investigation-agent prompt for a fix run (issue #436)."""
     labels = ", ".join(issue.labels) if issue.labels else "(none)"
@@ -508,18 +549,32 @@ def render_investigation_prompt(issue: FixIssue) -> str:
     )
 
 
-def render_build_prompt(issue: FixIssue, inv: dict, opts: FixOptions) -> str:
-    """Render the build-agent prompt for a fix run (issue #436)."""
+def render_build_prompt(
+    issue: FixIssue,
+    inv: dict,
+    opts: FixOptions,
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+) -> str:
+    """Render the build-agent prompt for a fix run (issue #436, #606).
+
+    ``cr_terms`` (Story 23.2-001) carries the host-correct change-request
+    phrasing — PR/`gh` on GitHub, MR/`glab` on GitLab — resolved once per run
+    from the fix's target host, so a GitLab fix tells the agent to open a Merge
+    Request rather than a Pull Request. GitHub's default keeps this byte-for-byte
+    what it always was.
+    """
     branch = f"feature/issue-{issue.number}"
+    abbr = cr_terms.abbr
     if opts.skip_coverage:
         deliver = (
-            f"6. Push the branch and open a PR with `gh pr create`. Put "
-            f'"Closes #{issue.number}" on its own line in the PR body so merging '
+            f"6. Push the branch and open a {abbr} with `{_cr_cli(cr_terms, 'create')}`. Put "
+            f'"Closes #{issue.number}" on its own line in the {abbr} body so merging '
             "auto-closes the issue. Report pr_number in the result block.\n"
         )
     else:
         deliver = (
-            "6. Commit locally only — the coverage agent pushes and opens the PR.\n"
+            f"6. Commit locally only — the coverage agent pushes and opens the {abbr}.\n"
         )
     return (
         f"You are fixing GitHub issue #{issue.number}.\n\n"
@@ -552,46 +607,58 @@ def render_build_prompt(issue: FixIssue, inv: dict, opts: FixOptions) -> str:
     )
 
 
-def render_coverage_prompt(issue: FixIssue, opts: FixOptions) -> str:
-    """Render the coverage-gate prompt for a fix run (issue #436)."""
+def render_coverage_prompt(
+    issue: FixIssue,
+    opts: FixOptions,
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+) -> str:
+    """Render the coverage-gate prompt for a fix run (issue #436, #606)."""
     branch = f"feature/issue-{issue.number}"
+    abbr = cr_terms.abbr
     return (
         f"Coverage gate for the fix of issue #{issue.number}.\n"
         f"Branch: {branch}. Threshold: {opts.coverage_threshold}%.\n"
         + _untrusted_block(issue)
         + "Fetch the branch, fill coverage gaps with tests, and commit. Then push "
-        "and open a PR with `gh pr create`. Put "
-        f'"Closes #{issue.number}" on its own line in the PR body so merging '
+        f"and open a {abbr} with `{_cr_cli(cr_terms, 'create')}`. Put "
+        f'"Closes #{issue.number}" on its own line in the {abbr} body so merging '
         "auto-closes the issue. Then emit the result block with the pr_number.\n\n"
         + _result_wrapper("coverage-agent-response.schema.json")
     )
 
 
 def render_review_prompt(
-    issue: FixIssue, pr_number: int | None, *, packet: str | None = None
+    issue: FixIssue,
+    pr_number: int | None,
+    *,
+    packet: str | None = None,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
 ) -> str:
-    """Render the review-gate prompt for a fix run (issue #436).
+    """Render the review-gate prompt for a fix run (issue #436, #606).
 
     Story 27.3-003: ``packet`` is the pre-baked review packet (CR meta, changed
     files, diff) — embedded so the reviewer stops re-deriving its inputs with
     ``gh pr view/diff/checkout``; None keeps today's prompt unchanged.
     """
+    abbr = cr_terms.abbr
     packet_block = (
         "Consume the pre-baked Review Packet below instead of re-fetching its "
-        "contents with `gh pr view` / `gh pr diff` / `gh pr checkout`. Fetch "
+        f"contents with `{_cr_cli(cr_terms, 'view')}` / `{_cr_cli(cr_terms, 'diff')}` / "
+        f"`{_cr_cli(cr_terms, 'checkout')}`. Fetch "
         "host-side only for something the packet does not contain.\n\n"
         f"{packet}\n"
         if packet
         else ""
     )
     return (
-        f"Review the PR for the fix of issue #{issue.number} "
-        f"(PR #{pr_number}).\n"
+        f"Review the {abbr} for the fix of issue #{issue.number} "
+        f"({abbr} #{pr_number}).\n"
         + _untrusted_block(issue)
         + packet_block
         + "Check architecture, security, performance, coverage, and code quality; "
         "approve when satisfied, then emit the result block.\n"
-        "Do NOT trust the implementer's report: the PR description, commit "
+        f"Do NOT trust the implementer's report: the {abbr} description, commit "
         "messages, and any summary are unverified claims until you have checked "
         "each against the diff itself.\n"
         "Inspect code outside the diff only for a concrete named risk; when you "
@@ -600,11 +667,21 @@ def render_review_prompt(
     )
 
 
-def render_merge_prompt(issue: FixIssue, pr_number: int | None) -> str:
-    """Render the merge-agent prompt for a fix run (issue #436)."""
+def render_merge_prompt(
+    issue: FixIssue,
+    pr_number: int | None,
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+) -> str:
+    """Render the merge-agent prompt for a fix run (issue #436, #606)."""
+    abbr = cr_terms.abbr
+    is_github = cr_terms.host == issue_host.GITHUB
+    rebase_cmd = "gh pr update-branch --rebase" if is_github else "glab mr update --rebase"
+    close_cmd = "gh issue close" if is_github else "glab issue close"
+    reason_flag = " --reason completed" if is_github else ""
     return (
-        f"Merge the PR for the fix of issue #{issue.number} "
-        f"(PR #{pr_number}).\n"
+        f"Merge the {abbr} for the fix of issue #{issue.number} "
+        f"({abbr} #{pr_number}).\n"
         # Run 6212933d (issue #565, merge attempt 1): the merge agent `cd`'d into
         # this repo's git superproject before every gh/git call, ran every command
         # against the wrong GitHub repository, concluded the PR did not exist, and
@@ -612,30 +689,30 @@ def render_merge_prompt(issue: FixIssue, pr_number: int | None) -> str:
         # already the correct repository and branch for this PR — do not `cd` out
         # of it (e.g. into a parent or sibling directory) before running gh/git.
         "Run every command from your current working directory — it is already "
-        "the repository and branch this PR belongs to. Do not `cd` into a parent "
-        "or sibling directory (e.g. a git superproject) before running gh/git "
-        "commands: doing so queries the wrong GitHub repository.\n"
+        f"the repository and branch this {abbr} belongs to. Do not `cd` into a "
+        "parent or sibling directory (e.g. a git superproject) before running "
+        "host-CLI/git commands: doing so queries the wrong repository.\n"
         + _untrusted_block(issue)
         + "1. Rebase the branch onto the latest origin/main first to absorb "
-        "baseline drift (`gh pr update-branch --rebase`, or a manual rebase). If "
+        f"baseline drift (`{rebase_cmd}`, or a manual rebase). If "
         'the rebase conflicts, report merge_status FAILED with "REBASE_CONFLICT" '
         "in block_reason and STOP.\n"
-        "2. Merge with: gh pr merge --squash --delete-branch.\n"
-        f"3. Close the issue: gh issue close {issue.number} --reason completed "
-        f'(and comment "Fixed in PR #{pr_number}.").\n'
+        f"2. Merge with: {_cr_cli(cr_terms, 'merge')}.\n"
+        f"3. Close the issue: {close_cmd} {issue.number}{reason_flag} "
+        f'(and comment "Fixed in {abbr} #{pr_number}.").\n'
         "4. Return to main: git checkout main && git pull.\n"
-        f"The PR body already carries \"Closes #{issue.number}\"; closing the issue "
-        "explicitly is a safety net.\n"
-        "If the PR is blocked only by the high-risk approval gate (it carries the "
-        "`risk:high` label with no `risk-approved` label and no `risk-approver` "
-        'review), do NOT force-merge: report merge_status FAILED and set '
-        'block_reason to "BLOCKED_HIGH_RISK" so the run parks awaiting human '
-        "approval.\n"
+        f'The {abbr} body already carries "Closes #{issue.number}"; closing the '
+        "issue explicitly is a safety net.\n"
+        f"If the {abbr} is blocked only by the high-risk approval gate (it carries "
+        "the `risk:high` label with no `risk-approved` label and no "
+        '`risk-approver` review), do NOT force-merge: report merge_status FAILED '
+        'and set block_reason to "BLOCKED_HIGH_RISK" so the run parks awaiting '
+        "human approval.\n"
         # Run 570d5db3 (issue #586): a review retry re-entered merge a day after
         # PR #588 had landed. Already-merged is the goal state, but it must be
         # reported *with* the landing sha — a bare SKIPPED is indistinguishable
         # from the wrong-directory skip above and fails the stage.
-        "If the PR has already been merged, do not merge again: report "
+        f"If the {abbr} has already been merged, do not merge again: report "
         "merge_status SKIPPED and set merge_sha to the sha it landed at (and "
         "merged_at to when) so the controller records the landing instead of "
         "treating the stage as failed.\n\n"
@@ -716,8 +793,13 @@ def render_e2e_prompt(issue: FixIssue, pr_number: int | None) -> str:
     )
 
 
-def render_doc_update_prompt(scope: str, merged: list[FixIssueOutcome]) -> str:
-    """Render the batch doc-update prompt (issue #436 PR3, skill Phase 10b).
+def render_doc_update_prompt(
+    scope: str,
+    merged: list[FixIssueOutcome],
+    *,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+) -> str:
+    """Render the batch doc-update prompt (issue #436 PR3, skill Phase 10b; #606).
 
     Best-effort and batch-only: after ≥1 issue merged, the agent reviews the
     batch's merged fixes and updates README / story docs in one pass on a fresh
@@ -726,21 +808,23 @@ def render_doc_update_prompt(scope: str, merged: list[FixIssueOutcome]) -> str:
     """
     issues = ", ".join(f"#{o.issue}" for o in merged)
     prs = ", ".join(f"#{o.pr_number}" for o in merged if o.pr_number) or "(none recorded)"
+    abbr = cr_terms.abbr
     return (
-        "You are a documentation agent. After a batch of GitHub issues was fixed "
+        "You are a documentation agent. After a batch of issues was fixed "
         "and merged, update the project documentation to reflect the fixes.\n\n"
         f"Scope: {scope}\n"
         f"Merged issues: {issues}\n"
-        f"Merged PRs: {prs}\n\n"
+        f"Merged {abbr}s: {prs}\n\n"
         "## Instructions\n"
-        "1. Review the merged fixes (via `gh pr view <n>` or `git log`) to "
-        "understand what changed.\n"
+        f"1. Review the merged fixes (via `{_cr_cli(cr_terms, 'view')} <n>` or "
+        "`git log`) to understand what changed.\n"
         "2. Update README.md and story/tracking docs (STORIES.md, docs/stories/*) "
         "ONLY where a fix genuinely changed documented behavior, known issues, or "
         "setup. Preserve the existing style; do not add a changelog.\n"
         "3. If nothing needs changing, report doc_update_status NO_CHANGES and stop.\n"
         "4. Otherwise create a fresh branch off the latest main, commit only "
-        "documentation files, push, and open a PR with `gh pr create`. Report "
+        f"documentation files, push, and open a {abbr} with "
+        f"`{_cr_cli(cr_terms, 'create')}`. Report "
         "doc_update_status UPDATED. Report FAILED (never raise) if the update "
         "cannot complete.\n\n"
         + _result_wrapper("doc-update-agent-response.schema.json")
@@ -1048,16 +1132,24 @@ def _fix_change_class(
 
 
 def _open_docs_only_pr(
-    issue: FixIssue, story: Story, ledger: Ledger, run_id: str, root: Path | None
+    issue: FixIssue,
+    story: Story,
+    ledger: Ledger,
+    run_id: str,
+    root: Path | None,
+    *,
+    host: str = issue_host.GITHUB,
 ) -> int | None:
     """Push the fix branch and open its PR deterministically for a docs-only skip.
 
     On the docs-only path the coverage agent — which normally pushes the branch
     and opens the PR — is never dispatched, so the controller does both itself via
-    plain git and the Epic-22/23 host adapter (GitHub/GitLab parity). The PR body
-    carries ``Closes #<N>`` so merging auto-closes the issue, exactly as the
-    coverage prompt instructs the agent to. Returns the PR number, or ``None`` on
-    any failure — the caller then falls back to the full coverage dispatch, so a
+    plain git and the Epic-22/23 host adapter (GitHub/GitLab parity). ``host`` is
+    the run's already-resolved host (issue #606) — an explicit ``--host`` or the
+    ``origin`` auto-detect, never re-derived here. The PR body carries
+    ``Closes #<N>`` so merging auto-closes the issue, exactly as the coverage
+    prompt instructs the agent to. Returns the PR number, or ``None`` on any
+    failure — the caller then falls back to the full coverage dispatch, so a
     push/host hiccup can never strand a fix without a change request.
     """
     root = root or Path.cwd()
@@ -1069,11 +1161,7 @@ def _open_docs_only_pr(
         )
         if push.returncode != 0:
             raise RuntimeError(push.stderr.strip() or "git push failed")
-        # Local import mirrors build.py's docs-only opener — keeps the host
-        # adapter off this module's hot import path.
-        from sdlc import issue_host
-
-        adapter = issue_host.get_adapter(issue_host.resolve_host(root))
+        adapter = issue_host.get_adapter(host)
         title = build_commit_header(
             ctype="docs",
             scope=None,
@@ -1103,24 +1191,25 @@ def _bake_review_packet(
     issue: FixIssue,
     story: Story,
     pr_number: int,
-    root: Path | None,
     ledger: Ledger,
     run_id: str,
+    *,
+    host: str = issue_host.GITHUB,
 ) -> str | None:
     """Bake the pre-baked review packet for the fix's PR, or None (Story 27.3-003).
 
     The fix-issue mirror of ``build._bake_review_packet``: baked once per review
-    stage entry via the Epic-22/23 host adapter. Best-effort — any host failure
-    or an oversized packet logs an event and returns None, degrading the prompt
-    to today's fetch-it-yourself instructions (never a truncated diff).
+    stage entry via the Epic-22/23 host adapter. ``host`` is the run's
+    already-resolved host (issue #606), mirroring :func:`_open_docs_only_pr`.
+    Best-effort — any host failure or an oversized packet logs an event and
+    returns None, degrading the prompt to today's fetch-it-yourself instructions
+    (never a truncated diff).
     """
-    root = root or Path.cwd()
     try:
-        # Local import mirrors _open_docs_only_pr — keeps the host adapter off
-        # this module's hot import path.
-        from sdlc import issue_host, review_packet
+        # Local import keeps review_packet off this module's hot import path.
+        from sdlc import review_packet
 
-        adapter = issue_host.get_adapter(issue_host.resolve_host(root))
+        adapter = issue_host.get_adapter(host)
         block = review_packet.packet_block(adapter, str(pr_number))
     except Exception:  # noqa: BLE001 — best-effort; the prompt has a fallback path
         block = None
@@ -1149,6 +1238,7 @@ def _fix_config(opts: FixOptions) -> dict:
         "e2e_gate": opts.e2e_gate,
         "model_overrides": dict(opts.model_overrides or {}),
         "harness_map": dict(opts.harness_map or {}),
+        "host": opts.host,
     }
 
 
@@ -1159,6 +1249,7 @@ def _options_from_fix_config(config: dict, issue_number: int) -> FixOptions:
     given option existed resumes exactly as it originally dispatched.
     """
     overrides = config.get("model_overrides")
+    host = config.get("host")
     return FixOptions(
         issue=int(config.get("issue") or issue_number),
         skip_coverage=bool(config.get("skip_coverage", False)),
@@ -1166,6 +1257,7 @@ def _options_from_fix_config(config: dict, issue_number: int) -> FixOptions:
         skip_preflight=bool(config.get("skip_preflight", False)),
         e2e_gate=str(config.get("e2e_gate", "off")),
         model_overrides=dict(overrides) if isinstance(overrides, dict) else {},
+        host=str(host) if host else None,
     )
 
 
@@ -1206,6 +1298,7 @@ def _run_stage_loop(
     logs_dir: Path,
     *,
     root: Path | None = None,
+    host: str = issue_host.GITHUB,
     done_stages: frozenset[str] = frozenset(),
     pr_number: int | None = None,
     bugfix_seq: int = 0,
@@ -1224,8 +1317,12 @@ def _run_stage_loop(
     opens the PR itself, recording the skip with its ``docs-only`` reason — and
     skips the advisory E2E warn-gate; the review and the merge run unchanged.
     ``root`` is the checkout the branch was built in (its diff feed and push
-    origin); ``None`` falls back to the current working directory.
+    origin); ``None`` falls back to the current working directory. ``host``
+    (issue #606) is the run's already-resolved code host — it picks the
+    change-request phrasing every stage's prompt uses and the adapter the
+    docs-only PR open / review-packet bake route through.
     """
+    cr_terms = issue_host.get_adapter(host).cr_terms
     stages = [s for s in FIX_CORE_STAGES if not (s == "coverage" and opts.skip_coverage)]
     # Issue #547: a resume re-enters here with the stages that already completed,
     # so they are never re-dispatched and their side effects (the branch, the PR)
@@ -1249,7 +1346,7 @@ def _run_stage_loop(
             story_class = _fix_change_class(issue, story, ledger, run_id, root)
         if stage == "coverage" and story_class == change_class.DOCS_ONLY:
             pr = pr_number if pr_number is not None else _open_docs_only_pr(
-                issue, story, ledger, run_id, root
+                issue, story, ledger, run_id, root, host=host
             )
             if pr is not None:
                 pr_number = pr
@@ -1281,7 +1378,7 @@ def _run_stage_loop(
         review_packet_block: str | None = None
         if stage == "review" and pr_number is not None:
             review_packet_block = _bake_review_packet(
-                issue, story, pr_number, root, ledger, run_id
+                issue, story, pr_number, ledger, run_id, host=host
             )
         while True:
             model = fix_model(stage, opts, escalate=escalate)
@@ -1311,7 +1408,7 @@ def _run_stage_loop(
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             prompt = _render_core_prompt(
                 stage, issue, inv, opts, pr_number,
-                review_packet=review_packet_block,
+                review_packet=review_packet_block, cr_terms=cr_terms,
             )
             try:
                 ok, result, failure, kind = _dispatch_fix_stage(
@@ -1392,15 +1489,18 @@ def _render_core_prompt(
     pr_number: int | None,
     *,
     review_packet: str | None = None,
+    cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
 ) -> str:
     """Render the fix prompt for one core pipeline stage."""
     if stage == "build":
-        return render_build_prompt(issue, inv, opts)
+        return render_build_prompt(issue, inv, opts, cr_terms=cr_terms)
     if stage == "coverage":
-        return render_coverage_prompt(issue, opts)
+        return render_coverage_prompt(issue, opts, cr_terms=cr_terms)
     if stage == "review":
-        return render_review_prompt(issue, pr_number, packet=review_packet)
-    return render_merge_prompt(issue, pr_number)
+        return render_review_prompt(
+            issue, pr_number, packet=review_packet, cr_terms=cr_terms
+        )
+    return render_merge_prompt(issue, pr_number, cr_terms=cr_terms)
 
 
 def _run_summary(
@@ -1580,14 +1680,19 @@ def run_fix(
         else (lambda: [])
     )
 
+    # Issue #606: resolve the code host once — --host wins, else the origin
+    # remote's auto-detected host, else GitHub — and thread it through every
+    # issue/CR operation below instead of always shelling out to `gh`.
+    host = _resolve_fix_host(root, opts.host)
+
     # --- Fetch + stop conditions (no run row for a deliberate pre-run stop) ---
     try:
-        issue = fetch_issue(opts.issue, runner=runner)
+        issue = fetch_issue(opts.issue, runner=runner, host=host)
     except FixIssueError as exc:
         return FixResult(
             issue=opts.issue, aborted=True, abort_reason=str(exc), status="ABORTED"
         )
-    stop = stop_reason(issue, runner=runner)
+    stop = stop_reason(issue, runner=runner, host=host)
     if stop:
         return FixResult(
             issue=opts.issue, aborted=True, abort_reason=stop, status="ABORTED"
@@ -1698,7 +1803,7 @@ def run_fix(
 
     # --- Core stage loop ------------------------------------------------------
     terminal, pr_number = _run_stage_loop(
-        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root
+        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root, host=host
     )
 
     return _finish_fix_run(
@@ -1840,8 +1945,13 @@ def resume_fix(
             abort_reason=reason,
         )
 
+    # Issue #606: replay the run's resolved host rather than re-deriving it, so a
+    # remote change between a run and its resume cannot finish it against the
+    # wrong host's CLI.
+    host = _resolve_fix_host(root, opts.host)
+
     try:
-        issue = fetch_issue(issue_number, runner=runner)
+        issue = fetch_issue(issue_number, runner=runner, host=host)
     except FixIssueError as exc:
         return FixResult(
             issue=issue_number, run_id=run_id, aborted=True, status="ABORTED",
@@ -1870,7 +1980,7 @@ def resume_fix(
 
     terminal, pr_number = _run_stage_loop(
         issue, plan, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
-        done_stages=done_stages, pr_number=pr_number, bugfix_seq=bugfix_seq,
+        host=host, done_stages=done_stages, pr_number=pr_number, bugfix_seq=bugfix_seq,
         start_attempts=start_attempts,
     )
     return _finish_fix_run(
@@ -2039,35 +2149,53 @@ def _candidate_sort_key(cand: _Candidate) -> tuple[int, int, int]:
     return (_category_rank(cand.labels), _priority_rank(cand.labels), cand.number)
 
 
-def _list_open_issues(runner: Runner, *, limit: int = 50) -> list[_Candidate]:
-    """List open issues via ``gh issue list`` for batch selection (issue #436).
+def _list_open_issues(
+    runner: Runner, *, host: str = issue_host.GITHUB, limit: int = 50
+) -> list[_Candidate]:
+    """List open issues via the resolved host's CLI for batch selection (#436, #606).
 
-    Raises :class:`FixIssueError` on a non-zero exit or malformed JSON so the
-    caller aborts the batch cleanly rather than fixing an empty/garbled set.
+    ``gh issue list`` on GitHub, ``glab issue list`` on GitLab. Raises
+    :class:`FixIssueError` on a non-zero exit or malformed JSON so the caller
+    aborts the batch cleanly rather than fixing an empty/garbled set. GitHub's
+    error text is unchanged from before #606 (``gh issue list failed: …`` /
+    ``gh returned malformed JSON for issue list: …``).
     """
-    res = _gh(
-        [
-            "issue", "list", "--state", "open",
+    cli = "glab" if host == issue_host.GITLAB else "gh"
+    if host == issue_host.GITLAB:
+        args = [cli, "issue", "list", "--output", "json", "--per-page", str(limit)]
+    else:
+        args = [
+            cli, "issue", "list", "--state", "open",
             "--json", "number,title,labels", "--limit", str(limit),
-        ],
-        runner=runner,
-    )
+        ]
+    res = runner(args)
     if res.returncode != 0:
         raise FixIssueError(
-            f"gh issue list failed: {res.stderr.strip() or 'non-zero exit'}"
+            f"{cli} issue list failed: {res.stderr.strip() or 'non-zero exit'}"
         )
     try:
         data = json.loads(res.stdout)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise FixIssueError(f"gh returned malformed JSON for issue list: {exc}") from exc
+        raise FixIssueError(f"{cli} returned malformed JSON for issue list: {exc}") from exc
     if len(data) >= limit:
-        # No silent caps: gh returned a full page, so the open-issue set may be
-        # truncated. Warn now (the run isn't open yet, so there's no ledger row).
+        # No silent caps: the host returned a full page, so the open-issue set
+        # may be truncated. Warn now (the run isn't open yet, so there's no
+        # ledger row).
         print(
-            f"warning: `gh issue list` hit the {limit}-issue cap; some open issues "
-            "may be excluded from this batch (narrow with `next --limit=N`).",
+            f"warning: `{cli} issue list` hit the {limit}-issue cap; some open "
+            "issues may be excluded from this batch (narrow with `next --limit=N`).",
             file=sys.stderr,
         )
+    if host == issue_host.GITLAB:
+        return [
+            _Candidate(
+                number=int(d["iid"]),
+                title=str(d.get("title", "")),
+                labels=tuple(str(name) for name in d.get("labels", []) if name),
+            )
+            for d in data
+            if d.get("iid") is not None
+        ]
     return [
         _Candidate(
             number=int(d.get("number")),
@@ -2084,7 +2212,11 @@ def _list_open_issues(runner: Runner, *, limit: int = 50) -> list[_Candidate]:
 
 
 def select_batch_issues(
-    target: str, limit: int | None, *, runner: Runner | None = None
+    target: str,
+    limit: int | None,
+    *,
+    runner: Runner | None = None,
+    host: str = issue_host.GITHUB,
 ) -> list[_Candidate]:
     """Select and order the open issues a batch fix run should target (issue #436).
 
@@ -2098,7 +2230,7 @@ def select_batch_issues(
     issue #558. They are planning artifacts for ``sdlc build``, not defects.
     """
     runner = runner or _default_runner
-    candidates = _list_open_issues(runner)
+    candidates = _list_open_issues(runner, host=host)
     story_count = sum(1 for c in candidates if _is_story_mirror(c.labels))
     if story_count:
         plural = "s" if story_count != 1 else ""
@@ -2202,6 +2334,7 @@ def _issue_options(batch: FixBatchOptions, number: int) -> FixOptions:
         e2e_gate=batch.e2e_gate,
         model_overrides=dict(batch.model_overrides),
         harness_map=dict(batch.harness_map),
+        host=batch.host,
     )
 
 
@@ -2236,6 +2369,7 @@ def _investigate_all(
     *,
     agent_type: str,
     workers: int,
+    host: str = issue_host.GITHUB,
 ) -> tuple[dict[str, _Investigated], dict[str, FixIssueOutcome]]:
     """Investigate every candidate under bounded concurrency (issue #436).
 
@@ -2256,7 +2390,7 @@ def _investigate_all(
     def _one(cand: _Candidate) -> None:
         story_id = f"issue-{cand.number}"
         try:
-            issue = fetch_issue(cand.number, runner=runner)
+            issue = fetch_issue(cand.number, runner=runner, host=host)
         except FixIssueError as exc:
             ledger.set_story_status(run_id, story_id, "SKIPPED")
             ledger.event_log(
@@ -2267,7 +2401,7 @@ def _investigate_all(
                 cand.number, "SKIPPED", drop_reason=f"fetch failed: {exc}"
             )
             return
-        stop = stop_reason(issue, runner=runner)
+        stop = stop_reason(issue, runner=runner, host=host)
         if stop:
             ledger.set_story_status(run_id, story_id, "SKIPPED")
             ledger.event_log(
@@ -2398,6 +2532,10 @@ def run_fix_batch(
     if registry is None and real_run:
         registry = Registry()
     workers = _batch_workers(batch)
+    # Issue #606: resolve the code host once for the whole batch — mirrors
+    # run_fix — and thread it through selection, investigation, and every
+    # issue's stage loop instead of always shelling out to `gh`.
+    host = _resolve_fix_host(root, batch.host)
 
     # --- Dirty shared-checkout guard (issue #590) -----------------------------
     # Every issue in the batch runs against the same repo root, so one check for
@@ -2423,7 +2561,7 @@ def run_fix_batch(
 
     # --- Selection (no run row when nothing is selectable) --------------------
     try:
-        candidates = select_batch_issues(batch.target, batch.limit, runner=runner)
+        candidates = select_batch_issues(batch.target, batch.limit, runner=runner, host=host)
     except FixIssueError as exc:
         return FixBatchResult(
             no_issues=True, status="ABORTED",
@@ -2484,7 +2622,7 @@ def run_fix_batch(
     # --- Investigate every issue (bounded concurrency) ------------------------
     ready, dropped = _investigate_all(
         candidates, batch, ledger, run_id, dispatch, runner, logs_dir, root,
-        agent_type=agent_type, workers=workers,
+        agent_type=agent_type, workers=workers, host=host,
     )
 
     # --- Overlap graph → synthetic dependencies -------------------------------
@@ -2525,7 +2663,7 @@ def run_fix_batch(
                 )
         terminal, pr_number = _run_stage_loop(
             entry.issue, entry.inv, story, opts, ledger, run_id, issue_dispatch, logs_dir,
-            root=workdir or Path.cwd(),
+            root=workdir or Path.cwd(), host=host,
         )
         if terminal == "DONE":
             _run_summary(
@@ -2640,7 +2778,7 @@ def run_fix_batch(
     # --- Doc-update (best-effort, only when ≥1 issue merged) ------------------
     # Runs once per completed batch, before the terminal finalize. Non-blocking:
     # a failure is logged and never changes the batch's terminal (skill Phase 10b).
-    _run_doc_update(ordered, scope, batch, ledger, run_id, dispatch, logs_dir)
+    _run_doc_update(ordered, scope, batch, ledger, run_id, dispatch, logs_dir, host=host)
 
     outcome = finalize_run(
         ledger, run_id, status,
@@ -2670,6 +2808,8 @@ def _run_doc_update(
     run_id: str,
     dispatch,
     logs_dir: Path,
+    *,
+    host: str = issue_host.GITHUB,
 ) -> None:
     """Best-effort batch doc-update phase — reviews merged fixes on a fresh PR.
 
@@ -2699,7 +2839,8 @@ def _run_doc_update(
             _BATCH_PHASE_STATUS,
         )
         ledger.stage_start(run_id, "", "doc-update", 1, model=model)
-        prompt = render_doc_update_prompt(scope, merged)
+        cr_terms = issue_host.get_adapter(host).cr_terms
+        prompt = render_doc_update_prompt(scope, merged, cr_terms=cr_terms)
         # No per-issue story: doc-update runs in the shared checkout and cuts its
         # own branch, so ``story`` is left None (dispatch_agent ignores it).
         result = dispatch(
@@ -2773,7 +2914,8 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
     bugs, default one) — yields a :class:`FixBatchOptions`. Shared flags:
     ``--skip-coverage``, ``--coverage-threshold=N``, ``--skip-preflight``,
     ``--allow-dirty`` (issue #590: start despite uncommitted changes),
-    ``--e2e-gate=warn|off`` (default off), and its ``--skip-e2e`` alias.
+    ``--e2e-gate=warn|off`` (default off), its ``--skip-e2e`` alias, and
+    ``--host=github|gitlab`` (issue #606: override host auto-detection).
     Batch-only flags: ``--limit=N`` (cap the issue set; the ``next`` default is 1),
     ``--sequential`` (one issue fully completes before the next), and
     ``--concurrency=N`` (issue-level worker cap, default 5).
@@ -2808,6 +2950,17 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
             concurrency = int(arg.split("=", 1)[1])
             if concurrency < 1:
                 raise FixConfigError(f"--concurrency must be >= 1: {arg}")
+        elif arg.startswith("--host="):
+            # Issue #606: override host auto-detection for a self-hosted origin
+            # `issue_host.detect_host` cannot classify, mirroring `sdlc build
+            # --host` / `sdlc issues init --host`.
+            host_value = arg.split("=", 1)[1].lower()
+            if host_value not in issue_host.SUPPORTED_HOSTS:
+                raise FixConfigError(
+                    f"invalid --host: {host_value} (expected one of "
+                    f"{', '.join(issue_host.SUPPORTED_HOSTS)})"
+                )
+            kwargs["host"] = host_value
         elif arg.startswith("--"):
             raise FixConfigError(f"unknown flag: {arg}")
         elif arg.lower() in _FIX_BATCH_TARGETS or arg.lower() in _FIX_BATCH_ALIASES:

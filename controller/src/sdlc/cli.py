@@ -463,6 +463,7 @@ Flags:
   --force                   take over a run/scope another (dead) process still shows live (issue #595)
   --e2e-gate=warn|off       run the advisory E2E gate after review (default off)
   --skip-e2e                alias for --e2e-gate=off
+  --host=github|gitlab      override host auto-detection (default: auto-detect from origin)
 
 \b
 Batch runs investigate every issue first, then serialize only issues that touch

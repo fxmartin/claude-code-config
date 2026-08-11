@@ -250,8 +250,11 @@ def test_fetch_issue_nonzero_exit_raises() -> None:
 
 
 def test_fetch_issue_malformed_json_raises() -> None:
+    # Routed through the GitHub adapter's `issue_view` (issue #606): unparseable
+    # JSON degrades to "no issue" rather than "malformed JSON" (the adapter's own
+    # error text), but it still raises FixIssueError so the caller aborts cleanly.
     gh = FakeGh("{not json")
-    with pytest.raises(FixIssueError, match="malformed JSON"):
+    with pytest.raises(FixIssueError, match="returned no issue"):
         fetch_issue(1, runner=gh)
 
 
@@ -291,6 +294,168 @@ def test_stop_reason_assignee_unknown_user_does_not_block() -> None:
     gh = FakeGh("", user="")  # api user returns empty -> None
     issue = FixIssue(1, "t", "b", "open", ("other",), ())
     assert stop_reason(issue, runner=gh) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #606: GitLab host support — `sdlc fix` must route through the code-host
+# abstraction (issue_host.py) instead of hardcoding `gh`, mirroring `sdlc build`.
+# ---------------------------------------------------------------------------
+
+
+class FakeGlab:
+    """Record argv and return canned RunResults for `glab issue view` / `glab api user`."""
+
+    def __init__(self, issue_payload: str, *, user="me", issue_rc=0, issue_err=""):
+        self.issue_payload = issue_payload
+        self.user = user
+        self.issue_rc = issue_rc
+        self.issue_err = issue_err
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, timeout=None):
+        self.calls.append(list(argv))
+        joined = " ".join(argv)
+        if "issue view" in joined:
+            return RunResult(self.issue_rc, self.issue_payload, self.issue_err)
+        if "api user" in joined:
+            return RunResult(0, json.dumps({"username": self.user}), "")
+        return RunResult(0, "", "")
+
+
+def _gitlab_issue_json(
+    iid=1, state="opened", assignees=None, labels=None, title="Bug", description="boom"
+) -> str:
+    return json.dumps(
+        {
+            "iid": iid,
+            "title": title,
+            "description": description,
+            "state": state,
+            "assignees": [{"username": a} for a in (assignees or [])],
+            "labels": list(labels or []),
+        }
+    )
+
+
+def test_fetch_issue_routes_to_glab_on_gitlab_host() -> None:
+    """The root-cause regression (#606): a GitLab-hosted fix must call `glab`,
+    never `gh`, to fetch the issue."""
+    glab = FakeGlab(_gitlab_issue_json(iid=38, title="Crash", labels=["bug"]))
+    issue = fetch_issue(38, runner=glab, host="gitlab")
+    assert issue.number == 38
+    assert issue.title == "Crash"
+    assert issue.labels == ("bug",)
+    assert all(call[0] == "glab" for call in glab.calls)
+    assert not any(call[0] == "gh" for call in glab.calls)
+
+
+def test_fetch_issue_defaults_to_github_host() -> None:
+    """No ``host`` given keeps every pre-#606 caller on `gh` (back-compat)."""
+    gh = FakeGh(_issue_json(number=1))
+    fetch_issue(1, runner=gh)
+    assert all(call[0] == "gh" for call in gh.calls)
+
+
+def test_fetch_issue_gitlab_nonzero_exit_raises() -> None:
+    glab = FakeGlab("", issue_rc=1, issue_err="issue not found")
+    with pytest.raises(FixIssueError, match="not found"):
+        fetch_issue(999, runner=glab, host="gitlab")
+
+
+def test_stop_reason_uses_glab_for_current_user_on_gitlab_host() -> None:
+    glab = FakeGlab("", user="me")
+    issue = FixIssue(1, "t", "b", "open", ("someone-else",), ())
+    reason = stop_reason(issue, runner=glab, host="gitlab")
+    assert "assigned to someone-else" in reason
+    assert any(call[0] == "glab" for call in glab.calls)
+
+
+def test_stop_reason_none_when_assigned_to_me_on_gitlab_host() -> None:
+    glab = FakeGlab("", user="me")
+    issue = FixIssue(1, "t", "b", "open", ("me",), ())
+    assert stop_reason(issue, runner=glab, host="gitlab") is None
+
+
+def test_resolve_fix_host_override_wins() -> None:
+    assert fix_mod._resolve_fix_host(Path("/nonexistent"), "gitlab") == "gitlab"
+
+
+def test_resolve_fix_host_defaults_to_github_when_undetectable(tmp_path) -> None:
+    # tmp_path is not a git repo — auto-detect fails, no override given.
+    assert fix_mod._resolve_fix_host(tmp_path, None) == "github"
+
+
+def test_resolve_fix_host_autodetects_gitlab_from_remote(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        fix_mod.issue_host, "detect_host", lambda root: "gitlab"
+    )
+    assert fix_mod._resolve_fix_host(tmp_path, None) == "gitlab"
+
+
+def test_parse_fix_args_host_flag() -> None:
+    opts = parse_fix_args(["38", "--host=gitlab"])
+    assert isinstance(opts, FixOptions)
+    assert opts.host == "gitlab"
+
+
+def test_parse_fix_args_host_flag_batch() -> None:
+    opts = parse_fix_args(["all", "--host=gitlab"])
+    assert isinstance(opts, FixBatchOptions)
+    assert opts.host == "gitlab"
+
+
+def test_parse_fix_args_invalid_host_rejected() -> None:
+    with pytest.raises(FixConfigError, match="invalid --host"):
+        parse_fix_args(["38", "--host=bitbucket"])
+
+
+def test_render_build_prompt_uses_mr_terms_on_gitlab() -> None:
+    from sdlc.issue_host import GITLAB_CR_TERMS
+
+    issue = FixIssue(38, "Bug", "b", "open", (), ())
+    prompt = render_build_prompt(
+        issue, _default_payload("investigation"), FixOptions(issue=38, skip_coverage=True),
+        cr_terms=GITLAB_CR_TERMS,
+    )
+    assert "glab mr create" in prompt
+    assert "gh pr create" not in prompt
+
+
+def test_render_merge_prompt_uses_mr_terms_on_gitlab() -> None:
+    from sdlc.issue_host import GITLAB_CR_TERMS
+
+    issue = FixIssue(38, "Bug", "b", "open", (), ())
+    prompt = render_merge_prompt(issue, 5, cr_terms=GITLAB_CR_TERMS)
+    assert "glab mr merge" in prompt
+    assert "glab issue close" in prompt
+    assert "gh pr merge" not in prompt
+    assert "gh issue close" not in prompt
+
+
+def test_render_merge_prompt_default_is_byte_identical_to_pre_606() -> None:
+    """GitHub's default `cr_terms` must render the exact pre-#606 merge prompt."""
+    issue = FixIssue(38, "Bug", "b", "open", (), ())
+    prompt = render_merge_prompt(issue, 100)
+    assert "Merge the PR for the fix of issue #38 (PR #100).\n" in prompt
+    assert "2. Merge with: gh pr merge --squash --delete-branch.\n" in prompt
+    assert (
+        '3. Close the issue: gh issue close 38 --reason completed '
+        '(and comment "Fixed in PR #100.").\n' in prompt
+    )
+
+
+def test_list_open_issues_routes_to_glab_on_gitlab_host() -> None:
+    class _GlabList:
+        def __call__(self, argv, timeout=None):
+            assert argv[0] == "glab"
+            return RunResult(
+                0,
+                json.dumps([{"iid": 5, "title": "t", "labels": ["bug"]}]),
+                "",
+            )
+
+    candidates = fix_mod._list_open_issues(_GlabList(), host="gitlab")
+    assert candidates == [fix_mod._Candidate(number=5, title="t", labels=("bug",))]
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +1123,29 @@ def test_run_fix_fetch_error_aborts_cleanly(tmp_path) -> None:
     )
     assert result.aborted is True
     assert result.status == "ABORTED"
+
+
+def test_run_fix_on_gitlab_host_routes_through_glab_not_gh(tmp_path) -> None:
+    """Regression for issue #606: `sdlc fix` on a GitLab-hosted repo used to
+    abort immediately (`gh issue view` against a host with no GitHub remote).
+    With ``--host=gitlab`` it must drive the whole run through `glab` instead,
+    and its prompts must tell the agents to open a Merge Request, not a PR.
+    """
+    glab = FakeGlab(_gitlab_issue_json(iid=38, title="Crash"))
+    dispatch = _PromptDispatcher()
+    result = run_fix(
+        FixOptions(issue=38, host="gitlab"),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=glab,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert not any(call[0] == "gh" for call in glab.calls)
+    assert any(call[0] == "glab" for call in glab.calls)
+    assert "glab mr merge" in dispatch.prompts["merge"]
+    assert "gh pr merge" not in dispatch.prompts["merge"]
 
 
 def test_run_fix_rate_limit_parks(tmp_path) -> None:
@@ -2892,7 +3080,7 @@ def _run_fix_class(tmp_path, monkeypatch, *, files, pr=100, opts=None, dispatch=
     )
     monkeypatch.setattr(
         fix_mod, "_open_docs_only_pr",
-        lambda issue, story, ledger, run_id, root: pr,
+        lambda issue, story, ledger, run_id, root, **kwargs: pr,
     )
     db = tmp_path / ".sdlc-state.db"
     dispatch = dispatch if dispatch is not None else RecordingDispatcher()
