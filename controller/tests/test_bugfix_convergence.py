@@ -177,7 +177,7 @@ def test_review_packet_rebaked_after_bugfix_push(tmp_path, monkeypatch) -> None:
     )
     bakes = {"n": 0}
 
-    def fake_bake(story, pr_number, workdir, ledger, run_id, signals, cr_terms):
+    def fake_bake(story, pr_number, workdir, ledger, run_id, signals, cr_terms, opts):
         bakes["n"] += 1
         return f"PACKET-{bakes['n']}"
 

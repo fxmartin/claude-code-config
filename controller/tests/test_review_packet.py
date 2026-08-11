@@ -360,6 +360,9 @@ class _SilentLedger:
     def set_story_merge_sha(self, *a, **k):
         pass
 
+    def inventory_get_mapping(self, story_id):
+        return None
+
 
 def test_run_story_embeds_packet_in_review_dispatch(tmp_path, monkeypatch) -> None:
     """The review (and adversarial-slot) dispatch reuses one baked packet; the

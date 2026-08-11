@@ -3978,6 +3978,192 @@ def test_build_on_gitlab_target_opens_an_mr_and_records_cr_ref(tmp_path) -> None
     assert row is not None and row[0] == 100
 
 
+# ---------------------------------------------------------------------------
+# Issue #608: the deterministic CR-open host resolution must consult the
+# story's own `story_inventory` mapping (and an explicit --host) before
+# falling back to the URL heuristic, which cannot recognise a self-hosted
+# GitLab remote (e.g. http://127.0.0.1:8080/root/llmbench.git).
+# ---------------------------------------------------------------------------
+
+
+def _repo_with_undetectable_origin(tmp_path: Path, branch: str) -> Path:
+    """A real, pushable git repo whose origin remote is not host-detectable.
+
+    A local bare-repo path matches neither the SCP-like nor the URL remote
+    pattern `host_from_remote` parses, mirroring a self-hosted GitLab remote
+    that carries no 'github'/'gitlab' hostname substring — while staying a
+    real, pushable remote so a test exercises the actual `git push`.
+    """
+    import subprocess
+
+    root = tmp_path / "repo"
+    bare = tmp_path / "origin.git"
+    root.mkdir()
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@e.c"], cwd=root, check=True, capture_output=True
+    )
+    subprocess.run(["git", "config", "user.name", "T"], cwd=root, check=True, capture_output=True)
+    (root / "README.md").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(bare)],
+        cwd=root, check=True, capture_output=True,
+    )
+    subprocess.run(["git", "checkout", "-b", branch], cwd=root, check=True, capture_output=True)
+    return root
+
+
+class _FakeCrAdapter:
+    """Captures cr_create calls; stands in for the real gh/glab adapter."""
+
+    def __init__(self, host: str, ref: str = "42") -> None:
+        self.host = host
+        self.ref = ref
+        self.created: list[dict] = []
+
+    def cr_create(self, source_branch, title, body, target_branch=None, draft=False):
+        self.created.append(
+            {"source_branch": source_branch, "title": title, "body": body}
+        )
+        return ih.ChangeRequest(host=self.host, ref=self.ref, url=f"https://x/{self.ref}")
+
+
+def _mapped_ledger(tmp_path: Path, story: Story, host: str, issue_ref: str) -> Ledger:
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    ledger.inventory_upsert_specs(
+        [(story.id, story.epic_id, story.epic_id + ".1", story.title, story.points, "Low")]
+    )
+    ledger.inventory_set_mapping(story.id, host, issue_ref)
+    return ledger
+
+
+def test_open_story_cr_falls_back_to_inventory_host_when_url_undetectable(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #608 regression: the deterministic CR open must consult the
+    story's own `story_inventory` mapping before giving up on URL
+    auto-detection.
+
+    Before the fix, `_open_story_cr` called `resolve_host(root)` with no
+    override, so a repo whose origin remote carries no recognisable
+    'github'/'gitlab' hostname (any self-hosted GitLab, e.g.
+    ``http://127.0.0.1:8080/...``) always raised — even though the ledger
+    already recorded this exact story's host as 'gitlab' via
+    `sdlc issues init --host gitlab`. The failure parks the story
+    NEEDS_ATTENTION *after* coverage has already run (the expensive part).
+    """
+    from sdlc.build import _open_story_cr
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
+
+    fake = _FakeCrAdapter("gitlab")
+    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: fake)
+
+    pr = _open_story_cr(
+        story, ledger, "run-1", root, "origin/main", None, ih.GITLAB_CR_TERMS,
+        BuildOptions(),
+        body="Coverage gate passed.", context="post-coverage",
+    )
+
+    assert pr == 42
+    assert fake.created  # cr_create was actually reached — no IssueHostError
+
+
+def test_open_story_cr_explicit_host_wins_over_inventory_mapping(
+    tmp_path, monkeypatch
+) -> None:
+    """An explicit `--host` is the top-priority override (issue #608)."""
+    from sdlc.build import _open_story_cr
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    # The ledger says gitlab; --host says github — the flag wins.
+    ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
+
+    fake = _FakeCrAdapter("github")
+    captured_hosts: list[str] = []
+    monkeypatch.setattr(
+        ih, "get_adapter",
+        lambda host, runner=None: (captured_hosts.append(host), fake)[1],
+    )
+
+    _open_story_cr(
+        story, ledger, "run-1", root, "origin/main", None, ih.GITHUB_CR_TERMS,
+        BuildOptions(host="github"),
+        body="Coverage gate passed.", context="post-coverage",
+    )
+
+    assert captured_hosts == ["github"]
+
+
+def test_open_story_cr_unmapped_story_keeps_url_only_degradation(
+    tmp_path, monkeypatch
+) -> None:
+    """An unmapped story with an undetectable remote still degrades to None
+    (never silently guesses a host) — the fix adds a fallback source, not a
+    bypass of `resolve_host`'s own validation.
+    """
+    from sdlc.build import _open_story_cr
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()  # no inventory mapping recorded for this story
+
+    pr = _open_story_cr(
+        story, ledger, "run-1", root, "origin/main", None, ih.GITHUB_CR_TERMS,
+        BuildOptions(),
+        body="Coverage gate passed.", context="post-coverage",
+    )
+
+    assert pr is None
+    with sqlite3.connect(ledger.db_path) as conn:
+        messages = [r[0] for r in conn.execute("SELECT message FROM events").fetchall()]
+    assert any("could not determine code host" in m for m in messages)
+
+
+def test_bake_review_packet_falls_back_to_inventory_host(tmp_path, monkeypatch) -> None:
+    """The review-packet bake resolves the host the same way as the CR open —
+    --host, then the story's inventory mapping — before the URL heuristic
+    (issue #608), so a self-hosted GitLab target never degrades to the
+    fetch-it-yourself fallback just because the origin URL is undetectable.
+    """
+    from sdlc import review_packet as review_packet_mod
+    from sdlc.build import _bake_review_packet
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
+
+    fake = _FakeCrAdapter("gitlab")
+    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: fake)
+    monkeypatch.setattr(
+        review_packet_mod, "packet_block",
+        lambda adapter, cr_ref, **kwargs: f"PACKET-{cr_ref}",
+    )
+
+    block = _bake_review_packet(
+        story, 9, root, ledger, "run-1", None, ih.GITLAB_CR_TERMS, BuildOptions(),
+    )
+
+    assert block == "PACKET-9"
+
+
+def test_parse_build_args_host_flag() -> None:
+    """`--host=gitlab|github` is the escape hatch mirroring `issues init` (#608)."""
+    assert parse_build_args([]).host is None
+    assert parse_build_args(["--host=gitlab"]).host == "gitlab"
+    assert parse_build_args(["--host=GitHub"]).host == "github"
+    with pytest.raises(ValueError, match="invalid --host"):
+        parse_build_args(["--host=bitbucket"])
+
+
 def test_origin_default_ref_resolves_head(tmp_path, monkeypatch) -> None:
     """`_origin_default_ref` reads origin/HEAD, else falls back to origin/main (AC3)."""
     from sdlc import build as build_mod

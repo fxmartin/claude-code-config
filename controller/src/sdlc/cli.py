@@ -175,6 +175,11 @@ Flags:
   --limit=N                 build at most N stories
   --coverage-threshold=N    required new-code coverage % (default 90)
   --preflight-timeout=SEC   abort the preflight gate after SEC seconds (default 600)
+  --host=HOST               github|gitlab — override host auto-detection for the
+                            deterministic change-request open (issue #608).
+                            Default: the story's own `story_inventory` mapping
+                            (as recorded by `sdlc issues init --host`), else
+                            auto-detect from the origin remote
   --budget=N                token ceiling for the run; a $-value (e.g. $5) is
                             converted to a notional API-equivalent token ceiling
   --budget-policy=POLICY    on crossing the ceiling: pause (resumable, default)
