@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.12] - 2026-08-11
+
+### Fixed
+
+- fix(sdlc): route fix_issue through the code-host abstraction (#616)
+
+
 ## [v2.45.11] - 2026-08-11
 
 ### Fixed
