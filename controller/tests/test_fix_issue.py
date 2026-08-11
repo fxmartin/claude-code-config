@@ -564,6 +564,70 @@ def test_run_fix_happy_path_all_stages_done(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #590: dirty shared-checkout guard refuses before any dispatch.
+# ---------------------------------------------------------------------------
+
+
+def test_run_fix_refuses_on_dirty_tree(tmp_path) -> None:
+    gh = FakeGh(_issue_json())
+    dispatch = RecordingDispatcher()
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+        dirty_check=lambda: ["src/dirty.py"],
+    )
+    assert result.status == "ABORTED"
+    assert result.dirty_tree == ["src/dirty.py"]
+    assert dispatch.agents() == []
+
+
+def test_run_fix_batch_refuses_on_dirty_tree(tmp_path) -> None:
+    gh = FakeBatchGh([_batch_issue(1)])
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]})
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+        dirty_check=lambda: ["src/dirty.py"],
+    )
+    assert result.status == "ABORTED"
+    assert result.dirty_tree == ["src/dirty.py"]
+    assert result.summary == "refused to start: uncommitted changes in the working tree"
+
+
+# ---------------------------------------------------------------------------
+# Story 27.3-003: review packet baking is best-effort — any host/packet
+# failure degrades to None (fetch-it-yourself fallback) instead of raising.
+# ---------------------------------------------------------------------------
+
+
+def test_bake_review_packet_swallows_exception_and_logs_event(tmp_path, monkeypatch) -> None:
+    import sdlc.review_packet as review_packet_mod
+
+    def boom(adapter, pr_number):
+        raise RuntimeError("packet explosion")
+
+    monkeypatch.setattr(review_packet_mod, "packet_block", boom)
+
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue)
+    ledger = _ledger(tmp_path)
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+
+    block = fix_mod._bake_review_packet(issue, story, 42, ledger, run_id)
+
+    assert block is None
+
+
+# ---------------------------------------------------------------------------
 # Issue #565: the story must flip IN_PROGRESS when investigation opens, not
 # when the post-investigation build pipeline starts — otherwise the dashboard
 # shows a fix run's story stuck on TODO for the entire (silent, can run several
