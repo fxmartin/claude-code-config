@@ -460,6 +460,7 @@ Flags:
   --coverage-threshold=N    required new-code coverage % (default 90)
   --skip-preflight          skip the preflight quality gate
   --allow-dirty             start even with uncommitted changes (issue #590)
+  --force                   take over a run/scope another (dead) process still shows live (issue #595)
   --e2e-gate=warn|off       run the advisory E2E gate after review (default off)
   --skip-e2e                alias for --e2e-gate=off
 
@@ -624,6 +625,12 @@ def resume(
         "value the original run used). A serial-mode run stays one-at-a-time.",
         min=1,
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Take over a run the registry shows already live under another pid "
+        "(issue #595). Use only once you have confirmed that pid is gone.",
+    ),
 ) -> None:
     """Resume an interrupted build from the SQLite ledger.
 
@@ -644,6 +651,11 @@ def resume(
     close the run out DONE). A fix run that recorded no investigation plan — one
     started before that plan was persisted — is refused and left resumable rather
     than continued on a freshly invented plan.
+
+    Issue #595: refused (exit 1, run untouched) when the host registry shows this
+    run already live under another pid — two processes must never drive the same
+    run at once. Pass ``--force`` to take over, but only once you have confirmed
+    that pid is actually gone (``sdlc status`` shows a stale run as ``DEAD``).
     """
     from sdlc.build import _parse_budget_value
     from sdlc.discovery import canonical_scope
@@ -690,7 +702,12 @@ def resume(
         budget_policy=budget_policy,
         cost_threshold=cost_threshold_tokens,
         concurrency=concurrency,
+        force=force,
     )
+
+    if result.refused:
+        typer.echo(result.refusal_reason, err=True)
+        raise typer.Exit(code=1)
 
     if result.nothing_to_resume:
         if result.run_id is None:

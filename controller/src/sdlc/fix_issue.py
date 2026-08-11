@@ -74,7 +74,7 @@ from sdlc.dispatch import (
 from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.issue_host import RunResult, Runner, _default_runner
 from sdlc.notify import notify
-from sdlc.registry import Registry
+from sdlc.registry import Registry, format_live_owner_refusal
 from sdlc.story_render import STORY_LABEL
 
 # --- Model routing: aligned with the Balanced build profile -----------------
@@ -174,6 +174,11 @@ class FixOptions:
     # same precedence `sdlc build` uses. Empty means "every role on the built-in
     # claude harness", which is what every fix run did unconditionally before.
     harness_map: dict[str, str] = field(default_factory=dict)
+    # Issue #595: opt out of the live-owner guard — proceed even though the host
+    # registry shows another process already holding this run/scope. Documented
+    # as "only if that pid is gone": a genuine takeover of an abandoned run, not
+    # a routine flag. Default False = refuse (see `find_live_owner`).
+    force: bool = False
 
 
 @dataclass
@@ -203,6 +208,10 @@ class FixBatchOptions:
     # Issue #551: the run's effective role->harness map, threaded down to each
     # issue exactly like the quality-gate knobs above.
     harness_map: dict[str, str] = field(default_factory=dict)
+    # Issue #595: mirrors :class:`FixOptions` — the batch opens a single run row
+    # for the whole selection, so the live-owner guard is checked once, here,
+    # before that `run_create`.
+    force: bool = False
 
 
 @dataclass
@@ -267,6 +276,11 @@ class FixResult:
     # to start on the shared checkout. Non-empty means nothing was dispatched and
     # no run row exists — the user's work is still exactly where they left it.
     dirty_tree: list[str] = field(default_factory=list)
+    # Issue #595: another process already holds this run/scope (a live registry
+    # entry). Distinguished from other `aborted` reasons so a caller resuming a
+    # fix-mode run through `sdlc resume` can surface this exact message instead
+    # of the generic "nothing to resume" it would otherwise collapse into.
+    live_owner_blocked: bool = False
     investigation_blocked: bool = False
     block_reason: str = ""
 
@@ -1596,9 +1610,26 @@ def run_fix(
     if not opts.skip_preflight and not check_preflight():
         return FixResult(issue=opts.issue, preflight_failed=True, status="FAILED")
 
+    scope = f"issue-{opts.issue}"
+    # --- Live-owner guard (issue #595) ----------------------------------------
+    # Two processes (`sdlc fix` / `sdlc resume`) must never drive the same run at
+    # once — the incident that motivated this guard left the ledger with a `1
+    # done` finish record immediately followed by a `0 done, 1 failed` one for the
+    # same run, because both writers raced to the finish line. Refuse before the
+    # run row (or anything else) is created; `--force` is the documented
+    # "only if that pid is gone" override.
+    if registry is not None and not opts.force:
+        live = registry.find_live_owner(
+            repo=str((root or Path.cwd()).resolve()), scope=scope, exclude_pid=os.getpid()
+        )
+        if live is not None:
+            return FixResult(
+                issue=opts.issue, status="ABORTED", aborted=True,
+                abort_reason=format_live_owner_refusal(live), live_owner_blocked=True,
+            )
+
     # --- Ledger bootstrap + run open -----------------------------------------
     ledger.init()
-    scope = f"issue-{opts.issue}"
     run_id = ledger.run_create(scope, "fix")
     story = issue_story(issue, root=root)
     ledger.set_total(run_id, 1)
@@ -1741,6 +1772,7 @@ def resume_fix(
     root: Path | None = None,
     logs_dir: Path | None = None,
     registry: Registry | None = None,
+    force: bool = False,
 ) -> FixResult:
     """Re-enter an interrupted `sdlc fix` run at the stage it died in (Issue #547).
 
@@ -1757,6 +1789,12 @@ def resume_fix(
     never saw, so the remaining stages would review and merge work against a
     rationale nothing in the run actually followed. Refusing leaves the run
     resumable — the one thing the old behaviour destroyed.
+
+    Issue #595: refused just the same, before any of the above, when the host
+    registry shows this run already live under another pid — two writers racing
+    to finish the same run is what left a real ledger self-contradictory (a
+    ``1 done`` finish immediately followed by ``0 done, 1 failed`` for the same
+    run). ``force`` is the documented override, "only if that pid is gone".
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
@@ -1772,6 +1810,16 @@ def resume_fix(
             abort_reason=f"not a single-issue fix run: scope={scope or '<none>'}",
         )
     issue_number = int(match.group(1))
+
+    # --- Live-owner guard (issue #595) ----------------------------------------
+    if registry is not None and not force:
+        live = registry.find_live_owner(run_id=run_id, exclude_pid=os.getpid())
+        if live is not None:
+            return FixResult(
+                issue=issue_number, run_id=run_id, aborted=True, status="ABORTED",
+                abort_reason=format_live_owner_refusal(live), live_owner_blocked=True,
+            )
+
     opts = _options_from_fix_config(ledger.run_config(run_id), issue_number)
     # Issue #551: replay the run's frozen role->harness map rather than resolving
     # afresh, so an edit to `.sdlc-harness.yaml` between a run and its resume
@@ -2387,10 +2435,23 @@ def run_fix_batch(
             summary=f"no open issues matched `sdlc fix {batch.target}`",
         )
 
-    # --- Ledger bootstrap + run open -----------------------------------------
-    ledger.init()
     numbers = [c.number for c in candidates]
     scope = _batch_scope(batch.target, numbers)
+    # --- Live-owner guard (issue #595) ----------------------------------------
+    # One run row covers the whole batch, so one check here — mirroring run_fix —
+    # protects every issue in the selection. `--force` opts out ("only if that
+    # pid is gone").
+    if registry is not None and not batch.force:
+        live = registry.find_live_owner(
+            repo=str((root or Path.cwd()).resolve()), scope=scope, exclude_pid=os.getpid()
+        )
+        if live is not None:
+            return FixBatchResult(
+                status="ABORTED", summary=format_live_owner_refusal(live),
+            )
+
+    # --- Ledger bootstrap + run open -----------------------------------------
+    ledger.init()
     mode = "serial" if workers == 1 else "parallel"
     run_id = ledger.run_create(scope, mode)
     ledger.set_total(run_id, len(candidates))
@@ -2696,6 +2757,8 @@ _FIX_BOOL_FLAGS = {
     # Issue #590: start anyway on a dirty shared checkout (opt-out of the guard).
     "--allow-dirty": "allow_dirty",
     "--sequential": "sequential",
+    # Issue #595: take over a run/scope another (dead) process still shows live.
+    "--force": "force",
 }
 _FIX_BATCH_TARGETS = {"all", "next"}
 # Convenience aliases for the ``all`` target.

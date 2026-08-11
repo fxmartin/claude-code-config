@@ -17,6 +17,7 @@ __all__ = [
     "RunRecord",
     "default_registry_path",
     "derive_state",
+    "format_live_owner_refusal",
     "pid_alive",
 ]
 
@@ -111,6 +112,24 @@ def derive_state(record: RunRecord) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def format_live_owner_refusal(record: RunRecord) -> str:
+    """The standard refusal text when a live owner blocks a fresh entry (issue #595).
+
+    Shared by every caller of :meth:`Registry.find_live_owner` — `sdlc fix`,
+    `sdlc resume`, and (issue #578) a future webhook trigger — so the message a
+    second process sees reads identically regardless of which command tripped the
+    guard: it names the owning pid and when it started, then gives the two ways
+    out (watch it, or take it over once that pid is confirmed gone).
+    """
+    return (
+        f"run {record.run_id} is already live (pid {record.pid}, "
+        f"started {record.started_at})\n"
+        "  → watch it:      sdlc status\n"
+        f"  → take it over:  sdlc resume --run {record.run_id} --force   "
+        "(only if that pid is gone)"
+    )
 
 
 class Registry:
@@ -247,6 +266,53 @@ class Registry:
             except (TypeError, ValueError):
                 continue
         return records
+
+    def find_live_owner(
+        self,
+        *,
+        run_id: str | None = None,
+        repo: str | None = None,
+        scope: str | None = None,
+        exclude_pid: int | None = None,
+    ) -> RunRecord | None:
+        """The live record already owning ``run_id`` or ``(repo, scope)``, if any.
+
+        A shared concurrency-guard primitive (issue #595, and issue #578's later
+        webhook trigger): a caller about to open or re-enter a run probes here
+        first so two processes never drive the same run at once. Match by
+        ``run_id`` when one exists already (the resume case); otherwise by the
+        ``(repo, scope)`` pair (the fresh-entry case, e.g. `sdlc fix <issue>` —
+        no run_id exists yet, but a live run already working that same repo+scope
+        would still collide). ``repo`` must be pre-resolved the same way
+        :func:`Registry.register`'s caller resolves it (``str(Path(...).resolve())``)
+        or it will never match.
+
+        "Live" means unfinished with a pid that still answers — the same test
+        :func:`derive_state` uses to avoid reporting ``DEAD`` as "in progress",
+        applied here as a gate rather than a display label. ``exclude_pid`` skips
+        a record plainly owned by the caller's own process (a process re-entering
+        a run it itself already holds is not a collision); it is not assumed to be
+        the common case, so callers pass their own pid explicitly rather than it
+        being implicit.
+
+        Returns ``None`` when nothing live matches — including when the only
+        match is DEAD (its pid is gone) or already finished, both of which are
+        reclaimable, not a collision.
+        """
+        if run_id is None and (repo is None or scope is None):
+            raise ValueError("find_live_owner requires run_id, or both repo and scope")
+        for record in self.records():
+            if exclude_pid is not None and record.pid == exclude_pid:
+                continue
+            if run_id is not None:
+                if record.run_id != run_id:
+                    continue
+            elif record.repo != repo or record.scope != scope:
+                continue
+            if record.finished_at or not pid_alive(record.pid):
+                continue
+            return record
+        return None
 
     def view(self) -> list[dict]:
         """Records as dicts annotated with the derived effective ``state``."""

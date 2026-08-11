@@ -12,6 +12,7 @@ from sdlc.registry import (
     RunRecord,
     default_registry_path,
     derive_state,
+    format_live_owner_refusal,
     pid_alive,
 )
 
@@ -297,3 +298,83 @@ def test_written_file_is_valid_json_list(tmp_path):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(data, list)
     assert data[0]["run_id"] == "run-1"
+
+
+# --- find_live_owner (issue #595) -------------------------------------------
+
+
+def test_find_live_owner_matches_by_run_id(tmp_path):
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record("run-1", pid=os.getpid()))
+    found = reg.find_live_owner(run_id="run-1")
+    assert found is not None
+    assert found.run_id == "run-1"
+
+
+def test_find_live_owner_none_when_run_id_unknown(tmp_path):
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record("run-1", pid=os.getpid()))
+    assert reg.find_live_owner(run_id="missing") is None
+
+
+def test_find_live_owner_does_not_match_a_dead_pid(tmp_path):
+    """A DEAD (crashed) owner is reclaimable, not a collision."""
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record("run-1", pid=DEAD_PID))
+    assert reg.find_live_owner(run_id="run-1") is None
+
+
+def test_find_live_owner_does_not_match_a_finished_run(tmp_path):
+    """A terminal run — even one whose pid happens to still be alive (pid reuse
+    by an unrelated later process) — is not "live" for guard purposes."""
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record("run-1", pid=os.getpid()))
+    reg.mark_finished("run-1", "DONE", completed=1)
+    assert reg.find_live_owner(run_id="run-1") is None
+
+
+def test_find_live_owner_matches_by_repo_and_scope(tmp_path):
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record("run-1", pid=os.getpid(), repo="/repo/a", scope="issue-42"))
+    found = reg.find_live_owner(repo="/repo/a", scope="issue-42")
+    assert found is not None
+    assert found.run_id == "run-1"
+
+
+def test_find_live_owner_repo_scope_mismatch_is_none(tmp_path):
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record("run-1", pid=os.getpid(), repo="/repo/a", scope="issue-42"))
+    assert reg.find_live_owner(repo="/repo/a", scope="issue-99") is None
+    assert reg.find_live_owner(repo="/repo/b", scope="issue-42") is None
+
+
+def test_find_live_owner_excludes_the_given_pid(tmp_path):
+    """A process re-entering a run it itself already holds is not a collision."""
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record("run-1", pid=os.getpid()))
+    assert reg.find_live_owner(run_id="run-1", exclude_pid=os.getpid()) is None
+
+
+def test_find_live_owner_requires_run_id_or_repo_and_scope(tmp_path):
+    reg = Registry(tmp_path / "registry.json")
+    try:
+        reg.find_live_owner()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for no selector")
+
+
+def test_find_live_owner_no_entries_is_none(tmp_path):
+    reg = Registry(tmp_path / "registry.json")
+    assert reg.find_live_owner(run_id="run-1") is None
+
+
+def test_format_live_owner_refusal_names_pid_and_started_at():
+    rec = _record("abc123", pid=4242, started_at="2026-08-11T09:00:00+00:00")
+    message = format_live_owner_refusal(rec)
+    assert "abc123" in message
+    assert "4242" in message
+    assert "2026-08-11T09:00:00+00:00" in message
+    assert "sdlc status" in message
+    assert "sdlc resume --run abc123 --force" in message
