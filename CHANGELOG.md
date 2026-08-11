@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.8] - 2026-08-11
+
+### Fixed
+
+- fix(sdlc): resolve deterministic mr-open host from story_inventory
+
+
 ## [v2.45.7] - 2026-08-10
 
 ### Fixed
