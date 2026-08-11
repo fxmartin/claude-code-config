@@ -2113,3 +2113,36 @@ def test_run_resume_fix_run_force_overrides_a_live_owner(tmp_path: Path) -> None
 
     assert result.refused is False
     assert (Ledger(db).run_row(run_id) or {})["status"] == "DONE"
+
+
+def test_resume_fix_run_surfaces_a_live_owner_refusal_from_resume_fix(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`_resume_fix_run` must translate `resume_fix`'s own refusal, not just
+    `run_resume`'s pre-check.
+
+    `run_resume` and `resume_fix` (fix_issue.py) each run the #595 guard
+    independently — `run_resume` checks before dispatch, `resume_fix` checks
+    again right before mutating the ledger, so a live owner registered in the
+    gap between the two is still caught. That inner refusal must collapse into
+    the same `refused`/`refusal_reason` result as the outer one, not the
+    generic `nothing_to_resume` every other `resume_fix` abort produces.
+    """
+    import sdlc.fix_issue as fix_issue_mod
+    from sdlc.fix_issue import FixResult
+
+    run_id = _seed_fix_run_interrupted(tmp_path)
+
+    def fake_resume_fix(*args, **kwargs):
+        return FixResult(
+            issue=7, run_id=run_id, aborted=True, status="ABORTED",
+            abort_reason="inner refusal", live_owner_blocked=True,
+        )
+
+    monkeypatch.setattr(fix_issue_mod, "resume_fix", fake_resume_fix)
+
+    result = resume_mod._resume_fix_run(run_id, ledger=Ledger(tmp_path / ".sdlc-state.db"))
+
+    assert result.refused is True
+    assert result.nothing_to_resume is False
+    assert result.refusal_reason == "inner refusal"
