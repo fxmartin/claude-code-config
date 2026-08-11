@@ -229,7 +229,13 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    # 10, not the 5 every other job uses: this is the only job that runs the
+    # full controller suite (3.8k tests), and at 5 it was cancelling mid-run on
+    # both OSes — ubuntu at 5m17s and macOS at 5m22s on the same afternoon, with
+    # the ubuntu rerun then passing in 2m24s. Normal runs land at 2m30s-4m30s,
+    # so the old cap left under a minute of headroom against ordinary runner
+    # variance and failed as a timeout, which reads like a real defect.
+    timeout-minutes: 10
     # Fail fast on leaked secrets before standing up the controller (9.2-001).
     needs: secrets-scan
     steps:
