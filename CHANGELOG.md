@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.11] - 2026-08-11
+
+### Fixed
+
+- fix(sdlc): detect agent escapes into the primary checkout (#607) (#612)
+
+
 ## [v2.45.10] - 2026-08-11
 
 ### Fixed
