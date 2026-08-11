@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.9] - 2026-08-11
+
+### Fixed
+
+- fix(sdlc): exclude build-progress render from dirty-tree guard (#611)
+
+
 ## [v2.45.8] - 2026-08-11
 
 ### Fixed
