@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.45.10] - 2026-08-11
+
+### Fixed
+
+- fix(sdlc): refuse concurrent fix/resume runs on a live-owned run (#613)
+
+
 ## [v2.45.9] - 2026-08-11
 
 ### Fixed
