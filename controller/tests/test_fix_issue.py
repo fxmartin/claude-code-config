@@ -53,7 +53,7 @@ from sdlc.fix_issue import (
     stop_reason,
 )
 from sdlc.issue_host import RunResult
-from sdlc.registry import Registry, default_registry_path
+from sdlc.registry import Registry, RunRecord, default_registry_path
 from sdlc.ledger_view import Ledger
 
 
@@ -1413,6 +1413,21 @@ def test_parse_fix_args_batch_propagates_quality_flags() -> None:
     assert opts.skip_coverage is True
     assert opts.coverage_threshold == 80
     assert opts.skip_preflight is True
+
+
+def test_parse_fix_args_force_flag_single_issue() -> None:
+    """Issue #595: `--force` mirrors `--allow-dirty`'s wiring exactly."""
+    opts = parse_fix_args(["7", "--force"])
+    assert opts.force is True
+
+
+def test_parse_fix_args_force_defaults_false() -> None:
+    assert parse_fix_args(["7"]).force is False
+
+
+def test_parse_fix_args_force_flag_batch() -> None:
+    opts = parse_fix_args(["all", "--force"])
+    assert opts.force is True
 
 
 def test_parse_fix_args_opened_alias_maps_to_all() -> None:
@@ -3335,6 +3350,176 @@ def test_run_fix_batch_registers_and_finalizes_the_run(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #595: two processes (`sdlc fix`/`sdlc resume`) must never drive the same
+# run concurrently — a live owner (a registry record with a still-alive pid, not
+# finished) refuses a fresh `run_fix`/`run_fix_batch` entry before anything is
+# dispatched or the ledger is touched, unless `--force` is passed.
+# ---------------------------------------------------------------------------
+
+# pid 1 is always alive (init) but is never this test process's own pid, so it
+# stands in for "some other live process already owns this run" without having
+# to actually fork one. `pid_alive(1)` is True whether or not the test runs as
+# root (root's `os.kill(1, 0)` succeeds directly; a non-root kill raises
+# PermissionError, which `pid_alive` also treats as alive) — the same trick
+# `pid_alive`'s own PermissionError test uses.
+_OTHER_LIVE_PID = 1
+
+
+def test_run_fix_refuses_when_a_live_owner_already_holds_the_scope(tmp_path) -> None:
+    """The issue #595 regression: a second `sdlc fix` on the same scope refuses."""
+    registry = _reg(tmp_path)
+    registry.register(
+        RunRecord(
+            run_id="prior-run",
+            repo=str(tmp_path.resolve()),
+            db=str((tmp_path / ".sdlc-state.db").resolve()),
+            scope="issue-1",
+            pid=_OTHER_LIVE_PID,
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+    dispatch = RecordingDispatcher()
+
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.status == "ABORTED"
+    assert result.aborted is True
+    assert "prior-run" in (result.abort_reason or "")
+    assert str(_OTHER_LIVE_PID) in (result.abort_reason or "")
+    assert "2026-08-11T09:00:00+00:00" in (result.abort_reason or "")
+    assert "sdlc resume --run prior-run --force" in (result.abort_reason or "")
+    # No dispatch and no run row — the refusal happens before either.
+    assert dispatch.agents() == []
+    assert result.run_id is None
+    # The refusal fires before `ledger.init()` even creates the DB.
+    assert not (tmp_path / ".sdlc-state.db").exists()
+    # The live-owner's own record is untouched by the refused second attempt.
+    assert [r.run_id for r in registry.records()] == ["prior-run"]
+
+
+def test_run_fix_ignores_a_dead_owner(tmp_path) -> None:
+    """A crashed prior attempt (pid gone) is reclaimable, not a collision."""
+    registry = _reg(tmp_path)
+    registry.register(
+        RunRecord(
+            run_id="crashed-run",
+            repo=str(tmp_path.resolve()),
+            db=str((tmp_path / ".sdlc-state.db").resolve()),
+            scope="issue-1",
+            pid=2**31 - 1,  # DEAD_PID — essentially never a real process
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "DONE"
+
+
+def test_run_fix_force_overrides_a_live_owner(tmp_path) -> None:
+    """`--force` (opts.force) is the documented `pid is gone` override."""
+    registry = _reg(tmp_path)
+    registry.register(
+        RunRecord(
+            run_id="prior-run",
+            repo=str(tmp_path.resolve()),
+            db=str((tmp_path / ".sdlc-state.db").resolve()),
+            scope="issue-1",
+            pid=_OTHER_LIVE_PID,
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+
+    result = run_fix(
+        FixOptions(issue=1, force=True),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=RecordingDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "DONE"
+
+
+def test_run_fix_batch_refuses_when_a_live_owner_already_holds_the_scope(tmp_path) -> None:
+    registry = _reg(tmp_path)
+    registry.register(
+        RunRecord(
+            run_id="prior-batch",
+            repo=str(tmp_path.resolve()),
+            db=str((tmp_path / ".sdlc-state.db").resolve()),
+            scope="issues-all",
+            pid=_OTHER_LIVE_PID,
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]})
+
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeBatchGh([_batch_issue(1)]),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.status == "ABORTED"
+    assert "prior-batch" in result.summary
+    assert dispatch.calls == []
+    assert result.run_id is None
+    # The refusal fires before `ledger.init()` even creates the DB.
+    assert not (tmp_path / ".sdlc-state.db").exists()
+
+
+def test_run_fix_batch_force_overrides_a_live_owner(tmp_path) -> None:
+    registry = _reg(tmp_path)
+    registry.register(
+        RunRecord(
+            run_id="prior-batch",
+            repo=str(tmp_path.resolve()),
+            db=str((tmp_path / ".sdlc-state.db").resolve()),
+            scope="issues-all",
+            pid=_OTHER_LIVE_PID,
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=5, force=True),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        dispatcher=BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]}),
+        preflight=lambda: True,
+        runner=FakeBatchGh([_batch_issue(1)]),
+        root=tmp_path,
+        registry=registry,
+    )
+    assert result.status == "DONE"
+
+
+# ---------------------------------------------------------------------------
 # Issue #547: an interrupted `sdlc fix` run must be resumable.
 #
 # `run_resume` derived the right resume point from the ledger, then intersected
@@ -3558,6 +3743,66 @@ def test_record_fix_plan_never_fails_the_run(tmp_path) -> None:
     ledger = _Exploding(tmp_path / ".sdlc-state.db")
     ledger.init()
     fix_mod._record_fix_plan(ledger, "run", {"root_cause": "x"})  # must not raise
+
+
+def test_resume_fix_refuses_when_a_live_owner_holds_the_run(tmp_path) -> None:
+    """Issue #595: a second `sdlc resume` (or `sdlc fix`) on the same run refuses."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    registry = _reg(tmp_path)
+    registry.register(
+        RunRecord(
+            run_id=run_id,
+            repo=str(tmp_path.resolve()),
+            db=str(db.resolve()),
+            scope="issue-1",
+            pid=_OTHER_LIVE_PID,
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+    dispatch = RecordingDispatcher()
+
+    result = fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=dispatch,
+        runner=FakeGh(_issue_json()), root=tmp_path, registry=registry,
+    )
+
+    assert result.aborted is True
+    assert result.status == "ABORTED"
+    assert run_id in (result.abort_reason or "")
+    assert str(_OTHER_LIVE_PID) in (result.abort_reason or "")
+    assert f"sdlc resume --run {run_id} --force" in (result.abort_reason or "")
+    assert dispatch.agents() == []
+    # The refusal never touches the ledger — the run stays exactly as it crashed.
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "IN_PROGRESS"
+
+
+def test_resume_fix_force_overrides_a_live_owner(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _fix_run_interrupted_at(
+        tmp_path, dispatcher=RecordingDispatcher(), stop_before="coverage"
+    )
+    registry = _reg(tmp_path)
+    registry.register(
+        RunRecord(
+            run_id=run_id,
+            repo=str(tmp_path.resolve()),
+            db=str(db.resolve()),
+            scope="issue-1",
+            pid=_OTHER_LIVE_PID,
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+
+    result = fix_mod.resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+        runner=FakeGh(_issue_json()), root=tmp_path, registry=registry, force=True,
+    )
+    assert result.status == "DONE"
 
 
 def test_resume_fix_refuses_a_non_issue_scope(tmp_path) -> None:

@@ -377,6 +377,100 @@ def test_resume_no_run_at_all_is_noop(tmp_path: Path) -> None:
     assert result.run_id is None
 
 
+# --- live-owner guard (issue #595) ------------------------------------------
+#
+# Two processes (`sdlc resume` and/or `sdlc fix`) must never drive the same run
+# concurrently — the incident that motivated this guard left a real ledger with
+# a `1 done` finish record immediately followed by `0 done, 1 failed` for the
+# same run, because both writers raced to the finish line.
+
+# pid 1 is always alive (init) but never this test process's own pid, so it
+# stands in for "some other live process already owns this run" without having
+# to actually fork one — `pid_alive(1)` is True either as root (the kill
+# succeeds directly) or not (PermissionError also counts as alive).
+_OTHER_LIVE_PID = 1
+
+
+def _seed_registry_live(tmp_path: Path, db: Path, run_id: str, scope: str) -> Registry:
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord(
+            run_id=run_id,
+            repo=str(tmp_path.resolve()),
+            db=str(db.resolve()),
+            scope=scope,
+            pid=_OTHER_LIVE_PID,
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+    return registry
+
+
+def test_run_resume_refuses_when_a_live_owner_holds_the_run(tmp_path: Path) -> None:
+    """The issue #595 regression: a second resume of the same run refuses."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_interrupted(db)
+    registry = _seed_registry_live(tmp_path, db, run_id, "epic-99")
+    dispatcher = FakeDispatcher()
+
+    result = run_resume(
+        "epic-99", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.refused is True
+    assert result.nothing_to_resume is False
+    assert run_id in result.refusal_reason
+    assert str(_OTHER_LIVE_PID) in result.refusal_reason
+    assert f"sdlc resume --run {run_id} --force" in result.refusal_reason
+    # No ledger mutation and no dispatch — the refusal fires before either.
+    assert dispatcher.calls == []
+    assert (Ledger(db).run_row(run_id) or {}).get("status") != "DONE"
+
+
+def test_run_resume_ignores_a_dead_owner(tmp_path: Path) -> None:
+    """A crashed prior resume (pid gone) is reclaimable, not a collision."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_interrupted(db)
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord(
+            run_id=run_id,
+            repo=str(tmp_path.resolve()),
+            db=str(db.resolve()),
+            scope="epic-99",
+            pid=2**31 - 1,  # essentially never a real process
+            status="IN_PROGRESS",
+            started_at="2026-08-11T09:00:00+00:00",
+        )
+    )
+
+    result = run_resume(
+        "epic-99", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        registry=registry,
+    )
+    assert result.refused is False
+    assert result.completed == 2
+
+
+def test_run_resume_force_overrides_a_live_owner(tmp_path: Path) -> None:
+    """`--force` (issue #595) is the documented "only if that pid is gone" override."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_interrupted(db)
+    registry = _seed_registry_live(tmp_path, db, run_id, "epic-99")
+
+    result = run_resume(
+        "epic-99", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path,
+        registry=registry, force=True,
+    )
+    assert result.refused is False
+    assert result.completed == 2
+
+
 # --- behaviour parity ------------------------------------------------------
 
 
@@ -1980,3 +2074,75 @@ def test_resume_preserves_a_fix_runs_mode(tmp_path: Path) -> None:
     )
 
     assert (Ledger(db).run_row(run_id) or {})["mode"] == "fix"
+
+
+def test_run_resume_refuses_a_live_owner_for_a_fix_run(tmp_path: Path) -> None:
+    """The live-owner guard (#595) also covers a resumed `sdlc fix` run.
+
+    `run_resume` hands a fix-mode run straight to `resume_fix`; the refusal must
+    surface its exact message (not the generic "nothing to resume" every other
+    `resume_fix` abort collapses into) so the operator sees the owning pid.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_fix_run_interrupted(tmp_path)
+    registry = _seed_registry_live(tmp_path, db, run_id, "issue-7")
+    dispatcher = _FixDispatcher()
+
+    result = run_resume(
+        "issue-7", ledger=Ledger(db), dispatcher=dispatcher, root=tmp_path,
+        run_id=run_id, runner=_fix_gh, registry=registry,
+    )
+
+    assert result.refused is True
+    assert result.nothing_to_resume is False
+    assert run_id in result.refusal_reason
+    assert str(_OTHER_LIVE_PID) in result.refusal_reason
+    assert dispatcher.agents == []
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "IN_PROGRESS"
+
+
+def test_run_resume_fix_run_force_overrides_a_live_owner(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_fix_run_interrupted(tmp_path)
+    registry = _seed_registry_live(tmp_path, db, run_id, "issue-7")
+
+    result = run_resume(
+        "issue-7", ledger=Ledger(db), dispatcher=_FixDispatcher(), root=tmp_path,
+        run_id=run_id, runner=_fix_gh, registry=registry, force=True,
+    )
+
+    assert result.refused is False
+    assert (Ledger(db).run_row(run_id) or {})["status"] == "DONE"
+
+
+def test_resume_fix_run_surfaces_a_live_owner_refusal_from_resume_fix(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`_resume_fix_run` must translate `resume_fix`'s own refusal, not just
+    `run_resume`'s pre-check.
+
+    `run_resume` and `resume_fix` (fix_issue.py) each run the #595 guard
+    independently — `run_resume` checks before dispatch, `resume_fix` checks
+    again right before mutating the ledger, so a live owner registered in the
+    gap between the two is still caught. That inner refusal must collapse into
+    the same `refused`/`refusal_reason` result as the outer one, not the
+    generic `nothing_to_resume` every other `resume_fix` abort produces.
+    """
+    import sdlc.fix_issue as fix_issue_mod
+    from sdlc.fix_issue import FixResult
+
+    run_id = _seed_fix_run_interrupted(tmp_path)
+
+    def fake_resume_fix(*args, **kwargs):
+        return FixResult(
+            issue=7, run_id=run_id, aborted=True, status="ABORTED",
+            abort_reason="inner refusal", live_owner_blocked=True,
+        )
+
+    monkeypatch.setattr(fix_issue_mod, "resume_fix", fake_resume_fix)
+
+    result = resume_mod._resume_fix_run(run_id, ledger=Ledger(tmp_path / ".sdlc-state.db"))
+
+    assert result.refused is True
+    assert result.nothing_to_resume is False
+    assert result.refusal_reason == "inner refusal"

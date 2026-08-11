@@ -138,6 +138,49 @@ def test_fix_preflight_failure_exits_one(tmp_path, monkeypatch) -> None:
     assert "PRE_FLIGHT_FAILURE" in result.output
 
 
+def test_fix_force_flag_reaches_run_fix(tmp_path, monkeypatch) -> None:
+    """Issue #595: `--force` parses (mirroring `--allow-dirty`) and reaches opts."""
+    monkeypatch.chdir(tmp_path)
+    captured: dict = {}
+
+    def _capture(opts, **kwargs):
+        captured["opts"] = opts
+        return FixResult(issue=opts.issue, run_id="r", status="DONE")
+
+    monkeypatch.setattr(fx, "run_fix", _capture)
+    result = runner.invoke(app, ["fix", "1", "--force"])
+    assert result.exit_code == 0, result.output
+    assert captured["opts"].force is True
+
+
+def test_fix_batch_force_flag_reaches_run_fix_batch(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    captured: dict = {}
+
+    def _capture(opts, **kwargs):
+        captured["opts"] = opts
+        return FixBatchResult(run_id="r", status="DONE", summary="0 fixed")
+
+    monkeypatch.setattr(fx, "run_fix_batch", _capture)
+    result = runner.invoke(app, ["fix", "all", "--force"])
+    assert result.exit_code == 0, result.output
+    assert captured["opts"].force is True
+
+
+def test_fix_live_owner_refusal_surfaces_via_aborted_path(tmp_path, monkeypatch) -> None:
+    """A live-owner refusal (#595) is just another `aborted` `run_fix` result."""
+    monkeypatch.chdir(tmp_path)
+    message = "run abc123 is already live (pid 4242, started 2026-08-11T09:00:00+00:00)"
+    _stub_run_fix(
+        monkeypatch,
+        FixResult(issue=1, aborted=True, abort_reason=message, status="ABORTED"),
+    )
+    result = runner.invoke(app, ["fix", "1"])
+    assert result.exit_code == 1
+    assert "already live" in result.output
+    assert "pid 4242" in result.output
+
+
 def test_fix_investigation_blocked_exits_one(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     _stub_run_fix(

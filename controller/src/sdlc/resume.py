@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -43,7 +44,7 @@ from sdlc.dispatch import dispatch_agent
 from sdlc.model_routing import OFF as MODEL_ROUTING_OFF
 from sdlc.model_routing import routing_snapshot
 from sdlc.notify import notify
-from sdlc.registry import Registry
+from sdlc.registry import Registry, format_live_owner_refusal
 
 __all__ = ["StoryResumeState", "ResumeResult", "compute_resume_plan", "run_resume"]
 
@@ -115,6 +116,13 @@ class ResumeResult:
     # Story 14.1-002: set when the interactive cost gate re-halted the resume. The
     # run is left IN_PROGRESS (resumable); raise --cost-threshold to continue.
     cost_gated: bool = False
+    # Issue #595: set when another process already holds this run live (a
+    # registry record with a still-alive pid, not finished) — the run is
+    # untouched, left exactly as it was, and ``refusal_reason`` names the owning
+    # pid and the ``--force`` override. Distinct from ``nothing_to_resume`` (an
+    # honest "no work left"): this is "work is already in flight elsewhere".
+    refused: bool = False
+    refusal_reason: str = ""
 
 
 # The run modes that mark a fix-issue run (Issue #547). ``fix`` is what the
@@ -132,6 +140,7 @@ def _resume_fix_run(
     root: Path | None = None,
     registry: "Registry | None" = None,
     runner=None,
+    force: bool = False,
 ) -> ResumeResult:
     """Delegate a fix-issue run to :func:`sdlc.fix_issue.resume_fix` (#547).
 
@@ -143,13 +152,20 @@ def _resume_fix_run(
     run stays IN_PROGRESS and recoverable. That is the whole point: the old path's
     sin was not failing to dispatch, it was marking the run terminal on its way
     out.
+
+    Issue #595: a live-owner refusal is a distinct case (``result.live_owner_blocked``)
+    and must not collapse into the generic ``nothing_to_resume`` above — that would
+    swallow the message naming the owning pid, which is the entire point of the
+    guard. It is surfaced as ``refused``/``refusal_reason`` instead.
     """
     from sdlc.fix_issue import resume_fix
 
     result = resume_fix(
         run_id, ledger=ledger, dispatcher=dispatcher, runner=runner,
-        render_view=render_view, root=root, registry=registry,
+        render_view=render_view, root=root, registry=registry, force=force,
     )
+    if result.live_owner_blocked:
+        return ResumeResult(run_id=run_id, refused=True, refusal_reason=result.abort_reason)
     if result.aborted:
         return ResumeResult(run_id=run_id, nothing_to_resume=True)
     story_id = f"issue-{result.issue}"
@@ -355,6 +371,7 @@ def run_resume(
     sleep_fn: Callable[[float], None] | None = None,
     rate_limit_probe: Callable[[], ProbeStatus] | None = None,
     runner=None,
+    force: bool = False,
 ) -> ResumeResult:
     """Resume the most recent interrupted run for ``scope`` from the ledger.
 
@@ -393,11 +410,35 @@ def run_resume(
     (``dispatcher is None``) probes the resolved harness and a run driven by an
     injected dispatcher does not probe at all — the same ``real_run`` seam the
     worktree/HEAD side effects use, so the test suite never shells out to a CLI.
+
+    Issue #595: refused, before any of the above, when the host registry shows
+    ``rid`` already live under another pid — two writers racing to finish the
+    same run is what left a real ledger self-contradictory (a ``1 done`` finish
+    record immediately followed by ``0 done, 1 failed`` for the same run).
+    ``force`` is the documented override, "only if that pid is gone". The check
+    covers the fix-mode delegation below too, since it runs before that branch.
     """
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
     if rid is None:
         return ResumeResult(run_id=None, nothing_to_resume=True)
+
+    # Issue #121: resolved here (not at close-out) so the Issue #595 guard below
+    # can use it too. A real run (dispatcher is None) gets the default
+    # `Registry()` when the caller injects none — the same `dispatcher is None`
+    # gate that guards reconciliation and the per-story HEAD reposition, so
+    # injected-fake orchestration tests never touch host state. Tests inject a
+    # path-scoped Registry to assert both the guard and the close-out refresh.
+    if registry is None and dispatcher is None:
+        registry = Registry()
+
+    # --- Live-owner guard (issue #595) ----------------------------------------
+    if registry is not None and not force:
+        live = registry.find_live_owner(run_id=rid, exclude_pid=os.getpid())
+        if live is not None:
+            return ResumeResult(
+                run_id=rid, refused=True, refusal_reason=format_live_owner_refusal(live),
+            )
 
     run_row = ledger.run_row(rid) or {}
     # Issue #547: a fix-issue run belongs to a different pipeline entirely. Its
@@ -410,7 +451,7 @@ def run_resume(
     if str(run_row.get("mode") or "") in _FIX_RUN_MODES:
         return _resume_fix_run(
             rid, ledger=ledger, dispatcher=dispatcher, render_view=render_view,
-            root=root, registry=registry, runner=runner,
+            root=root, registry=registry, runner=runner, force=force,
         )
 
     config = ledger.run_config(rid)
@@ -497,15 +538,6 @@ def run_resume(
     # ``dispatch_agent`` so a test that monkeypatches ``sdlc.resume.dispatch_agent``
     # still routes through its fake.
     dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
-
-    # Issue #121: refresh the host-level registry on close-out so a resumed run no
-    # longer shows its stale original status in the dashboard sidebar. A real run
-    # (dispatcher is None) gets the default `Registry()` when the caller injects
-    # none — the same `dispatcher is None` gate that guards reconciliation and the
-    # per-story HEAD reposition, so injected-fake orchestration tests never touch
-    # host state. Tests inject a path-scoped Registry to assert the refresh.
-    if registry is None and dispatcher is None:
-        registry = Registry()
 
     # Recompute the queue from the markdown source so each story carries its
     # title/epic_file/dependencies (the ledger stores progress, not the spec).

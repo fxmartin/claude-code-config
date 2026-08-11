@@ -82,6 +82,45 @@ def test_resume_stub_runs() -> None:
     assert "resume" in result.stdout.lower()
 
 
+def test_resume_refused_live_owner_exits_one(tmp_path, monkeypatch) -> None:
+    """Issue #595: a live-owner refusal from `run_resume` surfaces and exits 1."""
+    import sdlc.resume as resume_mod
+    from sdlc.resume import ResumeResult
+
+    message = (
+        "run abc123 is already live (pid 4242, started 2026-08-11T09:00:00+00:00)\n"
+        "  → watch it:      sdlc status\n"
+        "  → take it over:  sdlc resume --run abc123 --force   (only if that pid is gone)"
+    )
+    monkeypatch.setattr(
+        resume_mod, "run_resume",
+        lambda *a, **k: ResumeResult(run_id="abc123", refused=True, refusal_reason=message),
+    )
+    result = runner.invoke(app, ["resume", "--db", str(tmp_path / ".sdlc-state.db")])
+    assert result.exit_code == 1
+    assert "already live" in result.output
+    assert "pid 4242" in result.output
+
+
+def test_resume_force_flag_threads_to_run_resume(tmp_path, monkeypatch) -> None:
+    """`--force` (issue #595) reaches `run_resume` exactly like `--concurrency` does."""
+    import sdlc.resume as resume_mod
+    from sdlc.resume import ResumeResult
+
+    captured: dict = {}
+
+    def _capture(*args, **kwargs):
+        captured.update(kwargs)
+        return ResumeResult(run_id=None, nothing_to_resume=True)
+
+    monkeypatch.setattr(resume_mod, "run_resume", _capture)
+    result = runner.invoke(
+        app, ["resume", "--force", "--db", str(tmp_path / ".sdlc-state.db")]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("force") is True
+
+
 def test_status_no_run_exits_zero(tmp_path) -> None:
     """`status` is implemented (not a stub); with no ledger it exits 0 cleanly."""
     result = runner.invoke(app, ["status", "--db", str(tmp_path / ".sdlc-state.db")])
