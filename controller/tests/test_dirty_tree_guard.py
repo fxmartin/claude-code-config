@@ -112,6 +112,62 @@ def test_dirty_tree_paths_reports_every_changed_tracked_file(tmp_path) -> None:
     assert sorted(dirty_tree_paths(root)) == ["a.md", "b.md"]
 
 
+def _commit_progress_view(root: Path) -> Path:
+    """Track ``docs/stories/.build-progress.md`` — the #610 render path."""
+    progress_dir = root / "docs" / "stories"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = progress_dir / ".build-progress.md"
+    progress_path.write_text("# Build progress\n", encoding="utf-8")
+    _git(root, "add", "docs/stories/.build-progress.md")
+    _git(root, "commit", "-q", "-m", "chore: track build progress render")
+    return progress_path
+
+
+def test_dirty_tree_paths_excludes_the_build_progress_render(tmp_path) -> None:
+    """Issue #610: the controller's own regenerated read-model must never be
+    the thing that blocks the controller's next run."""
+    root = _init_repo(tmp_path)
+    progress_path = _commit_progress_view(root)
+    progress_path.write_text("# Build progress\n\nregenerated\n", encoding="utf-8")
+
+    assert dirty_tree_paths(root) == []
+
+
+def test_dirty_tree_paths_still_reports_other_files_alongside_the_render(
+    tmp_path,
+) -> None:
+    """The exclusion is narrow: a genuinely dirty tree is still refused."""
+    root = _init_repo(tmp_path)
+    progress_path = _commit_progress_view(root)
+    progress_path.write_text("# Build progress\n\nregenerated\n", encoding="utf-8")
+    (root / "CLAUDE.md").write_text("hand-edited\n", encoding="utf-8")
+
+    assert dirty_tree_paths(root) == ["CLAUDE.md"]
+
+
+def test_dirty_tree_paths_excludes_a_staged_build_progress_render(tmp_path) -> None:
+    root = _init_repo(tmp_path)
+    progress_path = _commit_progress_view(root)
+    progress_path.write_text("# Build progress\n\nstaged\n", encoding="utf-8")
+    _git(root, "add", "docs/stories/.build-progress.md")
+
+    assert dirty_tree_paths(root) == []
+
+
+def test_dirty_tree_paths_does_not_exclude_a_similarly_named_file(tmp_path) -> None:
+    """The exclusion is an exact path match, not a filename or suffix match."""
+    root = _init_repo(tmp_path)
+    other_dir = root / "docs" / "stories" / "nested"
+    other_dir.mkdir(parents=True)
+    other = other_dir / ".build-progress.md"
+    other.write_text("x\n", encoding="utf-8")
+    _git(root, "add", "docs/stories/nested/.build-progress.md")
+    _git(root, "commit", "-q", "-m", "chore: nested lookalike")
+    other.write_text("edited\n", encoding="utf-8")
+
+    assert dirty_tree_paths(root) == ["docs/stories/nested/.build-progress.md"]
+
+
 # ---------------------------------------------------------------------------
 # The refusal message
 # ---------------------------------------------------------------------------

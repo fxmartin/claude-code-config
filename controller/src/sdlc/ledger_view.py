@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+from sdlc.build import _PROGRESS_VIEW_PATH as _PROGRESS_VIEW
 from sdlc.build import Ledger  # re-exported for the CLI's convenience
 
 __all__ = ["Ledger", "default_db_path", "find_state_script", "make_render_view"]
@@ -16,7 +17,8 @@ __all__ = ["Ledger", "default_db_path", "find_state_script", "make_render_view"]
 _DEFAULT_DB_NAME = ".sdlc-state.db"
 
 # Where the markdown read-model is regenerated (Story 4.2-002 contract).
-_PROGRESS_VIEW = "docs/stories/.build-progress.md"
+# Reuses build.py's `_PROGRESS_VIEW_PATH` (issue #610's dirty-tree exclusion)
+# so the render path can't drift between the two modules.
 
 
 def default_db_path(root: Path | None = None) -> Path:
