@@ -1,20 +1,55 @@
 {
   "ignorePatterns": [
-    { "pattern": "^mailto:" },
-    { "pattern": "^https?://localhost" },
-    { "pattern": "^https?://127\\.0\\.0\\.1" },
-    { "pattern": "^https?://([^/]+\\.)?example\\.(com|org|net)" },
-    { "comment": "t.me refuses requests from CI runners (Status 0), so the link cannot be validated headlessly.", "pattern": "^https://t\\.me/" },
-    { "comment": "shields.io badges return Status 0 to CI runners (as t.me does), so the image endpoint cannot be validated headlessly.", "pattern": "^https://img\\.shields\\.io/" },
-    { "comment": "Planned deliverable of Epic-06, not yet created; forward-referenced by epic planning docs.", "pattern": "(^|/)docs/onboarding\\.md$" }
+    {
+      "pattern": "^mailto:"
+    },
+    {
+      "pattern": "^https?://localhost"
+    },
+    {
+      "pattern": "^https?://127\\.0\\.0\\.1"
+    },
+    {
+      "pattern": "^https?://([^/]+\\.)?example\\.(com|org|net)"
+    },
+    {
+      "comment": "t.me refuses requests from CI runners (Status 0), so the link cannot be validated headlessly.",
+      "pattern": "^https://t\\.me/"
+    },
+    {
+      "comment": "shields.io badges return Status 0 to CI runners (as t.me does), so the image endpoint cannot be validated headlessly.",
+      "pattern": "^https://img\\.shields\\.io/"
+    },
+    {
+      "comment": "Planned deliverable of Epic-06, not yet created; forward-referenced by epic planning docs.",
+      "pattern": "(^|/)docs/onboarding\\.md$"
+    },
+    {
+      "comment": "fxmartin/nix-install went private on 2026-08-30, so an unauthenticated CI link check gets 404. The repo exists; the checker simply cannot see it.",
+      "pattern": "^https://github\\.com/fxmartin/nix-install"
+    }
   ],
   "httpHeaders": [
     {
-      "urls": ["https://github.com", "https://raw.githubusercontent.com"],
-      "headers": { "Accept": "text/html,application/xhtml+xml" }
+      "urls": [
+        "https://github.com",
+        "https://raw.githubusercontent.com"
+      ],
+      "headers": {
+        "Accept": "text/html,application/xhtml+xml"
+      }
     }
   ],
-  "aliveStatusCodes": [200, 206, 301, 302, 307, 308, 403, 429],
+  "aliveStatusCodes": [
+    200,
+    206,
+    301,
+    302,
+    307,
+    308,
+    403,
+    429
+  ],
   "timeout": "20s",
   "retryOn429": true,
   "retryCount": 3,

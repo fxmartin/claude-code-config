@@ -17,3 +17,19 @@
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Runtime-mutated state that Claude Code and the SDLC controller write during
+# normal use. Tracking these kept the submodule permanently dirty, which
+# blocked `make release-*` in the parent repo and made `git commit -a` a
+# standing hazard there.
+#
+# settings.json is SEEDED from settings.template.json by the parent's
+# home-manager/modules/claude-code.nix on first activation, then owned by the
+# runtime. Promote a deliberate setting by editing the template.
+# Claude Code writes `model` (session model) and `autoMode.environment` (a
+# cached environment survey that included details of unrelated private repos)
+# into it during normal use.
+settings.json
+
+# The SDLC controller re-renders this on every run.
+docs/stories/.build-progress.md
