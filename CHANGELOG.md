@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.50.0] - 2026-09-05
+
+### Added
+
+- feat(harness-benchmarking-baseline): recorded (#31.3-001) (#628)
+
+
 ## [v2.49.0] - 2026-09-05
 
 ### Added
