@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from sdlc.evaluate import load_config
@@ -78,6 +79,21 @@ def test_eval_compare_output_is_recorded() -> None:
     assert "tolerance" in text
 
 
+def test_eval_compare_output_states_verdict_deltas_and_exclusions() -> None:
+    # AC3: the recorded output must include the per-metric deltas, the
+    # verdict, and any axes excluded as not-comparable, verbatim — not just
+    # that a comparison happened.
+    config = load_config(_FULL_CONFIG)
+    text = _COMPARE_OUTPUT.read_text(encoding="utf-8")
+    assert "OVERALL:" in text
+    assert any(verdict in text for verdict in ("WORSE", "BETTER", "NEUTRAL", "SAME"))
+    for ticket in config.tickets:
+        assert f"{ticket.id}:" in text, f"missing per-ticket verdict line for {ticket.id!r}"
+    assert "excluded from verdict" in text
+    assert "not comparable" in text
+    assert re.search(r"\(\s*[+-]?\d+%\)", text), "missing a per-metric percentage delta"
+
+
 def test_go_no_go_is_recorded_and_states_serial_discipline() -> None:
     assert _GO_NO_GO.is_file(), f"missing go/no-go record: {_GO_NO_GO}"
     text = _GO_NO_GO.read_text(encoding="utf-8")
@@ -86,3 +102,16 @@ def test_go_no_go_is_recorded_and_states_serial_discipline() -> None:
     assert "serial" in text.lower()
     assert "qwen" in text.lower()
     assert "go/no-go" in text.lower() or "go / no-go" in text.lower()
+
+
+def test_go_no_go_states_what_would_have_to_change_for_local() -> None:
+    # DoD: a short go/no-go must record which stages (if any) route to local
+    # inference, and what would have to change for the rest — not just a
+    # bare verdict.
+    text = _GO_NO_GO.read_text(encoding="utf-8")
+    lowered = text.lower()
+    assert "no-go" in lowered or "go-nogo" in lowered
+    assert "re-run checklist" in lowered, "missing the concrete steps to re-attempt the comparison"
+    assert "model" in lowered and "auth" in lowered, (
+        "missing the concrete blockers (model pin + auth) that would have to change"
+    )
