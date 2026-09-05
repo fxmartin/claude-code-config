@@ -2735,6 +2735,7 @@ def eval_baseline_cmd(
     from sdlc.eval_compare import (
         BaselineError,
         compare_scoreboards,
+        excluded_axes,
         load_scoreboard,
         regressions,
         save_scoreboard,
@@ -2763,9 +2764,16 @@ def eval_baseline_cmd(
 
     comparison = compare_scoreboards(base_board, cand_board, tolerance=tolerance)
     flagged = regressions(comparison)
+    # Story 31.2-002: an axis the two scoreboards are not made of the same thing
+    # on is excluded from the verdict, so this gate never checked it. Say so —
+    # "no regressions" over an unchecked axis is the very thing that story closes.
+    skipped = excluded_axes(comparison)
+    for label, reason in skipped:
+        typer.echo(f"not compared — {label}: {reason}", err=True)
     if not flagged:
+        scope = "the comparable metrics" if skipped else "all metrics"
         typer.echo(
-            f"baseline OK: no regressions beyond {tolerance:.0%} "
+            f"baseline OK: no regressions beyond {tolerance:.0%} on {scope} "
             f"({comparison.candidate_name} vs {comparison.baseline_name})"
         )
         raise typer.Exit(code=0)

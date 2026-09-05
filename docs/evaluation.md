@@ -303,6 +303,23 @@ exit on regression is what later wires a bounded eval into CI (18.1-003, warn or
 fail configurable). The comparison itself never mutates `main` or opens PRs — it is
 pure scoreboard arithmetic.
 
+An axis excluded as **not comparable** (31.2-002) was never checked, so the gate
+names it on stderr and qualifies its verdict rather than letting the exclusion
+read as a pass:
+
+```
+not compared — tokens: no component breakdown recorded on the baseline, so the
+  token mix cannot be judged — regenerate it with `sdlc eval --json`
+not compared — cost$: …
+baseline OK: no regressions beyond 10% on the comparable metrics (new vs base)
+```
+
+With nothing excluded the line reads "on all metrics". `controller/eval/baseline.json`
+predates 31.2-002 and carries no component breakdown, so **its token and cost axes
+are excluded on every check until it is regenerated** with
+`uv run sdlc eval --json > eval/baseline.json` — the netLOC/wall/quality axes are
+unaffected.
+
 ## CI integration (18.1-003)
 
 The full eval stays a manual/local command (it spends real quota on Max). What

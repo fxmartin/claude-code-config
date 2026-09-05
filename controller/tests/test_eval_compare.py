@@ -19,6 +19,7 @@ from sdlc.eval_compare import (
     classify_metric,
     comparison_to_dict,
     compare_scoreboards,
+    excluded_axes,
     has_regressions,
     load_scoreboard,
     provenance_warnings,
@@ -751,5 +752,45 @@ def test_an_excluded_axis_is_neither_a_regression_nor_an_improvement() -> None:
         _arm_board("a", **_CACHE_WRITE_ARM), _arm_board("b", **_CACHE_READ_ARM)
     )
     assert not has_regressions(cmp_)
-    assert all(m.direction == NEUTRAL for _, m in [] or [])
+    assert regressions(cmp_) == []
     assert _row(cmp_, "tokens_mean").direction == NEUTRAL
+
+
+# ---------------------------------------------------------------------------
+# Naming the exclusions to a gate (not just to the table)
+# ---------------------------------------------------------------------------
+
+
+def test_excluded_axes_names_each_unjudged_axis_once_with_its_reason() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("a", **_CACHE_WRITE_ARM), _arm_board("b", **_CACHE_READ_ARM)
+    )
+    axes = excluded_axes(cmp_)
+    assert [label for label, _ in axes] == ["tokens", "cost$"]
+    assert all("mix" in reason for _, reason in axes)
+
+
+def test_excluded_axes_is_empty_when_every_axis_is_comparable() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("a", **_CACHE_READ_ARM), _arm_board("b", **_CACHE_READ_ARM)
+    )
+    assert excluded_axes(cmp_) == ()
+
+
+def test_excluded_axes_dedupes_across_tickets_and_the_overall_row() -> None:
+    # Three rows (two tickets + overall) all miss the breakdown; a gate needs the
+    # axis named once, not once per row.
+    def _board_of(name: str) -> dict:
+        row = {
+            "runs": 1, "errors": 0, "loc_net_mean": 10.0,
+            "wall_mean": 10.0, "quality_pass_rate": 1.0,
+            "tokens_mean": 15000.0, "cost_mean": 0.05,
+        }
+        return {
+            "config_name": name,
+            "tickets": [dict(row, ticket_id="t1"), dict(row, ticket_id="t2")],
+            "overall": dict(row, ticket_id="OVERALL"),
+        }
+
+    axes = excluded_axes(compare_scoreboards(_board_of("a"), _board_of("b")))
+    assert [label for label, _ in axes] == ["tokens", "cost$"]

@@ -197,6 +197,27 @@ def excluded_labels(metrics: list[MetricDelta]) -> tuple[str, ...]:
     return tuple(m.label for m in metrics if not m.comparable)
 
 
+def excluded_axes(comparison: "Comparison") -> tuple[tuple[str, str], ...]:
+    """Every axis excluded from a verdict, as ``(label, reason)`` pairs, deduped.
+
+    Story 31.2-002: :func:`render_comparison_table` states an exclusion per row,
+    but a *gate* — ``sdlc eval-baseline`` — prints a single pass/fail line and has
+    to name what it never checked there. Without this an excluded axis reads as a
+    pass at exactly the surface where it matters most, which is the failure this
+    story exists to close. Labels come out in :data:`COMPARED_METRICS` order, each
+    named once however many rows dropped it.
+    """
+    rows = list(comparison.tickets)
+    if comparison.overall is not None:
+        rows.append(comparison.overall)
+    seen: dict[str, str] = {}
+    for row in rows:
+        for m in row.metrics:
+            if not m.comparable and m.label not in seen:
+                seen[m.label] = m.reason or "not comparable"
+    return tuple(seen.items())
+
+
 def ticket_verdict(metrics: list[MetricDelta]) -> str:
     """Fold per-metric directions into a single ``BETTER``/``WORSE``/``NEUTRAL`` verdict.
 
