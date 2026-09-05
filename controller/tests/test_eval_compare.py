@@ -507,7 +507,6 @@ def test_provenance_warnings_flags_both_missing() -> None:
     base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
     cand = _board("B", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
     assert len(provenance_warnings(base, cand)) == 2
-||||||| parent of 87f73aa (feat(harness-benchmarking-baseline): honest token (#31.2-002))
 
 
 # ---------------------------------------------------------------------------

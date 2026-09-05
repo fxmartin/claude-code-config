@@ -1196,7 +1196,6 @@ def test_provenance_is_frozen_dataclass() -> None:
     )
     with pytest.raises(Exception):  # noqa: B017 — FrozenInstanceError
         prov.model = "haiku"  # type: ignore[misc]
-||||||| parent of 87f73aa (feat(harness-benchmarking-baseline): honest token (#31.2-002))
 
 
 # ---------------------------------------------------------------------------

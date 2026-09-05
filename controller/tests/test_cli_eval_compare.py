@@ -29,8 +29,11 @@ def _score(ticket_id: str, *, loc: float, tokens: float, cost: float, wall: floa
 
 
 def _write_board(path: Path, name: str, score: dict, **extra: object) -> Path:
-||||||| parent of ece7395 (fix(harness-benchmarking-baseline): honest token (#31.2-002))
-def _write_board(path: Path, name: str, score: dict) -> Path:
+    board = {**_board("out", [score], None), **extra}
+    path.write_text(json.dumps(board), encoding="utf-8")
+    return path
+
+
 def _with_breakdown(score: dict) -> dict:
     """A row carrying the component breakdown a post-31.2-002 scoreboard records.
 
