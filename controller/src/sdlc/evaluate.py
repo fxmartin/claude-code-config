@@ -30,14 +30,16 @@ from sdlc.harness import (
 )
 from sdlc.model_routing import BALANCED, select_model
 from sdlc.rate_limit import seconds_until_reset, within_wait_cap
-
-# The four usage keys the agent envelope carries (mirrors build._RESULT_USAGE_KEYS
-# and dispatch's envelope parsing) so eval token counts match ledger metrics.
-_USAGE_KEYS = (
-    "input_tokens",
-    "output_tokens",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
+from sdlc.usage import (
+    APPROXIMATE_SOURCES,
+    UNAVAILABLE,
+    UNAVAILABLE_USAGE,
+    USAGE_COMPONENTS,
+    TokenBreakdown,
+    aggregate_source,
+    breakdown_from_envelope,
+    harness_breakdown,
+    usage_is_tracked,
 )
 
 # Default per-story headless dispatch ceiling (seconds). An eval ticket is a small
@@ -143,6 +145,11 @@ class RunResult:
     # already excluded from ``wall_s`` above (agent time, not agent-time-plus-
     # quota-backoff). ``None`` (not 0) when the run never stalled.
     stall_s: float | None = None
+    # Story 31.2-002: the four token components this run's ``tokens`` total is
+    # made of, plus their provenance. Carried individually because a total is a
+    # lossy summary — 15,160 cache-write tokens and 14,152 cache-read tokens are
+    # not parity — and the comparator cannot judge a mix it was never given.
+    usage: TokenBreakdown = UNAVAILABLE_USAGE
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,15 @@ class TicketScore:
     # Story 31.2-001: mean rate-limit wait already excluded from ``wall_mean``
     # (the None-not-zero convention: absent when no run in this ticket stalled).
     stall_mean: float | None = None
+    # Story 31.2-002: ``tokens_mean``'s component breakdown, each mean carried to
+    # the scoreboard rather than collapsed at capture, plus the provenance of the
+    # figure (measured / estimated / external / mixed / unavailable). Same
+    # None-not-zero convention throughout.
+    input_tokens_mean: float | None = None
+    output_tokens_mean: float | None = None
+    cache_read_tokens_mean: float | None = None
+    cache_creation_tokens_mean: float | None = None
+    tokens_source: str = UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -379,17 +395,12 @@ def tokens_from_usage(usage: dict[str, Any] | None) -> int | None:
     ``None`` (not 0) means the agent carried no usage (a plain-text custom agent),
     so an absent figure is never confused with a genuine zero.
     """
-    if not usage:
-        return None
-    vals = [usage.get(key) for key in _USAGE_KEYS]
-    if all(v is None for v in vals):
-        return None
-    return sum(int(v or 0) for v in vals)
+    return breakdown_from_envelope(usage).total
 
 
 def _cost_from(
     cost_usd: float | None,
-    usage: dict[str, Any] | None,
+    usage: TokenBreakdown,
     *,
     usd_per_million_tokens: float,
 ) -> float | None:
@@ -399,11 +410,16 @@ def _cost_from(
     derived from total tokens (the controller's notional-$ convention). ``None``
     when neither a cost nor any token usage is available. Shared by
     :func:`result_cost` and the contract-miss path (issue #435), which only has a
-    raw usage dict and cost, not an :class:`AgentResult`.
+    raw usage envelope and cost, not an :class:`AgentResult`.
+
+    Story 31.2-002: a harness whose usage is *unavailable* has no derived cost
+    either — the cost axis is only as honest as the token axis it comes from.
+    Callers gate ``cost_usd`` on the same capability, since ``usage_tracking``
+    covers usage *and* cost.
     """
     if cost_usd is not None:
         return float(cost_usd)
-    tokens = tokens_from_usage(usage)
+    tokens = usage.total
     if tokens is None:
         return None
     return notional_cost(tokens, usd_per_million_tokens=usd_per_million_tokens)
@@ -422,7 +438,9 @@ def result_cost(
     cost nor any token usage is available.
     """
     return _cost_from(
-        result.cost_usd, result.usage, usd_per_million_tokens=usd_per_million_tokens
+        result.cost_usd,
+        breakdown_from_envelope(result.usage),
+        usd_per_million_tokens=usd_per_million_tokens,
     )
 
 
@@ -464,6 +482,11 @@ def _optional_mean(values: Sequence[float | int | None]) -> float | None:
 
 def _score_runs(ticket_id: str, runs: Sequence[RunResult]) -> TicketScore:
     quality = [r.quality_pass for r in runs if r.quality_pass is not None]
+    usages = [r.usage for r in runs]
+    components = {
+        name: _optional_mean([u.components[name] for u in usages])
+        for name in USAGE_COMPONENTS
+    }
     return TicketScore(
         ticket_id=ticket_id,
         runs=len(runs),
@@ -478,6 +501,11 @@ def _score_runs(ticket_id: str, runs: Sequence[RunResult]) -> TicketScore:
             sum(1 for q in quality if q) / len(quality) if quality else None
         ),
         stall_mean=_optional_mean([r.stall_s for r in runs]),
+        input_tokens_mean=components["input"],
+        output_tokens_mean=components["output"],
+        cache_read_tokens_mean=components["cache_read"],
+        cache_creation_tokens_mean=components["cache_creation"],
+        tokens_source=aggregate_source(usages),
     )
 
 
@@ -529,12 +557,28 @@ def _fmt_rate(value: float | None) -> str:
     return "—" if value is None else f"{value * 100:.0f}%"
 
 
+def _fmt_tokens(score: TicketScore) -> str:
+    """The token figure with its provenance attached (Story 31.2-002).
+
+    An unavailable figure renders "—" (never 0) and an approximate one — a
+    pre-dispatch estimate, an external count, or an aggregate mixing the two — is
+    prefixed "~" so it can never be read as a measurement of the same run.
+    """
+    text = _fmt(score.tokens_mean, decimals=0)
+    if score.tokens_mean is not None and score.tokens_source in APPROXIMATE_SOURCES:
+        return f"~{text}"
+    return text
+
+
 def render_table(board: Scoreboard) -> str:
     """Render a scoreboard as a fixed-width text table (one row per ticket + overall).
 
     Story 31.2-001: ``wall_s`` is agent time — any in-process rate-limit wait is
     already excluded and shown separately in ``stalled`` (blank when a ticket
     never stalled), so neither figure silently stands in for the other.
+
+    Story 31.2-002: ``tokens`` is "—" when the harness reports no usage (never 0)
+    and "~"-prefixed when the figure is an estimate rather than a measurement.
     """
     header = (
         f"{'ticket':<16} {'runs':>4} {'err':>3} "
@@ -550,10 +594,15 @@ def render_table(board: Scoreboard) -> str:
             f"{score.ticket_id:<16} {score.runs:>4} {score.errors:>3} "
             f"{_fmt(score.loc_added_mean):>7} {_fmt(score.loc_removed_mean):>7} "
             f"{_fmt(score.loc_net_mean):>7} "
-            f"{_fmt(score.tokens_mean, decimals=0):>9} "
+            f"{_fmt_tokens(score):>9} "
             f"{_fmt(score.cost_mean, decimals=4):>8} "
             f"{_fmt(score.wall_mean):>7} {_fmt(score.stall_mean):>7} "
             f"{_fmt_rate(score.quality_pass_rate):>5}"
+        )
+    if any(score.tokens_source in APPROXIMATE_SOURCES for score in rows):
+        lines.append(
+            "~tokens is an estimate, not a measurement — do not compare it "
+            "against a measured figure."
         )
     return "\n".join(lines)
 
@@ -571,6 +620,11 @@ def _score_to_dict(score: TicketScore) -> dict[str, Any]:
         "wall_mean": score.wall_mean,
         "quality_pass_rate": score.quality_pass_rate,
         "stall_mean": score.stall_mean,
+        "input_tokens_mean": score.input_tokens_mean,
+        "output_tokens_mean": score.output_tokens_mean,
+        "cache_read_tokens_mean": score.cache_read_tokens_mean,
+        "cache_creation_tokens_mean": score.cache_creation_tokens_mean,
+        "tokens_source": score.tokens_source,
     }
 
 
@@ -737,6 +791,7 @@ def run_ticket(
     timeout: int = DEFAULT_TICKET_TIMEOUT_S,
     sleep_fn: Callable[[float], None] = time.sleep,
     rate_limit_max_wait_s: int = DEFAULT_RATE_LIMIT_MAX_WAIT_S,
+    capabilities: Mapping[str, bool] | None = None,
 ) -> RunResult:
     """Drive one ticket once in an isolated workspace and score the result.
 
@@ -753,6 +808,12 @@ def run_ticket(
     can't skew ``wall_mean`` across the scoreboard. A wait beyond
     ``rate_limit_max_wait_s`` gives up and scores the ticket as an error — an
     eval sweep has no durable-park/resume path like a build run does.
+
+    Story 31.2-002: ``capabilities`` is the resolved harness capability map (see
+    :func:`sdlc.capability.resolve_capabilities`). A harness that does not declare
+    ``usage_tracking`` scores ``tokens``/``cost_usd`` as *unavailable* rather than
+    the numbers it happened to print — and never as 0. ``None`` (no map resolved)
+    keeps today's behaviour for the built-in dispatch seam.
     """
     workdir = workspace / f"{ticket.id}-{run_index}"
     _init_workspace(config.target, workdir)
@@ -803,21 +864,31 @@ def run_ticket(
             # exception, under a distinct status so the scoreboard separates a
             # scored miss from a real error.
             wall = max(0.0, time.monotonic() - start - stall_s)
-            usage = getattr(exc, "usage", None)
+            breakdown = harness_breakdown(
+                getattr(exc, "usage", None),
+                capabilities=capabilities,
+                harness=config.harness,
+            )
+            reported_cost = (
+                getattr(exc, "cost_usd", None)
+                if usage_is_tracked(capabilities)
+                else None
+            )
             return RunResult(
                 ticket_id=ticket.id,
                 run_index=run_index,
                 diff=_measure_diff(workdir),
                 wall_s=wall,
-                tokens=tokens_from_usage(usage),
+                tokens=breakdown.total,
                 cost_usd=_cost_from(
-                    getattr(exc, "cost_usd", None),
-                    usage,
+                    reported_cost,
+                    breakdown,
                     usd_per_million_tokens=config.usd_per_million_tokens,
                 ),
                 quality_pass=run_quality_check(ticket.quality_cmd, workdir),
                 status="contract_miss",
                 stall_s=stall_s or None,
+                usage=breakdown,
             )
         except Exception as exc:  # noqa: BLE001 — record any dispatch failure, keep going
             wall = max(0.0, time.monotonic() - start - stall_s)
@@ -832,19 +903,29 @@ def run_ticket(
             )
         break
     wall = max(0.0, time.monotonic() - start - stall_s)
+    breakdown = harness_breakdown(
+        result.usage, capabilities=capabilities, harness=config.harness
+    )
+    # ``usage_tracking`` covers cost as well as tokens: a harness that does not
+    # declare it reports neither, so the arm is never priced off a figure it was
+    # not entitled to give.
+    reported_cost = result.cost_usd if usage_is_tracked(capabilities) else None
 
     return RunResult(
         ticket_id=ticket.id,
         run_index=run_index,
         diff=_measure_diff(workdir),
         wall_s=wall,
-        tokens=tokens_from_usage(result.usage),
-        cost_usd=result_cost(
-            result, usd_per_million_tokens=config.usd_per_million_tokens
+        tokens=breakdown.total,
+        cost_usd=_cost_from(
+            reported_cost,
+            breakdown,
+            usd_per_million_tokens=config.usd_per_million_tokens,
         ),
         quality_pass=run_quality_check(ticket.quality_cmd, workdir),
         error=None,
         stall_s=stall_s or None,
+        usage=breakdown,
     )
 
 
@@ -856,12 +937,15 @@ def run_eval(
     timeout: int = DEFAULT_TICKET_TIMEOUT_S,
     sleep_fn: Callable[[float], None] = time.sleep,
     rate_limit_max_wait_s: int = DEFAULT_RATE_LIMIT_MAX_WAIT_S,
+    capabilities: Mapping[str, bool] | None = None,
 ) -> list[RunResult]:
     """Run every ticket × ``n`` runs in isolation and return the per-run results.
 
     Pass the result list to :func:`aggregate` for a scoreboard. ``workspace`` is a
     throwaway directory (the caller owns its lifetime); the framework repo and the
-    sample-target template are never mutated.
+    sample-target template are never mutated. ``capabilities`` (Story 31.2-002) is
+    the resolved harness capability map every run's usage is gated on — see
+    :func:`run_ticket`.
     """
     results: list[RunResult] = []
     for ticket in config.tickets:
@@ -876,6 +960,7 @@ def run_eval(
                     timeout=timeout,
                     sleep_fn=sleep_fn,
                     rate_limit_max_wait_s=rate_limit_max_wait_s,
+                    capabilities=capabilities,
                 )
             )
     return results

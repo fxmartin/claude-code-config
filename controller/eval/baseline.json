@@ -1,5 +1,5 @@
 {
-  "_note": "Measured baseline from a live run on 2026-07-15 (sdlc eval --json, controller v2.22.0, 3 tickets x 3 runs). Regenerate with: uv run sdlc eval --json > eval/baseline.json",
+  "_note": "Measured baseline from a live run on 2026-07-15 (sdlc eval --json, controller v2.22.0, 3 tickets x 3 runs). Predates Story 31.2-002, so it carries no per-component token breakdown and its token/cost axes compare as 'not comparable'. Regenerate with: uv run sdlc eval --json > eval/baseline.json",
   "config_name": "strutils-baseline",
   "tickets": [
     {

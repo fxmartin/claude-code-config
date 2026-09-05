@@ -5480,3 +5480,78 @@ def test_story_rows_contract_unchanged_by_predictor_features(tmp_path) -> None:
         "story_id", "title", "priority", "status", "pr_number",
         "wave", "dependencies", "current_stage", "stage_status",
     }
+
+
+# ---------------------------------------------------------------------------
+# Story 31.2-002 — capability-gated stage usage (unavailable, never zero)
+# ---------------------------------------------------------------------------
+
+
+def _usage_result(**usage: int):  # type: ignore[no-untyped-def]
+    from sdlc.dispatch import AgentResult
+
+    return AgentResult(
+        agent_type="build", data={}, raw="", usage=dict(usage), cost_usd=0.09,
+        session_id="sess-1",
+    )
+
+
+def _usage_ledger(tmp_path):  # type: ignore[no-untyped-def]
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.story_upsert(run_id, "s1", "99", "S", "P1", 2, "py", "", None, "IN_PROGRESS")
+    ledger.stage_start(run_id, "s1", "build", 1)
+    return ledger, run_id
+
+
+def test_stage_usage_from_a_harness_without_usage_tracking_is_unavailable(tmp_path) -> None:
+    """A false-telemetry harness earns NULLs, never a fabricated zero."""
+    from sdlc.build import _record_stage_usage, _sum_tokens
+
+    ledger, run_id = _usage_ledger(tmp_path)
+    _record_stage_usage(
+        ledger, run_id, "s1", "build", 1,
+        _usage_result(input_tokens=999, output_tokens=1),
+        capabilities={"usage_tracking": False},
+    )
+    row = _stage_usage_row(ledger, run_id, "s1", "build")
+    assert row["input_tokens"] is None
+    assert row["output_tokens"] is None
+    assert row["cost_usd"] is None
+    assert _sum_tokens(dict(row)) is None
+
+
+def test_stage_usage_is_recorded_when_the_harness_declares_the_capability(tmp_path) -> None:
+    from sdlc.build import _record_stage_usage
+
+    ledger, run_id = _usage_ledger(tmp_path)
+    _record_stage_usage(
+        ledger, run_id, "s1", "build", 1,
+        _usage_result(input_tokens=10, cache_creation_input_tokens=90),
+        capabilities={"usage_tracking": True},
+    )
+    row = _stage_usage_row(ledger, run_id, "s1", "build")
+    assert row["input_tokens"] == 10
+    assert row["cache_creation_tokens"] == 90
+
+
+def test_stage_usage_still_records_the_observed_model_when_usage_is_unavailable(
+    tmp_path,
+) -> None:
+    """The capability gate covers usage only — model telemetry is a separate axis."""
+    from sdlc.build import _record_stage_usage
+    from sdlc.dispatch import AgentResult
+
+    ledger, run_id = _usage_ledger(tmp_path)
+    _record_stage_usage(
+        ledger, run_id, "s1", "build", 1,
+        AgentResult(
+            agent_type="build", data={}, raw="",
+            usage={"input_tokens": 5}, model="some-model",
+        ),
+        capabilities={"usage_tracking": False},
+    )
+    row = _stage_usage_row(ledger, run_id, "s1", "build")
+    assert row["input_tokens"] is None
+    assert row["model"] == "some-model"

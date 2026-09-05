@@ -2503,7 +2503,7 @@ def eval_cmd(
     """
     import tempfile
 
-    from sdlc.capability import ProbeStatus, probe_harness
+    from sdlc.capability import ProbeStatus, probe_harness, resolve_capabilities
     from sdlc.evaluate import (
         EvalConfig,
         EvalConfigError,
@@ -2576,7 +2576,15 @@ def eval_cmd(
     with tempfile.TemporaryDirectory(prefix="sdlc-eval-") as tmp:
         ws = workspace or Path(tmp)
         ws.mkdir(parents=True, exist_ok=True)
-        results = run_eval(config, ws, dispatcher=dispatcher_for_harness(resolved_harness))
+        # Story 31.2-002: the resolved harness's capabilities gate its usage —
+        # a harness that does not declare ``usage_tracking`` scores tokens/cost
+        # as unavailable rather than zero, so the cheap arm never looks free.
+        results = run_eval(
+            config,
+            ws,
+            dispatcher=dispatcher_for_harness(resolved_harness),
+            capabilities=resolve_capabilities(resolved_harness),
+        )
 
     # Story 31.1-002 AC1: the same probe the preflight above already ran is the
     # source of truth for the recorded harness version — a harness declaring no

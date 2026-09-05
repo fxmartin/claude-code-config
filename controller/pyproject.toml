@@ -114,6 +114,7 @@ module = [
     "sdlc.supply_chain_scan",
     "sdlc.sync",
     "sdlc.type_check",
+    "sdlc.usage",
 ]
 # `strict = true` is a global-only flag — setting it in a per-module override
 # silently applies it to the whole tree, which would put every module at rung 1
