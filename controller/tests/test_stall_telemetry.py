@@ -208,6 +208,30 @@ def test_status_snapshot_surfaces_stall_seconds(tmp_path: Path) -> None:
     assert stories["s1-002"]["stall_seconds"] is None
 
 
+def test_status_snapshot_duration_excludes_stall(tmp_path: Path) -> None:
+    # Story 31.2-001: the story's/run's reported duration is agent time — the
+    # rate-limit wait it recorded must be subtracted, not folded into it, so a
+    # single throttled story can't skew a wall-clock comparison.
+    db = tmp_path / "ledger.db"
+    run_id = _seed_with_stalls(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE runs SET started_at='2026-06-20 11:00:00', "
+            "finished_at='2026-06-20 11:20:00' WHERE id=?",
+            (run_id,),
+        )
+        conn.execute(
+            "UPDATE stages SET started_at='2026-06-20 11:00:00', "
+            "finished_at='2026-06-20 11:20:00' WHERE run_id=? AND story_id='s1-001'",
+            (run_id,),
+        )
+    snap = status_snapshot(Ledger(db))
+    stories = {s["story_id"]: s for s in snap["stories"]}
+    # 20m wall - 5m (300s) stalled = 15m = 900s, for both the story and the run.
+    assert stories["s1-001"]["duration_seconds"] == 900
+    assert snap["run"]["duration_seconds"] == 900
+
+
 def test_status_snapshot_zero_stalls(tmp_path: Path) -> None:
     db = tmp_path / "ledger.db"
     ledger = Ledger(db)

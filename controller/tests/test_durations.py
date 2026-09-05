@@ -90,3 +90,61 @@ def test_story_duration_finished_with_unparseable_finishes_is_none() -> None:
         {"name": "review", "started_at": "2026-06-20 11:03:00", "finished_at": "also-bad"},
     ]
     assert _story_duration_seconds(stages, now=_NOW) is None
+
+
+# --- stall-adjusted duration (Story 31.2-001) -------------------------------
+
+
+def test_duration_seconds_subtracts_stall() -> None:
+    secs = _duration_seconds(
+        "2026-06-20 11:00:00", "2026-06-20 11:10:00", stall_seconds=120
+    )
+    assert secs == 480  # 10m wall - 2m stalled
+
+
+def test_duration_seconds_no_stall_is_unchanged() -> None:
+    # A run that never stalled (None) reports plain wall-clock — the common
+    # case renders identically to before this story.
+    secs = _duration_seconds("2026-06-20 11:00:00", "2026-06-20 11:10:00", stall_seconds=None)
+    assert secs == 600
+    assert _duration_seconds(
+        "2026-06-20 11:00:00", "2026-06-20 11:10:00", stall_seconds=0
+    ) == 600
+
+
+def test_duration_seconds_stall_clamped_at_zero() -> None:
+    # A stall recorded slightly larger than the measured span (clock rounding
+    # across the wait loop) must never render a negative agent time.
+    secs = _duration_seconds(
+        "2026-06-20 11:00:00", "2026-06-20 11:01:00", stall_seconds=300
+    )
+    assert secs == 0
+
+
+def test_duration_seconds_in_progress_subtracts_stall() -> None:
+    secs = _duration_seconds(
+        "2026-06-20 11:30:00", None, now=_NOW, stall_seconds=300
+    )
+    assert secs == 1500  # 30m elapsed - 5m stalled
+
+
+def test_story_duration_subtracts_stall() -> None:
+    stages = [
+        {"name": "build", "started_at": "2026-06-20 11:00:00", "finished_at": "2026-06-20 11:02:00"},
+        {"name": "review", "started_at": "2026-06-20 11:03:00", "finished_at": "2026-06-20 11:05:30"},
+    ]
+    assert _story_duration_seconds(stages, stall_seconds=30) == 300  # 330 - 30
+
+
+def test_story_duration_stall_clamped_at_zero() -> None:
+    stages = [
+        {"name": "build", "started_at": "2026-06-20 11:00:00", "finished_at": "2026-06-20 11:02:00"},
+    ]
+    assert _story_duration_seconds(stages, stall_seconds=99999) == 0
+
+
+def test_story_duration_no_stall_is_unchanged() -> None:
+    stages = [
+        {"name": "build", "started_at": "2026-06-20 11:00:00", "finished_at": "2026-06-20 11:02:00"},
+    ]
+    assert _story_duration_seconds(stages, stall_seconds=None) == 120

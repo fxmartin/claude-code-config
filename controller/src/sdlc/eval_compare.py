@@ -41,6 +41,10 @@ class MetricSpec:
 # The comparable means in a :class:`sdlc.evaluate.TicketScore` dict. LOC/tokens/cost/
 # wall are "less is better"; quality is the one "more is better" — exactly the signal
 # Epic-14 routing must hold (does a cheaper model keep quality up while cutting cost?).
+# Story 31.2-001: "wall_mean" is stall-adjusted agent time — any in-process
+# rate-limit wait a run recorded is already excluded (see
+# ``sdlc.evaluate.RunResult.stall_s``) — so a rate-limited hosted harness is
+# compared on agent speed, not the state of its quota.
 COMPARED_METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("loc_net_mean", "netLOC", lower_is_better=True),
     MetricSpec("tokens_mean", "tokens", lower_is_better=True),
@@ -276,6 +280,7 @@ def render_comparison_table(comparison: Comparison) -> str:
     lines = [
         f"compare: {comparison.baseline_name} (baseline) vs "
         f"{comparison.candidate_name} (candidate)  [tolerance {comparison.tolerance:.0%}]",
+        "wall_s is stall-adjusted agent time (rate-limit waits excluded).",
     ]
     rows = list(comparison.tickets)
     if comparison.overall is not None:
