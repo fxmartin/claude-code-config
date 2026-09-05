@@ -348,9 +348,15 @@ Beyond `codex` (the worked reference throughout this page), the registry ships:
 
 - **qwen** — Qwen Code headless coding agent; `qwen-build-adapter.sh` using `qwen -p`.
 - **opencode** — open-source headless coding CLI; `opencode-build-adapter.sh`
-  using `opencode run --pure` with the prompt on stdin (`run` reads its message
-  from stdin when given no positional; argv delivery would cap the prompt at
-  Linux's 128 KiB `MAX_ARG_STRLEN`). Two things must be true before routing a
+  using `opencode run --pure --format json` with the prompt on stdin (`run`
+  reads its message from stdin when given no positional; argv delivery would
+  cap the prompt at Linux's 128 KiB `MAX_ARG_STRLEN`). Unlike the other
+  non-Claude adapters, it does **not** use the no-telemetry `codex-exec`
+  parser: `--format json` emits one JSON event per line, and the `opencode-json`
+  parser (Story 29.2-003) extracts the `<<<RESULT_JSON>>>` contract from the
+  event stream's text AND real per-session token usage/cost from its
+  `step_finish` events — so `usage_tracking: true` on this entry reflects
+  measured tokens, not an estimate. Two things must be true before routing a
   role here, and **both fail as an indefinite hang rather than an error**:
   - the target repo's `opencode.json` must set
     `"permission": { "edit": "allow", "bash": "allow" }`, or OpenCode blocks on
@@ -374,8 +380,10 @@ projects:
 - **gemini** — Google's CLI; wrap `gemini`'s headless mode to emit the result block.
 
 Each is the same recipe: a wrapper that maps stdin→CLI and CLI-stdout→result
-block, a `harnesses.yaml` entry with `parser: codex-exec`, and honest capability
-flags. The [codex, qwen, and opencode entries](../controller/src/sdlc/config/harnesses.yaml) are the
+block, a `harnesses.yaml` entry with `parser: codex-exec` (the no-telemetry
+default — only write a bespoke parser like `opencode-json` if the CLI has a
+real structured-usage mode worth extracting), and honest capability flags. The
+[codex, qwen, and opencode entries](../controller/src/sdlc/config/harnesses.yaml) are the
 canonical real-world examples to copy from.
 
 ## Where the boundary stays Claude-only

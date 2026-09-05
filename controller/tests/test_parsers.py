@@ -25,12 +25,15 @@ from sdlc.dispatch import (
 )
 from sdlc.parsers import (
     CLAUDE_PARSER_ID,
+    OPENCODE_PARSER_ID,
     CollectedOutput,
+    OpenCodeJsonParser,
     OutputParser,
     PlainResultParser,
     UnknownParserError,
     ClaudeStreamJsonParser,
     get_parser,
+    parse_opencode_export_usage,
     parser_ids,
 )
 
@@ -454,3 +457,268 @@ def test_output_parser_base_parse_raises_not_implemented() -> None:
 
     with pytest.raises(NotImplementedError):
         _StubParser().parse(_collected(stdout=_wrap(_VALID_BUILD)))
+
+
+# --- OpenCode `--format json` event-stream parser (Story 29.2-003) ---------
+#
+# Real shape verified against a live `opencode run --pure --format json
+# --model anthropic/claude-haiku-4-5` (OpenCode 1.18.15, 2026-09-05): one JSON
+# object per line, no header, no envelope wrapper. A "text" event's
+# `part.text` carries a chunk of the assistant's response (the same text a
+# `--pure` plain run would print); a "step_finish" event's `part.tokens` is
+# `{total, input, output, reasoning, cache: {read, write}}` and `part.cost` is
+# a float — both *per step*, not cumulative, confirmed by a two-step
+# (bash-tool) run where summing every step's tokens matched
+# `opencode export`'s single cumulative `info.tokens` for the same session.
+
+
+def _oc_text_event(text: str, session_id: str = "ses_abc123") -> str:
+    return json.dumps(
+        {
+            "type": "text",
+            "sessionID": session_id,
+            "part": {"type": "text", "text": text},
+        }
+    )
+
+
+def _oc_step_finish_event(
+    *,
+    input_tok: int = 3,
+    output_tok: int = 5,
+    reasoning: int = 0,
+    cache_write: int = 100,
+    cache_read: int = 0,
+    cost: float | None = 0.01,
+    session_id: str = "ses_abc123",
+) -> str:
+    part: dict = {
+        "type": "step-finish",
+        "tokens": {
+            "total": input_tok + output_tok + reasoning + cache_write + cache_read,
+            "input": input_tok,
+            "output": output_tok,
+            "reasoning": reasoning,
+            "cache": {"write": cache_write, "read": cache_read},
+        },
+    }
+    if cost is not None:
+        part["cost"] = cost
+    return json.dumps({"type": "step_finish", "sessionID": session_id, "part": part})
+
+
+def _oc_step_start_event(session_id: str = "ses_abc123") -> str:
+    return json.dumps(
+        {"type": "step_start", "sessionID": session_id, "part": {"type": "step-start"}}
+    )
+
+
+def test_get_parser_resolves_opencode_json() -> None:
+    parser = get_parser(OPENCODE_PARSER_ID)
+    assert isinstance(parser, OpenCodeJsonParser)
+    assert OPENCODE_PARSER_ID in parser_ids()
+
+
+def test_opencode_parser_extracts_contract_and_sums_usage_across_steps() -> None:
+    # Two steps (mirrors a bash-tool round trip): usage/cost sum, not overwrite.
+    stdout = "\n".join(
+        [
+            _oc_step_start_event(),
+            _oc_text_event("I'll run the command."),
+            _oc_step_finish_event(input_tok=3, output_tok=62, cache_write=11746, cost=0.0150),
+            _oc_step_start_event(),
+            _oc_text_event(_wrap(_VALID_BUILD)),
+            _oc_step_finish_event(
+                input_tok=6, output_tok=70, cache_write=73, cache_read=11746, cost=0.0016
+            ),
+        ]
+    )
+    parser = get_parser(OPENCODE_PARSER_ID)
+    result = parser.parse(_collected(stdout=stdout, agent_type="build"))
+
+    assert result.data == _VALID_BUILD
+    assert result.session_id == "ses_abc123"
+    assert result.usage_available is True
+    assert result.usage == {
+        "input_tokens": 9,
+        "output_tokens": 132,
+        "cache_read_input_tokens": 11746,
+        "cache_creation_input_tokens": 11819,
+    }
+    assert result.cost_usd == pytest.approx(0.0166, abs=1e-6)
+
+
+def test_opencode_parser_folds_reasoning_tokens_into_output() -> None:
+    # No dedicated ledger column for reasoning tokens; they are still generated
+    # output, so they fold into output_tokens (mirrors Claude's own envelope,
+    # which never separates thinking tokens out of output_tokens either) —
+    # the four-key sum still reconciles against OpenCode's own `total`.
+    stdout = "\n".join(
+        [
+            _oc_text_event(_wrap(_VALID_BUILD)),
+            _oc_step_finish_event(input_tok=3, output_tok=5, reasoning=40, cache_write=0),
+        ]
+    )
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+    assert result.usage["output_tokens"] == 45
+
+
+def test_opencode_parser_missing_cost_is_none_not_fabricated() -> None:
+    stdout = "\n".join(
+        [
+            _oc_text_event(_wrap(_VALID_BUILD)),
+            _oc_step_finish_event(cost=None),
+        ]
+    )
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+    assert result.usage is not None
+    assert result.cost_usd is None
+
+
+def test_opencode_parser_truncated_step_finish_degrades_usage_to_unavailable() -> None:
+    # Story 29.2-003 AC3: a stream cut mid-line (e.g. a killed/truncated
+    # process) must not fail the stage — the contract block already landed in
+    # a complete earlier "text" line, so it is still honored; the truncated
+    # step_finish line is simply unparsable JSON and is skipped, leaving no
+    # usable token counts.
+    good_step_finish = _oc_step_finish_event()
+    truncated = good_step_finish[: len(good_step_finish) // 2]
+    stdout = "\n".join([_oc_text_event(_wrap(_VALID_BUILD)), truncated])
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert result.data == _VALID_BUILD
+    assert result.usage is None
+    assert result.cost_usd is None
+    # Harness-level flag: opencode DOES support usage tracking as a class, even
+    # though this particular run's stream carried no usable telemetry.
+    assert result.usage_available is True
+
+
+def test_opencode_parser_no_step_finish_event_is_usage_unavailable() -> None:
+    # A stream with well-formed JSON throughout but simply no usage event.
+    stdout = "\n".join([_oc_step_start_event(), _oc_text_event(_wrap(_VALID_BUILD))])
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+    assert result.data == _VALID_BUILD
+    assert result.usage is None
+    assert result.cost_usd is None
+    assert result.usage_available is True
+
+
+def test_opencode_parser_non_json_stdout_degrades_to_plain_contract_path() -> None:
+    # Nothing on stdout parses as NDJSON at all (e.g. an older OpenCode / a
+    # non-JSON format slipped through) — fall back to reading the raw stdout
+    # exactly like the plain contract path, rather than failing the stage.
+    stdout = _wrap(_VALID_BUILD)
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+    assert result.data == _VALID_BUILD
+    assert result.usage is None
+    assert result.usage_available is True
+
+
+def test_opencode_parser_missing_result_block_raises_contract_error() -> None:
+    stdout = "\n".join([_oc_text_event("no markers here"), _oc_step_finish_event()])
+    with pytest.raises(ResultBlockError):
+        get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+
+def test_opencode_parser_nonzero_exit_is_plain_dispatch_error() -> None:
+    # No rate-limit semantics for opencode (rate_limit_aware: false) — a
+    # rate-limit-shaped message on a non-zero exit is still a plain error.
+    with pytest.raises(AgentDispatchError) as exc:
+        get_parser(OPENCODE_PARSER_ID).parse(
+            _collected(
+                returncode=1,
+                stderr="usage limit reached. Try again later.",
+            )
+        )
+    assert not isinstance(exc.value, RateLimitError)
+
+
+def test_opencode_parser_ignores_non_dict_and_blank_lines() -> None:
+    stdout = "\n".join(
+        [
+            "",
+            "  ",
+            "42",
+            "[1, 2, 3]",
+            _oc_text_event(_wrap(_VALID_BUILD)),
+            _oc_step_finish_event(),
+        ]
+    )
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+    assert result.data == _VALID_BUILD
+    assert result.usage_available is True
+    assert result.usage["input_tokens"] == 3
+
+
+# --- Post-hoc `opencode export <sessionID>` recovery (Story 29.2-003 AC4) --
+#
+# The field finding: the export must be written to a *file* before parsing —
+# piped through a parser it truncates around 64 KB — and, run without a TTY,
+# it omits the human-readable header line it prints interactively. Both
+# gotchas are the caller's responsibility (never pipe); this function's job is
+# to never assume the header is present OR absent.
+
+
+def _oc_export_json(
+    *,
+    input_tok: int = 9,
+    output_tok: int = 132,
+    reasoning: int = 0,
+    cache_read: int = 11746,
+    cache_write: int = 11819,
+    cost: float | None = 0.01661735,
+) -> str:
+    info: dict = {
+        "id": "ses_abc123",
+        "tokens": {
+            "input": input_tok,
+            "output": output_tok,
+            "reasoning": reasoning,
+            "cache": {"read": cache_read, "write": cache_write},
+        },
+    }
+    if cost is not None:
+        info["cost"] = cost
+    return json.dumps({"info": info, "messages": []})
+
+
+def test_parse_opencode_export_usage_no_tty_has_no_header() -> None:
+    # Verified: a piped/no-TTY `opencode export --pure` prints the JSON object
+    # as the very first byte — no header line to skip.
+    usage, cost = parse_opencode_export_usage(_oc_export_json())
+    assert usage == {
+        "input_tokens": 9,
+        "output_tokens": 132,
+        "cache_read_input_tokens": 11746,
+        "cache_creation_input_tokens": 11819,
+    }
+    assert cost == pytest.approx(0.01661735)
+
+
+def test_parse_opencode_export_usage_tolerates_a_leading_header_line() -> None:
+    # An interactive TTY run may print a banner before the JSON; the parser
+    # must not assume its absence (AC4) — it locates the JSON object directly.
+    text = "Exporting session ses_abc123...\n" + _oc_export_json()
+    usage, cost = parse_opencode_export_usage(text)
+    assert usage is not None
+    assert usage["input_tokens"] == 9
+    assert cost == pytest.approx(0.01661735)
+
+
+def test_parse_opencode_export_usage_folds_reasoning_into_output() -> None:
+    usage, _ = parse_opencode_export_usage(_oc_export_json(output_tok=100, reasoning=25))
+    assert usage["output_tokens"] == 125
+
+
+def test_parse_opencode_export_usage_missing_cost_is_none() -> None:
+    usage, cost = parse_opencode_export_usage(_oc_export_json(cost=None))
+    assert usage is not None
+    assert cost is None
+
+
+def test_parse_opencode_export_usage_malformed_text_returns_none() -> None:
+    usage, cost = parse_opencode_export_usage("not json at all")
+    assert usage is None
+    assert cost is None

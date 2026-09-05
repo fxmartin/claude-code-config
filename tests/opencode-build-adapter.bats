@@ -63,6 +63,14 @@ EOF
     [[ "$(cat "${OPENCODE_ARG_LOG}")" != *"${prompt}"* ]]
 }
 
+@test "invokes opencode with --format json so the controller's opencode-json parser has real usage to read (Story 29.2-003)" {
+    run bash -c "printf 'prompt' | bash '${WRAPPER}'"
+
+    [ "${status}" -eq 0 ]
+    [[ "$(cat "${OPENCODE_ARG_LOG}")" == *"--format"* ]]
+    [[ "$(cat "${OPENCODE_ARG_LOG}")" == *"json"* ]]
+}
+
 @test "preserves a multiline prompt intact on stdin" {
     local prompt=$'build story 29.2-001\nwith multiline context'
 

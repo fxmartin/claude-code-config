@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,6 +34,10 @@ from sdlc.dispatch import (
 # The canonical id of the built-in Claude harness parser. Mirrors the parser id
 # the registry (`harnesses.yaml`) and `harness.py` declare for the `claude` entry.
 CLAUDE_PARSER_ID = "claude-stream-json"
+
+# The canonical id of the OpenCode `--format json` event-stream parser. Mirrors
+# the parser id `harnesses.yaml`'s `opencode` entry declares (Story 29.2-003).
+OPENCODE_PARSER_ID = "opencode-json"
 
 
 class UnknownParserError(Exception):
@@ -285,13 +291,208 @@ class PlainResultParser(OutputParser):
         )
 
 
+def _sum_int(*values: Any) -> int:
+    return sum(int(v) for v in values if isinstance(v, (int, float)))
+
+
+class OpenCodeJsonParser(OutputParser):
+    """Parser for `opencode run --format json`'s NDJSON event stream (Story 29.2-003).
+
+    Verified against a live OpenCode 1.18.15 run (hosted and local oMLX
+    models, 2026-09-05): one JSON object per line, no envelope, no header. Two
+    event types matter here — a ``"text"`` event's ``part.text`` is a chunk of
+    the assistant's response (concatenated in order, the events reconstruct
+    the same prose a `--pure` plain run would print, including the
+    ``<<<RESULT_JSON>>>`` contract block), and a ``"step_finish"`` event's
+    ``part.tokens`` is ``{total, input, output, reasoning, cache: {read,
+    write}}`` with ``part.cost`` alongside it. Confirmed **per-step, not
+    cumulative**: a two-step (bash-tool) run's per-step tokens/cost summed to
+    exactly match ``opencode export``'s single cumulative total for the same
+    session, so every ``step_finish`` in the stream is accumulated here rather
+    than the last one winning.
+
+    ``reasoning`` tokens have no dedicated ledger column (the four canonical
+    usage keys — mirrored from Claude's own envelope — are input/output/
+    cache-read/cache-creation). They fold into ``output_tokens`` the same way
+    Claude's envelope never separates thinking tokens out of ``output_tokens``
+    either, so the four-key sum still reconciles against OpenCode's own
+    reported ``total``.
+
+    A line that fails to parse as JSON (a truncated or malformed stream) is
+    skipped rather than failing the stage (AC3) — the NDJSON format is
+    line-delimited, so one bad line never voids an already-complete line
+    elsewhere in the same stream. When *no* line parses as JSON at all, stdout
+    is treated as plain text and handed to the contract parser directly — the
+    same degraded path :class:`PlainResultParser` takes — so an unexpected
+    non-JSON stream (an older OpenCode, or a misconfigured `--format`) still
+    honors the result block instead of failing outright. Either way, usage is
+    recorded as *unavailable* (never fabricated as zero) whenever the stream
+    yielded no usable ``step_finish`` tokens for this particular run —
+    ``usage_available`` itself stays ``True`` because it marks the harness
+    *class* as usage-tracking capable, mirroring the Claude parser's
+    plain-text fallback (``usage_available=True``, ``usage=None``).
+
+    Has no rate-limit or context-overflow semantics (``rate_limit_aware:
+    false``), so — like :class:`PlainResultParser` — a non-zero exit is always
+    a plain :class:`AgentDispatchError`, never a fabricated 429.
+    """
+
+    id = OPENCODE_PARSER_ID
+
+    def parse(self, output: CollectedOutput) -> AgentResult:
+        if output.returncode != 0:
+            detail = (output.stderr or output.stdout or "").strip()
+            raise AgentDispatchError(
+                f"{output.agent_type} agent exited {output.returncode}: {detail}"
+            )
+
+        texts: list[str] = []
+        session_id: str | None = None
+        input_tokens = output_tokens = cache_read_tokens = cache_creation_tokens = 0
+        cost_total = 0.0
+        saw_json = False
+        saw_usage = False
+        saw_cost = False
+
+        for line in output.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # Require a string `type` field, OpenCode's own event discriminator,
+            # not just "this line happens to be valid JSON" — a plain-text
+            # response's <<<RESULT_JSON>>> body is itself a single-line JSON
+            # object with no `type` key, and must not be mistaken for a real
+            # NDJSON event (that would wrongly discard the surrounding prose).
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                continue
+            saw_json = True
+            session_id = session_id or event.get("sessionID")
+            part = event.get("part")
+            if not isinstance(part, dict):
+                continue
+            if event.get("type") == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif event.get("type") == "step_finish":
+                tokens = part.get("tokens")
+                if isinstance(tokens, dict):
+                    saw_usage = True
+                    cache = tokens.get("cache")
+                    cache = cache if isinstance(cache, dict) else {}
+                    input_tokens += _sum_int(tokens.get("input"))
+                    output_tokens += _sum_int(tokens.get("output"), tokens.get("reasoning"))
+                    cache_read_tokens += _sum_int(cache.get("read"))
+                    cache_creation_tokens += _sum_int(cache.get("write"))
+                cost = part.get("cost")
+                if isinstance(cost, (int, float)):
+                    saw_cost = True
+                    cost_total += float(cost)
+
+        # Degrade to the plain-contract path (AC3) when nothing on stdout
+        # parsed as NDJSON at all — the raw stdout might still be a valid
+        # plain-text agent response.
+        response_text = "\n".join(texts) if saw_json else output.stdout
+
+        if not output.streaming:
+            _write_transcript(output.transcript_path, response_text, output.stderr)
+
+        data = parse_and_validate(output.agent_type, response_text)
+
+        usage: dict[str, Any] | None = None
+        if saw_usage:
+            usage = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read_tokens,
+                "cache_creation_input_tokens": cache_creation_tokens,
+            }
+
+        return AgentResult(
+            agent_type=output.agent_type,
+            data=data,
+            raw=response_text,
+            usage=usage,
+            cost_usd=cost_total if (saw_usage and saw_cost) else None,
+            session_id=session_id,
+            usage_available=True,
+        )
+
+
+# A bare JSON object, greedy across newlines — used to locate the JSON payload
+# inside `opencode export` output regardless of whether a header line precedes
+# it (see `parse_opencode_export_usage` below).
+_EXPORT_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def parse_opencode_export_usage(
+    export_text: str,
+) -> tuple[dict[str, Any] | None, float | None]:
+    """Recover token/cost usage from `opencode export <sessionID>` text (Story 29.2-003 AC4).
+
+    The post-hoc fallback for a stage whose live `--format json` stream yielded
+    no usage (or was never captured with `--format json` at all): the session
+    id is enough to ask OpenCode itself for the final tally after the fact.
+
+    Two OpenCode 1.18.15 gotchas are the CALLER's responsibility, not this
+    function's — they cost real time to discover (2026-09-05, FX, oMLX
+    benchmark session) so they are recorded here where a future reader will
+    look for them:
+
+    - The export **truncates at ~64 KB through a pipe**. Always redirect
+      `opencode export <sessionID> > file` and read the file; never pipe the
+      command's output straight into a parser.
+    - Run **without a TTY** (any non-interactive caller), `export` omits the
+      human-readable header line it prints interactively. This function must
+      therefore never assume that line is present OR absent — it locates the
+      JSON object directly with a regex rather than skipping a fixed number of
+      leading lines, so it round-trips both an interactive capture (header +
+      JSON) and a scripted one (JSON only).
+
+    Returns ``(usage, cost_usd)`` — both ``None`` when the text carries no
+    parseable export JSON, mirroring the rest of the module's "never fabricate"
+    convention. ``usage`` uses the same four canonical keys the live NDJSON
+    parser produces (reasoning tokens folded into ``output_tokens``).
+    """
+    match = _EXPORT_JSON_RE.search(export_text)
+    if match is None:
+        return None, None
+    try:
+        data = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return None, None
+    info = data.get("info") if isinstance(data, dict) else None
+    if not isinstance(info, dict):
+        return None, None
+
+    usage: dict[str, Any] | None = None
+    tokens = info.get("tokens")
+    if isinstance(tokens, dict):
+        cache = tokens.get("cache")
+        cache = cache if isinstance(cache, dict) else {}
+        usage = {
+            "input_tokens": _sum_int(tokens.get("input")),
+            "output_tokens": _sum_int(tokens.get("output"), tokens.get("reasoning")),
+            "cache_read_input_tokens": _sum_int(cache.get("read")),
+            "cache_creation_input_tokens": _sum_int(cache.get("write")),
+        }
+
+    cost = info.get("cost")
+    cost_usd = float(cost) if isinstance(cost, (int, float)) else None
+    return usage, cost_usd
+
+
 # Registry of parsers by id. A harness's `parser` field in `harnesses.yaml` names
 # one of these keys; adding a harness that reuses an existing parser shape needs
 # no new code here. The `codex-exec` parser is the no-telemetry plain parser the
-# Codex adapter (Feature 20.3) builds on.
+# Codex adapter (Feature 20.3) builds on; `opencode-json` is the OpenCode
+# `--format json` event-stream parser (Story 29.2-003).
 _REGISTRY: dict[str, OutputParser] = {
     CLAUDE_PARSER_ID: ClaudeStreamJsonParser(),
     "codex-exec": PlainResultParser("codex-exec"),
+    OPENCODE_PARSER_ID: OpenCodeJsonParser(),
 }
 
 

@@ -129,13 +129,15 @@ harnesses:
       rate_limit_aware: false
 
   # OpenCode adapter (Story 29.2-001). The wrapper receives the assembled
-  # prompt on stdin and runs OpenCode headlessly via `opencode run --pure`,
-  # letting the prompt flow through on stdin (`run` reads its message there when
-  # given no positional), forwarding the neutral <<<RESULT_JSON>>> contract — with ANSI
-  # colour stripped, since OpenCode 1.18.15 emits CSI escapes even off a TTY —
-  # to the same plain parser used by Codex and Qwen. OpenCode does not expose
-  # Claude-style stream-json / usage / rate-limit telemetry through this
-  # wrapper, so those capabilities stay false.
+  # prompt on stdin and runs OpenCode headlessly via `opencode run --pure
+  # --format json`, letting the prompt flow through on stdin (`run` reads its
+  # message there when given no positional), forwarding the NDJSON event
+  # stream — with ANSI colour stripped, since OpenCode 1.18.15 emits CSI
+  # escapes even off a TTY — to the `opencode-json` parser (Story 29.2-003),
+  # which extracts the neutral <<<RESULT_JSON>>> contract AND real per-session
+  # token usage/cost from `step_finish` events. OpenCode still exposes no
+  # Claude-style rate-limit semantics through this wrapper, so that capability
+  # stays false, but usage_tracking is real (see below).
   #
   # REQUIRED for unattended dispatch: the target repo's `opencode.json` must
   # set `"permission": { "edit": "allow", "bash": "allow" }` (or an equivalent
@@ -193,7 +195,7 @@ harnesses:
     # Not entitled to these? Override without editing this file (redeploy-safe):
     #   export OPENCODE_FLAGS='--model <provider/model>'
     command: "opencode-build-adapter.sh --model {model}"
-    parser: codex-exec
+    parser: opencode-json
     enabled: true
     probe: "opencode --version"
     # Per-stage routing, mirroring Epic-14's Balanced profile
@@ -210,9 +212,14 @@ harnesses:
       bugfix: anthropic/claude-sonnet-5
       merge: anthropic/claude-haiku-4-5
       reask: anthropic/claude-haiku-4-5
+    # usage_tracking flipped true (Story 29.2-003, field finding 2026-09-05):
+    # `opencode run --format json` emits `step_finish` events carrying real
+    # per-step token counts and cost, which the `opencode-json` parser sums
+    # into the same four-key envelope the ledger already understands — no
+    # longer "unavailable" for a parallel OpenCode cohort's cost tracking.
     capabilities:
       worktree_isolation: true
       parallel: true
       json_contract: true
-      usage_tracking: false
+      usage_tracking: true
       rate_limit_aware: false
