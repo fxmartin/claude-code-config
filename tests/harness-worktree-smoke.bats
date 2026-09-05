@@ -85,3 +85,19 @@ teardown() {
     grep -q '"flags": "--custom-flag"' "$SANDBOX/evidence.json"
     grep -q 'adapter ran with flags: --custom-flag' "$SANDBOX/run3/wt-1.stdout"
 }
+
+@test "omitting --evidence-out defaults it to evidence.json under --sandbox" {
+    # Every other test passes --evidence-out explicitly, leaving the script's
+    # own default (`${sandbox}/evidence.json`) unexercised. --sandbox is still
+    # pinned here (unlike --evidence-out) because BSD mktemp on macOS ignores
+    # TMPDIR for a bare `mktemp -d`, unlike GNU mktemp in the Linux CI
+    # container — asserting on that default's location would pass on one
+    # platform and fail the other.
+    run bash "$SCRIPT" --harness fakeharness --adapter "$ADAPTER" \
+        --worktrees 1 --sandbox "$SANDBOX/run4"
+    [ "$status" -eq 0 ]
+
+    [ -f "$SANDBOX/run4/evidence.json" ]
+    grep -q '"harness": "fakeharness"' "$SANDBOX/run4/evidence.json"
+    [ -f "$SANDBOX/run4/wt-1/edited-by-fakeharness.txt" ]
+}
