@@ -57,6 +57,31 @@ EOF
     chmod +x "$TEST_BIN/qwen"
 }
 
+_install_mixed_qwen() {
+    # wt-2 fails, every other worktree succeeds — proves a per-worktree
+    # failure never gets mistaken for (or masked by) a sibling's success.
+    cat > "$TEST_BIN/qwen" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "--version" ]]; then
+    echo "0.0.0-fake"
+    exit 0
+fi
+if [[ "$(basename "$PWD")" == "wt-2" ]]; then
+    echo "No auth type is selected." >&2
+    exit 1
+fi
+printf '%s\n' "$@" >> "${QWEN_ARG_LOG}"
+echo done > "edited-by-qwen.txt"
+cat <<'RESULT'
+qwen reasoning prose
+<<<RESULT_JSON>>>
+{"branch_name":"n/a","build_status":"SUCCESS","commit_sha":"n/a"}
+<<<END_RESULT>>>
+RESULT
+EOF
+    chmod +x "$TEST_BIN/qwen"
+}
+
 @test "single worktree: successful qwen run edits only that worktree" {
     _install_succeeding_qwen
     run bash "$SCRIPT" --worktrees 1 --sandbox "$SANDBOX/run1" --evidence-out "$SANDBOX/evidence.json"
@@ -102,4 +127,21 @@ EOF
     [ "$status" -eq 1 ]
     run git -C "$SANDBOX/run5/scratch-repo" status --porcelain
     [ -z "$output" ]
+}
+
+@test "one worktree succeeding while its sibling fails keeps each edit confined to its own worktree" {
+    _install_mixed_qwen
+    run bash "$SCRIPT" --worktrees 2 --sandbox "$SANDBOX/run6" --evidence-out "$SANDBOX/evidence.json"
+    [ "$status" -eq 1 ]
+    [ -f "$SANDBOX/run6/wt-1/edited-by-qwen.txt" ]
+    [ ! -f "$SANDBOX/run6/wt-2/edited-by-qwen.txt" ]
+    grep -q '"overall": "FAIL"' "$SANDBOX/evidence.json"
+    # The successful sibling's file must never leak into the failed one.
+    grep -q '"isolation_ok": true' "$SANDBOX/evidence.json"
+}
+
+@test "an unrecognised flag exits with a usage error instead of running qwen" {
+    run bash "$SCRIPT" --bogus-flag
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"unknown argument"* ]]
 }
