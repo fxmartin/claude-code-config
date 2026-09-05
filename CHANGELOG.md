@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.52.1] - 2026-09-05
+
+### Fixed
+
+- fix(adapters): exec the agent cli instead of piping into sed (#635)
+
+
 ## [v2.52.0] - 2026-09-05
 
 ### Added
