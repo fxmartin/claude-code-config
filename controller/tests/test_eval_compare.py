@@ -312,6 +312,20 @@ def test_render_comparison_table_handles_missing_pct() -> None:
     assert "—" in table
 
 
+def test_render_comparison_table_handles_comparable_metric_with_no_pct() -> None:
+    # A zero-to-zero move is comparable (both sides present) but has no relative
+    # percentage — `_fmt_pct` must render the em dash instead of crashing on the
+    # division, and the row must go through the "(pct) arrow" branch, not the
+    # "not comparable" one.
+    base = _board("t1", [_score("t1", loc=0, tokens=1000, cost=0.05, wall=20, qual=1.0)], None)
+    cand = _board("t2", [_score("t1", loc=0, tokens=1000, cost=0.05, wall=20, qual=1.0)], None)
+    table = render_comparison_table(compare_scoreboards(base, cand))
+    loc_line = next(line for line in table.splitlines() if line.strip().startswith("netLOC"))
+    assert "not comparable" not in loc_line
+    assert "—" in loc_line
+    assert "= same" in loc_line
+
+
 def test_comparison_to_dict_roundtrips_shape() -> None:
     base = _board("A", [_score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0)], None)
     cand = _board("B", [_score("t1", loc=4, tokens=600, cost=0.02, wall=15, qual=1.0)], None)
@@ -630,6 +644,37 @@ def test_a_board_with_no_component_breakdown_cannot_have_its_mix_judged() -> Non
     tokens = _row(cmp_, "tokens_mean")
     assert tokens.comparable is False
     assert "component breakdown" in tokens.reason
+
+
+def test_candidate_with_no_component_breakdown_cannot_have_its_mix_judged() -> None:
+    # Same as above with the missing breakdown on the other side — the reason
+    # must name whichever arm actually lacks it, not always "baseline".
+    legacy = {"tokens_mean": 15000.0, "cost_mean": 0.05}
+    cmp_ = compare_scoreboards(_arm_board("new", **_CACHE_READ_ARM), _arm_board("old", **legacy))
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is False
+    assert "component breakdown" in tokens.reason
+    assert "candidate" in tokens.reason
+
+
+def test_components_summing_to_zero_cannot_have_their_mix_judged() -> None:
+    # All four components are present (not None) but sum to zero — there is no
+    # mix to divide by, so this must report the same "no breakdown" reason as a
+    # row that never carried components at all, not a ZeroDivisionError.
+    zero_mix = {
+        "tokens_mean": 0.0,
+        "cost_mean": 0.0,
+        "input_tokens_mean": 0.0,
+        "output_tokens_mean": 0.0,
+        "cache_read_tokens_mean": 0.0,
+        "cache_creation_tokens_mean": 0.0,
+        "tokens_source": "measured",
+    }
+    cmp_ = compare_scoreboards(_arm_board("zero", **zero_mix), _arm_board("new", **_CACHE_READ_ARM))
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is False
+    assert "component breakdown" in tokens.reason
+    assert "baseline" in tokens.reason
 
 
 # ---------------------------------------------------------------------------
