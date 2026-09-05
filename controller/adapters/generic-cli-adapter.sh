@@ -27,7 +27,7 @@ set -euo pipefail
 # headless. Edit this line per harness, or override at dispatch time by exporting
 # HARNESS_AGENT_CMD. Examples:
 #   AGENT_CMD="codex exec"
-#   AGENT_CMD="opencode run --quiet"
+#   AGENT_CMD="opencode run"
 AGENT_CMD="${HARNESS_AGENT_CMD:-}"
 
 # ---------------------------------------------------------------------------
@@ -61,5 +61,13 @@ if [ -z "$AGENT_CMD" ]; then
 fi
 
 # The controller delivers the prompt on stdin; hand it to the agent CLI on its
-# stdin and forward the CLI's stdout verbatim so the result block round-trips.
-exec bash -c "$AGENT_CMD"
+# stdin and forward the CLI's stdout so the result block round-trips.
+#
+# Colour is stripped on the way through: some CLIs (OpenCode 1.18.15, verified)
+# emit ANSI escapes even when stdout is not a TTY, and an escape landing inside
+# the result block makes the controller's contract parser reject the payload.
+# Everything outside the block is prose the controller ignores, so stripping is
+# safe and the block itself round-trips unchanged. `pipefail` (set above) keeps
+# the agent's own exit status, so a dispatch failure is still a dispatch failure.
+esc=$(printf '\033')
+bash -c "$AGENT_CMD" | sed -e "s/${esc}\[[0-9;?]*[a-zA-Z]//g"
