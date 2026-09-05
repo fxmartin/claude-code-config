@@ -424,6 +424,23 @@ def test_ticket_set_mismatches_flags_different_ticket_ids() -> None:
     assert any("ticket ids" in m for m in mismatches)
 
 
+def test_ticket_set_mismatches_reports_ids_missing_from_candidate() -> None:
+    # Baseline carries a ticket the candidate doesn't — the "only in baseline"
+    # side of the detail message, distinct from the "only in candidate" case
+    # covered above.
+    base = _board(
+        "A",
+        [
+            _score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0),
+            _score("t2", loc=1, tokens=1, cost=1, wall=1, qual=1.0),
+        ],
+        None,
+    )
+    cand = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    mismatches = ticket_set_mismatches(base, cand)
+    assert any("only in baseline" in m and "t2" in m for m in mismatches)
+
+
 def test_ticket_set_mismatches_flags_different_seed_when_both_known() -> None:
     base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
     base["provenance"] = _provenance(config_name="A", seed=1, ticket_ids=["t1"])
