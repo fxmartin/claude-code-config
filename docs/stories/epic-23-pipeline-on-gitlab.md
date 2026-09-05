@@ -152,6 +152,7 @@ GitLab CI template (23.3-001) for what "green" means.
 **Risk Level**: High
 
 ##### Story 23.2-003: Merge the MR + close the story issue + branch cleanup
+**Status**: Done
 **User Story**: As FX, I want a green MR merged and its story issue closed automatically so that the
 GitLab loop ends the same way the GitHub loop does.
 **Priority**: Should Have
