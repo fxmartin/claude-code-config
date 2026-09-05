@@ -1669,6 +1669,24 @@ is auditable in the run summary (AC3). `DegradationPlan.to_records()` yields the
 structured rows (`harness`, `kind`, `missing`, `message`, `requested_mode`,
 `effective_mode`) the ledger/summary persists.
 
+### Cross-harness benchmarking (Story 31.3-002)
+
+Comparing two harnesses' `sdlc eval` scoreboards (Epic-18, above) is not
+plain arithmetic once more than one harness is in the registry — a harness's
+declared capabilities decide what is even comparable. `usage_tracking: false`
+means the token/cost axes are unavailable, never `0`; `rate_limit_aware:
+false` means there is no stall to subtract, so its absence is correct, not a
+faster run; `parallel: false` means the eval already ran that arm serially,
+same as every other arm (the eval harness never exercises parallelism on
+either side). The method note at
+[`docs/harness-benchmarking-method.md`](harness-benchmarking-method.md)
+writes down each metric's source and precision (the ledger's whole-second
+`CURRENT_TIMESTAMP` vs the eval's sub-second `time.monotonic()` — never
+mixed in one table), the known non-comparabilities above, the admission
+criteria a harness must meet before joining a comparison (probe passes,
+capabilities declared, telemetry status known), and the literal command
+sequence to reproduce a baseline for a new harness or model.
+
 ### Per-role harness routing (Story 20.2-001)
 
 `sdlc/role_routing.py` maps each **pipeline role** to a harness so that, for
