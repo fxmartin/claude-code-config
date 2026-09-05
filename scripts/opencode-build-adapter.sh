@@ -109,6 +109,12 @@ if [ -n "$MODEL" ]; then
   model_flags=(--model "$MODEL")
 fi
 
+# Redirect stdout through the ANSI filter FIRST, then `exec` the CLI, so the
+# wrapper hands over its own PID instead of staying alive as a pipeline parent
+# (matching the codex and qwen adapters). The controller dispatches this wrapper
+# on the captured path, where a timeout reaps only the direct child — a pipeline
+# would leave OpenCode orphaned and still writing to the worktree while the
+# controller retries. `sed` exits on EOF once the exec'd CLI is gone.
 esc=$(printf '\033')
-"${OPENCODE_BIN}" run --pure "${opencode_flags[@]}" "${model_flags[@]}" -- "${prompt}" \
-  | sed -e "s/${esc}\[[0-9;?]*[a-zA-Z]//g"
+exec > >(sed -e "s/${esc}\[[0-9;?]*[a-zA-Z]//g")
+exec "${OPENCODE_BIN}" run --pure "${opencode_flags[@]}" "${model_flags[@]}" -- "${prompt}"

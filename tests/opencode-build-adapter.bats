@@ -137,3 +137,50 @@ EOF
     [[ "${output}" == *"<<<RESULT_JSON>>>"* ]]
     [[ "${output}" == *'"build_status":"SUCCESS"'* ]]
 }
+
+# Story 29.2-001 (review finding 1): the registry dispatches this wrapper by bare
+# name with no `stream-json`, so the controller always takes `_dispatch_captured`
+# — whose docstring states that on timeout `subprocess.run` reaps only the DIRECT
+# child; process-group TERM->KILL escalation lives on the streaming path alone.
+# A wrapper that ends in a pipeline therefore leaves the real CLI orphaned and
+# still writing to the worktree while the controller advances to a retry: two
+# writers, one repo. The wrapper must hand its own PID to the CLI via `exec`,
+# exactly as the codex and qwen adapters do.
+@test "the opencode CLI does not survive a kill of the wrapper (exec, not a pipeline)" {
+    export OPENCODE_PIDFILE="${BATS_TEST_TMPDIR}/cli.pid"
+    cat > "${TEST_BIN}/opencode" <<'EOF'
+#!/usr/bin/env bash
+echo $$ > "${OPENCODE_PIDFILE}"
+exec sleep 300
+EOF
+    chmod +x "${TEST_BIN}/opencode"
+
+    printf 'prompt' | bash "${WRAPPER}" >/dev/null 2>&1 &
+    wrapper_pid=$!
+
+    # Event-based wait with headroom (CI runs on modest, shared containers).
+    for _ in $(seq 1 100); do
+        [ -s "${OPENCODE_PIDFILE}" ] && break
+        sleep 0.2
+    done
+    [ -s "${OPENCODE_PIDFILE}" ]
+    cli_pid="$(cat "${OPENCODE_PIDFILE}")"
+
+    # Exactly what `subprocess.run(timeout=...)` does on the captured path: kill
+    # the direct child only, then reap it.
+    kill -KILL "${wrapper_pid}" 2>/dev/null || true
+    wait "${wrapper_pid}" 2>/dev/null || true
+
+    for _ in $(seq 1 50); do
+        kill -0 "${cli_pid}" 2>/dev/null || break
+        sleep 0.2
+    done
+
+    # Clean up before asserting, so a failing run cannot leak a stray `sleep`.
+    survived=0
+    if kill -0 "${cli_pid}" 2>/dev/null; then
+        survived=1
+        kill -KILL "${cli_pid}" 2>/dev/null || true
+    fi
+    [ "${survived}" -eq 0 ]
+}

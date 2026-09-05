@@ -1063,7 +1063,7 @@ document.addEventListener("keydown", e => { if(e.key === "Escape") closeSession(
 // the per-run Builds view and this Portfolio view. The panel renders from the
 // local inventory cache (/api/portfolio) with no host call, so it works offline;
 // the refresh button (and switching to the view) just re-reads that cache.
-const HARNESS_GLYPH = {claude:"\\u25c6", codex:"\\u25c8", qwen:"\\u25c7"};
+const HARNESS_GLYPH = {claude:"\\u25c6", codex:"\\u25c8", qwen:"\\u25c7", opencode:"\\u25c9"};
 function harnessBadge(h){
   const g = HARNESS_GLYPH[String(h||"").toLowerCase()] || "\\u25c7";
   return "<span class='hbadge' title='harness'>"+g+" "+esc(h)+"</span>";

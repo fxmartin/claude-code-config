@@ -2100,3 +2100,30 @@ def test_portfolio_view_present_in_page() -> None:
     assert "/api/portfolio" in _PAGE
     assert "renderPortfolio" in _PAGE
     assert "harnessBadge" in _PAGE
+
+
+def test_harness_glyph_is_distinct_per_registered_harness() -> None:
+    """Story 29.2-001 (review finding 3): every harness in the registry needs its
+    own glyph. `opencode` had no key, so `harnessBadge`'s fallback handed it the
+    same diamond as `qwen` and the portfolio badge could not tell them apart."""
+    import re
+
+    import yaml
+
+    from sdlc.dashboard import _PAGE
+
+    match = re.search(r"const HARNESS_GLYPH = \{(.*?)\};", _PAGE)
+    assert match, "HARNESS_GLYPH map not found in the dashboard page"
+    glyphs = dict(re.findall(r'(\w+):"([^"]+)"', match.group(1)))
+
+    registry = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "sdlc" / "config" / "harnesses.yaml"
+    )
+    harnesses = yaml.safe_load(registry.read_text())["harnesses"]
+
+    missing = sorted(set(harnesses) - set(glyphs))
+    assert not missing, f"harnesses with no dashboard glyph: {missing}"
+    assert len(set(glyphs.values())) == len(glyphs), (
+        f"duplicate harness glyphs: {glyphs}"
+    )
