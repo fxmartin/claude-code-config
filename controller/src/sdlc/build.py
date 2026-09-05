@@ -4850,6 +4850,18 @@ def render_merge_prompt(
         'merge_status="SKIPPED" and set merge_sha to the sha it landed at (and '
         "merged_at to when) so the controller records the landing instead of "
         "treating the stage as failed.\n"
+        # Story 29.1-001, run 8e16140c (merge attempt 1): the agent correctly
+        # detected the high-risk block and reported it, but wrote
+        # "merged_at": null for the timestamp it did not have. The schema types
+        # both fields as strings and only permits them *empty* on a non-MERGED
+        # outcome, so the envelope failed validation — and a contract error is
+        # classified before block_reason is ever read, so the 12.3-003
+        # awaiting-approval park was replaced by a re-ask and the bugfix loop.
+        # The empty-string convention lived only in the schema; say it here.
+        "merge_sha and merged_at are always JSON strings: when nothing landed "
+        "(FAILED, or SKIPPED with no earlier merge to point at) set them both "
+        'to the empty string "" — never null, which fails contract validation '
+        "and hides the reason you reported.\n"
         + _result_wrapper("merge-agent-response.schema.json")
     )
 

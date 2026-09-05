@@ -432,6 +432,23 @@ def test_render_merge_prompt_uses_mr_terms_on_gitlab() -> None:
     assert "gh issue close" not in prompt
 
 
+def test_render_merge_prompt_states_empty_string_convention() -> None:
+    """The fix pipeline's merge prompt shares the merge schema, so it shares the
+    null-timestamp trap that broke run 8e16140c (story 29.1-001).
+
+    Both of its documented non-merged exits — a rebase conflict and the
+    high-risk approval block — tell the agent to report FAILED without ever
+    saying what ``merge_sha``/``merged_at`` should hold. The schema types them
+    as strings and permits them empty; null fails validation and buries the
+    ``block_reason`` the controller parks on.
+    """
+    issue = FixIssue(38, "Bug", "b", "open", (), ())
+    prompt = render_merge_prompt(issue, 100)
+    assert "never null" in prompt
+    assert "merge_sha" in prompt and "merged_at" in prompt
+    assert '""' in prompt
+
+
 def test_render_merge_prompt_default_is_byte_identical_to_pre_606() -> None:
     """GitHub's default `cr_terms` must render the exact pre-#606 merge prompt."""
     issue = FixIssue(38, "Bug", "b", "open", (), ())

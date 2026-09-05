@@ -4577,6 +4577,56 @@ def test_high_risk_block_passes_real_merge_schema_validation() -> None:
     assert validate_response("merge", good) == good
 
 
+def test_merge_prompt_states_empty_string_convention_for_non_merged() -> None:
+    """The merge prompt must tell the agent to emit "" — never null — when
+    nothing landed (Story 29.1-001).
+
+    Regression for run 8e16140c (story 29.1-001, merge attempt 1). PR #633 was
+    correctly detected as high-risk-blocked and the agent emitted
+    ``{"merge_status": "FAILED", "merged_at": null, "block_reason":
+    "BLOCKED_HIGH_RISK"}``. The schema types ``merged_at`` as a string and
+    permits it *empty* on a non-MERGED outcome, but nothing in the agent-facing
+    prompt ever said so — the empty-string convention lived only in the schema
+    description and the controller's own docstrings. JSON null was the natural
+    choice for "no timestamp", so the envelope failed validation, the block was
+    classified ``contract`` instead of ``awaiting_approval``, and the
+    12.3-003 park was replaced by an envelope re-ask plus the bugfix loop.
+    """
+    from sdlc.build import render_merge_prompt
+
+    prompt = render_merge_prompt(_story("99.1-001"), 7)
+    assert "never null" in prompt
+    assert "merge_sha" in prompt and "merged_at" in prompt
+    assert '""' in prompt
+
+
+def test_high_risk_block_with_null_timestamp_fails_validation() -> None:
+    """The exact envelope run 8e16140c emitted is a contract violation.
+
+    Pins *why* the prompt fix above is the fix: a JSON null timestamp is not a
+    string, so validation rejects the response before ``block_reason`` can ever
+    be read — the awaiting-approval short-circuit is unreachable. The same
+    response with the documented empty string validates and is detected as a
+    high-risk block.
+    """
+    from sdlc.build import _merge_awaiting_approval
+    from sdlc.contracts import SchemaValidationError, validate_response
+
+    observed = {
+        "pr_number": 633,
+        "merge_status": "FAILED",
+        "merge_sha": "e7d945581890c88252aec0cbeb84917eeb36a237",
+        "merged_at": None,
+        "block_reason": "BLOCKED_HIGH_RISK",
+    }
+    with pytest.raises(SchemaValidationError):
+        validate_response("merge", observed)
+
+    corrected = {**observed, "merge_sha": "", "merged_at": ""}
+    assert validate_response("merge", corrected) == corrected
+    assert _merge_awaiting_approval("merge", corrected) is True
+
+
 def test_high_risk_block_detected_as_awaiting_approval() -> None:
     from sdlc.build import _merge_awaiting_approval
 

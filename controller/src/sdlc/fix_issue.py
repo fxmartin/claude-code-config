@@ -715,7 +715,15 @@ def render_merge_prompt(
         f"If the {abbr} has already been merged, do not merge again: report "
         "merge_status SKIPPED and set merge_sha to the sha it landed at (and "
         "merged_at to when) so the controller records the landing instead of "
-        "treating the stage as failed.\n\n"
+        "treating the stage as failed.\n"
+        # Story 29.1-001: same schema, same trap as the build pipeline's merge
+        # prompt. Both non-merged exits above (rebase conflict, high-risk block)
+        # leave the agent with no sha/timestamp; null fails validation and the
+        # resulting contract error buries the block_reason it just reported.
+        "merge_sha and merged_at are always JSON strings: when nothing landed "
+        "(FAILED, or SKIPPED with no earlier merge to point at) set them both "
+        'to the empty string "" — never null, which fails contract validation '
+        "and hides the reason you reported.\n\n"
         + _result_wrapper("merge-agent-response.schema.json")
     )
 
