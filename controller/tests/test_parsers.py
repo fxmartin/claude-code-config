@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from sdlc import parsers as sdlc_parsers
+
 from sdlc.contracts import (
     RESULT_END_MARKER,
     RESULT_START_MARKER,
@@ -513,6 +515,28 @@ def _oc_step_start_event(session_id: str = "ses_abc123") -> str:
     )
 
 
+@pytest.fixture
+def no_opencode_export(monkeypatch):
+    """Stub the AC4 post-hoc export seam out — no OpenCode CLI, nothing recovered.
+
+    Story 29.2-003 AC4 made ``OpenCodeJsonParser`` fall back to
+    ``opencode export <sessionID>`` whenever the live stream carried no usage.
+    That is a *subprocess*, and the suite must stay hermetic (no real CLI, on
+    any machine, offline CI included), so every test asserting the
+    "usage unavailable" outcome pins the fallback to "recovered nothing"
+    explicitly rather than depending on whether the box happens to have
+    OpenCode installed.
+    """
+    calls: list[str] = []
+
+    def _unavailable(session_id: str) -> None:
+        calls.append(session_id)
+        return None
+
+    monkeypatch.setattr(sdlc_parsers, "_opencode_export_text", _unavailable)
+    return calls
+
+
 def test_get_parser_resolves_opencode_json() -> None:
     parser = get_parser(OPENCODE_PARSER_ID)
     assert isinstance(parser, OpenCodeJsonParser)
@@ -575,12 +599,15 @@ def test_opencode_parser_missing_cost_is_none_not_fabricated() -> None:
     assert result.cost_usd is None
 
 
-def test_opencode_parser_truncated_step_finish_degrades_usage_to_unavailable() -> None:
+def test_opencode_parser_truncated_step_finish_degrades_usage_to_unavailable(
+    no_opencode_export,
+) -> None:
     # Story 29.2-003 AC3: a stream cut mid-line (e.g. a killed/truncated
     # process) must not fail the stage — the contract block already landed in
     # a complete earlier "text" line, so it is still honored; the truncated
     # step_finish line is simply unparsable JSON and is skipped, leaving no
-    # usable token counts.
+    # usable token counts. The AC4 export fallback is stubbed out here (no
+    # OpenCode on the box) so this stays the pure "nothing recovered" case.
     good_step_finish = _oc_step_finish_event()
     truncated = good_step_finish[: len(good_step_finish) // 2]
     stdout = "\n".join([_oc_text_event(_wrap(_VALID_BUILD)), truncated])
@@ -595,8 +622,11 @@ def test_opencode_parser_truncated_step_finish_degrades_usage_to_unavailable() -
     assert result.usage_available is True
 
 
-def test_opencode_parser_no_step_finish_event_is_usage_unavailable() -> None:
-    # A stream with well-formed JSON throughout but simply no usage event.
+def test_opencode_parser_no_step_finish_event_is_usage_unavailable(
+    no_opencode_export,
+) -> None:
+    # A stream with well-formed JSON throughout but simply no usage event, and
+    # no export to fall back to either (AC4 stubbed unavailable).
     stdout = "\n".join([_oc_step_start_event(), _oc_text_event(_wrap(_VALID_BUILD))])
     result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
     assert result.data == _VALID_BUILD
@@ -620,6 +650,48 @@ def test_opencode_parser_missing_result_block_raises_contract_error() -> None:
     stdout = "\n".join([_oc_text_event("no markers here"), _oc_step_finish_event()])
     with pytest.raises(ResultBlockError):
         get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+
+def test_opencode_parser_contract_miss_carries_usage_telemetry() -> None:
+    # Issue #435, now that opencode is a usage-tracking harness: a run that
+    # burned real tokens but ended in prose must hand its telemetry to the
+    # ContractError, or build.py's contract branch records a NULL-usage ledger
+    # row for a stage that genuinely cost money.
+    stdout = "\n".join(
+        [
+            _oc_text_event("I finished the change but forgot the result block."),
+            _oc_step_finish_event(input_tok=3, output_tok=62, cache_write=11746, cost=0.0150),
+        ]
+    )
+    with pytest.raises(ContractError) as exc:
+        get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+    err = exc.value
+    assert err.usage == {
+        "input_tokens": 3,
+        "output_tokens": 62,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 11746,
+    }
+    assert err.cost_usd == pytest.approx(0.0150)
+    # The harness tracks usage as a class, so the miss is not recorded as
+    # "usage unavailable" (ContractError's own default) — that would contradict
+    # the entry's `usage_tracking: true`.
+    assert err.usage_available is True
+
+
+def test_opencode_parser_contract_miss_without_usage_is_none_safe(
+    no_opencode_export,
+) -> None:
+    # A stream with no step_finish at all: the telemetry attributes must be
+    # present and None rather than fabricated as zero, mirroring the Claude
+    # parser's plain-text miss.
+    stdout = _oc_text_event("just prose, no result block here")
+    with pytest.raises(ContractError) as exc:
+        get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+    err = exc.value
+    assert err.usage is None
+    assert err.cost_usd is None
+    assert err.usage_available is True
 
 
 def test_opencode_parser_nonzero_exit_is_plain_dispatch_error() -> None:
@@ -751,3 +823,235 @@ def test_parse_opencode_export_usage_missing_info_key_returns_none() -> None:
     usage, cost = parse_opencode_export_usage('{"messages": []}')
     assert usage is None
     assert cost is None
+
+
+# --- The export seam wired into the parser (Story 29.2-003 AC4) ------------
+#
+# Review finding: `parse_opencode_export_usage` shipped with zero production
+# callers, so AC4's "recover it post-hoc" existed as a function nothing ever
+# ran. These pin the wiring: when — and only when — the live stream yielded no
+# usage but did name a session, the parser asks OpenCode itself.
+
+
+def _stub_export(monkeypatch, text: str | None) -> list[str]:
+    """Record every session id the parser asks to export; answer with `text`."""
+    calls: list[str] = []
+
+    def _export(session_id: str) -> str | None:
+        calls.append(session_id)
+        return text
+
+    monkeypatch.setattr(sdlc_parsers, "_opencode_export_text", _export)
+    return calls
+
+
+def test_opencode_parser_recovers_usage_from_export_when_stream_had_none(
+    monkeypatch,
+) -> None:
+    calls = _stub_export(monkeypatch, _oc_export_json())
+    # A well-formed stream that simply carried no `step_finish` — the case AC4
+    # exists for. The session id came off the `text` event.
+    stdout = "\n".join([_oc_step_start_event(), _oc_text_event(_wrap(_VALID_BUILD))])
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert calls == ["ses_abc123"]
+    assert result.data == _VALID_BUILD
+    assert result.usage == {
+        "input_tokens": 9,
+        "output_tokens": 132,
+        "cache_read_input_tokens": 11746,
+        "cache_creation_input_tokens": 11819,
+    }
+    assert result.cost_usd == pytest.approx(0.01661735)
+    assert result.usage_available is True
+
+
+def test_opencode_parser_export_recovery_survives_a_truncated_stream(
+    monkeypatch,
+) -> None:
+    # AC3 + AC4 together: the truncated `step_finish` is unusable, but the
+    # session id from the intact `text` line is enough to get the real tally.
+    good = _oc_step_finish_event()
+    stdout = "\n".join([_oc_text_event(_wrap(_VALID_BUILD)), good[: len(good) // 2]])
+    _stub_export(monkeypatch, _oc_export_json())
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert result.data == _VALID_BUILD
+    assert result.usage["input_tokens"] == 9
+
+
+def test_opencode_parser_does_not_export_when_the_stream_carried_usage(
+    monkeypatch,
+) -> None:
+    # The export is a *fallback*, not a second opinion: a stream that already
+    # reported its tokens must not spawn a subprocess, and must keep its own
+    # figures rather than being overwritten by the export's.
+    calls = _stub_export(monkeypatch, _oc_export_json())
+    stdout = "\n".join(
+        [_oc_text_event(_wrap(_VALID_BUILD)), _oc_step_finish_event(input_tok=3)]
+    )
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert calls == []
+    assert result.usage["input_tokens"] == 3
+
+
+def test_opencode_parser_does_not_export_without_a_session_id(monkeypatch) -> None:
+    # The non-NDJSON degraded path never learns a session id, so there is
+    # nothing to export — don't guess, don't shell out.
+    calls = _stub_export(monkeypatch, _oc_export_json())
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=_wrap(_VALID_BUILD)))
+
+    assert calls == []
+    assert result.data == _VALID_BUILD
+    assert result.usage is None
+
+
+def test_opencode_parser_export_recovery_keeps_a_cost_the_stream_reported(
+    monkeypatch,
+) -> None:
+    # A `step_finish` whose `tokens` is malformed but whose `cost` is valid:
+    # the live cost is real money and stays, while the tokens come from the
+    # export. The stream's own figure wins over the export's.
+    broken_tokens = json.dumps(
+        {
+            "type": "step_finish",
+            "sessionID": "ses_abc123",
+            "part": {"type": "step-finish", "tokens": "not-an-object", "cost": 0.25},
+        }
+    )
+    stdout = "\n".join([_oc_text_event(_wrap(_VALID_BUILD)), broken_tokens])
+    _stub_export(monkeypatch, _oc_export_json())
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert result.usage["input_tokens"] == 9
+    assert result.cost_usd == pytest.approx(0.25)
+
+
+def test_opencode_parser_keeps_cost_when_tokens_are_malformed_and_no_export(
+    no_opencode_export,
+) -> None:
+    # The gate is `saw_cost` alone, not `saw_usage and saw_cost`: dropping a
+    # cost the harness actually reported would fabricate a silent $0 for a
+    # stage that spent money — the same bug class as a NULL-usage contract miss.
+    broken_tokens = json.dumps(
+        {
+            "type": "step_finish",
+            "sessionID": "ses_abc123",
+            "part": {"type": "step-finish", "tokens": None, "cost": 0.25},
+        }
+    )
+    stdout = "\n".join([_oc_text_event(_wrap(_VALID_BUILD)), broken_tokens])
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert result.usage is None
+    assert result.cost_usd == pytest.approx(0.25)
+
+
+def test_opencode_parser_export_recovery_reaches_the_contract_error(
+    monkeypatch,
+) -> None:
+    # The two fixes compose: a prose-only run whose usage had to be recovered
+    # post-hoc still hands that usage to build.py's ContractError branch.
+    _stub_export(monkeypatch, _oc_export_json())
+    stdout = _oc_text_event("I forgot the result block entirely.")
+
+    with pytest.raises(ContractError) as exc:
+        get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert exc.value.usage["input_tokens"] == 9
+    assert exc.value.cost_usd == pytest.approx(0.01661735)
+
+
+def test_opencode_parser_unparseable_export_leaves_usage_unavailable(
+    monkeypatch,
+) -> None:
+    # An export that came back as garbage recovers nothing — never a zero.
+    _stub_export(monkeypatch, "opencode: no such session\n")
+    stdout = "\n".join([_oc_step_start_event(), _oc_text_event(_wrap(_VALID_BUILD))])
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert result.usage is None
+    assert result.cost_usd is None
+    assert result.usage_available is True
+
+
+# --- `_opencode_export_text`: the subprocess half of the seam ---------------
+
+
+def test_opencode_export_text_reads_a_file_never_a_pipe(monkeypatch, tmp_path) -> None:
+    # The field gotcha that cost real time: OpenCode truncates the export at
+    # ~64 KB through a pipe. This asserts the command's stdout is bound to a
+    # writable file handle, never subprocess.PIPE — a regression here would be
+    # invisible until an export happened to exceed 64 KB.
+    seen: dict = {}
+
+    def _fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["stdout"] = kwargs.get("stdout")
+        seen["timeout"] = kwargs.get("timeout")
+        kwargs["stdout"].write(_oc_export_json())
+        return _FakeCompleted("", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    text = sdlc_parsers._opencode_export_text("ses_abc123")
+
+    assert seen["cmd"] == ["opencode", "export", "ses_abc123"]
+    assert seen["stdout"] is not subprocess.PIPE
+    assert hasattr(seen["stdout"], "write")
+    # Bounded: a wedged OpenCode must not hang a stage that already finished.
+    assert seen["timeout"] == sdlc_parsers._EXPORT_TIMEOUT_S
+    usage, cost = parse_opencode_export_usage(text)
+    assert usage["input_tokens"] == 9
+    assert cost == pytest.approx(0.01661735)
+
+
+def test_opencode_export_text_honors_opencode_bin(monkeypatch) -> None:
+    # Same override the adapter honors (`scripts/opencode-build-adapter.sh`).
+    # OpenCode's sessions live in a per-install store, so exporting with a
+    # different binary than the one that ran the session finds nothing.
+    seen: dict = {}
+
+    def _fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        kwargs["stdout"].write(_oc_export_json())
+        return _FakeCompleted("", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setenv("OPENCODE_BIN", "/opt/custom/opencode")
+
+    assert sdlc_parsers._opencode_export_text("ses_abc123") is not None
+    assert seen["cmd"][0] == "/opt/custom/opencode"
+
+
+def test_opencode_export_text_returns_none_when_the_cli_is_absent(monkeypatch) -> None:
+    def _boom(cmd, **kwargs):
+        raise FileNotFoundError("opencode")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    assert sdlc_parsers._opencode_export_text("ses_abc123") is None
+
+
+def test_opencode_export_text_returns_none_on_timeout(monkeypatch) -> None:
+    def _hang(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, sdlc_parsers._EXPORT_TIMEOUT_S)
+
+    monkeypatch.setattr(subprocess, "run", _hang)
+    assert sdlc_parsers._opencode_export_text("ses_abc123") is None
+
+
+def test_opencode_export_text_returns_none_on_nonzero_exit(monkeypatch) -> None:
+    # An unknown session id exits non-zero; whatever partial bytes landed in the
+    # file are not a usable export.
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: _FakeCompleted("", returncode=1)
+    )
+    assert sdlc_parsers._opencode_export_text("ses_nope") is None

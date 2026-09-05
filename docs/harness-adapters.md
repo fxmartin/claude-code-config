@@ -78,6 +78,7 @@ genuinely new telemetry semantics:
 | ------------------- | --------------------------------------------------------------------------- |
 | `claude-stream-json`| The harness is Claude (stream-json envelope, usage, rate-limit, overflow).   |
 | `codex-exec`        | A plain CLI with a JSON contract but **no** usage/rate-limit telemetry. This is the parser any new stdin→`<<<RESULT_JSON>>>` harness should declare, including Qwen Code's `qwen -p` wrapper. |
+| `opencode-json`     | OpenCode specifically — `opencode run --format json`'s NDJSON event stream, from which it recovers the contract block AND real per-session tokens/cost (Story 29.2-003), falling back to a post-hoc `opencode export <sessionID>` when the stream carried no usage. Not a generic id: it keys on OpenCode's own `text` / `step_finish` event shapes. |
 
 The `codex-exec` parser reads the result block straight from stdout, records
 usage as *unavailable* (rather than a misleading zero), and treats every

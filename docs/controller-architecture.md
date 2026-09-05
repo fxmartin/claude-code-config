@@ -1632,25 +1632,29 @@ additive logging (all capabilities `true`, no probe), so dispatch is unchanged.
 | `worktree_isolation` | Can run each story in its own git worktree | ✅ | ❌ | ❌ | ✅ |
 | `parallel` | Can fan a cohort across concurrent workers | ✅ | ❌ | ❌ | ✅ |
 | `json_contract` | Emits the `<<<RESULT_JSON>>>` contract | ✅ | ✅ | ✅ | ✅ |
-| `usage_tracking` | Reports token usage / cost | ✅ | ❌ | ❌ | ❌ |
+| `usage_tracking` | Reports token usage / cost | ✅ | ❌ | ❌ | ✅ |
 | `rate_limit_aware` | Surfaces 429 / reset semantics for backoff | ✅ | ❌ | ❌ | ❌ |
 
 A `parallel` request on `codex` or `qwen` (neither declares
 `worktree_isolation` or `parallel`) degrades to `serial` with an explicit
 warning; their missing `usage_tracking` / `rate_limit_aware` are recorded as
 "unavailable" rather than fabricated (Story 20.5-002, below). `opencode`
-declares both `worktree_isolation` and `parallel` (Story 29.2-002, evidence:
+declares `worktree_isolation` and `parallel` (Story 29.2-002, evidence:
 `controller/eval/results/opencode-worktree-smoke-29.2-002.json`), so a
 `parallel` request routed to it runs concurrently with per-story isolation
-instead of degrading — its missing `usage_tracking` / `rate_limit_aware`
-still fall back the same way as codex/qwen.
+instead of degrading, and `usage_tracking` (Story 29.2-003), so its stages
+record real tokens/cost instead of "unavailable". Only its missing
+`rate_limit_aware` still falls back the same way as codex/qwen.
 
-The `opencode` adapter (Story 29.2-001) is the same no-telemetry recipe as
-`codex`/`qwen`: `scripts/opencode-build-adapter.sh` receives the prompt on
-stdin and passes it straight through to `opencode run --pure` (which reads its
+The `opencode` adapter (Story 29.2-001) is a stdin→CLI wrapper like
+`codex`/`qwen`, but — unlike them — it is **not** on the no-telemetry recipe:
+`scripts/opencode-build-adapter.sh` receives the prompt on stdin and passes it
+straight through to `opencode run --pure --format json` (which reads its
 message from stdin when given no positional), strips the ANSI colour OpenCode
-emits even off a TTY, and forwards the `<<<RESULT_JSON>>>` block to the
-`codex-exec` parser. Unattended dispatch requires the target repo's
+emits even off a TTY, and forwards the resulting NDJSON event stream to the
+`opencode-json` parser (Story 29.2-003), which recovers the
+`<<<RESULT_JSON>>>` block from the stream's `text` events and real per-session
+tokens/cost from its `step_finish` events. Unattended dispatch requires the target repo's
 `opencode.json` to set `"permission": { "edit": "allow", "bash": "allow" }` —
 without it OpenCode blocks on an interactive approval prompt with no TTY to
 answer it and the run hangs rather than failing fast. Story 29.2-002 verified
@@ -1879,7 +1883,7 @@ instead of the lossy plain-stdout fallback. The split is *collection* vs
   id; `None` selects the built-in default. An **unregistered id fails fast** with
   `UnknownParserError` (the typo + the registered ids), never a silent mis-parse.
 
-Two parsers ship:
+Three parsers ship:
 
 - **`claude-stream-json`** — `ClaudeStreamJsonParser`, the built-in default. The
   former `_interpret` body, preserved **verbatim**, so the Claude path is
@@ -1894,6 +1898,24 @@ Two parsers ship:
   `AgentDispatchError`, never a fabricated 429. Usage is recorded as
   **unavailable** (`AgentResult.usage_available=False`, `usage=None`) rather than
   fabricated as zero, so cost tracking skips the stage and the run still advances.
+- **`opencode-json`** — `OpenCodeJsonParser` (Story 29.2-003), for `opencode run
+  --format json`'s NDJSON event stream: one JSON object per line, no envelope.
+  It concatenates the `text` events' `part.text` back into the agent's response
+  (which is where the `<<<RESULT_JSON>>>` block lives) and **sums** every
+  `step_finish` event's `part.tokens` / `part.cost` — they are per-step, not
+  cumulative — into the same four-key usage envelope the ledger reads, folding
+  `reasoning` into `output_tokens` (no dedicated column, same as Claude's
+  envelope). Like `codex-exec` it has no rate-limit/overflow semantics, and it
+  never fabricates: an unparsable line is skipped, a stream that yields no
+  `step_finish` records `usage=None`, and a stream that is not NDJSON at all
+  degrades to reading raw stdout as the plain contract path. A contract miss
+  still carries the run's telemetry on the exception (Issue #435), so an
+  opencode stage that ends in prose records the tokens it really burned. When
+  the stream yielded no usage at all but did name its session, the parser falls
+  back to asking OpenCode itself — `opencode export <sessionID>`, captured to a
+  **file** (the export truncates at ~64 KB through a pipe) with a 30s ceiling,
+  and best-effort throughout: a missing CLI, a non-zero exit or a timeout leaves
+  usage unavailable rather than failing a stage whose work already succeeded.
 
 The `<<<RESULT_JSON>>>` contract (`sdlc.contracts.parse_and_validate`) is the
 harness-neutral seam both parsers validate against. `dispatch_agent(…, parser=…)`
