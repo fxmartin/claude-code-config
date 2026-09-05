@@ -15,7 +15,14 @@
 # Environment:
 #   QWEN_BIN    Override the Qwen executable path/name (default `qwen`).
 #   QWEN_FLAGS  Extra flags inserted before `-p`. Word-split intentionally for
-#               simple flag strings, e.g. '--model qwen3-coder'.
+#               simple flag strings, e.g. '--model qwen3-coder'. For unattended
+#               writes (no TTY, no interactive approval prompt) include
+#               `--yolo` (equivalently `--approval-mode yolo`; undocumented in
+#               `qwen --help` as of 0.21.10 but functional) — e.g.
+#               QWEN_FLAGS='--yolo'. This flag only affects tool-call approval;
+#               it does not configure auth (see Story 29.1-001 evidence at
+#               controller/eval/results/qwen-worktree-smoke-29.1-001.json for a
+#               host where auth blocked the run before approval mode mattered).
 
 set -euo pipefail
 

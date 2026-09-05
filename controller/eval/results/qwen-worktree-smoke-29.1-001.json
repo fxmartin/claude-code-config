@@ -1,0 +1,26 @@
+{
+  "_note": "Story 29.1-001 recorded evidence — real `qwen -p --yolo` run via scripts/qwen-worktree-smoke.sh against a scratch repo with 2 concurrent git worktrees. Not a scoreboard: qwen never got past its own auth check in either worktree, so the worktree-isolation question the story asks is verified-negative on this host, not silently abandoned.",
+  "command": "QWEN_FLAGS=\"--yolo\" bash scripts/qwen-worktree-smoke.sh --worktrees 2 --sandbox <scratch> --evidence-out <evidence.json>",
+  "host": "fxmartins-MacBook-Pro/arm64",
+  "timestamp": "2026-09-05T12:35:00Z",
+  "qwen_version": "0.21.10",
+  "flags_attempted": "--yolo",
+  "worktrees": [
+    {
+      "worktree": "wt-1",
+      "exit_code": 1,
+      "stderr": "Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice. No auth type is selected. Please configure an auth type (e.g. via settings or `--auth-type`) before running in non-interactive mode."
+    },
+    {
+      "worktree": "wt-2",
+      "exit_code": 1,
+      "stderr": "Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice. No auth type is selected. Please configure an auth type (e.g. via settings or `--auth-type`) before running in non-interactive mode."
+    }
+  ],
+  "isolation_ok": true,
+  "overall": "FAIL",
+  "failure_category": "harness_auth_unconfigured",
+  "root_cause": "No qwen auth type is configured on this host, and the CLI's own `qwen auth` subcommand is marked '(removed)' in v0.21.10 — there is no headless way to configure one either. A prior probe (controller/eval/results/qwen-preflight-failure.json, story 31.3-001) also tried `--auth-type qwen-oauth`, which reports the free OAuth tier was discontinued on 2026-04-15; a paid provider credential (Coding Plan, OpenRouter, Fireworks AI, ...) would be needed to get past this check.",
+  "approval_flag_found": "--yolo (equivalently --approval-mode yolo) is accepted by qwen 0.21.10 for unattended tool execution, even though it is undocumented in `qwen --help`. It was exercised in this run; it did not by itself unblock the auth check.",
+  "conclusion": "The worktree-isolation question (does an edit stay confined to its own worktree, and do concurrent worktrees stay isolated from each other and the repo root) was answered PASS as a side effect — both worktrees, both failing identically, left zero cross-contamination and the scratch repo root stayed clean. But qwen never completed the requested edit task in either worktree, so AC1's 'the task completes' condition is not met. Per AC5, `worktree_isolation` and `parallel` stay `false` in harnesses.yaml pending a host with configured qwen auth; this story closes as verified-negative."
+}

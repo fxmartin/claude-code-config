@@ -101,6 +101,21 @@ harnesses:
   # <<<RESULT_JSON>>> contract to the same plain parser used by Codex. Qwen Code
   # does not expose Claude-style stream-json / usage / rate-limit telemetry
   # through this wrapper, so those capabilities stay false.
+  #
+  # worktree_isolation / parallel verified-negative (Story 29.1-001, evidence:
+  # controller/eval/results/qwen-worktree-smoke-29.1-001.json, 2026-09-05, qwen
+  # 0.21.10): scripts/qwen-worktree-smoke.sh cut two concurrent git worktrees
+  # and ran the adapter in each. Isolation itself held (both worktrees stayed
+  # confined, no cross-contamination, scratch repo root untouched) — but qwen
+  # never completed the requested edit in either worktree because no auth type
+  # is configured on the verification host and the CLI's `qwen auth`
+  # subcommand is marked "(removed)" in this version, so there is no headless
+  # way to configure one; a prior probe found the free OAuth tier was also
+  # discontinued (2026-04-15). `--yolo` (equivalently `--approval-mode yolo`,
+  # undocumented in `qwen --help`) is the flag needed for unattended tool
+  # execution — set it via QWEN_FLAGS — but it does not bypass the auth check.
+  # Flip both flags to true once re-run on a host with a configured qwen auth
+  # provider confirms the edit actually completes.
   qwen:
     command: "qwen-build-adapter.sh"
     parser: codex-exec

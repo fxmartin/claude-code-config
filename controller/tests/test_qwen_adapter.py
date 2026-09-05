@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from sdlc.capability import MODE_PARALLEL, preflight_harness, resolve_capabilities
 from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
+from sdlc.degradation import DegradationKind, evaluate_degradations
 from sdlc.dispatch import AgentDispatchError
 from sdlc.harness import dispatch_on_harness, resolve_harness
 from sdlc.parsers import PlainResultParser, get_parser
@@ -91,6 +93,39 @@ def test_qwen_nonzero_exit_is_plain_dispatch_error(monkeypatch) -> None:
     with pytest.raises(AgentDispatchError) as excinfo:
         dispatch_on_harness(qwen, "build", "prompt")
     assert type(excinfo.value) is AgentDispatchError
+
+
+# ---------------------------------------------------------------------------
+# Story 29.1-001: worktree_isolation/parallel verified-negative on this host
+# (evidence: controller/eval/results/qwen-worktree-smoke-29.1-001.json) — qwen
+# never got past its own auth check inside a fresh worktree, so the flags stay
+# false rather than being flipped without proof. These tests lock the current
+# degradation behaviour as a regression guard: they must be updated (with new
+# evidence) if the harnesses.yaml capabilities are ever flipped to true.
+# ---------------------------------------------------------------------------
+
+
+def test_qwen_parallel_request_still_degrades_to_serial() -> None:
+    qwen = resolve_harness("qwen", config_path=CONFIG_PATH)
+    capabilities = resolve_capabilities(qwen)
+    plan = evaluate_degradations(qwen.name, capabilities, requested_mode=MODE_PARALLEL)
+
+    assert plan.has(DegradationKind.PARALLEL_TO_SERIAL)
+    assert plan.effective_mode != MODE_PARALLEL
+
+
+def test_qwen_preflight_warns_on_parallel_request() -> None:
+    qwen = resolve_harness("qwen", config_path=CONFIG_PATH)
+    pf = preflight_harness(qwen, requested_mode=MODE_PARALLEL)
+
+    assert pf.degraded is True
+    assert any("parallel" in warning for warning in pf.warnings)
+
+
+def test_qwen_capabilities_declare_no_worktree_isolation_pending_evidence() -> None:
+    qwen = resolve_harness("qwen", config_path=CONFIG_PATH)
+    assert qwen.capabilities["worktree_isolation"] is False
+    assert qwen.capabilities["parallel"] is False
 
 
 def test_full_qwen_run_spawns_zero_claude() -> None:
