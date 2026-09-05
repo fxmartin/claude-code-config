@@ -2503,10 +2503,12 @@ def eval_cmd(
     """
     import tempfile
 
+    from sdlc.capability import ProbeStatus, probe_harness
     from sdlc.evaluate import (
         EvalConfig,
         EvalConfigError,
         aggregate,
+        build_provenance,
         dispatcher_for_harness,
         load_config,
         render_table,
@@ -2576,7 +2578,14 @@ def eval_cmd(
         ws.mkdir(parents=True, exist_ok=True)
         results = run_eval(config, ws, dispatcher=dispatcher_for_harness(resolved_harness))
 
-    board = aggregate(results, config.name, harness=config.harness)
+    # Story 31.1-002 AC1: the same probe the preflight above already ran is the
+    # source of truth for the recorded harness version — a harness declaring no
+    # `probe` (e.g. the built-in claude harness) leaves this `None`, not an error.
+    probe = probe_harness(resolved_harness)
+    harness_version = probe.detail if probe.status is ProbeStatus.AVAILABLE else None
+    provenance = build_provenance(config, harness_version=harness_version)
+
+    board = aggregate(results, config.name, harness=config.harness, provenance=provenance)
     if as_json:
         typer.echo(json.dumps(scoreboard_to_dict(board), indent=2))
     else:
@@ -2612,6 +2621,15 @@ def eval_compare_cmd(
         help="Also persist the comparison JSON to this path (records the A/B decision).",
         show_default=False,
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Compare anyway when the two scoreboards' ticket sets (config name/"
+            "seed/ticket ids) disagree — the mismatch prints as a warning instead "
+            "of a refusal."
+        ),
+    ),
 ) -> None:
     """Compare two eval scoreboards on the same tickets — per-metric delta + verdict.
 
@@ -2619,14 +2637,19 @@ def eval_compare_cmd(
     through `sdlc eval --json`), produces a side-by-side delta and a clear
     better/worse/neutral verdict per ticket and overall, and can persist the
     comparison (`--out`) so a prompt/model decision is backed by data, not vibes. A
-    malformed scoreboard exits 2.
+    malformed scoreboard exits 2. Story 31.1-002: the two scoreboards must share a
+    ticket-set identity (config name + seed + ticket ids) or the comparison is
+    refused (exit 2) — pass `--force` to compare mismatched ticket sets anyway. A
+    scoreboard predating provenance tracking is still accepted, with a warning.
     """
     from sdlc.eval_compare import (
         BaselineError,
         comparison_to_dict,
         compare_scoreboards,
         load_scoreboard,
+        provenance_warnings,
         render_comparison_table,
+        ticket_set_mismatches,
     )
 
     try:
@@ -2636,8 +2659,23 @@ def eval_compare_cmd(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
 
+    mismatches = ticket_set_mismatches(base_board, cand_board)
+    if mismatches and not force:
+        typer.echo("error: refusing to compare different ticket sets (not an A/B):", err=True)
+        for reason in mismatches:
+            typer.echo(f"  - {reason}", err=True)
+        typer.echo("pass --force to compare anyway", err=True)
+        raise typer.Exit(code=2)
+
+    warnings = provenance_warnings(base_board, cand_board)
+    if mismatches:  # only reached with --force
+        warnings = [*warnings, *(f"ticket-set mismatch (forced): {r}" for r in mismatches)]
+    for warning in warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
     comparison = compare_scoreboards(base_board, cand_board, tolerance=tolerance)
     payload = comparison_to_dict(comparison)
+    payload["warnings"] = warnings
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

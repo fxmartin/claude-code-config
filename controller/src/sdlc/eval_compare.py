@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sdlc.harness import DEFAULT_HARNESS
+
 # Default relative tolerance: a metric must move more than this fraction of its
 # baseline to count as improved/regressed. Below it, model-run variance swamps the
 # signal, so the change is "neutral" — this is the knob that keeps the false-positive
@@ -89,6 +91,11 @@ class Comparison:
     tolerance: float
     tickets: list[TicketDelta]
     overall: TicketDelta | None
+    # Story 31.1-002 AC3: recorded unconditionally (not only when they differ)
+    # so a cross-harness A/B is never misread as a model-only delta — the
+    # header always states both, matching or not.
+    baseline_harness: str = DEFAULT_HARNESS
+    candidate_harness: str = DEFAULT_HARNESS
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +239,80 @@ def compare_scoreboards(
         tolerance=tolerance,
         tickets=tickets,
         overall=overall,
+        baseline_harness=str(baseline.get("harness") or DEFAULT_HARNESS),
+        candidate_harness=str(candidate.get("harness") or DEFAULT_HARNESS),
     )
+
+
+# ---------------------------------------------------------------------------
+# Provenance-aware guardrails (Story 31.1-002)
+# ---------------------------------------------------------------------------
+
+
+def _board_ticket_ids(board: dict[str, Any]) -> frozenset[str]:
+    return frozenset(
+        str(t["ticket_id"])
+        for t in board.get("tickets", [])
+        if isinstance(t, dict) and "ticket_id" in t
+    )
+
+
+def ticket_set_mismatches(baseline: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
+    """Human-readable reasons two scoreboards' ticket sets differ, ``[]`` if they match.
+
+    A "ticket set" is identified by config name + seed + ticket ids (AC2).
+    Config name and ticket ids are always present (even on a legacy
+    scoreboard, whose ``tickets`` list already names every ticket that ran),
+    so those two checks apply unconditionally. Seed only lives inside the
+    ``provenance`` block (Story 31.1-002 AC1), so it is compared only when
+    *both* sides carry one — a legacy scoreboard's absent seed is never
+    manufactured into a mismatch (AC4: legacy boards are accepted, not
+    penalised for predating provenance).
+    """
+    reasons: list[str] = []
+
+    base_name = str(baseline.get("config_name", ""))
+    cand_name = str(candidate.get("config_name", ""))
+    if base_name != cand_name:
+        reasons.append(f"config name differs: {base_name!r} vs {cand_name!r}")
+
+    base_prov = baseline.get("provenance")
+    cand_prov = candidate.get("provenance")
+    if isinstance(base_prov, dict) and isinstance(cand_prov, dict):
+        base_seed = base_prov.get("seed")
+        cand_seed = cand_prov.get("seed")
+        if base_seed != cand_seed:
+            reasons.append(f"seed differs: {base_seed!r} vs {cand_seed!r}")
+
+    base_ids = _board_ticket_ids(baseline)
+    cand_ids = _board_ticket_ids(candidate)
+    if base_ids != cand_ids:
+        only_base = sorted(base_ids - cand_ids)
+        only_cand = sorted(cand_ids - base_ids)
+        detail = []
+        if only_base:
+            detail.append(f"only in baseline: {only_base}")
+        if only_cand:
+            detail.append(f"only in candidate: {only_cand}")
+        reasons.append("ticket ids differ" + (f" ({'; '.join(detail)})" if detail else ""))
+
+    return reasons
+
+
+def provenance_warnings(baseline: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
+    """Warn (never reject, AC4) about a scoreboard predating provenance tracking."""
+    warnings: list[str] = []
+    if "provenance" not in baseline:
+        name = baseline.get("config_name", "baseline")
+        warnings.append(
+            f"{name}: provenance unknown (legacy scoreboard predates provenance tracking)"
+        )
+    if "provenance" not in candidate:
+        name = candidate.get("config_name", "candidate")
+        warnings.append(
+            f"{name}: provenance unknown (legacy scoreboard predates provenance tracking)"
+        )
+    return warnings
 
 
 def regressions(comparison: Comparison) -> list[tuple[str, MetricDelta]]:
@@ -278,8 +358,9 @@ _ARROW = {IMPROVED: "↓ better", REGRESSED: "↑ worse", NEUTRAL: "= same"}
 def render_comparison_table(comparison: Comparison) -> str:
     """Render an A/B comparison as a text table: per ticket, each metric + a verdict."""
     lines = [
-        f"compare: {comparison.baseline_name} (baseline) vs "
-        f"{comparison.candidate_name} (candidate)  [tolerance {comparison.tolerance:.0%}]",
+        f"compare: {comparison.baseline_name} (baseline, harness={comparison.baseline_harness}) vs "
+        f"{comparison.candidate_name} (candidate, harness={comparison.candidate_harness})  "
+        f"[tolerance {comparison.tolerance:.0%}]",
         "wall_s is stall-adjusted agent time (rate-limit waits excluded).",
     ]
     rows = list(comparison.tickets)
