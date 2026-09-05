@@ -3908,13 +3908,22 @@ def _parse_ts(value) -> datetime | None:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
-def _duration_seconds(started_at, finished_at, now: datetime | None = None) -> int | None:
+def _duration_seconds(
+    started_at, finished_at, now: datetime | None = None, stall_seconds: int | None = None,
+) -> int | None:
     """Whole-second span from ``started_at`` to ``finished_at`` (or ``now``).
 
     Returns None when the start is missing/unparseable (renders "—"), uses
     ``now`` (default: current UTC time) as the end for an in-progress span
     (``finished_at`` null), and degrades a negative span (clock skew / bad
     data) to None so the dashboard never shows a negative duration.
+
+    Story 31.2-001: ``stall_seconds`` (quota-backoff time already recorded as
+    its own ledger dimension — see :meth:`Ledger.stall_log`) is subtracted so
+    the returned figure is agent time, not agent-time-plus-rate-limit-wait.
+    Clamped at 0 rather than degrading to None: a span mostly spent stalled is
+    still a real (near-zero) duration, not clock skew. ``None``/``0`` is a
+    no-op, so a legacy ledger with no stall rows degrades to raw wall-clock.
     """
     start = _parse_ts(started_at)
     if start is None:
@@ -3923,16 +3932,26 @@ def _duration_seconds(started_at, finished_at, now: datetime | None = None) -> i
     if end is None:
         return None
     secs = (end - start).total_seconds()
-    return int(secs) if secs >= 0 else None
+    if secs < 0:
+        return None
+    if stall_seconds:
+        secs = max(0.0, secs - stall_seconds)
+    return int(secs)
 
 
-def _story_duration_seconds(stage_attempts: list[dict], now: datetime | None = None) -> int | None:
+def _story_duration_seconds(
+    stage_attempts: list[dict], now: datetime | None = None, stall_seconds: int | None = None,
+) -> int | None:
     """Wall-clock span of a story: earliest stage start → latest stage finish.
 
     The span (not the sum of stage durations) reflects real elapsed time
     including gaps between stages. An in-flight story (any started stage with no
     ``finished_at``) shows elapsed-so-far against ``now``. Returns None when no
     stage has started yet (renders "—").
+
+    Story 31.2-001: ``stall_seconds`` — this story's share of rate-limit wait
+    time — is subtracted for the same reason as :func:`_duration_seconds`
+    (agent time, not agent-time-plus-quota-backoff), clamped at 0.
     """
     starts = [_parse_ts(a.get("started_at")) for a in stage_attempts]
     starts = [s for s in starts if s is not None]
@@ -3949,7 +3968,11 @@ def _story_duration_seconds(stage_attempts: list[dict], now: datetime | None = N
             return None
         end = max(ends)
     secs = (end - earliest).total_seconds()
-    return int(secs) if secs >= 0 else None
+    if secs < 0:
+        return None
+    if stall_seconds:
+        secs = max(0.0, secs - stall_seconds)
+    return int(secs)
 
 
 def _sum_tokens(row: dict) -> int | None:
@@ -4112,13 +4135,17 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         # for the story, or None for runs with no streamed progress (captured
         # fallback / older runs) so consumers degrade to the stage name.
         s["activity"] = activity.get(s["story_id"])
-        # Per-story wall-clock duration (Story 11.2-005): earliest stage start →
-        # latest stage finish, elapsed-so-far while in flight. From the same
-        # attempts above, before PENDING/SKIPPED placeholders were appended.
-        s["duration_seconds"] = _story_duration_seconds(attempts, now=now)
         # Rate-limit stall time for the story (Story 27.3-004), shown apart
         # from the duration; None (not 0) when the story never stalled.
-        s["stall_seconds"] = stalls["by_story"].get(s["story_id"])
+        story_stall = stalls["by_story"].get(s["story_id"])
+        s["stall_seconds"] = story_stall
+        # Per-story agent-time duration (Story 11.2-005; stall-adjusted since
+        # 31.2-001): earliest stage start → latest stage finish, minus this
+        # story's stall time, elapsed-so-far while in flight. From the same
+        # attempts above, before PENDING/SKIPPED placeholders were appended.
+        s["duration_seconds"] = _story_duration_seconds(
+            attempts, now=now, stall_seconds=story_stall
+        )
 
     # Run-level usage rollup across every stage attempt of every story.
     run_usage = _aggregate_run_usage(breakdown)
@@ -4141,7 +4168,8 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "started_at": run_row.get("started_at"),
         "finished_at": run_row.get("finished_at"),
         "duration_seconds": _duration_seconds(
-            run_row.get("started_at"), run_row.get("finished_at"), now=now
+            run_row.get("started_at"), run_row.get("finished_at"), now=now,
+            stall_seconds=stalls["total_s"],
         ),
         "config": config,
         # Story 28.4-001: the fully-resolved routing config that *governed* this

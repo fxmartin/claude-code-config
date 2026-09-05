@@ -112,12 +112,16 @@ runs, with a final `OVERALL` aggregate:
 
 ```
 eval: strutils-baseline (harness: claude)
-ticket             runs err    +LOC    -LOC  netLOC    tokens    cost$  wall_s  qual
--------------------------------------------------------------------------------------
-add-capitalize        3   0     7.0     0.0     7.0      4120   0.0618    22.4  100%
+ticket           runs err    +LOC    -LOC  netLOC    tokens    cost$  wall_s stalled  qual
+------------------------------------------------------------------------------------------
+add-capitalize      3   0     7.0     0.0     7.0      4120   0.0618    22.4       —  100%
 ...
-OVERALL               9   0     8.1     0.3     7.8      4310   0.0646    23.1  100%
+OVERALL             9   0     8.1     0.3     7.8      4310   0.0646    23.1       —  100%
 ```
+
+`wall_s` is agent time: any in-process wait on a Max rate limit mid-ticket is
+excluded and shown separately in `stalled` (a bare `—` when the ticket never
+stalled) — a throttled ticket's wait time never inflates `wall_mean` (31.2-001).
 
 The `--json` form (`scoreboard_to_dict`) is the shape later stories store as a
 **baseline** to flag regressions (18.1-002) and run in **CI** on agent-affecting

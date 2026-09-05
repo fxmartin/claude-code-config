@@ -17,7 +17,7 @@ import yaml
 from sdlc.capability import ProbeRunner, ProbeStatus, probe_harness
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, _result_wrapper
 from sdlc.cost_estimate import DEFAULT_USD_PER_MILLION_TOKENS, notional_cost
-from sdlc.dispatch import AgentResult, dispatch_agent
+from sdlc.dispatch import AgentResult, RateLimitError, dispatch_agent
 from sdlc.harness import (
     DEFAULT_HARNESS,
     HarnessConfig,
@@ -26,6 +26,7 @@ from sdlc.harness import (
     resolve_harness,
 )
 from sdlc.model_routing import BALANCED, select_model
+from sdlc.rate_limit import seconds_until_reset, within_wait_cap
 
 # The four usage keys the agent envelope carries (mirrors build._RESULT_USAGE_KEYS
 # and dispatch's envelope parsing) so eval token counts match ledger metrics.
@@ -39,6 +40,11 @@ _USAGE_KEYS = (
 # Default per-story headless dispatch ceiling (seconds). An eval ticket is a small
 # edit on a tiny repo, so it should finish well inside a build's full timeout.
 DEFAULT_TICKET_TIMEOUT_S = 600
+
+# In-process rate-limit auto-wait cap (Story 31.2-001), mirroring build.py's
+# ``rate_limit_max_wait_s`` (~one Max rolling window). A wait beyond this is
+# treated as a lost run rather than held indefinitely inside an eval sweep.
+DEFAULT_RATE_LIMIT_MAX_WAIT_S = 18000
 
 # Label used for the aggregate row in a scoreboard.
 OVERALL_LABEL = "OVERALL"
@@ -130,6 +136,10 @@ class RunResult:
     # infrastructure failure that discarded the run. Distinguishes a recoverable,
     # still-scored miss from a lost run in the scoreboard's provenance.
     status: str = "ok"
+    # Story 31.2-001: seconds this run spent waiting in-process on a rate limit,
+    # already excluded from ``wall_s`` above (agent time, not agent-time-plus-
+    # quota-backoff). ``None`` (not 0) when the run never stalled.
+    stall_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +156,9 @@ class TicketScore:
     cost_mean: float | None
     wall_mean: float
     quality_pass_rate: float | None
+    # Story 31.2-001: mean rate-limit wait already excluded from ``wall_mean``
+    # (the None-not-zero convention: absent when no run in this ticket stalled).
+    stall_mean: float | None = None
 
 
 @dataclass(frozen=True)
@@ -394,6 +407,7 @@ def _score_runs(ticket_id: str, runs: Sequence[RunResult]) -> TicketScore:
         quality_pass_rate=(
             sum(1 for q in quality if q) / len(quality) if quality else None
         ),
+        stall_mean=_optional_mean([r.stall_s for r in runs]),
     )
 
 
@@ -442,11 +456,16 @@ def _fmt_rate(value: float | None) -> str:
 
 
 def render_table(board: Scoreboard) -> str:
-    """Render a scoreboard as a fixed-width text table (one row per ticket + overall)."""
+    """Render a scoreboard as a fixed-width text table (one row per ticket + overall).
+
+    Story 31.2-001: ``wall_s`` is agent time — any in-process rate-limit wait is
+    already excluded and shown separately in ``stalled`` (blank when a ticket
+    never stalled), so neither figure silently stands in for the other.
+    """
     header = (
         f"{'ticket':<16} {'runs':>4} {'err':>3} "
         f"{'+LOC':>7} {'-LOC':>7} {'netLOC':>7} "
-        f"{'tokens':>9} {'cost$':>8} {'wall_s':>7} {'qual':>5}"
+        f"{'tokens':>9} {'cost$':>8} {'wall_s':>7} {'stalled':>7} {'qual':>5}"
     )
     lines = [f"eval: {board.config_name} (harness: {board.harness})", header, "-" * len(header)]
     rows = list(board.tickets)
@@ -459,7 +478,8 @@ def render_table(board: Scoreboard) -> str:
             f"{_fmt(score.loc_net_mean):>7} "
             f"{_fmt(score.tokens_mean, decimals=0):>9} "
             f"{_fmt(score.cost_mean, decimals=4):>8} "
-            f"{_fmt(score.wall_mean):>7} {_fmt_rate(score.quality_pass_rate):>5}"
+            f"{_fmt(score.wall_mean):>7} {_fmt(score.stall_mean):>7} "
+            f"{_fmt_rate(score.quality_pass_rate):>5}"
         )
     return "\n".join(lines)
 
@@ -476,6 +496,7 @@ def _score_to_dict(score: TicketScore) -> dict[str, Any]:
         "cost_mean": score.cost_mean,
         "wall_mean": score.wall_mean,
         "quality_pass_rate": score.quality_pass_rate,
+        "stall_mean": score.stall_mean,
     }
 
 
@@ -617,6 +638,8 @@ def run_ticket(
     *,
     dispatcher: Dispatcher = dispatch_agent,
     timeout: int = DEFAULT_TICKET_TIMEOUT_S,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    rate_limit_max_wait_s: int = DEFAULT_RATE_LIMIT_MAX_WAIT_S,
 ) -> RunResult:
     """Drive one ticket once in an isolated workspace and score the result.
 
@@ -624,6 +647,15 @@ def run_ticket(
     the agent headlessly into it, then scores the diff (LOC), token/cost usage,
     wall-time, and the optional quality check. A dispatch failure is captured as
     ``error`` (with a zero diff) so one bad run never aborts the eval.
+
+    Story 31.2-001: a :class:`RateLimitError` mid-dispatch is a recoverable,
+    time-based pause (mirroring build.py's in-process wait, Story 14.1-003) —
+    the ticket waits for the window to reopen and retries the *same* dispatch,
+    rather than being scored as a lost run. Time spent waiting is tracked apart
+    from ``wall_s`` (see ``RunResult.stall_s``) so a single throttled ticket
+    can't skew ``wall_mean`` across the scoreboard. A wait beyond
+    ``rate_limit_max_wait_s`` gives up and scores the ticket as an error — an
+    eval sweep has no durable-park/resume path like a build run does.
     """
     workdir = workspace / f"{ticket.id}-{run_index}"
     _init_workspace(config.target, workdir)
@@ -636,46 +668,73 @@ def run_ticket(
     prompt = ticket.prompt + "\n\n" + _result_wrapper(AGENT_SCHEMAS[config.agent_type])
 
     start = time.monotonic()
-    try:
-        result = dispatcher(
-            config.agent_type,
-            prompt,
-            cwd=workdir,
-            model=config.model,
-            timeout=timeout,
-        )
-    except ContractError as exc:
-        # A contract miss is not a lost run: the agent still edited the workspace
-        # and burned tokens. Score the diff and quality, and recover tokens/cost
-        # from the telemetry parsers.py attached to the exception, under a distinct
-        # status so the scoreboard separates a scored miss from a real error.
-        wall = time.monotonic() - start
-        usage = getattr(exc, "usage", None)
-        return RunResult(
-            ticket_id=ticket.id,
-            run_index=run_index,
-            diff=_measure_diff(workdir),
-            wall_s=wall,
-            tokens=tokens_from_usage(usage),
-            cost_usd=_cost_from(
-                getattr(exc, "cost_usd", None),
-                usage,
-                usd_per_million_tokens=config.usd_per_million_tokens,
-            ),
-            quality_pass=run_quality_check(ticket.quality_cmd, workdir),
-            status="contract_miss",
-        )
-    except Exception as exc:  # noqa: BLE001 — record any dispatch failure, keep going
-        wall = time.monotonic() - start
-        return RunResult(
-            ticket_id=ticket.id,
-            run_index=run_index,
-            diff=_measure_diff(workdir),
-            wall_s=wall,
-            error=f"{type(exc).__name__}: {exc}",
-            status="error",
-        )
-    wall = time.monotonic() - start
+    stall_s = 0.0
+    while True:
+        try:
+            result = dispatcher(
+                config.agent_type,
+                prompt,
+                cwd=workdir,
+                model=config.model,
+                timeout=timeout,
+            )
+        except RateLimitError as exc:
+            wait_s = seconds_until_reset(
+                exc.signal, now=time.time(), window_s=rate_limit_max_wait_s
+            )
+            if not within_wait_cap(wait_s, rate_limit_max_wait_s):
+                wall = max(0.0, time.monotonic() - start - stall_s)
+                return RunResult(
+                    ticket_id=ticket.id,
+                    run_index=run_index,
+                    diff=_measure_diff(workdir),
+                    wall_s=wall,
+                    error=(
+                        f"rate limit wait ({wait_s}s) exceeds the "
+                        f"{rate_limit_max_wait_s}s cap: {exc}"
+                    ),
+                    status="error",
+                    stall_s=stall_s or None,
+                )
+            sleep_fn(wait_s)
+            stall_s += wait_s
+            continue
+        except ContractError as exc:
+            # A contract miss is not a lost run: the agent still edited the
+            # workspace and burned tokens. Score the diff and quality, and
+            # recover tokens/cost from the telemetry parsers.py attached to the
+            # exception, under a distinct status so the scoreboard separates a
+            # scored miss from a real error.
+            wall = max(0.0, time.monotonic() - start - stall_s)
+            usage = getattr(exc, "usage", None)
+            return RunResult(
+                ticket_id=ticket.id,
+                run_index=run_index,
+                diff=_measure_diff(workdir),
+                wall_s=wall,
+                tokens=tokens_from_usage(usage),
+                cost_usd=_cost_from(
+                    getattr(exc, "cost_usd", None),
+                    usage,
+                    usd_per_million_tokens=config.usd_per_million_tokens,
+                ),
+                quality_pass=run_quality_check(ticket.quality_cmd, workdir),
+                status="contract_miss",
+                stall_s=stall_s or None,
+            )
+        except Exception as exc:  # noqa: BLE001 — record any dispatch failure, keep going
+            wall = max(0.0, time.monotonic() - start - stall_s)
+            return RunResult(
+                ticket_id=ticket.id,
+                run_index=run_index,
+                diff=_measure_diff(workdir),
+                wall_s=wall,
+                error=f"{type(exc).__name__}: {exc}",
+                status="error",
+                stall_s=stall_s or None,
+            )
+        break
+    wall = max(0.0, time.monotonic() - start - stall_s)
 
     return RunResult(
         ticket_id=ticket.id,
@@ -688,6 +747,7 @@ def run_ticket(
         ),
         quality_pass=run_quality_check(ticket.quality_cmd, workdir),
         error=None,
+        stall_s=stall_s or None,
     )
 
 
@@ -697,6 +757,8 @@ def run_eval(
     *,
     dispatcher: Dispatcher = dispatch_agent,
     timeout: int = DEFAULT_TICKET_TIMEOUT_S,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    rate_limit_max_wait_s: int = DEFAULT_RATE_LIMIT_MAX_WAIT_S,
 ) -> list[RunResult]:
     """Run every ticket × ``n`` runs in isolation and return the per-run results.
 
@@ -715,6 +777,8 @@ def run_eval(
                     workspace,
                     dispatcher=dispatcher,
                     timeout=timeout,
+                    sleep_fn=sleep_fn,
+                    rate_limit_max_wait_s=rate_limit_max_wait_s,
                 )
             )
     return results

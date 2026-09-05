@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from sdlc.dispatch import AgentResult
+from sdlc.dispatch import AgentResult, RateLimitError
 from sdlc.evaluate import (
     DiffStats,
     EvalConfig,
@@ -24,10 +24,13 @@ from sdlc.evaluate import (
     result_cost,
     run_eval,
     run_quality_check,
+    run_ticket,
     scoreboard_to_dict,
     tokens_from_usage,
 )
 from sdlc.harness import DEFAULT_HARNESS
+from sdlc.rate_limit import RateLimitSignal
+
 
 # ---------------------------------------------------------------------------
 # parse_diff_numstat — LOC delta from git diff --numstat
@@ -142,6 +145,7 @@ def _run(
     wall: float = 1.0,
     quality: bool | None = None,
     error: str | None = None,
+    stall: float | None = None,
 ) -> RunResult:
     return RunResult(
         ticket_id=ticket,
@@ -152,6 +156,7 @@ def _run(
         cost_usd=cost,
         quality_pass=quality,
         error=error,
+        stall_s=stall,
     )
 
 
@@ -202,6 +207,25 @@ def test_aggregate_counts_errors_and_ignores_missing_quality() -> None:
     assert score.quality_pass_rate == 1.0  # only the one graded run counts
 
 
+def test_aggregate_stall_mean_ignores_never_stalled_runs() -> None:
+    # Story 31.2-001: a ticket where only one of two runs stalled reports the
+    # mean over the runs that actually stalled — the None-not-zero convention
+    # mirrors tokens_mean/cost_mean, so a never-stalled run never drags the
+    # mean toward zero.
+    results = [
+        _run("t1", 0, wall=10.0, stall=None),
+        _run("t1", 1, wall=8.0, stall=120.0),
+    ]
+    score = aggregate(results, "demo").tickets[0]
+    assert score.stall_mean == 120.0
+    assert score.wall_mean == 9.0
+
+
+def test_aggregate_stall_mean_none_when_no_run_stalled() -> None:
+    board = aggregate([_run("t1", 0, wall=5.0)], "demo")
+    assert board.tickets[0].stall_mean is None
+
+
 def test_aggregate_empty_has_no_overall() -> None:
     board = aggregate([], "demo")
     assert board.tickets == []
@@ -219,6 +243,19 @@ def test_render_table_includes_tickets_and_overall() -> None:
     assert "eval: demo" in table
     assert "t1" in table
     assert "OVERALL" in table
+
+
+def test_render_table_shows_stalled_column() -> None:
+    # Story 31.2-001: the stalled amount renders beside wall_s — a "—" for a
+    # ticket that never stalled, the seconds for one that did.
+    board = aggregate(
+        [_run("t1", 0, wall=8.0, stall=120.0), _run("t2", 0, wall=5.0)], "demo"
+    )
+    table = render_table(board)
+    assert "stalled" in table
+    lines = {line.split()[0]: line for line in table.splitlines()}
+    assert "120.0" in lines["t1"]
+    assert "—" in lines["t2"]
 
 
 def test_scoreboard_to_dict_roundtrips_shape() -> None:
@@ -450,6 +487,82 @@ def test_run_eval_captures_dispatch_failure_as_error(tmp_path: Path) -> None:
     assert results[0].error is not None
     assert "agent exploded" in results[0].error
     assert results[0].diff.net == 0  # no edits applied
+
+
+# ---------------------------------------------------------------------------
+# Story 31.2-001 — a rate-limit hit mid-ticket is a recoverable pause: the
+# ticket waits in-process and retries, and the wait is excluded from wall_s.
+# ---------------------------------------------------------------------------
+
+
+def test_run_ticket_retries_after_rate_limit_and_excludes_wait(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(name="demo", target=target, n=1, tickets=[Ticket(id="t1", prompt="p")])
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def flaky_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RateLimitError(
+                "429", signal=RateLimitSignal(source="429", retry_after_s=90)
+            )
+        return AgentResult(agent_type=agent_type, data={}, raw="")
+
+    run = run_ticket(
+        Ticket(id="t1", prompt="p"), config, 0, tmp_path / "ws",
+        dispatcher=flaky_dispatcher, sleep_fn=sleeps.append,
+    )
+    assert run.status == "ok"
+    assert run.error is None
+    assert calls["n"] == 2  # the same dispatch was retried, not abandoned
+    assert sleeps == [90]
+    assert run.stall_s == 90.0
+    assert run.wall_s >= 0.0
+
+
+def test_run_ticket_accumulates_stall_across_multiple_waits(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(name="demo", target=target, n=1, tickets=[Ticket(id="t1", prompt="p")])
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def flaky_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RateLimitError(
+                "429", signal=RateLimitSignal(source="429", retry_after_s=30)
+            )
+        return AgentResult(agent_type=agent_type, data={}, raw="")
+
+    run = run_ticket(
+        Ticket(id="t1", prompt="p"), config, 0, tmp_path / "ws",
+        dispatcher=flaky_dispatcher, sleep_fn=sleeps.append,
+    )
+    assert run.status == "ok"
+    assert sleeps == [30, 30]
+    assert run.stall_s == 60.0  # a single throttled ticket's total wait, not per-hit
+
+
+def test_run_ticket_gives_up_beyond_rate_limit_wait_cap(tmp_path: Path) -> None:
+    # An eval sweep has no durable-park/resume path like a build run does — a
+    # wait beyond the cap scores the ticket as an error instead of holding.
+    target = _sample_target(tmp_path)
+    config = EvalConfig(name="demo", target=target, n=1, tickets=[Ticket(id="t1", prompt="p")])
+
+    def throttled_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        raise RateLimitError(
+            "usage limit reached", signal=RateLimitSignal(source="usage-limit", retry_after_s=99_999)
+        )
+
+    run = run_ticket(
+        Ticket(id="t1", prompt="p"), config, 0, tmp_path / "ws",
+        dispatcher=throttled_dispatcher, sleep_fn=lambda _s: None,
+        rate_limit_max_wait_s=100,
+    )
+    assert run.status == "error"
+    assert run.stall_s is None  # nothing was actually waited
+    assert run.error is not None and "rate limit" in run.error.lower()
 
 
 def test_run_eval_runs_each_ticket_n_times(tmp_path: Path) -> None:
