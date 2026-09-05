@@ -3,19 +3,28 @@
 
 from __future__ import annotations
 
+import functools
 import shutil
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from sdlc.capability import ProbeRunner, ProbeStatus, probe_harness
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, _result_wrapper
 from sdlc.cost_estimate import DEFAULT_USD_PER_MILLION_TOKENS, notional_cost
 from sdlc.dispatch import AgentResult, dispatch_agent
+from sdlc.harness import (
+    DEFAULT_HARNESS,
+    HarnessConfig,
+    HarnessError,
+    dispatch_on_harness,
+    resolve_harness,
+)
 from sdlc.model_routing import BALANCED, select_model
 
 # The four usage keys the agent envelope carries (mirrors build._RESULT_USAGE_KEYS
@@ -75,6 +84,7 @@ class EvalConfig:
     agent_type: str = "build"
     usd_per_million_tokens: float = DEFAULT_USD_PER_MILLION_TOKENS
     model: str | None = None
+    harness: str | None = None
 
     def __post_init__(self) -> None:
         # Issue #435: pin a concrete model so an eval never silently runs on the
@@ -82,6 +92,12 @@ class EvalConfig:
         # Balanced-profile model for the eval's agent role (e.g. build → sonnet).
         if self.model is None:
             object.__setattr__(self, "model", select_model(self.agent_type, BALANCED))
+        # Story 31.1-001: pin a concrete harness name the same way — so a
+        # scoreboard never records "whatever the CLI happened to default to".
+        # A config naming none resolves to the built-in claude default, which
+        # dispatches byte-identically to today (AC3).
+        if self.harness is None:
+            object.__setattr__(self, "harness", DEFAULT_HARNESS)
 
 
 @dataclass(frozen=True)
@@ -139,6 +155,10 @@ class Scoreboard:
     config_name: str
     tickets: list[TicketScore] = field(default_factory=list)
     overall: TicketScore | None = None
+    # Story 31.1-001 AC1: the harness every ticket dispatch actually ran on, so
+    # per-harness scoreboards are comparable by construction, never guessed from
+    # context.
+    harness: str = DEFAULT_HARNESS
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +212,13 @@ def load_config(path: Path) -> EvalConfig:
     if model is not None and (not isinstance(model, str) or not model):
         raise EvalConfigError("config 'model' must be a non-empty string when set")
 
+    # Story 31.1-001: an optional harness name, resolved through the registry at
+    # dispatch time (never here — loading a config does no I/O beyond itself).
+    # Absent means the built-in claude default (EvalConfig pins it below).
+    harness = raw.get("harness")
+    if harness is not None and (not isinstance(harness, str) or not harness):
+        raise EvalConfigError("config 'harness' must be a non-empty string when set")
+
     raw_tickets = raw.get("tickets")
     if not isinstance(raw_tickets, list) or not raw_tickets:
         raise EvalConfigError("config 'tickets' is required and must be a non-empty list")
@@ -211,6 +238,7 @@ def load_config(path: Path) -> EvalConfig:
         seed=seed,
         agent_type=agent_type,
         model=model,
+        harness=harness,
     )
 
 
@@ -369,11 +397,22 @@ def _score_runs(ticket_id: str, runs: Sequence[RunResult]) -> TicketScore:
     )
 
 
-def aggregate(results: Sequence[RunResult], config_name: str) -> Scoreboard:
+def aggregate(
+    results: Sequence[RunResult],
+    config_name: str,
+    *,
+    harness: str | None = None,
+) -> Scoreboard:
     """Fold per-run results into per-ticket means plus an overall aggregate row.
 
     Ticket order follows first appearance in ``results`` so a scoreboard is stable
     and diff-friendly. An empty result set yields an empty scoreboard (no overall).
+    ``harness`` (Story 31.1-001 AC1) records the harness every dispatch in
+    ``results`` actually ran on; ``None`` (an existing caller that never passes it)
+    resolves to the built-in claude default, so today's scoreboard shape is
+    unchanged. Accepts ``None`` so a caller can pass ``EvalConfig.harness``
+    directly — typed optional at rest, always concrete after
+    ``EvalConfig.__post_init__`` pins it.
     """
     by_ticket: dict[str, list[RunResult]] = {}
     for r in results:
@@ -381,7 +420,12 @@ def aggregate(results: Sequence[RunResult], config_name: str) -> Scoreboard:
 
     tickets = [_score_runs(tid, runs) for tid, runs in by_ticket.items()]
     overall = _score_runs(OVERALL_LABEL, list(results)) if results else None
-    return Scoreboard(config_name=config_name, tickets=tickets, overall=overall)
+    return Scoreboard(
+        config_name=config_name,
+        tickets=tickets,
+        overall=overall,
+        harness=harness if harness is not None else DEFAULT_HARNESS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +448,7 @@ def render_table(board: Scoreboard) -> str:
         f"{'+LOC':>7} {'-LOC':>7} {'netLOC':>7} "
         f"{'tokens':>9} {'cost$':>8} {'wall_s':>7} {'qual':>5}"
     )
-    lines = [f"eval: {board.config_name}", header, "-" * len(header)]
+    lines = [f"eval: {board.config_name} (harness: {board.harness})", header, "-" * len(header)]
     rows = list(board.tickets)
     if board.overall is not None:
         rows.append(board.overall)
@@ -439,6 +483,7 @@ def scoreboard_to_dict(board: Scoreboard) -> dict[str, Any]:
     """Serialise a scoreboard to a plain dict for JSON output / baseline storage."""
     return {
         "config_name": board.config_name,
+        "harness": board.harness,
         "tickets": [_score_to_dict(t) for t in board.tickets],
         "overall": _score_to_dict(board.overall) if board.overall else None,
     }
@@ -452,6 +497,81 @@ def scoreboard_to_dict(board: Scoreboard) -> dict[str, Any]:
 # A dispatcher is anything with dispatch_agent's keyword surface; tests inject a
 # fake that edits ``cwd`` and returns a canned AgentResult instead of a live model.
 Dispatcher = Callable[..., AgentResult]
+
+
+# ---------------------------------------------------------------------------
+# Harness selection (Story 31.1-001)
+# ---------------------------------------------------------------------------
+
+
+def resolve_eval_harness(
+    config: EvalConfig,
+    *,
+    config_path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    probe_runner: ProbeRunner | None = None,
+) -> HarnessConfig:
+    """Resolve and preflight the eval's harness before any ticket dispatches.
+
+    Every ticket dispatch must go through the same resolved harness (command +
+    parser), so this resolves once, up front — never per-ticket, never mid-run.
+    A config naming no harness pins ``config.harness`` to
+    :data:`sdlc.harness.DEFAULT_HARNESS` in ``EvalConfig.__post_init__`` (mirroring
+    the model pin), so the no-harness path never reaches the registry lookup, the
+    probe, or the model-pin check below — dispatch stays byte-identical to today
+    (AC3).
+
+    Raises :class:`EvalConfigError` — before any dispatch, no half-run — when:
+
+    - the name is absent from the registry, or no registry is configured (AC4);
+    - a registry entry is declared ``enabled: false`` (AC4);
+    - the harness's ``probe`` command fails, meaning its CLI is not installed /
+      authenticated on this machine (AC5);
+    - a registry harness's command carries no ``{model}`` placeholder, so it
+      cannot honour the eval's pinned ``model`` (AC6) — surfaced here rather than
+      silently dropped.
+    """
+    try:
+        harness = resolve_harness(config.harness, config_path=config_path, env=env)
+    except HarnessError as exc:
+        where = f" (registry: {config_path})" if config_path is not None else ""
+        raise EvalConfigError(f"{exc}{where}") from exc
+
+    if not harness.enabled:
+        raise EvalConfigError(
+            f"harness {harness.name!r} is disabled in the registry "
+            f"({config_path}); enable it there or choose another harness"
+        )
+
+    probe = probe_harness(harness, runner=probe_runner)
+    if probe.status is ProbeStatus.UNAVAILABLE:
+        raise EvalConfigError(
+            f"harness {harness.name!r} probe failed: "
+            f"{probe.detail or 'CLI unavailable'}"
+        )
+
+    if harness.source == "registry" and "{model}" not in harness.command:
+        raise EvalConfigError(
+            f"harness {harness.name!r} cannot take a model pin (config model="
+            f"{config.model!r}); add a {{model}} placeholder and a 'models' map "
+            f"to its entry in the harness registry, or drop the harness override "
+            f"to run on the default claude harness"
+        )
+
+    return harness
+
+
+def dispatcher_for_harness(harness: HarnessConfig) -> Dispatcher:
+    """Bind a resolved harness's argv + parser to :func:`run_eval`'s Dispatcher seam.
+
+    Every ticket then dispatches through :func:`sdlc.harness.dispatch_on_harness`
+    bound to this one already-resolved ``harness`` — the registry is never
+    re-consulted inside the run loop. For the built-in/``env`` Claude slot this is
+    byte-identical to passing no dispatcher at all (AC3): ``dispatch_on_harness``
+    renders the same argv :func:`sdlc.dispatch.dispatch_agent` would resolve on its
+    own and keeps the default (stream-json) parser.
+    """
+    return functools.partial(dispatch_on_harness, harness)
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:

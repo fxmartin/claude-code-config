@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -15,16 +16,18 @@ from sdlc.evaluate import (
     RunResult,
     Ticket,
     aggregate,
+    dispatcher_for_harness,
     load_config,
     parse_diff_numstat,
     render_table,
+    resolve_eval_harness,
     result_cost,
     run_eval,
     run_quality_check,
     scoreboard_to_dict,
     tokens_from_usage,
 )
-
+from sdlc.harness import DEFAULT_HARNESS
 
 # ---------------------------------------------------------------------------
 # parse_diff_numstat — LOC delta from git diff --numstat
@@ -685,3 +688,280 @@ def test_load_config_rejects_empty_string_model(tmp_path: Path) -> None:
     )
     with pytest.raises(EvalConfigError, match="model"):
         load_config(path)
+
+
+# ---------------------------------------------------------------------------
+# Story 31.1-001 — harness selection: config field, CLI precedence (in
+# test_cli_eval.py), registry resolution, scoreboard provenance, preflight
+# aborts, and per-harness dispatch.
+# ---------------------------------------------------------------------------
+
+
+def test_eval_config_harness_defaults_to_claude() -> None:
+    config = EvalConfig(name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    # A concrete, pinned harness name — not None — mirroring the model pin
+    # (issue #435) so a scoreboard never records "whatever the CLI defaulted to".
+    assert config.harness == DEFAULT_HARNESS
+
+
+def test_eval_config_explicit_harness_is_kept() -> None:
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], harness="qwen"
+    )
+    assert config.harness == "qwen"
+
+
+def test_load_config_parses_explicit_harness(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\nharness: qwen\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    assert load_config(path).harness == "qwen"
+
+
+def test_load_config_absent_harness_defaults_to_claude(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\ntickets:\n  - id: t1\n    prompt: p\n",
+    )
+    assert load_config(path).harness == DEFAULT_HARNESS
+
+
+def test_load_config_rejects_non_string_harness(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\nharness: 123\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="harness"):
+        load_config(path)
+
+
+def test_load_config_rejects_empty_string_harness(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        'name: d\ntarget: target\nharness: ""\n'
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="harness"):
+        load_config(path)
+
+
+# --- Scoreboard records the harness name (AC1) -------------------------------
+
+
+def test_aggregate_defaults_scoreboard_harness_to_claude() -> None:
+    board = aggregate([_run("t1", 0, added=1)], "demo")
+    assert board.harness == DEFAULT_HARNESS
+
+
+def test_aggregate_records_explicit_harness() -> None:
+    board = aggregate([_run("t1", 0, added=1)], "demo", harness="qwen")
+    assert board.harness == "qwen"
+
+
+def test_render_table_includes_harness() -> None:
+    board = aggregate([_run("t1", 0, added=1)], "demo", harness="qwen")
+    assert "harness: qwen" in render_table(board)
+
+
+def test_scoreboard_to_dict_includes_harness() -> None:
+    board = aggregate([_run("t1", 0, added=1)], "demo", harness="qwen")
+    assert scoreboard_to_dict(board)["harness"] == "qwen"
+
+
+# --- resolve_eval_harness — preflight resolution + abort paths --------------
+
+
+def _write_registry(tmp_path: Path, body: str) -> Path:
+    cfg = tmp_path / "harnesses.yaml"
+    cfg.write_text(body, encoding="utf-8")
+    return cfg
+
+
+def test_resolve_eval_harness_unknown_name_aborts(tmp_path: Path) -> None:
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  codex:\n    command: codex exec\n    parser: codex-exec\n",
+    )
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], harness="bogus"
+    )
+    with pytest.raises(EvalConfigError, match="unknown harness 'bogus'"):
+        resolve_eval_harness(config, config_path=cfg)
+
+
+def test_resolve_eval_harness_unknown_name_names_the_registry_file(tmp_path: Path) -> None:
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  codex:\n    command: codex exec\n    parser: codex-exec\n",
+    )
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], harness="bogus"
+    )
+    with pytest.raises(EvalConfigError, match=re.escape(str(cfg))):
+        resolve_eval_harness(config, config_path=cfg)
+
+
+def test_resolve_eval_harness_no_registry_configured_aborts() -> None:
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], harness="qwen"
+    )
+    with pytest.raises(EvalConfigError, match="registry"):
+        resolve_eval_harness(config, config_path=None)
+
+
+def test_resolve_eval_harness_disabled_aborts(tmp_path: Path) -> None:
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  qwen:\n    command: qwen-build-adapter.sh\n"
+        "    parser: codex-exec\n    enabled: false\n",
+    )
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], harness="qwen"
+    )
+    with pytest.raises(EvalConfigError, match="disabled"):
+        resolve_eval_harness(config, config_path=cfg)
+
+
+def test_resolve_eval_harness_probe_failure_aborts(tmp_path: Path) -> None:
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  qwen:\n    command: qwen-build-adapter.sh\n"
+        "    parser: codex-exec\n    probe: 'qwen --version'\n",
+    )
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], harness="qwen"
+    )
+
+    def fake_probe_runner(argv: list[str]) -> tuple[int, str]:
+        return 127, "command not found: qwen"
+
+    with pytest.raises(EvalConfigError, match="probe failed"):
+        resolve_eval_harness(config, config_path=cfg, probe_runner=fake_probe_runner)
+
+
+def test_resolve_eval_harness_unsupported_model_pin_aborts(tmp_path: Path) -> None:
+    # No {model} placeholder in the command -> the harness ignores the eval's
+    # pinned model outright, so preflight must abort rather than silently drop it.
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  qwen:\n    command: qwen-build-adapter.sh\n    parser: codex-exec\n",
+    )
+    config = EvalConfig(
+        name="d",
+        target=Path("t"),
+        tickets=[Ticket(id="t1", prompt="p")],
+        harness="qwen",
+        model="opus",
+    )
+    with pytest.raises(EvalConfigError, match="cannot take a model pin"):
+        resolve_eval_harness(config, config_path=cfg)
+
+
+def test_resolve_eval_harness_model_placeholder_supported_succeeds(tmp_path: Path) -> None:
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  qwen:\n    command: 'qwen-build-adapter.sh --model {model}'\n"
+        "    parser: codex-exec\n    models:\n      default: qwen-max\n",
+    )
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], harness="qwen"
+    )
+    harness = resolve_eval_harness(config, config_path=cfg)
+    assert harness.name == "qwen"
+
+
+def test_resolve_eval_harness_default_claude_skips_probe_and_model_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3: a config naming no harness never touches the registry at all."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    # A registry that would abort on either check if it were ever consulted.
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  qwen:\n    command: qwen-build-adapter.sh\n"
+        "    parser: codex-exec\n    enabled: false\n",
+    )
+    config = EvalConfig(name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    harness = resolve_eval_harness(config, config_path=cfg)
+    assert harness.name == DEFAULT_HARNESS
+    assert harness.source == "builtin"
+
+
+def test_shipped_eval_configs_resolve_to_claude_default() -> None:
+    """DoD regression: existing configs run unchanged on the claude default."""
+    root = Path(__file__).resolve().parents[1] / "eval"
+    for name in ("eval-config.yaml", "ci-config.yaml"):
+        config = load_config(root / name)
+        assert config.harness == DEFAULT_HARNESS
+        harness = resolve_eval_harness(config, config_path=None)
+        assert harness.source == "builtin"
+
+
+# --- dispatcher_for_harness — per-ticket dispatch goes through the resolved --
+# harness's own command + parser (AC1), never re-resolving the registry.
+
+
+def test_dispatcher_for_harness_threads_registry_argv_and_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  qwen:\n    command: 'qwen-build-adapter.sh --model {model}'\n"
+        "    parser: codex-exec\n    models:\n      default: qwen-max\n",
+    )
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="d", target=target, n=1, tickets=[Ticket(id="t1", prompt="p")], harness="qwen"
+    )
+    harness = resolve_eval_harness(config, config_path=cfg)
+
+    seen: dict[str, object] = {}
+
+    def fake_dispatch_agent(
+        agent_type: str, prompt: str, *, agent_cmd=None, parser=None, **kwargs: object
+    ) -> AgentResult:
+        seen["agent_cmd"] = agent_cmd
+        seen["parser"] = parser
+        return AgentResult(agent_type=agent_type, data={}, raw="")
+
+    monkeypatch.setattr("sdlc.harness.dispatch_agent", fake_dispatch_agent)
+
+    run_eval(config, tmp_path / "ws", dispatcher=dispatcher_for_harness(harness))
+    assert seen["agent_cmd"] == harness.to_argv(model=config.model, stage=config.agent_type)
+    assert seen["parser"] == "codex-exec"
+
+
+def test_dispatcher_for_harness_builtin_matches_plain_dispatch_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3: the resolved default-slot dispatcher is byte-identical to no dispatcher."""
+    from sdlc.dispatch import resolve_agent_cmd
+
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="d",
+        target=target,
+        n=1,
+        model="haiku",
+        tickets=[Ticket(id="t1", prompt="p")],
+    )
+    harness = resolve_eval_harness(config, config_path=None)
+
+    seen: dict[str, object] = {}
+
+    def fake_dispatch_agent(
+        agent_type: str, prompt: str, *, agent_cmd=None, parser=None, **kwargs: object
+    ) -> AgentResult:
+        seen["agent_cmd"] = agent_cmd
+        seen["parser"] = parser
+        return AgentResult(agent_type=agent_type, data={}, raw="")
+
+    monkeypatch.setattr("sdlc.harness.dispatch_agent", fake_dispatch_agent)
+
+    run_eval(config, tmp_path / "ws", dispatcher=dispatcher_for_harness(harness))
+    assert seen["agent_cmd"] == resolve_agent_cmd(model="haiku")
+    assert seen["parser"] is None
