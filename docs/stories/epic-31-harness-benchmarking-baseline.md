@@ -1,6 +1,6 @@
 # Epic 31: Harness Benchmarking & Local-Model Baseline
 
-> **Status: IN PROGRESS (2/7)** — authored 2026-09-05, from FX's decision to
+> **Status: COMPLETE (7/7)** — authored 2026-09-05, from FX's decision to
 > baseline local agentic coding (OpenCode + a local dense Qwen model) against
 > the hosted Claude harness on **quality, token consumption, and time**.
 > Thesis: the controller already measures all three, but not *comparably*. The
@@ -157,6 +157,7 @@ than reaching into the registry from inside the run loop. Keep
 **Risk Level**: Medium
 
 ##### Story 31.1-002: Scoreboard provenance and refusal to compare unlike runs
+**Status**: Done
 **User Story**: As FX reading a scoreboard weeks later, I want every result to
 carry the harness, model, adapter/CLI version, host and timestamp that produced
 it, and `eval-compare` to refuse (not silently proceed) when two scoreboards
@@ -256,6 +257,7 @@ the local arm has no stall concept at all; absent is correct there, not zero.
 **Risk Level**: Medium
 
 ##### Story 31.2-002: Honest token accounting across harnesses
+**Status**: Done
 **User Story**: As FX comparing token consumption across harnesses, I want the
 comparison to refuse a token verdict both when an arm cannot report usage *and*
 when the two arms' totals are not made of the same thing, so that neither a
@@ -324,6 +326,7 @@ single highest-risk hole in the baseline: without it the local arm looks free.
 **Risk Level**: High
 
 ##### Story 31.2-003: A cost figure that means something for local inference
+**Status**: Done
 **User Story**: As FX weighing local inference against hosted API spend, I want
 the cost metric to distinguish metered spend from local inference (whose
 marginal cost is not $/token), so that "cost" in a cross-harness comparison is
@@ -380,6 +383,7 @@ session that produced it.
 #### Stories
 
 ##### Story 31.3-001: Recorded claude-vs-local baseline
+**Status**: Done
 **User Story**: As FX deciding whether local agentic coding is viable, I want a
 recorded head-to-head over the fixed ticket set — claude versus the local Qwen
 model, and OpenCode where Epic-29 has landed it — with quality, tokens and
@@ -430,6 +434,7 @@ the OpenCode arm (the qwen arm can proceed without it)
 **Risk Level**: Medium
 
 ##### Story 31.3-002: Benchmarking method and re-run runbook
+**Status**: Done
 **User Story**: As FX (or a colleague) re-running this in three months against
 a newer local model, I want the method written down — what is measured, what is
 deliberately not comparable, and the exact commands — so that a re-run is a
