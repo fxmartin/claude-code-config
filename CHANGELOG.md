@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.55.0] - 2026-09-05
+
+### Added
+
+- feat(harness-parallelism): verify and enable opencode (#29.2-002) (#637)
+
+
 ## [v2.54.0] - 2026-09-05
 
 ### Added
