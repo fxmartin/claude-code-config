@@ -1,0 +1,93 @@
+{
+  "config_name": "strutils-baseline",
+  "harness": "claude",
+  "tickets": [
+    {
+      "ticket_id": "add-capitalize",
+      "runs": 3,
+      "errors": 0,
+      "loc_added_mean": 12.0,
+      "loc_removed_mean": 1.0,
+      "loc_net_mean": 11.0,
+      "tokens_mean": 206940.66666666666,
+      "cost_mean": 0.10971833333333332,
+      "wall_mean": 32.922367528333176,
+      "quality_pass_rate": 1.0,
+      "stall_mean": null,
+      "input_tokens_mean": 13.333333333333334,
+      "output_tokens_mean": 1764.6666666666667,
+      "cache_read_tokens_mean": 191738.33333333334,
+      "cache_creation_tokens_mean": 13424.333333333334,
+      "tokens_source": "measured"
+    },
+    {
+      "ticket_id": "add-count-vowels",
+      "runs": 3,
+      "errors": 0,
+      "loc_added_mean": 7.333333333333333,
+      "loc_removed_mean": 0.6666666666666666,
+      "loc_net_mean": 6.666666666666667,
+      "tokens_mean": 206360.66666666666,
+      "cost_mean": 0.10798033333333334,
+      "wall_mean": 26.26942479200079,
+      "quality_pass_rate": 1.0,
+      "stall_mean": null,
+      "input_tokens_mean": 13.333333333333334,
+      "output_tokens_mean": 1614.6666666666667,
+      "cache_read_tokens_mean": 191348.33333333334,
+      "cache_creation_tokens_mean": 13384.333333333334,
+      "tokens_source": "measured"
+    },
+    {
+      "ticket_id": "add-truncate",
+      "runs": 3,
+      "errors": 0,
+      "loc_added_mean": 13.0,
+      "loc_removed_mean": 1.0,
+      "loc_net_mean": 12.0,
+      "tokens_mean": 184987.66666666666,
+      "cost_mean": 0.10159820000000001,
+      "wall_mean": 23.19599908334203,
+      "quality_pass_rate": 1.0,
+      "stall_mean": null,
+      "input_tokens_mean": 12.0,
+      "output_tokens_mean": 1477.6666666666667,
+      "cache_read_tokens_mean": 170314.33333333334,
+      "cache_creation_tokens_mean": 13183.666666666666,
+      "tokens_source": "measured"
+    }
+  ],
+  "overall": {
+    "ticket_id": "OVERALL",
+    "runs": 9,
+    "errors": 0,
+    "loc_added_mean": 10.777777777777779,
+    "loc_removed_mean": 0.8888888888888888,
+    "loc_net_mean": 9.88888888888889,
+    "tokens_mean": 199429.66666666666,
+    "cost_mean": 0.10643228888888889,
+    "wall_mean": 27.462597134558663,
+    "quality_pass_rate": 1.0,
+    "stall_mean": null,
+    "input_tokens_mean": 12.88888888888889,
+    "output_tokens_mean": 1619.0,
+    "cache_read_tokens_mean": 184467.0,
+    "cache_creation_tokens_mean": 13330.777777777777,
+    "tokens_source": "measured"
+  },
+  "provenance": {
+    "harness": "claude",
+    "model": "sonnet",
+    "harness_version": null,
+    "host": "fxmartins-MacBook-Pro/arm64",
+    "config_name": "strutils-baseline",
+    "seed": 1801,
+    "ticket_ids": [
+      "add-capitalize",
+      "add-count-vowels",
+      "add-truncate"
+    ],
+    "n": 3,
+    "timestamp": "2026-09-05T09:37:17Z"
+  }
+}
