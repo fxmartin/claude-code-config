@@ -584,6 +584,46 @@ def test_cost_rides_on_the_same_verdict_as_tokens() -> None:
     assert cost.reason == _row(cmp_, "tokens_mean").reason
 
 
+# ---------------------------------------------------------------------------
+# Story 31.2-003 — the cost axis on a not-metered (local-inference) arm never
+# reads as a delta, even when the token axis it rides alongside is comparable.
+# ---------------------------------------------------------------------------
+
+
+def test_not_metered_arm_cost_is_non_comparable_even_with_comparable_tokens() -> None:
+    """The field case (2026-09-05): a local harness's own `cost: 0` is recorded
+    as no figure at all (`cost_mean: None`, `cost_source: not_metered`), never
+    as a real zero — so the comparator must never assert it "saved" the
+    hosted arm's dollar figure. Both arms share the same token mix, so the
+    token row stays fully comparable; only cost is excluded."""
+    hosted = dict(_CACHE_READ_ARM, cost_mean=0.0569, cost_source="measured")
+    local = dict(_CACHE_READ_ARM, cost_mean=None, cost_source="not_metered")
+    cmp_ = compare_scoreboards(_arm_board("sonnet", **hosted), _arm_board("oMLX", **local))
+
+    cost = _row(cmp_, "cost_mean")
+    assert cost.comparable is False
+    assert cost.direction == NEUTRAL
+    assert "a missing figure is not zero" in cost.reason
+
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is True  # tokens are still the currency on the local arm
+
+    # Never a delta implying the local arm saved a specific dollar amount.
+    ticket = cmp_.tickets[0]
+    assert "cost$" in ticket.excluded
+    table = render_comparison_table(cmp_)
+    cost_line = next(
+        line for line in table.splitlines() if line.strip().startswith("cost$")
+    )
+    assert "not comparable" in cost_line
+    # The raw baseline figure may still be shown for context, but never as a
+    # computed delta/direction implying a saving.
+    assert "better" not in cost_line
+    assert "worse" not in cost_line
+    assert cost.delta is None
+    assert cost.pct is None
+
+
 def test_matching_mixes_stay_comparable_and_still_flag_a_regression() -> None:
     baseline = dict(_CACHE_READ_ARM)
     candidate = {

@@ -32,6 +32,9 @@ from sdlc.model_routing import BALANCED, select_model
 from sdlc.rate_limit import seconds_until_reset, within_wait_cap
 from sdlc.usage import (
     APPROXIMATE_SOURCES,
+    ESTIMATED,
+    MEASURED,
+    MIXED,
     UNAVAILABLE,
     UNAVAILABLE_USAGE,
     USAGE_COMPONENTS,
@@ -41,6 +44,23 @@ from sdlc.usage import (
     harness_breakdown,
     usage_is_tracked,
 )
+
+# Story 31.2-003: cost provenance reuses the token vocabulary above for the
+# concepts that carry over (a harness's own reported dollar figure is
+# ``MEASURED``, a $/Mtok-derived guess is ``ESTIMATED``, no figure at all is
+# ``UNAVAILABLE``, and a ticket's runs disagreeing is ``MIXED``) and adds two
+# the token axis never needs: a harness with no per-token price to derive at
+# all (``NOT_METERED`` — the field case: oMLX's own ``cost: 0`` telemetry is
+# not a saving, it is the absence of a meter) and a non-metered harness with
+# an explicit, recorded rate instead of the hosted $/Mtok assumption
+# (``LOCAL_RATE``).
+NOT_METERED = "not_metered"
+LOCAL_RATE = "local_rate"
+
+# Cost sources that are a derived/assumed figure rather than a harness's own
+# billed number — rendered "~"-prefixed, mirroring APPROXIMATE_SOURCES for
+# tokens.
+APPROXIMATE_COST_SOURCES: frozenset[str] = frozenset({ESTIMATED, LOCAL_RATE, MIXED})
 
 # Default per-story headless dispatch ceiling (seconds). An eval ticket is a small
 # edit on a tiny repo, so it should finish well inside a build's full timeout.
@@ -150,6 +170,12 @@ class RunResult:
     # lossy summary — 15,160 cache-write tokens and 14,152 cache-read tokens are
     # not parity — and the comparator cannot judge a mix it was never given.
     usage: TokenBreakdown = UNAVAILABLE_USAGE
+    # Story 31.2-003: this run's cost provenance — see the vocabulary above.
+    # Distinguishes a harness with no meter at all (``NOT_METERED``, ``cost_usd``
+    # stays ``None``) from a run that simply produced no tokens to derive a
+    # figure from (``UNAVAILABLE``) — collapsing the two would read a local
+    # harness's "no meter" as the same blank a genuinely lost run gets.
+    cost_source: str = UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -178,6 +204,11 @@ class TicketScore:
     cache_read_tokens_mean: float | None = None
     cache_creation_tokens_mean: float | None = None
     tokens_source: str = UNAVAILABLE
+    # Story 31.2-003: ``cost_mean``'s provenance, folded across this ticket's
+    # runs the same way ``tokens_source`` is — "the scoreboard says which" is
+    # the AC this satisfies: a not-metered harness reads plainly, never as a
+    # silent zero.
+    cost_source: str = UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -203,6 +234,14 @@ class Provenance:
     ticket_ids: list[str]
     n: int
     timestamp: str
+    # Story 31.2-003: whether this run's harness has a real/notional $/Mtok
+    # price at all (``True``, the default — every existing scoreboard/caller
+    # keeps today's hosted assumption), and the explicit local rate configured
+    # for it, if any. Recording both here is what makes the assumption travel
+    # with the number (AC5) rather than living only in a config file nobody
+    # re-reads later.
+    cost_metered: bool = True
+    local_rate_usd_per_million_tokens: float | None = None
 
 
 def host_identifier() -> str:
@@ -221,6 +260,8 @@ def build_provenance(
     harness_version: str | None = None,
     host: str | None = None,
     timestamp: str | None = None,
+    metered: bool = True,
+    local_rate_usd_per_million_tokens: float | None = None,
 ) -> Provenance:
     """Assemble a scoreboard's provenance block from a resolved :class:`EvalConfig`.
 
@@ -228,7 +269,12 @@ def build_provenance(
     (``EvalConfig.__post_init__`` pins both), so the block never records a
     guessed default. ``harness_version`` is the caller's job to supply (it
     requires running the harness's declared probe, an I/O step this pure
-    assembly function does not perform itself).
+    assembly function does not perform itself). ``metered``/
+    ``local_rate_usd_per_million_tokens`` (Story 31.2-003) are the resolved
+    harness's own cost-provenance fields — the caller's job too, since
+    resolving a :class:`~sdlc.harness.HarnessConfig` is I/O this assembly
+    function does not perform. Both default to today's hosted assumption, so
+    a caller that never passes them keeps unchanged behaviour (AC1).
     """
     return Provenance(
         harness=config.harness or DEFAULT_HARNESS,
@@ -240,6 +286,8 @@ def build_provenance(
         ticket_ids=[t.id for t in config.tickets],
         n=config.n,
         timestamp=timestamp if timestamp is not None else utc_timestamp(),
+        cost_metered=metered,
+        local_rate_usd_per_million_tokens=local_rate_usd_per_million_tokens,
     )
 
 
@@ -403,45 +451,74 @@ def _cost_from(
     usage: TokenBreakdown,
     *,
     usd_per_million_tokens: float,
-) -> float | None:
+    metered: bool = True,
+    local_rate_usd_per_million_tokens: float | None = None,
+) -> tuple[float | None, str]:
     """Notional cost from an explicit envelope cost or, failing that, token usage.
 
-    The envelope ``cost_usd`` wins when present; otherwise a notional figure is
-    derived from total tokens (the controller's notional-$ convention). ``None``
-    when neither a cost nor any token usage is available. Shared by
-    :func:`result_cost` and the contract-miss path (issue #435), which only has a
-    raw usage envelope and cost, not an :class:`AgentResult`.
+    Returns ``(cost_usd, cost_source)`` — see the provenance vocabulary above.
+    The envelope ``cost_usd`` wins when present *and the harness is metered*;
+    otherwise a notional figure is derived from total tokens (the controller's
+    notional-$ convention). ``None`` when neither a cost nor any token usage is
+    available. Shared by :func:`result_cost` and the contract-miss path (issue
+    #435), which only has a raw usage envelope and cost, not an
+    :class:`AgentResult`.
 
     Story 31.2-002: a harness whose usage is *unavailable* has no derived cost
     either — the cost axis is only as honest as the token axis it comes from.
     Callers gate ``cost_usd`` on the same capability, since ``usage_tracking``
     covers usage *and* cost.
+
+    Story 31.2-003: ``metered=False`` (a harness with no per-token price, e.g.
+    local inference) ignores ``cost_usd`` entirely — the field case: a
+    literal ``cost: 0`` from a local harness's own telemetry is not a real
+    zero-dollar spend, so it must never be trusted at face value. Such a
+    harness's cost is either an explicit ``local_rate_usd_per_million_tokens``
+    (a recorded assumption, derived from tokens the same way the hosted
+    convention is) or ``None`` labelled ``NOT_METERED`` — never a number, so a
+    comparator can never read it as a saving.
     """
+    if not metered:
+        if local_rate_usd_per_million_tokens is None:
+            return None, NOT_METERED
+        tokens = usage.total
+        if tokens is None:
+            return None, UNAVAILABLE
+        return (
+            notional_cost(tokens, usd_per_million_tokens=local_rate_usd_per_million_tokens),
+            LOCAL_RATE,
+        )
     if cost_usd is not None:
-        return float(cost_usd)
+        return float(cost_usd), MEASURED
     tokens = usage.total
     if tokens is None:
-        return None
-    return notional_cost(tokens, usd_per_million_tokens=usd_per_million_tokens)
+        return None, UNAVAILABLE
+    return notional_cost(tokens, usd_per_million_tokens=usd_per_million_tokens), ESTIMATED
 
 
 def result_cost(
     result: AgentResult,
     *,
     usd_per_million_tokens: float = DEFAULT_USD_PER_MILLION_TOKENS,
+    metered: bool = True,
+    local_rate_usd_per_million_tokens: float | None = None,
 ) -> float | None:
     """Notional cost of a run: the envelope ``cost_usd`` if present, else derived.
 
     Falls back to a notional figure computed from total tokens (mirrors the
     controller's notional-$ convention) so a run still carries a comparable cost
     even when the agent envelope omits ``total_cost_usd``. ``None`` when neither a
-    cost nor any token usage is available.
+    cost nor any token usage is available, or when the harness is not metered
+    (Story 31.2-003) and carries no configured local rate.
     """
-    return _cost_from(
+    cost, _source = _cost_from(
         result.cost_usd,
         breakdown_from_envelope(result.usage),
         usd_per_million_tokens=usd_per_million_tokens,
+        metered=metered,
+        local_rate_usd_per_million_tokens=local_rate_usd_per_million_tokens,
     )
+    return cost
 
 
 def run_quality_check(cmd: Sequence[str] | None, cwd: Path) -> bool | None:
@@ -480,6 +557,22 @@ def _optional_mean(values: Sequence[float | int | None]) -> float | None:
     return sum(present) / len(present) if present else None
 
 
+def _fold_cost_sources(sources: Sequence[str]) -> str:
+    """Fold several runs' cost provenance into one aggregate label.
+
+    Mirrors ``usage.aggregate_source`` for the cost axis: an unavailable run
+    contributes no figure and is ignored; runs that agree keep their shared
+    source; runs that disagree are ``MIXED`` — an aggregate of (say) a metered
+    run and a not-metered run is neither, and must not be compared as one.
+    """
+    distinct = {s for s in sources if s != UNAVAILABLE}
+    if not distinct:
+        return UNAVAILABLE
+    if len(distinct) == 1:
+        return next(iter(distinct))
+    return MIXED
+
+
 def _score_runs(ticket_id: str, runs: Sequence[RunResult]) -> TicketScore:
     quality = [r.quality_pass for r in runs if r.quality_pass is not None]
     usages = [r.usage for r in runs]
@@ -506,6 +599,7 @@ def _score_runs(ticket_id: str, runs: Sequence[RunResult]) -> TicketScore:
         cache_read_tokens_mean=components["cache_read"],
         cache_creation_tokens_mean=components["cache_creation"],
         tokens_source=aggregate_source(usages),
+        cost_source=_fold_cost_sources([r.cost_source for r in runs]),
     )
 
 
@@ -570,6 +664,22 @@ def _fmt_tokens(score: TicketScore) -> str:
     return text
 
 
+def _fmt_cost(score: TicketScore) -> str:
+    """The dollar figure with its provenance attached (Story 31.2-003).
+
+    ``not_metered`` renders literally — the field case: a local harness's own
+    ``cost: 0`` telemetry must never print as a plain "0.0000" indistinguishable
+    from a genuinely free hosted run. An approximate source (a $/Mtok estimate
+    or a configured local rate) gets the same "~" prefix tokens use.
+    """
+    if score.cost_source == NOT_METERED:
+        return "not metered"
+    text = _fmt(score.cost_mean, decimals=4)
+    if score.cost_mean is not None and score.cost_source in APPROXIMATE_COST_SOURCES:
+        return f"~{text}"
+    return text
+
+
 def render_table(board: Scoreboard) -> str:
     """Render a scoreboard as a fixed-width text table (one row per ticket + overall).
 
@@ -579,6 +689,10 @@ def render_table(board: Scoreboard) -> str:
 
     Story 31.2-002: ``tokens`` is "—" when the harness reports no usage (never 0)
     and "~"-prefixed when the figure is an estimate rather than a measurement.
+
+    Story 31.2-003: ``cost$`` reads "not metered" when the harness has no
+    per-token price at all — never "—" (which would read as merely missing)
+    and never "0.0000" (which would read as a real, comparable saving).
     """
     header = (
         f"{'ticket':<16} {'runs':>4} {'err':>3} "
@@ -595,7 +709,7 @@ def render_table(board: Scoreboard) -> str:
             f"{_fmt(score.loc_added_mean):>7} {_fmt(score.loc_removed_mean):>7} "
             f"{_fmt(score.loc_net_mean):>7} "
             f"{_fmt_tokens(score):>9} "
-            f"{_fmt(score.cost_mean, decimals=4):>8} "
+            f"{_fmt_cost(score):>8} "
             f"{_fmt(score.wall_mean):>7} {_fmt(score.stall_mean):>7} "
             f"{_fmt_rate(score.quality_pass_rate):>5}"
         )
@@ -603,6 +717,16 @@ def render_table(board: Scoreboard) -> str:
         lines.append(
             "~tokens is an estimate, not a measurement — do not compare it "
             "against a measured figure."
+        )
+    if any(score.cost_source == NOT_METERED for score in rows):
+        lines.append(
+            "cost 'not metered' means the harness has no per-token price "
+            "(e.g. local inference) — never read it as $0 spent."
+        )
+    if any(score.cost_source in APPROXIMATE_COST_SOURCES for score in rows):
+        lines.append(
+            "~cost is derived (a notional $/Mtok estimate or a configured "
+            "local rate), not a harness-reported figure."
         )
     return "\n".join(lines)
 
@@ -625,6 +749,7 @@ def _score_to_dict(score: TicketScore) -> dict[str, Any]:
         "cache_read_tokens_mean": score.cache_read_tokens_mean,
         "cache_creation_tokens_mean": score.cache_creation_tokens_mean,
         "tokens_source": score.tokens_source,
+        "cost_source": score.cost_source,
     }
 
 
@@ -639,6 +764,8 @@ def _provenance_to_dict(p: Provenance) -> dict[str, Any]:
         "ticket_ids": list(p.ticket_ids),
         "n": p.n,
         "timestamp": p.timestamp,
+        "cost_metered": p.cost_metered,
+        "local_rate_usd_per_million_tokens": p.local_rate_usd_per_million_tokens,
     }
 
 
@@ -792,6 +919,8 @@ def run_ticket(
     sleep_fn: Callable[[float], None] = time.sleep,
     rate_limit_max_wait_s: int = DEFAULT_RATE_LIMIT_MAX_WAIT_S,
     capabilities: Mapping[str, bool] | None = None,
+    metered: bool = True,
+    local_rate_usd_per_million_tokens: float | None = None,
 ) -> RunResult:
     """Drive one ticket once in an isolated workspace and score the result.
 
@@ -814,6 +943,11 @@ def run_ticket(
     ``usage_tracking`` scores ``tokens``/``cost_usd`` as *unavailable* rather than
     the numbers it happened to print — and never as 0. ``None`` (no map resolved)
     keeps today's behaviour for the built-in dispatch seam.
+
+    Story 31.2-003: ``metered``/``local_rate_usd_per_million_tokens`` are the
+    resolved harness's own cost-provenance fields (see
+    :class:`sdlc.harness.HarnessConfig`). Both default to today's hosted
+    assumption, so a caller that never passes them keeps unchanged behaviour.
     """
     workdir = workspace / f"{ticket.id}-{run_index}"
     _init_workspace(config.target, workdir)
@@ -874,21 +1008,25 @@ def run_ticket(
                 if usage_is_tracked(capabilities)
                 else None
             )
+            cost_value, cost_source = _cost_from(
+                reported_cost,
+                breakdown,
+                usd_per_million_tokens=config.usd_per_million_tokens,
+                metered=metered,
+                local_rate_usd_per_million_tokens=local_rate_usd_per_million_tokens,
+            )
             return RunResult(
                 ticket_id=ticket.id,
                 run_index=run_index,
                 diff=_measure_diff(workdir),
                 wall_s=wall,
                 tokens=breakdown.total,
-                cost_usd=_cost_from(
-                    reported_cost,
-                    breakdown,
-                    usd_per_million_tokens=config.usd_per_million_tokens,
-                ),
+                cost_usd=cost_value,
                 quality_pass=run_quality_check(ticket.quality_cmd, workdir),
                 status="contract_miss",
                 stall_s=stall_s or None,
                 usage=breakdown,
+                cost_source=cost_source,
             )
         except Exception as exc:  # noqa: BLE001 — record any dispatch failure, keep going
             wall = max(0.0, time.monotonic() - start - stall_s)
@@ -910,6 +1048,13 @@ def run_ticket(
     # declare it reports neither, so the arm is never priced off a figure it was
     # not entitled to give.
     reported_cost = result.cost_usd if usage_is_tracked(capabilities) else None
+    cost_value, cost_source = _cost_from(
+        reported_cost,
+        breakdown,
+        usd_per_million_tokens=config.usd_per_million_tokens,
+        metered=metered,
+        local_rate_usd_per_million_tokens=local_rate_usd_per_million_tokens,
+    )
 
     return RunResult(
         ticket_id=ticket.id,
@@ -917,15 +1062,12 @@ def run_ticket(
         diff=_measure_diff(workdir),
         wall_s=wall,
         tokens=breakdown.total,
-        cost_usd=_cost_from(
-            reported_cost,
-            breakdown,
-            usd_per_million_tokens=config.usd_per_million_tokens,
-        ),
+        cost_usd=cost_value,
         quality_pass=run_quality_check(ticket.quality_cmd, workdir),
         error=None,
         stall_s=stall_s or None,
         usage=breakdown,
+        cost_source=cost_source,
     )
 
 
@@ -938,6 +1080,8 @@ def run_eval(
     sleep_fn: Callable[[float], None] = time.sleep,
     rate_limit_max_wait_s: int = DEFAULT_RATE_LIMIT_MAX_WAIT_S,
     capabilities: Mapping[str, bool] | None = None,
+    metered: bool = True,
+    local_rate_usd_per_million_tokens: float | None = None,
 ) -> list[RunResult]:
     """Run every ticket × ``n`` runs in isolation and return the per-run results.
 
@@ -945,7 +1089,9 @@ def run_eval(
     throwaway directory (the caller owns its lifetime); the framework repo and the
     sample-target template are never mutated. ``capabilities`` (Story 31.2-002) is
     the resolved harness capability map every run's usage is gated on — see
-    :func:`run_ticket`.
+    :func:`run_ticket`. ``metered``/``local_rate_usd_per_million_tokens``
+    (Story 31.2-003) are the resolved harness's own cost-provenance fields,
+    threaded through unchanged for every run.
     """
     results: list[RunResult] = []
     for ticket in config.tickets:
@@ -961,6 +1107,8 @@ def run_eval(
                     sleep_fn=sleep_fn,
                     rate_limit_max_wait_s=rate_limit_max_wait_s,
                     capabilities=capabilities,
+                    metered=metered,
+                    local_rate_usd_per_million_tokens=local_rate_usd_per_million_tokens,
                 )
             )
     return results

@@ -2496,10 +2496,15 @@ def eval_cmd(
 
     Drives the build agent headlessly against a versioned sample target — once per
     ticket × ``n`` runs, each in an isolated git checkout — and scores every result
-    on LOC delta, token usage, notional cost, wall-time, and a quality check (the
-    ticket's ``quality_cmd``, exit 0 = pass). The framework repo and the sample
-    target are never mutated and no PRs are opened. ``--dry-run`` lists the tickets
-    without spending any quota. A malformed config, or an unusable harness, exits 2.
+    on LOC delta, token usage, cost, wall-time, and a quality check (the ticket's
+    ``quality_cmd``, exit 0 = pass). Cost is a real/notional $/Mtok figure for a
+    metered (hosted) harness, unchanged from today; a harness with no per-token
+    price (e.g. local inference, declared ``metered: false`` in the harness
+    registry) renders "not metered" instead of a dollar figure, or a configured
+    ``local_rate_usd_per_million_tokens`` if one is set. The framework repo and
+    the sample target are never mutated and no PRs are opened. ``--dry-run``
+    lists the tickets without spending any quota. A malformed config, or an
+    unusable harness, exits 2.
     """
     import tempfile
 
@@ -2584,6 +2589,8 @@ def eval_cmd(
             ws,
             dispatcher=dispatcher_for_harness(resolved_harness),
             capabilities=resolve_capabilities(resolved_harness),
+            metered=resolved_harness.metered,
+            local_rate_usd_per_million_tokens=resolved_harness.local_rate_usd_per_million_tokens,
         )
 
     # Story 31.1-002 AC1: the same probe the preflight above already ran is the
@@ -2591,7 +2598,15 @@ def eval_cmd(
     # `probe` (e.g. the built-in claude harness) leaves this `None`, not an error.
     probe = probe_harness(resolved_harness)
     harness_version = probe.detail if probe.status is ProbeStatus.AVAILABLE else None
-    provenance = build_provenance(config, harness_version=harness_version)
+    # Story 31.2-003: record the harness's cost-provenance fields alongside the
+    # rest of the run's conditions, so a scoreboard's dollars carry the
+    # assumption they were computed under.
+    provenance = build_provenance(
+        config,
+        harness_version=harness_version,
+        metered=resolved_harness.metered,
+        local_rate_usd_per_million_tokens=resolved_harness.local_rate_usd_per_million_tokens,
+    )
 
     board = aggregate(results, config.name, harness=config.harness, provenance=provenance)
     if as_json:

@@ -6,7 +6,7 @@ We change agent prompts, swap models (Epic-14 routing), add skills, and tweak
 schemas — but without a way to **measure** agent output we are guessing whether
 any of it helped or hurt. The eval harness closes that gap: a single command
 drives the build agent headlessly over a fixed ticket set on a sample repo, and
-scores every result on **LOC delta, token usage, notional cost, wall-time, and a
+scores every result on **LOC delta, token usage, cost, wall-time, and a
 quality check** (tests pass / no breakage), emitting a comparable scoreboard.
 
 It is deliberately small and inspectable — a promptfoo-style eval over real
@@ -50,7 +50,9 @@ For each ticket × `n` runs, the harness:
      `0` — for a plain-text agent or a harness that declares no `usage_tracking`
      (31.2-002).
    - **Cost** — the envelope `total_cost_usd`, else a notional figure from tokens
-     (the controller's `$15/Mtok` convention — never real subscription spend).
+     (the controller's `$15/Mtok` convention — never real subscription spend); a
+     harness with no per-token price at all renders "not metered" instead
+     (31.2-003, below).
      A run with no token figure has no derived cost either.
    - **Wall-time** — monotonic seconds for the dispatch.
    - **Quality** — the ticket's `quality_cmd` (exit 0 = pass); `None` if none set.
@@ -140,6 +142,7 @@ different prices. So the scoreboard carries the breakdown, not just the total:
 | `input_tokens_mean` / `output_tokens_mean` | mean per component |
 | `cache_read_tokens_mean` / `cache_creation_tokens_mean` | mean per component |
 | `tokens_source` | `measured`, `estimated`, `external`, `mixed`, or `unavailable` |
+| `cost_source` | `measured`, `estimated`, `local_rate`, `not_metered`, `mixed`, or `unavailable` (31.2-003, below) |
 
 Two rules follow, and both are **capability-driven** — they read the harness's
 `usage_tracking` flag from the registry, never its name:
@@ -164,6 +167,46 @@ The `--json` form (`scoreboard_to_dict`) is the shape later stories store as a
 **baseline** to flag regressions (18.1-002) and run in **CI** on agent-affecting
 changes (18.1-003).
 
+### Cost for local inference (31.2-003)
+
+`$/Mtok` is a hosted-API assumption — it does not hold for a model running on
+your own hardware. The field case: the same prompt on two arms, one hosted, one
+local — the local arm's own telemetry reported `cost: 0`. That zero is
+*correct* (there is no per-token meter) and also **not** a saving of the hosted
+arm's dollar figure in any sense a comparator should assert. So cost carries its
+own provenance, distinct from `tokens_source`:
+
+- A **metered** harness (`metered: true`, the default — every harness that
+  predates this story) is unchanged: the envelope's own cost wins when present
+  (`measured`), else a notional `$/Mtok` figure is derived from tokens
+  (`estimated`), exactly as before.
+- A **non-metered** harness (`metered: false` in the harness registry — see
+  [`docs/harness-adapters.md`](harness-adapters.md)) never has its own `cost`
+  telemetry trusted, even a literal `0` — the scoreboard renders **"not
+  metered"** instead of a dollar figure (`cost_source: not_metered`), so it can
+  never be misread as a real or notional spend.
+- If the registry configures an explicit `local_rate_usd_per_million_tokens`
+  for that harness (e.g. an assumed energy cost), cost is derived from tokens
+  under *that* rate instead (`cost_source: local_rate`) — a deliberate,
+  recorded assumption rather than an invented one. The rate travels with the
+  number: it is recorded in the scoreboard's `provenance` block (below), so the
+  assumption behind any given dollar figure is never lost.
+
+`sdlc eval-compare` reuses the existing not-comparable machinery (31.2-002):
+when one arm's cost is `not_metered` (so its `cost_mean` is `None`, never `0`),
+the cost row renders as a labelled non-comparison — "a missing figure is not
+zero" — and is excluded from the verdict, same as any other unavailable
+metric. The **token** axis is unaffected by any of this: a non-metered harness
+that reports real tokens keeps `tokens_mean`/`tokens_source` exactly as
+`usage_tracking` decides — tokens are the currency on the local arm, dollars on
+the hosted one.
+
+This is purely a Epic-31 (`sdlc eval`/`eval-compare`) concern. Epic-14/28's
+build-time cost governance (budget gates, calibration) does not read a
+harness's `metered` field at all — a build stage is always priced via the
+hosted `$/Mtok` convention regardless of which harness ran it, so encountering
+a not-metered harness there changes nothing.
+
 ## Scoreboard provenance (31.1-002)
 
 Every `--json` scoreboard carries a `provenance` block — enough to trace a
@@ -180,6 +223,8 @@ number back to the conditions that produced it, weeks later:
 | `ticket_ids`      | Every ticket id the config ran.                                          |
 | `n`               | Runs per ticket.                                                         |
 | `timestamp`       | UTC, `%Y-%m-%dT%H:%M:%SZ`.                                                |
+| `cost_metered`    | Whether the harness's cost is a real/notional `$/Mtok` figure (31.2-003). `true` (default) unless the registry declares `metered: false`. |
+| `local_rate_usd_per_million_tokens` | The harness's configured local rate, or `null` if none is set (31.2-003). |
 
 `config_name` + `seed` + `ticket_ids` together are a scoreboard's **ticket-set
 identity** — what `eval-compare` checks before treating two scoreboards as a

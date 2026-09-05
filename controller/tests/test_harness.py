@@ -80,6 +80,45 @@ def test_rate_limit_probe_loaded_from_yaml() -> None:
     assert registry["qwen"].rate_limit_probe is None
 
 
+def test_metered_defaults_true_for_shipped_entries() -> None:
+    """Story 31.2-003: every existing harness keeps today's hosted assumption."""
+    registry = load_harnesses_config(CONFIG_PATH)
+    assert registry[DEFAULT_HARNESS].metered is True
+    assert registry["codex"].metered is True
+    assert registry["qwen"].metered is True
+    assert registry[DEFAULT_HARNESS].local_rate_usd_per_million_tokens is None
+
+
+def test_load_metered_false_from_yaml(tmp_path: Path) -> None:
+    cfg = tmp_path / "harnesses.yaml"
+    cfg.write_text(
+        "harnesses:\n  local:\n    command: local run\n    parser: plain\n"
+        "    metered: false\n",
+        encoding="utf-8",
+    )
+    harness = load_harnesses_config(cfg)["local"]
+    assert harness.metered is False
+    assert harness.local_rate_usd_per_million_tokens is None
+
+
+def test_load_local_rate_from_yaml(tmp_path: Path) -> None:
+    cfg = tmp_path / "harnesses.yaml"
+    cfg.write_text(
+        "harnesses:\n  local:\n    command: local run\n    parser: plain\n"
+        "    metered: false\n    local_rate_usd_per_million_tokens: 2.5\n",
+        encoding="utf-8",
+    )
+    harness = load_harnesses_config(cfg)["local"]
+    assert harness.metered is False
+    assert harness.local_rate_usd_per_million_tokens == 2.5
+
+
+def test_load_omitted_metered_defaults_true(tmp_path: Path) -> None:
+    cfg = tmp_path / "harnesses.yaml"
+    cfg.write_text("harnesses:\n  foo:\n    command: foo run\n    parser: plain\n", encoding="utf-8")
+    assert load_harnesses_config(cfg)["foo"].metered is True
+
+
 def test_load_omitted_rate_limit_probe_is_none(tmp_path: Path) -> None:
     cfg = tmp_path / "harnesses.yaml"
     cfg.write_text("harnesses:\n  foo:\n    command: foo run\n    parser: plain\n", encoding="utf-8")

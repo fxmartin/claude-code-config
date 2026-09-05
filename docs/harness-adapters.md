@@ -10,7 +10,7 @@ declare an entry in [`controller/src/sdlc/config/harnesses.yaml`](../controller/
 point it at a wrapper script, reuse an existing output parser, and declare what
 the harness can do. The controller code never changes.
 
-This guide walks the four moving parts, then a complete worked example for a
+This guide walks the five moving parts, then a complete worked example for a
 hypothetical harness. The shipped **codex** and **qwen** entries are the
 canonical real examples; **opencode**, **pi**, and **gemini** are the candidate
 future targets this abstraction exists for.
@@ -38,7 +38,7 @@ A harness is just a command the controller runs once per agent dispatch:
 That is the whole boundary. Anything that can read a prompt on stdin and end its
 output with a `<<<RESULT_JSON>>>` block is a candidate harness.
 
-## The four moving parts
+## The five moving parts
 
 ### 1. A wrapper script
 
@@ -104,7 +104,38 @@ Optionally add a `probe:` command (a cheap "is the CLI installed/authenticated?"
 check). A zero exit means available; a non-zero exit degrades to a warning in
 preflight rather than a mid-run crash. Omit it to skip the check.
 
-### 5. Per-stage model routing (optional)
+### 5. Cost metering (optional, Story 31.2-003)
+
+`metered:` and `local_rate_usd_per_million_tokens:` are plain top-level
+declarations, not `capabilities:` flags — they state an economic fact about
+the harness rather than something the controller gates a run mode on:
+
+| Field                              | Meaning                                                                 |
+| ----------------------------------- | ------------------------------------------------------------------------ |
+| `metered`                           | Whether this harness's cost is a real/notional $/Mtok figure. Defaults to `true` — every harness that omits it keeps today's hosted-API assumption. |
+| `local_rate_usd_per_million_tokens` | An explicit, recorded $/Mtok-equivalent rate (e.g. an assumed energy cost). Only consulted when `metered` is `false`; ignored otherwise. |
+
+Set `metered: false` for a harness with no per-token price at all — local
+inference (e.g. an oMLX-backed CLI) being the motivating case: it still
+reports real token counts (`usage_tracking: true` is unaffected), but its own
+`cost` telemetry, even a literal `cost: 0`, is never a real dollar figure and
+must not be trusted at face value. With no `local_rate_usd_per_million_tokens`
+configured, `sdlc eval`'s scoreboard renders that harness's cost as **"not
+metered"** (never `0`, never a `$/Mtok` extrapolation), and `sdlc eval-compare`
+against a metered harness renders the cost row as a labelled non-comparison —
+never a delta implying the local arm saved a specific dollar amount. Configure
+`local_rate_usd_per_million_tokens` to price it anyway under an explicit,
+recorded assumption; that rate travels with every number it produces via the
+scoreboard's `provenance` block. See
+[`docs/evaluation.md`](evaluation.md#cost-for-local-inference-31-2-003) for the
+full behaviour.
+
+Epic-14/28's build-time cost governance (budget gates, calibration) never
+reads these fields — a build stage is always priced via the hosted convention
+regardless of which harness ran it, so a not-metered harness cannot affect a
+budget gate; only `sdlc eval`/`eval-compare` (Epic-31) consume them.
+
+### 6. Per-stage model routing (optional)
 
 A registry harness can route a **different model per pipeline stage** — the
 OpenAI analog of Epic-14's Claude Balanced map (build on a capable model, the

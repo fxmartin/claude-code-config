@@ -64,6 +64,15 @@
           "type": "object",
           "additionalProperties": { "type": "boolean" },
           "description": "Capability flags (worktree_isolation, parallel, json_contract, usage_tracking, rate_limit_aware, ...) the controller gates run modes on (Feature 20.5)."
+        },
+        "metered": {
+          "type": "boolean",
+          "description": "Whether this harness's cost is a real/notional $/Mtok figure (true, default) or has no per-token price at all — a local-inference harness with no metered API (Story 31.2-003). false without 'local_rate_usd_per_million_tokens' records cost as 'not metered', never $0."
+        },
+        "local_rate_usd_per_million_tokens": {
+          "type": "number",
+          "minimum": 0,
+          "description": "An explicit, recorded $/Mtok-equivalent rate for a non-metered harness (e.g. an assumed energy cost for local inference). Only consulted when 'metered' is false; ignored otherwise. Unset (default) leaves a non-metered harness's cost as 'not metered' rather than inventing a number (Story 31.2-003)."
         }
       }
     }

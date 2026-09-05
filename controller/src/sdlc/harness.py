@@ -110,6 +110,25 @@ class HarnessConfig:
     # distinct model per stage (the OpenAI analog of Epic-14's Balanced map),
     # rather than ignoring the routed model. Empty means no model routing.
     models: dict[str, str] = field(default_factory=dict)
+    # Story 31.2-003: whether this harness's cost is a real/notional $/Mtok
+    # figure at all. ``True`` (default, unchanged for every existing harness —
+    # AC1) means a hosted-API assumption applies, same as today. ``False`` is a
+    # harness with no per-token meter (e.g. local inference): its cost is never
+    # a $/Mtok extrapolation, only an explicit ``local_rate_usd_per_million_tokens``
+    # or "not metered" — see ``sdlc.evaluate._cost_from``. This is a plain
+    # invocation-declaration field, not a ``capabilities`` flag: it states an
+    # economic fact about the harness, not something the controller gates a run
+    # mode on. Epic-14/28's build-time cost governance (``build.py``) never
+    # reads this field — it always prices a stage via the hosted convention
+    # regardless of which harness ran it — so a not-metered harness cannot
+    # affect a budget gate or calibration; only the eval harness (Epic-31)
+    # consumes it.
+    metered: bool = True
+    # An explicit, recorded $/Mtok-equivalent rate for a non-metered harness
+    # (e.g. an assumed energy cost for local inference). Ignored when
+    # ``metered`` is true. Unset (default) leaves a non-metered harness's cost
+    # as "not metered" rather than inventing a number.
+    local_rate_usd_per_million_tokens: float | None = None
 
     def resolve_model(self, stage: str | None = None) -> str | None:
         """The model id this harness runs ``stage`` on, or ``None`` when unmapped.
@@ -219,6 +238,12 @@ def load_harnesses_config(path: str | Path) -> dict[str, HarnessConfig]:
                 else None
             ),
             models=models,
+            metered=bool(settings.get("metered", True)),
+            local_rate_usd_per_million_tokens=(
+                float(settings["local_rate_usd_per_million_tokens"])
+                if settings.get("local_rate_usd_per_million_tokens") is not None
+                else None
+            ),
         )
 
     default = raw.get("default")

@@ -113,6 +113,105 @@ def test_cost_none_when_no_cost_and_no_tokens() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Story 31.2-003 — cost provenance: metered (hosted, unchanged) vs not-metered
+# (local inference) vs a configured local rate.
+# ---------------------------------------------------------------------------
+
+
+def test_cost_from_hosted_metered_envelope_unchanged() -> None:
+    """AC1: a metered (hosted) harness's own reported cost is used as-is."""
+    from sdlc.evaluate import MEASURED, _cost_from
+    from sdlc.usage import UNAVAILABLE_USAGE
+
+    cost, source = _cost_from(
+        0.42, UNAVAILABLE_USAGE, usd_per_million_tokens=15.0, metered=True
+    )
+    assert cost == 0.42
+    assert source == MEASURED
+
+
+def test_cost_from_hosted_metered_falls_back_to_notional() -> None:
+    """AC1: hosted fallback-to-notional path is unchanged."""
+    from sdlc.evaluate import ESTIMATED, _cost_from
+    from sdlc.usage import TokenBreakdown
+
+    usage = TokenBreakdown(input_tokens=1_000_000)
+    cost, source = _cost_from(
+        None, usage, usd_per_million_tokens=15.0, metered=True
+    )
+    assert cost == pytest.approx(15.0)
+    assert source == ESTIMATED
+
+
+def test_cost_from_not_metered_ignores_literal_zero_telemetry() -> None:
+    """AC2 (field case): a local harness's own `cost: 0` is not a real $0 —
+    it must not be trusted at face value, and stays distinct from a genuinely
+    missing figure."""
+    from sdlc.evaluate import NOT_METERED, _cost_from
+    from sdlc.usage import TokenBreakdown
+
+    usage = TokenBreakdown(input_tokens=1000, output_tokens=200)
+    cost, source = _cost_from(0.0, usage, usd_per_million_tokens=15.0, metered=False)
+    assert cost is None
+    assert source == NOT_METERED
+
+
+def test_cost_from_not_metered_no_tokens_is_unavailable_not_not_metered() -> None:
+    """A run with no tokens at all is `unavailable`, distinct from a
+    deliberate `not_metered` harness state — the two `None`s must not collapse."""
+    from sdlc.evaluate import _cost_from
+    from sdlc.usage import UNAVAILABLE, UNAVAILABLE_USAGE
+
+    cost, source = _cost_from(
+        None,
+        UNAVAILABLE_USAGE,
+        usd_per_million_tokens=15.0,
+        metered=False,
+        local_rate_usd_per_million_tokens=2.5,
+    )
+    assert cost is None
+    assert source == UNAVAILABLE
+
+
+def test_cost_from_not_metered_with_configured_local_rate() -> None:
+    """AC3/AC5: an explicit local rate derives a real figure from tokens."""
+    from sdlc.evaluate import LOCAL_RATE, _cost_from
+    from sdlc.usage import TokenBreakdown
+
+    usage = TokenBreakdown(input_tokens=1_000_000)
+    cost, source = _cost_from(
+        None,
+        usage,
+        usd_per_million_tokens=15.0,
+        metered=False,
+        local_rate_usd_per_million_tokens=2.5,
+    )
+    assert cost == pytest.approx(2.5)
+    assert source == LOCAL_RATE
+
+
+def test_cost_from_not_metered_without_local_rate_is_none() -> None:
+    """AC3: no configured rate leaves cost `None`, labelled `not_metered`."""
+    from sdlc.evaluate import NOT_METERED, _cost_from
+    from sdlc.usage import TokenBreakdown
+
+    usage = TokenBreakdown(input_tokens=1_000_000)
+    cost, source = _cost_from(None, usage, usd_per_million_tokens=15.0, metered=False)
+    assert cost is None
+    assert source == NOT_METERED
+
+
+def test_result_cost_threads_metered_and_local_rate() -> None:
+    cost = result_cost(
+        _result(usage={"input_tokens": 1_000_000}, cost=0.0),
+        usd_per_million_tokens=15.0,
+        metered=False,
+        local_rate_usd_per_million_tokens=1.0,
+    )
+    assert cost == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
 # run_quality_check — exit-code based pass/fail
 # ---------------------------------------------------------------------------
 
@@ -1174,6 +1273,8 @@ def test_scoreboard_to_dict_includes_provenance_block_when_present() -> None:
         "ticket_ids": ["t1"],
         "n": 2,
         "timestamp": "2026-09-05T12:00:00Z",
+        "cost_metered": True,
+        "local_rate_usd_per_million_tokens": None,
     }
 
 
@@ -1196,6 +1297,23 @@ def test_provenance_is_frozen_dataclass() -> None:
     )
     with pytest.raises(Exception):  # noqa: B017 — FrozenInstanceError
         prov.model = "haiku"  # type: ignore[misc]
+
+
+def test_build_provenance_records_metered_and_local_rate() -> None:
+    """AC5: a configured local rate is recorded as provenance so the
+    assumption travels with the number."""
+    config = EvalConfig(name="demo", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    prov = build_provenance(config, metered=False, local_rate_usd_per_million_tokens=2.5)
+    assert prov.cost_metered is False
+    assert prov.local_rate_usd_per_million_tokens == 2.5
+
+
+def test_build_provenance_defaults_metered_true() -> None:
+    """AC1: a caller that never passes metered/local_rate keeps the hosted default."""
+    config = EvalConfig(name="demo", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    prov = build_provenance(config)
+    assert prov.cost_metered is True
+    assert prov.local_rate_usd_per_million_tokens is None
 
 
 # ---------------------------------------------------------------------------
@@ -1321,3 +1439,188 @@ def test_render_table_labels_an_estimated_token_figure(tmp_path: Path) -> None:
     assert "~100" in est_table
     assert "estimate" in est_table
     assert "~100" not in measured_table
+
+
+# ---------------------------------------------------------------------------
+# Story 31.2-003 — cost provenance end-to-end: aggregation, rendering, and
+# threading `metered`/`local_rate_usd_per_million_tokens` through the runner.
+# ---------------------------------------------------------------------------
+
+
+def _cost_run(ticket: str, idx: int, *, cost: float | None, cost_source: str) -> RunResult:
+    return RunResult(
+        ticket_id=ticket,
+        run_index=idx,
+        diff=DiffStats(added=1, removed=0, files=1),
+        wall_s=1.0,
+        tokens=100,
+        cost_usd=cost,
+        cost_source=cost_source,
+    )
+
+
+def test_aggregate_folds_cost_source_when_runs_agree() -> None:
+    from sdlc.usage import MEASURED
+
+    board = aggregate(
+        [
+            _cost_run("t1", 0, cost=1.0, cost_source=MEASURED),
+            _cost_run("t1", 1, cost=2.0, cost_source=MEASURED),
+        ],
+        "demo",
+    )
+    assert board.tickets[0].cost_source == MEASURED
+
+
+def test_aggregate_cost_source_not_metered_when_harness_has_no_meter() -> None:
+    from sdlc.evaluate import NOT_METERED
+
+    board = aggregate(
+        [_cost_run("t1", 0, cost=None, cost_source=NOT_METERED)], "demo"
+    )
+    score = board.tickets[0]
+    assert score.cost_mean is None
+    assert score.cost_source == NOT_METERED
+
+
+def test_aggregate_cost_source_mixed_when_runs_disagree() -> None:
+    from sdlc.usage import MEASURED, MIXED
+
+    from sdlc.evaluate import ESTIMATED
+
+    board = aggregate(
+        [
+            _cost_run("t1", 0, cost=1.0, cost_source=MEASURED),
+            _cost_run("t1", 1, cost=2.0, cost_source=ESTIMATED),
+        ],
+        "demo",
+    )
+    assert board.tickets[0].cost_source == MIXED
+
+
+def test_scoreboard_to_dict_includes_cost_source() -> None:
+    from sdlc.evaluate import NOT_METERED
+
+    board = aggregate([_cost_run("t1", 0, cost=None, cost_source=NOT_METERED)], "demo")
+    payload = scoreboard_to_dict(board)
+    assert payload["tickets"][0]["cost_source"] == NOT_METERED
+
+
+def test_render_table_shows_not_metered_instead_of_a_dollar_figure() -> None:
+    """AC2/AC3: a local harness's zero never prints as a plain, comparable $0."""
+    from sdlc.evaluate import NOT_METERED
+
+    board = aggregate([_cost_run("t1", 0, cost=None, cost_source=NOT_METERED)], "demo")
+    table = render_table(board)
+    assert "not metered" in table
+    assert "0.0000" not in table
+    assert "never read it as $0 spent" in table
+
+
+def test_render_table_labels_a_local_rate_cost_figure() -> None:
+    from sdlc.evaluate import LOCAL_RATE
+
+    board = aggregate([_cost_run("t1", 0, cost=2.5, cost_source=LOCAL_RATE)], "demo")
+    table = render_table(board)
+    assert "~2.5000" in table
+    assert "configured local rate" in table
+
+
+def test_render_table_hosted_metered_cost_unaffected() -> None:
+    """AC1: a plain metered figure renders exactly as before — no "~", no note."""
+    from sdlc.usage import MEASURED
+
+    board = aggregate([_cost_run("t1", 0, cost=1.2345, cost_source=MEASURED)], "demo")
+    table = render_table(board)
+    assert "1.2345" in table
+    assert "not metered" not in table
+    assert "~1.2345" not in table
+
+
+def test_run_ticket_not_metered_harness_ignores_literal_zero_cost(
+    tmp_path: Path,
+) -> None:
+    """Field case (AC2): a local harness's own `cost: 0` telemetry must not
+    read as a real zero-dollar spend."""
+    from sdlc.evaluate import NOT_METERED
+
+    target = _sample_target(tmp_path)
+    ticket = Ticket(id="t1", prompt="add a thing")
+    config = EvalConfig(name="c", target=target, tickets=[ticket])
+
+    def fake(agent_type, prompt, **kwargs):  # type: ignore[no-untyped-def]
+        (kwargs["cwd"] / "new.txt").write_text("x\n", encoding="utf-8")
+        return AgentResult(
+            agent_type=agent_type, data={}, raw="",
+            usage={"input_tokens": 1000, "output_tokens": 200},
+            cost_usd=0.0,
+        )
+
+    res = run_ticket(ticket, config, 0, tmp_path / "ws", dispatcher=fake, metered=False)
+    assert res.tokens == 1200  # tokens are still real — usage_tracking is unaffected
+    assert res.cost_usd is None
+    assert res.cost_source == NOT_METERED
+
+
+def test_run_ticket_not_metered_harness_with_configured_local_rate(
+    tmp_path: Path,
+) -> None:
+    from sdlc.evaluate import LOCAL_RATE
+
+    target = _sample_target(tmp_path)
+    ticket = Ticket(id="t1", prompt="add a thing")
+    config = EvalConfig(name="c", target=target, tickets=[ticket])
+
+    def fake(agent_type, prompt, **kwargs):  # type: ignore[no-untyped-def]
+        (kwargs["cwd"] / "new.txt").write_text("x\n", encoding="utf-8")
+        return AgentResult(
+            agent_type=agent_type, data={}, raw="",
+            usage={"input_tokens": 1_000_000},
+            cost_usd=0.0,
+        )
+
+    res = run_ticket(
+        ticket, config, 0, tmp_path / "ws",
+        dispatcher=fake, metered=False, local_rate_usd_per_million_tokens=2.5,
+    )
+    assert res.cost_usd == pytest.approx(2.5)
+    assert res.cost_source == LOCAL_RATE
+
+
+def test_run_eval_threads_metered_and_local_rate_to_every_ticket(
+    tmp_path: Path,
+) -> None:
+    from sdlc.evaluate import NOT_METERED
+
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo", target=target, n=1,
+        tickets=[Ticket(id="t1", prompt="p"), Ticket(id="t2", prompt="p")],
+    )
+
+    def fake(agent_type, prompt, **kwargs):  # type: ignore[no-untyped-def]
+        return AgentResult(
+            agent_type=agent_type, data={}, raw="",
+            usage={"input_tokens": 10}, cost_usd=0.0,
+        )
+
+    results = run_eval(config, tmp_path / "ws", dispatcher=fake, metered=False)
+    assert all(r.cost_usd is None for r in results)
+    assert all(r.cost_source == NOT_METERED for r in results)
+
+
+def test_run_ticket_contract_miss_respects_metered(tmp_path: Path) -> None:
+    """A contract miss must not treat a local harness's literal cost as real
+    either — the ContractError path shares the same cost-provenance logic."""
+    from sdlc.evaluate import NOT_METERED
+
+    target = _sample_target(tmp_path)
+    config = EvalConfig(name="demo", target=target, n=1, tickets=[Ticket(id="t1", prompt="edit")])
+
+    def miss_dispatcher(agent_type: str, prompt: str, *, cwd: Path, **_: object) -> AgentResult:
+        raise _contract_miss({"input_tokens": 10}, 0.0)
+
+    run = run_eval(config, tmp_path / "ws", dispatcher=miss_dispatcher, metered=False)[0]
+    assert run.status == "contract_miss"
+    assert run.cost_usd is None
+    assert run.cost_source == NOT_METERED
