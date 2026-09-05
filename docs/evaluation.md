@@ -230,6 +230,14 @@ number back to the conditions that produced it, weeks later:
 identity** — what `eval-compare` checks before treating two scoreboards as a
 valid A/B (below).
 
+Before comparing scoreboards from two *different harnesses* (as opposed to
+two prompt/model variants on the same harness), read
+[`docs/harness-benchmarking-method.md`](harness-benchmarking-method.md)
+(Story 31.3-002) — it states each metric's source and precision, the known
+non-comparabilities (telemetry-less harnesses, not-metered cost, stall
+asymmetry, serial-vs-parallel), the admission criteria for a harness to join
+a comparison, and the literal re-run command sequence.
+
 ## Variant comparison & regression baselines (18.1-002)
 
 A scoreboard on its own says *how good*, not *better or worse than what*. Story

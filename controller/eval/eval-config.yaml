@@ -38,6 +38,12 @@ agent_type: build
 # — before any ticket dispatches.
 # harness: qwen
 
+# Before comparing two scoreboards produced from this config (e.g. claude vs
+# qwen), read docs/harness-benchmarking-method.md (Story 31.3-002) — what each
+# metric measures, the known non-comparabilities (telemetry-less harnesses,
+# not-metered cost, stall asymmetry, serial-vs-parallel), and the exact
+# re-run command sequence including serving-setup provenance to capture.
+
 # Fixed ticket set. Each ticket is a small, well-scoped edit on the sample target
 # with a quality_cmd (exit 0 = pass) so "tests pass / no breakage" is measurable.
 tickets:
