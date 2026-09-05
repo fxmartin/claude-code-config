@@ -652,6 +652,17 @@ def test_opencode_parser_ignores_non_dict_and_blank_lines() -> None:
     assert result.usage["input_tokens"] == 3
 
 
+def test_opencode_parser_skips_event_with_no_part_object() -> None:
+    # A well-formed event (real `type`, real `sessionID`) but no `part` key at
+    # all — e.g. a future OpenCode event kind this parser doesn't know about
+    # yet. It must be skipped like any other uninterpretable line, not raise.
+    no_part_event = json.dumps({"type": "step_start", "sessionID": "ses_abc123"})
+    stdout = "\n".join([no_part_event, _oc_text_event(_wrap(_VALID_BUILD)), _oc_step_finish_event()])
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+    assert result.data == _VALID_BUILD
+    assert result.usage["input_tokens"] == 3
+
+
 # --- Post-hoc `opencode export <sessionID>` recovery (Story 29.2-003 AC4) --
 #
 # The field finding: the export must be written to a *file* before parsing —
@@ -720,5 +731,23 @@ def test_parse_opencode_export_usage_missing_cost_is_none() -> None:
 
 def test_parse_opencode_export_usage_malformed_text_returns_none() -> None:
     usage, cost = parse_opencode_export_usage("not json at all")
+    assert usage is None
+    assert cost is None
+
+
+def test_parse_opencode_export_usage_braces_present_but_invalid_json_returns_none() -> None:
+    # The regex finds a matched `{...}` span (so it isn't the "no braces at
+    # all" case above — the greedy match still needs a closing brace), but the
+    # span's content is not valid JSON — e.g. a truncated export whose write
+    # was cut mid-value, leaving a dangling trailing comma.
+    usage, cost = parse_opencode_export_usage('{"info": {"tokens": 1,}}')
+    assert usage is None
+    assert cost is None
+
+
+def test_parse_opencode_export_usage_missing_info_key_returns_none() -> None:
+    # Valid JSON, but no `info` object — an export shape this parser does not
+    # recognise. Never fabricate; degrade to (None, None) like any other miss.
+    usage, cost = parse_opencode_export_usage('{"messages": []}')
     assert usage is None
     assert cost is None
