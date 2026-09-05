@@ -258,6 +258,18 @@ longer speculative. `opencode run --format json` emits
 read}}` plus `.part.cost`. Verified against both a hosted model and a local
 oMLX one. Those are exactly the four keys `evaluate.py`'s `_USAGE_KEYS`
 expects, so this is a mapping exercise rather than a discovery exercise.
+
+**Post-hoc fallback (2026-09-05, FX, from the oMLX benchmark session)**: the
+live event stream is not the only source. `opencode export <sessionID>` returns
+the same usage after the fact, which is what FX's benchmark grader reads. Worth
+having as the degraded path when a stream is truncated, and as the way to
+backfill a stage whose usage was missed. Two gotchas that cost real time, both
+to be recorded in the parser's own comments:
+- The export **truncates at ~64 KB through a pipe** — write it to a file and
+  read the file, never `opencode export … | parser`.
+- Without a TTY it **omits its header line**, so a parser must not key on the
+  header being present.
+
 **User Story**: As FX reading run cost in the dashboard, I want an
 `opencode-json` parser that consumes `opencode run --format json` events and
 records real token usage on opencode-dispatched stages, so that parallel
@@ -276,6 +288,10 @@ OpenCode cohorts stop recording cost as "unavailable".
 - **Given** a malformed or truncated event stream **When** the parser runs
   **Then** it degrades to the plain-contract path (result block still honored,
   usage recorded unavailable) rather than failing the stage.
+- **Given** a stage whose stream yielded no usage **When** the session id is
+  known **Then** `opencode export <sessionID>` may be used to recover it
+  post-hoc, written to a file first (the pipe truncates at ~64 KB) and parsed
+  without assuming the header line exists (absent when there is no TTY).
 - **Given** the claude and codex parsers **When** the suite runs **Then** both
   are untouched — the new parser is additive, selected only by the opencode
   registry entry.
