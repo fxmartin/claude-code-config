@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.54.0] - 2026-09-05
+
+### Added
+
+- feat(harness-parallelism): opencode adapter and registry (#29.2-001) (#634)
+
+
 ## [v2.53.0] - 2026-09-05
 
 ### Added
