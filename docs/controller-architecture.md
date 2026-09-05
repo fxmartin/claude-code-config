@@ -1918,7 +1918,7 @@ Three parsers ship:
   usage unavailable rather than failing a stage whose work already succeeded.
 
 The `<<<RESULT_JSON>>>` contract (`sdlc.contracts.parse_and_validate`) is the
-harness-neutral seam both parsers validate against. `dispatch_agent(…, parser=…)`
+harness-neutral seam all three parsers validate against. `dispatch_agent(…, parser=…)`
 threads the id from the resolved harness; with no id the default keeps today's
 Claude behaviour, so the change is fully backward compatible. Adding a harness
 that reuses an existing parser shape needs **no new Python** — only a

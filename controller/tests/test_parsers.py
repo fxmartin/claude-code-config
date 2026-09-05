@@ -911,6 +911,51 @@ def test_opencode_parser_does_not_export_without_a_session_id(monkeypatch) -> No
     assert result.usage is None
 
 
+def test_opencode_parser_ignores_a_non_string_session_id(monkeypatch) -> None:
+    # `sessionID` is the one value that leaves the parser and becomes an argv
+    # word (`opencode export <sessionID>`) plus a ledger column, so a stream
+    # carrying a non-string there must be treated as "no session id" like any
+    # other malformed field — not handed to subprocess, which rejects a
+    # non-str argv entry with a TypeError that `_opencode_export_text`'s
+    # OSError/SubprocessError guard does not catch. That would lose a stage
+    # whose real work AND contract block already succeeded, to a *bonus*
+    # telemetry lookup (AC3: degrade, never fail the stage).
+    calls = _stub_export(monkeypatch, _oc_export_json())
+    stdout = json.dumps(
+        {
+            "type": "text",
+            "sessionID": 12345,
+            "part": {"type": "text", "text": _wrap(_VALID_BUILD)},
+        }
+    )
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert calls == []
+    assert result.data == _VALID_BUILD
+    assert result.session_id is None
+    assert result.usage is None
+    assert result.usage_available is True
+
+
+def test_opencode_parser_takes_the_session_id_from_a_later_well_formed_event(
+    monkeypatch,
+) -> None:
+    # Rejecting a malformed id must not poison the whole stream: a later event
+    # that names the session properly still enables the AC4 export recovery.
+    calls = _stub_export(monkeypatch, _oc_export_json())
+    bad_first = json.dumps(
+        {"type": "step_start", "sessionID": {"id": "nope"}, "part": {"type": "step-start"}}
+    )
+    stdout = "\n".join([bad_first, _oc_text_event(_wrap(_VALID_BUILD))])
+
+    result = get_parser(OPENCODE_PARSER_ID).parse(_collected(stdout=stdout))
+
+    assert calls == ["ses_abc123"]
+    assert result.session_id == "ses_abc123"
+    assert result.usage is not None
+
+
 def test_opencode_parser_export_recovery_keeps_a_cost_the_stream_reported(
     monkeypatch,
 ) -> None:

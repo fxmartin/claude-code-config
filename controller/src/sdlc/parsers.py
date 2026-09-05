@@ -381,7 +381,20 @@ class OpenCodeJsonParser(OutputParser):
             if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                 continue
             saw_json = True
-            session_id = session_id or event.get("sessionID")
+            if session_id is None:
+                # Type-guarded like every other read in this loop, and for a
+                # sharper reason: `sessionID` is the one value that leaves the
+                # parser and becomes both an argv word (`opencode export
+                # <sessionID>`, below) and a ledger column. A non-string there
+                # would raise TypeError out of `subprocess.run` — which
+                # `_opencode_export_text`'s OSError/SubprocessError guard does
+                # not catch — and lose a stage whose real work and contract
+                # block already succeeded, to a *bonus* telemetry lookup.
+                # A malformed id is simply "no session id" (skip the export),
+                # and a later well-formed event can still supply one.
+                candidate = event.get("sessionID")
+                if isinstance(candidate, str) and candidate:
+                    session_id = candidate
             part = event.get("part")
             if not isinstance(part, dict):
                 continue
