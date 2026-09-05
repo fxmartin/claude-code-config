@@ -210,9 +210,15 @@ repos to `claude`:
 ```bash
 HARNESS="$(sdlc doctor --json 2>/dev/null \
   | jq -r '.findings[] | select(.check=="harness") | .detail' \
-  | grep -oE '(claude|codex|qwen)' | head -1)"
+  | sed -n 's/.*default=\([A-Za-z0-9_-]*\).*/\1/p' | head -1)"
 HARNESS="${HARNESS:-claude}"   # sdlc absent or unreadable → the built-in default
 ```
+
+Read the `default=` value out of the detail string rather than matching a list of
+known harness names: the registry grows (`opencode` arrived in Story 29.2-001),
+and a stale enum here fails *silently* — the match whiffs, `${HARNESS:-claude}`
+fires, and the new repo is pinned to `claude`, which is exactly the reverting
+behaviour this lookup exists to prevent.
 
 Write a **minimal** file — the pin plus one pointer. Do not reproduce the full
 capability commentary here; a fresh repo's author has not met roles, adapters, or

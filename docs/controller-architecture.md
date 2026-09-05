@@ -1627,18 +1627,28 @@ additive logging (all capabilities `true`, no probe), so dispatch is unchanged.
 
 **Capability matrix** (canonical flags; the shipped `harnesses.yaml` values):
 
-| Capability | Meaning | `claude` | `codex` |
-|---|---|---|---|
-| `worktree_isolation` | Can run each story in its own git worktree | ✅ | ❌ |
-| `parallel` | Can fan a cohort across concurrent workers | ✅ | ❌ |
-| `json_contract` | Emits the `<<<RESULT_JSON>>>` contract | ✅ | ✅ |
-| `usage_tracking` | Reports token usage / cost | ✅ | ❌ |
-| `rate_limit_aware` | Surfaces 429 / reset semantics for backoff | ✅ | ❌ |
+| Capability | Meaning | `claude` | `codex` | `qwen` | `opencode` |
+|---|---|---|---|---|---|
+| `worktree_isolation` | Can run each story in its own git worktree | ✅ | ❌ | ❌ | ❌ |
+| `parallel` | Can fan a cohort across concurrent workers | ✅ | ❌ | ❌ | ❌ |
+| `json_contract` | Emits the `<<<RESULT_JSON>>>` contract | ✅ | ✅ | ✅ | ✅ |
+| `usage_tracking` | Reports token usage / cost | ✅ | ❌ | ❌ | ❌ |
+| `rate_limit_aware` | Surfaces 429 / reset semantics for backoff | ✅ | ❌ | ❌ | ❌ |
 
-A `parallel` request on `codex` (no `worktree_isolation`, no `parallel`) degrades
-to `serial` with an explicit warning; its missing `usage_tracking` /
-`rate_limit_aware` are recorded as "unavailable" rather than fabricated
-(Story 20.5-002, below).
+A `parallel` request on `codex`, `qwen`, or `opencode` (none declare
+`worktree_isolation` or `parallel`) degrades to `serial` with an explicit
+warning; their missing `usage_tracking` / `rate_limit_aware` are recorded as
+"unavailable" rather than fabricated (Story 20.5-002, below).
+
+The `opencode` adapter (Story 29.2-001) is the same no-telemetry recipe as
+`codex`/`qwen`: `scripts/opencode-build-adapter.sh` receives the prompt on
+stdin and passes it straight through to `opencode run --pure` (which reads its
+message from stdin when given no positional), strips the ANSI colour OpenCode
+emits even off a TTY, and forwards the `<<<RESULT_JSON>>>` block to the
+`codex-exec` parser. Unattended dispatch requires the target repo's
+`opencode.json` to set `"permission": { "edit": "allow", "bash": "allow" }` —
+without it OpenCode blocks on an interactive approval prompt with no TTY to
+answer it and the run hangs rather than failing fast.
 
 ### Degradation matrix and safe fallbacks (Story 20.5-002)
 

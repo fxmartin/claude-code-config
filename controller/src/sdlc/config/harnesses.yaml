@@ -127,3 +127,76 @@ harnesses:
       json_contract: true
       usage_tracking: false
       rate_limit_aware: false
+
+  # OpenCode adapter (Story 29.2-001). The wrapper receives the assembled
+  # prompt on stdin and runs OpenCode headlessly via `opencode run --pure`,
+  # letting the prompt flow through on stdin (`run` reads its message there when
+  # given no positional), forwarding the neutral <<<RESULT_JSON>>> contract — with ANSI
+  # colour stripped, since OpenCode 1.18.15 emits CSI escapes even off a TTY —
+  # to the same plain parser used by Codex and Qwen. OpenCode does not expose
+  # Claude-style stream-json / usage / rate-limit telemetry through this
+  # wrapper, so those capabilities stay false.
+  #
+  # REQUIRED for unattended dispatch: the target repo's `opencode.json` must
+  # set `"permission": { "edit": "allow", "bash": "allow" }` (or an equivalent
+  # `--auto`). Without it, OpenCode blocks a headless run on an interactive
+  # approval prompt it has no TTY to answer, and the run hangs indefinitely
+  # rather than failing fast — verified against a real OpenCode 1.18.15.
+  #
+  # ALSO REQUIRED: OpenCode's *resolved default model* must be reachable and
+  # authenticated. This entry pins no model on purpose (see below), so OpenCode
+  # falls back to whatever its own config selects — and if that points at a
+  # provider that is not answering (the common case: a `localhost` llama-server
+  # entry left in `opencode.json` with nothing listening), `opencode run` prints
+  # its banner and then blocks forever instead of erroring. Codex does not share
+  # this failure mode (`codex exec` 400s fast on an unusable model), so the
+  # blast radius is OpenCode-specific and large: this adapter always dispatches
+  # on the *captured* path, where dispatch.py's 300s output-idle stall detector
+  # does not apply (it is streaming-only), leaving only DEFAULT_TIMEOUT_S =
+  # 3600. Every routed stage therefore burns a silent hour, and a full
+  # build/coverage/review/merge/adversarial run burns about five.
+  # Before routing a role here, confirm the default answers:
+  #   echo ping | opencode run --pure
+  # If it hangs, either fix OpenCode's own default provider or name a known-good
+  # model for every dispatch without editing this shipped file:
+  #   export OPENCODE_FLAGS='--model anthropic/claude-haiku-4-5'
+  # (`OPENCODE_FLAGS` is read by `opencode-build-adapter.sh` and inserted ahead
+  # of the CLI's own flags; it survives `uv tool install --force`, which the
+  # `models:` map below does not.)
+  opencode:
+    # A model is pinned deliberately, against the issue-#228 "never assume an
+    # entitlement" instinct, because that instinct does not transfer here.
+    # `codex exec` fails fast on a model you cannot reach; OpenCode *hangs* —
+    # it resolves whatever its own config names as default, and an unreachable
+    # provider (e.g. a local llama-server that is not running) prints a banner
+    # and then nothing. The captured dispatch path has no stall detector
+    # (dispatch.py:713), so `DEFAULT_TIMEOUT_S = 3600` is the only backstop:
+    # one silent hour per stage, ~5 for a full build/coverage/review/merge/
+    # adversarial run. An unreachable default is the more likely failure than
+    # an unentitled pin, so the map below names ids verified on this host.
+    # Not entitled to these? Override without editing this file (redeploy-safe):
+    #   export OPENCODE_FLAGS='--model <provider/model>'
+    command: "opencode-build-adapter.sh --model {model}"
+    parser: codex-exec
+    enabled: true
+    probe: "opencode --version"
+    # Per-stage routing, mirroring Epic-14's Balanced profile
+    # (model_routing.py:132) so an opencode run costs what a claude run costs.
+    # `default` is required and covers any unlisted stage. Verified reachable
+    # on this host with `printf hi | opencode run --pure --model <id>`.
+    models:
+      default: anthropic/claude-sonnet-5
+      discovery: anthropic/claude-haiku-4-5
+      build: anthropic/claude-sonnet-5
+      coverage: anthropic/claude-sonnet-5
+      review: anthropic/claude-sonnet-5
+      adversarial: anthropic/claude-sonnet-5
+      bugfix: anthropic/claude-sonnet-5
+      merge: anthropic/claude-haiku-4-5
+      reask: anthropic/claude-haiku-4-5
+    capabilities:
+      worktree_isolation: false
+      parallel: false
+      json_contract: true
+      usage_tracking: false
+      rate_limit_aware: false

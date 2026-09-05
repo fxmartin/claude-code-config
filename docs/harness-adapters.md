@@ -232,16 +232,18 @@ touched.
 Routing a role to `codex` (`sdlc build --harness build=codex,…`, Story 20.7-001)
 dispatches that stage's worker through
 [`scripts/codex-build-adapter.sh`](../scripts/codex-build-adapter.sh). The harness
-registry invokes that adapter (and the qwen one) by **bare name**, resolved on
-PATH at dispatch. `install.sh --core` installs them automatically: it symlinks
-`scripts/codex-build-adapter.sh` and `scripts/qwen-build-adapter.sh` into
+registry invokes that adapter (and the qwen and opencode ones) by **bare name**,
+resolved on PATH at dispatch. `install.sh --core` installs them automatically: it
+symlinks `scripts/codex-build-adapter.sh`, `scripts/qwen-build-adapter.sh`, and
+`scripts/opencode-build-adapter.sh` into
 `~/.local/bin` (the same dir `uv` installs `sdlc` into), so a PATH-installed
 controller runs a cross-harness build with no manual step. If you have **not** run
 the installer, link them by hand as a fallback:
 
 ```bash
-ln -sf "$PWD/scripts/codex-build-adapter.sh" ~/.local/bin/
-ln -sf "$PWD/scripts/qwen-build-adapter.sh"  ~/.local/bin/
+ln -sf "$PWD/scripts/codex-build-adapter.sh"    ~/.local/bin/
+ln -sf "$PWD/scripts/qwen-build-adapter.sh"     ~/.local/bin/
+ln -sf "$PWD/scripts/opencode-build-adapter.sh" ~/.local/bin/
 ```
 
 Getting a codex-worker run green on a host then comes down to three things — get
@@ -340,19 +342,40 @@ before a single ticket runs — never mid-run. See
 [`docs/evaluation.md`](evaluation.md#harness-selection-31-1-001) for the full
 config format and abort matrix.
 
+## Shipped non-Claude adapters
+
+Beyond `codex` (the worked reference throughout this page), the registry ships:
+
+- **qwen** — Qwen Code headless coding agent; `qwen-build-adapter.sh` using `qwen -p`.
+- **opencode** — open-source headless coding CLI; `opencode-build-adapter.sh`
+  using `opencode run --pure` with the prompt on stdin (`run` reads its message
+  from stdin when given no positional; argv delivery would cap the prompt at
+  Linux's 128 KiB `MAX_ARG_STRLEN`). Two things must be true before routing a
+  role here, and **both fail as an indefinite hang rather than an error**:
+  - the target repo's `opencode.json` must set
+    `"permission": { "edit": "allow", "bash": "allow" }`, or OpenCode blocks on
+    an interactive approval prompt with no TTY to answer it;
+  - OpenCode's own resolved default model must be reachable and authenticated
+    (the registry entry pins no model, per issue #228). Check it with
+    `echo ping | opencode run --pure`; if it hangs, set
+    `OPENCODE_FLAGS='--model <provider/model>'`, which the adapter forwards and
+    which survives the `uv tool install --force` that rewrites `harnesses.yaml`.
+
+  Both matter because this adapter runs on the captured dispatch path, where the
+  300s output-idle stall detector does not apply — a hang costs the full 3600s
+  wall-clock timeout, per stage.
+
 ## Candidate future targets
 
 The abstraction exists so these become config exercises, not engineering
 projects:
 
-- **qwen** — Qwen Code headless coding agent; shipped as `qwen-build-adapter.sh` using `qwen -p`.
-- **opencode** — open-source headless coding CLI; `opencode run`-style invocation.
 - **pi** — lightweight agent CLI; stdin prompt, JSON result.
 - **gemini** — Google's CLI; wrap `gemini`'s headless mode to emit the result block.
 
 Each is the same recipe: a wrapper that maps stdin→CLI and CLI-stdout→result
 block, a `harnesses.yaml` entry with `parser: codex-exec`, and honest capability
-flags. The [codex and qwen entries](../controller/src/sdlc/config/harnesses.yaml) are the
+flags. The [codex, qwen, and opencode entries](../controller/src/sdlc/config/harnesses.yaml) are the
 canonical real-world examples to copy from.
 
 ## Where the boundary stays Claude-only

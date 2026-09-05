@@ -58,16 +58,18 @@ _run_install() {
     for target in \
         CLAUDE.md agents commands settings.json statusline-command.sh \
         keybindings.json reference-docs docs skills hooks fx-claude-config \
-        codex-build-adapter.sh qwen-build-adapter.sh overengineering-lens.sh
+        codex-build-adapter.sh qwen-build-adapter.sh opencode-build-adapter.sh \
+        overengineering-lens.sh
     do
         [[ "$output" == *"[dry-run]"*"${target}"* ]]
     done
-    # 14 ln -s lines expected (10 config items + 1 marketplace + 3 build
-    # adapters onto PATH, Story 21.3-001). Shared skills are committed relative
-    # symlinks inside commands/, so the installer no longer links them in
-    # separately (they would dirty the repo).
+    # 15 ln -s lines expected (10 config items + 1 marketplace + 4 build
+    # adapters onto PATH, Story 21.3-001 + the opencode adapter of Story
+    # 29.2-001). Shared skills are committed relative symlinks inside commands/,
+    # so the installer no longer links them in separately (they would dirty the
+    # repo).
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 14 ]
+    [ "$ln_lines" -eq 15 ]
 }
 
 @test "--core --dry-run previews git submodule init" {
@@ -113,33 +115,41 @@ _run_install() {
     # The harness registry dispatches the workers by bare name, so the adapters
     # must resolve on PATH — the installer mirrors them into ~/.local/bin (where
     # uv places sdlc), which under the test HOME is $FAKE_HOME/.local/bin.
-    local repo codex qwen
+    local repo codex qwen opencode
     repo="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
     codex="${FAKE_HOME}/.local/bin/codex-build-adapter.sh"
     qwen="${FAKE_HOME}/.local/bin/qwen-build-adapter.sh"
+    opencode="${FAKE_HOME}/.local/bin/opencode-build-adapter.sh"
     [ -L "$codex" ]
     [ -L "$qwen" ]
+    [ -L "$opencode" ]
     [ "$(readlink "$codex")" = "${repo}/scripts/codex-build-adapter.sh" ]
     [ "$(readlink "$qwen")"  = "${repo}/scripts/qwen-build-adapter.sh" ]
+    [ "$(readlink "$opencode")" = "${repo}/scripts/opencode-build-adapter.sh" ]
     # Symlinks resolve to executable regular files.
     [ -x "$codex" ]
     [ -x "$qwen" ]
+    [ -x "$opencode" ]
 }
 
 @test "--core adapter symlinks are idempotent" {
     _run_install --core
     [ "$status" -eq 0 ]
-    local codex qwen before_codex before_qwen
+    local codex qwen opencode before_codex before_qwen before_opencode
     codex="${FAKE_HOME}/.local/bin/codex-build-adapter.sh"
     qwen="${FAKE_HOME}/.local/bin/qwen-build-adapter.sh"
+    opencode="${FAKE_HOME}/.local/bin/opencode-build-adapter.sh"
     before_codex="$(readlink "$codex")"
     before_qwen="$(readlink "$qwen")"
+    before_opencode="$(readlink "$opencode")"
     _run_install --core
     [ "$status" -eq 0 ]
     [ -L "$codex" ]
     [ -L "$qwen" ]
+    [ -L "$opencode" ]
     [ "$(readlink "$codex")" = "$before_codex" ]
     [ "$(readlink "$qwen")"  = "$before_qwen" ]
+    [ "$(readlink "$opencode")" = "$before_opencode" ]
 }
 
 @test "--core warns when the bin dir is not on PATH" {
@@ -263,8 +273,8 @@ _run_install() {
     _run_install --all --dry-run
     [ "$status" -eq 0 ]
     all_ln="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    # 13 = the --core symlink set (tools/shell modes create no symlinks).
-    [ "$all_ln" -eq 14 ]
+    # 15 = the --core symlink set (tools/shell modes create no symlinks).
+    [ "$all_ln" -eq 15 ]
 }
 
 # ─── Backward-compat flags ───────────────────────────────────────────
@@ -282,12 +292,12 @@ _run_install() {
     _run_install --core --tools --shell --dry-run
     [ "$status" -eq 0 ]
     out_new="$output"
-    # Both should perform the same number of ln operations (14 core)
+    # Both should perform the same number of ln operations (15 core)
     # and neither should attempt the MCP jq merge.
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 14 ]
-    [ "$new_ln" -eq 14 ]
+    [ "$legacy_ln" -eq 15 ]
+    [ "$new_ln" -eq 15 ]
     # Neither should mention writing to ~/.claude.json
     [[ "$out_legacy" != *"Merged MCP"* ]]
     [[ "$out_new" != *"Merged MCP"* ]]
@@ -308,8 +318,8 @@ _run_install() {
     out_new="$output"
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 14 ]
-    [ "$new_ln" -eq 14 ]
+    [ "$legacy_ln" -eq 15 ]
+    [ "$new_ln" -eq 15 ]
 }
 
 # ─── --uninstall ─────────────────────────────────────────────────────
@@ -330,10 +340,12 @@ _run_install() {
     [ "$status" -eq 0 ]
     [ -L "${FAKE_HOME}/.local/bin/codex-build-adapter.sh" ]
     [ -L "${FAKE_HOME}/.local/bin/qwen-build-adapter.sh" ]
+    [ -L "${FAKE_HOME}/.local/bin/opencode-build-adapter.sh" ]
     _run_install --uninstall
     [ "$status" -eq 0 ]
     [ ! -L "${FAKE_HOME}/.local/bin/codex-build-adapter.sh" ]
     [ ! -L "${FAKE_HOME}/.local/bin/qwen-build-adapter.sh" ]
+    [ ! -L "${FAKE_HOME}/.local/bin/opencode-build-adapter.sh" ]
 }
 
 # ─── Dry-run drift fix (the Codex regression) ────────────────────────
