@@ -1,0 +1,28 @@
+{
+  "_note": "Story 29.2-002 recorded evidence — real `opencode run --pure --model anthropic/claude-haiku-4-5` via scripts/opencode-worktree-smoke.sh against a scratch repo with 2 concurrent git worktrees. Unlike qwen's 29.1-001 verified-negative, this run completed the requested edit task in both worktrees.",
+  "command": "OPENCODE_FLAGS=\"--model anthropic/claude-haiku-4-5\" bash scripts/opencode-worktree-smoke.sh --worktrees 2 --sandbox <scratch> --evidence-out <evidence.json>",
+  "host": "fxmartins-MacBook-Pro/arm64",
+  "timestamp": "2026-09-05T19:28:36Z",
+  "opencode_version": "1.18.15",
+  "flags_attempted": "--model anthropic/claude-haiku-4-5",
+  "permission_config": "opencode.json committed into the scratch repo's seed commit (inherited by every worktree via git worktree add): {\"permission\": {\"edit\": \"allow\", \"bash\": \"allow\"}}. Without it, a headless `opencode run` blocks on an interactive approval prompt it has no TTY to answer and hangs rather than failing fast (also verified separately on this host).",
+  "worktrees": [
+    {
+      "worktree": "wt-1",
+      "exit_code": 0,
+      "edited_file_written": true,
+      "stderr": "> build · claude-haiku-4-5 ← Write edited-by-opencode.txt Wrote file successfully."
+    },
+    {
+      "worktree": "wt-2",
+      "exit_code": 0,
+      "edited_file_written": true,
+      "stderr": "> build · claude-haiku-4-5 ← Write edited-by-opencode.txt Wrote file successfully."
+    }
+  ],
+  "isolation_ok": true,
+  "overall": "PASS",
+  "scratch_repo_root_untouched": true,
+  "concurrent_session_state_contention": "Checked per the story's Technical Notes. OpenCode keeps a single global SQLite session store at ~/.local/share/opencode/opencode.db (WAL mode: opencode.db-wal/-shm alongside it), plus a global ~/.config/opencode/opencode.json, shared across every project directory on this host — there is no per-worktree `.opencode/` state. Both concurrent sessions in this run (wt-1, wt-2, distinct cwds) wrote to that same shared DB simultaneously with zero errors, zero retries, and no 'database is locked' output in either worktree's stderr; opencode.db-wal's mtime advanced during the run, confirming both writers landed. WAL-mode SQLite tolerates concurrent writers by design, so no per-worktree OPENCODE_* env workaround was needed on this host. This is the one respect in which OpenCode's contention story differs from qwen's (which never got far enough to touch its own auth/session state) and from Claude's per-worktree isolation — OpenCode's shared store is real but did not contend under this story's 2-worktree load.",
+  "conclusion": "Both AC1 (single worktree completes an unattended edit, confined to that worktree) and AC2 (two concurrent worktrees stay isolated from each other and the scratch repo root) hold on this host with OpenCode 1.18.15, given the opencode.json permission config and an explicit --model override for a provider verified reachable here. Per AC3, `worktree_isolation` and `parallel` flip to true in harnesses.yaml with this evidence cited in the entry's comment."
+}
