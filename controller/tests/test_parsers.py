@@ -1100,3 +1100,53 @@ def test_opencode_export_text_returns_none_on_nonzero_exit(monkeypatch) -> None:
         subprocess, "run", lambda cmd, **kw: _FakeCompleted("", returncode=1)
     )
     assert sdlc_parsers._opencode_export_text("ses_nope") is None
+
+
+def test_opencode_parser_treats_an_all_zero_step_as_no_usage() -> None:
+    """An all-zero `tokens` object is absent usage, not a real zero.
+
+    OpenCode emits `step-finish` with every token field at 0 when a provider
+    reports nothing (`reason: "unknown"` — this shape exists in a real
+    `opencode.db`). Counting that as usage writes zeros where the columns
+    should stay NULL, so the arm renders as *free* rather than "—", stops
+    `usage_unavailable` from degrading, and short-circuits the AC4
+    `opencode export` recovery that would have returned the true tally.
+
+    Story 31.2-002's rule, applied at the source: never a 0 that reads as free.
+    """
+    stdout = "\n".join(
+        [
+            _oc_step_start_event(),
+            _oc_text_event(_wrap(_VALID_BUILD)),
+            _oc_step_finish_event(
+                input_tok=0, output_tok=0, reasoning=0,
+                cache_write=0, cache_read=0, cost=None,
+            ),
+        ]
+    )
+    parser = get_parser(OPENCODE_PARSER_ID)
+    result = parser.parse(_collected(stdout=stdout, agent_type="build"))
+
+    assert result.usage is None, f"all-zero step recorded as usage: {result.usage}"
+    assert result.cost_usd is None
+
+
+def test_opencode_parser_keeps_a_genuine_zero_cost_beside_real_tokens() -> None:
+    """A local model legitimately reports `cost: 0` while spending tokens.
+
+    The zero-usage guard must key on the token sum alone, so a real run on a
+    not-metered provider still records its tokens and its honest $0.
+    """
+    stdout = "\n".join(
+        [
+            _oc_step_start_event(),
+            _oc_text_event(_wrap(_VALID_BUILD)),
+            _oc_step_finish_event(input_tok=120, output_tok=340, cost=0.0),
+        ]
+    )
+    parser = get_parser(OPENCODE_PARSER_ID)
+    result = parser.parse(_collected(stdout=stdout, agent_type="build"))
+
+    assert result.usage is not None
+    assert result.usage["input_tokens"] == 120
+    assert result.cost_usd == 0.0

@@ -403,13 +403,28 @@ class OpenCodeJsonParser(OutputParser):
             elif event.get("type") == "step_finish":
                 tokens = part.get("tokens")
                 if isinstance(tokens, dict):
-                    saw_usage = True
                     cache = tokens.get("cache")
                     cache = cache if isinstance(cache, dict) else {}
-                    input_tokens += _sum_int(tokens.get("input"))
-                    output_tokens += _sum_int(tokens.get("output"), tokens.get("reasoning"))
-                    cache_read_tokens += _sum_int(cache.get("read"))
-                    cache_creation_tokens += _sum_int(cache.get("write"))
+                    step_input = _sum_int(tokens.get("input"))
+                    step_output = _sum_int(tokens.get("output"), tokens.get("reasoning"))
+                    step_cache_read = _sum_int(cache.get("read"))
+                    step_cache_write = _sum_int(cache.get("write"))
+                    # An all-zero step is absent usage, not a real zero. OpenCode
+                    # emits this shape when a provider reports nothing (seen with
+                    # ``reason: "unknown"``). Counting it would write zeros where
+                    # the columns must stay NULL — the arm then renders as *free*
+                    # rather than "—", ``usage_unavailable`` stops degrading, and
+                    # the AC4 ``opencode export`` recovery is short-circuited by
+                    # ``usage is not None``. Story 31.2-002's rule at the source:
+                    # never a 0 that reads as free. The cost gate stays separate,
+                    # so a genuine ``cost: 0`` on a not-metered local model still
+                    # records beside real tokens.
+                    if step_input or step_output or step_cache_read or step_cache_write:
+                        saw_usage = True
+                        input_tokens += step_input
+                        output_tokens += step_output
+                        cache_read_tokens += step_cache_read
+                        cache_creation_tokens += step_cache_write
                 cost = part.get("cost")
                 if isinstance(cost, (int, float)):
                     saw_cost = True
