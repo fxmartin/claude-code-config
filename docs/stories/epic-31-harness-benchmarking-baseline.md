@@ -1,6 +1,6 @@
 # Epic 31: Harness Benchmarking & Local-Model Baseline
 
-> **Status: NOT STARTED (0/7)** — authored 2026-09-05, from FX's decision to
+> **Status: IN PROGRESS (2/7)** — authored 2026-09-05, from FX's decision to
 > baseline local agentic coding (OpenCode + a local dense Qwen model) against
 > the hosted Claude harness on **quality, token consumption, and time**.
 > Thesis: the controller already measures all three, but not *comparably*. The
@@ -101,6 +101,7 @@ produced it. Without provenance an A/B is folklore.
 #### Stories
 
 ##### Story 31.1-001: Harness selection in the eval config and CLI
+**Status**: Done
 **User Story**: As FX baselining local inference, I want `sdlc eval` to accept
 a harness — in the versioned config and as a `--harness` override — resolved
 through the harness registry to the adapter command and parser, so that the
@@ -208,6 +209,7 @@ a hosted harness is compared to a local one.
 #### Stories
 
 ##### Story 31.2-001: Stall-adjusted wall-clock
+**Status**: Done
 **User Story**: As FX comparing a rate-limited hosted harness against a local
 model that never throttles, I want reported time to exclude quota-backoff
 stalls, with the excluded amount shown beside it, so that the comparison
@@ -253,15 +255,33 @@ the local arm has no stall concept at all; absent is correct there, not zero.
 **Dependencies**: none
 **Risk Level**: Medium
 
-##### Story 31.2-002: Honest token accounting for harnesses without usage telemetry
-**User Story**: As FX comparing token consumption across harnesses, I want a
-harness that cannot report usage to produce an explicit "unavailable" that
-propagates into the scoreboard and blocks a token verdict, so that a local
-arm's missing telemetry can never be read as "used no tokens".
+##### Story 31.2-002: Honest token accounting across harnesses
+**User Story**: As FX comparing token consumption across harnesses, I want the
+comparison to refuse a token verdict both when an arm cannot report usage *and*
+when the two arms' totals are not made of the same thing, so that neither a
+missing number nor a superficially-similar one can be read as a like-for-like
+result.
 **Priority**: Must Have
-**Story Points**: 5
+**Story Points**: 8
+
+**Field finding (2026-09-05, FX)**: the original premise — "a blank axis reads
+as zero" — understates the problem. Two arms can *both* report and the totals
+still mislead: **15,160 vs 14,152 tokens on the same prompt, one 99.9%
+cache-write and the other cache-read**. Those totals are within 7% of each
+other and describe completely different work at completely different prices.
+Availability is therefore necessary but not sufficient; comparability has to be
+judged on the **component breakdown**, not the total.
 
 **Acceptance Criteria**:
+- **Given** two arms that both report usage **When** their component mixes
+  differ materially (e.g. one dominated by cache-write, the other by
+  cache-read) **Then** the token row is reported as not-comparable with the
+  mix stated, even though both totals exist — a near-equal total must never be
+  presented as parity.
+- **Given** any reported usage **Then** the four components (input, output,
+  cache-read, cache-creation) are carried through to the scoreboard
+  individually, not collapsed to a total at the point of capture — the
+  comparator cannot judge a mix it was never given.
 - **Given** a harness declaring `usage_tracking: false` **When** an eval or
   build stage completes **Then** the token figure is recorded as unavailable
   (None), never 0, everywhere it surfaces — ledger, scoreboard, dashboard.
@@ -292,11 +312,13 @@ metric set without letting an excluded axis look like a pass. This is the
 single highest-risk hole in the baseline: without it the local arm looks free.
 
 **Definition of Done**:
+- [ ] Component breakdown carried to the scoreboard, not collapsed at capture
+- [ ] Mix-aware comparability: near-equal totals with different mixes are not-comparable
 - [ ] Unavailable-vs-zero enforced end to end for `usage_tracking: false` harnesses
 - [ ] `eval-compare` marks token/cost not-comparable and excludes them from the verdict, naming the exclusions
 - [ ] Estimates labelled as estimates and never compared against measurements
 - [ ] Capability-driven (no per-harness special cases); documented seam for external token counts
-- [ ] Tests: false-telemetry harness, mixed comparison, estimate labelling, verdict with excluded axes
+- [ ] Tests: the 15,160/14,152 cache-write-vs-cache-read case, false-telemetry harness, mixed comparison, estimate labelling, verdict with excluded axes
 
 **Dependencies**: 31.1-001; complements Epic-29 29.2-003
 **Risk Level**: High
@@ -309,9 +331,17 @@ either a real number or an explicitly labelled non-comparison.
 **Priority**: Should Have
 **Story Points**: 3
 
+**Field anchor (2026-09-05, FX)**: same prompt, two arms — oMLX reported
+`cost: 0`, Sonnet reported `$0.0569`. The local zero is *correct* (there is no
+per-token meter) and also *not* a saving of $0.0569 in any sense the comparator
+should assert. This is the concrete case the ACs below must handle.
+
 **Acceptance Criteria**:
 - **Given** a hosted harness **When** cost is reported **Then** behaviour is
   unchanged: metered or notional $/Mtok as today.
+- **Given** an arm reporting a literal `cost: 0` from its own telemetry **Then**
+  it is recorded as not-metered, not as zero dollars spent — a true `0` from a
+  local runtime and a `0` meaning "no data" must not collapse to the same value.
 - **Given** a local harness **When** cost is reported **Then** it is not a
   $/Mtok extrapolation; it is either an explicitly configured local rate
   (default: unset) or "not metered", and the scoreboard says which.

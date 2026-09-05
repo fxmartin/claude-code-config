@@ -143,6 +143,22 @@ Epic-20 holds: config + wrapper script, no Python dispatch changes.
 #### Stories
 
 ##### Story 29.2-001: OpenCode adapter and registry entry (serial)
+**Field finding (2026-09-05, FX)**: this is **effectively done, ad-hoc**. A
+working adapter and registry entry are live in `local-llm-tests/harness/`,
+resolving through `resolve_harness` and validating through
+`parse_and_validate`. Reconcile this story against that implementation rather
+than building it a second time.
+
+Two template defects found in the same session, both now fixed on `main`
+(PR #624): the worked example documented `opencode run --quiet`, a flag that
+does not exist in 1.18.15 (`run` prints help and exits), and OpenCode emits
+ANSI even when stdout is not a TTY, which `parse_and_validate` rejects
+outright. Either would have blocked a cold start on this story.
+
+**Still unproven**: whether OpenCode emits `<<<RESULT_JSON>>>` for **every**
+pipeline role. Only the build role is proven, via the self-test. This story's
+"any pipeline role can be routed to OpenCode" claim rests on that assumption —
+verify per role before closing it.
 **User Story**: As FX with OpenCode installed and multi-provider models
 configured, I want an `opencode` harness entry backed by
 `scripts/opencode-build-adapter.sh` so that any pipeline role can be routed to
@@ -235,6 +251,12 @@ shared store; if they do, document the workaround (e.g. per-worktree
 **Risk Level**: Medium
 
 ##### Story 29.2-003: OpenCode usage telemetry from the JSON event stream
+**Field finding (2026-09-05, FX)**: the seam is **confirmed and cheap**, no
+longer speculative. `opencode run --format json` emits
+`step_finish.part.tokens = {total, input, output, reasoning, cache:{write,
+read}}` plus `.part.cost`. Verified against both a hosted model and a local
+oMLX one. Those are exactly the four keys `evaluate.py`'s `_USAGE_KEYS`
+expects, so this is a mapping exercise rather than a discovery exercise.
 **User Story**: As FX reading run cost in the dashboard, I want an
 `opencode-json` parser that consumes `opencode run --format json` events and
 records real token usage on opencode-dispatched stages, so that parallel
