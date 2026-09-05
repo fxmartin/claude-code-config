@@ -60,16 +60,19 @@ install_core_run() {
   create_symlink "$SCRIPT_DIR" "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config"
 
   # Build-harness adapters on PATH (Story 21.3-001). The harness registry invokes
-  # the Codex/Qwen workers by BARE NAME (e.g. `codex-build-adapter.sh`), resolved
-  # on PATH at dispatch — so the adapters must live in a PATH dir or a cross-harness
-  # build fails with "command not found". uv installs the `sdlc` controller into
-  # ~/.local/bin, so we mirror the adapters into that same dir: an installed `sdlc`
-  # then runs a Codex/Qwen build with no manual `ln -sf`. Override with
-  # SDLC_ADAPTER_BIN_DIR (used by the bats suite to isolate state).
+  # the Codex/Qwen/OpenCode workers by BARE NAME (e.g. `codex-build-adapter.sh`),
+  # resolved on PATH at dispatch — so the adapters must live in a PATH dir or a
+  # cross-harness build fails with "command not found". uv installs the `sdlc`
+  # controller into ~/.local/bin, so we mirror the adapters into that same dir: an
+  # installed `sdlc` then runs a Codex/Qwen/OpenCode build with no manual
+  # `ln -sf`. Every harness entry in harnesses.yaml whose `command` is a bare
+  # adapter name needs a line here. Override with SDLC_ADAPTER_BIN_DIR (used by
+  # the bats suite to isolate state).
   local bin_dir="${SDLC_ADAPTER_BIN_DIR:-$HOME/.local/bin}"
   ensure_dir "$bin_dir"
   create_symlink "$SCRIPT_DIR/scripts/codex-build-adapter.sh" "$bin_dir/codex-build-adapter.sh"
   create_symlink "$SCRIPT_DIR/scripts/qwen-build-adapter.sh"  "$bin_dir/qwen-build-adapter.sh"
+  create_symlink "$SCRIPT_DIR/scripts/opencode-build-adapter.sh" "$bin_dir/opencode-build-adapter.sh"
   # The over-engineering lens (issue #445) is likewise dispatched by bare name
   # via the `command` template in overengineering-lens.yaml.
   create_symlink "$SCRIPT_DIR/scripts/overengineering-lens.sh" "$bin_dir/overengineering-lens.sh"
@@ -104,5 +107,6 @@ install_core_uninstall() {
   local bin_dir="${SDLC_ADAPTER_BIN_DIR:-$HOME/.local/bin}"
   remove_symlink "$bin_dir/codex-build-adapter.sh" "$SCRIPT_DIR/scripts/codex-build-adapter.sh"
   remove_symlink "$bin_dir/qwen-build-adapter.sh"  "$SCRIPT_DIR/scripts/qwen-build-adapter.sh"
+  remove_symlink "$bin_dir/opencode-build-adapter.sh" "$SCRIPT_DIR/scripts/opencode-build-adapter.sh"
   remove_symlink "$bin_dir/overengineering-lens.sh" "$SCRIPT_DIR/scripts/overengineering-lens.sh"
 }

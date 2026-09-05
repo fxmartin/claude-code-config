@@ -11,7 +11,7 @@ import pytest
 
 from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
 from sdlc.dispatch import AgentDispatchError
-from sdlc.harness import dispatch_on_harness, resolve_harness
+from sdlc.harness import dispatch_on_harness, load_harnesses_config, resolve_harness
 from sdlc.parsers import PlainResultParser, get_parser
 from sdlc.role_routing import PIPELINE_ROLES, resolve_role_routing
 
@@ -139,3 +139,38 @@ def test_full_opencode_run_spawns_zero_claude() -> None:
     for role, harness in resolved.items():
         assert harness.name == "opencode", f"role {role} did not route to opencode"
         assert not any("claude" in token for token in harness.to_argv())
+
+
+def test_registry_bare_adapter_commands_are_installed_on_path() -> None:
+    """Regression guard for Story 29.2-001's dispatch gap.
+
+    Registry entries invoke their wrapper by BARE NAME, resolved on PATH at
+    dispatch, and `install.sh --core` is what puts those wrappers on PATH. A new
+    harness whose adapter the installer does not symlink resolves to nothing on a
+    PATH-installed controller and the stage dies with "command not found" — which
+    is exactly what the shipped `opencode` entry did. Assert the invariant for
+    every registry adapter, not just this story's.
+    """
+    core_sh = Path(__file__).resolve().parents[2] / "install" / "core.sh"
+    if not core_sh.is_file():
+        pytest.skip("install/core.sh is not present (installed controller, not a checkout)")
+    installer = core_sh.read_text(encoding="utf-8")
+
+    registry = load_harnesses_config(CONFIG_PATH)
+    adapters = sorted(
+        {
+            token
+            for entry in registry.values()
+            for token in [entry.command.split()[0]]
+            if token.endswith("-adapter.sh") and "/" not in token
+        }
+    )
+    assert "opencode-build-adapter.sh" in adapters
+    for adapter in adapters:
+        assert f'create_symlink "$SCRIPT_DIR/scripts/{adapter}"' in installer, (
+            f"{adapter} is dispatched by bare name but install/core.sh never "
+            f"symlinks it onto PATH"
+        )
+        assert f'remove_symlink "$bin_dir/{adapter}"' in installer, (
+            f"{adapter} is symlinked onto PATH but --uninstall never removes it"
+        )

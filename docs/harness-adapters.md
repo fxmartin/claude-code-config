@@ -232,16 +232,18 @@ touched.
 Routing a role to `codex` (`sdlc build --harness build=codex,…`, Story 20.7-001)
 dispatches that stage's worker through
 [`scripts/codex-build-adapter.sh`](../scripts/codex-build-adapter.sh). The harness
-registry invokes that adapter (and the qwen one) by **bare name**, resolved on
-PATH at dispatch. `install.sh --core` installs them automatically: it symlinks
-`scripts/codex-build-adapter.sh` and `scripts/qwen-build-adapter.sh` into
+registry invokes that adapter (and the qwen and opencode ones) by **bare name**,
+resolved on PATH at dispatch. `install.sh --core` installs them automatically: it
+symlinks `scripts/codex-build-adapter.sh`, `scripts/qwen-build-adapter.sh`, and
+`scripts/opencode-build-adapter.sh` into
 `~/.local/bin` (the same dir `uv` installs `sdlc` into), so a PATH-installed
 controller runs a cross-harness build with no manual step. If you have **not** run
 the installer, link them by hand as a fallback:
 
 ```bash
-ln -sf "$PWD/scripts/codex-build-adapter.sh" ~/.local/bin/
-ln -sf "$PWD/scripts/qwen-build-adapter.sh"  ~/.local/bin/
+ln -sf "$PWD/scripts/codex-build-adapter.sh"    ~/.local/bin/
+ln -sf "$PWD/scripts/qwen-build-adapter.sh"     ~/.local/bin/
+ln -sf "$PWD/scripts/opencode-build-adapter.sh" ~/.local/bin/
 ```
 
 Getting a codex-worker run green on a host then comes down to three things — get
