@@ -163,6 +163,22 @@ harnesses:
   # (`OPENCODE_FLAGS` is read by `opencode-build-adapter.sh` and inserted ahead
   # of the CLI's own flags; it survives `uv tool install --force`, which the
   # `models:` map below does not.)
+  #
+  # worktree_isolation / parallel verified (Story 29.2-002, evidence:
+  # controller/eval/results/opencode-worktree-smoke-29.2-002.json, 2026-09-05,
+  # opencode 1.18.15): scripts/opencode-worktree-smoke.sh cut two concurrent
+  # git worktrees, each carrying the required opencode.json permission config
+  # as a tracked file, and ran the adapter in each with
+  # `OPENCODE_FLAGS='--model anthropic/claude-haiku-4-5'`. Unlike qwen's
+  # 29.1-001 verified-negative, both worktrees completed the requested edit:
+  # each edit landed only in its own worktree, the scratch repo root stayed
+  # untouched, and no cross-contamination occurred between worktrees.
+  # OpenCode's global session store (~/.local/share/opencode/opencode.db, WAL
+  # mode) is shared across every project directory on the host — there is no
+  # per-worktree `.opencode/` state — but the two concurrent sessions in this
+  # run wrote to it simultaneously with zero errors and no lock contention;
+  # SQLite's WAL mode tolerated the concurrent writers, so no per-worktree
+  # OPENCODE_* workaround was needed here.
   opencode:
     # A model is pinned deliberately, against the issue-#228 "never assume an
     # entitlement" instinct, because that instinct does not transfer here.
@@ -195,8 +211,8 @@ harnesses:
       merge: anthropic/claude-haiku-4-5
       reask: anthropic/claude-haiku-4-5
     capabilities:
-      worktree_isolation: false
-      parallel: false
+      worktree_isolation: true
+      parallel: true
       json_contract: true
       usage_tracking: false
       rate_limit_aware: false

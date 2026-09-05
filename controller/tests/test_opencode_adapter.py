@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from sdlc.capability import MODE_PARALLEL, preflight_harness, resolve_capabilities
 from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
+from sdlc.degradation import DegradationKind, evaluate_degradations
 from sdlc.dispatch import AgentDispatchError
 from sdlc.harness import dispatch_on_harness, load_harnesses_config, resolve_harness
 from sdlc.parsers import PlainResultParser, get_parser
@@ -51,12 +53,15 @@ def test_opencode_entry_uses_plain_result_parser() -> None:
     assert isinstance(get_parser(opencode.parser), PlainResultParser)
 
 
-def test_opencode_entry_declares_probe_and_conservative_capabilities() -> None:
+def test_opencode_entry_declares_probe_and_capabilities() -> None:
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     assert opencode.probe == "opencode --version"
     assert opencode.capabilities["json_contract"] is True
-    assert opencode.capabilities["worktree_isolation"] is False
-    assert opencode.capabilities["parallel"] is False
+    # worktree_isolation / parallel verified true by Story 29.2-002 (evidence:
+    # controller/eval/results/opencode-worktree-smoke-29.2-002.json) — see the
+    # degradation tests below for the preflight consequence.
+    assert opencode.capabilities["worktree_isolation"] is True
+    assert opencode.capabilities["parallel"] is True
     assert opencode.capabilities["usage_tracking"] is False
     assert opencode.capabilities["rate_limit_aware"] is False
 
@@ -216,3 +221,38 @@ def test_registry_bare_adapter_commands_are_installed_on_path() -> None:
         assert f'remove_symlink "$bin_dir/{adapter}"' in installer, (
             f"{adapter} is symlinked onto PATH but --uninstall never removes it"
         )
+
+
+# ---------------------------------------------------------------------------
+# Story 29.2-002: worktree_isolation/parallel verified true (evidence:
+# controller/eval/results/opencode-worktree-smoke-29.2-002.json) —
+# scripts/opencode-worktree-smoke.sh cut two concurrent git worktrees, each
+# carrying the required opencode.json permission config, and both completed
+# the requested edit with no cross-contamination. Unlike qwen's 29.1-001
+# verified-negative, a `parallel` request routed to opencode must no longer
+# degrade to serial. These tests lock the current (positive) degradation
+# behaviour as a regression guard, mirroring test_qwen_adapter.py's
+# verified-negative block but asserting the opposite outcome.
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_parallel_request_no_longer_degrades_to_serial() -> None:
+    opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
+    capabilities = resolve_capabilities(opencode)
+    plan = evaluate_degradations(opencode.name, capabilities, requested_mode=MODE_PARALLEL)
+
+    assert not plan.has(DegradationKind.PARALLEL_TO_SERIAL)
+    assert plan.effective_mode == MODE_PARALLEL
+
+
+def test_opencode_preflight_does_not_warn_on_parallel_request() -> None:
+    opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
+    pf = preflight_harness(opencode, requested_mode=MODE_PARALLEL)
+
+    assert not any("parallel" in warning for warning in pf.warnings)
+
+
+def test_opencode_capabilities_declare_worktree_isolation_and_parallel() -> None:
+    opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
+    assert opencode.capabilities["worktree_isolation"] is True
+    assert opencode.capabilities["parallel"] is True
