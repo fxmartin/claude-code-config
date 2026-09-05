@@ -1,5 +1,5 @@
 # ABOUTME: Tests for the OpenCode harness adapter registry integration (Story 29.2-001).
-# ABOUTME: Proves OpenCode dispatch uses the plain result parser and never invokes Claude.
+# ABOUTME: Proves OpenCode dispatch uses the opencode-json parser and never invokes Claude.
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
 from sdlc.degradation import DegradationKind, evaluate_degradations
 from sdlc.dispatch import AgentDispatchError
 from sdlc.harness import dispatch_on_harness, load_harnesses_config, resolve_harness
-from sdlc.parsers import PlainResultParser, get_parser
+from sdlc.parsers import OPENCODE_PARSER_ID, OpenCodeJsonParser, get_parser
 from sdlc.role_routing import PIPELINE_ROLES, resolve_role_routing
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
@@ -47,10 +47,12 @@ class _FakeCompleted:
         self.returncode = returncode
 
 
-def test_opencode_entry_uses_plain_result_parser() -> None:
+def test_opencode_entry_uses_opencode_json_parser() -> None:
+    # Story 29.2-003: switched off the no-telemetry plain parser onto the
+    # `--format json` event-stream parser that recovers real usage/cost.
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
-    assert opencode.parser == "codex-exec"
-    assert isinstance(get_parser(opencode.parser), PlainResultParser)
+    assert opencode.parser == OPENCODE_PARSER_ID
+    assert isinstance(get_parser(opencode.parser), OpenCodeJsonParser)
 
 
 def test_opencode_entry_declares_probe_and_capabilities() -> None:
@@ -62,7 +64,9 @@ def test_opencode_entry_declares_probe_and_capabilities() -> None:
     # degradation tests below for the preflight consequence.
     assert opencode.capabilities["worktree_isolation"] is True
     assert opencode.capabilities["parallel"] is True
-    assert opencode.capabilities["usage_tracking"] is False
+    # Story 29.2-003: flipped true once the `opencode-json` parser could
+    # actually recover real per-session tokens/cost off `step_finish` events.
+    assert opencode.capabilities["usage_tracking"] is True
     assert opencode.capabilities["rate_limit_aware"] is False
 
 
@@ -120,6 +124,36 @@ def test_opencode_entry_documents_the_unreachable_default_hang() -> None:
     )
 
 
+def _wrap_ndjson(payload: dict, *, session_id: str = "ses_test1") -> str:
+    """A realistic single-step `--format json` NDJSON stream carrying ``payload``.
+
+    Mirrors the real shape verified against OpenCode 1.18.15 (Story 29.2-003):
+    a ``text`` event's ``part.text`` carries the contract block, a
+    ``step_finish`` event's ``part.tokens``/``part.cost`` carry real usage.
+    """
+    text_event = json.dumps(
+        {"type": "text", "sessionID": session_id, "part": {"type": "text", "text": _wrap(payload)}}
+    )
+    finish_event = json.dumps(
+        {
+            "type": "step_finish",
+            "sessionID": session_id,
+            "part": {
+                "type": "step-finish",
+                "tokens": {
+                    "total": 118,
+                    "input": 3,
+                    "output": 5,
+                    "reasoning": 0,
+                    "cache": {"write": 100, "read": 10},
+                },
+                "cost": 0.02,
+            },
+        }
+    )
+    return f"{text_event}\n{finish_event}\n"
+
+
 def test_build_agent_round_trips_through_opencode(monkeypatch) -> None:
     seen_cmd: list[str] = []
     seen_input: list[str | None] = []
@@ -136,7 +170,12 @@ def test_build_agent_round_trips_through_opencode(monkeypatch) -> None:
 
     assert result.data["build_status"] == "SUCCESS"
     assert result.data["commit_sha"] == "feedface"
-    assert result.usage_available is False
+    # Story 29.2-003: usage_tracking is now a real harness-level capability, so
+    # usage_available is True even on this plain-text fixture (no NDJSON
+    # events at all) — the run itself simply carried no usable telemetry, so
+    # usage/cost stay None rather than a fabricated zero (see the NDJSON test
+    # below for the "real usage recorded" path).
+    assert result.usage_available is True
     assert result.usage is None
     assert result.cost_usd is None
     # The dispatched command is the opencode wrapper, not the claude CLI; the
@@ -144,6 +183,27 @@ def test_build_agent_round_trips_through_opencode(monkeypatch) -> None:
     assert "claude" not in seen_cmd[0]
     assert not any(tok == "claude" or tok.endswith("/claude") for tok in seen_cmd)
     assert seen_input == ["build story with opencode"]
+
+
+def test_build_agent_round_trip_through_opencode_records_real_usage(monkeypatch) -> None:
+    """Story 29.2-003 AC1/DoD: a real `--format json` stream's `step_finish`
+    tokens/cost land on the AgentResult the ledger's `stage_set_usage` reads —
+    the "dashboard/ledger show real usage on an opencode-routed stage" bar."""
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap_ndjson(_VALID_BUILD)))
+
+    opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
+    result = dispatch_on_harness(opencode, "build", "build story with opencode")
+
+    assert result.data["build_status"] == "SUCCESS"
+    assert result.usage_available is True
+    assert result.usage == {
+        "input_tokens": 3,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 100,
+    }
+    assert result.cost_usd == pytest.approx(0.02)
+    assert result.session_id == "ses_test1"
 
 
 def test_coverage_agent_round_trips_through_opencode(monkeypatch) -> None:
@@ -158,7 +218,8 @@ def test_coverage_agent_round_trips_through_opencode(monkeypatch) -> None:
     result = dispatch_on_harness(opencode, "coverage", "qa story with opencode")
 
     assert result.data["coverage_status"] == "PASS"
-    assert result.usage_available is False
+    assert result.usage_available is True
+    assert result.usage is None
 
 
 def test_opencode_nonzero_exit_is_plain_dispatch_error(monkeypatch) -> None:
@@ -256,3 +317,19 @@ def test_opencode_capabilities_declare_worktree_isolation_and_parallel() -> None
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     assert opencode.capabilities["worktree_isolation"] is True
     assert opencode.capabilities["parallel"] is True
+
+
+# ---------------------------------------------------------------------------
+# Story 29.2-003 AC2: usage_tracking flipped true once `opencode-json` could
+# recover real usage — the degradation plan must stop recording
+# `usage_unavailable` for opencode. Mirrors the block above's regression-guard
+# style for the parallel/worktree_isolation flip in 29.2-002.
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_no_longer_records_usage_unavailable_degradation() -> None:
+    opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
+    capabilities = resolve_capabilities(opencode)
+    plan = evaluate_degradations(opencode.name, capabilities, requested_mode=MODE_PARALLEL)
+
+    assert not plan.has(DegradationKind.USAGE_UNAVAILABLE)
