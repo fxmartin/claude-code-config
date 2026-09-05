@@ -21,9 +21,11 @@ from sdlc.eval_compare import (
     compare_scoreboards,
     has_regressions,
     load_scoreboard,
+    provenance_warnings,
     regressions,
     render_comparison_table,
     save_scoreboard,
+    ticket_set_mismatches,
     ticket_verdict,
 )
 
@@ -344,3 +346,124 @@ def test_load_scoreboard_non_mapping_raises(tmp_path: Path) -> None:
     bad.write_text("[1, 2, 3]", encoding="utf-8")
     with pytest.raises(BaselineError):
         load_scoreboard(bad)
+
+
+# ---------------------------------------------------------------------------
+# Story 31.1-002 — provenance: cross-harness header, ticket-set mismatch
+# refusal, and the legacy "provenance unknown" warning.
+# ---------------------------------------------------------------------------
+
+
+def _provenance(*, config_name: str, seed: int | None, ticket_ids: list[str]) -> dict:
+    return {
+        "harness": "claude",
+        "model": "sonnet",
+        "harness_version": None,
+        "host": "h/arm64",
+        "config_name": config_name,
+        "seed": seed,
+        "ticket_ids": ticket_ids,
+        "n": 1,
+        "timestamp": "2026-09-05T12:00:00Z",
+    }
+
+
+def test_compare_records_baseline_and_candidate_harness() -> None:
+    base = {**_board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None), "harness": "claude"}
+    cand = {**_board("B", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None), "harness": "codex"}
+    cmp = compare_scoreboards(base, cand)
+    assert cmp.baseline_harness == "claude"
+    assert cmp.candidate_harness == "codex"
+
+
+def test_compare_harness_defaults_to_claude_when_absent() -> None:
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand = _board("B", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cmp = compare_scoreboards(base, cand)
+    assert cmp.baseline_harness == "claude"
+    assert cmp.candidate_harness == "claude"
+
+
+def test_render_comparison_table_states_both_harnesses() -> None:
+    base = {**_board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None), "harness": "claude"}
+    cand = {**_board("B", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None), "harness": "codex"}
+    table = render_comparison_table(compare_scoreboards(base, cand))
+    assert "claude" in table
+    assert "codex" in table
+
+
+# --- ticket_set_mismatches — the eval-compare refusal signal -----------------
+
+
+def test_ticket_set_mismatches_empty_when_identical() -> None:
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    base["provenance"] = _provenance(config_name="A", seed=7, ticket_ids=["t1"])
+    cand = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand["provenance"] = _provenance(config_name="A", seed=7, ticket_ids=["t1"])
+    assert ticket_set_mismatches(base, cand) == []
+
+
+def test_ticket_set_mismatches_flags_different_config_name() -> None:
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand = _board("B", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    mismatches = ticket_set_mismatches(base, cand)
+    assert any("config name" in m for m in mismatches)
+
+
+def test_ticket_set_mismatches_flags_different_ticket_ids() -> None:
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand = _board(
+        "A",
+        [
+            _score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0),
+            _score("t2", loc=1, tokens=1, cost=1, wall=1, qual=1.0),
+        ],
+        None,
+    )
+    mismatches = ticket_set_mismatches(base, cand)
+    assert any("ticket ids" in m for m in mismatches)
+
+
+def test_ticket_set_mismatches_flags_different_seed_when_both_known() -> None:
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    base["provenance"] = _provenance(config_name="A", seed=1, ticket_ids=["t1"])
+    cand = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand["provenance"] = _provenance(config_name="A", seed=2, ticket_ids=["t1"])
+    mismatches = ticket_set_mismatches(base, cand)
+    assert any("seed" in m for m in mismatches)
+
+
+def test_ticket_set_mismatches_ignores_seed_when_provenance_missing() -> None:
+    # Legacy scoreboards carry no seed at all — never manufacture a seed
+    # mismatch from data that was never recorded.
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand["provenance"] = _provenance(config_name="A", seed=99, ticket_ids=["t1"])
+    assert ticket_set_mismatches(base, cand) == []
+
+
+# --- provenance_warnings — the "provenance unknown" acceptance path ---------
+
+
+def test_provenance_warnings_empty_when_both_present() -> None:
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    base["provenance"] = _provenance(config_name="A", seed=1, ticket_ids=["t1"])
+    cand = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand["provenance"] = _provenance(config_name="A", seed=1, ticket_ids=["t1"])
+    assert provenance_warnings(base, cand) == []
+
+
+def test_provenance_warnings_flags_legacy_baseline() -> None:
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand["provenance"] = _provenance(config_name="A", seed=1, ticket_ids=["t1"])
+    warnings = provenance_warnings(base, cand)
+    assert len(warnings) == 1
+    assert "provenance unknown" in warnings[0]
+    assert "A" in warnings[0]
+
+
+def test_provenance_warnings_flags_both_missing() -> None:
+    base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    cand = _board("B", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
+    assert len(provenance_warnings(base, cand)) == 2

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from sdlc.cli import app
@@ -306,6 +308,58 @@ def test_eval_failed_probe_aborts_before_any_dispatch(tmp_path: Path, monkeypatc
     assert result.exit_code == 2
     assert "probe failed" in result.stderr
     assert called["run"] is False
+
+
+def test_eval_json_includes_provenance_block(tmp_path: Path) -> None:
+    """Story 31.1-002 AC1: every eval records a provenance block."""
+    config = _write_eval_bundle(tmp_path)  # seed: 7, tickets: [t1]
+    stub = _write_stub_agent(tmp_path)
+    env = dict(os.environ, SDLC_AGENT_CMD=str(stub))
+    result = runner.invoke(app, ["eval", "--config", str(config), "--json"], env=env)
+    assert result.exit_code == 0, result.stdout
+    prov = json.loads(result.stdout)["provenance"]
+    assert prov["harness"] == "claude"
+    assert prov["config_name"] == "cli-demo"
+    assert prov["seed"] == 7
+    assert prov["ticket_ids"] == ["t1"]
+    assert prov["n"] == 1
+    assert prov["model"]
+    assert "/" in prov["host"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", prov["timestamp"])
+    # The built-in claude harness declares no `probe`, so no version is known.
+    assert prov["harness_version"] is None
+
+
+def test_eval_json_provenance_records_probed_harness_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registry harness's declared `probe` output becomes its recorded version."""
+    import sdlc.capability as capability_mod
+    import sdlc.evaluate as evaluate_mod
+    import sdlc.role_routing as role_routing_mod
+
+    registry = tmp_path / "harnesses.yaml"
+    registry.write_text(
+        "harnesses:\n  qwen:\n    command: 'qwen-build-adapter.sh --model {model}'\n"
+        "    parser: codex-exec\n    probe: 'qwen --version'\n"
+        "    models:\n      default: qwen-max\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(role_routing_mod, "default_registry_path", lambda: registry)
+    monkeypatch.setattr(
+        capability_mod, "_default_probe_runner", lambda argv, **k: (0, "qwen version 1.2.3")
+    )
+
+    def fake_run_eval(config, workspace, **kwargs):  # noqa: ANN001 — test double
+        return []
+
+    monkeypatch.setattr(evaluate_mod, "run_eval", fake_run_eval)
+    config = _write_eval_bundle(tmp_path)
+    result = runner.invoke(
+        app, ["eval", "--config", str(config), "--harness", "qwen", "--json"]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["provenance"]["harness_version"] == "qwen version 1.2.3"
 
 
 def test_eval_dry_run_still_aborts_on_unknown_harness(tmp_path: Path) -> None:

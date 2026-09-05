@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import functools
+import platform
 import shutil
+import socket
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +165,69 @@ class TicketScore:
 
 
 @dataclass(frozen=True)
+class Provenance:
+    """The conditions that produced a scoreboard — Story 31.1-002 AC1.
+
+    ``config_name`` + ``seed`` + ``ticket_ids`` together are the *ticket-set
+    identity* ``eval-compare`` checks before it treats two scoreboards as a
+    valid A/B: comparing runs built from different work is not a comparison.
+    ``harness_version`` is the registry's declared ``probe`` command output —
+    ``None`` when the harness declares no probe (e.g. the built-in claude
+    harness), which is an absent fact, not a failed one. ``host`` is coarse
+    (hostname/arch) by design, never a hardware fingerprint. ``timestamp`` is
+    UTC ISO-8601 (``%Y-%m-%dT%H:%M:%SZ``).
+    """
+
+    harness: str
+    model: str | None
+    harness_version: str | None
+    host: str
+    config_name: str
+    seed: int | None
+    ticket_ids: list[str]
+    n: int
+    timestamp: str
+
+
+def host_identifier() -> str:
+    """A coarse host id (``hostname/machine-arch``) — never a fingerprint."""
+    return f"{socket.gethostname()}/{platform.machine()}"
+
+
+def utc_timestamp() -> str:
+    """The current UTC time as ``%Y-%m-%dT%H:%M:%SZ`` (second precision)."""
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_provenance(
+    config: EvalConfig,
+    *,
+    harness_version: str | None = None,
+    host: str | None = None,
+    timestamp: str | None = None,
+) -> Provenance:
+    """Assemble a scoreboard's provenance block from a resolved :class:`EvalConfig`.
+
+    ``config.harness``/``config.model`` are always concrete by this point
+    (``EvalConfig.__post_init__`` pins both), so the block never records a
+    guessed default. ``harness_version`` is the caller's job to supply (it
+    requires running the harness's declared probe, an I/O step this pure
+    assembly function does not perform itself).
+    """
+    return Provenance(
+        harness=config.harness or DEFAULT_HARNESS,
+        model=config.model,
+        harness_version=harness_version,
+        host=host if host is not None else host_identifier(),
+        config_name=config.name,
+        seed=config.seed,
+        ticket_ids=[t.id for t in config.tickets],
+        n=config.n,
+        timestamp=timestamp if timestamp is not None else utc_timestamp(),
+    )
+
+
+@dataclass(frozen=True)
 class Scoreboard:
     """The full eval result: one :class:`TicketScore` per ticket plus an overall."""
 
@@ -172,6 +238,10 @@ class Scoreboard:
     # per-harness scoreboards are comparable by construction, never guessed from
     # context.
     harness: str = DEFAULT_HARNESS
+    # Story 31.1-002 AC1: full run provenance (harness/model/version/host/
+    # ticket-set identity/n/timestamp). ``None`` for a caller that never builds
+    # one — legacy scoreboards and any direct `aggregate()` call that skips it.
+    provenance: Provenance | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +486,7 @@ def aggregate(
     config_name: str,
     *,
     harness: str | None = None,
+    provenance: Provenance | None = None,
 ) -> Scoreboard:
     """Fold per-run results into per-ticket means plus an overall aggregate row.
 
@@ -426,7 +497,9 @@ def aggregate(
     resolves to the built-in claude default, so today's scoreboard shape is
     unchanged. Accepts ``None`` so a caller can pass ``EvalConfig.harness``
     directly — typed optional at rest, always concrete after
-    ``EvalConfig.__post_init__`` pins it.
+    ``EvalConfig.__post_init__`` pins it. ``provenance`` (Story 31.1-002 AC1) is
+    attached as-is; ``None`` (an existing caller that never passes it) keeps the
+    scoreboard's provenance-free shape unchanged.
     """
     by_ticket: dict[str, list[RunResult]] = {}
     for r in results:
@@ -439,6 +512,7 @@ def aggregate(
         tickets=tickets,
         overall=overall,
         harness=harness if harness is not None else DEFAULT_HARNESS,
+        provenance=provenance,
     )
 
 
@@ -500,14 +574,37 @@ def _score_to_dict(score: TicketScore) -> dict[str, Any]:
     }
 
 
-def scoreboard_to_dict(board: Scoreboard) -> dict[str, Any]:
-    """Serialise a scoreboard to a plain dict for JSON output / baseline storage."""
+def _provenance_to_dict(p: Provenance) -> dict[str, Any]:
     return {
+        "harness": p.harness,
+        "model": p.model,
+        "harness_version": p.harness_version,
+        "host": p.host,
+        "config_name": p.config_name,
+        "seed": p.seed,
+        "ticket_ids": list(p.ticket_ids),
+        "n": p.n,
+        "timestamp": p.timestamp,
+    }
+
+
+def scoreboard_to_dict(board: Scoreboard) -> dict[str, Any]:
+    """Serialise a scoreboard to a plain dict for JSON output / baseline storage.
+
+    The ``provenance`` key (Story 31.1-002 AC1) is present only when the board
+    carries one — a scoreboard built without it (an older caller, a legacy
+    baseline file) keeps exactly today's shape, so this stays backward
+    compatible with every scoreboard on disk.
+    """
+    payload: dict[str, Any] = {
         "config_name": board.config_name,
         "harness": board.harness,
         "tickets": [_score_to_dict(t) for t in board.tickets],
         "overall": _score_to_dict(board.overall) if board.overall else None,
     }
+    if board.provenance is not None:
+        payload["provenance"] = _provenance_to_dict(board.provenance)
+    return payload
 
 
 # ---------------------------------------------------------------------------

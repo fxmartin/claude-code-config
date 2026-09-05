@@ -127,6 +127,27 @@ The `--json` form (`scoreboard_to_dict`) is the shape later stories store as a
 **baseline** to flag regressions (18.1-002) and run in **CI** on agent-affecting
 changes (18.1-003).
 
+## Scoreboard provenance (31.1-002)
+
+Every `--json` scoreboard carries a `provenance` block — enough to trace a
+number back to the conditions that produced it, weeks later:
+
+| Field             | Meaning                                                                 |
+|-------------------|--------------------------------------------------------------------------|
+| `harness`         | The resolved harness name (e.g. `claude`, `qwen`).                       |
+| `model`           | The resolved, pinned model id the run actually dispatched on.            |
+| `harness_version` | The harness's declared `probe` command output (Story 31.1-001) — the same source of truth the preflight uses; `null` when the harness declares no `probe` (e.g. the built-in `claude` harness), not a failure. |
+| `host`            | A coarse host id, `hostname/machine-arch` — never a hardware fingerprint. |
+| `config_name`     | The eval config's `name:`.                                               |
+| `seed`            | The config's `seed:`, or `null` when unset.                              |
+| `ticket_ids`      | Every ticket id the config ran.                                          |
+| `n`               | Runs per ticket.                                                         |
+| `timestamp`       | UTC, `%Y-%m-%dT%H:%M:%SZ`.                                                |
+
+`config_name` + `seed` + `ticket_ids` together are a scoreboard's **ticket-set
+identity** — what `eval-compare` checks before treating two scoreboards as a
+valid A/B (below).
+
 ## Variant comparison & regression baselines (18.1-002)
 
 A scoreboard on its own says *how good*, not *better or worse than what*. Story
@@ -167,6 +188,37 @@ A metric only counts as moved when it changes by more than `--tolerance` (defaul
 the signal, so it stays neutral. This is the knob that keeps the false-positive
 rate down. This directly answers the Epic-14 question: *does cheaper-model routing
 hold quality?* — compare the two scoreboards and read the verdict.
+
+### Refusing to compare unlike runs (31.1-002)
+
+`eval-compare` checks the two scoreboards' **ticket-set identity**
+(`config_name` + `seed` + `ticket_ids`, from their `provenance` blocks and
+`tickets`) before comparing. Comparing runs built from different work is not
+an A/B:
+
+```bash
+uv run sdlc eval-compare --baseline /tmp/a.json --candidate /tmp/b.json
+# error: refusing to compare different ticket sets (not an A/B):
+#   - config name differs: 'strutils-baseline' vs 'other-eval'
+# pass --force to compare anyway
+```
+
+`--force` compares anyway, with the mismatch printed as a warning instead of a
+refusal — for the deliberate case (e.g. checking whether an old baseline is
+even in the same ballpark as a newer, differently-scoped eval):
+
+```bash
+uv run sdlc eval-compare --baseline /tmp/a.json --candidate /tmp/b.json --force
+```
+
+A **legacy scoreboard** — one predating provenance tracking, with no
+`provenance` block at all — is still accepted, never rejected; it prints a
+`provenance unknown` warning instead, so an old committed baseline stays
+usable. And when the two scoreboards ran on **different harnesses**, the
+comparison proceeds and states both harnesses in its header
+(`compare: ... (baseline, harness=claude) vs ... (candidate, harness=codex)`),
+so a delta is never misread as model-only. `--json` carries the same warnings
+under a `warnings` key.
 
 ### Regression baselines
 

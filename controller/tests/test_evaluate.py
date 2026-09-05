@@ -13,10 +13,13 @@ from sdlc.evaluate import (
     DiffStats,
     EvalConfig,
     EvalConfigError,
+    Provenance,
     RunResult,
     Ticket,
     aggregate,
+    build_provenance,
     dispatcher_for_harness,
+    host_identifier,
     load_config,
     parse_diff_numstat,
     render_table,
@@ -27,6 +30,7 @@ from sdlc.evaluate import (
     run_ticket,
     scoreboard_to_dict,
     tokens_from_usage,
+    utc_timestamp,
 )
 from sdlc.harness import DEFAULT_HARNESS
 from sdlc.rate_limit import RateLimitSignal
@@ -1078,3 +1082,117 @@ def test_dispatcher_for_harness_builtin_matches_plain_dispatch_agent(
     run_eval(config, tmp_path / "ws", dispatcher=dispatcher_for_harness(harness))
     assert seen["agent_cmd"] == resolve_agent_cmd(model="haiku")
     assert seen["parser"] is None
+
+
+# ---------------------------------------------------------------------------
+# Story 31.1-002 — scoreboard provenance: host/timestamp helpers, the
+# Provenance block, and its wiring through aggregate/scoreboard_to_dict.
+# ---------------------------------------------------------------------------
+
+
+def test_host_identifier_is_hostname_slash_arch() -> None:
+    host = host_identifier()
+    assert "/" in host
+    name, _, arch = host.partition("/")
+    assert name and arch
+
+
+def test_utc_timestamp_matches_iso8601_z_format() -> None:
+    ts = utc_timestamp()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", ts)
+
+
+def test_build_provenance_from_config() -> None:
+    config = EvalConfig(
+        name="demo",
+        target=Path("t"),
+        tickets=[Ticket(id="t1", prompt="p"), Ticket(id="t2", prompt="p2")],
+        n=3,
+        seed=42,
+        model="sonnet",
+        harness="qwen",
+    )
+    prov = build_provenance(
+        config,
+        harness_version="qwen 1.2.3",
+        host="myhost/arm64",
+        timestamp="2026-09-05T12:00:00Z",
+    )
+    assert prov.harness == "qwen"
+    assert prov.model == "sonnet"
+    assert prov.harness_version == "qwen 1.2.3"
+    assert prov.host == "myhost/arm64"
+    assert prov.config_name == "demo"
+    assert prov.seed == 42
+    assert prov.ticket_ids == ["t1", "t2"]
+    assert prov.n == 3
+    assert prov.timestamp == "2026-09-05T12:00:00Z"
+
+
+def test_build_provenance_defaults_host_and_timestamp_when_omitted() -> None:
+    config = EvalConfig(name="demo", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    prov = build_provenance(config)
+    assert "/" in prov.host
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", prov.timestamp)
+    assert prov.harness_version is None
+
+
+def test_build_provenance_no_probe_version_is_none_not_error() -> None:
+    # A harness that declares no `probe` command has no version to record — the
+    # field is absent, not a failure.
+    config = EvalConfig(name="demo", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    prov = build_provenance(config, harness_version=None)
+    assert prov.harness_version is None
+
+
+def test_aggregate_attaches_provenance_when_given() -> None:
+    config = EvalConfig(name="demo", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    prov = build_provenance(config, timestamp="2026-09-05T12:00:00Z", host="h/arm64")
+    board = aggregate([_run("t1", 0, added=1)], "demo", provenance=prov)
+    assert board.provenance == prov
+
+
+def test_aggregate_provenance_defaults_to_none() -> None:
+    board = aggregate([_run("t1", 0, added=1)], "demo")
+    assert board.provenance is None
+
+
+def test_scoreboard_to_dict_includes_provenance_block_when_present() -> None:
+    config = EvalConfig(
+        name="demo", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], seed=7, n=2
+    )
+    prov = build_provenance(config, timestamp="2026-09-05T12:00:00Z", host="h/arm64")
+    board = aggregate([_run("t1", 0, added=1)], "demo", provenance=prov)
+    payload = scoreboard_to_dict(board)
+    assert payload["provenance"] == {
+        "harness": DEFAULT_HARNESS,
+        "model": config.model,
+        "harness_version": None,
+        "host": "h/arm64",
+        "config_name": "demo",
+        "seed": 7,
+        "ticket_ids": ["t1"],
+        "n": 2,
+        "timestamp": "2026-09-05T12:00:00Z",
+    }
+
+
+def test_scoreboard_to_dict_omits_provenance_when_absent() -> None:
+    board = aggregate([_run("t1", 0, added=1)], "demo")
+    assert "provenance" not in scoreboard_to_dict(board)
+
+
+def test_provenance_is_frozen_dataclass() -> None:
+    prov = Provenance(
+        harness="claude",
+        model="sonnet",
+        harness_version=None,
+        host="h/arm64",
+        config_name="demo",
+        seed=None,
+        ticket_ids=["t1"],
+        n=1,
+        timestamp="2026-09-05T12:00:00Z",
+    )
+    with pytest.raises(Exception):  # noqa: B017 — FrozenInstanceError
+        prov.model = "haiku"  # type: ignore[misc]
