@@ -71,13 +71,38 @@ def test_opencode_argv_never_invokes_claude() -> None:
 def test_shipped_opencode_harness_pins_no_model_entitlement() -> None:
     """Issue #228 lesson (echoed in the story notes): never hardcode a model id
     in the shipped template — the default must run on whatever the user has
-    configured, with per-stage routing staying an opt-in."""
+    configured, with per-stage routing staying an opt-in.
+
+    The cost of that choice is real and is deliberately paid, not hidden: if
+    OpenCode's own resolved default points at an unreachable provider, the run
+    hangs silently for the full captured-path wall clock. It is documented as a
+    precondition with an `OPENCODE_FLAGS` escape hatch (pinned by
+    :func:`test_opencode_entry_documents_the_unreachable_default_hang`) rather
+    than papered over by hardcoding a model nobody is guaranteed to be entitled
+    to.
+    """
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     for stage in (None, "build", "coverage", "review", "merge", "adversarial"):
         argv = opencode.to_argv() if stage is None else opencode.to_argv(stage=stage)
         assert "--model" not in argv, (
             f"shipped opencode argv forces a model for stage={stage}: {argv}"
         )
+
+
+def test_opencode_entry_documents_the_unreachable_default_hang() -> None:
+    """The entry pins no model, so the *documentation* of that trade-off is the
+    only mitigation a user gets before burning a silent 3600s stage. Pin it: an
+    edit that drops the warning or the escape hatch must fail here."""
+    entry = CONFIG_PATH.read_text().split("  opencode:")[0].rsplit("# OpenCode adapter", 1)[-1]
+    assert "OPENCODE_FLAGS" in entry, (
+        "opencode entry no longer names the redeploy-safe model override"
+    )
+    assert "opencode run --pure" in entry, (
+        "opencode entry no longer shows how to check the resolved default answers"
+    )
+    assert "3600" in entry, (
+        "opencode entry no longer states the wall clock a silent hang costs"
+    )
 
 
 def test_build_agent_round_trips_through_opencode(monkeypatch) -> None:

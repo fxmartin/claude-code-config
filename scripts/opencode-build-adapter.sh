@@ -33,6 +33,19 @@
 # config file, but prefer the explicit permission block above outside a
 # disposable sandbox.
 #
+# ALSO REQUIRED: OpenCode's resolved default model must be reachable and
+# authenticated. This wrapper passes no `--model` unless the controller routes
+# one, so OpenCode picks its own configured default — and an unreachable default
+# (e.g. a `localhost` llama-server entry with nothing listening) makes
+# `opencode run` print its banner and then block forever rather than erroring.
+# The controller dispatches this wrapper on the captured path, which has no
+# output-idle stall detector, so the only backstop is the 3600s wall clock: one
+# silent hour per routed stage. Check the default before routing work here
+# (`echo ping | opencode run --pure`); if it hangs, name a known-good model for
+# every dispatch with `OPENCODE_FLAGS='--model anthropic/claude-haiku-4-5'`
+# rather than editing the shipped registry, which `uv tool install --force`
+# overwrites.
+#
 # Usage:
 #   echo "<agent prompt>" | opencode-build-adapter.sh [--model provider/model]
 #
@@ -48,7 +61,9 @@
 #   OPENCODE_BIN     Override the OpenCode executable path/name (default
 #                    `opencode`).
 #   OPENCODE_FLAGS   Extra flags inserted before the prompt, word-split
-#                    intentionally for simple flag strings, e.g. '--dir /work'.
+#                    intentionally for simple flag strings, e.g. '--dir /work'
+#                    or '--model anthropic/claude-haiku-4-5' (the redeploy-safe
+#                    way to override an unreachable default model — see above).
 #
 # Exit status:
 #   0  forwarded OpenCode's output (the controller's parser validates the block)
@@ -125,4 +140,10 @@ fi
 # controller retries. `sed` exits on EOF once the exec'd CLI is gone.
 esc=$(printf '\033')
 exec > >(sed -e "s/${esc}\[[0-9;?]*[a-zA-Z]//g")
-exec "${OPENCODE_BIN}" run --pure "${opencode_flags[@]}" "${model_flags[@]}"
+# `${arr[@]+"${arr[@]}"}` rather than a bare `"${arr[@]}"`: under `set -u`,
+# bash 3.2 (still /bin/bash on macOS) treats an *empty* array expansion as an
+# unbound variable and aborts, so the no-flags path — the shipped default —
+# would die before ever reaching OpenCode.
+exec "${OPENCODE_BIN}" run --pure \
+  ${opencode_flags[@]+"${opencode_flags[@]}"} \
+  ${model_flags[@]+"${model_flags[@]}"}

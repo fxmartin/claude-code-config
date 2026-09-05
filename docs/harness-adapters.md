@@ -342,20 +342,34 @@ before a single ticket runs — never mid-run. See
 [`docs/evaluation.md`](evaluation.md#harness-selection-31-1-001) for the full
 config format and abort matrix.
 
+## Shipped non-Claude adapters
+
+Beyond `codex` (the worked reference throughout this page), the registry ships:
+
+- **qwen** — Qwen Code headless coding agent; `qwen-build-adapter.sh` using `qwen -p`.
+- **opencode** — open-source headless coding CLI; `opencode-build-adapter.sh`
+  using `opencode run --pure` with the prompt on stdin (`run` reads its message
+  from stdin when given no positional; argv delivery would cap the prompt at
+  Linux's 128 KiB `MAX_ARG_STRLEN`). Two things must be true before routing a
+  role here, and **both fail as an indefinite hang rather than an error**:
+  - the target repo's `opencode.json` must set
+    `"permission": { "edit": "allow", "bash": "allow" }`, or OpenCode blocks on
+    an interactive approval prompt with no TTY to answer it;
+  - OpenCode's own resolved default model must be reachable and authenticated
+    (the registry entry pins no model, per issue #228). Check it with
+    `echo ping | opencode run --pure`; if it hangs, set
+    `OPENCODE_FLAGS='--model <provider/model>'`, which the adapter forwards and
+    which survives the `uv tool install --force` that rewrites `harnesses.yaml`.
+
+  Both matter because this adapter runs on the captured dispatch path, where the
+  300s output-idle stall detector does not apply — a hang costs the full 3600s
+  wall-clock timeout, per stage.
+
 ## Candidate future targets
 
 The abstraction exists so these become config exercises, not engineering
 projects:
 
-- **qwen** — Qwen Code headless coding agent; shipped as `qwen-build-adapter.sh` using `qwen -p`.
-- **opencode** — open-source headless coding CLI; shipped as
-  `opencode-build-adapter.sh` using `opencode run --pure` with the prompt on
-  stdin (`run` reads its message from stdin when given no positional; argv
-  delivery would cap the prompt at Linux's 128 KiB `MAX_ARG_STRLEN`).
-  Unattended dispatch requires the target repo's `opencode.json`
-  to set `"permission": { "edit": "allow", "bash": "allow" }`; without it
-  OpenCode blocks on an interactive approval prompt with no TTY to answer it
-  and the run hangs rather than failing fast.
 - **pi** — lightweight agent CLI; stdin prompt, JSON result.
 - **gemini** — Google's CLI; wrap `gemini`'s headless mode to emit the result block.
 

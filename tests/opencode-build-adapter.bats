@@ -2,10 +2,13 @@
 # Tests for scripts/opencode-build-adapter.sh (Story 29.2-001).
 #
 # The wrapper reads the controller prompt on stdin, invokes OpenCode headlessly
-# as `opencode run --pure ... -- "$prompt"`, and forwards stdout — stripped of
-# ANSI colour, which OpenCode 1.18.15 emits even off a TTY — so the
-# harness-neutral <<<RESULT_JSON>>> block reaches the controller's codex-exec
-# parser unchanged.
+# as `opencode run --pure ...` and lets that same stdin flow through to the CLI
+# (`run` reads its message from stdin when given no positional), then forwards
+# stdout — stripped of ANSI colour, which OpenCode 1.18.15 emits even off a TTY
+# — so the harness-neutral <<<RESULT_JSON>>> block reaches the controller's
+# codex-exec parser unchanged. The prompt must never appear in argv: the
+# assertions below enforce that, because argv delivery would cap the prompt at
+# Linux's 128 KiB MAX_ARG_STRLEN.
 
 WRAPPER="${BATS_TEST_DIRNAME}/../scripts/opencode-build-adapter.sh"
 
@@ -78,6 +81,36 @@ EOF
     [ "${status}" -eq 0 ]
     [[ "$(cat "${OPENCODE_ARG_LOG}")" == *"--dir"* ]]
     [[ "$(cat "${OPENCODE_ARG_LOG}")" == *"/work"* ]]
+    [ "$(cat "${OPENCODE_STDIN_LOG}")" = "prompt" ]
+}
+
+@test "OPENCODE_FLAGS can name the model, the documented hang escape hatch" {
+    # The shipped registry entry pins no model (issue #228), so OpenCode falls
+    # back to its own configured default — and an unreachable default hangs
+    # silently for the full 3600s captured-path timeout instead of erroring.
+    # `OPENCODE_FLAGS` is the remedy the adapter and registry both document, and
+    # unlike the `models:` map it survives `uv tool install --force`.
+    run bash -c "printf 'prompt' | OPENCODE_FLAGS='--model anthropic/claude-haiku-4-5' bash '${WRAPPER}'"
+
+    [ "${status}" -eq 0 ]
+    [[ "$(cat "${OPENCODE_ARG_LOG}")" == *"--model"* ]]
+    [[ "$(cat "${OPENCODE_ARG_LOG}")" == *"anthropic/claude-haiku-4-5"* ]]
+}
+
+@test "runs under bash 3.2 with neither OPENCODE_FLAGS nor --model set" {
+    # macOS still ships bash 3.2 as /bin/bash, where `set -u` aborts on an
+    # *empty* array expansion. A bare "${opencode_flags[@]}" therefore killed
+    # the shipped no-flags path — the default every dispatch takes — before it
+    # ever reached OpenCode.
+    if [ ! -x /bin/bash ]; then
+        skip "/bin/bash not present"
+    fi
+
+    run bash -c "printf 'prompt' | /bin/bash '${WRAPPER}'"
+
+    [ "${status}" -eq 0 ]
+    [[ "${output}" != *"unbound variable"* ]]
+    [[ "${output}" == *"<<<RESULT_JSON>>>"* ]]
     [ "$(cat "${OPENCODE_STDIN_LOG}")" = "prompt" ]
 }
 
