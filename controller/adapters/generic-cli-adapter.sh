@@ -67,7 +67,15 @@ fi
 # emit ANSI escapes even when stdout is not a TTY, and an escape landing inside
 # the result block makes the controller's contract parser reject the payload.
 # Everything outside the block is prose the controller ignores, so stripping is
-# safe and the block itself round-trips unchanged. `pipefail` (set above) keeps
-# the agent's own exit status, so a dispatch failure is still a dispatch failure.
+# safe and the block itself round-trips unchanged.
+#
+# The strip is attached with a process substitution and the CLI is then `exec`ed,
+# rather than piping into sed. A trailing pipeline would leave this bash as the
+# CLI's parent, and `_dispatch_captured` — the path every non-`stream-json`
+# adapter takes — kills only its direct child, so the real CLI would survive the
+# controller's timeout and reparent to PID 1. `exec` keeps this PID, so the CLI
+# *is* the dispatcher's direct child, exactly as the codex/qwen adapters do, and
+# its exit status is the wrapper's by construction.
 esc=$(printf '\033')
-bash -c "$AGENT_CMD" | sed -e "s/${esc}\[[0-9;?]*[a-zA-Z]//g"
+exec > >(sed -e "s/${esc}\[[0-9;?]*[a-zA-Z]//g")
+exec bash -c "$AGENT_CMD"

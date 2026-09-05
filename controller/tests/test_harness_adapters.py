@@ -416,3 +416,54 @@ def test_adapter_strips_ansi_so_the_result_block_still_parses() -> None:
     assert proc.returncode == 0, proc.stderr
     assert esc not in proc.stdout, "adapter forwarded raw ANSI escapes"
     parse_and_validate("build", proc.stdout)
+
+
+def test_adapter_execs_so_the_cli_is_the_dispatchers_direct_child(tmp_path: Path) -> None:
+    """The agent CLI must replace the wrapper, not run as its piped child.
+
+    `codex`/`qwen` end in `exec "${BIN}"`, so the CLI *is* `subprocess.run`'s
+    direct child. A wrapper ending in a pipeline leaves bash as the parent, and
+    `_dispatch_captured` (the path any non-`stream-json` adapter takes) kills
+    only the direct child — so the real CLI survives the controller's timeout
+    and is reparented to PID 1.
+
+    Asserted structurally, not by timing: the CLI records its own pid, which
+    must equal the pid the caller spawned. An exec chain makes them identical.
+    """
+    pidfile = tmp_path / "cli.pid"
+    cli = tmp_path / "fake-cli.sh"
+    cli.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$$" > "{pidfile}"\n'
+        # Colour on stdout: the wrapper must still strip it while exec'ing.
+        'printf "\\033[1m%s\\033[0m\\n" "'
+        + RESULT_START_MARKER
+        + '"\n'
+        # Quoted: a bare JSON line would be parsed by bash as a brace group.
+        "cat <<'JSON'\n"
+        '{"branch_name": "feature/x-0.0-000", "build_status": "SUCCESS", '
+        '"commit_sha": "0000000000000000000000000000000000000000"}\n'
+        "JSON\n"
+        f'printf "%s\\n" "{RESULT_END_MARKER}"\n'
+    )
+    cli.chmod(0o755)
+
+    proc = subprocess.Popen(
+        ["bash", str(ADAPTER_TEMPLATE)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={"HARNESS_AGENT_CMD": str(cli), "PATH": "/usr/bin:/bin:/usr/local/bin"},
+    )
+    out, err = proc.communicate(input="prompt", timeout=60)
+
+    assert proc.returncode == 0, err
+    assert pidfile.exists(), f"fake CLI never ran: {err}"
+    assert pidfile.read_text().strip() == str(proc.pid), (
+        "the agent CLI is not the dispatcher's direct child — the wrapper "
+        "survived as its parent, so process-group kill cannot reach the CLI"
+    )
+    # The exec must not cost us the ANSI stripping the wrapper exists to do.
+    assert "\033" not in out
+    parse_and_validate("build", out)
