@@ -1,0 +1,27 @@
+{
+  "_note": "Story 31.3-001 recorded baseline — the qwen (local) arm's actual, real result. Not a scoreboard: every dispatch was blocked before a single ticket ran, so there is no per-ticket data to report. Recorded here, by category, per AC4 ('a harness that cannot complete the work is a finding, not missing data') rather than silently dropped from the comparison.",
+  "harness": "qwen",
+  "config_name": "strutils-baseline",
+  "config_path": "eval/eval-config.yaml",
+  "ticket_ids": ["add-capitalize", "add-count-vowels", "add-truncate"],
+  "n": 3,
+  "seed": 1801,
+  "host": "fxmartins-MacBook-Pro/arm64",
+  "timestamp": "2026-09-05T09:34:17Z",
+  "harness_cli_version": "0.21.10",
+  "command_attempted": "uv run sdlc eval --harness qwen --json --config eval/eval-config.yaml",
+  "exit_code": 2,
+  "runs_attempted": 0,
+  "runs_completed": 0,
+  "failure_category": "harness_preflight_model_pin_unsupported",
+  "failure_stage": "preflight (before any ticket dispatched)",
+  "stderr_verbatim": "error: harness 'qwen' cannot take a model pin (config model='sonnet'); add a {model} placeholder and a 'models' map to its entry in the harness registry, or drop the harness override to run on the default claude harness",
+  "root_cause": "controller/src/sdlc/config/harnesses.yaml's qwen entry has no {model} placeholder in its command template. sdlc.evaluate.resolve_eval_harness (AC6 of Story 31.1-001) refuses to run any registry harness silently ignoring the eval's pinned model, so the whole sweep aborts before ticket 1 rather than mis-report a model that never ran.",
+  "secondary_finding": {
+    "description": "Even bypassing the model-pin gate, the qwen CLI itself has no auth configured on this machine and refuses to run non-interactively.",
+    "command": "qwen -p \"hello, reply with just OK\"",
+    "exit_code": 1,
+    "stderr_verbatim": "No auth type is selected. Please configure an auth type (e.g. via settings or `--auth-type`) before running in non-interactive mode.",
+    "note": "This is a config/deployment gap (no local model server or DashScope credential wired up on this host), not a quality or latency finding — recorded because Story 31.3-001's technical notes anticipate exactly this: the local arm exposing an adapter-level failure before it exposes any quality difference."
+  }
+}

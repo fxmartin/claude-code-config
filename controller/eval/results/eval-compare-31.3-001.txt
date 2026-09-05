@@ -1,0 +1,31 @@
+warning: strutils-baseline: provenance unknown (legacy scoreboard predates provenance tracking)
+compare: strutils-baseline (baseline, harness=claude) vs strutils-baseline (candidate, harness=claude)  [tolerance 10%]
+wall_s is stall-adjusted agent time (rate-limit waits excluded).
+
+add-capitalize: WORSE  (excluded from verdict: tokens, cost$)
+  netLOC       7.3333 ->    11.0000  ( +50%) ↑ worse
+  tokens   344298.3333 -> 206940.6667  not comparable — no component breakdown recorded on the baseline, so the token mix cannot be judged — regenerate it with `sdlc eval --json`
+  cost$        0.2649 ->     0.1097  not comparable — no component breakdown recorded on the baseline, so the token mix cannot be judged — regenerate it with `sdlc eval --json`
+  wall_s      35.8866 ->    32.9224  (  -8%) = same
+  qual         1.0000 ->     1.0000  (  +0%) = same
+
+add-count-vowels: NEUTRAL  (excluded from verdict: tokens, cost$)
+  netLOC       0.0000 ->     6.6667  (    —) ↑ worse
+  tokens   329170.3333 -> 206360.6667  not comparable — no component breakdown recorded on the baseline, so the token mix cannot be judged — regenerate it with `sdlc eval --json`
+  cost$        0.2571 ->     0.1080  not comparable — no component breakdown recorded on the baseline, so the token mix cannot be judged — regenerate it with `sdlc eval --json`
+  wall_s      31.6762 ->    26.2694  ( -17%) ↓ better
+  qual         1.0000 ->     1.0000  (  +0%) = same
+
+add-truncate: NEUTRAL  (excluded from verdict: tokens, cost$)
+  netLOC       4.0000 ->    12.0000  (+200%) ↑ worse
+  tokens   361050.0000 -> 184987.6667  not comparable — no component breakdown recorded on the baseline, so the token mix cannot be judged — regenerate it with `sdlc eval --json`
+  cost$        0.2689 ->     0.1016  not comparable — no component breakdown recorded on the baseline, so the token mix cannot be judged — regenerate it with `sdlc eval --json`
+  wall_s     133.1535 ->    23.1960  ( -83%) ↓ better
+  qual         1.0000 ->     1.0000  (  +0%) = same
+
+OVERALL: NEUTRAL  (excluded from verdict: tokens, cost$)
+  netLOC       3.7778 ->     9.8889  (+162%) ↑ worse
+  tokens   342813.2500 -> 199429.6667  not comparable — no component breakdown recorded on the baseline, so the token mix cannot be judged — regenerate it with `sdlc eval --json`
+  cost$        0.2630 ->     0.1064  not comparable — no component breakdown recorded on the baseline, so the token mix cannot be judged — regenerate it with `sdlc eval --json`
+  wall_s      66.9054 ->    27.4626  ( -59%) ↓ better
+  qual         1.0000 ->     1.0000  (  +0%) = same
