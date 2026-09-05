@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.53.0] - 2026-09-05
+
+### Added
+
+- feat(harness-parallelism): verify and enable qwen worktree (#29.1-001) (#633)
+
+
 ## [v2.52.1] - 2026-09-05
 
 ### Fixed
