@@ -69,6 +69,27 @@ def test_doc_gives_literal_rerun_commands() -> None:
     assert re.search(r"```", text), "commands must be in a fenced code block"
 
 
+def test_doc_command_sequence_is_literal_and_runnable() -> None:
+    # AC3 asks for the *literal* command sequence, not just the verb names —
+    # the dry-run probe, the scoreboard-producing flag, and both eval-compare
+    # inputs must all appear inside the fenced block a reader would paste.
+    match = re.search(r"```bash\n(.*?)```", _doc_text(), flags=re.DOTALL)
+    assert match, "missing a fenced bash block for the re-run sequence"
+    block = match.group(1)
+    assert "--dry-run" in block
+    assert "--json" in block
+    assert "--baseline" in block and "--candidate" in block
+
+
+def test_doc_covers_applying_to_a_new_local_model() -> None:
+    # AC3 covers reproducing a baseline "for a new harness or model" — the
+    # model half (re-pointing an existing harness at a different model) needs
+    # its own coverage, not just the new-harness path.
+    text = _doc_text().lower()
+    assert "new local model" in text or "newer local model" in text
+    assert "new baseline, not a patch" in text or "do not overwrite the previous one" in text
+
+
 def test_doc_lists_serving_setup_provenance_to_capture() -> None:
     text = _doc_text().lower()
     for field in ("quantisation", "context length", "server"):
