@@ -445,6 +445,52 @@ def test_run_build_records_degradations_for_bare_harness(tmp_path, monkeypatch) 
     assert "rate-limit" in joined
 
 
+def test_run_build_cost_governance_unaffected_by_a_not_metered_harness(
+    tmp_path, monkeypatch
+) -> None:
+    """Story 31.2-003 AC6: build.py's stage-cost recording never reads
+    ``HarnessConfig.metered``/``local_rate_usd_per_million_tokens`` — a build
+    routed to a non-metered harness records its stage cost exactly as any
+    other harness would (from the dispatcher's own reported ``cost_usd``), so
+    a not-metered harness cannot affect a budget gate or calibration."""
+    import sqlite3
+
+    from sdlc.harness import HarnessConfig
+
+    local = HarnessConfig(
+        name="local",
+        command="local run",
+        parser="codex-exec",
+        capabilities={
+            "worktree_isolation": False,
+            "parallel": False,
+            "json_contract": True,
+            "usage_tracking": True,
+            "rate_limit_aware": False,
+        },
+        metered=False,
+        local_rate_usd_per_million_tokens=5.0,
+    )
+    monkeypatch.setattr("sdlc.build.resolve_harness", lambda *a, **k: local)
+    db = tmp_path / "ledger.db"
+    run_build(
+        BuildOptions(scope="epic-99", skip_preflight=True, sequential=True),
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT cost_usd FROM stages "
+            "WHERE story_id='s1-001' AND stage_name='build' AND attempt=1"
+        ).fetchone()
+    # Unchanged from the dispatcher's own reported cost — never re-derived
+    # from ``local_rate_usd_per_million_tokens`` and never blanked to "not
+    # metered"; build.py's cost path has no notion of either.
+    assert row[0] == 0.05
+
+
 def test_run_build_degradation_recording_is_best_effort(tmp_path, monkeypatch) -> None:
     """Story 20.5-002 AC3: a failure while recording degradations never fails the
     build. The recorder is best-effort, so a raising dependency is swallowed and
