@@ -81,6 +81,7 @@ record the evidence, and let the capability flags tell the truth.
 #### Stories
 
 ##### Story 29.1-001: Verify and enable qwen worktree isolation + parallel
+**Status**: Done
 **User Story**: As FX routing batch work to Qwen Code, I want the qwen harness
 to declare `worktree_isolation: true` and `parallel: true` once a recorded
 smoke test proves `qwen -p` completes an edit task unattended inside a freshly

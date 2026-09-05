@@ -114,9 +114,9 @@ harnesses:
       rate_limit_aware: false
 
   # OpenCode adapter (Story 29.2-001). The wrapper receives the assembled
-  # prompt on stdin and runs OpenCode headlessly via `opencode run --pure --
-  # "$prompt"` (OpenCode takes the message as a trailing positional argument,
-  # not stdin), forwarding the neutral <<<RESULT_JSON>>> contract — with ANSI
+  # prompt on stdin and runs OpenCode headlessly via `opencode run --pure`,
+  # letting the prompt flow through on stdin (`run` reads its message there when
+  # given no positional), forwarding the neutral <<<RESULT_JSON>>> contract — with ANSI
   # colour stripped, since OpenCode 1.18.15 emits CSI escapes even off a TTY —
   # to the same plain parser used by Codex and Qwen. OpenCode does not expose
   # Claude-style stream-json / usage / rate-limit telemetry through this

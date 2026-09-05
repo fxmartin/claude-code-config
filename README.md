@@ -373,8 +373,8 @@ At 5 agents × (Claude Code + MCP fleet + LSP + worktree I/O) the machine is sit
 | `commands/` | Namespaced slash commands (`dev/`, `project/`, `research/`, plus top-level) | 16 |
 | `agents/` | Specialist agent definitions (8 SDLC + 4 personal extras) | 12 |
 | `hooks/` | Telegram notifier, worktree bootstrap, PR-merge docs hook, orphan-worktree sweeper, worktree GC, SQLite ledger emitter, hook profiles, session context | 8 scripts |
-| `scripts/` | CI validators, release gates (`compute-release.sh`, `release-guard.sh`), deploy + controller bootstrap, harness adapters (`codex-build-adapter.sh`, `qwen-build-adapter.sh`, `opencode-build-adapter.sh`), security scans (SAST, OSV, supply-chain), shared-skills sync, smoke test | 21 |
-| `tests/` | bats test suite for hooks, install smoke tests, the controller, harness adapters, and release gates | 39 bats |
+| `scripts/` | CI validators, release gates (`compute-release.sh`, `release-guard.sh`), deploy + controller bootstrap, harness adapters (`codex-build-adapter.sh`, `qwen-build-adapter.sh`, `opencode-build-adapter.sh`), security scans (SAST, OSV, supply-chain), shared-skills sync, smoke test | 24 |
+| `tests/` | bats test suite for hooks, install smoke tests, the controller, harness adapters, and release gates | 45 bats |
 | `templates/` | Shared scaffolding used by generator skills | 5 |
 | `reference-docs/` | Language/tooling references loaded via `@` imports | 3 |
 | `docs/` | User-facing docs (CLAUDE.md guide, Python/container/DB/testing best practices, generators, controller architecture, ADRs, contracts) | — |

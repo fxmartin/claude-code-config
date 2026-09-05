@@ -14,10 +14,12 @@ setup() {
     mkdir -p "${TEST_BIN}"
     export PATH="${TEST_BIN}:${PATH}"
     export OPENCODE_ARG_LOG="${BATS_TEST_TMPDIR}/opencode-args.log"
+    export OPENCODE_STDIN_LOG="${BATS_TEST_TMPDIR}/opencode-stdin.log"
 
     cat > "${TEST_BIN}/opencode" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "${OPENCODE_ARG_LOG}"
+cat > "${OPENCODE_STDIN_LOG}"
 cat <<'RESULT'
 opencode reasoning prose
 <<<RESULT_JSON>>>
@@ -42,7 +44,7 @@ EOF
     [[ "${output}" == *"<<<RESULT_JSON>>>"* ]]
 }
 
-@test "passes the stdin prompt as a positional message argument via --pure" {
+@test "delivers the prompt to opencode on stdin, not in argv" {
     local prompt="build story 29.2-001 with some context"
 
     run bash -c "printf '%s' \"\$1\" | bash '${WRAPPER}'" _ "${prompt}"
@@ -52,23 +54,23 @@ EOF
     run cat "${OPENCODE_ARG_LOG}"
     [[ "${output}" == *"run"* ]]
     [[ "${output}" == *"--pure"* ]]
-    [ "$(tail -n1 "${OPENCODE_ARG_LOG}")" = "${prompt}" ]
+    # `opencode run` reads its message from stdin when given no positional.
+    # Delivering it in argv instead caps the prompt at MAX_ARG_STRLEN (128 KiB).
+    [ "$(cat "${OPENCODE_STDIN_LOG}")" = "${prompt}" ]
+    [[ "$(cat "${OPENCODE_ARG_LOG}")" != *"${prompt}"* ]]
 }
 
-@test "preserves a multiline prompt intact as the trailing argument" {
+@test "preserves a multiline prompt intact on stdin" {
     local prompt=$'build story 29.2-001\nwith multiline context'
 
     run bash -c "printf '%s' \"\$1\" | bash '${WRAPPER}'" _ "${prompt}"
 
     [ "${status}" -eq 0 ]
-    # The prompt is the wrapper's own final positional arg (after `--`), which
-    # the fake CLI logs on its own trailing line(s) — the log's tail must equal
-    # the prompt verbatim, newline included, not truncated to one line.
-    logged="$(tail -n2 "${OPENCODE_ARG_LOG}")"
-    [ "${logged}" = "${prompt}" ]
+    # Newlines must survive the hand-off verbatim, not be truncated or re-joined.
+    [ "$(cat "${OPENCODE_STDIN_LOG}")" = "${prompt}" ]
 }
 
-@test "honors OPENCODE_BIN and OPENCODE_FLAGS before the prompt" {
+@test "honors OPENCODE_BIN and OPENCODE_FLAGS" {
     mv "${TEST_BIN}/opencode" "${TEST_BIN}/fake-opencode"
 
     run bash -c "printf 'prompt' | OPENCODE_BIN=fake-opencode OPENCODE_FLAGS='--dir /work' bash '${WRAPPER}'"
@@ -76,7 +78,7 @@ EOF
     [ "${status}" -eq 0 ]
     [[ "$(cat "${OPENCODE_ARG_LOG}")" == *"--dir"* ]]
     [[ "$(cat "${OPENCODE_ARG_LOG}")" == *"/work"* ]]
-    [ "$(tail -n1 "${OPENCODE_ARG_LOG}")" = "prompt" ]
+    [ "$(cat "${OPENCODE_STDIN_LOG}")" = "prompt" ]
 }
 
 @test "forwards --model to the underlying opencode invocation" {

@@ -1642,8 +1642,8 @@ warning; their missing `usage_tracking` / `rate_limit_aware` are recorded as
 
 The `opencode` adapter (Story 29.2-001) is the same no-telemetry recipe as
 `codex`/`qwen`: `scripts/opencode-build-adapter.sh` receives the prompt on
-stdin, runs `opencode run --pure -- "$prompt"` (OpenCode takes the message as a
-trailing positional argument, not stdin), strips the ANSI colour OpenCode
+stdin and passes it straight through to `opencode run --pure` (which reads its
+message from stdin when given no positional), strips the ANSI colour OpenCode
 emits even off a TTY, and forwards the `<<<RESULT_JSON>>>` block to the
 `codex-exec` parser. Unattended dispatch requires the target repo's
 `opencode.json` to set `"permission": { "edit": "allow", "bash": "allow" }` —

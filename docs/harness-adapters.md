@@ -349,9 +349,10 @@ projects:
 
 - **qwen** — Qwen Code headless coding agent; shipped as `qwen-build-adapter.sh` using `qwen -p`.
 - **opencode** — open-source headless coding CLI; shipped as
-  `opencode-build-adapter.sh` using `opencode run --pure -- "$prompt"` (the
-  prompt as a trailing positional argument — OpenCode's `run` does not read it
-  from stdin). Unattended dispatch requires the target repo's `opencode.json`
+  `opencode-build-adapter.sh` using `opencode run --pure` with the prompt on
+  stdin (`run` reads its message from stdin when given no positional; argv
+  delivery would cap the prompt at Linux's 128 KiB `MAX_ARG_STRLEN`).
+  Unattended dispatch requires the target repo's `opencode.json`
   to set `"permission": { "edit": "allow", "bash": "allow" }`; without it
   OpenCode blocks on an interactive approval prompt with no TTY to answer it
   and the run hangs rather than failing fast.

@@ -3,12 +3,18 @@
 # ABOUTME: OpenCode build/QA adapter — runs a controller agent through
 # ABOUTME: `opencode run` and forwards its <<<RESULT_JSON>>> contract to the codex-exec parser.
 #
-# The controller writes the assembled role prompt to this wrapper's stdin.
-# OpenCode's `run` subcommand takes the message as a trailing positional
-# argument, not stdin (verified against OpenCode 1.18.15: piping the prompt on
-# stdin with no message argument never reaches the model), so the wrapper reads
-# stdin into one prompt string and passes it as the final `--` positional
-# argument. `--pure` disables external plugins so plugin chatter cannot land in
+# The controller writes the assembled role prompt to this wrapper's stdin, and
+# the wrapper lets it flow straight through: `opencode run` reads its message
+# from stdin when given no positional (verified against OpenCode 1.18.15 —
+# `printf '...' | opencode run --pure --model anthropic/claude-haiku-4-5`
+# answers from the model). An earlier revision passed the prompt as a trailing
+# `--` positional on the belief that stdin "never reaches the model"; that
+# reading came from an *empty* stdin, which fails with "You must provide a
+# message or a command" for a different reason. Positional delivery also caps
+# the prompt at Linux's MAX_ARG_STRLEN (128 KiB for a single argument, whatever
+# ARG_MAX allows), so a large re-ask or bugfix prompt would die with E2BIG;
+# stdin has no such ceiling. `--pure` disables external plugins so plugin
+# chatter cannot land in
 # stdout. OpenCode's stdout is forwarded with ANSI colour stripped (OpenCode
 # emits CSI escapes even when stdout is not a TTY; forwarded verbatim they land
 # inside the result block and make the controller's `parse_and_validate` reject
@@ -99,7 +105,9 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-prompt="$(cat)"
+# The prompt is NOT slurped here: stdin is inherited across the `exec` below and
+# read by OpenCode itself, so an arbitrarily large prompt never has to fit in an
+# argv slot.
 
 # shellcheck disable=SC2206
 opencode_flags=(${OPENCODE_FLAGS_STRING})
@@ -117,4 +125,4 @@ fi
 # controller retries. `sed` exits on EOF once the exec'd CLI is gone.
 esc=$(printf '\033')
 exec > >(sed -e "s/${esc}\[[0-9;?]*[a-zA-Z]//g")
-exec "${OPENCODE_BIN}" run --pure "${opencode_flags[@]}" "${model_flags[@]}" -- "${prompt}"
+exec "${OPENCODE_BIN}" run --pure "${opencode_flags[@]}" "${model_flags[@]}"
