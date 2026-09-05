@@ -112,3 +112,46 @@ harnesses:
       json_contract: true
       usage_tracking: false
       rate_limit_aware: false
+
+  # OpenCode adapter (Story 29.2-001). The wrapper receives the assembled
+  # prompt on stdin and runs OpenCode headlessly via `opencode run --pure --
+  # "$prompt"` (OpenCode takes the message as a trailing positional argument,
+  # not stdin), forwarding the neutral <<<RESULT_JSON>>> contract — with ANSI
+  # colour stripped, since OpenCode 1.18.15 emits CSI escapes even off a TTY —
+  # to the same plain parser used by Codex and Qwen. OpenCode does not expose
+  # Claude-style stream-json / usage / rate-limit telemetry through this
+  # wrapper, so those capabilities stay false.
+  #
+  # REQUIRED for unattended dispatch: the target repo's `opencode.json` must
+  # set `"permission": { "edit": "allow", "bash": "allow" }` (or an equivalent
+  # `--auto`). Without it, OpenCode blocks a headless run on an interactive
+  # approval prompt it has no TTY to answer, and the run hangs indefinitely
+  # rather than failing fast — verified against a real OpenCode 1.18.15.
+  opencode:
+    # Default: no `{model}` placeholder, so the adapter runs `opencode run`
+    # and OpenCode uses whichever model its own config/provider defaults to.
+    # This never assumes a model entitlement (issue #228 lesson), so a build
+    # works out of the box on any authenticated OpenCode.
+    command: "opencode-build-adapter.sh"
+    parser: codex-exec
+    enabled: true
+    probe: "opencode --version"
+    # Per-stage model routing, the OpenCode analog of the codex `models:` map.
+    # To enable it, add `--model {model}` to `command` above and uncomment a
+    # `models:` map of stage -> a `provider/model` id you are entitled to
+    # (verify with `echo hi | opencode run --pure --model <id> --`). `default`
+    # is required and covers any unlisted stage. Example:
+    #   command: "opencode-build-adapter.sh --model {model}"
+    #   models:
+    #     default: openai/gpt-5.6
+    #     build: openai/gpt-5.6
+    #     coverage: openai/gpt-5.6
+    #     review: openai/gpt-5.6
+    #     merge: openai/gpt-5.6
+    #     adversarial: openai/gpt-5.6
+    capabilities:
+      worktree_isolation: false
+      parallel: false
+      json_contract: true
+      usage_tracking: false
+      rate_limit_aware: false

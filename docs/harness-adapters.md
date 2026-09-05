@@ -346,13 +346,19 @@ The abstraction exists so these become config exercises, not engineering
 projects:
 
 - **qwen** — Qwen Code headless coding agent; shipped as `qwen-build-adapter.sh` using `qwen -p`.
-- **opencode** — open-source headless coding CLI; `opencode run`-style invocation.
+- **opencode** — open-source headless coding CLI; shipped as
+  `opencode-build-adapter.sh` using `opencode run --pure -- "$prompt"` (the
+  prompt as a trailing positional argument — OpenCode's `run` does not read it
+  from stdin). Unattended dispatch requires the target repo's `opencode.json`
+  to set `"permission": { "edit": "allow", "bash": "allow" }`; without it
+  OpenCode blocks on an interactive approval prompt with no TTY to answer it
+  and the run hangs rather than failing fast.
 - **pi** — lightweight agent CLI; stdin prompt, JSON result.
 - **gemini** — Google's CLI; wrap `gemini`'s headless mode to emit the result block.
 
 Each is the same recipe: a wrapper that maps stdin→CLI and CLI-stdout→result
 block, a `harnesses.yaml` entry with `parser: codex-exec`, and honest capability
-flags. The [codex and qwen entries](../controller/src/sdlc/config/harnesses.yaml) are the
+flags. The [codex, qwen, and opencode entries](../controller/src/sdlc/config/harnesses.yaml) are the
 canonical real-world examples to copy from.
 
 ## Where the boundary stays Claude-only
