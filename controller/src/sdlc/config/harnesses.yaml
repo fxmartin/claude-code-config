@@ -149,31 +149,36 @@ harnesses:
   # of the CLI's own flags; it survives `uv tool install --force`, which the
   # `models:` map below does not.)
   opencode:
-    # Default: no `{model}` placeholder, so the adapter runs `opencode run`
-    # and OpenCode uses whichever model its own config/provider defaults to.
-    # This never assumes a model entitlement (issue #228 lesson), so a build
-    # works out of the box on any authenticated OpenCode — at the cost of the
-    # unreachable-default hang documented above, which is why the escape hatch
-    # is named there rather than papered over with a hardcoded model id.
-    command: "opencode-build-adapter.sh"
+    # A model is pinned deliberately, against the issue-#228 "never assume an
+    # entitlement" instinct, because that instinct does not transfer here.
+    # `codex exec` fails fast on a model you cannot reach; OpenCode *hangs* —
+    # it resolves whatever its own config names as default, and an unreachable
+    # provider (e.g. a local llama-server that is not running) prints a banner
+    # and then nothing. The captured dispatch path has no stall detector
+    # (dispatch.py:713), so `DEFAULT_TIMEOUT_S = 3600` is the only backstop:
+    # one silent hour per stage, ~5 for a full build/coverage/review/merge/
+    # adversarial run. An unreachable default is the more likely failure than
+    # an unentitled pin, so the map below names ids verified on this host.
+    # Not entitled to these? Override without editing this file (redeploy-safe):
+    #   export OPENCODE_FLAGS='--model <provider/model>'
+    command: "opencode-build-adapter.sh --model {model}"
     parser: codex-exec
     enabled: true
     probe: "opencode --version"
-    # Per-stage model routing, the OpenCode analog of the codex `models:` map.
-    # To enable it, add `--model {model}` to `command` above and uncomment a
-    # `models:` map of stage -> a `provider/model` id you are entitled to
-    # (verify with `echo hi | opencode run --pure --model <id>`). `default`
-    # is required and covers any unlisted stage. Editing this file is not
-    # redeploy-safe — `OPENCODE_FLAGS='--model <id>'` is the survivable
-    # single-model equivalent. Example:
-    #   command: "opencode-build-adapter.sh --model {model}"
-    #   models:
-    #     default: openai/gpt-5.6
-    #     build: openai/gpt-5.6
-    #     coverage: openai/gpt-5.6
-    #     review: openai/gpt-5.6
-    #     merge: openai/gpt-5.6
-    #     adversarial: openai/gpt-5.6
+    # Per-stage routing, mirroring Epic-14's Balanced profile
+    # (model_routing.py:132) so an opencode run costs what a claude run costs.
+    # `default` is required and covers any unlisted stage. Verified reachable
+    # on this host with `printf hi | opencode run --pure --model <id>`.
+    models:
+      default: anthropic/claude-sonnet-5
+      discovery: anthropic/claude-haiku-4-5
+      build: anthropic/claude-sonnet-5
+      coverage: anthropic/claude-sonnet-5
+      review: anthropic/claude-sonnet-5
+      adversarial: anthropic/claude-sonnet-5
+      bugfix: anthropic/claude-sonnet-5
+      merge: anthropic/claude-haiku-4-5
+      reask: anthropic/claude-haiku-4-5
     capabilities:
       worktree_isolation: false
       parallel: false

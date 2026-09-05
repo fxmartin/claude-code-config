@@ -64,29 +64,39 @@ def test_opencode_entry_declares_probe_and_conservative_capabilities() -> None:
 def test_opencode_argv_never_invokes_claude() -> None:
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     argv = opencode.to_argv()
-    assert argv == ["opencode-build-adapter.sh"]
-    assert not any("claude" in token for token in argv)
+    assert argv[0] == "opencode-build-adapter.sh"
+    # The executable must be the opencode wrapper, never the claude CLI. A
+    # pinned `anthropic/claude-*` *model* id is a different thing entirely — it
+    # is the Anthropic API reached through OpenCode, not Claude Code spawned as
+    # a harness — so the guard checks the command, not every token.
+    assert "claude" not in argv[0]
+    assert not any(tok == "claude" or tok.endswith("/claude") for tok in argv)
 
 
-def test_shipped_opencode_harness_pins_no_model_entitlement() -> None:
-    """Issue #228 lesson (echoed in the story notes): never hardcode a model id
-    in the shipped template — the default must run on whatever the user has
-    configured, with per-stage routing staying an opt-in.
+def test_shipped_opencode_harness_pins_a_reachable_model_every_stage() -> None:
+    """The entry pins a model deliberately, inverting the issue-#228 instinct.
 
-    The cost of that choice is real and is deliberately paid, not hidden: if
-    OpenCode's own resolved default points at an unreachable provider, the run
-    hangs silently for the full captured-path wall clock. It is documented as a
-    precondition with an `OPENCODE_FLAGS` escape hatch (pinned by
-    :func:`test_opencode_entry_documents_the_unreachable_default_hang`) rather
-    than papered over by hardcoding a model nobody is guaranteed to be entitled
-    to.
+    #228 says never hardcode a model id, because an unentitled pin fails. That
+    holds for `codex exec`, which errors fast on a model you cannot reach. It
+    does NOT hold for OpenCode: with no `--model` it resolves whatever its own
+    config names as default, and an unreachable provider hangs instead of
+    failing. The captured dispatch path has no stall detector
+    (``dispatch.py:713``), so ``DEFAULT_TIMEOUT_S`` (3600s) is the only
+    backstop — one silent hour per stage.
+
+    Between "an unentitled pin fails loudly" and "an unreachable default hangs
+    for an hour", the pin is the safer default. `OPENCODE_FLAGS='--model <id>'`
+    remains the redeploy-safe override for anyone entitled differently.
     """
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     for stage in (None, "build", "coverage", "review", "merge", "adversarial"):
         argv = opencode.to_argv() if stage is None else opencode.to_argv(stage=stage)
-        assert "--model" not in argv, (
-            f"shipped opencode argv forces a model for stage={stage}: {argv}"
+        assert "--model" in argv, (
+            f"shipped opencode argv resolves no model for stage={stage}: {argv}"
         )
+        model = argv[argv.index("--model") + 1]
+        assert "/" in model, f"stage={stage} model is not a provider/model id: {model}"
+        assert "{model}" not in model, f"stage={stage} left the placeholder unresolved"
 
 
 def test_opencode_entry_documents_the_unreachable_default_hang() -> None:
@@ -124,7 +134,10 @@ def test_build_agent_round_trips_through_opencode(monkeypatch) -> None:
     assert result.usage_available is False
     assert result.usage is None
     assert result.cost_usd is None
-    assert not any("claude" in token for token in seen_cmd)
+    # The dispatched command is the opencode wrapper, not the claude CLI; the
+    # pinned anthropic/claude-* model id rides in argv as data, not as an exe.
+    assert "claude" not in seen_cmd[0]
+    assert not any(tok == "claude" or tok.endswith("/claude") for tok in seen_cmd)
     assert seen_input == ["build story with opencode"]
 
 
@@ -163,7 +176,11 @@ def test_full_opencode_run_spawns_zero_claude() -> None:
     assert set(resolved) == set(PIPELINE_ROLES)
     for role, harness in resolved.items():
         assert harness.name == "opencode", f"role {role} did not route to opencode"
-        assert not any("claude" in token for token in harness.to_argv())
+        argv = harness.to_argv()
+        # No claude *binary* on any role's argv; a pinned anthropic/claude-*
+        # model id is the API behind OpenCode, not the Claude Code harness.
+        assert "claude" not in argv[0]
+        assert not any(tok == "claude" or tok.endswith("/claude") for tok in argv)
 
 
 def test_registry_bare_adapter_commands_are_installed_on_path() -> None:
