@@ -2503,7 +2503,7 @@ def eval_cmd(
     """
     import tempfile
 
-    from sdlc.capability import ProbeStatus, probe_harness
+    from sdlc.capability import ProbeStatus, probe_harness, resolve_capabilities
     from sdlc.evaluate import (
         EvalConfig,
         EvalConfigError,
@@ -2576,7 +2576,15 @@ def eval_cmd(
     with tempfile.TemporaryDirectory(prefix="sdlc-eval-") as tmp:
         ws = workspace or Path(tmp)
         ws.mkdir(parents=True, exist_ok=True)
-        results = run_eval(config, ws, dispatcher=dispatcher_for_harness(resolved_harness))
+        # Story 31.2-002: the resolved harness's capabilities gate its usage —
+        # a harness that does not declare ``usage_tracking`` scores tokens/cost
+        # as unavailable rather than zero, so the cheap arm never looks free.
+        results = run_eval(
+            config,
+            ws,
+            dispatcher=dispatcher_for_harness(resolved_harness),
+            capabilities=resolve_capabilities(resolved_harness),
+        )
 
     # Story 31.1-002 AC1: the same probe the preflight above already ran is the
     # source of truth for the recorded harness version — a harness declaring no
@@ -2727,6 +2735,7 @@ def eval_baseline_cmd(
     from sdlc.eval_compare import (
         BaselineError,
         compare_scoreboards,
+        excluded_axes,
         load_scoreboard,
         regressions,
         save_scoreboard,
@@ -2755,9 +2764,16 @@ def eval_baseline_cmd(
 
     comparison = compare_scoreboards(base_board, cand_board, tolerance=tolerance)
     flagged = regressions(comparison)
+    # Story 31.2-002: an axis the two scoreboards are not made of the same thing
+    # on is excluded from the verdict, so this gate never checked it. Say so —
+    # "no regressions" over an unchecked axis is the very thing that story closes.
+    skipped = excluded_axes(comparison)
+    for label, reason in skipped:
+        typer.echo(f"not compared — {label}: {reason}", err=True)
     if not flagged:
+        scope = "the comparable metrics" if skipped else "all metrics"
         typer.echo(
-            f"baseline OK: no regressions beyond {tolerance:.0%} "
+            f"baseline OK: no regressions beyond {tolerance:.0%} on {scope} "
             f"({comparison.candidate_name} vs {comparison.baseline_name})"
         )
         raise typer.Exit(code=0)

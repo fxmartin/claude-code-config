@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence, TypeVar
 
 from sdlc.capability import (
     ProbeStatus,
@@ -99,6 +99,7 @@ from sdlc.issue_host import (
 from sdlc.risk_gate import RISK_APPROVED_LABEL, RISK_LABEL
 from sdlc.registry import Registry, RunRecord
 from sdlc.story_markdown import mark_story_done
+from sdlc.usage import usage_is_tracked
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
 # "max 2 bugfix iterations" rule (Step 5d2) so behaviour matches the playbook.
@@ -7622,7 +7623,10 @@ def _run_story(
                     ledger.stage_finish(
                         run_id, story.id, stage, attempt, "DONE", output_path=str(tpath)
                     )
-                    _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
+                    _record_stage_usage(
+                        ledger, run_id, story.id, stage, attempt, result,
+                        capabilities=_stage_capabilities(stage, opts),
+                    )
                     # Story 14.1-002: reconcile the pre-dispatch estimate against
                     # the authoritative usage now known, for future calibration.
                     _reconcile_estimate(
@@ -7671,7 +7675,10 @@ def _run_story(
                     run_id, story.id, stage, attempt, "FAILED", f"{stage}-error", str(tpath)
                 )
                 # A schema-valid-but-FAILED agent response still carries usage.
-                _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
+                _record_stage_usage(
+                    ledger, run_id, story.id, stage, attempt, result,
+                    capabilities=_stage_capabilities(stage, opts),
+                )
                 ledger.event_log(
                     run_id, story.id, "error", "controller", f"{stage} failed: {failure}"
                 )
@@ -8027,6 +8034,27 @@ def _stage_harness(stage: str, opts: BuildOptions) -> str:
     """
     role = _STAGE_ROLE.get(stage, "build")
     return opts.harness_map.get(role) or DEFAULT_HARNESS
+
+
+def _stage_capabilities(stage: str, opts: BuildOptions) -> Mapping[str, bool] | None:
+    """The resolved capability map of the harness that runs ``stage`` (31.2-002).
+
+    Drives the honest-usage gate in :func:`_record_stage_usage` off the harness's
+    own declaration rather than a name check, so a harness that grows usage
+    telemetry later (Epic-29's 29.2-003 for OpenCode) only has to flip its
+    ``usage_tracking`` flag. Best-effort: an unreadable registry returns ``None``,
+    which keeps today's behaviour rather than silently blanking a run's usage.
+    """
+    try:
+        from sdlc.role_routing import default_registry_path
+
+        return resolve_capabilities(
+            resolve_harness(
+                _stage_harness(stage, opts), config_path=default_registry_path()
+            )
+        )
+    except Exception:  # noqa: BLE001 — never fail a build over a capability lookup
+        return None
 
 
 def _harness_dispatch_kwargs(
@@ -8594,6 +8622,8 @@ def _record_stage_usage(
     stage: str,
     attempt: int,
     result: AgentResult | None,
+    *,
+    capabilities: Mapping[str, bool] | None = None,
 ) -> None:
     """Persist a stage's token/cost usage — and its verified model — from its result.
 
@@ -8608,11 +8638,21 @@ def _record_stage_usage(
     lands a non-NULL ``stages.model`` on every stage type without threading the
     model through each call site. A harness with no model telemetry writes nothing, leaving the
     model ``stage_start`` resolved from the registry / routing profile in place.
+
+    Story 31.2-002: ``capabilities`` is the dispatching harness's resolved
+    capability map. A harness that does not declare ``usage_tracking`` records
+    *nothing* on the usage columns — they stay NULL and every surface renders "—"
+    — rather than persisting figures it is not entitled to report or a fabricated
+    zero that would make the arm look free. Model telemetry above is a separate
+    axis and is recorded either way. ``None`` (no map resolved) keeps today's
+    behaviour for the built-in dispatch seam.
     """
     if result is None:
         return
     if result.model:
         ledger.stage_set_model(run_id, story_id, stage, attempt, result.model)
+    if not usage_is_tracked(capabilities):
+        return
     if result.usage is None and result.cost_usd is None:
         return
     u = result.usage or {}
@@ -8965,7 +9005,10 @@ def _reask_envelope(
         return False, result
 
     ledger.stage_finish(run_id, story.id, "reask", seq, "DONE", output_path=out)
-    _record_stage_usage(ledger, run_id, story.id, "reask", seq, result)
+    _record_stage_usage(
+        ledger, run_id, story.id, "reask", seq, result,
+        capabilities=_stage_capabilities(stage, opts),
+    )
     ledger.event_log(
         run_id, story.id, "success", "controller",
         f"envelope re-ask recovered the {stage} result block",
@@ -9083,7 +9126,10 @@ def _lint_stage_commit(
                 break
             violations = lint_commit_message(message, config)
             continue
-        _record_stage_usage(ledger, run_id, story.id, "commitlint", lint_seq, result)
+        _record_stage_usage(
+            ledger, run_id, story.id, "commitlint", lint_seq, result,
+            capabilities=_stage_capabilities(stage, opts),
+        )
         ledger.stage_finish(
             run_id, story.id, "commitlint", lint_seq, "DONE", output_path=str(cpath)
         )
@@ -9196,7 +9242,10 @@ def _run_bugfix(
         str(data.get("failure_category", "")),
         out,
     )
-    _record_stage_usage(ledger, run_id, story.id, "bugfix", attempt, result)
+    _record_stage_usage(
+        ledger, run_id, story.id, "bugfix", attempt, result,
+        capabilities=_stage_capabilities(failed_stage, opts),
+    )
     ledger.event_log(
         run_id,
         story.id,

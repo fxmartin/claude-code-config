@@ -19,6 +19,7 @@ from sdlc.eval_compare import (
     classify_metric,
     comparison_to_dict,
     compare_scoreboards,
+    excluded_axes,
     has_regressions,
     load_scoreboard,
     provenance_warnings,
@@ -162,6 +163,9 @@ def test_verdict_efficiency_tie_is_neutral() -> None:
 
 
 def _score(ticket_id: str, *, loc: float, tokens: float, cost: float, wall: float, qual: float) -> dict:
+    # Story 31.2-002: a real scoreboard row carries the component breakdown its
+    # total is made of. These rows share one mix (90% cache-read), so the token
+    # axis stays comparable and these tests keep exercising it.
     return {
         "ticket_id": ticket_id,
         "runs": 1,
@@ -173,6 +177,11 @@ def _score(ticket_id: str, *, loc: float, tokens: float, cost: float, wall: floa
         "cost_mean": cost,
         "wall_mean": wall,
         "quality_pass_rate": qual,
+        "input_tokens_mean": tokens * 0.05,
+        "output_tokens_mean": tokens * 0.05,
+        "cache_read_tokens_mean": tokens * 0.90,
+        "cache_creation_tokens_mean": 0.0,
+        "tokens_source": "measured",
     }
 
 
@@ -302,6 +311,20 @@ def test_render_comparison_table_handles_missing_pct() -> None:
     table = render_comparison_table(compare_scoreboards(base, cand))
     assert "t2" in table
     assert "—" in table
+
+
+def test_render_comparison_table_handles_comparable_metric_with_no_pct() -> None:
+    # A zero-to-zero move is comparable (both sides present) but has no relative
+    # percentage — `_fmt_pct` must render the em dash instead of crashing on the
+    # division, and the row must go through the "(pct) arrow" branch, not the
+    # "not comparable" one.
+    base = _board("t1", [_score("t1", loc=0, tokens=1000, cost=0.05, wall=20, qual=1.0)], None)
+    cand = _board("t2", [_score("t1", loc=0, tokens=1000, cost=0.05, wall=20, qual=1.0)], None)
+    table = render_comparison_table(compare_scoreboards(base, cand))
+    loc_line = next(line for line in table.splitlines() if line.strip().startswith("netLOC"))
+    assert "not comparable" not in loc_line
+    assert "—" in loc_line
+    assert "= same" in loc_line
 
 
 def test_comparison_to_dict_roundtrips_shape() -> None:
@@ -484,3 +507,289 @@ def test_provenance_warnings_flags_both_missing() -> None:
     base = _board("A", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
     cand = _board("B", [_score("t1", loc=1, tokens=1, cost=1, wall=1, qual=1.0)], None)
     assert len(provenance_warnings(base, cand)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Story 31.2-002 — honest token accounting across harnesses
+# ---------------------------------------------------------------------------
+
+
+def _arm_board(name: str, **score: object) -> dict:
+    base = {
+        "ticket_id": "t1",
+        "runs": 1,
+        "errors": 0,
+        "loc_net_mean": 10.0,
+        "wall_mean": 10.0,
+        "quality_pass_rate": 1.0,
+    }
+    base.update(score)
+    return {"config_name": name, "tickets": [base]}
+
+
+# The field finding (2026-09-05): both arms report, the totals are within 7% of
+# each other, and they describe completely different work at different prices.
+_CACHE_WRITE_ARM = {
+    "tokens_mean": 15160.0,
+    "cost_mean": 0.0568,
+    "input_tokens_mean": 8.0,
+    "output_tokens_mean": 7.0,
+    "cache_read_tokens_mean": 0.0,
+    "cache_creation_tokens_mean": 15145.0,
+    "tokens_source": "measured",
+}
+_CACHE_READ_ARM = {
+    "tokens_mean": 14152.0,
+    "cost_mean": 0.0042,
+    "input_tokens_mean": 6.0,
+    "output_tokens_mean": 9.0,
+    "cache_read_tokens_mean": 14137.0,
+    "cache_creation_tokens_mean": 0.0,
+    "tokens_source": "measured",
+}
+
+
+def _row(comparison: object, key: str) -> MetricDelta:
+    ticket = comparison.tickets[0]  # type: ignore[attr-defined]
+    return next(m for m in ticket.metrics if m.key == key)
+
+
+def test_near_equal_totals_with_divergent_mixes_are_not_comparable() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("cache-write", **_CACHE_WRITE_ARM),
+        _arm_board("cache-read", **_CACHE_READ_ARM),
+    )
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is False
+    assert tokens.direction == NEUTRAL
+    # The mix, not the total, is what the reason states.
+    assert "mix" in tokens.reason
+    assert "cache_creation" in tokens.reason
+    assert "cache_read" in tokens.reason
+    # A near-equal total must never be presented as parity.
+    token_line = next(
+        line for line in render_comparison_table(cmp_).splitlines()
+        if line.strip().startswith("tokens")
+    )
+    assert "= same" not in token_line
+    assert "not comparable" in token_line
+
+
+def test_cost_rides_on_the_same_verdict_as_tokens() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("a", **_CACHE_WRITE_ARM), _arm_board("b", **_CACHE_READ_ARM)
+    )
+    cost = _row(cmp_, "cost_mean")
+    assert cost.comparable is False
+    assert cost.reason == _row(cmp_, "tokens_mean").reason
+
+
+def test_matching_mixes_stay_comparable_and_still_flag_a_regression() -> None:
+    baseline = dict(_CACHE_READ_ARM)
+    candidate = {
+        "tokens_mean": 28304.0,
+        "cost_mean": 0.0084,
+        "input_tokens_mean": 12.0,
+        "output_tokens_mean": 18.0,
+        "cache_read_tokens_mean": 28274.0,
+        "cache_creation_tokens_mean": 0.0,
+        "tokens_source": "measured",
+    }
+    cmp_ = compare_scoreboards(_arm_board("a", **baseline), _arm_board("b", **candidate))
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is True
+    assert tokens.direction == REGRESSED
+
+
+def test_unavailable_usage_on_one_arm_is_not_comparable_with_a_reason() -> None:
+    available = dict(_CACHE_READ_ARM)
+    absent = {
+        "tokens_mean": None,
+        "cost_mean": None,
+        "input_tokens_mean": None,
+        "output_tokens_mean": None,
+        "cache_read_tokens_mean": None,
+        "cache_creation_tokens_mean": None,
+        "tokens_source": "unavailable",
+    }
+    cmp_ = compare_scoreboards(_arm_board("claude", **available), _arm_board("local", **absent))
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is False
+    assert "unavailable" in tokens.reason
+    assert "candidate" in tokens.reason
+    # The local arm must not look free.
+    table = render_comparison_table(cmp_)
+    assert "not comparable" in table
+
+
+def test_an_estimate_is_never_compared_against_a_measurement() -> None:
+    measured = dict(_CACHE_READ_ARM)
+    estimated = dict(_CACHE_READ_ARM, tokens_source="estimated")
+    cmp_ = compare_scoreboards(_arm_board("a", **measured), _arm_board("b", **estimated))
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is False
+    assert "estimate" in tokens.reason
+
+
+def test_two_estimates_are_comparable_to_each_other() -> None:
+    a = dict(_CACHE_READ_ARM, tokens_source="estimated")
+    b = dict(_CACHE_READ_ARM, tokens_source="estimated")
+    cmp_ = compare_scoreboards(_arm_board("a", **a), _arm_board("b", **b))
+    assert _row(cmp_, "tokens_mean").comparable is True
+
+
+def test_a_board_with_no_component_breakdown_cannot_have_its_mix_judged() -> None:
+    legacy = {"tokens_mean": 15000.0, "cost_mean": 0.05}
+    cmp_ = compare_scoreboards(_arm_board("old", **legacy), _arm_board("new", **_CACHE_READ_ARM))
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is False
+    assert "component breakdown" in tokens.reason
+
+
+def test_candidate_with_no_component_breakdown_cannot_have_its_mix_judged() -> None:
+    # Same as above with the missing breakdown on the other side — the reason
+    # must name whichever arm actually lacks it, not always "baseline".
+    legacy = {"tokens_mean": 15000.0, "cost_mean": 0.05}
+    cmp_ = compare_scoreboards(_arm_board("new", **_CACHE_READ_ARM), _arm_board("old", **legacy))
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is False
+    assert "component breakdown" in tokens.reason
+    assert "candidate" in tokens.reason
+
+
+def test_components_summing_to_zero_cannot_have_their_mix_judged() -> None:
+    # All four components are present (not None) but sum to zero — there is no
+    # mix to divide by, so this must report the same "no breakdown" reason as a
+    # row that never carried components at all, not a ZeroDivisionError.
+    zero_mix = {
+        "tokens_mean": 0.0,
+        "cost_mean": 0.0,
+        "input_tokens_mean": 0.0,
+        "output_tokens_mean": 0.0,
+        "cache_read_tokens_mean": 0.0,
+        "cache_creation_tokens_mean": 0.0,
+        "tokens_source": "measured",
+    }
+    cmp_ = compare_scoreboards(_arm_board("zero", **zero_mix), _arm_board("new", **_CACHE_READ_ARM))
+    tokens = _row(cmp_, "tokens_mean")
+    assert tokens.comparable is False
+    assert "component breakdown" in tokens.reason
+    assert "baseline" in tokens.reason
+
+
+# ---------------------------------------------------------------------------
+# Verdict with excluded axes
+# ---------------------------------------------------------------------------
+
+
+def _delta(key: str, direction: str, *, comparable: bool = True) -> MetricDelta:
+    return MetricDelta(
+        key=key, label=key, baseline=1.0, candidate=1.0, delta=0.0, pct=0.0,
+        direction=direction, comparable=comparable,
+        reason=None if comparable else "not comparable",
+    )
+
+
+def test_an_excluded_axis_never_counts_toward_the_verdict() -> None:
+    # tokens "improved" only because it is excluded — it must not tip the verdict.
+    metrics = [
+        _delta("tokens_mean", IMPROVED, comparable=False),
+        _delta("loc_net_mean", REGRESSED),
+    ]
+    assert ticket_verdict(metrics) == WORSE
+
+
+def test_verdict_is_computed_from_the_comparable_metrics() -> None:
+    metrics = [
+        _delta("tokens_mean", NEUTRAL, comparable=False),
+        _delta("cost_mean", NEUTRAL, comparable=False),
+        _delta("loc_net_mean", IMPROVED),
+        _delta("wall_mean", IMPROVED),
+        _delta("quality_pass_rate", NEUTRAL),
+    ]
+    assert ticket_verdict(metrics) == BETTER
+
+
+def test_an_excluded_quality_axis_does_not_decide_the_verdict() -> None:
+    metrics = [
+        _delta("quality_pass_rate", REGRESSED, comparable=False),
+        _delta("loc_net_mean", IMPROVED),
+    ]
+    assert ticket_verdict(metrics) == BETTER
+
+
+def test_no_comparable_metric_at_all_is_neutral() -> None:
+    metrics = [
+        _delta("tokens_mean", IMPROVED, comparable=False),
+        _delta("loc_net_mean", IMPROVED, comparable=False),
+    ]
+    assert ticket_verdict(metrics) == NEUTRAL
+
+
+def test_comparison_names_the_excluded_axes() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("a", **_CACHE_WRITE_ARM), _arm_board("b", **_CACHE_READ_ARM)
+    )
+    assert cmp_.tickets[0].excluded == ("tokens", "cost$")
+    table = render_comparison_table(cmp_)
+    assert "excluded from verdict: tokens, cost$" in table
+
+
+def test_serialised_comparison_carries_comparability() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("a", **_CACHE_WRITE_ARM), _arm_board("b", **_CACHE_READ_ARM)
+    )
+    d = comparison_to_dict(cmp_)
+    tokens = next(m for m in d["tickets"][0]["metrics"] if m["key"] == "tokens_mean")
+    assert tokens["comparable"] is False
+    assert "mix" in tokens["reason"]
+    assert d["tickets"][0]["excluded"] == ["tokens", "cost$"]
+
+
+def test_an_excluded_axis_is_neither_a_regression_nor_an_improvement() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("a", **_CACHE_WRITE_ARM), _arm_board("b", **_CACHE_READ_ARM)
+    )
+    assert not has_regressions(cmp_)
+    assert regressions(cmp_) == []
+    assert _row(cmp_, "tokens_mean").direction == NEUTRAL
+
+
+# ---------------------------------------------------------------------------
+# Naming the exclusions to a gate (not just to the table)
+# ---------------------------------------------------------------------------
+
+
+def test_excluded_axes_names_each_unjudged_axis_once_with_its_reason() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("a", **_CACHE_WRITE_ARM), _arm_board("b", **_CACHE_READ_ARM)
+    )
+    axes = excluded_axes(cmp_)
+    assert [label for label, _ in axes] == ["tokens", "cost$"]
+    assert all("mix" in reason for _, reason in axes)
+
+
+def test_excluded_axes_is_empty_when_every_axis_is_comparable() -> None:
+    cmp_ = compare_scoreboards(
+        _arm_board("a", **_CACHE_READ_ARM), _arm_board("b", **_CACHE_READ_ARM)
+    )
+    assert excluded_axes(cmp_) == ()
+
+
+def test_excluded_axes_dedupes_across_tickets_and_the_overall_row() -> None:
+    # Three rows (two tickets + overall) all miss the breakdown; a gate needs the
+    # axis named once, not once per row.
+    def _board_of(name: str) -> dict:
+        row = {
+            "runs": 1, "errors": 0, "loc_net_mean": 10.0,
+            "wall_mean": 10.0, "quality_pass_rate": 1.0,
+            "tokens_mean": 15000.0, "cost_mean": 0.05,
+        }
+        return {
+            "config_name": name,
+            "tickets": [dict(row, ticket_id="t1"), dict(row, ticket_id="t2")],
+            "overall": dict(row, ticket_id="OVERALL"),
+        }
+
+    axes = excluded_axes(compare_scoreboards(_board_of("a"), _board_of("b")))
+    assert [label for label, _ in axes] == ["tokens", "cost$"]

@@ -45,9 +45,13 @@ For each ticket × `n` runs, the harness:
    `usage` envelope keys and `total_cost_usd`).
 3. **Scores** the result against the baseline:
    - **LOC delta** — `git diff --numstat` (new files included), added/removed/net.
-   - **Tokens** — sum of the four usage components, or `None` for a plain-text agent.
+   - **Tokens** — the four usage components (`input`, `output`, `cache_read`,
+     `cache_creation`) carried *individually*, plus their total. `None` — never
+     `0` — for a plain-text agent or a harness that declares no `usage_tracking`
+     (31.2-002).
    - **Cost** — the envelope `total_cost_usd`, else a notional figure from tokens
      (the controller's `$15/Mtok` convention — never real subscription spend).
+     A run with no token figure has no derived cost either.
    - **Wall-time** — monotonic seconds for the dispatch.
    - **Quality** — the ticket's `quality_cmd` (exit 0 = pass); `None` if none set.
 
@@ -123,6 +127,39 @@ OVERALL             9   0     8.1     0.3     7.8      4310   0.0646    23.1    
 excluded and shown separately in `stalled` (a bare `—` when the ticket never
 stalled) — a throttled ticket's wait time never inflates `wall_mean` (31.2-001).
 
+### Honest token accounting (31.2-002)
+
+A token *total* is a lossy summary. Two arms on the same prompt measured **15,160
+vs 14,152 tokens** — within 7% of each other — and one was 99.9% cache-*write*
+while the other was 99.9% cache-*read*: completely different work at completely
+different prices. So the scoreboard carries the breakdown, not just the total:
+
+| JSON key | meaning |
+| --- | --- |
+| `tokens_mean` | mean total (`None` when unavailable — never `0`) |
+| `input_tokens_mean` / `output_tokens_mean` | mean per component |
+| `cache_read_tokens_mean` / `cache_creation_tokens_mean` | mean per component |
+| `tokens_source` | `measured`, `estimated`, `external`, `mixed`, or `unavailable` |
+
+Two rules follow, and both are **capability-driven** — they read the harness's
+`usage_tracking` flag from the registry, never its name:
+
+- A harness that does not declare `usage_tracking` records its tokens and cost as
+  **unavailable** everywhere they surface (ledger, scoreboard, dashboard) — it
+  renders `—`, never `0`, so the arm that cannot report never looks free. A
+  harness that grows usage telemetry later only has to flip the flag.
+- An approximate figure (a pre-dispatch estimate, or an external count) renders
+  with a leading `~` and is labelled as an estimate, so it can never be read as a
+  measurement.
+
+**External token counts.** A local model whose serving layer can report an
+approximate token count plugs in through
+`sdlc.usage.register_token_counter(harness, counter)`: the counter receives the
+dispatch's usage envelope and returns a `TokenBreakdown` (or `None` to decline).
+Whatever comes back is labelled `external` — approximate, never `measured`. The
+controller ships no counter and commits to no particular server; the seam is there
+for one.
+
 The `--json` form (`scoreboard_to_dict`) is the shape later stories store as a
 **baseline** to flag regressions (18.1-002) and run in **CI** on agent-affecting
 changes (18.1-003).
@@ -182,6 +219,27 @@ Each ticket (and the `OVERALL` row) gets a verdict:
 - With quality unchanged, the efficiency metrics (netLOC, tokens, cost, wall) are
   tallied: more improvements than regressions → `BETTER`, the reverse → `WORSE`, a
   tie → `NEUTRAL`.
+- **Only comparable axes count** (31.2-002). An axis the two arms cannot be judged
+  on contributes nothing in either direction, and the verdict line names it:
+
+  ```
+  t1: BETTER  (excluded from verdict: tokens, cost$)
+    tokens   15160.0000 -> 14152.0000  not comparable — token mix differs
+      materially: baseline 99.9% cache_creation vs candidate 99.9% cache_read
+      (largest component gap 100% > 25%)
+  ```
+
+  The token and cost axes are excluded together — cost is derived from the same
+  components — for any of three reasons, checked in order:
+
+  1. **Unavailable** — a figure missing on either side. A missing number is not zero.
+  2. **Provenance** — an estimate against a measurement. Different quantities.
+  3. **Mix** — the largest per-component share gap exceeds 25%, or a scoreboard
+     carries no component breakdown to judge at all.
+
+  A scoreboard written before 31.2-002 has no component breakdown, so its token
+  and cost axes report *not comparable* until it is regenerated with
+  `uv run sdlc eval --json`. Every other axis compares as before.
 
 A metric only counts as moved when it changes by more than `--tolerance` (default
 **10%**, relative to the baseline value) — below that, model-run variance swamps
@@ -244,6 +302,23 @@ beyond `--tolerance`; cost and wall that hold steady are not flagged. The non-ze
 exit on regression is what later wires a bounded eval into CI (18.1-003, warn or
 fail configurable). The comparison itself never mutates `main` or opens PRs — it is
 pure scoreboard arithmetic.
+
+An axis excluded as **not comparable** (31.2-002) was never checked, so the gate
+names it on stderr and qualifies its verdict rather than letting the exclusion
+read as a pass:
+
+```
+not compared — tokens: no component breakdown recorded on the baseline, so the
+  token mix cannot be judged — regenerate it with `sdlc eval --json`
+not compared — cost$: …
+baseline OK: no regressions beyond 10% on the comparable metrics (new vs base)
+```
+
+With nothing excluded the line reads "on all metrics". `controller/eval/baseline.json`
+predates 31.2-002 and carries no component breakdown, so **its token and cost axes
+are excluded on every check until it is regenerated** with
+`uv run sdlc eval --json > eval/baseline.json` — the netLOC/wall/quality axes are
+unaffected.
 
 ## CI integration (18.1-003)
 

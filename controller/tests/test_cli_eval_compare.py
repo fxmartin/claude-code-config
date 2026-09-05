@@ -28,6 +28,23 @@ def _score(ticket_id: str, *, loc: float, tokens: float, cost: float, wall: floa
     }
 
 
+def _with_breakdown(score: dict) -> dict:
+    """A row carrying the component breakdown a post-31.2-002 scoreboard records.
+
+    Both arms get the same mix, so the token/cost axes stay comparable and the
+    gate really does check them.
+    """
+    tokens = score["tokens_mean"]
+    return {
+        **score,
+        "input_tokens_mean": tokens * 0.05,
+        "output_tokens_mean": tokens * 0.05,
+        "cache_read_tokens_mean": tokens * 0.90,
+        "cache_creation_tokens_mean": 0.0,
+        "tokens_source": "measured",
+    }
+
+
 def _write_board(path: Path, name: str, score: dict, **extra: object) -> Path:
     path.write_text(
         json.dumps({"config_name": name, "tickets": [score], "overall": score, **extra}),
@@ -186,6 +203,51 @@ def test_eval_baseline_clean_exits_0(tmp_path: Path) -> None:
     result = runner.invoke(app, ["eval-baseline", "--baseline", str(base), "--candidate", str(cand)])
     assert result.exit_code == 0
     assert "baseline OK" in result.stdout
+
+
+# Story 31.2-002: an axis the two scoreboards could not be judged on is excluded
+# from the verdict — the *gate* has to name it, or "no regressions" silently reads
+# as a pass on a metric nobody checked (the story's own failure mode).
+
+
+def test_eval_baseline_names_the_axes_it_could_not_check(tmp_path: Path) -> None:
+    # Neither row carries a component breakdown (a pre-31.2-002 baseline), so the
+    # token mix cannot be judged and both usage axes drop out of the check.
+    base = _write_board(tmp_path / "base.json", "base", _score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0))
+    cand = _write_board(tmp_path / "cand.json", "new", _score("t1", loc=8, tokens=900, cost=0.04, wall=19, qual=1.0))
+    result = runner.invoke(app, ["eval-baseline", "--baseline", str(base), "--candidate", str(cand)])
+    assert result.exit_code == 0
+    assert "not compared" in result.stderr
+    assert "tokens" in result.stderr
+    assert "cost$" in result.stderr
+    assert "component breakdown" in result.stderr
+    # ...and the OK line must not claim more than it checked.
+    assert "baseline OK" in result.stdout
+    assert "on the comparable metrics" in result.stdout
+
+
+def test_eval_baseline_clean_check_of_every_axis_claims_all_metrics(tmp_path: Path) -> None:
+    base = _write_board(
+        tmp_path / "base.json", "base",
+        _with_breakdown(_score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0)),
+    )
+    cand = _write_board(
+        tmp_path / "cand.json", "new",
+        _with_breakdown(_score("t1", loc=8, tokens=900, cost=0.04, wall=19, qual=1.0)),
+    )
+    result = runner.invoke(app, ["eval-baseline", "--baseline", str(base), "--candidate", str(cand)])
+    assert result.exit_code == 0
+    assert "not compared" not in result.stderr
+    assert "on all metrics" in result.stdout
+
+
+def test_eval_baseline_regression_still_names_the_excluded_axes(tmp_path: Path) -> None:
+    base = _write_board(tmp_path / "base.json", "base", _score("t1", loc=10, tokens=1000, cost=0.05, wall=20, qual=1.0))
+    cand = _write_board(tmp_path / "cand.json", "new", _score("t1", loc=40, tokens=1000, cost=0.05, wall=20, qual=0.5))
+    result = runner.invoke(app, ["eval-baseline", "--baseline", str(base), "--candidate", str(cand)])
+    assert result.exit_code == 1
+    assert "regressions vs baseline" in result.stderr
+    assert "not compared" in result.stderr
 
 
 def test_eval_baseline_regression_exits_1(tmp_path: Path) -> None:

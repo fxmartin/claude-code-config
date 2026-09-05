@@ -1196,3 +1196,128 @@ def test_provenance_is_frozen_dataclass() -> None:
     )
     with pytest.raises(Exception):  # noqa: B017 — FrozenInstanceError
         prov.model = "haiku"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Story 31.2-002 — component breakdown carried through to the scoreboard
+# ---------------------------------------------------------------------------
+
+
+def _breakdown(**kw: object) -> object:
+    from sdlc.usage import TokenBreakdown
+
+    return TokenBreakdown(**kw)  # type: ignore[arg-type]
+
+
+def _usage_run(ticket: str, idx: int, usage: object) -> RunResult:
+    return RunResult(
+        ticket_id=ticket,
+        run_index=idx,
+        diff=DiffStats(added=1, removed=0, files=1),
+        wall_s=1.0,
+        tokens=usage.total,  # type: ignore[attr-defined]
+        cost_usd=0.1,
+        quality_pass=True,
+        usage=usage,  # type: ignore[arg-type]
+    )
+
+
+def test_scoreboard_carries_the_four_components_not_just_a_total() -> None:
+    from sdlc.usage import MEASURED
+
+    usage = _breakdown(
+        input_tokens=10, output_tokens=20, cache_read_tokens=30,
+        cache_creation_tokens=40, source=MEASURED,
+    )
+    board = aggregate([_usage_run("t1", 0, usage)], "demo")
+    score = board.tickets[0]
+    assert score.tokens_mean == 100.0
+    assert score.input_tokens_mean == 10.0
+    assert score.output_tokens_mean == 20.0
+    assert score.cache_read_tokens_mean == 30.0
+    assert score.cache_creation_tokens_mean == 40.0
+    assert score.tokens_source == MEASURED
+
+    d = scoreboard_to_dict(board)["tickets"][0]
+    assert d["cache_creation_tokens_mean"] == 40.0
+    assert d["cache_read_tokens_mean"] == 30.0
+    assert d["tokens_source"] == MEASURED
+
+
+def test_scoreboard_components_are_none_when_usage_is_unavailable() -> None:
+    from sdlc.usage import UNAVAILABLE
+
+    board = aggregate([_run("t1", 0, added=5, tokens=None)], "demo")
+    score = board.tickets[0]
+    assert score.tokens_mean is None
+    assert score.input_tokens_mean is None
+    assert score.cache_read_tokens_mean is None
+    assert score.tokens_source == UNAVAILABLE
+
+
+def test_run_ticket_records_the_component_breakdown(tmp_path: Path) -> None:
+    from sdlc.usage import MEASURED
+
+    target = _sample_target(tmp_path)
+    ticket = Ticket(id="t1", prompt="add a thing")
+    config = EvalConfig(name="c", target=target, tickets=[ticket])
+
+    def fake(agent_type, prompt, **kwargs):  # type: ignore[no-untyped-def]
+        (kwargs["cwd"] / "new.txt").write_text("x\n", encoding="utf-8")
+        return AgentResult(
+            agent_type=agent_type, data={}, raw="",
+            usage={
+                "input_tokens": 8, "output_tokens": 7,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 15145,
+            },
+            cost_usd=0.5,
+        )
+
+    res = run_ticket(ticket, config, 0, tmp_path / "ws", dispatcher=fake)
+    assert res.tokens == 15160
+    assert res.usage.cache_creation_tokens == 15145
+    assert res.usage.source == MEASURED
+
+
+def test_run_ticket_on_a_harness_without_usage_tracking_reports_unavailable(
+    tmp_path: Path,
+) -> None:
+    # AC3: a false-telemetry harness that prints numbers anyway earns no figure.
+    from sdlc.usage import UNAVAILABLE
+
+    target = _sample_target(tmp_path)
+    ticket = Ticket(id="t1", prompt="add a thing")
+    config = EvalConfig(name="c", target=target, tickets=[ticket])
+
+    def fake(agent_type, prompt, **kwargs):  # type: ignore[no-untyped-def]
+        (kwargs["cwd"] / "new.txt").write_text("x\n", encoding="utf-8")
+        return AgentResult(
+            agent_type=agent_type, data={}, raw="",
+            usage={"input_tokens": 999, "output_tokens": 1},
+            cost_usd=0.0,
+        )
+
+    res = run_ticket(
+        ticket, config, 0, tmp_path / "ws",
+        dispatcher=fake, capabilities={"usage_tracking": False},
+    )
+    assert res.tokens is None
+    # usage_tracking covers cost too: the arm must not look free.
+    assert res.cost_usd is None
+    assert res.usage.source == UNAVAILABLE
+    board = aggregate([res], "demo")
+    assert board.tickets[0].tokens_mean is None
+    assert board.tickets[0].tokens_source == UNAVAILABLE
+
+
+def test_render_table_labels_an_estimated_token_figure(tmp_path: Path) -> None:
+    from sdlc.usage import ESTIMATED, MEASURED
+
+    est = _breakdown(input_tokens=100, source=ESTIMATED)
+    measured = _breakdown(input_tokens=100, source=MEASURED)
+    est_table = render_table(aggregate([_usage_run("t1", 0, est)], "demo"))
+    measured_table = render_table(aggregate([_usage_run("t1", 0, measured)], "demo"))
+    assert "~100" in est_table
+    assert "estimate" in est_table
+    assert "~100" not in measured_table

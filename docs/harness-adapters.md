@@ -97,7 +97,7 @@ crashing a parallel cohort mid-run.
 | `worktree_isolation` | Can run each agent in its own git worktree.                        |
 | `parallel`           | Can fan a cohort across concurrent workers.                        |
 | `json_contract`      | Emits the `<<<RESULT_JSON>>>` block.                               |
-| `usage_tracking`     | Reports token usage / cost.                                        |
+| `usage_tracking`     | Reports token usage / cost. Declaring it `false` (or omitting it) makes every token and cost figure for this harness **unavailable** — `—`, never `0` — in the ledger, scoreboard and dashboard, and makes the token/cost axes *not comparable* in `sdlc eval-compare` (31.2-002). Flip it to `true` when the adapter grows real usage telemetry; nothing else has to change. |
 | `rate_limit_aware`   | Surfaces a recoverable, time-based rate-limit signal.             |
 
 Optionally add a `probe:` command (a cheap "is the CLI installed/authenticated?"

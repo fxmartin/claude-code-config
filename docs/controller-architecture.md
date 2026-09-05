@@ -1652,7 +1652,7 @@ listing every fallback applied (each a `Degradation` with a stable `kind`, the
 | Missing capability | Requested | Fallback (`DegradationKind`) | Effect |
 |---|---|---|---|
 | `parallel` or `worktree_isolation` | `parallel` | `parallel_to_serial` | the cohort runs **serially** (the safe alternative), one explicit log line |
-| `usage_tracking` | any | `usage_unavailable` | cost/usage recorded as **"unavailable"**, not fabricated as zero (the `PlainResultParser` returns `usage_available=False`) |
+| `usage_tracking` | any | `usage_unavailable` | cost/usage recorded as **"unavailable"**, not fabricated as zero (the `PlainResultParser` returns `usage_available=False`). Story 31.2-002 enforces this at the write: `_record_stage_usage` leaves the usage columns NULL for such a harness, whatever the dispatch printed, so every surface renders `—` |
 | `rate_limit_aware` | any | `rate_limit_skipped` | **rate-limit backoff is skipped** — no fabricated 429 handling (a non-zero exit is a plain dispatch error) |
 
 A **fully capable** harness (the built-in Claude harness — every flag `true`)
