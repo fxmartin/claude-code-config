@@ -27,6 +27,17 @@ agent_type: build
 # silently uses the current CLI default. Set e.g. `model: opus` to override.
 # model: sonnet
 
+# Optional harness pin (Story 31.1-001), resolved through the harness registry
+# (controller/src/sdlc/config/harnesses.yaml) to that harness's command + parser
+# — so the same ticket set can be run on claude, qwen, opencode, etc. and the
+# scoreboards are comparable by construction. When omitted, the eval runs on the
+# built-in claude default (byte-identical to before this field existed). `--harness`
+# on the CLI wins over this field. An unknown/disabled harness, a harness whose CLI
+# isn't installed (its `probe` fails), or a harness that cannot honour the `model`
+# pin above (no `{model}` placeholder in its registry command) aborts at preflight
+# — before any ticket dispatches.
+# harness: qwen
+
 # Fixed ticket set. Each ticket is a small, well-scoped edit on the sample target
 # with a quality_cmd (exit 0 = pass) so "tests pass / no breakage" is measurable.
 tickets:

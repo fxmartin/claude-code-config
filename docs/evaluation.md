@@ -25,6 +25,9 @@ uv run sdlc eval
 
 # JSON scoreboard (for storage / comparison), one quick run per ticket.
 uv run sdlc eval --json --n 1
+
+# Run the same ticket set on another harness from the registry (Story 31.1-001).
+uv run sdlc eval --harness qwen --json
 ```
 
 The default config is `controller/eval/eval-config.yaml`. Point `--config` at any
@@ -65,6 +68,7 @@ target: sample-target        # dir of plain files, relative to this config
 n: 3                         # runs per ticket (averages out model variance)
 seed: 1801                   # reproducibility provenance for the harness inputs
 agent_type: build            # which agent role to dispatch
+# harness: qwen               # optional harness pin (Story 31.1-001); default: claude
 tickets:
   - id: add-capitalize
     prompt: >-
@@ -77,13 +81,37 @@ tickets:
 > so `n>1` averages out variance and results match only *within* that variance —
 > exactly the comparability the success metric calls for.
 
+### Harness selection (31.1-001)
+
+`harness:` in the config (or `--harness` on the CLI, which wins over the
+config — the same CLI > config > default precedence as `model:`) resolves
+through the harness registry
+([`controller/src/sdlc/config/harnesses.yaml`](../controller/src/sdlc/config/harnesses.yaml))
+to that harness's command + parser, so every ticket dispatch in the run goes
+through it and the resulting scoreboard records the harness name — the same
+fixed ticket set is then comparable across claude, qwen, opencode, etc. *by
+construction*. Omitting it entirely runs on the built-in `claude` default,
+byte-identical to every eval before this field existed.
+
+The harness is resolved and preflighted **once, before any ticket dispatches**
+— never mid-run:
+
+- an unknown or `enabled: false` harness aborts, naming the registry file;
+- a harness whose `probe` command fails (its CLI isn't installed on this
+  machine) aborts with the probe's own diagnostic;
+- a harness that cannot honour the eval's `model` pin — a registry command
+  with no `{model}` placeholder — aborts rather than silently ignoring it.
+
+See [`docs/harness-adapters.md`](harness-adapters.md) for the full registry
+format and the qwen/opencode/codex adapters.
+
 ## Scoreboard
 
 Text table (default) or `--json`. Each row is a per-ticket mean over its `n`
 runs, with a final `OVERALL` aggregate:
 
 ```
-eval: strutils-baseline
+eval: strutils-baseline (harness: claude)
 ticket             runs err    +LOC    -LOC  netLOC    tokens    cost$  wall_s  qual
 -------------------------------------------------------------------------------------
 add-capitalize        3   0     7.0     0.0     7.0      4120   0.0618    22.4  100%

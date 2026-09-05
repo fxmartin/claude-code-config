@@ -2461,6 +2461,20 @@ def eval_cmd(
         help="Override the config's runs-per-ticket (e.g. --n 1 for a quick pass).",
         show_default=False,
     ),
+    harness: str = typer.Option(
+        None,
+        "--harness",
+        help=(
+            "Override the config's harness (a name from "
+            "controller/src/sdlc/config/harnesses.yaml, e.g. qwen/opencode); wins "
+            "over the config's `harness:` field, mirroring the model-override "
+            "precedence (CLI > config > default). Omit both for the built-in "
+            "claude default. An unknown/disabled harness, a failed CLI probe, or "
+            "a harness that cannot take the eval's model pin fails fast (exit 2) "
+            "before any ticket dispatches."
+        ),
+        show_default=False,
+    ),
     as_json: bool = typer.Option(
         False,
         "--json",
@@ -2485,7 +2499,7 @@ def eval_cmd(
     on LOC delta, token usage, notional cost, wall-time, and a quality check (the
     ticket's ``quality_cmd``, exit 0 = pass). The framework repo and the sample
     target are never mutated and no PRs are opened. ``--dry-run`` lists the tickets
-    without spending any quota. A malformed config exits 2.
+    without spending any quota. A malformed config, or an unusable harness, exits 2.
     """
     import tempfile
 
@@ -2493,11 +2507,14 @@ def eval_cmd(
         EvalConfig,
         EvalConfigError,
         aggregate,
+        dispatcher_for_harness,
         load_config,
         render_table,
+        resolve_eval_harness,
         run_eval,
         scoreboard_to_dict,
     )
+    from sdlc.role_routing import default_registry_path
 
     try:
         config = load_config(config_file)
@@ -2518,12 +2535,37 @@ def eval_cmd(
             agent_type=config.agent_type,
             usd_per_million_tokens=config.usd_per_million_tokens,
             model=config.model,
+            harness=config.harness,
         )
+
+    if harness is not None:
+        config = EvalConfig(
+            name=config.name,
+            target=config.target,
+            tickets=config.tickets,
+            n=config.n,
+            seed=config.seed,
+            agent_type=config.agent_type,
+            usd_per_million_tokens=config.usd_per_million_tokens,
+            model=config.model,
+            harness=harness,
+        )
+
+    # Story 31.1-001 AC4/AC5/AC6: resolve + preflight the harness before any
+    # dispatch (including a --dry-run listing) — an unknown/disabled harness, a
+    # failed probe, or an unsupported model pin fails fast here, never mid-ticket.
+    try:
+        resolved_harness = resolve_eval_harness(
+            config, config_path=default_registry_path()
+        )
+    except EvalConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
     if dry_run:
         typer.echo(
             f"eval: {config.name} — {len(config.tickets)} ticket(s) × {config.n} run(s) "
-            f"against {config.target}"
+            f"against {config.target} (harness: {config.harness})"
         )
         for ticket in config.tickets:
             typer.echo(f"  - {ticket.id}")
@@ -2532,9 +2574,9 @@ def eval_cmd(
     with tempfile.TemporaryDirectory(prefix="sdlc-eval-") as tmp:
         ws = workspace or Path(tmp)
         ws.mkdir(parents=True, exist_ok=True)
-        results = run_eval(config, ws)
+        results = run_eval(config, ws, dispatcher=dispatcher_for_harness(resolved_harness))
 
-    board = aggregate(results, config.name)
+    board = aggregate(results, config.name, harness=config.harness)
     if as_json:
         typer.echo(json.dumps(scoreboard_to_dict(board), indent=2))
     else:

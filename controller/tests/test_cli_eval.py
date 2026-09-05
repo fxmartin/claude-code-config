@@ -169,3 +169,151 @@ def test_eval_n_override_preserves_config_model(tmp_path: Path, monkeypatch) -> 
     result = runner.invoke(app, ["eval", "--config", str(config), "--n", "2", "--json"])
     assert result.exit_code == 0, result.stdout
     assert seen == {"model": "haiku", "n": 2}
+
+
+# ---------------------------------------------------------------------------
+# Story 31.1-001 — --harness CLI override, precedence, scoreboard provenance,
+# and preflight aborts (unknown/disabled harness, failed probe).
+# ---------------------------------------------------------------------------
+
+
+def test_eval_no_harness_records_claude_in_scoreboard(tmp_path: Path) -> None:
+    config = _write_eval_bundle(tmp_path)
+    stub = _write_stub_agent(tmp_path)
+    env = dict(os.environ, SDLC_AGENT_CMD=str(stub))
+    result = runner.invoke(app, ["eval", "--config", str(config), "--json"], env=env)
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["harness"] == "claude"
+
+
+def test_eval_harness_flag_overrides_config(tmp_path: Path, monkeypatch) -> None:
+    """The CLI flag wins over the config's `harness:` field (mirrors --model precedence)."""
+    import sdlc.evaluate as evaluate_mod
+
+    target = tmp_path / "sample"
+    target.mkdir()
+    (target / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    config = tmp_path / "eval.yaml"
+    config.write_text(
+        "name: cli-demo\ntarget: sample\nn: 1\nharness: qwen\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+        encoding="utf-8",
+    )
+
+    def fake_run_eval(config, workspace, **kwargs):  # noqa: ANN001 — test double
+        return []
+
+    # `qwen` is not in the bundled registry under this repo checkout in a way
+    # that would probe cleanly here; --harness claude must win before any of
+    # that is ever consulted, so run_eval only needs to be intercepted, not the
+    # registry itself.
+    monkeypatch.setattr(evaluate_mod, "run_eval", fake_run_eval)
+    result = runner.invoke(
+        app, ["eval", "--config", str(config), "--harness", "claude", "--json"]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["harness"] == "claude"
+
+
+def test_eval_config_harness_used_when_no_cli_override(tmp_path: Path, monkeypatch) -> None:
+    import sdlc.evaluate as evaluate_mod
+
+    target = tmp_path / "sample"
+    target.mkdir()
+    (target / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    config = tmp_path / "eval.yaml"
+    config.write_text(
+        "name: cli-demo\ntarget: sample\nn: 1\nharness: claude\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+        encoding="utf-8",
+    )
+
+    def fake_run_eval(config, workspace, **kwargs):  # noqa: ANN001 — test double
+        return []
+
+    monkeypatch.setattr(evaluate_mod, "run_eval", fake_run_eval)
+    result = runner.invoke(app, ["eval", "--config", str(config), "--json"])
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["harness"] == "claude"
+
+
+def test_eval_unknown_harness_flag_aborts_before_any_dispatch(tmp_path: Path, monkeypatch) -> None:
+    import sdlc.evaluate as evaluate_mod
+
+    config = _write_eval_bundle(tmp_path)
+    called = {"run": False}
+
+    def fake_run_eval(*a, **k):
+        called["run"] = True
+        return []
+
+    monkeypatch.setattr(evaluate_mod, "run_eval", fake_run_eval)
+    result = runner.invoke(
+        app, ["eval", "--config", str(config), "--harness", "not-a-real-harness"]
+    )
+    assert result.exit_code == 2
+    assert "not-a-real-harness" in result.stderr
+    assert called["run"] is False
+
+
+def test_eval_disabled_harness_aborts_before_any_dispatch(tmp_path: Path, monkeypatch) -> None:
+    import sdlc.evaluate as evaluate_mod
+    import sdlc.role_routing as role_routing_mod
+
+    registry = tmp_path / "harnesses.yaml"
+    registry.write_text(
+        "harnesses:\n  qwen:\n    command: qwen-build-adapter.sh\n"
+        "    parser: codex-exec\n    enabled: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(role_routing_mod, "default_registry_path", lambda: registry)
+
+    config = _write_eval_bundle(tmp_path)
+    called = {"run": False}
+
+    def fake_run_eval(*a, **k):
+        called["run"] = True
+        return []
+
+    monkeypatch.setattr(evaluate_mod, "run_eval", fake_run_eval)
+    result = runner.invoke(app, ["eval", "--config", str(config), "--harness", "qwen"])
+    assert result.exit_code == 2
+    assert "disabled" in result.stderr
+    assert called["run"] is False
+
+
+def test_eval_failed_probe_aborts_before_any_dispatch(tmp_path: Path, monkeypatch) -> None:
+    import sdlc.evaluate as evaluate_mod
+    import sdlc.role_routing as role_routing_mod
+
+    registry = tmp_path / "harnesses.yaml"
+    registry.write_text(
+        "harnesses:\n  qwen:\n    command: qwen-build-adapter.sh\n"
+        "    parser: codex-exec\n    probe: 'no-such-qwen-binary --version'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(role_routing_mod, "default_registry_path", lambda: registry)
+
+    config = _write_eval_bundle(tmp_path)
+    called = {"run": False}
+
+    def fake_run_eval(*a, **k):
+        called["run"] = True
+        return []
+
+    monkeypatch.setattr(evaluate_mod, "run_eval", fake_run_eval)
+    result = runner.invoke(app, ["eval", "--config", str(config), "--harness", "qwen"])
+    assert result.exit_code == 2
+    assert "probe failed" in result.stderr
+    assert called["run"] is False
+
+
+def test_eval_dry_run_still_aborts_on_unknown_harness(tmp_path: Path) -> None:
+    """Preflight runs before --dry-run's listing too — no half-validated preview."""
+    config = _write_eval_bundle(tmp_path)
+    result = runner.invoke(
+        app,
+        ["eval", "--config", str(config), "--harness", "not-a-real-harness", "--dry-run"],
+    )
+    assert result.exit_code == 2
+    assert "t1" not in result.stdout

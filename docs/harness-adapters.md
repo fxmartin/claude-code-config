@@ -286,6 +286,29 @@ unknown role, or a `default:`/`roles:` harness that is unknown or disabled in
 [`controller/src/sdlc/config/harnesses.yaml`](../controller/src/sdlc/config/harnesses.yaml) fails
 fast (exit 2) before any stage runs — no half-run.
 
+## Running an eval on another harness
+
+`sdlc eval` (Story 31.1-001) is the other consumer of this registry, alongside
+`sdlc build`/`sdlc fix`. Its config gains a `harness:` field, and `--harness`
+on the CLI wins over it — the same CLI > config > default precedence as the
+eval's `model:` pin:
+
+```bash
+# The config's harness: field (default: claude if absent).
+uv run sdlc eval
+
+# --harness overrides it, so the same fixed ticket set is comparable across
+# harnesses by construction — the scoreboard records which one ran.
+uv run sdlc eval --harness qwen --json
+```
+
+Resolution and preflight happen once, before any ticket dispatches: an
+unknown or disabled harness, a failed `probe`, or a harness whose command has
+no `{model}` placeholder (so it cannot honour the eval's model pin) all abort
+before a single ticket runs — never mid-run. See
+[`docs/evaluation.md`](evaluation.md#harness-selection-31-1-001) for the full
+config format and abort matrix.
+
 ## Candidate future targets
 
 The abstraction exists so these become config exercises, not engineering
