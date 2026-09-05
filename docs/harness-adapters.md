@@ -45,7 +45,7 @@ output with a `<<<RESULT_JSON>>>` block is a candidate harness.
 Copy the generic template at
 [`controller/adapters/generic-cli-adapter.sh`](../controller/adapters/generic-cli-adapter.sh)
 to `controller/adapters/<harness>-adapter.sh` and set its one `AGENT_CMD` line to
-your CLI (e.g. `codex exec`, `opencode run --quiet`). The template already:
+your CLI (e.g. `codex exec`, `opencode run`). The template already:
 
 - reads the prompt on stdin and hands it to your CLI on *its* stdin,
 - forwards the CLI's stdout verbatim, so a result block the CLI emits round-trips

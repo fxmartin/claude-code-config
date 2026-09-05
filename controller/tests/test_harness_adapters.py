@@ -368,3 +368,51 @@ def test_guide_example_round_trips_through_loader(tmp_path: Path) -> None:
 
 def test_readme_links_to_the_guide() -> None:
     assert "docs/harness-adapters.md" in ROOT_README.read_text(encoding="utf-8")
+
+
+# --- OpenCode field findings (2026-09-05) -----------------------------------
+# Two defects the template shipped with, both found running a real OpenCode
+# 1.18.15 against it. Each makes a copy-paste of the documented example fail.
+
+
+def test_template_does_not_document_a_nonexistent_opencode_flag() -> None:
+    """`opencode run --quiet` is not a real invocation (verified on 1.18.15).
+
+    The flag does not exist; `run` responds by printing help and exiting, so a
+    harness wired from the documented example never dispatches anything.
+    """
+    for path in (ADAPTER_TEMPLATE, GUIDE):
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "opencode run" in line:
+                assert "--quiet" not in line, (
+                    f"{path.name} documents `opencode run --quiet`, which is not a "
+                    "real flag; `run` prints help and exits instead of dispatching."
+                )
+
+
+def test_adapter_strips_ansi_so_the_result_block_still_parses() -> None:
+    """A CLI that colours its output must still round-trip the contract.
+
+    OpenCode emits ANSI escapes even when stdout is not a TTY. Forwarded
+    verbatim they land inside the result block and `parse_and_validate`
+    rejects the payload outright.
+    """
+    esc = "\033"
+    agent = (
+        f"printf '{esc}[2mthinking...{esc}[0m\\n"
+        f"{esc}[1m{RESULT_START_MARKER}{esc}[0m\\n"
+        '{"branch_name": "feature/x-0.0-000", "build_status": "SUCCESS", '
+        '"commit_sha": "0000000000000000000000000000000000000000"}\\n'
+        f"{esc}[1m{RESULT_END_MARKER}{esc}[0m\\n'"
+    )
+    proc = subprocess.run(
+        ["bash", str(ADAPTER_TEMPLATE)],
+        input="prompt",
+        capture_output=True,
+        text=True,
+        env={"HARNESS_AGENT_CMD": agent, "PATH": "/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert esc not in proc.stdout, "adapter forwarded raw ANSI escapes"
+    parse_and_validate("build", proc.stdout)
