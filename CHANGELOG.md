@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.47.0] - 2026-09-05
+
+### Added
+
+- feat(harness-benchmarking-baseline): stall-adjusted (#31.2-001) (#623)
+
+
 ## [v2.46.1] - 2026-09-05
 
 ### Fixed
