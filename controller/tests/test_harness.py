@@ -307,8 +307,12 @@ def test_resolve_qwen_harness_from_registry(monkeypatch) -> None:
     harness = resolve_harness("qwen", config_path=CONFIG_PATH)
     assert harness.source == "registry"
     assert harness.name == "qwen"
+    # The entry pins the locally-served model so `sdlc eval --harness qwen`
+    # resolves one instead of aborting at model-pin-unsupported (31.1-001 AC6).
     assert resolve_agent_argv("qwen", config_path=CONFIG_PATH) == [
-        "qwen-build-adapter.sh"
+        "qwen-build-adapter.sh",
+        "--model",
+        "Qwen3.8-27B-oQ4e-mtp",
     ]
 
 

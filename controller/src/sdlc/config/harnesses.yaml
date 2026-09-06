@@ -116,11 +116,30 @@ harnesses:
   # execution — set it via QWEN_FLAGS — but it does not bypass the auth check.
   # Flip both flags to true once re-run on a host with a configured qwen auth
   # provider confirms the edit actually completes.
+  #
+  # Auth resolved 2026-09-06, and not by fixing `qwen auth`. Qwen Code still
+  # honours the OpenAI-compatible env triad, so pointing it at a local
+  # OpenAI-compatible server sidesteps the removed subcommand entirely:
+  #   OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+  # Verified against a local oMLX server (`qwen -p` answered from
+  # Qwen3.8-27B-oQ4e-mtp). Those live in `.env`, which is gitignored — this
+  # repo is public, so no key is ever committed. `.env` is NOT auto-loaded:
+  # the shell running `sdlc` must export it (`set -a; . ./.env; set +a`).
+  #
+  # Latency warning: that server answered a 16-token completion in 58s, and a
+  # trivial prompt through the CLI took ~5-6 minutes. Size any eval or stage
+  # timeout against that, not against a cloud harness.
   qwen:
-    command: "qwen-build-adapter.sh"
+    command: "qwen-build-adapter.sh --model {model}"
     parser: codex-exec
     enabled: true
     probe: "qwen --version"
+    # Pinned so `sdlc eval --harness qwen` resolves a model instead of aborting
+    # at `harness_preflight_model_pin_unsupported` (Story 31.1-001 AC6). One
+    # model for every stage: this is a single locally-served model, not a tier
+    # ladder. Override per-run with `OPENAI_MODEL`, or edit here.
+    models:
+      default: Qwen3.8-27B-oQ4e-mtp
     capabilities:
       worktree_isolation: false
       parallel: false

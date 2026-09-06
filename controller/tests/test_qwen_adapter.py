@@ -55,8 +55,10 @@ def test_qwen_entry_declares_probe_and_safe_capabilities() -> None:
 def test_qwen_argv_never_invokes_claude() -> None:
     qwen = resolve_harness("qwen", config_path=CONFIG_PATH)
     argv = qwen.to_argv()
-    assert argv == ["qwen-build-adapter.sh"]
-    assert not any("claude" in token for token in argv)
+    assert argv[0] == "qwen-build-adapter.sh"
+    # A pinned model id rides in argv as data; the guard is on the executable.
+    assert "claude" not in argv[0]
+    assert not any(tok == "claude" or tok.endswith("/claude") for tok in argv)
 
 
 def test_build_agent_round_trips_through_qwen(monkeypatch) -> None:

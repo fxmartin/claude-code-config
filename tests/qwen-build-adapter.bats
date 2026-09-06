@@ -74,3 +74,31 @@ EOF
     [ "${status}" -eq 2 ]
     [[ "${output}" == *"unexpected argument"* ]]
 }
+
+@test "forwards --model to the qwen CLI as -m" {
+    run bash -c "echo prompt | bash '${WRAPPER}' --model Qwen3.8-27B-oQ4e-mtp"
+
+    [ "${status}" -eq 0 ]
+    [[ "$(cat "${QWEN_ARG_LOG}")" == *"-m"* ]]
+    [[ "$(cat "${QWEN_ARG_LOG}")" == *"Qwen3.8-27B-oQ4e-mtp"* ]]
+}
+
+@test "accepts --model=<id> form" {
+    run bash -c "echo prompt | bash '${WRAPPER}' --model=Qwen3.8-27B-oQ4e-mtp"
+
+    [ "${status}" -eq 0 ]
+    [[ "$(cat "${QWEN_ARG_LOG}")" == *"Qwen3.8-27B-oQ4e-mtp"* ]]
+}
+
+@test "rejects --model with no value" {
+    run bash -c "echo prompt | bash '${WRAPPER}' --model"
+    [ "${status}" -eq 2 ]
+}
+
+@test "passes no -m when the controller routes no model" {
+    run bash -c "echo prompt | bash '${WRAPPER}'"
+
+    [ "${status}" -eq 0 ]
+    # Without a routed model the CLI resolves its own (e.g. from OPENAI_MODEL).
+    [[ "$(cat "${QWEN_ARG_LOG}")" != *"-m"* ]]
+}

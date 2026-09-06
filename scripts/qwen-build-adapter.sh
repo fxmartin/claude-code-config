@@ -45,14 +45,45 @@ EOF
   exit 0
 fi
 
-if [[ "$#" -gt 0 ]]; then
-  echo "qwen-build-adapter: unexpected argument: $1 (the prompt is read from stdin)" >&2
-  exit 2
-fi
+# `--model <id>` is how the controller routes a per-stage model (the registry's
+# `{model}` placeholder resolves into it, mirroring the codex/opencode
+# adapters). Omitted when no model is routed, so the CLI resolves its own —
+# e.g. from `OPENAI_MODEL` when Qwen Code is pointed at a local
+# OpenAI-compatible server. Qwen Code spells the flag `-m`.
+MODEL=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --model)
+      shift
+      MODEL="${1:-}"
+      if [ -z "$MODEL" ]; then
+        echo "qwen-build-adapter: --model needs a value" >&2
+        exit 2
+      fi
+      ;;
+    --model=*)
+      MODEL="${1#--model=}"
+      if [ -z "$MODEL" ]; then
+        echo "qwen-build-adapter: --model needs a value" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "qwen-build-adapter: unexpected argument: $1 (the prompt is read from stdin)" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 prompt="$(cat)"
 
 # shellcheck disable=SC2206
 qwen_flags=(${QWEN_FLAGS_STRING})
 
-exec "${QWEN_BIN}" "${qwen_flags[@]}" -p "${prompt}"
+model_flags=()
+if [ -n "$MODEL" ]; then
+  model_flags=(-m "$MODEL")
+fi
+
+exec "${QWEN_BIN}" "${qwen_flags[@]}" "${model_flags[@]}" -p "${prompt}"
