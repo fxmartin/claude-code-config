@@ -350,6 +350,10 @@ _PAGE = """<!doctype html>
   @media (prefers-reduced-motion: reduce) {
     .run--live::before { animation: none; }
   }
+  /* Sidebar toggle: hiding the Runs pane is a class flip on the wrapper; the
+     main pane is already `flex: 1`, so it takes the freed width on its own. */
+  .side-hidden .side { display: none; }
+  .side-toggle { margin-right: 12px; }
   .main { flex: 1; padding: 24px; overflow: auto; }
   h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
   .muted { color: var(--sub); } .small { font-size: 12px; }
@@ -521,13 +525,14 @@ _PAGE = """<!doctype html>
   <header class="topbar">
     <span class="brand">Autonomous <span class="tld">SDLC</span><span class="ver">__SDLC_VERSION__</span></span>
     <nav class="views">
+      <button id="toggleSide" class="vbtn side-toggle" aria-controls="side" aria-expanded="true" title="Hide the Runs pane">&#9776; Runs</button>
       <button id="viewBuilds" class="vbtn active">Builds</button>
       <button id="viewPortfolio" class="vbtn">Portfolio</button>
     </nav>
     <span id="repo" class="muted"></span>
   </header>
   <div class="wrap" id="buildsView">
-    <div class="side"><h2>Runs</h2><div id="runs"></div></div>
+    <div class="side" id="side"><h2>Runs</h2><div id="runs"></div></div>
     <div class="main">
       <div id="updated" class="muted">connecting…</div>
       <div id="head" class="muted"></div>
@@ -1114,6 +1119,23 @@ function showView(name){
 }
 document.getElementById("viewBuilds").addEventListener("click", () => showView("builds"));
 document.getElementById("viewPortfolio").addEventListener("click", () => showView("portfolio"));
+
+// Sidebar toggle: hide the Runs pane so the main panel gets the full width.
+// The choice is remembered per browser. Storage access is guarded because
+// `localStorage` can throw (private windows, blocked site data) and the page
+// must still render correctly with no stored value.
+const SIDE_KEY = "sdlc.dashboard.sideHidden";
+function setSideHidden(hidden){
+  document.getElementById("buildsView").classList.toggle("side-hidden", hidden);
+  const btn = document.getElementById("toggleSide");
+  btn.setAttribute("aria-expanded", String(!hidden));
+  btn.title = hidden ? "Show the Runs pane" : "Hide the Runs pane";
+  try { localStorage.setItem(SIDE_KEY, hidden ? "1" : "0"); } catch (e) {}
+}
+document.getElementById("toggleSide").addEventListener("click", () => {
+  setSideHidden(!document.getElementById("buildsView").classList.contains("side-hidden"));
+});
+try { if(localStorage.getItem(SIDE_KEY) === "1") setSideHidden(true); } catch (e) {}
 document.getElementById("pfRefresh").addEventListener("click", refreshPortfolio);
 
 tick();          // immediate first paint
