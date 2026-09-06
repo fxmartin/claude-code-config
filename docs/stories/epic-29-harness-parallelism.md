@@ -1,6 +1,6 @@
 # Epic 29: Harness Parallelism Beyond Claude
 
-> **Status: NOT STARTED (0/4)** — authored 2026-08-03. Thesis: the controller's
+> **Status: COMPLETE (4/4)** — authored 2026-08-03. Thesis: the controller's
 > parallel mode is gated on two capability flags (`parallel` +
 > `worktree_isolation`), and today only the built-in Claude harness declares
 > them. That gate is correct — N workers sharing one working tree would corrupt
@@ -254,6 +254,7 @@ shared store; if they do, document the workaround (e.g. per-worktree
 **Risk Level**: Medium
 
 ##### Story 29.2-003: OpenCode usage telemetry from the JSON event stream
+**Status**: Done
 **Field finding (2026-09-05, FX)**: the seam is **confirmed and cheap**, no
 longer speculative. `opencode run --format json` emits
 `step_finish.part.tokens = {total, input, output, reasoning, cache:{write,
