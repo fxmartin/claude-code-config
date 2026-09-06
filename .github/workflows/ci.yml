@@ -281,7 +281,9 @@ jobs:
         run: |
           cd controller
           uv sync --extra dev
-          uv run pytest -q
+          # Gate the controller's own coverage. Measured 99% on 2026-09-06; the
+          # threshold sits well below that so it catches regression, not noise.
+          uv run pytest -q --cov=sdlc --cov-report=term --cov-fail-under=90
 
   smoke-test:
     name: Smoke test (clean-machine install)

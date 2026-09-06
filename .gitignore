@@ -33,3 +33,6 @@ settings.json
 
 # The SDLC controller re-renders this on every run.
 docs/stories/.build-progress.md
+
+# pytest-cov data file (the CI gate and local --cov runs both write it).
+.coverage
