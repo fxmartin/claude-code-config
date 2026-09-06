@@ -117,6 +117,20 @@ class TestMatchHighRisk:
         result = match_high_risk(["app/special/thing.py"], override_path=override)
         assert "app/special/thing.py" in result
 
+    def test_policy_file_is_self_protected(self) -> None:
+        # Regression for issue #640: editing the policy itself must be
+        # high-risk, so a PR can't narrow the patterns to hide its own change.
+        result = match_high_risk(
+            ["controller/src/sdlc/config/high-risk-patterns.yaml"]
+        )
+        assert "controller/src/sdlc/config/high-risk-patterns.yaml" in result
+
+    def test_detector_script_is_self_protected(self) -> None:
+        # Regression for issue #640: the detector script must stay flagged
+        # even independent of the broad "**/*.sh" pattern.
+        result = match_high_risk(["scripts/risk-gate-detect.sh"])
+        assert "scripts/risk-gate-detect.sh" in result
+
 
 class TestGlobEdgeCases:
     """Cover the ? wildcard and the mid-pattern **/ trailing-slash branch."""

@@ -46,6 +46,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Trusted base-ref checkout (issue #640): the detector and its policy
+      # must never be evaluated from the PR's own checkout, or a PR could
+      # narrow a pattern and smuggle a high-risk change past its own edited
+      # gate in the same diff. This checkout is pinned to the base branch, so
+      # the PR head cannot influence which patterns or detector code run.
+      - name: Checkout trusted base ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base-ref
+          fetch-depth: 1
+
       - name: Detect high-risk changed files
         id: detect
         env:
@@ -53,9 +65,12 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Compare the PR head against the merge-base with the target branch.
+          # The diff itself only ever needs filenames from the PR checkout —
+          # inert input — while the detector and its policy run from the
+          # trusted base-ref checkout above.
           git fetch --no-tags origin "${BASE_SHA}" "${HEAD_SHA}" 2>/dev/null || true
           matches="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" \
-            | bash scripts/risk-gate-detect.sh || true)"
+            | bash base-ref/scripts/risk-gate-detect.sh base-ref || true)"
 
           if [ -n "${matches}" ]; then
             echo "high_risk=true" >> "${GITHUB_OUTPUT}"

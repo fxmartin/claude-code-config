@@ -19,3 +19,9 @@ high_risk_patterns:
   - "**/*.sh"  # destructive shell scripts; can be narrowed
   - "**/iam/**"
   - "**/policies/**"
+  # Self-referential: the gate's own policy and detector must be high-risk,
+  # so a PR can't narrow the patterns above and hide the change in the same
+  # diff (issue #640). Belt-and-suspenders alongside the trusted-base-ref
+  # checkout in .github/workflows/risk-gate.yml.
+  - "controller/src/sdlc/config/high-risk-patterns.yaml"
+  - "scripts/risk-gate-detect.sh"
