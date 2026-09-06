@@ -785,10 +785,16 @@ def _dispatch_captured(
 
     ``communicate()`` can also raise something other than ``TimeoutExpired`` —
     e.g. a ``UnicodeDecodeError`` from a crashing agent that writes invalid-UTF-8
-    bytes to stdout. ``subprocess.run`` used to guard against *any* such exception
-    (its internals wrap ``communicate()`` in a bare ``except: process.kill(); raise``),
-    a safety net this refactor must keep so an already-spawned grandchild is never
-    left orphaned by an exception the timeout branch alone wouldn't catch.
+    bytes to stdout, or a ``KeyboardInterrupt``/``SystemExit`` if an operator
+    interrupts a blocked stage. ``subprocess.run`` used to guard against *any*
+    such exception (its internals wrap ``communicate()`` in a bare
+    ``except: process.kill(); raise``, which — per CPython's own comment —
+    includes ``KeyboardInterrupt``), a safety net this refactor must keep so an
+    already-spawned grandchild is never left orphaned by an exception the
+    timeout branch alone wouldn't catch. ``KeyboardInterrupt``/``SystemExit``
+    get their own clause below (a plain ``except Exception`` would miss them)
+    so the interrupt still propagates unchanged after the process group is
+    torn down, instead of being swallowed into an ``AgentDispatchError``.
     """
     try:
         proc = subprocess.Popen(
@@ -815,6 +821,14 @@ def _dispatch_captured(
         raise AgentDispatchError(
             f"{agent_type} agent timed out after {timeout}s"
         ) from exc
+    except (KeyboardInterrupt, SystemExit):
+        # subprocess.run's bare `except:` kills the child on ANY exception,
+        # including these (per its own comment). Tear the group down before
+        # letting the interrupt propagate unchanged — wrapping it into
+        # AgentDispatchError below would let a plain `except Exception`
+        # upstream swallow an operator's Ctrl-C as an ordinary agent failure.
+        _terminate_process_group(proc)
+        raise
     except Exception as exc:  # noqa: BLE001 - mirror subprocess.run's own kill-on-any-error net
         _terminate_process_group(proc)
         _write_transcript(
