@@ -64,7 +64,17 @@ APPROXIMATE_COST_SOURCES: frozenset[str] = frozenset({ESTIMATED, LOCAL_RATE, MIX
 
 # Default per-story headless dispatch ceiling (seconds). An eval ticket is a small
 # edit on a tiny repo, so it should finish well inside a build's full timeout.
-DEFAULT_TICKET_TIMEOUT_S = 600
+#
+# Raised 600 -> 3600 for the local-model arms (Epic-31's whole point). Measured
+# 2026-09-06 against a local oMLX server: 58s for a *16-token* completion
+# straight to the API, and ~5-6 minutes for "reply with PONG" through the CLI.
+# A real ticket is a code edit plus a pytest run, so 600s turned the entire
+# local arm into timeouts — and a timeout is recorded as a timeout, not as a
+# quality failure (Story 31.3-001 AC4), so the arm scored as infrastructure
+# noise rather than as a result. 3600 matches dispatch.DEFAULT_TIMEOUT_S, so a
+# ticket is now bounded by the same ceiling a build stage is. Hosted arms are
+# unaffected: they finish in ~30s and never approach either number.
+DEFAULT_TICKET_TIMEOUT_S = 3600
 
 # In-process rate-limit auto-wait cap (Story 31.2-001), mirroring build.py's
 # ``rate_limit_max_wait_s`` (~one Max rolling window). A wait beyond this is
