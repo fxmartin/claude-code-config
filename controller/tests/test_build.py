@@ -22,6 +22,7 @@ from sdlc.build import (
     Ledger,
     _dispatch_overengineering_advisory,
     _filter_git_landed,
+    _log_controller_version_check,
     _log_harness_preflight,
     _record_degradations,
     _stamp_run_actor,
@@ -775,6 +776,109 @@ def test_log_harness_preflight_fully_claude_routing_has_no_warn_level(
     ).fetchall()
     assert rows, "the routing summary and default-slot lines must still log"
     assert all(level == "info" for (level,) in rows)
+
+
+# ---------------------------------------------------------------------------
+# Controller version preflight (Story 15.1-004)
+#
+# Field finding: the PATH-installed `sdlc` is a `uv tool install` snapshot, not
+# the checkout. Merging to `main` never updates it, so this warns beside the
+# harness routing line, and records a warning ledger event — never a gate.
+# ---------------------------------------------------------------------------
+
+
+def _declare_checkout_version(root: Path, version: str) -> None:
+    controller_dir = root / "controller"
+    controller_dir.mkdir(parents=True, exist_ok=True)
+    (controller_dir / "pyproject.toml").write_text(
+        f'[project]\nversion = "{version}"\n', encoding="utf-8"
+    )
+
+
+def test_log_controller_version_check_warns_when_installed_is_behind(
+    tmp_path, monkeypatch
+) -> None:
+    import sdlc.doctor as doctor_mod
+
+    monkeypatch.setattr(doctor_mod, "INSTALLED_VERSION", "2.45.12")
+    _declare_checkout_version(tmp_path, "2.57.0")
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+
+    _log_controller_version_check(ledger, run_id, tmp_path)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message, level FROM events WHERE source='install'"
+    ).fetchall()
+    assert len(rows) == 1
+    message, level = rows[0]
+    assert level == "warn"
+    assert "installed 2.45.12" in message
+    assert "checkout 2.57.0" in message
+    assert "install-controller.sh" in message
+
+
+def test_log_controller_version_check_clean_is_silent(tmp_path, monkeypatch) -> None:
+    import sdlc.doctor as doctor_mod
+
+    monkeypatch.setattr(doctor_mod, "INSTALLED_VERSION", "2.57.0")
+    _declare_checkout_version(tmp_path, "2.57.0")
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+
+    _log_controller_version_check(ledger, run_id, tmp_path)
+
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='install'"
+    ).fetchall()
+    assert rows == []
+
+
+def test_log_controller_version_check_never_fails_the_run(tmp_path, monkeypatch) -> None:
+    import sdlc.doctor as doctor_mod
+
+    def boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(doctor_mod, "check_controller_version", boom)
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "parallel")
+
+    _log_controller_version_check(ledger, run_id, tmp_path)  # must not raise
+
+
+def test_run_build_logs_controller_version_warning_beside_harness_routing(
+    tmp_path, monkeypatch
+) -> None:
+    """Story 15.1-004 AC4: the warning lands on the run before any dispatch."""
+    import sdlc.doctor as doctor_mod
+
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    monkeypatch.setattr(doctor_mod, "INSTALLED_VERSION", "2.45.12")
+    _declare_checkout_version(tmp_path, "2.57.0")
+    db = tmp_path / "ledger.db"
+    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    run_build(
+        opts,
+        queue=_sample_queue(),
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+        root=tmp_path,
+    )
+    conn = _open(db)
+    rows = conn.execute(
+        "SELECT message FROM events WHERE source='install'"
+    ).fetchall()
+    assert any("installed 2.45.12" in r[0] and "checkout 2.57.0" in r[0] for r in rows)
 
 
 def test_run_build_writes_ledger_after_every_stage(tmp_path) -> None:

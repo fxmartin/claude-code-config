@@ -4338,6 +4338,78 @@ def test_log_fix_harness_routing_never_fails_the_run(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Story 15.1-004: `sdlc fix` warns when the installed controller is stale.
+#
+# Field finding: the PATH-installed `sdlc` is a `uv tool install` snapshot, not
+# the checkout. Merging to `main` never updates it, so this warns beside the
+# harness routing line, and records a warning ledger event — never a gate.
+# ---------------------------------------------------------------------------
+
+
+def _declare_checkout_version(root: Path, version: str) -> None:
+    controller_dir = root / "controller"
+    controller_dir.mkdir(parents=True, exist_ok=True)
+    (controller_dir / "pyproject.toml").write_text(
+        f'[project]\nversion = "{version}"\n', encoding="utf-8"
+    )
+
+
+def test_run_fix_records_a_warning_when_the_installed_controller_is_behind(
+    tmp_path, monkeypatch
+) -> None:
+    import sdlc.doctor as doctor_mod
+
+    monkeypatch.setattr(doctor_mod, "INSTALLED_VERSION", "2.45.12")
+    _declare_checkout_version(tmp_path, "2.57.0")
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=_HarnessRecordingFixDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    events = Ledger(db).events_by_source(result.run_id, "install")
+    assert any(
+        "installed 2.45.12" in e and "checkout 2.57.0" in e for e in events
+    )
+
+
+def test_run_fix_records_no_version_warning_when_versions_agree(
+    tmp_path, monkeypatch
+) -> None:
+    import sdlc.doctor as doctor_mod
+
+    monkeypatch.setattr(doctor_mod, "INSTALLED_VERSION", "2.57.0")
+    _declare_checkout_version(tmp_path, "2.57.0")
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=_HarnessRecordingFixDispatcher(),
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+    assert Ledger(db).events_by_source(result.run_id, "install") == []
+
+
+def test_log_fix_controller_version_check_never_fails_the_run(
+    tmp_path, monkeypatch
+) -> None:
+    import sdlc.doctor as doctor_mod
+
+    def boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(doctor_mod, "check_controller_version", boom)
+    ledger = Ledger(tmp_path / ".sdlc-state.db")
+    ledger.init()
+    fix_mod._log_fix_controller_version_check(ledger, "run", tmp_path)  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # Issue #589: a retried stage must never reuse an attempt number, and a
 # collision on `stage_start`'s primary key must park the run instead of
 # crashing it.

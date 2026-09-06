@@ -16,6 +16,7 @@ from sdlc.doctor import (
     MANAGED_PATHS,
     DoctorReport,
     Finding,
+    check_controller_version,
     check_harness_pin,
     check_model_coverage,
     check_usage_agreement,
@@ -953,3 +954,124 @@ def test_harness_pin_degrades_when_the_registry_cannot_be_read(
     # Pinned to something unverifiable: trusted, not failed.
     _pin(tmp_path, "harness:\n  default: something-exotic\n")
     assert check_harness_pin(tmp_path).status == "CLEAN"
+
+
+# ---------------------------------------------------------------------------
+# Installed controller vs checkout (Story 15.1-004)
+#
+# Field finding: the PATH-installed `sdlc` is a `uv tool install` snapshot, not
+# the checkout. Merging to `main` never updates it, and nothing said so — this
+# check names both versions before any tokens are spent.
+# ---------------------------------------------------------------------------
+
+
+def _declare_checkout_version(root: Path, version: str) -> Path:
+    controller_dir = root / "controller"
+    controller_dir.mkdir(parents=True, exist_ok=True)
+    path = controller_dir / "pyproject.toml"
+    path.write_text(f'[project]\nversion = "{version}"\n', encoding="utf-8")
+    return path
+
+
+def test_controller_version_clean_when_equal(tmp_path: Path) -> None:
+    _declare_checkout_version(tmp_path, "2.57.0")
+    finding = check_controller_version(tmp_path, installed_version="2.57.0")
+    assert finding.status == "CLEAN"
+    assert finding.remedy == ""
+
+
+def test_controller_version_warns_when_installed_is_behind(tmp_path: Path) -> None:
+    _declare_checkout_version(tmp_path, "2.57.0")
+    finding = check_controller_version(tmp_path, installed_version="2.45.12")
+    assert finding.status == "WARN"
+    assert "installed 2.45.12" in finding.detail
+    assert "checkout 2.57.0" in finding.detail
+    assert "install-controller.sh" in finding.remedy
+    assert "sdlc dashboard --restart" in finding.remedy
+
+
+def test_controller_version_warns_when_installed_is_ahead(tmp_path: Path) -> None:
+    """The two disagree either way — but the remedy never suggests going backwards."""
+    _declare_checkout_version(tmp_path, "2.45.12")
+    finding = check_controller_version(tmp_path, installed_version="2.57.0")
+    assert finding.status == "WARN"
+    assert "installed 2.57.0" in finding.detail
+    assert "checkout 2.45.12" in finding.detail
+    assert "install-controller.sh" not in finding.remedy
+    assert "git pull" in finding.remedy
+
+
+def test_controller_version_not_applicable_when_no_controller_pyproject(
+    tmp_path: Path,
+) -> None:
+    """Any non-framework repo `sdlc` points at declares no controller version."""
+    finding = check_controller_version(tmp_path, installed_version="2.57.0")
+    assert finding.status == "CLEAN"
+    assert finding.remedy == ""
+
+
+def test_controller_version_clean_in_dev_mode(tmp_path: Path) -> None:
+    """`uv run` reads the same checkout `_resolve_version()` does — never a false WARN."""
+    _declare_checkout_version(tmp_path, "2.57.0")
+    finding = check_controller_version(tmp_path, installed_version="2.57.0")
+    assert finding.status == "CLEAN"
+
+
+def test_run_doctor_includes_the_controller_version_finding(tmp_path: Path) -> None:
+    report = _doctor(tmp_path)
+    assert any(f.name == "Installed controller vs checkout" for f in report.findings)
+
+
+def test_controller_version_clean_when_numerically_equal_but_written_differently(
+    tmp_path: Path,
+) -> None:
+    """`2.57` and `2.57.0` are the same release — no noise over formatting."""
+    _declare_checkout_version(tmp_path, "2.57.0")
+    finding = check_controller_version(tmp_path, installed_version="2.57")
+    assert finding.status == "CLEAN"
+
+
+def test_controller_version_not_applicable_on_malformed_pyproject(
+    tmp_path: Path,
+) -> None:
+    """A checkout `pyproject.toml` with no readable version must not crash doctor."""
+    controller_dir = tmp_path / "controller"
+    controller_dir.mkdir()
+    (controller_dir / "pyproject.toml").write_text("not valid toml [[[", encoding="utf-8")
+    finding = check_controller_version(tmp_path, installed_version="2.57.0")
+    assert finding.status == "CLEAN"
+    assert finding.remedy == ""
+
+
+def test_controller_version_not_applicable_when_project_table_has_no_version(
+    tmp_path: Path,
+) -> None:
+    controller_dir = tmp_path / "controller"
+    controller_dir.mkdir()
+    (controller_dir / "pyproject.toml").write_text(
+        "[project]\nname = \"sdlc-controller\"\n", encoding="utf-8"
+    )
+    finding = check_controller_version(tmp_path, installed_version="2.57.0")
+    assert finding.status == "CLEAN"
+
+
+def test_compare_versions_falls_back_to_tuple_parse_when_packaging_is_unavailable(
+    monkeypatch,
+) -> None:
+    """`packaging` is a transitive dependency — verify the stdlib fallback too."""
+    import sys
+
+    from sdlc.doctor import _compare_versions
+
+    monkeypatch.setitem(sys.modules, "packaging.version", None)
+    assert _compare_versions("2.45.12", "2.57.0") < 0
+    assert _compare_versions("2.57.0", "2.45.12") > 0
+    assert _compare_versions("2.57.0", "2.57.0") == 0
+
+
+def test_parse_semver_tolerates_a_prerelease_suffix() -> None:
+    from sdlc.doctor import _parse_semver
+
+    assert _parse_semver("2.57.0") == (2, 57, 0)
+    assert _parse_semver("2.57.0rc1") == (2, 57, 0)
+    assert _parse_semver("2.57") == (2, 57, 0)

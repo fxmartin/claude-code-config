@@ -7,11 +7,13 @@ import json
 import shutil
 import sqlite3
 import subprocess
+import tomllib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from sdlc import __version__ as INSTALLED_VERSION
 from sdlc.build import _MIGRATIONS, Ledger, list_stashes, status_snapshot
 from sdlc.harness import DEFAULT_HARNESS
 from sdlc.ledger_view import default_db_path
@@ -23,6 +25,7 @@ __all__ = [
     "DEPENDENCIES",
     "Finding",
     "DoctorReport",
+    "check_controller_version",
     "check_glab_dependency",
     "check_harness_pin",
     "check_model_coverage",
@@ -171,6 +174,120 @@ def check_install(claude_dir: Path) -> Finding:
         "Install integrity",
         "CLEAN",
         f"all {len(MANAGED_PATHS)} managed paths present under {claude_dir}",
+    )
+
+
+def _parse_semver(text: str) -> tuple[int, int, int]:
+    """Fallback tuple parse of a ``MAJOR.MINOR.PATCH``-shaped version string.
+
+    Tolerates a trailing pre-release/build suffix (``2.57.0rc1`` -> ``(2, 57, 0)``)
+    by taking only the leading digits of each dotted component.
+    """
+    core = text.split("+", 1)[0]
+    parts = core.split(".")[:3]
+    nums = []
+    for part in parts:
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        nums.append(int(digits) if digits else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
+
+
+def _compare_versions(a: str, b: str) -> int:
+    """-1/0/1 comparing version strings ``a`` and ``b``.
+
+    Prefers ``packaging.version`` (a transitive dependency already resolved by
+    `typer`/`pydantic` in `uv.lock`) so pre-release/build metadata compares
+    correctly; falls back to a stdlib ``MAJOR.MINOR.PATCH`` tuple parse if it is
+    ever unavailable, so this check never grows a hard new dependency.
+    """
+    try:
+        from packaging.version import Version
+
+        va, vb = Version(a), Version(b)
+    except Exception:  # noqa: BLE001 — packaging missing/unparsable: fall back
+        pa, pb = _parse_semver(a), _parse_semver(b)
+        return -1 if pa < pb else (1 if pa > pb else 0)
+    return -1 if va < vb else (1 if va > vb else 0)
+
+
+def check_controller_version(
+    repo_root: Path, *, installed_version: str | None = None
+) -> Finding:
+    """Warn when the installed `sdlc` differs from the checkout's declared version.
+
+    Story 15.1-004 — field finding: the PATH-installed `sdlc` is a
+    `uv tool install` snapshot, not the checkout. A merge to `main` never
+    updates it, and nothing said so: every run silently dispatches on stale
+    code until someone notices the version badge. This makes the disagreement
+    a visible, actionable finding instead.
+
+    Offline by construction: it reads only `repo_root/controller/pyproject.toml`
+    with `tomllib` — no network, no `gh`, no git fetch.
+
+    * A target repo with no `controller/pyproject.toml` (any project `sdlc` is
+      pointed at that is not this framework) declares no controller version —
+      the check is **not applicable**, reported `CLEAN` rather than `WARN`.
+    * Equal versions — `CLEAN`.
+    * Installed behind the checkout — `WARN`, remedy: reinstall from the
+      checkout, then restart the dashboard.
+    * Installed ahead of the checkout — `WARN` too (the two disagree either
+      way), but the remedy names the other side (`git pull` the checkout),
+      never a reinstall that would go backwards.
+
+    Running from a source checkout via `uv run` (development mode) reads this
+    same `pyproject.toml` for `sdlc.__version__` (`_resolve_version()`'s
+    fallback), so it naturally compares equal — no false positive for the way
+    the test suite and local development invoke it.
+    """
+    name = "Installed controller vs checkout"
+    pyproject = repo_root / "controller" / "pyproject.toml"
+    if not pyproject.is_file():
+        return Finding(
+            "install", name, "CLEAN",
+            f"not applicable — no {pyproject} (not the sdlc framework checkout)",
+        )
+
+    installed = installed_version if installed_version is not None else INSTALLED_VERSION
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        checkout = str(data["project"]["version"])
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        return Finding(
+            "install", name, "CLEAN",
+            f"not applicable — {pyproject} has no readable [project].version",
+        )
+
+    if installed == checkout:
+        return Finding(
+            "install", name, "CLEAN",
+            f"installed {installed} matches checkout {checkout}",
+        )
+
+    cmp = _compare_versions(installed, checkout)
+    if cmp == 0:
+        return Finding(
+            "install", name, "CLEAN",
+            f"installed {installed} matches checkout {checkout}",
+        )
+    if cmp < 0:
+        return Finding(
+            "install", name, "WARN",
+            f"installed {installed}, checkout {checkout} — the installed "
+            "controller is behind this checkout",
+            "reinstall from the checkout: bash scripts/install-controller.sh "
+            "&& sdlc dashboard --restart",
+        )
+    return Finding(
+        "install", name, "WARN",
+        f"installed {installed}, checkout {checkout} — the installed "
+        "controller is ahead of this checkout",
+        "git pull the checkout to catch up to the installed controller",
     )
 
 
@@ -945,6 +1062,7 @@ def run_doctor(
 
     findings: list[Finding] = [
         check_install(claude_dir),
+        check_controller_version(repo_root),
         check_ledger(db_path),
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
         check_config(repo_root),
