@@ -782,6 +782,13 @@ def _dispatch_captured(
     keeps the live process handle in scope, so the ``TimeoutExpired`` handler here
     can call :func:`_terminate_process_group` (graceful SIGTERM → grace → SIGKILL
     of the whole group) exactly like the streaming path already does.
+
+    ``communicate()`` can also raise something other than ``TimeoutExpired`` —
+    e.g. a ``UnicodeDecodeError`` from a crashing agent that writes invalid-UTF-8
+    bytes to stdout. ``subprocess.run`` used to guard against *any* such exception
+    (its internals wrap ``communicate()`` in a bare ``except: process.kill(); raise``),
+    a safety net this refactor must keep so an already-spawned grandchild is never
+    left orphaned by an exception the timeout branch alone wouldn't catch.
     """
     try:
         proc = subprocess.Popen(
@@ -807,6 +814,14 @@ def _dispatch_captured(
         _write_transcript(transcript_path, "", f"TIMEOUT after {timeout}s")
         raise AgentDispatchError(
             f"{agent_type} agent timed out after {timeout}s"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - mirror subprocess.run's own kill-on-any-error net
+        _terminate_process_group(proc)
+        _write_transcript(
+            transcript_path, "", f"{agent_type} agent output could not be read: {exc}"
+        )
+        raise AgentDispatchError(
+            f"{agent_type} agent output could not be read: {exc}"
         ) from exc
 
     # Persist the transcript before any interpretation, so even a non-zero exit

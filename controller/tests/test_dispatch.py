@@ -1849,6 +1849,54 @@ def test_captured_dispatch_timeout_writes_transcript(monkeypatch, tmp_path) -> N
     assert "TIMEOUT after 1s" in tpath.read_text(encoding="utf-8")
 
 
+def test_captured_dispatch_kills_process_group_on_non_timeout_error(
+    monkeypatch, tmp_path
+) -> None:
+    """Regression for issue #643 review feedback: ``communicate()`` can raise
+    something other than ``TimeoutExpired`` — e.g. a crashing agent that writes
+    invalid-UTF-8 bytes to stdout raises ``UnicodeDecodeError``. ``subprocess.run``
+    used to guard against *any* such exception; the ``Popen``/``communicate``
+    refactor must keep that net so a spawned grandchild is never left orphaned and
+    the failure still surfaces as the documented ``AgentDispatchError``."""
+
+    class _CrashOnCommunicate:
+        def __init__(self) -> None:
+            self.pid = 4321
+            self.returncode = None
+            self.signals: list[int] = []
+            self.killed = False
+
+        def communicate(self, input=None, timeout=None):  # noqa: ANN001
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        def send_signal(self, sig) -> None:  # noqa: ANN001
+            self.signals.append(sig)
+
+        def kill(self) -> None:
+            self.killed = True
+            self.signals.append(signal.SIGKILL)
+
+        def wait(self, timeout=None):  # noqa: ANN001
+            raise subprocess.TimeoutExpired("cmd", timeout)  # never exits on TERM
+
+    fake = _CrashOnCommunicate()
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr("sdlc.dispatch.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("sdlc.dispatch.os.killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+    tpath = tmp_path / "build-1.log"
+
+    with pytest.raises(AgentDispatchError, match="output could not be read"):
+        dispatch_agent(
+            "build", "prompt", agent_cmd=["fake-claude"], timeout=1, transcript_path=tpath
+        )
+
+    sigs = {sig for _pgid, sig in sent}
+    assert signal.SIGTERM in sigs  # graceful first
+    assert signal.SIGKILL in sigs  # then hard kill of the GROUP (orphans die)
+    assert "output could not be read" in tpath.read_text(encoding="utf-8")
+
+
 def test_streaming_dispatch_stall_kills_idle_agent(monkeypatch) -> None:
     """An agent that stops emitting output is killed within the stall window."""
     blocking = _BlockingStdout()
