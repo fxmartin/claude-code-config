@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.59.1] - 2026-09-06
+
+### Fixed
+
+- fix(risk-gate): evaluate detector and policy from trusted base ref (#649)
+
+
 ## [v2.59.0] - 2026-09-06
 
 ### Added
