@@ -144,6 +144,7 @@ Epic-20 holds: config + wrapper script, no Python dispatch changes.
 #### Stories
 
 ##### Story 29.2-001: OpenCode adapter and registry entry (serial)
+**Status**: Done
 **Field finding (2026-09-05, FX)**: this is **effectively done, ad-hoc**. A
 working adapter and registry entry are live in `local-llm-tests/harness/`,
 resolving through `resolve_harness` and validating through
@@ -215,6 +216,7 @@ lesson: never hardcode a model id in the shipped template).
 **Risk Level**: Low
 
 ##### Story 29.2-002: Verify and enable opencode worktree isolation + parallel
+**Status**: Done
 **User Story**: As FX running parallel batches on OpenCode, I want the same
 evidence-then-flip treatment qwen gets in 29.1-001 — a recorded unattended
 worktree smoke test, then `worktree_isolation: true` + `parallel: true` on the

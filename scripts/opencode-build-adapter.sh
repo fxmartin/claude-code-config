@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # ABOUTME: OpenCode build/QA adapter — runs a controller agent through
-# ABOUTME: `opencode run` and forwards its <<<RESULT_JSON>>> contract to the codex-exec parser.
+# ABOUTME: `opencode run --format json` and forwards its NDJSON event stream to the opencode-json parser.
 #
 # The controller writes the assembled role prompt to this wrapper's stdin, and
 # the wrapper lets it flow straight through: `opencode run` reads its message
@@ -14,12 +14,16 @@
 # the prompt at Linux's MAX_ARG_STRLEN (128 KiB for a single argument, whatever
 # ARG_MAX allows), so a large re-ask or bugfix prompt would die with E2BIG;
 # stdin has no such ceiling. `--pure` disables external plugins so plugin
-# chatter cannot land in
-# stdout. OpenCode's stdout is forwarded with ANSI colour stripped (OpenCode
-# emits CSI escapes even when stdout is not a TTY; forwarded verbatim they land
-# inside the result block and make the controller's `parse_and_validate` reject
-# valid JSON), so the final <<<RESULT_JSON>>> ... <<<END_RESULT>>> block
-# round-trips to the controller's `codex-exec` parser.
+# chatter cannot land in stdout. `--format json` (Story 29.2-003) switches the
+# CLI from formatted prose to one JSON event per line, so the controller's
+# `opencode-json` parser can read real per-step token usage and cost off
+# `step_finish` events instead of recording opencode-dispatched stages as
+# "usage unavailable". OpenCode's stdout is forwarded with ANSI colour
+# stripped (OpenCode emits CSI escapes even when stdout is not a TTY;
+# forwarded verbatim they would land inside a JSON string and could break a
+# naive line-by-line reader), so the final <<<RESULT_JSON>>> ... <<<END_RESULT>>>
+# block — embedded in a `text` event's `part.text` — round-trips to the
+# controller's `opencode-json` parser.
 #
 # REQUIRED for unattended dispatch: this repo's `opencode.json` must allow the
 # permissions OpenCode enforces even in headless `run` mode, e.g.:
@@ -144,6 +148,6 @@ exec > >(sed -e "s/${esc}\[[0-9;?]*[a-zA-Z]//g")
 # bash 3.2 (still /bin/bash on macOS) treats an *empty* array expansion as an
 # unbound variable and aborts, so the no-flags path — the shipped default —
 # would die before ever reaching OpenCode.
-exec "${OPENCODE_BIN}" run --pure \
+exec "${OPENCODE_BIN}" run --pure --format json \
   ${opencode_flags[@]+"${opencode_flags[@]}"} \
   ${model_flags[@]+"${model_flags[@]}"}

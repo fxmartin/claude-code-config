@@ -78,6 +78,7 @@ genuinely new telemetry semantics:
 | ------------------- | --------------------------------------------------------------------------- |
 | `claude-stream-json`| The harness is Claude (stream-json envelope, usage, rate-limit, overflow).   |
 | `codex-exec`        | A plain CLI with a JSON contract but **no** usage/rate-limit telemetry. This is the parser any new stdin→`<<<RESULT_JSON>>>` harness should declare, including Qwen Code's `qwen -p` wrapper. |
+| `opencode-json`     | OpenCode specifically — `opencode run --format json`'s NDJSON event stream, from which it recovers the contract block AND real per-session tokens/cost (Story 29.2-003), falling back to a post-hoc `opencode export <sessionID>` when the stream carried no usage. Not a generic id: it keys on OpenCode's own `text` / `step_finish` event shapes. |
 
 The `codex-exec` parser reads the result block straight from stdout, records
 usage as *unavailable* (rather than a misleading zero), and treats every
@@ -348,9 +349,15 @@ Beyond `codex` (the worked reference throughout this page), the registry ships:
 
 - **qwen** — Qwen Code headless coding agent; `qwen-build-adapter.sh` using `qwen -p`.
 - **opencode** — open-source headless coding CLI; `opencode-build-adapter.sh`
-  using `opencode run --pure` with the prompt on stdin (`run` reads its message
-  from stdin when given no positional; argv delivery would cap the prompt at
-  Linux's 128 KiB `MAX_ARG_STRLEN`). Two things must be true before routing a
+  using `opencode run --pure --format json` with the prompt on stdin (`run`
+  reads its message from stdin when given no positional; argv delivery would
+  cap the prompt at Linux's 128 KiB `MAX_ARG_STRLEN`). Unlike the other
+  non-Claude adapters, it does **not** use the no-telemetry `codex-exec`
+  parser: `--format json` emits one JSON event per line, and the `opencode-json`
+  parser (Story 29.2-003) extracts the `<<<RESULT_JSON>>>` contract from the
+  event stream's text AND real per-session token usage/cost from its
+  `step_finish` events — so `usage_tracking: true` on this entry reflects
+  measured tokens, not an estimate. Two things must be true before routing a
   role here, and **both fail as an indefinite hang rather than an error**:
   - the target repo's `opencode.json` must set
     `"permission": { "edit": "allow", "bash": "allow" }`, or OpenCode blocks on
@@ -374,8 +381,10 @@ projects:
 - **gemini** — Google's CLI; wrap `gemini`'s headless mode to emit the result block.
 
 Each is the same recipe: a wrapper that maps stdin→CLI and CLI-stdout→result
-block, a `harnesses.yaml` entry with `parser: codex-exec`, and honest capability
-flags. The [codex, qwen, and opencode entries](../controller/src/sdlc/config/harnesses.yaml) are the
+block, a `harnesses.yaml` entry with `parser: codex-exec` (the no-telemetry
+default — only write a bespoke parser like `opencode-json` if the CLI has a
+real structured-usage mode worth extracting), and honest capability flags. The
+[codex, qwen, and opencode entries](../controller/src/sdlc/config/harnesses.yaml) are the
 canonical real-world examples to copy from.
 
 ## Where the boundary stays Claude-only
