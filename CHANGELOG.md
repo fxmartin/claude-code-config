@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.58.0] - 2026-09-06
+
+### Added
+
+- feat(dashboard): toggle to hide the runs sidebar (#646)
+
+
 ## [v2.57.0] - 2026-09-06
 
 ### Added
