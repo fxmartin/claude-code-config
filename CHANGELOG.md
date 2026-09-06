@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.59.0] - 2026-09-06
+
+### Added
+
+- feat(operability-self-service): `sdlc doctor` warns when (#15.1-004) (#648)
+
+
 ## [v2.58.0] - 2026-09-06
 
 ### Added
