@@ -1,6 +1,8 @@
 # Epic 15: Operability & Self-Service
 
-> **Status: COMPLETE (5/5)** — all stories merged on `main` (2026-06-25): 15.3-001 `sdlc clean`
+> **Status: IN PROGRESS (5/6)** — 15.1-004 added 2026-09-06 (installed-controller staleness
+> check, not yet built) after a day of runs silently executed on a twelve-release-old install.
+> The original five merged on `main` (2026-06-25): 15.3-001 `sdlc clean`
 > (#174), 15.1-001 `sdlc doctor` (#175), 15.1-003 `sdlc repair` (#176), 15.2-001 hook profiles
 > (#177), 15.1-002 `status --markdown` (#178). Created 2026-06-20, inspired by the external
 > [affaan-m/ECC](https://github.com/affaan-m/ECC) operator tooling (`ecc doctor`/`repair`,
@@ -35,7 +37,7 @@ markdown export makes asking for help (when still needed) a paste, not a screen-
 
 ## Epic Scope
 
-**Total Stories**: 5 | **Total Points**: 12 | **MVP Stories**: 0 (roadmap — Should Have)
+**Total Stories**: 6 | **Total Points**: 15 | **MVP Stories**: 0 (roadmap — Should Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -141,6 +143,75 @@ if a separate verb proves redundant.
 - [ ] Documented
 
 **Dependencies**: None
+**Risk Level**: Low
+
+##### Story 15.1-004: `sdlc doctor` warns when the installed controller is behind the checkout
+**Field finding (2026-09-06, FX)**: the PATH-installed `sdlc` is a `uv tool install`
+snapshot, not the checkout. It sat at v2.45.12 while `main` moved to v2.57.0 — twelve
+releases — and every build run that day silently executed on the old code: none of the
+adapter, model-pin or parser fixes merged that morning were in the controller actually
+dispatching agents. The only tell was the version badge in the dashboard brand bar.
+Merging to `main` does not update the running tool, and nothing said so.
+**User Story**: As FX running `sdlc` from a PATH-installed wheel, I want `sdlc doctor` — and the
+run-start preflight of `sdlc build` / `sdlc fix` — to warn when the installed controller's version
+differs from the `controller/pyproject.toml` of the repo I am running against, naming both
+versions and the exact reinstall command, so that a merge to `main` can never again leave runs
+executing on stale code without a visible signal before any tokens are spent.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** the installed `sdlc.__version__` is behind the version declared in the target
+  repo's `controller/pyproject.toml` **When** `sdlc doctor` runs **Then** it reports a `WARN`
+  finding under the `install` check naming both versions (e.g. `installed 2.45.12, checkout
+  2.57.0`) with the remedy: reinstall from the machine's master checkout
+  (`bash scripts/install-controller.sh`) then `sdlc dashboard --restart`; `--exit-code` makes
+  it non-zero, matching every other doctor finding.
+- **Given** the two versions are equal **When** `doctor` runs **Then** the finding is `CLEAN`
+  and adds no noise; **Given** the installed tool is *newer* than the checkout **Then** it is
+  still `WARN` — the two disagree either way — but the remedy names the other side
+  (`git pull` the checkout), never a reinstall that would go backwards.
+- **Given** the target repo has no `controller/pyproject.toml` (any project `sdlc` is pointed
+  at that is not this framework) **When** `doctor` runs **Then** the check is reported as not
+  applicable, never `WARN` or `FAIL` — the framework repo is the only one that declares a
+  controller version.
+- **Given** `sdlc build` or `sdlc fix` starts against a checkout that disagrees with the
+  installed version **When** preflight runs **Then** the same one-line warning is printed
+  beside the existing `harness routing:` line and recorded as a `warning`-level ledger event
+  on the run, and **the run proceeds** — this is a signal before spend, not a gate (the
+  `--allow-dirty` refusal pattern is deliberately *not* used here).
+- **Given** the check runs anywhere (doctor, preflight, CI tests) **Then** it reads only the
+  local `pyproject.toml` — no network, no `gh` call, no git fetch — so it is deterministic and
+  satisfies the offline CI contract; tests use fixture pyprojects for equal, behind, ahead, and
+  absent.
+- **Given** the controller is run from a checkout via `uv run` (development mode, where
+  `_resolve_version()` reads the same tree) **When** the check runs **Then** it is `CLEAN` —
+  no false positive for the way the test suite and local development invoke it.
+
+**Technical Notes**: The installed version is `sdlc.__version__` (`controller/src/sdlc/__init__.py:28`,
+via `_resolve_version()`); the expected version is `[project].version` in the target repo's
+`controller/pyproject.toml`, parsed with `tomllib` (stdlib, no new dependency). Add a check in
+`doctor.py` following the `check_config(repo_root: Path) -> Finding` shape (`doctor.py:383`)
+under the existing `install` category, emitting the same
+`Finding(check, name, status, detail, remedy)` contract 15.1-001 defined (`doctor.py:108`) —
+`detail` carries the two version strings, `remedy` the side-specific command. The preflight hook is the point where `build.py:4460` /
+`fix_issue.py:916` emit the `harness routing:` line — surface the warning there so it lands in
+the same ledger event stream and the dashboard's run header. Version comparison: prefer
+`packaging.version` if already a transitive dependency, else a tuple parse of `MAJOR.MINOR.PATCH`;
+record which was chosen. Open question for the implementer: whether `sdlc repair`
+should also run this check, since #630 showed repair can relink to an empty install.
+
+**Definition of Done**:
+- [ ] `doctor` finding: WARN on any mismatch with both versions + side-specific remedy; CLEAN on
+      equal; not-applicable when the repo declares no controller version
+- [ ] `build`/`fix` preflight prints the warning beside `harness routing:` and records a
+      `warning` ledger event; the run is never blocked
+- [ ] Offline by construction; tests cover equal / behind / ahead / absent / dev-mode
+- [ ] `--exit-code` semantics unchanged (WARN → non-zero)
+- [ ] Documented in the controller reference beside the other doctor checks, and in
+      `docs/onboarding.md` as the "I merged but nothing changed" answer
+
+**Dependencies**: 15.1-001 (`sdlc doctor`); reads the `harness routing:` preflight seam from Epic-20
 **Risk Level**: Low
 
 ### Feature 15.2: Hook Ergonomics
