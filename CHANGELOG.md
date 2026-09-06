@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.57.0] - 2026-09-06
+
+### Added
+
+- feat(qwen): point the harness at a local openai-compatible server (#639)
+
+
 ## [v2.56.0] - 2026-09-06
 
 ### Added
