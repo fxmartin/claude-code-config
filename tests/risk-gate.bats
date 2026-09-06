@@ -72,3 +72,27 @@ FIXTURES="${BATS_TEST_DIRNAME}/fixtures/risk-gate"
     [[ "${output}" == *"error:"* ]]
     rm -rf "${tmp_root}"
 }
+
+@test "the policy file itself is a high-risk path" {
+    # Regression for issue #640: a PR that only edits the policy YAML must be
+    # flagged, so a self-narrowing patch can't slip through unlabeled.
+    run bash -c "printf 'controller/src/sdlc/config/high-risk-patterns.yaml\n' | '${DETECTOR}'"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"controller/src/sdlc/config/high-risk-patterns.yaml"* ]]
+}
+
+@test "the detector script remains high-risk even if the generic shell pattern is narrowed" {
+    # Regression for issue #640: an explicit, literal entry for the detector
+    # script must survive a PR that drops the broad "**/*.sh" pattern.
+    tmp_root="$(mktemp -d)"
+    mkdir -p "${tmp_root}/controller/src/sdlc/config"
+    grep -v '\*\*/\*\.sh' \
+        "${BATS_TEST_DIRNAME}/../controller/src/sdlc/config/high-risk-patterns.yaml" \
+        > "${tmp_root}/controller/src/sdlc/config/high-risk-patterns.yaml"
+
+    run bash -c "printf 'scripts/risk-gate-detect.sh\n' | '${DETECTOR}' '${tmp_root}'"
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *"scripts/risk-gate-detect.sh"* ]]
+
+    rm -rf "${tmp_root}"
+}

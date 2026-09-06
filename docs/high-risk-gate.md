@@ -93,11 +93,21 @@ high_risk_patterns:
   - "**/*.sh"  # destructive shell scripts; can be narrowed
   - "**/iam/**"
   - "**/policies/**"
+  - "controller/src/sdlc/config/high-risk-patterns.yaml"
+  - "scripts/risk-gate-detect.sh"
 ```
 
 A pattern like `**/*.sh` is deliberately broad. The point is to fail-safe, not
 to be perfectly precise — real-world narrowing happens after first contact with
 traffic.
+
+The last two entries are self-referential: the policy file and the detector
+script are themselves high-risk paths, so a PR can't narrow a pattern above and
+smuggle the change past its own edited gate in the same diff. As additional
+protection, `.github/workflows/risk-gate.yml` runs the detector and loads the
+policy from a **trusted checkout of the PR's base branch**, never from the PR's
+own checkout — the PR diff itself is only ever used to compute the changed file
+*names* (inert input) (issue #640).
 
 ### Per-repo overrides
 
