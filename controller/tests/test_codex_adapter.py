@@ -13,6 +13,7 @@ from sdlc.contracts import RESULT_END_MARKER, RESULT_START_MARKER
 from sdlc.dispatch import AgentDispatchError
 from sdlc.harness import dispatch_on_harness, resolve_harness
 from sdlc.parsers import PlainResultParser, get_parser
+from test_dispatch import _popen
 
 # The checked-in registry — the one a real run loads. Exercising the adapter
 # against it (rather than a bespoke tmp file) is what proves AC1: "harnesses.yaml
@@ -90,7 +91,7 @@ def test_build_agent_round_trips_through_codex(monkeypatch) -> None:
         seen_input.append(kwargs.get("input"))
         return _FakeCompleted(_wrap(_VALID_BUILD))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", _popen(fake_run))
 
     codex = resolve_harness("codex", config_path=CONFIG_PATH)
     result = dispatch_on_harness(codex, "build", "build story 20.3-001")
@@ -108,9 +109,7 @@ def test_build_agent_round_trips_through_codex(monkeypatch) -> None:
 
 def test_coverage_agent_round_trips_through_codex(monkeypatch) -> None:
     """A coverage/QA agent dispatched to codex validates against its schema (AC1)."""
-    monkeypatch.setattr(
-        subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_COVERAGE))
-    )
+    monkeypatch.setattr(subprocess, "Popen", _popen(lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_COVERAGE))))
 
     codex = resolve_harness("codex", config_path=CONFIG_PATH)
     result = dispatch_on_harness(codex, "coverage", "qa story 20.3-001")
@@ -121,11 +120,7 @@ def test_coverage_agent_round_trips_through_codex(monkeypatch) -> None:
 
 def test_codex_nonzero_exit_is_plain_dispatch_error(monkeypatch) -> None:
     """A codex failure is a plain dispatch error — the parser never fabricates a 429."""
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda cmd, **kw: _FakeCompleted("", returncode=1, stderr="codex blew up"),
-    )
+    monkeypatch.setattr(subprocess, "Popen", _popen(lambda cmd, **kw: _FakeCompleted("", returncode=1, stderr="codex blew up")))
 
     codex = resolve_harness("codex", config_path=CONFIG_PATH)
     with pytest.raises(AgentDispatchError) as excinfo:
@@ -150,7 +145,7 @@ def test_dispatch_on_harness_passes_through_dispatch_kwargs(monkeypatch) -> None
         seen_cwd.append(kwargs.get("cwd"))
         return _FakeCompleted(_wrap(_VALID_BUILD))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", _popen(fake_run))
 
     codex = resolve_harness("codex", config_path=CONFIG_PATH)
     worktree = Path("/tmp/story-worktree")

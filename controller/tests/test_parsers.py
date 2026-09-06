@@ -38,6 +38,7 @@ from sdlc.parsers import (
     parse_opencode_export_usage,
     parser_ids,
 )
+from test_dispatch import _popen
 
 _VALID_BUILD = {
     "branch_name": "feature/20.1-002",
@@ -418,9 +419,7 @@ class _FakeCompleted:
 
 
 def test_dispatch_agent_uses_declared_parser(monkeypatch) -> None:
-    monkeypatch.setattr(
-        subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_BUILD))
-    )
+    monkeypatch.setattr(subprocess, "Popen", _popen(lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_BUILD))))
     # A non-streaming custom command → captured path; parser="codex-exec" selects
     # the plain parser, which records usage as unavailable.
     result = dispatch_agent(
@@ -434,9 +433,7 @@ def test_dispatch_agent_uses_declared_parser(monkeypatch) -> None:
 
 
 def test_dispatch_agent_default_parser_is_claude(monkeypatch) -> None:
-    monkeypatch.setattr(
-        subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_BUILD))
-    )
+    monkeypatch.setattr(subprocess, "Popen", _popen(lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_BUILD))))
     # No parser arg → claude parity, usage-capable harness (backward compatible).
     result = dispatch_agent("build", "prompt", agent_cmd=["someagent"])
     assert result.data == _VALID_BUILD

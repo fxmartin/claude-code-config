@@ -773,43 +773,51 @@ def _dispatch_captured(
     ``cwd`` (Story 17.2-001) is the per-story worktree the agent runs in; ``None``
     inherits the parent's cwd (the shared-root path, unchanged).
 
-    Story 13.4-001: ``start_new_session=True`` puts the agent in its own session /
-    process group so it is isolated from the controller's group. On timeout
-    ``subprocess.run`` reaps the direct child; full graceful process-group
-    TERM→KILL escalation (so spawned children cannot survive) lives on the
-    streaming path, which is the default real-agent dispatch.
+    Story 13.4-001 / issue #643: ``start_new_session=True`` puts the agent in its
+    own session / process group. This path used to delegate to
+    ``subprocess.run(..., timeout=timeout)``, whose *own* ``TimeoutExpired``
+    handling calls ``process.kill()`` — a direct-child-only signal — before
+    re-raising, so a tool subprocess the agent spawned into its own session could
+    survive the timeout as an orphan. Driving ``Popen``/``communicate`` ourselves
+    keeps the live process handle in scope, so the ``TimeoutExpired`` handler here
+    can call :func:`_terminate_process_group` (graceful SIGTERM → grace → SIGKILL
+    of the whole group) exactly like the streaming path already does.
     """
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            input=prompt,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             env=env,
             cwd=cwd,
             start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        _write_transcript(transcript_path, "", f"TIMEOUT after {timeout}s")
-        raise AgentDispatchError(
-            f"{agent_type} agent timed out after {timeout}s"
-        ) from exc
     except (FileNotFoundError, OSError) as exc:
         _write_transcript(transcript_path, "", f"could not launch {cmd[0]!r}: {exc}")
         raise AgentDispatchError(
             f"could not launch {agent_type} agent ({cmd[0]!r}): {exc}"
         ) from exc
 
+    try:
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(proc)
+        _write_transcript(transcript_path, "", f"TIMEOUT after {timeout}s")
+        raise AgentDispatchError(
+            f"{agent_type} agent timed out after {timeout}s"
+        ) from exc
+
     # Persist the transcript before any interpretation, so even a non-zero exit
     # or a missing/invalid result block leaves the agent's output on disk (R8).
-    _write_transcript(transcript_path, completed.stdout, completed.stderr)
+    _write_transcript(transcript_path, stdout, stderr)
 
     return _interpret(
         agent_type,
-        completed.stdout,
-        completed.stderr,
-        completed.returncode,
+        stdout,
+        stderr,
+        proc.returncode,
         transcript_path,
         envelope=None,
         streaming=False,
