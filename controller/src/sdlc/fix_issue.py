@@ -934,6 +934,27 @@ def _log_fix_harness_routing(ledger: Ledger, run_id: str, opts: FixOptions) -> N
         pass
 
 
+def _log_fix_controller_version_check(ledger: Ledger, run_id: str, root: Path) -> None:
+    """Warn beside the harness routing line when the installed `sdlc` is stale (15.1-004).
+
+    The same one-line warning `sdlc build`'s `_log_controller_version_check`
+    writes — mirrors `sdlc doctor`'s `install` check
+    (:func:`sdlc.doctor.check_controller_version`) at run-start, so a fix run
+    surfaces the mismatch before any agent is dispatched. Never a gate: the run
+    proceeds regardless. Best-effort: logging must never fail a fix.
+    """
+    try:
+        from sdlc.doctor import check_controller_version
+
+        finding = check_controller_version(root)
+        if finding.status != "WARN":
+            return
+        line = f"controller version: {finding.detail} — {finding.remedy}"
+        ledger.event_log(run_id, "", "warn", "install", line)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def fix_model(stage: str, opts: FixOptions, *, escalate: bool = False) -> str | None:
     """The model for ``stage`` (issue #436): a ``model_overrides`` pin beats all.
 
@@ -1769,6 +1790,9 @@ def run_fix(
     # of a run interrupted across an upgrade; the run-row freeze is what every
     # resume replays instead of re-resolving against the current config.
     _log_fix_harness_routing(ledger, run_id, opts)
+    # Story 15.1-004: same one-line warning `run_build` logs, beside the
+    # harness routing line — never a gate, the run proceeds either way.
+    _log_fix_controller_version_check(ledger, run_id, root or Path.cwd())
     ledger.run_set_harness_routing(run_id, opts.harness_map)
     ledger.event_log(run_id, "", "info", "controller", f"fix started: scope={scope}")
     try:

@@ -1242,6 +1242,25 @@ it on the next real run).
   - **Install integrity** — every managed `~/.claude` symlink/file from
     `install/core.sh` is present and resolves (a dangling link counts as broken).
     Missing/broken → `FAIL`, remedy `./install.sh --core`.
+  - **Installed controller vs checkout** (Story 15.1-004) — compares
+    `sdlc.__version__` (the PATH-installed `uv tool install` snapshot) against
+    `[project].version` in the target repo's `controller/pyproject.toml` (the
+    checkout). A merge to `main` never updates an already-installed tool, and
+    the version badge in the dashboard was the only prior tell — this reports
+    the disagreement everywhere doctor runs. Equal → `CLEAN`. Installed behind
+    the checkout → `WARN`, remedy `bash scripts/install-controller.sh` then
+    `sdlc dashboard --restart`. Installed *ahead* of the checkout → `WARN` too
+    (the two disagree either way), but the remedy names the other side
+    (`git pull` the checkout) — never a reinstall that would go backwards. A
+    target repo with no `controller/pyproject.toml` (any project `sdlc` is
+    pointed at that is not this framework) declares no controller version, so
+    the check is **not applicable** — always `CLEAN`, never `WARN`/`FAIL`.
+    Offline by construction: it reads only the local `pyproject.toml` with
+    `tomllib`, no network or `gh`/git call. `sdlc build` and `sdlc fix` run the
+    same comparison at preflight — see
+    [Harness capability probe and preflight](#harness-capability-probe-and-preflight-story-205-001)
+    below — so the warning lands before any agent is dispatched, not only when
+    someone happens to run `doctor`.
   - **Ledger schema + integrity** — the ledger opens read-only and every
     `_MIGRATIONS` version is applied. Behind / pre-migration-framework → `WARN`
     (auto-migrates on the next `sdlc` verb); unreadable/corrupt → `FAIL`. No
@@ -1624,6 +1643,15 @@ the degradation matrix (Story 20.5-002) centralizes on.
 default-slot harness and writes each line to the `harness` event source — `info`
 normally, `warn` on any downgrade. For the built-in Claude harness this is purely
 additive logging (all capabilities `true`, no probe), so dispatch is unchanged.
+
+Right beside that call, `run_build` and `run_fix` also run the [installed
+controller vs checkout](#doctor-health-check-verb) comparison
+(`_log_controller_version_check` / `_log_fix_controller_version_check`, Story
+15.1-004) and, on a mismatch, write one `warn` event to the `install` source —
+`sdlc build` also prints it to stderr beside the `harness routing:` line. This
+is a signal, not a gate: the run always proceeds, so a merge to `main` can
+never again leave a run executing on stale code without a visible warning
+before any tokens are spent.
 
 **Capability matrix** (canonical flags; the shipped `harnesses.yaml` values):
 

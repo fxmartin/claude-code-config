@@ -4483,6 +4483,30 @@ def _log_harness_preflight(
         pass
 
 
+def _log_controller_version_check(ledger: "Ledger", run_id: str, root: Path) -> None:
+    """Warn beside the harness routing line when the installed `sdlc` is stale (15.1-004).
+
+    Field finding: the PATH-installed `sdlc` is a `uv tool install` snapshot, not
+    the checkout — merging to `main` never updates it, and nothing said so.
+    Mirrors `sdlc doctor`'s `install` check (:func:`sdlc.doctor.
+    check_controller_version`) but at run-start, so the signal lands before any
+    agent is dispatched rather than only when someone happens to run doctor.
+    This is a signal, never a gate: a mismatch never blocks the run. Best-effort
+    like every other preflight log: a lookup failure must never fail a build.
+    """
+    try:
+        from sdlc.doctor import check_controller_version
+
+        finding = check_controller_version(root)
+        if finding.status != "WARN":
+            return
+        line = f"controller version: {finding.detail} — {finding.remedy}"
+        print(line, file=sys.stderr)
+        ledger.event_log(run_id, "", "warn", "install", line)
+    except Exception:
+        pass
+
+
 def _record_degradations(
     ledger: "Ledger", run_id: str, requested_mode: str, opts: "BuildOptions"
 ) -> None:
@@ -6459,6 +6483,10 @@ def run_build(
     # default slot is the built-in Claude harness (no probe, all capabilities),
     # so this is purely additive logging and never alters dispatch behaviour.
     _log_harness_preflight(ledger, run_id, mode, opts)
+    # Story 15.1-004: warn (never block) when the installed `sdlc` disagrees
+    # with this checkout's declared controller version, beside the harness
+    # routing line — the only prior tell was the dashboard's version badge.
+    _log_controller_version_check(ledger, run_id, root or Path.cwd())
     # Issue #543: freeze the run's effective role->harness map on the run row, the
     # same resolve-once discipline Story 28.4-001 applies to models. The CLI has
     # already layered `--harness` > repo `.sdlc-harness.yaml` > registry `default:`
