@@ -2127,3 +2127,44 @@ def test_harness_glyph_is_distinct_per_registered_harness() -> None:
     assert len(set(glyphs.values())) == len(glyphs), (
         f"duplicate harness glyphs: {glyphs}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Sidebar toggle: the Runs pane can be hidden and the choice survives reloads.
+# ---------------------------------------------------------------------------
+
+
+def test_page_has_an_accessible_sidebar_toggle(tmp_path: Path) -> None:
+    """A top-bar button hides/shows the Runs pane; it is wired for assistive tech.
+
+    The pytest surface is the served markup, not a browser, so assert the
+    structural contract: a button that names the pane it controls and starts
+    expanded, and a pane with the id the button points at.
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db) as base:
+        _, _, body = _get(base + "/")
+    text = body.decode("utf-8")
+    assert 'id="toggleSide"' in text
+    assert 'aria-controls="side"' in text
+    assert 'aria-expanded="true"' in text
+    assert 'id="side"' in text
+
+
+def test_sidebar_toggle_hides_pane_and_persists(tmp_path: Path) -> None:
+    """Hiding is a class flip the CSS honours, and the choice is remembered.
+
+    `.side-hidden .side { display: none }` is what actually removes the pane;
+    the localStorage key is what brings it back on the next load. Both must be
+    present, and the storage access must be guarded — browsers can throw on
+    `localStorage` (private windows, blocked site data).
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db) as base:
+        _, _, body = _get(base + "/")
+    text = body.decode("utf-8")
+    assert ".side-hidden .side" in text and "display: none" in text
+    assert "sdlc.dashboard.sideHidden" in text
+    assert "try" in text and "localStorage" in text
