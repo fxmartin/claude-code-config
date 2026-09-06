@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.56.0] - 2026-09-06
+
+### Added
+
+- feat(harness-parallelism): opencode usage telemetry from (#29.2-003)
+
+### Fixed
+
+- fix(opencode): an all-zero step is absent usage, not a real zero
+- fix(harness-parallelism): opencode usage telemetry from (#29.2-003)
+- fix(harness-parallelism): opencode usage telemetry from (#29.2-003)
+
+
 ## [v2.55.0] - 2026-09-05
 
 ### Added
