@@ -297,3 +297,149 @@ def _config(*, poll_seconds: float):
     from sdlc.scheduler import SchedulerConfig
 
     return SchedulerConfig(slots=2, poll_seconds=poll_seconds)
+
+
+def test_ledger_plan_files_reads_the_runs_investigation_plan(tmp_path) -> None:
+    """AC2's write side: the files come from the run's own frozen `fix-plan` event."""
+    from sdlc.build import Ledger
+    from sdlc.fix_issue import _record_fix_plan
+    from sdlc.scheduler import ledger_plan_files
+
+    db = tmp_path / "state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("issue-42", "fix")
+    _record_fix_plan(
+        ledger, run_id, {"files_to_modify": ["src/b.py", "src/a.py"], "complexity": "LOW"}
+    )
+
+    assert ledger_plan_files(str(db), run_id) == ["src/a.py", "src/b.py"]
+
+
+def test_ledger_plan_files_unions_every_plan_the_run_recorded(tmp_path) -> None:
+    """A resumed run can record more than one plan; the job's footprint is their union."""
+    from sdlc.build import Ledger
+    from sdlc.fix_issue import _record_fix_plan
+    from sdlc.scheduler import ledger_plan_files
+
+    db = tmp_path / "state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("issue-42", "fix")
+    _record_fix_plan(ledger, run_id, {"files_to_modify": ["src/a.py"]})
+    _record_fix_plan(ledger, run_id, {"files_to_modify": ["src/c.py", "src/a.py"]})
+
+    assert ledger_plan_files(str(db), run_id) == ["src/a.py", "src/c.py"]
+
+
+def test_ledger_plan_files_degrades_to_empty_on_an_unreadable_ledger(tmp_path) -> None:
+    """A missing or corrupt ledger must leave the graph empty, never crash the drain."""
+    from sdlc.scheduler import ledger_plan_files
+
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not a sqlite database")
+    assert ledger_plan_files(str(tmp_path / "nope.db"), "run-1") == []
+    assert ledger_plan_files(str(corrupt), "run-1") == []
+
+
+def test_ledger_plan_files_ignores_a_plan_it_cannot_parse(tmp_path) -> None:
+    """A non-JSON or file-less plan event contributes nothing rather than raising."""
+    from sdlc.build import Ledger
+    from sdlc.scheduler import ledger_plan_files
+
+    db = tmp_path / "state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("issue-42", "fix")
+    ledger.event_log(run_id, "", "info", "fix-plan", "not json at all")
+    ledger.event_log(run_id, "", "info", "fix-plan", '["a list, not a plan"]')
+    ledger.event_log(run_id, "", "info", "fix-plan", '{"root_cause": "no files field"}')
+
+    assert ledger_plan_files(str(db), run_id) == []
+
+
+def test_the_scheduler_records_a_running_jobs_investigated_files(tmp_path) -> None:
+    """AC2: the queue row learns the job's file footprint while the run is live."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="fix", scope="1")
+
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    launcher = FakeLauncher()
+    calls: list[tuple[str, str]] = []
+
+    def plan_files(db: str, run_id: str) -> list[str]:
+        calls.append((db, run_id))
+        return ["src/a.py", "src/b.py"]
+
+    class OneShot(FakeLauncher):
+        """Registers a run, then exits on the *next* pass so the record lands first."""
+
+        def __call__(self, argv, cwd):
+            proc = launcher(argv, cwd)
+            registry.register(
+                RunRecord(run_id="run-plan", repo=repo, db=str(tmp_path / "x.db"),
+                          scope="1", pid=proc.pid, status="IN_PROGRESS", started_at="")
+            )
+            return proc
+
+    def sleeper(seconds: float) -> None:
+        launcher.procs[0].stopped = True  # let the second pass reap it
+        clock.advance(seconds)
+
+    _run(
+        store, tmp_path=tmp_path, launcher=OneShot(), clock=clock, sleeper=sleeper,
+        registry=registry, plan_files=plan_files,
+    )
+
+    assert store.get_job(job_id).files_to_modify() == {"src/a.py", "src/b.py"}
+    assert calls == [(str(tmp_path / "x.db"), "run-plan")]
+
+
+def test_recorded_files_hold_back_an_overlapping_queued_peer(tmp_path) -> None:
+    """AC2 end to end: what the scheduler records is what holds the next job back."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    running = store.add_job(repo=repo, kind="fix", scope="1")
+    waiting = store.add_job(repo=repo, kind="fix", scope="2")
+    store.record_files(waiting, ["src/a.py"])  # a previous run's footprint
+
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    launcher = FakeLauncher()
+
+    class Launching(FakeLauncher):
+        def __call__(self, argv, cwd):
+            proc = launcher(argv, cwd)
+            registry.register(
+                RunRecord(run_id=f"run-{len(launcher.procs)}", repo=repo,
+                          db=str(tmp_path / "x.db"), scope="1", pid=proc.pid,
+                          status="IN_PROGRESS", started_at="")
+            )
+            return proc
+
+    seen: list[tuple[int, str, str | None, frozenset[str]]] = []
+
+    def sleeper(seconds: float) -> None:
+        seen.append((
+            len(launcher.procs),
+            store.get_job(waiting).state,
+            store.get_job(waiting).reason,
+            frozenset(store.get_job(running).files_to_modify()),
+        ))
+        if len(seen) >= 2:
+            launcher.procs[0].stopped = True  # let the first job finish cleanly
+        clock.advance(seconds)
+
+    _run(
+        store, tmp_path=tmp_path, launcher=Launching(), clock=clock, registry=registry,
+        sleeper=sleeper, plan_files=lambda _db, _run: ["src/a.py"],
+    )
+
+    # While the first job is pending with a recorded footprint, the overlapping
+    # second job is neither launched nor left unexplained.
+    assert (1, "queued", f"waiting on job {running} (overlapping files)",
+            frozenset({"src/a.py"})) in seen
+    # And the hold releases itself: once the first job is terminal the second runs.
+    assert len(launcher.procs) == 2

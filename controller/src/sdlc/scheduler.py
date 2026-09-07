@@ -31,6 +31,7 @@ __all__ = [
     "controller_argv",
     "job_argv",
     "ledger_fix_rounds",
+    "ledger_plan_files",
     "run_queue",
 ]
 
@@ -89,6 +90,10 @@ VersionCheck = Callable[[Path], object]
 # ``(ledger_db_path, run_id) -> bugfix rounds burned``. A seam so the budget
 # breaker is testable without standing up a ledger (Story 32.3-001).
 FixRounds = Callable[[str, str], int]
+# ``(ledger_db_path, run_id) -> the run's investigated files_to_modify``. The
+# same shape and the same reason: the overlap graph's *write* side is testable
+# without standing up a ledger (Story 32.3-001 AC2).
+PlanFiles = Callable[[str, str], list[str]]
 
 
 @dataclass
@@ -141,6 +146,10 @@ class _InFlight:
     # ``budget`` is the class budget frozen on the job at enqueue.
     started_at: datetime
     budget: JobBudget
+    # Whether this launch has already copied the run's investigated file set
+    # onto the queue row (AC2). Latches, so a job's footprint is read from its
+    # ledger once rather than on every poll.
+    files_recorded: bool = False
 
 
 class _PopenProcess:
@@ -343,6 +352,46 @@ def ledger_fix_rounds(db_path: str, run_id: str) -> int:
     )
 
 
+def ledger_plan_files(db_path: str, run_id: str) -> list[str]:
+    """The files ``run_id``'s investigation said it would modify (Story 32.3-001 AC2).
+
+    The *write* side of the queue's file-overlap graph, and the counterpart to
+    :func:`ledger_fix_rounds`: both read the run's own public record rather than
+    reaching into the pipeline. `fix_issue` already freezes each investigation
+    plan as a ``fix-plan`` event (issue #547) precisely so a resume can recover
+    it; ``files_to_modify`` is the field
+    :meth:`QueueStore.overlap_holds` builds its graph from, so the queue reads
+    the same frozen plan instead of asking the job subprocess to write back —
+    a job stays ignorant of the queue that spawned it.
+
+    Every plan the run recorded is unioned, earliest first, because a resumed
+    run can record more than one and the job's footprint is all of them. Only
+    a `fix` run records plans at all; a `build` job simply has none, which is
+    the honest answer (its stories are not investigated up front) and leaves it
+    a singleton in the graph.
+
+    Degrades to ``[]`` on any read failure, and skips any plan it cannot parse:
+    an unreadable ledger is a reason to leave two jobs unchained, never a reason
+    to take the drain down.
+    """
+    from sdlc.build import Ledger
+    from sdlc.fix_issue import _FIX_PLAN_SOURCE
+
+    try:
+        messages = Ledger(Path(db_path)).events_by_source(run_id, _FIX_PLAN_SOURCE)
+    except Exception:
+        return []
+    files: set[str] = set()
+    for message in messages:
+        try:
+            plan = json.loads(message)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(plan, dict):
+            files.update(str(path) for path in (plan.get("files_to_modify") or []))
+    return sorted(files)
+
+
 def _default_launcher(argv: Sequence[str], cwd: Path) -> JobProcess:
     """Spawn a job as a detached process group under ``cwd``.
 
@@ -373,6 +422,7 @@ class _Scheduler:
         notifier: Callable[..., None],
         version_check: VersionCheck,
         fix_rounds: FixRounds,
+        plan_files: PlanFiles,
         echo: Callable[[str], None],
         identity: str,
     ) -> None:
@@ -385,6 +435,7 @@ class _Scheduler:
         self._notify = notifier
         self._version_check = version_check
         self._fix_rounds = fix_rounds
+        self._plan_files = plan_files
         self._echo = echo
         self._identity = identity
         self._in_flight: dict[int, _InFlight] = {}
@@ -396,6 +447,7 @@ class _Scheduler:
         try:
             while True:
                 self._attach_runs()
+                self._record_plan_files()
                 self._reap()
                 self._enforce_budgets()
                 self._renew()
@@ -637,6 +689,34 @@ class _Scheduler:
             self._echo(f"job {job_id} parked (needs_attention): {reason}")
             self._announce(entry.job, entry.run_id, "needs_attention")
 
+    def _record_plan_files(self) -> None:
+        """Copy each in-flight job's investigated file set onto its row (AC2).
+
+        The production writer behind :meth:`QueueStore.overlap_holds`: without
+        it the ``files`` column would stay NULL on every job and the overlap
+        graph would be all singletons, so two jobs racing the same paths would
+        never serialise.
+
+        Runs right after :meth:`_attach_runs` (a job has no ledger to read until
+        it has a run) and before :meth:`_reap`, so a job that finishes in this
+        same pass still leaves its footprint behind — the row keeps it, which is
+        what lets a requeued job be held on the strength of what it touched last
+        time. ``files_recorded`` latches per launch, and an empty answer is not
+        latched: the plan is frozen mid-run, so the first passes legitimately see
+        nothing yet and must look again.
+        """
+        for job_id, entry in list(self._in_flight.items()):
+            if entry.files_recorded or entry.run_id is None:
+                continue
+            record = self._registry_record(entry.run_id)
+            if record is None:
+                continue
+            files = self._plan_files(record.db, entry.run_id)
+            if not files:
+                continue
+            self._store.record_files(job_id, files)
+            entry.files_recorded = True
+
     def _run_fix_rounds(self, run_id: str) -> int:
         """Fix rounds burned by ``run_id``, via its registry-recorded ledger."""
         record = self._registry_record(run_id)
@@ -761,6 +841,7 @@ def run_queue(
     notifier: Callable[..., None] | None = None,
     version_check: VersionCheck | None = None,
     fix_rounds: FixRounds | None = None,
+    plan_files: PlanFiles | None = None,
     echo: Callable[[str], None] | None = None,
     identity: str | None = None,
 ) -> SchedulerResult:
@@ -800,6 +881,7 @@ def run_queue(
         notifier=notifier or notify,
         version_check=version_check or check_controller_version,
         fix_rounds=fix_rounds or ledger_fix_rounds,
+        plan_files=plan_files or ledger_plan_files,
         echo=echo or print,
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
     )

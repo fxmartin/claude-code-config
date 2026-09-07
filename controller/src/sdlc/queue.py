@@ -395,9 +395,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
 
 # Schema migrations applied after the base DDL, in the same
 # ``(version, name, table, columns, create_sql)`` shape as the ledger's
-# ``_MIGRATIONS`` (sdlc/build.py) — empty today (the fresh schema above covers
-# every column this story needs); future columns (e.g. a claim lease renewal
-# field) land here so an existing host queue.db upgrades in place.
+# ``_MIGRATIONS`` (sdlc/build.py). Version 1 is Story 32.3-001's; future columns
+# (e.g. a claim lease renewal field) take the next version so an existing host
+# queue.db upgrades in place. The DDL above always describes the *current*
+# schema, so a fresh store never runs these — they exist for the stores that
+# already have rows.
 _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     # Story 32.3-001: the per-class budget frozen on the job, and the
     # investigated file set the repo-scoped overlap graph is built from. Both
@@ -642,7 +644,9 @@ class QueueStore:
 
         The write side of the repo-scoped overlap graph: once a job's
         investigation says which files it will touch, an overlapping peer in the
-        same repo must wait for it (:meth:`overlap_holds`). Today per-repo
+        same repo must wait for it (:meth:`overlap_holds`). Its production
+        caller is the scheduler (``_Scheduler._record_plan_files``), which reads
+        the plan from the run's own ledger. Today per-repo
         exclusivity already serialises everything in one checkout, so this only
         *narrows* nothing; it is what keeps overlapping jobs serial once Story
         32.1-003 lets two non-overlapping jobs share a repo.

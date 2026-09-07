@@ -1450,6 +1450,20 @@ reaches the job's own agents rather than just its parent.
   exclusivity already serialises a whole repo, so this constrains nothing extra;
   it is what keeps overlapping jobs serial once Story 32.1-003 lets two
   non-overlapping jobs share a checkout.
+
+  The graph's **write** side is `scheduler.ledger_plan_files`, run once per
+  launch right after a job is linked to its run. It reads the `fix-plan` event
+  `fix_issue` already freezes for resume (issue #547) and copies that plan's
+  `files_to_modify` onto the job row with `QueueStore.record_files` — the queue
+  reads the run's own public record rather than having the job subprocess write
+  back, so a job stays ignorant of the queue that spawned it, exactly as
+  `ledger_fix_rounds` does for the budget breaker. Two consequences worth
+  stating: investigation happens *inside* the run, so a job's footprint is only
+  known from the moment its plan lands (before that it is a singleton in the
+  graph, and nothing is held); and the row keeps that footprint after the job
+  finishes, which is what lets a requeued job be held on the strength of what it
+  touched last time. A `build` job records nothing — its stories are not
+  investigated up front — and is a singleton by construction.
 - **Per-job budgets — the outer breaker.** Each job carries its class's budget,
   frozen onto the row at enqueue and shown in `sdlc queue list` as
   `<rounds>r/<clock>` (`5r/4h`). Two numbers, because a job runs away in two
