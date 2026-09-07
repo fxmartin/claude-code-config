@@ -1957,7 +1957,7 @@ def test_a_window_a_peer_scheduler_already_opened_is_not_re_announced(tmp_path) 
         echo=lambda _line: None, identity="test:1",
     )
     park = _RateLimitPark(
-        run_id="run-a", repo=str(tmp_path / "alpha"), db=tmp_path / "x.db",
+        job_id=1, run_id="run-a", repo=str(tmp_path / "alpha"), db=tmp_path / "x.db",
         reset_at=clock.now.timestamp() + 600, max_wait_s=18000,
     )
 
@@ -1969,7 +1969,7 @@ def test_a_window_a_peer_scheduler_already_opened_is_not_re_announced(tmp_path) 
     # A reset that has already passed is not a window at all.
     store.clear_pause()
     stale = _RateLimitPark(
-        run_id="run-b", repo=str(tmp_path / "beta"), db=tmp_path / "x.db",
+        job_id=2, run_id="run-b", repo=str(tmp_path / "beta"), db=tmp_path / "x.db",
         reset_at=clock.now.timestamp() - 1, max_wait_s=18000,
     )
     scheduler._pause_dispatch(stale)
@@ -2026,6 +2026,170 @@ def test_every_parked_run_shares_one_window_even_when_slots_are_scarce(tmp_path)
     )
     assert store.get_job(alpha).state == "done"
     assert store.get_job(beta).state == "done"
+
+
+
+def test_a_leftover_reset_less_park_does_not_open_a_second_window(tmp_path) -> None:
+    """A park the queue already waited out is spent evidence, not a new window.
+
+    The reset-carrying half of this was fixed by sizing the window off the
+    latest epoch (the test above): once that epoch passes, `_pause_dispatch`'s
+    `until <= now` guard makes a leftover park harmless. A *reset-less* park has
+    no epoch to pass — its window is a sliding `now + max_wait_s` — so it can
+    never be "already over", and every park left behind by a scarce slot opened
+    another full-length window: one pause and one resume per parked repo, and at
+    the 18000s default the queue idled another five hours per leftover on
+    evidence the window it had just served already covered.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    alpha, alpha_run, alpha_db = _parked_job(
+        store, registry, tmp_path, "alpha", max_wait_s=900
+    )
+    beta, beta_run, beta_db = _parked_job(
+        store, registry, tmp_path, "beta", max_wait_s=900
+    )
+
+    launcher = ResumingLauncher({alpha_run: alpha_db, beta_run: beta_db}, alive_polls=1)
+    notifier = RecordingNotifier()
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, probe=None,
+        sleeper=_stop_after(clock, 40),  # safety net; the drain ends well before
+        config=SchedulerConfig(slots=1, poll_seconds=100.0),
+    )
+
+    assert len(notifier.names("queue_paused")) == 1
+    assert len(notifier.names("queue_resumed")) == 1
+    assert result.paused == 1
+    # One 900s window, not one per parked repo.
+    assert clock.now < datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc) + timedelta(
+        seconds=1800
+    )
+    assert store.get_job(alpha).state == "done"
+    assert store.get_job(beta).state == "done"
+
+
+def test_a_probe_reopened_window_is_not_re_closed_by_a_leftover_park(tmp_path) -> None:
+    """An early reopen must not be undone by the epoch it overrode.
+
+    An AVAILABLE probe declares the window open *before* the recorded reset, so
+    every park left behind by a scarce slot still holds an epoch in the future.
+    Read as fresh evidence, the first of them slammed the queue shut again on
+    the very reset the live API had just disproved — the early reopen bought
+    nothing and cost a second pause notification.
+    """
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    reset_at = clock.now.timestamp() + 18000
+    alpha, alpha_run, alpha_db = _parked_job(
+        store, registry, tmp_path, "alpha", reset_at=reset_at
+    )
+    beta, beta_run, beta_db = _parked_job(
+        store, registry, tmp_path, "beta", reset_at=reset_at
+    )
+
+    launcher = ResumingLauncher({alpha_run: alpha_db, beta_run: beta_db}, alive_polls=1)
+    notifier = RecordingNotifier()
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, probe=lambda: ProbeStatus.AVAILABLE,
+        sleeper=_stop_after(clock, 40),  # safety net; the drain ends well before
+        config=SchedulerConfig(slots=1, poll_seconds=400.0),
+    )
+
+    assert len(notifier.names("queue_paused")) == 1
+    assert len(notifier.names("queue_resumed")) == 1
+    assert result.paused == 1
+    # Both drained long before the 5h epoch the probe overrode.
+    assert clock.now < datetime.fromtimestamp(reset_at, timezone.utc)
+    assert store.get_job(alpha).state == "done"
+    assert store.get_job(beta).state == "done"
+
+
+def test_a_run_that_parks_again_after_its_resume_opens_a_new_window(tmp_path) -> None:
+    """Spending a park's evidence must not deafen the queue to the next limit.
+
+    The counterpart to the two tests above: a run the queue resumed and that
+    walked straight back into the wall has parked *again*, and that is genuinely
+    new evidence. `_reap` re-stamps the park reason on the way out, so the
+    second window opens exactly as the first one did.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    alpha, alpha_run, alpha_db = _parked_job(
+        store, registry, tmp_path, "alpha", max_wait_s=900
+    )
+
+    # A plain launcher never clears the park, so the resumed run re-parks.
+    notifier = RecordingNotifier()
+    _run(
+        store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=1), clock=clock,
+        registry=registry, notifier=notifier, probe=None,
+        sleeper=_stop_after(clock, 30),
+        config=SchedulerConfig(slots=1, poll_seconds=100.0),
+    )
+
+    # Two windows: the one the queue served, and the one the re-park opened.
+    assert len(notifier.names("queue_paused")) == 2
+    assert store.dispatch_pause().is_active(clock()) is True
+    assert store.get_job(alpha).state == "running"  # still parked, still resumable
+
+
+
+def test_a_park_recording_a_later_reset_survives_the_served_window(tmp_path) -> None:
+    """Spending served evidence must not swallow a *later* window.
+
+    A job already in flight when the pause opened can hit the wall while it is
+    held, and the reset it records may fall beyond the window being waited out.
+    That park is news, not leftover evidence — spending it would resume every
+    repo straight back into a window that is still closed. A reset-less park has
+    no such claim: its window is the blind `max_wait` guess, so it is spent like
+    any other leftover and re-parks if the wall is really still there.
+    """
+    from sdlc.queue import QueuePause
+    from sdlc.scheduler import (
+        _WINDOW_SERVED_REASON, SchedulerConfig, _Scheduler,
+    )
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    served = clock.now + timedelta(seconds=600)
+    covered, _, _ = _parked_job(
+        store, registry, tmp_path, "alpha", reset_at=served.timestamp()
+    )
+    beyond, _, _ = _parked_job(
+        store, registry, tmp_path, "beta",
+        reset_at=(clock.now + timedelta(seconds=1800)).timestamp(),
+    )
+    guessing, _, _ = _parked_job(
+        store, registry, tmp_path, "gamma", max_wait_s=18000
+    )
+
+    scheduler = _Scheduler(
+        store, config=SchedulerConfig(), registry=registry,
+        launcher=FakeLauncher(), clock=clock, sleeper=lambda _s: None,
+        notifier=lambda *a, **k: None, version_check=_clean, probe=None,
+        echo=lambda _line: None, identity="test:1",
+    )
+    scheduler._spend_served_parks(
+        QueuePause(paused_until=served.isoformat(), paused_at=clock.now.isoformat())
+    )
+
+    assert store.get_job(covered).reason == _WINDOW_SERVED_REASON
+    assert store.get_job(guessing).reason == _WINDOW_SERVED_REASON
+    assert store.get_job(beyond).reason != _WINDOW_SERVED_REASON
 
 
 def test_probe_none_means_no_probe_rather_than_the_live_api(tmp_path, monkeypatch) -> None:

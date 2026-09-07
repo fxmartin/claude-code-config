@@ -94,6 +94,18 @@ _DEFAULT_RATE_LIMIT_MAX_WAIT_S = 18000
 # caches the reset so the window is discovered once rather than once per repo.
 _RATE_LIMITED = "RATE_LIMITED"
 
+# The two `reason` values a rate-limit park carries, and the state machine
+# between them: `_reap` writes the first when a run hands its window to the
+# queue, and `_resume_dispatch` rewrites it to the second once that window has
+# been served. `_discover_rate_limit` skips the second, which is what stops a
+# park left behind by a scarce slot from re-opening a window the queue already
+# waited out. Persisted on the job rather than held in memory so it survives a
+# scheduler restart and is read identically by every peer on the host — the
+# same "state lives in the store" rule the pause row itself follows, and the
+# same use of `reason` as `_stamp_repo_busy`'s "repo busy".
+_PARKED_REASON = "rate-limited: waiting for the shared window to reopen"
+_WINDOW_SERVED_REASON = "rate-limited: the window reopened — awaiting a free slot"
+
 # Registry *terminal* statuses that mean parked-for-a-human rather than failed:
 # the run reached an end state, but one a human decision reopens (approve the
 # merge, look at the stuck story). A job whose run ends in one of these mirrors
@@ -219,6 +231,7 @@ class _RateLimitPark:
     fail-open; sizing this off the window length instead would be a spec change.
     """
 
+    job_id: int
     run_id: str
     repo: str
     db: Path
@@ -631,6 +644,20 @@ def _as_float(value: object) -> float | None:
             return None
 
 
+def _as_datetime(value: str | None) -> datetime | None:
+    """An ISO-8601 stamp as an aware UTC datetime, or ``None`` when unreadable.
+
+    Naive stamps are read as UTC — the same reading :meth:`QueuePause.is_active`
+    and :meth:`_Scheduler._due_for_probe` give them, so every consumer of a
+    stored timestamp agrees about what a missing offset means.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def _as_int(value: object, fallback: int) -> int:
     """``value`` as a positive int, or ``fallback`` when it is absent/junk."""
     parsed = _as_float(value)
@@ -891,7 +918,7 @@ class _Scheduler:
             if code is None:
                 continue
             del self._in_flight[job_id]
-            if entry.run_id and self._rate_limit_park(entry.run_id) is not None:
+            if entry.run_id and self._rate_limit_park(job_id, entry.run_id) is not None:
                 # Story 32.2-001: a run that parked itself on a closed window
                 # exits non-zero, but it is *paused*, not finished. Stamping it
                 # terminal would need a manual `sdlc queue requeue` to undo, so
@@ -902,7 +929,7 @@ class _Scheduler:
                 # ledger read on the next pass.
                 self._store.release_claim(
                     job_id, claimed_by=self._identity,
-                    reason="rate-limited: waiting for the shared window to reopen",
+                    reason=_PARKED_REASON,
                     now=self._clock(),
                 )
                 self._echo(f"job {job_id} paused: rate-limited, awaiting the window")
@@ -1261,6 +1288,17 @@ class _Scheduler:
         run was about to finish on its own, and stall every other repo behind
         it. Only a run that exited while still ``RATE_LIMITED`` handed the
         window over to the queue.
+
+        A park the queue has already waited out is skipped too — its evidence
+        was spent on the window that has just been served (see
+        :meth:`_spend_served_parks`). Without that, a park left standing because
+        no slot was free re-opened a *second* window from the same limit: the
+        reset-carrying kind was harmless once its epoch passed, but a reset-less
+        park's window is a sliding ``now + max_wait_s`` that can never be over,
+        and a live probe that reopens early leaves every epoch still in the
+        future. Either way the queue idled another full window per leftover
+        repo — one pause and one resume each — which is the exact per-repo
+        storm this story exists to end.
         """
         parks: list[_RateLimitPark] = []
         for job in self._store.list_jobs():
@@ -1268,12 +1306,14 @@ class _Scheduler:
                 continue
             if job.id in self._in_flight or self._run_is_live(job.run_id):
                 continue  # waiting in-process; it resumes itself
-            park = self._rate_limit_park(job.run_id)
+            if job.reason == _WINDOW_SERVED_REASON:
+                continue  # spent evidence: this park's window was already served
+            park = self._rate_limit_park(job.id, job.run_id)
             if park is not None:
                 parks.append(park)
         return parks
 
-    def _rate_limit_park(self, run_id: str) -> "_RateLimitPark | None":
+    def _rate_limit_park(self, job_id: int, run_id: str) -> "_RateLimitPark | None":
         """``run_id``'s rate-limit park as its own ledger records it, or ``None``.
 
         Advisory by construction: a missing registry entry, a ledger that cannot
@@ -1295,6 +1335,7 @@ class _Scheduler:
         except Exception:  # noqa: BLE001 - a ledger read must never fail a drain
             return None
         return _RateLimitPark(
+            job_id=job_id,
             run_id=run_id,
             repo=record.repo,
             db=Path(record.db),
@@ -1341,6 +1382,7 @@ class _Scheduler:
 
     def _resume_dispatch(self, pause: QueuePause) -> None:
         """Lift the pause and announce it — once, for the whole queue."""
+        self._spend_served_parks(pause)
         self._store.clear_pause()
         self._echo("queue resumed: the rate-limit window reopened")
         self._notify(
@@ -1350,6 +1392,42 @@ class _Scheduler:
             paused_until=pause.paused_until,
             run=pause.run_id or "",
         )
+
+    def _spend_served_parks(self, pause: QueuePause) -> None:
+        """Mark every still-standing park as covered by the window just served.
+
+        The queue serves one window per limit, but the parks that discovered it
+        outlive it: only as many as there are free slots get resumed, and the
+        rest stay ``running`` with a ledger that still says ``RATE_LIMITED``.
+        Re-reading those as fresh evidence is what re-closed the queue. Stamping
+        them here spends the evidence exactly once — and only here, so a run
+        that is resumed and walks back into the wall re-parks through
+        :meth:`_reap`, gets ``_PARKED_REASON`` again, and opens the new window
+        it genuinely deserves.
+
+        A park recording a reset *beyond* the window just served is kept: a job
+        already in flight when the pause opened can hit the wall during it, and
+        the reset it records is a later window this one never covered. Only an
+        epoch earns that reprieve — a reset-less park carries the blind
+        ``max_wait`` guess, which is never evidence of a *new* limit (the same
+        ranking :meth:`_check_rate_limit` applies when sizing the window). If
+        the API really is still closed, resuming it costs one re-park, which
+        opens the next window properly rather than guessing at it here.
+
+        The jobs stay reclaim candidates throughout: this only re-words *why*
+        they are waiting, from "for the window" to "for a slot", which is also
+        the truer thing to show an operator running `sdlc queue list`.
+        """
+        served = _as_datetime(pause.paused_until)
+        now = self._clock()
+        for park in self._discover_rate_limit():
+            if (
+                served is not None
+                and park.reset_at is not None
+                and park.window_until(now) > served
+            ):
+                continue  # a later window than the one just served — real news
+            self._store.set_reason(park.job_id, _WINDOW_SERVED_REASON)
 
     def _window_reopened(self, pause: QueuePause) -> bool:
         """Whether a live probe says the window is open before its reset says so.

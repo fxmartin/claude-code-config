@@ -1629,6 +1629,19 @@ reaches the job's own agents rather than just its parent.
     `queue_paused` notify and one `queue_resumed`, not one per job. A later
     signal carrying a longer wait extends the window; a shorter one never
     shortens it.
+  - **A served window's evidence is spent.** Only as many parks as there are
+    free slots get resumed, so the rest stay `running` with a ledger that still
+    says `RATE_LIMITED`. Lifting the pause therefore re-words their `reason`
+    from "waiting for the shared window" to "awaiting a free slot", and
+    discovery skips that second wording. Without it a leftover park re-opened a
+    *second* window from the same limit — harmless once a recorded epoch had
+    passed, but a reset-less park's window is a sliding `now + max_wait_s` that
+    can never be over, and an early probe reopen leaves every epoch still in
+    the future. Either case idled the queue another full window per leftover
+    repo. A park recording a reset *beyond* the window just served keeps it (a
+    job in flight when the pause opened can hit a genuinely later limit), and a
+    run that re-parks after its resume is stamped afresh by the reap path, so
+    the next real window still opens.
   - **No reset time?** A usage-limit with no retry-after pauses for the run's
     own configured `rate_limit_max_wait_s` (~one Max window, the same
     conservative "assume a full window" heuristic `seconds_until_reset` uses).
