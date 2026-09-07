@@ -45,6 +45,91 @@ class RoleRoutingError(Exception):
     to an unknown/disabled harness. Raised so preflight fails fast (no half-run)."""
 
 
+def undenied_host_auth_routes(
+    role_map: Mapping[str, str] | None,
+    *,
+    config_path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    """Host-auth roles routed to a harness without the deny baseline (issue #654).
+
+    Returns ``[(role, harness_name), ...]`` — one entry per
+    :data:`sdlc.degradation.HOST_AUTH_ROLES` member whose routed harness resolves
+    to a capability map lacking ``deny_baseline``. Empty means every host-auth
+    role runs somewhere the Story 13.1-001 secret/egress floor actually holds, so
+    the run may start.
+
+    Scope, deliberately narrow (matching :func:`sdlc.build._routed_roles_by_harness`):
+    a role left unmapped, or mapped to the built-in ``claude`` default slot, is
+    skipped — that slot's argv is assembled by
+    :func:`sdlc.dispatch.resolve_agent_cmd`, which appends the baseline, so
+    routing-off behaviour is byte-identical to today. The decision itself is
+    delegated to :func:`sdlc.degradation.evaluate_degradations`, the single
+    source of truth for the degradation matrix, so this never re-derives the rule.
+
+    ``config_path`` defaults to the bundled registry (:func:`default_registry_path`)
+    rather than ``None``, so a caller that forgets it cannot open a hole by
+    silently failing to resolve every non-default harness.
+
+    A harness name that cannot be resolved (unknown/absent registry) is skipped
+    rather than raised on: it cannot dispatch at all, and
+    :func:`resolve_role_routing` already fails fast on it with a better message.
+    """
+    # Local imports keep the capability/degradation modules off this module's hot
+    # import path, the same discipline the reviewer-registry helpers below use.
+    from sdlc.capability import resolve_capabilities
+    from sdlc.degradation import HOST_AUTH_ROLES, DegradationKind, evaluate_degradations
+
+    if config_path is None:
+        config_path = default_registry_path()
+    mapping = {canonical_role(r): h for r, h in (role_map or {}).items()}
+    undenied: list[tuple[str, str]] = []
+    for role in HOST_AUTH_ROLES:
+        name = mapping.get(role)
+        if not name or name == DEFAULT_HARNESS:
+            continue
+        try:
+            harness = resolve_harness(name, config_path=config_path, env=env)
+        except HarnessError:
+            continue
+        plan = evaluate_degradations(
+            harness.name, resolve_capabilities(harness), roles=(role,)
+        )
+        if plan.has(DegradationKind.UNDENIED_HOST_AUTH):
+            undenied.append((role, harness.name))
+    return undenied
+
+
+def format_undenied_host_auth(
+    routes: list[tuple[str, str]], command: str = "sdlc build"
+) -> str:
+    """The one-line-actionable refusal for an undenied host-auth route (#654).
+
+    Names every offending ``role=harness`` pair, says what is missing and why it
+    matters, and gives the two ways forward: route the role back to a harness
+    that carries the floor, or opt out explicitly with ``--allow-undenied``.
+    """
+    pairs = ", ".join(f"{role}={harness}" for role, harness in routes)
+    return (
+        f"UNDENIED_HOST_AUTH: refusing to start — host-auth role(s) {pairs} are "
+        "routed to a harness that renders no deny baseline, so a merge/review "
+        "agent would hold gh/glab credentials with no secret/egress floor "
+        "(~/.ssh, ~/.aws, **/.env, `gh pr merge --admin`). Route them to "
+        f"{DEFAULT_HARNESS}, or accept the gap explicitly with "
+        f"`{command} --allow-undenied` (issue #654)."
+    )
+
+
+def format_undenied_bypass(routes: list[tuple[str, str]]) -> str:
+    """The preflight/ledger warning line the ``--allow-undenied`` bypass emits."""
+    pairs = ", ".join(f"{role}={harness}" for role, harness in routes)
+    return (
+        f"harness deny baseline: --allow-undenied — host-auth role(s) {pairs} "
+        "run with no deny baseline (secret/egress floor not enforced for this "
+        "run, issue #654)"
+    )
+
+
 def canonical_role(role: str) -> str:
     """Normalise a role token to its canonical pipeline role, applying aliases.
 

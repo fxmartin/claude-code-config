@@ -168,6 +168,11 @@ class FixOptions:
     # because the build agent, hit by the resulting failed `git checkout -b`, has
     # been seen stashing them itself — a stash a crashed run then strands.
     allow_dirty: bool = False
+    # Issue #654: opt out of the undenied-host-auth guard — mirrors
+    # :class:`sdlc.build.BuildOptions`. Default False = refuse to start when a
+    # host-auth role (merge, and by default review) is routed to a harness that
+    # renders no deny baseline; True proceeds and records a `warn` ledger event.
+    allow_undenied: bool = False
     # E2E warn-gate mode: ``off`` (default, no dispatch) or ``warn`` (advisory —
     # runs after review, logs a FAIL, and continues to merge). Issue #436 PR3.
     e2e_gate: str = "off"
@@ -211,6 +216,10 @@ class FixBatchOptions:
     # Issue #590: mirrors :class:`FixOptions` — the batch shares one checkout, so
     # the guard is checked once for the whole batch and threaded down per issue.
     allow_dirty: bool = False
+    # Issue #654: mirrors :class:`FixOptions` — the batch shares one role->harness
+    # map, so the guard is checked once for the whole batch and the decision is
+    # threaded down per issue.
+    allow_undenied: bool = False
     sequential: bool = False
     concurrency: int = 5
     # E2E warn-gate mode, threaded down to each issue's :class:`FixOptions`. Issue #436 PR3.
@@ -254,6 +263,10 @@ class FixBatchResult:
     # refuse to start on the shared checkout. Non-empty means nothing was
     # dispatched and no run row exists.
     dirty_tree: list[str] = field(default_factory=list)
+    # Issue #654: ``(role, harness)`` pairs that made the batch refuse to start —
+    # a host-auth role routed to a harness with no deny baseline. Non-empty means
+    # nothing was dispatched and no run row exists.
+    undenied_host_auth: list[tuple[str, str]] = field(default_factory=list)
     # True when selection found nothing to fix (no run row created).
     no_issues: bool = False
     summary: str = ""
@@ -290,6 +303,10 @@ class FixResult:
     # to start on the shared checkout. Non-empty means nothing was dispatched and
     # no run row exists — the user's work is still exactly where they left it.
     dirty_tree: list[str] = field(default_factory=list)
+    # Issue #654: ``(role, harness)`` pairs — host-auth roles routed to a harness
+    # that renders no deny baseline — that made the run refuse to start. Non-empty
+    # means nothing was dispatched and no run row exists.
+    undenied_host_auth: list[tuple[str, str]] = field(default_factory=list)
     # Issue #595: another process already holds this run/scope (a live registry
     # entry). Distinguished from other `aborted` reasons so a caller resuming a
     # fix-mode run through `sdlc resume` can surface this exact message instead
@@ -910,7 +927,13 @@ def _fix_dispatch_kwargs(stage: str, opts: FixOptions, model: str | None) -> dic
     }
 
 
-def _log_fix_harness_routing(ledger: Ledger, run_id: str, opts: FixOptions) -> None:
+def _log_fix_harness_routing(
+    ledger: Ledger,
+    run_id: str,
+    opts: FixOptions,
+    *,
+    undenied: list[tuple[str, str]] | None = None,
+) -> None:
     """Announce the run's effective map before the first dispatch (Issue #551).
 
     The same ``harness routing: <role>=<harness> …`` line ``sdlc build`` writes —
@@ -919,7 +942,20 @@ def _log_fix_harness_routing(ledger: Ledger, run_id: str, opts: FixOptions) -> N
     from exactly this event. Emitting it here is what lets a fix run interrupted
     across an upgrade be recovered at all. Best-effort: logging must never fail a
     fix.
+
+    Issue #654 (bypass): ``undenied`` carries the host-auth routes
+    ``--allow-undenied`` let through — the guard in :func:`run_fix` refuses
+    otherwise, so reaching here means the operator asked for it. It is announced
+    first, on stderr and as a ``warn`` ledger event naming the role and harness,
+    and deliberately outside the best-effort ``try`` below: an explicit security
+    bypass must never be swallowed alongside the cosmetic routing line.
     """
+    if undenied:
+        from sdlc.role_routing import format_undenied_bypass
+
+        bypass_line = format_undenied_bypass(undenied)
+        print(bypass_line, file=sys.stderr)
+        ledger.event_log(run_id, "", "warn", "harness", bypass_line)
     if not opts.harness_map:
         return
     try:
@@ -1739,6 +1775,22 @@ def run_fix(
         if dirty:
             return FixResult(issue=opts.issue, dirty_tree=dirty, status="ABORTED")
 
+    # --- Undenied host-auth routing guard (issue #654) ------------------------
+    # A registry harness renders its own command template and so never receives
+    # `dispatch.DENY_BASELINE`. Routing a host-auth role (merge, and by default
+    # review) there hands an agent gh/glab credentials with no secret/egress
+    # floor. Refuse here — before preflight and any dispatch, nothing written —
+    # rather than shim a wrapper-level path guard that would give false
+    # confidence about .env/.ssh protection. `--allow-undenied` opts out and is
+    # announced instead (see :func:`_log_fix_harness_routing`).
+    from sdlc.role_routing import undenied_host_auth_routes
+
+    undenied = undenied_host_auth_routes(opts.harness_map)
+    if undenied and not opts.allow_undenied:
+        return FixResult(
+            issue=opts.issue, undenied_host_auth=undenied, status="ABORTED"
+        )
+
     # --- Preflight ------------------------------------------------------------
     check_preflight = preflight or (lambda: default_preflight())
     if not opts.skip_preflight and not check_preflight():
@@ -1789,7 +1841,7 @@ def run_fix(
     # (#543). The event comes first so Migration 17's backfill can recover the map
     # of a run interrupted across an upgrade; the run-row freeze is what every
     # resume replays instead of re-resolving against the current config.
-    _log_fix_harness_routing(ledger, run_id, opts)
+    _log_fix_harness_routing(ledger, run_id, opts, undenied=undenied)
     # Story 15.1-004: same one-line warning `run_build` logs, beside the
     # harness routing line — never a gate, the run proceeds either way.
     _log_fix_controller_version_check(ledger, run_id, root or Path.cwd())
@@ -2363,6 +2415,9 @@ def _issue_options(batch: FixBatchOptions, number: int) -> FixOptions:
         # checkout; a per-issue re-check would trip on the batch's own in-flight
         # edits, so the decision is inherited rather than repeated.
         allow_dirty=True,
+        # Issue #654: same inheritance — the batch already refused (or was
+        # explicitly bypassed) once for the shared role->harness map.
+        allow_undenied=True,
         e2e_gate=batch.e2e_gate,
         model_overrides=dict(batch.model_overrides),
         harness_map=dict(batch.harness_map),
@@ -2585,6 +2640,23 @@ def run_fix_batch(
                 status="ABORTED",
                 summary="refused to start: uncommitted changes in the working tree",
             )
+
+    # --- Undenied host-auth routing guard (issue #654) ------------------------
+    # Every issue in the batch shares one role->harness map, so one check for the
+    # whole batch — before selection, preflight, or any dispatch. See
+    # :func:`run_fix` for the full rationale; `--allow-undenied` opts out.
+    from sdlc.role_routing import undenied_host_auth_routes
+
+    undenied = undenied_host_auth_routes(batch.harness_map)
+    if undenied and not batch.allow_undenied:
+        return FixBatchResult(
+            undenied_host_auth=undenied,
+            status="ABORTED",
+            summary=(
+                "refused to start: host-auth role(s) routed to a harness with "
+                "no deny baseline"
+            ),
+        )
 
     # --- Preflight ------------------------------------------------------------
     check_preflight = preflight or (lambda: default_preflight())
@@ -2929,6 +3001,8 @@ _FIX_BOOL_FLAGS = {
     "--skip-preflight": "skip_preflight",
     # Issue #590: start anyway on a dirty shared checkout (opt-out of the guard).
     "--allow-dirty": "allow_dirty",
+    # Issue #654: start anyway with a host-auth role on an undenied harness.
+    "--allow-undenied": "allow_undenied",
     "--sequential": "sequential",
     # Issue #595: take over a run/scope another (dead) process still shows live.
     "--force": "force",
@@ -2946,6 +3020,8 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
     bugs, default one) — yields a :class:`FixBatchOptions`. Shared flags:
     ``--skip-coverage``, ``--coverage-threshold=N``, ``--skip-preflight``,
     ``--allow-dirty`` (issue #590: start despite uncommitted changes),
+    ``--allow-undenied`` (issue #654: start despite a host-auth role routed to a
+    harness with no deny baseline),
     ``--e2e-gate=warn|off`` (default off), its ``--skip-e2e`` alias, and
     ``--host=github|gitlab`` (issue #606: override host auto-detection).
     Batch-only flags: ``--limit=N`` (cap the issue set; the ``next`` default is 1),
@@ -3037,7 +3113,8 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
         raise FixConfigError(
             "missing issue number — usage: `sdlc fix <issue-number> | all | next "
             "[--limit=N] [--sequential] [--concurrency=N] [--skip-coverage] "
-            "[--coverage-threshold=N] [--skip-preflight] [--allow-dirty]`."
+            "[--coverage-threshold=N] [--skip-preflight] [--allow-dirty] "
+            "[--allow-undenied]`."
         )
     # Batch-only flags on a single issue are a usage error, not a silent no-op.
     if limit is not None:

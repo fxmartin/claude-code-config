@@ -23,6 +23,13 @@ CAPABILITY_KEYS: tuple[str, ...] = (
     "json_contract",
     "usage_tracking",
     "rate_limit_aware",
+    # Issue #654: whether this harness's dispatched command carries the deny
+    # baseline (``sdlc.dispatch.DENY_BASELINE`` — the secret/egress floor from
+    # Story 13.1-001). Only the slots whose argv the controller builds itself can
+    # claim it; a registry harness renders its own command template, so it does
+    # not receive the baseline and must declare this ``false``. The conservative
+    # default above is what makes an undeclared harness safe by omission.
+    "deny_baseline",
 )
 
 # Run modes the executor recognises — Epic-17's `mode` authority

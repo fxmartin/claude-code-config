@@ -57,6 +57,12 @@ _BUILTIN_CAPABILITIES: dict[str, bool] = {
     "json_contract": True,
     "usage_tracking": True,
     "rate_limit_aware": True,
+    # Issue #654: the built-in slot's argv is assembled by
+    # :func:`sdlc.dispatch.resolve_agent_cmd`, which appends the deny baseline as
+    # ``--disallowedTools``. That is what makes this the one slot that genuinely
+    # carries the Story 13.1-001 secret/egress floor. The `env` slot overrides
+    # this to ``False`` below — see :func:`_adhoc_env_harness`.
+    "deny_baseline": True,
 }
 
 
@@ -271,12 +277,21 @@ def _builtin_harness() -> HarnessConfig:
 
 
 def _adhoc_env_harness(command: str) -> HarnessConfig:
-    """Re-express an ``SDLC_AGENT_CMD`` override as an ad-hoc registry entry (AC3)."""
+    """Re-express an ``SDLC_AGENT_CMD`` override as an ad-hoc registry entry (AC3).
+
+    Issue #654: ``resolve_agent_cmd`` appends the deny baseline only to the
+    *built-in* command — an ``SDLC_AGENT_CMD`` override is the documented escape
+    hatch and owns its own permission posture — so this slot declares
+    ``deny_baseline: False``. That is a truthful declaration, surfaced by
+    ``sdlc doctor`` and the preflight capability line; the host-auth routing gate
+    deliberately scopes itself to *non-default* routed harnesses, so setting
+    ``SDLC_AGENT_CMD`` still behaves exactly as it does today.
+    """
     return HarnessConfig(
         name=DEFAULT_HARNESS,
         command=command,
         parser=_CLAUDE_PARSER,
-        capabilities=dict(_BUILTIN_CAPABILITIES),
+        capabilities={**_BUILTIN_CAPABILITIES, "deny_baseline": False},
         source="env",
     )
 

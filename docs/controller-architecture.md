@@ -1590,7 +1590,8 @@ surface as `AgentDispatchError`; contract failures surface as the
 abstraction**: a `sdlc/config/harnesses.yaml` keyed by harness name (`claude`,
 `codex`, …) where each entry declares a **command template**, **invocation
 flags**, **capability flags** (`worktree_isolation`, `parallel`, `json_contract`,
-`usage_tracking`, `rate_limit_aware`), and an **output-parser id**. The file is
+`usage_tracking`, `rate_limit_aware`, `deny_baseline`), and an
+**output-parser id**. The file is
 validated against `schemas/harness-registry.schema.json` (draft 2020-12) on load;
 `load_harnesses_config` raises `HarnessError` with an actionable, field-named
 message on any malformed entry. Command templates reuse the
@@ -1662,6 +1663,7 @@ before any tokens are spent.
 | `json_contract` | Emits the `<<<RESULT_JSON>>>` contract | ✅ | ✅ | ✅ | ✅ |
 | `usage_tracking` | Reports token usage / cost | ✅ | ❌ | ❌ | ✅ |
 | `rate_limit_aware` | Surfaces 429 / reset semantics for backoff | ✅ | ❌ | ❌ | ❌ |
+| `deny_baseline` | Dispatched command carries `DENY_BASELINE` (13.1-001 secret/egress floor) | ✅ | ❌ | ❌ | ❌ |
 
 A `parallel` request on `codex` or `qwen` (neither declares
 `worktree_isolation` or `parallel`) degrades to `serial` with an explicit
@@ -1673,6 +1675,31 @@ declares `worktree_isolation` and `parallel` (Story 29.2-002, evidence:
 instead of degrading, and `usage_tracking` (Story 29.2-003), so its stages
 record real tokens/cost instead of "unavailable". Only its missing
 `rate_limit_aware` still falls back the same way as codex/qwen.
+
+`deny_baseline` (issue #654) is structurally different from the other four: it
+is not something a harness *could* implement, it is a fact about who builds the
+argv. `dispatch.resolve_agent_cmd` appends the deny rules as `--disallowedTools`
+only to the built-in command, so the `claude` slot is the only one that carries
+the floor; every registry harness renders its own command template and receives
+no deny rules at all. The `env` slot (`SDLC_AGENT_CMD`) also declares it `false`
+— that override is the documented escape hatch and owns its own permission
+posture — but the routing gate below deliberately scopes itself to *non-default*
+routed harnesses, so setting `SDLC_AGENT_CMD` behaves exactly as it does today.
+
+**Host-auth roles.** `merge` (mandatory) and, by default, `review` are the
+pipeline roles that can invoke mutating `gh`/`glab` operations, so their agent
+holds real host credentials (`degradation.HOST_AUTH_ROLES` — a pipeline-level
+constant, not a per-harness declaration). `role_routing.undenied_host_auth_routes`
+reports every host-auth role routed to a harness without `deny_baseline`, and
+`run_build` / `run_fix` / `run_fix_batch` **refuse to start** on one — beside the
+`--allow-dirty` guard, before preflight, the ledger and any dispatch, so nothing
+is written. `--allow-undenied` is the explicit opt-out: the run proceeds, prints
+the bypass line at preflight and records a `warn` `harness` event naming the role
+and harness. Non-host-auth roles (`build`, `coverage`, `docs`) route anywhere
+unchanged. There is deliberately **no wrapper-level path shim** — a guard giving
+false confidence about `.env`/`.ssh` protection would be worse than the
+documented gap. `sdlc doctor`'s `check_deny_baseline` lists the undenied
+harnesses and warns when the repo's own pin routes a host-auth role to one.
 
 The `opencode` adapter (Story 29.2-001) is a stdin→CLI wrapper like
 `codex`/`qwen`, but — unlike them — it is **not** on the no-telemetry recipe:
@@ -1706,6 +1733,7 @@ listing every fallback applied (each a `Degradation` with a stable `kind`, the
 | `parallel` or `worktree_isolation` | `parallel` | `parallel_to_serial` | the cohort runs **serially** (the safe alternative), one explicit log line |
 | `usage_tracking` | any | `usage_unavailable` | cost/usage recorded as **"unavailable"**, not fabricated as zero (the `PlainResultParser` returns `usage_available=False`). Story 31.2-002 enforces this at the write: `_record_stage_usage` leaves the usage columns NULL for such a harness, whatever the dispatch printed, so every surface renders `—` |
 | `rate_limit_aware` | any | `rate_limit_skipped` | **rate-limit backoff is skipped** — no fabricated 429 handling (a non-zero exit is a plain dispatch error) |
+| `deny_baseline` | any, with a host-auth role in `roles=` | `undenied_host_auth` | **not a fallback — a refusal** (`Degradation.refusal=True`). There is nothing to fall back to: the controller cannot impose a permission floor on a CLI whose argv it does not build. `run_build`/`run_fix` refuse to start unless `--allow-undenied` (issue #654) |
 
 A **fully capable** harness (the built-in Claude harness — every flag `true`)
 yields an **empty plan**, so wiring this in is purely additive for the default
@@ -1719,7 +1747,14 @@ default-slot harness, evaluates the matrix for the run's mode, and writes one
 `warn` event per fallback to the `degradation` event source — so any degradation
 is auditable in the run summary (AC3). `DegradationPlan.to_records()` yields the
 structured rows (`harness`, `kind`, `missing`, `message`, `requested_mode`,
-`effective_mode`) the ledger/summary persists.
+`effective_mode`, `refusal`, `roles`) the ledger/summary persists.
+
+`evaluate_degradations` takes an optional `roles=` argument naming the pipeline
+roles the harness will actually run; it is what activates the `undenied_host_auth`
+refusal above. Omitting it (every pre-#654 call site) can never yield a refusal,
+so the matrix's existing behaviour is unchanged. `DegradationPlan.refusals`
+returns the refusal entries — the flag callers gate on instead of re-deriving
+the rule.
 
 ### Cross-harness benchmarking (Story 31.3-002)
 

@@ -4174,6 +4174,15 @@ _ALL_ROLES_CODEX = {
 }
 
 
+def _codex_fix_options(**kwargs) -> FixOptions:
+    """A full-codex fix run. Issue #654: the map includes the host-auth
+    review/merge roles, so these routing tests opt out of the deny-baseline
+    gate explicitly — they are about dispatch routing, not that gate."""
+    return FixOptions(
+        issue=1, harness_map=dict(_ALL_ROLES_CODEX), allow_undenied=True, **kwargs
+    )
+
+
 class _HarnessRecordingFixDispatcher(RecordingDispatcher):
     """RecordingDispatcher that also captures the routed argv per stage."""
 
@@ -4206,7 +4215,7 @@ def test_run_fix_dispatches_on_the_repo_configured_harness(tmp_path) -> None:
     """The reported defect: a codex-routed repo ran `sdlc fix` on Claude."""
     dispatch = _HarnessRecordingFixDispatcher()
     run_fix(
-        FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        _codex_fix_options(),
         ledger=Ledger(tmp_path / ".sdlc-state.db"),
         dispatcher=dispatch,
         preflight=lambda: True,
@@ -4225,7 +4234,7 @@ def test_run_fix_records_the_harness_that_actually_ran(tmp_path) -> None:
     """The ledger asserted `claude` on every fix stage regardless of dispatch."""
     db = tmp_path / ".sdlc-state.db"
     result = run_fix(
-        FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        _codex_fix_options(),
         ledger=Ledger(db),
         dispatcher=_HarnessRecordingFixDispatcher(),
         preflight=lambda: True,
@@ -4243,7 +4252,7 @@ def test_run_fix_freezes_the_harness_map_on_the_run(tmp_path) -> None:
     """Frozen at creation, exactly as `run_build` does (#543's mechanism)."""
     db = tmp_path / ".sdlc-state.db"
     result = run_fix(
-        FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        _codex_fix_options(),
         ledger=Ledger(db),
         dispatcher=_HarnessRecordingFixDispatcher(),
         preflight=lambda: True,
@@ -4261,7 +4270,7 @@ def test_run_fix_logs_the_harness_routing_event(tmp_path) -> None:
     """
     db = tmp_path / ".sdlc-state.db"
     result = run_fix(
-        FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        _codex_fix_options(),
         ledger=Ledger(db),
         dispatcher=_HarnessRecordingFixDispatcher(),
         preflight=lambda: True,
@@ -4283,7 +4292,7 @@ def test_resume_fix_replays_the_frozen_map_not_the_current_config(tmp_path) -> N
         tmp_path,
         dispatcher=RecordingDispatcher(),
         stop_before="coverage",
-        opts=FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX)),
+        opts=_codex_fix_options(),
     )
 
     # The resume is handed a *claude* map; the frozen codex one must win.
@@ -4333,7 +4342,7 @@ def test_log_fix_harness_routing_never_fails_the_run(tmp_path) -> None:
     ledger = _Exploding(tmp_path / ".sdlc-state.db")
     ledger.init()
     fix_mod._log_fix_harness_routing(
-        ledger, "run", FixOptions(issue=1, harness_map=dict(_ALL_ROLES_CODEX))
+        ledger, "run", _codex_fix_options()
     )  # must not raise
 
 

@@ -63,7 +63,13 @@
         "capabilities": {
           "type": "object",
           "additionalProperties": { "type": "boolean" },
-          "description": "Capability flags (worktree_isolation, parallel, json_contract, usage_tracking, rate_limit_aware, ...) the controller gates run modes on (Feature 20.5)."
+          "properties": {
+            "deny_baseline": {
+              "type": "boolean",
+              "description": "Whether this harness's dispatched command carries the deny baseline (dispatch.DENY_BASELINE — the Story 13.1-001 secret/egress floor). Only the built-in claude slot, whose argv the controller assembles itself, can claim it; a registry harness renders its own command template and must declare false. Undeclared resolves to false (conservative default). A host-auth role (merge, and by default review) routed to a harness without it is refused at preflight unless `--allow-undenied` (issue #654)."
+            }
+          },
+          "description": "Capability flags (worktree_isolation, parallel, json_contract, usage_tracking, rate_limit_aware, deny_baseline, ...) the controller gates run modes on (Feature 20.5)."
         },
         "metered": {
           "type": "boolean",

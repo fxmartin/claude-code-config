@@ -842,6 +842,8 @@ _BOOL_FLAGS = {
     "--predict": "predict",
     # Issue #590: start anyway on a dirty shared checkout (opt-out of the guard).
     "--allow-dirty": "allow_dirty",
+    # Issue #654: start anyway with a host-auth role on an undenied harness.
+    "--allow-undenied": "allow_undenied",
 }
 
 
@@ -884,6 +886,14 @@ class BuildOptions:
     # because an agent that hits the resulting failed `git checkout -b` has been
     # seen stashing them itself — an untracked stash a crash then strands.
     allow_dirty: bool = False
+    # Issue #654: opt out of the undenied-host-auth guard. Default False = refuse
+    # to start when a host-auth role (merge, and by default review) is routed to a
+    # harness that renders no deny baseline, because that agent would hold
+    # gh/glab credentials with the Story 13.1-001 secret/egress floor silently
+    # dropped. Setting it True proceeds and records a `warn` ledger event naming
+    # the role and harness — the explicit-bypass half of the `--allow-dirty`
+    # pattern, never a silent downgrade.
+    allow_undenied: bool = False
     # Story 14.1-001: per-run token budget gate. ``budget`` is the token ceiling
     # (the governance primitive — 0 means no ceiling, today's behaviour). A
     # ``$``-denominated budget is accepted as a convenience and converted to the
@@ -2016,7 +2026,7 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
     Accepts the exact flags the skill documents:
     ``[scope...] [--dry-run] [--auto] [--skip-coverage] [--limit=N]
     [--sequential] [--concurrency=N] [--coverage-threshold=N] [--skip-preflight]
-    [--allow-dirty]
+    [--allow-dirty] [--allow-undenied]
     [--rebuild] [--preflight-timeout=SEC]``. Each ``scope`` is ``all``,
     ``epic-NN``, an epic name, or a single story id ``X.Y-NNN`` (default ``all``).
     Several scopes may be given (space- or comma-separated); they are collapsed
@@ -4305,6 +4315,10 @@ class BuildResult:
     # to start on the shared checkout. Non-empty means nothing was dispatched and
     # no run row exists — the user's work is still exactly where they left it.
     dirty_tree: list[str] = field(default_factory=list)
+    # Issue #654: ``(role, harness)`` pairs — host-auth roles routed to a harness
+    # that renders no deny baseline — that made the run refuse to start.
+    # Non-empty means nothing was dispatched and no run row exists.
+    undenied_host_auth: list[tuple[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -4422,7 +4436,12 @@ def _routed_roles_by_harness(opts: "BuildOptions") -> dict[str, list[str]]:
 
 
 def _log_harness_preflight(
-    ledger: "Ledger", run_id: str, requested_mode: str, opts: "BuildOptions"
+    ledger: "Ledger",
+    run_id: str,
+    requested_mode: str,
+    opts: "BuildOptions",
+    *,
+    undenied: list[tuple[str, str]] | None = None,
 ) -> None:
     """Resolve and log every dispatch harness's capabilities (Story 20.5-001).
 
@@ -4448,7 +4467,22 @@ def _log_harness_preflight(
     also preflights every distinct harness named in ``opts.harness_map``,
     labeled by the role(s) routed to it (e.g. ``role=build``), so a routed
     harness's own capability gap is logged just as loudly as the default slot's.
+
+    Issue #654 (bypass): ``undenied`` carries the host-auth routes the
+    ``--allow-undenied`` opt-out let through (the guard in :func:`run_build`
+    refuses otherwise, so reaching here means the operator asked for it). It is
+    announced first — one stderr line and a ``warn`` ledger event naming the role
+    and harness — and deliberately sits *outside* the best-effort ``try`` below,
+    because an explicit security bypass must never be swallowed with the
+    cosmetic preflight logging.
     """
+    if undenied:
+        from sdlc.role_routing import format_undenied_bypass
+
+        bypass_line = format_undenied_bypass(undenied)
+        print(bypass_line, file=sys.stderr)
+        ledger.event_log(run_id, "", "warn", "harness", bypass_line)
+
     try:
         if opts.harness_map:
             from sdlc.role_routing import PIPELINE_ROLES, default_registry_path
@@ -6451,6 +6485,22 @@ def run_build(
         if dirty:
             return BuildResult(dirty_tree=dirty, planned=len(buildable))
 
+    # --- Undenied host-auth routing guard (issue #654) -----------------------
+    # `DENY_BASELINE` decorates only the argv the controller assembles itself, so
+    # a registry harness rendering its own command template receives no deny
+    # rules at all. Routing a host-auth role (merge, and by default review) there
+    # gives an agent holding gh/glab credentials no secret/egress floor. FX's
+    # decision was to refuse rather than shim: a wrapper-level path guard that
+    # gives false confidence about .env/.ssh protection would be worse than the
+    # documented gap. Refused here — before preflight, the ledger, and any
+    # dispatch — so nothing is written. `--allow-undenied` is the explicit opt-out
+    # and is instead announced loudly below (see `_log_harness_preflight`).
+    from sdlc.role_routing import undenied_host_auth_routes
+
+    undenied = undenied_host_auth_routes(opts.harness_map)
+    if undenied and not opts.allow_undenied:
+        return BuildResult(undenied_host_auth=undenied, planned=len(buildable))
+
     # --- Phase 1: Preflight (real runs only) ---------------------------------
     if not opts.skip_preflight:
         if not check_preflight():
@@ -6482,7 +6532,7 @@ def run_build(
     # heterogeneous run is auditable and any mode downgrade is explicit. The
     # default slot is the built-in Claude harness (no probe, all capabilities),
     # so this is purely additive logging and never alters dispatch behaviour.
-    _log_harness_preflight(ledger, run_id, mode, opts)
+    _log_harness_preflight(ledger, run_id, mode, opts, undenied=undenied)
     # Story 15.1-004: warn (never block) when the installed `sdlc` disagrees
     # with this checkout's declared controller version, beside the harness
     # routing line — the only prior tell was the dashboard's version badge.

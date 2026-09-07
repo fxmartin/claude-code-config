@@ -1642,6 +1642,9 @@ def test_run_build_freezes_the_effective_harness_map_on_the_run_row(
     opts = BuildOptions(
         scope="epic-96", skip_coverage=True, skip_preflight=True, sequential=True,
         harness_map={"review": "codex"},
+        # Issue #654: routes the host-auth review/merge role(s) to codex to
+        # exercise dispatch routing, not the deny-baseline gate.
+        allow_undenied=True,
     )
     run_build(
         opts,

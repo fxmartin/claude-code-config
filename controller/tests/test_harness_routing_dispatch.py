@@ -105,6 +105,9 @@ def test_full_codex_map_dispatches_codex_argv_for_every_stage(tmp_path) -> None:
         skip_preflight=True,
         sequential=True,
         harness_map={role: "codex" for role in PIPELINE_ROLES},
+        # Issue #654: routes the host-auth review/merge role(s) to codex to
+        # exercise dispatch routing, not the deny-baseline gate.
+        allow_undenied=True,
     )
     result = run_build(
         opts,
@@ -140,6 +143,9 @@ def test_mixed_map_routes_each_stage_and_ledger_matches(tmp_path) -> None:
         skip_preflight=True,
         sequential=True,
         harness_map={"build": "claude", "review": "codex"},
+        # Issue #654: routes the host-auth review/merge role(s) to codex to
+        # exercise dispatch routing, not the deny-baseline gate.
+        allow_undenied=True,
     )
     run_build(
         opts,
@@ -202,6 +208,9 @@ def test_codex_route_survives_a_parallel_run(tmp_path) -> None:
         skip_preflight=True,
         concurrency=3,
         harness_map={role: "codex" for role in PIPELINE_ROLES},
+        # Issue #654: routes the host-auth review/merge role(s) to codex to
+        # exercise dispatch routing, not the deny-baseline gate.
+        allow_undenied=True,
     )
     result = run_build(
         opts,
