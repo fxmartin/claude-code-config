@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.66.0] - 2026-09-07
+
+### Added
+
+- feat(development-queue): approval-aware queue — re-poll (#32.2-002) (#669)
+
+
 ## [v2.65.0] - 2026-09-07
 
 ### Added
