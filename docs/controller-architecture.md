@@ -35,8 +35,8 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
 | `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
-| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002) and the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
-| `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), the approval park + auto-resume (Story 32.2-002), and the per-job budget breaker (Story 32.3-001). |
+| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002), the one host-level rate-limit pause every repo shares (Story 32.2-001), and the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
+| `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), the approval park + auto-resume (Story 32.2-002), one shared rate-limit window discovered and waited out once (Story 32.2-001), and the per-job budget breaker (Story 32.3-001). |
 | `sdlc/approval.py` | Read-only change-request approval probe — "is PR #N approved / merged / closed?" behind the queue's park (Story 32.2-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
@@ -811,23 +811,26 @@ spans every repo, so the panel is independent of the selected run and fetched
 on its own route rather than as part of the per-run status snapshot.
 
 `queue_view()` (`dashboard.py`) reads `QueueStore` directly and returns
-`[JobRecord.to_dict(), …]` — the exact JSON shape `sdlc queue list --json`
-emits, served unmodified at `/api/queue`. This is deliberate: the CLI and the
-dashboard are two consumers of the one source, so they can never drift. A host
-that has never enqueued anything degrades to an empty array (matching
-`QueueStore.list_jobs()`'s read-never-creates contract), which the client
-renders as a muted **"no queue"** line — the same graceful-degrade precedent
-as the GitHub panel's "unavailable" state, never an error.
+`{"pause": …|null, "jobs": [JobRecord.to_dict(), …]}` — the exact JSON shape
+`sdlc queue list --json` emits, served unmodified at `/api/queue`. This is
+deliberate: the CLI and the dashboard are two consumers of the one source, so
+they can never drift. The envelope (rather than a bare array) is what gives the
+host-level rate-limit pause somewhere to live that is *not* a job — see below.
+A host that has never enqueued anything degrades to `{"pause": null, "jobs":
+[]}` (matching `QueueStore.list_jobs()`'s read-never-creates contract), which
+the client renders as a muted **"no queue"** line — the same graceful-degrade
+precedent as the GitHub panel's "unavailable" state, never an error.
 
 The client groups jobs by `state` (known states ordered first, any future
 state sorted after), shows each job's repo/scope/priority/age, and computes
 **slot usage** as a live count of `running` jobs (there is no configured slot
 *cap* to show a fraction against yet — that lands with the scheduler in Story
-32.1-002). A job in the `RATE_LIMITED` state collapses into **one** pause
-banner instead of a normal per-state group row, showing its reset time
-(`lease_until`) and reason — this is forward-compatible scaffolding for Story
-32.2-001's host-level rate-limit pause, which does not exist yet, so the
-banner simply never renders today. The same forward-compatibility applies to
+32.1-002). The rate-limit pause is read off `data.pause` — the **queue's** own
+state, never a job's — and rendered as a single banner with its reset time
+(`paused_until`) and reason: one Max window shared by every repo is one pause,
+not N independently parked rows (Story 32.2-001 AC4). An elapsed window is
+reported as no pause at all, so the banner can never go stale. Forward
+compatibility still applies to
 `pr_number`/`pr_url`: rendered as a link when a job carries them (Story
 32.2-002's `parked` state), otherwise the cell degrades to `-`. Because the
 queue's data isn't a ledger event, the panel re-ticks on the GitHub badge's
@@ -1599,6 +1602,40 @@ reaches the job's own agents rather than just its parent.
   scheduler's environment and credentials, so reusing the name meant every job
   announced itself twice. The queue event names the job (`queue job 7 (build
   epic-3)`) and is the one that also covers a job parked before any run started.
+- **One rate-limit window for the whole queue (Story 32.2-001).** FX runs every
+  repo on one Max subscription, so a closed window is a property of the *host*,
+  not of the run that happened to find it. Each pass asks the queue one question
+  — is any `running` job's run parked `RATE_LIMITED` in its own ledger? — and if
+  so caches that run's reset epoch as the queue's `paused_until` (a single-row
+  `queue_state` table). While it holds, `_fill_slots` claims **nothing**, fresh
+  or resumed; jobs already in flight are left alone, because a run that parked
+  itself knows how to wait. Once it passes the pause is cleared and the parked
+  job is re-entered the ordinary way — `sdlc resume --run <id>` through the
+  reclaim path — so the queue resumes itself rather than waiting for the next
+  `sdlc queue run`. That is also why a one-shot drain stays alive across a
+  window instead of exiting.
+  - **Nothing here detects a rate limit.** `rate_limit.py` is pure and
+    `build.py` already writes the verdict per run; the queue only *caches* the
+    reset. The ledger stays the single source of truth.
+  - **A job whose run parked is not terminal.** Its claim is handed back the
+    `release_claim` way (state `running`, lease expired), never stamped
+    `blocked` — that would need a manual `sdlc queue requeue` to undo.
+  - **Announced once.** `QueueStore.pause_dispatch` returns whether *this* call
+    opened the window, so a second repo hitting the same wall is silent: one
+    `queue_paused` notify and one `queue_resumed`, not one per job. A later
+    signal carrying a longer wait extends the window; a shorter one never
+    shortens it.
+  - **No reset time?** A usage-limit with no retry-after pauses for the run's
+    own configured `rate_limit_max_wait_s` (~one Max window, the same
+    conservative "assume a full window" heuristic `seconds_until_reset` uses),
+    and the held queue re-probes the live API on a 5-minute throttle by
+    **reusing** `build._probe_parked_reset` — same function, same
+    never-fail-open contract (only `AVAILABLE` reopens; `UNAVAILABLE` and
+    `UNKNOWN` keep the window shut), and the verdict lands in the parked run's
+    own ledger so a queue-side check and a resume-side one read identically.
+  - **Surfaced as queue state.** `sdlc queue list` prints one banner above the
+    table (and `--json` carries it under `pause`); the dashboard renders the
+    same field as one banner. Never N parked rows.
 - **The dashboard needs no change.** The job's subprocess registers itself the
   way any `sdlc build` does, so a queued job appears as an ordinary run. The
   scheduler never writes to the registry; it only reads it (joining a child's

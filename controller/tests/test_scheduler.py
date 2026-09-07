@@ -1,5 +1,6 @@
 # ABOUTME: Behavior tests for the queue scheduler loop (Story 32.1-002).
 # ABOUTME: Claim/lease/renew/reclaim, per-repo exclusivity, slot cap, park, notify.
+# ABOUTME: Plus Story 32.2-001's one host-level rate-limit window for the whole queue.
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -1359,3 +1361,520 @@ def test_a_fix_waiting_on_a_running_build_is_stamped_repo_busy(tmp_path) -> None
 
     assert "repo busy" in seen
     assert store.get_job(waiting).state == "done"
+
+
+# --- AC1-AC4: one rate-limit window for the whole queue (Story 32.2-001) ----
+
+
+def _ledger_run(
+    repo: str,
+    *,
+    status: str = "RATE_LIMITED",
+    reset_at: float | None = None,
+    max_wait_s: int | None = None,
+) -> tuple[str, str]:
+    """Seed a repo's ledger with one run in ``status``; return (run_id, db path).
+
+    The real ledger, not a fake: rate-limit truth stays in the run's ledger
+    (this story only caches its reset in the queue), so the scheduler's read of
+    it has to be exercised against the schema `build.py` actually writes.
+    """
+    from sdlc.build import Ledger
+
+    db = str(Path(repo) / ".sdlc-state.db")
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-3", "build")
+    config: dict[str, object] = {}
+    if reset_at is not None:
+        config["rate_limit_reset_at"] = reset_at
+    if max_wait_s is not None:
+        config["rate_limit_max_wait_s"] = max_wait_s
+    if config:
+        ledger.event_log(run_id, "", "info", "config", json.dumps(config))
+    ledger.run_update_status(run_id, status)
+    return run_id, db
+
+
+def _parked_job(store, registry, tmp_path, name: str, **ledger_kwargs):
+    """A job whose run is rate-limit parked and whose scheduler is gone.
+
+    The shape a previous drain leaves behind: state `running` with a lapsed
+    lease (so it is a reclaim candidate) and a dead run pid.
+    """
+    repo = _repo(tmp_path, name)
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
+    store.claim_job(job_id, claimed_by="dead:1", lease_seconds=0,
+                    now=datetime(2026, 9, 7, 11, 0, tzinfo=timezone.utc))
+    run_id, db = _ledger_run(repo, **ledger_kwargs)
+    store.attach_run(job_id, run_id)
+    registry.register(
+        RunRecord(run_id=run_id, repo=repo, db=db, scope="epic-3",
+                  pid=_dead_pid(), status="IN_PROGRESS", started_at="")
+    )
+    return job_id, run_id, db
+
+
+class ResumingLauncher(FakeLauncher):
+    """A FakeLauncher whose `resume` child clears the run's rate-limit park.
+
+    What a real `sdlc resume` does — it re-enters the run, so the ledger stops
+    saying RATE_LIMITED. Without it the fake child would leave the park standing
+    and the queue would (rightly) pause on it again the moment it was reaped.
+    """
+
+    def __init__(self, ledgers: dict[str, str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._ledgers = ledgers
+
+    def __call__(self, argv, cwd):
+        from sdlc.build import Ledger
+
+        argv = list(argv)
+        if "resume" in argv:
+            run_id = argv[argv.index("--run") + 1]
+            Ledger(self._ledgers[run_id]).run_update_status(run_id, "DONE")
+        return super().__call__(argv, cwd)
+
+
+class RecordingNotifier:
+    """Captures every notify event so "one pause, one resume" is assertable."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def __call__(self, event, **fields):
+        self.events.append((event, fields))
+
+    def names(self, event: str) -> list[dict]:
+        return [fields for name, fields in self.events if name == event]
+
+
+def _stop_after(clock, passes: int):
+    """A sleeper that advances the fake clock, then interrupts the drain."""
+    calls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        clock.advance(seconds)
+        if calls["n"] >= passes:
+            raise KeyboardInterrupt
+
+    return sleeper
+
+
+def test_a_rate_limited_run_pauses_the_whole_queue(tmp_path) -> None:
+    """One run's RATE_LIMITED ledger row parks *dispatch*, host-wide (AC1).
+
+    The reset the run recorded becomes the queue's own `paused_until`, and the
+    other repo's queued job is not claimed — one window, waited out once.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    reset_at = clock.now.timestamp() + 600
+    job_id, run_id, db = _parked_job(store, registry, tmp_path, "alpha", reset_at=reset_at)
+    other = store.add_job(repo=_repo(tmp_path, "beta"), kind="fix", scope="42")
+
+    launcher = FakeLauncher(alive_polls=1)
+    notifier = RecordingNotifier()
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, sleeper=_stop_after(clock, 3),
+        config=SchedulerConfig(slots=2, poll_seconds=1.0),
+    )
+
+    assert launcher.calls == []  # nothing dispatched while the window is closed
+    assert store.get_job(other).state == "queued"
+    pause = store.dispatch_pause()
+    assert pause is not None
+    assert pause.run_id == run_id
+    assert pause.is_active(clock()) is True
+    assert pause.paused_until == datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
+    assert len(notifier.names("queue_paused")) == 1
+    assert result.paused == 1
+    # The parked job is still resumable, never written off as terminal.
+    assert store.get_job(job_id).state == "running"
+    assert store.get_job(job_id).run_id == run_id
+
+
+def test_the_queue_resumes_the_parked_job_itself_at_the_reset(tmp_path) -> None:
+    """The window reopens → one resume, through `resume.py`, then claiming again (AC2)."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    reset_at = clock.now.timestamp() + 20
+    job_id, run_id, db = _parked_job(store, registry, tmp_path, "alpha", reset_at=reset_at)
+    other = store.add_job(repo=_repo(tmp_path, "beta"), kind="fix", scope="42")
+
+    launcher = ResumingLauncher({run_id: db}, alive_polls=1)
+    notifier = RecordingNotifier()
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, config=SchedulerConfig(slots=2, poll_seconds=10.0),
+    )
+
+    assert launcher.commands[0] == ["resume", "--run", run_id]
+    assert ["fix", "42"] in [cmd[:2] for cmd in launcher.commands]
+    assert store.dispatch_pause() is None
+    assert len(notifier.names("queue_paused")) == 1
+    assert len(notifier.names("queue_resumed")) == 1
+    assert result.resumed == 1
+    assert store.get_job(other).state == "done"
+    assert store.get_job(job_id).state == "done"
+
+
+def test_a_second_rate_limited_run_does_not_re_announce_the_window(tmp_path) -> None:
+    """Two parked runs, one window: one pause notify and one resume notify (AC2)."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    reset_at = clock.now.timestamp() + 20
+    _parked_job(store, registry, tmp_path, "alpha", reset_at=reset_at)
+    _parked_job(store, registry, tmp_path, "beta", reset_at=reset_at)
+
+    notifier = RecordingNotifier()
+    _run(
+        store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=1), clock=clock,
+        registry=registry, notifier=notifier,
+        config=SchedulerConfig(slots=2, poll_seconds=10.0),
+    )
+
+    assert len(notifier.names("queue_paused")) == 1
+    assert len(notifier.names("queue_resumed")) == 1
+
+
+def test_a_limit_without_a_reset_pauses_for_the_configured_max_wait(tmp_path) -> None:
+    """No reset time → the run's own `rate_limit_max_wait` bounds the pause (AC3)."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    _parked_job(store, registry, tmp_path, "alpha", max_wait_s=900)
+
+    _run(
+        store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=1), clock=clock,
+        registry=registry, sleeper=_stop_after(clock, 2),
+        config=SchedulerConfig(slots=2, poll_seconds=1.0),
+    )
+
+    pause = store.dispatch_pause()
+    assert pause is not None
+    expected = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc) + timedelta(seconds=900)
+    assert pause.paused_until == expected.isoformat()
+
+
+def test_an_available_probe_reopens_the_queue_before_the_blind_wait_ends(tmp_path) -> None:
+    """The reset-less wait is probed, mirroring `_probe_parked_reset` (AC3).
+
+    Only an AVAILABLE verdict clears the window early — the same
+    never-fail-open contract the run-level gate keeps (issue #564).
+    """
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    job_id, run_id, db = _parked_job(store, registry, tmp_path, "alpha", max_wait_s=18000)
+
+    launcher = ResumingLauncher({run_id: db}, alive_polls=1)
+    notifier = RecordingNotifier()
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, probe=lambda: ProbeStatus.AVAILABLE,
+        config=SchedulerConfig(slots=2, poll_seconds=600.0),
+    )
+
+    # Resumed long before the 5h blind wait would have elapsed.
+    assert clock.now < datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc) + timedelta(seconds=18000)
+    assert launcher.commands[0] == ["resume", "--run", run_id]
+    assert store.dispatch_pause() is None
+    assert len(notifier.names("queue_resumed")) == 1
+    assert result.resumed == 1
+
+
+def test_a_closed_probe_keeps_the_queue_paused(tmp_path) -> None:
+    """UNAVAILABLE (and UNKNOWN) keep the window shut — the gate never fails open."""
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    _parked_job(store, registry, tmp_path, "alpha", max_wait_s=18000)
+
+    launcher = FakeLauncher(alive_polls=1)
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        probe=lambda: ProbeStatus.UNAVAILABLE, sleeper=_stop_after(clock, 4),
+        config=SchedulerConfig(slots=2, poll_seconds=600.0),
+    )
+
+    assert launcher.calls == []
+    assert store.dispatch_pause().is_active(clock()) is True
+
+
+def test_the_probe_is_throttled_rather_than_run_every_pass(tmp_path) -> None:
+    """A blind wait must not become one API request per poll interval."""
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    _parked_job(store, registry, tmp_path, "alpha", max_wait_s=18000)
+
+    probes = {"n": 0}
+
+    def probe() -> ProbeStatus:
+        probes["n"] += 1
+        return ProbeStatus.UNAVAILABLE
+
+    _run(
+        store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=1), clock=clock,
+        registry=registry, probe=probe, sleeper=_stop_after(clock, 20),
+        config=SchedulerConfig(slots=2, poll_seconds=100.0),
+    )
+
+    # 20 passes covering 1900s: one probe per 300s window, not one per pass.
+    assert probes["n"] == 6
+
+
+def test_a_rate_limited_job_whose_child_exits_is_parked_not_failed(tmp_path) -> None:
+    """A run that parked itself exits non-zero — that is a pause, not a failure.
+
+    The job is handed back with an expired lease (the `release_claim` shape) so
+    the reclaim path resumes it once the window reopens, rather than being
+    stamped terminal and needing a manual `sdlc queue requeue`.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    run_id, db = _ledger_run(repo, reset_at=clock.now.timestamp() + 600)
+
+    launcher = FakeLauncher(alive_polls=1, code=1)
+    calls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:  # the child registers its run, the way run_build does
+            registry.register(
+                RunRecord(run_id=run_id, repo=repo, db=db, scope="epic-3",
+                          pid=launcher.procs[0].pid, status="IN_PROGRESS",
+                          started_at="")
+            )
+        clock.advance(seconds)
+        if calls["n"] >= 5:
+            raise KeyboardInterrupt
+
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        sleeper=sleeper, config=SchedulerConfig(slots=2, poll_seconds=1.0),
+    )
+
+    job = store.get_job(job_id)
+    assert job.state == "running"  # resumable, not terminal
+    assert job.run_id == run_id
+    assert result.failed == 0
+    assert result.paused == 1
+    assert store.dispatch_pause() is not None
+
+
+def test_a_stale_pause_row_never_wedges_the_queue_shut(tmp_path) -> None:
+    """An elapsed window with no rate-limited run left resumes and announces once."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    clock = Clock()
+    store.pause_dispatch(
+        until=clock.now - timedelta(seconds=1), reason="rate limited", now=clock.now
+    )
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="42")
+
+    launcher = FakeLauncher(alive_polls=1)
+    notifier = RecordingNotifier()
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, notifier=notifier,
+        config=SchedulerConfig(slots=2, poll_seconds=1.0),
+    )
+
+    assert store.get_job(job_id).state == "done"
+    assert store.dispatch_pause() is None
+    assert len(notifier.names("queue_resumed")) == 1
+
+
+def test_junk_in_a_run_config_reads_as_no_reset_and_the_default_cap(tmp_path) -> None:
+    """Ledger config is whatever JSON was written; junk must degrade, not crash."""
+    from sdlc.scheduler import _DEFAULT_RATE_LIMIT_MAX_WAIT_S, _as_float, _as_int
+
+    assert _as_float(1757246400) == 1757246400.0
+    assert _as_float("1757246400.5") == 1757246400.5
+    assert _as_float("2026-09-07T12:00:00+00:00") is not None
+    assert _as_float(None) is None
+    assert _as_float(True) is None  # a bool is not an epoch, whatever int() says
+    assert _as_float("soon") is None
+    assert _as_float(["nope"]) is None
+
+    assert _as_int(900, 18000) == 900
+    assert _as_int("900", 18000) == 900
+    assert _as_int(0, 18000) == _DEFAULT_RATE_LIMIT_MAX_WAIT_S
+    assert _as_int(-5, 18000) == 18000
+    assert _as_int("later", 18000) == 18000
+
+
+def test_an_unreadable_ledger_never_pauses_the_queue(tmp_path) -> None:
+    """A corrupt ledger is no evidence of a rate limit — the drain carries on."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    repo = _repo(tmp_path, "alpha")
+    corrupt = Path(repo) / ".sdlc-state.db"
+    corrupt.write_bytes(b"this is not a sqlite database at all")
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
+    clock = Clock()
+    store.claim_job(job_id, claimed_by="dead:1", lease_seconds=0,
+                    now=clock.now - timedelta(hours=1))
+    store.attach_run(job_id, "run-abc")
+    registry.register(
+        RunRecord(run_id="run-abc", repo=repo, db=str(corrupt), scope="epic-3",
+                  pid=_dead_pid(), status="IN_PROGRESS", started_at="")
+    )
+
+    launcher = FakeLauncher(alive_polls=1)
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        config=SchedulerConfig(slots=2, poll_seconds=1.0),
+    )
+
+    assert store.dispatch_pause() is None
+    assert launcher.commands[0] == ["resume", "--run", "run-abc"]
+
+
+def test_a_probe_that_raises_keeps_the_window_shut(tmp_path) -> None:
+    """The gate protects a possibly-closed quota, so it never fails open."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    _parked_job(store, registry, tmp_path, "alpha", max_wait_s=18000)
+
+    def exploding_probe():
+        raise RuntimeError("the probe itself fell over")
+
+    launcher = FakeLauncher(alive_polls=1)
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        probe=exploding_probe, sleeper=_stop_after(clock, 4),
+        config=SchedulerConfig(slots=2, poll_seconds=600.0),
+    )
+
+    assert launcher.calls == []
+    assert store.dispatch_pause().is_active(clock()) is True
+
+
+def test_a_pause_whose_run_is_no_longer_registered_is_not_probed(tmp_path) -> None:
+    """A pruned registry leaves the verdict nowhere to go — hold the window.
+
+    "No evidence" keeps the pause, exactly as an UNKNOWN probe verdict does.
+    """
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    clock = Clock()
+    store.pause_dispatch(
+        until=clock.now + timedelta(seconds=3600), reason="rate limited",
+        run_id="run-gone", repo=str(tmp_path / "alpha"), now=clock.now,
+    )
+    store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="42")
+
+    launcher = FakeLauncher(alive_polls=1)
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock,
+        probe=lambda: ProbeStatus.AVAILABLE, sleeper=_stop_after(clock, 4),
+        config=SchedulerConfig(slots=2, poll_seconds=600.0),
+    )
+
+    assert launcher.calls == []
+    assert store.dispatch_pause().is_active(clock()) is True
+
+
+def test_a_pause_row_with_a_corrupt_probe_stamp_is_probed_immediately(tmp_path) -> None:
+    """An unparseable `probed_at` must not stall the probe forever."""
+    from sdlc.queue import QueuePause
+    from sdlc.scheduler import SchedulerConfig, _Scheduler
+
+    store = _store(tmp_path)
+    clock = Clock()
+    scheduler = _Scheduler(
+        store, config=SchedulerConfig(), registry=Registry(tmp_path / "registry.json"),
+        launcher=FakeLauncher(), clock=clock, sleeper=lambda _s: None,
+        notifier=lambda *a, **k: None, version_check=_clean, probe=None,
+        approval_probe=lambda _root, _pr: None,
+        fix_rounds=lambda _db, _run: 0, plan_files=lambda _db, _run: [],
+        echo=lambda _line: None, identity="test:1",
+    )
+
+    corrupt = QueuePause(paused_until="", paused_at="not-a-time", probed_at="junk")
+    assert scheduler._due_for_probe(corrupt) is True
+    naive = QueuePause(paused_until="", paused_at="2026-09-07T11:00:00")
+    assert scheduler._due_for_probe(naive) is True
+
+
+def test_a_window_a_peer_scheduler_already_opened_is_not_re_announced(tmp_path) -> None:
+    """Two `sdlc queue run` processes, one subscription, one announcement.
+
+    The store's `pause_dispatch` is the arbiter: whoever writes the row first
+    owns the notification, so a peer that discovers the same window between our
+    read and our write stays silent rather than double-announcing it.
+    """
+    from sdlc.queue import QueuePause
+    from sdlc.scheduler import SchedulerConfig, _RateLimitPark, _Scheduler
+
+    store = _store(tmp_path)
+    clock = Clock()
+    notifier = RecordingNotifier()
+    scheduler = _Scheduler(
+        store, config=SchedulerConfig(), registry=Registry(tmp_path / "registry.json"),
+        launcher=FakeLauncher(), clock=clock, sleeper=lambda _s: None,
+        notifier=notifier, version_check=_clean, probe=None,
+        approval_probe=lambda _root, _pr: None,
+        fix_rounds=lambda _db, _run: 0, plan_files=lambda _db, _run: [],
+        echo=lambda _line: None, identity="test:1",
+    )
+    park = _RateLimitPark(
+        run_id="run-a", repo=str(tmp_path / "alpha"), db=tmp_path / "x.db",
+        reset_at=clock.now.timestamp() + 600, max_wait_s=18000,
+    )
+
+    scheduler._pause_dispatch(park)
+    assert len(notifier.names("queue_paused")) == 1
+    scheduler._pause_dispatch(park)  # a peer already opened this window
+    assert len(notifier.names("queue_paused")) == 1
+
+    # A reset that has already passed is not a window at all.
+    store.clear_pause()
+    stale = _RateLimitPark(
+        run_id="run-b", repo=str(tmp_path / "beta"), db=tmp_path / "x.db",
+        reset_at=clock.now.timestamp() - 1, max_wait_s=18000,
+    )
+    scheduler._pause_dispatch(stale)
+    assert store.dispatch_pause() is None
+    assert len(notifier.names("queue_paused")) == 1
+
+    # A pause with no attributed run has no ledger to log a probe verdict into.
+    assert scheduler._pause_ledger(QueuePause(paused_until="", paused_at="")) is None

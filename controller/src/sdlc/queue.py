@@ -19,6 +19,7 @@ __all__ = [
     "PRIORITY_CLASSES",
     "JobBudget",
     "JobRecord",
+    "QueuePause",
     "QueueError",
     "QueueStore",
     "budget_breach",
@@ -405,13 +406,80 @@ class JobRecord:
         return _decode_files(self.files)
 
 
+@dataclass
+class QueuePause:
+    """The queue's own state while it waits out one shared rate-limit window.
+
+    Story 32.2-001. ``paused_until`` is the cached reset instant (ISO-8601 UTC);
+    ``run_id``/``repo``/``source`` name whichever run *discovered* the window, so
+    an operator can go read the authoritative story in that run's ledger.
+    ``probed_at`` is the last live-API re-probe, throttling the probe across
+    passes, restarts and peer schedulers.
+    """
+
+    paused_until: str
+    paused_at: str
+    reason: str | None = None
+    run_id: str | None = None
+    repo: str | None = None
+    source: str | None = None
+    probed_at: str | None = None
+
+    def is_active(self, now: datetime | None = None) -> bool:
+        """Whether dispatch is still held at ``now``.
+
+        A ``paused_until`` that cannot be parsed (a hand-edited store) reads as
+        *not paused*: an unreadable timestamp must never wedge the queue shut
+        with no way to tell how long for.
+        """
+        try:
+            until = datetime.fromisoformat(self.paused_until)
+        except (TypeError, ValueError):
+            return False
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return _at(now) < until
+
+    def to_dict(self) -> dict:
+        return {
+            "paused_until": self.paused_until,
+            "paused_at": self.paused_at,
+            "reason": self.reason,
+            "run_id": self.run_id,
+            "repo": self.repo,
+            "source": self.source,
+            "probed_at": self.probed_at,
+        }
+
+
 # Queue DDL. Deliberately mirrors the ledger's connect/init/migrate shape
 # (sdlc/build.py's Ledger class) rather than sharing it: build.py's Ledger is
 # entangled with the run state machine, and extracting a shared base at this
 # story's scope would be a large, risky refactor for a five-point story. This
 # is the documented debt from REVIEW.md item 5 — a later pass can lift both
 # onto one shared helper once the ledger side is decoupled enough to move.
-_SCHEMA_DDL = """
+#
+# One rate-limit window for the whole queue (Story 32.2-001). The Max plan is a
+# *host* resource, so the pause is a property of the queue, not of N parked
+# jobs: a single row (``CHECK (id = 1)`` makes "single" a schema fact rather than
+# a convention) holding when dispatch may resume and what discovered the window.
+# Rate-limit truth still lives in the run's ledger — this only *caches* the
+# reset, so every repo waits the window out once instead of rediscovering it.
+_QUEUE_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS queue_state (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    paused_until TIMESTAMP,
+    reason       TEXT,
+    run_id       TEXT,
+    repo         TEXT,
+    source       TEXT,
+    paused_at    TIMESTAMP,
+    probed_at    TIMESTAMP
+);
+"""
+
+_SCHEMA_DDL = (
+    """
 PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -444,15 +512,17 @@ CREATE TABLE IF NOT EXISTS _migrations (
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
 """
+    + _QUEUE_STATE_DDL
+)
 
 # Schema migrations applied after the base DDL, in the same
 # ``(version, name, table, columns, create_sql)`` shape as the ledger's
 # ``_MIGRATIONS`` (sdlc/build.py). The fresh schema above already carries every
 # column, so these only matter to a host queue.db written by an earlier version
 # — it upgrades in place rather than being rebuilt. Versions are append-only:
-# 1 is Story 32.2-002's, 2 and 3 are Story 32.3-001's, and future columns (e.g.
-# a claim lease renewal field) take the next number so a host queue.db that has
-# already applied the earlier ones does not re-run them.
+# 1 is Story 32.2-002's, 2 and 3 are Story 32.3-001's, 4 is Story 32.2-001's, and
+# future columns (e.g. a claim lease renewal field) take the next number so a host
+# queue.db that has already applied the earlier ones does not re-run them.
 _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (
         1,
@@ -485,6 +555,11 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         [("fix_rounds_baseline", "INTEGER")],
         None,
     ),
+    # Story 32.2-001: the host pause table, for a queue.db written before it
+    # existed. The fresh schema above already carries it, so on a new store the
+    # ``CREATE TABLE IF NOT EXISTS`` is a no-op and only the bookkeeping row is
+    # written.
+    (4, "queue_state_pause", "queue_state", [], _QUEUE_STATE_DDL),
 ]
 
 
@@ -785,6 +860,106 @@ class QueueStore:
                 (state, _now_iso(), job_id),
             )
 
+
+    # --- host-level dispatch pause (Story 32.2-001) -----------------------
+
+    def pause_dispatch(
+        self,
+        *,
+        until: datetime,
+        reason: str | None = None,
+        run_id: str | None = None,
+        repo: str | None = None,
+        source: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Hold all dispatch until ``until``. ``True`` when *this* call opened it.
+
+        One window for the whole host: the Max subscription every repo shares is
+        exhausted once, so the queue records the reset once and every scheduler
+        reads it. The return value is what keeps the announcement singular — the
+        caller notifies only on ``True``, so a second job hitting the same wall
+        inside the window is silent rather than one notify per repo.
+
+        An already-open window is *extended* to the later reset and never
+        shortened: a second signal carrying a longer wait is new information,
+        while one carrying a shorter one would resume dispatch early into a
+        still-closed window. The discovering run keeps its attribution either
+        way — it is the one whose ledger holds the authoritative story.
+        """
+        moment = _at(now)
+        existing = self.dispatch_pause()
+        active = existing is not None and existing.is_active(moment)
+        if active:
+            assert existing is not None  # narrowed by `active`
+            current = datetime.fromisoformat(existing.paused_until)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            if until > current:
+                with self._connect() as conn:
+                    conn.execute(
+                        "UPDATE queue_state SET paused_until = ? WHERE id = 1",
+                        (until.isoformat(),),
+                    )
+            return False
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO queue_state(id, paused_until, reason, run_id, repo, "
+                "source, paused_at, probed_at) VALUES (1, ?, ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(id) DO UPDATE SET paused_until = excluded.paused_until, "
+                "reason = excluded.reason, run_id = excluded.run_id, "
+                "repo = excluded.repo, source = excluded.source, "
+                "paused_at = excluded.paused_at, probed_at = NULL",
+                (until.isoformat(), reason, run_id, repo, source, moment.isoformat()),
+            )
+        return True
+
+    def clear_pause(self) -> None:
+        """Resume dispatch — drop the recorded window (idempotent)."""
+        if not self.db_path.exists():
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM queue_state WHERE id = 1")
+
+    def mark_pause_probed(self, *, now: datetime | None = None) -> None:
+        """Stamp the last live-API re-probe, so the throttle survives a restart."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE queue_state SET probed_at = ? WHERE id = 1",
+                (_at(now).isoformat(),),
+            )
+
+    def dispatch_pause(self) -> QueuePause | None:
+        """The recorded window, or ``None`` when none was ever recorded.
+
+        Deliberately *raw*: an elapsed window is still returned, because the
+        difference between "was paused, the window just reopened" (announce a
+        resume, clear the row) and "never paused" (say nothing) is exactly what
+        keeps the resume notification singular. Callers ask
+        :meth:`QueuePause.is_active` for the live question.
+        """
+        if not self.db_path.exists():
+            return None
+        with self._connect() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT * FROM queue_state WHERE id = 1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # A queue.db from before this story that no writer has migrated
+                # yet — not paused, and a read must never create the table.
+                return None
+        if row is None:
+            return None
+        return QueuePause(
+            paused_until=row["paused_until"],
+            paused_at=row["paused_at"],
+            reason=row["reason"],
+            run_id=row["run_id"],
+            repo=row["repo"],
+            source=row["source"],
+            probed_at=row["probed_at"],
+        )
 
     # --- claims + leases (Story 32.1-002) ---------------------------------
 

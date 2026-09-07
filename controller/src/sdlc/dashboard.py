@@ -211,16 +211,26 @@ def dag_layout(stories: list[dict]) -> dict:
 # selected run and fetched on its own route.
 
 
-def queue_view() -> list[dict]:
-    """The host queue as `JobRecord.to_dict()` rows — identical in shape to
-    `sdlc queue list --json` (same `QueueStore`, same `to_dict()`; the CLI and
-    this dashboard route are two consumers of the one source, per Story
-    32.3-002 AC3). A host that has never enqueued anything degrades to an
-    empty list rather than conjuring a `queue.db`, matching
-    `QueueStore.list_jobs`'s own read-never-creates contract.
+def queue_view() -> dict:
+    """The host queue as ``{"pause": …|null, "jobs": [JobRecord.to_dict(), …]}``.
+
+    Identical in shape to `sdlc queue list --json` (same `QueueStore`, same
+    `to_dict()`; the CLI and this dashboard route are two consumers of the one
+    source, per Story 32.3-002 AC3). `pause` is the host-level rate-limit window
+    (Story 32.2-001) — the queue's own state, not a job's, which is exactly why
+    it sits beside the rows rather than among them. An elapsed window is
+    reported as no pause at all, so the banner can never go stale. A host that
+    has never enqueued anything degrades to an empty list rather than conjuring
+    a `queue.db`, matching `QueueStore.list_jobs`'s read-never-creates contract.
     """
     store = QueueStore(default_queue_path())
-    return [r.to_dict() for r in store.list_jobs()]
+    pause = store.dispatch_pause()
+    if pause is not None and not pause.is_active():
+        pause = None
+    return {
+        "pause": pause.to_dict() if pause else None,
+        "jobs": [r.to_dict() for r in store.list_jobs()],
+    }
 
 
 # --- live transport: change detection (Story 11.2-003) ---------------------
@@ -926,13 +936,14 @@ function drawDagEdges(edges){
 }
 
 // Host-level development queue panel (Story 32.3-002). Renders whatever
-// `/api/queue` returns, which is exactly `sdlc queue list --json`'s array —
-// one source, two consumers (queue_view() in dashboard.py). Grouped by state;
-// a RATE_LIMITED job (Story 32.2-001, not live yet) collapses into one pause
-// banner instead of N group rows, per its "queue's state, not N independent
-// parked runs" contract. A `parked` job (Story 32.2-002) carries the
-// `pr_number` of the change request the queue is polling for approval, rendered
-// as a link when a `pr_url` is available — absent fields simply render nothing.
+// `/api/queue` returns, which is exactly what `sdlc queue list --json` emits —
+// one source, two consumers (queue_view() in dashboard.py). Jobs are grouped by
+// state; the rate-limit pause (Story 32.2-001) is read off `data.pause`, the
+// *queue's* own state, and rendered as one banner — one Max window shared by
+// every repo is one pause, never N independently parked rows. A `parked` job
+// (Story 32.2-002) carries the `pr_number` of the change request the queue is
+// polling for approval, rendered as a link when a `pr_url` is available —
+// absent fields simply render nothing.
 const QUEUE_STATE_ORDER = ["queued","running","parked","blocked","done","failed","cancelled"];
 function queueAge(iso){
   if(!iso) return "?";
@@ -953,24 +964,23 @@ function queuePrLink(j){
 function queueRepoLabel(repo){
   return repo ? esc(String(repo).split(/[\\/]/).pop()) : "-";
 }
-function renderQueue(jobs){
+function renderQueue(data){
   const el = document.getElementById("queue");
   if(!el) return;
-  if(!jobs || !jobs.length){
+  const jobs = (data && data.jobs) || [];
+  const pause = data && data.pause;
+  if(!jobs.length && !pause){
     el.innerHTML = "<div class='queuewrap unavail'>no queue</div>";
     return;
   }
-  const pauseJobs = jobs.filter(j => j.state === "RATE_LIMITED");
-  const rest = jobs.filter(j => j.state !== "RATE_LIMITED");
   const byState = {};
-  rest.forEach(j => { (byState[j.state] = byState[j.state] || []).push(j); });
+  jobs.forEach(j => { (byState[j.state] = byState[j.state] || []).push(j); });
   const order = QUEUE_STATE_ORDER.filter(s => byState[s])
     .concat(Object.keys(byState).filter(s => !QUEUE_STATE_ORDER.includes(s)).sort());
-  const pauseHtml = pauseJobs.length
-    ? "<div class='queue-pause'>queue paused (rate limited) · "
-      + esc(pauseJobs.length)+" job"+(pauseJobs.length>1?"s":"")
-      + (pauseJobs[0].lease_until ? " · resumes " + esc(fmtLocal(pauseJobs[0].lease_until)) : "")
-      + (pauseJobs[0].reason ? " · " + esc(pauseJobs[0].reason) : "") + "</div>"
+  const pauseHtml = pause
+    ? "<div class='queue-pause'>queue paused (rate limited)"
+      + (pause.paused_until ? " · resumes " + esc(fmtLocal(pause.paused_until)) : "")
+      + (pause.reason ? " · " + esc(pause.reason) : "") + "</div>"
     : "";
   const running = jobs.filter(j => j.state === "running").length;
   const groups = order.map(state => {

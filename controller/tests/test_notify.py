@@ -605,3 +605,51 @@ def test_queue_job_resumed_without_a_signal_still_renders():
     )
     text = json.loads(captured[0].decode("utf-8"))["text"]
     assert "resumed" in text
+
+
+# --- the queue's one rate-limit window (Story 32.2-001) -------------------
+
+
+def test_queue_paused_announces_the_window_not_a_run():
+    """One line for the whole queue, naming when dispatch resumes."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "queue_paused",
+        run="a7493b3d-4135-4076-8190-139fefb2dcb9",
+        repo="claude-code-config",
+        subject="development queue",
+        reset_at="2026-09-07T17:00:00+00:00",
+        detail="reset recorded by the run",
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "development queue" in text
+    assert "rate-limited" in text.lower()
+    assert "2026-09-07T17:00:00+00:00" in text
+    assert "a7493b3d" in text
+    assert "subject=" not in text
+    assert "reset_at=" not in text
+
+
+def test_queue_resumed_announces_the_window_reopening():
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "queue_resumed",
+        run="",
+        repo="claude-code-config",
+        subject="development queue",
+        paused_until="2026-09-07T17:00:00+00:00",
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "development queue" in text
+    assert "resum" in text.lower()
+    assert "subject=" not in text
