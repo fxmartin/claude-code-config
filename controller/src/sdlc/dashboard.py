@@ -27,6 +27,7 @@ from sdlc import __version__, github_stats
 from sdlc.build import _EMPTY_COUNTS, Ledger, _duration_seconds, status_snapshot
 from sdlc.issue_host import GITHUB, detect_host
 from sdlc.portfolio import portfolio_view
+from sdlc.queue import QueueStore, default_queue_path
 from sdlc.registry import Registry, RunRecord, derive_state
 
 # scp-like remote: git@host:owner/sub/repo.git
@@ -202,6 +203,24 @@ def dag_layout(stories: list[dict]) -> dict:
         if dep in present
     ]
     return {"available": True, "waves": waves, "edges": edges}
+
+
+# --- host-level development queue panel (Story 32.3-002) -------------------
+# The queue (sdlc/queue.py, Story 32.1-001) is host-level — one store spans
+# every repo — so unlike the per-run panels above it is independent of the
+# selected run and fetched on its own route.
+
+
+def queue_view() -> list[dict]:
+    """The host queue as `JobRecord.to_dict()` rows — identical in shape to
+    `sdlc queue list --json` (same `QueueStore`, same `to_dict()`; the CLI and
+    this dashboard route are two consumers of the one source, per Story
+    32.3-002 AC3). A host that has never enqueued anything degrades to an
+    empty list rather than conjuring a `queue.db`, matching
+    `QueueStore.list_jobs`'s own read-never-creates contract.
+    """
+    store = QueueStore(default_queue_path())
+    return [r.to_dict() for r in store.list_jobs()]
 
 
 # --- live transport: change detection (Story 11.2-003) ---------------------
@@ -467,6 +486,23 @@ _PAGE = """<!doctype html>
   .dag-node .nid { font-family: monospace; color: var(--text); }
   .dag-node .ntitle { color: var(--sub); display: block; margin: 2px 0 4px;
                       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Story 32.3-002: host-level development queue panel — jobs grouped by
+     state, a queue-wide RATE_LIMITED pause banner, slot usage. Host-level (every
+     repo), so it re-ticks on the GitHub badge's cadence rather than SSE (queue
+     changes are not this run's ledger events). */
+  .queuewrap { margin: 16px 0; padding: 12px 14px; background: var(--mantle);
+               border: 1px solid var(--surface); border-radius: 8px; }
+  .queuewrap h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  .queuewrap.unavail { color: var(--sub); font-style: italic; }
+  .queue-slots { margin-bottom: 8px; font-size: 12px; color: var(--sub); }
+  .queue-pause { margin-bottom: 10px; padding: 6px 10px; border-radius: 6px;
+                 background: #fdf6e3; color: #df8e1d; font-size: 12px; }
+  .queue-group { margin-top: 10px; }
+  .queue-group h4 { margin: 0 0 4px; font-size: 12px; font-weight: 600; color: var(--sub); }
+  /* Issue #655's lesson applied from the start: wide content scrolls inside its
+     own panel, never the page — a horizontal scrollbar on the table, not `.main`. */
+  .queue-scroll { overflow-x: auto; padding-bottom: 6px; }
+  .queue-scroll table { min-width: 640px; }
   /* Story 11.2-010: in-dashboard transcript viewer. A "view session" control
      per story opens a modal listing that story's stage transcripts and renders
      each inline — no leaving the page. The new-tab /log link stays as fallback. */
@@ -567,6 +603,7 @@ _PAGE = """<!doctype html>
       <div class="chips" id="chips"></div>
       <div id="github"></div>
       <div id="dag"></div>
+      <div id="queue"></div>
       <div id="stories"></div>
       <div class="events" id="events"></div>
     </div>
@@ -734,14 +771,16 @@ function activityRow(s, totalCols){
 async function tick(){
   try{
     const q = sel ? ("?run=" + encodeURIComponent(sel)) : "";
-    const [runsR, statR, ghR] = await Promise.all([
+    const [runsR, statR, ghR, qR] = await Promise.all([
       fetch("/api/runs",{cache:"no-store"}),
       fetch("/api/status"+q,{cache:"no-store"}),
       fetch("/api/github"+q,{cache:"no-store"}),
+      fetch("/api/queue",{cache:"no-store"}),
     ]);
     renderRuns(await runsR.json());
     renderMain(await statR.json());
     renderGithub(await ghR.json());
+    renderQueue(await qR.json());
     document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
   }catch(e){
     document.getElementById("updated").textContent = "reconnecting…";
@@ -884,6 +923,69 @@ function drawDagEdges(edges){
     const mx = (x1 + x2) / 2;
     return "<path d='M"+x1+" "+y1+" C"+mx+" "+y1+" "+mx+" "+y2+" "+x2+" "+y2+"'></path>";
   }).join("");
+}
+
+// Host-level development queue panel (Story 32.3-002). Renders whatever
+// `/api/queue` returns, which is exactly `sdlc queue list --json`'s array —
+// one source, two consumers (queue_view() in dashboard.py). Grouped by state;
+// a RATE_LIMITED job (Story 32.2-001, not live yet) collapses into one pause
+// banner instead of N group rows, per its "queue's state, not N independent
+// parked runs" contract. A `parked` job (Story 32.2-002, not live yet) may
+// carry `pr_number`/`pr_url`, rendered as a link — absent fields simply render
+// nothing, so the panel is correct today and richer once those stories land.
+const QUEUE_STATE_ORDER = ["queued","running","done","failed","cancelled"];
+function queueAge(iso){
+  if(!iso) return "?";
+  let s = String(iso);
+  if(!/[zZ]$|[+-]\\d{2}:?\\d{2}$/.test(s)) s = s.replace(" ", "T") + "Z";
+  const d = new Date(s);
+  if(isNaN(d)) return "?";
+  const secs = Math.max(0, Math.floor((Date.now() - d.getTime())/1000));
+  if(secs < 3600) return Math.floor(secs/60)+"m";
+  if(secs < 86400) return Math.floor(secs/3600)+"h";
+  return Math.floor(secs/86400)+"d";
+}
+function queuePrLink(j){
+  if(j.pr_url) return "<a href='"+esc(j.pr_url)+"' target='_blank' rel='noopener'>#"+esc(j.pr_number!=null?j.pr_number:"")+"</a>";
+  if(j.pr_number!=null) return "#"+esc(j.pr_number);
+  return "-";
+}
+function queueRepoLabel(repo){
+  return repo ? esc(String(repo).split(/[\\/]/).pop()) : "-";
+}
+function renderQueue(jobs){
+  const el = document.getElementById("queue");
+  if(!el) return;
+  if(!jobs || !jobs.length){
+    el.innerHTML = "<div class='queuewrap unavail'>no queue</div>";
+    return;
+  }
+  const pauseJobs = jobs.filter(j => j.state === "RATE_LIMITED");
+  const rest = jobs.filter(j => j.state !== "RATE_LIMITED");
+  const byState = {};
+  rest.forEach(j => { (byState[j.state] = byState[j.state] || []).push(j); });
+  const order = QUEUE_STATE_ORDER.filter(s => byState[s])
+    .concat(Object.keys(byState).filter(s => !QUEUE_STATE_ORDER.includes(s)).sort());
+  const pauseHtml = pauseJobs.length
+    ? "<div class='queue-pause'>queue paused (rate limited) · "
+      + esc(pauseJobs.length)+" job"+(pauseJobs.length>1?"s":"")
+      + (pauseJobs[0].lease_until ? " · resumes " + esc(fmtLocal(pauseJobs[0].lease_until)) : "")
+      + (pauseJobs[0].reason ? " · " + esc(pauseJobs[0].reason) : "") + "</div>"
+    : "";
+  const running = jobs.filter(j => j.state === "running").length;
+  const groups = order.map(state => {
+    const rows = byState[state].map(j =>
+      "<tr><td>"+queueRepoLabel(j.repo)+"</td><td>"+esc(j.scope)+"</td>"
+      + "<td>"+esc(j.priority)+"</td><td>"+queueAge(j.created_at)+"</td>"
+      + "<td>"+queuePrLink(j)+"</td></tr>"
+    ).join("");
+    return "<div class='queue-group'><h4>"+esc(state)+" ("+byState[state].length+")</h4>"
+      + "<div class='queue-scroll'><table><tr><th>repo</th><th>scope</th><th>priority</th>"
+      + "<th>age</th><th>PR</th></tr>"+rows+"</table></div></div>";
+  }).join("");
+  el.innerHTML = "<div class='queuewrap'><h3>Development queue</h3>"
+    + "<div class='queue-slots'>slots in use: "+running+" running</div>"
+    + pauseHtml + groups + "</div>";
 }
 
 function renderMain(d){
@@ -1094,7 +1196,10 @@ setInterval(tickRuntime, 1000);
 // stream only pushes on ledger movement, so a quiet/finished run would never
 // refresh its GitHub badges/panel. Re-tick on the backend cache's ~60s cadence
 // (independent of SSE) so the data refreshes without a full reload — tick()
-// reads the cached summary and never itself drives `gh`.
+// reads the cached summary and never itself drives `gh`. The host-level queue
+// panel (Story 32.3-002) is the same shape of problem — its data isn't a
+// ledger event either — so it reuses this exact cadence rather than a second
+// timer.
 const GH_REFRESH_INTERVAL = 30000;
 setInterval(tick, GH_REFRESH_INTERVAL);
 
@@ -1324,6 +1429,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(self._github_stats(run))
         elif path == "/api/portfolio":
             self._json(self._portfolio(run))
+        elif path == "/api/queue":
+            self._json(queue_view())
         elif path == "/api/stream":
             self._serve_stream()
         elif path == "/log":

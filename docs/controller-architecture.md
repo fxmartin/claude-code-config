@@ -799,6 +799,41 @@ so each repo shows its own inventory; the refresh button (and opening the view)
 just re-reads the cache. The owner shown is the `22.5-001` cached read of the host
 assignee.
 
+### Queue panel — the host-level development queue (Story 32.3-002)
+
+The Builds view gains a **Queue** panel (not a new view — it sits alongside the
+GitHub and DAG panels) that answers "what will run next, and why isn't it
+running" for the host-level development queue (`sdlc/queue.py`, Story
+32.1-001). Unlike every other panel, the queue is **host-level**: one store
+spans every repo, so the panel is independent of the selected run and fetched
+on its own route rather than as part of the per-run status snapshot.
+
+`queue_view()` (`dashboard.py`) reads `QueueStore` directly and returns
+`[JobRecord.to_dict(), …]` — the exact JSON shape `sdlc queue list --json`
+emits, served unmodified at `/api/queue`. This is deliberate: the CLI and the
+dashboard are two consumers of the one source, so they can never drift. A host
+that has never enqueued anything degrades to an empty array (matching
+`QueueStore.list_jobs()`'s read-never-creates contract), which the client
+renders as a muted **"no queue"** line — the same graceful-degrade precedent
+as the GitHub panel's "unavailable" state, never an error.
+
+The client groups jobs by `state` (known states ordered first, any future
+state sorted after), shows each job's repo/scope/priority/age, and computes
+**slot usage** as a live count of `running` jobs (there is no configured slot
+*cap* to show a fraction against yet — that lands with the scheduler in Story
+32.1-002). A job in the `RATE_LIMITED` state collapses into **one** pause
+banner instead of a normal per-state group row, showing its reset time
+(`lease_until`) and reason — this is forward-compatible scaffolding for Story
+32.2-001's host-level rate-limit pause, which does not exist yet, so the
+banner simply never renders today. The same forward-compatibility applies to
+`pr_number`/`pr_url`: rendered as a link when a job carries them (Story
+32.2-002's `parked` state), otherwise the cell degrades to `-`. Because the
+queue's data isn't a ledger event, the panel re-ticks on the GitHub badge's
+existing 30-second cadence (`GH_REFRESH_INTERVAL`) rather than a new timer.
+Following the DAG panel's overflow lesson (issue #655), the panel's jobs table
+scrolls horizontally *inside* its own box (`.queue-scroll { overflow-x: auto }`)
+rather than overflowing into the page.
+
 ## Resume, status, and state
 
 Because every stage transition is persisted **before** the next stage runs, the
