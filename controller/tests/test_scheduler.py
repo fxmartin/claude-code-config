@@ -245,6 +245,77 @@ def test_repo_busy_reason_is_visible_while_the_repo_is_held(tmp_path) -> None:
     assert "repo busy" in seen
 
 
+def test_two_build_jobs_in_one_repo_overlap_after_32_1_003(tmp_path) -> None:
+    """Story 32.1-003 relaxes exclusivity for build/build: they may run at once.
+
+    Both jobs share one repo, so `running_repos()` (distinct repo paths) stays
+    at 1 either way — the concurrency signal here is the count of `running`
+    *job rows*, which only exceeds 1 if the second job was claimed and
+    launched before the first one finished.
+    """
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="build", scope="epic-1")
+    store.add_job(repo=repo, kind="build", scope="epic-2")
+
+    concurrency_at_launch: list[int] = []
+    launcher = FakeLauncher(alive_polls=2)
+
+    def recording(argv, cwd):
+        running = sum(1 for j in store.list_jobs() if j.state == "running")
+        concurrency_at_launch.append(running)
+        return launcher(argv, cwd)
+
+    _run(store, tmp_path=tmp_path, launcher=recording)
+
+    assert len(launcher.calls) == 2
+    assert max(concurrency_at_launch) == 2  # both launched while the repo was "busy"
+    assert [j.state for j in store.list_jobs()] == ["done"] * 2
+
+
+def test_a_fix_job_still_waits_out_a_running_build_in_one_repo(tmp_path) -> None:
+    """The relaxed rule is build/build only — fix stays exclusive against build."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="build", scope="epic-1")
+    fix_job = store.add_job(repo=repo, kind="fix", scope="1")
+
+    concurrency_at_launch: list[int] = []
+    launcher = FakeLauncher(alive_polls=2)
+
+    def recording(argv, cwd):
+        running = sum(1 for j in store.list_jobs() if j.state == "running")
+        concurrency_at_launch.append(running)
+        return launcher(argv, cwd)
+
+    _run(store, tmp_path=tmp_path, launcher=recording)
+
+    assert len(launcher.calls) == 2
+    assert concurrency_at_launch == [1, 1]  # never overlapped
+    assert store.get_job(fix_job).state == "done"
+
+
+def test_a_build_job_still_waits_out_a_running_fix_in_one_repo(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="fix", scope="1")
+    build_job = store.add_job(repo=repo, kind="build", scope="epic-1")
+
+    concurrency_at_launch: list[int] = []
+    launcher = FakeLauncher(alive_polls=2)
+
+    def recording(argv, cwd):
+        running = sum(1 for j in store.list_jobs() if j.state == "running")
+        concurrency_at_launch.append(running)
+        return launcher(argv, cwd)
+
+    _run(store, tmp_path=tmp_path, launcher=recording)
+
+    assert len(launcher.calls) == 2
+    assert concurrency_at_launch == [1, 1]  # never overlapped
+    assert store.get_job(build_job).state == "done"
+
+
 def test_the_scheduler_never_injects_allow_dirty_or_force(tmp_path) -> None:
     """No `--allow-dirty`, no stash, no bypass of the #590 guard (AC2)."""
     store = _store(tmp_path)

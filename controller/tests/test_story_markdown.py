@@ -1,11 +1,17 @@
-# ABOUTME: Tests for the epic-markdown write-back helper (Issue #598).
-# ABOUTME: mark_story_done sets **Status**: Done; find_epic_file resolves by story id.
+# ABOUTME: Tests for the epic-markdown renderer (Issue #598; Story 32.1-003).
+# ABOUTME: render_story_done/render_done_markers are pure; mark_story_done/render_epic_file write on request.
 
 from __future__ import annotations
 
 import pytest
 
-from sdlc.story_markdown import find_epic_file, mark_story_done
+from sdlc.story_markdown import (
+    find_epic_file,
+    mark_story_done,
+    render_done_markers,
+    render_epic_file,
+    render_story_done,
+)
 
 
 def _write(tmp_path, text: str):
@@ -142,3 +148,133 @@ def test_find_epic_file_none_when_major_is_not_numeric(tmp_path) -> None:
     (story_dir / "epic-07-sample.md").write_text("x\n", encoding="utf-8")
 
     assert find_epic_file("abc.1-001", tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# render_story_done (Story 32.1-003): the pure transform mark_story_done wraps.
+# ---------------------------------------------------------------------------
+
+
+def test_render_story_done_replaces_existing_status_line() -> None:
+    text = (
+        "##### Story 7.1-001: Do the thing\n"
+        "**Status**: Not started\n"
+        "**Priority**: P1\n"
+    )
+    new_text, changed = render_story_done(text, "7.1-001")
+    assert changed is True
+    assert new_text == (
+        "##### Story 7.1-001: Do the thing\n"
+        "**Status**: Done\n"
+        "**Priority**: P1\n"
+    )
+
+
+def test_render_story_done_is_pure_no_io(tmp_path) -> None:
+    """Calling the renderer must never touch the filesystem."""
+    text = "##### Story 7.1-001: Do\n**Status**: Not started\n"
+    before = set(tmp_path.iterdir())
+    render_story_done(text, "7.1-001")
+    assert set(tmp_path.iterdir()) == before
+
+
+def test_render_story_done_noop_returns_original_text() -> None:
+    text = "##### Story 7.1-001: Do\n**Status**: Done\n"
+    new_text, changed = render_story_done(text, "7.1-001")
+    assert changed is False
+    assert new_text == text
+
+
+def test_render_story_done_noop_when_story_id_not_found() -> None:
+    text = "##### Story 7.1-001: Do\n**Status**: Not started\n"
+    new_text, changed = render_story_done(text, "7.1-999")
+    assert changed is False
+    assert new_text == text
+
+
+def test_mark_story_done_matches_render_story_done(tmp_path) -> None:
+    """mark_story_done is now a thin write-if-changed wrapper over the renderer."""
+    text = "##### Story 7.1-001: Do\n**Status**: Not started\n"
+    path = _write(tmp_path, text)
+    rendered, changed = render_story_done(text, "7.1-001")
+
+    assert mark_story_done(path, "7.1-001") == changed
+    assert path.read_text(encoding="utf-8") == rendered
+
+
+# ---------------------------------------------------------------------------
+# render_done_markers (Story 32.1-003): the pure batch renderer.
+# ---------------------------------------------------------------------------
+
+
+def test_render_done_markers_applies_every_matching_id() -> None:
+    text = (
+        "##### Story 7.1-001: First\n"
+        "**Status**: Not started\n"
+        "\n"
+        "##### Story 7.1-002: Second\n"
+        "**Status**: Not started\n"
+    )
+    new_text, changed_ids = render_done_markers(text, ["7.1-001", "7.1-002"])
+    assert changed_ids == ["7.1-001", "7.1-002"]
+    assert "Story 7.1-001: First\n**Status**: Done\n" in new_text
+    assert "Story 7.1-002: Second\n**Status**: Done\n" in new_text
+
+
+def test_render_done_markers_skips_already_done_and_unmatched_ids() -> None:
+    text = (
+        "##### Story 7.1-001: First\n"
+        "**Status**: Done\n"
+        "\n"
+        "##### Story 7.1-002: Second\n"
+        "**Status**: Not started\n"
+    )
+    new_text, changed_ids = render_done_markers(
+        text, ["7.1-001", "7.1-002", "7.1-999"]
+    )
+    assert changed_ids == ["7.1-002"]
+    assert new_text.count("**Status**: Done") == 2
+
+
+def test_render_done_markers_empty_ids_is_a_pure_noop() -> None:
+    text = "##### Story 7.1-001: First\n**Status**: Not started\n"
+    new_text, changed_ids = render_done_markers(text, [])
+    assert changed_ids == []
+    assert new_text == text
+
+
+# ---------------------------------------------------------------------------
+# render_epic_file (Story 32.1-003): the on-demand disk writer, driven by an
+# externally-supplied done-id set (e.g. sourced from the ledger).
+# ---------------------------------------------------------------------------
+
+
+def test_render_epic_file_writes_only_when_changed(tmp_path) -> None:
+    path = _write(
+        tmp_path,
+        "##### Story 7.1-001: First\n"
+        "**Status**: Not started\n"
+        "\n"
+        "##### Story 7.1-002: Second\n"
+        "**Status**: Not started\n",
+    )
+    changed_ids = render_epic_file(path, ["7.1-001", "7.1-999"])
+    assert changed_ids == ["7.1-001"]
+    text = path.read_text(encoding="utf-8")
+    assert "Story 7.1-001: First\n**Status**: Done\n" in text
+    assert "Story 7.1-002: Second\n**Status**: Not started\n" in text
+
+
+def test_render_epic_file_noop_leaves_file_untouched(tmp_path) -> None:
+    original = "##### Story 7.1-001: First\n**Status**: Done\n"
+    path = _write(tmp_path, original)
+    mtime_before = path.stat().st_mtime_ns
+
+    assert render_epic_file(path, ["7.1-001"]) == []
+    assert path.read_text(encoding="utf-8") == original
+    assert path.stat().st_mtime_ns == mtime_before
+
+
+def test_render_epic_file_raises_on_missing_file(tmp_path) -> None:
+    with pytest.raises(OSError):
+        render_epic_file(tmp_path / "does-not-exist.md", ["7.1-001"])

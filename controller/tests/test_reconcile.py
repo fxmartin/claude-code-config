@@ -7,9 +7,11 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import sdlc.reconcile as reconcile_mod
 from sdlc.build import Ledger
-from sdlc.reconcile import ReconcileResult, _gh_pr_state, reconcile_run
+from sdlc.reconcile import ReconcileResult, _gh_pr_state, reconcile_run, render_docs
 
 
 # --- git fixture helpers ----------------------------------------------------
@@ -1038,13 +1040,15 @@ def test_doc_update_anchor_alone_is_nothing_to_reconcile(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# Issue #598: a reconciled-to-DONE story writes `**Status**: Done` back into
-# its epic markdown too, not just the ledger — the epic file is the documented
-# single source of truth and `sdlc issues init` reads it at face value.
+# Story 32.1-003: reconcile_run itself never touches the shared checkout any
+# more — only the ledger. render_docs is the separate, explicit, on-demand
+# renderer (the `sdlc reconcile` CLI command's model) that stamps epic
+# markdown from the ledger's DONE stories.
 # ---------------------------------------------------------------------------
 
 
-def test_reconcile_writes_status_done_to_epic_markdown(tmp_path: Path) -> None:
+def test_reconcile_run_never_writes_epic_markdown(tmp_path: Path) -> None:
+    """reconcile_run reclassifies in the ledger but leaves the checkout untouched."""
     root = _init_repo(tmp_path)
     _checkout(root, "feature/99.1-001", new=True)
     _commit(root, "ff.py", "x = 1\n", "feat: ff (#99.1-001)")
@@ -1054,46 +1058,13 @@ def test_reconcile_writes_status_done_to_epic_markdown(tmp_path: Path) -> None:
     story_dir = root / "docs" / "stories"
     story_dir.mkdir(parents=True)
     epic_file = story_dir / "epic-99-sample.md"
-    epic_file.write_text(
+    original = (
         "##### Story 99.1-001: Fast-forward landing\n"
         "**Status**: Not started\n"
-        "**Priority**: P1\n",
-        encoding="utf-8",
+        "**Priority**: P1\n"
     )
-
-    db = tmp_path / "ledger.db"
-    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
-
-    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
-
-    assert [r["story_id"] for r in result.reclassified] == ["99.1-001"]
-    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
-
-
-def test_reconcile_epic_markdown_write_failure_is_non_fatal(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """A write-back OSError must log a warning and never break reconciliation."""
-    root = _init_repo(tmp_path)
-    _checkout(root, "feature/99.1-001", new=True)
-    _commit(root, "ff.py", "x = 1\n", "feat: ff (#99.1-001)")
-    _checkout(root, "main")
-    _git(root, "merge", "-q", "--ff-only", "feature/99.1-001")
-
-    story_dir = root / "docs" / "stories"
-    story_dir.mkdir(parents=True)
-    epic_file = story_dir / "epic-99-sample.md"
-    epic_file.write_text(
-        "##### Story 99.1-001: Fast-forward landing\n"
-        "**Status**: Not started\n"
-        "**Priority**: P1\n",
-        encoding="utf-8",
-    )
-
-    def _boom(epic_file, story_id):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(reconcile_mod, "mark_story_done", _boom)
+    epic_file.write_text(original, encoding="utf-8")
+    mtime_before = epic_file.stat().st_mtime_ns
 
     db = tmp_path / "ledger.db"
     run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
@@ -1102,18 +1073,8 @@ def test_reconcile_epic_markdown_write_failure_is_non_fatal(
 
     assert [r["story_id"] for r in result.reclassified] == ["99.1-001"]
     assert _status(db, run_id, "99.1-001") == "DONE"
-    assert "**Status**: Not started" in epic_file.read_text(encoding="utf-8")
-
-    conn = sqlite3.connect(db)
-    try:
-        events = conn.execute(
-            "SELECT message FROM events WHERE run_id = ? AND story_id = '99.1-001'"
-            " AND level = 'warn'",
-            (run_id,),
-        ).fetchall()
-    finally:
-        conn.close()
-    assert any("epic markdown write-back failed" in row[0] for row in events)
+    assert epic_file.read_text(encoding="utf-8") == original
+    assert epic_file.stat().st_mtime_ns == mtime_before
 
 
 def test_reconcile_without_epic_file_is_non_fatal(tmp_path: Path) -> None:
@@ -1130,4 +1091,102 @@ def test_reconcile_without_epic_file_is_non_fatal(tmp_path: Path) -> None:
     result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
 
     assert [r["story_id"] for r in result.reclassified] == ["99.1-001"]
+
+
+# ---------------------------------------------------------------------------
+# render_docs (Story 32.1-003): the on-demand renderer over the ledger's DONE
+# stories. Byte-identical to the old mid-run write-back's output, just moved
+# to an explicit call site.
+# ---------------------------------------------------------------------------
+
+
+def test_render_docs_writes_status_done_to_epic_markdown(tmp_path: Path) -> None:
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-001: Fast-forward landing\n"
+        "**Status**: Not started\n"
+        "**Priority**: P1\n",
+        encoding="utf-8",
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+
+    rendered = render_docs(Ledger(db), run_id, root=root)
+
+    assert rendered == {str(epic_file): ["99.1-001"]}
+    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+
+
+def test_render_docs_only_renders_done_stories(tmp_path: Path) -> None:
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    original = "##### Story 99.1-001: Still building\n**Status**: Not started\n"
+    epic_file.write_text(original, encoding="utf-8")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+
+    assert render_docs(Ledger(db), run_id, root=root) == {}
+    assert epic_file.read_text(encoding="utf-8") == original
+
+
+def test_render_docs_is_idempotent(tmp_path: Path) -> None:
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-001: Fast-forward landing\n**Status**: Not started\n",
+        encoding="utf-8",
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+
+    first = render_docs(Ledger(db), run_id, root=root)
+    assert first == {str(epic_file): ["99.1-001"]}
+    second = render_docs(Ledger(db), run_id, root=root)
+    assert second == {}
+
+
+def test_render_docs_without_epic_file_is_non_fatal(tmp_path: Path) -> None:
+    """No docs/stories dir at all must not raise — the story is silently skipped."""
+    root = _init_repo(tmp_path)
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+
+    assert render_docs(Ledger(db), run_id, root=root) == {}
+
+
+def test_render_docs_raises_on_write_failure(tmp_path: Path, monkeypatch) -> None:
+    """An OSError writing the epic file is the caller's job (the CLI reports it)."""
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-001: Fast-forward landing\n**Status**: Not started\n",
+        encoding="utf-8",
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+
+    def _boom(epic_file, done_story_ids):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(reconcile_mod, "render_epic_file", _boom)
+
+    with pytest.raises(OSError):
+        render_docs(Ledger(db), run_id, root=root)
     assert _status(db, run_id, "99.1-001") == "DONE"

@@ -934,6 +934,21 @@ longer shows FAILED days after the work actually shipped.
 - **Clean absence.** No ledger / no runs reports cleanly and never materialises a
   spurious empty ledger; only a genuinely-unknown *explicit* run id exits
   non-zero (CLI exit 2).
+- **The on-demand epic-markdown renderer (Story 32.1-003).** `reconcile_run`
+  itself never touches the shared checkout — it only ever updates the ledger,
+  so two build runs sharing a repo never trip the #590 dirty-tree guard on
+  each other's leftovers (`sdlc build`'s per-merge callback stopped writing
+  `**Status**: Done` into `docs/stories/*.md` mid-run for the same reason).
+  After `reconcile_run` returns, the CLI calls `reconcile.render_docs(ledger,
+  run_id)`, which reads every `DONE` story off the ledger, groups the ids by
+  their resolved epic file (`story_markdown.find_epic_file`), and writes each
+  file's `**Status**: Done` markers in one pass
+  (`story_markdown.render_epic_file`) — the ids and epic files touched are
+  echoed as `rendered <ids> → <epic file>`. `story_markdown.py` is a pure
+  renderer (`render_story_done`/`render_done_markers` take text in, return
+  text out, touch no disk); `mark_story_done`/`render_epic_file` are its thin
+  write-on-request wrappers, so this is the only place in the controller that
+  writes the shared checkout's status markers.
 
 ## Usage reconciliation (ledger vs session logs)
 

@@ -127,6 +127,28 @@ def test_reconcile_explicit_run_id(tmp_path: Path, monkeypatch) -> None:
     assert _status(db, target, "99.1-005") == "DONE"
 
 
+def test_reconcile_renders_epic_markdown_on_demand(tmp_path: Path, monkeypatch) -> None:
+    """Story 32.1-003: `sdlc reconcile` is the on-demand epic-markdown renderer."""
+    root = _init_repo_with_origin(tmp_path)
+    _land_story(root, "99.1-007")
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-007: Fast-forward landing\n**Status**: Not started\n",
+        encoding="utf-8",
+    )
+    db = tmp_path / "ledger.db"
+    _seed_run(db, [("99.1-007", "FAILED", 106)])
+
+    monkeypatch.chdir(root)
+    result = runner.invoke(app, ["reconcile", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert "rendered 99.1-007" in result.output
+    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+
+
 # --- idempotent "nothing to reconcile" when no parked stories ---------------
 
 

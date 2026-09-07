@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sdlc.build import _STAGES, Ledger, _base_ref, _git
-from sdlc.story_markdown import find_epic_file, mark_story_done
+from sdlc.story_markdown import find_epic_file, render_epic_file
 
 if TYPE_CHECKING:
     from sdlc.registry import Registry
 
-__all__ = ["ReconcileResult", "reconcile_run"]
+__all__ = ["ReconcileResult", "reconcile_run", "render_docs"]
 
 # Statuses that an unattended run can park a story in even though its PR may have
 # genuinely merged. Reconciliation re-checks each of these against origin/main.
@@ -297,6 +297,15 @@ def reconcile_run(
     ``git fetch`` failure (offline / no remote) degrades to a no-op skip. Stories
     already ``DONE``/``SKIPPED`` are untouched, and a re-run over an
     already-reconciled run is idempotent (no flips, no duplicate rows).
+
+    Story 32.1-003: this never writes to the shared checkout — it only ever
+    updates the ledger. It runs both automatically at a run's close-out and
+    on demand via ``sdlc reconcile``, and the former must never touch the
+    checkout (two build runs sharing a repo would trip the #590 dirty-tree
+    guard on each other's leftovers). Call :func:`render_docs` separately
+    when you actually want the epic markdown's ``**Status**: Done`` markers
+    rendered into the checkout — the ``sdlc reconcile`` CLI command does this
+    after calling this function.
     """
     root = root or Path.cwd()
     rid = run_id or ledger.latest_run_id()
@@ -345,20 +354,12 @@ def reconcile_run(
             continue
         signal, sha = landing
         ledger.set_story_status(rid, sid, "DONE")
-        # Issue #598: stamp the epic markdown too, not just the ledger — the
-        # ledger row carries no epic_file, so resolve it by story-id major
-        # number. Best-effort: no matching epic file is a silent no-op, and a
-        # write failure logs a warning rather than breaking reconciliation
-        # (this function's "never fails an otherwise-good run" contract).
-        epic_file = find_epic_file(sid, root)
-        if epic_file is not None:
-            try:
-                mark_story_done(epic_file, sid)
-            except OSError as exc:
-                ledger.event_log(
-                    rid, sid, "warn", "reconcile",
-                    f"epic markdown write-back failed (non-fatal): {exc}",
-                )
+        # Story 32.1-003: the epic markdown is no longer stamped here — the
+        # ledger status set above is the sole source of truth for the duration
+        # of a run, so the shared checkout stays untouched and two build runs
+        # can overlap in one repo without tripping the #590 dirty-tree guard.
+        # :func:`render_docs` renders it into the checkout on request instead
+        # (the ``sdlc reconcile`` CLI command is the on-demand trigger).
         # Backfill the PR best-effort: keep an already-recorded number, else
         # resolve the merged PR behind the landing via gh. A failed/empty lookup
         # leaves pr_number as-is and never crashes (reconcile's contract).
@@ -419,3 +420,41 @@ def reconcile_run(
         run_status_after=after,
         fetched=fetched,
     )
+
+
+def render_docs(ledger: Ledger, run_id: str, root: Path | None = None) -> dict[str, list[str]]:
+    """Render every ``DONE`` story's epic-markdown marker into the checkout, on request.
+
+    Story 32.1-003: the on-demand counterpart to the write-back
+    :func:`reconcile_run` and the old per-merge build callback used to do
+    mid-run. Reads ``run_id``'s story statuses from the ledger — the sole
+    source of truth during a run — groups the ``DONE`` ids by their resolved
+    epic file (:func:`find_epic_file`), and writes each file's markers in one
+    pass via :func:`sdlc.story_markdown.render_epic_file`. A story whose epic
+    file cannot be resolved is silently skipped (mirrors
+    :func:`reconcile_run`'s prior best-effort posture); an epic file that
+    fails to write raises ``OSError`` — the caller's job (the CLI reports it).
+
+    Returns ``{epic_file_path: [story_id, ...]}`` for the files actually
+    changed — an unchanged epic (already-stamped or nothing to stamp) is
+    omitted, keeping the CLI summary and any test byte-identical to a no-op.
+    """
+    root = root or Path.cwd()
+    done_ids = [
+        row["story_id"]
+        for row in ledger.story_rows(run_id)
+        if row.get("story_id") and row.get("status") == "DONE"
+    ]
+
+    by_epic_file: dict[Path, list[str]] = {}
+    for sid in done_ids:
+        epic_file = find_epic_file(sid, root)
+        if epic_file is not None:
+            by_epic_file.setdefault(epic_file, []).append(sid)
+
+    rendered: dict[str, list[str]] = {}
+    for epic_file, sids in by_epic_file.items():
+        changed_ids = render_epic_file(epic_file, sids)
+        if changed_ids:
+            rendered[str(epic_file)] = changed_ids
+    return rendered
