@@ -209,6 +209,14 @@ class _RateLimitPark:
     all (a usage-limit with no retry-after), and the queue falls back to the
     run's configured ``max_wait_s`` — the same conservative "assume a full
     window" heuristic ``seconds_until_reset`` applies in-process.
+
+    Note the deliberate divergence AC3 asks for: ``rate_limit_max_wait_s`` is
+    the run-level *cap on an in-process wait*, while ``seconds_until_reset``
+    sizes its blind wait off ``window_s``. They are the same 18000s at the
+    defaults, so this only bites a host that lowers ``--rate-limit-max-wait`` —
+    which would reopen the queue that many seconds into a still-closed window.
+    A live probe cannot reopen early on its own, so that is the floor, not a
+    fail-open; sizing this off the window length instead would be a spec change.
     """
 
     run_id: str
@@ -571,6 +579,19 @@ def _utc_now() -> datetime:
 def _default_approval_probe(root: Path, pr_number: int) -> ApprovalVerdict | None:
     """The real, read-only host poll behind a parked job (Story 32.2-002)."""
     return poll_approval(root, pr_number)
+
+
+class _Unset:
+    """Sentinel for "``probe`` was never passed" (Story 32.2-001).
+
+    ``None`` is a *meaningful* value for a probe — ``_window_reopened`` reads it
+    as "no live check wired, so only the recorded reset reopens this window" —
+    so it cannot double as `run_queue`'s "use the default" default. Without this
+    a caller asking for no probe silently got a real API request instead.
+    """
+
+
+_UNSET = _Unset()
 
 @dataclass
 class _ProbeContext:
@@ -1183,9 +1204,16 @@ class _Scheduler:
                 return
             self._resume_dispatch(pause)
             return
-        park = self._discover_rate_limit()
-        if park is not None:
-            self._pause_dispatch(park)
+        parks = self._discover_rate_limit()
+        # A park that recorded a reset carries evidence; a reset-less one only
+        # carries the max-wait *guess*. Sizing the shared window off the guess
+        # while another run holds the real reset would stall every repo for the
+        # five-hour cap, so the guess is used only when nothing better exists.
+        candidates = [park for park in parks if park.reset_at is not None] or parks
+        if candidates:
+            now = self._clock()
+            latest = max(candidates, key=lambda park: park.window_until(now))
+            self._pause_dispatch(latest)
 
     def _dispatch_paused(self) -> bool:
         pause = self._store.dispatch_pause()
@@ -1208,8 +1236,15 @@ class _Scheduler:
             or self._store.expired_running_jobs(now=now)
         )
 
-    def _discover_rate_limit(self) -> "_RateLimitPark | None":
-        """The first job whose run *durably parked* on a closed window, if any.
+    def _discover_rate_limit(self) -> list["_RateLimitPark"]:
+        """Every job whose run *durably parked* on a closed window.
+
+        All of them, not the first: parked jobs routinely outnumber free slots,
+        and a window sized to whichever park happened to be listed first would
+        be lifted while another parked run's ledger still records a later reset
+        — a second pause, from stale evidence, once the first job was already
+        running again. The caller sizes the one window off the latest reset any
+        park recorded, so a single pause covers every parked run on the host.
 
         Reads every ``running`` job in the *store*, not just this scheduler's
         own in-flight ones: a second `sdlc queue run` on the same host shares the
@@ -1227,6 +1262,7 @@ class _Scheduler:
         it. Only a run that exited while still ``RATE_LIMITED`` handed the
         window over to the queue.
         """
+        parks: list[_RateLimitPark] = []
         for job in self._store.list_jobs():
             if job.state != "running" or not job.run_id:
                 continue
@@ -1234,8 +1270,8 @@ class _Scheduler:
                 continue  # waiting in-process; it resumes itself
             park = self._rate_limit_park(job.run_id)
             if park is not None:
-                return park
-        return None
+                parks.append(park)
+        return parks
 
     def _rate_limit_park(self, run_id: str) -> "_RateLimitPark | None":
         """``run_id``'s rate-limit park as its own ledger records it, or ``None``.
@@ -1484,7 +1520,7 @@ def run_queue(
     approval_probe: ApprovalProbe | None = None,
     fix_rounds: FixRounds | None = None,
     plan_files: PlanFiles | None = None,
-    probe: RateLimitProbe | None = None,
+    probe: RateLimitProbe | None | _Unset = _UNSET,
     echo: Callable[[str], None] | None = None,
     identity: str | None = None,
 ) -> SchedulerResult:
@@ -1513,8 +1549,8 @@ def run_queue(
     ``approval_probe`` is the read-only change-request poll, ``fix_rounds``
     counts a run's burned bugfix rounds, ``plan_files`` reads the file set a
     run's investigation froze (the overlap graph's write side), ``probe`` is the
-    live-API rate-limit check behind a held window, and ``notifier`` is the
-    Telegram path.
+    live-API rate-limit check behind a held window (omit it for the real one;
+    pass ``None`` to wire none at all), and ``notifier`` is the Telegram path.
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from
@@ -1536,7 +1572,7 @@ def run_queue(
         approval_probe=approval_probe or _default_approval_probe,
         fix_rounds=fix_rounds or ledger_fix_rounds,
         plan_files=plan_files or ledger_plan_files,
-        probe=probe if probe is not None else default_rate_limit_probe,
+        probe=default_rate_limit_probe if isinstance(probe, _Unset) else probe,
         echo=echo or print,
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
     )

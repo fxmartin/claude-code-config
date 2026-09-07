@@ -1978,3 +1978,150 @@ def test_a_window_a_peer_scheduler_already_opened_is_not_re_announced(tmp_path) 
 
     # A pause with no attributed run has no ledger to log a probe verdict into.
     assert scheduler._pause_ledger(QueuePause(paused_until="", paused_at="")) is None
+
+
+def test_every_parked_run_shares_one_window_even_when_slots_are_scarce(tmp_path) -> None:
+    """Parked jobs outnumbering free slots is still *one* window (AC2).
+
+    Discovery used to stop at the first park, so the queue cached only that
+    run's reset. With a single slot the second park was found on a later pass —
+    after the first window had been waited out and lifted — and opened a
+    *second* window from a stale ledger, stalling dispatch on evidence the job
+    already running had disproved. One shared subscription, one pause, one
+    resume: the window has to cover the latest reset any parked run recorded.
+    """
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    early, late = clock.now.timestamp() + 600, clock.now.timestamp() + 900
+    alpha, alpha_run, alpha_db = _parked_job(
+        store, registry, tmp_path, "alpha", reset_at=early
+    )
+    beta, beta_run, beta_db = _parked_job(
+        store, registry, tmp_path, "beta", reset_at=late
+    )
+
+    launcher = ResumingLauncher({alpha_run: alpha_db, beta_run: beta_db}, alive_polls=1)
+    notifier = RecordingNotifier()
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, probe=lambda: ProbeStatus.UNKNOWN,
+        sleeper=_stop_after(clock, 40),  # safety net; the drain ends well before
+        config=SchedulerConfig(slots=1, poll_seconds=100.0),
+    )
+
+    assert len(notifier.names("queue_paused")) == 1
+    assert len(notifier.names("queue_resumed")) == 1
+    assert result.paused == 1
+    # The one window covers the *latest* reset, not whichever park was seen first.
+    assert notifier.names("queue_paused")[0]["reset_at"] == (
+        datetime.fromtimestamp(late, timezone.utc).isoformat()
+    )
+    assert store.dispatch_pause() is None
+    assert sorted(cmd[2] for cmd in launcher.commands if cmd[0] == "resume") == sorted(
+        [alpha_run, beta_run]
+    )
+    assert store.get_job(alpha).state == "done"
+    assert store.get_job(beta).state == "done"
+
+
+def test_probe_none_means_no_probe_rather_than_the_live_api(tmp_path, monkeypatch) -> None:
+    """`run_queue(probe=None)` must honour the `RateLimitProbe | None` type.
+
+    `None` was overwritten with `default_rate_limit_probe`, so a caller — a test
+    above all — asking for *no* probe silently got a real API request against
+    the resolved harness. CLAUDE.md's offline CI contract forbids that, and
+    `_window_reopened`'s own `if self._probe is None` guard says it was never
+    the intent.
+    """
+    import sdlc.build as build
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    calls = {"n": 0}
+
+    def live_probe() -> ProbeStatus:
+        calls["n"] += 1
+        return ProbeStatus.AVAILABLE
+
+    monkeypatch.setattr(build, "default_rate_limit_probe", live_probe)
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    _parked_job(store, registry, tmp_path, "alpha", max_wait_s=18000)
+
+    _run(
+        store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=1), clock=clock,
+        registry=registry, probe=None, sleeper=_stop_after(clock, 5),
+        config=SchedulerConfig(slots=2, poll_seconds=100.0),
+    )
+
+    # 500s elapsed — past the 300s throttle, so a wired probe would have fired.
+    assert calls["n"] == 0
+    assert store.dispatch_pause().is_active(clock()) is True
+
+
+def test_omitting_the_probe_still_wires_the_live_one(tmp_path, monkeypatch) -> None:
+    """The sentinel must not cost production its default probe."""
+    import sdlc.build as build
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    calls = {"n": 0}
+
+    def live_probe() -> ProbeStatus:
+        calls["n"] += 1
+        return ProbeStatus.AVAILABLE
+
+    monkeypatch.setattr(build, "default_rate_limit_probe", live_probe)
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    _, run_id, db = _parked_job(store, registry, tmp_path, "alpha", max_wait_s=18000)
+
+    _run(
+        store, tmp_path=tmp_path, launcher=ResumingLauncher({run_id: db}, alive_polls=1),
+        clock=clock, registry=registry, sleeper=_stop_after(clock, 20),
+        config=SchedulerConfig(slots=2, poll_seconds=100.0),
+    )
+
+    assert calls["n"] >= 1
+    assert store.dispatch_pause() is None
+
+
+def test_a_recorded_reset_outranks_another_run_s_max_wait_guess(tmp_path) -> None:
+    """Evidence beats the fallback when both are parked at once.
+
+    A reset-less park's window is the run's own `max_wait` cap — a conservative
+    *guess*, five hours by default. Sizing the shared window off it while
+    another run holds a real reset epoch would stall every repo for hours on no
+    evidence, so the guess only sizes the window when nothing better is parked.
+    """
+    from sdlc.capability import ProbeStatus
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    reset_at = clock.now.timestamp() + 600
+    _parked_job(store, registry, tmp_path, "alpha", reset_at=reset_at)
+    _parked_job(store, registry, tmp_path, "beta", max_wait_s=18000)
+
+    _run(
+        store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=1), clock=clock,
+        registry=registry, probe=lambda: ProbeStatus.UNKNOWN,
+        sleeper=_stop_after(clock, 2),
+        config=SchedulerConfig(slots=2, poll_seconds=100.0),
+    )
+
+    pause = store.dispatch_pause()
+    assert pause is not None
+    assert pause.paused_until == (
+        datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
+    )
+    assert pause.source == "reset-epoch"

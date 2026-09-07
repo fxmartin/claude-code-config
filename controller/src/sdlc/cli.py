@@ -3128,7 +3128,7 @@ def _format_age(now: datetime, created_at: str) -> str:
 @queue_app.command("list")
 def queue_list_cmd(
     as_json: bool = typer.Option(
-        False, "--json", help="Emit the queue as a JSON array."
+        False, "--json", help="Emit the queue as JSON: {pause, jobs}."
     ),
 ) -> None:
     """List every job on the host across every repo.

@@ -1605,9 +1605,13 @@ reaches the job's own agents rather than just its parent.
 - **One rate-limit window for the whole queue (Story 32.2-001).** FX runs every
   repo on one Max subscription, so a closed window is a property of the *host*,
   not of the run that happened to find it. Each pass asks the queue one question
-  — is any `running` job's run parked `RATE_LIMITED` in its own ledger? — and if
-  so caches that run's reset epoch as the queue's `paused_until` (a single-row
-  `queue_state` table). While it holds, `_fill_slots` claims **nothing**, fresh
+  — which `running` jobs' runs are parked `RATE_LIMITED` in their own ledgers? —
+  and caches the *latest* reset epoch any of them recorded as the queue's
+  `paused_until` (a single-row `queue_state` table). Every park is read, not
+  just the first: parked jobs routinely outnumber free slots, and a window sized
+  off one park would be lifted while another's ledger still records a later
+  reset — a second pause, from evidence the resumed job had already disproved.
+  While it holds, `_fill_slots` claims **nothing**, fresh
   or resumed; jobs already in flight are left alone, because a run that parked
   itself knows how to wait. Once it passes the pause is cleared and the parked
   job is re-entered the ordinary way — `sdlc resume --run <id>` through the
@@ -1627,8 +1631,10 @@ reaches the job's own agents rather than just its parent.
     shortens it.
   - **No reset time?** A usage-limit with no retry-after pauses for the run's
     own configured `rate_limit_max_wait_s` (~one Max window, the same
-    conservative "assume a full window" heuristic `seconds_until_reset` uses),
-    and the held queue re-probes the live API on a 5-minute throttle by
+    conservative "assume a full window" heuristic `seconds_until_reset` uses).
+    That is a *guess*, so it only sizes the window when no parked run recorded a
+    real reset — otherwise a five-hour blind cap would outrank the evidence.
+    Either way the held queue re-probes the live API on a 5-minute throttle by
     **reusing** `build._probe_parked_reset` — same function, same
     never-fail-open contract (only `AVAILABLE` reopens; `UNAVAILABLE` and
     `UNKNOWN` keep the window shut), and the verdict lands in the parked run's
