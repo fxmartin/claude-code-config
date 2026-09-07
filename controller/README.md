@@ -69,7 +69,10 @@ per-story token column and per-stage tooltips — captured from Claude Code's
 `--output-format json` envelope (override the agent command with `$SDLC_AGENT_CMD`;
 omitting the flag simply records no usage). A **left sidebar lists this repo's
 past runs** (the ledger is per-repo, with token/cost per run) so you can click any
-run to inspect it; "● Live" follows the newest. The **header names the GitHub
+run to inspect it; "● Live" follows the newest. A row of **status chips**
+above the list (one per status present, each with a live count) filters the
+sidebar to any combination — live runs always stay listed regardless of the
+filter, and the choice is remembered per browser. The **header names the GitHub
 project** (`owner/repo`, linked). Binds **localhost only** by default
 (`--host`/`--port`/`--run` to override). Runs until Ctrl-C.
 

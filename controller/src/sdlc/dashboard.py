@@ -334,6 +334,23 @@ _PAGE = """<!doctype html>
           border-right: 1px solid var(--surface); padding: 16px; overflow: auto; }
   .side h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
              color: var(--sub); margin: 0 0 10px; }
+  /* Story 19.2-003: RUNS sidebar status-filter chip row. Reuses the `.badge`
+     base + status colour classes (.DONE, .STARTED, …) so the filter
+     vocabulary can never drift from the run cards it filters. min-height
+     reserves room for the wrapped chip row so a live-tick count change never
+     reflows the run list below it (the 11.2-011 stable-height rule). */
+  .side-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; min-height: 4.6em; }
+  .fchip { cursor: pointer; opacity: .45; }
+  .fchip:hover { opacity: .75; }
+  .fchip.fchip-on { opacity: 1; }
+  .fchip.fchip-all { background: var(--mantle); border: 1px solid var(--surface); color: var(--sub); }
+  /* The STARTED chip is pinned/always-on: live runs are always listed no
+     matter the filter (see isRunVisible), so this chip can never actually be
+     "off" — it must not invite a click that would silently do nothing. */
+  .fchip.fchip-pinned { cursor: default; }
+  .fchip.fchip-pinned:hover { opacity: 1; }
+  .side-hint { min-height: 1.5em; font-size: 12px; color: var(--peach); margin: 0 0 8px; }
+  .side-hint a { margin-left: 4px; cursor: pointer; }
   .run { padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 6px; }
   .run:hover { background: var(--crust); }
   .run.active { background: var(--surface); }
@@ -381,6 +398,12 @@ _PAGE = """<!doctype html>
   .SKIPPED { background: var(--surface); color: var(--sub); }
   .TODO { background: var(--crust); color: var(--overlay); }
   .PENDING { background: var(--crust); color: var(--overlay); }
+  /* Story 19.2-003: ABORTED (explicit stop) and DEAD (registry pid gone) join
+     the badge vocabulary — needed for the sidebar status-filter chips, and
+     (previously unstyled) run cards showing these statuses now get a colour
+     instead of falling back to plain text. */
+  .ABORTED { background: #fbe3e8; color: var(--red); }
+  .DEAD { background: var(--surface); color: var(--sub); }
   /* Story 11.2-014: the activity line is the third row of a story's stacked
      block — no inner border below it; the next block's title-row border-top is
      the separator (see .story-title below). */
@@ -532,7 +555,11 @@ _PAGE = """<!doctype html>
     <span id="repo" class="muted"></span>
   </header>
   <div class="wrap" id="buildsView">
-    <div class="side" id="side"><h2>Runs</h2><div id="runs"></div></div>
+    <div class="side" id="side"><h2>Runs</h2>
+      <div class="side-chips" id="sideChips"></div>
+      <div id="sideHint"></div>
+      <div id="runs"></div>
+    </div>
     <div class="main">
       <div id="updated" class="muted">connecting…</div>
       <div id="head" class="muted"></div>
@@ -559,8 +586,17 @@ _PAGE = """<!doctype html>
     </div>
   </div>
 <script>
-const ORDER = ["DONE","IN_PROGRESS","RATE_LIMITED","FAILED","BLOCKED","NEEDS_ATTENTION","AWAITING_APPROVAL","SKIPPED","TODO"];
+// Story 19.2-003: ABORTED and DEAD are run-level-only terminal statuses (a
+// story never carries them) — appended here so the sidebar's chip order (see
+// renderSideChips) can reuse this one ordering source without a second list.
+const ORDER = ["DONE","IN_PROGRESS","RATE_LIMITED","FAILED","ABORTED","BLOCKED","NEEDS_ATTENTION","AWAITING_APPROVAL","DEAD","SKIPPED","TODO"];
 let sel = null;  // null = Live (latest)
+// RUNS sidebar status filter (Story 19.2-003). A Set of raw run statuses;
+// empty = unfiltered ("all"). `lastRuns` caches the most recent /api/runs
+// fetch so a chip click can re-render the list immediately without waiting
+// for the next tick.
+let sideFilter = loadSideFilter();
+let lastRuns = [];
 // Live run-duration ticker (Story 11.2-005): when a run is in-progress, count
 // up locally from the server-computed elapsed (runtimeBase) captured at fetch
 // (runtimeAnchor). null disables the ticker (finished run / no timestamps).
@@ -712,10 +748,74 @@ async function tick(){
   }
 }
 
+// RUNS sidebar status filter (Story 19.2-003). Persistence mirrors the
+// sidebar-toggle pattern exactly: a namespaced localStorage key, every access
+// guarded (browsers can throw in private windows / with blocked site data),
+// and the page renders unfiltered when there is no stored value.
+const FILTER_KEY = "sdlc.dashboard.statusFilter";
+function saveSideFilter(){
+  try { localStorage.setItem(FILTER_KEY, JSON.stringify([...sideFilter])); } catch (e) {}
+}
+function loadSideFilter(){
+  try {
+    const raw = localStorage.getItem(FILTER_KEY);
+    if (raw) return new Set(JSON.parse(raw));
+  } catch (e) {}
+  return new Set();
+}
+// The always-visible-while-live rule as a single named, testable function
+// (not CSS): a run reading STARTED (raw status IN_PROGRESS) is always listed
+// regardless of the filter, so a persisted "DONE only" filter can never hide
+// something in flight. An empty filter Set means unfiltered ("all").
+function isRunVisible(status, filter){
+  if (status === "IN_PROGRESS" || status === "STARTED") return true;
+  if (!filter || filter.size === 0) return true;
+  return filter.has(status);
+}
+// Per-status chip row above the run list: one chip per status *present* in
+// the fetched runs (absent statuses render no chip), each carrying its live
+// count. Chip order reuses ORDER (falling back to any status ORDER doesn't
+// know about, sorted, so a genuinely new status still gets a chip with no
+// dashboard change); chip colour reuses the same badge()/statusLabel()
+// helpers the run cards use, so the vocabulary can never disagree.
+function renderSideChips(runs){
+  const el = document.getElementById("sideChips");
+  if (!el) return;
+  const counts = {};
+  (runs||[]).forEach(r => { counts[r.status] = (counts[r.status]||0) + 1; });
+  const present = new Set(Object.keys(counts));
+  const order = ORDER.filter(s => present.has(s))
+    .concat([...present].filter(s => !ORDER.includes(s)).sort());
+  if (!order.length){ el.innerHTML = ""; return; }
+  const allOn = sideFilter.size === 0;
+  const chips = order.map(s => {
+    const live = s === "IN_PROGRESS";
+    const on = live || sideFilter.has(s);
+    const cls = "badge fchip " + esc(s) + (on ? " fchip-on" : "") + (live ? " fchip-pinned" : "");
+    const title = live ? " title='live runs are always shown, regardless of the filter'" : "";
+    return "<span class='"+cls+"' data-status='"+esc(s)+"'"+title+">"
+      + esc(statusLabel(s)) + " " + counts[s] + "</span>";
+  }).join("");
+  el.innerHTML = "<span class='fchip fchip-all"+(allOn?" fchip-on":"")+"' data-status=''>all</span>" + chips;
+}
 function renderRuns(runs){
+  lastRuns = runs || [];
+  renderSideChips(lastRuns);
+  const visible = lastRuns.filter(r => isRunVisible(r.status, sideFilter));
+  // Story 19.2-003: if the selected run got filtered out, the detail pane
+  // (renderMain, driven by `sel` independently of this list) keeps showing
+  // it — but the sidebar must say so, with a one-line hint and a clear action,
+  // so the selection never reads as silently orphaned.
+  const selRun = sel ? lastRuns.find(r => r.id === sel) : null;
+  const hintEl = document.getElementById("sideHint");
+  if (hintEl){
+    hintEl.innerHTML = (selRun && !isRunVisible(selRun.status, sideFilter))
+      ? "<span>selected run hidden by filter</span><a id='sideHintClear'>show it</a>"
+      : "";
+  }
   let html = "<div class='run "+(sel===null?"active":"")+"' data-run=''>"
     + "<b>● Live</b> <span class='muted small'>(latest)</span></div>";
-  html += (runs||[]).map(r => {
+  html += visible.map(r => {
     const sub = esc(r.scope) + " &middot; " + esc(r.done) + "/" + esc(r.total)
       + (r.failed ? " &middot; " + esc(r.failed) + " failed" : "")
       + (r.duration_seconds!=null ? " &middot; " + humanDuration(r.duration_seconds) : "")
@@ -941,6 +1041,32 @@ document.getElementById("runs").addEventListener("click", e => {
   if(next !== sel) closeSession();
   sel = next;
   tick();
+});
+
+// Chip toggle (Story 19.2-003): any combination selectable. The pinned
+// STARTED chip's click is a no-op — toggling it can never change what live
+// runs show (isRunVisible always shows them), so it must not pretend it can.
+// Tapping the last selected chip off (or the explicit "all" chip) empties the
+// Set, which `isRunVisible` already reads as unfiltered.
+document.getElementById("sideChips").addEventListener("click", e => {
+  const el = e.target.closest(".fchip");
+  if(!el || el.classList.contains("fchip-pinned")) return;
+  const status = el.dataset.status;
+  if(status === ""){
+    sideFilter.clear();
+  } else if(sideFilter.has(status)){
+    sideFilter.delete(status);
+  } else {
+    sideFilter.add(status);
+  }
+  saveSideFilter();
+  renderRuns(lastRuns);
+});
+document.getElementById("sideHint").addEventListener("click", e => {
+  if(!e.target.closest("#sideHintClear")) return;
+  sideFilter.clear();
+  saveSideFilter();
+  renderRuns(lastRuns);
 });
 
 // Live transport: subscribe to the server's SSE stream and refetch on each
