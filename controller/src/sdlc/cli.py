@@ -3178,7 +3178,15 @@ def queue_add_cmd(
         "none). Flags only — the scope above is dispatched for you.",
     ),
 ) -> None:
-    """Add a job to the host queue directly (without going through --enqueue)."""
+    """Add a job to the host queue directly (without going through --enqueue).
+
+    The job's priority class carries its budget — max `bugfix` rounds and a
+    wall-clock cap — and that budget is frozen onto the row here, which is what
+    makes the ceiling `sdlc queue list` shows the one the job is actually held
+    to. `SDLC_QUEUE_MAX_FIX_ROUNDS` / `SDLC_QUEUE_WALL_CLOCK_MINUTES` override
+    the per-class defaults host-wide and are read *at this point*, not at
+    `sdlc queue run`; a malformed or non-positive value is ignored.
+    """
     from sdlc.queue import QueueError, QueueStore, default_queue_path
 
     store = QueueStore(default_queue_path())
@@ -3233,13 +3241,18 @@ def queue_run_cmd(
     `controller/pyproject.toml` is parked `blocked` with the reinstall remedy
     rather than executed on stale code (Story 15.1-004).
 
-    Each job is held to its priority class's budget — max `bugfix` rounds (read
-    from the run's ledger) and a wall-clock cap per launch. Exceeding either
-    stops the job and parks it `needs_attention` with a notification, so a
-    runaway is capped by policy rather than by someone noticing. Override the
-    defaults host-wide with `SDLC_QUEUE_MAX_FIX_ROUNDS` /
-    `SDLC_QUEUE_WALL_CLOCK_MINUTES`. This is the queue's outer breaker; the
-    pipeline's own per-story `MAX_BUGFIX_ATTEMPTS` is untouched.
+    Each job is held to the budget frozen on it at enqueue — max `bugfix` rounds
+    (read from the run's ledger) and a wall-clock cap per launch. Exceeding
+    either stops the job and parks it `needs_attention` with a notification, so
+    a runaway is capped by policy rather than by someone noticing. This is the
+    queue's outer breaker; the pipeline's own per-story `MAX_BUGFIX_ATTEMPTS` is
+    untouched.
+
+    The budget is read off the job's row, so `SDLC_QUEUE_MAX_FIX_ROUNDS` /
+    `SDLC_QUEUE_WALL_CLOCK_MINUTES` do nothing here — they are read when a job
+    is stamped (`sdlc queue add`, `--enqueue`, `sdlc queue prioritise`). To
+    change an already-enqueued job's ceiling, re-stamp it with `sdlc queue
+    prioritise`.
 
     A killed scheduler loses nothing: the next `sdlc queue run` reclaims every
     job whose lease lapsed and re-enters it through `sdlc resume` — never from
@@ -3307,6 +3320,12 @@ def queue_requeue_cmd(
     kept, so nothing has to be retyped. A job that already opened a run returns
     to `running` with an expired lease so the next `sdlc queue run` **resumes**
     it rather than restarting it from scratch. Refuses a `running` job.
+
+    Also the exit from a `needs_attention` budget park: the resumed job gets a
+    fresh wall clock (it is measured per launch) and one more class allowance of
+    fix rounds counted from the spend the breaker banked, so it makes real
+    progress rather than being stopped again on its first poll — and the breaker
+    still fires an allowance later if it is still thrashing.
     """
     from sdlc.queue import QueueError, QueueStore, default_queue_path
 
@@ -3332,7 +3351,13 @@ def queue_prioritise_cmd(
 
     The class carries the job's budget (max fix rounds, wall-clock cap), so a
     move re-stamps it — a job promoted to `urgent` is held to `urgent`'s
-    ceiling from then on, not the one it was enqueued with.
+    ceiling from then on, not the one it was enqueued with. Re-stamping is also
+    how `SDLC_QUEUE_MAX_FIX_ROUNDS` / `SDLC_QUEUE_WALL_CLOCK_MINUTES` reach a
+    job that is already enqueued: they are read here and at `sdlc queue add`,
+    never at `sdlc queue run`.
+
+    The rounds a job has already burned are not erased by the move — a class
+    change reprices the work, it does not forgive the spend.
     """
     from sdlc.queue import QueueError, QueueStore, default_queue_path
 

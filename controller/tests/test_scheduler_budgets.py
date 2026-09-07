@@ -443,3 +443,239 @@ def test_recorded_files_hold_back_an_overlapping_queued_peer(tmp_path) -> None:
             frozenset({"src/a.py"})) in seen
     # And the hold releases itself: once the first job is terminal the second runs.
     assert len(launcher.procs) == 2
+
+
+class SurvivesOnePoll(FakeProc):
+    """Alive for its first reap, gone by the second.
+
+    The breaker only ever looks at a job that is still in flight
+    (`_enforce_budgets` runs after `_reap`), so a proc that exits on the first
+    reap is never offered to it. This one gives the breaker exactly one look
+    before finishing cleanly, which is what makes "the breaker did *not* fire"
+    an assertion rather than an accident of ordering.
+    """
+
+    def __init__(self, pid: int) -> None:
+        super().__init__(pid)
+        self._polls = 0
+
+    def poll(self) -> int | None:
+        if self.stopped:
+            return 0
+        self._polls += 1
+        return 0 if self._polls > 1 else None
+
+
+class SurvivingLauncher(FakeLauncher):
+    def __call__(self, argv, cwd):
+        proc = SurvivesOnePoll(90000 + len(self.procs))
+        self.procs.append(proc)
+        return proc
+
+
+def _dead_pid() -> int:
+    """A pid that is certainly gone — spawned and reaped before we return it."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def _registering(launcher, registry, repo, tmp_path, run_id="run-thrash"):
+    """A launcher whose job registers its run, the way `run_build` does."""
+
+    def launching(argv, cwd):
+        proc = launcher(argv, cwd)
+        registry.register(
+            RunRecord(run_id=run_id, repo=repo, db=str(tmp_path / "x.db"),
+                      scope="1", pid=proc.pid, status="IN_PROGRESS", started_at="")
+        )
+        return proc
+
+    return launching
+
+
+def _hand_back(store, registry, job_id, repo, tmp_path, clock, run_id="run-thrash"):
+    """Retire the parked run's process and requeue the job, as an operator would.
+
+    The scheduler only resumes a job whose run is genuinely dead (two drivers on
+    one run is what the registry guard exists to prevent), so the park's pid has
+    to be reaped before the next drain, and the lease has to be strictly older
+    than that drain's clock.
+    """
+    registry.register(
+        RunRecord(run_id=run_id, repo=repo, db=str(tmp_path / "x.db"),
+                  scope="1", pid=_dead_pid(), status="IN_PROGRESS", started_at="")
+    )
+    store.requeue_job(job_id, now=clock.now)
+    clock.advance(200)
+
+
+def test_requeue_recovers_a_fix_round_park_instead_of_re_parking_it(tmp_path) -> None:
+    """`sdlc queue requeue` is the documented exit from a budget park, so it has
+    to actually work.
+
+    `ledger_fix_rounds` is *cumulative* over the run and a requeue re-enters the
+    **same** run, so the count that fired the breaker is still at the cap on the
+    resumed job's very first poll. Without a baseline the job is stopped again
+    having made no progress at all, and the `_enforce_budgets` docstring, the
+    README and the architecture doc that all advertise requeue as the exit are
+    simply wrong.
+    """
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="fix", scope="1")
+    budget = store.get_job(job_id).job_budget()
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+
+    # The ledger does not forget: rounds already burned stay burned.
+    def fix_rounds(_db: str, _run_id: str) -> int:
+        return budget.max_fix_rounds
+
+    _run(
+        store, tmp_path=tmp_path, clock=clock, registry=registry,
+        launcher=_registering(FakeLauncher(), registry, repo, tmp_path),
+        fix_rounds=fix_rounds,
+    )
+    assert store.get_job(job_id).state == "needs_attention"
+    assert store.get_job(job_id).fix_rounds_baseline == budget.max_fix_rounds
+
+    _hand_back(store, registry, job_id, repo, tmp_path, clock)
+    second = SurvivingLauncher()
+    result = _run(
+        store, tmp_path=tmp_path, clock=clock, registry=registry,
+        launcher=_registering(second, registry, repo, tmp_path),
+        fix_rounds=fix_rounds,
+    )
+
+    assert result.resumed == 1
+    assert result.parked == 0
+    assert second.procs[0].stopped is False  # the breaker never touched it
+    assert store.get_job(job_id).state == "done"
+
+
+def test_requeue_grants_one_more_budget_rather_than_disarming_the_breaker(
+    tmp_path,
+) -> None:
+    """The rope a requeue grants is one more class budget, not infinity.
+
+    A breaker an operator can permanently disarm by requeueing once is not a
+    breaker, so the baseline has to move the cap up — never remove it.
+    """
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="fix", scope="1")
+    budget = store.get_job(job_id).job_budget()
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    burned = [budget.max_fix_rounds]
+
+    def fix_rounds(_db: str, _run_id: str) -> int:
+        return burned[0]
+
+    _run(
+        store, tmp_path=tmp_path, clock=clock, registry=registry,
+        launcher=_registering(FakeLauncher(), registry, repo, tmp_path),
+        fix_rounds=fix_rounds,
+    )
+    assert store.get_job(job_id).state == "needs_attention"
+
+    # The resumed job thrashes through the whole second allowance too.
+    _hand_back(store, registry, job_id, repo, tmp_path, clock)
+    burned[0] = budget.max_fix_rounds * 2
+    result = _run(
+        store, tmp_path=tmp_path, clock=clock, registry=registry,
+        launcher=_registering(FakeLauncher(), registry, repo, tmp_path),
+        fix_rounds=fix_rounds,
+    )
+
+    assert result.parked == 1
+    job = store.get_job(job_id)
+    assert job.state == "needs_attention"
+    # The reason counts rounds burned *since the last park* — the number the cap
+    # is actually being compared against, not the run's lifetime total.
+    assert f"{budget.max_fix_rounds} fix rounds" in (job.reason or "")
+    assert job.fix_rounds_baseline == budget.max_fix_rounds * 2
+
+
+def test_a_wall_clock_park_does_not_grant_fresh_fix_rounds(tmp_path) -> None:
+    """Only the thrash arm banks a baseline.
+
+    A job stopped by the clock has not spent its fix-round budget, so crediting
+    the rounds it *had* burned would quietly hand it a second allowance and let
+    it thrash past the cap on its next launch.
+    """
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="fix", scope="1")
+    budget = store.get_job(job_id).job_budget()
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    burned = [budget.max_fix_rounds - 1]  # inside the cap, so the clock parks it
+
+    def fix_rounds(_db: str, _run_id: str) -> int:
+        return burned[0]
+
+    _run(
+        store, tmp_path=tmp_path, clock=clock, registry=registry,
+        launcher=_registering(FakeLauncher(), registry, repo, tmp_path),
+        fix_rounds=fix_rounds,
+        config=_config(poll_seconds=budget.wall_clock_seconds + 1),
+    )
+    job = store.get_job(job_id)
+    assert job.state == "needs_attention"
+    assert "wall-clock" in (job.reason or "")
+    assert job.fix_rounds_baseline == 0
+
+    # One more round on the resumed job now reaches the class cap outright.
+    _hand_back(store, registry, job_id, repo, tmp_path, clock)
+    burned[0] = budget.max_fix_rounds
+    result = _run(
+        store, tmp_path=tmp_path, clock=clock, registry=registry,
+        launcher=_registering(FakeLauncher(), registry, repo, tmp_path),
+        fix_rounds=fix_rounds,
+    )
+
+    assert result.parked == 1
+    assert "fix round" in (store.get_job(job_id).reason or "")
+
+
+def test_stage_attempt_count_is_scoped_to_its_run_and_stage(tmp_path) -> None:
+    """The cheap counter behind `ledger_fix_rounds` must not over-count.
+
+    It replaces a full `stage_breakdown` materialisation on a 2s poll, so the
+    thing worth pinning is its WHERE clause: other stages, and other runs
+    sharing the ledger, are somebody else's rounds.
+    """
+    from sdlc.build import Ledger
+
+    db = tmp_path / "state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    mine = ledger.run_create("epic-3", "auto")
+    theirs = ledger.run_create("epic-4", "auto")
+    for run_id, story in ((mine, "1.1-001"), (theirs, "1.2-001")):
+        ledger.story_upsert(
+            run_id, story, "epic-3", "Title", "High", 3, "backend", "br", None, "TODO"
+        )
+    for attempt in (1, 2, 3):
+        ledger.stage_start(mine, "1.1-001", "bugfix", attempt)
+        ledger.stage_finish(mine, "1.1-001", "bugfix", attempt, "DONE")
+    ledger.stage_start(mine, "1.1-001", "review", 1)
+    ledger.stage_finish(mine, "1.1-001", "review", 1, "DONE")
+    ledger.stage_start(theirs, "1.2-001", "bugfix", 1)
+    ledger.stage_finish(theirs, "1.2-001", "bugfix", 1, "DONE")
+
+    assert ledger.stage_attempt_count(mine, "bugfix") == 3
+    assert ledger.stage_attempt_count(theirs, "bugfix") == 1
+    assert ledger.stage_attempt_count(mine, "coverage") == 0
+
+
+def test_stage_attempt_count_on_a_missing_ledger_is_zero(tmp_path) -> None:
+    """Read-never-creates: an absent ledger counts zero rather than raising."""
+    from sdlc.build import Ledger
+
+    assert Ledger(tmp_path / "nope.db").stage_attempt_count("run-1", "bugfix") == 0

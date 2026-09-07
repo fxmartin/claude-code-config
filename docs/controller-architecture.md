@@ -1447,9 +1447,19 @@ reaches the job's own agents rather than just its parent.
   chain runs oldest-first, which outranks the priority class — a component is a
   correctness constraint, and classes order work *across* components. Nothing
   deadlocks: the head of every chain is always claimable. Today per-repo
-  exclusivity already serialises a whole repo, so this constrains nothing extra;
-  it is what keeps overlapping jobs serial once Story 32.1-003 lets two
-  non-overlapping jobs share a checkout.
+  exclusivity already serialises a whole repo, so this constrains nothing extra.
+
+  Be precise about what it will buy later, because the mechanism is narrower
+  than "overlapping jobs never run together". It holds a job whose **recorded**
+  footprint overlaps a pending peer's, and a footprint is only recorded once a
+  run has frozen its plan — so two *never-run* jobs in one repo are both
+  singletons, both claimable, and would both start before either footprint
+  exists. Story 32.1-003, which lets two non-overlapping jobs share a checkout,
+  therefore needs a start-time step of its own — investigate before claiming, or
+  re-check the graph when a plan lands and yield the loser — layered *on top of*
+  this graph. What this graph gives 32.1-003 for free is the returning case: a
+  requeued or second-wave job held on the strength of what its predecessor
+  touched last time.
 
   The graph's **write** side is `scheduler.ledger_plan_files`, run once per
   launch right after a job is linked to its run. It reads the `fix-plan` event
@@ -1480,13 +1490,34 @@ reaches the job's own agents rather than just its parent.
   `SDLC_QUEUE_MAX_FIX_ROUNDS` / `SDLC_QUEUE_WALL_CLOCK_MINUTES` override the
   numbers host-wide for every class; a malformed or non-positive value is
   ignored rather than honoured, because disarming a breaker by typo is the one
-  failure mode a breaker must not have. `sdlc queue prioritise` re-stamps the
-  budget along with the class — leaving the old one behind would make the move a
-  half-move. Exceeding either ceiling stops the job's process group, parks it
-  **`needs_attention`** with the reason naming which ceiling and by how much, and
-  fires the same `queue_job_finished` notification any other terminal does. The
-  wall clock is measured from *this launch*, so a resumed job gets a fresh one
-  rather than inheriting a dead scheduler's.
+  failure mode a breaker must not have. They are read where a budget is
+  **stamped** — `sdlc queue add`, `--enqueue`, `sdlc queue prioritise` — and not
+  at `sdlc queue run`, because the budget lives on the row: that freeze is what
+  makes the `queue list` column the ceiling the job is actually held to, and the
+  price of it is that exporting the variables before a drain changes nothing
+  about jobs already enqueued. `sdlc queue prioritise` re-stamps the budget along
+  with the class — leaving the old one behind would make the move a half-move,
+  and it doubles as the way to reprice a job in flight. Exceeding either ceiling
+  stops the job's process group, parks it **`needs_attention`** with the reason
+  naming which ceiling and by how much, and fires the same `queue_job_finished`
+  notification any other terminal does.
+
+  Both ceilings are re-based when they fire, so `sdlc queue requeue` is a real
+  exit and not a loop. The wall clock is measured from *this launch*, so a
+  resumed job gets a fresh one rather than inheriting a dead scheduler's. Fix
+  rounds are the harder half: `ledger_fix_rounds` counts every `bugfix` row the
+  *run* has recorded and a requeue re-enters that same run, so a naive
+  comparison would stop the resumed job on its first poll having made no
+  progress at all. The breaker therefore banks the rounds burned into the job's
+  `fix_rounds_baseline` column as it parks, and the cap is measured from there —
+  one human decision buys exactly one more class allowance, and the breaker
+  still fires an allowance later if the job is still thrashing. Only the thrash
+  arm banks: a job the clock stopped has not spent its rounds, and crediting
+  them would hand it an allowance it never earned. The baseline is its own
+  column rather than a key inside `budget` because the two are different kinds
+  of fact — `budget` is policy copied from the class and re-stamped wholesale by
+  `prioritise`, the baseline is consumption measured off the ledger, and a class
+  change must not erase it.
 - **Two layers of retry budget, two knobs.** This is deliberately **not** the
   pipeline's own retry budget, and the two must not be conflated:
 
@@ -1494,7 +1525,7 @@ reaches the job's own agents rather than just its parent.
   |---|---|---|
   | scope | one **story**'s bugfix loop | the whole **job** |
   | who enforces | the pipeline, from inside the run | the scheduler, from outside it |
-  | read from | its own in-loop counter | the run's ledger (`stage_breakdown`, `bugfix` rows) |
+  | read from | its own in-loop counter | the run's ledger (`stage_attempt_count`, `bugfix` rows) |
   | on exhaustion | the story ends `FAILED`; the run continues | the job is stopped and parked `needs_attention` |
 
   The inner knob decides when a *story* gives up; the outer one decides when the

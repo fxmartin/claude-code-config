@@ -53,9 +53,10 @@ def test_init_creates_wal_schema(tmp_path) -> None:
         assert cols == {
             "id", "repo", "kind", "scope", "priority", "state", "claimed_by",
             "lease_until", "run_id", "options", "created_at", "updated_at", "reason",
-            # Story 32.3-001: the frozen per-class budget and the investigated
-            # file set the repo-scoped overlap graph is built from.
-            "budget", "files",
+            # Story 32.3-001: the frozen per-class budget, the investigated
+            # file set the repo-scoped overlap graph is built from, and the
+            # fix rounds already banked when the breaker last parked the job.
+            "budget", "files", "fix_rounds_baseline",
         }
     finally:
         conn.close()
@@ -263,9 +264,10 @@ def test_set_state_rejects_unknown_state(tmp_path) -> None:
 
 
 def test_apply_migrations_adds_column_and_is_idempotent(tmp_path, monkeypatch) -> None:
-    """A future migration entry (today's `_MIGRATIONS` is empty) adds its column
-    on first `init()` and is skipped as already-applied on a second — the same
-    upgrade-in-place path a real schema change will exercise later."""
+    """A migration entry adds its column on first `init()` and is skipped as
+    already-applied on a second. Stubbed rather than run against the real
+    `_MIGRATIONS` so the mechanism is pinned independently of whichever columns
+    the current schema happens to have."""
     import sdlc.queue as queue_mod
     from sdlc.queue import QueueStore
 
@@ -325,3 +327,4 @@ def test_row_to_record_reads_a_pre_32_3_001_row_without_crashing(tmp_path) -> No
     job = QueueStore(db).get_job(1)
     assert job.budget is None
     assert job.files is None
+    assert job.fix_rounds_baseline == 0

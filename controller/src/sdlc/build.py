@@ -3732,6 +3732,28 @@ class Ledger:
             out.setdefault(d.pop("story_id"), []).append(d)
         return out
 
+    def stage_attempt_count(self, run_id: str, stage_name: str) -> int:
+        """How many attempts of ``stage_name`` ``run_id`` has recorded.
+
+        The counting counterpart to :meth:`stage_breakdown`, for callers that
+        want the number and not the rows. The queue's budget breaker
+        (``sdlc.scheduler.ledger_fix_rounds``) asks this of every in-flight job
+        on every 2s poll, and paying for a full breakdown — every attempt of
+        every story, materialised into dicts with summed token counts — to keep
+        one stage's rows is a scan per poll for a number ``COUNT(*)`` returns.
+
+        Read-only and read-never-creates: an absent ledger counts zero, matching
+        :meth:`stage_breakdown`'s empty answer rather than raising.
+        """
+        if not self.db_path.exists():
+            return 0
+        with self._connect_ro() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM stages WHERE run_id = ? AND stage_name = ?",
+                (run_id, stage_name),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
     def stage_usage_rows(self, run_id: str) -> list[dict]:
         """Every stage attempt of ``run_id`` with its recorded usage (28.1-001).
 

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 __all__ = [
     "DEFAULT_BUDGETS",
@@ -24,6 +24,7 @@ __all__ = [
     "budget_for",
     "default_priority",
     "default_queue_path",
+    "fix_rounds_exhausted",
     "overlap_dependencies",
 ]
 
@@ -199,6 +200,13 @@ DEFAULT_BUDGETS: dict[str, JobBudget] = {
 # runs hotter or colder than the defaults actually wants. A malformed or
 # non-positive value is ignored rather than honoured — disarming a breaker by
 # typo is the one failure mode a breaker must not have.
+#
+# They are read at **stamp time** — `sdlc queue add`/`--enqueue` and `sdlc queue
+# prioritise` — and never at drain time, because the budget is frozen onto the
+# row (that freeze is what makes `queue list`'s ``5r/4h`` column honest). So
+# setting them before `sdlc queue run` does nothing to jobs that are already
+# enqueued; to change those, re-stamp them with `sdlc queue prioritise`. Every
+# help string and doc that names these two says so.
 _ENV_MAX_FIX_ROUNDS = "SDLC_QUEUE_MAX_FIX_ROUNDS"
 _ENV_WALL_CLOCK_MINUTES = "SDLC_QUEUE_WALL_CLOCK_MINUTES"
 
@@ -233,6 +241,18 @@ def budget_for(priority: str) -> JobBudget:
     )
 
 
+def fix_rounds_exhausted(budget: JobBudget, fix_rounds: int) -> bool:
+    """Whether ``fix_rounds`` alone has exhausted ``budget`` — the *thrash* arm.
+
+    Split out of :func:`budget_breach` because the caller needs the arm, not
+    just the reason: a thrash park banks a fix-round baseline so the operator's
+    `sdlc queue requeue` grants one more allowance, and a wall-clock park must
+    not (it has not spent the rounds). One definition, so the reason string and
+    the baseline decision can never disagree about what "thrashed" means.
+    """
+    return fix_rounds >= budget.max_fix_rounds
+
+
 def budget_breach(
     budget: JobBudget, *, elapsed_seconds: float, fix_rounds: int
 ) -> str | None:
@@ -241,8 +261,13 @@ def budget_breach(
     Returns an operator-readable reason rather than a bool so the park recorded
     on the job says *which* ceiling was hit and by how much — "budget exceeded"
     on its own sends a human to read the ledger to find out what happened.
+
+    ``fix_rounds`` is the rounds burned *since the job's fix-round baseline*
+    (:meth:`QueueStore.record_fix_rounds_baseline`), not since the run opened —
+    the caller subtracts. The two are the same number until the first thrash
+    park, which is when the baseline starts to exist.
     """
-    if fix_rounds >= budget.max_fix_rounds:
+    if fix_rounds_exhausted(budget, fix_rounds):
         return (
             f"budget exhausted: {fix_rounds} fix rounds "
             f"(cap {budget.max_fix_rounds})"
@@ -308,9 +333,14 @@ class JobRecord:
     reason: str | None
     # Story 32.3-001. ``budget`` is the class budget frozen at enqueue (JSON);
     # ``files`` is the job's investigated ``files_to_modify`` (JSON array),
-    # which is what the repo-scoped overlap graph is built from.
+    # which is what the repo-scoped overlap graph is built from;
+    # ``fix_rounds_baseline`` is the run's cumulative bugfix-round count as of
+    # the last thrash park, so the cap is measured from there rather than from
+    # the run's birth. Zero (never parked) for every job until the breaker
+    # fires, and for every row written before the column existed.
     budget: str | None = None
     files: str | None = None
+    fix_rounds_baseline: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -329,6 +359,7 @@ class JobRecord:
             "reason": self.reason,
             "budget": self.budget,
             "files": self.files,
+            "fix_rounds_baseline": self.fix_rounds_baseline,
         }
 
     def job_budget(self) -> JobBudget:
@@ -380,7 +411,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     reason      TEXT,
     budget      TEXT,
-    files       TEXT
+    files       TEXT,
+    fix_rounds_baseline INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -395,9 +427,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
 
 # Schema migrations applied after the base DDL, in the same
 # ``(version, name, table, columns, create_sql)`` shape as the ledger's
-# ``_MIGRATIONS`` (sdlc/build.py). Version 1 is Story 32.3-001's; future columns
-# (e.g. a claim lease renewal field) take the next version so an existing host
-# queue.db upgrades in place. The DDL above always describes the *current*
+# ``_MIGRATIONS`` (sdlc/build.py). Versions 1 and 2 are Story 32.3-001's; future
+# columns (e.g. a claim lease renewal field) take the next version so an existing
+# host queue.db upgrades in place. The DDL above always describes the *current*
 # schema, so a fresh store never runs these — they exist for the stores that
 # already have rows.
 _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
@@ -410,6 +442,19 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         "job_budget_and_files",
         "jobs",
         [("budget", "TEXT"), ("files", "TEXT")],
+        None,
+    ),
+    # Story 32.3-001: the fix rounds already burned when the breaker last parked
+    # the job. Its own column rather than a key inside ``budget`` because the
+    # two are different kinds of fact — ``budget`` is policy copied from the
+    # class (and re-stamped wholesale by `prioritise`), this is consumption
+    # measured off the run's ledger, and a class change must not erase it.
+    # Nullable, read as 0: a row from before this migration has banked nothing.
+    (
+        2,
+        "job_fix_rounds_baseline",
+        "jobs",
+        [("fix_rounds_baseline", "INTEGER")],
         None,
     ),
 ]
@@ -591,6 +636,13 @@ class QueueStore:
         scheduler instead) and a ``queued`` one (already armed; silently
         succeeding would hide a mistyped id). ``options``, ``priority``,
         ``kind`` and ``scope`` are untouched; only lifecycle fields move.
+
+        Budgets are untouched here too, and deliberately so: the wall clock is
+        measured from each *launch*, so the resumed job gets a fresh one for
+        free, and the fix-round allowance was already re-based by the breaker
+        when it parked the job (:meth:`record_fix_rounds_baseline`). Requeue
+        therefore needs no ledger of its own — which is what keeps this store
+        ignorant of runs.
         """
         job = self.get_job(job_id)
         if job is None:
@@ -646,15 +698,45 @@ class QueueStore:
         investigation says which files it will touch, an overlapping peer in the
         same repo must wait for it (:meth:`overlap_holds`). Its production
         caller is the scheduler (``_Scheduler._record_plan_files``), which reads
-        the plan from the run's own ledger. Today per-repo
-        exclusivity already serialises everything in one checkout, so this only
-        *narrows* nothing; it is what keeps overlapping jobs serial once Story
-        32.1-003 lets two non-overlapping jobs share a repo.
+        the plan from the run's own ledger. Today per-repo exclusivity already
+        serialises everything in one checkout, so this narrows nothing yet.
+
+        Note the horizon this buys, and the one it does not. A footprint is only
+        knowable *after* a job has run far enough to freeze an investigation, so
+        the graph can hold a job whose **recorded** footprint overlaps a pending
+        peer — a requeued job held on the strength of what it touched last time —
+        and can never hold two never-run jobs whose investigations would collide.
+        Story 32.1-003, which lets two non-overlapping jobs share a checkout,
+        therefore needs a start-time check of its own (investigate before claim,
+        or re-check once the plan lands) *on top of* this graph, not just this
+        graph. See :meth:`overlap_holds`.
         """
         with self._connect() as conn:
             conn.execute(
                 "UPDATE jobs SET files = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(sorted({str(p) for p in paths})), _now_iso(), job_id),
+            )
+
+    def record_fix_rounds_baseline(self, job_id: int, rounds: int) -> None:
+        """Bank the fix rounds burned so far, so the cap counts from here.
+
+        Written by the scheduler's breaker at the moment it parks a job for
+        thrashing (``_Scheduler._enforce_budgets``), and only for that arm — a
+        wall-clock park has not spent the rounds, so banking them there would
+        hand the job a second allowance it never earned.
+
+        This is what makes `sdlc queue requeue` a real exit from a fix-round
+        park. ``ledger_fix_rounds`` counts every ``bugfix`` row the *run* has
+        ever recorded, and a requeue re-enters that same run, so without a
+        baseline the resumed job is over its cap on its first poll and is
+        stopped again having done nothing. With it, the operator's decision to
+        keep paying buys exactly one more class budget — the breaker still
+        fires, one allowance later, which is the point of it being a breaker.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET fix_rounds_baseline = ?, updated_at = ? WHERE id = ?",
+                (int(rounds), _now_iso(), job_id),
             )
 
     def _set_state(self, job_id: int, state: str) -> None:
@@ -728,6 +810,11 @@ class QueueStore:
         a predecessor that reaches any terminal (or is cancelled) drops out of
         the graph, so its successor becomes claimable on the very next pass with
         no extra bookkeeping to get wrong.
+
+        A job with no recorded footprint is a singleton and is never held: the
+        guarantee is over *recorded* file sets, not over the files two never-run
+        jobs would turn out to want. :meth:`record_files` spells out what that
+        leaves for Story 32.1-003 to add.
         """
         if not self.db_path.exists():
             return {}
@@ -915,7 +1002,12 @@ class QueueStore:
             )
 
     def finish_job(self, job_id: int, state: str, *, reason: str | None = None) -> None:
-        """Stamp a job terminal (``done``/``failed``/``blocked``) and drop its lease."""
+        """Stamp a job terminal and drop its lease.
+
+        The four terminals are ``done``, ``failed``, ``blocked`` (the run parked
+        itself, or the scheduler refused to start it) and ``needs_attention``
+        (the queue's own budget breaker stopped it).
+        """
         if state not in _TERMINAL_STATES:
             raise QueueError(
                 f"invalid terminal state: {state!r} "
@@ -1033,6 +1125,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         reason=row["reason"],
         budget=_optional_column(row, "budget"),
         files=_optional_column(row, "files"),
+        fix_rounds_baseline=int(_optional_column(row, "fix_rounds_baseline") or 0),
     )
 
 
@@ -1049,12 +1142,13 @@ def _decode_files(raw: str | None) -> set[str]:
     return {str(item) for item in parsed}
 
 
-def _optional_column(row: sqlite3.Row, name: str) -> str | None:
+def _optional_column(row: sqlite3.Row, name: str) -> Any:
     """``row[name]`` when the column exists, else ``None``.
 
     A read verb never migrates (:meth:`QueueStore.ensure_migrated` is explicit),
     so `sdlc queue list` can legitimately meet a pre-32.3-001 queue.db that has
-    no ``budget``/``files`` columns. Missing reads as absent, not as a crash.
+    no ``budget``/``files``/``fix_rounds_baseline`` columns. Missing reads as
+    absent, not as a crash.
     """
     try:
         return row[name]

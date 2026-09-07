@@ -16,7 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
-from sdlc.queue import JobBudget, JobRecord, QueueStore, budget_breach
+from sdlc.queue import (
+    JobBudget,
+    JobRecord,
+    QueueStore,
+    budget_breach,
+    fix_rounds_exhausted,
+)
 from sdlc.registry import Registry, RunRecord, pid_alive
 
 __all__ = [
@@ -143,9 +149,14 @@ class _InFlight:
     last_renewed: datetime
     # Story 32.3-001. ``started_at`` is when *this launch* began, so a resumed
     # job gets a fresh wall clock rather than inheriting the dead scheduler's;
-    # ``budget`` is the class budget frozen on the job at enqueue.
+    # ``budget`` is the class budget frozen on the job at enqueue;
+    # ``fix_rounds_baseline`` is the rounds the run had already burned when the
+    # breaker last parked this job, so the cap is measured from there and a
+    # requeued job is not re-parked on its first poll for a spend a human has
+    # already signed off.
     started_at: datetime
     budget: JobBudget
+    fix_rounds_baseline: int = 0
     # Whether this launch has already copied the run's investigated file set
     # onto the queue row (AC2). Latches, so a job's footprint is read from its
     # ledger once rather than on every poll.
@@ -331,8 +342,15 @@ def ledger_fix_rounds(db_path: str, run_id: str) -> int:
     ``build.MAX_BUGFIX_ATTEMPTS``; this counts the same rows from the outside,
     across every story in the run, so the queue can stop paying for a job that
     is thrashing story after story while each individual loop stays legal.
-    Deliberately reads ``stage_breakdown`` rather than reaching into the
-    pipeline's counters — the ledger is the run's public record.
+    Deliberately reads the ledger rather than reaching into the pipeline's
+    counters — the ledger is the run's public record.
+
+    Counts with ``stage_attempt_count`` rather than filtering a
+    ``stage_breakdown``: this runs once per in-flight job on every poll
+    (``DEFAULT_POLL_SECONDS`` is 2s, so ~1800 times an hour per job), and
+    materialising every stage attempt of a long run into per-attempt dicts with
+    summed token counts — to then keep only the ``bugfix`` rows — is a scan and
+    an allocation per poll for a number SQL can return directly.
 
     Degrades to ``0`` on any read failure: an unreadable ledger is a reason to
     leave the breaker un-fired, never a reason to park a healthy job or to take
@@ -341,15 +359,9 @@ def ledger_fix_rounds(db_path: str, run_id: str) -> int:
     from sdlc.build import Ledger
 
     try:
-        breakdown = Ledger(Path(db_path)).stage_breakdown(run_id)
+        return Ledger(Path(db_path)).stage_attempt_count(run_id, "bugfix")
     except Exception:
         return 0
-    return sum(
-        1
-        for attempts in breakdown.values()
-        for attempt in attempts
-        if attempt.get("name") == "bugfix"
-    )
 
 
 def ledger_plan_files(db_path: str, run_id: str) -> list[str]:
@@ -596,7 +608,7 @@ class _Scheduler:
         self._in_flight[job.id] = _InFlight(
             job=job, proc=proc, slots=cost, run_id=job.run_id,
             last_renewed=self._clock(), started_at=self._clock(),
-            budget=job.job_budget(),
+            budget=job.job_budget(), fix_rounds_baseline=job.fix_rounds_baseline,
         )
         if resume:
             self._result.resumed += 1
@@ -666,12 +678,27 @@ class _Scheduler:
         continuing. `sdlc queue requeue` is that decision's exit, and for a job
         that already opened a run it comes back as a *resume*, so the spend so
         far is not thrown away.
+
+        For that exit to work, the two ceilings have to be re-based when they
+        fire, and they are re-based differently because they measure different
+        things. The wall clock is per *launch*, so a resume gets a fresh one by
+        construction. Fix rounds are read cumulatively off the run's ledger and
+        a resume re-enters the **same** run, so the count that fired the breaker
+        is still there on the next poll: the rounds burned are banked as the
+        job's baseline (:meth:`QueueStore.record_fix_rounds_baseline`) and the
+        cap is measured from it. A requeue then buys exactly one more class
+        budget rather than an immediate re-park — or an uncapped job.
+
+        Only the thrash arm banks a baseline. A job the clock stopped has not
+        spent its rounds, and crediting them would quietly hand it a second
+        allowance it never earned.
         """
         now = self._clock()
         for job_id, entry in list(self._in_flight.items()):
-            rounds = (
+            burned = (
                 self._run_fix_rounds(entry.run_id) if entry.run_id else 0
             )
+            rounds = max(0, burned - entry.fix_rounds_baseline)
             reason = budget_breach(
                 entry.budget,
                 elapsed_seconds=(now - entry.started_at).total_seconds(),
@@ -684,6 +711,8 @@ class _Scheduler:
                 entry.proc.stop()
             except OSError as exc:
                 self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            if fix_rounds_exhausted(entry.budget, rounds):
+                self._store.record_fix_rounds_baseline(job_id, burned)
             self._store.finish_job(job_id, "needs_attention", reason=reason)
             self._result.parked += 1
             self._echo(f"job {job_id} parked (needs_attention): {reason}")
@@ -861,8 +890,9 @@ def run_queue(
     Every collaborator is injectable so the loop is testable without forking:
     ``launcher`` spawns a job, ``clock``/``sleeper`` drive time, ``registry``
     supplies run liveness, ``version_check`` is Story 15.1-004's per-repo check,
-    ``fix_rounds`` counts a run's burned bugfix rounds, and ``notifier`` is the
-    Telegram path.
+    ``fix_rounds`` counts a run's burned bugfix rounds, ``plan_files`` reads the
+    file set a run's investigation froze (the overlap graph's write side), and
+    ``notifier`` is the Telegram path.
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from

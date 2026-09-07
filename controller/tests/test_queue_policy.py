@@ -330,3 +330,46 @@ def test_needs_attention_is_a_terminal_park(tmp_path) -> None:
 
     store.requeue_job(job_id)
     assert store.get_job(job_id).state == "queued"
+
+
+def test_fix_rounds_exhausted_is_the_thrash_arm_of_budget_breach() -> None:
+    """One definition of "has thrashed", shared by the reason and the baseline.
+
+    `_enforce_budgets` has to bank a fix-round baseline on a thrash park but not
+    on a clock park, so it needs the arm as a predicate rather than by matching
+    on the reason string.
+    """
+    from sdlc.queue import JobBudget, budget_breach, fix_rounds_exhausted
+
+    budget = JobBudget(max_fix_rounds=5, wall_clock_seconds=60)
+    assert fix_rounds_exhausted(budget, 4) is False
+    assert fix_rounds_exhausted(budget, 5) is True
+    # A clock breach is not a thrash breach, however loud the reason is.
+    assert "wall-clock" in (budget_breach(budget, elapsed_seconds=61, fix_rounds=4) or "")
+    assert fix_rounds_exhausted(budget, 4) is False
+
+
+def test_record_fix_rounds_baseline_banks_the_spend_so_far(tmp_path) -> None:
+    """The rounds a job had burned when the breaker last fired.
+
+    The cap is measured *from* this, so a requeued job's next allowance is one
+    more class budget rather than a re-park on its first poll.
+    """
+    store = _store(tmp_path)
+    job_id = store.add_job(repo="/a", kind="fix", scope="1")
+    assert store.get_job(job_id).fix_rounds_baseline == 0
+
+    store.record_fix_rounds_baseline(job_id, 5)
+    assert store.get_job(job_id).fix_rounds_baseline == 5
+
+
+def test_a_pre_migration_row_reads_a_zero_fix_rounds_baseline(tmp_path) -> None:
+    """A row written before this column exists has spent nothing off the record."""
+    from sdlc.queue import JobRecord
+
+    record = JobRecord(
+        id=1, repo="/a", kind="fix", scope="1", priority="high", state="queued",
+        claimed_by=None, lease_until=None, run_id=None, options=None,
+        created_at="", updated_at="", reason=None,
+    )
+    assert record.fix_rounds_baseline == 0
