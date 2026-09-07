@@ -392,6 +392,132 @@ def test_resolve_fix_host_autodetects_gitlab_from_remote(tmp_path, monkeypatch) 
     assert fix_mod._resolve_fix_host(tmp_path, None) == "gitlab"
 
 
+def test_resolve_fix_forge_override_wins() -> None:
+    resolution = fix_mod._resolve_fix_forge(Path("/nonexistent"), "gitlab")
+    assert resolution == fix_mod.issue_host.ForgeResolution(
+        host="gitlab", instance_url=None, source="override"
+    )
+
+
+def test_resolve_fix_forge_defaults_to_github_when_undetectable(tmp_path) -> None:
+    resolution = fix_mod._resolve_fix_forge(tmp_path, None)
+    assert resolution == fix_mod.issue_host.ForgeResolution(
+        host="github", instance_url=None, source="auto-detect"
+    )
+
+
+def test_resolve_fix_forge_declaration_wins_over_auto_detect(tmp_path, monkeypatch) -> None:
+    (tmp_path / fix_mod.issue_host.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    monkeypatch.setattr(fix_mod.issue_host, "detect_host", lambda root: "github")
+    resolution = fix_mod._resolve_fix_forge(tmp_path, None)
+    assert resolution == fix_mod.issue_host.ForgeResolution(
+        host="gitlab", instance_url="http://127.0.0.1:8080", source="declaration"
+    )
+
+
+def test_resolve_fix_forge_override_keeps_declared_instance_for_same_forge(tmp_path) -> None:
+    """Story 30.1-001: `sdlc fix --host gitlab` in a repo that declares a local
+    GitLab instance must still target that instance — the flag names the forge
+    kind, only the declaration names the instance."""
+    (tmp_path / fix_mod.issue_host.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    resolution = fix_mod._resolve_fix_forge(tmp_path, "gitlab")
+    assert resolution.host == "gitlab"
+    assert resolution.instance_url == "http://127.0.0.1:8080"
+    assert resolution.source == "override"
+
+
+def test_resolve_fix_forge_override_for_other_forge_drops_instance(tmp_path) -> None:
+    (tmp_path / fix_mod.issue_host.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    resolution = fix_mod._resolve_fix_forge(tmp_path, "github")
+    assert resolution.host == "github"
+    assert resolution.instance_url is None
+
+
+def test_resolve_fix_forge_malformed_declaration_raises(tmp_path) -> None:
+    (tmp_path / fix_mod.issue_host.FORGE_OVERRIDE_FILENAME).write_text("forge: bitbucket\n")
+    with pytest.raises(fix_mod.issue_host.IssueHostError, match="unsupported forge"):
+        fix_mod._resolve_fix_forge(tmp_path, None)
+
+
+def test_resolve_fix_host_delegates_to_resolve_fix_forge(tmp_path) -> None:
+    (tmp_path / fix_mod.issue_host.FORGE_OVERRIDE_FILENAME).write_text("forge: gitlab\n")
+    assert fix_mod._resolve_fix_host(tmp_path, None) == "gitlab"
+
+
+def test_open_docs_only_pr_threads_declared_instance_url(tmp_path, monkeypatch) -> None:
+    import subprocess
+
+    import sdlc.issue_host as issue_host_mod
+    from sdlc.issue_host import ChangeRequest
+
+    root = _fix_repo_with_origin(tmp_path, "feature/issue-7")
+    captured: dict = {}
+
+    class _Adapter:
+        def cr_create(self, source_branch, title, body, target_branch=None, draft=False):
+            return ChangeRequest(host="gitlab", ref="9", url="https://x/-/merge_requests/9")
+
+    monkeypatch.setattr(
+        issue_host_mod, "get_adapter",
+        lambda host, runner=None, instance_url=None: (
+            captured.update(host=host, instance_url=instance_url), _Adapter()
+        )[1],
+    )
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("issue-7", "fix")
+    issue = FixIssue(7, "Fix broken README link", "b", "open", (), ())
+    story = issue_story(issue, root=root)
+    pr = fix_mod._open_docs_only_pr(
+        issue, story, ledger, run_id, root,
+        host="gitlab", instance_url="http://127.0.0.1:8080",
+    )
+    assert pr == 9
+    assert captured == {"host": "gitlab", "instance_url": "http://127.0.0.1:8080"}
+
+
+def test_list_open_issues_threads_gitlab_host_env() -> None:
+    """Story 30.1-001: a declared instance reaches `glab` via a per-invocation
+    `GITLAB_HOST` env override, without touching the injected runner when no
+    instance is declared (existing GitHub/GitLab callers stay unaffected)."""
+    seen: dict = {}
+
+    def runner(argv, timeout=None, env=None):
+        seen["env"] = env
+        return fix_mod.issue_host.RunResult(returncode=0, stdout="[]", stderr="")
+
+    fix_mod._list_open_issues(
+        runner, host="gitlab", instance_url="http://127.0.0.1:8080"
+    )
+    assert seen["env"]["GITLAB_HOST"] == "http://127.0.0.1:8080"
+    # The shared helper is the single seam, so a plaintext instance gets the
+    # private `glab` config dir here too — not just inside the adapters.
+    assert "GLAB_CONFIG_DIR" in seen["env"]
+
+
+def test_list_open_issues_no_instance_url_passes_no_env() -> None:
+    """Story 30.1-001 AC2: with no declared instance the runner is invoked exactly
+    as before — a pre-existing double whose signature has no ``env`` keyword is
+    never called with one (that would raise TypeError). The call is asserted, so
+    "did not raise" cannot pass vacuously on a runner that was never reached."""
+    calls: list[list[str]] = []
+
+    def runner(argv, timeout=None):
+        calls.append(list(argv))
+        return fix_mod.issue_host.RunResult(returncode=0, stdout="[]", stderr="")
+
+    fix_mod._list_open_issues(runner, host="gitlab")
+
+    assert calls, "the env-less runner was never invoked"
+    assert all("GITLAB_HOST" not in " ".join(argv) for argv in calls)
+
+
 def test_parse_fix_args_host_flag() -> None:
     opts = parse_fix_args(["38", "--host=gitlab"])
     assert isinstance(opts, FixOptions)
@@ -3334,7 +3460,10 @@ def test_open_docs_only_pr_pushes_and_opens(tmp_path, monkeypatch) -> None:
             return ChangeRequest(host="github", ref="123", url="https://x/pull/123")
 
     monkeypatch.setattr(issue_host_mod, "resolve_host", lambda r, override=None: "github")
-    monkeypatch.setattr(issue_host_mod, "get_adapter", lambda host, runner=None: _Adapter())
+    monkeypatch.setattr(
+        issue_host_mod, "get_adapter",
+        lambda host, runner=None, instance_url=None: _Adapter(),
+    )
     ledger = Ledger(tmp_path / "l.db")
     ledger.init()
     run_id = ledger.run_create("issue-7", "fix")

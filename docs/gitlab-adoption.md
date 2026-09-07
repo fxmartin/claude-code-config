@@ -74,6 +74,11 @@ Starting from a fresh company GitLab repo:
    sdlc issues init           # auto-detects the GitLab host from the remote
    ```
 
+   A **local or self-hosted** instance whose hostname carries no `gitlab`
+   substring (auto-detection can't key on it) should instead check in a
+   `.sdlc-forge.yaml` — see
+   [Declaring a self-hosted instance](issue-host-adapters.md#declaring-a-self-hosted-instance--sdlc-forgeyaml-story-301-001).
+
 4. **Run the preflight and clear every gap** until it is all green:
 
    ```bash

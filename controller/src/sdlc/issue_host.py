@@ -3,14 +3,22 @@
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
 import re
+import shutil
 import subprocess
+import tempfile
+import threading
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Protocol
+from urllib.parse import urlparse
+
+import yaml
 
 __all__ = [
     "GITHUB",
@@ -37,6 +45,15 @@ __all__ = [
     "host_from_remote",
     "detect_host",
     "resolve_host",
+    "FORGE_OVERRIDE_FILENAME",
+    "ForgeDeclaration",
+    "ForgeResolution",
+    "load_repo_forge_declaration",
+    "resolve_forge",
+    "declared_instance_for",
+    "format_forge_preflight_line",
+    "gitlab_instance_env",
+    "github_instance_env",
 ]
 
 # The two code hosts this epic targets. GitHub is FX's personal forge (where the
@@ -95,10 +112,22 @@ class RunResult:
     stderr: str
 
 
-# A runner runs one CLI argv and returns its :class:`RunResult`. Injected into
-# adapters so tests can stub `gh`/`glab` without a live CLI, mirroring the
-# dispatch-seam philosophy of Epic-20 (swap the CLI behind a stable interface).
-Runner = Callable[[Sequence[str]], RunResult]
+class Runner(Protocol):
+    """Runs one CLI argv and returns its :class:`RunResult`.
+
+    Injected into adapters so tests can stub `gh`/`glab` without a live CLI,
+    mirroring the dispatch-seam philosophy of Epic-20 (swap the CLI behind a
+    stable interface). ``env`` (Story 30.1-001) is an optional mapping merged
+    onto the invocation's environment; :func:`_default_runner` and
+    :func:`repo_runner` both honour it. :class:`IssueHostAdapter` only ever
+    passes it when an adapter carries a declared instance URL, so a runner
+    that ignores the keyword (a pre-existing test double) is never called with
+    it.
+    """
+
+    def __call__(
+        self, argv: Sequence[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult: ...
 
 
 @dataclass(frozen=True)
@@ -227,6 +256,7 @@ def _default_runner(
     argv: Sequence[str],
     timeout: float = _CLI_TIMEOUT,
     cwd: "str | Path | None" = None,
+    env: Mapping[str, str] | None = None,
 ) -> RunResult:
     """Run ``argv`` via subprocess; raise :class:`IssueHostError` if the CLI is absent.
 
@@ -235,6 +265,12 @@ def _default_runner(
     target repo (the build and fix pipelines) leave it None; a caller driving
     several repos from one process (`sdlc queue run`) passes the repo root via
     :func:`repo_runner`.
+
+    ``env`` (Story 30.1-001) merges onto the *current* environment for this one
+    invocation only — never mutates ``os.environ`` or the user's global CLI
+    config — so a GitLab adapter carrying a declared instance URL can point
+    `glab` at it (``GITLAB_HOST``) per call, and every other invocation on the
+    process (a different repo, a different host) is unaffected.
     """
     try:
         out = subprocess.run(
@@ -243,6 +279,7 @@ def _default_runner(
             text=True,
             timeout=timeout,
             cwd=str(cwd) if cwd is not None else None,
+            env={**os.environ, **env} if env is not None else None,
         )
     except FileNotFoundError as exc:
         raise IssueHostError(f"{argv[0]} not found on PATH — install the host CLI") from exc
@@ -257,12 +294,16 @@ def repo_runner(root: "str | Path") -> Runner:
     `gh`/`glab` infer the repository from the working directory, so a process
     that polls change requests across several repos — the queue scheduler —
     cannot use the default runner, which inherits its own cwd. Everything else
-    (missing-CLI handling, timeouts, the :class:`RunResult` shape) is the
-    default runner's.
+    (missing-CLI handling, timeouts, the :class:`RunResult` shape, the optional
+    per-invocation ``env`` — Story 30.1-001) is the default runner's.
     """
 
-    def _run(argv: Sequence[str], timeout: float = _CLI_TIMEOUT) -> RunResult:
-        return _default_runner(argv, timeout, cwd=root)
+    def _run(
+        argv: Sequence[str],
+        timeout: float = _CLI_TIMEOUT,
+        env: Mapping[str, str] | None = None,
+    ) -> RunResult:
+        return _default_runner(argv, timeout, cwd=root, env=env)
 
     return _run
 
@@ -322,23 +363,308 @@ def detect_host(root: str | Path) -> str | None:
     return host_from_remote(_remote_url(root))
 
 
-def resolve_host(root: str | Path, override: str | None = None) -> str:
-    """Pick the host: explicit ``override`` wins, else auto-detect from the remote.
+# --- `.sdlc-forge.yaml` declaration (Story 30.1-001) -------------------------
 
-    Fails fast with a clear message when the host cannot be determined or is
-    unsupported, so a command never silently targets the wrong forge.
+# The additive per-repo file a consumer repo may ship at its root to declare
+# its forge kind/instance ahead of hostname auto-detection — so a repo whose
+# origin points at a local/self-hosted instance (`http://127.0.0.1:8080/...`)
+# never depends on the remote's hostname carrying a `gitlab`/`github` tell.
+# Mirrors the existing `.sdlc-*` convention (`.sdlc-harness.yaml`,
+# `.sdlc-model-routing.yaml`, `.sdlc-risk-config.yaml`).
+FORGE_OVERRIDE_FILENAME = ".sdlc-forge.yaml"
+
+
+@dataclass(frozen=True)
+class ForgeDeclaration:
+    """A repo's `.sdlc-forge.yaml` contents: which forge, and (optionally) which instance.
+
+    ``forge`` is one of :data:`SUPPORTED_HOSTS`; ``instance_url`` is the
+    self-hosted/local instance's base URL (the file's ``<forge>_url`` key, e.g.
+    ``gitlab_url``), or None when the file names only the kind.
     """
-    host = (override or detect_host(root) or "").lower()
+
+    forge: str
+    instance_url: str | None = None
+
+
+def load_repo_forge_declaration(
+    *,
+    override_path: Path | None = None,
+    override_text: str | None = None,
+) -> ForgeDeclaration | None:
+    """Load a repo's ``.sdlc-forge.yaml`` (Story 30.1-001), or None when absent.
+
+    A missing file / blank text returns None — today's behaviour, so the common
+    (undeclared) repo costs one ``stat``. ``override_text`` is the inline form
+    tests use; otherwise the YAML at ``override_path`` is read when it exists.
+
+    The file is flat: a top-level ``forge:`` key (must be one of
+    :data:`SUPPORTED_HOSTS`) and an optional ``<forge>_url:`` key naming the
+    instance (e.g. ``gitlab_url: http://127.0.0.1:8080``). A present-but-malformed
+    file (bad YAML, not a mapping, a missing/unsupported ``forge:``, or a
+    malformed URL) raises :class:`IssueHostError` so a typo fails fast at
+    preflight rather than silently guessing wrong.
+    """
+    text = override_text
+    if text is None and override_path is not None and override_path.is_file():
+        # A non-UTF-8 file (a UTF-16 save from a Windows editor) or an
+        # unreadable one must fail the same way every other malformed
+        # declaration does: callers catch :class:`IssueHostError` only, so a raw
+        # `UnicodeDecodeError`/`OSError` here would escape every fail-fast guard
+        # as a traceback and break the "one actionable line" contract (AC3).
+        try:
+            text = override_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise IssueHostError(
+                f"{FORGE_OVERRIDE_FILENAME} could not be read as UTF-8 text: {exc}"
+            ) from exc
+    if text is None:
+        return None
+
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise IssueHostError(
+            f"{FORGE_OVERRIDE_FILENAME} is not valid YAML: {exc}"
+        ) from exc
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise IssueHostError(f"{FORGE_OVERRIDE_FILENAME} must be a mapping")
+
+    forge = raw.get("forge")
+    if not isinstance(forge, str) or not forge.strip():
+        raise IssueHostError(
+            f"{FORGE_OVERRIDE_FILENAME} must declare a non-empty 'forge' key"
+        )
+    forge = forge.strip().lower()
+    if forge not in SUPPORTED_HOSTS:
+        raise IssueHostError(
+            f"{FORGE_OVERRIDE_FILENAME} names unsupported forge {forge!r}; "
+            f"supported forges: {', '.join(SUPPORTED_HOSTS)}"
+        )
+
+    url_key = f"{forge}_url"
+    instance_url_raw = raw.get(url_key)
+    instance_url: str | None = None
+    if instance_url_raw is not None:
+        if not isinstance(instance_url_raw, str) or not instance_url_raw.strip():
+            raise IssueHostError(
+                f"{FORGE_OVERRIDE_FILENAME} {url_key!r} must be a non-empty URL"
+            )
+        instance_url = instance_url_raw.strip()
+        parsed = urlparse(instance_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise IssueHostError(
+                f"{FORGE_OVERRIDE_FILENAME} {url_key!r} is not a valid URL: "
+                f"{instance_url!r}"
+            )
+
+    return ForgeDeclaration(forge=forge, instance_url=instance_url)
+
+
+def declared_instance_for(
+    declaration: ForgeDeclaration | None, host: str
+) -> str | None:
+    """The declared instance URL that applies to ``host``, or None (Story 30.1-001).
+
+    Shared by :func:`resolve_forge` and ``fix_issue._resolve_fix_forge`` so both
+    apply one rule: a declaration only contributes its instance to the forge it
+    actually names. ``host`` is compared case-insensitively, since overrides
+    arrive verbatim from a CLI flag or the ledger's inventory cache.
+    """
+    if declaration is None or not declaration.instance_url:
+        return None
+    return declaration.instance_url if declaration.forge == host.strip().lower() else None
+
+
+@dataclass(frozen=True)
+class ForgeResolution:
+    """The outcome of resolving a run's forge (Story 30.1-001).
+
+    ``source`` names which precedence tier decided the *host* — ``"override"``
+    (an explicit CLI/env host), ``"declaration"`` (the repo's
+    `.sdlc-forge.yaml`), or ``"auto-detect"`` (today's hostname heuristic) — so
+    the preflight line (:func:`format_forge_preflight_line`) can say *why* a
+    host was picked, not just what it resolved to.
+
+    ``instance_url`` is a separate axis and always comes from the declaration:
+    no override or auto-detection names a specific self-hosted instance, so a
+    winning override sets ``host`` while the declaration still supplies the
+    instance whenever the two agree on the forge.
+    """
+
+    host: str
+    instance_url: str | None
+    source: str
+
+
+def resolve_forge(root: str | Path, override: str | None = None) -> ForgeResolution:
+    """Resolve the run's forge: CLI/env ``override`` > repo declaration > auto-detect.
+
+    Mirrors :func:`sdlc.role_routing.merge_harness_defaults`'s precedence for
+    harness routing (Story 20.7-005): an explicit override always wins; absent
+    one, a checked-in ``.sdlc-forge.yaml`` (Story 30.1-001) wins over guessing
+    from the ``origin`` remote's hostname. Fails fast with a one-line actionable
+    :class:`IssueHostError` when no host can be determined, when an override or
+    declared forge is unsupported, or when the declaration file itself is
+    malformed — never mid-pipeline. The override is validated *before* the file
+    is read, so an unsupported ``--host`` reports itself rather than a
+    (possibly also broken) declaration.
+
+    Host and instance are separate axes. An override names the forge *kind*
+    only — neither a `--host` flag nor the story inventory's recorded host
+    names a specific self-hosted instance — so a declaration for that same
+    forge still supplies ``instance_url``. Without that merge, every mapped
+    story's CR open (``build._story_cr_host_override`` returns the inventory's
+    host on any repo that ran ``sdlc issues init``) would silently target
+    gitlab.com instead of the repo's declared local instance. A declaration for
+    a *different* forge contributes nothing, so an explicit `--host github`
+    never inherits a GitLab instance.
+    """
+    host: str | None = None
+    if override:
+        host = override.strip().lower()
+        if host not in SUPPORTED_HOSTS:
+            raise IssueHostError(
+                f"unsupported host {host!r}; supported hosts: {', '.join(SUPPORTED_HOSTS)}"
+            )
+
+    declaration = load_repo_forge_declaration(
+        override_path=Path(root) / FORGE_OVERRIDE_FILENAME
+    )
+    if host is not None:
+        return ForgeResolution(
+            host=host,
+            instance_url=declared_instance_for(declaration, host),
+            source="override",
+        )
+    if declaration is not None:
+        return ForgeResolution(
+            host=declaration.forge, instance_url=declaration.instance_url,
+            source="declaration",
+        )
+
+    host = detect_host(root) or ""
     if not host:
         raise IssueHostError(
             "could not determine code host from git remote; "
-            "pass an explicit host (github|gitlab)"
+            f"pass an explicit host (github|gitlab) or add {FORGE_OVERRIDE_FILENAME}"
         )
     if host not in SUPPORTED_HOSTS:
         raise IssueHostError(
             f"unsupported host {host!r}; supported hosts: {', '.join(SUPPORTED_HOSTS)}"
         )
-    return host
+    return ForgeResolution(host=host, instance_url=None, source="auto-detect")
+
+
+def format_forge_preflight_line(resolution: ForgeResolution) -> str:
+    """The `harness routing:` precedent's forge analogue — one preflight log line."""
+    instance = f" instance={resolution.instance_url}" if resolution.instance_url else ""
+    return f"forge routing: {resolution.host}{instance} ({resolution.source})"
+
+
+def resolve_host(root: str | Path, override: str | None = None) -> str:
+    """Pick the host: explicit ``override`` wins, else the repo's declared forge
+    (`.sdlc-forge.yaml`, Story 30.1-001), else auto-detect from the remote.
+
+    A thin wrapper over :func:`resolve_forge` for callers that only need the
+    host string (not the declared instance URL) — every existing call site's
+    behaviour is unchanged when the repo declares nothing (AC2).
+    """
+    return resolve_forge(root, override=override).host
+
+
+# --- per-invocation CLI env for a declared instance (Story 30.1-001 AC5) -----
+
+# `glab` derives the API base from `GITLAB_HOST` but **discards the URL's
+# scheme**: every host is forced to https except the one hardcoded GDK default
+# `127.0.0.1:8080`. A declaration that names any other plaintext instance
+# (`http://127.0.0.1:8929`, `http://gitlab.corp:8080`) would therefore TLS-fail
+# on every call — silently, because most host seams are best-effort. The only
+# mechanism `glab` honours for the protocol is a config file's per-host
+# `api_protocol`, so an http declaration gets a **controller-owned** config dir
+# (`GLAB_CONFIG_DIR`) holding just that host's entry. The user's own
+# `~/.config/glab-cli/config.yml` is never written to; its entry for that host
+# is copied in read-only so a `glab auth login` token still authenticates.
+_GLAB_HTTP_CONFIG_DIRS: dict[str, str] = {}
+_GLAB_HTTP_CONFIG_LOCK = threading.Lock()
+
+
+def _user_glab_host_entry(netloc: str) -> dict:
+    """The user's own `glab` config entry for ``netloc`` (token, username), or {}.
+
+    Read-only and best-effort: an absent/unreadable/malformed config yields an
+    empty entry, and authentication then falls back to ``GITLAB_TOKEN`` in the
+    environment — the same credential source a fresh machine uses.
+    """
+    base = os.environ.get("GLAB_CONFIG_DIR") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "glab-cli"
+    )
+    try:
+        raw = yaml.safe_load(Path(base, "config.yml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    hosts = raw.get("hosts")
+    entry = hosts.get(netloc) if isinstance(hosts, dict) else None
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def _glab_http_config_dir(instance_url: str) -> str:
+    """A private `glab` config dir pinning ``instance_url``'s host to plain http.
+
+    Built once per instance URL per process (adapters are constructed per
+    operation) and removed at interpreter exit. Only the one host's entry is
+    copied from the user's config, so no unrelated forge token is duplicated
+    onto disk; the file is written 0600 inside a 0700 temp dir.
+    """
+    with _GLAB_HTTP_CONFIG_LOCK:
+        cached = _GLAB_HTTP_CONFIG_DIRS.get(instance_url)
+        if cached is not None:
+            return cached
+        netloc = urlparse(instance_url).netloc
+        entry = _user_glab_host_entry(netloc)
+        entry["api_protocol"] = "http"
+        entry.setdefault("api_host", netloc)
+        config_dir = tempfile.mkdtemp(prefix="sdlc-glab-")
+        config = Path(config_dir, "config.yml")
+        config.write_text(yaml.safe_dump({"hosts": {netloc: entry}}), encoding="utf-8")
+        config.chmod(0o600)
+        atexit.register(shutil.rmtree, config_dir, True)
+        _GLAB_HTTP_CONFIG_DIRS[instance_url] = config_dir
+        return config_dir
+
+
+def gitlab_instance_env(instance_url: str | None) -> dict[str, str]:
+    """Per-invocation env pointing `glab` at ``instance_url`` (Story 30.1-001 AC5).
+
+    ``GITLAB_HOST`` selects the instance; a plaintext (``http://``) instance also
+    needs ``GLAB_CONFIG_DIR`` because `glab` ignores the URL's scheme (see the
+    module comment above). No declared instance means no override at all, so an
+    undeclared repo invokes `glab` exactly as before this story.
+    """
+    if not instance_url:
+        return {}
+    env = {"GITLAB_HOST": instance_url}
+    if urlparse(instance_url).scheme == "http":
+        env["GLAB_CONFIG_DIR"] = _glab_http_config_dir(instance_url)
+    return env
+
+
+def github_instance_env(instance_url: str | None) -> dict[str, str]:
+    """Per-invocation env pointing `gh` at ``instance_url`` (Story 30.1-001 AC1).
+
+    `gh` targets a non-default (Enterprise Server) install via ``GH_HOST``, which
+    takes a bare **hostname**, not a URL — so the declaration's URL is reduced to
+    its netloc. Without this the dashboard would rewrite deep links to a declared
+    ``github_url`` while every `gh` subprocess still hit github.com.
+    """
+    if not instance_url:
+        return {}
+    netloc = urlparse(instance_url).netloc
+    return {"GH_HOST": netloc} if netloc else {}
 
 
 # --- the adapter interface ---------------------------------------------------
@@ -366,8 +692,14 @@ class IssueHostAdapter(ABC):
     # route through (Story 23.2-001); each backend binds its own constant.
     cr_terms: ChangeRequestTerms
 
-    def __init__(self, runner: Runner | None = None) -> None:
+    def __init__(self, runner: Runner | None = None, instance_url: str | None = None) -> None:
         self._runner = runner or _default_runner
+        # The repo's declared self-hosted instance (`.sdlc-forge.yaml`, Story
+        # 30.1-001), if any. Each backend turns it into its own CLI's
+        # per-invocation env override (`GITLAB_HOST`/`GH_HOST`); the base class
+        # only records it.
+        self.instance_url = instance_url
+        self._instance_env: dict[str, str] | None = None
 
     # -- shared close-keyword (host-correct form) --
     def close_keyword(self, ref: "str | Issue") -> str:
@@ -542,9 +874,18 @@ class IssueHostAdapter(ABC):
 
     # -- shared call plumbing --
     def _invoke(self, *args: str) -> RunResult:
-        """Run ``<cli> ARGS`` through the runner; a missing/broken CLI raises IssueHostError."""
+        """Run ``<cli> ARGS`` through the runner; a missing/broken CLI raises IssueHostError.
+
+        When this adapter carries a declared instance (Story 30.1-001), the
+        env override is passed *per invocation* — the runner merges it onto
+        that one subprocess's environment — never by mutating `glab`'s global
+        config or `os.environ` for the process.
+        """
+        argv = [self.cli, *args]
         try:
-            return self._runner([self.cli, *args])
+            if self._instance_env:
+                return self._runner(argv, env=self._instance_env)
+            return self._runner(argv)
         except (OSError, subprocess.SubprocessError) as exc:
             raise IssueHostError(f"{self.cli} invocation failed: {exc}") from exc
 
@@ -607,6 +948,14 @@ class GitHubAdapter(IssueHostAdapter):
     host = GITHUB
     cli = "gh"
     cr_terms = GITHUB_CR_TERMS
+
+    def __init__(self, runner: Runner | None = None, instance_url: str | None = None) -> None:
+        super().__init__(runner=runner, instance_url=instance_url)
+        # A declared `github_url:` names an Enterprise Server install; `gh`
+        # targets it via `GH_HOST` (Story 30.1-001, :func:`github_instance_env`).
+        # Without this the dashboard's declared-instance deep links and this
+        # adapter's `gh` calls would name different forges.
+        self._instance_env = github_instance_env(instance_url) or None
 
     def whoami(self) -> str:
         return self._run("api", "user", "--jq", ".login").stdout.strip()
@@ -833,6 +1182,14 @@ class GitLabAdapter(IssueHostAdapter):
     host = GITLAB
     cli = "glab"
     cr_terms = GITLAB_CR_TERMS
+
+    def __init__(self, runner: Runner | None = None, instance_url: str | None = None) -> None:
+        super().__init__(runner=runner, instance_url=instance_url)
+        # `glab` reads `GITLAB_HOST` to target a non-default instance, plus a
+        # private `GLAB_CONFIG_DIR` for a plaintext one (Story 30.1-001 AC5,
+        # :func:`gitlab_instance_env`) — set only when a declaration named an
+        # instance, so a plain GitLab adapter invokes `glab` exactly as before.
+        self._instance_env = gitlab_instance_env(instance_url) or None
 
     def whoami(self) -> str:
         # `glab api` has no `--jq` flag (unlike `gh api`), so parse the JSON here.
@@ -1197,13 +1554,21 @@ def _norm_state(state: str | None) -> str | None:
     return s
 
 
-def get_adapter(host: str, runner: Runner | None = None) -> IssueHostAdapter:
-    """Build the adapter for ``host`` (``github``/``gitlab``); raise if unsupported."""
+def get_adapter(
+    host: str, runner: Runner | None = None, instance_url: str | None = None
+) -> IssueHostAdapter:
+    """Build the adapter for ``host`` (``github``/``gitlab``); raise if unsupported.
+
+    ``instance_url`` (Story 30.1-001) is the repo's declared self-hosted
+    instance — threaded onto whichever adapter is built so every subprocess it
+    runs targets that instance: `glab` via ``GITLAB_HOST`` (plus a private
+    ``GLAB_CONFIG_DIR`` for a plaintext instance), `gh` via ``GH_HOST``.
+    """
     host = (host or "").lower()
     if host == GITHUB:
-        return GitHubAdapter(runner=runner)
+        return GitHubAdapter(runner=runner, instance_url=instance_url)
     if host == GITLAB:
-        return GitLabAdapter(runner=runner)
+        return GitLabAdapter(runner=runner, instance_url=instance_url)
     raise IssueHostError(
         f"unsupported host {host!r}; supported hosts: {', '.join(SUPPORTED_HOSTS)}"
     )

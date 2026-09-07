@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -11,7 +12,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Callable
 
-from sdlc.issue_host import GITHUB, GITLAB
+from sdlc.issue_host import GITHUB, GITLAB, gitlab_instance_env
 
 __all__ = [
     "GITHUB",
@@ -61,12 +62,18 @@ def _run_gh(args: list[str], timeout: float = _GH_TIMEOUT) -> str | None:
     return out.stdout
 
 
-def _run_glab(args: list[str], timeout: float = _GH_TIMEOUT) -> str | None:
+def _run_glab(
+    args: list[str], timeout: float = _GH_TIMEOUT, env: dict[str, str] | None = None
+) -> str | None:
     """Run ``glab ARGS`` and return stdout text, or None on any failure.
 
     The GitLab twin of :func:`_run_gh`: returns None when ``glab`` is absent,
     errors, times out, or exits non-zero (unauthenticated / no such project) so
     the caller degrades to the "unavailable" sentinel rather than raising.
+
+    ``env`` (Story 30.1-001) merges onto this one subprocess's environment so a
+    repo that declares a self-hosted instance fetches *its* health instead of
+    whatever project shares the slug on gitlab.com.
     """
     try:
         out = subprocess.run(
@@ -74,6 +81,7 @@ def _run_glab(args: list[str], timeout: float = _GH_TIMEOUT) -> str | None:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env={**os.environ, **env} if env else None,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -246,18 +254,23 @@ def _fetch_ci(slug: str) -> dict | None:
     )
 
 
-def fetch_stats(slug: str | None, host: str = GITHUB) -> dict:
+def fetch_stats(
+    slug: str | None, host: str = GITHUB, instance_url: str | None = None
+) -> dict:
     """Fetch one repo's health (issues/CRs/CI), routed by ``host`` (Story 23.7-001).
 
     Dispatches to the GitHub (``gh``) or GitLab (``glab``) fetcher behind one
     stats shape, so a GitLab project shows GitLab health instead of the "GitHub
     unavailable" sentinel. ``host`` defaults to GitHub, keeping every pre-existing
     call byte-identical. A missing slug degrades to the ``no-remote`` sentinel.
+    ``instance_url`` (Story 30.1-001) is the repo's declared self-hosted
+    instance — without it a declared local-GitLab repo would fetch the health of
+    whatever project happens to share its slug on gitlab.com.
     """
     if not slug:
         return unavailable(None, "no-remote", host=host)
     if host == GITLAB:
-        return fetch_gitlab_stats(slug)
+        return fetch_gitlab_stats(slug, instance_url)
     return _fetch_github_stats(slug)
 
 
@@ -296,15 +309,15 @@ def _fetch_github_stats(slug: str) -> dict:
 # for the *selected run's* repo — not whatever repo it happens to run in.
 
 
-def _glab_count(args: list[str]) -> int | None:
+def _glab_count(args: list[str], env: dict[str, str] | None = None) -> int | None:
     """Count the rows a ``glab … list --output json`` call returns, or None."""
-    return _json_len(_run_glab(args))
+    return _json_len(_run_glab(args, env=env))
 
 
-def _gitlab_default_branch(slug: str) -> str | None:
+def _gitlab_default_branch(slug: str, env: dict[str, str] | None = None) -> str | None:
     """The project's default branch via the REST API, or None on any failure."""
     enc = urllib.parse.quote(slug, safe="")
-    out = _run_glab(["api", f"projects/{enc}"])
+    out = _run_glab(["api", f"projects/{enc}"], env=env)
     if not out:
         return None
     try:
@@ -315,13 +328,13 @@ def _gitlab_default_branch(slug: str) -> str | None:
     return branch or None
 
 
-def _fetch_gitlab_ci(slug: str) -> dict | None:
+def _fetch_gitlab_ci(slug: str, env: dict[str, str] | None = None) -> dict | None:
     """Latest pipeline on the project's *default* branch, normalized, or None."""
-    branch = _gitlab_default_branch(slug)
+    branch = _gitlab_default_branch(slug, env)
     if branch is None:
         return None
     enc = urllib.parse.quote(slug, safe="")
-    out = _run_glab(["api", f"projects/{enc}/pipelines?ref={branch}&per_page=1"])
+    out = _run_glab(["api", f"projects/{enc}/pipelines?ref={branch}&per_page=1"], env=env)
     if not out:
         return None
     try:
@@ -333,26 +346,28 @@ def _fetch_gitlab_ci(slug: str) -> dict | None:
     return normalize_gitlab_ci(pipelines[0])
 
 
-def fetch_gitlab_stats(slug: str) -> dict:
+def fetch_gitlab_stats(slug: str, instance_url: str | None = None) -> dict:
     """Fetch one repo's GitLab health (open/closed issues + MRs, default-branch CI).
 
     MRs map onto the shared ``prs_*`` fields so the dashboard renders them the
     same way it renders GitHub PRs. When *every* underlying call fails the repo
     is reported unavailable (``glab`` missing / unauthenticated / no such
     project); a partial result (counts present but no pipeline yet) still renders
-    as available.
+    as available. ``instance_url`` (Story 30.1-001) is the repo's declared
+    instance; None keeps every call byte-identical to the gitlab.com path.
     """
+    env = gitlab_instance_env(instance_url) or None
     counts = {
-        "issues_open": _glab_count(["issue", "list", "-R", slug, "--output", "json"]),
+        "issues_open": _glab_count(["issue", "list", "-R", slug, "--output", "json"], env),
         "issues_closed": _glab_count(
-            ["issue", "list", "-R", slug, "--closed", "--output", "json"]
+            ["issue", "list", "-R", slug, "--closed", "--output", "json"], env
         ),
-        "prs_open": _glab_count(["mr", "list", "-R", slug, "--output", "json"]),
+        "prs_open": _glab_count(["mr", "list", "-R", slug, "--output", "json"], env),
         "prs_closed": _glab_count(
-            ["mr", "list", "-R", slug, "--closed", "--output", "json"]
+            ["mr", "list", "-R", slug, "--closed", "--output", "json"], env
         ),
     }
-    ci = _fetch_gitlab_ci(slug)
+    ci = _fetch_gitlab_ci(slug, env)
     if ci is None and all(v is None for v in counts.values()):
         return unavailable(slug, "glab-unavailable", host=GITLAB)
     return {
@@ -398,7 +413,7 @@ class GitHubStatsCache:
         self,
         *,
         ttl: float = _DEFAULT_TTL,
-        fetcher: Callable[[str, str], dict] | None = None,
+        fetcher: Callable[[str, str, str | None], dict] | None = None,
         clock: Callable[[], float] | None = None,
         spawn: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
@@ -407,14 +422,22 @@ class GitHubStatsCache:
         self._clock = clock or time.monotonic
         self._spawn = spawn or _spawn_daemon
         self._lock = threading.Lock()
-        self._entries: dict[tuple[str, str], _Entry] = {}
-        self._inflight: set[tuple[str, str]] = set()
+        self._entries: dict[tuple[str, str, str], _Entry] = {}
+        self._inflight: set[tuple[str, str, str]] = set()
 
-    def get(self, slug: str | None, host: str = GITHUB) -> dict:
-        """Cached stats for ``(host, slug)``; schedules a background refresh when stale."""
+    def get(
+        self, slug: str | None, host: str = GITHUB, instance_url: str | None = None
+    ) -> dict:
+        """Cached stats for ``(host, slug, instance)``; refreshes in the background when stale.
+
+        ``instance_url`` (Story 30.1-001) is part of the key, not just the fetch:
+        the same ``owner/repo`` slug can exist on gitlab.com and on a declared
+        self-hosted instance, and one repo's health must never be served for the
+        other's.
+        """
         if not slug:
             return unavailable(None, "no-remote", host=host)
-        key = (host, slug)
+        key = (host, slug, instance_url or "")
         with self._lock:
             entry = self._entries.get(key)
             now = self._clock()
@@ -425,16 +448,19 @@ class GitHubStatsCache:
             if schedule:
                 self._inflight.add(key)
         if schedule:
-            self._spawn(lambda: self._refresh(slug, host))
+            self._spawn(lambda: self._refresh(slug, host, instance_url))
         with self._lock:
             entry = self._entries.get(key)
         return entry.stats if entry is not None else unavailable(slug, "pending", host=host)
 
-    def _refresh(self, slug: str, host: str = GITHUB) -> None:
+    def _refresh(
+        self, slug: str, host: str = GITHUB, instance_url: str | None = None
+    ) -> None:
+        key = (host, slug, instance_url or "")
         try:
-            stats = self._fetcher(slug, host)
+            stats = self._fetcher(slug, host, instance_url)
         except Exception:  # pragma: no cover - fetcher already degrades to a dict
             stats = unavailable(slug, "gh-unavailable", host=host)
         with self._lock:
-            self._entries[(host, slug)] = _Entry(stats, self._clock())
-            self._inflight.discard((host, slug))
+            self._entries[key] = _Entry(stats, self._clock())
+            self._inflight.discard(key)

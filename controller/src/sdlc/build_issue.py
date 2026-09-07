@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sdlc.issue_host import (
+    FORGE_OVERRIDE_FILENAME,
     GITHUB_CR_TERMS,
     ChangeRequestChecks,
     ChangeRequestTerms,
     IssueHostError,
     Runner,
+    declared_instance_for,
     get_adapter,
+    load_repo_forge_declaration,
 )
 
 if TYPE_CHECKING:  # avoid a runtime import cycle with build.py (which imports this)
@@ -78,14 +82,33 @@ def _adapter_and_ref(ledger: "Ledger", story_id: str, runner: Runner | None):
     Resolves the host from the inventory mapping and builds its adapter. Returns
     None — never raises — when the story has no mapping or the recorded host is
     unsupported, so every caller degrades to a clean no-op.
+
+    Story 30.1-001: the inventory records the forge *kind* only, so the repo's
+    `.sdlc-forge.yaml` supplies the self-hosted instance for that kind (the same
+    host-vs-instance split :func:`~sdlc.issue_host.resolve_forge` applies to an
+    explicit override). Without it every mirror-lifecycle call here — close-link,
+    CR terms, the merge gate's CI poll, status announcements — would build a
+    GitLab adapter with no ``GITLAB_HOST`` and target gitlab.com on precisely the
+    local-forge repos the declaration exists for. The declaration is read from
+    the process cwd because that is where these adapters' `gh`/`glab`
+    subprocesses run — every caller here uses the default (cwd-inheriting)
+    runner, so cwd's repo is the one being talked to.
     """
     mapping = ledger.inventory_get_mapping(story_id)
     if mapping is None:
         return None
     host, ref = mapping
     try:
-        return get_adapter(host, runner=runner), ref
+        declaration = load_repo_forge_declaration(
+            override_path=Path.cwd() / FORGE_OVERRIDE_FILENAME
+        )
+        instance_url = declared_instance_for(declaration, host)
+        return get_adapter(host, runner=runner, instance_url=instance_url), ref
     except IssueHostError:
+        # An unsupported recorded host, or a malformed declaration — a build
+        # aborts on the latter at preflight (`build._forge_declaration_error`),
+        # so reaching it here means a best-effort caller that must no-op rather
+        # than guess an instance and talk to the wrong forge.
         return None
 
 

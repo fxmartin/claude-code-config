@@ -309,8 +309,16 @@ def test_open_docs_only_cr_pushes_and_opens(tmp_path, monkeypatch) -> None:
 
     root = _repo_with_origin(tmp_path)
     created: list[dict] = []
-    monkeypatch.setattr(issue_host_mod, "resolve_host", lambda r, override=None: "github")
-    monkeypatch.setattr(issue_host_mod, "get_adapter", lambda host, runner=None: _fake_adapter(created))
+    monkeypatch.setattr(
+        issue_host_mod, "resolve_forge",
+        lambda r, override=None: issue_host_mod.ForgeResolution(
+            host="github", instance_url=None, source="override"
+        ),
+    )
+    monkeypatch.setattr(
+        issue_host_mod, "get_adapter",
+        lambda host, runner=None, instance_url=None: _fake_adapter(created),
+    )
     ledger = _EventLedger()
     pr = build_mod._open_docs_only_cr(
         _story(), ledger, "run-1", root, "origin/main", "Closes #7", GITHUB_CR_TERMS,

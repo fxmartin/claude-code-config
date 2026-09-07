@@ -238,9 +238,24 @@ def _cli_app():
     return app
 
 
+def _stub_forge(monkeypatch, host=ih.GITHUB, instance_url=None, captured=None) -> None:
+    monkeypatch.setattr(
+        ih, "resolve_forge",
+        lambda root, override=None: ih.ForgeResolution(
+            host=host, instance_url=instance_url, source="auto-detect"
+        ),
+    )
+
+    def _get(h, runner=None, instance_url=None):
+        if captured is not None:
+            captured.update(host=h, instance_url=instance_url)
+        return FakeAdapter()
+
+    monkeypatch.setattr(ih, "get_adapter", _get)
+
+
 def test_cli_review_packet_prints_packet(monkeypatch) -> None:
-    monkeypatch.setattr(ih, "resolve_host", lambda root, override=None: ih.GITHUB)
-    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: FakeAdapter())
+    _stub_forge(monkeypatch)
     result = runner.invoke(_cli_app(), ["review-packet", "7"])
     assert result.exit_code == 0
     assert "+y = 2" in result.stdout
@@ -251,15 +266,28 @@ def test_cli_review_packet_host_error_exits_1(monkeypatch) -> None:
     def boom(root, override=None):
         raise ih.IssueHostError("no remote")
 
-    monkeypatch.setattr(ih, "resolve_host", boom)
+    monkeypatch.setattr(ih, "resolve_forge", boom)
     result = runner.invoke(_cli_app(), ["review-packet", "7"])
     assert result.exit_code == 1
     assert "no remote" in result.output
 
 
+def test_cli_review_packet_threads_declared_instance(monkeypatch) -> None:
+    """Story 30.1-001: baking a packet is a host-touching path — without the
+    declared instance the `glab mr view/diff` calls hit gitlab.com and the
+    command reports a host failure instead of printing a packet."""
+    captured: dict = {}
+    _stub_forge(
+        monkeypatch, host=ih.GITLAB,
+        instance_url="http://127.0.0.1:8080", captured=captured,
+    )
+    result = runner.invoke(_cli_app(), ["review-packet", "7"])
+    assert result.exit_code == 0, result.output
+    assert captured == {"host": "gitlab", "instance_url": "http://127.0.0.1:8080"}
+
+
 def test_cli_review_packet_oversize_exits_3_naming_fallback(monkeypatch) -> None:
-    monkeypatch.setattr(ih, "resolve_host", lambda root, override=None: ih.GITHUB)
-    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: FakeAdapter())
+    _stub_forge(monkeypatch)
     result = runner.invoke(_cli_app(), ["review-packet", "7", "--max-chars", "50"])
     assert result.exit_code == 3
     assert "fall back" in result.output
@@ -370,8 +398,15 @@ def test_run_story_embeds_packet_in_review_dispatch(tmp_path, monkeypatch) -> No
     from sdlc.build import BuildOptions, _run_story
     from sdlc.dispatch import AgentResult
 
-    monkeypatch.setattr(ih, "resolve_host", lambda root, override=None: ih.GITHUB)
-    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: FakeAdapter())
+    monkeypatch.setattr(
+        ih, "resolve_forge",
+        lambda root, override=None: ih.ForgeResolution(
+            host=ih.GITHUB, instance_url=None, source="override"
+        ),
+    )
+    monkeypatch.setattr(
+        ih, "get_adapter", lambda host, runner=None, instance_url=None: FakeAdapter()
+    )
 
     prompts: dict[str, str] = {}
 

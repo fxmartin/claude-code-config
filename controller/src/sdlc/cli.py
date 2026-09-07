@@ -387,10 +387,11 @@ def build(ctx: typer.Context) -> None:
     # run's actor from host identity. Best-effort — a repo with no/unsupported
     # host remote yields no adapter, and run_build degrades the actor to
     # `unknown` (it never blocks a build; AC3).
-    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.issue_host import IssueHostError, get_adapter, resolve_forge
 
     try:
-        actor_adapter = get_adapter(resolve_host(Path.cwd()))
+        resolution = resolve_forge(Path.cwd())
+        actor_adapter = get_adapter(resolution.host, instance_url=resolution.instance_url)
     except IssueHostError:
         actor_adapter = None
     result = run_build(
@@ -434,6 +435,13 @@ def build(ctx: typer.Context) -> None:
             err=True,
         )
         raise typer.Exit(code=1)
+
+    if result.forge_error:
+        # Story 30.1-001 AC3: a malformed `.sdlc-forge.yaml` — refused before
+        # preflight, the ledger, and any dispatch. Exit 2 (a bad declaration is a
+        # configuration error), matching `sdlc fix`/`issues init`/`dashboard`.
+        typer.echo(f"error: {result.forge_error}", err=True)
+        raise typer.Exit(code=2)
 
     if result.preflight_failed:
         typer.echo(
@@ -568,6 +576,7 @@ def fix(ctx: typer.Context) -> None:
         run_fix,
         run_fix_batch,
     )
+    from sdlc.issue_host import IssueHostError
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
 
     # Story 32.1-001: `--enqueue` records a job in the host queue instead of
@@ -594,13 +603,22 @@ def fix(ctx: typer.Context) -> None:
     ledger = Ledger(default_db_path())
     ledger.ensure_migrated()
 
-    if isinstance(opts, FixBatchOptions):
-        # _run_fix_batch_cli always raises typer.Exit — it never returns here.
-        _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view)
+    # Story 30.1-001 AC3: `_resolve_fix_forge` raises on a malformed
+    # `.sdlc-forge.yaml` so a typo fails at preflight rather than mid-pipeline —
+    # but "fails fast" must mean one actionable line and exit 2, not a raw
+    # traceback out of the command. Only the declaration error is caught here;
+    # `_run_fix_batch_cli`'s own `typer.Exit` passes straight through.
+    try:
+        if isinstance(opts, FixBatchOptions):
+            # _run_fix_batch_cli always raises typer.Exit — it never returns here.
+            _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view)
 
-    result = run_fix(
-        opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
-    )
+        result = run_fix(
+            opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
+        )
+    except IssueHostError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
     if result.dirty_tree:
         # Issue #590: refused before any dispatch — nothing was stashed or moved.
@@ -765,6 +783,7 @@ def resume(
     """
     from sdlc.build import _parse_budget_value
     from sdlc.discovery import canonical_scope
+    from sdlc.issue_host import IssueHostError
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
     from sdlc.resume import run_resume
 
@@ -799,17 +818,25 @@ def resume(
     # Migrate a pre-existing (possibly stale) ledger before resume reads it.
     ledger.ensure_migrated()
     run = _resolve_run_option(ledger, run)
-    result = run_resume(
-        scope_label,
-        ledger=ledger,
-        run_id=run,
-        render_view=make_render_view(db_path),
-        budget=budget_tokens,
-        budget_policy=budget_policy,
-        cost_threshold=cost_threshold_tokens,
-        concurrency=concurrency,
-        force=force,
-    )
+    # Story 30.1-001 AC3: resuming a fix run re-resolves the forge
+    # (`fix_issue.resume_fix`), so a malformed `.sdlc-forge.yaml` must report one
+    # actionable line here too rather than escaping as a traceback — the same
+    # contract `sdlc fix` honours.
+    try:
+        result = run_resume(
+            scope_label,
+            ledger=ledger,
+            run_id=run,
+            render_view=make_render_view(db_path),
+            budget=budget_tokens,
+            budget_policy=budget_policy,
+            cost_threshold=cost_threshold_tokens,
+            concurrency=concurrency,
+            force=force,
+        )
+    except IssueHostError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
     if result.refused:
         typer.echo(result.refusal_reason, err=True)
@@ -1374,6 +1401,8 @@ def dashboard(
         )
         raise typer.Exit(code=0)
 
+    from sdlc.issue_host import IssueHostError
+
     try:
         # db is None → registry-discovery mode (multi-run overview, Story 11.2-002).
         serve(db, host=host, port=port, run_id=run, open_browser=open_browser)
@@ -1386,6 +1415,11 @@ def dashboard(
             err=True,
         )
         raise typer.Exit(code=0) from exc
+    except IssueHostError as exc:
+        # Story 30.1-001: a malformed `.sdlc-forge.yaml` in single-repo (--db)
+        # mode aborts server startup — the dashboard's preflight.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["state"])
@@ -1506,12 +1540,16 @@ def review_packet(
     cap: the consumer must then fall back to fetch-it-yourself review, never a
     truncated diff.
     """
-    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.issue_host import IssueHostError, get_adapter, resolve_forge
     from sdlc.review_packet import PACKET_MAX_CHARS, build_review_packet
 
     cap = max_chars if max_chars is not None else PACKET_MAX_CHARS
     try:
-        adapter = get_adapter(resolve_host(repo_root, host))
+        # Story 30.1-001: a declared self-hosted instance must reach the packet's
+        # `glab` calls too — baking a packet against gitlab.com for a local-forge
+        # repo yields a host failure, not a packet.
+        resolution = resolve_forge(repo_root, host)
+        adapter = get_adapter(resolution.host, instance_url=resolution.instance_url)
         packet = build_review_packet(adapter, cr_ref, checks=checks)
     except IssueHostError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -2969,7 +3007,7 @@ def issues_init(
     With no framework-format stories it exits 1 pointing at ``generate-epics``; an
     undeterminable/unsupported host or an unauthenticated CLI exits 2.
     """
-    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.issue_host import IssueHostError, format_forge_preflight_line, get_adapter, resolve_forge
     from sdlc.ledger_view import Ledger, default_db_path
     from sdlc.story_init import NoStoriesError, init_issues
     from sdlc.story_render import parse_story_docs
@@ -2986,8 +3024,9 @@ def issues_init(
         raise typer.Exit(code=1)
 
     try:
-        resolved = resolve_host(root_path, host)
-        adapter = get_adapter(resolved)
+        resolution = resolve_forge(root_path, host)
+        typer.echo(format_forge_preflight_line(resolution), err=True)
+        adapter = get_adapter(resolution.host, instance_url=resolution.instance_url)
         adapter.ensure_ready()
     except IssueHostError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -3052,7 +3091,7 @@ def issues_assign(
     stories — nothing is half-assigned. Exits 1 when one or more requested stories
     have no issue on this host (reported, never silently skipped).
     """
-    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.issue_host import IssueHostError, get_adapter, resolve_forge
     from sdlc.ledger_view import Ledger, default_db_path
     from sdlc.story_assign import AssignError, assign
 
@@ -3066,8 +3105,11 @@ def issues_assign(
     ledger.init()
 
     try:
-        resolved = resolve_host(Path.cwd(), override=host)
-        adapter = get_adapter(resolved)
+        # Story 30.1-001: same declaration-aware resolution as every other
+        # host-touching command, so assigning on a local instance reaches it.
+        resolution = resolve_forge(Path.cwd(), override=host)
+        resolved = resolution.host
+        adapter = get_adapter(resolved, instance_url=resolution.instance_url)
         # Fail fast on an unauthenticated host before any assignment.
         adapter.ensure_ready()
         result = assign(adapter, ledger, target, user)

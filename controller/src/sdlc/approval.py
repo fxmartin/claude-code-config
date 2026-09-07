@@ -12,7 +12,7 @@ from sdlc.issue_host import (
     Runner,
     get_adapter,
     repo_runner,
-    resolve_host,
+    resolve_forge,
 )
 from sdlc.risk_gate import RISK_APPROVED_LABEL
 
@@ -59,7 +59,8 @@ def poll_approval(
     have been last night.
 
     Best-effort, and the "None" case matters: an absent CLI, an unauthenticated
-    host, a network blip, a rate-limit rejection or an undetectable forge all
+    host, a network blip, a rate-limit rejection, an undetectable forge or a
+    malformed `.sdlc-forge.yaml` all
     return None rather than raising, and the caller leaves the job parked. The
     alternative — reading a failed lookup as "closed" — would fail a job over a
     dropped packet.
@@ -69,7 +70,15 @@ def poll_approval(
     directory and the scheduler polls several repos from one process.
     """
     try:
-        adapter = get_adapter(resolve_host(root), runner=runner or repo_runner(root))
+        # Story 30.1-001: resolve the forge *and* any declared self-hosted
+        # instance, so a parked job in a local-forge repo polls that instance
+        # instead of gitlab.com (which answers None and parks it forever).
+        resolution = resolve_forge(root)
+        adapter = get_adapter(
+            resolution.host,
+            runner=runner or repo_runner(root),
+            instance_url=resolution.instance_url,
+        )
         view = adapter.cr_approval(str(pr_number))
     except IssueHostError:
         log.debug("approval poll failed for #%s in %s", pr_number, root, exc_info=True)

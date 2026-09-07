@@ -176,14 +176,17 @@ def test_count_none_on_non_numeric() -> None:
 # --- GitLab fetch (Story 23.7-001) ------------------------------------------
 
 
-def _stub_glab(monkeypatch, mapping):
+def _stub_glab(monkeypatch, mapping, envs=None):
     """Stub ``_run_glab`` so a (args→stdout) mapping drives the GitLab fetch.
 
     Matches the first needle that is a substring of the joined args (insertion
     order), so list the more-specific endpoints (``pipelines``) first; value
-    None simulates a failing call.
+    None simulates a failing call. ``envs``, when given, records each call's
+    per-invocation env override (Story 30.1-001).
     """
-    def fake(args, timeout=gh._GH_TIMEOUT):
+    def fake(args, timeout=gh._GH_TIMEOUT, env=None):
+        if envs is not None:
+            envs.append(env)
         joined = " ".join(args)
         for needle, out in mapping.items():
             if needle in joined:
@@ -249,6 +252,45 @@ def test_fetch_gitlab_stats_counts_ok_but_no_pipeline(monkeypatch) -> None:
     assert s["available"] is True
     assert s["issues_open"] == 1
     assert s["ci_status"] is None and s["ci_branch"] is None
+
+
+def test_fetch_gitlab_stats_declared_instance_reaches_every_glab_call(monkeypatch) -> None:
+    """Story 30.1-001: without the instance every call would query gitlab.com for
+    a slug that only exists on the declared local instance."""
+    envs: list = []
+    _stub_glab(monkeypatch, {
+        "projects/owner%2Frepo": json.dumps({"default_branch": "main"}),
+    }, envs=envs)
+    gh.fetch_stats("owner/repo", host=gh.GITLAB, instance_url="https://gitlab.corp")
+    assert envs and all(e == {"GITLAB_HOST": "https://gitlab.corp"} for e in envs)
+
+
+def test_fetch_gitlab_stats_without_instance_passes_no_env(monkeypatch) -> None:
+    envs: list = []
+    _stub_glab(monkeypatch, {}, envs=envs)
+    gh.fetch_stats("owner/repo", host=gh.GITLAB)
+    assert envs and all(e is None for e in envs)
+
+
+def test_run_glab_env_merges_onto_os_environ(monkeypatch) -> None:
+    seen: dict = {}
+
+    class R:
+        returncode = 0
+        stdout = "[]\n"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return R()
+
+    monkeypatch.setattr(gh.subprocess, "run", fake_run)
+    monkeypatch.setenv("SOME_EXISTING_VAR", "keep-me")
+    gh._run_glab(["issue", "list"], env={"GITLAB_HOST": "https://gitlab.corp"})
+    assert seen["env"]["GITLAB_HOST"] == "https://gitlab.corp"
+    assert seen["env"]["SOME_EXISTING_VAR"] == "keep-me"
+    gh._run_glab(["issue", "list"])
+    assert seen["env"] is None
 
 
 def test_fetch_stats_gitlab_no_slug_is_no_remote() -> None:
@@ -327,7 +369,7 @@ def _sync_spawn(fn):
 def test_cache_fetches_once_and_serves_cached() -> None:
     calls = []
 
-    def fetcher(slug, host):
+    def fetcher(slug, host, instance_url=None):
         calls.append(slug)
         return {"available": True, "slug": slug, "issues_open": len(calls)}
 
@@ -345,7 +387,7 @@ def test_cache_fetches_once_and_serves_cached() -> None:
 def test_cache_refetches_after_ttl() -> None:
     calls = []
 
-    def fetcher(slug, host):
+    def fetcher(slug, host, instance_url=None):
         calls.append(slug)
         return {"available": True, "slug": slug, "issues_open": len(calls)}
 
@@ -360,7 +402,7 @@ def test_cache_refetches_after_ttl() -> None:
 def test_cache_dedups_per_slug() -> None:
     calls = []
 
-    def fetcher(slug, host):
+    def fetcher(slug, host, instance_url=None):
         calls.append(slug)
         return {"available": True, "slug": slug}
 
@@ -372,12 +414,33 @@ def test_cache_dedups_per_slug() -> None:
     assert sorted(calls) == ["a/one", "b/two"]
 
 
+def test_cache_keys_by_declared_instance() -> None:
+    # Story 30.1-001: the same slug can exist on gitlab.com and on a declared
+    # self-hosted instance — one repo's health must never be served for the other.
+    calls = []
+
+    def fetcher(slug, host, instance_url=None):
+        calls.append((slug, host, instance_url))
+        return {"available": True, "slug": slug, "host": host, "instance": instance_url}
+
+    cache = gh.GitHubStatsCache(ttl=60.0, fetcher=fetcher, clock=_Clock(), spawn=_sync_spawn)
+    assert cache.get("o/r", gh.GITLAB)["instance"] is None
+    assert cache.get("o/r", gh.GITLAB, "http://127.0.0.1:8080")["instance"] == (
+        "http://127.0.0.1:8080"
+    )
+    cache.get("o/r", gh.GITLAB, "http://127.0.0.1:8080")  # cached — no third fetch
+    assert calls == [
+        ("o/r", gh.GITLAB, None),
+        ("o/r", gh.GITLAB, "http://127.0.0.1:8080"),
+    ]
+
+
 def test_cache_keys_by_host_and_slug() -> None:
     # Story 23.7-001: the same slug on different forges is different data, so the
     # cache keys on (host, slug) and passes the host through to the fetcher.
     calls = []
 
-    def fetcher(slug, host):
+    def fetcher(slug, host, instance_url=None):
         calls.append((slug, host))
         return {"available": True, "slug": slug, "host": host}
 
@@ -391,7 +454,7 @@ def test_cache_keys_by_host_and_slug() -> None:
 def test_cache_none_slug_no_fetch() -> None:
     calls = []
     cache = gh.GitHubStatsCache(
-        ttl=60.0, fetcher=lambda s, h: calls.append(s), clock=_Clock(), spawn=_sync_spawn
+        ttl=60.0, fetcher=lambda s, h, i=None: calls.append(s), clock=_Clock(), spawn=_sync_spawn
     )
     s = cache.get(None)
     assert s["available"] is False and s["reason"] == "no-remote"
@@ -408,7 +471,7 @@ def test_cache_default_uses_background_thread() -> None:
     release = threading.Event()
     started = threading.Event()
 
-    def fetcher(slug, host):
+    def fetcher(slug, host, instance_url=None):
         started.set()
         release.wait(timeout=5.0)  # hold the fetch open while we prove get() returned
         return {"available": True, "slug": slug, "issues_open": 9}

@@ -344,11 +344,51 @@ def _resolve_fix_host(root: Path | None, override: str | None) -> str:
     ``--host`` value is validated once at CLI-parse time (:func:`parse_fix_args`),
     so it is never silently swallowed here.
     """
-    return override or issue_host.detect_host(root or Path.cwd()) or issue_host.GITHUB
+    return _resolve_fix_forge(root, override).host
+
+
+def _resolve_fix_forge(root: Path | None, override: str | None) -> issue_host.ForgeResolution:
+    """The forge (host + declared instance) a fix run targets (#606, Story 30.1-001).
+
+    Mirrors :func:`_resolve_fix_host`'s precedence (``--host`` > repo
+    ``.sdlc-forge.yaml`` > ``origin`` auto-detect) and its non-raising contract
+    for an *undetectable* remote (falls back to GitHub, no declared instance —
+    today's behaviour). A malformed declaration still raises
+    :class:`issue_host.IssueHostError`: an explicit repo declaration error must
+    fail fast at preflight, never be silently swallowed into the fallback.
+
+    ``--host`` names the forge *kind* only, so a declaration for that same forge
+    still supplies the instance URL (:func:`issue_host.declared_instance_for`) —
+    ``sdlc fix --host gitlab`` in a repo that declares a local instance must
+    reach that instance, not gitlab.com. ``host`` is returned verbatim (not
+    normalised) because :func:`parse_fix_args` already validated the flag and
+    every downstream :func:`issue_host.get_adapter` lower-cases it.
+    """
+    root = root or Path.cwd()
+    declaration = issue_host.load_repo_forge_declaration(
+        override_path=root / issue_host.FORGE_OVERRIDE_FILENAME
+    )
+    if override:
+        return issue_host.ForgeResolution(
+            host=override,
+            instance_url=issue_host.declared_instance_for(declaration, override),
+            source="override",
+        )
+    if declaration is not None:
+        return issue_host.ForgeResolution(
+            host=declaration.forge, instance_url=declaration.instance_url,
+            source="declaration",
+        )
+    host = issue_host.detect_host(root) or issue_host.GITHUB
+    return issue_host.ForgeResolution(host=host, instance_url=None, source="auto-detect")
 
 
 def fetch_issue(
-    number: int, *, runner: Runner | None = None, host: str = issue_host.GITHUB
+    number: int,
+    *,
+    runner: Runner | None = None,
+    host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
 ) -> FixIssue:
     """Fetch a code-host issue's metadata via the resolved host adapter (#436, #606).
 
@@ -356,13 +396,16 @@ def fetch_issue(
     ``glab issue view`` on GitLab — the same abstraction ``sdlc build`` already
     drives, so a fix run targets whichever host ``host`` resolves to instead of
     always shelling out to ``gh``. ``host`` defaults to GitHub so a caller that
-    never resolved one keeps today's behaviour.
+    never resolved one keeps today's behaviour. ``instance_url`` (Story
+    30.1-001) is the repo's declared self-hosted GitLab instance, if any.
 
     Raises :class:`FixIssueError` when the issue cannot be fetched (missing
     issue, auth problem, an unparseable host response) so the caller can abort
     cleanly rather than run a fix against nothing.
     """
-    adapter = issue_host.get_adapter(host, runner=runner or _default_runner)
+    adapter = issue_host.get_adapter(
+        host, runner=runner or _default_runner, instance_url=instance_url
+    )
     try:
         fetched = adapter.issue_view(str(number))
     except IssueHostError as exc:
@@ -378,17 +421,23 @@ def fetch_issue(
     )
 
 
-def _current_host_user(host: str, runner: Runner) -> str | None:
+def _current_host_user(
+    host: str, runner: Runner, instance_url: str | None = None
+) -> str | None:
     """The authenticated host-CLI login, or None when it cannot be resolved."""
     try:
-        who = issue_host.get_adapter(host, runner=runner).whoami()
+        who = issue_host.get_adapter(host, runner=runner, instance_url=instance_url).whoami()
     except Exception:  # noqa: BLE001 — identity is best-effort; never crash a stop-check
         return None
     return who.strip() or None
 
 
 def stop_reason(
-    issue: FixIssue, *, runner: Runner | None = None, host: str = issue_host.GITHUB
+    issue: FixIssue,
+    *,
+    runner: Runner | None = None,
+    host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
 ) -> str | None:
     """The deliberate-stop reason for ``issue``, or None to proceed (issue #436).
 
@@ -404,7 +453,7 @@ def stop_reason(
     if {label.strip().lower() for label in issue.labels} & _WONTFIX_LABELS:
         return "issue is labelled wontfix"
     if issue.assignees:
-        me = _current_host_user(host, runner)
+        me = _current_host_user(host, runner, instance_url=instance_url)
         if me is not None and me not in issue.assignees:
             return f"issue is assigned to {', '.join(issue.assignees)} (not {me})"
     return None
@@ -1204,6 +1253,7 @@ def _open_docs_only_pr(
     root: Path | None,
     *,
     host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
 ) -> int | None:
     """Push the fix branch and open its PR deterministically for a docs-only skip.
 
@@ -1211,10 +1261,11 @@ def _open_docs_only_pr(
     and opens the PR — is never dispatched, so the controller does both itself via
     plain git and the Epic-22/23 host adapter (GitHub/GitLab parity). ``host`` is
     the run's already-resolved host (issue #606) — an explicit ``--host`` or the
-    ``origin`` auto-detect, never re-derived here. The PR body carries
-    ``Closes #<N>`` so merging auto-closes the issue, exactly as the coverage
-    prompt instructs the agent to. Returns the PR number, or ``None`` on any
-    failure — the caller then falls back to the full coverage dispatch, so a
+    ``origin`` auto-detect, never re-derived here. ``instance_url`` (Story
+    30.1-001) is the repo's declared self-hosted GitLab instance, if any. The PR
+    body carries ``Closes #<N>`` so merging auto-closes the issue, exactly as the
+    coverage prompt instructs the agent to. Returns the PR number, or ``None`` on
+    any failure — the caller then falls back to the full coverage dispatch, so a
     push/host hiccup can never strand a fix without a change request.
     """
     root = root or Path.cwd()
@@ -1226,7 +1277,7 @@ def _open_docs_only_pr(
         )
         if push.returncode != 0:
             raise RuntimeError(push.stderr.strip() or "git push failed")
-        adapter = issue_host.get_adapter(host)
+        adapter = issue_host.get_adapter(host, instance_url=instance_url)
         title = build_commit_header(
             ctype="docs",
             scope=None,
@@ -1260,21 +1311,23 @@ def _bake_review_packet(
     run_id: str,
     *,
     host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
 ) -> str | None:
     """Bake the pre-baked review packet for the fix's PR, or None (Story 27.3-003).
 
     The fix-issue mirror of ``build._bake_review_packet``: baked once per review
     stage entry via the Epic-22/23 host adapter. ``host`` is the run's
     already-resolved host (issue #606), mirroring :func:`_open_docs_only_pr`.
-    Best-effort — any host failure or an oversized packet logs an event and
-    returns None, degrading the prompt to today's fetch-it-yourself instructions
-    (never a truncated diff).
+    ``instance_url`` (Story 30.1-001) is the repo's declared self-hosted GitLab
+    instance, if any. Best-effort — any host failure or an oversized packet logs
+    an event and returns None, degrading the prompt to today's
+    fetch-it-yourself instructions (never a truncated diff).
     """
     try:
         # Local import keeps review_packet off this module's hot import path.
         from sdlc import review_packet
 
-        adapter = issue_host.get_adapter(host)
+        adapter = issue_host.get_adapter(host, instance_url=instance_url)
         block = review_packet.packet_block(adapter, str(pr_number))
     except Exception:  # noqa: BLE001 — best-effort; the prompt has a fallback path
         block = None
@@ -1364,6 +1417,7 @@ def _run_stage_loop(
     *,
     root: Path | None = None,
     host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
     done_stages: frozenset[str] = frozenset(),
     pr_number: int | None = None,
     bugfix_seq: int = 0,
@@ -1385,9 +1439,10 @@ def _run_stage_loop(
     origin); ``None`` falls back to the current working directory. ``host``
     (issue #606) is the run's already-resolved code host — it picks the
     change-request phrasing every stage's prompt uses and the adapter the
-    docs-only PR open / review-packet bake route through.
+    docs-only PR open / review-packet bake route through. ``instance_url``
+    (Story 30.1-001) is the repo's declared self-hosted GitLab instance, if any.
     """
-    cr_terms = issue_host.get_adapter(host).cr_terms
+    cr_terms = issue_host.get_adapter(host, instance_url=instance_url).cr_terms
     stages = [s for s in FIX_CORE_STAGES if not (s == "coverage" and opts.skip_coverage)]
     # Issue #547: a resume re-enters here with the stages that already completed,
     # so they are never re-dispatched and their side effects (the branch, the PR)
@@ -1411,7 +1466,7 @@ def _run_stage_loop(
             story_class = _fix_change_class(issue, story, ledger, run_id, root)
         if stage == "coverage" and story_class == change_class.DOCS_ONLY:
             pr = pr_number if pr_number is not None else _open_docs_only_pr(
-                issue, story, ledger, run_id, root, host=host
+                issue, story, ledger, run_id, root, host=host, instance_url=instance_url
             )
             if pr is not None:
                 pr_number = pr
@@ -1443,7 +1498,7 @@ def _run_stage_loop(
         review_packet_block: str | None = None
         if stage == "review" and pr_number is not None:
             review_packet_block = _bake_review_packet(
-                issue, story, pr_number, ledger, run_id, host=host
+                issue, story, pr_number, ledger, run_id, host=host, instance_url=instance_url
             )
         while True:
             model = fix_model(stage, opts, escalate=escalate)
@@ -1745,19 +1800,22 @@ def run_fix(
         else (lambda: [])
     )
 
-    # Issue #606: resolve the code host once — --host wins, else the origin
-    # remote's auto-detected host, else GitHub — and thread it through every
-    # issue/CR operation below instead of always shelling out to `gh`.
-    host = _resolve_fix_host(root, opts.host)
+    # Issue #606 / Story 30.1-001: resolve the code host (and any declared
+    # self-hosted instance) once — --host wins, else the repo's
+    # `.sdlc-forge.yaml`, else the origin remote's auto-detected host, else
+    # GitHub — and thread both through every issue/CR operation below instead
+    # of always shelling out to `gh`.
+    resolution = _resolve_fix_forge(root, opts.host)
+    host, instance_url = resolution.host, resolution.instance_url
 
     # --- Fetch + stop conditions (no run row for a deliberate pre-run stop) ---
     try:
-        issue = fetch_issue(opts.issue, runner=runner, host=host)
+        issue = fetch_issue(opts.issue, runner=runner, host=host, instance_url=instance_url)
     except FixIssueError as exc:
         return FixResult(
             issue=opts.issue, aborted=True, abort_reason=str(exc), status="ABORTED"
         )
-    stop = stop_reason(issue, runner=runner, host=host)
+    stop = stop_reason(issue, runner=runner, host=host, instance_url=instance_url)
     if stop:
         return FixResult(
             issue=opts.issue, aborted=True, abort_reason=stop, status="ABORTED"
@@ -1887,7 +1945,8 @@ def run_fix(
 
     # --- Core stage loop ------------------------------------------------------
     terminal, pr_number = _run_stage_loop(
-        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root, host=host
+        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
+        host=host, instance_url=instance_url,
     )
 
     return _finish_fix_run(
@@ -2029,13 +2088,15 @@ def resume_fix(
             abort_reason=reason,
         )
 
-    # Issue #606: replay the run's resolved host rather than re-deriving it, so a
-    # remote change between a run and its resume cannot finish it against the
-    # wrong host's CLI.
-    host = _resolve_fix_host(root, opts.host)
+    # Issue #606 / Story 30.1-001: replay the run's resolved host (and any
+    # declared instance) rather than re-deriving it, so a remote or declaration
+    # change between a run and its resume cannot finish it against the wrong
+    # host's CLI.
+    resolution = _resolve_fix_forge(root, opts.host)
+    host, instance_url = resolution.host, resolution.instance_url
 
     try:
-        issue = fetch_issue(issue_number, runner=runner, host=host)
+        issue = fetch_issue(issue_number, runner=runner, host=host, instance_url=instance_url)
     except FixIssueError as exc:
         return FixResult(
             issue=issue_number, run_id=run_id, aborted=True, status="ABORTED",
@@ -2064,8 +2125,8 @@ def resume_fix(
 
     terminal, pr_number = _run_stage_loop(
         issue, plan, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
-        host=host, done_stages=done_stages, pr_number=pr_number, bugfix_seq=bugfix_seq,
-        start_attempts=start_attempts,
+        host=host, instance_url=instance_url, done_stages=done_stages,
+        pr_number=pr_number, bugfix_seq=bugfix_seq, start_attempts=start_attempts,
     )
     return _finish_fix_run(
         issue, plan, story, opts, ledger, run_id, dispatch, logs_dir,
@@ -2234,11 +2295,19 @@ def _candidate_sort_key(cand: _Candidate) -> tuple[int, int, int]:
 
 
 def _list_open_issues(
-    runner: Runner, *, host: str = issue_host.GITHUB, limit: int = 50
+    runner: Runner,
+    *,
+    host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
+    limit: int = 50,
 ) -> list[_Candidate]:
     """List open issues via the resolved host's CLI for batch selection (#436, #606).
 
-    ``gh issue list`` on GitHub, ``glab issue list`` on GitLab. Raises
+    ``gh issue list`` on GitHub, ``glab issue list`` on GitLab. ``instance_url``
+    (Story 30.1-001) is the repo's declared self-hosted GitLab instance, if any
+    — threaded to `glab` through :func:`issue_host.gitlab_instance_env`, the same
+    per-invocation env the adapters use (:meth:`issue_host.IssueHostAdapter._invoke`),
+    so a plaintext instance gets the same `GLAB_CONFIG_DIR` treatment here. Raises
     :class:`FixIssueError` on a non-zero exit or malformed JSON so the caller
     aborts the batch cleanly rather than fixing an empty/garbled set. GitHub's
     error text is unchanged from before #606 (``gh issue list failed: …`` /
@@ -2252,7 +2321,12 @@ def _list_open_issues(
             cli, "issue", "list", "--state", "open",
             "--json", "number,title,labels", "--limit", str(limit),
         ]
-    res = runner(args)
+    env = (
+        issue_host.gitlab_instance_env(instance_url) or None
+        if host == issue_host.GITLAB
+        else None
+    )
+    res = runner(args, env=env) if env else runner(args)
     if res.returncode != 0:
         raise FixIssueError(
             f"{cli} issue list failed: {res.stderr.strip() or 'non-zero exit'}"
@@ -2301,6 +2375,7 @@ def select_batch_issues(
     *,
     runner: Runner | None = None,
     host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
 ) -> list[_Candidate]:
     """Select and order the open issues a batch fix run should target (issue #436).
 
@@ -2308,13 +2383,15 @@ def select_batch_issues(
     rest, each ranked by priority then issue number). ``next`` restricts to open
     bugs. A positive ``limit`` caps the ordered result — the skill's ``next``
     default of one highest-priority bug is just ``next`` with ``limit=1``.
+    ``instance_url`` (Story 30.1-001) is the repo's declared self-hosted GitLab
+    instance, if any.
 
     Story-mirror issues (``sdlc issues init`` backfill, carrying the exact
     :data:`STORY_LABEL` marker) are never candidates for either target —
     issue #558. They are planning artifacts for ``sdlc build``, not defects.
     """
     runner = runner or _default_runner
-    candidates = _list_open_issues(runner, host=host)
+    candidates = _list_open_issues(runner, host=host, instance_url=instance_url)
     story_count = sum(1 for c in candidates if _is_story_mirror(c.labels))
     if story_count:
         plural = "s" if story_count != 1 else ""
@@ -2457,6 +2534,7 @@ def _investigate_all(
     agent_type: str,
     workers: int,
     host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
 ) -> tuple[dict[str, _Investigated], dict[str, FixIssueOutcome]]:
     """Investigate every candidate under bounded concurrency (issue #436).
 
@@ -2477,7 +2555,7 @@ def _investigate_all(
     def _one(cand: _Candidate) -> None:
         story_id = f"issue-{cand.number}"
         try:
-            issue = fetch_issue(cand.number, runner=runner, host=host)
+            issue = fetch_issue(cand.number, runner=runner, host=host, instance_url=instance_url)
         except FixIssueError as exc:
             ledger.set_story_status(run_id, story_id, "SKIPPED")
             ledger.event_log(
@@ -2488,7 +2566,7 @@ def _investigate_all(
                 cand.number, "SKIPPED", drop_reason=f"fetch failed: {exc}"
             )
             return
-        stop = stop_reason(issue, runner=runner, host=host)
+        stop = stop_reason(issue, runner=runner, host=host, instance_url=instance_url)
         if stop:
             ledger.set_story_status(run_id, story_id, "SKIPPED")
             ledger.event_log(
@@ -2619,10 +2697,12 @@ def run_fix_batch(
     if registry is None and real_run:
         registry = Registry()
     workers = _batch_workers(batch)
-    # Issue #606: resolve the code host once for the whole batch — mirrors
-    # run_fix — and thread it through selection, investigation, and every
-    # issue's stage loop instead of always shelling out to `gh`.
-    host = _resolve_fix_host(root, batch.host)
+    # Issue #606 / Story 30.1-001: resolve the code host (and any declared
+    # instance) once for the whole batch — mirrors run_fix — and thread both
+    # through selection, investigation, and every issue's stage loop instead of
+    # always shelling out to `gh`.
+    resolution = _resolve_fix_forge(root, batch.host)
+    host, instance_url = resolution.host, resolution.instance_url
 
     # --- Dirty shared-checkout guard (issue #590) -----------------------------
     # Every issue in the batch runs against the same repo root, so one check for
@@ -2665,7 +2745,9 @@ def run_fix_batch(
 
     # --- Selection (no run row when nothing is selectable) --------------------
     try:
-        candidates = select_batch_issues(batch.target, batch.limit, runner=runner, host=host)
+        candidates = select_batch_issues(
+            batch.target, batch.limit, runner=runner, host=host, instance_url=instance_url
+        )
     except FixIssueError as exc:
         return FixBatchResult(
             no_issues=True, status="ABORTED",
@@ -2726,7 +2808,7 @@ def run_fix_batch(
     # --- Investigate every issue (bounded concurrency) ------------------------
     ready, dropped = _investigate_all(
         candidates, batch, ledger, run_id, dispatch, runner, logs_dir, root,
-        agent_type=agent_type, workers=workers, host=host,
+        agent_type=agent_type, workers=workers, host=host, instance_url=instance_url,
     )
 
     # --- Overlap graph → synthetic dependencies -------------------------------
@@ -2767,7 +2849,7 @@ def run_fix_batch(
                 )
         terminal, pr_number = _run_stage_loop(
             entry.issue, entry.inv, story, opts, ledger, run_id, issue_dispatch, logs_dir,
-            root=workdir or Path.cwd(), host=host,
+            root=workdir or Path.cwd(), host=host, instance_url=instance_url,
         )
         if terminal == "DONE":
             _run_summary(
@@ -2882,7 +2964,10 @@ def run_fix_batch(
     # --- Doc-update (best-effort, only when ≥1 issue merged) ------------------
     # Runs once per completed batch, before the terminal finalize. Non-blocking:
     # a failure is logged and never changes the batch's terminal (skill Phase 10b).
-    _run_doc_update(ordered, scope, batch, ledger, run_id, dispatch, logs_dir, host=host)
+    _run_doc_update(
+        ordered, scope, batch, ledger, run_id, dispatch, logs_dir,
+        host=host, instance_url=instance_url,
+    )
 
     outcome = finalize_run(
         ledger, run_id, status,
@@ -2914,6 +2999,7 @@ def _run_doc_update(
     logs_dir: Path,
     *,
     host: str = issue_host.GITHUB,
+    instance_url: str | None = None,
 ) -> None:
     """Best-effort batch doc-update phase — reviews merged fixes on a fresh PR.
 
@@ -2943,7 +3029,7 @@ def _run_doc_update(
             _BATCH_PHASE_STATUS,
         )
         ledger.stage_start(run_id, "", "doc-update", 1, model=model)
-        cr_terms = issue_host.get_adapter(host).cr_terms
+        cr_terms = issue_host.get_adapter(host, instance_url=instance_url).cr_terms
         prompt = render_doc_update_prompt(scope, merged, cr_terms=cr_terms)
         # No per-issue story: doc-update runs in the shared checkout and cuts its
         # own branch, so ``story`` is left None (dispatch_agent ignores it).

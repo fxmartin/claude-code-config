@@ -114,8 +114,15 @@ def _seed_stories(root: Path, text: str = _EPIC_MD) -> None:
 
 
 def _patch_host(monkeypatch, fake: FakeHost) -> None:
-    monkeypatch.setattr(issue_host, "resolve_host", lambda root, override=None: fake.host)
-    monkeypatch.setattr(issue_host, "get_adapter", lambda host, runner=None: fake)
+    monkeypatch.setattr(
+        issue_host, "resolve_forge",
+        lambda root, override=None: issue_host.ForgeResolution(
+            host=fake.host, instance_url=None, source="override"
+        ),
+    )
+    monkeypatch.setattr(
+        issue_host, "get_adapter", lambda host, runner=None, instance_url=None: fake
+    )
 
 
 def test_init_backfills_and_reports(tmp_path, monkeypatch):
@@ -136,6 +143,34 @@ def test_init_backfills_and_reports(tmp_path, monkeypatch):
     # the Done story's issue is closed on the host
     done_ref = next(r for r, d in fake.issues.items() if "22.2-001" in d["body"])
     assert fake.issues[done_ref]["state"] == "closed"
+
+
+def test_init_threads_declared_instance_url_and_logs_preflight_line(tmp_path, monkeypatch):
+    """Story 30.1-001: a `.sdlc-forge.yaml` instance URL reaches `get_adapter`,
+    and the effective forge is logged as a one-line preflight, mirroring the
+    `harness routing:` precedent."""
+    _seed_stories(tmp_path)
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    fake = FakeHost(host="gitlab")
+    captured: dict = {}
+    monkeypatch.setattr(issue_host, "resolve_forge", issue_host.resolve_forge)
+    monkeypatch.setattr(
+        issue_host, "get_adapter",
+        lambda host, runner=None, instance_url=None: (
+            captured.update(host=host, instance_url=instance_url), fake
+        )[1],
+    )
+
+    result = runner.invoke(
+        app,
+        ["issues", "init", "--root", str(tmp_path), "--db", str(tmp_path / ".sdlc-state.db")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == {"host": "gitlab", "instance_url": "http://127.0.0.1:8080"}
+    assert "forge routing: gitlab instance=http://127.0.0.1:8080 (declaration)" in result.output
 
 
 def test_init_resume_is_idempotent(tmp_path, monkeypatch):
@@ -173,7 +208,7 @@ def test_init_undeterminable_host_exits_two(tmp_path, monkeypatch):
     def _boom(root, override=None):
         raise IssueHostError("could not determine code host from git remote")
 
-    monkeypatch.setattr(issue_host, "resolve_host", _boom)
+    monkeypatch.setattr(issue_host, "resolve_forge", _boom)
 
     result = runner.invoke(
         app, ["issues", "init", "--root", str(tmp_path)]
