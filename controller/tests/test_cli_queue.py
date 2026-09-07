@@ -195,6 +195,72 @@ def test_queue_cancel_accepts_a_blocked_job(tmp_path, monkeypatch) -> None:
     assert after[0]["state"] == "cancelled"
 
 
+# --- Story 32.2-002: the parked change request in `queue list` --------------
+
+
+def _park(tmp_path, monkeypatch) -> int:
+    """Add a job, give it a run, and park it on PR #12."""
+    from datetime import datetime, timezone
+
+    from sdlc.queue import QueueStore, default_queue_path
+
+    runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
+    store = QueueStore(default_queue_path())
+    job_id = store.list_jobs()[0].id
+    store.claim_job(
+        job_id, claimed_by="host:1", lease_seconds=90,
+        now=datetime(2026, 9, 7, tzinfo=timezone.utc),
+    )
+    store.attach_run(job_id, "run-abc")
+    store.park_job(job_id, pr_number=12, reason="awaiting approval", poll_after=None)
+    return job_id
+
+
+def test_queue_list_shows_the_parked_change_request(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    _park(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["queue", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "PR" in result.output
+    assert "#12" in result.output
+    assert "parked" in result.output
+
+
+def test_queue_list_json_carries_the_pr_and_next_poll(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    _park(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["queue", "list", "--json"])
+
+    rows = json.loads(result.output)
+    assert rows[0]["state"] == "parked"
+    assert rows[0]["pr_number"] == 12
+    assert "poll_after" in rows[0]
+
+
+def test_a_parked_job_can_be_cancelled_from_the_cli(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    job_id = _park(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["queue", "cancel", str(job_id)])
+
+    assert result.exit_code == 0, result.output
+    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    assert rows[0]["state"] == "cancelled"
+
+
+def test_a_parked_job_can_be_requeued_from_the_cli(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    job_id = _park(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["queue", "requeue", str(job_id)])
+
+    assert result.exit_code == 0, result.output
+    assert "will resume its run" in result.output
+
+
 # --- Story 32.3-001: priority classes + budgets on the CLI ------------------
 
 

@@ -501,3 +501,107 @@ def test_gitlab_cr_terms_phrase_a_merge_request() -> None:
     assert terms.ref_noun == "MR iid"
     # The GitLab hint names the create CLI so the agent reaches for glab, not gh.
     assert "glab mr create" in terms.cli_hint
+
+
+# --- cr_approval (Story 32.2-002) -------------------------------------------
+
+
+def test_github_cr_approval_reads_state_labels_and_review_decision() -> None:
+    payload = json.dumps({
+        "state": "OPEN",
+        "labels": [{"name": "risk:high"}, {"name": "risk-approved"}],
+        "reviewDecision": "APPROVED",
+        "reviews": [{"state": "APPROVED"}],
+    })
+    runner = FakeRunner({"pr view": (0, payload, "")})
+    adapter = ih.GitHubAdapter(runner=runner)
+
+    view = adapter.cr_approval("612")
+
+    assert view.state == "open"
+    assert view.labels == ("risk:high", "risk-approved")
+    assert view.approved is True
+    argv = runner.calls[0]
+    assert argv[:4] == ["gh", "pr", "view", "612"]
+    assert "state,labels,reviewDecision,reviews" in argv
+
+
+def test_github_cr_approval_counts_a_review_the_decision_dismissed() -> None:
+    """A pushed fixup flips reviewDecision back — the approval still happened."""
+    payload = json.dumps({
+        "state": "OPEN", "labels": [], "reviewDecision": "REVIEW_REQUIRED",
+        "reviews": [{"state": "COMMENTED"}, {"state": "APPROVED"}],
+    })
+    adapter = ih.GitHubAdapter(runner=FakeRunner({"pr view": (0, payload, "")}))
+
+    assert adapter.cr_approval("1").approved is True
+
+
+def test_github_cr_approval_skips_malformed_review_entries() -> None:
+    payload = json.dumps({
+        "state": "OPEN", "labels": [], "reviewDecision": None,
+        "reviews": ["not an object", {"state": "COMMENTED"}],
+    })
+    adapter = ih.GitHubAdapter(runner=FakeRunner({"pr view": (0, payload, "")}))
+
+    assert adapter.cr_approval("1").approved is False
+
+
+def test_github_cr_approval_raises_on_an_empty_payload() -> None:
+    adapter = ih.GitHubAdapter(runner=FakeRunner({"pr view": (0, "", "")}))
+
+    with pytest.raises(ih.IssueHostError, match="no change request"):
+        adapter.cr_approval("1")
+
+
+def test_gitlab_cr_approval_queries_approvals_only_while_open() -> None:
+    mr = json.dumps({"iid": 12, "state": "opened", "labels": ["risk:high"]})
+    approvals = json.dumps({"approved": True, "approved_by": [{"user": {"id": 1}}]})
+    runner = FakeRunner({"mr view": (0, mr, ""), "approvals": (0, approvals, "")})
+    adapter = ih.GitLabAdapter(runner=runner)
+
+    view = adapter.cr_approval("12")
+
+    assert view.state == "open"
+    assert view.approved is True
+    assert any("approvals" in " ".join(argv) for argv in runner.calls)
+
+
+def test_gitlab_cr_approval_skips_the_approvals_call_on_a_merged_mr() -> None:
+    mr = json.dumps({"iid": 12, "state": "merged", "labels": []})
+    runner = FakeRunner({"mr view": (0, mr, "")})
+    adapter = ih.GitLabAdapter(runner=runner)
+
+    view = adapter.cr_approval("12")
+
+    assert view.state == "merged"
+    assert view.approved is False
+    assert not any("approvals" in " ".join(argv) for argv in runner.calls)
+
+
+def test_gitlab_cr_approval_degrades_when_approvals_are_premium_gated() -> None:
+    mr = json.dumps({"iid": 12, "state": "opened", "labels": []})
+    runner = FakeRunner({"mr view": (0, mr, ""), "approvals": (1, "", "403 forbidden")})
+    adapter = ih.GitLabAdapter(runner=runner)
+
+    view = adapter.cr_approval("12")
+
+    assert view.state == "open"
+    assert view.approved is False
+
+
+def test_gitlab_cr_approval_raises_on_an_empty_payload() -> None:
+    adapter = ih.GitLabAdapter(runner=FakeRunner({"mr view": (0, "", "")}))
+
+    with pytest.raises(ih.IssueHostError, match="no change request"):
+        adapter.cr_approval("12")
+
+
+def test_base_adapter_cr_approval_raises_issue_host_error() -> None:
+    """Deliberately not abstract, so a third-party adapter keeps loading."""
+    runner = FakeRunner()
+    adapter = ih.GitHubAdapter(runner=runner)
+
+    with pytest.raises(ih.IssueHostError, match="does not implement cr_approval"):
+        ih.IssueHostAdapter.cr_approval(adapter, "5")
+    assert runner.calls == []

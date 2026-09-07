@@ -15,7 +15,13 @@ from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
 from sdlc.eval_compare import DEFAULT_TOLERANCE
 # `sdlc queue run`'s defaults live with the scheduler, so `--help` prints the
 # real figures rather than a copy that can drift (Story 32.1-002).
-from sdlc.scheduler import DEFAULT_POLL_SECONDS, DEFAULT_SLOTS
+from sdlc.scheduler import (
+    DEFAULT_APPROVAL_POLL_SECONDS,
+    DEFAULT_POLL_SECONDS,
+    DEFAULT_SLOTS,
+    MAX_APPROVAL_POLL_SECONDS,
+    MIN_APPROVAL_POLL_SECONDS,
+)
 
 # The full set of planned subcommands with one-line descriptions. `--help`
 # renders these even while the bodies are stubs, so the surface area is visible
@@ -1602,9 +1608,16 @@ def reconcile(
     / no-remote degrades to a clean skip. No ledger / no runs reports cleanly;
     only a genuinely-unknown *explicit* run id exits non-zero, and no spurious
     empty ledger is ever created.
+
+    Story 32.1-003: this is also the on-demand trigger for the epic markdown's
+    ``**Status**: Done`` markers — ``reconcile_run`` itself only ever touches
+    the ledger, so after it returns this command renders every ``DONE`` story
+    of the run into its epic file via ``render_docs``. A write failure there
+    is reported but does not change the command's exit code (mirrors the old
+    best-effort write-back's non-fatal posture).
     """
     from sdlc.ledger_view import Ledger, default_db_path
-    from sdlc.reconcile import reconcile_run
+    from sdlc.reconcile import reconcile_run, render_docs
     from sdlc.registry import Registry
 
     db_path = db or default_db_path()
@@ -1631,6 +1644,14 @@ def reconcile(
             "origin (offline / no remote)."
         )
         raise typer.Exit(code=0)
+
+    try:
+        rendered = render_docs(ledger, result.run_id)
+    except OSError as exc:
+        rendered = {}
+        typer.echo(f"epic markdown render failed (non-fatal): {exc}", err=True)
+    for epic_file, story_ids in rendered.items():
+        typer.echo(f"  rendered {', '.join(story_ids)} → {epic_file}")
 
     if not result.changed:
         typer.echo(f"nothing to reconcile: run {result.run_id[:8]} unchanged.")
@@ -3136,14 +3157,17 @@ def queue_list_cmd(
     now = datetime.now(timezone.utc)
     typer.echo(
         f"{'ID':<6}{'STATE':<16}{'PRIORITY':<10}{'BUDGET':<9}{'KIND':<7}"
-        f"{'SCOPE':<16}{'AGE':<6}{'RUN':<14}REPO"
+        f"{'SCOPE':<16}{'AGE':<6}{'PR':<7}{'RUN':<14}REPO"
     )
     for r in rows:
         run_disp = (r.run_id or "-")[:12]
+        # The CR a `parked` job is waiting on (Story 32.2-002) — the one number
+        # an operator needs to go and label.
+        pr_disp = f"#{r.pr_number}" if r.pr_number is not None else "-"
         typer.echo(
             f"{r.id:<6}{r.state:<16}{r.priority:<10}{r.job_budget().label():<9}"
             f"{r.kind:<7}{r.scope:<16}"
-            f"{_format_age(now, r.created_at):<6}{run_disp:<14}{r.repo}"
+            f"{_format_age(now, r.created_at):<6}{pr_disp:<7}{run_disp:<14}{r.repo}"
         )
     raise typer.Exit(code=0)
 
@@ -3225,6 +3249,16 @@ def queue_run_cmd(
         min=0.1,
         help=f"Seconds between loop passes (default: {DEFAULT_POLL_SECONDS}).",
     ),
+    approval_poll_interval: float = typer.Option(
+        DEFAULT_APPROVAL_POLL_SECONDS,
+        "--approval-poll-interval",
+        min=MIN_APPROVAL_POLL_SECONDS,
+        max=MAX_APPROVAL_POLL_SECONDS,
+        help="Seconds between reads of a parked job's PR/MR (default: "
+        f"{int(DEFAULT_APPROVAL_POLL_SECONDS)}; bounded to "
+        f"{int(MIN_APPROVAL_POLL_SECONDS)}-{int(MAX_APPROVAL_POLL_SECONDS)} so "
+        "polling stays inside the host's API rate limits).",
+    ),
     as_json: bool = typer.Option(
         False, "--json", help="Emit the drain summary as JSON."
     ),
@@ -3259,6 +3293,15 @@ def queue_run_cmd(
     scratch — while a job whose run pid still answers is left alone. Ctrl-C
     stops the jobs it started and hands their leases back (exit 130).
 
+    A job whose run stops `AWAITING_APPROVAL` is recorded `parked` with its
+    PR/MR number and holds no slot (Story 32.2-002). Its change request is
+    re-read every `--approval-poll-interval` seconds, read-only. The moment it
+    carries `risk-approved` (or an approving review) the queue resumes the run,
+    so the controller performs the merge and records DONE — no hand-merge, no
+    `sdlc resume`. A PR merged by hand is reconciled instead; one closed without
+    merging fails the job with `reason=pr closed`. Without `--follow` a drain
+    polls its parks once and exits, leaving them in the queue for the next run.
+
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
     deliberately not built into the controller.
@@ -3271,7 +3314,12 @@ def queue_run_cmd(
 
     result = run_queue(
         store,
-        config=SchedulerConfig(slots=slots, follow=follow, poll_seconds=poll_interval),
+        config=SchedulerConfig(
+            slots=slots,
+            follow=follow,
+            poll_seconds=poll_interval,
+            approval_poll_seconds=approval_poll_interval,
+        ),
         echo=typer.echo,
     )
 
@@ -3280,7 +3328,8 @@ def queue_run_cmd(
     else:
         typer.echo(
             f"queue drained: {result.started} started, {result.resumed} resumed, "
-            f"{result.done} done, {result.failed} failed, {result.parked} parked"
+            f"{result.reconciled} reconciled, {result.done} done, "
+            f"{result.failed} failed, {result.parked} parked"
             + (" (interrupted)" if result.interrupted else "")
         )
     if result.interrupted:
@@ -3295,7 +3344,11 @@ def queue_run_cmd(
 def queue_cancel_cmd(
     job_id: int = typer.Argument(..., help="Job id to cancel."),
 ) -> None:
-    """Cancel a `queued` or parked (`blocked`) job. Refuses a `running` one."""
+    """Cancel a `queued`, `parked` or `blocked` job. Refuses a `running` one.
+
+    `parked` is the approval wait (Story 32.2-002): cancelling one abandons the
+    wait, leaving the change request exactly as it is for a human to finish.
+    """
     from sdlc.queue import QueueError, QueueStore, default_queue_path
 
     store = QueueStore(default_queue_path())
@@ -3313,13 +3366,17 @@ def queue_cancel_cmd(
 def queue_requeue_cmd(
     job_id: int = typer.Argument(..., help="Job id to put back in the queue."),
 ) -> None:
-    """Re-arm a parked (`blocked`), `failed` or `cancelled` job for the next drain.
+    """Re-arm a `blocked`, `parked`, `failed` or `cancelled` job for the next drain.
 
     The exit from the `blocked` park (Story 32.1-002): follow the remedy the job
     carries, then requeue it — its frozen options, priority, kind and scope are
     kept, so nothing has to be retyped. A job that already opened a run returns
     to `running` with an expired lease so the next `sdlc queue run` **resumes**
     it rather than restarting it from scratch. Refuses a `running` job.
+
+    A `parked` job (Story 32.2-002) is normally left alone — the queue resumes
+    it by itself once its change request is approved. Requeue one only to force
+    that resume now, without waiting for the next poll.
 
     Also the exit from a `needs_attention` budget park: the resumed job gets a
     fresh wall clock (it is measured per launch) and one more class allowance of

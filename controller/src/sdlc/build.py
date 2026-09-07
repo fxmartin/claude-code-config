@@ -98,7 +98,6 @@ from sdlc.issue_host import (
 )
 from sdlc.risk_gate import RISK_APPROVED_LABEL, RISK_LABEL
 from sdlc.registry import Registry, RunRecord
-from sdlc.story_markdown import mark_story_done
 from sdlc.usage import usage_is_tracked
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -8948,11 +8947,13 @@ def _record_merge_landing(
     (``hooks/worktree-gc.sh`` / :func:`remove_story_worktree`), host-agnostic
     local git, so it works unchanged on a GitLab target (AC2).
 
-    Issue #598: also stamps ``**Status**: Done`` onto the story's own block in
-    its epic markdown — the documented single source of truth, which every
-    other consumer (``issues init``, progress reporting) reads at face value.
-    Best-effort: a missing/unparseable epic file logs a warning and never
-    fails the merge landing.
+    Story 32.1-003: the epic markdown's ``**Status**: Done`` marker is no
+    longer stamped here — the ledger (via ``set_story_merge_sha`` below) is the
+    sole source of truth for the duration of a run, so the shared checkout
+    stays untouched and two build runs can overlap in one repo without
+    tripping the #590 dirty-tree guard. The marker is rendered into the
+    checkout on demand instead (``sdlc reconcile``; ``story_markdown.py`` is
+    now a pure renderer over that ledger state).
     """
     if stage != "merge":
         return
@@ -8965,13 +8966,6 @@ def _record_merge_landing(
         run_id, story.id, "info", "controller",
         f"merge landed: story DONE at {sha}{cr}",
     )
-    try:
-        mark_story_done(story.epic_file, story.id)
-    except OSError as exc:
-        ledger.event_log(
-            run_id, story.id, "warn", "controller",
-            f"epic markdown write-back failed (non-fatal): {exc}",
-        )
 
 
 def _dispatch_overengineering_advisory(
