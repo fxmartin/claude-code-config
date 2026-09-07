@@ -36,6 +36,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 | `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|prioritise` manage (Story 32.1-001). |
+| `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, and reclaim-and-resume for a killed scheduler (Story 32.1-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
 
@@ -1304,7 +1305,7 @@ it on the next real run).
   - **Development queue** (`sdlc/queue.py`, Story 32.1-001) — the host-level
     `queue.db` `sdlc build/fix --enqueue` and `sdlc queue` write to opens
     read-only, every migration is applied, and job counts by lifecycle state
-    (`queued`/`running`/`done`/`failed`/`cancelled`) are reported. Same
+    (`queued`/`running`/`done`/`failed`/`cancelled`/`blocked`) are reported. Same
     severity ladder as the ledger check: behind / pre-migration-framework →
     `WARN`; unreadable/corrupt → `FAIL`; no queue yet ("nothing enqueued on
     this host") → `CLEAN`.
@@ -1380,6 +1381,65 @@ announces itself in a host-level **registry** (`sdlc/registry.py`).
   `Registry.prune` drops `DEAD` entries (and, optionally, finished ones).
 - **`sdlc runs`** lists the registry view (repo, scope, derived state, progress);
   `--json` emits it for tooling and `--prune` clears crashed entries first.
+
+## The queue scheduler (`sdlc queue run`, Story 32.1-002)
+
+`sdlc build --enqueue` / `sdlc fix --enqueue` only *record* a job. `sdlc queue
+run` is what drains them: a foreground loop (`sdlc/scheduler.py`) over
+`queue.py` + `registry.py` that starts each job with the existing `build`/`fix`
+machinery. It is deliberately thin — every job runs as a **subprocess in its own
+process group**, so a job's crash cannot take the scheduler down and a stop
+reaches the job's own agents rather than just its parent.
+
+- **Claim = one guarded UPDATE.** `QueueStore.claim_job` is
+  `UPDATE … WHERE state='queued' AND (lease_until IS NULL OR lease_until < now)`.
+  SQLite's write lock makes it atomic, so two schedulers racing for a row
+  produce exactly one winner; the loser retries the next candidate. Candidate
+  *selection* (`peek_claimable`) is a separate read, because the scheduler must
+  weigh a job's slot cost — something SQL cannot compute — before taking it.
+- **Leases.** A claim carries `lease_until = now + 90s`, renewed every 30s
+  (Hyqs's tested figures). A lease is the only thing that says "a live scheduler
+  owns this job"; nothing else has to be cleaned up when one dies.
+- **Reclaim and resume.** On each pass, any `running` job whose lease lapsed is
+  a reclaim candidate. If its run's pid still answers (`registry.pid_alive`) it
+  is **left alone** — the lease lapsed but the work did not, and two drivers on
+  one run is exactly what the registry guard exists to prevent. Otherwise the
+  job is reclaimed and re-entered through **`sdlc resume --run <id>`**, never a
+  fresh `build`/`fix`: `resume.py` picks each story up at the stage it died in.
+  A job claimed but with no run yet goes back to `queued` — nothing to resume.
+- **Per-repo exclusivity.** `running_repos()` is read from the store, not from
+  one scheduler's memory, so two `sdlc queue run` processes on the same host
+  still never put two runs in one repo. A job held back this way is stamped
+  `reason=repo busy` so `sdlc queue list` says why. Nothing is bypassed to make
+  a job fit: no `--allow-dirty`, no stash, no `--force`. (Story 32.1-003 will
+  narrow this to *fix* jobs so two builds in one repo may overlap.)
+- **Agent slots.** `--slots` (default 2) caps *agent subprocesses* host-wide,
+  not runs. A job costs one slot, or the worker cap its own frozen
+  `--concurrency=N` declares. A job larger than the cap is still run — alone —
+  so an oversized job can never starve.
+- **Per-job version check.** Before each launch, Story 15.1-004's
+  `check_controller_version` runs against **that job's repo**. A repo whose
+  installed `sdlc` disagrees with its own `controller/pyproject.toml` parks the
+  job `blocked` carrying the reinstall remedy, rather than running it on stale
+  code.
+- **Terminal states.** A finished job mirrors its run: exit 0 → `done`; a
+  registry status of `RATE_LIMITED` / `AWAITING_APPROVAL` / `NEEDS_ATTENTION` →
+  `blocked` (parked, resumable — calling that `failed` would bury it); otherwise
+  `failed`. Each terminal fires the existing Telegram `run_finished` notify.
+- **The dashboard needs no change.** The job's subprocess registers itself the
+  way any `sdlc build` does, so a queued job appears as an ordinary run. The
+  scheduler never writes to the registry; it only reads it (joining a child's
+  pid to its `run_id`, which is what makes resume-not-restart possible).
+- **Ctrl-C.** Children are stopped first (SIGTERM → SIGKILL on the process
+  group, with headroom), leases released second — the reverse order would invite
+  a second scheduler onto a still-live run. A job that never started a run goes
+  back to `queued`; a job with a run stays `running` with an expired lease, so
+  the next drain resumes it. Exit code 130.
+- **Daemonising is out of scope here.** The documented path is the Epic-30
+  30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secret from the
+  env/file convention) wrapping this same foreground verb. `--follow` keeps the
+  loop alive on an empty queue so an intake — the `sdlc listen` supervisor this
+  loop becomes — can enqueue into a scheduler that is already draining.
 
 ## Run-logging CLI for non-controller pipelines (Story 11.2-013)
 

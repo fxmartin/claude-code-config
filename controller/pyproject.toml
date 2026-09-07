@@ -103,6 +103,7 @@ module = [
     "sdlc.repair",
     "sdlc.review_packet",
     "sdlc.risk_gate",
+    "sdlc.scheduler",
     "sdlc.runlog",
     "sdlc.sanitize",
     "sdlc.security_scan",

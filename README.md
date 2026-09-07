@@ -176,6 +176,7 @@ Claude Code). The plugin half needs a Claude Code restart to take effect.
 | `sdlc build [scope] [--dry-run] [--auto] [--harness role=name] [--concurrency=N]` | Run the full build-stories orchestration |
 | `sdlc build --enqueue <scope>` · `sdlc fix --enqueue <issue>` | Record a job in the host queue instead of running now; no run starts. Foreground stays the default when `--enqueue` is omitted |
 | `sdlc queue list` · `sdlc queue add` · `sdlc queue cancel <id>` · `sdlc queue prioritise <id> <class>` | Inspect and manage the host-level job queue (`$XDG_STATE_HOME/sdlc/queue.db`, `SDLC_QUEUE_PATH`-overridable) — every job on the host across repos, any state, priority, and age |
+| `sdlc queue run [--slots N] [--follow]` | Drain the host queue in the foreground: claim each job under a renewable lease and run it with the existing `build`/`fix` machinery as a subprocess. Never two jobs in one repo, never more than `--slots` agent slots host-wide (default 2). Ctrl-C stops its jobs and hands the leases back (exit 130); the next run reclaims any lapsed job and re-enters it via `sdlc resume`, never from scratch |
 | `sdlc resume` | Resume an interrupted build from the ledger state |
 | `sdlc status` · `sdlc state` | Run status and stage progress · inspect the persisted state machine |
 | `sdlc dashboard --open` | Live multi-run browser dashboard (see [Observability](#observability--the-live-dashboard)) |
