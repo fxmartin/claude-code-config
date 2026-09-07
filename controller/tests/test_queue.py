@@ -238,3 +238,55 @@ def test_counts_by_state(tmp_path) -> None:
     store.cancel_job(a)
     counts = store.counts_by_state()
     assert counts == {"queued": 1, "cancelled": 1}
+
+
+def test_counts_by_state_absent_store_returns_empty(tmp_path) -> None:
+    """A store that has never been `init()`-ed reports no counts, not a crash."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    assert store.counts_by_state() == {}
+
+
+def test_set_state_rejects_unknown_state(tmp_path) -> None:
+    from sdlc.queue import QueueError, QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    with pytest.raises(QueueError):
+        store._set_state(job_id, "bogus")
+
+
+def test_apply_migrations_adds_column_and_is_idempotent(tmp_path, monkeypatch) -> None:
+    """A future migration entry (today's `_MIGRATIONS` is empty) adds its column
+    on first `init()` and is skipped as already-applied on a second — the same
+    upgrade-in-place path a real schema change will exercise later."""
+    import sdlc.queue as queue_mod
+    from sdlc.queue import QueueStore
+
+    fake_migration = (
+        1,
+        "add_worker_note",
+        "jobs",
+        [("worker_note", "TEXT")],
+        "CREATE TABLE IF NOT EXISTS _queue_migration_marker (id INTEGER);",
+    )
+    monkeypatch.setattr(queue_mod, "_MIGRATIONS", [fake_migration])
+
+    db = tmp_path / "queue.db"
+    store = QueueStore(db)
+    store.init()
+
+    conn = sqlite3.connect(db)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        assert "worker_note" in cols
+        applied = {row[0] for row in conn.execute("SELECT version FROM _migrations").fetchall()}
+        assert applied == {1}
+    finally:
+        conn.close()
+
+    # A second init() must skip the already-applied version (no duplicate
+    # ALTER TABLE, which would raise "duplicate column name").
+    store.init()
