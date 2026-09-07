@@ -303,6 +303,43 @@ def test_build_help_lists_flags_and_scopes() -> None:
     assert "epic-NN" in _BUILD_EPILOG and "X.Y-NNN" in _BUILD_EPILOG
 
 
+def test_build_actor_adapter_honours_declared_forge(tmp_path, monkeypatch) -> None:
+    """Story 30.1-001 / AC1: `sdlc build`'s actor-adapter resolution is a
+    `detect_host` call site — a declared `.sdlc-forge.yaml` instance must reach
+    it exactly like every other host-touching path (fix, issues init, dashboard)."""
+    import subprocess
+
+    import sdlc.build as build_mod
+    from sdlc.build import BuildResult
+
+    _make_project(tmp_path)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         "git@example.com:owner/repo.git"],
+        check=True,
+    )
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    captured: dict = {}
+
+    def _fake_run_build(opts, **kwargs):
+        captured["actor_adapter"] = kwargs.get("actor_adapter")
+        return BuildResult(dry_run=True, planned=0, run_id="run-x")
+
+    monkeypatch.setattr(build_mod, "run_build", _fake_run_build)
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    adapter = captured["actor_adapter"]
+    assert adapter is not None
+    assert adapter.host == "gitlab"
+    assert adapter.instance_url == "http://127.0.0.1:8080"
+
+
 def test_build_reports_budget_stop_with_notional_label(tmp_path, monkeypatch) -> None:
     """Story 14.1-001: a budget-gated stop prints the labelled-notional $ and
     exits non-zero (a paused run is not fully done)."""

@@ -1207,6 +1207,21 @@ def test_git_project_url_handles_missing_git(monkeypatch) -> None:
     assert dash.git_project_url("/nope") is None
 
 
+def test_git_project_url_unparseable_remote_returns_none(tmp_path: Path) -> None:
+    """An origin `_web_url_from_remote` can't parse (no `.sdlc-forge.yaml`
+    either) returns None before the declared-instance rewrite ever runs."""
+    import subprocess
+
+    from sdlc.dashboard import git_project_url
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin", "not a url"],
+        check=True,
+    )
+    assert git_project_url(tmp_path) is None
+
+
 def test_git_project_url_declared_instance_rewrites_web_base(tmp_path: Path) -> None:
     """Story 30.1-001: a declared instance URL replaces the remote's scheme+host,
     so MR deep links on the dashboard open the local instance."""

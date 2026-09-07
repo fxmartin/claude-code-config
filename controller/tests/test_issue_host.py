@@ -940,6 +940,15 @@ def test_resolve_forge_unsupported_override_fails_fast(tmp_path) -> None:
         ih.resolve_forge(tmp_path, override="bitbucket")
 
 
+def test_resolve_forge_unsupported_auto_detected_host_fails_fast(tmp_path, monkeypatch) -> None:
+    """Defensive branch: an auto-detected host outside SUPPORTED_HOSTS still
+    fails fast with the same "unsupported host" message as an unsupported
+    override, even though `detect_host` today only ever returns github/gitlab/None."""
+    monkeypatch.setattr(ih, "detect_host", lambda root: "bitbucket")
+    with pytest.raises(ih.IssueHostError, match="unsupported host"):
+        ih.resolve_forge(tmp_path)
+
+
 def test_format_forge_preflight_line_no_instance() -> None:
     resolution = ih.ForgeResolution(host=ih.GITHUB, instance_url=None, source="auto-detect")
     assert ih.format_forge_preflight_line(resolution) == "forge routing: github (auto-detect)"

@@ -200,6 +200,27 @@ def test_dashboard_stop_still_works_under_sentinel(monkeypatch) -> None:
     assert IN_TEST_ENV_VAR not in result.output
 
 
+def test_dashboard_malformed_forge_declaration_aborts_at_preflight(monkeypatch) -> None:
+    """AC3 / Story 30.1-001: a malformed `.sdlc-forge.yaml` in single-repo
+    (--db) mode aborts dashboard startup with an actionable error, exit 2 —
+    never a hang or a silent fallback."""
+    from sdlc.build import IN_TEST_ENV_VAR
+    import sdlc.dashboard as dash_mod
+    from sdlc.issue_host import IssueHostError
+
+    monkeypatch.delenv(IN_TEST_ENV_VAR, raising=False)
+
+    def _boom(*args, **kwargs):
+        raise IssueHostError(".sdlc-forge.yaml names unsupported forge 'bitbucket'")
+
+    monkeypatch.setattr(dash_mod, "serve", _boom)
+
+    result = runner.invoke(app, ["dashboard"])
+    assert result.exit_code == 2, result.output
+    assert "error:" in result.output
+    assert "unsupported forge" in result.output
+
+
 def test_unknown_command_exits_nonzero() -> None:
     """Invoking an unknown command produces a non-zero exit code."""
     result = runner.invoke(app, ["nonexistent-command"])
