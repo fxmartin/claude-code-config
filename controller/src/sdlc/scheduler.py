@@ -1,6 +1,7 @@
 # ABOUTME: The `sdlc queue run` scheduler — leased claims, per-repo exclusivity, slot cap.
 # ABOUTME: Stories 32.1-002 + 32.2-002. A thin loop over queue.py + registry.py that
 # ABOUTME: spawns build/fix/resume/reconcile, including the approval park and auto-resume.
+# ABOUTME: Story 32.2-001 adds one host-level rate-limit window shared by every repo.
 
 from __future__ import annotations
 
@@ -15,12 +16,13 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, cast
 
 from sdlc.approval import ApprovalVerdict, poll_approval
 from sdlc.queue import (
     JobBudget,
     JobRecord,
+    QueuePause,
     QueueStore,
     budget_breach,
     fix_rounds_exhausted,
@@ -28,10 +30,14 @@ from sdlc.queue import (
 from sdlc.registry import Registry, RunRecord, pid_alive
 from sdlc.risk_gate import RISK_APPROVED_LABEL
 
+if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
+    from sdlc.build import Ledger
+
 __all__ = [
     "DEFAULT_APPROVAL_POLL_SECONDS",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_POLL_SECONDS",
+    "DEFAULT_PROBE_INTERVAL_SECONDS",
     "DEFAULT_RENEW_SECONDS",
     "DEFAULT_SLOTS",
     "MAX_APPROVAL_POLL_SECONDS",
@@ -69,6 +75,36 @@ DEFAULT_POLL_SECONDS = 2.0
 DEFAULT_APPROVAL_POLL_SECONDS = 300.0
 MIN_APPROVAL_POLL_SECONDS = 30.0
 MAX_APPROVAL_POLL_SECONDS = 3600.0
+# How often a *held* queue re-probes the live API while it waits out a window
+# (Story 32.2-001). The window's own reset is the primary signal; the probe is
+# the correction for an epoch that was never right — a network blip misread as a
+# throttle, or a reset-less limit padded out to the full auto-wait cap. Five
+# minutes is one tiny request per 300s of waiting: cheap enough to run for hours,
+# frequent enough that the queue reopens minutes rather than hours late.
+DEFAULT_PROBE_INTERVAL_SECONDS = 300.0
+
+# The in-process auto-wait cap a run without a persisted reset falls back to
+# (`BuildOptions.rate_limit_max_wait_s` — ~one Max rolling window). The run's own
+# configured value is preferred when its ledger recorded one; this is only the
+# floor for a run whose config predates the key.
+_DEFAULT_RATE_LIMIT_MAX_WAIT_S = 18000
+
+# The ledger run status that holds the whole queue. Rate-limit truth stays in
+# the run's ledger (`build.py` writes it via `run_update_status`); the queue only
+# caches the reset so the window is discovered once rather than once per repo.
+_RATE_LIMITED = "RATE_LIMITED"
+
+# The two `reason` values a rate-limit park carries, and the state machine
+# between them: `_reap` writes the first when a run hands its window to the
+# queue, and `_resume_dispatch` rewrites it to the second once that window has
+# been served. `_discover_rate_limit` skips the second, which is what stops a
+# park left behind by a scarce slot from re-opening a window the queue already
+# waited out. Persisted on the job rather than held in memory so it survives a
+# scheduler restart and is read identically by every peer on the host — the
+# same "state lives in the store" rule the pause row itself follows, and the
+# same use of `reason` as `_stamp_repo_busy`'s "repo busy".
+_PARKED_REASON = "rate-limited: waiting for the shared window to reopen"
+_WINDOW_SERVED_REASON = "rate-limited: the window reopened — awaiting a free slot"
 
 # Registry *terminal* statuses that mean parked-for-a-human rather than failed:
 # the run reached an end state, but one a human decision reopens (approve the
@@ -121,6 +157,9 @@ FixRounds = Callable[[str, str], int]
 # same shape and the same reason: the overlap graph's *write* side is testable
 # without standing up a ledger (Story 32.3-001 AC2).
 PlanFiles = Callable[[str, str], list[str]]
+# Returns a `sdlc.capability.ProbeStatus`; typed loosely so importing this
+# module never drags in the harness/capability stack.
+RateLimitProbe = Callable[[], object]
 
 
 @dataclass
@@ -138,6 +177,9 @@ class SchedulerConfig:
     # How often a parked job's change request is re-read (Story 32.2-002).
     # Clamped by :func:`approval_poll_interval` before use.
     approval_poll_seconds: float = DEFAULT_APPROVAL_POLL_SECONDS
+    # Seconds between live-API re-probes while the queue waits out a rate-limit
+    # window (Story 32.2-001).
+    probe_interval_seconds: float = DEFAULT_PROBE_INTERVAL_SECONDS
 
 
 @dataclass
@@ -152,6 +194,9 @@ class SchedulerResult:
     done: int = 0
     failed: int = 0
     parked: int = 0
+    # Rate-limit windows this drain waited out (Story 32.2-001) — windows, not
+    # jobs: N repos sharing one closed window is still one pause.
+    paused: int = 0
     interrupted: bool = False
 
     def to_dict(self) -> dict[str, object]:
@@ -162,8 +207,46 @@ class SchedulerResult:
             "done": self.done,
             "failed": self.failed,
             "parked": self.parked,
+            "paused": self.paused,
             "interrupted": self.interrupted,
         }
+
+
+@dataclass
+class _RateLimitPark:
+    """One run's rate-limit state, read from its own ledger (Story 32.2-001).
+
+    ``reset_at`` is the epoch the run persisted when it parked
+    (``apply_rate_limit_park``); ``None`` means the limit surfaced no reset at
+    all (a usage-limit with no retry-after), and the queue falls back to the
+    run's configured ``max_wait_s`` — the same conservative "assume a full
+    window" heuristic ``seconds_until_reset`` applies in-process.
+
+    Note the deliberate divergence AC3 asks for: ``rate_limit_max_wait_s`` is
+    the run-level *cap on an in-process wait*, while ``seconds_until_reset``
+    sizes its blind wait off ``window_s``. They are the same 18000s at the
+    defaults, so this only bites a host that lowers ``--rate-limit-max-wait`` —
+    which would reopen the queue that many seconds into a still-closed window.
+    A live probe cannot reopen early on its own, so that is the floor, not a
+    fail-open; sizing this off the window length instead would be a spec change.
+    """
+
+    job_id: int
+    run_id: str
+    repo: str
+    db: Path
+    reset_at: float | None
+    max_wait_s: int
+
+    def window_until(self, now: datetime) -> datetime:
+        """The instant dispatch may resume."""
+        if self.reset_at is not None:
+            return datetime.fromtimestamp(self.reset_at, timezone.utc)
+        return now + timedelta(seconds=self.max_wait_s)
+
+    @property
+    def source(self) -> str:
+        return "reset-epoch" if self.reset_at is not None else "max-wait"
 
 
 @dataclass
@@ -511,6 +594,78 @@ def _default_approval_probe(root: Path, pr_number: int) -> ApprovalVerdict | Non
     return poll_approval(root, pr_number)
 
 
+class _Unset:
+    """Sentinel for "``probe`` was never passed" (Story 32.2-001).
+
+    ``None`` is a *meaningful* value for a probe — ``_window_reopened`` reads it
+    as "no live check wired, so only the recorded reset reopens this window" —
+    so it cannot double as `run_queue`'s "use the default" default. Without this
+    a caller asking for no probe silently got a real API request instead.
+    """
+
+
+_UNSET = _Unset()
+
+@dataclass
+class _ProbeContext:
+    """The one attribute ``build._probe_parked_reset`` reads off its context.
+
+    That function takes a ``_RateLimitContext`` but touches only ``.probe``;
+    building a whole ``BuildOptions``/window quota here just to satisfy the type
+    would be ceremony. This keeps the reuse honest and the coupling one field
+    wide.
+    """
+
+    probe: RateLimitProbe | None
+
+
+def _as_float(value: object) -> float | None:
+    """``value`` as an epoch float, or ``None`` when it is absent/unparseable.
+
+    Ledger config is whatever JSON was written into it, so the epoch may arrive
+    as a number, as a numeric string, or (from the queue's own pause row) as an
+    ISO-8601 instant. All three are the same fact; anything else is junk and
+    reads as "no reset recorded".
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):  # `True` is not an epoch, whatever int() says
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
+
+
+def _as_datetime(value: str | None) -> datetime | None:
+    """An ISO-8601 stamp as an aware UTC datetime, or ``None`` when unreadable.
+
+    Naive stamps are read as UTC — the same reading :meth:`QueuePause.is_active`
+    and :meth:`_Scheduler._due_for_probe` give them, so every consumer of a
+    stored timestamp agrees about what a missing offset means.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _as_int(value: object, fallback: int) -> int:
+    """``value`` as a positive int, or ``fallback`` when it is absent/junk."""
+    parsed = _as_float(value)
+    if parsed is None or parsed <= 0:
+        return fallback
+    return int(parsed)
+
+
 class _Scheduler:
     """The drain loop. See :func:`run_queue` for the public entry point."""
 
@@ -528,6 +683,7 @@ class _Scheduler:
         approval_probe: ApprovalProbe,
         fix_rounds: FixRounds,
         plan_files: PlanFiles,
+        probe: RateLimitProbe | None,
         echo: Callable[[str], None],
         identity: str,
     ) -> None:
@@ -542,6 +698,7 @@ class _Scheduler:
         self._approval_probe = approval_probe
         self._fix_rounds = fix_rounds
         self._plan_files = plan_files
+        self._probe = probe
         self._echo = echo
         self._identity = identity
         self._in_flight: dict[int, _InFlight] = {}
@@ -558,10 +715,16 @@ class _Scheduler:
                 self._reap()
                 self._enforce_budgets()
                 self._renew()
+                self._check_rate_limit()
                 polled = self._poll_parked()
                 progressed = self._fill_slots() or polled
                 self._stamp_repo_busy()
-                if not self._in_flight and not progressed and not self._config.follow:
+                if (
+                    not self._in_flight
+                    and not progressed
+                    and not self._config.follow
+                    and not self._waiting_out_window()
+                ):
                     break
                 self._sleep(self._config.poll_seconds)
         except KeyboardInterrupt:
@@ -575,7 +738,16 @@ class _Scheduler:
         return sum(entry.slots for entry in self._in_flight.values())
 
     def _fill_slots(self) -> bool:
-        """Claim and launch while slots and claimable work remain."""
+        """Claim and launch while slots and claimable work remain.
+
+        A host-level rate-limit pause (Story 32.2-001) closes this door
+        entirely: the Max plan every repo shares is exhausted, so claiming *any*
+        job — fresh or resumed — would only spend into a window that is already
+        closed. Jobs already in flight are left alone; a run that parked itself
+        is the one that knows how to wait.
+        """
+        if self._dispatch_paused():
+            return False
         progressed = False
         # Bounded so a pathological race (every claim lost to another
         # scheduler) can never spin this pass forever.
@@ -746,6 +918,22 @@ class _Scheduler:
             if code is None:
                 continue
             del self._in_flight[job_id]
+            if entry.run_id and self._rate_limit_park(job_id, entry.run_id) is not None:
+                # Story 32.2-001: a run that parked itself on a closed window
+                # exits non-zero, but it is *paused*, not finished. Stamping it
+                # terminal would need a manual `sdlc queue requeue` to undo, so
+                # the claim is handed back the `release_claim` way — state
+                # ``running`` with an expired lease — and the reclaim path
+                # resumes it through `sdlc resume` once the window reopens.
+                # `_check_rate_limit` records the host pause from the same
+                # ledger read on the next pass.
+                self._store.release_claim(
+                    job_id, claimed_by=self._identity,
+                    reason=_PARKED_REASON,
+                    now=self._clock(),
+                )
+                self._echo(f"job {job_id} paused: rate-limited, awaiting the window")
+                continue
             record = (
                 self._registry_record(entry.run_id) if entry.run_id else None
             )
@@ -940,7 +1128,15 @@ class _Scheduler:
         spins; and a job whose repo is busy, or for which no agent slot is free,
         is skipped *before* the read — there would be nothing to do with the
         answer, so the API call would be pure waste.
+
+        A host-level rate-limit pause (Story 32.2-001) closes this door for the
+        same reason it closes :meth:`_fill_slots`: resuming an approved job
+        launches an agent against the one Max window every repo shares, and that
+        window is shut. The parks keep their ``poll_after`` and are re-read on
+        the pass after the window reopens.
         """
+        if self._dispatch_paused():
+            return False
         due = self._store.due_parked_jobs(now=self._clock())
         if not due:
             return False
@@ -1012,6 +1208,293 @@ class _Scheduler:
                 run=job.run_id or "",
             )
         return True
+    # --- one rate-limit window for the whole queue (Story 32.2-001) --------
+
+    def _check_rate_limit(self) -> None:
+        """Open, hold, or lift the host-level pause — once per window.
+
+        FX runs every repo on one Max subscription, so a closed window is a
+        property of the *host*, not of the run that happened to discover it.
+        Each pass therefore asks one question of the queue as a whole: is any
+        live job's run parked ``RATE_LIMITED``? If so the reset is cached on the
+        queue and every scheduler stops claiming until it passes — the window is
+        discovered once and waited out once, with one notify for the pause and
+        one for the resume rather than one per repo.
+
+        The ledger stays the source of truth (the technical note is explicit
+        about that): nothing here *decides* a rate limit, it only reads the
+        verdict `build.py` already wrote and caches its reset time.
+        """
+        pause = self._store.dispatch_pause()
+        if pause is not None:
+            if pause.is_active(self._clock()) and not self._window_reopened(pause):
+                return
+            self._resume_dispatch(pause)
+            return
+        parks = self._discover_rate_limit()
+        # A park that recorded a reset carries evidence; a reset-less one only
+        # carries the max-wait *guess*. Sizing the shared window off the guess
+        # while another run holds the real reset would stall every repo for the
+        # five-hour cap, so the guess is used only when nothing better exists.
+        candidates = [park for park in parks if park.reset_at is not None] or parks
+        if candidates:
+            now = self._clock()
+            latest = max(candidates, key=lambda park: park.window_until(now))
+            self._pause_dispatch(latest)
+
+    def _dispatch_paused(self) -> bool:
+        pause = self._store.dispatch_pause()
+        return pause is not None and pause.is_active(self._clock())
+
+    def _waiting_out_window(self) -> bool:
+        """Whether a one-shot drain must stay alive to see the window reopen.
+
+        Without this a plain `sdlc queue run` would exit the moment it paused,
+        leaving the parked job for whoever runs the command next — the opposite
+        of "the queue resumes everything itself at that moment". It only holds
+        while there is work the reopened window would actually let through, so a
+        pause discovered on an otherwise empty queue still exits.
+        """
+        if not self._dispatch_paused():
+            return False
+        now = self._clock()
+        return bool(
+            self._store.peek_claimable(now=now)
+            or self._store.expired_running_jobs(now=now)
+        )
+
+    def _discover_rate_limit(self) -> list["_RateLimitPark"]:
+        """Every job whose run *durably parked* on a closed window.
+
+        All of them, not the first: parked jobs routinely outnumber free slots,
+        and a window sized to whichever park happened to be listed first would
+        be lifted while another parked run's ledger still records a later reset
+        — a second pause, from stale evidence, once the first job was already
+        running again. The caller sizes the one window off the latest reset any
+        park recorded, so a single pause covers every parked run on the host.
+
+        Reads every ``running`` job in the *store*, not just this scheduler's
+        own in-flight ones: a second `sdlc queue run` on the same host shares the
+        one subscription, and a job parked by a previous drain still holds the
+        window it discovered.
+
+        A run whose process is still alive is skipped, because ``RATE_LIMITED``
+        alone does not mean "durably parked". ``build._rate_limit_wait`` flips a
+        run to that same status for the duration of a *bounded in-process* wait
+        — one that stays inside the run's own auto-wait cap, records no reset
+        epoch, and un-flips itself to ``IN_PROGRESS`` seconds later without any
+        help from the queue. Reading that as a host park would open a window on
+        the reset-less ``max-wait`` fallback (a five-hour cap) over a wait the
+        run was about to finish on its own, and stall every other repo behind
+        it. Only a run that exited while still ``RATE_LIMITED`` handed the
+        window over to the queue.
+
+        A park the queue has already waited out is skipped too — its evidence
+        was spent on the window that has just been served (see
+        :meth:`_spend_served_parks`). Without that, a park left standing because
+        no slot was free re-opened a *second* window from the same limit: the
+        reset-carrying kind was harmless once its epoch passed, but a reset-less
+        park's window is a sliding ``now + max_wait_s`` that can never be over,
+        and a live probe that reopens early leaves every epoch still in the
+        future. Either way the queue idled another full window per leftover
+        repo — one pause and one resume each — which is the exact per-repo
+        storm this story exists to end.
+        """
+        parks: list[_RateLimitPark] = []
+        for job in self._store.list_jobs():
+            if job.state != "running" or not job.run_id:
+                continue
+            if job.id in self._in_flight or self._run_is_live(job.run_id):
+                continue  # waiting in-process; it resumes itself
+            if job.reason == _WINDOW_SERVED_REASON:
+                continue  # spent evidence: this park's window was already served
+            park = self._rate_limit_park(job.id, job.run_id)
+            if park is not None:
+                parks.append(park)
+        return parks
+
+    def _rate_limit_park(self, job_id: int, run_id: str) -> "_RateLimitPark | None":
+        """``run_id``'s rate-limit park as its own ledger records it, or ``None``.
+
+        Advisory by construction: a missing registry entry, a ledger that cannot
+        be opened, or a config value that is not a number all read as "not
+        rate-limited". Failing a whole drain over an unreadable ledger would be
+        far worse than missing one pause, which the next pass re-reads anyway.
+        """
+        record = self._registry_record(run_id)
+        if record is None or record.finished_at:
+            return None
+        try:
+            from sdlc.build import Ledger  # heavy module; only needed on this path
+
+            ledger = Ledger(Path(record.db))
+            row = ledger.run_row(run_id)
+            if row is None or row.get("status") != _RATE_LIMITED:
+                return None
+            config = ledger.run_config(run_id)
+        except Exception:  # noqa: BLE001 - a ledger read must never fail a drain
+            return None
+        return _RateLimitPark(
+            job_id=job_id,
+            run_id=run_id,
+            repo=record.repo,
+            db=Path(record.db),
+            reset_at=_as_float(config.get("rate_limit_reset_at")),
+            max_wait_s=_as_int(
+                config.get("rate_limit_max_wait_s"), _DEFAULT_RATE_LIMIT_MAX_WAIT_S
+            ),
+        )
+
+    def _pause_dispatch(self, park: "_RateLimitPark") -> None:
+        """Cache the window on the queue and announce it — at most once."""
+        now = self._clock()
+        until = park.window_until(now)
+        if until <= now:
+            return  # the recorded reset has already passed — nothing to wait for
+        detail = (
+            "reset recorded by the run"
+            if park.reset_at is not None
+            else f"no reset time — waiting the configured {park.max_wait_s}s cap"
+        )
+        opened = self._store.pause_dispatch(
+            until=until,
+            reason=f"rate limited ({detail})",
+            run_id=park.run_id,
+            repo=park.repo,
+            source=park.source,
+            now=now,
+        )
+        if not opened:
+            return  # another job already discovered this window — stay silent
+        self._result.paused += 1
+        self._echo(
+            f"queue paused: rate limited (run {park.run_id[:8]}) — no job is "
+            f"claimed until {until.isoformat()}"
+        )
+        self._notify(
+            "queue_paused",
+            repo=Path(park.repo).name,
+            subject="development queue",
+            reset_at=until.isoformat(),
+            detail=detail,
+            run=park.run_id,
+        )
+
+    def _resume_dispatch(self, pause: QueuePause) -> None:
+        """Lift the pause and announce it — once, for the whole queue."""
+        self._spend_served_parks(pause)
+        self._store.clear_pause()
+        self._echo("queue resumed: the rate-limit window reopened")
+        self._notify(
+            "queue_resumed",
+            repo=Path(pause.repo).name if pause.repo else "",
+            subject="development queue",
+            paused_until=pause.paused_until,
+            run=pause.run_id or "",
+        )
+
+    def _spend_served_parks(self, pause: QueuePause) -> None:
+        """Mark every still-standing park as covered by the window just served.
+
+        The queue serves one window per limit, but the parks that discovered it
+        outlive it: only as many as there are free slots get resumed, and the
+        rest stay ``running`` with a ledger that still says ``RATE_LIMITED``.
+        Re-reading those as fresh evidence is what re-closed the queue. Stamping
+        them here spends the evidence exactly once — and only here, so a run
+        that is resumed and walks back into the wall re-parks through
+        :meth:`_reap`, gets ``_PARKED_REASON`` again, and opens the new window
+        it genuinely deserves.
+
+        A park recording a reset *beyond* the window just served is kept: a job
+        already in flight when the pause opened can hit the wall during it, and
+        the reset it records is a later window this one never covered. Only an
+        epoch earns that reprieve — a reset-less park carries the blind
+        ``max_wait`` guess, which is never evidence of a *new* limit (the same
+        ranking :meth:`_check_rate_limit` applies when sizing the window). If
+        the API really is still closed, resuming it costs one re-park, which
+        opens the next window properly rather than guessing at it here.
+
+        The jobs stay reclaim candidates throughout: this only re-words *why*
+        they are waiting, from "for the window" to "for a slot", which is also
+        the truer thing to show an operator running `sdlc queue list`.
+        """
+        served = _as_datetime(pause.paused_until)
+        now = self._clock()
+        for park in self._discover_rate_limit():
+            if (
+                served is not None
+                and park.reset_at is not None
+                and park.window_until(now) > served
+            ):
+                continue  # a later window than the one just served — real news
+            self._store.set_reason(park.job_id, _WINDOW_SERVED_REASON)
+
+    def _window_reopened(self, pause: QueuePause) -> bool:
+        """Whether a live probe says the window is open before its reset says so.
+
+        Mirrors :func:`sdlc.build._probe_parked_reset` — reused, not
+        reimplemented, down to writing the verdict into the parked run's own
+        ledger so a queue-side check and a resume-side one read identically.
+        Only ``AVAILABLE`` reopens; ``UNAVAILABLE`` and ``UNKNOWN`` (no probe
+        wired, or the probe itself errored) keep the window shut, because this
+        gate protects a quota that may still be closed and so must never fail
+        open. Throttled to ``probe_interval_seconds`` and stamped on the queue,
+        so a five-hour blind wait costs a handful of tiny requests rather than
+        one per poll.
+        """
+        if self._probe is None or not self._due_for_probe(pause):
+            return False
+        self._store.mark_pause_probed(now=self._clock())
+        from sdlc.build import _probe_parked_reset
+        from sdlc.capability import ProbeStatus
+
+        ledger = self._pause_ledger(pause)
+        if ledger is None:
+            return False
+        reset_at = _as_float(pause.paused_until)
+        try:
+            status = _probe_parked_reset(
+                ledger,
+                pause.run_id or "",
+                # Structurally all that function reads is ``.probe`` — see
+                # :class:`_ProbeContext`. The cast keeps the reuse honest
+                # without constructing a whole BuildOptions to satisfy a type.
+                cast(Any, _ProbeContext(probe=self._probe)),
+                reset_at if reset_at is not None else 0.0,
+            )
+        except Exception:  # noqa: BLE001 - a probe must never fail a drain
+            return False
+        return status is ProbeStatus.AVAILABLE
+
+    def _due_for_probe(self, pause: QueuePause) -> bool:
+        last = pause.probed_at or pause.paused_at
+        try:
+            since = datetime.fromisoformat(last)
+        except (TypeError, ValueError):
+            return True
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        elapsed = (self._clock() - since).total_seconds()
+        return elapsed >= self._config.probe_interval_seconds
+
+    def _pause_ledger(self, pause: QueuePause) -> "Ledger | None":
+        """The parked run's ledger, so the probe verdict is logged where it belongs.
+
+        ``None`` when the run is no longer discoverable — the verdict would have
+        nowhere to go, and a probe whose outcome cannot be recorded is exactly
+        the "no evidence" case the gate keeps the window shut for.
+        """
+        if not pause.run_id:
+            return None
+        record = self._registry_record(pause.run_id)
+        if record is None:
+            return None
+        try:
+            from sdlc.build import Ledger
+
+            return Ledger(Path(record.db))
+        except Exception:  # noqa: BLE001
+            return None
 
     # --- registry ---------------------------------------------------------
 
@@ -1115,6 +1598,7 @@ def run_queue(
     approval_probe: ApprovalProbe | None = None,
     fix_rounds: FixRounds | None = None,
     plan_files: PlanFiles | None = None,
+    probe: RateLimitProbe | None | _Unset = _UNSET,
     echo: Callable[[str], None] | None = None,
     identity: str | None = None,
 ) -> SchedulerResult:
@@ -1130,10 +1614,11 @@ def run_queue(
        (Story 32.3-001) — fix rounds read from the run's ledger, wall clock
        measured from this launch;
     4. renew our leases;
-    5. re-read any parked change request whose poll is due and act on it: an
+    5. open, hold or lift the one host-level rate-limit window (Story 32.2-001);
+    6. re-read any parked change request whose poll is due and act on it: an
        approval resumes the run, a hand-merge reconciles it, a close fails the
        job;
-    6. reclaim any lapsed job whose run is genuinely dead and resume it, then
+    7. reclaim any lapsed job whose run is genuinely dead and resume it, then
        claim fresh work while agent slots and non-busy repos remain.
 
     Every collaborator is injectable so the loop is testable without forking:
@@ -1141,13 +1626,15 @@ def run_queue(
     supplies run liveness, ``version_check`` is Story 15.1-004's per-repo check,
     ``approval_probe`` is the read-only change-request poll, ``fix_rounds``
     counts a run's burned bugfix rounds, ``plan_files`` reads the file set a
-    run's investigation froze (the overlap graph's write side), and ``notifier``
-    is the Telegram path.
+    run's investigation froze (the overlap graph's write side), ``probe`` is the
+    live-API rate-limit check behind a held window (omit it for the real one;
+    pass ``None`` to wire none at all), and ``notifier`` is the Telegram path.
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from
     the env/file convention) wrapping this same foreground command.
     """
+    from sdlc.build import default_rate_limit_probe
     from sdlc.doctor import check_controller_version
     from sdlc.notify import notify
 
@@ -1163,6 +1650,7 @@ def run_queue(
         approval_probe=approval_probe or _default_approval_probe,
         fix_rounds=fix_rounds or ledger_fix_rounds,
         plan_files=plan_files or ledger_plan_files,
+        probe=default_rate_limit_probe if isinstance(probe, _Unset) else probe,
         echo=echo or print,
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
     )

@@ -2364,7 +2364,7 @@ def test_queue_view_empty_when_no_store(tmp_path: Path, monkeypatch: pytest.Monk
     from sdlc.dashboard import queue_view
 
     monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
-    assert queue_view() == []
+    assert queue_view() == {"pause": None, "jobs": []}
     assert not (tmp_path / "queue.db").exists()
 
 
@@ -2375,7 +2375,7 @@ def test_queue_view_returns_job_dicts_across_repos(tmp_path: Path, monkeypatch: 
     store = _seed_queue(tmp_path, monkeypatch)
     store.add_job(repo="/repo/a", kind="build", scope="epic-5", priority="high")
     store.add_job(repo="/repo/b", kind="fix", scope="42", priority="urgent")
-    rows = queue_view()
+    rows = queue_view()["jobs"]
     assert [r["repo"] for r in rows] == ["/repo/b", "/repo/a"]  # urgent before high
     assert rows[0]["kind"] == "fix" and rows[0]["scope"] == "42" and rows[0]["state"] == "queued"
 
@@ -2387,7 +2387,7 @@ def test_api_queue_empty_returns_empty_array(tmp_path: Path, monkeypatch: pytest
         status, ctype, body = _get(base + "/api/queue")
     assert status == 200
     assert "application/json" in ctype
-    assert json.loads(body) == []
+    assert json.loads(body) == {"pause": None, "jobs": []}
 
 
 def test_api_queue_matches_cli_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2463,16 +2463,17 @@ def test_page_queue_groups_jobs_by_state() -> None:
 
 
 def test_page_queue_pause_banner_shows_reset_time() -> None:
-    """A queue-level RATE_LIMITED pause is one banner (not N rows) with its
-    reset time."""
+    """A queue-level rate-limit pause is one banner (not N rows) with its
+    reset time — read off the queue's own state (Story 32.2-001)."""
     from sdlc.dashboard import _PAGE
 
     render_start = _PAGE.index("function renderQueue(")
     render_end = _PAGE.index("\n}", render_start)
     body = _PAGE[render_start:render_end]
-    assert "RATE_LIMITED" in body
+    assert "data.pause" in body
     assert "queue-pause" in body
-    assert "lease_until" in body  # the reset-time field the banner reads
+    assert "paused_until" in body  # the reset-time field the banner reads
+    assert 'state === "RATE_LIMITED"' not in body  # never a job state
 
 
 def test_page_queue_shows_slot_usage() -> None:
@@ -2496,3 +2497,36 @@ def test_page_queue_renders_pr_link_for_parked_jobs_when_present() -> None:
     fn_end = _PAGE.index("\n}", fn_start)
     body = _PAGE[fn_start:fn_end]
     assert "pr_number" in body and "pr_url" in body
+
+
+def test_queue_view_carries_the_queue_level_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dashboard sees the rate-limit window as the queue's state (32.2-001 AC4)."""
+    from datetime import datetime, timedelta, timezone
+
+    from sdlc.dashboard import queue_view
+
+    store = _seed_queue(tmp_path, monkeypatch)
+    store.add_job(repo="/repo/a", kind="fix", scope="42")
+    now = datetime.now(timezone.utc)
+    store.pause_dispatch(until=now + timedelta(seconds=600), reason="rate limited",
+                         run_id="run-a", repo="/repo/a", now=now)
+
+    view = queue_view()
+    assert view["pause"]["run_id"] == "run-a"
+    assert len(view["jobs"]) == 1
+
+
+def test_queue_view_drops_an_elapsed_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reopened window is not the queue's state — no stale banner."""
+    from datetime import datetime, timedelta, timezone
+
+    from sdlc.dashboard import queue_view
+
+    store = _seed_queue(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    store.pause_dispatch(until=now - timedelta(seconds=1), now=now - timedelta(seconds=2))
+    assert queue_view()["pause"] is None

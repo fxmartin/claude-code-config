@@ -3128,7 +3128,7 @@ def _format_age(now: datetime, created_at: str) -> str:
 @queue_app.command("list")
 def queue_list_cmd(
     as_json: bool = typer.Option(
-        False, "--json", help="Emit the queue as a JSON array."
+        False, "--json", help="Emit the queue as JSON: {pause, jobs}."
     ),
 ) -> None:
     """List every job on the host across every repo.
@@ -3141,20 +3141,41 @@ def queue_list_cmd(
     ``BUDGET`` is the job's per-class spend ceiling (Story 32.3-001) as
     ``<fix rounds>r/<wall clock>`` — e.g. ``5r/4h``. Exceeding either parks the
     job `needs_attention`.
+
+    A rate-limit pause (Story 32.2-001) is reported as the **queue's** own
+    state — one banner above the table — because that is what it is: one Max
+    window shared by every repo, waited out once, not N independently parked
+    runs. ``--json`` emits ``{"pause": …|null, "jobs": [...]}`` for the same
+    reason: the pause needs somewhere to live that is not a job.
     """
     from sdlc.queue import QueueStore, default_queue_path
 
     store = QueueStore(default_queue_path())
     rows = store.list_jobs()
+    now = datetime.now(timezone.utc)
+    pause = store.dispatch_pause()
+    if pause is not None and not pause.is_active(now):
+        pause = None  # the window already reopened — not the queue's state now
     if as_json:
-        typer.echo(json.dumps([r.to_dict() for r in rows], default=str))
+        typer.echo(
+            json.dumps(
+                {
+                    "pause": pause.to_dict() if pause else None,
+                    "jobs": [r.to_dict() for r in rows],
+                },
+                default=str,
+            )
+        )
         raise typer.Exit(code=0)
+
+    if pause is not None:
+        detail = f" · {pause.reason}" if pause.reason else ""
+        typer.echo(f"queue paused until {pause.paused_until}{detail}")
 
     if not rows:
         typer.echo("no jobs queued.")
         raise typer.Exit(code=0)
 
-    now = datetime.now(timezone.utc)
     typer.echo(
         f"{'ID':<6}{'STATE':<16}{'PRIORITY':<10}{'BUDGET':<9}{'KIND':<7}"
         f"{'SCOPE':<16}{'AGE':<6}{'PR':<7}{'RUN':<14}REPO"
@@ -3287,6 +3308,13 @@ def queue_run_cmd(
     is stamped (`sdlc queue add`, `--enqueue`, `sdlc queue prioritise`). To
     change an already-enqueued job's ceiling, re-stamp it with `sdlc queue
     prioritise`.
+    One Max subscription serves every repo, so one rate limit stops everything:
+    when any live job's run parks `RATE_LIMITED`, the queue records the reset as
+    its own `paused_until`, claims nothing until it passes, and then resumes the
+    parked job itself through `sdlc resume` — one pause and one resume for the
+    whole host, not one per repo. The command therefore keeps running while it
+    waits out a window rather than exiting and leaving the job for the next
+    invocation (Story 32.2-001).
 
     A killed scheduler loses nothing: the next `sdlc queue run` reclaims every
     job whose lease lapsed and re-enters it through `sdlc resume` — never from
@@ -3330,6 +3358,12 @@ def queue_run_cmd(
             f"queue drained: {result.started} started, {result.resumed} resumed, "
             f"{result.reconciled} reconciled, {result.done} done, "
             f"{result.failed} failed, {result.parked} parked"
+            + (
+                f", {result.paused} rate-limit window"
+                f"{'s' if result.paused != 1 else ''} waited out"
+                if result.paused
+                else ""
+            )
             + (" (interrupted)" if result.interrupted else "")
         )
     if result.interrupted:

@@ -49,7 +49,7 @@ def test_queue_list_json(tmp_path, monkeypatch) -> None:
     runner.invoke(app, ["queue", "add", "fix", "42", "--repo", str(tmp_path)])
     result = runner.invoke(app, ["queue", "list", "--json"])
     assert result.exit_code == 0, result.output
-    rows = json.loads(result.output)
+    rows = json.loads(result.output)["jobs"]
     assert len(rows) == 1
     assert rows[0]["kind"] == "fix"
     assert rows[0]["scope"] == "42"
@@ -60,12 +60,12 @@ def test_queue_cancel(tmp_path, monkeypatch) -> None:
     _isolate(tmp_path, monkeypatch)
     runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
     list_result = runner.invoke(app, ["queue", "list", "--json"])
-    job_id = json.loads(list_result.output)[0]["id"]
+    job_id = json.loads(list_result.output)["jobs"][0]["id"]
 
     cancel = runner.invoke(app, ["queue", "cancel", str(job_id)])
     assert cancel.exit_code == 0, cancel.output
 
-    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["jobs"]
     assert after[0]["state"] == "cancelled"
 
 
@@ -80,12 +80,12 @@ def test_queue_prioritise(tmp_path, monkeypatch) -> None:
     _isolate(tmp_path, monkeypatch)
     runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
     list_result = runner.invoke(app, ["queue", "list", "--json"])
-    job_id = json.loads(list_result.output)[0]["id"]
+    job_id = json.loads(list_result.output)["jobs"][0]["id"]
 
     result = runner.invoke(app, ["queue", "prioritise", str(job_id), "urgent"])
     assert result.exit_code == 0, result.output
 
-    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["jobs"]
     assert after[0]["priority"] == "urgent"
 
 
@@ -93,7 +93,7 @@ def test_queue_prioritise_rejects_unknown_class(tmp_path, monkeypatch) -> None:
     _isolate(tmp_path, monkeypatch)
     runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
     list_result = runner.invoke(app, ["queue", "list", "--json"])
-    job_id = json.loads(list_result.output)[0]["id"]
+    job_id = json.loads(list_result.output)["jobs"][0]["id"]
 
     result = runner.invoke(app, ["queue", "prioritise", str(job_id), "asap"])
     assert result.exit_code == 2
@@ -136,7 +136,7 @@ def test_format_age_malformed_created_at_returns_placeholder() -> None:
 
 
 def _job_id(output: str) -> int:
-    return json.loads(output)[0]["id"]
+    return json.loads(output)["jobs"][0]["id"]
 
 
 def _park_blocked(job_id: int, tmp_path) -> None:
@@ -157,7 +157,7 @@ def test_queue_requeue_re_arms_a_blocked_job(tmp_path, monkeypatch) -> None:
     result = runner.invoke(app, ["queue", "requeue", str(job_id)])
     assert result.exit_code == 0, result.output
 
-    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["jobs"]
     assert after[0]["state"] == "queued"
     assert after[0]["reason"] is None
 
@@ -191,7 +191,7 @@ def test_queue_cancel_accepts_a_blocked_job(tmp_path, monkeypatch) -> None:
     result = runner.invoke(app, ["queue", "cancel", str(job_id)])
     assert result.exit_code == 0, result.output
 
-    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["jobs"]
     assert after[0]["state"] == "cancelled"
 
 
@@ -234,7 +234,7 @@ def test_queue_list_json_carries_the_pr_and_next_poll(tmp_path, monkeypatch) -> 
 
     result = runner.invoke(app, ["queue", "list", "--json"])
 
-    rows = json.loads(result.output)
+    rows = json.loads(result.output)["jobs"]
     assert rows[0]["state"] == "parked"
     assert rows[0]["pr_number"] == 12
     assert "poll_after" in rows[0]
@@ -247,7 +247,7 @@ def test_a_parked_job_can_be_cancelled_from_the_cli(tmp_path, monkeypatch) -> No
     result = runner.invoke(app, ["queue", "cancel", str(job_id)])
 
     assert result.exit_code == 0, result.output
-    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["jobs"]
     assert rows[0]["state"] == "cancelled"
 
 
@@ -272,7 +272,7 @@ def test_queue_add_derives_the_priority_class(tmp_path, monkeypatch) -> None:
     runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
     runner.invoke(app, ["queue", "add", "fix", "42", "--repo", str(tmp_path)])
 
-    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["jobs"]
     by_kind = {r["kind"]: r["priority"] for r in rows}
     assert PRIORITY_CLASSES.index(by_kind["fix"]) > PRIORITY_CLASSES.index(
         by_kind["build"]
@@ -291,7 +291,7 @@ def test_queue_add_label_raises_a_bug_above_an_enhancement(tmp_path, monkeypatch
         ["queue", "add", "fix", "2", "--repo", str(tmp_path), "--label", "enhancement"],
     )
 
-    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["jobs"]
     by_scope = {r["scope"]: r["priority"] for r in rows}
     assert PRIORITY_CLASSES.index(by_scope["1"]) > PRIORITY_CLASSES.index(
         by_scope["2"]
@@ -325,6 +325,81 @@ def test_queue_prioritise_restamps_the_budget(tmp_path, monkeypatch) -> None:
     )
     assert runner.invoke(app, ["queue", "prioritise", "1", "urgent"]).exit_code == 0
 
-    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["jobs"]
     assert rows[0]["priority"] == "urgent"
     assert json.loads(rows[0]["budget"]) == budget_for("urgent").to_dict()
+
+
+# --- the queue-level rate-limit pause (Story 32.2-001) --------------------
+
+
+def _pause(tmp_path, **kwargs):
+    """Record a host pause on the isolated queue; return its reset instant."""
+    from datetime import datetime, timedelta, timezone
+
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(seconds=kwargs.pop("seconds", 600))
+    store.pause_dispatch(until=until, reason="rate limited (reset recorded by the run)",
+                         run_id="run-abcdef12", repo=str(tmp_path), source="reset-epoch",
+                         now=now, **kwargs)
+    return store, until
+
+
+def test_queue_list_shows_the_pause_as_the_queues_own_state(tmp_path, monkeypatch) -> None:
+    """One banner for the queue, not one parked row per repo (AC4)."""
+    _isolate(tmp_path, monkeypatch)
+    store, until = _pause(tmp_path)
+    store.add_job(repo=str(tmp_path), kind="fix", scope="42")
+
+    result = runner.invoke(app, ["queue", "list"])
+    assert result.exit_code == 0, result.output
+    assert "queue paused" in result.output.lower()
+    assert until.isoformat() in result.output
+    assert "rate limited" in result.output.lower()
+    # Still exactly one job row — the pause is queue state, not a job state.
+    assert result.output.count("queued") == 1
+
+
+def test_queue_list_banner_shows_even_with_no_jobs(tmp_path, monkeypatch) -> None:
+    """An empty-but-paused queue must not read as "nothing going on"."""
+    _isolate(tmp_path, monkeypatch)
+    _pause(tmp_path)
+    result = runner.invoke(app, ["queue", "list"])
+    assert result.exit_code == 0, result.output
+    assert "queue paused" in result.output.lower()
+    assert "no jobs" in result.output.lower()
+
+
+def test_queue_list_json_carries_pause_and_jobs(tmp_path, monkeypatch) -> None:
+    """`--json` is `{pause, jobs}` so the pause has somewhere to live (AC4)."""
+    _isolate(tmp_path, monkeypatch)
+    store, until = _pause(tmp_path)
+    store.add_job(repo=str(tmp_path), kind="fix", scope="42")
+
+    result = runner.invoke(app, ["queue", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["pause"]["paused_until"] == until.isoformat()
+    assert payload["pause"]["run_id"] == "run-abcdef12"
+    assert [j["scope"] for j in payload["jobs"]] == ["42"]
+
+
+def test_queue_list_json_reports_no_pause_as_null(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    runner.invoke(app, ["queue", "add", "fix", "42", "--repo", str(tmp_path)])
+    payload = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    assert payload["pause"] is None
+    assert len(payload["jobs"]) == 1
+
+
+def test_queue_list_ignores_an_elapsed_pause(tmp_path, monkeypatch) -> None:
+    """A window that already reopened is not the queue's state any more."""
+    _isolate(tmp_path, monkeypatch)
+    _pause(tmp_path, seconds=-1)
+    result = runner.invoke(app, ["queue", "list"])
+    assert "queue paused" not in result.output.lower()
+    assert json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["pause"] is None

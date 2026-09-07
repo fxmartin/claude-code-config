@@ -425,3 +425,228 @@ def test_row_to_record_reads_a_pre_32_3_001_row_without_crashing(tmp_path) -> No
     assert job.budget is None
     assert job.files is None
     assert job.fix_rounds_baseline == 0
+
+
+# --- host-level dispatch pause (Story 32.2-001) ---------------------------
+
+
+def _paused_store(tmp_path):
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    return store
+
+
+def test_init_creates_the_queue_state_table(tmp_path) -> None:
+    """The host pause lives in its own single-row table, created with the schema."""
+    from sdlc.queue import QueueStore
+
+    db = tmp_path / "queue.db"
+    QueueStore(db).init()
+
+    conn = sqlite3.connect(db)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(queue_state)").fetchall()}
+        assert cols == {
+            "id", "paused_until", "reason", "run_id", "repo", "source",
+            "paused_at", "probed_at",
+        }
+    finally:
+        conn.close()
+
+
+def test_pre_existing_queue_upgrades_to_the_pause_table(tmp_path) -> None:
+    """A queue.db written before this story gains `queue_state` on ensure_migrated."""
+    from sdlc.queue import QueueStore
+
+    db = tmp_path / "queue.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT, "
+            "kind TEXT, scope TEXT, priority TEXT, state TEXT, claimed_by TEXT, "
+            "lease_until TIMESTAMP, run_id TEXT, options TEXT, "
+            "created_at TIMESTAMP, updated_at TIMESTAMP, reason TEXT);"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = QueueStore(db)
+    store.ensure_migrated()
+    assert store.dispatch_pause() is None  # readable, so the table exists
+
+
+def test_no_pause_by_default(tmp_path) -> None:
+    """A fresh queue is not paused, and an absent store never conjures one."""
+    from sdlc.queue import QueueStore
+
+    assert QueueStore(tmp_path / "missing.db").dispatch_pause() is None
+    assert _paused_store(tmp_path).dispatch_pause() is None
+
+
+def test_pause_dispatch_records_the_window_once(tmp_path) -> None:
+    """The first pause is *established* (True); a second while it holds is not.
+
+    "Discovered once and waited out once" — the boolean is what gates the single
+    notify, so a second rate-limited job inside the same window is silent.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    store = _paused_store(tmp_path)
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+    until = now + timedelta(seconds=600)
+
+    assert store.pause_dispatch(
+        until=until, reason="rate limited", run_id="run-a", repo="/repo/a",
+        source="retry-after", now=now,
+    ) is True
+    assert store.pause_dispatch(
+        until=until, reason="rate limited", run_id="run-b", repo="/repo/b", now=now
+    ) is False
+
+    pause = store.dispatch_pause()
+    assert pause is not None
+    assert pause.run_id == "run-a"  # the discovering run keeps the window
+    assert pause.source == "retry-after"
+    assert pause.is_active(now) is True
+    assert pause.is_active(until + timedelta(seconds=1)) is False
+
+
+def test_pause_dispatch_extends_but_never_shortens_the_window(tmp_path) -> None:
+    """A later reset extends the pause; an earlier one must not resume early."""
+    from datetime import datetime, timedelta, timezone
+
+    store = _paused_store(tmp_path)
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+    store.pause_dispatch(until=now + timedelta(seconds=600), now=now)
+
+    store.pause_dispatch(until=now + timedelta(seconds=900), now=now)
+    assert store.dispatch_pause().paused_until == (now + timedelta(seconds=900)).isoformat()
+
+    store.pause_dispatch(until=now + timedelta(seconds=60), now=now)
+    assert store.dispatch_pause().paused_until == (now + timedelta(seconds=900)).isoformat()
+
+
+def test_pause_dispatch_after_the_window_elapsed_is_a_fresh_discovery(tmp_path) -> None:
+    """An elapsed pause no longer holds, so the next limit is a new window."""
+    from datetime import datetime, timedelta, timezone
+
+    store = _paused_store(tmp_path)
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+    store.pause_dispatch(until=now + timedelta(seconds=60), run_id="run-a", now=now)
+
+    later = now + timedelta(seconds=120)
+    assert store.pause_dispatch(
+        until=later + timedelta(seconds=60), run_id="run-b", now=later
+    ) is True
+    assert store.dispatch_pause().run_id == "run-b"
+
+
+def test_clear_pause_removes_the_window(tmp_path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    store = _paused_store(tmp_path)
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+    store.pause_dispatch(until=now + timedelta(seconds=600), now=now)
+    store.clear_pause()
+    assert store.dispatch_pause() is None
+
+
+def test_mark_pause_probed_stamps_the_throttle(tmp_path) -> None:
+    """The probe throttle is stored, so restarts and peers share one cadence."""
+    from datetime import datetime, timedelta, timezone
+
+    store = _paused_store(tmp_path)
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+    store.pause_dispatch(until=now + timedelta(seconds=600), now=now)
+    assert store.dispatch_pause().probed_at is None
+
+    store.mark_pause_probed(now=now)
+    assert store.dispatch_pause().probed_at == now.isoformat()
+
+
+def test_pause_to_dict_is_json_safe(tmp_path) -> None:
+    """`sdlc queue list --json` and `/api/queue` serialise the pause as-is."""
+    from datetime import datetime, timedelta, timezone
+
+    store = _paused_store(tmp_path)
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+    store.pause_dispatch(
+        until=now + timedelta(seconds=600), reason="rate limited",
+        run_id="run-a", repo="/repo/a", source="usage-limit", now=now,
+    )
+    payload = json.loads(json.dumps(store.dispatch_pause().to_dict()))
+    assert payload["reason"] == "rate limited"
+    assert payload["run_id"] == "run-a"
+    assert payload["paused_until"] == (now + timedelta(seconds=600)).isoformat()
+
+
+def test_pause_is_active_tolerates_a_corrupt_timestamp(tmp_path) -> None:
+    """A hand-edited/garbled `paused_until` must not wedge the queue shut."""
+    from sdlc.queue import QueuePause
+
+    assert QueuePause(paused_until="not-a-time", paused_at="").is_active() is False
+
+
+def test_reading_a_pause_from_an_unmigrated_queue_is_not_paused(tmp_path) -> None:
+    """`sdlc queue list` on a pre-32.2-001 queue.db reads "not paused", not a crash.
+
+    Read verbs never migrate (and never create), so the pause table can legitimately
+    be missing under them — that has to degrade, or the first `queue list` after an
+    upgrade would blow up.
+    """
+    from sdlc.queue import QueueStore
+
+    db = tmp_path / "queue.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT, "
+            "kind TEXT, scope TEXT, priority TEXT, state TEXT, claimed_by TEXT, "
+            "lease_until TIMESTAMP, run_id TEXT, options TEXT, "
+            "created_at TIMESTAMP, updated_at TIMESTAMP, reason TEXT);"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert QueueStore(db).dispatch_pause() is None
+
+
+def test_clear_pause_on_an_absent_store_is_a_no_op(tmp_path) -> None:
+    """Never conjure a queue.db from a write that has nothing to undo."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.clear_pause()
+    assert not (tmp_path / "queue.db").exists()
+
+
+def test_naive_timestamps_are_read_as_utc(tmp_path) -> None:
+    """A hand-edited store may carry a tz-naive instant; treat it as UTC.
+
+    Assuming the local zone instead would silently shift the window by hours.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sdlc.queue import QueuePause, QueueStore
+
+    now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+    naive = QueuePause(paused_until="2026-09-07T12:10:00", paused_at="")
+    assert naive.is_active(now) is True
+    assert naive.is_active(now + timedelta(minutes=20)) is False
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    store.pause_dispatch(until=now + timedelta(seconds=600), now=now)
+    conn = sqlite3.connect(tmp_path / "queue.db")
+    try:
+        with conn:
+            conn.execute("UPDATE queue_state SET paused_until = '2026-09-07T12:10:00'")
+    finally:
+        conn.close()
+    # An extension is still measured against that naive instant, read as UTC.
+    store.pause_dispatch(until=now + timedelta(seconds=1200), now=now)
+    assert store.dispatch_pause().paused_until == (now + timedelta(seconds=1200)).isoformat()

@@ -111,6 +111,8 @@ _TITLES = {
     "run_started": "Run started",
     "run_finished": "Run finished",
     "rate_limited": "Run rate-limited (parked)",
+    "queue_paused": "Queue paused (rate-limited)",
+    "queue_resumed": "Queue resumed",
     "story_failed": "Story failed",
 }
 
@@ -218,6 +220,28 @@ def _queue_job_resumed_title(fields: dict[str, object]) -> str:
         core = f"{core} → PR #{pr}"
     return f"▶️ {_repo_prefix(fields)}{core}"
 
+def _queue_paused_title(fields: dict[str, object]) -> str:
+    """The host queue parking on one shared rate-limit window (Story 32.2-001).
+
+    Deliberately distinct from ``rate_limited``, which is one *run* parking:
+    this says every repo on the host has stopped, and until when — the single
+    line that replaces the one-notify-per-repo storm the story exists to end.
+    """
+    reset_at = fields.get("reset_at")
+    core = _subject(fields) or "development queue"
+    if reset_at:
+        core = f"{core} until {reset_at}"
+    detail = fields.get("detail")
+    if detail:
+        core = f"{core} ({detail})"
+    return f"⏸ {_repo_prefix(fields)}{core} paused (rate-limited)"
+
+
+def _queue_resumed_title(fields: dict[str, object]) -> str:
+    """The window reopened and the queue is claiming again (Story 32.2-001)."""
+    core = _subject(fields) or "development queue"
+    return f"▶️ {_repo_prefix(fields)}{core} resumed — the rate-limit window reopened"
+
 
 def _rate_limited_title(fields: dict[str, object]) -> str:
     label = _subject(fields)
@@ -245,6 +269,8 @@ _FORMATTERS: dict[str, Callable[[dict[str, object]], str]] = {
     "queue_job_finished": _queue_job_finished_title,
     "queue_job_parked": _queue_job_parked_title,
     "queue_job_resumed": _queue_job_resumed_title,
+    "queue_paused": _queue_paused_title,
+    "queue_resumed": _queue_resumed_title,
     "rate_limited": _rate_limited_title,
     "story_failed": _story_failed_title,
 }
@@ -257,6 +283,8 @@ _TITLE_FIELDS: dict[str, set[str]] = {
     "queue_job_finished": {"repo", "subject", "scope", "terminal"},
     "queue_job_parked": {"repo", "subject", "scope", "pr"},
     "queue_job_resumed": {"repo", "subject", "scope", "pr", "signal"},
+    "queue_paused": {"repo", "subject", "scope", "reset_at", "detail"},
+    "queue_resumed": {"repo", "subject", "scope"},
     "rate_limited": {"repo", "subject", "scope"},
     "story_failed": {"repo", "subject", "story_id"},
 }
