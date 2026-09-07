@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.67.0] - 2026-09-07
+
+### Added
+
+- feat(development-queue): priority classes, per-job (#32.3-001)
+
+### Fixed
+
+- fix(development-queue): priority classes, per-job budgets, (#32.3-001)
+- fix(development-queue): priority classes, per-job budgets, (#32.3-001)
+
+
 ## [v2.66.0] - 2026-09-07
 
 ### Added
