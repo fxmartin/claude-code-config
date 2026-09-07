@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.63.0] - 2026-09-07
+
+### Added
+
+- feat(development-queue): queue panel on the dashboard (#32.3-002)
+
+
 ## [v2.62.0] - 2026-09-07
 
 ### Added
