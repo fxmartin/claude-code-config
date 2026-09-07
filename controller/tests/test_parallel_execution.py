@@ -1136,10 +1136,43 @@ def test_failed_dependency_blocks_across_waves_without_stalling_others(tmp_path)
     }
 
 
+class SlotGatedProbeDispatcher(ConcurrencyProbeDispatcher):
+    """A probe whose first ``parties`` build calls block until all have arrived.
+
+    ``_dispatch_ready_queue`` *submits* the lowest ids first, but submission
+    order is not observation order: a submitted worker thread that is slow to
+    start (a loaded 2-CPU CI runner) lets a faster sibling run its whole story,
+    free its slot and dispatch the next id before the starved thread ever
+    records its own call. Asserting on the recorded order alone therefore tests
+    thread start-up timing, not the scheduler's tie-break.
+
+    Holding every worker until the pool is full makes "no slot can free before
+    the first batch is observed" a property of the test rather than of thread
+    scheduling, so the assertion measures the AC4 guarantee it names.
+    """
+
+    def __init__(self, parties: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.parties = parties
+        self._barrier = threading.Barrier(parties)
+        self._arrived = 0
+
+    def __call__(self, agent_type, prompt, story=None, **kwargs):
+        if agent_type == "build":
+            with self._lock:
+                self._arrived += 1
+                in_first_batch = self._arrived <= self.parties
+            if in_first_batch:
+                # Bounded: a batch that never fills must fail the assertion
+                # below (a real AC4 regression), never hang the suite.
+                self._barrier.wait(timeout=30)
+        return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+
 def test_ready_set_dispatches_in_ascending_id_order(tmp_path) -> None:
     """AC4: with more ready stories than free workers, ties break by ascending
     story id so the schedule stays deterministic."""
-    dispatcher = ConcurrencyProbeDispatcher(hold=0.01)
+    dispatcher = SlotGatedProbeDispatcher(parties=2, hold=0.01)
     run_build(
         BuildOptions(scope="epic-99", skip_preflight=True, concurrency=2),
         queue=_independent(3),  # p0-001, p1-001, p2-001 — all ready at once
