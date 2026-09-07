@@ -5,17 +5,22 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from pathlib import Path
 
 import pytest
 
 from sdlc.repair import (
     MANAGED_LINKS,
+    MARKER_FILENAME,
     ArtifactStatus,
+    MissingSourceError,
     RepairAction,
+    UnsafeRepairRootError,
     WorktreeRootError,
     apply_plan,
     build_plan,
+    is_allowed_root,
     is_worktree_root,
 )
 
@@ -26,9 +31,17 @@ def _is_file_artifact(src_rel: str) -> bool:
 
 
 def _seed_repo(root: Path) -> Path:
-    """Lay down a fake framework repo holding every managed source artifact."""
+    """Lay down a fake framework repo holding every managed source artifact.
+
+    Also writes the ``MARKER_FILENAME`` marker, mirroring what the real
+    installer leaves at the stable checkout: ``tmp_path`` is not under $HOME,
+    so without it every ``build_plan`` call in this hermetic suite would trip
+    the ``is_allowed_root`` guard (see the dedicated allowlist tests below,
+    which build a repo WITHOUT this marker to exercise that refusal).
+    """
     repo = root / "repo"
     repo.mkdir(parents=True, exist_ok=True)
+    (repo / MARKER_FILENAME).touch()
     for _dest_rel, src_rel in MANAGED_LINKS:
         if src_rel == ".":  # the marketplace link points at the repo root itself
             continue
@@ -187,6 +200,7 @@ def test_default_repo_root_fallback_absolute_marketplace(tmp_path: Path, monkeyp
 
     canonical = tmp_path / "stable-checkout"
     canonical.mkdir()
+    (canonical / repair_mod.MARKER_FILENAME).touch()  # canonical sits outside $HOME in this test
     claude_dir = tmp_path / "dot-claude"
     marketplace_dir = claude_dir / "plugins" / "marketplaces"
     marketplace_dir.mkdir(parents=True)
@@ -211,6 +225,7 @@ def test_default_repo_root_fallback_relative_marketplace(tmp_path: Path, monkeyp
 
     canonical = tmp_path / "stable-checkout"
     canonical.mkdir()
+    (canonical / repair_mod.MARKER_FILENAME).touch()  # canonical sits outside $HOME in this test
     claude_dir = tmp_path / "dot-claude"
     marketplace_dir = claude_dir / "plugins" / "marketplaces"
     marketplace_dir.mkdir(parents=True)
@@ -223,6 +238,37 @@ def test_default_repo_root_fallback_relative_marketplace(tmp_path: Path, monkeyp
 
     result = repair_mod.default_repo_root()
     assert result == canonical.resolve()
+
+
+def test_default_repo_root_falls_back_to_derived_when_canonical_unsafe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Ignores a canonical marketplace target that fails `is_allowed_root` (#642).
+
+    The marketplace-fallback branch guards on `is_allowed_root` in addition to
+    `is_worktree_root` — a real, non-worktree canonical dir that sits outside
+    $HOME with no marker file must still be refused, falling back to derived.
+    """
+    import sdlc.repair as repair_mod
+
+    canonical = tmp_path / "untrusted-checkout"
+    canonical.mkdir()  # no MARKER_FILENAME -- outside $HOME and unmarked
+    claude_dir = tmp_path / "dot-claude"
+    marketplace_dir = claude_dir / "plugins" / "marketplaces"
+    marketplace_dir.mkdir(parents=True)
+    marketplace = marketplace_dir / "fx-claude-config"
+    os.symlink(canonical, marketplace)
+
+    # Treat every path except canonical as a worktree root, forcing the derived
+    # check to fail so the marketplace fallback is actually evaluated.
+    monkeypatch.setattr(
+        repair_mod, "is_worktree_root", lambda p: p.resolve() != canonical.resolve()
+    )
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    derived = Path(repair_mod.__file__).resolve().parents[3]
+    result = repair_mod.default_repo_root()
+    assert result == derived
 
 
 def test_default_repo_root_falls_back_to_derived_when_no_marketplace(tmp_path: Path, monkeypatch) -> None:
@@ -394,6 +440,77 @@ def test_build_plan_refuses_worktree_root(tmp_path: Path) -> None:
         build_plan(repo, claude_dir)
 
 
+# --- positive allowlist guard (#630/#642) ------------------------------------
+
+
+def test_is_allowed_root_accepts_home_rooted_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+
+    assert is_allowed_root(repo) is True
+
+
+def test_is_allowed_root_accepts_marker_file_outside_home(tmp_path: Path) -> None:
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    (repo / MARKER_FILENAME).touch()
+
+    assert is_allowed_root(repo) is True
+
+
+def test_is_allowed_root_refuses_non_home_root_without_marker(tmp_path: Path) -> None:
+    """A scratch checkout outside $HOME with no marker is refused (#630).
+
+    This is the exact incident shape: /private/tmp/branch-check-31002 is not
+    a worktree-glob match, so ``is_worktree_root`` alone let it through.
+    """
+    repo = tmp_path / "private" / "tmp" / "branch-check-31002"
+    repo.mkdir(parents=True)
+
+    assert is_worktree_root(repo) is False  # the old guard alone misses this
+    assert is_allowed_root(repo) is False
+
+
+def test_build_plan_refuses_unsafe_root_that_is_not_a_worktree(tmp_path: Path) -> None:
+    """build_plan refuses a non-$HOME, non-marker root even without a worktree glob hit."""
+    repo = _seed_repo(tmp_path)
+    (repo / MARKER_FILENAME).unlink()  # simulate a root outside $HOME, un-marked
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+
+    with pytest.raises(UnsafeRepairRootError, match=r"\$HOME"):
+        build_plan(repo, claude_dir)
+
+
+def test_build_plan_accepts_marker_bearing_root_outside_worktree_glob(tmp_path: Path) -> None:
+    """A marker-bearing root outside the worktree glob is accepted, not refused."""
+    repo = _seed_repo(tmp_path)  # _seed_repo writes MARKER_FILENAME
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+
+    plan = build_plan(repo, claude_dir)
+
+    assert len(plan.artifacts) == len(MANAGED_LINKS)
+
+
+def test_build_plan_refuses_missing_source(tmp_path: Path) -> None:
+    """build_plan must refuse to plan a relink whose source does not exist (#642).
+
+    Reproduces the second half of the incident: a resolved root that passes
+    both the worktree and allowlist checks but is missing the actual managed
+    sources (e.g. a bare package-install ``lib/`` dir) must not silently plan
+    a relink into a void.
+    """
+    repo = _seed_repo(tmp_path)
+    shutil.rmtree(repo / "hooks")
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+
+    with pytest.raises(MissingSourceError, match="hooks"):
+        build_plan(repo, claude_dir)
+
+
 # --- managed set authority: parity with install/core.sh ---------------------
 
 
@@ -420,3 +537,25 @@ def test_managed_links_match_install_core_sh() -> None:
         pairs.add((dest_rel, src_rel))
 
     assert pairs == set(MANAGED_LINKS)
+
+
+def test_install_core_sh_marker_matches_repair_py() -> None:
+    """install/core.sh must write the same marker filename repair.py checks (#642).
+
+    is_allowed_root's marker branch is only reachable in practice if the
+    installer actually writes MARKER_FILENAME somewhere; this locks
+    install/core.sh's literal and write call in place so the two never
+    silently diverge, mirroring test_managed_links_match_install_core_sh above.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    core_sh = (repo_root / "install" / "core.sh").read_text(encoding="utf-8")
+
+    match = re.search(r'SDLC_PRIMARY_ROOT_MARKER="([^"]+)"', core_sh)
+    assert match is not None, "install/core.sh must define SDLC_PRIMARY_ROOT_MARKER"
+    assert match.group(1) == MARKER_FILENAME
+
+    run_body = core_sh.split("install_core_run()", 1)[1].split("install_core_uninstall()", 1)[0]
+    assert "$SDLC_PRIMARY_ROOT_MARKER" in run_body, (
+        "install_core_run() must write the primary-root marker so a non-$HOME "
+        "install can later be trusted by sdlc repair"
+    )

@@ -23,6 +23,11 @@ setup() {
 teardown() {
     [ -n "${FAKE_HOME:-}" ] && rm -rf "${FAKE_HOME}"
     [ -n "${STUB_BIN:-}"  ] && rm -rf "${STUB_BIN}"
+    # A real (non-dry-run) --core run stamps the actual repo checkout
+    # (SCRIPT_DIR is always the real repo here, not FAKE_HOME) with the
+    # primary-root marker (#630/#642) — remove it so tests never leave the
+    # working tree dirty.
+    rm -f "${BATS_TEST_DIRNAME}/../.sdlc-primary-root"
 }
 
 # Run installer with a pristine HOME and no .env loaded.
@@ -94,6 +99,21 @@ _run_install() {
     [ -L "${FAKE_HOME}/.claude/reference-docs" ]
     [ -L "${FAKE_HOME}/.claude/docs" ]
     [ -L "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config" ]
+}
+
+@test "--core stamps the repo root with the primary-root marker (#630/#642)" {
+    # sdlc repair's is_allowed_root trusts a non-$HOME repo root only when this
+    # marker is present; --core must leave it behind or that branch is
+    # unreachable in practice. Cleaned up by teardown().
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ -f "${BATS_TEST_DIRNAME}/../.sdlc-primary-root" ]
+}
+
+@test "--core --dry-run does not stamp the primary-root marker" {
+    _run_install --core --dry-run
+    [ "$status" -eq 0 ]
+    [ ! -f "${BATS_TEST_DIRNAME}/../.sdlc-primary-root" ]
 }
 
 @test "--core is idempotent on second run" {
