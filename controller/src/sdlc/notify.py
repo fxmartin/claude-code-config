@@ -192,6 +192,33 @@ def _queue_job_finished_title(fields: dict[str, object]) -> str:
     return f"{emoji} {_repo_prefix(fields)}{core}"
 
 
+def _queue_job_parked_title(fields: dict[str, object]) -> str:
+    """A `sdlc queue run` job parked on a change request's approval (Story 32.2-002).
+
+    The one message FX acts on: it names the CR to label, and the queue picks
+    the job back up on its own once that label lands — so the message asks for a
+    label, never for a `sdlc resume`.
+    """
+    core = _subject(fields) or "queue job"
+    pr = fields.get("pr")
+    if pr is not None:
+        core = f"{core} awaiting approval → PR #{pr}"
+    else:
+        core = f"{core} awaiting approval"
+    return f"⏳ {_repo_prefix(fields)}{core}"
+
+
+def _queue_job_resumed_title(fields: dict[str, object]) -> str:
+    """A parked job the queue resumed on its own (Story 32.2-002)."""
+    core = _subject(fields) or "queue job"
+    signal = fields.get("signal")
+    core = f"{core} resumed" + (f" ({signal})" if signal else "")
+    pr = fields.get("pr")
+    if pr is not None:
+        core = f"{core} → PR #{pr}"
+    return f"▶️ {_repo_prefix(fields)}{core}"
+
+
 def _rate_limited_title(fields: dict[str, object]) -> str:
     label = _subject(fields)
     suffix = f" ({label})" if label else ""
@@ -216,6 +243,8 @@ _FORMATTERS: dict[str, Callable[[dict[str, object]], str]] = {
     "run_started": _run_started_title,
     "run_finished": _run_finished_title,
     "queue_job_finished": _queue_job_finished_title,
+    "queue_job_parked": _queue_job_parked_title,
+    "queue_job_resumed": _queue_job_resumed_title,
     "rate_limited": _rate_limited_title,
     "story_failed": _story_failed_title,
 }
@@ -226,6 +255,8 @@ _TITLE_FIELDS: dict[str, set[str]] = {
     "run_started": {"repo", "subject", "scope", "detail", "mode"},
     "run_finished": {"repo", "subject", "scope", "terminal", "pr", "done", "total", "duration"},
     "queue_job_finished": {"repo", "subject", "scope", "terminal"},
+    "queue_job_parked": {"repo", "subject", "scope", "pr"},
+    "queue_job_resumed": {"repo", "subject", "scope", "pr", "signal"},
     "rate_limited": {"repo", "subject", "scope"},
     "story_failed": {"repo", "subject", "story_id"},
 }

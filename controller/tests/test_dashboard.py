@@ -2456,7 +2456,10 @@ def test_page_queue_degrades_to_muted_no_queue_line() -> None:
 def test_page_queue_groups_jobs_by_state() -> None:
     from sdlc.dashboard import _PAGE
 
-    assert 'QUEUE_STATE_ORDER = ["queued","running","done","failed","cancelled"]' in _PAGE
+    assert (
+        'QUEUE_STATE_ORDER = ["queued","running","parked","blocked",'
+        '"done","failed","cancelled"]'
+    ) in _PAGE
 
 
 def test_page_queue_pause_banner_shows_reset_time() -> None:

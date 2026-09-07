@@ -1,5 +1,6 @@
 # ABOUTME: The `sdlc queue run` scheduler — leased claims, per-repo exclusivity, slot cap.
-# ABOUTME: Story 32.1-002. A thin loop over queue.py + registry.py that spawns build/fix/resume.
+# ABOUTME: Stories 32.1-002 + 32.2-002. A thin loop over queue.py + registry.py that
+# ABOUTME: spawns build/fix/resume/reconcile, including the approval park and auto-resume.
 
 from __future__ import annotations
 
@@ -12,22 +13,28 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
+from sdlc.approval import ApprovalVerdict, poll_approval
 from sdlc.queue import JobRecord, QueueStore
 from sdlc.registry import Registry, RunRecord, pid_alive
+from sdlc.risk_gate import RISK_APPROVED_LABEL
 
 __all__ = [
+    "DEFAULT_APPROVAL_POLL_SECONDS",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_POLL_SECONDS",
     "DEFAULT_RENEW_SECONDS",
     "DEFAULT_SLOTS",
+    "MAX_APPROVAL_POLL_SECONDS",
+    "MIN_APPROVAL_POLL_SECONDS",
     "JobProcess",
     "SchedulerConfig",
     "SchedulerResult",
     "agent_slots",
+    "approval_poll_interval",
     "controller_argv",
     "job_argv",
     "run_queue",
@@ -43,6 +50,17 @@ DEFAULT_RENEW_SECONDS = 30
 # is also FX's daily driver; raise it with `--slots`.
 DEFAULT_SLOTS = 2
 DEFAULT_POLL_SECONDS = 2.0
+
+# How often a *parked* job's change request is re-read (Story 32.2-002). Five
+# minutes is the story's default: fast enough that FX's morning label is acted
+# on before the coffee is poured, slow enough that a night of parked jobs costs
+# a couple of hundred API reads rather than tens of thousands. The bounds are
+# hard: below the floor the poll is an abuse of the host's rate limit, above the
+# ceiling an approval could sit unnoticed for over an hour, which defeats the
+# story.
+DEFAULT_APPROVAL_POLL_SECONDS = 300.0
+MIN_APPROVAL_POLL_SECONDS = 30.0
+MAX_APPROVAL_POLL_SECONDS = 3600.0
 
 # Registry *terminal* statuses that mean parked-for-a-human rather than failed:
 # the run reached an end state, but one a human decision reopens (approve the
@@ -85,6 +103,9 @@ class JobProcess(Protocol):
 Launcher = Callable[[Sequence[str], Path], JobProcess]
 Clock = Callable[[], datetime]
 VersionCheck = Callable[[Path], object]
+# One read of a parked job's change request: ``(repo_root, cr_number)`` →
+# verdict, or None when the host could not be read (Story 32.2-002).
+ApprovalProbe = Callable[[Path, int], "ApprovalVerdict | None"]
 
 
 @dataclass
@@ -99,6 +120,9 @@ class SchedulerConfig:
     # `sdlc listen`, Epic-30) can enqueue into a draining scheduler. The default
     # drains what is there and exits, which is what a night's batch wants.
     follow: bool = False
+    # How often a parked job's change request is re-read (Story 32.2-002).
+    # Clamped by :func:`approval_poll_interval` before use.
+    approval_poll_seconds: float = DEFAULT_APPROVAL_POLL_SECONDS
 
 
 @dataclass
@@ -107,6 +131,9 @@ class SchedulerResult:
 
     started: int = 0
     resumed: int = 0
+    # Jobs whose parked change request turned out to have been merged by hand,
+    # so the queue reconciled the run instead of resuming it (Story 32.2-002).
+    reconciled: int = 0
     done: int = 0
     failed: int = 0
     parked: int = 0
@@ -116,6 +143,7 @@ class SchedulerResult:
         return {
             "started": self.started,
             "resumed": self.resumed,
+            "reconciled": self.reconciled,
             "done": self.done,
             "failed": self.failed,
             "parked": self.parked,
@@ -272,6 +300,34 @@ def job_argv(job: JobRecord, *, resume: bool, prefix: Sequence[str] | None = Non
     return argv + [job.kind, job.scope] + options
 
 
+def approval_poll_interval(seconds: float) -> float:
+    """Clamp a requested approval poll interval into its documented bounds (AC4).
+
+    A single place so the CLI flag, the config default and the scheduler agree.
+    The floor protects the host's API rate limit from a `--follow` loop that
+    would otherwise re-read every parked CR on every two-second pass; the
+    ceiling keeps the story's promise that a morning's label is acted on
+    without a human ever typing `sdlc resume`.
+    """
+    return max(MIN_APPROVAL_POLL_SECONDS, min(MAX_APPROVAL_POLL_SECONDS, float(seconds)))
+
+
+def reconcile_argv(job: JobRecord, *, prefix: Sequence[str] | None = None) -> list[str]:
+    """The command that reconciles ``job``'s run after a hand-merged CR (AC3).
+
+    `sdlc reconcile <run>` already exists and is the *only* thing that should
+    run here: it fetches origin, proves the story's branch landed on the base,
+    flips it DONE with a ``source="reconcile"`` audit event, and re-terminals
+    the run. Resuming instead would re-enter a merge stage against a CR that is
+    already merged, and hand-merging plus a manual `reconcile` is exactly the
+    chore this story removes.
+    """
+    if not job.run_id:
+        raise ValueError(f"job {job.id} has no run to reconcile")
+    argv = list(prefix) if prefix is not None else controller_argv()
+    return argv + ["reconcile", job.run_id]
+
+
 def terminal_job_state(
     exit_code: int, run_status: str | None, *, run_finished: bool = True
 ) -> str:
@@ -305,6 +361,37 @@ def terminal_job_state(
     return "done" if exit_code == 0 else "failed"
 
 
+def _awaiting_approval_pr(record: RunRecord | None) -> int | None:
+    """The change request a run parked ``AWAITING_APPROVAL`` is waiting on.
+
+    The registry names the run's ledger (``RunRecord.db``) and the ledger is the
+    only place the story↔PR link lives, so the queue reads it there — read-only,
+    through the same ``story_rows`` view every other surface uses.
+
+    A run may park several stories at once. The queue watches the first of them
+    (story rows come back in a stable order), which converges rather than
+    stalls: approving it resumes the run, the run re-parks on whichever story is
+    still unapproved, and the job re-parks on *that* CR. Returns None — leaving
+    the pre-32.2 ``blocked`` terminal in place — whenever no PR can be resolved,
+    because a park with nothing to poll is a dead end that should say so.
+    """
+    if record is None or not record.db:
+        return None
+    try:
+        from sdlc.ledger_view import Ledger
+
+        rows = Ledger(Path(record.db)).story_rows(record.run_id)
+    except Exception:  # noqa: BLE001 — a ledger hiccup must not crash the drain
+        return None
+    for row in rows:
+        if row.get("status") != "AWAITING_APPROVAL":
+            continue
+        pr_number = row.get("pr_number")
+        if isinstance(pr_number, int):
+            return pr_number
+    return None
+
+
 def _default_launcher(argv: Sequence[str], cwd: Path) -> JobProcess:
     """Spawn a job as a detached process group under ``cwd``.
 
@@ -318,6 +405,11 @@ def _default_launcher(argv: Sequence[str], cwd: Path) -> JobProcess:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _default_approval_probe(root: Path, pr_number: int) -> ApprovalVerdict | None:
+    """The real, read-only host poll behind a parked job (Story 32.2-002)."""
+    return poll_approval(root, pr_number)
 
 
 class _Scheduler:
@@ -334,6 +426,7 @@ class _Scheduler:
         sleeper: Callable[[float], None],
         notifier: Callable[..., None],
         version_check: VersionCheck,
+        approval_probe: ApprovalProbe,
         echo: Callable[[str], None],
         identity: str,
     ) -> None:
@@ -345,10 +438,12 @@ class _Scheduler:
         self._sleep = sleeper
         self._notify = notifier
         self._version_check = version_check
+        self._approval_probe = approval_probe
         self._echo = echo
         self._identity = identity
         self._in_flight: dict[int, _InFlight] = {}
         self._result = SchedulerResult()
+        self._poll_interval = approval_poll_interval(config.approval_poll_seconds)
 
     # --- the loop ---------------------------------------------------------
 
@@ -358,7 +453,8 @@ class _Scheduler:
                 self._attach_runs()
                 self._reap()
                 self._renew()
-                progressed = self._fill_slots()
+                polled = self._poll_parked()
+                progressed = self._fill_slots() or polled
                 self._stamp_repo_busy()
                 if not self._in_flight and not progressed and not self._config.follow:
                     break
@@ -400,7 +496,7 @@ class _Scheduler:
                 )
             if claimed is None:
                 continue  # lost the race to another scheduler — try the next one
-            self._start(claimed, resume=resume, cost=cost)
+            self._start(claimed, action="resume" if resume else "start", cost=cost)
             progressed = True
         return progressed
 
@@ -460,7 +556,16 @@ class _Scheduler:
 
     # --- launch + reap ----------------------------------------------------
 
-    def _start(self, job: JobRecord, *, resume: bool, cost: int) -> None:
+    def _start(self, job: JobRecord, *, action: str, cost: int) -> bool:
+        """Launch ``job``; True when a child is actually in flight.
+
+        ``action`` is what the queue decided this job needs now: ``start`` a
+        fresh `build`/`fix`, ``resume`` an existing run, or ``reconcile`` one
+        whose change request was merged by hand (Story 32.2-002). Everything
+        else — the version guard, slot accounting, launch-failure handling,
+        bookkeeping — is identical across the three, which is exactly why they
+        share this one path.
+        """
         # Story 15.1-004, per job: a repo whose installed controller disagrees
         # with its own checkout would run this job on stale code. Park it with
         # the remedy instead — the check is cheap, offline, and repo-local, so
@@ -475,7 +580,7 @@ class _Scheduler:
             self._result.parked += 1
             self._echo(f"job {job.id} parked (blocked): {reason}")
             self._announce(job, None, "blocked")
-            return
+            return False
 
         if cost > self._config.slots:
             # Never starve a job the host cap cannot fit: run it alone, and say
@@ -485,7 +590,10 @@ class _Scheduler:
                 f"{self._config.slots}) — running it alone"
             )
 
-        argv = job_argv(job, resume=resume)
+        argv = (
+            reconcile_argv(job) if action == "reconcile"
+            else job_argv(job, resume=action == "resume")
+        )
         try:
             proc = self._launcher(argv, Path(job.repo))
         except OSError as exc:
@@ -493,21 +601,24 @@ class _Scheduler:
             self._result.failed += 1
             self._echo(f"job {job.id} could not be launched: {exc}")
             self._announce(job, None, "failed")
-            return
+            return False
 
         self._in_flight[job.id] = _InFlight(
             job=job, proc=proc, slots=cost, run_id=job.run_id,
             last_renewed=self._clock(),
         )
-        if resume:
+        if action == "resume":
             self._result.resumed += 1
+        elif action == "reconcile":
+            self._result.reconciled += 1
         else:
             self._result.started += 1
-        verb = "resuming" if resume else "started"
+        verb = {"resume": "resuming", "reconcile": "reconciling"}.get(action, "started")
         self._echo(
             f"{verb} job {job.id} ({job.kind} {job.scope}) in {job.repo} "
             f"[pid {proc.pid}, {cost} slot{'s' if cost != 1 else ''}]"
         )
+        return True
 
     def _reap(self) -> None:
         for job_id, entry in list(self._in_flight.items()):
@@ -521,6 +632,15 @@ class _Scheduler:
             run_status = record.status if record is not None else None
             run_finished = bool(record.finished_at) if record is not None else True
             state = terminal_job_state(code, run_status, run_finished=run_finished)
+            # Story 32.2-002: `AWAITING_APPROVAL` is terminal for the run — it
+            # must stay so, the bugfix loop cannot self-approve — but not for the
+            # job. When the change request behind it is knowable, the queue takes
+            # over the wait instead of stamping a `blocked` dead end.
+            if state == "blocked" and run_status == "AWAITING_APPROVAL":
+                pr_number = _awaiting_approval_pr(record)
+                if pr_number is not None:
+                    self._park_for_approval(entry, pr_number)
+                    continue
             reason = self._finish_reason(state, code, run_status, entry.run_id,
                                          run_finished)
             self._store.finish_job(job_id, state, reason=reason)
@@ -570,6 +690,120 @@ class _Scheduler:
                 # reap, and killing it here would abort work we no longer own.
                 del self._in_flight[job_id]
                 self._echo(f"job {job_id}: lease lost, another scheduler took it over")
+
+    # --- the approval park (Story 32.2-002) -------------------------------
+
+    def _next_poll(self) -> datetime:
+        """When this job's change request may next be read."""
+        return self._clock() + timedelta(seconds=self._poll_interval)
+
+    def _park_for_approval(self, entry: _InFlight, pr_number: int) -> None:
+        """Hand a job's approval wait to the queue instead of ending it (AC1)."""
+        job = entry.job
+        reason = (
+            f"awaiting approval on #{pr_number} — polling every "
+            f"{int(self._poll_interval)}s for the `{RISK_APPROVED_LABEL}` label "
+            f"or an approving review"
+        )
+        self._store.park_job(
+            job.id, pr_number=pr_number, reason=reason, poll_after=self._next_poll()
+        )
+        self._result.parked += 1
+        self._echo(f"job {job.id} parked: awaiting approval on #{pr_number}")
+        self._notify(
+            "queue_job_parked",
+            repo=Path(job.repo).name,
+            subject=f"queue job {job.id} ({job.kind} {job.scope})",
+            pr=pr_number,
+            detail=f"label `{RISK_APPROVED_LABEL}` or approve to resume",
+            run=entry.run_id or "",
+        )
+
+    def _poll_parked(self) -> bool:
+        """Re-read every due parked change request and act on what it says.
+
+        Returns whether any job moved, so a plain drain that resumes a job on
+        its very first pass keeps looping to see it through, while one that
+        finds nothing new exits and leaves the parks in the store for the next
+        `sdlc queue run` — the queue, not this process, is what outlives a run.
+
+        Two things keep this inside the host's rate limits (AC4). ``poll_after``
+        means a job is read once per interval no matter how fast the loop
+        spins; and a job whose repo is busy, or for which no agent slot is free,
+        is skipped *before* the read — there would be nothing to do with the
+        answer, so the API call would be pure waste.
+        """
+        due = self._store.due_parked_jobs(now=self._clock())
+        if not due:
+            return False
+        busy = self._store.running_repos()
+        progressed = False
+        for job in due:
+            cost = agent_slots(job)
+            used = self._used_slots()
+            if job.repo in busy or (used and used + cost > self._config.slots):
+                continue
+            if job.pr_number is None:
+                # A park with no CR cannot be polled. Push its next poll out so
+                # it does not re-list every pass; `sdlc queue cancel/requeue`
+                # are the operator's exits.
+                self._store.schedule_poll(job.id, self._next_poll())
+                continue
+            verdict = self._approval_probe(Path(job.repo), job.pr_number)
+            self._store.schedule_poll(job.id, self._next_poll())
+            if verdict is None:
+                # Unreadable host (offline, unauthenticated, rate-limited). Stay
+                # parked and try again next interval — never guess.
+                continue
+            if self._act_on_verdict(job, verdict, cost=cost):
+                busy.add(job.repo)
+                progressed = True
+        return progressed
+
+    def _act_on_verdict(
+        self, job: JobRecord, verdict: ApprovalVerdict, *, cost: int
+    ) -> bool:
+        """Turn one change-request verdict into the queue's next move (AC2/AC3)."""
+        if verdict.state == "merged":
+            # Merged by hand while we were parked. Resuming would re-enter a
+            # merge stage against an already-merged CR; `sdlc reconcile` is the
+            # verb that exists for exactly this and it is the one we call.
+            return self._drive_parked(job, action="reconcile", cost=cost)
+        if verdict.state == "closed":
+            self._store.finish_job(job.id, "failed", reason="pr closed")
+            self._result.failed += 1
+            self._echo(f"job {job.id} failed: PR #{job.pr_number} closed without merging")
+            self._announce(job, job.run_id, "failed")
+            return True
+        if verdict.approved:
+            return self._drive_parked(
+                job, action="resume", cost=cost, signal=verdict.signal
+            )
+        return False
+
+    def _drive_parked(
+        self, job: JobRecord, *, action: str, cost: int, signal: str = ""
+    ) -> bool:
+        """Take a parked job back under a lease and launch ``action`` on it."""
+        claimed = self._store.take_parked_job(
+            job.id, claimed_by=self._identity,
+            lease_seconds=self._config.lease_seconds, now=self._clock(),
+        )
+        if claimed is None:
+            return False  # another scheduler got there first, or the repo went busy
+        launched = self._start(claimed, action=action, cost=cost)
+        if launched and action == "resume":
+            # Announced only once the resume is genuinely in flight — a version
+            # check that blocks the job announces its own terminal instead.
+            self._notify(
+                "queue_job_resumed",
+                repo=Path(job.repo).name,
+                subject=f"queue job {job.id} ({job.kind} {job.scope})",
+                pr=job.pr_number,
+                signal=signal,
+                run=job.run_id or "",
+            )
+        return True
 
     # --- registry ---------------------------------------------------------
 
@@ -670,6 +904,7 @@ def run_queue(
     sleeper: Callable[[float], None] | None = None,
     notifier: Callable[..., None] | None = None,
     version_check: VersionCheck | None = None,
+    approval_probe: ApprovalProbe | None = None,
     echo: Callable[[str], None] | None = None,
     identity: str | None = None,
 ) -> SchedulerResult:
@@ -678,15 +913,21 @@ def run_queue(
     The foreground loop behind `sdlc queue run` (Story 32.1-002). Each pass:
 
     1. link in-flight jobs to the runs their subprocesses registered;
-    2. reap finished jobs and mirror the run's terminal status onto the job;
+    2. reap finished jobs and mirror the run's terminal status onto the job — a
+       run that stopped ``AWAITING_APPROVAL`` is *parked* on its change request
+       rather than ended (Story 32.2-002);
     3. renew our leases;
-    4. reclaim any lapsed job whose run is genuinely dead and resume it, then
+    4. re-read any parked change request whose poll is due and act on it: an
+       approval resumes the run, a hand-merge reconciles it, a close fails the
+       job;
+    5. reclaim any lapsed job whose run is genuinely dead and resume it, then
        claim fresh work while agent slots and non-busy repos remain.
 
     Every collaborator is injectable so the loop is testable without forking:
     ``launcher`` spawns a job, ``clock``/``sleeper`` drive time, ``registry``
     supplies run liveness, ``version_check`` is Story 15.1-004's per-repo check,
-    and ``notifier`` is the Telegram path.
+    ``approval_probe`` is the read-only change-request poll, and ``notifier`` is
+    the Telegram path.
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from
@@ -704,6 +945,7 @@ def run_queue(
         sleeper=sleeper or time.sleep,
         notifier=notifier or notify,
         version_check=version_check or check_controller_version,
+        approval_probe=approval_probe or _default_approval_probe,
         echo=echo or print,
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
     )

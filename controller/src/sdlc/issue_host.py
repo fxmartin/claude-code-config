@@ -31,7 +31,9 @@ __all__ = [
     "IssueHostAdapter",
     "GitHubAdapter",
     "GitLabAdapter",
+    "ChangeRequestApproval",
     "get_adapter",
+    "repo_runner",
     "host_from_remote",
     "detect_host",
     "resolve_host",
@@ -162,6 +164,23 @@ class ChangeRequestChecks:
 
 
 @dataclass(frozen=True)
+class ChangeRequestApproval:
+    """A change request's approval-relevant state (Story 32.2-002).
+
+    The read the approval-aware queue polls a parked job's CR with: is it still
+    open, which labels does it carry, and has a human approved it. ``state`` is
+    normalised (``open``/``closed``/``merged``); ``labels`` are the CR's label
+    names verbatim; ``approved`` is true when the host reports an approving
+    review (GitHub) or an approver (GitLab) — the *label* half of the approval
+    rule is policy and lives in :mod:`sdlc.approval`, not in the adapter.
+    """
+
+    state: str | None = None
+    labels: tuple[str, ...] = ()
+    approved: bool = False
+
+
+@dataclass(frozen=True)
 class ChangeRequestTerms:
     """Host-correct phrasing for the change request a build agent opens (Story 23.2-001).
 
@@ -204,20 +223,48 @@ GITLAB_CR_TERMS = ChangeRequestTerms(
 )
 
 
-def _default_runner(argv: Sequence[str], timeout: float = _CLI_TIMEOUT) -> RunResult:
-    """Run ``argv`` via subprocess; raise :class:`IssueHostError` if the CLI is absent."""
+def _default_runner(
+    argv: Sequence[str],
+    timeout: float = _CLI_TIMEOUT,
+    cwd: "str | Path | None" = None,
+) -> RunResult:
+    """Run ``argv`` via subprocess; raise :class:`IssueHostError` if the CLI is absent.
+
+    ``cwd`` matters because both host CLIs resolve *which repository* they are
+    talking to from the working directory. Callers that already run inside the
+    target repo (the build and fix pipelines) leave it None; a caller driving
+    several repos from one process (`sdlc queue run`) passes the repo root via
+    :func:`repo_runner`.
+    """
     try:
         out = subprocess.run(
             list(argv),
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=str(cwd) if cwd is not None else None,
         )
     except FileNotFoundError as exc:
         raise IssueHostError(f"{argv[0]} not found on PATH — install the host CLI") from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise IssueHostError(f"{argv[0]} invocation failed: {exc}") from exc
     return RunResult(returncode=out.returncode, stdout=out.stdout, stderr=out.stderr)
+
+
+def repo_runner(root: "str | Path") -> Runner:
+    """A :data:`Runner` that invokes the host CLI inside ``root`` (Story 32.2-002).
+
+    `gh`/`glab` infer the repository from the working directory, so a process
+    that polls change requests across several repos — the queue scheduler —
+    cannot use the default runner, which inherits its own cwd. Everything else
+    (missing-CLI handling, timeouts, the :class:`RunResult` shape) is the
+    default runner's.
+    """
+
+    def _run(argv: Sequence[str], timeout: float = _CLI_TIMEOUT) -> RunResult:
+        return _default_runner(argv, timeout, cwd=root)
+
+    return _run
 
 
 # --- host auto-detection -----------------------------------------------------
@@ -469,6 +516,17 @@ class IssueHostAdapter(ABC):
         None (no reclassification) rather than a hard failure.
         """
         raise IssueHostError(f"{self.host} adapter does not implement cr_checks")
+
+    def cr_approval(self, ref: "str | ChangeRequest") -> ChangeRequestApproval:
+        """Return a change request's open/closed/merged state, labels, and approval.
+
+        Story 32.2-002: the read-only poll behind the approval-aware queue. Like
+        :meth:`cr_checks` this is deliberately **not** abstract — a backend
+        without an implementation raises :class:`IssueHostError`, which the
+        best-effort caller (:func:`sdlc.approval.poll_approval`) degrades to
+        None, leaving the job parked rather than mis-deciding its fate.
+        """
+        raise IssueHostError(f"{self.host} adapter does not implement cr_approval")
 
     @abstractmethod
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
@@ -726,6 +784,29 @@ class GitHubAdapter(IssueHostAdapter):
             labels=_label_names(row.get("labels")), checks=tuple(checks)
         )
 
+    def cr_approval(self, ref: "str | ChangeRequest") -> ChangeRequestApproval:
+        out = self._run(
+            "pr", "view", _cr_ref_of(ref),
+            "--json", "state,labels,reviewDecision,reviews",
+        ).stdout
+        row = _parse_json_object(out)
+        if not row:
+            raise IssueHostError(f"gh pr view {_cr_ref_of(ref)} returned no change request")
+        # `reviewDecision` is the *current* verdict and flips back to
+        # REVIEW_REQUIRED whenever a new commit dismisses stale approvals, so an
+        # approving review in the list counts on its own too: FX approving and
+        # the run then pushing a fixup must not silently un-approve the job.
+        reviews = row.get("reviews")
+        approved = str(row.get("reviewDecision") or "").upper() == "APPROVED" or any(
+            isinstance(r, dict) and str(r.get("state") or "").upper() == "APPROVED"
+            for r in (reviews if isinstance(reviews, list) else [])
+        )
+        return ChangeRequestApproval(
+            state=_norm_state(row.get("state")),
+            labels=_label_names(row.get("labels")),
+            approved=approved,
+        )
+
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
         ref = _cr_ref_of(ref)
         self._run("pr", "merge", ref, "--merge")
@@ -936,6 +1017,33 @@ class GitLabAdapter(IssueHostAdapter):
                 name = str(job.get("name") or "")
                 checks.append((name, _gitlab_pipeline_status(job.get("status"))))
         return ChangeRequestChecks(labels=labels, checks=tuple(checks))
+
+    def cr_approval(self, ref: "str | ChangeRequest") -> ChangeRequestApproval:
+        ref = _cr_ref_of(ref)
+        out = self._run("mr", "view", ref, "--output", "json").stdout
+        row = _parse_json_object(out)
+        if not row:
+            raise IssueHostError(f"glab mr view {ref} returned no change request")
+        state = _norm_state(row.get("state"))
+        labels = _label_names(row.get("labels"))
+        # The approvals endpoint is a second call and is premium-gated on some
+        # instances, so it is only made when it could still change the answer (a
+        # closed or merged MR is decided already) and its failure degrades to
+        # "no approver" rather than losing the state and labels we do have.
+        approved = False
+        if state == "open":
+            try:
+                approvals = _parse_json_object(
+                    self._run(
+                        "api", f"projects/:id/merge_requests/{ref}/approvals"
+                    ).stdout
+                )
+                approved = bool(approvals.get("approved")) or bool(
+                    approvals.get("approved_by")
+                )
+            except IssueHostError:
+                approved = False
+        return ChangeRequestApproval(state=state, labels=labels, approved=approved)
 
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
         ref = _cr_ref_of(ref)

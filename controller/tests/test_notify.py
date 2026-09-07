@@ -529,3 +529,79 @@ def test_queue_job_finished_without_a_run_still_renders():
     text = json.loads(captured[0].decode("utf-8"))["text"]
     assert "queue job 9 (fix 42)" in text
     assert "BLOCKED" in text
+
+
+# --- approval park / auto-resume announcements (Story 32.2-002) ------------
+
+
+def test_queue_job_parked_names_the_change_request_to_label():
+    """The message FX acts on: which CR, and that a label is all it needs."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "queue_job_parked",
+        run="a7493b3d-4135-4076-8190-139fefb2dcb9",
+        repo="claude-code-config",
+        subject="queue job 7 (build epic-3)",
+        pr=612,
+        detail="label `risk-approved` or approve to resume",
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "queue job 7 (build epic-3)" in text
+    assert "awaiting approval" in text
+    assert "PR #612" in text
+    assert "risk-approved" in text
+    assert "a7493b3d" in text
+    assert "pr=" not in text
+
+
+def test_queue_job_parked_without_a_pr_still_renders():
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "queue_job_parked", repo="repo", subject="queue job 3 (fix 42)", sender=sender
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "awaiting approval" in text
+
+
+def test_queue_job_resumed_names_the_signal_that_released_it():
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "queue_job_resumed",
+        run="a7493b3d-4135-4076-8190-139fefb2dcb9",
+        repo="claude-code-config",
+        subject="queue job 7 (build epic-3)",
+        pr=612,
+        signal="risk-approved label",
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "queue job 7 (build epic-3) resumed" in text
+    assert "risk-approved label" in text
+    assert "PR #612" in text
+    assert "signal=" not in text
+
+
+def test_queue_job_resumed_without_a_signal_still_renders():
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "queue_job_resumed", repo="repo", subject="queue job 3 (fix 42)", sender=sender
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "resumed" in text

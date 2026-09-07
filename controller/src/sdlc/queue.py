@@ -1,5 +1,6 @@
 # ABOUTME: Host-level development queue — `sdlc build/fix --enqueue` records jobs here.
-# ABOUTME: Story 32.1-001. SQLite/WAL store for `sdlc queue list|add|cancel|prioritise`.
+# ABOUTME: Stories 32.1-001/32.2-002. SQLite/WAL store for `sdlc queue list|add|cancel|
+# ABOUTME: requeue|prioritise`, plus the approval park a scheduler re-polls.
 
 from __future__ import annotations
 
@@ -34,7 +35,13 @@ _PRIORITY_RANK = {name: rank for rank, name in enumerate(_PRIORITIES)}
 # scheduler stamps on a job it refused to execute (e.g. the repo's installed
 # controller disagrees with its checkout, Story 15.1-004) rather than running
 # it on stale code.
-_STATES = {"queued", "running", "done", "failed", "cancelled", "blocked"}
+#
+# Story 32.2-002 adds ``parked``, which is deliberately *not* terminal: a job
+# whose run stopped ``AWAITING_APPROVAL`` is waiting on a human labelling its
+# change request, and the queue re-polls that CR until it can resume the run
+# itself. ``blocked`` needs an operator command to leave; ``parked`` leaves on
+# its own the moment the forge says so.
+_STATES = {"queued", "running", "done", "failed", "cancelled", "blocked", "parked"}
 
 # The subset of :data:`_STATES` a job can finish in. ``running`` and
 # ``queued`` are in-flight; ``cancelled`` is an operator action, not an
@@ -43,9 +50,11 @@ _TERMINAL_STATES = {"done", "failed", "blocked"}
 
 # States an operator may retire. ``queued`` is the everyday case; ``blocked``
 # is here because Story 32.1-002 introduced that park and it would otherwise be
-# a dead end. A ``running`` job belongs to a live scheduler and its child, and a
+# a dead end; ``parked`` is here because Story 32.2-002's approval wait must be
+# abandonable when FX decides the change request is not going to be approved. A
+# ``running`` job belongs to a live scheduler and its child, and a
 # ``done``/``failed`` job is history worth keeping — neither is cancellable.
-_CANCELLABLE_STATES = {"queued", "blocked"}
+_CANCELLABLE_STATES = {"queued", "blocked", "parked"}
 
 # States an operator may re-arm with :meth:`QueueStore.requeue_job`. ``queued``
 # is excluded because it is already armed, ``running`` because it is live.
@@ -92,6 +101,12 @@ class JobRecord:
     created_at: str
     updated_at: str
     reason: str | None
+    # Story 32.2-002. ``pr_number`` is the change request the run left open when
+    # it parked ``AWAITING_APPROVAL``; ``poll_after`` is the earliest instant the
+    # scheduler may read that CR again — the bound that keeps a night of polling
+    # inside the host's API rate limits.
+    pr_number: int | None = None
+    poll_after: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -108,6 +123,8 @@ class JobRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "reason": self.reason,
+            "pr_number": self.pr_number,
+            "poll_after": self.poll_after,
         }
 
 
@@ -133,7 +150,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     options     TEXT,
     created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    reason      TEXT
+    reason      TEXT,
+    pr_number   INTEGER,
+    poll_after  TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -148,10 +167,18 @@ CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
 
 # Schema migrations applied after the base DDL, in the same
 # ``(version, name, table, columns, create_sql)`` shape as the ledger's
-# ``_MIGRATIONS`` (sdlc/build.py) — empty today (the fresh schema above covers
-# every column this story needs); future columns (e.g. a claim lease renewal
-# field) land here so an existing host queue.db upgrades in place.
-_MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = []
+# ``_MIGRATIONS`` (sdlc/build.py). The fresh schema above already carries every
+# column, so these only matter to a host queue.db written by an earlier version
+# — it upgrades in place rather than being rebuilt.
+_MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
+    (
+        1,
+        "approval_park",  # Story 32.2-002
+        "jobs",
+        [("pr_number", "INTEGER"), ("poll_after", "TIMESTAMP")],
+        None,
+    ),
+]
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -203,6 +230,11 @@ class QueueStore:
     list|add|cancel|prioritise` manage it. The per-repo ledger stays the sole
     truth for a run once one starts — this store only tracks the job's own
     lifecycle plus the `run_id` link (Story 32.1-001 AC5).
+
+    Story 32.2-002 adds the approval park on top of that lifecycle: a job whose
+    run stopped ``AWAITING_APPROVAL`` records the change request it is waiting
+    on (``pr_number``) and when it may next be read (``poll_after``), so the
+    wait outlives both the run and the scheduler that started it.
     """
 
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
@@ -613,6 +645,111 @@ class QueueStore:
                 (reason, _now_iso(), job_id),
             )
 
+    # --- the approval park (Story 32.2-002) -------------------------------
+
+    def park_job(
+        self,
+        job_id: int,
+        *,
+        pr_number: int,
+        reason: str,
+        poll_after: datetime | None,
+    ) -> None:
+        """Park a job on ``pr_number`` pending a human's approval.
+
+        ``AWAITING_APPROVAL`` is terminal for a *run* — ``build.py`` stops there
+        deliberately, because the bugfix loop cannot self-approve — but it is not
+        terminal for the *job*. Parking is the queue outliving the run: the job
+        keeps its ``run_id`` (so the resume that follows is a resume, never a
+        restart), records the CR to watch, and drops its claim and lease so its
+        repo and its agent slot go straight back to the pool.
+
+        Refuses a job with no ``run_id``: without a run there is nothing for an
+        approval to release, and a job that never started belongs in ``queued``.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            raise QueueError(f"unknown job id: {job_id}")
+        if not job.run_id:
+            raise QueueError(
+                f"cannot park job {job_id}: it opened no run to resume later"
+            )
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET state = 'parked', claimed_by = NULL, "
+                "lease_until = NULL, pr_number = ?, poll_after = ?, reason = ?, "
+                "updated_at = ? WHERE id = ?",
+                (
+                    pr_number,
+                    poll_after.isoformat() if poll_after is not None else None,
+                    reason,
+                    _now_iso(),
+                    job_id,
+                ),
+            )
+
+    def schedule_poll(self, job_id: int, poll_after: datetime | None) -> None:
+        """Set the earliest instant this job's change request may be read again.
+
+        The rate-limit bound (AC4). Every poll — whether it learned something or
+        the host was simply unreachable — pushes this out by the configured
+        interval, so a `--follow` scheduler ticking every two seconds still
+        makes one API read per job per interval.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET poll_after = ?, updated_at = ? WHERE id = ?",
+                (
+                    poll_after.isoformat() if poll_after is not None else None,
+                    _now_iso(),
+                    job_id,
+                ),
+            )
+
+    def take_parked_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> JobRecord | None:
+        """Take a ``parked`` job back under a lease; ``None`` when we may not.
+
+        The approval landed (or the CR was merged by hand) and the queue is
+        about to drive the job again — as a `sdlc resume` or a `sdlc reconcile`,
+        both of which are real work in the repo, so the job returns to
+        ``running`` and re-occupies its slot.
+
+        Guarded exactly like :meth:`claim_job`, and for the same two reasons: a
+        single atomic UPDATE means two schedulers polling the same CR produce
+        one winner, and the ``NOT EXISTS`` predicate re-asserts per-repo
+        exclusivity at the moment of the take rather than at the moment of the
+        read. ``pr_number`` is deliberately kept — it is the record of which CR
+        this job's work landed on — while ``poll_after`` is cleared, since a job
+        that is running is no longer being polled.
+        """
+        moment = _at(now)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET state = 'running', claimed_by = ?, lease_until = ?, "
+                "poll_after = NULL, reason = NULL, updated_at = ? "
+                "WHERE id = ? AND state = 'parked' "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM jobs AS busy "
+                "  WHERE busy.repo = jobs.repo AND busy.state = 'running'"
+                ")",
+                (
+                    claimed_by,
+                    (moment + timedelta(seconds=lease_seconds)).isoformat(),
+                    moment.isoformat(),
+                    job_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+        return self.get_job(job_id)
+
     # --- readers ----------------------------------------------------------
 
     def get_job(self, job_id: int) -> JobRecord | None:
@@ -667,6 +804,31 @@ class QueueStore:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
+    def due_parked_jobs(self, *, now: datetime | None = None) -> list[JobRecord]:
+        """``parked`` jobs whose change request is due for another read (AC1).
+
+        Filtered in SQL on ``poll_after`` so a scheduler that loops every two
+        seconds does no work — and issues no API call — for a job it polled four
+        minutes ago. A ``NULL`` ``poll_after`` is due immediately: that is a job
+        parked by an older controller (or one whose poll was explicitly reset),
+        and stalling it forever would be the worse failure.
+
+        Restricted to ``parked`` by the same predicate that makes polling stop
+        at a terminal state: a job that has been cancelled, resumed or failed is
+        simply not in this list any more.
+        """
+        if not self.db_path.exists():
+            return []
+        cutoff = _at(now).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE state = 'parked' "
+                "AND (poll_after IS NULL OR poll_after <= ?) "
+                "ORDER BY id ASC",
+                (cutoff,),
+            ).fetchall()
+        return [_row_to_record(row) for row in rows]
+
     def running_repos(self, *, kind: str | None = None) -> set[str]:
         """Repo paths with a ``running`` job — the per-repo exclusivity set (AC2).
 
@@ -699,6 +861,11 @@ class QueueStore:
 
 
 def _row_to_record(row: sqlite3.Row) -> JobRecord:
+    # Story 32.2-002's columns are read defensively: the read verbs (`sdlc queue
+    # list`, the dashboard's queue panel) deliberately never migrate the store,
+    # so a queue.db written before this story still has to render. A missing
+    # column reads as "unknown", not as a crash.
+    keys = row.keys()
     return JobRecord(
         id=row["id"],
         repo=row["repo"],
@@ -713,4 +880,6 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         reason=row["reason"],
+        pr_number=row["pr_number"] if "pr_number" in keys else None,
+        poll_after=row["poll_after"] if "poll_after" in keys else None,
     )

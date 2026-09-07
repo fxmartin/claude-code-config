@@ -95,3 +95,68 @@ def test_queue_run_creates_the_store_when_absent(tmp_path, monkeypatch) -> None:
     result = runner.invoke(app, ["queue", "run"])
     assert result.exit_code == 0, result.output
     assert (tmp_path / "queue.db").exists()
+
+
+# --- Story 32.2-002: the approval poll interval ----------------------------
+
+
+def test_queue_run_passes_the_approval_poll_interval(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    seen = _capture(monkeypatch, SchedulerResult())
+
+    result = runner.invoke(
+        app, ["queue", "run", "--approval-poll-interval", "600"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["config"].approval_poll_seconds == 600.0
+
+
+def test_queue_run_defaults_the_approval_poll_to_five_minutes(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    seen = _capture(monkeypatch, SchedulerResult())
+
+    result = runner.invoke(app, ["queue", "run"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["config"].approval_poll_seconds == 300.0
+
+
+def test_queue_run_rejects_an_approval_poll_below_the_floor(tmp_path, monkeypatch) -> None:
+    """Typer enforces the bound, so an abusive interval never reaches the host."""
+    _isolate(tmp_path, monkeypatch)
+    _capture(monkeypatch, SchedulerResult())
+
+    result = runner.invoke(app, ["queue", "run", "--approval-poll-interval", "1"])
+
+    assert result.exit_code != 0
+
+
+def test_queue_run_rejects_an_approval_poll_above_the_ceiling(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    _capture(monkeypatch, SchedulerResult())
+
+    result = runner.invoke(app, ["queue", "run", "--approval-poll-interval", "99999"])
+
+    assert result.exit_code != 0
+
+
+def test_the_drain_summary_reports_reconciled_jobs(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    _capture(monkeypatch, SchedulerResult(resumed=1, reconciled=2, done=3))
+
+    result = runner.invoke(app, ["queue", "run"])
+
+    assert result.exit_code == 0, result.output
+    assert "2 reconciled" in result.output
+
+
+def test_the_json_drain_summary_carries_reconciled(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    _capture(monkeypatch, SchedulerResult(reconciled=1, parked=1))
+
+    result = runner.invoke(app, ["queue", "run", "--json"])
+
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["reconciled"] == 1
+    assert payload["parked"] == 1

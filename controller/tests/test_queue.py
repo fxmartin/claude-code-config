@@ -53,6 +53,8 @@ def test_init_creates_wal_schema(tmp_path) -> None:
         assert cols == {
             "id", "repo", "kind", "scope", "priority", "state", "claimed_by",
             "lease_until", "run_id", "options", "created_at", "updated_at", "reason",
+            # Story 32.2-002's approval park.
+            "pr_number", "poll_after",
         }
     finally:
         conn.close()
