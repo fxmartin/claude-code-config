@@ -245,6 +245,77 @@ def test_repo_busy_reason_is_visible_while_the_repo_is_held(tmp_path) -> None:
     assert "repo busy" in seen
 
 
+def test_two_build_jobs_in_one_repo_overlap_after_32_1_003(tmp_path) -> None:
+    """Story 32.1-003 relaxes exclusivity for build/build: they may run at once.
+
+    Both jobs share one repo, so `running_repos()` (distinct repo paths) stays
+    at 1 either way — the concurrency signal here is the count of `running`
+    *job rows*, which only exceeds 1 if the second job was claimed and
+    launched before the first one finished.
+    """
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="build", scope="epic-1")
+    store.add_job(repo=repo, kind="build", scope="epic-2")
+
+    concurrency_at_launch: list[int] = []
+    launcher = FakeLauncher(alive_polls=2)
+
+    def recording(argv, cwd):
+        running = sum(1 for j in store.list_jobs() if j.state == "running")
+        concurrency_at_launch.append(running)
+        return launcher(argv, cwd)
+
+    _run(store, tmp_path=tmp_path, launcher=recording)
+
+    assert len(launcher.calls) == 2
+    assert max(concurrency_at_launch) == 2  # both launched while the repo was "busy"
+    assert [j.state for j in store.list_jobs()] == ["done"] * 2
+
+
+def test_a_fix_job_still_waits_out_a_running_build_in_one_repo(tmp_path) -> None:
+    """The relaxed rule is build/build only — fix stays exclusive against build."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="build", scope="epic-1")
+    fix_job = store.add_job(repo=repo, kind="fix", scope="1")
+
+    concurrency_at_launch: list[int] = []
+    launcher = FakeLauncher(alive_polls=2)
+
+    def recording(argv, cwd):
+        running = sum(1 for j in store.list_jobs() if j.state == "running")
+        concurrency_at_launch.append(running)
+        return launcher(argv, cwd)
+
+    _run(store, tmp_path=tmp_path, launcher=recording)
+
+    assert len(launcher.calls) == 2
+    assert concurrency_at_launch == [1, 1]  # never overlapped
+    assert store.get_job(fix_job).state == "done"
+
+
+def test_a_build_job_still_waits_out_a_running_fix_in_one_repo(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="fix", scope="1")
+    build_job = store.add_job(repo=repo, kind="build", scope="epic-1")
+
+    concurrency_at_launch: list[int] = []
+    launcher = FakeLauncher(alive_polls=2)
+
+    def recording(argv, cwd):
+        running = sum(1 for j in store.list_jobs() if j.state == "running")
+        concurrency_at_launch.append(running)
+        return launcher(argv, cwd)
+
+    _run(store, tmp_path=tmp_path, launcher=recording)
+
+    assert len(launcher.calls) == 2
+    assert concurrency_at_launch == [1, 1]  # never overlapped
+    assert store.get_job(build_job).state == "done"
+
+
 def test_the_scheduler_never_injects_allow_dirty_or_force(tmp_path) -> None:
     """No `--allow-dirty`, no stash, no bypass of the #590 guard (AC2)."""
     store = _store(tmp_path)
@@ -1224,3 +1295,62 @@ def test_a_finished_job_announces_a_queue_specific_event(tmp_path) -> None:
 
     assert [event for event, _ in events] == ["queue_job_finished"]
     assert events[0][1]["terminal"] == "DONE"
+
+
+def test_a_build_waiting_on_a_slot_is_not_stamped_repo_busy(tmp_path) -> None:
+    """Story 32.1-003: build/build is not exclusive, so "repo busy" would lie.
+
+    With one slot the second build genuinely waits, but on a *slot*, not on the
+    repo — stamping "repo busy" here (what the pre-32.1-003 predicate did for
+    every busy repo) would tell FX the queue is blocked by a rule that no
+    longer exists.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="build", scope="epic-1")
+    waiting = store.add_job(repo=repo, kind="build", scope="epic-2")
+
+    seen: list[str | None] = []
+    clock = Clock()
+
+    def sleeper(seconds: float) -> None:
+        seen.append(store.get_job(waiting).reason)
+        clock.advance(seconds)
+
+    _run(store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=2),
+         clock=clock, sleeper=sleeper,
+         config=SchedulerConfig(slots=1, poll_seconds=1.0))
+
+    assert "repo busy" not in seen
+    assert store.get_job(waiting).state == "done"
+
+
+def test_a_fix_waiting_on_a_running_build_is_stamped_repo_busy(tmp_path) -> None:
+    """The other half of the relaxed predicate: fix-behind-build is still blocked.
+
+    `running_repos(kind="fix")` is empty here, so only the `job.kind == "fix"`
+    arm can explain this job — the arm that keeps a fix off a repo another
+    kind of run already holds.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="build", scope="epic-1")
+    waiting = store.add_job(repo=repo, kind="fix", scope="1")
+
+    seen: list[str | None] = []
+    clock = Clock()
+
+    def sleeper(seconds: float) -> None:
+        seen.append(store.get_job(waiting).reason)
+        clock.advance(seconds)
+
+    _run(store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=2),
+         clock=clock, sleeper=sleeper,
+         config=SchedulerConfig(slots=2, poll_seconds=1.0))
+
+    assert "repo busy" in seen
+    assert store.get_job(waiting).state == "done"

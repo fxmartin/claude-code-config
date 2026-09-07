@@ -235,21 +235,25 @@ def test_record_merge_landing_stamps_sha_and_logs_event(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Issue #598: a landed merge writes `**Status**: Done` back into the epic
-# markdown, not just the ledger — the epic file is the documented single
-# source of truth and every other consumer (issues init, progress reporting)
-# reads it at face value.
+# Story 32.1-003: a landed merge no longer writes `**Status**: Done` back into
+# the epic markdown — only the ledger, via set_story_merge_sha above. The
+# shared checkout must stay byte-for-byte untouched for the run's duration
+# (fingerprinted before/after) so two build runs can overlap in one repo
+# without tripping the #590 dirty-tree guard; rendering the marker into the
+# checkout is deferred to the on-demand `sdlc reconcile` path (reconcile.py's
+# render_docs).
 # ---------------------------------------------------------------------------
 
 
-def test_record_merge_landing_writes_status_done_to_epic_markdown(tmp_path) -> None:
+def test_record_merge_landing_does_not_touch_epic_markdown(tmp_path) -> None:
     epic_file = tmp_path / "epic-23-pipeline-on-gitlab.md"
-    epic_file.write_text(
+    original = (
         "##### Story 23.2-003: Land the story change\n"
         "**Status**: Not started\n"
-        "**Priority**: Should\n",
-        encoding="utf-8",
+        "**Priority**: Should\n"
     )
+    epic_file.write_text(original, encoding="utf-8")
+    mtime_before = epic_file.stat().st_mtime_ns
     story = Story(
         id="23.2-003",
         title="Land the story change",
@@ -273,11 +277,17 @@ def test_record_merge_landing_writes_status_done_to_epic_markdown(tmp_path) -> N
     )
     _record_merge_landing("merge", merged, ledger, run_id, story, 7)
 
-    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+    assert ledger.story_merge_sha(run_id, "23.2-003") == "cafef00d"
+    assert epic_file.read_text(encoding="utf-8") == original
+    assert epic_file.stat().st_mtime_ns == mtime_before
 
 
 def test_record_merge_landing_missing_epic_file_is_non_fatal(tmp_path) -> None:
-    """A landed merge whose epic_file does not exist on disk must not raise (AC3 stays intact)."""
+    """A landed merge whose epic_file does not exist on disk must not raise (AC3 stays intact).
+
+    Nothing reads ``story.epic_file`` here any more (Story 32.1-003), so this
+    doubles as regression coverage for that field going fully unused mid-run.
+    """
     db = tmp_path / "ledger.db"
     ledger = Ledger(db)
     ledger.init()
@@ -289,7 +299,7 @@ def test_record_merge_landing_missing_epic_file_is_non_fatal(tmp_path) -> None:
         raw="",
     )
     # _story()'s epic_file ("docs/stories/epic-23-pipeline-on-gitlab.md") does not
-    # exist relative to the test's cwd — the write-back must degrade quietly.
+    # exist relative to the test's cwd.
     _record_merge_landing("merge", merged, ledger, run_id, _story(), 7)
 
     assert ledger.story_merge_sha(run_id, "23.2-003") == "cafef00d"

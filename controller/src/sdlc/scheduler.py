@@ -435,17 +435,27 @@ class _Scheduler:
             return job, True
 
         busy = self._store.running_repos()
-        for job in self._store.peek_claimable(busy_repos=busy, now=self._clock()):
+        fix_busy = self._store.running_repos(kind="fix")
+        for job in self._store.peek_claimable(
+            busy_repos=busy, fix_busy_repos=fix_busy, now=self._clock()
+        ):
             return job, False
         return None
 
     def _stamp_repo_busy(self) -> None:
-        """Explain a job that could have run but for its repo already being busy."""
+        """Explain a job that could have run but for its repo already being busy.
+
+        Story 32.1-003: a ``build`` candidate is only genuinely blocked by a
+        running ``fix`` (build/build now overlaps freely), so it must not be
+        stamped "repo busy" just because another build is live in its repo.
+        """
         busy = self._store.running_repos()
+        fix_busy = self._store.running_repos(kind="fix")
         if not busy:
             return
         for job in self._store.peek_claimable(now=self._clock()):
-            if job.repo in busy and job.reason != "repo busy":
+            blocked = job.repo in fix_busy or (job.kind == "fix" and job.repo in busy)
+            if blocked and job.reason != "repo busy":
                 self._store.set_reason(job.id, "repo busy")
 
     # --- launch + reap ----------------------------------------------------

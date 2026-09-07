@@ -378,6 +378,7 @@ class QueueStore:
         self,
         *,
         busy_repos: "set[str] | frozenset[str] | None" = None,
+        fix_busy_repos: "set[str] | frozenset[str] | None" = None,
         now: datetime | None = None,
     ) -> list[JobRecord]:
         """Claimable jobs in dispatch order (highest priority, then FIFO).
@@ -388,16 +389,21 @@ class QueueStore:
         itself stays a single guarded UPDATE, so losing a race here costs one
         retry, never a double-run.
 
-        ``busy_repos`` are repo paths already occupied by a live job — the
-        per-repo exclusivity rule (Story 32.1-002 AC2). They are filtered in
-        Python rather than SQL because the set is small (one entry per running
+        Per-repo exclusivity (Story 32.1-002 AC2, relaxed by 32.1-003): a
+        ``fix`` job needs the repo root to itself, so it is excluded whenever
+        the repo has *any* live job (``busy_repos``); a ``build`` job only
+        needs the repo free of a live ``fix`` job (``fix_busy_repos``) — two
+        ``build`` jobs may now overlap in one repo, since neither writes to
+        the shared checkout mid-run any more. Both sets are filtered in
+        Python rather than SQL because they are small (one entry per running
         job) and an ``IN`` clause built from caller strings is not worth the
         injection surface.
         """
         if not self.db_path.exists():
             return []
         cutoff = _at(now).isoformat()
-        excluded = busy_repos or frozenset()
+        any_busy = busy_repos or frozenset()
+        fix_busy = fix_busy_repos or frozenset()
         query = (
             "SELECT * FROM jobs WHERE state = 'queued' "
             "AND (lease_until IS NULL OR lease_until < ?) "
@@ -407,10 +413,16 @@ class QueueStore:
         )
         with self._connect() as conn:
             rows = conn.execute(query, (cutoff,)).fetchall()
+
+        def _blocked(record: JobRecord) -> bool:
+            if record.repo in fix_busy:
+                return True
+            return record.kind == "fix" and record.repo in any_busy
+
         return [
             record
             for record in (_row_to_record(row) for row in rows)
-            if record.repo not in excluded
+            if not _blocked(record)
         ]
 
     def claim_job(
@@ -428,15 +440,23 @@ class QueueStore:
         makes it atomic, so two schedulers racing for the same row produce
         exactly one winner.
 
-        The guard also carries **per-repo exclusivity** (AC2), not just the row
-        conditions. :meth:`peek_claimable` filters busy repos in Python, which
-        is a read: two schedulers that both peek before either claims would each
-        see one repo idle and each take a *different* queued job in it — two
-        UPDATEs on distinct rows, so both succeed and the repo ends up with two
-        runs. Re-asserting the rule inside the claim closes that window, and
-        costs nothing in the single-scheduler case because the candidate has
-        already passed the same test. It never blocks the row being claimed
-        (that one is still ``queued``, not ``running``).
+        The guard also carries **per-repo exclusivity** (AC2, relaxed for
+        build/build by Story 32.1-003), not just the row conditions.
+        :meth:`peek_claimable` filters busy repos in Python, which is a read:
+        two schedulers that both peek before either claims would each see one
+        repo idle and each take a *different* queued job in it — two UPDATEs
+        on distinct rows, so both succeed and the repo ends up with two runs
+        that should have been exclusive. Re-asserting the rule inside the
+        claim closes that window, and costs nothing in the single-scheduler
+        case because the candidate has already passed the same test. It never
+        blocks the row being claimed (that one is still ``queued``, not
+        ``running``).
+
+        The exclusivity predicate: a live job in the same repo blocks this
+        claim only when *either* side is ``fix`` — a ``fix`` job always needs
+        the repo root to itself, and a live ``fix`` job always excludes a new
+        claim of any kind. Two ``build`` jobs never block each other any more
+        (32.1-003 moved their status markers off the shared checkout).
         """
         moment = _at(now)
         with self._connect() as conn:
@@ -447,7 +467,8 @@ class QueueStore:
                 "AND (lease_until IS NULL OR lease_until < ?) "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM jobs AS busy "
-                "  WHERE busy.repo = jobs.repo AND busy.state = 'running'"
+                "  WHERE busy.repo = jobs.repo AND busy.state = 'running' "
+                "  AND (busy.kind = 'fix' OR jobs.kind = 'fix')"
                 ")",
                 (
                     claimed_by,
@@ -646,19 +667,24 @@ class QueueStore:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
-    def running_repos(self) -> set[str]:
+    def running_repos(self, *, kind: str | None = None) -> set[str]:
         """Repo paths with a ``running`` job — the per-repo exclusivity set (AC2).
 
         Read from the store rather than from one scheduler's in-memory state so
         two `sdlc queue run` processes on the same host still never put two
-        runs in one repo.
+        runs in one repo. ``kind`` narrows to running jobs of that kind only —
+        the scheduler uses ``kind="fix"`` (Story 32.1-003) to compute the
+        ``fix_busy_repos`` half of :meth:`peek_claimable`'s exclusivity check.
         """
         if not self.db_path.exists():
             return set()
+        query = "SELECT DISTINCT repo FROM jobs WHERE state = 'running'"
+        params: tuple[str, ...] = ()
+        if kind is not None:
+            query += " AND kind = ?"
+            params = (kind,)
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT repo FROM jobs WHERE state = 'running'"
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return {row["repo"] for row in rows}
 
     def counts_by_state(self) -> dict[str, int]:

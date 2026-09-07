@@ -1596,9 +1596,16 @@ def reconcile(
     / no-remote degrades to a clean skip. No ledger / no runs reports cleanly;
     only a genuinely-unknown *explicit* run id exits non-zero, and no spurious
     empty ledger is ever created.
+
+    Story 32.1-003: this is also the on-demand trigger for the epic markdown's
+    ``**Status**: Done`` markers — ``reconcile_run`` itself only ever touches
+    the ledger, so after it returns this command renders every ``DONE`` story
+    of the run into its epic file via ``render_docs``. A write failure there
+    is reported but does not change the command's exit code (mirrors the old
+    best-effort write-back's non-fatal posture).
     """
     from sdlc.ledger_view import Ledger, default_db_path
-    from sdlc.reconcile import reconcile_run
+    from sdlc.reconcile import reconcile_run, render_docs
     from sdlc.registry import Registry
 
     db_path = db or default_db_path()
@@ -1625,6 +1632,14 @@ def reconcile(
             "origin (offline / no remote)."
         )
         raise typer.Exit(code=0)
+
+    try:
+        rendered = render_docs(ledger, result.run_id)
+    except OSError as exc:
+        rendered = {}
+        typer.echo(f"epic markdown render failed (non-fatal): {exc}", err=True)
+    for epic_file, story_ids in rendered.items():
+        typer.echo(f"  rendered {', '.join(story_ids)} → {epic_file}")
 
     if not result.changed:
         typer.echo(f"nothing to reconcile: run {result.run_id[:8]} unchanged.")

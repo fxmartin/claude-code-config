@@ -290,3 +290,98 @@ def test_apply_migrations_adds_column_and_is_idempotent(tmp_path, monkeypatch) -
     # A second init() must skip the already-applied version (no duplicate
     # ALTER TABLE, which would raise "duplicate column name").
     store.init()
+
+
+# ---------------------------------------------------------------------------
+# Story 32.1-003: per-repo exclusivity relaxed for build/build, kept for any
+# combination touching a fix job (fix runs in the repo root, exclusive always).
+# ---------------------------------------------------------------------------
+
+
+def _store(tmp_path):
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    return store
+
+
+def test_claim_job_allows_two_build_jobs_in_one_repo(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = str(tmp_path / "repo")
+    first = store.add_job(repo=repo, kind="build", scope="epic-1")
+    second = store.add_job(repo=repo, kind="build", scope="epic-2")
+
+    assert store.claim_job(first, claimed_by="w1", lease_seconds=90) is not None
+    assert store.claim_job(second, claimed_by="w2", lease_seconds=90) is not None
+
+
+def test_claim_job_still_exclusive_for_two_fix_jobs_in_one_repo(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = str(tmp_path / "repo")
+    first = store.add_job(repo=repo, kind="fix", scope="1")
+    second = store.add_job(repo=repo, kind="fix", scope="2")
+
+    assert store.claim_job(first, claimed_by="w1", lease_seconds=90) is not None
+    assert store.claim_job(second, claimed_by="w2", lease_seconds=90) is None
+
+
+def test_claim_job_fix_blocked_by_a_running_build_in_the_same_repo(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = str(tmp_path / "repo")
+    build_job = store.add_job(repo=repo, kind="build", scope="epic-1")
+    fix_job = store.add_job(repo=repo, kind="fix", scope="1")
+
+    assert store.claim_job(build_job, claimed_by="w1", lease_seconds=90) is not None
+    assert store.claim_job(fix_job, claimed_by="w2", lease_seconds=90) is None
+
+
+def test_claim_job_build_blocked_by_a_running_fix_in_the_same_repo(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = str(tmp_path / "repo")
+    fix_job = store.add_job(repo=repo, kind="fix", scope="1")
+    build_job = store.add_job(repo=repo, kind="build", scope="epic-1")
+
+    assert store.claim_job(fix_job, claimed_by="w1", lease_seconds=90) is not None
+    assert store.claim_job(build_job, claimed_by="w2", lease_seconds=90) is None
+
+
+def test_peek_claimable_build_not_excluded_by_a_running_build(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = str(tmp_path / "repo")
+    store.add_job(repo=repo, kind="build", scope="epic-2")
+
+    claimable = store.peek_claimable(busy_repos={repo}, fix_busy_repos=set())
+    assert len(claimable) == 1
+
+
+def test_peek_claimable_fix_excluded_by_any_running_job(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = str(tmp_path / "repo")
+    store.add_job(repo=repo, kind="fix", scope="2")
+
+    claimable = store.peek_claimable(busy_repos={repo}, fix_busy_repos=set())
+    assert claimable == []
+
+
+def test_peek_claimable_build_excluded_by_a_running_fix(tmp_path) -> None:
+    store = _store(tmp_path)
+    repo = str(tmp_path / "repo")
+    store.add_job(repo=repo, kind="build", scope="epic-2")
+
+    claimable = store.peek_claimable(busy_repos=set(), fix_busy_repos={repo})
+    assert claimable == []
+
+
+def test_running_repos_filters_by_kind(tmp_path) -> None:
+    store = _store(tmp_path)
+    build_repo = str(tmp_path / "alpha")
+    fix_repo = str(tmp_path / "beta")
+    build_job = store.add_job(repo=build_repo, kind="build", scope="epic-1")
+    fix_job = store.add_job(repo=fix_repo, kind="fix", scope="1")
+    store.claim_job(build_job, claimed_by="w1", lease_seconds=90)
+    store.claim_job(fix_job, claimed_by="w2", lease_seconds=90)
+
+    assert store.running_repos() == {build_repo, fix_repo}
+    assert store.running_repos(kind="fix") == {fix_repo}
+    assert store.running_repos(kind="build") == {build_repo}
