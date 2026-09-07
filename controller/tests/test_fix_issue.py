@@ -499,13 +499,20 @@ def test_list_open_issues_threads_gitlab_host_env() -> None:
 
 
 def test_list_open_issues_no_instance_url_passes_no_env() -> None:
-    seen: dict = {"called_with_env_kw": False}
+    """Story 30.1-001 AC2: with no declared instance the runner is invoked exactly
+    as before — a pre-existing double whose signature has no ``env`` keyword is
+    never called with one (that would raise TypeError). The call is asserted, so
+    "did not raise" cannot pass vacuously on a runner that was never reached."""
+    calls: list[list[str]] = []
 
     def runner(argv, timeout=None):
-        seen["called_with_env_kw"] = False
+        calls.append(list(argv))
         return fix_mod.issue_host.RunResult(returncode=0, stdout="[]", stderr="")
 
-    fix_mod._list_open_issues(runner, host="gitlab")  # must not raise (no env kwarg)
+    fix_mod._list_open_issues(runner, host="gitlab")
+
+    assert calls, "the env-less runner was never invoked"
+    assert all("GITLAB_HOST" not in " ".join(argv) for argv in calls)
 
 
 def test_parse_fix_args_host_flag() -> None:

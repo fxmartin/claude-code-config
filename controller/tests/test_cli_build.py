@@ -340,6 +340,43 @@ def test_build_actor_adapter_honours_declared_forge(tmp_path, monkeypatch) -> No
     assert adapter.instance_url == "http://127.0.0.1:8080"
 
 
+def test_build_malformed_forge_declaration_aborts_before_any_dispatch(
+    tmp_path, monkeypatch
+) -> None:
+    """Story 30.1-001 AC3: a malformed `.sdlc-forge.yaml` refuses the run with one
+    actionable line and exit 2 — before preflight, the ledger, or any dispatch.
+    The pre-fix behaviour was the opposite: `_log_forge_preflight` swallowed the
+    error and the build ran on, targeting whatever host detection guessed."""
+    from sdlc.build import IN_TEST_ENV_VAR
+
+    _make_project(tmp_path)
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # The recursion guard short-circuits every refusal path, so drop the sentinel
+    # to reach the real preflight ordering (as the dirty/undenied guards' tests do).
+    monkeypatch.delenv(IN_TEST_ENV_VAR, raising=False)
+
+    result = runner.invoke(app, ["build", "epic-99"])
+
+    assert result.exit_code == 2, result.output
+    assert "error:" in result.output
+    assert "unsupported forge 'bitbucket'" in result.output
+    # Refused before the ledger bootstrap — no run row, no transcript dir.
+    assert not (tmp_path / ".sdlc-state.db").exists()
+
+
+def test_build_undetectable_remote_still_builds(tmp_path, monkeypatch) -> None:
+    """Story 30.1-001 AC2: the AC3 guard is scoped to *declaration* errors only —
+    a repo with no recognisable remote and no declaration is unchanged."""
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "dry run" in result.output.lower()
+
+
 def test_build_reports_budget_stop_with_notional_label(tmp_path, monkeypatch) -> None:
     """Story 14.1-001: a budget-gated stop prints the labelled-notional $ and
     exits non-zero (a paused run is not fully done)."""

@@ -8,7 +8,7 @@ import json
 import pytest
 
 from sdlc.approval import poll_approval
-from sdlc.issue_host import IssueHostError, RunResult
+from sdlc.issue_host import ForgeResolution, IssueHostError, RunResult
 
 
 class FakeRunner:
@@ -29,13 +29,17 @@ class FakeRunner:
         return RunResult(returncode=1, stdout="", stderr=f"no fixture for {argv}")
 
 
+def _resolution(host: str, instance_url: str | None = None) -> ForgeResolution:
+    return ForgeResolution(host=host, instance_url=instance_url, source="auto-detect")
+
+
 def _github(monkeypatch, runner) -> None:
-    monkeypatch.setattr("sdlc.approval.resolve_host", lambda _root: "github")
+    monkeypatch.setattr("sdlc.approval.resolve_forge", lambda _root: _resolution("github"))
     monkeypatch.setattr("sdlc.approval.repo_runner", lambda _root: runner)
 
 
 def _gitlab(monkeypatch, runner) -> None:
-    monkeypatch.setattr("sdlc.approval.resolve_host", lambda _root: "gitlab")
+    monkeypatch.setattr("sdlc.approval.resolve_forge", lambda _root: _resolution("gitlab"))
     monkeypatch.setattr("sdlc.approval.repo_runner", lambda _root: runner)
 
 
@@ -163,7 +167,7 @@ def test_an_undetectable_host_yields_none(tmp_path, monkeypatch) -> None:
     def boom(_root):
         raise IssueHostError("could not determine code host from git remote")
 
-    monkeypatch.setattr("sdlc.approval.resolve_host", boom)
+    monkeypatch.setattr("sdlc.approval.resolve_forge", boom)
 
     assert poll_approval(tmp_path, 12) is None
 
@@ -244,8 +248,13 @@ def test_a_view_with_no_state_yields_none(tmp_path, monkeypatch) -> None:
         def cr_approval(self, _ref):
             return ChangeRequestApproval(state=None, labels=("risk-approved",))
 
-    monkeypatch.setattr("sdlc.approval.resolve_host", lambda _root: "github")
-    monkeypatch.setattr("sdlc.approval.get_adapter", lambda _h, runner=None: Adapter())
+    monkeypatch.setattr(
+        "sdlc.approval.resolve_forge", lambda _root: _resolution("github")
+    )
+    monkeypatch.setattr(
+        "sdlc.approval.get_adapter",
+        lambda _h, runner=None, instance_url=None: Adapter(),
+    )
 
     assert poll_approval(tmp_path, 12) is None
 
@@ -257,8 +266,13 @@ def test_an_unexpected_adapter_crash_yields_none(tmp_path, monkeypatch) -> None:
         def cr_approval(self, _ref):
             raise RuntimeError("something entirely unexpected")
 
-    monkeypatch.setattr("sdlc.approval.resolve_host", lambda _root: "github")
-    monkeypatch.setattr("sdlc.approval.get_adapter", lambda _h, runner=None: Adapter())
+    monkeypatch.setattr(
+        "sdlc.approval.resolve_forge", lambda _root: _resolution("github")
+    )
+    monkeypatch.setattr(
+        "sdlc.approval.get_adapter",
+        lambda _h, runner=None, instance_url=None: Adapter(),
+    )
 
     assert poll_approval(tmp_path, 12) is None
 
@@ -268,7 +282,9 @@ def test_an_injected_runner_replaces_the_repo_scoped_one(tmp_path, monkeypatch) 
     runner = FakeRunner({
         "pr view": {"state": "OPEN", "labels": [], "reviewDecision": None, "reviews": []}
     })
-    monkeypatch.setattr("sdlc.approval.resolve_host", lambda _root: "github")
+    monkeypatch.setattr(
+        "sdlc.approval.resolve_forge", lambda _root: _resolution("github")
+    )
 
     def explode(_root):
         raise AssertionError("repo_runner must not be built when one is injected")
@@ -279,3 +295,43 @@ def test_an_injected_runner_replaces_the_repo_scoped_one(tmp_path, monkeypatch) 
 
     assert verdict.state == "open"
     assert runner.calls[0][:3] == ["gh", "pr", "view"]
+
+
+# --- declared forge instance (Story 30.1-001) --------------------------------
+
+
+def test_poll_targets_the_declared_instance(tmp_path, monkeypatch) -> None:
+    """Story 30.1-001: a parked job in a local-forge repo must poll the declared
+    instance. Before this, `resolve_host` dropped the instance and every `glab`
+    call went to gitlab.com — which answers None, so the job stayed parked
+    forever instead of releasing on FX's approval."""
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n", encoding="utf-8"
+    )
+    seen: list = []
+
+    def runner(argv, timeout: float = 30.0, env=None) -> RunResult:
+        seen.append(env)
+        return RunResult(
+            returncode=0,
+            stdout=json.dumps({"state": "opened", "labels": ["risk-approved"]}),
+            stderr="",
+        )
+
+    verdict = poll_approval(tmp_path, 12, runner=runner)
+
+    assert verdict is not None and verdict.approved is True
+    assert seen and all(env == {"GITLAB_HOST": "http://127.0.0.1:8080"} for env in seen)
+
+
+def test_a_malformed_declaration_yields_none(tmp_path, monkeypatch) -> None:
+    """A malformed declaration is an IssueHostError like any other unreadable
+    forge: the poll returns None and the job stays parked, never crashing the
+    scheduler and never guessing an instance."""
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n", encoding="utf-8")
+
+    def explode(_argv, timeout: float = 30.0, env=None):  # pragma: no cover
+        raise AssertionError("no host call may be made on a malformed declaration")
+
+    assert poll_approval(tmp_path, 12, runner=explode) is None
+

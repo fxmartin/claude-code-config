@@ -221,6 +221,27 @@ def test_dashboard_malformed_forge_declaration_aborts_at_preflight(monkeypatch) 
     assert "unsupported forge" in result.output
 
 
+def test_resume_malformed_forge_declaration_aborts_cleanly(tmp_path, monkeypatch) -> None:
+    """Story 30.1-001 AC3: resuming a fix run re-resolves the forge
+    (`fix_issue.resume_fix` → `_resolve_fix_forge`), so a malformed
+    `.sdlc-forge.yaml` must report one actionable line and exit 2 here too —
+    the same regression class the `sdlc fix` handler closes."""
+    import sdlc.resume as resume_mod
+    from sdlc.issue_host import IssueHostError
+
+    monkeypatch.chdir(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise IssueHostError(".sdlc-forge.yaml names unsupported forge 'bitbucket'")
+
+    monkeypatch.setattr(resume_mod, "run_resume", _boom)
+
+    result = runner.invoke(app, ["resume"])
+    assert result.exit_code == 2, result.output
+    assert "error:" in result.output
+    assert "unsupported forge" in result.output
+
+
 def test_unknown_command_exits_nonzero() -> None:
     """Invoking an unknown command produces a non-zero exit code."""
     result = runner.invoke(app, ["nonexistent-command"])

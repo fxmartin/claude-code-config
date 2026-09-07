@@ -311,3 +311,73 @@ def test_change_request_checks_tolerates_host_failure(tmp_path):
     _mapped(ledger, story_id="25.1-001", host=ih.GITHUB, ref="42")
     runner = FakeRunner(default=(1, "", "boom"))
     assert bi.change_request_checks(ledger, "25.1-001", 100, runner=runner) is None
+
+
+# --- declared forge instance (Story 30.1-001) --------------------------------
+
+
+def test_mirror_lifecycle_threads_declared_instance(tmp_path, monkeypatch):
+    """Story 30.1-001: the inventory records the forge *kind*, so the repo's
+    `.sdlc-forge.yaml` must supply the instance for the mirror-lifecycle
+    adapters too. Without it every `glab` call below targets gitlab.com — the CI
+    poll never resolves and the merge gate degrades — on exactly the local-forge
+    repos the declaration exists for."""
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, host=ih.GITLAB, ref="7")
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    seen: list = []
+
+    def runner(argv, timeout=None, env=None):
+        seen.append(env)
+        return ih.RunResult(returncode=0, stdout="{}", stderr="")
+
+    assert bi.close_link(ledger, "22.4-002", runner=runner) == "Closes #7"
+    bi.change_request_status(ledger, "22.4-002", 9, runner=runner)
+
+    assert seen, "no host call was made"
+    assert all(env == {"GITLAB_HOST": "http://127.0.0.1:8080"} for env in seen)
+
+
+def test_mirror_lifecycle_ignores_declaration_for_another_forge(tmp_path, monkeypatch):
+    """A declaration only contributes its instance to the forge it names — a
+    GitHub-mapped story never inherits a GitLab instance."""
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, host=ih.GITHUB, ref="7")
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runner = FakeRunner()  # no `env` keyword: being passed one would raise
+    assert bi.close_link(ledger, "22.4-002", runner=runner) == "Closes #7"
+
+
+def test_mirror_lifecycle_no_declaration_is_unchanged(tmp_path, monkeypatch):
+    """AC2: with no `.sdlc-forge.yaml` the runner is invoked exactly as before —
+    a pre-existing double with no `env` keyword is never called with one."""
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, host=ih.GITLAB, ref="7")
+    monkeypatch.chdir(tmp_path)
+
+    runner = FakeRunner()
+    assert bi.close_link(ledger, "22.4-002", runner=runner) == "Closes #7"
+
+
+def test_mirror_lifecycle_no_ops_on_malformed_declaration(tmp_path, monkeypatch):
+    """A malformed declaration means the instance is unknown; these best-effort
+    seams no-op rather than guess and talk to the wrong forge (a build already
+    refused upstream at `build._forge_declaration_error`)."""
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, host=ih.GITLAB, ref="7")
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    runner = FakeRunner()
+    assert bi.close_link(ledger, "22.4-002", runner=runner) is None
+    assert bi.change_request_status(ledger, "22.4-002", 9, runner=runner) is None
+    assert bi.change_request_terms(ledger, "22.4-002", runner=runner) is ih.GITHUB_CR_TERMS
+    assert runner.calls == []

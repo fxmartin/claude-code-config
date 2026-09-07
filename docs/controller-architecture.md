@@ -2291,6 +2291,23 @@ declaration (unsupported `forge:`, a non-URL `<forge>_url:`) raises
 the same contract `load_repo_harness_defaults` enforces for a malformed
 `.sdlc-harness.yaml`.
 
+"Fails fast" is enforced per entry point, because each owns a different refusal
+surface, and the error must be *one actionable line*, never a traceback:
+
+| Entry point | Guard | Exit |
+|---|---|---|
+| `sdlc build` | `build._forge_declaration_error`, beside the dirty-tree and undenied-host-auth guards — before preflight, the ledger row, and any dispatch (`BuildResult.forge_error`) | 2 |
+| `sdlc fix` / `sdlc resume` | `fix_issue._resolve_fix_forge` raises; the CLI verbs catch `IssueHostError` | 2 |
+| `sdlc issues init`, `sdlc issues assign`, `sdlc review-packet` | `resolve_forge` raises inside each command's existing `except IssueHostError` | 2 |
+| `sdlc dashboard` (single-repo `--db` mode) | validated once at startup | 2 |
+
+Only *declaration* errors are fatal. An undetectable remote is not one — that
+path is unchanged, which is what keeps "no declaration, no change" true. The
+deliberately best-effort seams (`build_issue`'s mirror lifecycle,
+`approval.poll_approval`, registry-discovery dashboard mode) keep degrading to a
+clean no-op instead: they run *after* the guard above, so reaching them with a
+bad file means the safe answer is "do nothing", never "guess an instance".
+
 **Threading the instance URL.** A declared instance is only useful if the
 `glab` calls an adapter makes actually target it. `issue_host.get_adapter(host,
 instance_url=...)` threads it onto `GitLabAdapter`, which passes it to every
@@ -2298,15 +2315,20 @@ instance_url=...)` threads it onto `GitLabAdapter`, which passes it to every
 (`IssueHostAdapter._invoke`) — never by mutating `glab`'s persistent global
 config, so a controller process touching several repos on several instances in
 one run never cross-contaminates them. The declaration-aware call sites: `sdlc
-build` (`_open_story_cr`/`_bake_review_packet`, and the run-start actor-identity
-resolve), `sdlc fix` (`_resolve_fix_forge` mirrors `_resolve_fix_host`'s
+build` (`_open_story_cr`/`_bake_review_packet`, the run-start actor-identity
+resolve, and `build_issue`'s whole issue-mirror lifecycle — close-link, CR
+terms, the merge gate's CI poll, status announcements — which resolves the
+instance for the inventory's recorded *kind* from cwd, where its `gh`/`glab`
+subprocesses run), `sdlc fix` (`_resolve_fix_forge` mirrors `_resolve_fix_host`'s
 non-raising auto-detect fallback but still raises on a malformed declaration;
 threaded through `fetch_issue`/`stop_reason`/the stage loop/batch selection),
-`sdlc issues init`, and the dashboard (`git_project_url` rewrites the PR/MR
-deep-link web base to the declared instance; `make_server`'s single-repo mode
-validates the declaration once at startup — registry-discovery mode resolves
-it per-repo, per-request, best-effort, so one repo's bad file can't take the
-whole dashboard down).
+`sdlc issues init`, `sdlc issues assign`, `sdlc review-packet`, the scheduler's
+approval poll (`approval.poll_approval` — a parked job in a local-forge repo
+must poll that instance, or it never sees FX's approval and stays parked), and
+the dashboard (`git_project_url` rewrites the PR/MR deep-link web base to the
+declared instance; `make_server`'s single-repo mode validates the declaration
+once at startup — registry-discovery mode resolves it per-repo, per-request,
+best-effort, so one repo's bad file can't take the whole dashboard down).
 
 **Preflight line.** Every routed build/fix run logs `forge routing: <host>
 [instance=<url>] (<source>)` beside the `harness routing: …` line

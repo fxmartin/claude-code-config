@@ -25,9 +25,15 @@ def _seed_mapped(db: Path, story_id: str, host: str, ref: str) -> None:
     ledger.inventory_set_mapping(story_id, host, ref)
 
 
-def _patch_adapter(monkeypatch, fake: FakeHost) -> None:
+def _patch_adapter(monkeypatch, fake: FakeHost, captured: dict | None = None) -> None:
     """Make the CLI's ``get_adapter`` return our in-memory fake host."""
-    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: fake)
+
+    def _get(host, runner=None, instance_url=None):
+        if captured is not None:
+            captured.update(host=host, instance_url=instance_url)
+        return fake
+
+    monkeypatch.setattr(ih, "get_adapter", _get)
 
 
 def test_assign_single_story(tmp_path, monkeypatch) -> None:
@@ -205,3 +211,38 @@ def test_assign_against_never_mirrored_repo_does_not_crash(tmp_path, monkeypatch
     assert "1 unmapped" in result.output
     assert fake.assigned == []
     assert db.exists()  # the schema was provisioned
+
+
+def test_assign_threads_the_declared_instance(tmp_path, monkeypatch) -> None:
+    """Story 30.1-001: `issues assign` is a host-touching path like every other —
+    a declared instance must reach its adapter, or the assignment is attempted on
+    gitlab.com for a repo whose issues only exist on the local instance."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_mapped(db, "30.1-001", ih.GITLAB, "7")
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    fake = FakeHost(ih.GITLAB)
+    captured: dict = {}
+    _patch_adapter(monkeypatch, fake, captured)
+
+    result = runner.invoke(app, ["issues", "assign", "30.1-001", "alice", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert captured == {"host": "gitlab", "instance_url": "http://127.0.0.1:8080"}
+
+
+def test_assign_malformed_declaration_exits_two(tmp_path, monkeypatch) -> None:
+    """AC3: a malformed declaration aborts with the command's existing
+    configuration-error contract (exit 2) rather than assigning against a guess."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_mapped(db, "30.1-001", ih.GITLAB, "7")
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["issues", "assign", "30.1-001", "alice", "--db", str(db)])
+
+    assert result.exit_code == 2, result.output
+    assert "unsupported forge 'bitbucket'" in result.output
+

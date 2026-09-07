@@ -4353,6 +4353,10 @@ class BuildResult:
     # that renders no deny baseline — that made the run refuse to start.
     # Non-empty means nothing was dispatched and no run row exists.
     undenied_host_auth: list[tuple[str, str]] = field(default_factory=list)
+    # Story 30.1-001 AC3: the one-line reason a malformed `.sdlc-forge.yaml` made
+    # the run refuse to start. Non-empty means nothing was dispatched and no run
+    # row exists — the declaration is a preflight fact, never a mid-pipeline one.
+    forge_error: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -4575,6 +4579,31 @@ def _log_controller_version_check(ledger: "Ledger", run_id: str, root: Path) -> 
         pass
 
 
+def _forge_declaration_error(root: Path) -> str:
+    """The one-line reason ``root``'s `.sdlc-forge.yaml` is unusable, else "" (AC3).
+
+    Story 30.1-001: a malformed declaration — bad YAML, a non-mapping, a missing
+    or unsupported ``forge:``, a non-URL ``<forge>_url:`` — must abort the run at
+    preflight, before the ledger, the registry, or any dispatch. It cannot be
+    left to :func:`_log_forge_preflight` (best-effort by construction) or to
+    :func:`_open_story_cr`'s degradation path, which would turn an operator typo
+    into a mid-pipeline warning on a run that already spent tokens.
+
+    Only *declaration* errors are reported. An undetectable remote is not one:
+    that path is unchanged (a repo with no recognisable origin still builds, as
+    it does today), which is what keeps AC2's "no declaration, no change".
+    """
+    from sdlc import issue_host
+
+    try:
+        issue_host.load_repo_forge_declaration(
+            override_path=root / issue_host.FORGE_OVERRIDE_FILENAME
+        )
+    except issue_host.IssueHostError as exc:
+        return str(exc)
+    return ""
+
+
 def _log_forge_preflight(
     ledger: "Ledger", run_id: str, root: Path, opts: "BuildOptions"
 ) -> None:
@@ -4586,7 +4615,9 @@ def _log_forge_preflight(
     :func:`sdlc.issue_host.resolve_forge` applies at every per-story CR open
     (:func:`_open_story_cr`, :func:`_bake_review_packet`). Purely additive
     logging: a resolution failure (no remote, unsupported host) is common on a
-    non-git ``root`` in tests and must never fail an otherwise-good build.
+    non-git ``root`` in tests and must never fail an otherwise-good build. The
+    one failure that *is* fatal — a malformed declaration — never reaches here:
+    :func:`_forge_declaration_error` already refused the run upstream (AC3).
     """
     try:
         from sdlc import issue_host
@@ -6558,6 +6589,15 @@ def run_build(
     undenied = undenied_host_auth_routes(opts.harness_map)
     if undenied and not opts.allow_undenied:
         return BuildResult(undenied_host_auth=undenied, planned=len(buildable))
+
+    # --- Malformed forge declaration guard (Story 30.1-001 AC3) --------------
+    # The repo's `.sdlc-forge.yaml` decides which forge every CR open, status
+    # announcement and merge gate below targets. A typo in it must be reported
+    # *here* — before preflight burns a test run and before any run row exists —
+    # rather than surfacing as a degraded CR open halfway through the queue.
+    forge_error = _forge_declaration_error(root or Path.cwd())
+    if forge_error:
+        return BuildResult(forge_error=forge_error, planned=len(buildable))
 
     # --- Phase 1: Preflight (real runs only) ---------------------------------
     if not opts.skip_preflight:

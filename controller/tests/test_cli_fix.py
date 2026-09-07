@@ -193,3 +193,41 @@ def test_fix_investigation_blocked_exits_one(tmp_path, monkeypatch) -> None:
     result = runner.invoke(app, ["fix", "1"])
     assert result.exit_code == 1
     assert "blocked" in result.output.lower()
+
+
+# --- malformed forge declaration (Story 30.1-001 AC3) ------------------------
+
+
+def test_fix_malformed_forge_declaration_reports_and_exits_two(
+    tmp_path, monkeypatch
+) -> None:
+    """Story 30.1-001 AC3: `_resolve_fix_forge` raises on a malformed
+    `.sdlc-forge.yaml` so the run fails at preflight — but the command must
+    report one actionable line and exit 2, not let the traceback escape. The
+    pre-fix path had no handler at all (`_resolve_fix_host` never raised)."""
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: not-a-url\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["fix", "5"])
+
+    assert result.exit_code == 2, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "error:" in result.output
+    assert "not a valid URL" in result.output
+
+
+def test_fix_batch_malformed_forge_declaration_reports_and_exits_two(
+    tmp_path, monkeypatch
+) -> None:
+    """The batch entry point resolves the forge the same way — same contract."""
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["fix", "all"])
+
+    assert result.exit_code == 2, result.output
+    assert "error:" in result.output
+    assert "unsupported forge 'bitbucket'" in result.output
+
