@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.68.1] - 2026-09-07
+
+### Fixed
+
+- fix(ledger): make migration idempotency name-aware (#621) (#670)
+
+
 ## [v2.68.0] - 2026-09-07
 
 ### Added
