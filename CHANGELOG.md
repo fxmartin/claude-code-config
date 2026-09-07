@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.60.0] - 2026-09-07
+
+### Added
+
+- feat(harness): refuse host-auth roles on an undenied harness (#654) (#658)
+
+
 ## [v2.59.4] - 2026-09-07
 
 ### Fixed
