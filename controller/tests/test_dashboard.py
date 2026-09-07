@@ -2340,3 +2340,156 @@ def test_runs_page_still_renders_with_registry_statuses(tmp_path: Path) -> None:
     assert runs[0]["status"] == "DEAD"
     text = body.decode("utf-8")
     assert 'id="sideChips"' in text
+
+
+# ---------------------------------------------------------------------------
+# Queue panel on the dashboard (Story 32.3-002)
+# ---------------------------------------------------------------------------
+
+
+def _seed_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point the host queue at an isolated per-test path; return the store."""
+    from sdlc.queue import QueueStore
+
+    queue_path = tmp_path / "queue.db"
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(queue_path))
+    store = QueueStore(queue_path)
+    store.init()
+    return store
+
+
+def test_queue_view_empty_when_no_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A host that has never enqueued anything reports an empty list, not an error —
+    the same read-never-creates contract as `QueueStore.list_jobs`."""
+    from sdlc.dashboard import queue_view
+
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    assert queue_view() == []
+    assert not (tmp_path / "queue.db").exists()
+
+
+def test_queue_view_returns_job_dicts_across_repos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """queue_view() is exactly `JobRecord.to_dict()` rows, host-wide (every repo)."""
+    from sdlc.dashboard import queue_view
+
+    store = _seed_queue(tmp_path, monkeypatch)
+    store.add_job(repo="/repo/a", kind="build", scope="epic-5", priority="high")
+    store.add_job(repo="/repo/b", kind="fix", scope="42", priority="urgent")
+    rows = queue_view()
+    assert [r["repo"] for r in rows] == ["/repo/b", "/repo/a"]  # urgent before high
+    assert rows[0]["kind"] == "fix" and rows[0]["scope"] == "42" and rows[0]["state"] == "queued"
+
+
+def test_api_queue_empty_returns_empty_array(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = tmp_path / ".sdlc-state.db"  # never created
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    with _running(db) as base:
+        status, ctype, body = _get(base + "/api/queue")
+    assert status == 200
+    assert "application/json" in ctype
+    assert json.loads(body) == []
+
+
+def test_api_queue_matches_cli_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One source, two consumers: `/api/queue` and `sdlc queue list --json` agree
+    byte-for-byte on the same host queue (Story 32.3-002 AC3)."""
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    db = tmp_path / ".sdlc-state.db"
+    store = _seed_queue(tmp_path, monkeypatch)
+    store.add_job(repo="/repo/a", kind="fix", scope="42", priority="urgent")
+    store.add_job(repo="/repo/b", kind="build", scope="epic-9")
+
+    cli_rows = json.loads(CliRunner().invoke(app, ["queue", "list", "--json"]).output)
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/queue")
+    assert json.loads(body) == cli_rows
+
+
+def test_page_has_queue_panel_and_fetch_hooks() -> None:
+    """The page ships the queue render hooks (panel container + fetch route)."""
+    from sdlc.dashboard import _PAGE
+
+    assert "/api/queue" in _PAGE
+    assert 'id="queue"' in _PAGE
+    assert "function renderQueue(" in _PAGE
+
+
+def test_page_queue_fetch_lives_inside_tick() -> None:
+    """The queue is host-level, not ledger-driven — like the GitHub badge, it must
+    refresh on tick()'s steady GH_REFRESH_INTERVAL cadence, not only on SSE."""
+    from sdlc.dashboard import _PAGE
+
+    tick_start = _PAGE.index("async function tick()")
+    tick_end = _PAGE.index("\n}", tick_start)
+    tick_body = _PAGE[tick_start:tick_end]
+    assert "/api/queue" in tick_body
+    assert "renderQueue(" in tick_body
+
+
+def test_page_queue_panel_scrolls_wide_content_inside_itself() -> None:
+    """Story #655's lesson applied up front: wide content scrolls inside the
+    panel's own box, never the page."""
+    from sdlc.dashboard import _PAGE
+
+    assert ".queue-scroll" in _PAGE
+    assert "overflow-x: auto" in _PAGE
+    render_start = _PAGE.index("function renderQueue(")
+    render_end = _PAGE.index("\n}", render_start)
+    assert "queue-scroll" in _PAGE[render_start:render_end]
+
+
+def test_page_queue_degrades_to_muted_no_queue_line() -> None:
+    """No queue store → a muted 'no queue' line (the GitHub-panel precedent),
+    never an error."""
+    from sdlc.dashboard import _PAGE
+
+    render_start = _PAGE.index("function renderQueue(")
+    render_end = _PAGE.index("\n}", render_start)
+    body = _PAGE[render_start:render_end]
+    assert "no queue" in body
+    assert "unavail" in body  # reuses the muted/italic degrade class
+
+
+def test_page_queue_groups_jobs_by_state() -> None:
+    from sdlc.dashboard import _PAGE
+
+    assert 'QUEUE_STATE_ORDER = ["queued","running","done","failed","cancelled"]' in _PAGE
+
+
+def test_page_queue_pause_banner_shows_reset_time() -> None:
+    """A queue-level RATE_LIMITED pause is one banner (not N rows) with its
+    reset time."""
+    from sdlc.dashboard import _PAGE
+
+    render_start = _PAGE.index("function renderQueue(")
+    render_end = _PAGE.index("\n}", render_start)
+    body = _PAGE[render_start:render_end]
+    assert "RATE_LIMITED" in body
+    assert "queue-pause" in body
+    assert "lease_until" in body  # the reset-time field the banner reads
+
+
+def test_page_queue_shows_slot_usage() -> None:
+    """DoD: slot usage is visible (jobs currently claimed/running)."""
+    from sdlc.dashboard import _PAGE
+
+    render_start = _PAGE.index("function renderQueue(")
+    render_end = _PAGE.index("\n}", render_start)
+    body = _PAGE[render_start:render_end]
+    assert "queue-slots" in body
+    assert '"running"' in body
+
+
+def test_page_queue_renders_pr_link_for_parked_jobs_when_present() -> None:
+    """PR links are graceful: rendered when a job carries `pr_number`/`pr_url`
+    (Story 32.2-002, not live yet), otherwise the cell degrades to '-'."""
+    from sdlc.dashboard import _PAGE
+
+    assert "function queuePrLink(" in _PAGE
+    fn_start = _PAGE.index("function queuePrLink(")
+    fn_end = _PAGE.index("\n}", fn_start)
+    body = _PAGE[fn_start:fn_end]
+    assert "pr_number" in body and "pr_url" in body
