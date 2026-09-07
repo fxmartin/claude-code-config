@@ -35,7 +35,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
 | `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
-| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|prioritise` manage (Story 32.1-001). |
+| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise` manage (Story 32.1-001). |
 | `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, and reclaim-and-resume for a killed scheduler (Story 32.1-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
@@ -1397,6 +1397,16 @@ reaches the job's own agents rather than just its parent.
   produce exactly one winner; the loser retries the next candidate. Candidate
   *selection* (`peek_claimable`) is a separate read, because the scheduler must
   weigh a job's slot cost — something SQL cannot compute — before taking it.
+- **What a job dispatches.** `sdlc <kind> <scope> <flags…>`. Two shapes reach
+  the store and both must resolve to the same command: `--enqueue` freezes the
+  whole argv, scope positional included, so the job re-runs byte-identically;
+  `sdlc queue add build epic-3 --options '["--auto"]'` records the scope in its
+  own column and *only flags* in `options`, exactly as that flag's help says.
+  So the scope is prepended unless the frozen vector already carries a
+  positional — replaying the `--options` vector as-is dropped it and silently
+  widened the job to `build`'s `all` default. "Carries a positional" mirrors the
+  parsers: any token not starting with `--`, except the value of `--harness`,
+  the one two-token flag. Nothing else is injected.
 - **Leases.** A claim carries `lease_until = now + 90s`, renewed every 30s
   (Hyqs's tested figures). A lease is the only thing that says "a live scheduler
   owns this job"; nothing else has to be cleaned up when one dies.
@@ -1407,12 +1417,17 @@ reaches the job's own agents rather than just its parent.
   job is reclaimed and re-entered through **`sdlc resume --run <id>`**, never a
   fresh `build`/`fix`: `resume.py` picks each story up at the stage it died in.
   A job claimed but with no run yet goes back to `queued` — nothing to resume.
-- **Per-repo exclusivity.** `running_repos()` is read from the store, not from
-  one scheduler's memory, so two `sdlc queue run` processes on the same host
-  still never put two runs in one repo. A job held back this way is stamped
-  `reason=repo busy` so `sdlc queue list` says why. Nothing is bypassed to make
-  a job fit: no `--allow-dirty`, no stash, no `--force`. (Story 32.1-003 will
-  narrow this to *fix* jobs so two builds in one repo may overlap.)
+- **Per-repo exclusivity.** Enforced twice, in the two places it has to be.
+  Candidate *selection* reads `running_repos()` from the store — not from one
+  scheduler's memory — and skips a busy repo; and `claim_job`'s UPDATE carries
+  the same rule as a `NOT EXISTS (… state='running' AND repo = …)` predicate, so
+  two `sdlc queue run` processes that both peek before either claims cannot each
+  take a *different* job in one repo. The read alone was time-of-check/time-of-use;
+  the claim-side predicate is what makes the cross-scheduler guarantee real. A job
+  held back this way is stamped `reason=repo busy` so `sdlc queue list` says why.
+  Nothing is bypassed to make a job fit: no `--allow-dirty`, no stash, no
+  `--force`. (Story 32.1-003 will narrow this to *fix* jobs so two builds in one
+  repo may overlap.)
 - **Agent slots.** `--slots` (default 2) caps *agent subprocesses* host-wide,
   not runs. A job costs one slot, or the worker cap its own frozen
   `--concurrency=N` declares. A job larger than the cap is still run — alone —
@@ -1422,10 +1437,26 @@ reaches the job's own agents rather than just its parent.
   installed `sdlc` disagrees with its own `controller/pyproject.toml` parks the
   job `blocked` carrying the reinstall remedy, rather than running it on stale
   code.
-- **Terminal states.** A finished job mirrors its run: exit 0 → `done`; a
-  registry status of `RATE_LIMITED` / `AWAITING_APPROVAL` / `NEEDS_ATTENTION` →
-  `blocked` (parked, resumable — calling that `failed` would bury it); otherwise
-  `failed`. Each terminal fires the existing Telegram `run_finished` notify.
+- **Terminal states.** A finished job mirrors its run, and the exit code alone
+  is not enough to read that. The paths that pause a run *resumably* — a
+  rate-limit window, the interactive cost gate, `--budget-policy=pause` — exit
+  non-zero but deliberately skip `finalize_run` so `latest_resumable_run` can
+  still find the run, which leaves the registry record **open** (`finished_at`
+  empty, status still `IN_PROGRESS`). So: exit 0 → `done`; a non-zero exit whose
+  run record is still open → `blocked` (parked, resumable — calling that
+  `failed` would bury it); a terminal that still needs a human
+  (`AWAITING_APPROVAL` / `NEEDS_ATTENTION`, and `RATE_LIMITED` should a future
+  writer put it there) → `blocked`; otherwise `failed`. A `blocked` job is not a
+  dead end: `sdlc queue cancel` retires it and `sdlc queue requeue` re-arms it
+  with its frozen options intact — and if it already opened a run, the requeue
+  returns it to `running` with an expired lease so the next drain **resumes**
+  rather than restarts it.
+- **Notify.** Each terminal fires the existing Telegram path under its own
+  `queue_job_finished` event. Deliberately *not* `run_finished`: a drained job's
+  own subprocess already emits that for its run (`finalize_run`), inheriting the
+  scheduler's environment and credentials, so reusing the name meant every job
+  announced itself twice. The queue event names the job (`queue job 7 (build
+  epic-3)`) and is the one that also covers a job parked before any run started.
 - **The dashboard needs no change.** The job's subprocess registers itself the
   way any `sdlc build` does, so a queued job appears as an ordinary run. The
   scheduler never writes to the registry; it only reads it (joining a child's

@@ -130,3 +130,66 @@ def test_format_age_malformed_created_at_returns_placeholder() -> None:
 
     now = datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)
     assert _format_age(now, "not-a-timestamp") == "?"
+
+
+# --- review follow-ups (bugfix #32.1-002) ---------------------------------
+
+
+def _job_id(output: str) -> int:
+    return json.loads(output)[0]["id"]
+
+
+def _park_blocked(job_id: int, tmp_path) -> None:
+    """Drive a job to `blocked` the way the scheduler's version check does."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store._set_state(job_id, "running")
+    store.finish_job(job_id, "blocked", reason="reinstall the controller")
+
+
+def test_queue_requeue_re_arms_a_blocked_job(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
+    job_id = _job_id(runner.invoke(app, ["queue", "list", "--json"]).output)
+    _park_blocked(job_id, tmp_path)
+
+    result = runner.invoke(app, ["queue", "requeue", str(job_id)])
+    assert result.exit_code == 0, result.output
+
+    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    assert after[0]["state"] == "queued"
+    assert after[0]["reason"] is None
+
+
+def test_queue_requeue_refuses_a_running_job(tmp_path, monkeypatch) -> None:
+    from sdlc.queue import QueueStore
+
+    _isolate(tmp_path, monkeypatch)
+    runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
+    job_id = _job_id(runner.invoke(app, ["queue", "list", "--json"]).output)
+    QueueStore(tmp_path / "queue.db")._set_state(job_id, "running")
+
+    result = runner.invoke(app, ["queue", "requeue", str(job_id)])
+    assert result.exit_code == 2
+    assert "error" in result.output.lower()
+
+
+def test_queue_requeue_unknown_id_exits_nonzero(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["queue", "requeue", "999"])
+    assert result.exit_code != 0
+    assert "error" in result.output.lower()
+
+
+def test_queue_cancel_accepts_a_blocked_job(tmp_path, monkeypatch) -> None:
+    _isolate(tmp_path, monkeypatch)
+    runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
+    job_id = _job_id(runner.invoke(app, ["queue", "list", "--json"]).output)
+    _park_blocked(job_id, tmp_path)
+
+    result = runner.invoke(app, ["queue", "cancel", str(job_id)])
+    assert result.exit_code == 0, result.output
+
+    after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    assert after[0]["state"] == "cancelled"

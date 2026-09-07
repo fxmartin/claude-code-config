@@ -44,10 +44,18 @@ DEFAULT_RENEW_SECONDS = 30
 DEFAULT_SLOTS = 2
 DEFAULT_POLL_SECONDS = 2.0
 
-# Registry run statuses that mean *parked*, not finished: the run stopped short
-# and is resumable by a human decision (raise the budget, approve the merge,
-# wait out the rate limit). A job whose run ends in one of these mirrors it as
-# ``blocked`` rather than ``failed`` — see :func:`terminal_job_state`.
+# Registry *terminal* statuses that mean parked-for-a-human rather than failed:
+# the run reached an end state, but one a human decision reopens (approve the
+# merge, look at the stuck story). A job whose run ends in one of these mirrors
+# it as ``blocked`` rather than ``failed`` — see :func:`terminal_job_state`.
+#
+# ``RATE_LIMITED`` is listed defensively, not because the registry carries it
+# today: it is the *ledger's* vocabulary (``build.py`` writes it via
+# ``run_update_status``), and a rate-limit park deliberately skips
+# ``finalize_run``, so the registry record is left *open* instead. That case is
+# caught by the open-record check in :func:`terminal_job_state`, which is the
+# one that matters; keeping the name here costs nothing and means a future
+# writer (Story 32.2-001's host-level pause) cannot regress the mapping.
 _PARKED_RUN_STATUSES = frozenset(
     {"RATE_LIMITED", "AWAITING_APPROVAL", "NEEDS_ATTENTION"}
 )
@@ -216,14 +224,38 @@ def agent_slots(job: JobRecord) -> int:
     return 1
 
 
+def _carries_a_scope(options: Sequence[str]) -> bool:
+    """Whether ``options`` already contains the scope as a bare positional.
+
+    Both parsers (``parse_build_args``, ``parse_fix_args``) treat every token
+    that does not start with ``--`` as a positional scope token, with exactly
+    one exception: ``sdlc build --harness <spec>``, whose value is a second
+    token. Mirroring that rule here is what keeps a ``--harness`` value from
+    being mistaken for a scope the vector already carries.
+    """
+    tokens = iter(options)
+    for token in tokens:
+        if token == "--harness":
+            next(tokens, None)  # the space-separated form's value, not a scope
+            continue
+        if not token.startswith("--"):
+            return True
+    return False
+
+
 def job_argv(job: JobRecord, *, resume: bool, prefix: Sequence[str] | None = None) -> list[str]:
     """The command that runs ``job``.
 
-    A *fresh* job replays its frozen flag vector verbatim — that vector already
-    carries the scope as its first positional, so a job enqueued as
-    ``sdlc build epic-3 --auto`` re-runs byte-identically. Nothing is added:
-    no ``--allow-dirty``, no ``--force``, no stash. A job the repo's dirty-tree
-    guard (#590) would refuse must be refused here too.
+    A *fresh* job replays its frozen flag vector, prefixed with the job's own
+    ``scope`` unless that vector already carries one. Both shapes reach this
+    store: ``--enqueue`` freezes the whole argv (scope included), so a job
+    enqueued as ``sdlc build epic-3 --auto`` re-runs byte-identically; but
+    ``sdlc queue add build epic-3 --options '["--auto"]'`` records the scope in
+    its own column and *only flags* in ``options``, exactly as that flag's help
+    documents. Taking the vector as-is there dropped the positional and silently
+    widened the job to the ``all`` default — every epic in the repo. Nothing
+    else is added: no ``--allow-dirty``, no ``--force``, no stash. A job the
+    repo's dirty-tree guard (#590) would refuse must be refused here too.
 
     A *reclaimed* job re-enters through ``sdlc resume --run <id>``, never a
     fresh ``build``/``fix`` — ``resume.py`` is the re-entry path and it picks
@@ -235,16 +267,39 @@ def job_argv(job: JobRecord, *, resume: bool, prefix: Sequence[str] | None = Non
             raise ValueError(f"job {job.id} has no run to resume")
         return argv + ["resume", "--run", job.run_id]
     options = _frozen_options(job)
-    return argv + [job.kind] + (options or [job.scope])
+    if _carries_a_scope(options):
+        return argv + [job.kind] + options
+    return argv + [job.kind, job.scope] + options
 
 
-def terminal_job_state(exit_code: int, run_status: str | None) -> str:
+def terminal_job_state(
+    exit_code: int, run_status: str | None, *, run_finished: bool = True
+) -> str:
     """The job state mirroring how the run actually ended (AC6).
 
-    The run's own registry status wins when it names a parked terminal — a
-    RATE_LIMITED or AWAITING_APPROVAL run exits non-zero but is *resumable*,
-    and calling that ``failed`` would bury it. Otherwise the exit code decides.
+    The exit code alone lies about the paths that matter most. A run parked
+    *resumably* — a rate-limit window, the interactive cost gate, a
+    ``--budget-policy=pause`` stop — exits non-zero but deliberately never
+    stamps a terminal status: ``_rate_limit_close_out``/``_cost_gate_close_out``
+    skip ``finalize_run`` precisely so ``latest_resumable_run`` can still find
+    the run, which leaves its registry record **open** (no ``finished_at``,
+    status still ``IN_PROGRESS``). Reading only the exit code called all three
+    ``failed`` and buried work `sdlc resume` could have finished.
+
+    So the questions, in order:
+
+    1. Did a run exist that never reached a terminal, while its child exited
+       non-zero? Then it is *parked*, not failed — ``blocked``. Exit 0 is the
+       stronger signal and wins, so a successful run is never parked.
+    2. Did the run reach a terminal that still needs a human (``AWAITING_APPROVAL``
+       / ``NEEDS_ATTENTION``)? Also ``blocked``.
+    3. Otherwise the exit code decides.
+
+    A job with no run at all (``run_status is None`` — ``--dry-run``, a launch
+    that aborted before registering) falls straight through to the exit code.
     """
+    if run_status is not None and not run_finished and exit_code != 0:
+        return "blocked"
     if run_status in _PARKED_RUN_STATUSES:
         return "blocked"
     return "done" if exit_code == 0 else "failed"
@@ -450,9 +505,14 @@ class _Scheduler:
             if code is None:
                 continue
             del self._in_flight[job_id]
-            run_status = self._run_status(entry.run_id)
-            state = terminal_job_state(code, run_status)
-            reason = None if state == "done" else f"run status {run_status or code}"
+            record = (
+                self._registry_record(entry.run_id) if entry.run_id else None
+            )
+            run_status = record.status if record is not None else None
+            run_finished = bool(record.finished_at) if record is not None else True
+            state = terminal_job_state(code, run_status, run_finished=run_finished)
+            reason = self._finish_reason(state, code, run_status, entry.run_id,
+                                         run_finished)
             self._store.finish_job(job_id, state, reason=reason)
             if state == "done":
                 self._result.done += 1
@@ -462,6 +522,27 @@ class _Scheduler:
                 self._result.failed += 1
             self._echo(f"job {job_id} finished: {state}")
             self._announce(entry.job, entry.run_id, state)
+
+    @staticmethod
+    def _finish_reason(
+        state: str, exit_code: int, run_status: str | None, run_id: str | None,
+        run_finished: bool,
+    ) -> str | None:
+        """Why a job ended, in words an operator can act on.
+
+        A run parked open has no terminal status to quote — saying "run status
+        IN_PROGRESS" would read as a bug rather than as the resumable park it
+        is — so it names the re-entry command instead.
+        """
+        if state == "done":
+            return None
+        if state == "blocked" and not run_finished and run_id:
+            return (
+                f"run paused and still resumable — clear the cause "
+                f"(rate-limit window, --cost-threshold, --budget) then "
+                f"`sdlc resume --run {run_id}`"
+            )
+        return f"run status {run_status or exit_code}"
 
     def _renew(self) -> None:
         now = self._clock()
@@ -488,6 +569,17 @@ class _Scheduler:
         `run_build`/`run_fix` register with ``pid=os.getpid()``, which is
         exactly the child we spawned — so the child's pid is the join key. The
         link is what lets a killed scheduler resume rather than restart.
+
+        The pid is not enough on its own. ``Registry.records()`` returns every
+        parseable row on the host, finished ones included (it never prunes;
+        ``--prune`` is a manual verb), so on a long-lived host an OS-reused pid
+        can collide with a stale record from an unrelated repo — and attaching
+        it would later run ``sdlc resume --run <foreign-id>`` in the wrong
+        checkout. The window is widest for a job that never registers at all
+        (``--dry-run``, a `fix` that aborts pre-run), where ``run_id`` stays
+        ``None`` and every pass re-scans. Two more predicates close it: the
+        record must belong to *this job's repo*, and it must still be open —
+        our child is by definition still running when we scan.
         """
         pending = {
             entry.proc.pid: job_id
@@ -498,7 +590,9 @@ class _Scheduler:
             return
         for record in self._registry.records():
             job_id = pending.get(record.pid)
-            if job_id is None:
+            if job_id is None or record.finished_at:
+                continue
+            if Path(record.repo) != Path(self._in_flight[job_id].job.repo):
                 continue
             self._in_flight[job_id].run_id = record.run_id
             self._store.attach_run(job_id, record.run_id)
@@ -515,18 +609,20 @@ class _Scheduler:
             return False
         return pid_alive(record.pid)
 
-    def _run_status(self, run_id: str | None) -> str | None:
-        if run_id is None:
-            return None
-        record = self._registry_record(run_id)
-        return record.status if record is not None else None
-
     # --- notify + shutdown ------------------------------------------------
 
     def _announce(self, job: JobRecord, run_id: str | None, state: str) -> None:
-        """Announce a terminal job down the existing Telegram notify path (AC6)."""
+        """Announce a terminal job down the existing Telegram notify path (AC6).
+
+        A *queue* event, not a second ``run_finished``: a drained job's own
+        subprocess already fires ``run_finished`` for its run from
+        ``finalize_run``, inheriting this process's environment and so its
+        notify credentials. Reusing the event name here meant every job
+        double-notified with two near-identical messages. ``queue_job_finished``
+        renders through the same formatter machinery and says which job it is.
+        """
         self._notify(
-            "run_finished",
+            "queue_job_finished",
             repo=Path(job.repo).name,
             subject=f"queue job {job.id} ({job.kind} {job.scope})",
             terminal=state.upper(),

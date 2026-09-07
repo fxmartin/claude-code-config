@@ -498,12 +498,22 @@ def test_a_failing_job_is_recorded_failed_and_announced(tmp_path) -> None:
 
     assert store.get_job(job_id).state == "failed"
     assert result.failed == 1
-    assert events and events[0][0] == "run_finished"
+    # A *queue* event, not a second `run_finished` — the job's own subprocess
+    # already fires that one for its run (see the double-notify test below).
+    assert events and events[0][0] == "queue_job_finished"
     assert events[0][1]["terminal"] == "FAILED"
 
 
 def test_a_parked_run_status_maps_to_blocked(tmp_path) -> None:
-    """A RATE_LIMITED run is parked, not failed — the job mirrors that."""
+    """A run that *finished* needing a human is parked, not failed.
+
+    Guards the ``_PARKED_RUN_STATUSES`` mapping on the status the controller
+    genuinely writes to the registry for this case: ``_run_terminal`` produces
+    ``AWAITING_APPROVAL``, ``finalize_run`` stamps it, and the CLI still exits
+    1 — so only the status distinguishes it from a real failure. (The other
+    park, a run left *open* and resumable, is a different branch and is covered
+    by ``test_a_cost_gated_run_is_parked_blocked_not_failed``.)
+    """
     store = _store(tmp_path)
     repo = _repo(tmp_path, "alpha")
     job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
@@ -513,19 +523,25 @@ def test_a_parked_run_status_maps_to_blocked(tmp_path) -> None:
     calls = {"n": 0}
 
     def sleeper(seconds: float) -> None:
+        # The real sequence: the child registers itself open on its first pass,
+        # then `finalize_run` stamps the terminal on its way out.
         calls["n"] += 1
         if calls["n"] == 1:
             registry.register(
-                RunRecord(run_id="run-rl", repo=repo, db=str(tmp_path / "x.db"),
+                RunRecord(run_id="run-appr", repo=repo, db=str(tmp_path / "x.db"),
                           scope="epic-3", pid=launcher.procs[0].pid,
-                          status="RATE_LIMITED", started_at="")
+                          status="IN_PROGRESS", started_at="")
             )
+        elif calls["n"] == 2:
+            registry.mark_finished("run-appr", "AWAITING_APPROVAL", completed=1)
         clock.advance(seconds)
 
     result = _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock,
                   sleeper=sleeper, registry=registry)
 
-    assert store.get_job(job_id).state == "blocked"
+    job = store.get_job(job_id)
+    assert job.state == "blocked"
+    assert job.reason == "run status AWAITING_APPROVAL"
     assert result.parked == 1
 
 
@@ -996,3 +1012,215 @@ def test_reclaim_race_lost_to_another_scheduler_skips_release(tmp_path) -> None:
     assert row is not None
     assert row.state == "running"
     assert row.claimed_by is None
+
+
+# --- review follow-ups (bugfix #32.1-002) ---------------------------------
+
+
+def _park_registry(registry, *, repo, pid, run_id, status, tmp_path):
+    """Register a run the way a *paused* child leaves it: open, never finished."""
+    registry.register(
+        RunRecord(run_id=run_id, repo=repo, db=str(tmp_path / "x.db"),
+                  scope="epic-3", pid=pid, status=status, started_at="")
+    )
+
+
+def test_a_cost_gated_run_is_parked_blocked_not_failed(tmp_path) -> None:
+    """The registry status a *real* pause leaves behind is `IN_PROGRESS`, not
+    `RATE_LIMITED`: `_cost_gate_close_out`/`_rate_limit_close_out` deliberately
+    skip `finalize_run`, so the record stays open while the CLI exits 1. Reading
+    the exit code alone buries a run `sdlc resume` could still finish.
+    """
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
+    registry = Registry(tmp_path / "registry.json")
+    launcher = FakeLauncher(alive_polls=2, code=1)
+    clock = Clock()
+    calls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _park_registry(registry, repo=repo, pid=launcher.procs[0].pid,
+                           run_id="run-gate", status="IN_PROGRESS", tmp_path=tmp_path)
+        clock.advance(seconds)
+
+    result = _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock,
+                  sleeper=sleeper, registry=registry)
+
+    job = store.get_job(job_id)
+    assert job.state == "blocked"
+    assert result.parked == 1
+    assert "resume" in (job.reason or "")
+
+
+def test_an_open_record_with_a_clean_exit_is_still_done(tmp_path) -> None:
+    """Exit 0 is the stronger signal: a run that succeeded is never `blocked`."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
+    registry = Registry(tmp_path / "registry.json")
+    launcher = FakeLauncher(alive_polls=2, code=0)
+    clock = Clock()
+    calls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _park_registry(registry, repo=repo, pid=launcher.procs[0].pid,
+                           run_id="run-ok", status="IN_PROGRESS", tmp_path=tmp_path)
+        clock.advance(seconds)
+
+    _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock,
+         sleeper=sleeper, registry=registry)
+
+    assert store.get_job(job_id).state == "done"
+
+
+def test_a_finished_failed_run_is_still_failed(tmp_path) -> None:
+    """A run that *did* reach FAILED stays `failed` — parking is for open runs."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
+    registry = Registry(tmp_path / "registry.json")
+    launcher = FakeLauncher(alive_polls=2, code=1)
+    clock = Clock()
+    calls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            registry.register(
+                RunRecord(run_id="run-bad", repo=repo, db=str(tmp_path / "x.db"),
+                          scope="epic-3", pid=launcher.procs[0].pid,
+                          status="FAILED", started_at="",
+                          finished_at="2026-09-07T11:00:00+00:00")
+            )
+        clock.advance(seconds)
+
+    result = _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock,
+                  sleeper=sleeper, registry=registry)
+
+    assert store.get_job(job_id).state == "failed"
+    assert result.failed == 1
+
+
+def test_a_job_added_with_flag_only_options_still_dispatches_its_scope(tmp_path) -> None:
+    """`sdlc queue add build epic-3 --options '["--auto"]'` must build epic-3.
+
+    ``--options`` is documented as "a JSON array of CLI flags", so the vector
+    need not carry the scope positional the ``--enqueue`` path freezes. Dropping
+    it silently widened the job to `all` — every epic in the repo.
+    """
+    from sdlc.scheduler import job_argv
+
+    store = _store(tmp_path)
+    job_id = store.add_job(
+        repo=_repo(tmp_path, "alpha"), kind="build", scope="epic-3",
+        options_json=json.dumps(["--auto"]),
+    )
+    assert job_argv(store.get_job(job_id), resume=False, prefix=["sdlc"]) == [
+        "sdlc", "build", "epic-3", "--auto",
+    ]
+
+
+def test_frozen_options_that_carry_the_scope_are_replayed_verbatim(tmp_path) -> None:
+    """The `--enqueue` vector already holds the scope — never duplicate it."""
+    from sdlc.scheduler import job_argv
+
+    store = _store(tmp_path)
+    job_id = store.add_job(
+        repo=_repo(tmp_path, "alpha"), kind="build", scope="epic-3",
+        options_json=json.dumps(["epic-3", "--auto"]),
+    )
+    assert job_argv(store.get_job(job_id), resume=False, prefix=["sdlc"]) == [
+        "sdlc", "build", "epic-3", "--auto",
+    ]
+
+
+def test_a_two_token_harness_value_is_not_mistaken_for_a_scope(tmp_path) -> None:
+    """`--harness <spec>` is the one two-token flag; its value is not a scope."""
+    from sdlc.scheduler import job_argv
+
+    store = _store(tmp_path)
+    job_id = store.add_job(
+        repo=_repo(tmp_path, "alpha"), kind="build", scope="epic-3",
+        options_json=json.dumps(["--harness", "build=claude"]),
+    )
+    assert job_argv(store.get_job(job_id), resume=False, prefix=["sdlc"]) == [
+        "sdlc", "build", "epic-3", "--harness", "build=claude",
+    ]
+
+
+def test_a_registry_record_from_another_repo_is_never_attached(tmp_path) -> None:
+    """OS pid reuse must not link a job to a foreign repo's run."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="fix", scope="42")
+    registry = Registry(tmp_path / "registry.json")
+    launcher = FakeLauncher(alive_polls=2)
+    clock = Clock()
+    calls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            registry.register(
+                RunRecord(run_id="other-repo", repo=_repo(tmp_path, "beta"),
+                          db=str(tmp_path / "x.db"), scope="99",
+                          pid=launcher.procs[0].pid, status="IN_PROGRESS",
+                          started_at="")
+            )
+        clock.advance(seconds)
+
+    _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock,
+         sleeper=sleeper, registry=registry)
+
+    assert store.get_job(job_id).run_id is None
+
+
+def test_a_finished_registry_record_is_never_attached(tmp_path) -> None:
+    """A stale record whose run already ended cannot be this child's run."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="fix", scope="42")
+    registry = Registry(tmp_path / "registry.json")
+    launcher = FakeLauncher(alive_polls=2)
+    clock = Clock()
+    calls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            registry.register(
+                RunRecord(run_id="stale", repo=repo, db=str(tmp_path / "x.db"),
+                          scope="42", pid=launcher.procs[0].pid, status="DONE",
+                          started_at="", finished_at="2026-09-07T11:00:00+00:00")
+            )
+        clock.advance(seconds)
+
+    _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock,
+         sleeper=sleeper, registry=registry)
+
+    assert store.get_job(job_id).run_id is None
+
+
+def test_a_finished_job_announces_a_queue_specific_event(tmp_path) -> None:
+    """The child already fires `run_finished` for its own run — don't double up.
+
+    `finalize_run` (build.py) notifies `run_finished` from inside the job's own
+    subprocess, which inherits our environment. A second `run_finished` here
+    meant an operator draining ten jobs got twenty near-identical messages.
+    """
+    store = _store(tmp_path)
+    store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="42")
+    events: list[tuple[str, dict]] = []
+
+    _run(
+        store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=1, code=0),
+        notifier=lambda event, **fields: events.append((event, fields)),
+    )
+
+    assert [event for event, _ in events] == ["queue_job_finished"]
+    assert events[0][1]["terminal"] == "DONE"

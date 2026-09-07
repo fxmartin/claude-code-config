@@ -3150,7 +3150,10 @@ def queue_add_cmd(
         "normal", "--priority", help="low|normal|high|urgent (default: normal)."
     ),
     options: str | None = typer.Option(
-        None, "--options", help="JSON array of CLI flags to replay (default: none)."
+        None,
+        "--options",
+        help="JSON array of CLI flags to replay, e.g. '[\"--auto\"]' (default: "
+        "none). Flags only — the scope above is dispatched for you.",
     ),
 ) -> None:
     """Add a job to the host queue directly (without going through --enqueue)."""
@@ -3249,7 +3252,7 @@ def queue_run_cmd(
 def queue_cancel_cmd(
     job_id: int = typer.Argument(..., help="Job id to cancel."),
 ) -> None:
-    """Cancel a `queued` job. Refuses when the job is already `running`."""
+    """Cancel a `queued` or parked (`blocked`) job. Refuses a `running` one."""
     from sdlc.queue import QueueError, QueueStore, default_queue_path
 
     store = QueueStore(default_queue_path())
@@ -3260,6 +3263,33 @@ def queue_cancel_cmd(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(f"cancelled: job {job_id}")
+    raise typer.Exit(code=0)
+
+
+@queue_app.command("requeue")
+def queue_requeue_cmd(
+    job_id: int = typer.Argument(..., help="Job id to put back in the queue."),
+) -> None:
+    """Re-arm a parked (`blocked`), `failed` or `cancelled` job for the next drain.
+
+    The exit from the `blocked` park (Story 32.1-002): follow the remedy the job
+    carries, then requeue it — its frozen options, priority, kind and scope are
+    kept, so nothing has to be retyped. A job that already opened a run returns
+    to `running` with an expired lease so the next `sdlc queue run` **resumes**
+    it rather than restarting it from scratch. Refuses a `running` job.
+    """
+    from sdlc.queue import QueueError, QueueStore, default_queue_path
+
+    store = QueueStore(default_queue_path())
+    store.ensure_migrated()
+    try:
+        store.requeue_job(job_id)
+    except QueueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    job = store.get_job(job_id)
+    tail = " (will resume its run)" if job is not None and job.run_id else ""
+    typer.echo(f"requeued: job {job_id}{tail}")
     raise typer.Exit(code=0)
 
 
