@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.61.0] - 2026-09-07
+
+### Added
+
+- feat(controller-ux): dashboard sidebar — filter runs by (#19.2-003)
+
+
 ## [v2.60.0] - 2026-09-07
 
 ### Added
