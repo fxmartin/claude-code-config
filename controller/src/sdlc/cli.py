@@ -2400,7 +2400,9 @@ def repair(
     reports the plan without acting.
     """
     from sdlc.repair import (
+        MissingSourceError,
         RepairAction,
+        UnsafeRepairRootError,
         WorktreeRootError,
         apply_plan,
         build_plan,
@@ -2414,7 +2416,7 @@ def repair(
 
     try:
         plan = build_plan(repo_root, cdir)
-    except WorktreeRootError as exc:
+    except (WorktreeRootError, UnsafeRepairRootError, MissingSourceError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     if plan.healthy:

@@ -9,7 +9,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from sdlc.cli import app
-from sdlc.repair import MANAGED_LINKS
+from sdlc.repair import MANAGED_LINKS, MARKER_FILENAME
 
 runner = CliRunner()
 
@@ -19,8 +19,10 @@ def _is_file_artifact(src_rel: str) -> bool:
 
 
 def _seed_repo(root: Path) -> Path:
+    """Seed a fake repo, marked as the primary root — tmp_path is not under $HOME."""
     repo = root / "repo"
     repo.mkdir(parents=True, exist_ok=True)
+    (repo / MARKER_FILENAME).touch()
     for _dest_rel, src_rel in MANAGED_LINKS:
         if src_rel == ".":
             continue
@@ -89,6 +91,43 @@ def test_repair_refuses_worktree_root(tmp_path: Path) -> None:
     assert result.exit_code != 0
     assert "worktree" in result.output.lower()
     # No managed symlink was created in the target.
+    assert list(claude_dir.iterdir()) == []
+
+
+def test_repair_refuses_unsafe_root(tmp_path: Path) -> None:
+    # Guard (#630/#642): a root outside $HOME with no primary-root marker must be
+    # refused even though it is not a worktree-glob match (the original incident).
+    repo = _seed_repo(tmp_path)
+    (repo / MARKER_FILENAME).unlink()
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+
+    result = runner.invoke(
+        app, ["repair", "--root", str(repo), "--claude-dir", str(claude_dir)]
+    )
+
+    assert result.exit_code != 0
+    assert "$home" in result.output.lower()
+    assert list(claude_dir.iterdir()) == []
+
+
+def test_repair_refuses_missing_source(tmp_path: Path) -> None:
+    # Guard (#642): a root that passes both prior checks but is missing an actual
+    # managed source (e.g. a bare package-install lib/ dir) must not silently
+    # plan a relink into a void.
+    import shutil
+
+    repo = _seed_repo(tmp_path)
+    shutil.rmtree(repo / "hooks")
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+
+    result = runner.invoke(
+        app, ["repair", "--root", str(repo), "--claude-dir", str(claude_dir)]
+    )
+
+    assert result.exit_code != 0
+    assert "hooks" in result.output
     assert list(claude_dir.iterdir()) == []
 
 
