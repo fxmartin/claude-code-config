@@ -3,6 +3,10 @@
 *.backup
 .claude/worktrees/
 
+# Stamped by install/core.sh's --core install so sdlc repair's is_allowed_root
+# can trust a non-$HOME checkout (#630/#642); machine-local, never committed.
+.sdlc-primary-root
+
 # Epic-04: SQLite ledger (truth source for build-stories runs).
 # The DB and its WAL companions are machine-local and never committed.
 .sdlc-state.db

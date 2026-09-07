@@ -4,6 +4,14 @@
 #
 # Sourced by install.sh after common.sh. Expects SCRIPT_DIR, CLAUDE_DIR, DRY_RUN.
 
+# Written into the install root on a successful --core install (below) and
+# read back by controller/src/sdlc/repair.py's is_allowed_root — its presence
+# proves a non-$HOME root is still the authoritative install, not a scratch
+# clone (#630/#642). Keep this literal in sync with repair.py's
+# MARKER_FILENAME; test_repair.py::test_install_core_sh_marker_matches_repair_py
+# asserts the two never diverge.
+SDLC_PRIMARY_ROOT_MARKER=".sdlc-primary-root"
+
 install_core_run() {
   # Guard (#179): refuse to install from an ephemeral build worktree. --core
   # symlinks every managed ~/.claude entry to $SCRIPT_DIR; if SCRIPT_DIR is a
@@ -84,6 +92,12 @@ install_core_run() {
     *":$bin_dir:"*) ;;
     *) warn "$bin_dir is not on your PATH — add it so the build adapters resolve: export PATH=\"$bin_dir:\$PATH\"" ;;
   esac
+
+  # Stamp SCRIPT_DIR as the primary install root (#630/#642). repair.py's
+  # is_allowed_root has no other way to trust a non-$HOME checkout, so a
+  # --core install must leave this behind or that guard's marker branch is
+  # unreachable in practice. A no-op re-touch when already present.
+  run touch "$SCRIPT_DIR/$SDLC_PRIMARY_ROOT_MARKER"
 }
 
 install_core_uninstall() {

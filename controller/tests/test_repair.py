@@ -537,3 +537,25 @@ def test_managed_links_match_install_core_sh() -> None:
         pairs.add((dest_rel, src_rel))
 
     assert pairs == set(MANAGED_LINKS)
+
+
+def test_install_core_sh_marker_matches_repair_py() -> None:
+    """install/core.sh must write the same marker filename repair.py checks (#642).
+
+    is_allowed_root's marker branch is only reachable in practice if the
+    installer actually writes MARKER_FILENAME somewhere; this locks
+    install/core.sh's literal and write call in place so the two never
+    silently diverge, mirroring test_managed_links_match_install_core_sh above.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    core_sh = (repo_root / "install" / "core.sh").read_text(encoding="utf-8")
+
+    match = re.search(r'SDLC_PRIMARY_ROOT_MARKER="([^"]+)"', core_sh)
+    assert match is not None, "install/core.sh must define SDLC_PRIMARY_ROOT_MARKER"
+    assert match.group(1) == MARKER_FILENAME
+
+    run_body = core_sh.split("install_core_run()", 1)[1].split("install_core_uninstall()", 1)[0]
+    assert "$SDLC_PRIMARY_ROOT_MARKER" in run_body, (
+        "install_core_run() must write the primary-root marker so a non-$HOME "
+        "install can later be trusted by sdlc repair"
+    )
