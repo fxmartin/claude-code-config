@@ -84,6 +84,17 @@ _DISPATCH_IN_TEST_ENV = "SDLC_IN_TEST"
 # dispatched agent (e.g. a dashboard-visual story) cannot launch a headed browser.
 # ``mcp__<server>__<glob>`` is the documented MCP deny syntax; the wildcard removes
 # every ``browser_*`` tool the playwright server exposes from the agent's context.
+#
+# Issue #653 (split from #641, REVIEW.md SEC-2): "never `gh pr merge --admin`" used
+# to exist only as prose in the merge-update-prompt skill template, which a merge
+# agent running under --dangerously-skip-permissions (with admin-scoped gh/glab
+# auth) can bypass via prompt injection or a non-compliant run. These two rules
+# match ``--admin`` in any argument position on both hosts, so they don't affect
+# the standard ``gh pr merge --squash --delete-branch`` template. Known accepted
+# gap: ``gh api -X PUT .../merge`` reaches the same outcome through the REST API
+# and is not covered here — broadening to a generic ``gh api *merge*`` deny would
+# also block legitimate merge-status reads, so it is left as a documented gap
+# rather than a rule.
 DENY_BASELINE: tuple[str, ...] = (
     "Read(~/.ssh/**)",
     "Read(~/.aws/**)",
@@ -91,6 +102,8 @@ DENY_BASELINE: tuple[str, ...] = (
     "Write(~/.ssh/**)",
     "Bash(curl * | bash)",
     "Bash(ssh *)",
+    "Bash(gh pr merge *--admin*)",
+    "Bash(glab mr merge *--admin*)",
     "mcp__playwright__browser_*",
 )
 

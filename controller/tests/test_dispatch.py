@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import signal
 import subprocess
@@ -608,6 +609,56 @@ def test_deny_baseline_does_not_block_legitimate_dev_work() -> None:
     # Bash denials are specific egress patterns, never a catch-all.
     for rule in (r for r in deny if r.startswith("Bash(")):
         assert rule != "Bash(*)"
+
+
+def _bash_pattern_matches(pattern: str, command: str) -> bool:
+    """Match ``command`` against a ``Bash(...)`` deny pattern's inner glob, mirroring
+    the mid-string ``*`` style already used by e.g. ``Bash(curl * | bash)``."""
+    assert pattern.startswith("Bash(") and pattern.endswith(")")
+    return fnmatch.fnmatch(command, pattern[len("Bash(") : -1])
+
+
+# Issue #653 (split from #641, REVIEW.md SEC-2): "never `gh pr merge --admin`"
+# previously existed only as prose in the merge-update-prompt skill template, which
+# an agent running under --dangerously-skip-permissions can bypass via prompt
+# injection or a non-compliant run. The baseline itself carried no rule blocking it.
+def test_deny_baseline_blocks_admin_merge_on_both_hosts() -> None:
+    """The baseline denies an admin-override merge on both gh and glab, with
+    --admin matched in any argument position (AC1, #653)."""
+    admin_merge_commands = (
+        "gh pr merge --admin",
+        "gh pr merge 123 --squash --admin",
+        "gh pr merge --admin --squash 123",
+        "glab mr merge --admin",
+        "glab mr merge 123 --admin --squash",
+    )
+    for command in admin_merge_commands:
+        assert any(
+            rule.startswith("Bash(") and _bash_pattern_matches(rule, command)
+            for rule in DENY_BASELINE
+        ), f"no deny rule in DENY_BASELINE matches {command!r}"
+
+
+def test_deny_baseline_admin_merge_rules_do_not_block_plain_merges() -> None:
+    """Regression guard: the new admin-merge rules must not catch the standard,
+    allowed merge template (no --admin flag) (AC2, #653)."""
+    plain_merge_commands = (
+        "gh pr merge --squash",
+        "gh pr merge --squash --delete-branch",
+        "gh pr merge 123 --squash --delete-branch",
+        "glab mr merge --squash",
+    )
+    admin_merge_rules = [
+        rule
+        for rule in DENY_BASELINE
+        if rule.startswith("Bash(") and "merge" in rule and "admin" in rule
+    ]
+    assert admin_merge_rules, "expected at least one admin-merge deny rule"
+    for command in plain_merge_commands:
+        for rule in admin_merge_rules:
+            assert not _bash_pattern_matches(
+                rule, command
+            ), f"deny rule {rule!r} incorrectly matches plain merge {command!r}"
 
 
 def test_resolve_deny_rules_override_replaces_baseline(monkeypatch) -> None:
