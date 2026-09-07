@@ -482,8 +482,8 @@ _PAGE = """<!doctype html>
   /* Story 11.2-008: wave-column dependency DAG. Columns = cohort waves, nodes =
      stories, edges = SVG connectors. position:relative anchors the absolute edge
      overlay; nodes flow as normal columns so no per-pixel layout maths leak in. */
-  .dagwrap { margin: 16px 0; padding: 12px 14px; background: var(--mantle);
-             border: 1px solid var(--surface); border-radius: 8px; }
+  .dagwrap { margin: 16px 0; padding: 12px 14px 18px; background: var(--mantle);
+             border: 1px solid var(--surface); border-radius: 8px; overflow-x: auto; }
   .dagwrap h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
   .dag-cols { position: relative; display: flex; gap: 36px; align-items: flex-start; }
   .dag-edges { position: absolute; inset: 0; width: 100%; height: 100%;

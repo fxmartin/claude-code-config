@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -1931,6 +1932,18 @@ def test_page_renders_wave_dag() -> None:
     assert "runs in parallel" in _PAGE          # wave header copy
     assert "<svg" in _PAGE                       # inline SVG edges, no external lib
     assert "<path" in _PAGE                      # edges as SVG connectors
+
+
+def test_dag_panel_scrolls_instead_of_overflowing() -> None:
+    """A DAG with enough waves to exceed the panel's width must scroll inside
+    its own box, not overflow past the panel border (issue #655). `.dagwrap`
+    needs `overflow-x: auto` so a wide, non-wrapping `.dag-cols` flex row
+    scrolls horizontally instead of being clipped by the viewport."""
+    from sdlc.dashboard import _PAGE
+
+    dagwrap_rule = re.search(r"\.dagwrap\s*\{[^}]*\}", _PAGE)
+    assert dagwrap_rule is not None
+    assert "overflow-x: auto" in dagwrap_rule.group(0)
 
 
 # --- stable-height live regions (Story 11.2-011) ---------------------------
