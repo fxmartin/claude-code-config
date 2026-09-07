@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.59.4] - 2026-09-07
+
+### Fixed
+
+- fix(dispatch): deny admin-override merges in deny_baseline (#653) (#656)
+
+
 ## [v2.59.3] - 2026-09-07
 
 ### Fixed
