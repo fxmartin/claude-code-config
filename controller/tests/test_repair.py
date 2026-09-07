@@ -240,6 +240,37 @@ def test_default_repo_root_fallback_relative_marketplace(tmp_path: Path, monkeyp
     assert result == canonical.resolve()
 
 
+def test_default_repo_root_falls_back_to_derived_when_canonical_unsafe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Ignores a canonical marketplace target that fails `is_allowed_root` (#642).
+
+    The marketplace-fallback branch guards on `is_allowed_root` in addition to
+    `is_worktree_root` — a real, non-worktree canonical dir that sits outside
+    $HOME with no marker file must still be refused, falling back to derived.
+    """
+    import sdlc.repair as repair_mod
+
+    canonical = tmp_path / "untrusted-checkout"
+    canonical.mkdir()  # no MARKER_FILENAME -- outside $HOME and unmarked
+    claude_dir = tmp_path / "dot-claude"
+    marketplace_dir = claude_dir / "plugins" / "marketplaces"
+    marketplace_dir.mkdir(parents=True)
+    marketplace = marketplace_dir / "fx-claude-config"
+    os.symlink(canonical, marketplace)
+
+    # Treat every path except canonical as a worktree root, forcing the derived
+    # check to fail so the marketplace fallback is actually evaluated.
+    monkeypatch.setattr(
+        repair_mod, "is_worktree_root", lambda p: p.resolve() != canonical.resolve()
+    )
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    derived = Path(repair_mod.__file__).resolve().parents[3]
+    result = repair_mod.default_repo_root()
+    assert result == derived
+
+
 def test_default_repo_root_falls_back_to_derived_when_no_marketplace(tmp_path: Path, monkeypatch) -> None:
     """Returns the derived (worktree) path when the marketplace link is absent.
 
