@@ -1209,16 +1209,29 @@ class _Scheduler:
         )
 
     def _discover_rate_limit(self) -> "_RateLimitPark | None":
-        """The first live job whose run is parked on a closed window, if any.
+        """The first job whose run *durably parked* on a closed window, if any.
 
         Reads every ``running`` job in the *store*, not just this scheduler's
         own in-flight ones: a second `sdlc queue run` on the same host shares the
         one subscription, and a job parked by a previous drain still holds the
         window it discovered.
+
+        A run whose process is still alive is skipped, because ``RATE_LIMITED``
+        alone does not mean "durably parked". ``build._rate_limit_wait`` flips a
+        run to that same status for the duration of a *bounded in-process* wait
+        — one that stays inside the run's own auto-wait cap, records no reset
+        epoch, and un-flips itself to ``IN_PROGRESS`` seconds later without any
+        help from the queue. Reading that as a host park would open a window on
+        the reset-less ``max-wait`` fallback (a five-hour cap) over a wait the
+        run was about to finish on its own, and stall every other repo behind
+        it. Only a run that exited while still ``RATE_LIMITED`` handed the
+        window over to the queue.
         """
         for job in self._store.list_jobs():
             if job.state != "running" or not job.run_id:
                 continue
+            if job.id in self._in_flight or self._run_is_live(job.run_id):
+                continue  # waiting in-process; it resumes itself
             park = self._rate_limit_park(job.run_id)
             if park is not None:
                 return park

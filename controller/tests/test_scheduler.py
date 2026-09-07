@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -1690,6 +1691,47 @@ def test_a_rate_limited_job_whose_child_exits_is_parked_not_failed(tmp_path) -> 
     assert result.failed == 0
     assert result.paused == 1
     assert store.dispatch_pause() is not None
+
+
+def test_a_run_waiting_in_process_does_not_pause_the_whole_queue(tmp_path) -> None:
+    """A bounded in-process wait is not a durable park — the queue keeps going.
+
+    `build._rate_limit_wait` flips a *live* run to RATE_LIMITED for the duration
+    of a wait that stays inside its own auto-wait cap, writes no reset epoch, and
+    un-flips itself seconds later. Treating that as a host park opened a window
+    on the reset-less five-hour `max-wait` fallback and stalled every other repo
+    behind a run that needed no help at all.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    alpha = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=alpha, kind="build", scope="epic-3")
+    store.claim_job(job_id, claimed_by="peer:1", lease_seconds=900,
+                    now=datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+    run_id, db = _ledger_run(alpha, reset_at=None)  # no reset: the in-process shape
+    store.attach_run(job_id, run_id)
+    registry.register(  # our own pid: a run that is unmistakably still alive
+        RunRecord(run_id=run_id, repo=alpha, db=db, scope="epic-3",
+                  pid=os.getpid(), status="IN_PROGRESS", started_at="")
+    )
+    beta = _repo(tmp_path, "beta")
+    store.add_job(repo=beta, kind="fix", scope="7")
+
+    clock = Clock()
+    launcher = FakeLauncher(alive_polls=1)
+    notifier = RecordingNotifier()
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, sleeper=_stop_after(clock, 4),
+        config=SchedulerConfig(slots=2, poll_seconds=1.0),
+    )
+
+    assert store.dispatch_pause() is None
+    assert notifier.names("queue_paused") == []
+    assert result.paused == 0
+    assert [cwd for _, cwd in launcher.calls] == [beta]  # beta was not held back
 
 
 def test_a_stale_pause_row_never_wedges_the_queue_shut(tmp_path) -> None:
