@@ -300,6 +300,42 @@ def test_apply_migrations_adds_column_and_is_idempotent(tmp_path, monkeypatch) -
     store.init()
 
 
+def test_apply_migrations_reruns_a_version_whose_recorded_name_disagrees(
+    tmp_path, monkeypatch,
+) -> None:
+    """Mirrors the build-ledger fix for Issue #621: a queue.db can carry a
+    bookkeeping row whose version matches a current migration but whose name
+    is stale (e.g. from a renumbering upstream). A version-only idempotency
+    check would treat that row as proof the migration already ran and skip
+    its column-add forever. The name-aware check must re-run it instead."""
+    import sdlc.queue as queue_mod
+    from sdlc.queue import QueueStore
+
+    db = tmp_path / "queue.db"
+    store = QueueStore(db)
+    store.init()  # applies the real _MIGRATIONS, recording version 1 as "approval_park"
+
+    fake_migration = (
+        1,
+        "add_worker_note",
+        "jobs",
+        [("worker_note", "TEXT")],
+        None,
+    )
+    monkeypatch.setattr(queue_mod, "_MIGRATIONS", [fake_migration])
+
+    store.init()  # version 1's recorded name now disagrees with the (stubbed) definition
+
+    conn = sqlite3.connect(db)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        assert "worker_note" in cols
+        name = conn.execute("SELECT name FROM _migrations WHERE version = 1").fetchone()[0]
+        assert name == "add_worker_note"
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Story 32.1-003: per-repo exclusivity relaxed for build/build, kept for any
 # combination touching a fix job (fix runs in the repo root, exclusive always).

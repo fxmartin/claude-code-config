@@ -567,16 +567,20 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply pending schema migrations on an open connection (idempotent).
 
     Mirrors ``sdlc.build._apply_migrations``; see the module docstring above
-    the DDL for why this is a mirror rather than a shared helper.
+    the DDL for why this is a mirror rather than a shared helper. The
+    idempotency check is name-aware, not version-only (Issue #621) — see
+    ``sdlc.build._apply_migrations`` for why.
     """
     conn.execute(
         "CREATE TABLE IF NOT EXISTS _migrations ("
         "version INTEGER PRIMARY KEY, name TEXT NOT NULL, "
         "applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
-    applied = {r[0] for r in conn.execute("SELECT version FROM _migrations").fetchall()}
+    applied = {
+        r[0]: r[1] for r in conn.execute("SELECT version, name FROM _migrations").fetchall()
+    }
     for version, name, table, columns, create_sql in _MIGRATIONS:
-        if version in applied:
+        if applied.get(version) == name:
             continue
         if create_sql:
             conn.executescript(create_sql)
@@ -586,7 +590,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                 if col not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
         conn.execute(
-            "INSERT OR IGNORE INTO _migrations(version, name) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO _migrations(version, name) VALUES (?, ?)",
             (version, name),
         )
 

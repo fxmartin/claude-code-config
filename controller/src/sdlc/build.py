@@ -785,15 +785,28 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     against a pre-existing ledger that may predate the migration framework
     entirely (exactly the ledger Migration 1 targets), so this function cannot
     assume the table exists.
+
+    The idempotency check is name-aware, not version-only (Issue #621): a
+    ledger bootstrapped before the migration renumbering can hold a stale
+    ``(1, 'init')`` row that predates Migration 1's current identity ("stage
+    usage columns"). A version-only check would treat that row as proof
+    migration 1 already ran and skip it forever, permanently missing the six
+    usage columns while every later migration applies normally. Comparing the
+    recorded name catches the mismatch and re-runs (and re-records) that
+    migration; the column-add logic below is already idempotent via the
+    ``PRAGMA table_info`` guard, so re-running it on a ledger that legitimately
+    has the columns is a no-op.
     """
     conn.execute(
         "CREATE TABLE IF NOT EXISTS _migrations ("
         "version INTEGER PRIMARY KEY, name TEXT NOT NULL, "
         "applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
-    applied = {r[0] for r in conn.execute("SELECT version FROM _migrations").fetchall()}
+    applied = {
+        r[0]: r[1] for r in conn.execute("SELECT version, name FROM _migrations").fetchall()
+    }
     for version, name, table, columns, create_sql in _MIGRATIONS:
-        if version in applied:
+        if applied.get(version) == name:
             continue
         # A table-creation migration brings a wholly new table onto a pre-existing
         # ledger (the column-add path below cannot, since PRAGMA table_info is
@@ -821,7 +834,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             elif backfill:
                 conn.execute(backfill)
         conn.execute(
-            "INSERT OR IGNORE INTO _migrations(version, name) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO _migrations(version, name) VALUES (?, ?)",
             (version, name),
         )
 
