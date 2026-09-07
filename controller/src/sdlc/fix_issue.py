@@ -2305,8 +2305,9 @@ def _list_open_issues(
 
     ``gh issue list`` on GitHub, ``glab issue list`` on GitLab. ``instance_url``
     (Story 30.1-001) is the repo's declared self-hosted GitLab instance, if any
-    — threaded to `glab` as a per-invocation ``GITLAB_HOST`` env override, the
-    same seam :meth:`issue_host.IssueHostAdapter._invoke` uses. Raises
+    — threaded to `glab` through :func:`issue_host.gitlab_instance_env`, the same
+    per-invocation env the adapters use (:meth:`issue_host.IssueHostAdapter._invoke`),
+    so a plaintext instance gets the same `GLAB_CONFIG_DIR` treatment here. Raises
     :class:`FixIssueError` on a non-zero exit or malformed JSON so the caller
     aborts the batch cleanly rather than fixing an empty/garbled set. GitHub's
     error text is unchanged from before #606 (``gh issue list failed: …`` /
@@ -2320,7 +2321,11 @@ def _list_open_issues(
             cli, "issue", "list", "--state", "open",
             "--json", "number,title,labels", "--limit", str(limit),
         ]
-    env = {"GITLAB_HOST": instance_url} if host == issue_host.GITLAB and instance_url else None
+    env = (
+        issue_host.gitlab_instance_env(instance_url) or None
+        if host == issue_host.GITLAB
+        else None
+    )
     res = runner(args, env=env) if env else runner(args)
     if res.returncode != 0:
         raise FixIssueError(

@@ -321,7 +321,9 @@ def test_poll_targets_the_declared_instance(tmp_path, monkeypatch) -> None:
     verdict = poll_approval(tmp_path, 12, runner=runner)
 
     assert verdict is not None and verdict.approved is True
-    assert seen and all(env == {"GITLAB_HOST": "http://127.0.0.1:8080"} for env in seen)
+    assert seen and all(
+        env["GITLAB_HOST"] == "http://127.0.0.1:8080" for env in seen
+    )
 
 
 def test_a_malformed_declaration_yields_none(tmp_path, monkeypatch) -> None:

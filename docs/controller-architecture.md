@@ -2263,7 +2263,7 @@ gitlab_url: http://127.0.0.1:8080
 ```
 
 `forge:` must be one of `issue_host.SUPPORTED_HOSTS`; `<forge>_url:` (e.g.
-`gitlab_url:`) is optional and names the instance's base URL.
+`gitlab_url:`, `github_url:`) is optional and names the instance's base URL.
 
 **Resolution precedence** (`issue_host.resolve_forge`), mirroring the harness
 pin's `--harness` > repo file > registry `default:`:
@@ -2286,8 +2286,9 @@ contributes nothing, so `--host github` never inherits a GitLab instance.
 No file present is byte-identical to today: `resolve_host` (the existing
 host-only API every pre-existing call site uses) is now a thin wrapper over
 `resolve_forge(...).host`, so the declaration is purely additive. A malformed
-declaration (unsupported `forge:`, a non-URL `<forge>_url:`) raises
-`IssueHostError` so the run **fails fast at preflight**, never mid-pipeline —
+declaration (unsupported `forge:`, a non-URL `<forge>_url:`, or a file that is
+not UTF-8 text) raises `IssueHostError` so the run **fails fast at preflight**,
+never mid-pipeline —
 the same contract `load_repo_harness_defaults` enforces for a malformed
 `.sdlc-harness.yaml`.
 
@@ -2308,13 +2309,32 @@ deliberately best-effort seams (`build_issue`'s mirror lifecycle,
 clean no-op instead: they run *after* the guard above, so reaching them with a
 bad file means the safe answer is "do nothing", never "guess an instance".
 
-**Threading the instance URL.** A declared instance is only useful if the
-`glab` calls an adapter makes actually target it. `issue_host.get_adapter(host,
-instance_url=...)` threads it onto `GitLabAdapter`, which passes it to every
-`glab` invocation as a **per-call** `GITLAB_HOST` env override
-(`IssueHostAdapter._invoke`) — never by mutating `glab`'s persistent global
-config, so a controller process touching several repos on several instances in
-one run never cross-contaminates them. The declaration-aware call sites: `sdlc
+**Threading the instance URL.** A declared instance is only useful if the CLI
+calls an adapter makes actually target it. `issue_host.get_adapter(host,
+instance_url=...)` threads it onto the adapter, which passes it to every
+invocation as a **per-call** env override (`IssueHostAdapter._invoke`) — never
+by mutating the CLI's persistent global config, so a controller process touching
+several repos on several instances in one run never cross-contaminates them.
+`GitLabAdapter` sets `GITLAB_HOST` (`issue_host.gitlab_instance_env`);
+`GitHubAdapter` sets `GH_HOST` to the URL's hostname
+(`issue_host.github_instance_env`) — without that, a declared `github_url:`
+would rewrite the dashboard's deep links while every `gh` subprocess still hit
+github.com, so links and API calls would name different forges.
+
+A **plaintext** (`http://`) GitLab instance needs one thing more: `glab` reads
+`GITLAB_HOST` but discards the URL's scheme, forcing `https` for every host bar
+the hardcoded GDK default `127.0.0.1:8080`. The story's own example passes by
+coincidence; `http://gitlab.corp:8080` or `http://127.0.0.1:8929` would TLS-fail
+on every call, and because most host seams are best-effort those failures are
+silent. The only mechanism `glab` honours for the protocol is a config file's
+per-host `api_protocol`, so `gitlab_instance_env` also emits a
+**controller-owned** `GLAB_CONFIG_DIR`: a 0700 temp dir (one per instance URL
+per process, `atexit`-removed) whose 0600 `config.yml` carries just that host's
+entry with `api_protocol: http`. The user's `~/.config/glab-cli/config.yml` is
+read-only input — that one host's entry is copied so a `glab auth login` token
+still authenticates, and no unrelated forge's token is duplicated to disk.
+
+The declaration-aware call sites: `sdlc
 build` (`_open_story_cr`/`_bake_review_packet`, the run-start actor-identity
 resolve, and `build_issue`'s whole issue-mirror lifecycle — close-link, CR
 terms, the merge gate's CI poll, status announcements — which resolves the
@@ -2326,9 +2346,13 @@ threaded through `fetch_issue`/`stop_reason`/the stage loop/batch selection),
 approval poll (`approval.poll_approval` — a parked job in a local-forge repo
 must poll that instance, or it never sees FX's approval and stays parked), and
 the dashboard (`git_project_url` rewrites the PR/MR deep-link web base to the
-declared instance; `make_server`'s single-repo mode validates the declaration
-once at startup — registry-discovery mode resolves it per-repo, per-request,
-best-effort, so one repo's bad file can't take the whole dashboard down).
+declared instance, and `repo_forge` hands the host *and* instance to the
+repo-health fetch — `github_stats.fetch_stats`/the per-`(host, slug, instance)`
+TTL cache — so a declared local repo never reports the health of whatever
+project shares its slug on gitlab.com; `make_server`'s single-repo mode
+validates the declaration once at startup — registry-discovery mode resolves it
+per-repo, per-request, best-effort, so one repo's bad file can't take the whole
+dashboard down).
 
 **Preflight line.** Every routed build/fix run logs `forge routing: <host>
 [instance=<url>] (<source>)` beside the `harness routing: …` line

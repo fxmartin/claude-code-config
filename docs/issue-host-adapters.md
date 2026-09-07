@@ -155,13 +155,30 @@ gitlab_url: http://127.0.0.1:8080
 ```
 
 `forge:` is required and must be `github` or `gitlab`; `<forge>_url:` (e.g.
-`gitlab_url:`) is optional and names the instance's base URL. No file present
-is byte-identical to today — the declaration is purely additive, same as
-`.sdlc-harness.yaml`. When a `gitlab_url` is declared, every `glab` call the
-resolved adapter makes targets that instance via a **per-invocation**
-`GITLAB_HOST` env override — never by mutating `glab`'s global config — so a
-controller process touching several GitLab instances in one run never
-cross-contaminates them.
+`gitlab_url:`, `github_url:`) is optional and names the instance's base URL. No
+file present is byte-identical to today — the declaration is purely additive,
+same as `.sdlc-harness.yaml`. When an instance is declared, every CLI call the
+resolved adapter makes targets it via a **per-invocation** env override —
+never by mutating the CLI's global config — so a controller process touching
+several instances in one run never cross-contaminates them:
+
+| Declared | Env the adapter sets | Notes |
+|---|---|---|
+| `gitlab_url: https://…` | `GITLAB_HOST` | |
+| `gitlab_url: http://…` | `GITLAB_HOST` + `GLAB_CONFIG_DIR` | see *plaintext instances* below |
+| `github_url: https://…` | `GH_HOST` (the URL's **hostname**, not the URL) | GitHub Enterprise Server |
+
+**Plaintext (`http://`) GitLab instances.** `glab` derives the API base from
+`GITLAB_HOST` but **discards the URL's scheme**: it forces `https` for every
+host except the one hardcoded GDK default `127.0.0.1:8080`. So
+`gitlab_url: http://gitlab.corp:8080` would TLS-fail on every call — silently,
+since most host seams are best-effort. The only knob `glab` honours for the
+protocol is a config file's per-host `api_protocol`, so an `http://`
+declaration also gets a **controller-owned** `GLAB_CONFIG_DIR` (a 0700 temp dir,
+one per instance per process, removed at exit) holding just that host's entry
+with `api_protocol: http`. Your own `~/.config/glab-cli/config.yml` is never
+written to; its entry for that one host is copied in so a `glab auth login`
+token still authenticates (otherwise `GITLAB_TOKEN` from the environment does).
 
 ## Issue rendering & the label/board taxonomy (Story 22.2-002)
 

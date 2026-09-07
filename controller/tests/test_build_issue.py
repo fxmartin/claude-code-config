@@ -339,7 +339,7 @@ def test_mirror_lifecycle_threads_declared_instance(tmp_path, monkeypatch):
     bi.change_request_status(ledger, "22.4-002", 9, runner=runner)
 
     assert seen, "no host call was made"
-    assert all(env == {"GITLAB_HOST": "http://127.0.0.1:8080"} for env in seen)
+    assert all(env["GITLAB_HOST"] == "http://127.0.0.1:8080" for env in seen)
 
 
 def test_mirror_lifecycle_ignores_declaration_for_another_forge(tmp_path, monkeypatch):

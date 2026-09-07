@@ -495,7 +495,10 @@ def test_list_open_issues_threads_gitlab_host_env() -> None:
     fix_mod._list_open_issues(
         runner, host="gitlab", instance_url="http://127.0.0.1:8080"
     )
-    assert seen["env"] == {"GITLAB_HOST": "http://127.0.0.1:8080"}
+    assert seen["env"]["GITLAB_HOST"] == "http://127.0.0.1:8080"
+    # The shared helper is the single seam, so a plaintext instance gets the
+    # private `glab` config dir here too — not just inside the adapters.
+    assert "GLAB_CONFIG_DIR" in seen["env"]
 
 
 def test_list_open_issues_no_instance_url_passes_no_env() -> None:

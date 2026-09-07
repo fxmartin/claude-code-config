@@ -1700,16 +1700,70 @@ def test_github_stats_routes_gitlab_host(tmp_path: Path) -> None:
     assert cache.hosts == ["gitlab"]
 
 
+def test_github_stats_threads_the_declared_instance(tmp_path: Path) -> None:
+    """Story 30.1-001: a declared local-GitLab repo must fetch *its* health — the
+    same slug on gitlab.com would otherwise answer for it."""
+    from types import SimpleNamespace
+
+    from sdlc.dashboard import _Handler
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo_with_origin(repo, "http://127.0.0.1:8080/acme/widgets.git")
+    (repo / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    db = repo / ".sdlc-state.db"
+    _seed(db)
+    cache = _StubCache()
+    h = _Handler.__new__(_Handler)
+    h.server = SimpleNamespace(registry=None, db_path=db, github_cache=cache)
+    h._github_stats(None)
+    assert cache.hosts == ["gitlab"]
+    assert cache.instances == ["http://127.0.0.1:8080"]
+
+
+def test_github_stats_undeclared_repo_passes_no_instance(tmp_path: Path) -> None:
+    """AC2: no declaration → byte-identical to the pre-story fetch."""
+    from types import SimpleNamespace
+
+    from sdlc.dashboard import _Handler
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo_with_origin(repo, "git@github.com:acme/widgets.git")
+    db = repo / ".sdlc-state.db"
+    _seed(db)
+    cache = _StubCache()
+    h = _Handler.__new__(_Handler)
+    h.server = SimpleNamespace(registry=None, db_path=db, github_cache=cache)
+    h._github_stats(None)
+    assert cache.hosts == ["github"] and cache.instances == [None]
+
+
+def test_repo_forge_returns_host_and_declared_instance(tmp_path: Path) -> None:
+    from sdlc.dashboard import repo_forge
+
+    _git_repo_with_origin(tmp_path, "git@127.0.0.1:acme/widgets.git")
+    assert repo_forge(tmp_path) == ("github", None)
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    assert repo_forge(tmp_path) == ("gitlab", "http://127.0.0.1:8080")
+
+
 class _StubCache:
     """A GitHub cache double: records slug lookups, returns canned stats."""
 
     def __init__(self) -> None:
         self.calls: list[str | None] = []
         self.hosts: list[str] = []
+        self.instances: list[str | None] = []
 
-    def get(self, slug, host="github"):
+    def get(self, slug, host="github", instance_url=None):
         self.calls.append(slug)
         self.hosts.append(host)
+        self.instances.append(instance_url)
         if not slug:
             return {"available": False, "slug": None, "host": host, "reason": "no-remote"}
         return {"available": True, "slug": slug, "host": host, "issues_open": 4, "prs_open": 1,

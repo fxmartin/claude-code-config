@@ -145,21 +145,28 @@ def repo_slug(root: str | Path) -> str | None:
     return _slug_from_url(git_project_url(root))
 
 
-def repo_host(root: str | Path) -> str:
-    """The run's code host (``github``/``gitlab``): declared, else auto-detected.
+def repo_forge(root: str | Path) -> tuple[str, str | None]:
+    """The run's ``(host, declared instance URL)`` — one declaration read (30.1-001).
 
     Story 23.7-001: the repo-health surface fetches via the host's CLI, so it
     must know which forge a run targets. Story 30.1-001: a repo's
     ``.sdlc-forge.yaml`` wins over the git-remote heuristic, so a self-hosted
-    GitLab origin the hostname can't classify still resolves correctly.
-    Defaults to GitHub when neither resolves (no remote, no declaration, or an
-    unrecognised host), so a GitHub repo — and any ambiguous remote — behaves
-    exactly as before this story.
+    GitLab origin the hostname can't classify still resolves correctly — *and*
+    the instance it names has to reach the fetch, or a declared local-forge repo
+    would query gitlab.com for a slug that only exists locally.
+    Defaults to GitHub with no instance when neither resolves (no remote, no
+    declaration, or an unrecognised host), so a GitHub repo — and any ambiguous
+    remote — behaves exactly as before this story.
     """
     declaration = _declared_forge(root)
     if declaration is not None:
-        return declaration.forge
-    return detect_host(root) or GITHUB
+        return declaration.forge, declaration.instance_url
+    return detect_host(root) or GITHUB, None
+
+
+def repo_host(root: str | Path) -> str:
+    """The run's code host (``github``/``gitlab``) — :func:`repo_forge`'s host half."""
+    return repo_forge(root)[0]
 
 
 # --- multi-run registry discovery (Story 11.2-002) -------------------------
@@ -208,7 +215,8 @@ def _registry_runs_view(
         }
         if github is not None:
             if rec.repo not in gh_by_repo:
-                gh_by_repo[rec.repo] = github.get(repo_slug(rec.repo), repo_host(rec.repo))
+                host, instance_url = repo_forge(rec.repo)
+                gh_by_repo[rec.repo] = github.get(repo_slug(rec.repo), host, instance_url)
             row["github"] = gh_by_repo[rec.repo]
         rows.append(row)
     rows.sort(key=lambda r: (r["started_at"] or ""), reverse=True)
@@ -1548,8 +1556,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         Registry mode resolves the repo via the run's registry record; single
         ``--db`` mode resolves it from the ledger's parent directory. The forge
-        (``github``/``gitlab``) is detected from that repo's remote so a GitLab
-        project fetches GitLab health. The read goes through the per-(host,slug)
+        (``github``/``gitlab``) and any declared instance come from that repo's
+        ``.sdlc-forge.yaml``/remote so a GitLab project — local or not — fetches
+        its own GitLab health. The read goes through the per-(host,slug,instance)
         TTL cache, so it never drives ``gh``/``glab`` on the request path and
         degrades to the muted "unavailable" sentinel when the run / repo / CLI
         cannot be resolved.
@@ -1565,7 +1574,8 @@ class _Handler(BaseHTTPRequestHandler):
             if db_path is None:
                 return github_stats.unavailable(None, "no-run")
             root = Path(db_path).parent
-        return cache.get(repo_slug(root), repo_host(root))
+        host, instance_url = repo_forge(root)
+        return cache.get(repo_slug(root), host, instance_url)
 
     # --- all-epics portfolio panel (Story 22.6-001) ------------------------
 

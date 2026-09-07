@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import json
+import tempfile
+from pathlib import Path
 
 import pytest
+import yaml
 
 from sdlc import issue_host as ih
 
@@ -884,6 +887,35 @@ def test_load_repo_forge_declaration_non_string_url_raises() -> None:
         ih.load_repo_forge_declaration(override_text="forge: gitlab\ngitlab_url: 8080\n")
 
 
+def test_load_repo_forge_declaration_non_utf8_file_raises_issue_host_error(tmp_path) -> None:
+    """Story 30.1-001 AC3: every caller catches :class:`IssueHostError` only, so a
+    UTF-16 save must not escape the fail-fast guards as a raw UnicodeDecodeError."""
+    path = tmp_path / ih.FORGE_OVERRIDE_FILENAME
+    path.write_bytes("forge: gitlab\n".encode("utf-16"))
+    with pytest.raises(ih.IssueHostError, match="could not be read as UTF-8"):
+        ih.load_repo_forge_declaration(override_path=path)
+
+
+def test_load_repo_forge_declaration_unreadable_file_raises_issue_host_error(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / ih.FORGE_OVERRIDE_FILENAME
+    path.write_text("forge: gitlab\n")
+
+    def boom(self, *a, **kw):
+        raise OSError("EIO")
+
+    monkeypatch.setattr(ih.Path, "read_text", boom)
+    with pytest.raises(ih.IssueHostError, match="could not be read as UTF-8"):
+        ih.load_repo_forge_declaration(override_path=path)
+
+
+def test_load_repo_forge_declaration_utf8_bom_is_accepted(tmp_path) -> None:
+    path = tmp_path / ih.FORGE_OVERRIDE_FILENAME
+    path.write_bytes("forge: gitlab\n".encode("utf-8-sig"))
+    assert ih.load_repo_forge_declaration(override_path=path).forge == ih.GITLAB
+
+
 # --- resolve_forge precedence (Story 30.1-001) -------------------------------
 
 
@@ -1016,9 +1048,9 @@ def test_resolve_host_no_file_is_byte_identical(monkeypatch) -> None:
 
 def test_get_adapter_gitlab_with_instance_url_sets_env() -> None:
     runner = FakeRunner(mapping={"api user": (0, '{"username": "fx"}', "")})
-    adapter = ih.get_adapter(ih.GITLAB, runner=runner, instance_url="http://127.0.0.1:8080")
+    adapter = ih.get_adapter(ih.GITLAB, runner=runner, instance_url="https://gitlab.corp")
     assert adapter.whoami() == "fx"
-    assert runner.envs[-1] == {"GITLAB_HOST": "http://127.0.0.1:8080"}
+    assert runner.envs[-1] == {"GITLAB_HOST": "https://gitlab.corp"}
 
 
 def test_gitlab_adapter_without_instance_url_passes_no_env() -> None:
@@ -1028,8 +1060,118 @@ def test_gitlab_adapter_without_instance_url_passes_no_env() -> None:
     assert runner.envs[-1] is None
 
 
-def test_get_adapter_github_ignores_instance_url() -> None:
-    runner = FakeRunner()
-    adapter = ih.get_adapter(ih.GITHUB, runner=runner, instance_url="http://127.0.0.1:8080")
+def test_get_adapter_github_with_instance_url_sets_gh_host() -> None:
+    """Story 30.1-001: a declared `github_url:` must reach `gh` too, or the
+    dashboard's declared deep links and the adapter's API calls name different
+    forges."""
+    runner = FakeRunner(mapping={"api user": (0, "fx", "")})
+    adapter = ih.get_adapter(
+        ih.GITHUB, runner=runner, instance_url="https://github.corp.example.com"
+    )
     assert isinstance(adapter, ih.GitHubAdapter)
-    assert adapter.instance_url == "http://127.0.0.1:8080"
+    assert adapter.instance_url == "https://github.corp.example.com"
+    adapter.whoami()
+    assert runner.envs[-1] == {"GH_HOST": "github.corp.example.com"}
+
+
+def test_github_adapter_without_instance_url_passes_no_env() -> None:
+    runner = FakeRunner(mapping={"api user": (0, "fx", "")})
+    ih.GitHubAdapter(runner=runner).whoami()
+    assert runner.envs[-1] is None
+
+
+def test_github_instance_env_drops_a_url_with_no_host() -> None:
+    assert ih.github_instance_env(None) == {}
+    assert ih.github_instance_env("not-a-url") == {}
+
+
+# --- a plaintext GitLab instance needs a private `glab` config (AC5) ---------
+
+
+def test_gitlab_instance_env_http_adds_config_dir_pinning_api_protocol(monkeypatch) -> None:
+    """`glab` discards the URL scheme and forces https for every host but the GDK
+    default, so an http instance is only reachable via a config `api_protocol`."""
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.delenv("GLAB_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(Path(tempfile.mkdtemp())))
+    env = ih.gitlab_instance_env("http://gitlab.corp:8080")
+    assert env["GITLAB_HOST"] == "http://gitlab.corp:8080"
+    config = yaml.safe_load(Path(env["GLAB_CONFIG_DIR"], "config.yml").read_text())
+    assert config["hosts"]["gitlab.corp:8080"]["api_protocol"] == "http"
+    assert config["hosts"]["gitlab.corp:8080"]["api_host"] == "gitlab.corp:8080"
+
+
+def test_gitlab_instance_env_https_passes_only_gitlab_host(monkeypatch) -> None:
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    assert ih.gitlab_instance_env("https://gitlab.corp") == {
+        "GITLAB_HOST": "https://gitlab.corp"
+    }
+
+
+def test_gitlab_instance_env_without_instance_is_empty() -> None:
+    assert ih.gitlab_instance_env(None) == {}
+    assert ih.gitlab_instance_env("") == {}
+
+
+def test_gitlab_instance_env_reuses_one_config_dir_per_instance(monkeypatch) -> None:
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(Path(tempfile.mkdtemp())))
+    first = ih.gitlab_instance_env("http://127.0.0.1:8929")["GLAB_CONFIG_DIR"]
+    second = ih.gitlab_instance_env("http://127.0.0.1:8929")["GLAB_CONFIG_DIR"]
+    assert first == second
+
+
+def test_gitlab_instance_env_copies_the_users_token_for_that_host(monkeypatch, tmp_path) -> None:
+    """Redirecting `GLAB_CONFIG_DIR` would otherwise drop a `glab auth login`
+    token; only the declared host's entry is copied, never another forge's."""
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    (tmp_path / "config.yml").write_text(
+        "hosts:\n"
+        "  '127.0.0.1:8080':\n"
+        "    token: local-token\n"
+        "    username: fx\n"
+        "  gitlab.com:\n"
+        "    token: dot-com-token\n"
+    )
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path))
+    env = ih.gitlab_instance_env("http://127.0.0.1:8080")
+    config = yaml.safe_load(Path(env["GLAB_CONFIG_DIR"], "config.yml").read_text())
+    assert config["hosts"]["127.0.0.1:8080"]["token"] == "local-token"
+    assert config["hosts"]["127.0.0.1:8080"]["username"] == "fx"
+    assert config["hosts"]["127.0.0.1:8080"]["api_protocol"] == "http"
+    assert "gitlab.com" not in config["hosts"]
+
+
+@pytest.mark.parametrize(
+    "user_config",
+    [
+        "hosts: [not, a, mapping]\n",   # `hosts` is not a mapping
+        "- not-a-mapping-at-all\n",     # the whole config is not a mapping
+        "hosts: {gitlab.com: nope}\n",  # the host entry is not a mapping
+        "*** not: yaml\n",              # unparseable
+    ],
+)
+def test_gitlab_instance_env_tolerates_an_unusable_user_config(
+    monkeypatch, tmp_path, user_config
+) -> None:
+    """The user's config is best-effort input: anything unusable degrades to a
+    token-less entry (auth then falls back to `GITLAB_TOKEN`), never a crash."""
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    (tmp_path / "config.yml").write_text(user_config)
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path))
+    env = ih.gitlab_instance_env("http://gitlab.corp:8080")
+    config = yaml.safe_load(Path(env["GLAB_CONFIG_DIR"], "config.yml").read_text())
+    assert config["hosts"]["gitlab.corp:8080"] == {
+        "api_protocol": "http",
+        "api_host": "gitlab.corp:8080",
+    }
+
+
+def test_gitlab_adapter_http_instance_threads_the_config_dir_per_call(monkeypatch) -> None:
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(Path(tempfile.mkdtemp())))
+    runner = FakeRunner(mapping={"api user": (0, '{"username": "fx"}', "")})
+    adapter = ih.get_adapter(ih.GITLAB, runner=runner, instance_url="http://127.0.0.1:8080")
+    adapter.whoami()
+    assert runner.envs[-1]["GITLAB_HOST"] == "http://127.0.0.1:8080"
+    assert "GLAB_CONFIG_DIR" in runner.envs[-1]
