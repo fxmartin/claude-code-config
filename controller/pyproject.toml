@@ -82,6 +82,7 @@ show_error_codes = true
 # today and must keep doing so. Grow this list; never shrink it.
 [[tool.mypy.overrides]]
 module = [
+    "sdlc.approval",
     "sdlc.capability",
     "sdlc.change_class",
     "sdlc.cohort",

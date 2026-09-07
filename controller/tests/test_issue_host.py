@@ -723,3 +723,26 @@ def test_label_color_is_categorised():
     # approval on the board (the sole approval path on GitLab Free/Core).
     assert ih._label_color("risk-approved") == "0e8a16"
     assert ih._label_color("anything-else") == "ededed"
+
+
+def test_repo_runner_invokes_the_host_cli_inside_the_repo(tmp_path, monkeypatch) -> None:
+    """`gh`/`glab` resolve the repo from cwd, so a multi-repo poller must set it."""
+    seen: dict = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["cwd"] = kwargs.get("cwd")
+        return Completed()
+
+    monkeypatch.setattr(ih.subprocess, "run", fake_run)
+
+    result = ih.repo_runner(tmp_path)(["gh", "pr", "view", "1"])
+
+    assert result.returncode == 0
+    assert seen["cwd"] == str(tmp_path)
+    assert seen["argv"] == ["gh", "pr", "view", "1"]

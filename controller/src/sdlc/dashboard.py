@@ -930,10 +930,10 @@ function drawDagEdges(edges){
 // one source, two consumers (queue_view() in dashboard.py). Grouped by state;
 // a RATE_LIMITED job (Story 32.2-001, not live yet) collapses into one pause
 // banner instead of N group rows, per its "queue's state, not N independent
-// parked runs" contract. A `parked` job (Story 32.2-002, not live yet) may
-// carry `pr_number`/`pr_url`, rendered as a link — absent fields simply render
-// nothing, so the panel is correct today and richer once those stories land.
-const QUEUE_STATE_ORDER = ["queued","running","done","failed","cancelled"];
+// parked runs" contract. A `parked` job (Story 32.2-002) carries the
+// `pr_number` of the change request the queue is polling for approval, rendered
+// as a link when a `pr_url` is available — absent fields simply render nothing.
+const QUEUE_STATE_ORDER = ["queued","running","parked","blocked","done","failed","cancelled"];
 function queueAge(iso){
   if(!iso) return "?";
   let s = String(iso);

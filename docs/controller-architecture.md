@@ -35,8 +35,9 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
 | `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
-| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise` manage (Story 32.1-001). |
-| `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, and reclaim-and-resume for a killed scheduler (Story 32.1-002). |
+| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002). |
+| `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), and the approval park + auto-resume (Story 32.2-002). |
+| `sdlc/approval.py` | Read-only change-request approval probe — "is PR #N approved / merged / closed?" behind the queue's park (Story 32.2-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
 
@@ -1320,7 +1321,7 @@ it on the next real run).
   - **Development queue** (`sdlc/queue.py`, Story 32.1-001) — the host-level
     `queue.db` `sdlc build/fix --enqueue` and `sdlc queue` write to opens
     read-only, every migration is applied, and job counts by lifecycle state
-    (`queued`/`running`/`done`/`failed`/`cancelled`/`blocked`) are reported. Same
+    (`queued`/`running`/`parked`/`done`/`failed`/`cancelled`/`blocked`) are reported. Same
     severity ladder as the ledger check: behind / pre-migration-framework →
     `WARN`; unreadable/corrupt → `FAIL`; no queue yet ("nothing enqueued on
     this host") → `CLEAN`.
@@ -1461,7 +1462,9 @@ reaches the job's own agents rather than just its parent.
   run record is still open → `blocked` (parked, resumable — calling that
   `failed` would bury it); a terminal that still needs a human
   (`AWAITING_APPROVAL` / `NEEDS_ATTENTION`, and `RATE_LIMITED` should a future
-  writer put it there) → `blocked`; otherwise `failed`. A `blocked` job is not a
+  writer put it there) → `blocked`; otherwise `failed`. An `AWAITING_APPROVAL`
+  run whose change request is knowable is the one exception — it becomes
+  `parked`, not `blocked` (see the approval park below). A `blocked` job is not a
   dead end: `sdlc queue cancel` retires it and `sdlc queue requeue` re-arms it
   with its frozen options intact — and if it already opened a run, the requeue
   returns it to `running` with an expired lease so the next drain **resumes**
@@ -1486,6 +1489,58 @@ reaches the job's own agents rather than just its parent.
   env/file convention) wrapping this same foreground verb. `--follow` keeps the
   loop alive on an empty queue so an intake — the `sdlc listen` supervisor this
   loop becomes — can enqueue into a scheduler that is already draining.
+
+## The approval park (`parked`, Story 32.2-002)
+
+`AWAITING_APPROVAL` is terminal for a *run* and must stay so — the merge is
+blocked by the high-risk gate and the bugfix loop cannot self-approve, so
+`build.py` parks rather than burning attempts. The queue is the layer that
+outlives the run: it takes the wait over, so a night's high-risk work is waiting
+for FX's label in the morning rather than for the label *and* three
+`sdlc resume` commands.
+
+- **Park, not block.** When a reaped job's run ended `AWAITING_APPROVAL`, the
+  scheduler resolves the change request from the run's own ledger
+  (`RunRecord.db` → `story_rows`, read-only) and records the job `parked` with
+  that `pr_number`. `parked` is deliberately *not* a terminal state: `blocked`
+  needs an operator command to leave, `parked` leaves on its own the moment the
+  forge says so. A run with no resolvable CR has nothing to poll, so it keeps
+  the pre-32.2 `blocked` terminal and says so.
+- **Parked jobs hold nothing.** The park drops the claim and the lease, so the
+  job leaves `running_repos()` — its repo and its agent slot go straight back to
+  the pool and the next job in that repo starts immediately.
+- **Bounded, read-only polling.** `poll_after` on the job row is the rate-limit
+  bound: a due job is read once per `--approval-poll-interval` (default 300s,
+  clamped to 30–3600s) no matter how fast the loop spins, and a job whose repo is
+  busy or for which no slot is free is skipped *before* the read — there would be
+  nothing to do with the answer. The read itself is one `gh pr view` /
+  `glab mr view` through `sdlc/approval.py`; nothing merges, labels, comments or
+  closes. An unreadable host (offline, unauthenticated, rate-limited) returns
+  None and the job simply stays parked — reading a dropped packet as "closed"
+  would fail a job over a network blip.
+- **What releases a park.** The `risk-approved` label or an approving review —
+  either means a human said yes, and the winning signal is named in the
+  notification. On GitHub an approving review counts even when `reviewDecision`
+  has since flipped back (a pushed fixup dismisses stale approvals; the approval
+  still happened). On GitLab the premium-gated approvals endpoint is only queried
+  while the MR is open, and its failure degrades to "no approver".
+- **Three outcomes, three existing verbs.** Approved → `sdlc resume --run <id>`,
+  so the *controller* performs the merge and records DONE in the ledger. Merged
+  by hand while parked → `sdlc reconcile <run>`, which is the verb that already
+  exists for exactly this; resuming would re-enter a merge stage against an
+  already-merged CR. Closed without merging → the job is `failed` with
+  `reason=pr closed`. All three go through the same `_start` path as any other
+  job, so the per-repo version check, the slot accounting and the launch-failure
+  handling are not re-implemented.
+- **Notify on park and on resume.** `queue_job_parked` names the CR to label;
+  `queue_job_resumed` names the signal that released it. Both are queue events
+  beside the run's own `run_finished`, the same separation `queue_job_finished`
+  draws.
+- **Where the loop ends.** Without `--follow` a drain polls its parks once and
+  exits, leaving them in the store for the next `sdlc queue run` — so a morning
+  `sdlc queue run` picks up last night's approvals and drives them to DONE. With
+  `--follow` (the LaunchAgent shape) the scheduler keeps polling on the interval,
+  which is the overnight configuration the story is written for.
 
 ## Run-logging CLI for non-controller pipelines (Story 11.2-013)
 
