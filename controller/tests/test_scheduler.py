@@ -1900,6 +1900,8 @@ def test_a_reused_probe_helper_that_itself_raises_keeps_the_window_shut(monkeypa
         launcher=FakeLauncher(), clock=Clock(), sleeper=lambda _s: None,
         notifier=lambda *a, **k: None, version_check=_clean,
         probe=lambda: ProbeStatus.AVAILABLE,
+        approval_probe=lambda _root, _pr: None,
+        fix_rounds=lambda _db, _run: 0, plan_files=lambda _db, _run: [],
         echo=lambda _line: None, identity="test:1",
     )
     pause = QueuePause(
@@ -1929,6 +1931,8 @@ def test_a_pause_ledger_that_fails_to_construct_is_no_evidence(monkeypatch, tmp_
         store, config=SchedulerConfig(), registry=registry,
         launcher=FakeLauncher(), clock=Clock(), sleeper=lambda _s: None,
         notifier=lambda *a, **k: None, version_check=_clean, probe=None,
+        approval_probe=lambda _root, _pr: None,
+        fix_rounds=lambda _db, _run: 0, plan_files=lambda _db, _run: [],
         echo=lambda _line: None, identity="test:1",
     )
     pause = QueuePause(paused_until="", paused_at="", run_id=run_id)
@@ -2181,6 +2185,8 @@ def test_a_park_recording_a_later_reset_survives_the_served_window(tmp_path) -> 
         store, config=SchedulerConfig(), registry=registry,
         launcher=FakeLauncher(), clock=clock, sleeper=lambda _s: None,
         notifier=lambda *a, **k: None, version_check=_clean, probe=None,
+        approval_probe=lambda _root, _pr: None,
+        fix_rounds=lambda _db, _run: 0, plan_files=lambda _db, _run: [],
         echo=lambda _line: None, identity="test:1",
     )
     scheduler._spend_served_parks(
