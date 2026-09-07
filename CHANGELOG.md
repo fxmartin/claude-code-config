@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.64.0] - 2026-09-07
+
+### Added
+
+- feat(development-queue): scheduler loop with leased (#32.1-002) (#664)
+
+
 ## [v2.63.0] - 2026-09-07
 
 ### Added
