@@ -146,6 +146,7 @@ if a separate verb proves redundant.
 **Risk Level**: Low
 
 ##### Story 15.1-004: `sdlc doctor` warns when the installed controller is behind the checkout
+**Status**: Done
 **Field finding (2026-09-06, FX)**: the PATH-installed `sdlc` is a `uv tool install`
 snapshot, not the checkout. It sat at v2.45.12 while `main` moved to v2.57.0 — twelve
 releases — and every build run that day silently executed on the old code: none of the
