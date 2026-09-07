@@ -356,13 +356,24 @@ def _resolve_fix_forge(root: Path | None, override: str | None) -> issue_host.Fo
     today's behaviour). A malformed declaration still raises
     :class:`issue_host.IssueHostError`: an explicit repo declaration error must
     fail fast at preflight, never be silently swallowed into the fallback.
+
+    ``--host`` names the forge *kind* only, so a declaration for that same forge
+    still supplies the instance URL (:func:`issue_host.declared_instance_for`) —
+    ``sdlc fix --host gitlab`` in a repo that declares a local instance must
+    reach that instance, not gitlab.com. ``host`` is returned verbatim (not
+    normalised) because :func:`parse_fix_args` already validated the flag and
+    every downstream :func:`issue_host.get_adapter` lower-cases it.
     """
     root = root or Path.cwd()
-    if override:
-        return issue_host.ForgeResolution(host=override, instance_url=None, source="override")
     declaration = issue_host.load_repo_forge_declaration(
         override_path=root / issue_host.FORGE_OVERRIDE_FILENAME
     )
+    if override:
+        return issue_host.ForgeResolution(
+            host=override,
+            instance_url=issue_host.declared_instance_for(declaration, override),
+            source="override",
+        )
     if declaration is not None:
         return issue_host.ForgeResolution(
             host=declaration.forge, instance_url=declaration.instance_url,

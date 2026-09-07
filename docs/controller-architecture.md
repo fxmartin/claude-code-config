@@ -2272,6 +2272,17 @@ pin's `--harness` > repo file > registry `default:`:
 2. The repo's `.sdlc-forge.yaml`
 3. The `origin` remote's auto-detected hostname (today's behaviour)
 
+Host and instance are **separate axes**. Every tier above resolves the forge
+*kind*; only the declaration ever names an instance. So a winning override
+takes the host and the declaration still supplies `instance_url` when the two
+name the same forge (`issue_host.declared_instance_for`). Tier 1 is the common
+path, not the exotic one — `build._story_cr_host_override` returns the
+inventory's recorded host for every story on any repo that ran `sdlc issues
+init` — so short-circuiting the file read on an override would leave the
+declared instance unused on precisely the local-forge repos it exists for, and
+send each CR open to `gitlab.com`. A declaration for a *different* forge
+contributes nothing, so `--host github` never inherits a GitLab instance.
+
 No file present is byte-identical to today: `resolve_host` (the existing
 host-only API every pre-existing call site uses) is now a thin wrapper over
 `resolve_forge(...).host`, so the declaration is purely additive. A malformed

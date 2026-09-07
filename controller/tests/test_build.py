@@ -4316,6 +4316,45 @@ def test_open_story_cr_threads_declared_instance_url(tmp_path, monkeypatch) -> N
     assert captured == {"host": "gitlab", "instance_url": "http://127.0.0.1:8080"}
 
 
+def test_open_story_cr_keeps_declared_instance_with_an_inventory_host(
+    tmp_path, monkeypatch
+) -> None:
+    """Story 30.1-001: `sdlc issues init` records a host per story, so
+    `_story_cr_host_override` returns one on every mapped story — the common
+    case. That override names the forge kind only; the repo's declared instance
+    must still reach the adapter, or every CR open in a local-forge repo goes
+    to gitlab.com."""
+    from sdlc.build import _open_story_cr
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    (root / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    ledger.inventory_upsert_specs([(story.id, "epic-05", "f", "t", None, None)])
+    ledger.inventory_set_mapping(story.id, "gitlab", "7")
+
+    fake = _FakeCrAdapter("gitlab")
+    captured: dict = {}
+    monkeypatch.setattr(
+        ih, "get_adapter",
+        lambda host, runner=None, instance_url=None: (
+            captured.update(host=host, instance_url=instance_url), fake
+        )[1],
+    )
+
+    pr = _open_story_cr(
+        story, ledger, "run-1", root, "origin/main", None, ih.GITLAB_CR_TERMS,
+        BuildOptions(),
+        body="Coverage gate passed.", context="post-coverage",
+    )
+
+    assert pr == 42
+    assert captured == {"host": "gitlab", "instance_url": "http://127.0.0.1:8080"}
+
+
 def test_log_forge_preflight_logs_the_resolved_forge(tmp_path) -> None:
     from sdlc.build import _log_forge_preflight
 

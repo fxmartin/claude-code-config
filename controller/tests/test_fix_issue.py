@@ -417,6 +417,28 @@ def test_resolve_fix_forge_declaration_wins_over_auto_detect(tmp_path, monkeypat
     )
 
 
+def test_resolve_fix_forge_override_keeps_declared_instance_for_same_forge(tmp_path) -> None:
+    """Story 30.1-001: `sdlc fix --host gitlab` in a repo that declares a local
+    GitLab instance must still target that instance — the flag names the forge
+    kind, only the declaration names the instance."""
+    (tmp_path / fix_mod.issue_host.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    resolution = fix_mod._resolve_fix_forge(tmp_path, "gitlab")
+    assert resolution.host == "gitlab"
+    assert resolution.instance_url == "http://127.0.0.1:8080"
+    assert resolution.source == "override"
+
+
+def test_resolve_fix_forge_override_for_other_forge_drops_instance(tmp_path) -> None:
+    (tmp_path / fix_mod.issue_host.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    resolution = fix_mod._resolve_fix_forge(tmp_path, "github")
+    assert resolution.host == "github"
+    assert resolution.instance_url is None
+
+
 def test_resolve_fix_forge_malformed_declaration_raises(tmp_path) -> None:
     (tmp_path / fix_mod.issue_host.FORGE_OVERRIDE_FILENAME).write_text("forge: bitbucket\n")
     with pytest.raises(fix_mod.issue_host.IssueHostError, match="unsupported forge"):

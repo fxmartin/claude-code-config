@@ -46,6 +46,7 @@ __all__ = [
     "ForgeResolution",
     "load_repo_forge_declaration",
     "resolve_forge",
+    "declared_instance_for",
     "format_forge_preflight_line",
 ]
 
@@ -446,15 +447,35 @@ def load_repo_forge_declaration(
     return ForgeDeclaration(forge=forge, instance_url=instance_url)
 
 
+def declared_instance_for(
+    declaration: ForgeDeclaration | None, host: str
+) -> str | None:
+    """The declared instance URL that applies to ``host``, or None (Story 30.1-001).
+
+    Shared by :func:`resolve_forge` and ``fix_issue._resolve_fix_forge`` so both
+    apply one rule: a declaration only contributes its instance to the forge it
+    actually names. ``host`` is compared case-insensitively, since overrides
+    arrive verbatim from a CLI flag or the ledger's inventory cache.
+    """
+    if declaration is None or not declaration.instance_url:
+        return None
+    return declaration.instance_url if declaration.forge == host.strip().lower() else None
+
+
 @dataclass(frozen=True)
 class ForgeResolution:
     """The outcome of resolving a run's forge (Story 30.1-001).
 
-    ``source`` names which precedence tier won — ``"override"`` (an explicit
-    CLI/env host), ``"declaration"`` (the repo's `.sdlc-forge.yaml`), or
-    ``"auto-detect"`` (today's hostname heuristic) — so the preflight line
-    (:func:`format_forge_preflight_line`) can say *why* a host was picked, not
-    just what it resolved to.
+    ``source`` names which precedence tier decided the *host* — ``"override"``
+    (an explicit CLI/env host), ``"declaration"`` (the repo's
+    `.sdlc-forge.yaml`), or ``"auto-detect"`` (today's hostname heuristic) — so
+    the preflight line (:func:`format_forge_preflight_line`) can say *why* a
+    host was picked, not just what it resolved to.
+
+    ``instance_url`` is a separate axis and always comes from the declaration:
+    no override or auto-detection names a specific self-hosted instance, so a
+    winning override sets ``host`` while the declaration still supplies the
+    instance whenever the two agree on the forge.
     """
 
     host: str
@@ -471,23 +492,37 @@ def resolve_forge(root: str | Path, override: str | None = None) -> ForgeResolut
     from the ``origin`` remote's hostname. Fails fast with a one-line actionable
     :class:`IssueHostError` when no host can be determined, when an override or
     declared forge is unsupported, or when the declaration file itself is
-    malformed — never mid-pipeline.
+    malformed — never mid-pipeline. The override is validated *before* the file
+    is read, so an unsupported ``--host`` reports itself rather than a
+    (possibly also broken) declaration.
 
-    A declared instance URL only ever comes from the repo file: an override (CLI
-    flag or auto-detection) never carries one, since neither names a specific
-    self-hosted instance.
+    Host and instance are separate axes. An override names the forge *kind*
+    only — neither a `--host` flag nor the story inventory's recorded host
+    names a specific self-hosted instance — so a declaration for that same
+    forge still supplies ``instance_url``. Without that merge, every mapped
+    story's CR open (``build._story_cr_host_override`` returns the inventory's
+    host on any repo that ran ``sdlc issues init``) would silently target
+    gitlab.com instead of the repo's declared local instance. A declaration for
+    a *different* forge contributes nothing, so an explicit `--host github`
+    never inherits a GitLab instance.
     """
+    host: str | None = None
     if override:
         host = override.strip().lower()
         if host not in SUPPORTED_HOSTS:
             raise IssueHostError(
                 f"unsupported host {host!r}; supported hosts: {', '.join(SUPPORTED_HOSTS)}"
             )
-        return ForgeResolution(host=host, instance_url=None, source="override")
 
     declaration = load_repo_forge_declaration(
         override_path=Path(root) / FORGE_OVERRIDE_FILENAME
     )
+    if host is not None:
+        return ForgeResolution(
+            host=host,
+            instance_url=declared_instance_for(declaration, host),
+            source="override",
+        )
     if declaration is not None:
         return ForgeResolution(
             host=declaration.forge, instance_url=declaration.instance_url,

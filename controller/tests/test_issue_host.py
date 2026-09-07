@@ -915,6 +915,39 @@ def test_resolve_forge_override_wins_over_declaration(tmp_path) -> None:
     assert resolution == ih.ForgeResolution(host=ih.GITHUB, instance_url=None, source="override")
 
 
+def test_resolve_forge_override_keeps_declared_instance_for_the_same_forge(tmp_path) -> None:
+    """Story 30.1-001: an override names the forge *kind*; only the declaration
+    ever names an instance. `sdlc build` reaches here with the story
+    inventory's recorded host on every mapped story, so dropping the declared
+    instance whenever an override is present would point `glab` at gitlab.com
+    for exactly the local-forge repos this story exists to support."""
+    (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    resolution = ih.resolve_forge(tmp_path, override="gitlab")
+    assert resolution == ih.ForgeResolution(
+        host=ih.GITLAB, instance_url="http://127.0.0.1:8080", source="override"
+    )
+
+
+def test_resolve_forge_override_for_a_different_forge_drops_the_instance(tmp_path) -> None:
+    """A declared GitLab instance must not leak onto an explicitly GitHub run."""
+    (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    assert ih.resolve_forge(tmp_path, override="GitHub ") == ih.ForgeResolution(
+        host=ih.GITHUB, instance_url=None, source="override"
+    )
+
+
+def test_resolve_forge_unsupported_override_beats_a_malformed_declaration(tmp_path) -> None:
+    """The override is validated before the file is read, so an unsupported
+    host still reports "unsupported host" rather than the file's error."""
+    (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text("forge: bitbucket\n")
+    with pytest.raises(ih.IssueHostError, match="unsupported host"):
+        ih.resolve_forge(tmp_path, override="bitbucket")
+
+
 def test_resolve_forge_bad_declaration_aborts(tmp_path) -> None:
     (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text("forge: bitbucket\n")
     with pytest.raises(ih.IssueHostError, match="unsupported forge"):

@@ -108,6 +108,13 @@ no merge trains, no Premium-only keywords.
 Story 30.1-001 — which instance:
 
 1. **Explicit override wins** — a `--host github|gitlab` flag or config value.
+   An override names the forge *kind* only; it never names an instance, so a
+   `.sdlc-forge.yaml` **for that same forge** still supplies the
+   `instance_url`. (This matters: `sdlc build` reaches `resolve_forge` with the
+   story inventory's recorded host on every mapped story, so treating an
+   override as "no instance" would send every CR open in a local-forge repo to
+   `gitlab.com`.) A declaration for a *different* forge contributes nothing —
+   `--host github` never inherits a declared GitLab instance.
 2. **Otherwise the repo's declared forge** — a checked-in `.sdlc-forge.yaml` at
    the repo root (see [Declaring a self-hosted instance](#declaring-a-self-hosted-instance--sdlc-forgeyaml-story-301-001)
    below).
