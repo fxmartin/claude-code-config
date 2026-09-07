@@ -13,6 +13,9 @@ import typer
 from sdlc import __version__
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
 from sdlc.eval_compare import DEFAULT_TOLERANCE
+# `sdlc queue run`'s defaults live with the scheduler, so `--help` prints the
+# real figures rather than a copy that can drift (Story 32.1-002).
+from sdlc.scheduler import DEFAULT_POLL_SECONDS, DEFAULT_SLOTS
 
 # The full set of planned subcommands with one-line descriptions. `--help`
 # renders these even while the bodies are stubs, so the surface area is visible
@@ -191,8 +194,8 @@ Scope (positional, default `all`):
 Flags:
   --enqueue                 record a `queued` job in the host queue
                              ($XDG_STATE_HOME/sdlc/queue.db) instead of running
-                             now; no run starts. Manage it with `sdlc queue`
-                             (Story 32.1-001). Omitted: unchanged, runs now
+                             now; no run starts. Manage it with `sdlc queue`,
+                             drain it with `sdlc queue run`. Omitted: runs now
   --dry-run                 plan only; dispatch nothing
   --auto                    non-interactive run
   --skip-coverage           build agent opens the PR directly (no coverage gate)
@@ -508,8 +511,8 @@ Target (positional — pass exactly one):
 Flags:
   --enqueue                 record a `queued` job in the host queue
                              ($XDG_STATE_HOME/sdlc/queue.db) instead of running
-                             now; no run starts. Manage it with `sdlc queue`
-                             (Story 32.1-001). Omitted: unchanged, runs now
+                             now; no run starts. Manage it with `sdlc queue`,
+                             drain it with `sdlc queue run`. Omitted: runs now
   --limit=N                 batch only: cap the issue set (`next` defaults to 1)
   --sequential              batch only: one issue fully completes before the next
   --concurrency=N           batch only: issue-level worker cap (default 5)
@@ -3147,7 +3150,10 @@ def queue_add_cmd(
         "normal", "--priority", help="low|normal|high|urgent (default: normal)."
     ),
     options: str | None = typer.Option(
-        None, "--options", help="JSON array of CLI flags to replay (default: none)."
+        None,
+        "--options",
+        help="JSON array of CLI flags to replay, e.g. '[\"--auto\"]' (default: "
+        "none). Flags only — the scope above is dispatched for you.",
     ),
 ) -> None:
     """Add a job to the host queue directly (without going through --enqueue)."""
@@ -3168,11 +3174,85 @@ def queue_add_cmd(
     raise typer.Exit(code=0)
 
 
+@queue_app.command("run")
+def queue_run_cmd(
+    slots: int = typer.Option(
+        DEFAULT_SLOTS,
+        "--slots",
+        min=1,
+        help=f"Host-wide agent-slot cap (default: {DEFAULT_SLOTS}). A job costs "
+        "one slot, or the worker cap its own `--concurrency=N` declares.",
+    ),
+    follow: bool = typer.Option(
+        False,
+        "--follow",
+        help="Keep waiting on an empty queue instead of exiting, so an intake "
+        "can enqueue into a draining scheduler.",
+    ),
+    poll_interval: float = typer.Option(
+        DEFAULT_POLL_SECONDS,
+        "--poll-interval",
+        min=0.1,
+        help=f"Seconds between loop passes (default: {DEFAULT_POLL_SECONDS}).",
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the drain summary as JSON."
+    ),
+) -> None:
+    """Drain the host queue in the foreground — claim jobs and run them.
+
+    Claims each queued job under a short renewable lease (90s, renewed every
+    30s) and starts it with the existing `sdlc build` / `sdlc fix` machinery as
+    a subprocess, so a job's crash cannot take the scheduler down. Two jobs
+    never run in one repo, and the host-wide agent-slot cap is never exceeded.
+    Each job registers as a normal run, so `sdlc dashboard` sees it unchanged.
+
+    A job whose repo's installed controller disagrees with its own
+    `controller/pyproject.toml` is parked `blocked` with the reinstall remedy
+    rather than executed on stale code (Story 15.1-004).
+
+    A killed scheduler loses nothing: the next `sdlc queue run` reclaims every
+    job whose lease lapsed and re-enters it through `sdlc resume` — never from
+    scratch — while a job whose run pid still answers is left alone. Ctrl-C
+    stops the jobs it started and hands their leases back (exit 130).
+
+    This is the foreground command. Daemonising it is the Epic-30 30.3-001
+    LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
+    deliberately not built into the controller.
+    """
+    from sdlc.queue import QueueStore, default_queue_path
+    from sdlc.scheduler import SchedulerConfig, run_queue
+
+    store = QueueStore(default_queue_path())
+    store.init()
+
+    result = run_queue(
+        store,
+        config=SchedulerConfig(slots=slots, follow=follow, poll_seconds=poll_interval),
+        echo=typer.echo,
+    )
+
+    if as_json:
+        typer.echo(json.dumps(result.to_dict()))
+    else:
+        typer.echo(
+            f"queue drained: {result.started} started, {result.resumed} resumed, "
+            f"{result.done} done, {result.failed} failed, {result.parked} parked"
+            + (" (interrupted)" if result.interrupted else "")
+        )
+    if result.interrupted:
+        # 130 is the conventional "terminated by SIGINT" status, so a wrapper
+        # (a LaunchAgent, a shell loop) can tell an operator Ctrl-C from a real
+        # failure.
+        raise typer.Exit(code=130)
+    raise typer.Exit(code=1 if result.failed else 0)
+
+
 @queue_app.command("cancel")
 def queue_cancel_cmd(
     job_id: int = typer.Argument(..., help="Job id to cancel."),
 ) -> None:
-    """Cancel a `queued` job. Refuses when the job is already `running`."""
+    """Cancel a `queued` or parked (`blocked`) job. Refuses a `running` one."""
     from sdlc.queue import QueueError, QueueStore, default_queue_path
 
     store = QueueStore(default_queue_path())
@@ -3183,6 +3263,33 @@ def queue_cancel_cmd(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(f"cancelled: job {job_id}")
+    raise typer.Exit(code=0)
+
+
+@queue_app.command("requeue")
+def queue_requeue_cmd(
+    job_id: int = typer.Argument(..., help="Job id to put back in the queue."),
+) -> None:
+    """Re-arm a parked (`blocked`), `failed` or `cancelled` job for the next drain.
+
+    The exit from the `blocked` park (Story 32.1-002): follow the remedy the job
+    carries, then requeue it — its frozen options, priority, kind and scope are
+    kept, so nothing has to be retyped. A job that already opened a run returns
+    to `running` with an expired lease so the next `sdlc queue run` **resumes**
+    it rather than restarting it from scratch. Refuses a `running` job.
+    """
+    from sdlc.queue import QueueError, QueueStore, default_queue_path
+
+    store = QueueStore(default_queue_path())
+    store.ensure_migrated()
+    try:
+        store.requeue_job(job_id)
+    except QueueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    job = store.get_job(job_id)
+    tail = " (will resume its run)" if job is not None and job.run_id else ""
+    typer.echo(f"requeued: job {job_id}{tail}")
     raise typer.Exit(code=0)
 
 

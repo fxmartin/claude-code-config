@@ -477,3 +477,55 @@ def test_default_sender_success_path(monkeypatch):
     assert req.full_url == "https://api.telegram.org/botTOKEN/sendMessage"
     assert req.get_header("Content-type") == "application/json"
     assert req.data == b'{"chat_id": "123", "text": "hi"}'
+
+
+# --- queue job announcements (bugfix #32.1-002) ---------------------------
+
+
+def test_queue_job_finished_reads_as_a_queue_event_not_a_second_run_finish():
+    """The scheduler's own announcement, distinct from the child's `run_finished`.
+
+    A drained job's subprocess already fires `run_finished` for its run; this
+    event is what tells the pair apart in a night's Telegram history.
+    """
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "queue_job_finished",
+        run="a7493b3d-4135-4076-8190-139fefb2dcb9",
+        repo="claude-code-config",
+        subject="queue job 7 (build epic-3)",
+        terminal="BLOCKED",
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "queue job 7 (build epic-3)" in text
+    assert "BLOCKED" in text
+    assert "claude-code-config" in text
+    assert "a7493b3d" in text
+    # No raw key=value leftovers for fields the title already rendered.
+    assert "terminal=" not in text
+    assert "subject=" not in text
+
+
+def test_queue_job_finished_without_a_run_still_renders():
+    """A job parked before any run started carries no run id — still readable."""
+    captured: list[bytes] = []
+
+    def sender(url: str, payload: bytes) -> None:
+        captured.append(payload)
+
+    notify_mod.notify(
+        "queue_job_finished",
+        run="",
+        repo="claude-code-config",
+        subject="queue job 9 (fix 42)",
+        terminal="BLOCKED",
+        sender=sender,
+    )
+    text = json.loads(captured[0].decode("utf-8"))["text"]
+    assert "queue job 9 (fix 42)" in text
+    assert "BLOCKED" in text

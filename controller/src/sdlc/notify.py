@@ -123,6 +123,9 @@ _TERMINAL_EMOJI = {
     "NEEDS_ATTENTION": "⚠️",
     "AWAITING_APPROVAL": "⏳",
     "RATE_LIMITED": "⏸",
+    # A `sdlc queue run` job parked rather than finished (Story 32.1-002) — the
+    # same "stopped short, resumable" sense ⏸ already carries for a rate limit.
+    "BLOCKED": "⏸",
 }
 
 # Count fields folded into the run_finished tally line, in display order.
@@ -174,6 +177,21 @@ def _run_finished_title(fields: dict[str, object]) -> str:
     return f"{emoji} {_repo_prefix(fields)}{core}"
 
 
+def _queue_job_finished_title(fields: dict[str, object]) -> str:
+    """A `sdlc queue run` job reaching a terminal state (Story 32.1-002).
+
+    Deliberately distinct from ``run_finished``: the job's own subprocess
+    already announced its *run*, so this line is about the *job* — which one,
+    and how the queue recorded it — and reads as such beside the run's message.
+    """
+    terminal = fields.get("terminal")
+    emoji = _TERMINAL_EMOJI.get(str(terminal), "🏁")
+    core = _subject(fields) or "queue job"
+    if terminal:
+        core = f"{core} {terminal}"
+    return f"{emoji} {_repo_prefix(fields)}{core}"
+
+
 def _rate_limited_title(fields: dict[str, object]) -> str:
     label = _subject(fields)
     suffix = f" ({label})" if label else ""
@@ -197,6 +215,7 @@ def _story_failed_title(fields: dict[str, object]) -> str:
 _FORMATTERS: dict[str, Callable[[dict[str, object]], str]] = {
     "run_started": _run_started_title,
     "run_finished": _run_finished_title,
+    "queue_job_finished": _queue_job_finished_title,
     "rate_limited": _rate_limited_title,
     "story_failed": _story_failed_title,
 }
@@ -206,6 +225,7 @@ _FORMATTERS: dict[str, Callable[[dict[str, object]], str]] = {
 _TITLE_FIELDS: dict[str, set[str]] = {
     "run_started": {"repo", "subject", "scope", "detail", "mode"},
     "run_finished": {"repo", "subject", "scope", "terminal", "pr", "done", "total", "duration"},
+    "queue_job_finished": {"repo", "subject", "scope", "terminal"},
     "rate_limited": {"repo", "subject", "scope"},
     "story_failed": {"repo", "subject", "story_id"},
 }

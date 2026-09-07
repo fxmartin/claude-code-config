@@ -7,7 +7,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -30,7 +30,26 @@ QUEUE_BUSY_TIMEOUT_MS = 5000
 _KINDS = {"build", "fix"}
 _PRIORITIES = ("low", "normal", "high", "urgent")
 _PRIORITY_RANK = {name: rank for rank, name in enumerate(_PRIORITIES)}
-_STATES = {"queued", "running", "done", "failed", "cancelled"}
+# Lifecycle states. Story 32.1-002 adds ``blocked`` — the parked terminal a
+# scheduler stamps on a job it refused to execute (e.g. the repo's installed
+# controller disagrees with its checkout, Story 15.1-004) rather than running
+# it on stale code.
+_STATES = {"queued", "running", "done", "failed", "cancelled", "blocked"}
+
+# The subset of :data:`_STATES` a job can finish in. ``running`` and
+# ``queued`` are in-flight; ``cancelled`` is an operator action, not an
+# outcome the scheduler reports.
+_TERMINAL_STATES = {"done", "failed", "blocked"}
+
+# States an operator may retire. ``queued`` is the everyday case; ``blocked``
+# is here because Story 32.1-002 introduced that park and it would otherwise be
+# a dead end. A ``running`` job belongs to a live scheduler and its child, and a
+# ``done``/``failed`` job is history worth keeping — neither is cancellable.
+_CANCELLABLE_STATES = {"queued", "blocked"}
+
+# States an operator may re-arm with :meth:`QueueStore.requeue_job`. ``queued``
+# is excluded because it is already armed, ``running`` because it is live.
+_REQUEUEABLE_STATES = _STATES - {"running", "queued"}
 
 
 def default_queue_path() -> Path:
@@ -167,6 +186,15 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _at(now: datetime | None) -> datetime:
+    """``now`` or the current UTC instant — the single clock seam for leases.
+
+    Every lease comparison in this module goes through here so a test can drive
+    expiry deterministically instead of sleeping out a real 90-second lease.
+    """
+    return now if now is not None else datetime.now(timezone.utc)
+
+
 class QueueStore:
     """Durable host-level job queue, backed by SQLite/WAL.
 
@@ -248,16 +276,71 @@ class QueueStore:
             return int(cur.lastrowid)
 
     def cancel_job(self, job_id: int) -> None:
-        """Mark a ``queued`` job ``cancelled``; refuse on any other state."""
+        """Retire a job that is not live; refuse a ``running`` one.
+
+        ``queued`` is the everyday case. A *parked* job (``blocked`` — Story
+        32.1-002's version-check terminal) is accepted too: it is not live, so
+        cancelling it is safe, and without this it would sit in `queue list`
+        forever with no way out. A ``running`` job still belongs to a scheduler
+        and its child process, so it is refused — stop the scheduler instead.
+        """
         job = self.get_job(job_id)
         if job is None:
             raise QueueError(f"unknown job id: {job_id}")
-        if job.state != "queued":
+        if job.state not in _CANCELLABLE_STATES:
             raise QueueError(
                 f"cannot cancel job {job_id}: state is {job.state} "
-                "(only a queued job can be cancelled)"
+                f"(cancellable: {', '.join(sorted(_CANCELLABLE_STATES))})"
             )
         self._set_state(job_id, "cancelled")
+
+    def requeue_job(self, job_id: int, *, now: datetime | None = None) -> None:
+        """Re-arm a finished-or-parked job for the next drain, options intact.
+
+        The exit from ``blocked`` (Story 32.1-002). The version check parks a
+        job carrying a remedy — "reinstall the controller" — and an operator who
+        follows that remedy needs the job to *run*, not to be re-created by hand
+        from options `queue list` does not even display. Also serves a `failed`
+        job worth one more attempt, and un-does a `cancelled`.
+
+        Two shapes, the same ones :meth:`release_claim` draws, and for the same
+        reason — a job that already opened a run must be **resumed, never
+        restarted**:
+
+        * **No ``run_id``** — nothing ran (the version-check park is always
+          this shape), so the job goes back to ``queued`` for a clean start.
+        * **A run exists** — the job returns to ``running`` with an already
+          expired lease, so :meth:`expired_running_jobs` surfaces it to the next
+          `sdlc queue run`, which re-enters through `sdlc resume --run <id>` and
+          picks each story up at the stage it stopped in.
+
+        Refuses a ``running`` job (a live scheduler owns it — stop that
+        scheduler instead) and a ``queued`` one (already armed; silently
+        succeeding would hide a mistyped id). ``options``, ``priority``,
+        ``kind`` and ``scope`` are untouched; only lifecycle fields move.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            raise QueueError(f"unknown job id: {job_id}")
+        if job.state not in _REQUEUEABLE_STATES:
+            raise QueueError(
+                f"cannot requeue job {job_id}: state is {job.state} "
+                f"(requeueable: {', '.join(sorted(_REQUEUEABLE_STATES))})"
+            )
+        moment = _at(now).isoformat()
+        with self._connect() as conn:
+            if job.run_id:
+                conn.execute(
+                    "UPDATE jobs SET state = 'running', claimed_by = NULL, "
+                    "lease_until = ?, reason = NULL, updated_at = ? WHERE id = ?",
+                    (moment, moment, job_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET state = 'queued', claimed_by = NULL, "
+                    "lease_until = NULL, reason = NULL, updated_at = ? WHERE id = ?",
+                    (moment, job_id),
+                )
 
     def prioritise_job(self, job_id: int, priority_class: str) -> None:
         """Reorder a job by changing its priority class."""
@@ -286,6 +369,227 @@ class QueueStore:
             conn.execute(
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE id = ?",
                 (state, _now_iso(), job_id),
+            )
+
+
+    # --- claims + leases (Story 32.1-002) ---------------------------------
+
+    def peek_claimable(
+        self,
+        *,
+        busy_repos: "set[str] | frozenset[str] | None" = None,
+        now: datetime | None = None,
+    ) -> list[JobRecord]:
+        """Claimable jobs in dispatch order (highest priority, then FIFO).
+
+        A read-only *candidate* list, deliberately separate from
+        :meth:`claim_job`: the scheduler must weigh a job's agent-slot cost
+        before it takes the job, and SQL cannot compute that cost. The claim
+        itself stays a single guarded UPDATE, so losing a race here costs one
+        retry, never a double-run.
+
+        ``busy_repos`` are repo paths already occupied by a live job — the
+        per-repo exclusivity rule (Story 32.1-002 AC2). They are filtered in
+        Python rather than SQL because the set is small (one entry per running
+        job) and an ``IN`` clause built from caller strings is not worth the
+        injection surface.
+        """
+        if not self.db_path.exists():
+            return []
+        cutoff = _at(now).isoformat()
+        excluded = busy_repos or frozenset()
+        query = (
+            "SELECT * FROM jobs WHERE state = 'queued' "
+            "AND (lease_until IS NULL OR lease_until < ?) "
+            "ORDER BY CASE priority "
+            + " ".join(f"WHEN '{name}' THEN {rank}" for name, rank in _PRIORITY_RANK.items())
+            + " ELSE 1 END DESC, created_at ASC, id ASC"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(query, (cutoff,)).fetchall()
+        return [
+            record
+            for record in (_row_to_record(row) for row in rows)
+            if record.repo not in excluded
+        ]
+
+    def claim_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> JobRecord | None:
+        """Take a ``queued`` job under a lease; ``None`` when someone beat us.
+
+        The single guarded UPDATE the story specifies — ``WHERE state='queued'
+        AND (lease_until IS NULL OR lease_until < now)``. SQLite's write lock
+        makes it atomic, so two schedulers racing for the same row produce
+        exactly one winner.
+
+        The guard also carries **per-repo exclusivity** (AC2), not just the row
+        conditions. :meth:`peek_claimable` filters busy repos in Python, which
+        is a read: two schedulers that both peek before either claims would each
+        see one repo idle and each take a *different* queued job in it — two
+        UPDATEs on distinct rows, so both succeed and the repo ends up with two
+        runs. Re-asserting the rule inside the claim closes that window, and
+        costs nothing in the single-scheduler case because the candidate has
+        already passed the same test. It never blocks the row being claimed
+        (that one is still ``queued``, not ``running``).
+        """
+        moment = _at(now)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET state = 'running', claimed_by = ?, lease_until = ?, "
+                "reason = NULL, updated_at = ? "
+                "WHERE id = ? AND state = 'queued' "
+                "AND (lease_until IS NULL OR lease_until < ?) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM jobs AS busy "
+                "  WHERE busy.repo = jobs.repo AND busy.state = 'running'"
+                ")",
+                (
+                    claimed_by,
+                    (moment + timedelta(seconds=lease_seconds)).isoformat(),
+                    moment.isoformat(),
+                    job_id,
+                    moment.isoformat(),
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+        return self.get_job(job_id)
+
+    def reclaim_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> JobRecord | None:
+        """Take over a ``running`` job whose lease lapsed; ``None`` if it did not.
+
+        The killed-scheduler path (AC3). Same atomicity as :meth:`claim_job`,
+        with ``state='running'`` and a *mandatory* expired lease as the guard —
+        a job still under a live lease is never stolen. Liveness of the run's
+        own pid is the caller's check (the registry owns that truth), not this
+        store's.
+        """
+        moment = _at(now)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET claimed_by = ?, lease_until = ?, updated_at = ? "
+                "WHERE id = ? AND state = 'running' "
+                "AND (lease_until IS NULL OR lease_until < ?)",
+                (
+                    claimed_by,
+                    (moment + timedelta(seconds=lease_seconds)).isoformat(),
+                    moment.isoformat(),
+                    job_id,
+                    moment.isoformat(),
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+        return self.get_job(job_id)
+
+    def renew_lease(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Extend our own lease. ``False`` when we no longer hold the job.
+
+        A lost renewal is not fatal — it means another scheduler already
+        reclaimed the job (our process was presumed dead) — but the caller
+        should stop treating the job as its own.
+        """
+        moment = _at(now)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET lease_until = ?, updated_at = ? "
+                "WHERE id = ? AND state = 'running' AND claimed_by = ?",
+                (
+                    (moment + timedelta(seconds=lease_seconds)).isoformat(),
+                    moment.isoformat(),
+                    job_id,
+                    claimed_by,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def release_claim(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Give up a claim on shutdown (Ctrl-C) without losing the job.
+
+        Two shapes, because "release" means different things either side of a
+        started run:
+
+        * **No ``run_id`` yet** — nothing was executed, so the job goes back to
+          ``queued`` and the next scheduler starts it cleanly.
+        * **A run exists** — the run is half-done and must be *resumed*, never
+          restarted, so the job stays ``running`` and only its lease is expired
+          (``lease_until = now``). :meth:`expired_running_jobs` then surfaces
+          it to the next `sdlc queue run`, which re-enters via `sdlc resume`.
+        """
+        job = self.get_job(job_id)
+        if job is None or job.claimed_by != claimed_by:
+            return
+        moment = _at(now).isoformat()
+        with self._connect() as conn:
+            if job.run_id:
+                conn.execute(
+                    "UPDATE jobs SET claimed_by = NULL, lease_until = ?, reason = ?, "
+                    "updated_at = ? WHERE id = ? AND claimed_by = ?",
+                    (moment, reason, moment, job_id, claimed_by),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET state = 'queued', claimed_by = NULL, "
+                    "lease_until = NULL, reason = ?, updated_at = ? "
+                    "WHERE id = ? AND claimed_by = ?",
+                    (reason, moment, job_id, claimed_by),
+                )
+
+    def attach_run(self, job_id: int, run_id: str) -> None:
+        """Link the job to the run its subprocess opened (Story 32.1-001 AC5)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET run_id = ?, updated_at = ? WHERE id = ?",
+                (run_id, _now_iso(), job_id),
+            )
+
+    def finish_job(self, job_id: int, state: str, *, reason: str | None = None) -> None:
+        """Stamp a job terminal (``done``/``failed``/``blocked``) and drop its lease."""
+        if state not in _TERMINAL_STATES:
+            raise QueueError(
+                f"invalid terminal state: {state!r} "
+                f"(expected one of {sorted(_TERMINAL_STATES)})"
+            )
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET state = ?, claimed_by = NULL, lease_until = NULL, "
+                "reason = ?, updated_at = ? WHERE id = ?",
+                (state, reason, _now_iso(), job_id),
+            )
+
+    def set_reason(self, job_id: int, reason: str | None) -> None:
+        """Record why a job is not progressing (e.g. ``repo busy``) without moving it."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET reason = ?, updated_at = ? WHERE id = ?",
+                (reason, _now_iso(), job_id),
             )
 
     # --- readers ----------------------------------------------------------
@@ -321,6 +625,41 @@ class QueueStore:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [_row_to_record(row) for row in rows]
+
+    def expired_running_jobs(self, *, now: datetime | None = None) -> list[JobRecord]:
+        """``running`` jobs whose lease lapsed — reclaim candidates (AC3).
+
+        A lapsed lease only means *no scheduler is renewing this job*. Whether
+        the run itself is still alive is a separate question the caller answers
+        against the registry's pid liveness; a job whose pid still answers is
+        left alone.
+        """
+        if not self.db_path.exists():
+            return []
+        cutoff = _at(now).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE state = 'running' "
+                "AND (lease_until IS NULL OR lease_until < ?) "
+                "ORDER BY id ASC",
+                (cutoff,),
+            ).fetchall()
+        return [_row_to_record(row) for row in rows]
+
+    def running_repos(self) -> set[str]:
+        """Repo paths with a ``running`` job — the per-repo exclusivity set (AC2).
+
+        Read from the store rather than from one scheduler's in-memory state so
+        two `sdlc queue run` processes on the same host still never put two
+        runs in one repo.
+        """
+        if not self.db_path.exists():
+            return set()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT repo FROM jobs WHERE state = 'running'"
+            ).fetchall()
+        return {row["repo"] for row in rows}
 
     def counts_by_state(self) -> dict[str, int]:
         """Job counts grouped by lifecycle state, for `sdlc doctor`."""
