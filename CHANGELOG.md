@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.65.0] - 2026-09-07
+
+### Added
+
+- feat(development-queue): status markers off the shared (#32.1-003)
+
+
 ## [v2.64.0] - 2026-09-07
 
 ### Added
