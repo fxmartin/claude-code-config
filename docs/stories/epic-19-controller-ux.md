@@ -1,6 +1,7 @@
 # Epic 19: Controller UX & Ergonomics
 
-> **Status: COMPLETE (3/3)** — all stories merged on `main` (2026-06-25, parallel
+> **Status: IN PROGRESS (3/4)** — 19.2-003 added 2026-09-07 (sidebar status filter,
+> not yet built). The original three merged on `main` (2026-06-25, parallel
 > run 1ac839c4): multi-epic build scope 19.1-001 (#193), dashboard sidebar
 > active-vs-finished 19.2-001 (#192), live per-story parallel progress 19.2-002
 > (#194). Created 2026-06-25. Quality-of-life improvements to the
@@ -192,6 +193,73 @@ beyond confirming the bar width derives from live `done/total`.
 **Risk Level**: Medium — touches the parallel executor's status/count writes
 (`controller/src/sdlc/build.py`); must stay idempotent with the existing barrier
 finalize and not regress serial mode. No `.sh`/`.github` (no high-risk gate).
+
+##### Story 19.2-003: Dashboard sidebar — filter runs by status
+
+**User Story**: As someone watching the dashboard with runs from several repos
+listed, I want to filter the left RUNS sidebar by status — any combination of
+STARTED, DONE, FAILED, ABORTED, RATE_LIMITED, NEEDS_ATTENTION, AWAITING_APPROVAL,
+DEAD — with a count per status, so that "what needs me right now" is one gesture
+instead of a scroll through a week of finished runs.
+
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** the RUNS sidebar **When** rendered **Then** a row of status chips sits
+  above the list, one per status *present in the registry* (absent statuses are
+  not shown), each carrying its live count, e.g. `STARTED 2 · DONE 14 · FAILED 3`;
+  chips use the existing badge colours so the vocabulary matches the cards.
+- **Given** chips **When** one is tapped **Then** it toggles; any combination may
+  be selected; the list shows only runs whose status is selected; an `all` chip
+  (or tapping the last selected chip off) clears the filter. Filtering never
+  changes the sort order 19.2-001 established.
+- **Given** a filter that excludes `STARTED` **When** a run is live **Then** live
+  runs are **always listed regardless of the filter** — a persisted "DONE only"
+  can never hide something in flight; the chip row makes this visible (e.g. the
+  STARTED chip renders as pinned/always-on).
+- **Given** the selected run (`.active`) is filtered out **When** the filter
+  applies **Then** the detail pane keeps showing it and the sidebar shows a
+  one-line "selected run hidden by filter" hint with a clear action — the
+  selection is never silently orphaned.
+- **Given** the live tick (SSE) re-renders the sidebar **When** counts or statuses
+  change **Then** the chips update in place and the filter persists across the
+  re-render; the stable-height rule from 11.2-011 holds (no screen jump).
+- **Given** the filter **When** the page is reloaded **Then** it is restored from
+  `localStorage` under a namespaced key, with every storage access guarded —
+  browsers can throw on `localStorage` — and the page renders unfiltered with no
+  stored value.
+- **Given** the status vocabulary **Then** the chips are driven by the statuses
+  the server actually reports (`derive_state`, incl. `DEAD`) and the
+  `IN_PROGRESS → STARTED` display mapping from 11.2-009, not a hardcoded list —
+  a new status shows up as a chip with no dashboard change.
+
+**Technical Notes**: Sidebar render is `renderRuns()`
+(`controller/src/sdlc/dashboard.py:715-740`); statuses arrive as
+`derive_state(rec)` (`:150`). Reuse `ORDER` (`:562`) for chip order and
+`statusLabel`/`LABELS` (`:576-577`) plus `badge()` (`:586`) for chip text and
+colour, so chips and cards can never disagree. The filter is a `Set` of statuses
+held beside `sel` (`:563`) and applied inside `renderRuns` before the HTML is
+built; the click handler at `:933` gets a sibling for the chip row. Persistence
+follows the Runs-toggle pattern exactly (`SIDE_KEY`, `:1127-1133`: namespaced
+key, `try/catch` on every access, restore on load). Keep the always-visible rule
+for live runs in the filter function, not in CSS, so it is testable. No server
+change: everything needed is already in the `/api/status` payload.
+
+**Definition of Done**:
+- [ ] Chip row with per-status counts, derived from reported statuses; multi-select
+      toggle; `all` reset; sort order unchanged
+- [ ] Live runs always listed; hidden-selection hint; stable height on re-render
+- [ ] Persisted per browser under a namespaced key with guarded storage access
+- [ ] Render tests: chips emitted with counts, filter markup present, storage key
+      and guard present (the 19.2-001 / sidebar-toggle assertion style); a
+      Playwright pass mirroring the sidebar-toggle verification (toggle a chip,
+      reload, filter restored, live run still visible)
+- [ ] No regression to the "● Live (latest)" entry, selection, or 19.2-001 styling
+
+**Dependencies**: 19.2-001 (COMPLETE); Epic-11 11.2-002/11.2-009 (COMPLETE)
+**Risk Level**: Low — render-only JS/CSS in `dashboard.py`; no controller or
+ledger logic; no `.sh`/`.github` (no high-risk gate)
 
 ## Epic Complete When
 - `sdlc build`/`resume` accept multiple explicit epic/story scopes (union + dedup,
