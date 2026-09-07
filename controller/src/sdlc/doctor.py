@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+import yaml
+
 from sdlc import __version__ as INSTALLED_VERSION
 from sdlc.build import _MIGRATIONS, Ledger, list_stashes, status_snapshot
 from sdlc.harness import DEFAULT_HARNESS
@@ -26,6 +28,7 @@ __all__ = [
     "Finding",
     "DoctorReport",
     "check_controller_version",
+    "check_deny_baseline",
     "check_glab_dependency",
     "check_harness_pin",
     "check_model_coverage",
@@ -617,6 +620,99 @@ def check_harness_pin(
     )
 
 
+def check_deny_baseline(
+    repo_root: Path, *, registry_path: Path | None = None
+) -> Finding:
+    """Report which harnesses lack the deny baseline, and whether this repo
+    routes a host-auth role to one (issue #654).
+
+    `dispatch.DENY_BASELINE` — the Story 13.1-001 secret/egress floor — decorates
+    only the argv the controller assembles itself. A registry harness renders its
+    own command template, so it receives no deny rules at all. That gap was
+    invisible: nothing named which harnesses lacked the floor.
+
+    * **WARN** — this repo's effective routing puts a host-auth role (merge,
+      review) on an undenied harness, so `sdlc build` / `sdlc fix` refuse to
+      start here unless `--allow-undenied` is passed.
+    * **CLEAN** — no host-auth role is routed to one. The detail still *lists*
+      the undenied harnesses, because routing a non-host-auth role (build,
+      coverage, docs) to them is a supported configuration worth knowing about,
+      not a problem to fix.
+    * **FAIL** — the registry itself does not parse (every routed run fails).
+    """
+    name = "Harness deny baseline"
+    from sdlc.degradation import DENY_BASELINE_CAPABILITY, HOST_AUTH_ROLES
+    from sdlc.harness import HarnessError, load_harnesses_config
+    from sdlc.role_routing import (
+        HARNESS_OVERRIDE_FILENAME,
+        RoleRoutingError,
+        apply_registry_default,
+        default_registry_path,
+        load_repo_harness_defaults,
+        merge_harness_defaults,
+        undenied_host_auth_routes,
+    )
+
+    path = registry_path if registry_path is not None else default_registry_path()
+    if path is None or not Path(path).exists():
+        return Finding(
+            "harness", name, "CLEAN",
+            "no harness registry wired; only the built-in claude slot dispatches, "
+            "and it carries the deny baseline",
+        )
+    try:
+        registry = load_harnesses_config(path)
+    except HarnessError as exc:
+        return Finding(
+            "harness", name, "FAIL",
+            f"harness registry is invalid: {exc}",
+            "fix the harness registry — every routed run fails until it parses",
+        )
+
+    undenied = sorted(
+        harness_name
+        for harness_name, harness in registry.items()
+        if harness.enabled
+        and not harness.capabilities.get(DENY_BASELINE_CAPABILITY, False)
+    )
+    inventory = (
+        f"harness(es) without the deny baseline: {', '.join(undenied)}"
+        if undenied
+        else "every enabled harness declares deny_baseline"
+    )
+
+    # What this repo would actually dispatch with: the same precedence a run
+    # resolves (repo `.sdlc-harness.yaml` > registry `default:`), minus the
+    # `--harness` flag, which is per-invocation and not inspectable from here.
+    try:
+        file_default, file_roles = load_repo_harness_defaults(
+            override_path=repo_root / HARNESS_OVERRIDE_FILENAME
+        )
+    except RoleRoutingError:
+        # A broken pin is `check_harness_pin`'s FAIL to report, not ours.
+        file_default, file_roles = None, {}
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    reg_default = raw.get("default") if isinstance(raw, dict) else None
+    effective = apply_registry_default(
+        merge_harness_defaults(None, file_default, file_roles),
+        str(reg_default) if reg_default else None,
+    )
+    routed = undenied_host_auth_routes(effective, config_path=path)
+    if not routed:
+        return Finding("harness", name, "CLEAN", inventory)
+
+    pairs = ", ".join(f"{role}={harness}" for role, harness in routed)
+    roles = "/".join(HOST_AUTH_ROLES)
+    return Finding(
+        "harness", name, "WARN",
+        f"{inventory}; this repo routes host-auth role(s) {pairs} to one, so a "
+        "merge/review agent would run with no secret/egress floor",
+        f"route the host-auth roles ({roles}) to a harness that declares "
+        "deny_baseline — `sdlc build` / `sdlc fix` refuse such a route unless "
+        "`--allow-undenied` (issue #654)",
+    )
+
+
 def check_usage_agreement(
     db_path: Path,
     *,
@@ -1067,6 +1163,7 @@ def run_doctor(
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
         check_config(repo_root),
         check_harness_pin(repo_root),
+        check_deny_baseline(repo_root),
         check_usage_agreement(db_path),
         check_model_coverage(db_path),
         check_model_routing(db_path),

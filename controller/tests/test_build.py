@@ -359,7 +359,12 @@ def test_run_build_per_role_harness_map_logs_routing_and_labels_default_slot(
     the work."""
     monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
     db = tmp_path / "ledger.db"
-    opts = BuildOptions(scope="epic-99", skip_preflight=True, sequential=True)
+    opts = BuildOptions(
+        scope="epic-99", skip_preflight=True, sequential=True,
+        # Issue #654: the full-codex map includes the host-auth review/merge
+        # roles; this test is about the routing *log line*, not the gate.
+        allow_undenied=True,
+    )
     opts.harness_map = {
         "build": "codex",
         "coverage": "codex",

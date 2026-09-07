@@ -275,6 +275,9 @@ def test_build_loop_launches_each_codex_stage_with_its_mapped_model(tmp_path, mo
     opts = BuildOptions(
         scope="epic-99", skip_preflight=True, sequential=True,
         harness_map={role: "codex" for role in PIPELINE_ROLES},
+        # Issue #654: routes the host-auth review/merge role(s) to codex to
+        # exercise dispatch routing, not the deny-baseline gate.
+        allow_undenied=True,
     )
     run_build(
         opts,

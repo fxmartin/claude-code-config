@@ -100,10 +100,49 @@ crashing a parallel cohort mid-run.
 | `json_contract`      | Emits the `<<<RESULT_JSON>>>` block.                               |
 | `usage_tracking`     | Reports token usage / cost. Declaring it `false` (or omitting it) makes every token and cost figure for this harness **unavailable** — `—`, never `0` — in the ledger, scoreboard and dashboard, and makes the token/cost axes *not comparable* in `sdlc eval-compare` (31.2-002). Flip it to `true` when the adapter grows real usage telemetry; nothing else has to change. |
 | `rate_limit_aware`   | Surfaces a recoverable, time-based rate-limit signal.             |
+| `deny_baseline`      | The harness's dispatched command carries the deny baseline (`dispatch.DENY_BASELINE` — the Story 13.1-001 secret/egress floor). **Only the built-in `claude` slot can honestly claim this**, because it is the one slot whose argv the controller assembles itself (`resolve_agent_cmd` appends the rules as `--disallowedTools`). Your harness renders its own command template, so it receives no deny rules at all — declare it `false` (or omit it). See [Host-auth roles and the deny baseline](#host-auth-roles-and-the-deny-baseline) below. |
 
 Optionally add a `probe:` command (a cheap "is the CLI installed/authenticated?"
 check). A zero exit means available; a non-zero exit degrades to a warning in
 preflight rather than a mid-run crash. Omit it to skip the check.
+
+### Host-auth roles and the deny baseline
+
+Two pipeline roles can invoke *mutating* `gh`/`glab` operations, so their agent
+holds real host credentials: **`merge`** (it lands the change request) and, by
+default, **`review`** (it posts reviews). These are the *host-auth roles*
+(`sdlc.degradation.HOST_AUTH_ROLES`) — a small pipeline-level constant, not a
+per-harness declaration.
+
+Routing a host-auth role to a harness without `deny_baseline` would hand an
+agent host credentials with the secret/egress floor (`~/.ssh`, `~/.aws`,
+`**/.env`, `curl … | bash`, `gh pr merge --admin`) silently dropped. `sdlc build`
+and `sdlc fix` therefore **refuse to start** on such a route — before preflight,
+before the ledger, before any dispatch:
+
+```
+$ sdlc build epic-20 --harness merge=opencode
+UNDENIED_HOST_AUTH: refusing to start — host-auth role(s) merge=opencode are routed
+to a harness that renders no deny baseline, …
+```
+
+Three things this deliberately is *not*:
+
+- **Not a shim.** There is no wrapper-level path guard. A guard that gave false
+  confidence about `.env`/`.ssh` protection would be worse than the documented
+  gap, so the controller refuses instead of pretending (issue #654).
+- **Not a restriction on ordinary work.** `build`, `coverage` and `docs` route to
+  any harness exactly as before — this narrows only what a non-Claude harness may
+  do *with credentials*, not what it may read.
+- **Not a silent downgrade.** The degradation matrix records it as a *refusal*
+  (`DegradationKind.UNDENIED_HOST_AUTH`, `refusal=True`), never a fallback.
+
+Accept the gap explicitly with `--allow-undenied` on either command. The run then
+proceeds, prints the bypass line at preflight, and records a `warn` ledger event
+naming the role and harness — the same explicit-opt-out pattern as
+`--allow-dirty`. `sdlc doctor`'s **Harness deny baseline** check lists every
+harness lacking the floor, and warns when this repo's own pin routes a host-auth
+role to one.
 
 ### 5. Cost metering (optional, Story 31.2-003)
 

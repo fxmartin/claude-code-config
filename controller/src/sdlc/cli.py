@@ -169,6 +169,8 @@ Flags:
   --skip-coverage           build agent opens the PR directly (no coverage gate)
   --skip-preflight          skip the preflight quality gate
   --rebuild                 rebuild stories the epic already marks Done
+  --allow-undenied          start even with a host-auth role (merge/review) routed
+                            to a harness that renders no deny baseline (issue #654)
   --sequential              one story at a time (no cohort parallelism)
   --concurrency=N           max stories of a cohort to run at once in parallel
                             mode (default 5; --sequential forces 1)
@@ -367,6 +369,17 @@ def build(ctx: typer.Context) -> None:
         )
         raise typer.Exit(code=1)
 
+    if result.undenied_host_auth:
+        # Issue #654: refused before any dispatch — a host-auth role was routed to
+        # a harness that renders no deny baseline.
+        from sdlc.role_routing import format_undenied_host_auth
+
+        typer.echo(
+            format_undenied_host_auth(result.undenied_host_auth, "sdlc build"),
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     if result.preflight_failed:
         typer.echo(
             "PRE_FLIGHT_FAILURE: test suite is red on main — fix before building.",
@@ -460,6 +473,8 @@ Flags:
   --coverage-threshold=N    required new-code coverage % (default 90)
   --skip-preflight          skip the preflight quality gate
   --allow-dirty             start even with uncommitted changes (issue #590)
+  --allow-undenied          start even with a host-auth role (merge/review) routed
+                            to a harness that renders no deny baseline (issue #654)
   --force                   take over a run/scope another (dead) process still shows live (issue #595)
   --e2e-gate=warn|off       run the advisory E2E gate after review (default off)
   --skip-e2e                alias for --e2e-gate=off
@@ -526,6 +541,16 @@ def fix(ctx: typer.Context) -> None:
         )
         raise typer.Exit(code=1)
 
+    if result.undenied_host_auth:
+        # Issue #654: refused before any dispatch — a host-auth role was routed to
+        # a harness that renders no deny baseline.
+        from sdlc.role_routing import format_undenied_host_auth
+
+        typer.echo(
+            format_undenied_host_auth(result.undenied_host_auth, "sdlc fix"), err=True
+        )
+        raise typer.Exit(code=1)
+
     if result.preflight_failed:
         typer.echo(
             "PRE_FLIGHT_FAILURE: test suite is red on main — fix before running `sdlc fix`.",
@@ -566,6 +591,16 @@ def _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view) -> None:
 
         typer.echo(
             format_dirty_tree(Path.cwd(), result.dirty_tree, "sdlc fix"), err=True
+        )
+        raise typer.Exit(code=1)
+
+    if result.undenied_host_auth:
+        # Issue #654: refused before any dispatch — a host-auth role was routed to
+        # a harness that renders no deny baseline.
+        from sdlc.role_routing import format_undenied_host_auth
+
+        typer.echo(
+            format_undenied_host_auth(result.undenied_host_auth, "sdlc fix"), err=True
         )
         raise typer.Exit(code=1)
 

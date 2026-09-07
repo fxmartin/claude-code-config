@@ -54,6 +54,12 @@ harnesses:
       json_contract: true
       usage_tracking: true
       rate_limit_aware: true
+      # Issue #654: the ONLY slot that receives dispatch.DENY_BASELINE — the
+      # controller assembles this argv itself (resolve_agent_cmd appends the
+      # rules as --disallowedTools), so the Story 13.1-001 secret/egress floor
+      # actually holds here. Every registry harness below renders its own
+      # command template and therefore declares this false.
+      deny_baseline: true
 
   # First concrete non-Claude adapter (Story 20.3-001). The wrapper
   # `scripts/codex-build-adapter.sh` receives the assembled prompt on stdin, runs
@@ -95,6 +101,10 @@ harnesses:
       json_contract: true
       usage_tracking: false
       rate_limit_aware: false
+      # Issue #654: this harness renders its own command template, so it never
+      # receives dispatch.DENY_BASELINE. Routing a host-auth role (merge, and by
+      # default review) here is refused at preflight unless `--allow-undenied`.
+      deny_baseline: false
 
   # Qwen Code adapter. The wrapper receives the assembled prompt on stdin and
   # runs Qwen Code headlessly with `qwen -p "$prompt"`, forwarding the neutral
@@ -146,6 +156,10 @@ harnesses:
       json_contract: true
       usage_tracking: false
       rate_limit_aware: false
+      # Issue #654: this harness renders its own command template, so it never
+      # receives dispatch.DENY_BASELINE. Routing a host-auth role (merge, and by
+      # default review) here is refused at preflight unless `--allow-undenied`.
+      deny_baseline: false
 
   # OpenCode adapter (Story 29.2-001). The wrapper receives the assembled
   # prompt on stdin and runs OpenCode headlessly via `opencode run --pure
@@ -242,3 +256,6 @@ harnesses:
       json_contract: true
       usage_tracking: true
       rate_limit_aware: false
+      # Issue #654: as for codex/qwen — an own-template harness gets no deny
+      # baseline, so host-auth roles are refused here unless `--allow-undenied`.
+      deny_baseline: false

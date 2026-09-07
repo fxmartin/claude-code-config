@@ -67,6 +67,9 @@ def _run(tmp_path, monkeypatch, *, files: list[str], cr: int | None = 100,
     opts = BuildOptions(
         scope="epic-27", skip_preflight=True, sequential=True,
         harness_map=dict(harness_map or {}),
+        # Issue #654: these tests route the host-auth `review` role to codex to
+        # exercise the adversarial-review slot, not the deny-baseline gate.
+        allow_undenied=True,
     )
     run_build(
         opts, queue=[_story()], ledger=ledger, dispatcher=disp,
