@@ -306,7 +306,7 @@ def check_ledger(db_path: Path) -> Finding:
             "no ledger yet — nothing has been built in this repo",
         )
 
-    expected = {version for version, *_ in _MIGRATIONS}
+    expected = {version: name for version, name, *_ in _MIGRATIONS}
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     except sqlite3.Error as exc:
@@ -320,8 +320,8 @@ def check_ledger(db_path: Path) -> Finding:
     try:
         try:
             applied = {
-                row[0]
-                for row in conn.execute("SELECT version FROM _migrations").fetchall()
+                row[0]: row[1]
+                for row in conn.execute("SELECT version, name FROM _migrations").fetchall()
             }
         except sqlite3.DatabaseError:
             # Either the file is corrupt or it predates the migration framework
@@ -356,7 +356,12 @@ def check_ledger(db_path: Path) -> Finding:
     finally:
         conn.close()
 
-    missing = expected - applied
+    # Name-aware, not version-only (Issue #621): a ledger bootstrapped before a
+    # migration renumbering can hold a stale row (e.g. legacy ``(1, 'init')``)
+    # whose version matches but whose name disagrees with the migration's
+    # current identity. Comparing names as well as versions surfaces that drift
+    # as behind-schema instead of falsely reporting CLEAN.
+    missing = {version for version, name in expected.items() if applied.get(version) != name}
     if missing:
         return Finding(
             "ledger",
@@ -389,7 +394,7 @@ def check_queue(queue_path: Path) -> Finding:
             "no queue yet — nothing has been enqueued on this host",
         )
 
-    expected = {version for version, *_ in _QUEUE_MIGRATIONS}
+    expected = {version: name for version, name, *_ in _QUEUE_MIGRATIONS}
     try:
         conn = sqlite3.connect(f"file:{queue_path}?mode=ro", uri=True, timeout=2.0)
     except sqlite3.Error as exc:
@@ -403,8 +408,8 @@ def check_queue(queue_path: Path) -> Finding:
     try:
         try:
             applied = {
-                row[0]
-                for row in conn.execute("SELECT version FROM _migrations").fetchall()
+                row[0]: row[1]
+                for row in conn.execute("SELECT version, name FROM _migrations").fetchall()
             }
         except sqlite3.DatabaseError:
             try:
@@ -443,7 +448,8 @@ def check_queue(queue_path: Path) -> Finding:
         if counts
         else "no jobs recorded"
     )
-    missing = expected - applied
+    # Name-aware, not version-only (Issue #621) — see check_ledger.
+    missing = {version for version, name in expected.items() if applied.get(version) != name}
     if missing:
         return Finding(
             "queue",

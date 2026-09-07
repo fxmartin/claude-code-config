@@ -361,6 +361,64 @@ def test_migrate_registry_ledgers_skips_corrupt_existing_db(tmp_path: Path) -> N
     assert _USAGE_COLS <= _columns(good_db, "stages")  # the valid ledger migrated
 
 
+# --- Issue #621: version-only idempotency swallows a renumbered migration ---
+
+
+def test_ensure_migrated_applies_migration_1_despite_legacy_init_row(
+    tmp_path: Path,
+) -> None:
+    """A ledger bootstrapped before the migration renumbering records
+    ``(1, 'init')`` in ``_migrations`` — a stale bookkeeping row that predates
+    Migration 1 being named/defined as "stage usage columns". A version-only
+    idempotency check treats that row as proof migration 1 already ran and
+    skips it forever, so the six usage columns are never added and the ledger
+    looks healthy (versions 2-17 apply fine) right up until a stage tries to
+    record usage. ensure_migrated must apply migration 1 anyway when its
+    recorded name disagrees with the current definition.
+    """
+    db = tmp_path / "legacy.db"
+    _old_schema_db(db, with_run=True)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("INSERT INTO _migrations(version, name) VALUES (1, 'init')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    Ledger(db).ensure_migrated()
+
+    assert _USAGE_COLS <= _columns(db, "stages")
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+    conn = sqlite3.connect(db)
+    try:
+        name = conn.execute(
+            "SELECT name FROM _migrations WHERE version = 1"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert name == "stage usage columns"  # legacy 'init' name corrected
+
+
+def test_ensure_migrated_legacy_init_row_is_idempotent(tmp_path: Path) -> None:
+    """Reconciling the legacy ``(1, 'init')`` row must not re-run migration 1
+    on every launch — after the first correction, its name matches and it is
+    skipped like any other applied migration."""
+    db = tmp_path / "legacy.db"
+    _old_schema_db(db, with_run=True)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("INSERT INTO _migrations(version, name) VALUES (1, 'init')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    Ledger(db).ensure_migrated()
+    Ledger(db).ensure_migrated()  # second pass must not raise (no duplicate ALTER)
+
+    assert _USAGE_COLS <= _columns(db, "stages")
+    assert _versions(db) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+
+
 # --- Story 28.2-001: predictor-feature columns -------------------------------
 
 # The three predictor-feature columns Story 28.2-001 adds to `stories`.

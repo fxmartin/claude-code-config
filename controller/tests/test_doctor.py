@@ -197,6 +197,22 @@ def test_ledger_pre_migration_framework_warns(tmp_path: Path) -> None:
     assert _finding(report, "ledger").status == "WARN"
 
 
+def test_ledger_renumbered_migration_with_stale_name_warns(tmp_path: Path) -> None:
+    """Issue #621: a ledger bootstrapped before a migration renumbering can
+    hold a bookkeeping row whose version matches migration 1 but whose name
+    is the old ``'init'`` identity rather than "stage usage columns". A
+    version-only comparison would call this schema current (false CLEAN);
+    the name-aware check must flag it as behind instead."""
+    db = _fresh_ledger(tmp_path)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE _migrations SET name = 'init' WHERE version = 1")
+    report = _doctor(tmp_path, db_path=db)
+    ledger = _finding(report, "ledger")
+    assert ledger.status == "WARN"
+    assert "1" in ledger.detail
+    assert ledger.remedy
+
+
 def test_ledger_that_cannot_be_opened_fails(tmp_path: Path) -> None:
     """A path that exists but is not an openable database is a FAIL, not a crash."""
     db = tmp_path / "ledger-is-a-directory.db"
@@ -288,6 +304,27 @@ def test_queue_stale_schema_warns(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         doctor_mod, "_QUEUE_MIGRATIONS", [(999, "future_migration", "jobs", [], None)]
     )
+
+    report = _doctor(tmp_path, queue_path=queue_path)
+    queue = _finding(report, "queue")
+    assert queue.status == "WARN"
+    assert queue.remedy
+
+
+def test_queue_renumbered_migration_with_stale_name_warns(tmp_path: Path) -> None:
+    """Mirrors test_ledger_renumbered_migration_with_stale_name_warns for the
+    queue's own _MIGRATIONS/_apply_migrations mirror (Issue #621)."""
+    from sdlc.queue import QueueStore
+
+    queue_path = tmp_path / "queue.db"
+    QueueStore(queue_path).init()
+    with sqlite3.connect(queue_path) as conn:
+        newest_name = conn.execute(
+            "SELECT name FROM _migrations WHERE version = 1"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE _migrations SET name = ? WHERE version = 1", (f"stale-{newest_name}",)
+        )
 
     report = _doctor(tmp_path, queue_path=queue_path)
     queue = _finding(report, "queue")
