@@ -369,10 +369,10 @@ def test_bugfix_contract_error_story_fails(tmp_path) -> None:
 def test_dispatch_raises_on_file_not_found(monkeypatch) -> None:
     """FileNotFoundError from subprocess is wrapped as AgentDispatchError."""
 
-    def fake_run(cmd, **kwargs):
+    def boom(*a, **kw):
         raise FileNotFoundError("No such file: fake-claude")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", boom)
     with pytest.raises(AgentDispatchError, match="could not launch"):
         dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
 
@@ -380,10 +380,10 @@ def test_dispatch_raises_on_file_not_found(monkeypatch) -> None:
 def test_dispatch_raises_on_os_error(monkeypatch) -> None:
     """An OSError from subprocess (e.g. permission denied) is also wrapped."""
 
-    def fake_run(cmd, **kwargs):
+    def boom(*a, **kw):
         raise OSError("Permission denied")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", boom)
     with pytest.raises(AgentDispatchError, match="could not launch"):
         dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
 

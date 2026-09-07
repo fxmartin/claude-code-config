@@ -16,6 +16,7 @@ from sdlc.dispatch import AgentDispatchError
 from sdlc.harness import dispatch_on_harness, load_harnesses_config, resolve_harness
 from sdlc.parsers import OPENCODE_PARSER_ID, OpenCodeJsonParser, get_parser
 from sdlc.role_routing import PIPELINE_ROLES, resolve_role_routing
+from test_dispatch import _popen
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
 
@@ -163,7 +164,7 @@ def test_build_agent_round_trips_through_opencode(monkeypatch) -> None:
         seen_input.append(kwargs.get("input"))
         return _FakeCompleted(_wrap(_VALID_BUILD))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", _popen(fake_run))
 
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     result = dispatch_on_harness(opencode, "build", "build story with opencode")
@@ -189,7 +190,7 @@ def test_build_agent_round_trip_through_opencode_records_real_usage(monkeypatch)
     """Story 29.2-003 AC1/DoD: a real `--format json` stream's `step_finish`
     tokens/cost land on the AgentResult the ledger's `stage_set_usage` reads —
     the "dashboard/ledger show real usage on an opencode-routed stage" bar."""
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap_ndjson(_VALID_BUILD)))
+    monkeypatch.setattr(subprocess, "Popen", _popen(lambda cmd, **kw: _FakeCompleted(_wrap_ndjson(_VALID_BUILD))))
 
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     result = dispatch_on_harness(opencode, "build", "build story with opencode")
@@ -210,9 +211,7 @@ def test_coverage_agent_round_trips_through_opencode(monkeypatch) -> None:
     """Only the build role is proven live per the story's field finding — this
     proves the coverage role at least round-trips through the same wrapper and
     parser, so "any pipeline role" is not resting solely on the build self-test."""
-    monkeypatch.setattr(
-        subprocess, "run", lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_COVERAGE))
-    )
+    monkeypatch.setattr(subprocess, "Popen", _popen(lambda cmd, **kw: _FakeCompleted(_wrap(_VALID_COVERAGE))))
 
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     result = dispatch_on_harness(opencode, "coverage", "qa story with opencode")
@@ -223,11 +222,7 @@ def test_coverage_agent_round_trips_through_opencode(monkeypatch) -> None:
 
 
 def test_opencode_nonzero_exit_is_plain_dispatch_error(monkeypatch) -> None:
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda cmd, **kw: _FakeCompleted("", returncode=1, stderr="opencode blew up"),
-    )
+    monkeypatch.setattr(subprocess, "Popen", _popen(lambda cmd, **kw: _FakeCompleted("", returncode=1, stderr="opencode blew up")))
 
     opencode = resolve_harness("opencode", config_path=CONFIG_PATH)
     with pytest.raises(AgentDispatchError) as excinfo:

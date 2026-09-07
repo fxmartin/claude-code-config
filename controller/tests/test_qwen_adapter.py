@@ -16,6 +16,7 @@ from sdlc.dispatch import AgentDispatchError
 from sdlc.harness import dispatch_on_harness, resolve_harness
 from sdlc.parsers import PlainResultParser, get_parser
 from sdlc.role_routing import PIPELINE_ROLES, resolve_role_routing
+from test_dispatch import _popen
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "src" / "sdlc" / "config" / "harnesses.yaml"
 
@@ -70,7 +71,7 @@ def test_build_agent_round_trips_through_qwen(monkeypatch) -> None:
         seen_input.append(kwargs.get("input"))
         return _FakeCompleted(_wrap(_VALID_BUILD))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", _popen(fake_run))
 
     qwen = resolve_harness("qwen", config_path=CONFIG_PATH)
     result = dispatch_on_harness(qwen, "build", "build story with qwen")
@@ -85,11 +86,7 @@ def test_build_agent_round_trips_through_qwen(monkeypatch) -> None:
 
 
 def test_qwen_nonzero_exit_is_plain_dispatch_error(monkeypatch) -> None:
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda cmd, **kw: _FakeCompleted("", returncode=1, stderr="qwen blew up"),
-    )
+    monkeypatch.setattr(subprocess, "Popen", _popen(lambda cmd, **kw: _FakeCompleted("", returncode=1, stderr="qwen blew up")))
 
     qwen = resolve_harness("qwen", config_path=CONFIG_PATH)
     with pytest.raises(AgentDispatchError) as excinfo:
