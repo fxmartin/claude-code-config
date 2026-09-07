@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.59.2] - 2026-09-07
+
+### Fixed
+
+- fix(dispatch): kill the whole process group on a captured-path timeout (#650)
+
+
 ## [v2.59.1] - 2026-09-06
 
 ### Fixed
