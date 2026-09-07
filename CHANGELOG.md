@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.68.2] - 2026-09-07
+
+### Fixed
+
+- fix(dashboard): scroll wide dag panels instead of overflowing (#655) (#671)
+
+
 ## [v2.68.1] - 2026-09-07
 
 ### Fixed
