@@ -35,8 +35,8 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
 | `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
-| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise` manage (Story 32.1-001). |
-| `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, and reclaim-and-resume for a killed scheduler (Story 32.1-002). |
+| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise` manage (Story 32.1-001), plus the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
+| `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), and the per-job budget breaker (Story 32.3-001). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
 
@@ -1305,7 +1305,8 @@ it on the next real run).
   - **Development queue** (`sdlc/queue.py`, Story 32.1-001) — the host-level
     `queue.db` `sdlc build/fix --enqueue` and `sdlc queue` write to opens
     read-only, every migration is applied, and job counts by lifecycle state
-    (`queued`/`running`/`done`/`failed`/`cancelled`/`blocked`) are reported. Same
+    (`queued`/`running`/`done`/`failed`/`cancelled`/`blocked`/`needs_attention`)
+    are reported. Same
     severity ladder as the ledger check: behind / pre-migration-framework →
     `WARN`; unreadable/corrupt → `FAIL`; no queue yet ("nothing enqueued on
     this host") → `CLEAN`.
@@ -1417,6 +1418,84 @@ reaches the job's own agents rather than just its parent.
   job is reclaimed and re-entered through **`sdlc resume --run <id>`**, never a
   fresh `build`/`fix`: `resume.py` picks each story up at the stage it died in.
   A job claimed but with no run yet goes back to `queued` — nothing to resume.
+- **Priority classes decide claim order.** `peek_claimable` orders by class
+  (`urgent` > `high` > `normal` > `low`), then by age — FIFO inside a class. A
+  job's class is *derived* when nothing says otherwise (`queue.default_priority`,
+  Story 32.3-001): a `fix` job outranks a `build` job, and a `fix` on an issue
+  labelled `bug` outranks one labelled `enhancement` — the same judgement
+  `sdlc fix all` already makes with `_category_rank`, and it reuses `fix all`'s
+  own `_is_bug` predicate so the two orders cannot drift. The four classes are
+  coarser than that three-way rank, so an enhancement and an unlabelled fix share
+  `high`; the classes are an operator vocabulary too (`sdlc queue prioritise
+  <id> <class>`), and more of them would cost more than the ordering is worth.
+  Labels are never *fetched* — `sdlc fix --enqueue 42` must stay offline and
+  instant — so the label half applies where labels are already in hand
+  (`sdlc queue add --label bug`) or after a `prioritise`.
+- **Overlapping jobs in one repo serialise.** Two jobs in the *same* repo whose
+  investigated `files_to_modify` intersect must not run at once — they would race
+  the same paths. `queue.overlap_dependencies` is
+  `fix_issue.build_overlap_dependencies` (issue #436) applied **once per repo**
+  instead of once per `fix all` batch: the same union-find over the file-overlap
+  graph, the same ascending-id chain within each connected component, the same
+  path normalisation, grouped by repo first so two checkouts can never chain to
+  each other however identical their file lists look. `QueueStore.overlap_holds`
+  builds that graph over the *pending* jobs only (`queued` + `running`), which is
+  what makes a hold release itself: the predecessor reaching any terminal drops
+  out of the graph, and its successor is claimable on the next pass with no
+  bookkeeping to unwind. Held jobs are filtered out of `peek_claimable` and
+  stamped `reason=waiting on job N (overlapping files)`. Within a component the
+  chain runs oldest-first, which outranks the priority class — a component is a
+  correctness constraint, and classes order work *across* components. Nothing
+  deadlocks: the head of every chain is always claimable. Today per-repo
+  exclusivity already serialises a whole repo, so this constrains nothing extra;
+  it is what keeps overlapping jobs serial once Story 32.1-003 lets two
+  non-overlapping jobs share a checkout.
+- **Per-job budgets — the outer breaker.** Each job carries its class's budget,
+  frozen onto the row at enqueue and shown in `sdlc queue list` as
+  `<rounds>r/<clock>` (`5r/4h`). Two numbers, because a job runs away in two
+  directions:
+
+  | class | max fix rounds | wall clock |
+  |-------|----------------|------------|
+  | `urgent` | 8 | 8h |
+  | `high` | 5 | 6h |
+  | `normal` | 5 | 4h |
+  | `low` | 3 | 2h |
+
+  A more important job gets more rope, which is the point of having classes.
+  `SDLC_QUEUE_MAX_FIX_ROUNDS` / `SDLC_QUEUE_WALL_CLOCK_MINUTES` override the
+  numbers host-wide for every class; a malformed or non-positive value is
+  ignored rather than honoured, because disarming a breaker by typo is the one
+  failure mode a breaker must not have. `sdlc queue prioritise` re-stamps the
+  budget along with the class — leaving the old one behind would make the move a
+  half-move. Exceeding either ceiling stops the job's process group, parks it
+  **`needs_attention`** with the reason naming which ceiling and by how much, and
+  fires the same `queue_job_finished` notification any other terminal does. The
+  wall clock is measured from *this launch*, so a resumed job gets a fresh one
+  rather than inheriting a dead scheduler's.
+- **Two layers of retry budget, two knobs.** This is deliberately **not** the
+  pipeline's own retry budget, and the two must not be conflated:
+
+  | | `build.MAX_BUGFIX_ATTEMPTS` (=2, `MAX_BUGFIX_ATTEMPTS_SPREAD`=3) | `JobBudget.max_fix_rounds` |
+  |---|---|---|
+  | scope | one **story**'s bugfix loop | the whole **job** |
+  | who enforces | the pipeline, from inside the run | the scheduler, from outside it |
+  | read from | its own in-loop counter | the run's ledger (`stage_breakdown`, `bugfix` rows) |
+  | on exhaustion | the story ends `FAILED`; the run continues | the job is stopped and parked `needs_attention` |
+
+  The inner knob decides when a *story* gives up; the outer one decides when the
+  host stops paying for the *job* at all — a run can thrash story after story
+  while every individual loop stays legal, and that is exactly the cumulative
+  spend the outer breaker exists to cap (REVIEW.md item 8). The scheduler never
+  touches `MAX_BUGFIX_ATTEMPTS`; it only counts the rows that loop already wrote.
+- **`blocked` vs `needs_attention`.** Two parks, two causes, so `queue list`
+  says which happened. `blocked` means the *run* parked itself (rate-limit
+  window, approval gate) or the scheduler refused to start the job at all (stale
+  installed controller). `needs_attention` means the run believed it was making
+  progress and the **queue** stopped it for spending too much. Both are terminal
+  and neither is a dead end: `sdlc queue cancel` retires either, and `sdlc queue
+  requeue` re-arms either with its frozen options intact — as a *resume* when a
+  run was already opened, so the spend so far is not thrown away.
 - **Per-repo exclusivity.** Enforced twice, in the two places it has to be.
   Candidate *selection* reads `running_repos()` from the store — not from one
   scheduler's memory — and skips a busy repo; and `claim_job`'s UPDATE carries

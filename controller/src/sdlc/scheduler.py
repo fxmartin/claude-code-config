@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
-from sdlc.queue import JobRecord, QueueStore
+from sdlc.queue import JobBudget, JobRecord, QueueStore, budget_breach
 from sdlc.registry import Registry, RunRecord, pid_alive
 
 __all__ = [
@@ -30,6 +30,7 @@ __all__ = [
     "agent_slots",
     "controller_argv",
     "job_argv",
+    "ledger_fix_rounds",
     "run_queue",
 ]
 
@@ -85,6 +86,9 @@ class JobProcess(Protocol):
 Launcher = Callable[[Sequence[str], Path], JobProcess]
 Clock = Callable[[], datetime]
 VersionCheck = Callable[[Path], object]
+# ``(ledger_db_path, run_id) -> bugfix rounds burned``. A seam so the budget
+# breaker is testable without standing up a ledger (Story 32.3-001).
+FixRounds = Callable[[str, str], int]
 
 
 @dataclass
@@ -132,6 +136,11 @@ class _InFlight:
     slots: int
     run_id: str | None
     last_renewed: datetime
+    # Story 32.3-001. ``started_at`` is when *this launch* began, so a resumed
+    # job gets a fresh wall clock rather than inheriting the dead scheduler's;
+    # ``budget`` is the class budget frozen on the job at enqueue.
+    started_at: datetime
+    budget: JobBudget
 
 
 class _PopenProcess:
@@ -305,6 +314,35 @@ def terminal_job_state(
     return "done" if exit_code == 0 else "failed"
 
 
+def ledger_fix_rounds(db_path: str, run_id: str) -> int:
+    """How many ``bugfix`` rounds ``run_id`` has burned, from its own ledger.
+
+    The outer half of the two-layer retry budget (Story 32.3-001). The pipeline
+    bounds each *story*'s bugfix loop from the inside with
+    ``build.MAX_BUGFIX_ATTEMPTS``; this counts the same rows from the outside,
+    across every story in the run, so the queue can stop paying for a job that
+    is thrashing story after story while each individual loop stays legal.
+    Deliberately reads ``stage_breakdown`` rather than reaching into the
+    pipeline's counters — the ledger is the run's public record.
+
+    Degrades to ``0`` on any read failure: an unreadable ledger is a reason to
+    leave the breaker un-fired, never a reason to park a healthy job or to take
+    the drain down.
+    """
+    from sdlc.build import Ledger
+
+    try:
+        breakdown = Ledger(Path(db_path)).stage_breakdown(run_id)
+    except Exception:
+        return 0
+    return sum(
+        1
+        for attempts in breakdown.values()
+        for attempt in attempts
+        if attempt.get("name") == "bugfix"
+    )
+
+
 def _default_launcher(argv: Sequence[str], cwd: Path) -> JobProcess:
     """Spawn a job as a detached process group under ``cwd``.
 
@@ -334,6 +372,7 @@ class _Scheduler:
         sleeper: Callable[[float], None],
         notifier: Callable[..., None],
         version_check: VersionCheck,
+        fix_rounds: FixRounds,
         echo: Callable[[str], None],
         identity: str,
     ) -> None:
@@ -345,6 +384,7 @@ class _Scheduler:
         self._sleep = sleeper
         self._notify = notifier
         self._version_check = version_check
+        self._fix_rounds = fix_rounds
         self._echo = echo
         self._identity = identity
         self._in_flight: dict[int, _InFlight] = {}
@@ -357,6 +397,7 @@ class _Scheduler:
             while True:
                 self._attach_runs()
                 self._reap()
+                self._enforce_budgets()
                 self._renew()
                 progressed = self._fill_slots()
                 self._stamp_repo_busy()
@@ -440,7 +481,22 @@ class _Scheduler:
         return None
 
     def _stamp_repo_busy(self) -> None:
-        """Explain a job that could have run but for its repo already being busy."""
+        """Explain a job that could have run but was held back.
+
+        Two reasons a claimable-looking job is standing still, both worth saying
+        out loud in `sdlc queue list`: its repo is already busy (Story 32.1-002
+        AC2), or it overlaps the files of an unfinished peer in that repo
+        (Story 32.3-001 AC2). The overlap set is read separately because
+        :meth:`QueueStore.peek_claimable` has already filtered those jobs out —
+        by construction they are not candidates, so they would otherwise go
+        unexplained.
+        """
+        for job_id, holder in self._store.overlap_holds().items():
+            reason = f"waiting on job {holder} (overlapping files)"
+            job = self._store.get_job(job_id)
+            if job is not None and job.state == "queued" and job.reason != reason:
+                self._store.set_reason(job_id, reason)
+
         busy = self._store.running_repos()
         if not busy:
             return
@@ -487,7 +543,8 @@ class _Scheduler:
 
         self._in_flight[job.id] = _InFlight(
             job=job, proc=proc, slots=cost, run_id=job.run_id,
-            last_renewed=self._clock(),
+            last_renewed=self._clock(), started_at=self._clock(),
+            budget=job.job_budget(),
         )
         if resume:
             self._result.resumed += 1
@@ -543,6 +600,49 @@ class _Scheduler:
                 f"`sdlc resume --run {run_id}`"
             )
         return f"run status {run_status or exit_code}"
+
+    def _enforce_budgets(self) -> None:
+        """Stop and park any in-flight job that has exhausted its budget (AC3).
+
+        Runs *after* :meth:`_reap`, so a job that already exited on its own is
+        never posthumously parked, and before :meth:`_renew`, so a lease is
+        never extended on a job we are about to stop.
+
+        The park is terminal (``needs_attention``) rather than a release,
+        because the whole point is that no scheduler should pick this job up
+        again unattended — a human decides whether the spend was worth
+        continuing. `sdlc queue requeue` is that decision's exit, and for a job
+        that already opened a run it comes back as a *resume*, so the spend so
+        far is not thrown away.
+        """
+        now = self._clock()
+        for job_id, entry in list(self._in_flight.items()):
+            rounds = (
+                self._run_fix_rounds(entry.run_id) if entry.run_id else 0
+            )
+            reason = budget_breach(
+                entry.budget,
+                elapsed_seconds=(now - entry.started_at).total_seconds(),
+                fix_rounds=rounds,
+            )
+            if reason is None:
+                continue
+            del self._in_flight[job_id]
+            try:
+                entry.proc.stop()
+            except OSError as exc:
+                self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            self._store.finish_job(job_id, "needs_attention", reason=reason)
+            self._result.parked += 1
+            self._echo(f"job {job_id} parked (needs_attention): {reason}")
+            self._announce(entry.job, entry.run_id, "needs_attention")
+
+    def _run_fix_rounds(self, run_id: str) -> int:
+        """Fix rounds burned by ``run_id``, via its registry-recorded ledger."""
+        record = self._registry_record(run_id)
+        if record is None:
+            return 0
+        return self._fix_rounds(record.db, run_id)
 
     def _renew(self) -> None:
         now = self._clock()
@@ -660,6 +760,7 @@ def run_queue(
     sleeper: Callable[[float], None] | None = None,
     notifier: Callable[..., None] | None = None,
     version_check: VersionCheck | None = None,
+    fix_rounds: FixRounds | None = None,
     echo: Callable[[str], None] | None = None,
     identity: str | None = None,
 ) -> SchedulerResult:
@@ -669,14 +770,18 @@ def run_queue(
 
     1. link in-flight jobs to the runs their subprocesses registered;
     2. reap finished jobs and mirror the run's terminal status onto the job;
-    3. renew our leases;
-    4. reclaim any lapsed job whose run is genuinely dead and resume it, then
+    3. stop and park any job that has exhausted its per-class budget
+       (Story 32.3-001) — fix rounds read from the run's ledger, wall clock
+       measured from this launch;
+    4. renew our leases;
+    5. reclaim any lapsed job whose run is genuinely dead and resume it, then
        claim fresh work while agent slots and non-busy repos remain.
 
     Every collaborator is injectable so the loop is testable without forking:
     ``launcher`` spawns a job, ``clock``/``sleeper`` drive time, ``registry``
     supplies run liveness, ``version_check`` is Story 15.1-004's per-repo check,
-    and ``notifier`` is the Telegram path.
+    ``fix_rounds`` counts a run's burned bugfix rounds, and ``notifier`` is the
+    Telegram path.
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from
@@ -694,6 +799,7 @@ def run_queue(
         sleeper=sleeper or time.sleep,
         notifier=notifier or notify,
         version_check=version_check or check_controller_version,
+        fix_rounds=fix_rounds or ledger_fix_rounds,
         echo=echo or print,
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
     )

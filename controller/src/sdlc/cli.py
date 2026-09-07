@@ -161,6 +161,12 @@ def _enqueue_job(*, kind: str, scope: str, cli_args: list[str]) -> None:
     internal non-JSON-safe fields) is what makes a replay byte-identical.
     Prints the queued job id; the caller exits 0 immediately after (no run
     starts — AC1/AC2).
+
+    No ``priority`` is passed, so the store derives the class from ``kind``
+    (Story 32.3-001): a `fix` job outranks a `build` job. Labels are
+    deliberately not fetched — enqueueing must stay offline and instant — so
+    the bug-over-enhancement half of that order needs `sdlc queue add --label`
+    or a later `sdlc queue prioritise`.
     """
     from sdlc.queue import QueueStore, default_queue_path
 
@@ -3110,6 +3116,10 @@ def queue_list_cmd(
     Never mutates the store — a host that has never enqueued anything reports
     "no jobs queued" rather than creating an empty one. Sorted highest-priority
     first, then FIFO within a priority class.
+
+    ``BUDGET`` is the job's per-class spend ceiling (Story 32.3-001) as
+    ``<fix rounds>r/<wall clock>`` — e.g. ``5r/4h``. Exceeding either parks the
+    job `needs_attention`.
     """
     from sdlc.queue import QueueStore, default_queue_path
 
@@ -3125,13 +3135,14 @@ def queue_list_cmd(
 
     now = datetime.now(timezone.utc)
     typer.echo(
-        f"{'ID':<6}{'STATE':<11}{'PRIORITY':<10}{'KIND':<7}{'SCOPE':<16}"
-        f"{'AGE':<6}{'RUN':<14}REPO"
+        f"{'ID':<6}{'STATE':<16}{'PRIORITY':<10}{'BUDGET':<9}{'KIND':<7}"
+        f"{'SCOPE':<16}{'AGE':<6}{'RUN':<14}REPO"
     )
     for r in rows:
         run_disp = (r.run_id or "-")[:12]
         typer.echo(
-            f"{r.id:<6}{r.state:<11}{r.priority:<10}{r.kind:<7}{r.scope:<16}"
+            f"{r.id:<6}{r.state:<16}{r.priority:<10}{r.job_budget().label():<9}"
+            f"{r.kind:<7}{r.scope:<16}"
             f"{_format_age(now, r.created_at):<6}{run_disp:<14}{r.repo}"
         )
     raise typer.Exit(code=0)
@@ -3146,8 +3157,19 @@ def queue_add_cmd(
     repo: Path | None = typer.Option(
         None, "--repo", help="Repo path the job runs against (default: cwd)."
     ),
-    priority: str = typer.Option(
-        "normal", "--priority", help="low|normal|high|urgent (default: normal)."
+    priority: str | None = typer.Option(
+        None,
+        "--priority",
+        help="low|normal|high|urgent. Omitted: derived from kind and labels — "
+        "`fix` outranks `build`, a `bug` outranks an `enhancement`, mirroring "
+        "`fix all`'s order.",
+    ),
+    label: list[str] = typer.Option(
+        [],
+        "--label",
+        help="Issue label, repeatable. Only used to derive the priority class "
+        "when --priority is omitted (the enqueue path is offline, so labels are "
+        "never fetched for you).",
     ),
     options: str | None = typer.Option(
         None,
@@ -3165,7 +3187,7 @@ def queue_add_cmd(
     try:
         job_id = store.add_job(
             repo=repo_path, kind=kind, scope=scope, priority=priority,
-            options_json=options,
+            options_json=options, labels=label,
         )
     except QueueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -3210,6 +3232,14 @@ def queue_run_cmd(
     A job whose repo's installed controller disagrees with its own
     `controller/pyproject.toml` is parked `blocked` with the reinstall remedy
     rather than executed on stale code (Story 15.1-004).
+
+    Each job is held to its priority class's budget — max `bugfix` rounds (read
+    from the run's ledger) and a wall-clock cap per launch. Exceeding either
+    stops the job and parks it `needs_attention` with a notification, so a
+    runaway is capped by policy rather than by someone noticing. Override the
+    defaults host-wide with `SDLC_QUEUE_MAX_FIX_ROUNDS` /
+    `SDLC_QUEUE_WALL_CLOCK_MINUTES`. This is the queue's outer breaker; the
+    pipeline's own per-story `MAX_BUGFIX_ATTEMPTS` is untouched.
 
     A killed scheduler loses nothing: the next `sdlc queue run` reclaims every
     job whose lease lapsed and re-enters it through `sdlc resume` — never from
@@ -3298,7 +3328,12 @@ def queue_prioritise_cmd(
     job_id: int = typer.Argument(..., help="Job id to reprioritise."),
     priority_class: str = typer.Argument(..., help="low|normal|high|urgent"),
 ) -> None:
-    """Reorder a job by changing its priority class."""
+    """Reorder a job by changing its priority class.
+
+    The class carries the job's budget (max fix rounds, wall-clock cap), so a
+    move re-stamps it — a job promoted to `urgent` is held to `urgent`'s
+    ceiling from then on, not the one it was enqueued with.
+    """
     from sdlc.queue import QueueError, QueueStore, default_queue_path
 
     store = QueueStore(default_queue_path())

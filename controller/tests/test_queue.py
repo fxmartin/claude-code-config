@@ -53,6 +53,9 @@ def test_init_creates_wal_schema(tmp_path) -> None:
         assert cols == {
             "id", "repo", "kind", "scope", "priority", "state", "claimed_by",
             "lease_until", "run_id", "options", "created_at", "updated_at", "reason",
+            # Story 32.3-001: the frozen per-class budget and the investigated
+            # file set the repo-scoped overlap graph is built from.
+            "budget", "files",
         }
     finally:
         conn.close()
@@ -102,13 +105,14 @@ def test_add_job_records_shape(tmp_path) -> None:
     assert job.created_at
 
 
-def test_add_job_defaults_priority_normal(tmp_path) -> None:
-    from sdlc.queue import QueueStore
+def test_add_job_defaults_priority_from_kind(tmp_path) -> None:
+    """Story 32.3-001: an omitted class is derived, not a flat `normal`."""
+    from sdlc.queue import QueueStore, default_priority
 
     store = QueueStore(tmp_path / "queue.db")
     store.init()
     store.add_job(repo="/repo", kind="fix", scope="42")
-    assert store.list_jobs()[0].priority == "normal"
+    assert store.list_jobs()[0].priority == default_priority("fix")
 
 
 def test_add_job_rejects_unknown_kind(tmp_path) -> None:

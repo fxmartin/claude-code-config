@@ -193,3 +193,72 @@ def test_queue_cancel_accepts_a_blocked_job(tmp_path, monkeypatch) -> None:
 
     after = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
     assert after[0]["state"] == "cancelled"
+
+
+# --- Story 32.3-001: priority classes + budgets on the CLI ------------------
+
+
+def test_queue_add_derives_the_priority_class(tmp_path, monkeypatch) -> None:
+    """`fix` outranks `build` when --priority is omitted."""
+    from sdlc.queue import PRIORITY_CLASSES
+
+    _isolate(tmp_path, monkeypatch)
+    runner.invoke(app, ["queue", "add", "build", "epic-5", "--repo", str(tmp_path)])
+    runner.invoke(app, ["queue", "add", "fix", "42", "--repo", str(tmp_path)])
+
+    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    by_kind = {r["kind"]: r["priority"] for r in rows}
+    assert PRIORITY_CLASSES.index(by_kind["fix"]) > PRIORITY_CLASSES.index(
+        by_kind["build"]
+    )
+
+
+def test_queue_add_label_raises_a_bug_above_an_enhancement(tmp_path, monkeypatch) -> None:
+    from sdlc.queue import PRIORITY_CLASSES
+
+    _isolate(tmp_path, monkeypatch)
+    runner.invoke(
+        app, ["queue", "add", "fix", "1", "--repo", str(tmp_path), "--label", "bug"]
+    )
+    runner.invoke(
+        app,
+        ["queue", "add", "fix", "2", "--repo", str(tmp_path), "--label", "enhancement"],
+    )
+
+    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    by_scope = {r["scope"]: r["priority"] for r in rows}
+    assert PRIORITY_CLASSES.index(by_scope["1"]) > PRIORITY_CLASSES.index(
+        by_scope["2"]
+    )
+
+
+def test_queue_list_shows_the_budget(tmp_path, monkeypatch) -> None:
+    """AC4: the budget is visible in `queue list`."""
+    from sdlc.queue import budget_for
+
+    _isolate(tmp_path, monkeypatch)
+    runner.invoke(
+        app,
+        ["queue", "add", "build", "epic-5", "--repo", str(tmp_path),
+         "--priority", "low"],
+    )
+    result = runner.invoke(app, ["queue", "list"])
+    assert result.exit_code == 0, result.output
+    assert "BUDGET" in result.output
+    assert budget_for("low").label() in result.output
+
+
+def test_queue_prioritise_restamps_the_budget(tmp_path, monkeypatch) -> None:
+    from sdlc.queue import budget_for
+
+    _isolate(tmp_path, monkeypatch)
+    runner.invoke(
+        app,
+        ["queue", "add", "build", "epic-5", "--repo", str(tmp_path),
+         "--priority", "low"],
+    )
+    assert runner.invoke(app, ["queue", "prioritise", "1", "urgent"]).exit_code == 0
+
+    rows = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    assert rows[0]["priority"] == "urgent"
+    assert json.loads(rows[0]["budget"]) == budget_for("urgent").to_dict()
