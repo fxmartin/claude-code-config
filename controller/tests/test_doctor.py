@@ -235,6 +235,66 @@ def test_queue_present_reports_job_counts(tmp_path: Path) -> None:
     assert "1 cancelled" in queue.detail
 
 
+def test_queue_that_cannot_be_opened_fails(tmp_path: Path) -> None:
+    """A path that exists but is not an openable database is a FAIL, not a crash."""
+    queue_path = tmp_path / "queue-is-a-directory.db"
+    queue_path.mkdir()
+    report = _doctor(tmp_path, queue_path=queue_path)
+    queue = _finding(report, "queue")
+    assert queue.status == "FAIL"
+    assert "could not be opened" in queue.detail
+    assert queue.remedy
+
+
+def test_queue_pre_migration_framework_warns(tmp_path: Path) -> None:
+    queue_path = tmp_path / "old-queue.db"
+    # A queue that predates the migration framework: has jobs, no _migrations.
+    with sqlite3.connect(queue_path) as conn:
+        conn.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY, state TEXT)")
+    report = _doctor(tmp_path, queue_path=queue_path)
+    assert _finding(report, "queue").status == "WARN"
+
+
+def test_queue_corrupt_fails(tmp_path: Path) -> None:
+    queue_path = tmp_path / "corrupt-queue.db"
+    queue_path.write_bytes(b"this is not a sqlite database at all")
+    report = _doctor(tmp_path, queue_path=queue_path)
+    assert _finding(report, "queue").status == "FAIL"
+
+
+def test_queue_missing_jobs_table_fails(tmp_path: Path) -> None:
+    """`_migrations` exists but `jobs` does not — the count query itself fails."""
+    queue_path = tmp_path / "half-migrated-queue.db"
+    with sqlite3.connect(queue_path) as conn:
+        conn.execute(
+            "CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT, "
+            "applied_at TIMESTAMP)"
+        )
+    report = _doctor(tmp_path, queue_path=queue_path)
+    queue = _finding(report, "queue")
+    assert queue.status == "FAIL"
+    assert "unreadable" in queue.detail.lower() or "corrupt" in queue.detail.lower()
+
+
+def test_queue_stale_schema_warns(tmp_path: Path, monkeypatch) -> None:
+    from sdlc.queue import QueueStore
+
+    import sdlc.doctor as doctor_mod
+
+    queue_path = tmp_path / "queue.db"
+    QueueStore(queue_path).init()
+    # Today's real `_MIGRATIONS` is empty; simulate a future migration the
+    # on-disk queue hasn't picked up yet.
+    monkeypatch.setattr(
+        doctor_mod, "_QUEUE_MIGRATIONS", [(1, "future_migration", "jobs", [], None)]
+    )
+
+    report = _doctor(tmp_path, queue_path=queue_path)
+    queue = _finding(report, "queue")
+    assert queue.status == "WARN"
+    assert queue.remedy
+
+
 def test_ledger_corrupt_fails(tmp_path: Path) -> None:
     db = tmp_path / "corrupt.db"
     db.write_bytes(b"this is not a sqlite database at all")

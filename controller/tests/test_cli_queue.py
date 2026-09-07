@@ -97,3 +97,36 @@ def test_queue_prioritise_rejects_unknown_class(tmp_path, monkeypatch) -> None:
 
     result = runner.invoke(app, ["queue", "prioritise", str(job_id), "asap"])
     assert result.exit_code == 2
+
+
+# --- `_format_age` edge cases (Story 32.1-001) ------------------------------
+
+
+def test_format_age_minutes_hours_and_days() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from sdlc.cli import _format_age
+
+    now = datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)
+    assert _format_age(now, (now - timedelta(minutes=3)).isoformat()) == "3m"
+    assert _format_age(now, (now - timedelta(hours=2)).isoformat()) == "2h"
+    assert _format_age(now, (now - timedelta(days=5)).isoformat()) == "5d"
+
+
+def test_format_age_naive_created_at_uses_now_tzinfo() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from sdlc.cli import _format_age
+
+    now = datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)
+    naive = (now - timedelta(minutes=10)).replace(tzinfo=None).isoformat()
+    assert _format_age(now, naive) == "10m"
+
+
+def test_format_age_malformed_created_at_returns_placeholder() -> None:
+    from datetime import datetime, timezone
+
+    from sdlc.cli import _format_age
+
+    now = datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)
+    assert _format_age(now, "not-a-timestamp") == "?"
