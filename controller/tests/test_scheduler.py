@@ -1835,6 +1835,64 @@ def test_a_pause_row_with_a_corrupt_probe_stamp_is_probed_immediately(tmp_path) 
     assert scheduler._due_for_probe(naive) is True
 
 
+def test_a_reused_probe_helper_that_itself_raises_keeps_the_window_shut(monkeypatch, tmp_path) -> None:
+    """A failure in `_probe_parked_reset` itself (not the probe callback it
+    wraps — that path is `test_a_probe_that_raises_keeps_the_window_shut`)
+    must never fail the gate open either."""
+    import sdlc.build as build_module
+    from sdlc.capability import ProbeStatus
+    from sdlc.queue import QueuePause
+    from sdlc.scheduler import SchedulerConfig, _Scheduler
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    _, run_id, db = _parked_job(store, registry, tmp_path, "alpha", max_wait_s=18000)
+
+    def exploding_helper(*_args, **_kwargs):
+        raise RuntimeError("the reused helper itself fell over")
+
+    monkeypatch.setattr(build_module, "_probe_parked_reset", exploding_helper)
+
+    scheduler = _Scheduler(
+        store, config=SchedulerConfig(), registry=registry,
+        launcher=FakeLauncher(), clock=Clock(), sleeper=lambda _s: None,
+        notifier=lambda *a, **k: None, version_check=_clean,
+        probe=lambda: ProbeStatus.AVAILABLE,
+        echo=lambda _line: None, identity="test:1",
+    )
+    pause = QueuePause(
+        paused_until="2026-09-07T12:00:00+00:00", paused_at="2026-09-07T11:00:00+00:00",
+        run_id=run_id,
+    )
+    assert scheduler._window_reopened(pause) is False
+
+
+def test_a_pause_ledger_that_fails_to_construct_is_no_evidence(monkeypatch, tmp_path) -> None:
+    """A ledger the queue cannot even open has nowhere to log a verdict —
+    hold the window, same as any other "no evidence" case."""
+    import sdlc.build as build_module
+    from sdlc.queue import QueuePause
+    from sdlc.scheduler import SchedulerConfig, _Scheduler
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    _, run_id, db = _parked_job(store, registry, tmp_path, "alpha", max_wait_s=18000)
+
+    def exploding_ledger(_db_path):
+        raise RuntimeError("cannot open this ledger")
+
+    monkeypatch.setattr(build_module, "Ledger", exploding_ledger)
+
+    scheduler = _Scheduler(
+        store, config=SchedulerConfig(), registry=registry,
+        launcher=FakeLauncher(), clock=Clock(), sleeper=lambda _s: None,
+        notifier=lambda *a, **k: None, version_check=_clean, probe=None,
+        echo=lambda _line: None, identity="test:1",
+    )
+    pause = QueuePause(paused_until="", paused_at="", run_id=run_id)
+    assert scheduler._pause_ledger(pause) is None
+
+
 def test_a_window_a_peer_scheduler_already_opened_is_not_re_announced(tmp_path) -> None:
     """Two `sdlc queue run` processes, one subscription, one announcement.
 
