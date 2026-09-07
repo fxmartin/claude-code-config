@@ -1295,3 +1295,62 @@ def test_a_finished_job_announces_a_queue_specific_event(tmp_path) -> None:
 
     assert [event for event, _ in events] == ["queue_job_finished"]
     assert events[0][1]["terminal"] == "DONE"
+
+
+def test_a_build_waiting_on_a_slot_is_not_stamped_repo_busy(tmp_path) -> None:
+    """Story 32.1-003: build/build is not exclusive, so "repo busy" would lie.
+
+    With one slot the second build genuinely waits, but on a *slot*, not on the
+    repo — stamping "repo busy" here (what the pre-32.1-003 predicate did for
+    every busy repo) would tell FX the queue is blocked by a rule that no
+    longer exists.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="build", scope="epic-1")
+    waiting = store.add_job(repo=repo, kind="build", scope="epic-2")
+
+    seen: list[str | None] = []
+    clock = Clock()
+
+    def sleeper(seconds: float) -> None:
+        seen.append(store.get_job(waiting).reason)
+        clock.advance(seconds)
+
+    _run(store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=2),
+         clock=clock, sleeper=sleeper,
+         config=SchedulerConfig(slots=1, poll_seconds=1.0))
+
+    assert "repo busy" not in seen
+    assert store.get_job(waiting).state == "done"
+
+
+def test_a_fix_waiting_on_a_running_build_is_stamped_repo_busy(tmp_path) -> None:
+    """The other half of the relaxed predicate: fix-behind-build is still blocked.
+
+    `running_repos(kind="fix")` is empty here, so only the `job.kind == "fix"`
+    arm can explain this job — the arm that keeps a fix off a repo another
+    kind of run already holds.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    store.add_job(repo=repo, kind="build", scope="epic-1")
+    waiting = store.add_job(repo=repo, kind="fix", scope="1")
+
+    seen: list[str | None] = []
+    clock = Clock()
+
+    def sleeper(seconds: float) -> None:
+        seen.append(store.get_job(waiting).reason)
+        clock.advance(seconds)
+
+    _run(store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=2),
+         clock=clock, sleeper=sleeper,
+         config=SchedulerConfig(slots=2, poll_seconds=1.0))
+
+    assert "repo busy" in seen
+    assert store.get_job(waiting).state == "done"

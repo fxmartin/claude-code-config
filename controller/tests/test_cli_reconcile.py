@@ -149,6 +149,35 @@ def test_reconcile_renders_epic_markdown_on_demand(tmp_path: Path, monkeypatch) 
     assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
 
 
+def test_reconcile_render_failure_is_non_fatal(tmp_path: Path, monkeypatch) -> None:
+    """Story 32.1-003: an unwritable epic file is reported, never a failed exit.
+
+    `render_docs` is called *after* the ledger flip, so letting an OSError
+    there escape would turn a correct reconciliation into a non-zero exit and
+    a confusing "reconcile failed" — the same non-fatal posture the old
+    per-merge write-back had. Injected through the `sdlc.cli` seam because as
+    root (CI) a chmod-based unwritable file silently stays writable.
+    """
+    root = _init_repo_with_origin(tmp_path)
+    _land_story(root, "99.1-007")
+    db = tmp_path / "ledger.db"
+    _seed_run(db, [("99.1-007", "FAILED", 106)])
+
+    import sdlc.reconcile as reconcile_mod
+
+    def boom(ledger, run_id, root=None):  # noqa: ANN001 - test double
+        raise OSError("Read-only file system: epic-99-sample.md")
+
+    monkeypatch.setattr(reconcile_mod, "render_docs", boom)
+    monkeypatch.chdir(root)
+    result = runner.invoke(app, ["reconcile", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert "epic markdown render failed (non-fatal)" in result.output
+    assert "Read-only file system" in result.output
+    # The ledger flip still landed — the render is a view, not the source.
+    assert _status(db, Ledger(db).latest_run_id(), "99.1-007") == "DONE"
+
 # --- idempotent "nothing to reconcile" when no parked stories ---------------
 
 

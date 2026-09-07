@@ -1190,3 +1190,110 @@ def test_render_docs_raises_on_write_failure(tmp_path: Path, monkeypatch) -> Non
     with pytest.raises(OSError):
         render_docs(Ledger(db), run_id, root=root)
     assert _status(db, run_id, "99.1-001") == "DONE"
+
+
+def test_render_docs_batches_stories_sharing_one_epic_file(tmp_path: Path) -> None:
+    """Two DONE stories in one epic file are stamped in a single read/write pass.
+
+    Story 32.1-003 groups by resolved epic file before writing, so the second
+    story must not read back a stale copy of the first's render and clobber it.
+    A per-story write loop would leave only one marker stamped here.
+    """
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-001: First\n**Status**: Not started\n"
+        "##### Story 99.1-002: Second\n**Status**: In progress\n",
+        encoding="utf-8",
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100), ("99.1-002", "FAILED", 101)])
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+    Ledger(db).set_story_status(run_id, "99.1-002", "DONE")
+
+    rendered = render_docs(Ledger(db), run_id, root=root)
+
+    assert rendered == {str(epic_file): ["99.1-001", "99.1-002"]}
+    assert epic_file.read_text(encoding="utf-8") == (
+        "##### Story 99.1-001: First\n**Status**: Done\n"
+        "##### Story 99.1-002: Second\n**Status**: Done\n"
+    )
+
+
+def test_render_docs_groups_stories_across_two_epic_files(tmp_path: Path) -> None:
+    """Stories from different epics each land in their own resolved epic file."""
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_99 = story_dir / "epic-99-sample.md"
+    epic_99.write_text(
+        "##### Story 99.1-001: Ninety-nine\n**Status**: Not started\n",
+        encoding="utf-8",
+    )
+    epic_98 = story_dir / "epic-98-other.md"
+    epic_98.write_text(
+        "##### Story 98.2-004: Ninety-eight\n**Status**: Not started\n",
+        encoding="utf-8",
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100), ("98.2-004", "FAILED", 101)])
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+    Ledger(db).set_story_status(run_id, "98.2-004", "DONE")
+
+    rendered = render_docs(Ledger(db), run_id, root=root)
+
+    assert rendered == {
+        str(epic_99): ["99.1-001"],
+        str(epic_98): ["98.2-004"],
+    }
+    assert "**Status**: Done" in epic_99.read_text(encoding="utf-8")
+    assert "**Status**: Done" in epic_98.read_text(encoding="utf-8")
+
+
+def test_render_docs_partial_epic_resolution_still_renders_the_rest(tmp_path: Path) -> None:
+    """A DONE story with no epic file is skipped without starving its siblings."""
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-001: Has an epic file\n**Status**: Not started\n",
+        encoding="utf-8",
+    )
+
+    db = tmp_path / "ledger.db"
+    # 97.x resolves to no epic file at all (no epic-97-*.md on disk).
+    run_id = _seed_run(db, [("97.1-009", "FAILED", 99), ("99.1-001", "FAILED", 100)])
+    Ledger(db).set_story_status(run_id, "97.1-009", "DONE")
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+
+    rendered = render_docs(Ledger(db), run_id, root=root)
+
+    assert rendered == {str(epic_file): ["99.1-001"]}
+    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+
+
+def test_render_docs_defaults_root_to_cwd(tmp_path: Path, monkeypatch) -> None:
+    """Omitting `root` resolves epic files relative to the cwd (the CLI's call)."""
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    epic_file.write_text(
+        "##### Story 99.1-001: Cwd-relative\n**Status**: Not started\n",
+        encoding="utf-8",
+    )
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+
+    monkeypatch.chdir(root)
+    rendered = render_docs(Ledger(db), run_id)
+
+    assert list(rendered.values()) == [["99.1-001"]]
+    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")

@@ -278,3 +278,125 @@ def test_render_epic_file_noop_leaves_file_untouched(tmp_path) -> None:
 def test_render_epic_file_raises_on_missing_file(tmp_path) -> None:
     with pytest.raises(OSError):
         render_epic_file(tmp_path / "does-not-exist.md", ["7.1-001"])
+
+
+# ---------------------------------------------------------------------------
+# byte-identical output (Story 32.1-003 DoD)
+# ---------------------------------------------------------------------------
+
+
+# A realistic epic slice exercising every marker shape in one document: an
+# existing status line to replace, a story with no status line at all (the
+# insertion path), an already-"Done" story, a story that must stay untouched,
+# and epic-level headers/prose around them.
+_EPIC_FIXTURE = (
+    "# Epic-07 — Sample\n"
+    "\n"
+    "**Status**: In progress\n"
+    "\n"
+    "##### Story 7.1-001: Replace an existing status\n"
+    "**Status**: Not started\n"
+    "**Priority**: Must Have\n"
+    "\n"
+    "##### Story 7.1-002: No status line at all\n"
+    "**Priority**: Should Have\n"
+    "\n"
+    "##### Story 7.1-003: Already done\n"
+    "**Status**: Done\n"
+    "\n"
+    "##### Story 7.1-004: Untouched\n"
+    "**Status**: Not started\n"
+    "\n"
+    "## Verification\n"
+    "Trailing epic-level prose.\n"
+)
+
+_EPIC_RENDERED = (
+    "# Epic-07 — Sample\n"
+    "\n"
+    "**Status**: In progress\n"
+    "\n"
+    "##### Story 7.1-001: Replace an existing status\n"
+    "**Status**: Done\n"
+    "**Priority**: Must Have\n"
+    "\n"
+    "##### Story 7.1-002: No status line at all\n"
+    "**Status**: Done\n"
+    "**Priority**: Should Have\n"
+    "\n"
+    "##### Story 7.1-003: Already done\n"
+    "**Status**: Done\n"
+    "\n"
+    "##### Story 7.1-004: Untouched\n"
+    "**Status**: Not started\n"
+    "\n"
+    "## Verification\n"
+    "Trailing epic-level prose.\n"
+)
+
+
+def test_render_epic_file_output_is_byte_identical_to_the_golden(tmp_path) -> None:
+    """Story 32.1-003 DoD: the on-demand renderer's bytes are pinned.
+
+    The rendered result is what lands in docs PRs (#632, #652), so any drift in
+    marker text, insertion position, epic-level `**Status**` handling or
+    trailing whitespace is a regression, not a refactor.
+    """
+    path = _write(tmp_path, _EPIC_FIXTURE)
+
+    changed = render_epic_file(path, ["7.1-001", "7.1-002", "7.1-003"])
+
+    assert changed == ["7.1-001", "7.1-002"]
+    assert path.read_bytes() == _EPIC_RENDERED.encode("utf-8")
+
+
+def test_batch_render_is_byte_identical_to_the_per_story_writer(tmp_path) -> None:
+    """The batch renderer and the one-at-a-time writer agree byte-for-byte.
+
+    `mark_story_done` is the shape the pre-32.1-003 mid-run write-back used;
+    the batched on-demand path must produce exactly the same file so the
+    checkout's content is unchanged by *where* the render now happens.
+    """
+    ids = ["7.1-001", "7.1-002", "7.1-003"]
+
+    batched = tmp_path / "batched.md"
+    batched.write_text(_EPIC_FIXTURE, encoding="utf-8")
+    render_epic_file(batched, ids)
+
+    sequential = tmp_path / "sequential.md"
+    sequential.write_text(_EPIC_FIXTURE, encoding="utf-8")
+    for story_id in ids:
+        mark_story_done(sequential, story_id)
+
+    assert batched.read_bytes() == sequential.read_bytes()
+
+
+def test_render_done_markers_is_byte_identical_to_render_epic_file(tmp_path) -> None:
+    """The pure transform and its writing wrapper agree byte-for-byte."""
+    ids = ["7.1-002", "7.1-001"]
+
+    pure_text, pure_ids = render_done_markers(_EPIC_FIXTURE, ids)
+
+    path = _write(tmp_path, _EPIC_FIXTURE)
+    written_ids = render_epic_file(path, ids)
+
+    assert written_ids == pure_ids == ids
+    assert path.read_bytes() == pure_text.encode("utf-8")
+
+
+def test_render_epic_file_preserves_a_missing_trailing_newline(tmp_path) -> None:
+    """A file that does not end in a newline still does not gain a spurious one."""
+    path = _write(
+        tmp_path,
+        "##### Story 7.1-001: First\n"
+        "**Status**: Not started\n"
+        "##### Story 7.1-002: Last line, no newline",
+    )
+
+    assert render_epic_file(path, ["7.1-001", "7.1-002"]) == ["7.1-001", "7.1-002"]
+    assert path.read_bytes() == (
+        b"##### Story 7.1-001: First\n"
+        b"**Status**: Done\n"
+        b"##### Story 7.1-002: Last line, no newline\n"
+        b"**Status**: Done\n"
+    )
