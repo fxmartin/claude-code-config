@@ -1,7 +1,7 @@
 # Epic 15: Operability & Self-Service
 
-> **Status: IN PROGRESS (5/6)** — 15.1-004 added 2026-09-06 (installed-controller staleness
-> check, not yet built) after a day of runs silently executed on a twelve-release-old install.
+> **Status: COMPLETE (6/6)** — 15.1-004 merged 2026-09-06 (#648; installed-controller staleness
+> check, live since v2.59.0) after a day of runs silently executed on a twelve-release-old install.
 > The original five merged on `main` (2026-06-25): 15.3-001 `sdlc clean`
 > (#174), 15.1-001 `sdlc doctor` (#175), 15.1-003 `sdlc repair` (#176), 15.2-001 hook profiles
 > (#177), 15.1-002 `status --markdown` (#178). Created 2026-06-20, inspired by the external
