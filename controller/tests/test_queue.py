@@ -55,6 +55,10 @@ def test_init_creates_wal_schema(tmp_path) -> None:
             "lease_until", "run_id", "options", "created_at", "updated_at", "reason",
             # Story 32.2-002's approval park.
             "pr_number", "poll_after",
+            # Story 32.3-001: the frozen per-class budget, the investigated
+            # file set the repo-scoped overlap graph is built from, and the
+            # fix rounds already banked when the breaker last parked the job.
+            "budget", "files", "fix_rounds_baseline",
         }
     finally:
         conn.close()
@@ -104,13 +108,14 @@ def test_add_job_records_shape(tmp_path) -> None:
     assert job.created_at
 
 
-def test_add_job_defaults_priority_normal(tmp_path) -> None:
-    from sdlc.queue import QueueStore
+def test_add_job_defaults_priority_from_kind(tmp_path) -> None:
+    """Story 32.3-001: an omitted class is derived, not a flat `normal`."""
+    from sdlc.queue import QueueStore, default_priority
 
     store = QueueStore(tmp_path / "queue.db")
     store.init()
     store.add_job(repo="/repo", kind="fix", scope="42")
-    assert store.list_jobs()[0].priority == "normal"
+    assert store.list_jobs()[0].priority == default_priority("fix")
 
 
 def test_add_job_rejects_unknown_kind(tmp_path) -> None:
@@ -261,9 +266,10 @@ def test_set_state_rejects_unknown_state(tmp_path) -> None:
 
 
 def test_apply_migrations_adds_column_and_is_idempotent(tmp_path, monkeypatch) -> None:
-    """A future migration entry (today's `_MIGRATIONS` is empty) adds its column
-    on first `init()` and is skipped as already-applied on a second — the same
-    upgrade-in-place path a real schema change will exercise later."""
+    """A migration entry adds its column on first `init()` and is skipped as
+    already-applied on a second. Stubbed rather than run against the real
+    `_MIGRATIONS` so the mechanism is pinned independently of whichever columns
+    the current schema happens to have."""
     import sdlc.queue as queue_mod
     from sdlc.queue import QueueStore
 
@@ -387,3 +393,35 @@ def test_running_repos_filters_by_kind(tmp_path) -> None:
     assert store.running_repos() == {build_repo, fix_repo}
     assert store.running_repos(kind="fix") == {fix_repo}
     assert store.running_repos(kind="build") == {build_repo}
+
+
+def test_row_to_record_reads_a_pre_32_3_001_row_without_crashing(tmp_path) -> None:
+    """A jobs table from before Story 32.3-001 has no `budget`/`files` columns;
+    `_optional_column` must degrade that absence to `None` rather than raising."""
+    from sdlc.queue import QueueStore
+
+    db = tmp_path / "queue.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE jobs ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, "
+            "kind TEXT NOT NULL, scope TEXT NOT NULL, "
+            "priority TEXT NOT NULL DEFAULT 'normal', "
+            "state TEXT NOT NULL DEFAULT 'queued', claimed_by TEXT, "
+            "lease_until TIMESTAMP, run_id TEXT, options TEXT, "
+            "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, reason TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO jobs(repo, kind, scope, priority, state, created_at, updated_at) "
+            "VALUES ('/repo', 'build', '1', 'normal', 'queued', '', '')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    job = QueueStore(db).get_job(1)
+    assert job.budget is None
+    assert job.files is None
+    assert job.fix_rounds_baseline == 0

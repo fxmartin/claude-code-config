@@ -1333,13 +1333,18 @@ def test_a_fix_waiting_on_a_running_build_is_stamped_repo_busy(tmp_path) -> None
     `running_repos(kind="fix")` is empty here, so only the `job.kind == "fix"`
     arm can explain this job — the arm that keeps a fix off a repo another
     kind of run already holds.
+
+    Both jobs are pinned to one class because Story 32.3-001 derives an omitted
+    priority from the kind (a `fix` outranks a `build`), which would claim the
+    fix first and leave the *build* waiting — the mirror image of the case under
+    test. Equal classes fall back to FIFO, so the build runs and the fix waits.
     """
     from sdlc.scheduler import SchedulerConfig
 
     store = _store(tmp_path)
     repo = _repo(tmp_path, "alpha")
-    store.add_job(repo=repo, kind="build", scope="epic-1")
-    waiting = store.add_job(repo=repo, kind="fix", scope="1")
+    store.add_job(repo=repo, kind="build", scope="epic-1", priority="normal")
+    waiting = store.add_job(repo=repo, kind="fix", scope="1", priority="normal")
 
     seen: list[str | None] = []
     clock = Clock()

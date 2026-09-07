@@ -4,19 +4,29 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 __all__ = [
+    "DEFAULT_BUDGETS",
+    "PRIORITY_CLASSES",
+    "JobBudget",
     "JobRecord",
     "QueueError",
     "QueueStore",
+    "budget_breach",
+    "budget_for",
+    "default_priority",
     "default_queue_path",
+    "fix_rounds_exhausted",
+    "overlap_dependencies",
 ]
 
 # Queue filename under the chosen state directory — a sibling of registry.json
@@ -30,6 +40,10 @@ QUEUE_BUSY_TIMEOUT_MS = 5000
 
 _KINDS = {"build", "fix"}
 _PRIORITIES = ("low", "normal", "high", "urgent")
+# The public, ordered vocabulary (lowest class first). Story 32.3-001 AC1 talks
+# about jobs being in a *higher* class than others, so the order has to be
+# nameable outside this module — `PRIORITY_CLASSES.index(...)` is that name.
+PRIORITY_CLASSES = _PRIORITIES
 _PRIORITY_RANK = {name: rank for rank, name in enumerate(_PRIORITIES)}
 # Lifecycle states. Story 32.1-002 adds ``blocked`` — the parked terminal a
 # scheduler stamps on a job it refused to execute (e.g. the repo's installed
@@ -41,12 +55,23 @@ _PRIORITY_RANK = {name: rank for rank, name in enumerate(_PRIORITIES)}
 # change request, and the queue re-polls that CR until it can resume the run
 # itself. ``blocked`` needs an operator command to leave; ``parked`` leaves on
 # its own the moment the forge says so.
-_STATES = {"queued", "running", "done", "failed", "cancelled", "blocked", "parked"}
+#
+# Story 32.3-001 adds ``needs_attention`` — the park the queue's *own* budget
+# breaker stamps when a job burns more fix rounds or wall-clock than its class
+# allows. Deliberately distinct from ``blocked``: ``blocked`` means the run
+# parked itself (rate limit, approval gate) or the scheduler refused to start it
+# (stale controller); ``needs_attention`` means the job was running fine as far
+# as the run knew and the *queue* stopped it. Two causes, two words, so
+# `queue list` says which happened.
+_STATES = {
+    "queued", "running", "done", "failed", "cancelled", "blocked", "parked",
+    "needs_attention",
+}
 
 # The subset of :data:`_STATES` a job can finish in. ``running`` and
 # ``queued`` are in-flight; ``cancelled`` is an operator action, not an
 # outcome the scheduler reports.
-_TERMINAL_STATES = {"done", "failed", "blocked"}
+_TERMINAL_STATES = {"done", "failed", "blocked", "needs_attention"}
 
 # States an operator may retire. ``queued`` is the everyday case; ``blocked``
 # is here because Story 32.1-002 introduced that park and it would otherwise be
@@ -54,11 +79,16 @@ _TERMINAL_STATES = {"done", "failed", "blocked"}
 # abandonable when FX decides the change request is not going to be approved. A
 # ``running`` job belongs to a live scheduler and its child, and a
 # ``done``/``failed`` job is history worth keeping — neither is cancellable.
-_CANCELLABLE_STATES = {"queued", "blocked", "parked"}
+_CANCELLABLE_STATES = {"queued", "blocked", "parked", "needs_attention"}
 
 # States an operator may re-arm with :meth:`QueueStore.requeue_job`. ``queued``
 # is excluded because it is already armed, ``running`` because it is live.
 _REQUEUEABLE_STATES = _STATES - {"running", "queued"}
+
+# States in which a job is still "ahead" of an overlapping peer: it has not
+# finished touching its files, so a job that shares one must wait. Every
+# terminal (and ``cancelled``) releases the hold — see :meth:`QueueStore.overlap_holds`.
+_PENDING_STATES = ("queued", "running")
 
 
 def default_queue_path() -> Path:
@@ -84,6 +114,216 @@ class QueueError(Exception):
     """A queue operation was refused (unknown job, invalid state/priority)."""
 
 
+# ---------------------------------------------------------------------------
+# Policy: priority classes, per-class budgets, file-overlap serialisation.
+# These are pure functions over queue rows plus each job's investigation output
+# (Story 32.3-001) — no store, no scheduler, no clock, so they are testable on
+# their own and reusable by any caller that has the same two inputs.
+# ---------------------------------------------------------------------------
+
+
+def default_priority(kind: str, labels: Iterable[str] = ()) -> str:
+    """The class a job starts in, mirroring `sdlc fix all`'s dispatch order.
+
+    `fix all` ranks its candidates *bugs, then enhancements, then the rest*
+    (``fix_issue._category_rank``), and a repair is more urgent than new
+    feature work. This maps that judgement onto the queue's four classes:
+
+    ==================================  ==========
+    job                                 class
+    ==================================  ==========
+    `fix` on an issue labelled ``bug``  ``urgent``
+    any other `fix`                     ``high``
+    `build`                             ``normal``
+    ==================================  ==========
+
+    So a `fix` job outranks a `build` job and a bug outranks an enhancement —
+    AC1's two rules. The four classes are coarser than `fix all`'s three-way
+    category rank, so an enhancement and an unlabelled fix share ``high``; that
+    collapse is deliberate, since the queue's classes are also an *operator*
+    vocabulary (`sdlc queue prioritise`) and splitting them further would make
+    them harder to hold in the head than the ordering is worth.
+
+    ``labels`` is optional because the enqueue path is deliberately offline —
+    `sdlc fix --enqueue 42` must not call the forge — so the label half only
+    applies where labels are already in hand (`sdlc queue add --label`).
+    """
+    if kind != "fix":
+        return "normal"
+    # Reuse `fix all`'s own predicates rather than re-deriving the vocabulary:
+    # one definition of "is a bug", so the two orders cannot drift. Imported
+    # lazily — fix_issue pulls in the whole pipeline, and queue.py is imported
+    # by read-only callers (`sdlc doctor`, the dashboard) that must stay light.
+    from sdlc.fix_issue import _is_bug
+
+    return "urgent" if _is_bug(labels) else "high"
+
+
+@dataclass(frozen=True)
+class JobBudget:
+    """One job's spend ceiling — the queue's runaway breaker (AC3).
+
+    Two numbers, because a job runs away in two directions: it can thrash
+    (``max_fix_rounds`` — how many ``bugfix`` stage attempts its run may burn)
+    or it can hang (``wall_clock_seconds`` — how long one *launch* of the job
+    may take). Either one exceeded parks the job ``needs_attention``.
+
+    This is **not** the pipeline's own retry budget. `build.py`'s
+    ``MAX_BUGFIX_ATTEMPTS`` bounds one *story's* bugfix loop from inside the
+    run; this bounds the *job* from outside it, by reading the run's ledger.
+    Two layers, two knobs: the inner one decides when a story gives up, the
+    outer one decides when the host stops paying for the job at all.
+    """
+
+    max_fix_rounds: int
+    wall_clock_seconds: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "max_fix_rounds": self.max_fix_rounds,
+            "wall_clock_seconds": self.wall_clock_seconds,
+        }
+
+    def label(self) -> str:
+        """A column-width summary for `sdlc queue list`, e.g. ``5r/4h``."""
+        hours = self.wall_clock_seconds / 3600
+        clock = f"{hours:g}h" if hours >= 1 else f"{self.wall_clock_seconds // 60}m"
+        return f"{self.max_fix_rounds}r/{clock}"
+
+
+# Per-class defaults. A more important job gets more rope, which is the whole
+# point of having classes at all. The shape (a handful of fix rounds, a
+# multi-hour job cap) follows Hyqs's tested figures scaled from its per-stage
+# cap to a whole job: five rounds is the "thrashing, not progressing" line, and
+# a job that has not finished in its class's hours has stopped being a job and
+# started being a bill.
+DEFAULT_BUDGETS: dict[str, JobBudget] = {
+    "urgent": JobBudget(max_fix_rounds=8, wall_clock_seconds=8 * 3600),
+    "high": JobBudget(max_fix_rounds=5, wall_clock_seconds=6 * 3600),
+    "normal": JobBudget(max_fix_rounds=5, wall_clock_seconds=4 * 3600),
+    "low": JobBudget(max_fix_rounds=3, wall_clock_seconds=2 * 3600),
+}
+
+# Host-wide overrides, in the ``SDLC_*`` env convention the rest of the
+# controller uses (``SDLC_QUEUE_PATH``, ``SDLC_NOTIFY``). Blunt on purpose:
+# they replace the value for *every* class, which is what a host that simply
+# runs hotter or colder than the defaults actually wants. A malformed or
+# non-positive value is ignored rather than honoured — disarming a breaker by
+# typo is the one failure mode a breaker must not have.
+#
+# They are read at **stamp time** — `sdlc queue add`/`--enqueue` and `sdlc queue
+# prioritise` — and never at drain time, because the budget is frozen onto the
+# row (that freeze is what makes `queue list`'s ``5r/4h`` column honest). So
+# setting them before `sdlc queue run` does nothing to jobs that are already
+# enqueued; to change those, re-stamp them with `sdlc queue prioritise`. Every
+# help string and doc that names these two says so.
+_ENV_MAX_FIX_ROUNDS = "SDLC_QUEUE_MAX_FIX_ROUNDS"
+_ENV_WALL_CLOCK_MINUTES = "SDLC_QUEUE_WALL_CLOCK_MINUTES"
+
+
+def _positive_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def budget_for(priority: str) -> JobBudget:
+    """The budget a job in class ``priority`` carries (AC4 — config, not constants).
+
+    Falls back to the ``normal`` class for an unknown name so a hand-edited row
+    can never leave a job *un*budgeted.
+    """
+    budget = DEFAULT_BUDGETS.get(priority, DEFAULT_BUDGETS["normal"])
+    rounds = _positive_env(_ENV_MAX_FIX_ROUNDS)
+    minutes = _positive_env(_ENV_WALL_CLOCK_MINUTES)
+    if rounds is None and minutes is None:
+        return budget
+    return JobBudget(
+        max_fix_rounds=rounds if rounds is not None else budget.max_fix_rounds,
+        wall_clock_seconds=(
+            minutes * 60 if minutes is not None else budget.wall_clock_seconds
+        ),
+    )
+
+
+def fix_rounds_exhausted(budget: JobBudget, fix_rounds: int) -> bool:
+    """Whether ``fix_rounds`` alone has exhausted ``budget`` — the *thrash* arm.
+
+    Split out of :func:`budget_breach` because the caller needs the arm, not
+    just the reason: a thrash park banks a fix-round baseline so the operator's
+    `sdlc queue requeue` grants one more allowance, and a wall-clock park must
+    not (it has not spent the rounds). One definition, so the reason string and
+    the baseline decision can never disagree about what "thrashed" means.
+    """
+    return fix_rounds >= budget.max_fix_rounds
+
+
+def budget_breach(
+    budget: JobBudget, *, elapsed_seconds: float, fix_rounds: int
+) -> str | None:
+    """Why ``budget`` is exhausted, or ``None`` while it is not (AC3).
+
+    Returns an operator-readable reason rather than a bool so the park recorded
+    on the job says *which* ceiling was hit and by how much — "budget exceeded"
+    on its own sends a human to read the ledger to find out what happened.
+
+    ``fix_rounds`` is the rounds burned *since the job's fix-round baseline*
+    (:meth:`QueueStore.record_fix_rounds_baseline`), not since the run opened —
+    the caller subtracts. The two are the same number until the first thrash
+    park, which is when the baseline starts to exist.
+    """
+    if fix_rounds_exhausted(budget, fix_rounds):
+        return (
+            f"budget exhausted: {fix_rounds} fix rounds "
+            f"(cap {budget.max_fix_rounds})"
+        )
+    if elapsed_seconds > budget.wall_clock_seconds:
+        return (
+            f"budget exhausted: wall-clock {int(elapsed_seconds // 60)}m "
+            f"(cap {budget.wall_clock_seconds // 60}m)"
+        )
+    return None
+
+
+def overlap_dependencies(
+    jobs: Sequence[tuple[int, str]],
+    files_by_job: Mapping[int, set[str]],
+) -> dict[int, list[int]]:
+    """Serialisation edges between jobs in one repo whose files overlap (AC2).
+
+    ``jobs`` is ``[(job_id, repo), …]`` — the queue rows — and ``files_by_job``
+    is each job's investigated ``files_to_modify``. Returns
+    ``{job_id: [predecessor_job_ids]}``: at most one edge per job, the chain
+    predecessor, exactly as ``fix_issue.build_overlap_dependencies`` produces
+    for one `fix all` batch.
+
+    This *is* that function, applied once per repo instead of once per batch —
+    the extension AC2 asks for. Grouping by repo first is the whole difference:
+    two jobs in different checkouts cannot race a path, however identical their
+    file lists look, so they must never be chained.
+
+    The chain runs in ascending job id, i.e. oldest first, which is inherited
+    from #436's "ascending issue number". Within an overlapping component that
+    outranks the priority class — a component is a correctness constraint, and
+    the classes order work *across* components. Nothing deadlocks: the head of
+    every chain is always claimable.
+    """
+    from sdlc.fix_issue import build_overlap_dependencies
+
+    by_repo: dict[str, dict[int, set[str]]] = defaultdict(dict)
+    for job_id, repo in jobs:
+        by_repo[repo][job_id] = set(files_by_job.get(job_id) or ())
+    deps: dict[int, list[int]] = {}
+    for repo_files in by_repo.values():
+        deps.update(build_overlap_dependencies(repo_files))
+    return deps
+
+
 @dataclass
 class JobRecord:
     """One row of the ``jobs`` table."""
@@ -107,6 +347,16 @@ class JobRecord:
     # inside the host's API rate limits.
     pr_number: int | None = None
     poll_after: str | None = None
+    # Story 32.3-001. ``budget`` is the class budget frozen at enqueue (JSON);
+    # ``files`` is the job's investigated ``files_to_modify`` (JSON array),
+    # which is what the repo-scoped overlap graph is built from;
+    # ``fix_rounds_baseline`` is the run's cumulative bugfix-round count as of
+    # the last thrash park, so the cap is measured from there rather than from
+    # the run's birth. Zero (never parked) for every job until the breaker
+    # fires, and for every row written before the column existed.
+    budget: str | None = None
+    files: str | None = None
+    fix_rounds_baseline: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -125,7 +375,34 @@ class JobRecord:
             "reason": self.reason,
             "pr_number": self.pr_number,
             "poll_after": self.poll_after,
+            "budget": self.budget,
+            "files": self.files,
+            "fix_rounds_baseline": self.fix_rounds_baseline,
         }
+
+    def job_budget(self) -> JobBudget:
+        """The budget recorded on this job, or its class default.
+
+        Recorded rather than recomputed so an operator can see in `queue list`
+        the ceiling the job is actually being held to; the class default is the
+        fallback for a row written before this story or corrupted since, which
+        must still leave the job *budgeted* rather than uncapped.
+        """
+        default = budget_for(self.priority)
+        if not self.budget:
+            return default
+        try:
+            data = json.loads(self.budget)
+            return JobBudget(
+                max_fix_rounds=int(data["max_fix_rounds"]),
+                wall_clock_seconds=int(data["wall_clock_seconds"]),
+            )
+        except (ValueError, TypeError, KeyError):
+            return default
+
+    def files_to_modify(self) -> set[str]:
+        """The job's investigated file set, or empty when it has none."""
+        return _decode_files(self.files)
 
 
 # Queue DDL. Deliberately mirrors the ledger's connect/init/migrate shape
@@ -152,7 +429,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     reason      TEXT,
     pr_number   INTEGER,
-    poll_after  TIMESTAMP
+    poll_after  TIMESTAMP,
+    budget      TEXT,
+    files       TEXT,
+    fix_rounds_baseline INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -169,13 +449,40 @@ CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
 # ``(version, name, table, columns, create_sql)`` shape as the ledger's
 # ``_MIGRATIONS`` (sdlc/build.py). The fresh schema above already carries every
 # column, so these only matter to a host queue.db written by an earlier version
-# — it upgrades in place rather than being rebuilt.
+# — it upgrades in place rather than being rebuilt. Versions are append-only:
+# 1 is Story 32.2-002's, 2 and 3 are Story 32.3-001's, and future columns (e.g.
+# a claim lease renewal field) take the next number so a host queue.db that has
+# already applied the earlier ones does not re-run them.
 _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (
         1,
         "approval_park",  # Story 32.2-002
         "jobs",
         [("pr_number", "INTEGER"), ("poll_after", "TIMESTAMP")],
+        None,
+    ),
+    # Story 32.3-001: the per-class budget frozen on the job, and the
+    # investigated file set the repo-scoped overlap graph is built from. Both
+    # are nullable, so a pre-existing host queue.db upgrades in place and its
+    # older rows simply fall back to their class default / no files.
+    (
+        2,
+        "job_budget_and_files",
+        "jobs",
+        [("budget", "TEXT"), ("files", "TEXT")],
+        None,
+    ),
+    # Story 32.3-001: the fix rounds already burned when the breaker last parked
+    # the job. Its own column rather than a key inside ``budget`` because the
+    # two are different kinds of fact — ``budget`` is policy copied from the
+    # class (and re-stamped wholesale by `prioritise`), this is consumption
+    # measured off the run's ledger, and a class change must not erase it.
+    # Nullable, read as 0: a row from before this migration has banked nothing.
+    (
+        3,
+        "job_fix_rounds_baseline",
+        "jobs",
+        [("fix_rounds_baseline", "INTEGER")],
         None,
     ),
 ]
@@ -281,28 +588,40 @@ class QueueStore:
         repo: str,
         kind: str,
         scope: str,
-        priority: str = "normal",
+        priority: str | None = None,
         options_json: str | None = None,
+        labels: Iterable[str] = (),
     ) -> int:
         """Insert a fresh ``queued`` job and return its id.
 
         ``repo`` must already be resolved the way the registry resolves it
         (``str(Path(...).resolve())``) — this store does not re-resolve it.
+
+        ``priority`` omitted derives the class from ``kind``/``labels`` via
+        :func:`default_priority`, so an unattended enqueue lands in the same
+        order `fix all` would have chosen; passing one explicitly is the
+        operator override and is never second-guessed. Either way the class's
+        budget (:func:`budget_for`) is frozen onto the row — recorded, not
+        recomputed, so `queue list` shows the ceiling the job is held to.
         """
         if kind not in _KINDS:
             raise QueueError(
                 f"invalid kind: {kind!r} (expected one of {sorted(_KINDS)})"
             )
+        if priority is None:
+            priority = default_priority(kind, labels)
         if priority not in _PRIORITY_RANK:
             raise QueueError(
                 f"invalid priority: {priority!r} (expected one of {list(_PRIORITIES)})"
             )
         now = _now_iso()
+        budget = json.dumps(budget_for(priority).to_dict())
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO jobs(repo, kind, scope, priority, state, options, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
-                (repo, kind, scope, priority, options_json, now, now),
+                "created_at, updated_at, budget) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+                (repo, kind, scope, priority, options_json, now, now, budget),
             )
             assert cur.lastrowid is not None  # INSERT always assigns a rowid
             return int(cur.lastrowid)
@@ -350,6 +669,13 @@ class QueueStore:
         scheduler instead) and a ``queued`` one (already armed; silently
         succeeding would hide a mistyped id). ``options``, ``priority``,
         ``kind`` and ``scope`` are untouched; only lifecycle fields move.
+
+        Budgets are untouched here too, and deliberately so: the wall clock is
+        measured from each *launch*, so the resumed job gets a fresh one for
+        free, and the fix-round allowance was already re-based by the breaker
+        when it parked the job (:meth:`record_fix_rounds_baseline`). Requeue
+        therefore needs no ledger of its own — which is what keeps this store
+        ignorant of runs.
         """
         job = self.get_job(job_id)
         if job is None:
@@ -384,10 +710,66 @@ class QueueStore:
         job = self.get_job(job_id)
         if job is None:
             raise QueueError(f"unknown job id: {job_id}")
+        # The budget belongs to the class, so moving classes moves the budget
+        # (AC3/AC4). Leaving the old one behind would make `prioritise` a
+        # half-move: a job promoted to `urgent` would still be capped as `low`.
         with self._connect() as conn:
             conn.execute(
-                "UPDATE jobs SET priority = ?, updated_at = ? WHERE id = ?",
-                (priority_class, _now_iso(), job_id),
+                "UPDATE jobs SET priority = ?, budget = ?, updated_at = ? WHERE id = ?",
+                (
+                    priority_class,
+                    json.dumps(budget_for(priority_class).to_dict()),
+                    _now_iso(),
+                    job_id,
+                ),
+            )
+
+    def record_files(self, job_id: int, paths: Iterable[str]) -> None:
+        """Record a job's investigated ``files_to_modify`` (Story 32.3-001 AC2).
+
+        The write side of the repo-scoped overlap graph: once a job's
+        investigation says which files it will touch, an overlapping peer in the
+        same repo must wait for it (:meth:`overlap_holds`). Its production
+        caller is the scheduler (``_Scheduler._record_plan_files``), which reads
+        the plan from the run's own ledger. Today per-repo exclusivity already
+        serialises everything in one checkout, so this narrows nothing yet.
+
+        Note the horizon this buys, and the one it does not. A footprint is only
+        knowable *after* a job has run far enough to freeze an investigation, so
+        the graph can hold a job whose **recorded** footprint overlaps a pending
+        peer — a requeued job held on the strength of what it touched last time —
+        and can never hold two never-run jobs whose investigations would collide.
+        Story 32.1-003, which lets two non-overlapping jobs share a checkout,
+        therefore needs a start-time check of its own (investigate before claim,
+        or re-check once the plan lands) *on top of* this graph, not just this
+        graph. See :meth:`overlap_holds`.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET files = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(sorted({str(p) for p in paths})), _now_iso(), job_id),
+            )
+
+    def record_fix_rounds_baseline(self, job_id: int, rounds: int) -> None:
+        """Bank the fix rounds burned so far, so the cap counts from here.
+
+        Written by the scheduler's breaker at the moment it parks a job for
+        thrashing (``_Scheduler._enforce_budgets``), and only for that arm — a
+        wall-clock park has not spent the rounds, so banking them there would
+        hand the job a second allowance it never earned.
+
+        This is what makes `sdlc queue requeue` a real exit from a fix-round
+        park. ``ledger_fix_rounds`` counts every ``bugfix`` row the *run* has
+        ever recorded, and a requeue re-enters that same run, so without a
+        baseline the resumed job is over its cap on its first poll and is
+        stopped again having done nothing. With it, the operator's decision to
+        keep paying buys exactly one more class budget — the breaker still
+        fires, one allowance later, which is the point of it being a breaker.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET fix_rounds_baseline = ?, updated_at = ? WHERE id = ?",
+                (int(rounds), _now_iso(), job_id),
             )
 
     def _set_state(self, job_id: int, state: str) -> None:
@@ -430,12 +812,18 @@ class QueueStore:
         Python rather than SQL because they are small (one entry per running
         job) and an ``IN`` clause built from caller strings is not worth the
         injection surface.
+
+        Jobs held back by a file overlap with an unfinished peer in the same
+        repo (Story 32.3-001 AC2, :meth:`overlap_holds`) are filtered out here
+        too, for the same reason and in the same place: a candidate the
+        scheduler must not start is not a candidate.
         """
         if not self.db_path.exists():
             return []
         cutoff = _at(now).isoformat()
         any_busy = busy_repos or frozenset()
         fix_busy = fix_busy_repos or frozenset()
+        held = self.overlap_holds()
         query = (
             "SELECT * FROM jobs WHERE state = 'queued' "
             "AND (lease_until IS NULL OR lease_until < ?) "
@@ -454,8 +842,52 @@ class QueueStore:
         return [
             record
             for record in (_row_to_record(row) for row in rows)
-            if not _blocked(record)
+            if not _blocked(record) and record.id not in held
         ]
+
+    def overlap_holds(self) -> dict[int, int]:
+        """``{held_job_id: predecessor_job_id}`` for file-overlapping peers (AC2).
+
+        Builds the repo-scoped overlap graph (:func:`overlap_dependencies`) over
+        every job that is still *pending* — ``queued`` or ``running`` — and
+        reports each job whose chain predecessor has not finished with it yet.
+        Restricting the graph to pending jobs is what makes the hold *release*:
+        a predecessor that reaches any terminal (or is cancelled) drops out of
+        the graph, so its successor becomes claimable on the very next pass with
+        no extra bookkeeping to get wrong.
+
+        A job with no recorded footprint is a singleton and is never held: the
+        guarantee is over *recorded* file sets, not over the files two never-run
+        jobs would turn out to want. :meth:`record_files` spells out what that
+        leaves for Story 32.1-003 to add.
+        """
+        if not self.db_path.exists():
+            return {}
+        with self._connect() as conn:
+            # Two literal placeholders rather than a generated IN-list: the SQL
+            # stays static (nothing to inject into) and the pair below is the
+            # one thing to keep in step with :data:`_PENDING_STATES`.
+            queued, running = _PENDING_STATES
+            rows = conn.execute(
+                "SELECT id, repo, files FROM jobs WHERE state IN (?, ?)",
+                (queued, running),
+            ).fetchall()
+        pending = {row["id"] for row in rows}
+        jobs = [(row["id"], row["repo"]) for row in rows]
+        files_by_job = {
+            row["id"]: _decode_files(_optional_column(row, "files")) for row in rows
+        }
+        if not any(files_by_job.values()):
+            # The common case by far — nothing has been investigated yet, so
+            # there is no graph to build. Skip the (lazy, heavy) fix_issue
+            # import entirely rather than pay for an all-singleton answer.
+            return {}
+        holds: dict[int, int] = {}
+        for job_id, deps in overlap_dependencies(jobs, files_by_job).items():
+            blocking = [dep for dep in deps if dep in pending]
+            if blocking:
+                holds[job_id] = blocking[0]
+        return holds
 
     def claim_job(
         self,
@@ -624,7 +1056,12 @@ class QueueStore:
             )
 
     def finish_job(self, job_id: int, state: str, *, reason: str | None = None) -> None:
-        """Stamp a job terminal (``done``/``failed``/``blocked``) and drop its lease."""
+        """Stamp a job terminal and drop its lease.
+
+        The four terminals are ``done``, ``failed``, ``blocked`` (the run parked
+        itself, or the scheduler refused to start it) and ``needs_attention``
+        (the queue's own budget breaker stopped it).
+        """
         if state not in _TERMINAL_STATES:
             raise QueueError(
                 f"invalid terminal state: {state!r} "
@@ -882,4 +1319,34 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         reason=row["reason"],
         pr_number=row["pr_number"] if "pr_number" in keys else None,
         poll_after=row["poll_after"] if "poll_after" in keys else None,
+        budget=_optional_column(row, "budget"),
+        files=_optional_column(row, "files"),
+        fix_rounds_baseline=int(_optional_column(row, "fix_rounds_baseline") or 0),
     )
+
+
+def _decode_files(raw: str | None) -> set[str]:
+    """A ``files`` column's JSON array as a set; junk/absent reads as empty."""
+    if not raw:
+        return set()
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    return {str(item) for item in parsed}
+
+
+def _optional_column(row: sqlite3.Row, name: str) -> Any:
+    """``row[name]`` when the column exists, else ``None``.
+
+    A read verb never migrates (:meth:`QueueStore.ensure_migrated` is explicit),
+    so `sdlc queue list` can legitimately meet a pre-32.3-001 queue.db that has
+    no ``budget``/``files``/``fix_rounds_baseline`` columns. Missing reads as
+    absent, not as a crash.
+    """
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None

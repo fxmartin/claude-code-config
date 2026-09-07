@@ -283,8 +283,8 @@ def test_queue_stale_schema_warns(tmp_path: Path, monkeypatch) -> None:
 
     queue_path = tmp_path / "queue.db"
     QueueStore(queue_path).init()
-    # Simulate a migration newer than anything `init()` applied, so the on-disk
-    # queue is genuinely behind the code's expectations.
+    # Simulate a migration newer than anything `_MIGRATIONS` ships today, so
+    # the on-disk queue is genuinely behind the code's expectations.
     monkeypatch.setattr(
         doctor_mod, "_QUEUE_MIGRATIONS", [(999, "future_migration", "jobs", [], None)]
     )
