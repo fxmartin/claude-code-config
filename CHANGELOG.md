@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.69.0] - 2026-09-07
+
+### Added
+
+- feat(local-forge-event-driven-dispatch): `.sdlc-forge.yaml` (#30.1-001) (#672)
+
+
 ## [v2.68.2] - 2026-09-07
 
 ### Fixed
