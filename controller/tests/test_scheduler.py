@@ -878,6 +878,25 @@ def test_stop_gives_up_quietly_when_the_group_is_already_gone(monkeypatch) -> No
     scheduler._PopenProcess(LingeringPopen()).stop()  # must not raise
 
 
+def test_stop_gives_up_when_sigkill_also_times_out(monkeypatch) -> None:
+    """Both signals sent, neither reaped in time: return quietly, never hang."""
+    from sdlc import scheduler
+
+    monkeypatch.setattr(scheduler.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(scheduler.os, "killpg", lambda pgid, sig: None)
+
+    class ImmovablePopen:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("cmd", timeout or 0)
+
+    scheduler._PopenProcess(ImmovablePopen()).stop()  # must return, not raise
+
+
 def test_our_own_in_flight_job_is_never_reclaimed_from_us(tmp_path) -> None:
     """A lease that lapses while we still hold the child must not double-launch it."""
     from sdlc.scheduler import SchedulerConfig
@@ -937,3 +956,43 @@ def test_an_ownerless_running_job_with_no_run_is_still_requeued(tmp_path) -> Non
     assert result.started == 1
     assert launcher.calls[0][0][-2:] == ["fix", "42"]
     assert store.get_job(job_id).state == "done"
+
+
+def test_reclaim_race_lost_to_another_scheduler_skips_release(tmp_path) -> None:
+    """A reclaim another scheduler already won must not release a claim we
+    never held — only the owner may release (queue.py's own guard)."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind="fix", scope="42")
+    clock = Clock()
+    store.claim_job(job_id, claimed_by="dead:1", lease_seconds=90, now=clock())
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE jobs SET claimed_by = NULL, lease_until = NULL WHERE id = ?",
+            (job_id,),
+        )
+
+    release_calls: list[int] = []
+
+    class RaceLostStore:
+        def __init__(self, real: QueueStore) -> None:
+            self._real = real
+
+        def reclaim_job(self, *args, **kwargs):
+            return None  # another scheduler already won this reclaim
+
+        def release_claim(self, job_id, **kwargs):
+            release_calls.append(job_id)
+            return self._real.release_claim(job_id, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    result = _run(RaceLostStore(store), tmp_path=tmp_path, launcher=FakeLauncher())
+
+    assert release_calls == []
+    assert result.started == 0
+    row = store.get_job(job_id)
+    assert row is not None
+    assert row.state == "running"
+    assert row.claimed_by is None
