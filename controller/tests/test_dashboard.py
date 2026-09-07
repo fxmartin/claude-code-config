@@ -2168,3 +2168,175 @@ def test_sidebar_toggle_hides_pane_and_persists(tmp_path: Path) -> None:
     assert ".side-hidden .side" in text and "display: none" in text
     assert "sdlc.dashboard.sideHidden" in text
     assert "try" in text and "localStorage" in text
+
+
+# ---------------------------------------------------------------------------
+# RUNS sidebar status filter (Story 19.2-003)
+# ---------------------------------------------------------------------------
+
+
+def test_sidebar_has_status_chip_row_and_hint_containers(tmp_path: Path) -> None:
+    """The sidebar markup carries a chip-row container above the run list and a
+    hint container for the "selected run hidden by filter" message — both are
+    siblings of `#runs` inside `#side` (Story 19.2-003)."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db) as base:
+        _, _, body = _get(base + "/")
+    text = body.decode("utf-8")
+    side_start = text.index('id="side"')
+    runs_start = text.index('id="runs"', side_start)
+    side_markup = text[side_start:runs_start]
+    assert 'id="sideChips"' in side_markup
+    assert 'id="sideHint"' in side_markup
+
+
+def test_render_runs_renders_status_chips_with_counts_and_badge_colours() -> None:
+    """`renderRuns` derives a per-status chip row from the fetched runs, reusing
+    `badge`/`statusLabel` so chip colours can never drift from the run cards
+    (Story 19.2-003)."""
+    from sdlc.dashboard import _PAGE
+
+    start = _PAGE.index("function renderSideChips(")
+    end = _PAGE.index("\n}", start)
+    body = _PAGE[start:end]
+    assert "badge" in body
+    assert "counts" in body
+    # Chip order reuses ORDER, extended with the run-only terminal statuses.
+    assert "ORDER" in body
+    # renderRuns must invoke it so every runs fetch refreshes the chip row.
+    runs_start = _PAGE.index("function renderRuns(")
+    runs_end = _PAGE.index("\n}", runs_start)
+    assert "renderSideChips(" in _PAGE[runs_start:runs_end]
+
+
+def test_order_includes_run_only_terminal_statuses() -> None:
+    """ORDER (reused for chip order, Story 19.2-003) is extended with ABORTED
+    and DEAD — run-level-only terminal statuses the sidebar must be able to
+    show a chip for, alongside the pre-existing story-level statuses."""
+    from sdlc.dashboard import _PAGE
+
+    order_line = _PAGE[_PAGE.index('const ORDER ='):_PAGE.index("\n", _PAGE.index('const ORDER ='))]
+    assert '"ABORTED"' in order_line
+    assert '"DEAD"' in order_line
+
+
+def test_is_run_visible_always_shows_live_runs_regardless_of_filter() -> None:
+    """The always-visible-while-live rule lives in a small, named JS function
+    (not CSS), so it is a single testable choke point — a persisted "DONE only"
+    filter can never hide a run that is still in flight (Story 19.2-003)."""
+    from sdlc.dashboard import _PAGE
+
+    start = _PAGE.index("function isRunVisible(")
+    end = _PAGE.index("\n}", start)
+    body = _PAGE[start:end]
+    assert "IN_PROGRESS" in body
+    assert "STARTED" in body
+    assert "return true" in body
+
+
+def test_started_chip_renders_pinned_and_click_handler_ignores_it() -> None:
+    """The STARTED chip is visually pinned/always-on and its own click is a
+    no-op — toggling it can never change what live runs show, so the chip must
+    not pretend it can (Story 19.2-003)."""
+    from sdlc.dashboard import _PAGE
+
+    assert "fchip-pinned" in _PAGE
+    click_start = _PAGE.index('document.getElementById("sideChips").addEventListener("click"')
+    click_end = _PAGE.index("\n});", click_start)
+    click_body = _PAGE[click_start:click_end]
+    assert "fchip-pinned" in click_body
+
+
+def test_status_filter_toggle_supports_any_combination_and_all_reset() -> None:
+    """Clicking a chip toggles it into/out of a Set (any combination selectable);
+    an explicit "all" chip (data-status="") clears the filter outright, and
+    tapping the last selected chip off empties the Set the same way — both
+    read as "unfiltered" via `isRunVisible`'s size===0 check (Story 19.2-003)."""
+    from sdlc.dashboard import _PAGE
+
+    click_start = _PAGE.index('document.getElementById("sideChips").addEventListener("click"')
+    click_end = _PAGE.index("\n});", click_start)
+    click_body = _PAGE[click_start:click_end]
+    assert "sideFilter.add(" in click_body
+    assert "sideFilter.delete(" in click_body
+    assert "sideFilter.clear(" in click_body
+    assert 'fchip-all' in _PAGE
+
+
+def test_hidden_selection_hint_is_rendered_with_a_clear_action() -> None:
+    """When the selected run (`sel`) is filtered out of the sidebar list, a
+    one-line hint with a clear action is shown so the selection never reads as
+    silently orphaned (Story 19.2-003)."""
+    from sdlc.dashboard import _PAGE
+
+    runs_start = _PAGE.index("function renderRuns(")
+    runs_end = _PAGE.index("\n}", runs_start)
+    body = _PAGE[runs_start:runs_end]
+    assert "sideHint" in body
+    assert "hidden by filter" in body
+
+
+def test_status_filter_persists_via_guarded_localstorage() -> None:
+    """The filter is restored from a namespaced localStorage key on load, and
+    every access (both read and write) is wrapped in try/catch — the sidebar
+    toggle's persistence pattern, applied to the status filter (Story
+    19.2-003)."""
+    from sdlc.dashboard import _PAGE
+
+    assert "sdlc.dashboard.statusFilter" in _PAGE
+    save_start = _PAGE.index("function saveSideFilter(")
+    save_end = _PAGE.index("\n}", save_start)
+    assert "try" in _PAGE[save_start:save_end] and "localStorage" in _PAGE[save_start:save_end]
+    load_start = _PAGE.index("function loadSideFilter(")
+    load_end = _PAGE.index("\n}", load_start)
+    assert "try" in _PAGE[load_start:load_end] and "localStorage" in _PAGE[load_start:load_end]
+
+
+def test_side_chips_css_reserves_height_for_stable_layout() -> None:
+    """The chip row reserves height so a live-tick count change never reflows
+    the run list below it — the 11.2-011 stable-height rule (Story 19.2-003)."""
+    from sdlc.dashboard import _PAGE
+
+    start = _PAGE.index(".side-chips {")
+    end = _PAGE.index("}", start)
+    assert "min-height" in _PAGE[start:end]
+
+
+def test_aborted_and_dead_badge_styles_exist() -> None:
+    """ABORTED and DEAD join the badge vocabulary — required for the sidebar
+    filter chips to carry the "existing badge colours" the story asks for,
+    and (previously unstyled) run cards showing these statuses now render
+    with a colour instead of falling back to plain text (Story 19.2-003)."""
+    from sdlc.dashboard import _PAGE
+
+    assert ".ABORTED {" in _PAGE
+    assert ".DEAD {" in _PAGE
+
+
+def test_runs_page_still_renders_with_registry_statuses(tmp_path: Path) -> None:
+    """End-to-end smoke test: registry-discovery mode with a DEAD run (pid gone)
+    still serves a working page — the new sidebar chip/filter markup must not
+    break the existing registry flow (Story 19.2-003)."""
+    from sdlc.registry import Registry, RunRecord
+
+    repo1 = tmp_path / "repo1"
+    repo1.mkdir()
+    db1 = repo1 / ".sdlc-state.db"
+    run1 = _seed_run(db1, "34", "34.1-001", "DONE")
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord(
+            run1, str(repo1), str(db1), "34",
+            999999999,  # not a live pid → derive_state reports DEAD
+            "IN_PROGRESS", "2024-01-01T00:00:00+00:00",
+        )
+    )
+    with _running_registry(registry) as base:
+        status, _ctype, body = _get(base + "/")
+        _rs, _rc, runs_body = _get(base + "/api/runs")
+    assert status == 200
+    runs = json.loads(runs_body)
+    assert runs[0]["status"] == "DEAD"
+    text = body.decode("utf-8")
+    assert 'id="sideChips"' in text
