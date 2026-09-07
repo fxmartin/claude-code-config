@@ -100,6 +100,23 @@ def _isolated_queue(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_agent_dispatch_env(monkeypatch):
+    """Strip ``SDLC_AGENT_CMD``/``SDLC_DENY_BASELINE`` for every test (issue #660).
+
+    ``resolve_harness``/``resolve_agent_cmd`` (and ``resolve_deny_rules``) read
+    these two escape-hatch vars straight from ``os.environ`` with no test seam,
+    so a developer with either exported locally (e.g. testing the override
+    themselves) sees the "env" harness / a different deny baseline where CI's
+    clean env sees "builtin" — same ambient-env-leak class as the other
+    fixtures in this file. Tests that deliberately exercise the override
+    (e.g. ``test_the_env_override_slot_declares_no_floor``) call
+    ``monkeypatch.setenv`` themselves, which layers on top after this fixture.
+    """
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    monkeypatch.delenv("SDLC_DENY_BASELINE", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_git_push(monkeypatch):
     """Block a real ``git push`` for every test by default (issue #527).
 
