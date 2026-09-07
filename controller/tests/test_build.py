@@ -4218,7 +4218,9 @@ def test_open_story_cr_falls_back_to_inventory_host_when_url_undetectable(
     ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
 
     fake = _FakeCrAdapter("gitlab")
-    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: fake)
+    monkeypatch.setattr(
+        ih, "get_adapter", lambda host, runner=None, instance_url=None: fake
+    )
 
     pr = _open_story_cr(
         story, ledger, "run-1", root, "origin/main", None, ih.GITLAB_CR_TERMS,
@@ -4245,7 +4247,7 @@ def test_open_story_cr_explicit_host_wins_over_inventory_mapping(
     captured_hosts: list[str] = []
     monkeypatch.setattr(
         ih, "get_adapter",
-        lambda host, runner=None: (captured_hosts.append(host), fake)[1],
+        lambda host, runner=None, instance_url=None: (captured_hosts.append(host), fake)[1],
     )
 
     _open_story_cr(
@@ -4283,6 +4285,70 @@ def test_open_story_cr_unmapped_story_keeps_url_only_degradation(
     assert any("could not determine code host" in m for m in messages)
 
 
+def test_open_story_cr_threads_declared_instance_url(tmp_path, monkeypatch) -> None:
+    """Story 30.1-001: a repo's `.sdlc-forge.yaml` instance URL reaches `get_adapter`."""
+    from sdlc.build import _open_story_cr
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    (root / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()  # no inventory mapping — the declaration alone must resolve it
+
+    fake = _FakeCrAdapter("gitlab")
+    captured: dict = {}
+    monkeypatch.setattr(
+        ih, "get_adapter",
+        lambda host, runner=None, instance_url=None: (
+            captured.update(host=host, instance_url=instance_url), fake
+        )[1],
+    )
+
+    pr = _open_story_cr(
+        story, ledger, "run-1", root, "origin/main", None, ih.GITLAB_CR_TERMS,
+        BuildOptions(),
+        body="Coverage gate passed.", context="post-coverage",
+    )
+
+    assert pr == 42
+    assert captured == {"host": "gitlab", "instance_url": "http://127.0.0.1:8080"}
+
+
+def test_log_forge_preflight_logs_the_resolved_forge(tmp_path) -> None:
+    from sdlc.build import _log_forge_preflight
+
+    root = _repo_with_undetectable_origin(tmp_path, "feature/x")
+    (root / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("all", "serial")
+
+    _log_forge_preflight(ledger, run_id, root, BuildOptions())
+
+    with sqlite3.connect(ledger.db_path) as conn:
+        messages = [r[0] for r in conn.execute("SELECT message FROM events").fetchall()]
+    assert any(
+        "forge routing: gitlab instance=http://127.0.0.1:8080" in m for m in messages
+    )
+
+
+def test_log_forge_preflight_never_raises_on_undetectable_host(tmp_path) -> None:
+    """A repo with no declaration and no detectable host degrades silently —
+    forge preflight logging must never fail an otherwise-good build."""
+    from sdlc.build import _log_forge_preflight
+
+    root = _repo_with_undetectable_origin(tmp_path, "feature/x")
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("all", "serial")
+
+    _log_forge_preflight(ledger, run_id, root, BuildOptions())  # must not raise
+
+
 def test_bake_review_packet_falls_back_to_inventory_host(tmp_path, monkeypatch) -> None:
     """The review-packet bake resolves the host the same way as the CR open —
     --host, then the story's inventory mapping — before the URL heuristic
@@ -4297,7 +4363,9 @@ def test_bake_review_packet_falls_back_to_inventory_host(tmp_path, monkeypatch) 
     ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
 
     fake = _FakeCrAdapter("gitlab")
-    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: fake)
+    monkeypatch.setattr(
+        ih, "get_adapter", lambda host, runner=None, instance_url=None: fake
+    )
     monkeypatch.setattr(
         review_packet_mod, "packet_block",
         lambda adapter, cr_ref, **kwargs: f"PACKET-{cr_ref}",

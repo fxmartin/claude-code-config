@@ -1207,6 +1207,57 @@ def test_git_project_url_handles_missing_git(monkeypatch) -> None:
     assert dash.git_project_url("/nope") is None
 
 
+def test_git_project_url_declared_instance_rewrites_web_base(tmp_path: Path) -> None:
+    """Story 30.1-001: a declared instance URL replaces the remote's scheme+host,
+    so MR deep links on the dashboard open the local instance."""
+    import subprocess
+
+    from sdlc.dashboard import git_project_url
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         "git@gitlab.example.com:owner/repo.git"],
+        check=True,
+    )
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    assert git_project_url(tmp_path) == "http://127.0.0.1:8080/owner/repo"
+
+
+def test_git_project_url_malformed_declaration_degrades_to_remote(tmp_path: Path) -> None:
+    """A malformed declaration must not crash a per-request URL resolution —
+    only `validate_forge_declaration` (the single-repo startup preflight) raises."""
+    import subprocess
+
+    from sdlc.dashboard import git_project_url
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         "git@github.com:owner/repo.git"],
+        check=True,
+    )
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n")
+    assert git_project_url(tmp_path) == "https://github.com/owner/repo"
+
+
+def test_validate_forge_declaration_raises_on_malformed_file(tmp_path: Path) -> None:
+    from sdlc.dashboard import validate_forge_declaration
+    from sdlc.issue_host import IssueHostError
+
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n")
+    with pytest.raises(IssueHostError, match="unsupported forge"):
+        validate_forge_declaration(tmp_path)
+
+
+def test_validate_forge_declaration_no_file_is_a_noop(tmp_path: Path) -> None:
+    from sdlc.dashboard import validate_forge_declaration
+
+    validate_forge_declaration(tmp_path)  # must not raise
+
+
 def test_project_name_from_url() -> None:
     """``owner/repo`` is taken from the URL when one is known."""
     from sdlc.dashboard import _project_name
@@ -1603,6 +1654,18 @@ def test_repo_host_defaults_github_without_remote(tmp_path: Path) -> None:
     assert repo_host(tmp_path) == "github"
 
 
+def test_repo_host_declaration_wins_over_ambiguous_remote(tmp_path: Path) -> None:
+    """Story 30.1-001: `.sdlc-forge.yaml` resolves the forge even when the
+    remote's hostname carries no github/gitlab tell (a local/self-hosted origin)."""
+    from sdlc.dashboard import repo_host
+
+    _git_repo_with_origin(tmp_path, "git@127.0.0.1:acme/widgets.git")
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    assert repo_host(tmp_path) == "gitlab"
+
+
 def test_github_stats_routes_gitlab_host(tmp_path: Path) -> None:
     """A GitLab run's repo-health read is dispatched to the ``gitlab`` fetcher."""
     from types import SimpleNamespace
@@ -1768,6 +1831,33 @@ def test_make_server_creates_github_cache_both_modes(tmp_path: Path) -> None:
     disco = make_server(db_path=None, host="127.0.0.1", port=0, registry=reg)
     assert isinstance(disco.github_cache, GitHubStatsCache)
     disco.server_close()
+
+
+def test_make_server_single_repo_aborts_on_malformed_forge_declaration(
+    tmp_path: Path,
+) -> None:
+    """Story 30.1-001: single-repo mode validates `.sdlc-forge.yaml` at startup —
+    a malformed file aborts server construction rather than silently degrading
+    every later request's deep links."""
+    from sdlc.issue_host import IssueHostError
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n")
+    with pytest.raises(IssueHostError, match="unsupported forge"):
+        make_server(db, host="127.0.0.1", port=0)
+
+
+def test_make_server_registry_mode_ignores_forge_declaration(tmp_path: Path) -> None:
+    """Registry-discovery mode has no single repo to validate against — a
+    malformed file anywhere must never block server startup (it degrades
+    per-repo, per-request instead)."""
+    from sdlc.registry import Registry
+
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n")
+    reg = Registry(tmp_path / "registry.json")
+    server = make_server(db_path=None, host="127.0.0.1", port=0, registry=reg)
+    server.server_close()
 
 
 def test_page_has_github_panel_and_badge_hooks() -> None:

@@ -370,8 +370,15 @@ def test_run_story_embeds_packet_in_review_dispatch(tmp_path, monkeypatch) -> No
     from sdlc.build import BuildOptions, _run_story
     from sdlc.dispatch import AgentResult
 
-    monkeypatch.setattr(ih, "resolve_host", lambda root, override=None: ih.GITHUB)
-    monkeypatch.setattr(ih, "get_adapter", lambda host, runner=None: FakeAdapter())
+    monkeypatch.setattr(
+        ih, "resolve_forge",
+        lambda root, override=None: ih.ForgeResolution(
+            host=ih.GITHUB, instance_url=None, source="override"
+        ),
+    )
+    monkeypatch.setattr(
+        ih, "get_adapter", lambda host, runner=None, instance_url=None: FakeAdapter()
+    )
 
     prompts: dict[str, str] = {}
 

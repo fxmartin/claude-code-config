@@ -387,10 +387,11 @@ def build(ctx: typer.Context) -> None:
     # run's actor from host identity. Best-effort — a repo with no/unsupported
     # host remote yields no adapter, and run_build degrades the actor to
     # `unknown` (it never blocks a build; AC3).
-    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.issue_host import IssueHostError, get_adapter, resolve_forge
 
     try:
-        actor_adapter = get_adapter(resolve_host(Path.cwd()))
+        resolution = resolve_forge(Path.cwd())
+        actor_adapter = get_adapter(resolution.host, instance_url=resolution.instance_url)
     except IssueHostError:
         actor_adapter = None
     result = run_build(
@@ -1374,6 +1375,8 @@ def dashboard(
         )
         raise typer.Exit(code=0)
 
+    from sdlc.issue_host import IssueHostError
+
     try:
         # db is None → registry-discovery mode (multi-run overview, Story 11.2-002).
         serve(db, host=host, port=port, run_id=run, open_browser=open_browser)
@@ -1386,6 +1389,11 @@ def dashboard(
             err=True,
         )
         raise typer.Exit(code=0) from exc
+    except IssueHostError as exc:
+        # Story 30.1-001: a malformed `.sdlc-forge.yaml` in single-repo (--db)
+        # mode aborts server startup — the dashboard's preflight.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
 
 @app.command(help=PLANNED_SUBCOMMANDS["state"])
@@ -2969,7 +2977,7 @@ def issues_init(
     With no framework-format stories it exits 1 pointing at ``generate-epics``; an
     undeterminable/unsupported host or an unauthenticated CLI exits 2.
     """
-    from sdlc.issue_host import IssueHostError, get_adapter, resolve_host
+    from sdlc.issue_host import IssueHostError, format_forge_preflight_line, get_adapter, resolve_forge
     from sdlc.ledger_view import Ledger, default_db_path
     from sdlc.story_init import NoStoriesError, init_issues
     from sdlc.story_render import parse_story_docs
@@ -2986,8 +2994,9 @@ def issues_init(
         raise typer.Exit(code=1)
 
     try:
-        resolved = resolve_host(root_path, host)
-        adapter = get_adapter(resolved)
+        resolution = resolve_forge(root_path, host)
+        typer.echo(format_forge_preflight_line(resolution), err=True)
+        adapter = get_adapter(resolution.host, instance_url=resolution.instance_url)
         adapter.ensure_ready()
     except IssueHostError as exc:
         typer.echo(f"error: {exc}", err=True)

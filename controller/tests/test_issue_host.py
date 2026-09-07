@@ -36,9 +36,11 @@ class FakeRunner:
         self.mapping = mapping or {}
         self.default = default
         self.calls: list[list[str]] = []
+        self.envs: list[dict | None] = []
 
-    def __call__(self, argv, timeout=None):
+    def __call__(self, argv, timeout=None, env=None):
         self.calls.append(list(argv))
+        self.envs.append(env)
         joined = " ".join(argv)
         for needle, result in self.mapping.items():
             if needle in joined:
@@ -746,3 +748,246 @@ def test_repo_runner_invokes_the_host_cli_inside_the_repo(tmp_path, monkeypatch)
     assert result.returncode == 0
     assert seen["cwd"] == str(tmp_path)
     assert seen["argv"] == ["gh", "pr", "view", "1"]
+
+
+def test_default_runner_no_env_override_passes_none(monkeypatch) -> None:
+    seen: dict = {}
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return Completed()
+
+    monkeypatch.setattr(ih.subprocess, "run", fake_run)
+    ih._default_runner(["gh", "pr", "view", "1"])
+    assert seen["env"] is None
+
+
+def test_default_runner_env_override_merges_onto_os_environ(monkeypatch) -> None:
+    seen: dict = {}
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return Completed()
+
+    monkeypatch.setattr(ih.subprocess, "run", fake_run)
+    monkeypatch.setenv("SOME_EXISTING_VAR", "keep-me")
+    ih._default_runner(["glab", "mr", "view", "1"], env={"GITLAB_HOST": "http://127.0.0.1:8080"})
+    assert seen["env"]["GITLAB_HOST"] == "http://127.0.0.1:8080"
+    assert seen["env"]["SOME_EXISTING_VAR"] == "keep-me"
+
+
+def test_repo_runner_threads_env_alongside_cwd(monkeypatch, tmp_path) -> None:
+    seen: dict = {}
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return Completed()
+
+    monkeypatch.setattr(ih.subprocess, "run", fake_run)
+    ih.repo_runner(tmp_path)(
+        ["glab", "mr", "view", "1"], env={"GITLAB_HOST": "http://127.0.0.1:8080"}
+    )
+    assert seen["cwd"] == str(tmp_path)
+    assert seen["env"]["GITLAB_HOST"] == "http://127.0.0.1:8080"
+
+
+# --- `.sdlc-forge.yaml` declaration (Story 30.1-001) -------------------------
+
+
+def test_load_repo_forge_declaration_missing_file_returns_none(tmp_path) -> None:
+    path = tmp_path / ih.FORGE_OVERRIDE_FILENAME
+    assert ih.load_repo_forge_declaration(override_path=path) is None
+
+
+def test_load_repo_forge_declaration_blank_text_returns_none() -> None:
+    assert ih.load_repo_forge_declaration(override_text="") is None
+    assert ih.load_repo_forge_declaration(override_text="   \n") is None
+
+
+def test_load_repo_forge_declaration_parses_forge_and_instance_url() -> None:
+    decl = ih.load_repo_forge_declaration(
+        override_text="forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    assert decl == ih.ForgeDeclaration(forge=ih.GITLAB, instance_url="http://127.0.0.1:8080")
+
+
+def test_load_repo_forge_declaration_forge_only_has_no_instance_url() -> None:
+    decl = ih.load_repo_forge_declaration(override_text="forge: github\n")
+    assert decl == ih.ForgeDeclaration(forge=ih.GITHUB, instance_url=None)
+
+
+def test_load_repo_forge_declaration_is_case_and_whitespace_insensitive() -> None:
+    decl = ih.load_repo_forge_declaration(override_text="forge: '  GitLab  '\n")
+    assert decl.forge == ih.GITLAB
+
+
+def test_load_repo_forge_declaration_reads_from_path(tmp_path) -> None:
+    path = tmp_path / ih.FORGE_OVERRIDE_FILENAME
+    path.write_text("forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n")
+    decl = ih.load_repo_forge_declaration(override_path=path)
+    assert decl.forge == ih.GITLAB
+    assert decl.instance_url == "http://127.0.0.1:8080"
+
+
+def test_load_repo_forge_declaration_bad_yaml_raises() -> None:
+    with pytest.raises(ih.IssueHostError, match="not valid YAML"):
+        ih.load_repo_forge_declaration(override_text="forge: [gitlab\n")
+
+
+def test_load_repo_forge_declaration_non_mapping_raises() -> None:
+    with pytest.raises(ih.IssueHostError, match="mapping"):
+        ih.load_repo_forge_declaration(override_text="- gitlab\n")
+
+
+def test_load_repo_forge_declaration_missing_forge_key_raises() -> None:
+    with pytest.raises(ih.IssueHostError, match="'forge'"):
+        ih.load_repo_forge_declaration(override_text="gitlab_url: http://127.0.0.1:8080\n")
+
+
+def test_load_repo_forge_declaration_empty_forge_raises() -> None:
+    with pytest.raises(ih.IssueHostError, match="'forge'"):
+        ih.load_repo_forge_declaration(override_text="forge: ''\n")
+
+
+def test_load_repo_forge_declaration_unsupported_forge_raises() -> None:
+    with pytest.raises(ih.IssueHostError, match="unsupported forge"):
+        ih.load_repo_forge_declaration(override_text="forge: bitbucket\n")
+
+
+def test_load_repo_forge_declaration_malformed_url_raises() -> None:
+    with pytest.raises(ih.IssueHostError, match="not a valid URL"):
+        ih.load_repo_forge_declaration(override_text="forge: gitlab\ngitlab_url: not-a-url\n")
+
+
+def test_load_repo_forge_declaration_empty_url_raises() -> None:
+    with pytest.raises(ih.IssueHostError, match="non-empty URL"):
+        ih.load_repo_forge_declaration(override_text="forge: gitlab\ngitlab_url: ''\n")
+
+
+def test_load_repo_forge_declaration_non_string_url_raises() -> None:
+    with pytest.raises(ih.IssueHostError, match="non-empty URL"):
+        ih.load_repo_forge_declaration(override_text="forge: gitlab\ngitlab_url: 8080\n")
+
+
+# --- resolve_forge precedence (Story 30.1-001) -------------------------------
+
+
+def test_resolve_forge_no_file_falls_back_to_auto_detect(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(ih, "_remote_url", lambda root: "git@github.com:fx/r.git")
+    resolution = ih.resolve_forge(tmp_path)
+    assert resolution == ih.ForgeResolution(
+        host=ih.GITHUB, instance_url=None, source="auto-detect"
+    )
+
+
+def test_resolve_forge_declaration_wins_over_ambiguous_remote(tmp_path, monkeypatch) -> None:
+    (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    # An origin the hostname heuristic cannot classify would otherwise fail.
+    monkeypatch.setattr(ih, "_remote_url", lambda root: "git@bitbucket.org:g/r.git")
+    resolution = ih.resolve_forge(tmp_path)
+    assert resolution == ih.ForgeResolution(
+        host=ih.GITLAB, instance_url="http://127.0.0.1:8080", source="declaration"
+    )
+
+
+def test_resolve_forge_override_wins_over_declaration(tmp_path) -> None:
+    (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    resolution = ih.resolve_forge(tmp_path, override="github")
+    assert resolution == ih.ForgeResolution(host=ih.GITHUB, instance_url=None, source="override")
+
+
+def test_resolve_forge_bad_declaration_aborts(tmp_path) -> None:
+    (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text("forge: bitbucket\n")
+    with pytest.raises(ih.IssueHostError, match="unsupported forge"):
+        ih.resolve_forge(tmp_path)
+
+
+def test_resolve_forge_malformed_url_aborts(tmp_path) -> None:
+    (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: not-a-url\n"
+    )
+    with pytest.raises(ih.IssueHostError, match="not a valid URL"):
+        ih.resolve_forge(tmp_path)
+
+
+def test_resolve_forge_unknown_fails_fast(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(ih, "_remote_url", lambda root: "git@bitbucket.org:g/r.git")
+    with pytest.raises(ih.IssueHostError, match="could not determine"):
+        ih.resolve_forge(tmp_path)
+
+
+def test_resolve_forge_unsupported_override_fails_fast(tmp_path) -> None:
+    with pytest.raises(ih.IssueHostError, match="unsupported host"):
+        ih.resolve_forge(tmp_path, override="bitbucket")
+
+
+def test_format_forge_preflight_line_no_instance() -> None:
+    resolution = ih.ForgeResolution(host=ih.GITHUB, instance_url=None, source="auto-detect")
+    assert ih.format_forge_preflight_line(resolution) == "forge routing: github (auto-detect)"
+
+
+def test_format_forge_preflight_line_with_instance() -> None:
+    resolution = ih.ForgeResolution(
+        host=ih.GITLAB, instance_url="http://127.0.0.1:8080", source="declaration"
+    )
+    assert ih.format_forge_preflight_line(resolution) == (
+        "forge routing: gitlab instance=http://127.0.0.1:8080 (declaration)"
+    )
+
+
+# --- resolve_host stays byte-identical with no declaration (AC2) -------------
+
+
+def test_resolve_host_delegates_declaration_first(tmp_path) -> None:
+    (tmp_path / ih.FORGE_OVERRIDE_FILENAME).write_text(
+        "forge: gitlab\ngitlab_url: http://127.0.0.1:8080\n"
+    )
+    assert ih.resolve_host(tmp_path) == ih.GITLAB
+
+
+def test_resolve_host_no_file_is_byte_identical(monkeypatch) -> None:
+    monkeypatch.setattr(ih, "_remote_url", lambda root: "git@gitlab.com:g/r.git")
+    assert ih.resolve_host(".") == ih.GITLAB
+
+
+# --- GitLab adapter threads the declared instance URL per invocation (AC5) ---
+
+
+def test_get_adapter_gitlab_with_instance_url_sets_env() -> None:
+    runner = FakeRunner(mapping={"api user": (0, '{"username": "fx"}', "")})
+    adapter = ih.get_adapter(ih.GITLAB, runner=runner, instance_url="http://127.0.0.1:8080")
+    assert adapter.whoami() == "fx"
+    assert runner.envs[-1] == {"GITLAB_HOST": "http://127.0.0.1:8080"}
+
+
+def test_gitlab_adapter_without_instance_url_passes_no_env() -> None:
+    runner = FakeRunner(mapping={"api user": (0, '{"username": "fx"}', "")})
+    adapter = ih.GitLabAdapter(runner=runner)
+    adapter.whoami()
+    assert runner.envs[-1] is None
+
+
+def test_get_adapter_github_ignores_instance_url() -> None:
+    runner = FakeRunner()
+    adapter = ih.get_adapter(ih.GITHUB, runner=runner, instance_url="http://127.0.0.1:8080")
+    assert isinstance(adapter, ih.GitHubAdapter)
+    assert adapter.instance_url == "http://127.0.0.1:8080"

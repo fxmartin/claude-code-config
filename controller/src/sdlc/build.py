@@ -4575,6 +4575,30 @@ def _log_controller_version_check(ledger: "Ledger", run_id: str, root: Path) -> 
         pass
 
 
+def _log_forge_preflight(
+    ledger: "Ledger", run_id: str, root: Path, opts: "BuildOptions"
+) -> None:
+    """Resolve and log the run's effective forge — the `.sdlc-forge.yaml` analogue
+    of :func:`_log_harness_preflight`'s `harness routing:` line (Story 30.1-001).
+
+    Resolves once, from the run's own root and ``--host``/``opts.host``
+    override — the same precedence (CLI/env > repo declaration > auto-detect)
+    :func:`sdlc.issue_host.resolve_forge` applies at every per-story CR open
+    (:func:`_open_story_cr`, :func:`_bake_review_packet`). Purely additive
+    logging: a resolution failure (no remote, unsupported host) is common on a
+    non-git ``root`` in tests and must never fail an otherwise-good build.
+    """
+    try:
+        from sdlc import issue_host
+
+        resolution = issue_host.resolve_forge(root, override=opts.host)
+        line = issue_host.format_forge_preflight_line(resolution)
+        print(line, file=sys.stderr)
+        ledger.event_log(run_id, "", "info", "forge", line)
+    except Exception:
+        pass
+
+
 def _record_degradations(
     ledger: "Ledger", run_id: str, requested_mode: str, opts: "BuildOptions"
 ) -> None:
@@ -5183,10 +5207,10 @@ def _open_story_cr(
         # adapter off this module's hot import path.
         from sdlc import issue_host
 
-        host = issue_host.resolve_host(
+        resolution = issue_host.resolve_forge(
             root, override=_story_cr_host_override(story, ledger, opts)
         )
-        adapter = issue_host.get_adapter(host)
+        adapter = issue_host.get_adapter(resolution.host, instance_url=resolution.instance_url)
         title = build_commit_header(
             ctype="feat",
             scope=story.epic_name,
@@ -5272,10 +5296,10 @@ def _bake_review_packet(
         # this module's hot import path.
         from sdlc import issue_host, review_packet
 
-        host = issue_host.resolve_host(
+        resolution = issue_host.resolve_forge(
             root, override=_story_cr_host_override(story, ledger, opts)
         )
-        adapter = issue_host.get_adapter(host)
+        adapter = issue_host.get_adapter(resolution.host, instance_url=resolution.instance_url)
         block = review_packet.packet_block(adapter, str(pr_number), checks=checks)
     except Exception:  # noqa: BLE001 — best-effort; the prompt has a fallback path
         block = None
@@ -6567,6 +6591,10 @@ def run_build(
     # default slot is the built-in Claude harness (no probe, all capabilities),
     # so this is purely additive logging and never alters dispatch behaviour.
     _log_harness_preflight(ledger, run_id, mode, opts, undenied=undenied)
+    # Story 30.1-001: resolve and log the run's effective forge (github/gitlab,
+    # and any declared self-hosted instance) beside the harness routing line —
+    # the `.sdlc-forge.yaml` analogue of the `harness routing:` precedent.
+    _log_forge_preflight(ledger, run_id, root or Path.cwd(), opts)
     # Story 15.1-004: warn (never block) when the installed `sdlc` disagrees
     # with this checkout's declared controller version, beside the harness
     # routing line — the only prior tell was the dashboard's version badge.

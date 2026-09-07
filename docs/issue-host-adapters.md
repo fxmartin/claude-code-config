@@ -104,25 +104,57 @@ no merge trains, no Premium-only keywords.
 
 ## Choosing the host
 
-`resolve_host(root, override=None)` decides which backend to use:
+`resolve_forge(root, override=None)` decides which backend to use, and — since
+Story 30.1-001 — which instance:
 
 1. **Explicit override wins** — a `--host github|gitlab` flag or config value.
-2. **Otherwise auto-detect** from `git remote get-url origin`: the hostname is
+2. **Otherwise the repo's declared forge** — a checked-in `.sdlc-forge.yaml` at
+   the repo root (see [Declaring a self-hosted instance](#declaring-a-self-hosted-instance--sdlc-forgeyaml-story-301-001)
+   below).
+3. **Otherwise auto-detect** from `git remote get-url origin`: the hostname is
    matched as a substring, so `github.com`, `gitlab.com`, and self-hosted
-   `gitlab.corp.internal` all resolve.
-3. **Fail fast** — an undeterminable host ("could not determine code host …")
+   `gitlab.corp.internal` all resolve. A **local** instance
+   (`http://127.0.0.1:8080/...`) carries no such substring — declare it instead.
+4. **Fail fast** — an undeterminable host ("could not determine code host …")
    or an unsupported one ("unsupported host …") raises `IssueHostError` with a
-   clear message rather than silently targeting the wrong forge. An
+   clear message rather than silently targeting the wrong forge. A malformed
+   declaration raises the same way, at preflight, never mid-pipeline. An
    unauthenticated CLI fails the same way via `ensure_ready()`.
 
 ```python
-from sdlc.issue_host import get_adapter, resolve_host
+from sdlc.issue_host import get_adapter, resolve_forge
 
-host = resolve_host(".", override=cli_flag)   # "github" | "gitlab"
-adapter = get_adapter(host)
+resolution = resolve_forge(".", override=cli_flag)   # host + declared instance_url + source
+adapter = get_adapter(resolution.host, instance_url=resolution.instance_url)
 adapter.ensure_ready()                          # raises if the CLI is absent/unauthed
 issue = adapter.issue_create("Story 22.2-001", body, labels=["story", "epic:22"])
 ```
+
+`resolve_host(root, override=None)` is still available as a thin wrapper
+returning just the host string (`resolve_forge(...).host`) for callers that
+never need the declared instance.
+
+### Declaring a self-hosted instance — `.sdlc-forge.yaml` (Story 30.1-001)
+
+A repo whose `origin` points at a **local or self-hosted** GitLab (one whose
+hostname carries no `gitlab` substring for auto-detection to key on, e.g. a
+local dev instance at `http://127.0.0.1:8080`) checks in a `.sdlc-forge.yaml`
+at its root so host resolution never has to guess:
+
+```yaml
+# <repo-root>/.sdlc-forge.yaml
+forge: gitlab
+gitlab_url: http://127.0.0.1:8080
+```
+
+`forge:` is required and must be `github` or `gitlab`; `<forge>_url:` (e.g.
+`gitlab_url:`) is optional and names the instance's base URL. No file present
+is byte-identical to today — the declaration is purely additive, same as
+`.sdlc-harness.yaml`. When a `gitlab_url` is declared, every `glab` call the
+resolved adapter makes targets that instance via a **per-invocation**
+`GITLAB_HOST` env override — never by mutating `glab`'s global config — so a
+controller process touching several GitLab instances in one run never
+cross-contaminates them.
 
 ## Issue rendering & the label/board taxonomy (Story 22.2-002)
 

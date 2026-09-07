@@ -2248,6 +2248,61 @@ confined to the two releases between the `.sdlc-harness.yaml` feature and the
 event line (v2.16.0–v2.17.1); resume one with `SDLC_AGENT_CMD` set, or start a
 fresh run, to put it back on Codex.
 
+### `.sdlc-forge.yaml` forge declaration (Story 30.1-001)
+
+Mirrors `.sdlc-harness.yaml`'s pattern for the **code host** instead of the
+harness: a repo whose origin is a local/self-hosted forge (e.g. GitLab at
+`http://127.0.0.1:8080/...`) checks in a `.sdlc-forge.yaml` naming the forge
+kind and instance, so hostname auto-detection (`issue_host.host_from_remote`,
+which keys on a `github`/`gitlab` substring in the remote hostname) never has
+to guess at an unrecognisable host:
+
+```yaml
+forge: gitlab
+gitlab_url: http://127.0.0.1:8080
+```
+
+`forge:` must be one of `issue_host.SUPPORTED_HOSTS`; `<forge>_url:` (e.g.
+`gitlab_url:`) is optional and names the instance's base URL.
+
+**Resolution precedence** (`issue_host.resolve_forge`), mirroring the harness
+pin's `--harness` > repo file > registry `default:`:
+
+1. An explicit CLI/env override (`--host`, a story's inventory-mapped host, …)
+2. The repo's `.sdlc-forge.yaml`
+3. The `origin` remote's auto-detected hostname (today's behaviour)
+
+No file present is byte-identical to today: `resolve_host` (the existing
+host-only API every pre-existing call site uses) is now a thin wrapper over
+`resolve_forge(...).host`, so the declaration is purely additive. A malformed
+declaration (unsupported `forge:`, a non-URL `<forge>_url:`) raises
+`IssueHostError` so the run **fails fast at preflight**, never mid-pipeline —
+the same contract `load_repo_harness_defaults` enforces for a malformed
+`.sdlc-harness.yaml`.
+
+**Threading the instance URL.** A declared instance is only useful if the
+`glab` calls an adapter makes actually target it. `issue_host.get_adapter(host,
+instance_url=...)` threads it onto `GitLabAdapter`, which passes it to every
+`glab` invocation as a **per-call** `GITLAB_HOST` env override
+(`IssueHostAdapter._invoke`) — never by mutating `glab`'s persistent global
+config, so a controller process touching several repos on several instances in
+one run never cross-contaminates them. The declaration-aware call sites: `sdlc
+build` (`_open_story_cr`/`_bake_review_packet`, and the run-start actor-identity
+resolve), `sdlc fix` (`_resolve_fix_forge` mirrors `_resolve_fix_host`'s
+non-raising auto-detect fallback but still raises on a malformed declaration;
+threaded through `fetch_issue`/`stop_reason`/the stage loop/batch selection),
+`sdlc issues init`, and the dashboard (`git_project_url` rewrites the PR/MR
+deep-link web base to the declared instance; `make_server`'s single-repo mode
+validates the declaration once at startup — registry-discovery mode resolves
+it per-repo, per-request, best-effort, so one repo's bad file can't take the
+whole dashboard down).
+
+**Preflight line.** Every routed build/fix run logs `forge routing: <host>
+[instance=<url>] (<source>)` beside the `harness routing: …` line
+(`format_forge_preflight_line`), so which forge a run targeted — and whether
+that came from an override, a declaration, or auto-detection — is always
+auditable from the run log, not just inferred from behaviour.
+
 ### Codex build/QA adapter (Story 20.3-001)
 
 The `codex` registry entry is the first concrete **non-Claude** adapter, proving
