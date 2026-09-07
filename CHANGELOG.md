@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.68.0] - 2026-09-07
+
+### Added
+
+- feat(development-queue): one rate-limit window for the (#32.2-001) (#668)
+
+
 ## [v2.67.0] - 2026-09-07
 
 ### Added
