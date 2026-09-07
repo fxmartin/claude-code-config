@@ -174,11 +174,13 @@ Claude Code). The plugin half needs a Claude Code restart to take effect.
 | Command | Purpose |
 |---------|---------|
 | `sdlc build [scope] [--dry-run] [--auto] [--harness role=name] [--concurrency=N]` | Run the full build-stories orchestration |
+| `sdlc build --enqueue <scope>` · `sdlc fix --enqueue <issue>` | Record a job in the host queue instead of running now; no run starts. Foreground stays the default when `--enqueue` is omitted |
+| `sdlc queue list` · `sdlc queue add` · `sdlc queue cancel <id>` · `sdlc queue prioritise <id> <class>` | Inspect and manage the host-level job queue (`$XDG_STATE_HOME/sdlc/queue.db`, `SDLC_QUEUE_PATH`-overridable) — every job on the host across repos, any state, priority, and age |
 | `sdlc resume` | Resume an interrupted build from the ledger state |
 | `sdlc status` · `sdlc state` | Run status and stage progress · inspect the persisted state machine |
 | `sdlc dashboard --open` | Live multi-run browser dashboard (see [Observability](#observability--the-live-dashboard)) |
 | `sdlc issues init` · `sdlc issues assign` | Backfill the GitHub/GitLab issue board (one issue per story) · assign a story or epic to a host user. During a build, each story's issue updates live (a `status:` label + comment as it moves `building → in-review → merging`) and auto-closes on merge via its `Closes #N` link |
-| `sdlc doctor [--gitlab]` | Health-check install, ledger, config, and forge prerequisites |
+| `sdlc doctor [--gitlab]` | Health-check install, ledger, queue, config, and forge prerequisites |
 | `sdlc clean` · `sdlc repair` · `sdlc rollback` · `sdlc reconcile` | Workspace GC · ledger repair · checkpoint unwind · terminal-status reconciliation vs `origin/main` |
 | `sdlc usage-reconcile [--all]` | Backfill per-stage token/cost usage from the session logs and score ledger-vs-logs agreement (`sdlc doctor` reports the rate) |
 | `sdlc model-backfill [--all]` | Backfill per-stage model attribution (`stages.model`) from the session logs; unrecoverable rows are counted, never coerced (`sdlc doctor` reports the coverage) |

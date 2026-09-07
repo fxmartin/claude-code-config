@@ -35,6 +35,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
 | `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
+| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|prioritise` manage (Story 32.1-001). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
 
@@ -1265,6 +1266,13 @@ it on the next real run).
     `_MIGRATIONS` version is applied. Behind / pre-migration-framework → `WARN`
     (auto-migrates on the next `sdlc` verb); unreadable/corrupt → `FAIL`. No
     ledger yet is `CLEAN` ("nothing built").
+  - **Development queue** (`sdlc/queue.py`, Story 32.1-001) — the host-level
+    `queue.db` `sdlc build/fix --enqueue` and `sdlc queue` write to opens
+    read-only, every migration is applied, and job counts by lifecycle state
+    (`queued`/`running`/`done`/`failed`/`cancelled`) are reported. Same
+    severity ladder as the ledger check: behind / pre-migration-framework →
+    `WARN`; unreadable/corrupt → `FAIL`; no queue yet ("nothing enqueued on
+    this host") → `CLEAN`.
   - **Stuck / stale runs** — reuses the registry's pid logic
     ([the run registry](#the-run-registry-cross-repo-discovery)): an
     `IN_PROGRESS` run whose pid is dead derives `DEAD` → `FAIL` (remedy

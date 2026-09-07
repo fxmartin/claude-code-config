@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
@@ -145,6 +146,30 @@ def _resolve_run_option(ledger, value: str | None, *, strict: bool = True) -> st
     return matches[0]
 
 
+def _enqueue_job(*, kind: str, scope: str, cli_args: list[str]) -> None:
+    """Record a `queued` job for `build --enqueue` / `fix --enqueue` (32.1-001).
+
+    ``cli_args`` is the exact CLI flag vector the job was invoked with (minus
+    ``--enqueue`` itself), frozen as JSON — the same "replay verbatim" contract
+    ``runs.harness_routing``/``model_routing`` use for a resume, but here it is
+    the raw argv rather than a resolved config: a later verb re-parses it with
+    the same ``parse_build_args``/``parse_fix_args`` this command already ran,
+    so freezing the source flags (not the parsed dataclass, which carries
+    internal non-JSON-safe fields) is what makes a replay byte-identical.
+    Prints the queued job id; the caller exits 0 immediately after (no run
+    starts — AC1/AC2).
+    """
+    from sdlc.queue import QueueStore, default_queue_path
+
+    store = QueueStore(default_queue_path())
+    store.init()
+    repo = str(Path.cwd().resolve())
+    job_id = store.add_job(
+        repo=repo, kind=kind, scope=scope, options_json=json.dumps(cli_args)
+    )
+    typer.echo(f"queued: job {job_id} ({kind} {scope}) in {repo}")
+
+
 # Note: there is no `init` verb. Epic-07 scaffolded one as a stub, but `build`
 # already creates the SQLite ledger on first use (`Ledger.init()` runs inside
 # `run_build`), so a separate workspace-scaffold command had no distinct job.
@@ -164,6 +189,10 @@ Scope (positional, default `all`):
 
 \b
 Flags:
+  --enqueue                 record a `queued` job in the host queue
+                             ($XDG_STATE_HOME/sdlc/queue.db) instead of running
+                             now; no run starts. Manage it with `sdlc queue`
+                             (Story 32.1-001). Omitted: unchanged, runs now
   --dry-run                 plan only; dispatch nothing
   --auto                    non-interactive run
   --skip-coverage           build agent opens the PR directly (no coverage gate)
@@ -259,11 +288,22 @@ def build(ctx: typer.Context) -> None:
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
     from sdlc.registry import Registry
 
+    # Story 32.1-001: `--enqueue` records a job in the host queue instead of
+    # running now. Stripped before parsing so the rest of the flag surface is
+    # unchanged; when absent this is a no-op and behaviour stays byte-identical
+    # to before this story (AC2).
+    enqueue = "--enqueue" in ctx.args
+    args = [arg for arg in ctx.args if arg != "--enqueue"]
+
     try:
-        opts = parse_build_args(ctx.args)
+        opts = parse_build_args(args)
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+    if enqueue:
+        _enqueue_job(kind="build", scope=opts.scope, cli_args=args)
+        raise typer.Exit(code=0)
 
     # Story 20.7-005: merge a repo-root `.sdlc-harness.yaml` under the CLI
     # `--harness` map (precedence: CLI flag > repo file > built-in default) so the
@@ -466,6 +506,10 @@ Target (positional — pass exactly one):
 
 \b
 Flags:
+  --enqueue                 record a `queued` job in the host queue
+                             ($XDG_STATE_HOME/sdlc/queue.db) instead of running
+                             now; no run starts. Manage it with `sdlc queue`
+                             (Story 32.1-001). Omitted: unchanged, runs now
   --limit=N                 batch only: cap the issue set (`next` defaults to 1)
   --sequential              batch only: one issue fully completes before the next
   --concurrency=N           batch only: issue-level worker cap (default 5)
@@ -504,17 +548,28 @@ def fix(ctx: typer.Context) -> None:
     from sdlc.fix_issue import (
         FixBatchOptions,
         FixConfigError,
+        FixOptions,
         parse_fix_args,
         run_fix,
         run_fix_batch,
     )
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
 
+    # Story 32.1-001: `--enqueue` records a job in the host queue instead of
+    # running now — mirrors `sdlc build --enqueue` (see its comment there).
+    enqueue = "--enqueue" in ctx.args
+    args = [arg for arg in ctx.args if arg != "--enqueue"]
+
     try:
-        opts = parse_fix_args(ctx.args)
+        opts = parse_fix_args(args)
     except FixConfigError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+    if enqueue:
+        scope = str(opts.issue) if isinstance(opts, FixOptions) else opts.target
+        _enqueue_job(kind="fix", scope=scope, cli_args=args)
+        raise typer.Exit(code=0)
 
     # Issue #551: resolve the same role->harness map `sdlc build` does, so a repo
     # configured for another harness stops silently running its fixes on Claude.
@@ -942,6 +997,11 @@ def doctor(
     db: Path | None = typer.Option(
         None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
     ),
+    queue: Path | None = typer.Option(
+        None,
+        "--queue",
+        help="Host queue DB path (default: $XDG_STATE_HOME/sdlc/queue.db).",
+    ),
     claude_dir: Path | None = typer.Option(
         None,
         "--claude-dir",
@@ -974,9 +1034,11 @@ def doctor(
     """Check the install and run state, reporting a remedy for each problem.
 
     Runs read-only health-checks across install integrity (managed symlinks),
-    ledger schema currency + integrity, stuck/stale runs (an IN_PROGRESS run with
-    a dead pid or no recent activity), config validity (settings/schemas parse),
-    ledger-vs-logs usage agreement, per-stage model attribution, and dependency
+    ledger schema currency + integrity, host queue schema currency + job counts
+    by state (Story 32.1-001, ``sdlc queue``'s store), stuck/stale runs (an
+    IN_PROGRESS run with a dead pid or no recent activity), config validity
+    (settings/schemas parse), ledger-vs-logs usage agreement, per-stage model
+    attribution, and dependency
     availability (gh, claude, semgrep, osv-scanner, and a host-aware check for
     glab — WARN when the repo's origin targets GitLab, or is undetectable, and
     glab is missing; not-applicable on a GitHub-targeted repo). Each finding
@@ -1014,6 +1076,7 @@ def doctor(
         repo_root=repo_root,
         claude_dir=claude_dir,
         db_path=db,
+        queue_path=queue,
     )
 
     if gitlab:
@@ -3001,6 +3064,145 @@ def issues_assign(
     # An unmapped story means the pass could not cover everything — exit non-zero
     # so a partial run is never read as a clean success (Story 22.5-002 AC3).
     raise typer.Exit(code=1 if result.unmapped else 0)
+
+
+# ---------------------------------------------------------------------------
+# `sdlc queue` — the host-level development queue (Story 32.1-001)
+# ---------------------------------------------------------------------------
+
+queue_app = typer.Typer(
+    name="queue",
+    help="Manage the host-level development queue (jobs `--enqueue` records).",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(queue_app, name="queue")
+
+
+def _format_age(now: datetime, created_at: str) -> str:
+    """A short human age like ``3m``/``2h``/``5d`` from an ISO `created_at`."""
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:
+        return "?"
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=now.tzinfo)
+    seconds = max(0, int((now - created).total_seconds()))
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+@queue_app.command("list")
+def queue_list_cmd(
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the queue as a JSON array."
+    ),
+) -> None:
+    """List every job on the host across every repo.
+
+    Reads ``$XDG_STATE_HOME/sdlc/queue.db`` (``SDLC_QUEUE_PATH`` overrides it).
+    Never mutates the store — a host that has never enqueued anything reports
+    "no jobs queued" rather than creating an empty one. Sorted highest-priority
+    first, then FIFO within a priority class.
+    """
+    from sdlc.queue import QueueStore, default_queue_path
+
+    store = QueueStore(default_queue_path())
+    rows = store.list_jobs()
+    if as_json:
+        typer.echo(json.dumps([r.to_dict() for r in rows], default=str))
+        raise typer.Exit(code=0)
+
+    if not rows:
+        typer.echo("no jobs queued.")
+        raise typer.Exit(code=0)
+
+    now = datetime.now(timezone.utc)
+    typer.echo(
+        f"{'ID':<6}{'STATE':<11}{'PRIORITY':<10}{'KIND':<7}{'SCOPE':<16}"
+        f"{'AGE':<6}{'RUN':<14}REPO"
+    )
+    for r in rows:
+        run_disp = (r.run_id or "-")[:12]
+        typer.echo(
+            f"{r.id:<6}{r.state:<11}{r.priority:<10}{r.kind:<7}{r.scope:<16}"
+            f"{_format_age(now, r.created_at):<6}{run_disp:<14}{r.repo}"
+        )
+    raise typer.Exit(code=0)
+
+
+@queue_app.command("add")
+def queue_add_cmd(
+    kind: str = typer.Argument(..., help="build|fix"),
+    scope: str = typer.Argument(
+        ..., help="Scope/target for the job (epic-NN, story id, issue number, all, next)."
+    ),
+    repo: Path | None = typer.Option(
+        None, "--repo", help="Repo path the job runs against (default: cwd)."
+    ),
+    priority: str = typer.Option(
+        "normal", "--priority", help="low|normal|high|urgent (default: normal)."
+    ),
+    options: str | None = typer.Option(
+        None, "--options", help="JSON array of CLI flags to replay (default: none)."
+    ),
+) -> None:
+    """Add a job to the host queue directly (without going through --enqueue)."""
+    from sdlc.queue import QueueError, QueueStore, default_queue_path
+
+    store = QueueStore(default_queue_path())
+    store.init()
+    repo_path = str((repo or Path.cwd()).resolve())
+    try:
+        job_id = store.add_job(
+            repo=repo_path, kind=kind, scope=scope, priority=priority,
+            options_json=options,
+        )
+    except QueueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"queued: job {job_id} ({kind} {scope}) in {repo_path}")
+    raise typer.Exit(code=0)
+
+
+@queue_app.command("cancel")
+def queue_cancel_cmd(
+    job_id: int = typer.Argument(..., help="Job id to cancel."),
+) -> None:
+    """Cancel a `queued` job. Refuses when the job is already `running`."""
+    from sdlc.queue import QueueError, QueueStore, default_queue_path
+
+    store = QueueStore(default_queue_path())
+    store.ensure_migrated()
+    try:
+        store.cancel_job(job_id)
+    except QueueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"cancelled: job {job_id}")
+    raise typer.Exit(code=0)
+
+
+@queue_app.command("prioritise")
+def queue_prioritise_cmd(
+    job_id: int = typer.Argument(..., help="Job id to reprioritise."),
+    priority_class: str = typer.Argument(..., help="low|normal|high|urgent"),
+) -> None:
+    """Reorder a job by changing its priority class."""
+    from sdlc.queue import QueueError, QueueStore, default_queue_path
+
+    store = QueueStore(default_queue_path())
+    store.ensure_migrated()
+    try:
+        store.prioritise_job(job_id, priority_class)
+    except QueueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"prioritised: job {job_id} -> {priority_class}")
+    raise typer.Exit(code=0)
 
 
 if __name__ == "__main__":

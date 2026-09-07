@@ -88,6 +88,18 @@ def _isolated_registry(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_queue(monkeypatch, tmp_path):
+    """Point the host-level development queue at a per-test tmp file (32.1-001).
+
+    Mirrors ``_isolated_registry`` above: ``QueueStore(default_queue_path())``
+    resolves ``~/.sdlc/queue.db`` on a dev machine when ``SDLC_QUEUE_PATH`` is
+    unset, so an un-isolated test exercising `--enqueue`/`sdlc queue` would
+    write real jobs into the developer's own host queue.
+    """
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_git_push(monkeypatch):
     """Block a real ``git push`` for every test by default (issue #527).
 

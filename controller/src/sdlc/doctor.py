@@ -20,6 +20,8 @@ from sdlc.build import _MIGRATIONS, Ledger, list_stashes, status_snapshot
 from sdlc.harness import DEFAULT_HARNESS
 from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
+from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
+from sdlc.queue import default_queue_path
 from sdlc.registry import Registry, derive_state
 
 __all__ = [
@@ -368,6 +370,93 @@ def check_ledger(db_path: Path) -> Finding:
         "Ledger schema + integrity",
         "CLEAN",
         "schema current, ledger readable",
+    )
+
+
+def check_queue(queue_path: Path) -> Finding:
+    """Verify the host-level development queue is readable and current.
+
+    Reports schema currency the same way :func:`check_ledger` does, plus job
+    counts by lifecycle state (Story 32.1-001 DoD). A queue that has never
+    been written to (no host job has ever been enqueued) is CLEAN, not a
+    problem — mirroring the absent-ledger case.
+    """
+    if not queue_path.exists():
+        return Finding(
+            "queue",
+            "Development queue",
+            "CLEAN",
+            "no queue yet — nothing has been enqueued on this host",
+        )
+
+    expected = {version for version, *_ in _QUEUE_MIGRATIONS}
+    try:
+        conn = sqlite3.connect(f"file:{queue_path}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error as exc:
+        return Finding(
+            "queue",
+            "Development queue",
+            "FAIL",
+            f"queue could not be opened: {exc}",
+            "inspect/restore queue.db (`sdlc queue add` recreates it)",
+        )
+    try:
+        try:
+            applied = {
+                row[0]
+                for row in conn.execute("SELECT version FROM _migrations").fetchall()
+            }
+        except sqlite3.DatabaseError:
+            try:
+                conn.execute("SELECT count(*) FROM jobs").fetchone()
+            except sqlite3.DatabaseError as exc:
+                return Finding(
+                    "queue",
+                    "Development queue",
+                    "FAIL",
+                    f"queue is unreadable / corrupt: {exc}",
+                    "inspect/restore queue.db (`sdlc queue add` recreates it)",
+                )
+            return Finding(
+                "queue",
+                "Development queue",
+                "WARN",
+                "queue predates the migration framework (no _migrations table)",
+                "any `sdlc queue` verb auto-migrates it on next use",
+            )
+        counts = dict(
+            conn.execute("SELECT state, COUNT(*) FROM jobs GROUP BY state").fetchall()
+        )
+    except sqlite3.DatabaseError as exc:
+        return Finding(
+            "queue",
+            "Development queue",
+            "FAIL",
+            f"queue is unreadable / corrupt: {exc}",
+            "inspect/restore queue.db (`sdlc queue add` recreates it)",
+        )
+    finally:
+        conn.close()
+
+    breakdown = (
+        ", ".join(f"{n} {state}" for state, n in sorted(counts.items()))
+        if counts
+        else "no jobs recorded"
+    )
+    missing = expected - applied
+    if missing:
+        return Finding(
+            "queue",
+            "Development queue",
+            "WARN",
+            f"schema behind by {len(missing)} migration(s): {sorted(missing)}; {breakdown}",
+            "any `sdlc queue` verb auto-migrates it on next use",
+        )
+    return Finding(
+        "queue",
+        "Development queue",
+        "CLEAN",
+        f"schema current; {breakdown} (host-wide)",
     )
 
 
@@ -1138,6 +1227,7 @@ def run_doctor(
     repo_root: Path | None = None,
     claude_dir: Path | None = None,
     db_path: Path | None = None,
+    queue_path: Path | None = None,
     registry: Registry | None = None,
     dep_probe: Callable[[str], bool] | None = None,
     now: datetime | None = None,
@@ -1145,14 +1235,15 @@ def run_doctor(
 ) -> DoctorReport:
     """Run every health-check and return the aggregated :class:`DoctorReport`.
 
-    Read-only: doctor never mutates the ledger or the install — a behind-on-
-    migrations DB is *reported* (Epic-12 12.2-003 fixes it), not migrated here.
-    All inputs are injectable so the checks are testable against seeded-broken
-    fixtures.
+    Read-only: doctor never mutates the ledger, queue, or the install — a
+    behind-on-migrations DB is *reported* (Epic-12 12.2-003 fixes it), not
+    migrated here. All inputs are injectable so the checks are testable
+    against seeded-broken fixtures.
     """
     repo_root = repo_root or _detect_repo_root()
     claude_dir = claude_dir or (Path.home() / ".claude")
     db_path = db_path or default_db_path()
+    queue_path = queue_path or default_queue_path()
     registry = registry or Registry()
     dep_probe = dep_probe or _default_dep_probe
 
@@ -1160,6 +1251,7 @@ def run_doctor(
         check_install(claude_dir),
         check_controller_version(repo_root),
         check_ledger(db_path),
+        check_queue(queue_path),
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
         check_config(repo_root),
         check_harness_pin(repo_root),
