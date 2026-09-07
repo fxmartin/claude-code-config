@@ -208,6 +208,33 @@ def test_ledger_that_cannot_be_opened_fails(tmp_path: Path) -> None:
     assert ledger.remedy
 
 
+# --- queue presence + schema currency + job counts (Story 32.1-001) --------
+
+
+def test_queue_absent_is_clean(tmp_path: Path) -> None:
+    report = _doctor(tmp_path, queue_path=tmp_path / "missing-queue.db")
+    queue = _finding(report, "queue")
+    assert queue.status == "CLEAN"
+    assert "no" in queue.detail.lower()
+
+
+def test_queue_present_reports_job_counts(tmp_path: Path) -> None:
+    from sdlc.queue import QueueStore
+
+    queue_path = tmp_path / "queue.db"
+    store = QueueStore(queue_path)
+    store.init()
+    store.add_job(repo="/repo-a", kind="build", scope="epic-1")
+    job_id = store.add_job(repo="/repo-b", kind="fix", scope="7")
+    store.cancel_job(job_id)
+
+    report = _doctor(tmp_path, queue_path=queue_path)
+    queue = _finding(report, "queue")
+    assert queue.status == "CLEAN"
+    assert "1 queued" in queue.detail
+    assert "1 cancelled" in queue.detail
+
+
 def test_ledger_corrupt_fails(tmp_path: Path) -> None:
     db = tmp_path / "corrupt.db"
     db.write_bytes(b"this is not a sqlite database at all")
