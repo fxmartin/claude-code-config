@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.59.3] - 2026-09-07
+
+### Fixed
+
+- fix(repair): refuse unsafe repair roots and missing artifact sources (#651)
+
+
 ## [v2.59.2] - 2026-09-07
 
 ### Fixed
