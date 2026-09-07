@@ -175,6 +175,39 @@ def test_record_files_round_trips_as_json(tmp_path) -> None:
     assert json.loads(store.get_job(job_id).files) == ["src/a.py", "src/b.py"]
 
 
+def test_overlap_holds_empty_when_the_queue_was_never_created(tmp_path) -> None:
+    """A read verb must not conjure a queue.db — no rows, no holds, no crash."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    assert store.overlap_holds() == {}
+
+
+def test_files_to_modify_ignores_junk_json() -> None:
+    """A corrupted `files` column reads as no investigated files, not a crash."""
+    from sdlc.queue import JobRecord
+
+    record = JobRecord(
+        id=1, repo="/a", kind="fix", scope="1", priority="normal", state="queued",
+        claimed_by=None, lease_until=None, run_id=None, options=None,
+        created_at="", updated_at="", reason=None, budget=None, files="not json",
+    )
+    assert record.files_to_modify() == set()
+
+
+def test_files_to_modify_ignores_non_list_json() -> None:
+    """Valid JSON that is not an array is still not a file list."""
+    from sdlc.queue import JobRecord
+
+    record = JobRecord(
+        id=1, repo="/a", kind="fix", scope="1", priority="normal", state="queued",
+        claimed_by=None, lease_until=None, run_id=None, options=None,
+        created_at="", updated_at="", reason=None, budget=None,
+        files=json.dumps({"src/a.py": True}),
+    )
+    assert record.files_to_modify() == set()
+
+
 # --- AC3/AC4: per-class budgets --------------------------------------------
 
 
@@ -268,6 +301,19 @@ def test_job_budget_falls_back_when_the_column_is_junk(tmp_path) -> None:
         id=1, repo="/a", kind="fix", scope="1", priority="normal", state="queued",
         claimed_by=None, lease_until=None, run_id=None, options=None,
         created_at="", updated_at="", reason=None, budget="not json", files=None,
+    )
+    assert record.job_budget() == budget_for("normal")
+
+
+def test_job_budget_falls_back_when_the_column_is_absent(tmp_path) -> None:
+    """A row with no `budget` at all (pre-migration, or never re-stamped) still
+    yields a live cap — the class default, not `None`."""
+    from sdlc.queue import JobRecord, budget_for
+
+    record = JobRecord(
+        id=1, repo="/a", kind="fix", scope="1", priority="normal", state="queued",
+        claimed_by=None, lease_until=None, run_id=None, options=None,
+        created_at="", updated_at="", reason=None, budget=None, files=None,
     )
     assert record.job_budget() == budget_for("normal")
 

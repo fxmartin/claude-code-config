@@ -294,3 +294,34 @@ def test_apply_migrations_adds_column_and_is_idempotent(tmp_path, monkeypatch) -
     # A second init() must skip the already-applied version (no duplicate
     # ALTER TABLE, which would raise "duplicate column name").
     store.init()
+
+
+def test_row_to_record_reads_a_pre_32_3_001_row_without_crashing(tmp_path) -> None:
+    """A jobs table from before Story 32.3-001 has no `budget`/`files` columns;
+    `_optional_column` must degrade that absence to `None` rather than raising."""
+    from sdlc.queue import QueueStore
+
+    db = tmp_path / "queue.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE jobs ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, "
+            "kind TEXT NOT NULL, scope TEXT NOT NULL, "
+            "priority TEXT NOT NULL DEFAULT 'normal', "
+            "state TEXT NOT NULL DEFAULT 'queued', claimed_by TEXT, "
+            "lease_until TIMESTAMP, run_id TEXT, options TEXT, "
+            "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, reason TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO jobs(repo, kind, scope, priority, state, created_at, updated_at) "
+            "VALUES ('/repo', 'build', '1', 'normal', 'queued', '', '')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    job = QueueStore(db).get_job(1)
+    assert job.budget is None
+    assert job.files is None

@@ -231,6 +231,68 @@ def test_ledger_fix_rounds_degrades_to_zero_on_an_unreadable_ledger(tmp_path) ->
     assert ledger_fix_rounds(str(tmp_path / "nope.db"), "run-1") == 0
 
 
+def test_ledger_fix_rounds_degrades_to_zero_on_a_corrupt_ledger_file(tmp_path) -> None:
+    """A ledger file that exists but is not a valid sqlite database raises inside
+    `stage_breakdown` — the outer `except Exception` must still land on zero."""
+    from sdlc.scheduler import ledger_fix_rounds
+
+    db = tmp_path / "corrupt.db"
+    db.write_bytes(b"not a sqlite database")
+    assert ledger_fix_rounds(str(db), "run-1") == 0
+
+
+def test_an_overlap_held_job_is_stamped_with_the_holder_reason(tmp_path) -> None:
+    """32.3-001 AC2: `_stamp_repo_busy` explains a file overlap, not just a busy repo."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    first = store.add_job(repo=repo, kind="fix", scope="1")
+    second = store.add_job(repo=repo, kind="fix", scope="2")
+    budget = store.get_job(first).job_budget()
+    store.record_files(first, ["src/a.py"])
+    store.record_files(second, ["src/a.py"])
+
+    seen: list[str | None] = []
+    clock = Clock()
+
+    def sleeper(seconds: float) -> None:
+        seen.append(store.get_job(second).reason)
+        clock.advance(seconds)
+
+    _run(
+        store, tmp_path=tmp_path, launcher=FakeLauncher(), clock=clock,
+        sleeper=sleeper, config=_config(poll_seconds=budget.wall_clock_seconds + 1),
+    )
+
+    assert any(reason and "overlapping files" in reason for reason in seen)
+
+
+def test_a_budget_breach_still_parks_the_job_when_stopping_it_fails(tmp_path) -> None:
+    """AC3: a process that won't answer to `stop()` must not block the park."""
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    budget = store.get_job(job_id).job_budget()
+
+    class UnstoppableProc(FakeProc):
+        def stop(self) -> None:
+            raise OSError("no such process")
+
+    class UnstoppableLauncher(FakeLauncher):
+        def __call__(self, argv, cwd):
+            proc = UnstoppableProc(90000 + len(self.procs))
+            self.procs.append(proc)
+            return proc
+
+    echoed: list[str] = []
+    _run(
+        store, tmp_path=tmp_path, launcher=UnstoppableLauncher(), clock=Clock(),
+        config=_config(poll_seconds=budget.wall_clock_seconds + 1),
+        echo=echoed.append,
+    )
+
+    assert store.get_job(job_id).state == "needs_attention"
+    assert any("could not stop pid" in line for line in echoed)
+
+
 def _config(*, poll_seconds: float):
     from sdlc.scheduler import SchedulerConfig
 
