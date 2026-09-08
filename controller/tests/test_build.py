@@ -4494,6 +4494,43 @@ def test_bake_review_packet_true_failure_records_full_render_size(
     assert not any("degraded to summary" in m for m in messages)
 
 
+def test_bake_review_packet_swallows_exception_and_logs_event(
+    tmp_path, monkeypatch
+) -> None:
+    """A host failure (or any other exception raised while baking) must never
+    fail the review stage — it degrades to the fetch-it-yourself fallback with
+    no size evidence to log, mirroring fix_issue._bake_review_packet's own
+    exception-swallowing test."""
+    from sdlc import review_packet as review_packet_mod
+    from sdlc.build import _bake_review_packet
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
+
+    def boom(adapter, cr_ref, **kwargs):
+        raise RuntimeError("packet explosion")
+
+    fake = _FakeCrAdapter("gitlab")
+    monkeypatch.setattr(
+        ih, "get_adapter", lambda host, runner=None, instance_url=None: fake
+    )
+    monkeypatch.setattr(review_packet_mod, "packet_result", boom)
+
+    block = _bake_review_packet(
+        story, 9, root, ledger, "run-1", None, ih.GITLAB_CR_TERMS, BuildOptions(),
+    )
+
+    assert block is None
+    with sqlite3.connect(ledger.db_path) as conn:
+        messages = [r[0] for r in conn.execute("SELECT message FROM events").fetchall()]
+    assert any(
+        "review packet unavailable or oversized" in m and "(full render" not in m
+        for m in messages
+    )
+    assert not any("degraded to summary" in m for m in messages)
+
+
 def test_parse_build_args_host_flag() -> None:
     """`--host=gitlab|github` is the escape hatch mirroring `issues init` (#608)."""
     assert parse_build_args([]).host is None
