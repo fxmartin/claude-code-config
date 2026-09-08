@@ -17,7 +17,13 @@ import sdlc.change_class as change_class_mod
 import sdlc.fix_issue as fix_mod
 from sdlc.build import MAX_COMMITLINT_REASK
 from sdlc.change_class import CODE, DOCS_ONLY
-from sdlc.dispatch import AgentDispatchError, AgentResult, ContextOverflowError, RateLimitError
+from sdlc.dispatch import (
+    AgentDispatchError,
+    AgentResult,
+    ContextOverflowError,
+    RateLimitError,
+    RateLimitSignal,
+)
 from sdlc.fix_issue import (
     FIX_STAGE_MODELS,
     FixBatchOptions,
@@ -853,6 +859,109 @@ def test_fix_exhausted_commit_lint_parks_needs_attention(tmp_path, monkeypatch) 
         ).fetchall()
     ]
     assert any("still violates commitlint" in m for m in msgs)
+
+
+def _fix_lint_ledger(tmp_path):
+    """A ledger with the run+story rows `_lint_fix_stage_commit` writes stages against."""
+    ledger = _ledger(tmp_path)
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue)
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(
+        run_id, story.id, "", story.title, story.priority, story.points,
+        story.agent_type, "", None, "TODO",
+    )
+    return ledger, run_id, story
+
+
+def test_lint_fix_stage_commit_unreadable_initial_message_is_noop(tmp_path, monkeypatch) -> None:
+    """An unreadable HEAD commit degrades to a no-op rather than dispatching a re-ask."""
+    monkeypatch.setattr(fix_mod, "load_commitlint_config", lambda root: _FIX_COMMITLINT_RULES)
+    monkeypatch.setattr(fix_mod, "_commit_message", lambda ref, root=None: None)
+    ledger, run_id, story = _fix_lint_ledger(tmp_path)
+
+    def dispatch(*_args, **_kwargs):
+        raise AssertionError("must not dispatch when the commit is unreadable")
+
+    seq, ok = fix_mod._lint_fix_stage_commit(
+        "build", story, FixOptions(issue=1), ledger, run_id, dispatch, tmp_path, 5,
+    )
+    assert (seq, ok) == (5, True)
+
+
+def test_lint_fix_stage_commit_unreadable_after_reask_breaks(tmp_path, monkeypatch) -> None:
+    """If the commit becomes unreadable after an amend re-ask, the loop breaks and parks."""
+    monkeypatch.setattr(fix_mod, "load_commitlint_config", lambda root: _FIX_COMMITLINT_RULES)
+    reads = {"n": 0}
+
+    def commit_message(ref, root=None):
+        reads["n"] += 1
+        return _FIX_BAD_COMMIT if reads["n"] == 1 else None
+
+    monkeypatch.setattr(fix_mod, "_commit_message", commit_message)
+    dispatched = []
+
+    def dispatch(agent_type, _prompt, **_kwargs):
+        dispatched.append(agent_type)
+        return AgentResult(agent_type=agent_type, data=_default_payload(agent_type), raw="")
+
+    ledger, run_id, story = _fix_lint_ledger(tmp_path)
+    seq, ok = fix_mod._lint_fix_stage_commit(
+        "build", story, FixOptions(issue=1), ledger, run_id, dispatch, tmp_path, 0,
+    )
+    assert ok is False
+    assert dispatched == ["build"]
+    conn = sqlite3.connect(ledger.db_path)
+    msgs = [
+        r[0] for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='issue-1'"
+        ).fetchall()
+    ]
+    assert any("still violates commitlint" in m for m in msgs)
+
+
+def test_lint_fix_stage_commit_reraises_rate_limit_error(tmp_path, monkeypatch) -> None:
+    """A rate-limited re-ask propagates rather than being swallowed as a violation."""
+    monkeypatch.setattr(fix_mod, "load_commitlint_config", lambda root: _FIX_COMMITLINT_RULES)
+    monkeypatch.setattr(fix_mod, "_commit_message", lambda ref, root=None: _FIX_BAD_COMMIT)
+    ledger, run_id, story = _fix_lint_ledger(tmp_path)
+
+    def dispatch(*_args, **_kwargs):
+        raise RateLimitError("rate limited", signal=RateLimitSignal(source="429"))
+
+    with pytest.raises(RateLimitError):
+        fix_mod._lint_fix_stage_commit(
+            "build", story, FixOptions(issue=1), ledger, run_id, dispatch, tmp_path, 0,
+        )
+
+
+def test_lint_fix_stage_commit_malformed_reask_is_not_recovered(tmp_path, monkeypatch) -> None:
+    """Unlike build.py's gate, a malformed re-ask reply just spends the attempt."""
+    from sdlc.contracts import ContractError
+
+    monkeypatch.setattr(fix_mod, "load_commitlint_config", lambda root: _FIX_COMMITLINT_RULES)
+    monkeypatch.setattr(fix_mod, "_commit_message", lambda ref, root=None: _FIX_BAD_COMMIT)
+    ledger, run_id, story = _fix_lint_ledger(tmp_path)
+    dispatched = []
+
+    def dispatch(agent_type, _prompt, **_kwargs):
+        dispatched.append(agent_type)
+        raise ContractError("missing required field 'branch_name'")
+
+    seq, ok = fix_mod._lint_fix_stage_commit(
+        "build", story, FixOptions(issue=1), ledger, run_id, dispatch, tmp_path, 0,
+    )
+    assert ok is False
+    assert dispatched == ["build"]  # exhausted on the first malformed reply, no retry
+    conn = sqlite3.connect(ledger.db_path)
+    msgs = [
+        r[0] for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='issue-1'"
+        ).fetchall()
+    ]
+    assert any("commit-lint re-ask response malformed" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------
