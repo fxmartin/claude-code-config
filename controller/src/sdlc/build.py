@@ -4907,14 +4907,17 @@ def render_review_prompt(
     # files, diff, test/coverage signals) baked once per review stage entry so
     # the reviewer — including the adversarial slot, which consumes this same
     # rendered prompt — stops re-deriving its inputs with `gh pr view/diff/
-    # checkout` round-trips. None (host failure / oversized packet) keeps
-    # today's fetch-it-yourself prompt unchanged.
+    # checkout` round-trips. None (host failure, or oversized past even the
+    # summary tier, Issue #674) keeps today's fetch-it-yourself prompt
+    # unchanged; the packet itself names whether it carries the full diff or
+    # the diff-omitted summary tier.
     packet_block = (
         "Consume the pre-baked Review Packet below instead of re-fetching its "
         "contents with `gh pr view` / `gh pr diff` / `gh pr checkout` — it "
-        "already carries the metadata, changed files, full diff, and pipeline "
-        "test/coverage signals. Fetch host-side only for something the packet "
-        "does not contain.\n\n"
+        "already carries the metadata, changed files, and pipeline "
+        "test/coverage signals (plus the full diff, unless the packet itself "
+        "says it was too large and degraded to a summary). Fetch host-side "
+        "only for something the packet does not contain.\n\n"
         f"{packet}\n"
         if packet
         else ""
@@ -5317,11 +5320,17 @@ def _bake_review_packet(
 
     Baked once per review stage entry so the review dispatch — and the
     adversarial slot, which consumes the same rendered prompt — reuses one
-    packet. Best-effort: any host failure or an oversized packet logs an event
-    and returns None, degrading the prompt to today's fetch-it-yourself
-    instructions (never a truncated diff).
+    packet. Best-effort, tiered (Issue #674): past the size cap this degrades
+    to a diff-omitted summary packet before giving up entirely; either
+    degradation logs a distinct, size-bearing ledger event so the cap can be
+    tuned from evidence, and only a true failure (host error, or even the
+    summary tier oversized) drops the prompt to today's fetch-it-yourself
+    instructions.
     """
     root = workdir or Path.cwd()
+    tier: str = "none"
+    full_chars: int | None = None
+    text: str | None = None
     try:
         # Local import mirrors _open_docs_only_cr — keeps the host adapter off
         # this module's hot import path.
@@ -5331,16 +5340,25 @@ def _bake_review_packet(
             root, override=_story_cr_host_override(story, ledger, opts)
         )
         adapter = issue_host.get_adapter(resolution.host, instance_url=resolution.instance_url)
-        block = review_packet.packet_block(adapter, str(pr_number), checks=checks)
+        result = review_packet.packet_result(adapter, str(pr_number), checks=checks)
+        tier, full_chars, text = result.tier, result.full_chars, result.text
     except Exception:  # noqa: BLE001 — best-effort; the prompt has a fallback path
-        block = None
-    if block is None:
+        pass
+    if tier == "summary":
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            f"review packet degraded to summary for {cr_terms.abbr} #{pr_number} "
+            f"— full render {full_chars} chars over the size cap; diff omitted, "
+            "meta/checks/changed-files/diffstat kept",
+        )
+    elif tier == "none":
+        size_note = f" (full render {full_chars} chars)" if full_chars is not None else ""
         ledger.event_log(
             run_id, story.id, "info", "controller",
             f"review packet unavailable or oversized for {cr_terms.abbr} "
-            f"#{pr_number} — reviewer falls back to host fetch",
+            f"#{pr_number}{size_note} — reviewer falls back to host fetch",
         )
-    return block
+    return text
 
 
 def _review_is_adversarial_slot(opts: BuildOptions) -> bool:

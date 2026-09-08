@@ -4406,8 +4406,10 @@ def test_bake_review_packet_falls_back_to_inventory_host(tmp_path, monkeypatch) 
         ih, "get_adapter", lambda host, runner=None, instance_url=None: fake
     )
     monkeypatch.setattr(
-        review_packet_mod, "packet_block",
-        lambda adapter, cr_ref, **kwargs: f"PACKET-{cr_ref}",
+        review_packet_mod, "packet_result",
+        lambda adapter, cr_ref, **kwargs: review_packet_mod.PacketResult(
+            text=f"PACKET-{cr_ref}", tier="full", full_chars=9,
+        ),
     )
 
     block = _bake_review_packet(
@@ -4415,6 +4417,81 @@ def test_bake_review_packet_falls_back_to_inventory_host(tmp_path, monkeypatch) 
     )
 
     assert block == "PACKET-9"
+
+
+def test_bake_review_packet_summary_tier_logs_size_bearing_event(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #674: past the size cap the bake degrades to the summary tier —
+    the reviewer still gets a packet (diff omitted), and the ledger records
+    the full render's size as evidence for tuning the cap, distinct from the
+    true-failure event."""
+    from sdlc import review_packet as review_packet_mod
+    from sdlc.build import _bake_review_packet
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
+
+    fake = _FakeCrAdapter("gitlab")
+    monkeypatch.setattr(
+        ih, "get_adapter", lambda host, runner=None, instance_url=None: fake
+    )
+    monkeypatch.setattr(
+        review_packet_mod, "packet_result",
+        lambda adapter, cr_ref, **kwargs: review_packet_mod.PacketResult(
+            text=f"SUMMARY-{cr_ref}", tier="summary", full_chars=169_032,
+        ),
+    )
+
+    block = _bake_review_packet(
+        story, 9, root, ledger, "run-1", None, ih.GITLAB_CR_TERMS, BuildOptions(),
+    )
+
+    assert block == "SUMMARY-9"
+    with sqlite3.connect(ledger.db_path) as conn:
+        messages = [r[0] for r in conn.execute("SELECT message FROM events").fetchall()]
+    assert any(
+        "review packet degraded to summary" in m and "169032" in m for m in messages
+    )
+    assert not any("unavailable or oversized" in m for m in messages)
+
+
+def test_bake_review_packet_true_failure_records_full_render_size(
+    tmp_path, monkeypatch
+) -> None:
+    """Even the summary tier can overflow the cap — a true failure — and the
+    ledger event still records the full render's size for evidence, distinct
+    from the summary-degrade event."""
+    from sdlc import review_packet as review_packet_mod
+    from sdlc.build import _bake_review_packet
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
+
+    fake = _FakeCrAdapter("gitlab")
+    monkeypatch.setattr(
+        ih, "get_adapter", lambda host, runner=None, instance_url=None: fake
+    )
+    monkeypatch.setattr(
+        review_packet_mod, "packet_result",
+        lambda adapter, cr_ref, **kwargs: review_packet_mod.PacketResult(
+            text=None, tier="none", full_chars=250_000,
+        ),
+    )
+
+    block = _bake_review_packet(
+        story, 9, root, ledger, "run-1", None, ih.GITLAB_CR_TERMS, BuildOptions(),
+    )
+
+    assert block is None
+    with sqlite3.connect(ledger.db_path) as conn:
+        messages = [r[0] for r in conn.execute("SELECT message FROM events").fetchall()]
+    assert any(
+        "unavailable or oversized" in m and "250000" in m for m in messages
+    )
+    assert not any("degraded to summary" in m for m in messages)
 
 
 def test_parse_build_args_host_flag() -> None:
