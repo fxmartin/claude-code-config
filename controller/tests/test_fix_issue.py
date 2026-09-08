@@ -1015,7 +1015,7 @@ def test_bake_review_packet_swallows_exception_and_logs_event(tmp_path, monkeypa
     def boom(adapter, pr_number):
         raise RuntimeError("packet explosion")
 
-    monkeypatch.setattr(review_packet_mod, "packet_block", boom)
+    monkeypatch.setattr(review_packet_mod, "packet_result", boom)
 
     issue = FixIssue(1, "t", "b", "open", (), ())
     story = issue_story(issue)
@@ -1026,6 +1026,73 @@ def test_bake_review_packet_swallows_exception_and_logs_event(tmp_path, monkeypa
     block = fix_mod._bake_review_packet(issue, story, 42, ledger, run_id)
 
     assert block is None
+
+
+def test_bake_review_packet_summary_tier_logs_size_bearing_event(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #674: past the size cap the fix-issue bake degrades to the
+    summary tier (mirrors build._bake_review_packet) — the reviewer still
+    gets a packet, and the ledger records the full render's size."""
+    import sdlc.review_packet as review_packet_mod
+
+    monkeypatch.setattr(
+        review_packet_mod, "packet_result",
+        lambda adapter, cr_ref, **kwargs: review_packet_mod.PacketResult(
+            text=f"SUMMARY-{cr_ref}", tier="summary", full_chars=169_032,
+        ),
+    )
+
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue)
+    ledger = _ledger(tmp_path)
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+
+    block = fix_mod._bake_review_packet(issue, story, 42, ledger, run_id)
+
+    assert block == "SUMMARY-42"
+    conn = sqlite3.connect(ledger.db_path)
+    try:
+        messages = [r[0] for r in conn.execute("SELECT message FROM events").fetchall()]
+    finally:
+        conn.close()
+    assert any(
+        "review packet degraded to summary" in m and "169032" in m for m in messages
+    )
+    assert not any("unavailable or oversized" in m for m in messages)
+
+
+def test_bake_review_packet_true_failure_records_full_render_size(
+    tmp_path, monkeypatch
+) -> None:
+    """Even the summary tier can overflow the cap — a true failure — and the
+    ledger event still records the full render's size for evidence."""
+    import sdlc.review_packet as review_packet_mod
+
+    monkeypatch.setattr(
+        review_packet_mod, "packet_result",
+        lambda adapter, cr_ref, **kwargs: review_packet_mod.PacketResult(
+            text=None, tier="none", full_chars=250_000,
+        ),
+    )
+
+    issue = FixIssue(1, "t", "b", "open", (), ())
+    story = issue_story(issue)
+    ledger = _ledger(tmp_path)
+    ledger.init()
+    run_id = ledger.run_create("issue-1", "fix")
+
+    block = fix_mod._bake_review_packet(issue, story, 42, ledger, run_id)
+
+    assert block is None
+    conn = sqlite3.connect(ledger.db_path)
+    try:
+        messages = [r[0] for r in conn.execute("SELECT message FROM events").fetchall()]
+    finally:
+        conn.close()
+    assert any("unavailable or oversized" in m and "250000" in m for m in messages)
+    assert not any("degraded to summary" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------

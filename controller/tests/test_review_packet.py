@@ -147,7 +147,8 @@ def test_packet_block_returns_rendered_markdown() -> None:
 
 
 def test_packet_block_oversize_falls_back_never_truncates() -> None:
-    """Over the cap the block is None (fallback) — never a shortened packet."""
+    """Below even the summary tier's size the block is None (true failure) —
+    never a shortened/truncated full packet."""
     block = rp.packet_block(FakeAdapter(), "7", max_chars=50)
     assert block is None
 
@@ -155,6 +156,74 @@ def test_packet_block_oversize_falls_back_never_truncates() -> None:
 def test_packet_block_host_error_falls_back() -> None:
     adapter = FakeAdapter(error=ih.IssueHostError("gh exploded"))
     assert rp.packet_block(adapter, "7") is None
+
+
+# --- packet_result (tiered: full -> summary -> none) ---------------------------
+
+
+def test_packet_result_fits_under_cap_is_full_tier() -> None:
+    result = rp.packet_result(FakeAdapter(), "7", checks="tests green")
+    assert result.tier == "full"
+    assert result.text is not None
+    assert "+y = 2" in result.text
+    assert result.full_chars == len(result.text)
+
+
+_BIG_DIFF = (
+    "diff --git a/src/app.py b/src/app.py\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/src/app.py\n"
+    "+++ b/src/app.py\n"
+    "@@ -1,3 +1,300 @@\n"
+    + "".join(f"+line {n}\n" for n in range(300))
+)
+
+
+def test_packet_result_over_full_cap_degrades_to_summary_tier() -> None:
+    """Past the full-packet cap but with room for the diff-omitted summary,
+    the reviewer still gets meta/checks/file list instead of nothing."""
+    adapter = FakeAdapter(diff=_BIG_DIFF)
+    full_len = len(rp.build_review_packet(adapter, "7").render())
+    summary_len = len(rp.build_review_packet(adapter, "7").render_summary())
+    assert summary_len < full_len  # sanity: summary is cheaper than full
+    result = rp.packet_result(adapter, "7", max_chars=summary_len + 10)
+    assert result.tier == "summary"
+    assert result.text is not None
+    assert "src/app.py" in result.text
+    assert "line 1" not in result.text  # diff body omitted
+    assert result.full_chars == full_len
+
+
+def test_packet_result_summary_render_omits_diff_but_keeps_diffstat() -> None:
+    packet = rp.build_review_packet(FakeAdapter(), "7", checks="coverage_pct=93.4")
+    summary = packet.render_summary()
+    assert "#7" in summary
+    assert "feat(demo): add y" in summary
+    assert "coverage_pct=93.4" in summary
+    assert "src/app.py" in summary and "docs/guide.md" in summary
+    # Per-file diffstat present, diff hunks are not.
+    assert "+1/-0" in summary
+    assert "+1/-1" in summary
+    assert "@@ -1 +1,2 @@" not in summary
+    assert "+y = 2" not in summary
+
+
+def test_packet_result_under_both_tiers_is_none_with_evidence() -> None:
+    """Even the summary tier overflows a tiny cap: true failure, but the full
+    render's size is still recorded for evidence (cap tuning)."""
+    full_len = len(rp.build_review_packet(FakeAdapter(), "7").render())
+    result = rp.packet_result(FakeAdapter(), "7", max_chars=50)
+    assert result.tier == "none"
+    assert result.text is None
+    assert result.full_chars == full_len
+
+
+def test_packet_result_host_error_is_none_without_size() -> None:
+    adapter = FakeAdapter(error=ih.IssueHostError("gh exploded"))
+    result = rp.packet_result(adapter, "7")
+    assert result.tier == "none"
+    assert result.text is None
+    assert result.full_chars is None
 
 
 # --- adapter cr_view (GitHub / GitLab parity) ----------------------------------

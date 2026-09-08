@@ -1426,25 +1426,41 @@ def _bake_review_packet(
     stage entry via the Epic-22/23 host adapter. ``host`` is the run's
     already-resolved host (issue #606), mirroring :func:`_open_docs_only_pr`.
     ``instance_url`` (Story 30.1-001) is the repo's declared self-hosted GitLab
-    instance, if any. Best-effort — any host failure or an oversized packet logs
-    an event and returns None, degrading the prompt to today's
-    fetch-it-yourself instructions (never a truncated diff).
+    instance, if any. Best-effort, tiered (Issue #674): past the size cap this
+    degrades to a diff-omitted summary packet before giving up entirely;
+    either degradation logs a distinct, size-bearing ledger event, and only a
+    true failure (host error, or even the summary tier oversized) drops the
+    prompt to today's fetch-it-yourself instructions.
     """
+    tier: str = "none"
+    full_chars: int | None = None
+    text: str | None = None
     try:
         # Local import keeps review_packet off this module's hot import path.
         from sdlc import review_packet
 
         adapter = issue_host.get_adapter(host, instance_url=instance_url)
-        block = review_packet.packet_block(adapter, str(pr_number))
+        result = review_packet.packet_result(adapter, str(pr_number))
+        tier, full_chars, text = result.tier, result.full_chars, result.text
     except Exception:  # noqa: BLE001 — best-effort; the prompt has a fallback path
-        block = None
-    if block is None:
+        pass
+    if tier == "summary":
         ledger.event_log(
             run_id, story.id, "info", "controller",
-            f"review packet unavailable or oversized for PR #{pr_number} — "
-            "reviewer falls back to host fetch (issue #" + str(issue.number) + ")",
+            f"review packet degraded to summary for PR #{pr_number} — full "
+            f"render {full_chars} chars over the size cap; diff omitted, "
+            "meta/checks/changed-files/diffstat kept (issue #"
+            + str(issue.number) + ")",
         )
-    return block
+    elif tier == "none":
+        size_note = f" (full render {full_chars} chars)" if full_chars is not None else ""
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            f"review packet unavailable or oversized for PR #{pr_number}"
+            f"{size_note} — reviewer falls back to host fetch (issue #"
+            + str(issue.number) + ")",
+        )
+    return text
 
 
 # The event source carrying a fix run's investigation plan (Issue #547). An event
