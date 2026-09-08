@@ -42,8 +42,10 @@ from typing import Callable, Iterable
 from sdlc import change_class, issue_host
 from sdlc.build import (
     MAX_BUGFIX_ATTEMPTS,
+    MAX_COMMITLINT_REASK,
     Ledger,
     WorktreeError,
+    _commit_message,
     _dispatch_ready_queue,
     _extract_pr,
     _merge_awaiting_approval,
@@ -60,9 +62,14 @@ from sdlc.build import (
     dirty_tree_paths,
     finalize_run,
     remove_story_worktree,
+    render_commit_lint_reask_prompt,
 )
 from sdlc.cohort import Story
-from sdlc.commitlint import build_commit_header
+from sdlc.commitlint import (
+    build_commit_header,
+    lint_commit_message,
+    load_commitlint_config,
+)
 from sdlc.contracts import ContractError, _result_wrapper
 from sdlc.dispatch import (
     AgentDispatchError,
@@ -1156,6 +1163,106 @@ def _run_bugfix(
     return fixed
 
 
+def _lint_fix_stage_commit(
+    stage: str,
+    story: Story,
+    opts: FixOptions,
+    ledger: Ledger,
+    run_id: str,
+    dispatch,
+    logs_dir: Path,
+    seq: int,
+) -> tuple[int, bool]:
+    """Lint a fix stage's commit against commitlint, mirroring build.py's gate.
+
+    Issue #673: `sdlc build` validates every build/coverage commit against the
+    repo's commitlint rules (Story 12.2-002, :func:`sdlc.build._lint_stage_commit`)
+    before it can reach a PR; `sdlc fix` never did, so a non-compliant header
+    (e.g. run 917489d1) reached CI and cost a full cycle plus a bugfix dispatch to
+    amend. This is the same bounded amend re-ask, routed through the fix
+    pipeline's own dispatch surface (:func:`_fix_dispatch_kwargs` /
+    :func:`fix_stage_harness`) instead of build.py's ``BuildOptions``-coupled
+    internals.
+
+    Unlike build.py's gate, a malformed re-ask envelope (``ContractError`` /
+    ``AgentDispatchError``) is not recovered — the fix pipeline has no
+    envelope-only re-ask primitive — so it simply exhausts that attempt and, if
+    re-asks run out, parks the story like any other unfixable violation.
+
+    Returns ``(seq, compliant)`` — see :func:`sdlc.build._lint_stage_commit`.
+    """
+    root = Path.cwd()
+    config = load_commitlint_config(root)
+    if config is None:
+        return seq, True  # No config → invent no rules.
+    ref = f"feature/{story.id}"
+    message = _commit_message(ref, root)
+    if message is None:
+        return seq, True  # Unreadable commit → degrade to a no-op.
+    violations = lint_commit_message(message, config)
+    if not violations:
+        return seq, True  # Compliant → no behaviour change.
+
+    attempt = 0
+    while violations and attempt < MAX_COMMITLINT_REASK:
+        attempt += 1
+        seq += 1
+        lint_seq = seq
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"{stage} commit message violates commitlint "
+            f"({'; '.join(violations)}) — re-asking the {stage} agent to amend",
+        )
+        cpath = logs_dir / f"{story.id}-commitlint-{lint_seq}.log"
+        ledger.stage_start(
+            run_id, story.id, "commitlint", lint_seq,
+            harness=fix_stage_harness(stage, opts),
+        )
+        prompt = render_commit_lint_reask_prompt(stage, story, message, violations)
+        model = fix_model(stage, opts)
+        try:
+            result = dispatch(
+                stage, prompt, story=story, model=model,
+                transcript_path=cpath, on_progress=None,
+                **_fix_dispatch_kwargs(stage, opts, model),
+            )
+        except RateLimitError:
+            raise
+        except (ContractError, AgentDispatchError) as exc:
+            ledger.event_log(
+                run_id, story.id, "warn", "controller",
+                f"commit-lint re-ask response malformed ({exc}) — no envelope "
+                "recovery in the fix pipeline, treating this attempt as spent",
+            )
+            ledger.stage_finish(
+                run_id, story.id, "commitlint", lint_seq, "FAILED",
+                "commitlint-error", str(cpath),
+            )
+            break
+        _record_stage_usage(ledger, run_id, story.id, "commitlint", lint_seq, result)
+        ledger.stage_finish(
+            run_id, story.id, "commitlint", lint_seq, "DONE", output_path=str(cpath)
+        )
+        message = _commit_message(ref, root)
+        if message is None:
+            break
+        violations = lint_commit_message(message, config)
+
+    if violations:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"{stage} commit message still violates commitlint after {attempt} "
+            f"re-ask(s) ({'; '.join(violations)}) — parking for manual fix so a "
+            "non-compliant header never reaches the PR (work preserved)",
+        )
+        return seq, False
+    ledger.event_log(
+        run_id, story.id, "success", "controller",
+        f"{stage} commit message is now commitlint-compliant",
+    )
+    return seq, True
+
+
 def _run_investigation(
     issue: FixIssue,
     story: Story,
@@ -1559,6 +1666,16 @@ def _run_stage_loop(
                 pr_number = _extract_pr(result, pr_number)
                 if pr_number is not None:
                     ledger.set_story_pr(run_id, story.id, pr_number)
+                # Issue #673: lint a commit-authoring stage's HEAD commit against
+                # commitlint before advancing, mirroring build.py's Story 12.2-002
+                # gate — bounded amend re-ask, then park rather than let a known
+                # non-compliant header reach the PR and fail CI's commit-format job.
+                if stage in ("build", "coverage"):
+                    bugfix_seq, lint_ok = _lint_fix_stage_commit(
+                        stage, story, opts, ledger, run_id, dispatch, logs_dir, bugfix_seq,
+                    )
+                    if not lint_ok:
+                        return "NEEDS_ATTENTION", pr_number
                 # The E2E warn-gate runs after review passes and before merge (skill
                 # Phase 7). It is advisory: a miss is logged and merge proceeds. A
                 # docs-only fix skips it (Story 27.2-003), recorded as a skip.

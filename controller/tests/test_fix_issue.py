@@ -15,6 +15,7 @@ import pytest
 
 import sdlc.change_class as change_class_mod
 import sdlc.fix_issue as fix_mod
+from sdlc.build import MAX_COMMITLINT_REASK
 from sdlc.change_class import CODE, DOCS_ONLY
 from sdlc.dispatch import AgentDispatchError, AgentResult, ContextOverflowError, RateLimitError
 from sdlc.fix_issue import (
@@ -704,6 +705,154 @@ def test_run_fix_happy_path_all_stages_done(tmp_path) -> None:
     assert result.pr_number == 100
     agents = dispatch.agents()
     assert {"investigation", "build", "coverage", "review", "merge", "summary"}.issubset(agents)
+
+
+# ---------------------------------------------------------------------------
+# Issue #673: the fix pipeline must lint every build/coverage commit against
+# commitlint before advancing, mirroring build.py's Story 12.2-002 gate — a
+# non-compliant header must never reach a PR and fail the commit-format CI job.
+# ---------------------------------------------------------------------------
+
+_FIX_COMMITLINT_RULES = {
+    "rules": {
+        "type-enum": [2, "always", ["feat", "fix", "chore", "docs", "test"]],
+        "type-empty": [2, "never"],
+        "subject-empty": [2, "never"],
+        "subject-case": [2, "always", "lower-case"],
+        "subject-full-stop": [2, "never", "."],
+        "header-max-length": [2, "always", 72],
+    }
+}
+
+# A header that breaks subject-case (capital) and subject-full-stop.
+_FIX_BAD_COMMIT = "feat(controller): Add the thing."
+_FIX_GOOD_COMMIT = "feat(controller): add the thing"
+
+
+class _FixCommitLintDispatcher:
+    """An agent whose freshly-authored commit is amended on a commit-lint re-ask.
+
+    Mirrors test_build.py's ``_CommitLintDispatcher`` but matches the fix
+    pipeline's dispatch call signature.
+    """
+
+    def __init__(self, fix_on_reask: bool = True, start_compliant: bool = False) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.fix_on_reask = fix_on_reask
+        self.compliant = start_compliant
+
+    def __call__(self, agent_type, prompt, *, story=None, model=None,
+                 transcript_path=None, on_progress=None, **kwargs):
+        is_lint = "commitlint" in prompt
+        self.calls.append((agent_type, "commitlint" if is_lint else "stage"))
+        if is_lint:
+            self.compliant = self.fix_on_reask  # re-ask amends iff allowed
+        elif agent_type in ("build", "coverage", "bugfix"):
+            self.compliant = False  # a new commit-authoring stage → fresh commit
+        return AgentResult(agent_type=agent_type, data=_default_payload(agent_type), raw="")
+
+
+def _patch_fix_commitlint(monkeypatch, disp, config, *, good=_FIX_GOOD_COMMIT, bad=_FIX_BAD_COMMIT):
+    monkeypatch.setattr(fix_mod, "load_commitlint_config", lambda root: config)
+    monkeypatch.setattr(
+        fix_mod, "_commit_message", lambda ref, root=None: good if disp.compliant else bad,
+    )
+
+
+def test_fix_noncompliant_build_commit_triggers_reask_and_recovers(tmp_path, monkeypatch) -> None:
+    """A commitlint-violating build commit is amended via a bounded re-ask."""
+    gh = FakeGh(_issue_json())
+    disp = _FixCommitLintDispatcher(fix_on_reask=True)
+    _patch_fix_commitlint(monkeypatch, disp, _FIX_COMMITLINT_RULES)
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    # A commit-lint re-ask was dispatched against the build agent.
+    assert any(kind == "commitlint" for _, kind in disp.calls)
+    conn = sqlite3.connect(db)
+    stages = [
+        r[0] for r in conn.execute(
+            "SELECT stage_name FROM stages WHERE story_id='issue-1'"
+        ).fetchall()
+    ]
+    assert "commitlint" in stages
+    msgs = [
+        r[0] for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='issue-1'"
+        ).fetchall()
+    ]
+    assert any("violates commitlint" in m for m in msgs)
+    assert any("commitlint-compliant" in m for m in msgs)
+
+
+def test_fix_no_commitlint_config_is_a_noop(tmp_path, monkeypatch) -> None:
+    """With no commitlint config the fix pipeline invents no rules."""
+    gh = FakeGh(_issue_json())
+    disp = _FixCommitLintDispatcher()
+    monkeypatch.setattr(fix_mod, "load_commitlint_config", lambda root: None)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=disp,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert all(kind != "commitlint" for _, kind in disp.calls)
+
+
+def test_fix_compliant_commit_has_no_reask(tmp_path, monkeypatch) -> None:
+    """A compliant build commit changes nothing — no re-ask."""
+    gh = FakeGh(_issue_json())
+    disp = _FixCommitLintDispatcher()
+    _patch_fix_commitlint(monkeypatch, disp, _FIX_COMMITLINT_RULES, bad=_FIX_GOOD_COMMIT)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=_ledger(tmp_path),
+        dispatcher=disp,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    assert result.status == "DONE"
+    assert all(kind != "commitlint" for _, kind in disp.calls)
+
+
+def test_fix_exhausted_commit_lint_parks_needs_attention(tmp_path, monkeypatch) -> None:
+    """An unfixable message is bounded, then parked — never advanced to a PR."""
+    gh = FakeGh(_issue_json())
+    disp = _FixCommitLintDispatcher(fix_on_reask=False)  # re-ask never amends
+    _patch_fix_commitlint(monkeypatch, disp, _FIX_COMMITLINT_RULES)
+    db = tmp_path / ".sdlc-state.db"
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(db),
+        dispatcher=disp,
+        preflight=lambda: True,
+        runner=gh,
+        root=tmp_path,
+    )
+    # The story is parked, not advanced: a non-compliant header must not reach a PR.
+    assert result.status == "NEEDS_ATTENTION"
+    advanced = {agent for agent, _ in disp.calls}
+    assert "review" not in advanced and "merge" not in advanced
+    lint_calls = [c for c in disp.calls if c[1] == "commitlint"]
+    assert len(lint_calls) == MAX_COMMITLINT_REASK
+    conn = sqlite3.connect(db)
+    msgs = [
+        r[0] for r in conn.execute(
+            "SELECT message FROM events WHERE story_id='issue-1'"
+        ).fetchall()
+    ]
+    assert any("still violates commitlint" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------
