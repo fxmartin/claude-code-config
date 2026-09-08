@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.69.1] - 2026-09-08
+
+### Fixed
+
+- fix(fix-pipeline): gate build/coverage commits with commitlint (#675)
+
+
 ## [v2.69.0] - 2026-09-07
 
 ### Added
