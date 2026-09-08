@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.69.2] - 2026-09-08
+
+### Fixed
+
+- fix(review-packet): degrade to a summary tier instead of dropping oversized packets (#676)
+
+
 ## [v2.69.1] - 2026-09-08
 
 ### Fixed
