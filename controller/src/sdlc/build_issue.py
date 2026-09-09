@@ -17,7 +17,9 @@ from sdlc.issue_host import (
     declared_instance_for,
     get_adapter,
     load_repo_forge_declaration,
+    resolve_forge,
 )
+from sdlc.story_render import story_marker
 
 if TYPE_CHECKING:  # avoid a runtime import cycle with build.py (which imports this)
     from sdlc.build import Ledger
@@ -76,12 +78,96 @@ def stage_status(stage: str) -> str | None:
     return _STAGE_STATUS.get(stage)
 
 
-def _adapter_and_ref(ledger: "Ledger", story_id: str, runner: Runner | None):
+# Issue #677: the `story_inventory` mapping is a **per-checkout** cache, written
+# only by `sdlc issues init`. A story mirrored from another checkout (or any
+# fresh clone) reads no row here, which silently cost the PR its `Closes #N` and
+# skipped the merge CI gate. The marker search that recovers it is a live host
+# call, so its outcome — the found ref, or None for a genuine miss — is cached
+# for the process: the inventory write-back below only persists when this
+# checkout actually has a row for the story, and a story authored elsewhere has
+# none. Keyed by ledger path so parallel cohorts on distinct ledgers never share.
+_RECOVERED_REFS: dict[tuple[str, str], str | None] = {}
+
+
+def _mirrors_stories(ledger: "Ledger") -> bool:
+    """True when this checkout's inventory maps at least one story to an issue.
+
+    The evidence gate for the recovery path: a repo that never ran
+    ``sdlc issues init`` has no mirror to recover from, so it must keep today's
+    zero-host-call behaviour rather than pay a live marker search (and emit a
+    warn) on every seam of every build.
+    """
+    return ledger.inventory_any_mapped()
+
+
+def _repo_adapter(ledger: "Ledger", runner: Runner | None):
+    """The adapter for the repo's *own* forge, or None when this checkout doesn't mirror.
+
+    Resolved exactly as :func:`sdlc.build._open_story_cr` resolves the forge it
+    opens the change request on — the repo's declaration/remote, not the story's
+    inventory mapping — so it is available even when the mapping is missing.
+    Raises :class:`IssueHostError` when the forge itself cannot be resolved.
+    """
+    if not _mirrors_stories(ledger):
+        return None
+    resolution = resolve_forge(Path.cwd())
+    return get_adapter(
+        resolution.host, runner=runner, instance_url=resolution.instance_url
+    )
+
+
+def _recover_ref(
+    ledger: "Ledger", story_id: str, adapter, run_id: str | None
+) -> str | None:
+    """Re-discover a story's issue on the host by its body marker, or None.
+
+    The same mechanism :func:`sdlc.story_mirror.mirror_story` already uses to
+    recover a stale ref, applied to the case it never covered: a ref that is
+    simply *absent* from this checkout. A hit is written back to the inventory so
+    later runs in this checkout resolve locally; a genuine miss is recorded as a
+    ``warn`` event naming the story rather than a silent debug log (issue #677).
+    """
+    key = (str(ledger.db_path), story_id)
+    if key in _RECOVERED_REFS:
+        return _RECOVERED_REFS[key]
+    found = adapter.issue_find(story_marker(story_id))
+    ref = found.ref if found is not None else None
+    _RECOVERED_REFS[key] = ref
+    if ref is not None:
+        # A no-op when this checkout has no inventory row for the story — the
+        # process cache above is then the only thing keeping the search to one.
+        ledger.inventory_set_mapping(story_id, adapter.host, ref)
+    else:
+        _warn_unmapped(ledger, run_id, story_id)
+    return ref
+
+
+def _warn_unmapped(ledger: "Ledger", run_id: str | None, story_id: str) -> None:
+    """Surface a story with no host issue as a ``warn`` event naming it (issue #677)."""
+    message = (
+        f"story mirror: no host issue found for story {story_id} (not in this "
+        "checkout's inventory and no marker match on the host) — close-link and "
+        "issue lifecycle skipped; run `sdlc issues init` to mirror it"
+    )
+    if not run_id:
+        log.debug(message)
+        return
+    try:
+        ledger.event_log(run_id, story_id, "warn", "controller", message)
+    except Exception:  # noqa: BLE001 — best-effort; a ledger hiccup never fails a build
+        log.debug("unmapped-story warn failed for %s", story_id, exc_info=True)
+
+
+def _adapter_and_ref(
+    ledger: "Ledger", story_id: str, runner: Runner | None, run_id: str | None = None
+):
     """Return ``(adapter, ref)`` for a story's mapped issue, or None when unmapped.
 
-    Resolves the host from the inventory mapping and builds its adapter. Returns
-    None — never raises — when the story has no mapping or the recorded host is
-    unsupported, so every caller degrades to a clean no-op.
+    Resolves the host from the inventory mapping and builds its adapter. When the
+    story has no mapping *and* this checkout mirrors at all, the issue is
+    re-discovered on the host by its body marker and the mapping cached
+    (issue #677). Returns None — never raises — when nothing resolves or the
+    recorded host is unsupported, so every caller degrades to a clean no-op.
 
     Story 30.1-001: the inventory records the forge *kind* only, so the repo's
     `.sdlc-forge.yaml` supplies the self-hosted instance for that kind (the same
@@ -95,10 +181,14 @@ def _adapter_and_ref(ledger: "Ledger", story_id: str, runner: Runner | None):
     runner, so cwd's repo is the one being talked to.
     """
     mapping = ledger.inventory_get_mapping(story_id)
-    if mapping is None:
-        return None
-    host, ref = mapping
     try:
+        if mapping is None:
+            adapter = _repo_adapter(ledger, runner)
+            if adapter is None:
+                return None
+            ref = _recover_ref(ledger, story_id, adapter, run_id)
+            return (adapter, ref) if ref is not None else None
+        host, ref = mapping
         declaration = load_repo_forge_declaration(
             override_path=Path.cwd() / FORGE_OVERRIDE_FILENAME
         )
@@ -112,8 +202,35 @@ def _adapter_and_ref(ledger: "Ledger", story_id: str, runner: Runner | None):
         return None
 
 
+def _cr_adapter(ledger: "Ledger", story_id: str, runner: Runner | None):
+    """The adapter to read a story's *change request* with, or None.
+
+    A CR lookup needs a host adapter and the CR number the caller already holds —
+    the story's issue mapping only refines *which* host. Issue #677: routing it
+    through the mapping meant a missing mirror row made the merge CI gate see an
+    unresolvable status and skip, even though the PR (and its forge) were known.
+    So an unmapped story falls back to the repo's own forge. A story mapped to a
+    host that will not resolve is *not* re-guessed onto another forge — the
+    recorded host is a deliberate choice, and talking to the wrong one is worse
+    than degrading.
+    """
+    got = _adapter_and_ref(ledger, story_id, runner)
+    if got is not None:
+        return got[0]
+    if ledger.inventory_get_mapping(story_id) is not None:
+        return None
+    try:
+        return _repo_adapter(ledger, runner)
+    except IssueHostError:
+        return None
+
+
 def close_link(
-    ledger: "Ledger", story_id: str, *, runner: Runner | None = None
+    ledger: "Ledger",
+    story_id: str,
+    *,
+    runner: Runner | None = None,
+    run_id: str | None = None,
 ) -> str | None:
     """``Closes #<ref>`` for a story's mapped issue, or None when unmapped (AC1).
 
@@ -121,9 +238,13 @@ def close_link(
     the story's tracking issue. Best-effort: any lookup/host failure (including a
     ledger without the inventory table) yields None and the PR is opened without
     a close-link — a build is never blocked on the mirror.
+
+    This is the once-per-story resolution point, so ``run_id`` is threaded here
+    (and only here) to log the one ``warn`` event for a story that resolves to no
+    host issue at all — the later seams reuse the same cached outcome (#677).
     """
     try:
-        got = _adapter_and_ref(ledger, story_id, runner)
+        got = _adapter_and_ref(ledger, story_id, runner, run_id)
         if got is None:
             return None
         adapter, ref = got
@@ -146,10 +267,9 @@ def change_request_terms(
     byte-identical to today (AC2) and a host hiccup never blocks a build.
     """
     try:
-        got = _adapter_and_ref(ledger, story_id, runner)
-        if got is None:
+        adapter = _cr_adapter(ledger, story_id, runner)
+        if adapter is None:
             return GITHUB_CR_TERMS
-        adapter, _ = got
         return adapter.cr_terms
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
         log.debug("change_request_terms failed for %s", story_id, exc_info=True)
@@ -171,10 +291,9 @@ def change_request_status(
     blocking a build on a mirror hiccup.
     """
     try:
-        got = _adapter_and_ref(ledger, story_id, runner)
-        if got is None:
+        adapter = _cr_adapter(ledger, story_id, runner)
+        if adapter is None:
             return None
-        adapter, _ = got
         return adapter.cr_status(str(cr_ref))
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
         log.debug("change_request_status failed for %s", story_id, exc_info=True)
@@ -196,10 +315,9 @@ def change_request_checks(
     merge failure (no false-positive parking).
     """
     try:
-        got = _adapter_and_ref(ledger, story_id, runner)
-        if got is None:
+        adapter = _cr_adapter(ledger, story_id, runner)
+        if adapter is None:
             return None
-        adapter, _ = got
         return adapter.cr_checks(str(cr_ref))
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
         log.debug("change_request_checks failed for %s", story_id, exc_info=True)

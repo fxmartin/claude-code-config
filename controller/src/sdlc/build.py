@@ -3156,6 +3156,21 @@ class Ledger:
             return None
         return (row[0], row[1])
 
+    def inventory_any_mapped(self) -> bool:
+        """True when *any* story in the inventory is mapped to a host issue.
+
+        The evidence that this checkout participates in the story mirror at all
+        (issue #677). ``build_issue`` gates its marker-recovery search on it, so
+        a repo that never ran ``sdlc issues init`` never pays a live host lookup
+        for a story that was simply never mirrored.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM story_inventory "
+                "WHERE host IS NOT NULL AND issue_ref IS NOT NULL LIMIT 1"
+            ).fetchone()
+        return row is not None
+
     def inventory_set_mapping(
         self, story_id: str, host: str | None, issue_ref: str | None
     ) -> None:
@@ -7569,7 +7584,9 @@ def _run_story(
     # injected into the PR-opening stage's prompt so the merge auto-closes the
     # issue. Resolved once per story; None when the story has no mapped issue (the
     # common case today) or any host lookup fails — best-effort, never blocks.
-    close_link = build_issue.close_link(ledger, story.id)
+    # ``run_id`` rides along so a story that resolves to no issue at all is a
+    # visible `warn` event in this run rather than a silent debug log (#677).
+    close_link = build_issue.close_link(ledger, story.id, run_id=run_id)
     # Story 23.2-001: the host-correct change-request phrasing (PR via gh / MR via
     # glab) and the default branch ``feature/<id>`` is cut from + the change
     # request targets. Resolved once per story from the story's mapped host and the

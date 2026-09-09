@@ -381,3 +381,191 @@ def test_mirror_lifecycle_no_ops_on_malformed_declaration(tmp_path, monkeypatch)
     assert bi.change_request_status(ledger, "22.4-002", 9, runner=runner) is None
     assert bi.change_request_terms(ledger, "22.4-002", runner=runner) is ih.GITHUB_CR_TERMS
     assert runner.calls == []
+
+
+# --- issue #677: the inventory mapping is a per-checkout cache ---------------
+# `sdlc issues init` writes the story→issue mapping into *one* checkout's
+# ledger. A build run from any other checkout (or a fresh clone) reads no row,
+# so the close-link vanished from the PR and the merge CI gate silently skipped.
+# The mapping is now recovered from the host by the story's body marker.
+
+
+@pytest.fixture(autouse=True)
+def _clear_recovery_cache():
+    """The marker-recovery cache is process-wide; keep it from leaking across tests."""
+    bi._RECOVERED_REFS.clear()
+    yield
+    bi._RECOVERED_REFS.clear()
+
+
+def _mirror_repo(tmp_path, monkeypatch, forge=ih.GITHUB) -> Ledger:
+    """A ledger that already mirrors *some* story, in a repo declaring ``forge``."""
+    ledger = _ledger(tmp_path)
+    # Evidence this repo uses the mirror: one other story is mapped.
+    _mapped(ledger, story_id="22.1-001", host=forge, ref="1")
+    (tmp_path / ".sdlc-forge.yaml").write_text(f"forge: {forge}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    return ledger
+
+
+def _found_payload(story_id: str, number: int) -> str:
+    """A `gh issue list --json` row whose body carries the story's hidden marker."""
+    import json
+
+    from sdlc.story_render import story_marker
+
+    return json.dumps([{
+        "number": number, "url": f"https://example.test/{number}",
+        "title": f"{story_id}: t", "state": "OPEN",
+        "body": f"body\n{story_marker(story_id)}\n", "assignees": [],
+    }])
+
+
+def test_close_link_recovers_an_unmapped_story_by_marker(tmp_path, monkeypatch):
+    """The regression: a story mirrored from another checkout still gets Closes #N."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    runner = FakeRunner({"issue list": (0, _found_payload("29.4-004", 573), "")})
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner) == "Closes #573"
+
+
+def test_recovered_mapping_is_cached_in_the_inventory(tmp_path, monkeypatch):
+    """A recovered mapping is written back so the next run in this checkout is local."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    runner = FakeRunner({"issue list": (0, _found_payload("29.4-004", 573), "")})
+
+    bi.close_link(ledger, "29.4-004", runner=runner)
+
+    assert ledger.inventory_get_mapping("29.4-004") == (ih.GITHUB, "573")
+
+
+def test_marker_search_happens_once_per_story(tmp_path, monkeypatch):
+    """Every mirror-lifecycle seam shares one host search, not one search each."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    runner = FakeRunner({"issue list": (0, _found_payload("29.4-004", 573), "")})
+
+    bi.close_link(ledger, "29.4-004", runner=runner)
+    bi.close_link(ledger, "29.4-004", runner=runner)
+    bi.change_request_terms(ledger, "29.4-004", runner=runner)
+
+    searches = [c for c in runner.calls if "list" in c]
+    assert len(searches) == 1
+
+
+def test_merge_ci_gate_resolves_status_for_an_unmapped_story(tmp_path, monkeypatch):
+    """A missing *mirror* mapping must not disable the merge CI gate (issue #677).
+
+    The CR number is already known at that point; the pipeline lookup only needs
+    the repo's own forge. Here the marker search finds nothing at all, so even
+    the recovery misses — the gate must still read the CR's pipeline.
+    """
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("30.1-001", "30", "30.1", "t", 3, "Should")])
+    runner = FakeRunner({
+        "issue list": (0, "[]", ""),
+        "pr view": (0, '{"statusCheckRollup": [{"status": "COMPLETED", '
+                       '"conclusion": "SUCCESS"}]}', ""),
+    })
+
+    assert bi.change_request_status(ledger, "30.1-001", 672, runner=runner) == ih.CR_SUCCESS
+
+
+def test_unmapped_story_logs_a_warn_event_naming_the_story(tmp_path, monkeypatch):
+    """A genuine miss is surfaced, not silently downgraded to a debug log."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    run_id = ledger.run_create("epic-29", "build")
+    runner = FakeRunner({"issue list": (0, "[]", "")})
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner, run_id=run_id) is None
+
+    events = ledger.recent_events(run_id, limit=50)
+    warns = [e for e in events if e["level"] == "warn" and "29.4-004" in e["message"]]
+    assert warns, f"no warn event naming the story: {[e['message'] for e in events]}"
+
+
+def test_no_host_search_when_the_repo_never_mirrored(tmp_path, monkeypatch):
+    """A repo that never ran `sdlc issues init` keeps today's zero-host-call path."""
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: github\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    runner = FakeRunner()
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner) is None
+    assert bi.change_request_status(ledger, "29.4-004", 7, runner=runner) is None
+    assert runner.calls == []
+
+
+def test_recorded_but_unusable_host_never_falls_back(tmp_path, monkeypatch):
+    """A story mapped to an unsupported host is not re-guessed onto another forge."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    ledger.inventory_set_mapping("29.4-004", "bitbucket", "9")
+    runner = FakeRunner()
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner) is None
+    assert bi.change_request_status(ledger, "29.4-004", 7, runner=runner) is None
+    assert runner.calls == []
+
+
+def test_recovery_tolerates_a_host_search_failure(tmp_path, monkeypatch):
+    """A failing marker search degrades to today's no-op — it never raises."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    runner = FakeRunner(default=(1, "", "boom"))
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner) is None
+    assert bi.change_request_terms(ledger, "29.4-004", runner=runner) is ih.GITHUB_CR_TERMS
+
+
+def test_recovery_no_ops_on_a_malformed_declaration(tmp_path, monkeypatch):
+    """An unresolvable forge means no search and no fallback adapter."""
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, story_id="22.1-001", host=ih.GITHUB, ref="1")
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    runner = FakeRunner()
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner) is None
+    assert bi.change_request_status(ledger, "29.4-004", 7, runner=runner) is None
+    assert runner.calls == []
+
+
+def test_recovered_story_gets_status_announcements(tmp_path, monkeypatch):
+    """The whole mirror lifecycle recovers, not just the close-link."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    runner = FakeRunner({"issue list": (0, _found_payload("29.4-004", 573), "")})
+
+    assert bi.announce_status(ledger, "29.4-004", "building", runner=runner) == "building"
+    assert any("gh issue comment 573" in " ".join(c) for c in runner.calls)
+
+
+def test_recovery_survives_a_story_with_no_inventory_row(tmp_path, monkeypatch):
+    """A story never projected into *this* checkout still recovers (the reported case)."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    # No inventory_upsert_specs for this story at all: inventory_set_mapping is a
+    # no-op, so only the in-process cache can keep the search down to one.
+    runner = FakeRunner({"issue list": (0, _found_payload("32.1-001", 700), "")})
+
+    assert bi.close_link(ledger, "32.1-001", runner=runner) == "Closes #700"
+    assert bi.close_link(ledger, "32.1-001", runner=runner) == "Closes #700"
+    assert len([c for c in runner.calls if "list" in c]) == 1
+
+
+def test_warn_event_failure_never_breaks_the_lookup(tmp_path, monkeypatch):
+    """A ledger hiccup while logging the warn degrades to a debug log, not a raise."""
+    ledger = _mirror_repo(tmp_path, monkeypatch)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    monkeypatch.setattr(
+        ledger, "event_log",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ledger is locked")),
+    )
+    runner = FakeRunner({"issue list": (0, "[]", "")})
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner, run_id="run-1") is None
