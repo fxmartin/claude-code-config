@@ -95,6 +95,41 @@ def _seed_complete(db_path: Path) -> str:
     return run_id
 
 
+def _seed_failed_resumable(db_path: Path) -> str:
+    """A run the controller closed FAILED on a transient dispatch error.
+
+    99.1-001: build+review+merge DONE, story DONE.
+    99.1-002: build DONE, review FAILED (e.g. an expired OAuth session), story
+    FAILED. The run itself is stamped FAILED — exactly what a controller
+    close-out does once any story ends FAILED — even though 99.1-002 still
+    owes its review stage and would complete via `sdlc resume --run` (#679).
+    """
+    ledger = Ledger(db_path)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    ledger.set_total(run_id, 2)
+    ledger.event_log(run_id, "", "info", "controller", "run started: scope=epic-99 mode=serial")
+    ledger.event_log(run_id, "", "info", "config", json.dumps({"skip_coverage": True, "coverage_threshold": 90}))
+
+    ledger.story_upsert(run_id, "99.1-001", "99", "One", "P1", 1, "general-purpose", "", None, "TODO")
+    ledger.story_upsert(run_id, "99.1-002", "99", "Two", "P2", 2, "general-purpose", "", None, "TODO")
+
+    for stage in ("build", "review", "merge"):
+        ledger.stage_start(run_id, "99.1-001", stage, 1)
+        ledger.stage_finish(run_id, "99.1-001", stage, 1, "DONE")
+    ledger.set_story_pr(run_id, "99.1-001", 100)
+    ledger.set_story_status(run_id, "99.1-001", "DONE")
+
+    ledger.stage_start(run_id, "99.1-002", "build", 1)
+    ledger.stage_finish(run_id, "99.1-002", "build", 1, "DONE")
+    ledger.stage_start(run_id, "99.1-002", "review", 1)
+    ledger.stage_finish(run_id, "99.1-002", "review", 1, "FAILED", "auth-expired")
+    ledger.set_story_status(run_id, "99.1-002", "FAILED")
+
+    ledger.run_update_status(run_id, "FAILED")
+    return run_id
+
+
 # --- resume plan -----------------------------------------------------------
 
 
@@ -330,6 +365,41 @@ def test_latest_resumable_run_finds_in_progress(tmp_path: Path) -> None:
     assert Ledger(db2).latest_resumable_run("epic-99") is None
 
 
+def test_latest_resumable_run_excludes_failed(tmp_path: Path) -> None:
+    """Issue #679: FAILED stays outside the auto-discovery statuses — it may
+    cover a genuinely dead run, not just a transient-dispatch-error one."""
+    db = tmp_path / ".sdlc-state.db"
+    _seed_failed_resumable(db)
+    assert Ledger(db).latest_resumable_run("epic-99") is None
+
+
+def test_latest_failed_run_finds_it(tmp_path: Path) -> None:
+    """Issue #679: the new lookup surfaces the FAILED run by scope."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_failed_resumable(db)
+    assert Ledger(db).latest_failed_run("epic-99") == run_id
+    # Wrong scope and no ledger both miss.
+    assert Ledger(db).latest_failed_run("epic-34") is None
+    assert Ledger(tmp_path / "missing.db").latest_failed_run("epic-99") is None
+    # A run that closed DONE is not surfaced as FAILED.
+    db2 = tmp_path / "done.db"
+    _seed_complete(db2)
+    assert Ledger(db2).latest_failed_run("epic-99") is None
+
+
+def test_has_resumable_work_true_for_failed_run_with_owed_stage(tmp_path: Path) -> None:
+    """Issue #679: a FAILED run whose story still owes a stage is resumable."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_failed_resumable(db)
+    assert resume_mod.has_resumable_work(Ledger(db), run_id) is True
+
+
+def test_has_resumable_work_false_when_every_story_terminal(tmp_path: Path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_complete(db)
+    assert resume_mod.has_resumable_work(Ledger(db), run_id) is False
+
+
 # --- run_resume ------------------------------------------------------------
 
 
@@ -375,6 +445,38 @@ def test_resume_no_run_at_all_is_noop(tmp_path: Path) -> None:
     result = run_resume("epic-99", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path)
     assert result.nothing_to_resume is True
     assert result.run_id is None
+
+
+def test_resume_default_scope_is_noop_for_failed_run(tmp_path: Path) -> None:
+    """Issue #679 repro (leg 1): the default (no --run) lookup still refuses a
+    FAILED run, even one whose stories are actually resumable."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_failed_resumable(db)
+    result = run_resume("epic-99", ledger=Ledger(db), dispatcher=FakeDispatcher(), root=tmp_path)
+    assert result.nothing_to_resume is True
+    assert result.run_id is None
+
+
+def test_resume_explicit_run_id_completes_failed_run(tmp_path: Path) -> None:
+    """Issue #679 repro (leg 2): `--run <id>` on the same FAILED run bypasses
+    the status filter and finishes the owed stage — confirming the fix's CLI
+    hint (`sdlc resume --run <id> <scope>`) actually works."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_failed_resumable(db)
+
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-99", ledger=Ledger(db), dispatcher=dispatcher, run_id=run_id, root=tmp_path
+    )
+
+    assert result.nothing_to_resume is False
+    assert result.completed == 2
+    assert result.resumed == 1
+    ledger = Ledger(db)
+    rows = {r["story_id"]: r for r in ledger.story_rows(run_id)}
+    assert rows["99.1-002"]["status"] == "DONE"
 
 
 # --- live-owner guard (issue #595) ------------------------------------------
@@ -1305,6 +1407,69 @@ def test_resume_cli_accepts_multiple_positionals(tmp_path: Path, monkeypatch) ->
     result = CliRunner().invoke(app, ["resume", "epic-18", "epic-15"])
     assert result.exit_code == 0, result.output
     assert captured["scope"] == "epic-15,epic-18"
+
+
+def test_resume_cli_nothing_to_resume_names_failed_run(tmp_path: Path, monkeypatch) -> None:
+    """Issue #679: when the default lookup finds nothing, but the scope's
+    latest FAILED run still has resumable stories, the CLI names it and the
+    exact `--run` command instead of the bare "nothing to resume"."""
+    import sdlc.resume as resume_mod
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    db = tmp_path / ".sdlc-state.db"
+    failed_run_id = _seed_failed_resumable(db)
+
+    monkeypatch.setattr(
+        resume_mod, "run_resume", lambda *a, **k: ResumeResult(run_id=None, nothing_to_resume=True)
+    )
+    result = CliRunner().invoke(app, ["resume", "epic-99", "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    assert failed_run_id in result.output
+    assert f"sdlc resume --run {failed_run_id} epic-99" in result.output
+
+
+def test_resume_cli_nothing_to_resume_bare_message_without_failed_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No FAILED run exists for the scope: the message stays the plain one."""
+    import sdlc.resume as resume_mod
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed_complete(db)  # closes DONE, not FAILED
+
+    monkeypatch.setattr(
+        resume_mod, "run_resume", lambda *a, **k: ResumeResult(run_id=None, nothing_to_resume=True)
+    )
+    result = CliRunner().invoke(app, ["resume", "epic-99", "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "nothing to resume: no incomplete run for scope 'epic-99'."
+
+
+def test_resume_cli_nothing_to_resume_ignores_failed_run_missing_stages(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A FAILED run for the scope exists but every story is already terminal
+    (DONE/SKIPPED): it must not be suggested — there is nothing left to finish."""
+    import sdlc.resume as resume_mod
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_complete(db)
+    Ledger(db).run_update_status(run_id, "FAILED")  # terminal-but-FAILED edge case
+
+    monkeypatch.setattr(
+        resume_mod, "run_resume", lambda *a, **k: ResumeResult(run_id=None, nothing_to_resume=True)
+    )
+    result = CliRunner().invoke(app, ["resume", "epic-99", "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "nothing to resume: no incomplete run for scope 'epic-99'."
 
 
 # --- Issue #537: git-landed done-skips must not block on resume -------------

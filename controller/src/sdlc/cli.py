@@ -765,6 +765,12 @@ def resume(
     attempt count preserved. Completed stories are not rebuilt. A run with no
     incomplete stories is a no-op that reports "nothing to resume" and exits 0.
 
+    Issue #679: a run the controller closed FAILED (e.g. every dispatch hit a
+    transient auth/rate error) is never auto-picked here — FAILED also covers
+    genuinely dead runs — but if the scope's latest FAILED run still has
+    resumable stories, the "nothing to resume" message names it and the exact
+    ``sdlc resume --run <id>`` command that would finish it.
+
     Story 14.1-001: a budget-paused run carries its token ceiling, so resuming
     without raising it re-pauses immediately. Pass ``--budget`` to raise it and
     continue.
@@ -785,7 +791,7 @@ def resume(
     from sdlc.discovery import canonical_scope
     from sdlc.issue_host import IssueHostError
     from sdlc.ledger_view import Ledger, default_db_path, make_render_view
-    from sdlc.resume import run_resume
+    from sdlc.resume import has_resumable_work, run_resume
 
     # Story 19.1-001: fold the (possibly several) positional scopes into one
     # canonical label so a composite run resumes in any order; no positional
@@ -844,7 +850,19 @@ def resume(
 
     if result.nothing_to_resume:
         if result.run_id is None:
-            typer.echo(f"nothing to resume: no incomplete run for scope '{scope_label}'.")
+            # Issue #679: latest_resumable_run deliberately never auto-picks a
+            # FAILED run (it may be genuinely dead), but one closed FAILED on a
+            # transient dispatch error can still finish via an explicit --run —
+            # name it instead of silently reporting nothing to do.
+            failed_run_id = ledger.latest_failed_run(scope_label)
+            if failed_run_id is not None and has_resumable_work(ledger, failed_run_id):
+                typer.echo(
+                    f"nothing to resume: no incomplete run for scope '{scope_label}', "
+                    f"but run {failed_run_id[:8]} failed with resumable stories — try: "
+                    f"sdlc resume --run {failed_run_id} {scope_label}"
+                )
+            else:
+                typer.echo(f"nothing to resume: no incomplete run for scope '{scope_label}'.")
         else:
             typer.echo(
                 f"nothing to resume: run {result.run_id[:8]} has no incomplete stories."
