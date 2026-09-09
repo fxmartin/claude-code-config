@@ -1299,6 +1299,43 @@ def test_resume_registers_missing_run_id_in_registry(tmp_path: Path) -> None:
     assert record.pid == os.getpid()
 
 
+def test_resume_registers_queue_length_when_total_stories_unset(tmp_path: Path) -> None:
+    """Issue #683: a run interrupted before its total was ever persisted (the
+    ``runs.total_stories`` column defaults to 0) must not register a record
+    claiming zero stories. ``run_row.get("total_stories") or len(run_queue)``
+    falls back to the recomputed queue length so the dashboard still shows a
+    sane total instead of 0."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_interrupted(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE runs SET total_stories = 0 WHERE id = ?", (run_id,))
+
+    registered: list[RunRecord] = []
+
+    class _SpyRegistry(Registry):
+        def register(self, record: RunRecord) -> None:  # type: ignore[override]
+            registered.append(record)
+            super().register(record)
+
+    registry = _SpyRegistry(tmp_path / "registry.json")
+    result = run_resume(
+        "epic-99",
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.completed == 2  # resume still succeeds despite the unset total
+    # The pre-dispatch registration — first of possibly several (close-out
+    # re-registers with the final count) — is the one this fix adds.
+    assert registered[0].run_id == run_id
+    # Falls back to len(run_queue) — both stories, not the unset 0 — never a
+    # record that claims a resumed run has zero stories.
+    assert registered[0].total == 2
+
+
 def test_resume_reregisters_own_pid_before_dispatch(tmp_path: Path) -> None:
     """Issue #683 root cause: after a crash the registry record still carries
     the dead original orchestrator's pid for the resumed run's entire life, so
