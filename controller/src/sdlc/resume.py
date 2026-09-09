@@ -22,6 +22,7 @@ from sdlc.build import (
     _log_routing_banner,
     _make_rate_limit_context,
     _prepare_story_workdir,
+    _registry_register,
     _reposition_head,
     _resolve_dispatch,
     _run_story_rate_limited,
@@ -596,6 +597,24 @@ def run_resume(
     # Mark the run live again and announce the resume.
     ledger.run_update_status(rid, "IN_PROGRESS")
     ledger.event_log(rid, "", "info", "controller", f"run resumed: scope={scope}")
+    # Issue #683: re-announce the run under this process's own pid before any
+    # dispatch. Left unregistered, the record still carries the crashed
+    # original orchestrator's pid for the resumed run's entire life —
+    # `sdlc doctor` reports a live resume as crashed, and `sdlc runs --prune`
+    # (doctor's own suggested remedy) deletes it out from under the dashboard.
+    # `register` upserts by run_id, so this is safe whether or not a record
+    # already exists (including one already pruned). Total/completed come from
+    # the run row rather than being reset to a fresh-run 0/`len(run_queue)` —
+    # the latter excludes already-shipped/SKIPPED stories — so the dashboard's
+    # progress does not shrink or reset on resume.
+    if registry is not None:
+        _registry_register(
+            registry, rid, scope, ledger.db_path,
+            run_row.get("total_stories") or len(run_queue),
+            repo=root or Path.cwd(),
+            completed=run_row.get("completed") or 0,
+            started_at=run_row.get("started_at") or "",
+        )
     try:  # best-effort lifecycle notification; never fail a resume
         epic_name = run_queue[0].epic_name if run_queue else None
         subject = f"resume {scope}" + (f' "{epic_name}"' if epic_name else "")
