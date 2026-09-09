@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.69.6] - 2026-09-09
+
+### Fixed
+
+- fix(resume): re-register the run in the host registry with its own pid (#684)
+
+
 ## [v2.69.5] - 2026-09-09
 
 ### Fixed
