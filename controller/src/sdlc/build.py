@@ -6353,14 +6353,19 @@ def _commit_message(ref: str, root: Path | None = None) -> str | None:
 
 def _registry_register(
     registry: Registry, run_id: str, scope: str, db_path: Path, total: int,
-    repo: Path | None = None,
+    repo: Path | None = None, *, completed: int = 0, started_at: str = "",
 ) -> None:
-    """Register a starting run; swallow any cache IO error (never fails a build).
+    """Register a starting (or resuming) run; swallow any cache IO error.
 
     ``repo`` is the checkout the run belongs to, defaulting to the process cwd —
     which is what ``run_build`` has always registered. ``run_fix`` passes its
     explicit ``root`` instead (Issue #545), so a fix driven against another
     checkout is discovered under that repo rather than wherever it was launched.
+
+    ``completed``/``started_at`` default to a fresh run's 0/now. Issue #683:
+    ``sdlc resume`` passes the run's already-accrued counts instead, so
+    re-registering the record under the resuming process's own pid does not
+    reset the dashboard's progress display back to 0.
     """
     try:
         registry.register(
@@ -6371,9 +6376,9 @@ def _registry_register(
                 scope=scope,
                 pid=os.getpid(),
                 status="IN_PROGRESS",
-                started_at="",  # registry stamps the start time
+                started_at=started_at,  # registry stamps the start time when blank
                 total=total,
-                completed=0,
+                completed=completed,
             )
         )
     except OSError:

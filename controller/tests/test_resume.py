@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from sdlc.build import (
 )
 from sdlc.cohort import Story
 from sdlc.discovery import discover_queue
-from sdlc.registry import Registry, RunRecord
+from sdlc.registry import Registry, RunRecord, derive_state
 import sdlc.resume as resume_mod
 from sdlc.resume import ResumeResult, compute_resume_plan, run_resume
 
@@ -1274,12 +1275,13 @@ def test_resume_refreshes_registry_to_done(tmp_path: Path) -> None:
     assert record.completed == 2  # the recovered DONE count, not the stale 1
 
 
-def test_resume_registry_missing_run_id_does_not_crash(tmp_path: Path) -> None:
-    """Resuming a run with no registry entry (started elsewhere) is fine —
-    mark_finished is a documented no-op for unknown run_ids."""
+def test_resume_registers_missing_run_id_in_registry(tmp_path: Path) -> None:
+    """Issue #683: resuming a run with no registry entry (started elsewhere, or
+    already pruned) must still register it under this process's own pid —
+    ``register`` upserts, so a missing record is created, not skipped."""
     _make_project(tmp_path)
     db = tmp_path / ".sdlc-state.db"
-    _seed_interrupted(db)
+    run_id = _seed_interrupted(db)
 
     # An empty registry: this run was never registered here.
     registry = Registry(tmp_path / "registry.json")
@@ -1293,7 +1295,96 @@ def test_resume_registry_missing_run_id_does_not_crash(tmp_path: Path) -> None:
     )
 
     assert result.completed == 2  # resume still succeeds
-    assert registry.records() == []  # no entry conjured for an unknown run
+    record = next(r for r in registry.records() if r.run_id == run_id)
+    assert record.pid == os.getpid()
+
+
+def test_resume_reregisters_own_pid_before_dispatch(tmp_path: Path) -> None:
+    """Issue #683 root cause: after a crash the registry record still carries
+    the dead original orchestrator's pid for the resumed run's entire life, so
+    `sdlc doctor` reports it crashed and `sdlc runs --prune` deletes the live
+    run out from under the dashboard. Resume must overwrite the record with
+    its own pid — and carry the run's real total/already-accrued completed
+    count, not reset them — before dispatching anything."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_interrupted(db)
+    # One story already landed before the crash that orphaned this record.
+    Ledger(db).run_update_counts(run_id, 1, 0)
+    ledger_started_at = Ledger(db).run_row(run_id)["started_at"]
+
+    reg_path = tmp_path / "registry.json"
+    dead_pid = 2**31 - 1  # never a real pid on this host
+    seed_registry = Registry(reg_path)
+    seed_registry.register(
+        RunRecord(
+            run_id=run_id,
+            repo=str(tmp_path.resolve()),
+            db=str(db.resolve()),
+            scope="epic-99",
+            pid=dead_pid,  # the crashed original orchestrator
+            status="IN_PROGRESS",
+            started_at="2026-09-09T13:00:00+00:00",
+            total=2,
+            completed=1,
+        )
+    )
+
+    registered: list[RunRecord] = []
+
+    class _SpyRegistry(Registry):
+        def register(self, record: RunRecord) -> None:  # type: ignore[override]
+            registered.append(record)
+            super().register(record)
+
+    registry = _SpyRegistry(reg_path)
+    result = run_resume(
+        "epic-99",
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.completed == 2
+    # Registered exactly once, before dispatch, under this process's own pid.
+    assert len(registered) == 1
+    record = registered[0]
+    assert record.run_id == run_id
+    assert record.pid == os.getpid()
+    assert record.total == 2  # the run row's real total, not len(run_queue)
+    assert record.completed == 1  # the pre-crash accrual, not reset to 0
+    # Carried from the ledger's own started_at, not restamped to "now" and not
+    # left as the stale registry seed value from the crashed original run.
+    assert record.started_at == ledger_started_at
+    # `sdlc doctor`/`sdlc runs --prune` derive state from this record; with the
+    # live pid it must no longer read as crashed.
+    assert derive_state(record) != "DEAD"
+
+
+def test_resume_registry_register_error_is_swallowed(tmp_path: Path) -> None:
+    """A registry IO failure on the new pre-dispatch register call must never
+    fail an otherwise-good resume — best-effort, exactly like mark_finished's
+    swallowed OSError (#121)."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    _seed_interrupted(db)
+
+    class _BoomRegistry(Registry):
+        def register(self, *args, **kwargs):  # type: ignore[override]
+            raise OSError("registry unwritable")
+
+    registry = _BoomRegistry(tmp_path / "registry.json")
+
+    result = run_resume(
+        "epic-99",
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        root=tmp_path,
+        registry=registry,
+    )
+
+    assert result.completed == 2  # resume returns its normal result despite IO error
 
 
 def test_resume_registry_io_error_is_swallowed(tmp_path: Path) -> None:
