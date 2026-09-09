@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -1622,6 +1623,133 @@ def test_migrate_registry_ledgers_dedups_and_tolerates_bad_ledgers(tmp_path: Pat
 
     # Must complete without raising despite the bad ledger.
     _migrate_registry_ledgers(registry)
+
+
+def test_migrate_registry_ledgers_bounded_by_blocking_open(monkeypatch, tmp_path: Path) -> None:
+    """A ledger whose ``open()`` blocks forever (e.g. an evicted iCloud file)
+    must not stall ``_migrate_registry_ledgers`` past its per-ledger deadline.
+
+    Regression for issue #678: ``ensure_migrated`` raises neither ``OSError``
+    nor ``sqlite3.Error`` when the underlying ``open()`` syscall simply never
+    returns, so the pre-fix best-effort ``except`` never fired and the
+    registry-discovery dashboard hung before ``serve_forever`` — the bound
+    socket accepted nothing. A healthy ledger registered alongside the stuck
+    one must still be migrated.
+    """
+    import os
+
+    import sdlc.dashboard as dash
+    from sdlc.registry import Registry, RunRecord
+
+    healthy_repo = tmp_path / "healthy"
+    healthy_repo.mkdir()
+    healthy_db = healthy_repo / ".sdlc-state.db"
+    healthy_run_id = _seed_run(healthy_db, "epic-aaa", "AAA.1-001", "IN_PROGRESS")
+
+    stuck_repo = tmp_path / "stuck"
+    stuck_repo.mkdir()
+    stuck_db = stuck_repo / ".sdlc-state.db"
+    stuck_db.write_text("")  # exists, so ensure_migrated proceeds to open() it
+
+    never_unblocked = threading.Event()
+
+    real_ensure_migrated = dash.Ledger.ensure_migrated
+
+    def _ensure_migrated(self):
+        if self.db_path == stuck_db:
+            never_unblocked.wait()  # simulates a blocking open() that never returns
+            return
+        return real_ensure_migrated(self)
+
+    monkeypatch.setattr(dash.Ledger, "ensure_migrated", _ensure_migrated)
+    monkeypatch.setattr(dash, "_MIGRATE_LEDGER_TIMEOUT_SEC", 0.2)
+
+    registry = Registry(tmp_path / "registry.json")
+    started = "2026-01-01T00:00:00+00:00"
+    registry.register(
+        RunRecord(healthy_run_id, str(healthy_repo), str(healthy_db), "epic-aaa",
+                  os.getpid(), "IN_PROGRESS", started, total=1, completed=0)
+    )
+    registry.register(
+        RunRecord("stuck-run", str(stuck_repo), str(stuck_db), "epic-bbb",
+                  os.getpid(), "IN_PROGRESS", started, total=1, completed=0)
+    )
+
+    start = time.monotonic()
+    dash._migrate_registry_ledgers(registry)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5.0, f"migration must not block on a stuck ledger, took {elapsed}s"
+
+
+def test_migrate_registry_ledgers_shares_one_deadline_across_stuck_ledgers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Multiple stuck ledgers must not multiply the wait: they block
+    concurrently on their own threads against one shared deadline, not a
+    fresh timeout each (which would make the sweep scale with registry size
+    instead of staying bounded)."""
+    import os
+
+    import sdlc.dashboard as dash
+    from sdlc.registry import Registry, RunRecord
+
+    never_unblocked = threading.Event()
+    monkeypatch.setattr(
+        dash.Ledger, "ensure_migrated", lambda self: never_unblocked.wait()
+    )
+    monkeypatch.setattr(dash, "_MIGRATE_LEDGER_TIMEOUT_SEC", 0.3)
+
+    registry = Registry(tmp_path / "registry.json")
+    started = "2026-01-01T00:00:00+00:00"
+    for i in range(5):
+        repo = tmp_path / f"stuck-{i}"
+        repo.mkdir()
+        registry.register(
+            RunRecord(f"run-{i}", str(repo), str(repo / ".sdlc-state.db"),
+                      "epic-aaa", os.getpid(), "IN_PROGRESS", started,
+                      total=1, completed=0)
+        )
+
+    start = time.monotonic()
+    dash._migrate_registry_ledgers(registry)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, (
+        f"5 stuck ledgers took {elapsed}s — deadline must be shared, not per-ledger"
+    )
+
+
+def test_make_server_registry_mode_returns_despite_stuck_ledger(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """End-to-end regression for issue #678: ``make_server`` in
+    registry-discovery mode must return (so ``serve()`` can reach
+    ``serve_forever``) even when a registered ledger's ``open()`` blocks
+    forever."""
+    import sdlc.dashboard as dash
+    from sdlc.registry import Registry, RunRecord
+
+    never_unblocked = threading.Event()
+    monkeypatch.setattr(
+        dash.Ledger, "ensure_migrated", lambda self: never_unblocked.wait()
+    )
+    monkeypatch.setattr(dash, "_MIGRATE_LEDGER_TIMEOUT_SEC", 0.2)
+
+    repo = tmp_path / "stuck"
+    repo.mkdir()
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord("run-1", str(repo), str(repo / ".sdlc-state.db"), "epic-aaa",
+                  1, "IN_PROGRESS", "2026-01-01T00:00:00+00:00", total=1, completed=0)
+    )
+
+    start = time.monotonic()
+    server = make_server(db_path=None, host="127.0.0.1", port=0, registry=registry)
+    elapsed = time.monotonic() - start
+    server.server_close()
+
+    assert elapsed < 5.0, f"make_server must not hang on a stuck ledger, took {elapsed}s"
 
 
 # --- GitHub repo health (Story 11.2-006) -----------------------------------
