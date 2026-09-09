@@ -387,6 +387,15 @@ def test_latest_failed_run_finds_it(tmp_path: Path) -> None:
     assert Ledger(db2).latest_failed_run("epic-99") is None
 
 
+def test_latest_failed_run_default_scope_matches_any(tmp_path: Path) -> None:
+    """Issue #679: ``scope`` ``None``/``"all"`` matches any scope, mirroring
+    ``latest_resumable_run``'s documented default-scope behavior."""
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_failed_resumable(db)
+    assert Ledger(db).latest_failed_run(None) == run_id
+    assert Ledger(db).latest_failed_run("all") == run_id
+
+
 def test_has_resumable_work_true_for_failed_run_with_owed_stage(tmp_path: Path) -> None:
     """Issue #679: a FAILED run whose story still owes a stage is resumable."""
     db = tmp_path / ".sdlc-state.db"
