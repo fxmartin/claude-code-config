@@ -17,6 +17,7 @@ import socket
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1760,6 +1761,21 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(payload)
 
 
+# Per-ledger budget for the startup migration sweep (issue #678): a ledger
+# whose file lives on an evicted iCloud path or a stalled volume can block
+# forever inside open() — no exception, so the old best-effort except never
+# fired and the dashboard never reached serve_forever. This bounds the whole
+# sweep to roughly this many seconds regardless of how many ledgers are stuck.
+_MIGRATE_LEDGER_TIMEOUT_SEC = 5.0
+
+
+def _migrate_one_ledger(db_path: str) -> None:
+    try:
+        Ledger(db_path).ensure_migrated()
+    except (OSError, sqlite3.Error):
+        pass  # unreachable/corrupt ledger → leave it; reads already tolerate this
+
+
 def _migrate_registry_ledgers(registry: Registry) -> None:
     """Apply pending migrations to every discovered run's ledger (best-effort).
 
@@ -1768,16 +1784,28 @@ def _migrate_registry_ledgers(registry: Registry) -> None:
     "no such column". Migrate each up front. A missing/corrupt/unreachable ledger
     is skipped (the registry is best-effort) — and ``ensure_migrated`` is itself a
     no-op when the DB file is absent, so no record materialises a spurious DB.
+
+    Each distinct ledger is migrated on its own daemon thread so a blocking
+    ``open()`` (see ``_MIGRATE_LEDGER_TIMEOUT_SEC``) cannot stall the others; a
+    ``ThreadPoolExecutor`` is deliberately not used here because its atexit
+    hook joins outstanding workers, which would turn an abandoned stuck ledger
+    into a hang at *process exit* instead of one at startup. A thread that
+    outlives its deadline is simply abandoned — being a daemon, it cannot
+    block interpreter shutdown, and the read paths already tolerate an
+    unmigrated/unreachable ledger.
     """
     seen: set[str] = set()
+    threads: list[threading.Thread] = []
     for rec in registry.records():
         if rec.db in seen:
             continue
         seen.add(rec.db)
-        try:
-            Ledger(rec.db).ensure_migrated()
-        except (OSError, sqlite3.Error):
-            pass  # unreachable/corrupt ledger → leave it; reads already tolerate this
+        t = threading.Thread(target=_migrate_one_ledger, args=(rec.db,), daemon=True)
+        t.start()
+        threads.append(t)
+    deadline = time.monotonic() + _MIGRATE_LEDGER_TIMEOUT_SEC
+    for t in threads:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def make_server(
