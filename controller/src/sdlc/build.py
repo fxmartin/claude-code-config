@@ -3361,6 +3361,14 @@ class Ledger:
         resume` continues it once the window reopens. ``scope`` ``None``/``all``
         matches any scope; a specific scope (``epic-99``, a story id) filters to
         that run.
+
+        Issue #679: ``FAILED`` is deliberately excluded even though a run the
+        controller closed FAILED after a transient dispatch error (an expired
+        OAuth session, a #651-class auth/rate failure) can be just as resumable
+        as an ``IN_PROGRESS`` one — ``FAILED`` also covers genuine, non-transient
+        failures, so auto-picking the latest one here would silently retry a
+        permanently broken run. Use :meth:`latest_failed_run` to surface that run
+        for an explicit ``sdlc resume --run <id>`` instead.
         """
         if not self.db_path.exists():
             return None
@@ -3379,6 +3387,33 @@ class Ledger:
             else:
                 row = conn.execute(
                     "SELECT id FROM runs WHERE status IN ('IN_PROGRESS', 'RATE_LIMITED') "
+                    "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+                ).fetchone()
+        return row["id"] if row else None
+
+    def latest_failed_run(self, scope: str | None = None) -> str | None:
+        """The most recent ``FAILED`` run id (optionally for ``scope``), or None.
+
+        Issue #679: mirrors :meth:`latest_resumable_run`'s query but for the
+        ``FAILED`` status that method deliberately excludes from automatic
+        discovery. Callers use this to *name* a FAILED run's stories may still
+        be resumable via an explicit ``sdlc resume --run <id>`` — never to
+        auto-resume it, since ``FAILED`` also covers genuinely dead runs.
+        """
+        if not self.db_path.exists():
+            return None
+        if scope is not None:
+            scope = canonical_scope(scope)
+        with self._connect_ro() as conn:
+            if scope and scope.lower() != "all":
+                row = conn.execute(
+                    "SELECT id FROM runs WHERE status = 'FAILED' "
+                    "AND scope = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    (scope,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id FROM runs WHERE status = 'FAILED' "
                     "ORDER BY started_at DESC, rowid DESC LIMIT 1"
                 ).fetchone()
         return row["id"] if row else None

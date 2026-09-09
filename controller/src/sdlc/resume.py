@@ -46,7 +46,13 @@ from sdlc.model_routing import routing_snapshot
 from sdlc.notify import notify
 from sdlc.registry import Registry, format_live_owner_refusal
 
-__all__ = ["StoryResumeState", "ResumeResult", "compute_resume_plan", "run_resume"]
+__all__ = [
+    "StoryResumeState",
+    "ResumeResult",
+    "compute_resume_plan",
+    "has_resumable_work",
+    "run_resume",
+]
 
 # Story statuses the controller treats as already finished — never re-run.
 _TERMINAL_STORY_STATES = {"DONE", "SKIPPED"}
@@ -266,6 +272,19 @@ def compute_resume_plan(
             bugfix_seq=bugfix_seq,
         )
     return plan
+
+
+def has_resumable_work(ledger: Ledger, run_id: str) -> bool:
+    """True when ``run_id`` has a story still owed work (not DONE/SKIPPED).
+
+    Issue #679: mirrors the incomplete/end-crash check :func:`run_resume` uses
+    to decide ``nothing_to_resume``, factored out so the CLI can tell whether a
+    ``FAILED`` run it is *not* auto-resuming would actually finish via an
+    explicit ``sdlc resume --run <id>`` before suggesting it.
+    """
+    config = ledger.run_config(run_id)
+    plan = compute_resume_plan(ledger, run_id, skip_coverage=bool(config.get("skip_coverage")))
+    return any(st.status not in _TERMINAL_STORY_STATES for st in plan.values())
 
 
 def _options_from_config(
