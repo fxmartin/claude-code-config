@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.69.4] - 2026-09-09
+
+### Fixed
+
+- fix(dashboard): bound ledger migration to a per-sweep deadline (#678) (#681)
+
+
 ## [v2.69.3] - 2026-09-09
 
 ### Fixed
