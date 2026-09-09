@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.69.5] - 2026-09-09
+
+### Fixed
+
+- fix(resume): name the latest failed run as a --run suggestion (#682)
+
+
 ## [v2.69.4] - 2026-09-09
 
 ### Fixed
