@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.69.3] - 2026-09-09
+
+### Fixed
+
+- fix(build): recover the story mirror mapping from the host (#677) (#680)
+
+
 ## [v2.69.2] - 2026-09-08
 
 ### Fixed
