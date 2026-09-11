@@ -5832,6 +5832,77 @@ def guard_primary_checkout(
         check_primary_checkout_unchanged(ledger, run_id, story_id, root, baseline)
 
 
+# The ledger DB, its WAL/SHM siblings and its per-run logs dir all share this
+# prefix and change on every stage, so they are never the operator's files.
+_LEDGER_FILE_PREFIX = ".sdlc-state.db"
+
+
+def _file_digest(path: Path) -> str | None:
+    """sha256 of ``path``'s bytes (a symlink's target string), or None when absent."""
+    try:
+        if path.is_symlink():
+            return "link:" + os.readlink(path)
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def operator_files_snapshot(root: Path) -> dict[str, str | None] | None:
+    """The operator's uncommitted files at run start, path -> content digest (#685).
+
+    ``sdlc fix`` runs every stage in the shared checkout, and ``--allow-dirty`` is
+    a promise that the operator's pre-existing dirty and untracked files survive
+    the run. Unlike :func:`primary_checkout_fingerprint` — whose whole-tree digest
+    a build in the *same* checkout moves legitimately — this records each
+    pre-existing path individually, so :func:`operator_files_damage` can name the
+    exact file an agent deleted or rewrote while ignoring the fix's own changes.
+
+    A tracked deletion (absent on disk) records ``None`` and is never checked.
+    Returns ``None`` when the tree cannot be inspected (git missing, not a repo),
+    which disables the check rather than accusing every stage.
+    """
+    try:
+        res = _git(root, "status", "--porcelain", "--untracked-files=all")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    snapshot: dict[str, str | None] = {}
+    for line in res.stdout.splitlines():
+        if not line.strip() or _controller_owned(line[3:]):
+            continue
+        path = line[3:].rsplit(" -> ", 1)[-1].strip('"')
+        if path.startswith(_LEDGER_FILE_PREFIX):
+            continue
+        snapshot[path] = _file_digest(root / path)
+    return snapshot
+
+
+def operator_files_damage(
+    root: Path, snapshot: dict[str, str | None] | None
+) -> list[str]:
+    """The snapshotted operator files that were deleted or changed since (#685).
+
+    Each entry reads ``"<path> (deleted)"`` or ``"<path> (modified)"``. Files that
+    appeared after the snapshot are the fix's own work and are not reported. A
+    ``None`` snapshot (un-inspectable tree at run start) reports nothing.
+    """
+    damage: list[str] = []
+    for path, before in (snapshot or {}).items():
+        if before is None:
+            continue
+        after = _file_digest(root / path)
+        if after is None:
+            damage.append(f"{path} (deleted)")
+        elif after != before:
+            damage.append(f"{path} (modified)")
+    return damage
+
+
 def format_dirty_tree(root: Path, paths: list[str], command: str) -> str:
     """The operator-facing refusal for a dirty shared checkout (issue #590)."""
     listed = paths[:_DIRTY_TREE_MAX_LISTED]

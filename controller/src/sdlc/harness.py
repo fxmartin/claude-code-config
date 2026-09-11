@@ -178,7 +178,8 @@ class HarnessConfig:
         regression for harnesses that route a single fixed model.
         """
         if self.source in ("builtin", "env"):
-            return resolve_agent_cmd(model=model)
+            # Issue #685: the stage is the role that picks the destructive floor.
+            return resolve_agent_cmd(model=model, role=stage)
         if "{model}" in self.command:
             # The loader guarantees a `{model}` command declares a `default`, so
             # an unmapped stage still resolves (never KeyError on .format()).
