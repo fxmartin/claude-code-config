@@ -237,6 +237,47 @@ def test_damage_check_degrades_when_the_tree_becomes_uninspectable(tmp_path) -> 
     assert operator_files_damage(tmp_path / "gone", snap) == ["REVIEW.md (deleted)"]
 
 
+def test_snapshot_returns_none_when_git_invocation_raises(tmp_path, monkeypatch) -> None:
+    """An un-inspectable tree (git missing, timeout) disables the check, not the run."""
+    root = _init_repo(tmp_path)
+
+    def boom(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=10)
+
+    monkeypatch.setattr("sdlc.build._git", boom)
+    assert operator_files_snapshot(root) is None
+
+
+def test_progress_view_path_is_excluded_from_the_snapshot(tmp_path) -> None:
+    """The controller's own render (issue #610) is churn, never operator data."""
+    root = _init_repo(tmp_path)
+    (root / "docs" / "stories").mkdir(parents=True)
+    (root / "docs" / "stories" / ".build-progress.md").write_text("render\n", encoding="utf-8")
+    assert operator_files_snapshot(root) == {}
+
+
+def test_symlinked_operator_file_digests_its_target_string(tmp_path) -> None:
+    """A symlink is compared by its target string, not by following and hashing it."""
+    root = _init_repo(tmp_path)
+    (root / "link.txt").symlink_to("REVIEW.md")
+    snap = operator_files_snapshot(root)
+    assert snap == {"link.txt": "link:REVIEW.md"}
+    assert operator_files_damage(root, snap) == []
+    (root / "link.txt").unlink()
+    (root / "link.txt").symlink_to("other.md")
+    assert operator_files_damage(root, snap) == ["link.txt (modified)"]
+
+
+def test_pre_deleted_tracked_file_is_never_checked_again(tmp_path) -> None:
+    """A tracked file the operator deleted before the run records None and stays unchecked."""
+    root = _init_repo(tmp_path)
+    (root / "tracked.md").unlink()
+    snap = operator_files_snapshot(root)
+    assert snap == {"tracked.md": None}
+    (root / "tracked.md").write_text("agent recreated me\n", encoding="utf-8")
+    assert operator_files_damage(root, snap) == []
+
+
 # ---------------------------------------------------------------------------
 # Defect 2b: an agent's self-reported destructive action is surfaced
 # ---------------------------------------------------------------------------
