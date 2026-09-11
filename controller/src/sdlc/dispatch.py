@@ -114,8 +114,27 @@ DENY_BASELINE: tuple[str, ...] = (
 # the operator owns the posture per environment.
 DENY_BASELINE_ENV = "SDLC_DENY_BASELINE"
 
+# Issue #685: the baseline above guards secrets and egress but nothing that
+# destroys local state, so a review agent — read-only by purpose — held full
+# delete rights over the operator's shared checkout and `rm -f`'d an untracked,
+# unrecoverable file. Roles whose job is only to read (investigate, review,
+# summarise) get this destructive floor on top of the baseline. It is scoped to
+# those roles because build/bugfix legitimately delete files as part of a fix;
+# their protection is the controller's operator-file drift check instead.
+DESTRUCTIVE_DENY_FLOOR: tuple[str, ...] = (
+    "Bash(rm *)",
+    "Bash(git clean*)",
+    "Bash(git checkout -- *)",
+    "Bash(git restore*)",
+    "Bash(git reset --hard*)",
+    "Bash(git stash*)",
+)
 
-def resolve_deny_rules() -> list[str]:
+# The dispatched agent types that never need to delete or discard files.
+READ_ONLY_ROLES: frozenset[str] = frozenset({"investigation", "review", "summary"})
+
+
+def resolve_deny_rules(role: str | None = None) -> list[str]:
     """The deny rules to apply to the built-in dispatch command.
 
     Story 13.1-001: ``$SDLC_DENY_BASELINE`` (comma-separated) replaces the
@@ -123,11 +142,19 @@ def resolve_deny_rules() -> list[str]:
     for that repo (the documented per-repo opt-out). Whitespace around each rule is
     trimmed and blank entries are dropped, so ``"A, , B"`` yields ``["A", "B"]``.
     Unset → the built-in baseline, so default behaviour needs no configuration.
+
+    Issue #685: a ``role`` in :data:`READ_ONLY_ROLES` also gets the
+    :data:`DESTRUCTIVE_DENY_FLOOR`. The override does not remove it — the opt-out
+    exists to relax the secret/egress baseline, not the operator-data floor.
     """
     override = os.environ.get(DENY_BASELINE_ENV)
     if override is not None:
-        return [rule.strip() for rule in override.split(",") if rule.strip()]
-    return list(DENY_BASELINE)
+        rules = [rule.strip() for rule in override.split(",") if rule.strip()]
+    else:
+        rules = list(DENY_BASELINE)
+    if role in READ_ONLY_ROLES:
+        rules += [rule for rule in DESTRUCTIVE_DENY_FLOOR if rule not in rules]
+    return rules
 
 
 def _dispatch_env(thinking_cap: int | None) -> dict[str, str]:
@@ -164,7 +191,10 @@ def _dispatch_env(thinking_cap: int | None) -> dict[str, str]:
 
 
 def resolve_agent_cmd(
-    explicit: list[str] | None = None, *, model: str | None = None
+    explicit: list[str] | None = None,
+    *,
+    model: str | None = None,
+    role: str | None = None,
 ) -> list[str]:
     """The command to launch the agent: explicit arg → ``$SDLC_AGENT_CMD`` → default.
 
@@ -181,6 +211,9 @@ def resolve_agent_cmd(
     built-in default — an explicit/env command owns its own permission posture, so
     no deny rules are appended there. An empty resolved baseline (per-repo opt-out)
     omits the flag entirely, leaving the default byte-for-byte its pre-13.1 form.
+
+    Issue #685: ``role`` is the dispatched agent type; a read-only role adds the
+    destructive floor to the deny list (see :func:`resolve_deny_rules`).
     """
     if explicit is not None:
         return list(explicit)
@@ -188,7 +221,7 @@ def resolve_agent_cmd(
     if env:
         return shlex.split(env)
     cmd = list(DEFAULT_AGENT_CMD)
-    deny = resolve_deny_rules()
+    deny = resolve_deny_rules(role)
     if deny:
         cmd += ["--disallowedTools", ",".join(deny)]
     if model:
@@ -741,7 +774,7 @@ def dispatch_agent(
     gets proper handling instead of the lossy plain-stdout fallback. An
     unregistered id fails fast with :class:`~sdlc.parsers.UnknownParserError`.
     """
-    cmd = resolve_agent_cmd(agent_cmd, model=model)
+    cmd = resolve_agent_cmd(agent_cmd, model=model, role=agent_type)
     env = _dispatch_env(thinking_cap)
     if sandbox_enabled(sandbox):
         cmd = _apply_sandbox(cmd, cwd=cwd, env=env)

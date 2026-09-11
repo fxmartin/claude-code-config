@@ -61,6 +61,8 @@ from sdlc.build import (
     default_preflight,
     dirty_tree_paths,
     finalize_run,
+    operator_files_damage,
+    operator_files_snapshot,
     remove_story_worktree,
     render_commit_lint_reask_prompt,
 )
@@ -1110,6 +1112,101 @@ def _dispatch_fix_stage(
     return True, result, "", ""
 
 
+# Issue #685: first-person admissions of a destructive or out-of-scope action. A
+# plain "I deleted" is deliberately absent — build/bugfix agents report deleting
+# dead code as ordinary work. The lookbehind skips a phrase opened by a quote or
+# backtick, so an agent *discussing* these phrases (e.g. reviewing this scan)
+# is not mistaken for one confessing.
+_SELF_REPORT_RE = re.compile(
+    r"(?<![\"'`“‘])\bI (?:"
+    r"made a mistake"
+    r"|(?:accidentally|mistakenly|inadvertently|wrongly) "
+    r"(?:deleted|removed|overwrote|discarded|reverted|reset|wiped)"
+    r"|(?:should not|shouldn't|shouldn’t) have"
+    r")\b",
+    re.IGNORECASE,
+)
+_SELF_REPORT_MAX_QUOTE = 300
+
+
+def _agent_texts(result: AgentResult | None, transcript_path: Path | None) -> list[str]:
+    """The agent's own words: its final text plus every mid-stream text block.
+
+    Only ``assistant`` text blocks are read from the stream-json transcript —
+    tool results carry file contents and command output, which are not the agent
+    speaking. An unreadable transcript contributes nothing.
+    """
+    texts = [result.raw] if result is not None and result.raw else []
+    if transcript_path is None:
+        return texts
+    try:
+        lines = Path(transcript_path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return texts
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(str(block.get("text", "")))
+    return texts
+
+
+def _self_reported_mistake(
+    result: AgentResult | None, transcript_path: Path | None
+) -> str | None:
+    """The sentence in which the agent admits a destructive action, or None (#685).
+
+    The #685 review agent deleted an operator file and said so in its very next
+    message, yet its structured verdict was ``APPROVED`` and the run merged: the
+    admission lived only in the raw transcript. This surfaces it.
+    """
+    for text in _agent_texts(result, transcript_path):
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+            if _SELF_REPORT_RE.search(sentence):
+                return sentence.strip()[:_SELF_REPORT_MAX_QUOTE]
+    return None
+
+
+def _stage_safety_violation(
+    stage: str,
+    result: AgentResult | None,
+    transcript_path: Path | None,
+    checkout: Path,
+    protected: dict[str, str | None] | None,
+) -> str | None:
+    """Why the run must park after ``stage``, or None when it may continue (#685).
+
+    Checked regardless of the stage's structured verdict: an operator file present
+    at run start that was deleted or rewritten, or an agent's own admission of a
+    destructive action. Either one means the run must not advance to a merge.
+    """
+    damage = operator_files_damage(checkout, protected)
+    if damage:
+        return (
+            f"{stage} stage changed operator files present at run start: "
+            f"{', '.join(damage)} — the controller restored nothing; recover them "
+            "before resuming"
+        )
+    admission = _self_reported_mistake(result, transcript_path)
+    if admission:
+        return f"{stage} agent reported a destructive or out-of-scope action: \"{admission}\""
+    return None
+
+
+def _log_safety_park(ledger: Ledger, run_id: str, story_id: str, violation: str) -> None:
+    """Record a #685 safety park at ``error`` and echo it on stderr for the operator."""
+    line = f"{violation} — parking NEEDS_ATTENTION (issue #685)"
+    ledger.event_log(run_id, story_id, "error", "controller", line)
+    print(f"sdlc fix: {line}", file=sys.stderr)
+
+
 def _run_bugfix(
     issue: FixIssue,
     inv: dict,
@@ -1545,6 +1642,7 @@ def _run_stage_loop(
     pr_number: int | None = None,
     bugfix_seq: int = 0,
     start_attempts: dict[str, int] | None = None,
+    protected_files: dict[str, str | None] | None = None,
 ) -> tuple[str, int | None]:
     """Drive build → coverage → review → merge with the bounded bugfix loop.
 
@@ -1564,7 +1662,16 @@ def _run_stage_loop(
     change-request phrasing every stage's prompt uses and the adapter the
     docs-only PR open / review-packet bake route through. ``instance_url``
     (Story 30.1-001) is the repo's declared self-hosted GitLab instance, if any.
+
+    Issue #685: ``protected_files`` is the :func:`operator_files_snapshot` of the
+    checkout taken at run start (``None`` snapshots it here, at loop entry — the
+    best baseline a resume has). After every stage and bugfix dispatch, a deleted
+    or rewritten snapshotted file, or an agent's self-reported destructive action,
+    parks the run ``NEEDS_ATTENTION`` whatever the stage's structured verdict said.
     """
+    checkout = root or Path.cwd()
+    if protected_files is None:
+        protected_files = operator_files_snapshot(checkout)
     cr_terms = issue_host.get_adapter(host, instance_url=instance_url).cr_terms
     stages = [s for s in FIX_CORE_STAGES if not (s == "coverage" and opts.skip_coverage)]
     # Issue #547: a resume re-enters here with the stages that already completed,
@@ -1676,6 +1783,17 @@ def _run_stage_loop(
                 )
                 return "RATE_LIMITED", pr_number
 
+            violation = _stage_safety_violation(
+                stage, result, tpath, checkout, protected_files
+            )
+            if violation:
+                ledger.stage_finish(
+                    run_id, story.id, stage, attempt, "FAILED", "safety-violation", str(tpath)
+                )
+                _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
+                _log_safety_park(ledger, run_id, story.id, violation)
+                return "NEEDS_ATTENTION", pr_number
+
             if ok:
                 ledger.stage_finish(run_id, story.id, stage, attempt, "DONE", output_path=str(tpath))
                 _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
@@ -1725,9 +1843,16 @@ def _run_stage_loop(
             bugfix_attempts += 1
             bugfix_seq += 1
             bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
-            if not _run_bugfix(
+            fixed = _run_bugfix(
                 issue, inv, story, stage, failure, opts, ledger, run_id, dispatch, bpath, bugfix_seq
-            ):
+            )
+            violation = _stage_safety_violation(
+                "bugfix", None, bpath, checkout, protected_files
+            )
+            if violation:
+                _log_safety_park(ledger, run_id, story.id, violation)
+                return "NEEDS_ATTENTION", pr_number
+            if not fixed:
                 return "FAILED", pr_number
             attempt += 1
 
@@ -2047,6 +2172,10 @@ def run_fix(
     except Exception:  # noqa: BLE001
         pass
 
+    # Issue #685: snapshot the operator's dirty/untracked files before the first
+    # agent runs, so the stage loop can prove `--allow-dirty` kept its promise.
+    protected_files = operator_files_snapshot(root or Path.cwd())
+
     # --- Investigation --------------------------------------------------------
     inv_status, inv = _run_investigation(
         issue, story, opts, ledger, run_id, dispatch, logs_dir
@@ -2079,7 +2208,7 @@ def run_fix(
     # --- Core stage loop ------------------------------------------------------
     terminal, pr_number = _run_stage_loop(
         issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
-        host=host, instance_url=instance_url,
+        host=host, instance_url=instance_url, protected_files=protected_files,
     )
 
     return _finish_fix_run(
