@@ -211,7 +211,7 @@ _run_install() {
         bash "${INSTALL}" --tools --dry-run
     [ "$status" -eq 0 ]
     # On Linux the tools module should emit the apt preview comment.
-    [[ "$output" == *"apt"* || "$output" == *"3.1-002"* ]]
+    [[ "$output" == *"apt"* || "$output" == *"pacman"* || "$output" == *"3.1-002"* ]]
     rm -rf "$stub_bin"
 }
 
@@ -251,7 +251,7 @@ _run_install() {
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
     [ "$ln_lines" -eq 15 ]
     # Tools output present (brew or apt mention)
-    [[ "$output" == *"brew"* || "$output" == *"apt"* || "$output" == *"Homebrew"* ]]
+    [[ "$output" == *"brew"* || "$output" == *"apt"* || "$output" == *"Homebrew"* || "$output" == *"pacman"* ]]
 }
 
 @test "--core --mcp combination runs both modes without error" {

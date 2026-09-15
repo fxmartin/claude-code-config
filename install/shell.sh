@@ -5,13 +5,15 @@
 # Sourced by install.sh after common.sh. Expects HOME, DRY_RUN, PLATFORM.
 #
 # Target file selection:
-#   - macOS or Linux with $SHELL ending in /zsh → ~/.zshrc.
-#   - WSL2 with non-zsh shell → ~/.bashrc.
-#   - Anything else falls back to ~/.zshrc (existing behaviour).
+#   - macOS → ~/.zshrc (always).
+#   - WSL2 or Linux with $SHELL ending in /zsh → ~/.zshrc.
+#   - WSL2 or Linux with any other shell → ~/.bashrc.
 #
-# dev() on WSL2 is a stub that prints "cmux is macOS-only; this command is a
-# no-op on WSL2" so the user can keep the same muscle memory across machines
-# without launching a broken cmux invocation.
+# dev() is platform-specific because cmux is macOS-only:
+#   - macOS → the cmux workspace launcher.
+#   - Linux → a tmux session (claude | terminal | yazi) with the same shape.
+#   - WSL2  → a stub that prints "cmux is macOS-only; this command is a no-op
+#             on WSL2" so the muscle memory survives without a broken launch.
 
 install_shell_run() {
   echo ""
@@ -25,15 +27,19 @@ install_shell_run() {
 }
 
 # Pick the shellrc to append to based on PLATFORM and $SHELL. Returns an
-# absolute path. On WSL2 with a non-zsh default shell, this is ~/.bashrc;
-# everywhere else (including WSL2 with zsh) it remains ~/.zshrc to match the
-# pre-3.1-002 default.
+# absolute path. On WSL2 and Linux with a non-zsh default shell (Omarchy ships
+# bash), this is ~/.bashrc; everywhere else (macOS, or zsh anywhere) it remains
+# ~/.zshrc to match the pre-3.1-002 default.
 install_shell_target_rc() {
-  if [ "${PLATFORM:-}" = "WSL2" ] && [[ "${SHELL:-}" != */zsh ]]; then
-    echo "$HOME/.bashrc"
-  else
-    echo "$HOME/.zshrc"
-  fi
+  case "${PLATFORM:-}" in
+    WSL2|Linux)
+      if [[ "${SHELL:-}" != */zsh ]]; then
+        echo "$HOME/.bashrc"
+        return
+      fi
+      ;;
+  esac
+  echo "$HOME/.zshrc"
 }
 
 # Append the dev() cmux workspace launcher (or its WSL2 stub) if absent.
@@ -45,6 +51,10 @@ install_shell_append_dev() {
   fi
   if [ "${PLATFORM:-}" = "WSL2" ]; then
     install_shell_append_dev_stub "$rcfile"
+    return
+  fi
+  if [ "${PLATFORM:-}" = "Linux" ]; then
+    install_shell_append_dev_tmux "$rcfile"
     return
   fi
   if [ "${DRY_RUN:-false}" = "true" ]; then
@@ -116,6 +126,51 @@ function dev() {
 }
 BASH
   info "Added dev() WSL2 stub to $(basename "$rcfile")"
+}
+
+# Linux dev() — same three-pane shape as the cmux version, built on tmux
+# (Omarchy ships it; --tools installs it on Arch). One session per project,
+# named after the directory. Windows use send-keys rather than a window
+# command so they drop to a shell when claude/yazi exit, mirroring cmux.
+install_shell_append_dev_tmux() {
+  local rcfile="$1"
+  if [ "${DRY_RUN:-false}" = "true" ]; then
+    echo "  [dry-run] append dev() tmux function to $rcfile"
+    return
+  fi
+  cat >> "$rcfile" << 'BASH'
+
+# tmux dev workspace — one session per project: claude | terminal | yazi
+function dev() {
+  local dir="${1:-.}"
+  dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo "Invalid directory: $1"; return 1; }
+  command -v tmux >/dev/null 2>&1 || { echo "tmux not found — install it (sudo pacman -S tmux) to use dev()"; return 1; }
+
+  # Session name = dir basename; tmux forbids '.' and ':' in session names.
+  local session="${dir##*/}"
+  session="${session//[^A-Za-z0-9_-]/_}"
+  : "${session:=dev}"
+
+  # '=' forces an exact name match instead of tmux's prefix matching.
+  if ! tmux has-session -t "=$session" 2>/dev/null; then
+    tmux new-session -d -s "$session" -c "$dir" -n claude
+    if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      tmux send-keys -t "=$session:claude" 'claude' C-m
+    fi
+    tmux new-window -t "=$session" -c "$dir" -n terminal
+    tmux new-window -t "=$session" -c "$dir" -n yazi
+    tmux send-keys -t "=$session:yazi" 'yazi' C-m
+    tmux select-window -t "=$session:claude"
+  fi
+
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "=$session"
+  else
+    tmux attach-session -t "=$session"
+  fi
+}
+BASH
+  info "Added dev() tmux function to $(basename "$rcfile")"
 }
 
 # Append the y() yazi wrapper if absent.
