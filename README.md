@@ -492,9 +492,9 @@ Each mode is **opt-in**, **idempotent**, and supports `--dry-run` for an exact p
 | Mode | Touches | Files added | Files modified |
 |------|---------|-------------|----------------|
 | `--core` | `~/.claude/` | symlinks for `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `settings.json`, `statusline-command.sh`, `keybindings.json`, `reference-docs/`, `docs/`, `plugins/marketplaces/fx-claude-config` | none |
-| `--tools` | `/opt/homebrew/` (macOS) or apt (WSL2; `--prefer-brew` opts back into brew) | `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip`, `jq`, optional Nerd Font; on WSL2 `yazi` falls back to `cargo install --locked yazi-fm` | `~/.config/yazi/yazi.toml`, `~/.config/yazi/init.lua` (created if absent) |
+| `--tools` | `/opt/homebrew/` (macOS), apt (WSL2; `--prefer-brew` opts back into brew), or pacman (Arch Linux / Omarchy) | `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip`, `jq`, optional Nerd Font; on WSL2 `yazi` falls back to `cargo install --locked yazi-fm`; on Arch `tmux` is added for `dev()` | `~/.config/yazi/yazi.toml`, `~/.config/yazi/init.lua` (created if absent) |
 | `--mcp` | `~/.claude.json` | merges `mcp/config.template.json` into existing JSON via `jq` | only the `mcpServers` key |
-| `--shell` | `~/.zshrc` (macOS / zsh) or `~/.bashrc` (WSL2 with non-zsh default) | nothing | appends `dev()` and `y()` shell functions if absent; on WSL2 `dev()` is a stub that prints `"cmux is macOS-only; this command is a no-op on WSL2"` |
+| `--shell` | `~/.zshrc` (macOS / zsh) or `~/.bashrc` (WSL2 or Linux with non-zsh default) | nothing | appends `dev()` and `y()` shell functions if absent; on Linux `dev()` opens a tmux session (claude \| terminal \| yazi); on WSL2 `dev()` is a stub that prints `"cmux is macOS-only; this command is a no-op on WSL2"` |
 
 ##### Deprecated flags (still supported, removed in next MAJOR)
 
@@ -516,6 +516,13 @@ mount, and `--shell` appends to `~/.bashrc` when zsh is not the default
 ### Windows
 
 See [docs/install-windows.md](docs/install-windows.md) for the WSL2-based install guide.
+
+### Arch Linux / Omarchy
+
+The installer detects plain Linux with `pacman` on PATH and switches to it for
+`--tools`, honours bash as the default shell for `--shell`, installs a tmux-based
+`dev()`, and auto-detects a Chromium-based browser for `--mcp`. See
+[docs/install-omarchy.md](docs/install-omarchy.md) for the Omarchy 4 runbook.
 
 ### As a submodule (Nix-managed machines)
 
