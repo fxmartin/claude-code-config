@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ABOUTME: --tools mode — install CLI utilities (yazi, bat, fd, rg, fzf, …).
-# ABOUTME: macOS uses Homebrew; WSL2 prefers apt (override with --prefer-brew).
+# ABOUTME: macOS uses Homebrew; WSL2 prefers apt (--prefer-brew); Arch uses pacman.
 #
 # Sourced by install.sh after common.sh. Expects PLATFORM, DRY_RUN, PREFER_BREW.
 
@@ -48,10 +48,12 @@ install_tools_run() {
       install_tools_wsl2
       ;;
     *)
-      # Plain Linux (non-WSL): same apt path as WSL2 for now, minus the
-      # Windows-side warnings. Kept simple — production Linux support is not
-      # an Epic-03 goal.
-      if [ "${DRY_RUN:-false}" = "true" ]; then
+      # Plain Linux (non-WSL). Arch/Omarchy is a supported target and is
+      # recognised by pacman on PATH. Other distros keep the apt preview as
+      # best-effort — production support for them is not a goal.
+      if command -v pacman &>/dev/null; then
+        install_tools_pacman
+      elif [ "${DRY_RUN:-false}" = "true" ]; then
         echo "  [dry-run] apt install ${apt_packages[*]}"
         warn "CLI tools install on ${PLATFORM:-unknown} is best-effort (WSL2 is the tested Linux target)"
       else
@@ -153,6 +155,34 @@ install_tools_wsl2_apt() {
   warn "yazi is not in apt — run: cargo install --locked yazi-fm yazi-cli"
   if [ "${DRY_RUN:-false}" = "true" ]; then
     echo "  [dry-run] cargo install --locked yazi-fm yazi-cli  # (if cargo is available)"
+  fi
+}
+
+# Arch Linux branch (Omarchy). Every package lives in the official repos
+# (extra/core) so no AUR helper is needed. --needed makes re-runs idempotent;
+# --noconfirm keeps pacman non-interactive under run(). tmux is included
+# because the Linux dev() helper in shell.sh depends on it. No -Sy here: a
+# partial upgrade is a known Arch hazard, so the runbook asks for `pacman -Syu`
+# before running the installer.
+install_tools_pacman() {
+  local pacman_packages=(
+    yazi        # Terminal file manager (ships `ya` for the plugin step)
+    bat         # Syntax-highlighted file viewer
+    fd          # Fast find alternative
+    ripgrep     # Fast grep alternative
+    fzf         # Fuzzy finder
+    zoxide      # Smarter cd with frecency
+    ffmpeg      # Media preview support
+    imagemagick # Image preview/conversion
+    poppler     # PDF preview (pdftotext, pdfinfo)
+    7zip        # Archive preview (replaces p7zip)
+    jq          # JSON processing
+    ttf-nerd-fonts-symbols # File icons in yazi
+    tmux        # dev() workspace launcher on Linux
+  )
+  run sudo pacman -S --needed --noconfirm "${pacman_packages[@]}"
+  if [ "${DRY_RUN:-false}" != "true" ]; then
+    info "Tools installed via pacman"
   fi
 }
 

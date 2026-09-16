@@ -15,6 +15,19 @@ install_mcp_run() {
     info "Loaded .env"
   fi
 
+  # Linux (non-WSL2): pick the first Chromium-based browser on PATH so a fresh
+  # Arch/Omarchy box does not need a .env just to silence the warning.
+  if [ -z "${BROWSER_PATH:-}" ] && [ "${PLATFORM:-}" = "Linux" ]; then
+    local candidate
+    for candidate in brave chromium google-chrome-stable; do
+      if command -v "$candidate" &>/dev/null; then
+        BROWSER_PATH="$(command -v "$candidate")"
+        info "BROWSER_PATH auto-detected: $BROWSER_PATH"
+        break
+      fi
+    done
+  fi
+
   if [ -z "${BROWSER_PATH:-}" ]; then
     warn "BROWSER_PATH not set. Create .env from .env.example or export BROWSER_PATH"
     warn "MCP config will have empty browser path"
@@ -37,6 +50,12 @@ install_mcp_run() {
         warn "Use the /mnt/<drive>/... form (e.g. /mnt/c/Program Files/...) or a WSL-side path."
         ;;
     esac
+  fi
+
+  # Linux: a configured path that is not an executable file will silently
+  # fail at runtime, so flag it here.
+  if [ "${PLATFORM:-}" = "Linux" ] && [ -n "$BROWSER_PATH" ] && [ ! -x "$BROWSER_PATH" ]; then
+    warn "BROWSER_PATH=$BROWSER_PATH is not an executable file"
   fi
 
   local template="$SCRIPT_DIR/mcp/config.template.json"

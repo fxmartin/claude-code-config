@@ -20,7 +20,7 @@ Before you start, confirm the following on the machine you intend to install on:
 
 | Requirement | Why |
 |-------------|-----|
-| macOS 13+ **or** Windows 11 with WSL2 (Ubuntu 22.04) | Tested platforms. Intel and Apple Silicon both supported on macOS. |
+| macOS 13+, Windows 11 with WSL2 (Ubuntu 22.04), **or** Arch Linux (Omarchy 4) | Tested platforms. Intel and Apple Silicon both supported on macOS. Arch is covered by the `smoke-test-arch` CI job and [`docs/install-omarchy.md`](install-omarchy.md). |
 | [Claude Code](https://claude.com/claude-code) installed and signed in | The harness is a Claude Code configuration; without it nothing runs. |
 | `gh` CLI authenticated (`gh auth status` returns "Logged in") | The pipeline creates PRs, files issues, and reads release tags through `gh`. |
 | `git` configured with your name and email | Conventional Commits + signed-author CI rely on this. |
@@ -80,9 +80,9 @@ The installer is **modal** — pick one or more of these flags. Order does not m
 | Mode | What it does | Touches |
 |------|--------------|---------|
 | `--core` (default) | Symlinks `agents/`, `commands/`, `skills/`, `hooks/`, `CLAUDE.md`, `settings.json`, plus the marketplace symlink so the plugin resolves | `~/.claude/` |
-| `--tools` | Installs `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `jq`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip` | Homebrew on macOS / apt on WSL2 (override with `--prefer-brew`) |
+| `--tools` | Installs `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `jq`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip` | Homebrew on macOS / apt on WSL2 (override with `--prefer-brew`) / pacman on Arch Linux |
 | `--mcp` | Merges `mcp/config.template.json` into `~/.claude.json` (Playwright + context7 MCP servers) | `~/.claude.json` |
-| `--shell` | Appends the `dev()` and `y()` shell helpers | `~/.zshrc` (macOS) or `~/.bashrc` (WSL2 non-zsh) |
+| `--shell` | Appends the `dev()` and `y()` shell helpers | `~/.zshrc` (macOS, or zsh anywhere) or `~/.bashrc` (WSL2 / Linux non-zsh) |
 | `--all` | All four modes in one shot | everything above |
 | `--dry-run` | Prints every action it WOULD take, mutates nothing | — |
 | `--uninstall` | Removes the `--core` symlinks (other modes untouched) | `~/.claude/` |
@@ -416,8 +416,8 @@ For pilot feedback specifically, every friction point you hit during the install
 
 ## Known limitations
 
-- **cmux is macOS-only.** WSL2 colleagues get no sidebar UI; the pipeline runs identically without it. The `dev()` shell helper is a no-op stub on WSL2.
-- **Package manager preference is platform-pinned.** `--tools` mode prefers Homebrew on macOS and apt on WSL2/Linux. Override with `--prefer-brew` if you have Homebrew installed on WSL2.
+- **cmux is macOS-only.** WSL2 colleagues get no sidebar UI; the pipeline runs identically without it. The `dev()` shell helper is a no-op stub on WSL2; on Linux it opens a tmux session (claude | terminal | yazi) instead.
+- **Package manager preference is platform-pinned.** `--tools` mode prefers Homebrew on macOS, apt on WSL2, and pacman on Arch Linux (other Linux distros only get an apt preview). Override with `--prefer-brew` if you have Homebrew installed on WSL2.
 - **commitlint requires `node_modules` locally** for in-repo validation. CI does not need this — the CI job installs commitlint itself. If you want to run `npx commitlint` locally, `npm install` in the repo root once.
 - **`build-stories --parallel` caps at 5 concurrent agents.** This is a RAM ceiling on a 48 GB MacBook Pro M3 Max — six agents start swapping, seven thrash. If you are on less than 48 GB, use `--sequential` or `--limit=N`.
 - **The framework writes to your filesystem.** Every install action is idempotent and `--dry-run` previews exactly what changes, but install on a machine you control.
@@ -431,6 +431,7 @@ For pilot feedback specifically, every friction point you hit during the install
 |-----------|---------|---------------|
 | macOS | 13+ (Ventura, Sonoma, Sequoia) on Intel and Apple Silicon | 2026-05-20 |
 | Windows / WSL2 | Windows 11 + WSL2 Ubuntu 22.04 LTS | 2026-05-20 (target — see [`docs/install-windows.md`](install-windows.md)) |
+| Arch Linux / Omarchy | Omarchy 4 "Quattro" (Hyprland, Foot, bash 5) | 2026-09-15 (CI container; laptop pending — see [`docs/install-omarchy.md`](install-omarchy.md)) |
 | Claude Code | v2.1.119 | 2026-05-20 |
 | `gh` CLI | 2.x | 2026-05-20 |
 | cmux | latest (optional, macOS only) | 2026-05-20 |

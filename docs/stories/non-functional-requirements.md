@@ -20,9 +20,9 @@ These constraints apply across all epics. Every story must respect them; the CI 
 
 ## Portability
 
-- **Supported platforms in MVP**: macOS 13 or later (Apple Silicon and Intel) and Windows 10 or 11 via WSL2 (Ubuntu 22.04 or later).
-- **Out of MVP**: native PowerShell, Linux desktop distros, ARM Linux servers.
-- **Required runtime**: Bash 4 or later. macOS uses `/opt/homebrew/bin/bash` or `/usr/local/bin/bash` (Homebrew bash). WSL2 uses system bash.
+- **Supported platforms**: macOS 13 or later (Apple Silicon and Intel), Windows 10 or 11 via WSL2 (Ubuntu 22.04 or later), and Arch Linux (Omarchy 4; added 2026-09-15, after MVP).
+- **Out of scope**: native PowerShell, ARM Linux servers. Other Linux desktop distros are best-effort: the installer previews an apt command list but does not run it.
+- **Required runtime**: Bash 4 or later. macOS uses `/opt/homebrew/bin/bash` or `/usr/local/bin/bash` (Homebrew bash). WSL2 and Arch use system bash (bash 5 on Arch).
 - **Optional runtimes**: Python 3.11 or later (only for the external controller, Roadmap Epic-07). Node 20 or later (release tooling).
 - **Path separators**: every script uses POSIX paths. Windows paths only appear inside WSL2-side scripts, which see `/mnt/c/...`.
 

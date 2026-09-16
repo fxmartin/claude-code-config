@@ -199,7 +199,7 @@ _run_install() {
     [ "$status" -eq 0 ]
     # Expect dry-run output to reference at least one package manager
     # (brew/apt) or a fallback warning when neither is present.
-    [[ "$output" == *"brew"* || "$output" == *"apt"* || "$output" == *"Homebrew"* ]]
+    [[ "$output" == *"brew"* || "$output" == *"apt"* || "$output" == *"Homebrew"* || "$output" == *"pacman"* ]]
     # No real install should have happened; the marker file used by the
     # tools module to track yazi config must be absent.
     [ ! -e "${FAKE_HOME}/.config/yazi/yazi.toml" ]
@@ -255,7 +255,8 @@ _run_install() {
 
 @test "--shell appends dev() and y() to ~/.zshrc" {
     touch "${FAKE_HOME}/.zshrc"
-    _run_install --shell
+    # Pin zsh: on Linux with a bash $SHELL, --shell targets ~/.bashrc instead.
+    SHELL=/bin/zsh _run_install --shell
     [ "$status" -eq 0 ]
     run grep -q 'function dev()' "${FAKE_HOME}/.zshrc"
     [ "$status" -eq 0 ]
@@ -265,10 +266,10 @@ _run_install() {
 
 @test "--shell is idempotent" {
     touch "${FAKE_HOME}/.zshrc"
-    _run_install --shell
+    SHELL=/bin/zsh _run_install --shell
     [ "$status" -eq 0 ]
     before="$(cat "${FAKE_HOME}/.zshrc")"
-    _run_install --shell
+    SHELL=/bin/zsh _run_install --shell
     [ "$status" -eq 0 ]
     after="$(cat "${FAKE_HOME}/.zshrc")"
     [ "$before" = "$after" ]

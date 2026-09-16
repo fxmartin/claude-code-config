@@ -31,7 +31,7 @@ Modes (additive, combine freely):
   --core       Symlink config into ~/.claude (default if no mode flag is given).
   --tools      Install CLI utilities (yazi, bat, fd, rg, fzf, zoxide, jq, …).
   --mcp        Merge mcp/config.template.json into ~/.claude.json.
-  --shell      Append dev() and y() helper functions to ~/.zshrc.
+  --shell      Append dev() and y() helper functions to your shellrc (~/.zshrc or ~/.bashrc).
   --all        Shortcut for --core --tools --mcp --shell.
 
 Options:
