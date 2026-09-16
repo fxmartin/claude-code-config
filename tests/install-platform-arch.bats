@@ -276,6 +276,14 @@ _run_dev() {
 }
 
 @test "Linux --mcp still warns when no browser is on PATH" {
+    # GitHub's Ubuntu runners ship Chrome in /usr/bin, which the strict PATH
+    # keeps for core utils; the auto-detect would find it.
+    local b
+    for b in brave chromium google-chrome-stable; do
+        if [ -x "/usr/bin/$b" ] || [ -x "/bin/$b" ]; then
+            skip "host has $b in /usr/bin; cannot simulate an empty PATH"
+        fi
+    done
     _run_install_strict --mcp --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"BROWSER_PATH not set"* ]]
