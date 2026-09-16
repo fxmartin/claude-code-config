@@ -93,6 +93,11 @@ PACMAN_LINE='[dry-run] sudo pacman -S --needed --noconfirm yazi bat fd ripgrep f
 }
 
 @test "Linux --tools --dry-run keeps the apt preview when pacman is absent" {
+    # The strict PATH keeps /usr/bin for core utils, so a real pacman there
+    # (an Arch host) cannot be hidden. The case is covered on macOS/Ubuntu.
+    if [ -x /usr/bin/pacman ] || [ -x /bin/pacman ]; then
+        skip "host has pacman in /usr/bin; cannot simulate its absence"
+    fi
     _run_install_strict --tools --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"[dry-run] apt install"* ]]
@@ -236,6 +241,11 @@ _run_dev() {
 }
 
 @test "dev() reports a clear error when tmux is missing" {
+    # A real tmux in /usr/bin (Arch) would be found instead and would spawn a
+    # detached server that outlives the test and holds the output pipe open.
+    if [ -x /usr/bin/tmux ] || [ -x /bin/tmux ]; then
+        skip "host has tmux in /usr/bin; cannot simulate its absence"
+    fi
     local proj="${FAKE_HOME}/myproj"
     mkdir -p "$proj"
     _run_install_strict SHELL=/bin/bash --shell
