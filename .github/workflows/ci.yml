@@ -338,8 +338,10 @@ jobs:
       - name: Trust the runner-owned workspace
         # The workspace is owned by the runner uid while the container runs
         # as root; --core's `git submodule update` would otherwise die with
-        # "dubious ownership".
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        # "dubious ownership" (exit 128). System-level, not --global: the
+        # smoke test overrides HOME, which hides ~/.gitconfig. '*' also
+        # covers the submodule checkout under skills/.
+        run: git config --system --add safe.directory '*'
 
       - name: Exercise the pacman and tmux arms (dry-run)
         run: |
