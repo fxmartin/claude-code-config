@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.70.0] - 2026-09-16
+
+### Added
+
+- feat(install): arch linux / omarchy support (#687)
+
+
 ## [v2.69.7] - 2026-09-11
 
 ### Fixed
