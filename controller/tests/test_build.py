@@ -29,6 +29,7 @@ from sdlc.build import (
     default_preflight,
     detect_test_command,
     in_test_sentinel,
+    BuildOptions,
     parse_build_args,
     run_build,
 )
@@ -1576,6 +1577,67 @@ def test_default_preflight_times_out(tmp_path, capsys) -> None:
     )
     assert default_preflight(root=tmp_path, timeout=1) is False
     assert "PRE_FLIGHT_TIMEOUT" in capsys.readouterr().err
+
+
+def test_default_preflight_timeout_says_nothing_about_red_tests(tmp_path, capsys) -> None:
+    """A timeout is not a failing suite, and must not be reported as one.
+
+    The caller prints a generic PRE_FLIGHT_FAILURE line; this asserts the
+    only *specific* diagnosis on the timeout path is the timeout itself.
+    Reporting "red on main" for a suite that was cut off mid-flight with zero
+    failures sends the operator hunting a broken test that does not exist —
+    it cost two diagnostic cycles on fxmartin/nix-install before the real
+    cause (a racy helper) was found.
+    """
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text(
+        "#!/usr/bin/env bash\nsleep 5\n", encoding="utf-8"
+    )
+    assert default_preflight(root=tmp_path, timeout=1) is False
+    err = capsys.readouterr().err
+    assert "PRE_FLIGHT_TIMEOUT" in err
+    assert "PRE_FLIGHT_RED" not in err
+    assert "red" not in err.lower()
+
+
+def test_default_preflight_nonzero_says_the_suite_is_red(tmp_path, capsys) -> None:
+    """The genuine-failure path names itself, so the two cases are told apart
+    at the point each is detected rather than by a caller that cannot see
+    which happened."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "quality-gate.sh").write_text(
+        "#!/usr/bin/env bash\nexit 1\n", encoding="utf-8"
+    )
+    assert default_preflight(root=tmp_path, timeout=10) is False
+    err = capsys.readouterr().err
+    assert "PRE_FLIGHT_RED" in err
+    assert "PRE_FLIGHT_TIMEOUT" not in err
+
+
+def test_default_preflight_timeout_default_fits_a_large_suite() -> None:
+    """600s could not fit a real repo's suite, so every build there aborted.
+
+    Measured on fxmartin/nix-install: `make test` reached test 1080 of 1336
+    when the 600s ceiling fired, so the suite needs ~730s and grows with
+    every story that adds coverage. A default that deterministically aborts
+    a whole repo is worse than one that waits: `--preflight-timeout` exists
+    for the outliers, and `--skip-preflight` for the impatient.
+    """
+    import inspect
+
+    assert inspect.signature(default_preflight).parameters["timeout"].default >= 1800
+    assert BuildOptions().preflight_timeout >= 1800
+
+
+def test_fix_issue_preflight_uses_the_same_default() -> None:
+    """`sdlc fix` calls default_preflight() with no timeout and exposes no
+    flag to raise it, so the default is the only lever that path has."""
+    import inspect
+
+    from sdlc import fix_issue
+
+    src = inspect.getsource(fix_issue)
+    assert "default_preflight()" in src
 
 
 # ---------------------------------------------------------------------------
