@@ -14,9 +14,9 @@ _section() {
 }
 
 @test "both instruction files carry a Piloting the SDLC section" {
-    run rg -n '^## Piloting the SDLC$' "$CLAUDE_MD"
+    run grep -n '^## Piloting the SDLC$' "$CLAUDE_MD"
     [ "$status" -eq 0 ]
-    run rg -n '^## Piloting the SDLC$' "$AGENTS_MD"
+    run grep -n '^## Piloting the SDLC$' "$AGENTS_MD"
     [ "$status" -eq 0 ]
 }
 

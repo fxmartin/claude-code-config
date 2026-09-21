@@ -9,9 +9,9 @@ setup() {
 }
 
 @test "both instruction files carry a Machines section" {
-    run rg -n '^## Machines$' "$CLAUDE_MD"
+    run grep -n '^## Machines$' "$CLAUDE_MD"
     [ "$status" -eq 0 ]
-    run rg -n '^## Machines$' "$AGENTS_MD"
+    run grep -n '^## Machines$' "$AGENTS_MD"
     [ "$status" -eq 0 ]
 }
 
@@ -25,9 +25,9 @@ setup() {
 
 @test "the Machines section names both hosts" {
     for f in "$CLAUDE_MD" "$AGENTS_MD"; do
-        run rg -n 'macbook-pro-m3-max' "$f"
+        run grep -n 'macbook-pro-m3-max' "$f"
         [ "$status" -eq 0 ]
-        run rg -n 'Dell XPS 13 9350' "$f"
+        run grep -n 'Dell XPS 13 9350' "$f"
         [ "$status" -eq 0 ]
     done
 }
@@ -35,7 +35,7 @@ setup() {
 @test "the Machines section tells the agent to detect the platform" {
     # A shared config that asserts one platform is wrong on the other host.
     for f in "$CLAUDE_MD" "$AGENTS_MD"; do
-        run rg -n 'uname -s' "$f"
+        run grep -n 'uname -s' "$f"
         [ "$status" -eq 0 ]
     done
 }
@@ -43,7 +43,7 @@ setup() {
 @test "omarchy command discovery is a command, not a hardcoded list" {
     # Omarchy ships new omarchy-* scripts per release; a frozen list goes stale.
     for f in "$CLAUDE_MD" "$AGENTS_MD"; do
-        run rg -n 'compgen -c omarchy' "$f"
+        run grep -n 'compgen -c omarchy' "$f"
         [ "$status" -eq 0 ]
     done
 }
