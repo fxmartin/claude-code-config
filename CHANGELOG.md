@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.1] - 2026-09-21
+
+### Fixed
+
+- fix(preflight): raise the default ceiling and stop calling a timeout red (#689)
+
+
 ## [v2.71.0] - 2026-09-21
 
 ### Added
