@@ -124,7 +124,7 @@ What each mode does on Arch:
 
 | Mode | Effect |
 |------|--------|
-| `--core` | Symlinks `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `settings.json`, … into `~/.claude/` |
+| `--core` | Symlinks `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `settings.json`, … into `~/.claude/`, and `AGENTS.md` into `~/.codex/` for Codex |
 | `--tools` | `sudo pacman -S --needed --noconfirm yazi bat fd ripgrep fzf zoxide ffmpeg imagemagick poppler 7zip jq ttf-nerd-fonts-symbols tmux` (packages Omarchy already ships are skipped) |
 | `--mcp` | Merges the Playwright + context7 MCP servers into `~/.claude.json` |
 | `--shell` | Appends `dev()` and `y()` to `~/.bashrc` (or `~/.zshrc` if zsh is your `$SHELL`) |

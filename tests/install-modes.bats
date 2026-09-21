@@ -62,19 +62,19 @@ _run_install() {
     [ "$status" -eq 0 ]
     for target in \
         CLAUDE.md agents commands settings.json statusline-command.sh \
-        keybindings.json reference-docs docs skills hooks fx-claude-config \
+        keybindings.json reference-docs docs skills hooks AGENTS.md fx-claude-config \
         codex-build-adapter.sh qwen-build-adapter.sh opencode-build-adapter.sh \
         overengineering-lens.sh
     do
         [[ "$output" == *"[dry-run]"*"${target}"* ]]
     done
-    # 15 ln -s lines expected (10 config items + 1 marketplace + 4 build
-    # adapters onto PATH, Story 21.3-001 + the opencode adapter of Story
-    # 29.2-001). Shared skills are committed relative symlinks inside commands/,
-    # so the installer no longer links them in separately (they would dirty the
-    # repo).
+    # 16 ln -s lines expected (10 config items into ~/.claude + AGENTS.md into
+    # ~/.codex + 1 marketplace + 4 build adapters onto PATH, Story 21.3-001 +
+    # the opencode adapter of Story 29.2-001). Shared skills are committed
+    # relative symlinks inside commands/, so the installer no longer links them
+    # in separately (they would dirty the repo).
     ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 15 ]
+    [ "$ln_lines" -eq 16 ]
 }
 
 @test "--core --dry-run previews git submodule init" {
@@ -99,6 +99,29 @@ _run_install() {
     [ -L "${FAKE_HOME}/.claude/reference-docs" ]
     [ -L "${FAKE_HOME}/.claude/docs" ]
     [ -L "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config" ]
+}
+
+@test "--core links AGENTS.md into ~/.codex for Codex" {
+    # Codex reads its global instructions from ~/.codex/AGENTS.md. The file is
+    # the Codex counterpart of CLAUDE.md and lives in this repo so one source
+    # serves every machine, including Linux hosts where nix-install cannot run.
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ -L "${FAKE_HOME}/.codex/AGENTS.md" ]
+    # The link must resolve to this repo's AGENTS.md, not merely exist.
+    # SCRIPT_DIR is cd+pwd-resolved, so compare against the resolved repo root
+    # rather than the unnormalized "${BATS_TEST_DIRNAME}/.." spelling.
+    repo_root="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
+    [ "$(readlink "${FAKE_HOME}/.codex/AGENTS.md")" = "${repo_root}/AGENTS.md" ]
+    [ -f "${FAKE_HOME}/.codex/AGENTS.md" ]
+}
+
+@test "--core is idempotent for the Codex link" {
+    _run_install --core
+    [ "$status" -eq 0 ]
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ -L "${FAKE_HOME}/.codex/AGENTS.md" ]
 }
 
 @test "--core stamps the repo root with the primary-root marker (#630/#642)" {
@@ -295,7 +318,7 @@ _run_install() {
     [ "$status" -eq 0 ]
     all_ln="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
     # 15 = the --core symlink set (tools/shell modes create no symlinks).
-    [ "$all_ln" -eq 15 ]
+    [ "$all_ln" -eq 16 ]
 }
 
 # ─── Backward-compat flags ───────────────────────────────────────────
@@ -317,8 +340,8 @@ _run_install() {
     # and neither should attempt the MCP jq merge.
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 15 ]
-    [ "$new_ln" -eq 15 ]
+    [ "$legacy_ln" -eq 16 ]
+    [ "$new_ln" -eq 16 ]
     # Neither should mention writing to ~/.claude.json
     [[ "$out_legacy" != *"Merged MCP"* ]]
     [[ "$out_new" != *"Merged MCP"* ]]
@@ -339,8 +362,8 @@ _run_install() {
     out_new="$output"
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 15 ]
-    [ "$new_ln" -eq 15 ]
+    [ "$legacy_ln" -eq 16 ]
+    [ "$new_ln" -eq 16 ]
 }
 
 # ─── --uninstall ─────────────────────────────────────────────────────
@@ -354,6 +377,26 @@ _run_install() {
     [ ! -L "${FAKE_HOME}/.claude/CLAUDE.md" ]
     [ ! -L "${FAKE_HOME}/.claude/agents" ]
     [ ! -L "${FAKE_HOME}/.claude/skills" ]
+}
+
+@test "--uninstall removes the Codex AGENTS.md link" {
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ -L "${FAKE_HOME}/.codex/AGENTS.md" ]
+    _run_install --uninstall
+    [ "$status" -eq 0 ]
+    [ ! -L "${FAKE_HOME}/.codex/AGENTS.md" ]
+}
+
+@test "--uninstall leaves an unrelated ~/.codex/AGENTS.md alone" {
+    # remove_symlink only unlinks a link pointing at our own source, so a
+    # hand-written AGENTS.md must survive an uninstall.
+    mkdir -p "${FAKE_HOME}/.codex"
+    echo "hand written" > "${FAKE_HOME}/.codex/AGENTS.md"
+    _run_install --uninstall
+    [ "$status" -eq 0 ]
+    [ -f "${FAKE_HOME}/.codex/AGENTS.md" ]
+    [ "$(cat "${FAKE_HOME}/.codex/AGENTS.md")" = "hand written" ]
 }
 
 @test "--uninstall removes the adapter symlinks" {
