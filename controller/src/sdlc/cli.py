@@ -445,7 +445,9 @@ def build(ctx: typer.Context) -> None:
 
     if result.preflight_failed:
         typer.echo(
-            "PRE_FLIGHT_FAILURE: test suite is red on main — fix before building.",
+            "PRE_FLIGHT_FAILURE: the preflight gate did not pass — see the "
+            "PRE_FLIGHT_TIMEOUT or PRE_FLIGHT_RED line above for which. "
+            "Fix before building.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -641,7 +643,9 @@ def fix(ctx: typer.Context) -> None:
 
     if result.preflight_failed:
         typer.echo(
-            "PRE_FLIGHT_FAILURE: test suite is red on main — fix before running `sdlc fix`.",
+            "PRE_FLIGHT_FAILURE: the preflight gate did not pass — see the "
+            "PRE_FLIGHT_TIMEOUT or PRE_FLIGHT_RED line above for which. "
+            "Fix before running `sdlc fix`.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -694,7 +698,9 @@ def _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view) -> None:
 
     if result.preflight_failed:
         typer.echo(
-            "PRE_FLIGHT_FAILURE: test suite is red on main — fix before running `sdlc fix`.",
+            "PRE_FLIGHT_FAILURE: the preflight gate did not pass — see the "
+            "PRE_FLIGHT_TIMEOUT or PRE_FLIGHT_RED line above for which. "
+            "Fix before running `sdlc fix`.",
             err=True,
         )
         raise typer.Exit(code=1)

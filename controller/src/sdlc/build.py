@@ -892,7 +892,15 @@ class BuildOptions:
     coverage_threshold: int = 90
     skip_preflight: bool = False
     rebuild: bool = False
-    preflight_timeout: int = 600
+    # 1800, not 600: a ceiling that cannot fit a repo's suite aborts *every*
+    # build there, deterministically, before anything is dispatched. Measured
+    # on fxmartin/nix-install — `make test` reached test 1080 of 1336 when the
+    # old 600s fired, so that suite needs ~730s and grows with every story
+    # that adds coverage. Waiting longer on a genuinely hung suite is the
+    # cheaper failure: `--preflight-timeout` tunes the outliers and
+    # `--skip-preflight` bypasses entirely, but a default nobody can discover
+    # without reading the source blocks a whole repo (claude-code-config#688).
+    preflight_timeout: int = 1800
     # Issue #590: opt out of the dirty-shared-checkout guard. Default False =
     # refuse to start when the repo root carries uncommitted tracked changes,
     # because an agent that hits the resulting failed `git checkout -b` has been
@@ -4470,7 +4478,7 @@ def _has_pytest_timeout(root: Path) -> bool:
     return False
 
 
-def default_preflight(root: Path | None = None, timeout: int = 600) -> bool:
+def default_preflight(root: Path | None = None, timeout: int = 1800) -> bool:
     """Run the detected preflight command and return True when it is green.
 
     Streams the command's output (no capture) so the user sees progress instead
@@ -4498,7 +4506,19 @@ def default_preflight(root: Path | None = None, timeout: int = 600) -> bool:
             file=sys.stderr,
         )
         return False
-    return completed.returncode == 0
+    if completed.returncode != 0:
+        # Distinct from PRE_FLIGHT_TIMEOUT above (claude-code-config#688): the
+        # caller only sees a bool, so it cannot tell a suite that failed from
+        # one that was cut off mid-flight, and it used to report both as "test
+        # suite is red on main". Each case now names itself here, where the
+        # difference is actually known.
+        print(
+            f"PRE_FLIGHT_RED: '{' '.join(cmd)}' exited {completed.returncode} — "
+            "the suite is failing. Fix it, or bypass with --skip-preflight.",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _routed_roles_by_harness(opts: "BuildOptions") -> dict[str, list[str]]:
