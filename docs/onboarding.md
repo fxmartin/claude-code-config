@@ -79,13 +79,13 @@ The installer is **modal** — pick one or more of these flags. Order does not m
 
 | Mode | What it does | Touches |
 |------|--------------|---------|
-| `--core` (default) | Symlinks `agents/`, `commands/`, `skills/`, `hooks/`, `CLAUDE.md`, `settings.json`, plus the marketplace symlink so the plugin resolves | `~/.claude/` |
+| `--core` (default) | Symlinks `agents/`, `commands/`, `skills/`, `hooks/`, `CLAUDE.md`, `settings.json`, plus the marketplace symlink so the plugin resolves; also links `AGENTS.md` into `~/.codex/` so Codex reads the same rules | `~/.claude/`, `~/.codex/` |
 | `--tools` | Installs `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `jq`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip` | Homebrew on macOS / apt on WSL2 (override with `--prefer-brew`) / pacman on Arch Linux |
 | `--mcp` | Merges `mcp/config.template.json` into `~/.claude.json` (Playwright + context7 MCP servers) | `~/.claude.json` |
 | `--shell` | Appends the `dev()` and `y()` shell helpers | `~/.zshrc` (macOS, or zsh anywhere) or `~/.bashrc` (WSL2 / Linux non-zsh) |
 | `--all` | All four modes in one shot | everything above |
 | `--dry-run` | Prints every action it WOULD take, mutates nothing | — |
-| `--uninstall` | Removes the `--core` symlinks (other modes untouched) | `~/.claude/` |
+| `--uninstall` | Removes the `--core` symlinks (other modes untouched) | `~/.claude/`, `~/.codex/` |
 
 > **Drifted install?** If the `--core` symlinks later go missing or point at the
 > wrong place, you don't need a full reinstall — run `sdlc repair --dry-run` to

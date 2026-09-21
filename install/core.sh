@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# ABOUTME: --core mode — symlink config files/dirs from the repo into ~/.claude.
+# ABOUTME: --core mode — symlink config files/dirs from the repo into ~/.claude
+# ABOUTME: and the Codex instructions into ~/.codex.
 # ABOUTME: Idempotent: re-running with everything in place is a no-op.
 #
-# Sourced by install.sh after common.sh. Expects SCRIPT_DIR, CLAUDE_DIR, DRY_RUN.
+# Sourced by install.sh after common.sh. Expects SCRIPT_DIR, CLAUDE_DIR,
+# CODEX_DIR, DRY_RUN.
 
 # Written into the install root on a successful --core install (below) and
 # read back by controller/src/sdlc/repair.py's is_allowed_root — its presence
@@ -53,6 +55,13 @@ install_core_run() {
   create_symlink "$SCRIPT_DIR/docs"                    "$CLAUDE_DIR/docs"
   create_symlink "$SCRIPT_DIR/skills"                  "$CLAUDE_DIR/skills"
   create_symlink "$SCRIPT_DIR/hooks"                   "$CLAUDE_DIR/hooks"
+
+  # Codex reads its global instructions from ~/.codex/AGENTS.md — the Codex
+  # counterpart of CLAUDE.md above. It lives here rather than in a
+  # platform-specific dotfiles repo so a single clone personalizes both agents
+  # on every machine, Linux hosts included.
+  ensure_dir "$CODEX_DIR"
+  create_symlink "$SCRIPT_DIR/AGENTS.md"               "$CODEX_DIR/AGENTS.md"
 
   # Shared skills (ADR-002) are the single source of truth under shared-skills/.
   # They are exposed as bare top-level slash commands (e.g. /coverage, /roast,
@@ -112,6 +121,7 @@ install_core_uninstall() {
   remove_symlink "$CLAUDE_DIR/docs"                    "$SCRIPT_DIR/docs"
   remove_symlink "$CLAUDE_DIR/skills"                  "$SCRIPT_DIR/skills"
   remove_symlink "$CLAUDE_DIR/hooks"                   "$SCRIPT_DIR/hooks"
+  remove_symlink "$CODEX_DIR/AGENTS.md"                "$SCRIPT_DIR/AGENTS.md"
   # Shared-skill commands are committed relative symlinks inside commands/, so
   # removing the commands symlink above already unlinks them; nothing to do here.
   remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
