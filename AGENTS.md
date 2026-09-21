@@ -18,6 +18,29 @@
 - Ask for clarification when a decision is risky, ambiguous, or cannot be inferred from the repo. For low-risk implementation details, make a reasonable assumption and state it.
 - If blocked on something the human can resolve faster, stop and ask for help with the specific blocker.
 
+## Machines
+
+This config is shared across machines via symlinks, so never assume a platform.
+Check with `uname -s` (`Darwin` / `Linux`) before reaching for a platform tool.
+
+| Host | Hardware | OS | Managed by |
+|------|----------|----|------------|
+| `macbook-pro-m3-max` | MacBook Pro M3 Max | macOS | `nix-install` (nix-darwin) |
+| `omarchy-xps13` *(in setup)* | Dell XPS 13 9350 | Omarchy 4 "Quattro" — Arch Linux, Hyprland/Wayland, Foot, bash 5 | `omarchy-install` |
+
+On Omarchy, prefer what the distro already ships over hand-rolling an equivalent:
+
+- `omarchy` — the top-level CLI (`omarchy update`, `omarchy bar put <plugin> --section right`).
+- The `omarchy-*` script family (e.g. `omarchy-microphone-test`,
+  `omarchy-nvme-suspend-fix`). Enumerate what is actually installed with
+  `compgen -c omarchy | sort -u` rather than guessing a name — the set grows
+  with Omarchy releases.
+- `pacman` for packages — never `brew`. `systemctl --user` for user services.
+- The Omarchy menu is `Super + Space`; the terminal is Foot (`Super + Return`).
+
+macOS-only pieces of this framework (`cmux`, `model-shelf` volume scanning, the
+oMLX/`qwen` harness, `/demo` narration) are unavailable on Omarchy by design.
+
 ## Code Quality Standards
 
 ### Python
