@@ -107,6 +107,18 @@ Strong success criteria let agents loop independently. Weak criteria ("make it w
 
 **Integration patterns**: API-agnostic frontends · database optimization (no N+1) · Podman + OCI · security-first · performance monitoring.
 
+## Piloting the SDLC
+
+The `sdlc` CLI (Python, `controller/`) owns every autonomous pipeline: build, fix, resume, queue. Orchestration lives in that code, never in a prompt — the build-stories and fix-issue skills are thin wrappers that shell out to it.
+
+- **Look before acting.** `sdlc status --json`, `sdlc runs --json`, `sdlc queue list --json`, `sdlc doctor --json` are read-only and safe at any time. A `.sdlc-state.db` in the repo means a run exists — inspect it before starting another.
+- **Start work through the front door.** `sdlc fix <issue>`, `sdlc build <scope>`, `sdlc resume`, or add `--enqueue` to queue instead of running now. Never call the pipeline's internals (`run-open`, `run-stage`, `run-close`) by hand; they belong to the controller.
+- **Never nest.** If `SDLC_BATCH_BUILD` is set, you are an agent the controller dispatched: do the stage you were given and return the `<<<RESULT_JSON>>>` block. Do not run `sdlc build`, `sdlc fix`, `sdlc resume`, or `sdlc queue run`.
+- **One live run per repo.** The registry refuses a second one. On refusal, watch with `sdlc status`; `sdlc resume --run <id> --force` only once the owning pid is confirmed gone.
+- **Long runs are not tool calls.** `build` and `fix` take minutes to hours: run them in a terminal or the queue and poll with `status`; never block a tool call on them.
+
+Reference: `README.md` → "The `sdlc` controller" (full subcommand table), `docs/controller-architecture.md`.
+
 ## CLI Tools — Prefer installed utilities over builtins
 The following tools are installed and SHOULD be used via Bash when the built-in Claude Code tools (Read, Grep, Glob, Edit) are insufficient or when working in shell scripts, pipelines, or subagents:
 
