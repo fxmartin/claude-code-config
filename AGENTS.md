@@ -18,6 +18,29 @@
 - Ask for clarification when a decision is risky, ambiguous, or cannot be inferred from the repo. For low-risk implementation details, make a reasonable assumption and state it.
 - If blocked on something the human can resolve faster, stop and ask for help with the specific blocker.
 
+## Machines
+
+This config is shared across machines via symlinks, so never assume a platform.
+Check with `uname -s` (`Darwin` / `Linux`) before reaching for a platform tool.
+
+| Host | Hardware | OS | Managed by |
+|------|----------|----|------------|
+| `macbook-pro-m3-max` | MacBook Pro M3 Max | macOS | `nix-install` (nix-darwin) |
+| `omarchy-xps13` *(in setup)* | Dell XPS 13 9350 | Omarchy 4 "Quattro" — Arch Linux, Hyprland/Wayland, Foot, bash 5 | `omarchy-install` |
+
+On Omarchy, prefer what the distro already ships over hand-rolling an equivalent:
+
+- `omarchy` — the top-level CLI (`omarchy update`, `omarchy bar put <plugin> --section right`).
+- The `omarchy-*` script family (e.g. `omarchy-microphone-test`,
+  `omarchy-nvme-suspend-fix`). Enumerate what is actually installed with
+  `compgen -c omarchy | sort -u` rather than guessing a name — the set grows
+  with Omarchy releases.
+- `pacman` for packages — never `brew`. `systemctl --user` for user services.
+- The Omarchy menu is `Super + Space`; the terminal is Foot (`Super + Return`).
+
+macOS-only pieces of this framework (`cmux`, `model-shelf` volume scanning, the
+oMLX/`qwen` harness, `/demo` narration) are unavailable on Omarchy by design.
+
 ## Code Quality Standards
 
 ### Python
@@ -61,6 +84,18 @@ Strong success criteria let work proceed independently. Convert fuzzy asks into 
 - Use structured parsers and APIs for structured data instead of ad hoc string manipulation when reasonable.
 - Before editing files, state what you are about to change.
 - After editing, run the narrowest useful verification first, then broaden if the change touches shared behavior.
+
+## Piloting the SDLC
+
+The `sdlc` CLI (Python, `controller/`) owns every autonomous pipeline: build, fix, resume, queue. Orchestration lives in that code, never in a prompt — the build-stories and fix-issue skills are thin wrappers that shell out to it.
+
+- **Look before acting.** `sdlc status --json`, `sdlc runs --json`, `sdlc queue list --json`, `sdlc doctor --json` are read-only and safe at any time. A `.sdlc-state.db` in the repo means a run exists — inspect it before starting another.
+- **Start work through the front door.** `sdlc fix <issue>`, `sdlc build <scope>`, `sdlc resume`, or add `--enqueue` to queue instead of running now. Never call the pipeline's internals (`run-open`, `run-stage`, `run-close`) by hand; they belong to the controller.
+- **Never nest.** If `SDLC_BATCH_BUILD` is set, you are an agent the controller dispatched: do the stage you were given and return the `<<<RESULT_JSON>>>` block. Do not run `sdlc build`, `sdlc fix`, `sdlc resume`, or `sdlc queue run`.
+- **One live run per repo.** The registry refuses a second one. On refusal, watch with `sdlc status`; `sdlc resume --run <id> --force` only once the owning pid is confirmed gone.
+- **Long runs are not tool calls.** `build` and `fix` take minutes to hours: run them in a terminal or the queue and poll with `status`; never block a tool call on them.
+
+Reference: `README.md` → "The `sdlc` controller" (full subcommand table), `docs/controller-architecture.md`.
 
 ## Codex Tooling
 - Use `rg` or `rg --files` first for searching files and text.

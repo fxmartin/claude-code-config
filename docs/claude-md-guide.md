@@ -236,6 +236,14 @@ Opens with the story-driven-development paragraph, then:
 
 **The Agents + Skills inventory** is worth calling out as an anti-pattern you avoided: you *could* duplicate each agent's full description here. You don't. You just name them. Sub-agents' full descriptions live in `agents/*.md` — CLAUDE.md just orients Claude to what's available. This is the right depth: enough that Claude knows to dispatch `ui-engineer` for frontend work, not so much that the list swallows the file.
 
+### Section 4b: Piloting the SDLC
+
+Five rules about the `sdlc` controller, byte-identical in `AGENTS.md` (enforced by `tests/sdlc-piloting-section.bats`, the same parity pattern as `## Machines`).
+
+**What it solves:** before this section, neither instruction file mentioned `sdlc` — an agent only learned the controller existed when a skill fired. The rules point at guard rails that already exist in the controller rather than restating them: the `--json` read-only commands, the front-door entry points, the `SDLC_BATCH_BUILD` marker every dispatched agent receives (so it never starts a nested run), the one-live-run-per-repo registry refusal, and the fact that `build`/`fix` run for hours and must be polled, not awaited inside a tool call.
+
+**Weak version:** pasting the README's subcommand table here. It would swell the always-loaded file and go stale on the next controller release; the strong version names the five behaviours and links out.
+
 ### Section 5: Reference Materials (the link-out layer)
 
 ```markdown
