@@ -27,6 +27,12 @@ Check with `uname -s` (`Darwin` / `Linux`) before reaching for a platform tool.
 |------|----------|----|------------|
 | `macbook-pro-m3-max` | MacBook Pro M3 Max | macOS | `nix-install` (nix-darwin) |
 | `omarchy-xps13` *(in setup)* | Dell XPS 13 9350 | Omarchy 4 "Quattro" — Arch Linux, Hyprland/Wayland, Foot, bash 5 | `omarchy-install` |
+| `home-lab` | MacBook Pro M1 Pro (`MacBookPro18,3`) | macOS | `nix-install` (nix-darwin) |
+
+`home-lab` hosts the **local-ci-cd** GitLab stack the CI Compatibility section
+below assumes. Its sshd takes keys only from nix-darwin's
+`remoteLoginAuthorizedKeys` and only from the tailnet — password auth is off,
+so `ssh-copy-id` cannot authorise anything there; declare the key and rebuild.
 
 On Omarchy, prefer what the distro already ships over hand-rolling an equivalent:
 
