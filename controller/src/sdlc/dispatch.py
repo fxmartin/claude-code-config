@@ -70,6 +70,10 @@ THINKING_CAP_ENV = "MAX_THINKING_TOKENS"
 # is presence-/truthy-based on the build side, so ``"1"`` satisfies the guard.
 _DISPATCH_IN_TEST_ENV = "SDLC_IN_TEST"
 
+# The env var gh/glab consult to open a URL; forced to a no-op for every dispatch
+# (see ``_dispatch_env``) because a headless agent must never open a browser.
+_DISPATCH_BROWSER_ENV = "BROWSER"
+
 # Story 13.1-001: the default deny baseline for a dispatched agent. Every agent
 # runs under ``--dangerously-skip-permissions`` (no human to approve tool calls),
 # which suppresses the *prompt* but does NOT disable an explicit deny list on the
@@ -105,6 +109,18 @@ DENY_BASELINE: tuple[str, ...] = (
     "Bash(gh pr merge *--admin*)",
     "Bash(glab mr merge *--admin*)",
     "mcp__playwright__browser_*",
+    # A merge agent on a GitLab repo ran `glab mr view 24 --web` and a Chromium
+    # tab opened on the operator's desktop (dead: the instance's external_url
+    # only resolves on the CI host). A headless agent never needs a browser, so
+    # deny every gh/glab form that hands a URL to $BROWSER. Two variants per CLI
+    # (`--web` terminal, `--web ` mid-string) so `--web=false` — which the agents
+    # also use, harmlessly — stays allowed. $BROWSER is neutralised in
+    # `_dispatch_env` as the backstop for any route these rules cannot see.
+    "Bash(gh * --web)",
+    "Bash(gh * --web *)",
+    "Bash(gh browse*)",
+    "Bash(glab * --web)",
+    "Bash(glab * --web *)",
 )
 
 # Per-repo override for the deny baseline (AC3): set ``SDLC_DENY_BASELINE`` to a
@@ -185,6 +201,11 @@ def _dispatch_env(thinking_cap: int | None) -> dict[str, str]:
     # Issue #145: mark the dispatch as in-test so a nested ``sdlc build`` the agent
     # might shell out short-circuits instead of launching a second real run.
     env[_DISPATCH_IN_TEST_ENV] = "1"
+    # gh/glab (and python's webbrowser) honour $BROWSER before falling back to
+    # xdg-open. Point it at the coreutils no-op so a dispatched agent that finds
+    # a route past the `--web` deny rules still cannot open a window on the
+    # operator's desktop. Only the copy is changed; the parent keeps its launcher.
+    env[_DISPATCH_BROWSER_ENV] = "true"
     if thinking_cap and thinking_cap > 0:
         env[THINKING_CAP_ENV] = str(thinking_cap)
     return env
