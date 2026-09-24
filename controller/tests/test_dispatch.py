@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import signal
 import subprocess
 import threading
@@ -2335,3 +2336,77 @@ def test_detect_container_runtime_blank_force_auto_detects(monkeypatch) -> None:
         lambda name: f"/usr/bin/{name}" if name in {"podman", "docker"} else None,
     )
     assert detect_container_runtime() == "podman"
+
+
+# --- browser-opening commands are denied, and $BROWSER is neutralised ---------
+# A merge agent on a GitLab repo ran `glab mr view 24 --web` to inspect an MR;
+# glab handed the URL to $BROWSER (omarchy-launch-browser on Omarchy) and a
+# Chromium tab opened on the operator's desktop — dead, because the instance's
+# external_url (gitlab.test) only resolves on the CI host. A headless agent has
+# no business opening windows: deny the explicit `--web` / `gh browse` forms at
+# the argv level, and point $BROWSER at a no-op so any other route is inert.
+
+
+def test_deny_baseline_blocks_browser_opening_commands() -> None:
+    """The baseline denies every gh/glab form that hands a URL to a browser."""
+    browser_commands = (
+        "gh pr view 12 --web",
+        "gh pr view --web 12",
+        "gh issue view 5 --web",
+        "gh repo view --web",
+        "gh browse",
+        "gh browse 12",
+        "glab mr view 24 --web",
+        'glab mr view 24 --web 2>&1 || echo "Cannot open web"',
+        "glab mr view 8 --web 2>&1 | head -1",
+        "glab issue view 3 --web",
+        "glab repo view --web",
+    )
+    for command in browser_commands:
+        assert any(
+            rule.startswith("Bash(") and _bash_pattern_matches(rule, command)
+            for rule in DENY_BASELINE
+        ), f"no deny rule in DENY_BASELINE matches {command!r}"
+
+
+def test_deny_baseline_browser_rules_do_not_block_api_and_json_reads() -> None:
+    """Regression guard: the non-browser forms the merge/review agents rely on
+    (`--output json`, `--web=false`, `glab api …`) stay allowed."""
+    allowed_commands = (
+        "gh pr view 12 --json state",
+        "gh pr view 12",
+        "glab mr view 24 --output json",
+        "glab mr view 3 --web=false 2>&1 | head -10",
+        "glab api projects/:id/merge_requests/26",
+        "gh pr checks 12 --watch",
+    )
+    browser_rules = [
+        rule
+        for rule in DENY_BASELINE
+        if rule.startswith("Bash(") and ("--web" in rule or "browse" in rule)
+    ]
+    assert browser_rules, "expected at least one browser-opening deny rule"
+    for command in allowed_commands:
+        for rule in browser_rules:
+            assert not _bash_pattern_matches(
+                rule, command
+            ), f"deny rule {rule!r} incorrectly matches allowed command {command!r}"
+
+
+def test_dispatch_env_neutralises_browser(monkeypatch) -> None:
+    """$BROWSER is forced to the no-op `true` for every dispatched agent, even
+    when the operator's shell exports a real launcher."""
+    monkeypatch.setenv("BROWSER", "omarchy-launch-browser")
+    env = _dispatch_env(None)
+    assert env["BROWSER"] == "true"
+    # The parent process keeps its own launcher — only the copy is changed.
+    assert os.environ["BROWSER"] == "omarchy-launch-browser"
+
+
+def test_dispatch_env_neutralises_browser_when_unset(monkeypatch) -> None:
+    """No inherited $BROWSER still yields the no-op, so gh/glab never fall back
+    to xdg-open."""
+    monkeypatch.delenv("BROWSER", raising=False)
+    env = _dispatch_env(4096)
+    assert env["BROWSER"] == "true"
+    assert env["MAX_THINKING_TOKENS"] == "4096"
