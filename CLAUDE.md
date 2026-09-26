@@ -134,14 +134,38 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 - Use these CLI tools via Bash when you need shell pipelines, complex filtering, or when the built-in tools are too limited
 - In shell scripts and automation, always use `fd`/`rg`/`bat`/`jq` over legacy alternatives
 
-## GitHub Operations — Use `gh` CLI (NOT MCP)
-- **Always use `gh` CLI** for all GitHub operations (issues, PRs, releases, API calls)
-- Do NOT rely on a GitHub MCP server — it has been removed from all environments
-- Common commands:
-  - `gh issue list`, `gh issue create`, `gh issue view <number>`
-  - `gh pr list`, `gh pr create`, `gh pr view <number>`, `gh pr checks`
-  - `gh api repos/{owner}/{repo}/...` for anything not covered by subcommands
-- The `gh` CLI is pre-authenticated and available in all dev shells
+## Source Control — local GitLab is master
+
+Every repo under `~/Work` uses the local-ci-cd GitLab on `home-lab` as its
+authoritative remote; GitHub is a one-way push mirror. Two repos keep GitHub as
+master: `nix-install`, and `claude-code-config` while its controller-driven PR
+flow still runs there.
+
+- **Reach GitLab as `http://gitlab.test`** (port 80 via `tailscale serve` +
+  split DNS) and set `GITLAB_HOST=gitlab.test` for `glab`. Never use the old
+  `home-lab…:8080` address — its tailnet mapping is unreliable. A global git
+  `insteadOf` rewrite still maps stale `:8080` remotes to `gitlab.test`.
+- **`origin` is GitLab** (`http://gitlab.test/root/<repo>.git`); the `github`
+  remote is only the mirror target. Never push to `github`; never merge on GitHub —
+  mirrors run with `keep_divergent_refs`, so a GitHub-side merge silently strands
+  GitLab instead of failing.
+- **Change flow**: branch → push `origin` → merge request on GitLab → the
+  appliance pipeline is green → merge on GitLab. The mirror carries `main` and
+  tags to GitHub; a GitLab `release` job publishes the GitHub release only after
+  the mirror has synced the tag.
+- **Issues and MRs live on GitLab — use `glab`.** `gh` stays for the two
+  GitHub-master repos and for read-only mirror checks.
+  Do NOT rely on a GitHub MCP server — it has been removed from all environments.
+  `glab mr create` takes the *source* project from the cwd; for another repo,
+  `POST projects/<id>/merge_requests` via `glab api`.
+- **Every GitLab-master repo carries `.sdlc-forge.yaml`** (`forge: gitlab`,
+  `gitlab_url: http://gitlab.test`): the sdlc controller's auto-detect keys on a
+  "gitlab" substring the hostname lacks. Keep it.
+- **Keep `.github/workflows/ci.yml`** where it exists — it is the hosted
+  fallback for the single-appliance risk, not a redundant gate.
+
+Mirror operations, credential rotation, and post-reboot recovery of the
+appliance: `~/.claude/reference-docs/source-control.md`.
 
 ## Release Version Alignment
 - Before creating or deploying a release tag, align the package release number with the GitHub tag: `nyx/package.json` version `X.Y.Z` must match Git tag `vX.Y.Z`.
@@ -152,8 +176,8 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 
 This repo enforces [Conventional Commits](https://www.conventionalcommits.org/) via
 commitlint (`.commitlintrc.json`). The `commit-format` CI job runs
-`commitlint --from origin/main --to HEAD` on every PR; a PR fails if any of its
-commits violate the rules. Existing history on `main` is exempt.
+`commitlint --from origin/main --to HEAD` on every merge request or PR; it fails
+if any of its commits violate the rules. Existing history on `main` is exempt.
 
 **How to write a commit message:**
 - Header: `type(scope): subject` — `type` is required and lower-case, `scope` is
