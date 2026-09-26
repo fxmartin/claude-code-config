@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sdlc.build import _STAGES, Ledger, _base_ref, _git
+from sdlc.issue_host import (
+    GITHUB,
+    IssueHostError,
+    get_adapter,
+    repo_runner,
+    resolve_forge,
+)
 from sdlc.story_markdown import find_epic_file, render_epic_file
 
 if TYPE_CHECKING:
@@ -46,13 +53,53 @@ class ReconcileResult:
         )
 
 
-def _gh_pr_state(pr_number: int, root: Path) -> str | None:
-    """The GitHub state of ``pr_number`` (e.g. ``MERGED``), or None.
+def _non_github_forge(root: Path):
+    """The repo's resolved forge when it is *not* GitHub, else None (issue #699).
 
-    Best-effort and isolated so tests can monkeypatch it: returns None — never
-    raises — when ``gh`` is absent, unauthenticated, offline, or the PR is
-    unknown, so the gh signal simply does not fire.
+    A declared (or detected) GitLab forge must never be answered by ``gh``: an MR
+    iid collides with an old PR number on a `github` mirror remote.
     """
+    try:
+        resolution = resolve_forge(root)
+    except IssueHostError:
+        return None
+    return None if resolution.host == GITHUB else resolution
+
+
+def _forge_cr_state(
+    resolution, pr_number: int, root: Path, expected_branch: str | None
+) -> str | None:
+    """The upper-cased CR state from the declared forge, or None (never raises).
+
+    ``expected_branch`` pins the CR to the story's own head ref, so an iid that
+    resolves to somebody else's change request yields no signal.
+    """
+    adapter = get_adapter(
+        resolution.host, runner=repo_runner(root), instance_url=resolution.instance_url
+    )
+    try:
+        cr = adapter.cr_view(str(pr_number))
+    except IssueHostError:
+        return None
+    if expected_branch and cr.source_branch != expected_branch:
+        return None
+    return (cr.state or "").upper() or None
+
+
+def _gh_pr_state(
+    pr_number: int, root: Path, expected_branch: str | None = None
+) -> str | None:
+    """The forge state of change request ``pr_number`` (e.g. ``MERGED``), or None.
+
+    Routes to the declared non-GitHub forge's CLI when there is one (issue #699);
+    otherwise shells out to ``gh``. Best-effort and isolated so tests can
+    monkeypatch it: returns None — never raises — when the CLI is absent,
+    unauthenticated, offline, or the CR is unknown, so the signal simply does not
+    fire.
+    """
+    resolution = _non_github_forge(root)
+    if resolution is not None:
+        return _forge_cr_state(resolution, pr_number, root, expected_branch)
     try:
         out = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--json", "state", "-q", ".state"],
@@ -84,6 +131,10 @@ def _gh_pr_for_landing(story_id: str, sha: str, root: Path) -> int | None:
     absent, unauthenticated, offline, or no PR matches, so PR backfill simply
     does not happen and the caller leaves ``pr_number`` as-is.
     """
+    if _non_github_forge(root) is not None:
+        # No merged-CR search on non-GitHub forges yet; skipping the backfill is
+        # safe, whereas asking `gh` would attach an unrelated GitHub PR (#699).
+        return None
     branch = f"feature/{story_id}"
     searches = [f"head:{branch}"] + ([sha] if sha else [])
     for query in searches:
@@ -184,7 +235,7 @@ def _detect_landing(
             if lines and not any(ln.startswith("+") for ln in lines):
                 return "git-cherry", _rev(root, base)
 
-    if pr_number and _gh_pr_state(pr_number, root) == "MERGED":
+    if pr_number and _gh_pr_state(pr_number, root, branch) == "MERGED":
         return "gh-pr-merged", _rev(root, base) if base else ""
 
     if base:

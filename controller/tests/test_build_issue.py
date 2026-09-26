@@ -562,8 +562,9 @@ def test_recorded_but_unusable_host_never_falls_back(tmp_path, monkeypatch):
     runner = FakeRunner()
 
     assert bi.close_link(ledger, "29.4-004", runner=runner) is None
-    assert bi.change_request_status(ledger, "29.4-004", 7, runner=runner) is None
-    assert runner.calls == []
+    # Issue #699: the declared forge (not the bitbucket mapping) owns CR lookups.
+    bi.change_request_status(ledger, "29.4-004", 7, runner=runner)
+    assert all(c[0] == "gh" for c in runner.calls)
 
 
 def test_recovery_tolerates_a_host_search_failure(tmp_path, monkeypatch):
@@ -623,3 +624,55 @@ def test_warn_event_failure_never_breaks_the_lookup(tmp_path, monkeypatch):
     runner = FakeRunner({"issue list": (0, "[]", "")})
 
     assert bi.close_link(ledger, "29.4-004", runner=runner, run_id="run-1") is None
+
+
+# --- issue #699: the declared forge beats the story's inventory mapping ------
+
+
+def _declare_gitlab(tmp_path, monkeypatch) -> None:
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://home-lab:8080\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+
+def test_declared_gitlab_beats_github_inventory_mapping(tmp_path, monkeypatch):
+    """A story mapped to `github` in a repo declaring `forge: gitlab` must still
+    read its change request from GitLab — never `gh` (issue #699)."""
+    ledger = _ledger(tmp_path)
+    _mapped(ledger, host=ih.GITHUB, ref="42")
+    _declare_gitlab(tmp_path, monkeypatch)
+    runner = FakeRunner({"mr view": (0, '{"pipeline": {"status": "success"}}', "")})
+
+    assert bi.change_request_terms(ledger, "22.4-002", runner=runner).abbr == "MR"
+    assert bi.change_request_status(ledger, "22.4-002", 5, runner=runner) == ih.CR_SUCCESS
+    assert all(c[0] == "glab" for c in runner.calls)
+
+
+def test_declared_gitlab_unmapped_story_gets_mr_terms(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)  # no mirror evidence at all
+    _declare_gitlab(tmp_path, monkeypatch)
+
+    assert bi.change_request_terms(ledger, "10.2-001", runner=FakeRunner()).abbr == "MR"
+
+
+def test_change_request_view_returns_declared_forge_cr(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    _declare_gitlab(tmp_path, monkeypatch)
+    runner = FakeRunner({
+        "mr view": (0, '{"iid": 5, "state": "opened", "source_branch": "feature/10.2-001"}', ""),
+    })
+
+    cr = bi.change_request_view(ledger, "10.2-001", 5, runner=runner)
+
+    assert cr is not None and cr.state == "open"
+    assert cr.source_branch == "feature/10.2-001"
+
+
+def test_change_request_view_is_none_on_host_error(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    _declare_gitlab(tmp_path, monkeypatch)
+
+    assert bi.change_request_view(
+        ledger, "10.2-001", 5, runner=FakeRunner(default=(1, "", "timeout"))
+    ) is None

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from sdlc.issue_host import (
     FORGE_OVERRIDE_FILENAME,
     GITHUB_CR_TERMS,
+    ChangeRequest,
     ChangeRequestChecks,
     ChangeRequestTerms,
     IssueHostError,
@@ -31,6 +32,8 @@ __all__ = [
     "close_link",
     "change_request_terms",
     "change_request_status",
+    "change_request_view",
+    "forge_declared",
     "change_request_checks",
     "announce_status",
     "announce_terminal",
@@ -213,6 +216,19 @@ def _adapter_and_ref(
         return None
 
 
+def forge_declared() -> bool:
+    """Whether the cwd repo carries a valid ``.sdlc-forge.yaml`` declaration (#699)."""
+    try:
+        return (
+            load_repo_forge_declaration(
+                override_path=Path.cwd() / FORGE_OVERRIDE_FILENAME
+            )
+            is not None
+        )
+    except IssueHostError:
+        return False
+
+
 def _cr_adapter(ledger: "Ledger", story_id: str, runner: Runner | None):
     """The adapter to read a story's *change request* with, or None.
 
@@ -225,6 +241,14 @@ def _cr_adapter(ledger: "Ledger", story_id: str, runner: Runner | None):
     recorded host is a deliberate choice, and talking to the wrong one is worse
     than degrading.
     """
+    # Issue #699: a declared forge is authoritative — a stale/mismatched inventory
+    # mapping (or a `github` mirror remote) must never route a CR lookup to gh.
+    if forge_declared():
+        try:
+            return _forge_adapter(runner)
+        except IssueHostError as exc:
+            log.warning("CR lookup: cannot resolve the declared forge for %s: %s", story_id, exc)
+            return None
     got = _adapter_and_ref(ledger, story_id, runner)
     if got is not None:
         return got[0]
@@ -309,6 +333,24 @@ def change_request_status(
         return adapter.cr_status(str(cr_ref))
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
         log.warning("change_request_status failed for %s", story_id, exc_info=True)
+        return None
+
+
+def change_request_view(
+    ledger: "Ledger", story_id: str, cr_ref: object, *, runner: Runner | None = None
+) -> ChangeRequest | None:
+    """A story CR's normalised metadata (state, branches) from its forge, or None.
+
+    Issue #699: the controller verifies an agent's "already merged" verdict
+    against the CR itself. Best-effort — never raises; None means unverifiable.
+    """
+    try:
+        adapter = _cr_adapter(ledger, story_id, runner)
+        if adapter is None:
+            return None
+        return adapter.cr_view(str(cr_ref))
+    except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
+        log.warning("change_request_view failed for %s", story_id, exc_info=True)
         return None
 
 
