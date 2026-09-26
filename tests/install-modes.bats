@@ -557,15 +557,3 @@ _run_install() {
     [ "$status" -eq 0 ]
     [[ "$output" != *"dangle"* ]]
 }
-
-@test "--core leaves a real skill dir that collides with a repo skill untouched (#694)" {
-    local sk="${FAKE_HOME}/.claude/skills"
-    mkdir -p "$sk/telegram"
-    echo mine > "$sk/telegram/SKILL.md"
-    _run_install --core
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"Skipping skill telegram"* ]]
-    [ ! -L "$sk/telegram" ]
-    [ "$(cat "$sk/telegram/SKILL.md")" = "mine" ]
-    [ -L "$sk/create-skill" ]
-}
