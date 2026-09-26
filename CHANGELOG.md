@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.10] - 2026-09-26
+
+### Fixed
+
+- fix(dispatch): deny gh/glab --web and force a no-op browser for agents (#700)
+
+
 ## [v2.71.9] - 2026-09-26
 
 ### Fixed
