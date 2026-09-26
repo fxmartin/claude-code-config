@@ -14,6 +14,57 @@
 # asserts the two never diverge.
 SDLC_PRIMARY_ROOT_MARKER=".sdlc-primary-root"
 
+# Entries in $SCRIPT_DIR/skills that are runtime/distro leftovers, not repo
+# skills (#694). Never linked back into ~/.claude/skills.
+_skill_entry_is_foreign() {
+  case "$1" in
+    .*|synced|omarchy|diagnose-crash) return 0 ;;
+  esac
+  return 1
+}
+
+# Link each repo skill individually so ~/.claude/skills stays a real directory
+# that distro-, runtime- and user-provided skills can live in (#694).
+link_skill_entries() {
+  local skills_dst="$CLAUDE_DIR/skills" entry name
+
+  # Migrate a legacy directory-level symlink into the clone.
+  if [ -L "$skills_dst" ] && [ "$(readlink "$skills_dst")" = "$SCRIPT_DIR/skills" ]; then
+    run rm "$skills_dst"
+  fi
+  ensure_dir "$skills_dst"
+
+  for entry in "$SCRIPT_DIR"/skills/*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name="$(basename "$entry")"
+    _skill_entry_is_foreign "$name" && continue
+    if [ -e "$skills_dst/$name" ] && [ ! -L "$skills_dst/$name" ]; then
+      warn "Skipping skill $name: a real ${skills_dst}/$name already exists (left untouched)"
+      continue
+    fi
+    create_symlink "$entry" "$skills_dst/$name"
+  done
+}
+
+# Remove only the per-skill links --core created; foreign skills stay.
+unlink_skill_entries() {
+  local skills_dst="$CLAUDE_DIR/skills" entry name
+
+  # Legacy directory-level symlink from an older --core.
+  remove_symlink "$skills_dst" "$SCRIPT_DIR/skills"
+  [ -d "$skills_dst" ] && [ ! -L "$skills_dst" ] || return 0
+
+  for entry in "$SCRIPT_DIR"/skills/*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name="$(basename "$entry")"
+    remove_symlink "$skills_dst/$name" "$entry"
+  done
+  # Drop the directory only if we left it empty.
+  if [ "${DRY_RUN:-false}" != "true" ]; then
+    rmdir "$skills_dst" 2>/dev/null || true
+  fi
+}
+
 install_core_run() {
   # Guard (#179): refuse to install from an ephemeral build worktree. --core
   # symlinks every managed ~/.claude entry to $SCRIPT_DIR; if SCRIPT_DIR is a
@@ -61,7 +112,7 @@ install_core_run() {
   create_symlink "$SCRIPT_DIR/keybindings.json"        "$CLAUDE_DIR/keybindings.json"
   create_symlink "$SCRIPT_DIR/reference-docs"          "$CLAUDE_DIR/reference-docs"
   create_symlink "$SCRIPT_DIR/docs"                    "$CLAUDE_DIR/docs"
-  create_symlink "$SCRIPT_DIR/skills"                  "$CLAUDE_DIR/skills"
+  link_skill_entries
   create_symlink "$SCRIPT_DIR/hooks"                   "$CLAUDE_DIR/hooks"
 
   # Codex reads its global instructions from ~/.codex/AGENTS.md — the Codex
@@ -127,7 +178,7 @@ install_core_uninstall() {
   remove_symlink "$CLAUDE_DIR/keybindings.json"        "$SCRIPT_DIR/keybindings.json"
   remove_symlink "$CLAUDE_DIR/reference-docs"          "$SCRIPT_DIR/reference-docs"
   remove_symlink "$CLAUDE_DIR/docs"                    "$SCRIPT_DIR/docs"
-  remove_symlink "$CLAUDE_DIR/skills"                  "$SCRIPT_DIR/skills"
+  unlink_skill_entries
   remove_symlink "$CLAUDE_DIR/hooks"                   "$SCRIPT_DIR/hooks"
   remove_symlink "$CODEX_DIR/AGENTS.md"                "$SCRIPT_DIR/AGENTS.md"
   # Shared-skill commands are committed relative symlinks inside commands/, so

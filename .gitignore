@@ -40,3 +40,6 @@ docs/stories/.build-progress.md
 
 # pytest-cov data file (the CI gate and local --cov runs both write it).
 .coverage
+
+# Claude Code writes account-synced skills here if ~/.claude/skills ever resolves into the clone (#694).
+skills/synced/

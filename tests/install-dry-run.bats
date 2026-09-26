@@ -74,6 +74,15 @@ _snapshot() {
     # are committed relative symlinks inside commands/, carried in by the commands
     # directory symlink, so they are not linked separately (doing so would rewrite
     # them as absolute and dirty the repo).
-    ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 16 ]
+    ln_lines="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
+    [ "$ln_lines" -eq 15 ]
+}
+
+@test "dry-run leaves a pre-populated ~/.claude/skills untouched (#694)" {
+    mkdir -p "${FAKE_HOME}/.claude/skills/foreign"
+    before="$(find "${FAKE_HOME}" | sort)"
+    run env HOME="${FAKE_HOME}" bash "${INSTALL}" --dry-run --skip-tools --skip-mcp
+    [ "$status" -eq 0 ]
+    [ "$before" = "$(find "${FAKE_HOME}" | sort)" ]
+    [[ "$output" != *"Backed up skills"* ]]
 }

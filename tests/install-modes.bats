@@ -77,8 +77,8 @@ _run_install() {
     # the opencode adapter of Story 29.2-001). Shared skills are committed
     # relative symlinks inside commands/, so the installer no longer links them
     # in separately (they would dirty the repo).
-    ln_lines="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
-    [ "$ln_lines" -eq 16 ]
+    ln_lines="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
+    [ "$ln_lines" -eq 15 ]
 }
 
 @test "--core --dry-run previews git submodule init" {
@@ -99,8 +99,9 @@ _run_install() {
     [ -e "${FAKE_HOME}/.claude/agents" ]
     [ -L "${FAKE_HOME}/.claude/commands" ]
     [ -e "${FAKE_HOME}/.claude/commands" ]
-    [ -L "${FAKE_HOME}/.claude/skills" ]
-    [ -e "${FAKE_HOME}/.claude/skills" ]
+    [ -d "${FAKE_HOME}/.claude/skills" ] && [ ! -L "${FAKE_HOME}/.claude/skills" ]
+    [ -L "${FAKE_HOME}/.claude/skills/telegram" ]
+    [ -e "${FAKE_HOME}/.claude/skills/telegram" ]
     [ -L "${FAKE_HOME}/.claude/hooks" ]
     [ -e "${FAKE_HOME}/.claude/hooks" ]
     [ -L "${FAKE_HOME}/.claude/settings.json" ]
@@ -332,9 +333,9 @@ _run_install() {
 @test "--all dry-run output equals union of per-mode dry-runs for ln + jq" {
     _run_install --all --dry-run
     [ "$status" -eq 0 ]
-    all_ln="$(printf '%s\n' "$output" | grep -c '\[dry-run\] ln -s')"
+    all_ln="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
     # 15 = the --core symlink set (tools/shell modes create no symlinks).
-    [ "$all_ln" -eq 16 ]
+    [ "$all_ln" -eq 15 ]
 }
 
 # ─── Backward-compat flags ───────────────────────────────────────────
@@ -354,10 +355,10 @@ _run_install() {
     out_new="$output"
     # Both should perform the same number of ln operations (15 core)
     # and neither should attempt the MCP jq merge.
-    legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
-    new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 16 ]
-    [ "$new_ln" -eq 16 ]
+    legacy_ln="$(printf '%s\n' "$out_legacy" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
+    new_ln="$(printf '%s\n'    "$out_new"    | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
+    [ "$legacy_ln" -eq 15 ]
+    [ "$new_ln" -eq 15 ]
     # Neither should mention writing to ~/.claude.json
     [[ "$out_legacy" != *"Merged MCP"* ]]
     [[ "$out_new" != *"Merged MCP"* ]]
@@ -376,10 +377,10 @@ _run_install() {
     _run_install --core --mcp --shell --dry-run
     [ "$status" -eq 0 ]
     out_new="$output"
-    legacy_ln="$(printf '%s\n' "$out_legacy" | grep -c '\[dry-run\] ln -s')"
-    new_ln="$(printf '%s\n'    "$out_new"    | grep -c '\[dry-run\] ln -s')"
-    [ "$legacy_ln" -eq 16 ]
-    [ "$new_ln" -eq 16 ]
+    legacy_ln="$(printf '%s\n' "$out_legacy" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
+    new_ln="$(printf '%s\n'    "$out_new"    | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
+    [ "$legacy_ln" -eq 15 ]
+    [ "$new_ln" -eq 15 ]
 }
 
 # ─── --uninstall ─────────────────────────────────────────────────────
@@ -392,7 +393,50 @@ _run_install() {
     [ "$status" -eq 0 ]
     [ ! -L "${FAKE_HOME}/.claude/CLAUDE.md" ]
     [ ! -L "${FAKE_HOME}/.claude/agents" ]
+    [ ! -L "${FAKE_HOME}/.claude/skills/telegram" ]
+}
+
+@test "--core keeps foreign skills and links repo skills per entry (#694)" {
+    local sk="${FAKE_HOME}/.claude/skills"
+    mkdir -p "$sk/foreign-real" "$sk/synced" "${FAKE_HOME}/elsewhere/other"
+    ln -s "${FAKE_HOME}/elsewhere/other" "$sk/foreign-link"
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ -d "$sk" ] && [ ! -L "$sk" ]
+    [ -d "$sk/foreign-real" ] && [ ! -L "$sk/foreign-real" ]
+    [ -d "$sk/synced" ] && [ ! -L "$sk/synced" ]
+    [ "$(readlink "$sk/foreign-link")" = "${FAKE_HOME}/elsewhere/other" ]
+    for d in "${BATS_TEST_DIRNAME}"/../skills/*/; do
+        n="$(basename "$d")"
+        case "$n" in synced|omarchy|diagnose-crash) continue ;; esac
+        [ -L "$sk/$n" ]
+    done
+    # Nothing was moved to the backup dir, and the clone is not written into.
+    [ ! -e "${FAKE_HOME}/.claude/backups" ]
+    [ ! -e "${BATS_TEST_DIRNAME}/../skills/foreign-real" ]
+    # Re-run is a no-op.
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ ! -e "${FAKE_HOME}/.claude/backups" ]
+}
+
+@test "--core migrates a legacy directory-level skills symlink (#694)" {
+    mkdir -p "${FAKE_HOME}/.claude"
+    ln -s "$(cd "${BATS_TEST_DIRNAME}/.." && pwd)/skills" "${FAKE_HOME}/.claude/skills"
+    _run_install --core
+    [ "$status" -eq 0 ]
     [ ! -L "${FAKE_HOME}/.claude/skills" ]
+    [ -L "${FAKE_HOME}/.claude/skills/telegram" ]
+}
+
+@test "--uninstall removes only repo skill links and keeps foreign skills (#694)" {
+    mkdir -p "${FAKE_HOME}/.claude/skills/foreign-real"
+    _run_install --core
+    [ "$status" -eq 0 ]
+    _run_install --uninstall
+    [ "$status" -eq 0 ]
+    [ -d "${FAKE_HOME}/.claude/skills/foreign-real" ]
+    [ ! -L "${FAKE_HOME}/.claude/skills/telegram" ]
 }
 
 @test "--uninstall removes the Codex AGENTS.md link" {
@@ -444,6 +488,18 @@ _run_install() {
     fi
     # Belt-and-braces: the directory itself was not created.
     [ ! -e "${FAKE_HOME}/.claude" ]
+}
+
+@test "--core leaves a real skill dir that collides with a repo skill untouched (#694)" {
+    local sk="${FAKE_HOME}/.claude/skills"
+    mkdir -p "$sk/telegram"
+    echo mine > "$sk/telegram/SKILL.md"
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Skipping skill telegram"* ]]
+    [ ! -L "$sk/telegram" ]
+    [ "$(cat "$sk/telegram/SKILL.md")" = "mine" ]
+    [ -L "$sk/create-skill" ]
 }
 
 @test "--core seeds settings.json from the template in a fresh clone (#693)" {
@@ -500,4 +556,16 @@ _run_install() {
         create_symlink "$CLAUDE_DIR/src" "$CLAUDE_DIR/link"'
     [ "$status" -eq 0 ]
     [[ "$output" != *"dangle"* ]]
+}
+
+@test "--core leaves a real skill dir that collides with a repo skill untouched (#694)" {
+    local sk="${FAKE_HOME}/.claude/skills"
+    mkdir -p "$sk/telegram"
+    echo mine > "$sk/telegram/SKILL.md"
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Skipping skill telegram"* ]]
+    [ ! -L "$sk/telegram" ]
+    [ "$(cat "$sk/telegram/SKILL.md")" = "mine" ]
+    [ -L "$sk/create-skill" ]
 }
