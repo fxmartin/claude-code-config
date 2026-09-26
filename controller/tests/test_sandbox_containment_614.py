@@ -761,7 +761,9 @@ def test_reattached_clone_is_reset_to_trusted_git(tmp_path) -> None:
     create_story_sandbox_clone(primary, "61.4-001", "run1-x")
     for key in ("core.sshCommand", "core.fsmonitor", "core.hooksPath", "credential.helper"):
         res = subprocess.run(
-            ["git", "-C", str(clone), "config", "--get", key],
+            # --local: macOS runners set credential.helper=osxkeychain at
+            # system scope; only the clone's own (agent-writable) config counts.
+            ["git", "-C", str(clone), "config", "--local", "--get", key],
             capture_output=True, text=True,
         )
         assert res.returncode != 0, key
