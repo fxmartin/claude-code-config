@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.2] - 2026-09-26
+
+### Fixed
+
+- fix(build): resolve merge CI gate without a story mirror (#696) (#702)
+
+
 ## [v2.71.1] - 2026-09-21
 
 ### Fixed
