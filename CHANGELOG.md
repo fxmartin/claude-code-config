@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.4] - 2026-09-26
+
+### Fixed
+
+- fix(build): retry cr open before review when resume finds no cr (#704)
+
+
 ## [v2.71.3] - 2026-09-26
 
 ### Fixed
