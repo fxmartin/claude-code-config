@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.72.0] - 2026-09-26
+
+### Added
+
+- feat(project-init): support gitlab-master repos (#697) (#720)
+
+
 ## [v2.71.12] - 2026-09-26
 
 ### Fixed
