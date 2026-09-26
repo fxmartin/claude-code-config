@@ -4971,12 +4971,21 @@ def render_coverage_prompt(
             f"{'passed' if precheck.tests_passed else 'FAILED'}; {measured} "
             f"(threshold {opts.coverage_threshold}%).\n"
         )
+    # Issue #614: a contained coverage stage has no network — the branch is
+    # already checked out in the story clone, so a `git fetch` can only fail.
+    fetch_step = (
+        "You are in a network-less sandbox: the branch is already checked out; "
+        "do not run git fetch/pull/push. Fill coverage gaps"
+        if _story_sandboxed(opts)
+        else "Fetch the branch, fill coverage gaps"
+    )
     return (
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
         + section_block
         + precheck_block
-        + "Fetch the branch, fill coverage gaps, then commit with this exact, "
+        + fetch_step
+        + ", then commit with this exact, "
         "conventional-commit-compliant message — do not alter it:\n"
         f"   {commit_header}\n"
         f"Commit locally; the controller pushes and opens the {cr_terms.abbr}. "

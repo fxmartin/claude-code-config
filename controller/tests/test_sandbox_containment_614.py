@@ -19,6 +19,7 @@ from sdlc.build import (
     create_story_sandbox_clone,
     is_sandbox_clone,
     render_build_prompt,
+    render_coverage_prompt,
     sync_sandbox_branch,
 )
 from sdlc.cohort import Story
@@ -452,6 +453,20 @@ def test_host_build_prompt_still_fetches(monkeypatch) -> None:
     monkeypatch.delenv(SANDBOX_ENV, raising=False)
     prompt = render_build_prompt(_story(), BuildOptions())
     assert "git fetch origin && git checkout -b feature/61.4-001 origin/main" in prompt
+    assert "network-less sandbox" not in prompt
+
+
+def test_sandboxed_coverage_prompt_does_not_fetch() -> None:
+    prompt = render_coverage_prompt(_story(), BuildOptions(sandbox=True))
+    assert "Fetch the branch" not in prompt
+    assert "already checked out" in prompt
+    assert "network-less sandbox" in prompt
+
+
+def test_host_coverage_prompt_still_fetches(monkeypatch) -> None:
+    monkeypatch.delenv(SANDBOX_ENV, raising=False)
+    prompt = render_coverage_prompt(_story(), BuildOptions())
+    assert "Fetch the branch, fill coverage gaps" in prompt
     assert "network-less sandbox" not in prompt
 
 
