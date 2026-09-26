@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.73.0] - 2026-09-26
+
+### Added
+
+- feat(development-queue): operator-declared limit reset — (#32.2-003) (#725)
+
+
 ## [v2.72.3] - 2026-09-26
 
 ### Fixed
