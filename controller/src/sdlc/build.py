@@ -5239,8 +5239,20 @@ def _run_merge_ci_gate(
     def _default_status() -> str | None:
         return build_issue.change_request_status(ledger, story.id, pr_number)
 
+    raw_status_fn = status_fn or _default_status
+
+    def _gated_status() -> str | None:
+        status = raw_status_fn()
+        if status == CR_FAILED:
+            view = build_issue.change_request_checks(ledger, story.id, pr_number)
+            if view is not None and _gate_red_others_pending(view):
+                # Issue #719: a red risk gate makes the rollup "failed" while other
+                # checks still run — keep polling so the gate-only park can apply.
+                return CR_PENDING
+        return status
+
     status, polls, waited = _poll_cr_status(
-        status_fn or _default_status,
+        _gated_status,
         timeout_s=opts.ci_gate_timeout_s,
         poll_s=opts.ci_gate_poll_s,
         sleep_fn=sleep_fn,
@@ -9368,6 +9380,19 @@ def _gate_only_block(view: ChangeRequestChecks) -> bool:
         status == CR_PENDING and name.strip().lower() not in _GATE_CHECK_NAMES
         for name, status in view.checks
     )
+
+
+def _gate_red_others_pending(view: ChangeRequestChecks) -> bool:
+    """True when the only red checks are the risk gate's and another check is pending.
+
+    Issue #719: the rollup reads ``failed`` as soon as the human gate is red, but
+    :func:`_gate_only_block` refuses to park while any other check is in flight.
+    The merge CI gate keeps polling in that state until the pending checks settle.
+    """
+    failing = [name for name, status in view.checks if status == CR_FAILED]
+    if not failing or any(n.strip().lower() not in _GATE_CHECK_NAMES for n in failing):
+        return False
+    return any(status == CR_PENDING for _, status in view.checks)
 
 
 def _merge_gate_only_block(

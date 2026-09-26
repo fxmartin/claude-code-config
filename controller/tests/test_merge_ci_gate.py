@@ -445,3 +445,98 @@ def test_merge_verdict_is_verified_against_the_forge(tmp_path, monkeypatch, cr, 
     monkeypatch.setattr(bi, "change_request_view", lambda *a, **k: cr)
     reason = _merge_unverified_reason(_ledger(tmp_path), _story(), 5)
     assert (reason is None) is expected_ok
+
+
+# --- issue #719: red risk gate + pending checks keeps polling ------------------
+
+_GATE = "High-risk file approval gate"
+
+
+def _patch_checks(monkeypatch, views):
+    """Serve successive ChangeRequestChecks views (last one repeats); count calls."""
+    seq = list(views)
+    calls = {"n": 0}
+
+    def fake(ledger, story_id, cr_ref, **_kw):
+        i = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return seq[i]
+
+    monkeypatch.setattr(bi, "change_request_checks", fake)
+    return calls
+
+
+def _view(*checks):
+    return ih.ChangeRequestChecks(labels=("risk:high",), checks=tuple(checks))
+
+
+def test_gate_keeps_polling_when_only_risk_gate_red_and_others_pending(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    _patch_checks(monkeypatch, [
+        _view((_GATE, ih.CR_FAILED), ("smoke", ih.CR_PENDING)),
+        _view((_GATE, ih.CR_FAILED), ("smoke", ih.CR_SUCCESS)),
+    ])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_FAILED, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.verdict == _GATE_BLOCK
+    assert gate.status == ih.CR_FAILED
+    assert gate.polls == 2
+
+
+def test_gate_blocks_immediately_when_a_real_check_is_red(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    _patch_checks(monkeypatch, [
+        _view((_GATE, ih.CR_FAILED), ("unit", ih.CR_FAILED), ("smoke", ih.CR_PENDING)),
+    ])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_FAILED, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.polls == 1
+    assert gate.status == ih.CR_FAILED
+
+
+def test_gate_blocks_immediately_when_checks_lookup_fails(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    _patch_checks(monkeypatch, [None])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_FAILED, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.polls == 1
+    assert gate.verdict == _GATE_BLOCK
+
+
+def test_gate_times_out_when_others_stay_pending(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    _patch_checks(monkeypatch, [_view((_GATE, ih.CR_FAILED), ("smoke", ih.CR_PENDING))])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_FAILED, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.verdict == _GATE_BLOCK
+    assert gate.status == ih.CR_PENDING
+    assert gate.polls > 1
+
+
+def test_gate_blocks_immediately_when_risk_gate_red_and_nothing_pending(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    _patch_checks(monkeypatch, [_view((_GATE, ih.CR_FAILED), ("smoke", ih.CR_SUCCESS))])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_FAILED, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.polls == 1
+    assert gate.status == ih.CR_FAILED
