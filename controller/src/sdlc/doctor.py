@@ -7,6 +7,7 @@ import json
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import tomllib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -29,7 +30,9 @@ __all__ = [
     "DEPENDENCIES",
     "Finding",
     "DoctorReport",
+    "base_ref_controller_version",
     "check_controller_version",
+    "self_update_controller",
     "check_deny_baseline",
     "check_glab_dependency",
     "check_harness_pin",
@@ -221,6 +224,129 @@ def _compare_versions(a: str, b: str) -> int:
     return -1 if va < vb else (1 if va > vb else 0)
 
 
+# Issue #709: the refs a repo's controller version is read from, in order. The
+# working tree is only the last resort — a merge parked on its feature branch
+# leaves the checkout there, and that branch's older `pyproject.toml` would
+# report the installed controller as "ahead" (and a reinstall from it would be
+# a downgrade).
+_BASE_REFS = ("origin/main", "main")
+_CONTROLLER_PYPROJECT = "controller/pyproject.toml"
+
+
+def _git_base_ref(repo_root: Path) -> str | None:
+    """The first of :data:`_BASE_REFS` that carries a controller pyproject."""
+    for ref in _BASE_REFS:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo_root), "cat-file", "-e",
+                 f"{ref}:./{_CONTROLLER_PYPROJECT}"],
+                capture_output=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode == 0:
+            return ref
+    return None
+
+
+def _declared_version(text: str) -> str | None:
+    try:
+        return str(tomllib.loads(text)["project"]["version"])
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+
+
+def base_ref_controller_version(repo_root: Path) -> str | None:
+    """The controller version ``repo_root``'s base ref declares, or None.
+
+    Reads committed history only (``git show``) — never the working tree, never
+    the network. None when ``repo_root`` is not a git repo or no base ref
+    carries a readable ``controller/pyproject.toml``.
+    """
+    ref = _git_base_ref(repo_root)
+    if ref is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{ref}:./{_CONTROLLER_PYPROJECT}"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _declared_version(proc.stdout) if proc.returncode == 0 else None
+
+
+def _run_install_script(tree: Path) -> bool:
+    """The real installer: `scripts/install-controller.sh` run from ``tree``."""
+    try:
+        proc = subprocess.run(
+            ["bash", str(tree / "scripts" / "install-controller.sh")],
+            cwd=tree, capture_output=True, timeout=600, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def self_update_controller(
+    repo_root: Path,
+    installed_version: str,
+    *,
+    installer: Callable[[Path], bool] = _run_install_script,
+    fetch: bool = True,
+) -> str | None:
+    """Reinstall the controller from ``repo_root``'s base ref when it is ahead.
+
+    Issue #709 — the remedy the version guard prints, applied by the queue
+    (`sdlc queue run --self-update`). Returns the version now installed, or
+    None when nothing was (or could be) installed.
+
+    * Only ever installs *forward*: a base ref at or behind
+      ``installed_version`` is left alone, so a checkout behind the installed
+      controller is never reinstalled from.
+    * Installs from a throwaway detached worktree of the base ref, never from
+      the working tree — which may be sitting on a parked feature branch.
+    * ``fetch`` first refreshes ``origin/main`` (best effort): the release
+      that bumps the version is cut remotely after a merge.
+    """
+    if _git_base_ref(repo_root) is None:
+        return None  # not this controller's source repo — nothing to fetch
+    if fetch:
+        try:
+            subprocess.run(
+                ["git", "-C", str(repo_root), "fetch", "--quiet", "origin", "main"],
+                capture_output=True, timeout=60, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # offline: decide on the refs we already have
+    target = base_ref_controller_version(repo_root)
+    ref = _git_base_ref(repo_root)
+    if target is None or ref is None or _compare_versions(installed_version, target) >= 0:
+        return None
+
+    tree = Path(tempfile.mkdtemp(prefix="sdlc-self-update-")) / "tree"
+    try:
+        added = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "add", "--quiet", "--detach",
+             str(tree), ref],
+            capture_output=True, timeout=60, check=False,
+        )
+        if added.returncode != 0:
+            return None
+        return target if installer(tree) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            subprocess.run(
+                ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(tree)],
+                capture_output=True, timeout=60, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # the rmtree below still drops the tree; `git worktree prune` reaps it
+        shutil.rmtree(tree.parent, ignore_errors=True)
+
+
 def check_controller_version(
     repo_root: Path, *, installed_version: str | None = None
 ) -> Finding:
@@ -232,8 +358,10 @@ def check_controller_version(
     code until someone notices the version badge. This makes the disagreement
     a visible, actionable finding instead.
 
-    Offline by construction: it reads only `repo_root/controller/pyproject.toml`
-    with `tomllib` — no network, no `gh`, no git fetch.
+    Offline by construction: it reads `controller/pyproject.toml` from the
+    repo's base ref (`origin/main`, else `main` — issue #709: a checkout parked
+    on an older feature branch must not read as behind), falling back to the
+    working tree outside git — no network, no `gh`, no git fetch.
 
     * A target repo with no `controller/pyproject.toml` (any project `sdlc` is
       pointed at that is not this framework) declares no controller version —
@@ -251,22 +379,24 @@ def check_controller_version(
     the test suite and local development invoke it.
     """
     name = "Installed controller vs checkout"
-    pyproject = repo_root / "controller" / "pyproject.toml"
-    if not pyproject.is_file():
-        return Finding(
-            "install", name, "CLEAN",
-            f"not applicable — no {pyproject} (not the sdlc framework checkout)",
-        )
-
     installed = installed_version if installed_version is not None else INSTALLED_VERSION
-    try:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        checkout = str(data["project"]["version"])
-    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
-        return Finding(
-            "install", name, "CLEAN",
-            f"not applicable — {pyproject} has no readable [project].version",
-        )
+    checkout = base_ref_controller_version(repo_root)
+    if checkout is None:
+        pyproject = repo_root / "controller" / "pyproject.toml"
+        if not pyproject.is_file():
+            return Finding(
+                "install", name, "CLEAN",
+                f"not applicable — no {pyproject} (not the sdlc framework checkout)",
+            )
+        try:
+            checkout = _declared_version(pyproject.read_text(encoding="utf-8"))
+        except OSError:
+            checkout = None
+        if checkout is None:
+            return Finding(
+                "install", name, "CLEAN",
+                f"not applicable — {pyproject} has no readable [project].version",
+            )
 
     if installed == checkout:
         return Finding(
