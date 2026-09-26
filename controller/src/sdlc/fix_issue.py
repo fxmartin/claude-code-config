@@ -82,6 +82,7 @@ from sdlc.dispatch import (
     ContextOverflowError,
     RateLimitError,
     dispatch_agent,
+    sandbox_enabled,
 )
 from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.issue_host import (
@@ -2057,6 +2058,19 @@ def _run_e2e(
 # ---------------------------------------------------------------------------
 
 
+# Issue #614: the container sandbox contains the writer stages of ``sdlc build``
+# only — each story gets a self-contained clone and the controller owns every
+# fetch/push. The fix pipeline has none of that wiring (its agents fetch, push
+# and open the CR themselves, in the shared root or a linked worktree), so under
+# ``$SDLC_SANDBOX`` every contained stage would refuse mid-run. Refuse up front
+# instead — never silently run the fix uncontained on the host.
+SANDBOX_UNSUPPORTED_REASON = (
+    "refused to start: $SDLC_SANDBOX is set, but `sdlc fix` does not support "
+    "the container sandbox yet (only `sdlc build` contains its writer stages); "
+    "unset SDLC_SANDBOX for this run or use `sdlc build --sandbox`"
+)
+
+
 def run_fix(
     opts: FixOptions,
     *,
@@ -2114,6 +2128,12 @@ def run_fix(
     # of always shelling out to `gh`.
     resolution = _resolve_fix_forge(root, opts.host)
     host, instance_url = resolution.host, resolution.instance_url
+
+    if sandbox_enabled():
+        return FixResult(
+            issue=opts.issue, aborted=True,
+            abort_reason=SANDBOX_UNSUPPORTED_REASON, status="ABORTED",
+        )
 
     # --- Fetch + stop conditions (no run row for a deliberate pre-run stop) ---
     try:
@@ -3026,6 +3046,8 @@ def run_fix_batch(
     check_dirty = dirty_check or (
         (lambda: dirty_tree_paths(root or Path.cwd())) if real_run else (lambda: [])
     )
+    if sandbox_enabled():
+        return FixBatchResult(status="ABORTED", summary=SANDBOX_UNSUPPORTED_REASON)
     if not batch.allow_dirty:
         dirty = check_dirty()
         if dirty:

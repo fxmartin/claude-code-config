@@ -541,23 +541,56 @@ def _is_context_overflow(text: str) -> bool:
 # config equivalent so an untrusted repo can default to sandboxed without the flag
 # — and so a *resumed* run honours it even before the flag is re-supplied.
 SANDBOX_ENV = "SDLC_SANDBOX"
-# The container image the agent runs inside. It must already contain ``claude``
-# (and the repo's toolchain); the controller never builds it. Default is a
-# conventional name the operator is expected to have built or pulled.
+# The container image the agent runs inside. Issue #614: the shipped default is
+# never a mutable tag. ``controller/sandbox/Containerfile`` is built per host
+# architecture by ``scripts/deploy.sh``, which records the resulting image id in
+# the bundled ``config/sandbox-image.yaml``; dispatch runs *that* id and nothing
+# else (``--pull never``). ``$SDLC_SANDBOX_IMAGE`` remains an explicit override.
 SANDBOX_IMAGE_ENV = "SDLC_SANDBOX_IMAGE"
-DEFAULT_SANDBOX_IMAGE = "sdlc-agent-sandbox:latest"
+SANDBOX_IMAGE_PIN_FILE = "sandbox-image.yaml"
+# A pinned value must be a content-addressed image id, so a tag can never slip in.
+_PINNED_IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# ``platform.machine()`` spellings → the OCI architecture names the pin file uses.
+_OCI_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+# Issue #614 scope: only the stages that *write code* are contained. Review keeps
+# the read-only deny floor (#685) on the host; merge stays on the host because it
+# needs forge auth. A commit-lint amend or envelope re-ask re-dispatches under
+# its originating stage's name, so it inherits that stage's containment.
+SANDBOXED_ROLES: frozenset[str] = frozenset({"build", "coverage", "bugfix"})
 # Force a specific container runtime; unset → auto-detect (podman, then docker).
 SANDBOX_RUNTIME_ENV = "SDLC_SANDBOX_RUNTIME"
-# Network mode for the container. Default ``none`` = no egress (AC1). The operator
-# can point this at a locked-down filtering network for the rare stage that
-# genuinely needs the API — "explicit allowlist only if a stage needs it" — but
-# the default keeps the agent fully off-network.
+# Network mode for the container. Issue #614, decision 2 (revised 2026-09-26):
+# the contained agent *is* the claude CLI and must reach the Anthropic API, so
+# the default is the runtime's ordinary ``bridge`` network. What this sandbox
+# delivers is FILESYSTEM containment — only the story clone is mounted, so the
+# #607 escape path does not exist in here. An operator who runs an egress proxy
+# can point this at it; an allowlisted egress network is a later story.
 SANDBOX_NETWORK_ENV = "SDLC_SANDBOX_NETWORK"
-DEFAULT_SANDBOX_NETWORK = "none"
+DEFAULT_SANDBOX_NETWORK = "bridge"
+# Issue #614: how the contained claude CLI signs in. The host's OAuth credentials
+# file (Linux keeps it on disk; the same Max subscription, rate-limit window and
+# cost accounting as host runs) is bind-mounted READ-ONLY into the container's
+# HOME (``/home/agent``, see controller/sandbox/Containerfile). Nothing else from
+# ``~/.claude`` goes in. When the file is absent — macOS keeps the token in the
+# Keychain — a token env var is forwarded instead; with neither, dispatch refuses
+# rather than launching an agent that cannot sign in.
+_SANDBOX_CREDENTIALS_FILE = ".claude/.credentials.json"
+_SANDBOX_HOME = "/home/agent"
+_SANDBOX_TOKEN_ENVS: tuple[str, ...] = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 # Runtimes tried, in order, when ``$SDLC_SANDBOX_RUNTIME`` is unset.
 _SANDBOX_RUNTIMES: tuple[str, ...] = ("podman", "docker")
 # Where the worktree is bind-mounted inside the container; the agent runs here.
 _SANDBOX_WORKDIR = "/workspace"
+# Issue #614: host package caches, bind-mounted read-only so dependency
+# resolution never has to reach a registry. Each entry is the host-side env var
+# that relocates the cache, its default under ``$HOME``, the in-container mount
+# point, and the env that points the in-container tool at it (offline).
+_SANDBOX_CACHES: tuple[tuple[str, str, str, dict[str, str]], ...] = (
+    ("UV_CACHE_DIR", ".cache/uv", "/cache/uv",
+     {"UV_CACHE_DIR": "/cache/uv", "UV_OFFLINE": "1"}),
+    ("npm_config_cache", ".npm", "/cache/npm",
+     {"npm_config_cache": "/cache/npm", "npm_config_offline": "true"}),
+)
 
 
 class SandboxUnavailableError(AgentDispatchError):
@@ -616,32 +649,58 @@ def sandbox_wrap(
     network: str = DEFAULT_SANDBOX_NETWORK,
     env: dict[str, str] | None = None,
     forward_env: tuple[str, ...] = (),
+    caches: tuple[Path | None, ...] = (),
+    credentials: Path | None = None,
 ) -> list[str]:
-    """Wrap ``cmd`` in a hardened, no-egress ``<runtime> run`` invocation (AC1).
+    """Wrap ``cmd`` in a hardened ``<runtime> run`` invocation (AC1).
 
     The worktree (``mount``) is bind-mounted at ``/workspace`` and becomes the
     agent's working directory, so branches/commits the agent makes land back in
     the host worktree and the ``<<<RESULT_JSON>>>`` envelope streams out over
     stdout exactly as on the host path (AC2 — the contract is unchanged). The
-    container has no network egress (``--network none`` by default), every Linux
+    container is on the runtime's ``bridge`` network by default (the agent must
+    reach the API; containment here is of the filesystem), has every Linux
     capability dropped (``--cap-drop ALL``), no privilege escalation
     (``--security-opt no-new-privileges``), and a non-root user matching the host
     uid/gid so mounted files stay owned by the operator. ``-i`` keeps stdin open so
     the prompt is delivered exactly as on the host path; ``--rm`` discards the
     container after the stage. ``forward_env`` names env vars (e.g. the
     thinking-token cap) to pass through into the container from ``env``.
+
+    Issue #614: ``--pull never`` means the runtime only ever runs an image
+    already on the host (the pinned build) — dispatch never fetches one.
+    ``caches`` are the host uv/npm cache directories (see
+    :func:`_host_sandbox_caches`), paired positionally with ``_SANDBOX_CACHES``
+    and mounted read-only with the tools pointed at them offline. ``credentials``
+    is the host's ``~/.claude/.credentials.json``, mounted read-only at the same
+    path under the container HOME so the CLI signs in as the operator.
     """
     uid = os.getuid() if hasattr(os, "getuid") else 0
     gid = os.getgid() if hasattr(os, "getgid") else 0
     argv = [
         runtime, "run", "--rm", "-i",
+        "--pull", "never",
         "--network", network,
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--user", f"{uid}:{gid}",
+    ]
+    # Rootless podman maps the host uid to container root, so ``--user uid:gid``
+    # alone sees the mounted clone as foreign-owned and git refuses it
+    # ("dubious ownership"). ``keep-id`` maps the operator to the same uid.
+    if Path(runtime).name == "podman":
+        argv += ["--userns", "keep-id"]
+    argv += [
         "-v", f"{Path(mount)}:{_SANDBOX_WORKDIR}:Z",
         "-w", _SANDBOX_WORKDIR,
     ]
+    for host_dir, (_, _, target, tool_env) in zip(caches, _SANDBOX_CACHES):
+        if host_dir is None:
+            continue
+        argv += ["-v", f"{Path(host_dir)}:{target}:ro,z"]
+        argv += [arg for item in tool_env.items() for arg in ("-e", "=".join(item))]
+    if credentials is not None:
+        argv += ["-v", f"{Path(credentials)}:{_SANDBOX_HOME}/{_SANDBOX_CREDENTIALS_FILE}:ro,z"]
     source = env if env is not None else os.environ
     for key in forward_env:
         value = source.get(key)
@@ -652,26 +711,132 @@ def sandbox_wrap(
     return argv
 
 
+def pinned_sandbox_image(arch: str | None = None) -> str | None:
+    """The deploy-recorded sandbox image id for ``arch``, or None when unpinned.
+
+    Reads the bundled ``config/sandbox-image.yaml`` that ``scripts/deploy.sh``
+    writes after building ``controller/sandbox/Containerfile`` (issue #614).
+    ``arch`` defaults to this host's; each host builds and pins its own. A value
+    that is not a ``sha256:<64 hex>`` image id is treated as unpinned, so a tag
+    (``:latest`` included) can never become the default by editing the file.
+    """
+    import platform
+
+    import yaml
+
+    from sdlc.role_routing import bundled_config_path
+
+    machine = arch or platform.machine()
+    key = _OCI_ARCH.get(machine.lower(), machine.lower())
+    path = bundled_config_path(SANDBOX_IMAGE_PIN_FILE)
+    if path is None:
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    value = str(data.get(key) or "").strip() if isinstance(data, dict) else ""
+    return value if _PINNED_IMAGE_RE.match(value) else None
+
+
+def _resolve_sandbox_image() -> str:
+    """``$SDLC_SANDBOX_IMAGE`` if set, else the pinned id — or refuse (#614)."""
+    override = os.environ.get(SANDBOX_IMAGE_ENV, "").strip()
+    if override:
+        return override
+    pinned = pinned_sandbox_image()
+    if pinned is None:
+        raise SandboxUnavailableError(
+            "sandbox requested but no pinned sandbox image is recorded for this "
+            f"host's architecture in {SANDBOX_IMAGE_PIN_FILE}; run "
+            f"scripts/deploy.sh to build and pin it, or set ${SANDBOX_IMAGE_ENV}"
+        )
+    return pinned
+
+
+def _check_sandbox_mount(mount: Path) -> None:
+    """Refuse a mount that would expose the primary checkout or its ``.git`` (#614).
+
+    The whole point of the sandbox is that only the story's own tree exists
+    inside the container. Two mounts break that:
+
+    * the controller's own checkout (the ``cwd=None`` shared-root path) or any
+      ancestor of it — that *is* the primary checkout, with its ``.git``;
+    * a linked ``git worktree``, whose ``.git`` is a file pointing into the
+      primary ``.git``. Git cannot work in it unless the primary ``.git`` is
+      mounted too, which is exactly what must never happen. Sandboxed stories
+      get a self-contained clone instead (``build.create_story_sandbox_clone``).
+
+    Raised before launch, so a misconfigured run refuses rather than degrades.
+    """
+    resolved = mount.resolve()
+    primary = Path.cwd().resolve()
+    if resolved == primary or resolved in primary.parents:
+        raise SandboxUnavailableError(
+            f"sandbox refused: mount {mount} is the primary checkout (or contains "
+            "it); a contained stage needs its own self-contained story clone"
+        )
+    if (mount / ".git").is_file():
+        raise SandboxUnavailableError(
+            f"sandbox refused: {mount} is a linked git worktree whose .git points "
+            "into the primary repository, which is never mounted; use a "
+            "self-contained story clone"
+        )
+
+
+def _host_sandbox_caches() -> tuple[Path | None, ...]:
+    """The host uv/npm cache dirs, positionally matching ``_SANDBOX_CACHES``.
+
+    A cache absent on the host is skipped (``None`` placeholder keeps the
+    pairing), so the mount never creates a directory on the host.
+    """
+    found: list[Path | None] = []
+    for env_var, default, _, _ in _SANDBOX_CACHES:
+        raw = os.environ.get(env_var, "").strip()
+        path = Path(raw).expanduser() if raw else Path.home() / default
+        found.append(path if path.is_dir() else None)
+    return tuple(found)
+
+
+def _host_sandbox_credentials() -> Path | None:
+    """The host's claude OAuth credentials file, or None when it is not on disk."""
+    path = Path.home() / _SANDBOX_CREDENTIALS_FILE
+    return path if path.is_file() else None
+
+
 def _apply_sandbox(
     cmd: list[str], *, cwd: Path | None, env: dict[str, str] | None
 ) -> list[str]:
-    """Resolve sandbox config and wrap ``cmd``; fail fast if no runtime (AC3).
+    """Resolve sandbox config and wrap ``cmd``; fail fast if it cannot contain (AC3).
 
     Reads the runtime (auto-detected or ``$SDLC_SANDBOX_RUNTIME``), image
-    (``$SDLC_SANDBOX_IMAGE`` → :data:`DEFAULT_SANDBOX_IMAGE`), and network mode
-    (``$SDLC_SANDBOX_NETWORK`` → ``none``) from the environment. The bind mount is
-    the per-story worktree ``cwd`` (the controller's concurrency unit); ``None``
-    falls back to the current directory. The thinking-token cap, when set on the
-    dispatch ``env``, is forwarded into the container so the in-sandbox agent
-    honours the same ``MAX_THINKING_TOKENS`` bound as the host path.
+    (``$SDLC_SANDBOX_IMAGE`` → the deploy-pinned image id, issue #614), and
+    network mode (``$SDLC_SANDBOX_NETWORK`` → ``bridge``) from the environment.
+    The bind mount is the per-story clone ``cwd``; ``None`` would mean the
+    primary checkout and is refused (:func:`_check_sandbox_mount`). The
+    thinking-token cap, when set on the dispatch ``env``, is forwarded into the
+    container so the in-sandbox agent honours the same ``MAX_THINKING_TOKENS``
+    bound as the host path.
     """
     runtime = detect_container_runtime()
-    image = os.environ.get(SANDBOX_IMAGE_ENV, "").strip() or DEFAULT_SANDBOX_IMAGE
+    image = _resolve_sandbox_image()
     network = os.environ.get(SANDBOX_NETWORK_ENV, "").strip() or DEFAULT_SANDBOX_NETWORK
     mount = Path(cwd) if cwd is not None else Path.cwd()
+    _check_sandbox_mount(mount)
+    credentials = _host_sandbox_credentials()
+    source = env if env is not None else os.environ
+    if credentials is None and not any(source.get(k) for k in _SANDBOX_TOKEN_ENVS):
+        raise SandboxUnavailableError(
+            "sandbox requested but there are no agent credentials to pass in: "
+            f"~/{_SANDBOX_CREDENTIALS_FILE} is not on disk and neither "
+            f"${_SANDBOX_TOKEN_ENVS[0]} nor ${_SANDBOX_TOKEN_ENVS[1]} is set — the "
+            "contained claude CLI could not sign in (on macOS the OAuth token lives "
+            f"in the Keychain: export {_SANDBOX_TOKEN_ENVS[0]})"
+        )
     return sandbox_wrap(
         cmd, runtime=runtime, image=image, mount=mount, network=network,
-        env=env, forward_env=(THINKING_CAP_ENV,),
+        env=env, forward_env=(THINKING_CAP_ENV, *_SANDBOX_TOKEN_ENVS),
+        caches=_host_sandbox_caches(), credentials=credentials,
     )
 
 
@@ -728,6 +893,29 @@ def _parse_envelope(stdout: str) -> dict[str, Any] | None:
     if isinstance(env, dict) and env.get("type") == "result" and "result" in env:
         return env
     return None
+
+
+# Issue #614: in a sandboxed run the host-side stages (review, merge) run in
+# the story clone, whose working tree the contained agent wrote. Claude Code
+# loads ``.claude/settings.json`` hooks and ``.mcp.json`` servers from its cwd,
+# so a committed hook would execute on the host with full network and
+# filesystem. Loading user settings only, with no project MCP config, closes
+# that route back out of the sandbox.
+HOST_STAGE_ISOLATION_FLAGS: tuple[str, ...] = (
+    "--setting-sources", "user", "--strict-mcp-config",
+)
+
+
+def _isolate_host_stage(cmd: list[str]) -> list[str]:
+    """Append :data:`HOST_STAGE_ISOLATION_FLAGS` to a ``claude`` command.
+
+    Applied to any ``claude`` invocation, including an ``$SDLC_AGENT_CMD`` or
+    explicit override, because the risk is the cwd, not the posture the
+    operator chose. A non-claude harness is returned unchanged.
+    """
+    if not cmd or Path(cmd[0]).name != "claude" or "--setting-sources" in cmd:
+        return cmd
+    return [*cmd, *HOST_STAGE_ISOLATION_FLAGS]
 
 
 def dispatch_agent(
@@ -787,6 +975,9 @@ def dispatch_agent(
     present, dispatch fails fast with :class:`SandboxUnavailableError` rather than
     running unsandboxed (AC3). The result contract is identical to the host path
     (AC2). Default (``None`` with the env unset) is the host path, unchanged.
+    Issue #614: only :data:`SANDBOXED_ROLES` (build/coverage/bugfix) are wrapped;
+    review and merge always run on the host, with project settings and MCP
+    config ignored (:func:`_isolate_host_stage`) since the clone is untrusted.
 
     ``parser`` (Story 20.1-002) is the id of the per-harness output parser used to
     interpret the agent's stdout into the validated result. ``None`` selects the
@@ -797,8 +988,13 @@ def dispatch_agent(
     """
     cmd = resolve_agent_cmd(agent_cmd, model=model, role=agent_type)
     env = _dispatch_env(thinking_cap)
+    # Issue #614: only the code-writing roles are contained; review and merge
+    # stay on the host (read-only deny floor / forge auth) even when enabled.
     if sandbox_enabled(sandbox):
-        cmd = _apply_sandbox(cmd, cwd=cwd, env=env)
+        if agent_type in SANDBOXED_ROLES:
+            cmd = _apply_sandbox(cmd, cwd=cwd, env=env)
+        else:
+            cmd = _isolate_host_stage(cmd)
     # Story 13.3-001: the agent runs under --dangerously-skip-permissions, so any
     # untrusted text woven into the prompt (story bodies, issue/PR comments) is a
     # prompt-injection surface. Sanitize the assembled prompt at this single

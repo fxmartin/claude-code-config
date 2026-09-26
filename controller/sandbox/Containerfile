@@ -1,0 +1,44 @@
+# ABOUTME: The container a contained sdlc writer stage (build/coverage/bugfix) runs in.
+# ABOUTME: Built per host arch by scripts/deploy.sh, which pins the resulting image id.
+#
+# Issue #614: with SDLC_SANDBOX=1 the controller runs writer agents inside this
+# image with only the story's self-contained clone bind-mounted at /workspace,
+# every capability dropped and the host uid:gid. A path outside the story tree
+# (the #607 escape) simply does not exist in here. The container sits on the
+# runtime's bridge network — the agent is the claude CLI and must reach the
+# API — and signs in with the host's ~/.claude/.credentials.json, bind-mounted
+# read-only under HOME (or a forwarded CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY).
+#
+# Toolchain: git, bats, python3 + uv, node + npm, and the claude CLI. Host uv
+# and npm caches are bind-mounted read-only at /cache/{uv,npm} at dispatch, so
+# dependency resolution works offline.
+#
+# The base and tool versions are build args so a host can bump them
+# deliberately; the *result* is what dispatch pins, by image id, in
+# controller/src/sdlc/config/sandbox-image.yaml.
+ARG NODE_IMAGE=docker.io/library/node:22-bookworm-slim
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.8
+
+FROM ${UV_IMAGE} AS uv
+
+FROM ${NODE_IMAGE}
+ARG CLAUDE_CODE_VERSION=latest
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bats ca-certificates git python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+ && npm cache clean --force
+
+# The agent runs as the host operator's uid:gid, which has no passwd entry
+# here; give it a writable HOME so the claude CLI and git can keep state.
+# ~/.claude is pre-created so the read-only credentials bind mount lands in a
+# directory the CLI can still write its own state next to.
+RUN mkdir -p /home/agent/.claude && chmod 1777 /home/agent /home/agent/.claude
+ENV HOME=/home/agent
+
+WORKDIR /workspace

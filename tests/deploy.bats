@@ -47,6 +47,28 @@ printf '%s\n' "\$*" >"${PLUGIN_MARKER}"
 echo plugin >>"${ORDER_LOG}"
 EOF
     chmod +x "${STUB_BIN}/claude"
+
+    # Stub container runtime for the sandbox-image step (issue #614), injected
+    # via the SANDBOX_RUNTIME seam so no suite run ever builds a real image.
+    # `build` records its argv; `image inspect` prints a podman-style bare id.
+    SANDBOX_MARKER="${TMP}/sandbox-built"
+    FAKE_ID="$(printf 'd%.0s' $(seq 64))"
+    cat >"${STUB_BIN}/fake-runtime" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  build) printf '%s\n' "\$*" >"${SANDBOX_MARKER}"; echo sandbox >>"${ORDER_LOG}" ;;
+  image) echo "\${FAKE_IMAGE_ID:-${FAKE_ID}}" ;;
+esac
+EOF
+    chmod +x "${STUB_BIN}/fake-runtime"
+
+    # A throwaway copy of the pin file, so the repo's real pin is never touched.
+    PIN_FILE="${TMP}/sandbox-image.yaml"
+    printf '# pins\namd64:\narm64:\n' >"${PIN_FILE}"
+    case "$(uname -m)" in
+        x86_64|amd64) ARCH=amd64 ;;
+        aarch64|arm64) ARCH=arm64 ;;
+    esac
 }
 
 teardown() {
@@ -57,6 +79,8 @@ teardown() {
 _run_deploy() {
     run env \
         INSTALL_CONTROLLER="${FAKE_INSTALL_CONTROLLER}" \
+        SANDBOX_RUNTIME="${STUB_BIN}/fake-runtime" \
+        SANDBOX_PIN_FILE="${PIN_FILE}" \
         PATH="${STUB_BIN}:${PATH}" \
         bash "${DEPLOY}" "$@"
 }
@@ -67,6 +91,8 @@ _run_deploy() {
 _run_deploy_without_claude() {
     run env \
         INSTALL_CONTROLLER="${FAKE_INSTALL_CONTROLLER}" \
+        SANDBOX_RUNTIME="${STUB_BIN}/fake-runtime" \
+        SANDBOX_PIN_FILE="${PIN_FILE}" \
         PATH="/usr/bin:/bin" \
         bash "${DEPLOY}" "$@"
 }
@@ -215,8 +241,9 @@ _run_deploy_without_claude() {
     _run_deploy
     [ "$status" -eq 0 ]
     run cat "${ORDER_LOG}"
-    [ "${lines[0]}" = "plugin" ]
-    [ "${lines[1]}" = "controller" ]
+    [ "${lines[0]}" = "sandbox" ]
+    [ "${lines[1]}" = "plugin" ]
+    [ "${lines[2]}" = "controller" ]
 }
 
 @test "a failing plugin update aborts before the controller install" {
@@ -246,4 +273,133 @@ EOF
     [ -e "${PLUGIN_MARKER}" ]
     [[ "$output" == *"re-run"* ]]
     [[ "$output" == *"restart"* ]]
+}
+
+# --- Sandbox image (issue #614) ---------------------------------------------
+# deploy.sh builds controller/sandbox/Containerfile and pins the resulting image
+# id for this host's arch. The pin is controller package data, so the build runs
+# before the controller install; and before the plugin, so a failed build (a
+# base-image pull, npm) leaves the machine untouched.
+
+@test "default run builds the sandbox image from the repo Containerfile" {
+    _run_deploy
+    [ "$status" -eq 0 ]
+    run cat "${SANDBOX_MARKER}"
+    [[ "$output" == *"build"* ]]
+    [[ "$output" == *"controller/sandbox/Containerfile"* ]]
+}
+
+@test "the pinned id is recorded for this host's arch, sha256-prefixed" {
+    _run_deploy
+    [ "$status" -eq 0 ]
+    run grep "^${ARCH}:" "${PIN_FILE}"
+    [ "$output" = "${ARCH}: sha256:${FAKE_ID}" ]
+}
+
+@test "the other arch's pin is left untouched" {
+    other=arm64; [ "${ARCH}" = arm64 ] && other=amd64
+    other_pin="sha256:$(printf 'c%.0s' $(seq 64))"
+    printf '%s: %s\n' "${other}" "${other_pin}" >>"${PIN_FILE}"
+    _run_deploy
+    [ "$status" -eq 0 ]
+    run grep "^${other}: sha256" "${PIN_FILE}"
+    [ "$output" = "${other}: ${other_pin}" ]
+    run grep -c "^${ARCH}:" "${PIN_FILE}"
+    [ "$output" = "1" ]
+}
+
+@test "the pin is host-local: it leaves no dirty tree to commit" {
+    git init -q "${TMP}/repo"
+    PIN_FILE="${TMP}/repo/sandbox-image.yaml"
+    printf '# pins\namd64:\narm64:\n' >"${PIN_FILE}"
+    git -C "${TMP}/repo" add sandbox-image.yaml
+    git -C "${TMP}/repo" -c user.name=t -c user.email=t@example.com commit -qm "chore: pins"
+    _run_deploy
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"— commit"* ]]
+    [[ "$output" == *"do not commit"* ]]
+    run grep "^${ARCH}:" "${PIN_FILE}"
+    [ "$output" = "${ARCH}: sha256:${FAKE_ID}" ]
+    run git -C "${TMP}/repo" status --porcelain
+    [ -z "$output" ]
+}
+
+@test "a docker-style sha256-prefixed id is not double-prefixed" {
+    FAKE_IMAGE_ID="sha256:${FAKE_ID}" _run_deploy
+    [ "$status" -eq 0 ]
+    run grep "^${ARCH}:" "${PIN_FILE}"
+    [ "$output" = "${ARCH}: sha256:${FAKE_ID}" ]
+}
+
+@test "a malformed image id fails before the plugin or controller move" {
+    FAKE_IMAGE_ID="not-an-id" _run_deploy
+    [ "$status" -ne 0 ]
+    [ ! -e "${PLUGIN_MARKER}" ]
+    [ ! -e "${CONTROLLER_MARKER}" ]
+    run grep -c "sha256" "${PIN_FILE}"
+    [ "$output" = "0" ]
+}
+
+@test "a failing image build aborts with the machine untouched" {
+    printf '#!/usr/bin/env bash\nexit 1\n' >"${STUB_BIN}/fake-runtime"
+    _run_deploy
+    [ "$status" -ne 0 ]
+    [ ! -e "${PLUGIN_MARKER}" ]
+    [ ! -e "${CONTROLLER_MARKER}" ]
+}
+
+@test "--skip-sandbox-image skips the build and leaves the pin alone" {
+    _run_deploy --skip-sandbox-image
+    [ "$status" -eq 0 ]
+    [ ! -e "${SANDBOX_MARKER}" ]
+    [ -e "${CONTROLLER_MARKER}" ]
+    run grep -c "sha256" "${PIN_FILE}"
+    [ "$output" = "0" ]
+}
+
+@test "--plugin-only never builds the sandbox image" {
+    _run_deploy --plugin-only
+    [ "$status" -eq 0 ]
+    [ ! -e "${SANDBOX_MARKER}" ]
+}
+
+@test "--dry-run reports the sandbox build but builds nothing" {
+    _run_deploy --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"would run"*"build"* ]]
+    [ ! -e "${SANDBOX_MARKER}" ]
+    run grep -c "sha256" "${PIN_FILE}"
+    [ "$output" = "0" ]
+}
+
+@test "a forced runtime that is missing fails preflight" {
+    run env \
+        INSTALL_CONTROLLER="${FAKE_INSTALL_CONTROLLER}" \
+        SANDBOX_RUNTIME="${TMP}/no-such-runtime" \
+        SANDBOX_PIN_FILE="${PIN_FILE}" \
+        PATH="${STUB_BIN}:${PATH}" \
+        bash "${DEPLOY}"
+    [ "$status" -ne 0 ]
+    [ ! -e "${PLUGIN_MARKER}" ]
+    [ ! -e "${CONTROLLER_MARKER}" ]
+}
+
+@test "no container runtime on PATH skips the image and still deploys" {
+    # A PATH holding only the stubs and the few tools deploy.sh needs, so a real
+    # podman/docker on the host cannot be auto-detected.
+    MINBIN="${TMP}/minbin"
+    mkdir -p "${MINBIN}"
+    for tool in bash env dirname sed awk uname mktemp mv cat touch; do
+        ln -s "$(command -v "${tool}")" "${MINBIN}/${tool}"
+    done
+    ln -s "${STUB_BIN}/claude" "${MINBIN}/claude"
+    run env -u SANDBOX_RUNTIME \
+        INSTALL_CONTROLLER="${FAKE_INSTALL_CONTROLLER}" \
+        SANDBOX_PIN_FILE="${PIN_FILE}" \
+        PATH="${MINBIN}" \
+        "${MINBIN}/bash" "${DEPLOY}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"sandbox image not built"* ]]
+    [ -e "${CONTROLLER_MARKER}" ]
+    [ -e "${PLUGIN_MARKER}" ]
 }

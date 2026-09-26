@@ -59,7 +59,9 @@ from sdlc.dispatch import (
     AgentResult,
     ContextOverflowError,
     RateLimitError,
+    SandboxUnavailableError,
     dispatch_agent,
+    sandbox_enabled,
 )
 from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.predictor import (
@@ -4346,8 +4348,8 @@ def _resolve_dispatch(
     dispatch = dispatcher or default
     if dispatcher is None and opts.thinking_cap:
         dispatch = functools.partial(dispatch, thinking_cap=opts.thinking_cap)
-    # Story 13.4-002: bind the container-sandbox flag onto the real seam so every
-    # stage's dispatch (build/coverage/review/merge/bugfix/reask) runs inside the
+    # Story 13.4-002: bind the container-sandbox flag onto the real seam; dispatch
+    # then contains the writer stages (build/coverage/bugfix — issue #614) in the
     # no-egress container. Only the real default seam is wrapped (an injected fake
     # owns its own signature); off → the seam is returned unchanged (host path).
     if dispatcher is None and opts.sandbox:
@@ -4799,20 +4801,33 @@ def render_build_prompt(
     request targets. Both default to GitHub's wording, so the GitHub path is
     byte-identical to today (AC2).
     """
+    # Issue #614: a contained build has no network — the controller already ran
+    # `git fetch origin` on the host before cutting the story clone, and it (not
+    # the agent) pushes and opens the change request, even with --skip-coverage.
+    sandboxed = _story_sandboxed(opts)
+    agent_opens_cr = opts.skip_coverage and not sandboxed
     # Only inject the close-link when the build agent itself opens the change request.
     close_hint = (
         _close_link_instruction(close_link, cr_terms=cr_terms)
-        if opts.skip_coverage
+        if agent_opens_cr
+        else ""
+    )
+    fetch = "" if sandboxed else "git fetch origin && "
+    sandbox_note = (
+        "   You are in a network-less sandbox: the controller already fetched "
+        f"{base_ref}; do not run git fetch/pull/push. If the story genuinely "
+        "needs the internet, emit BUILD_STATUS: FAILED and say so.\n"
+        if sandboxed
         else ""
     )
     push = (
         f"6. Push and create {cr_terms.abbr}{cr_terms.cli_hint}; "
         f"include the {cr_terms.ref_noun} in the result block."
-        if opts.skip_coverage
+        if agent_opens_cr
         # Story 27.3-001: the controller pushes and opens the change request
         # deterministically once the coverage gate completes — no agent does.
         else f"6. Commit locally; the controller pushes and opens the {cr_terms.abbr} "
-        "after the coverage gate."
+        + ("after the coverage gate." if not opts.skip_coverage else "before review.")
     )
     # Story 18.3-001: keep user-facing docs current with each story. When the
     # documentation-currency lens is enabled (the default), instruct the build
@@ -4863,11 +4878,12 @@ def render_build_prompt(
         # ``git checkout -b feature/<id>`` lets the branch stack on a previous
         # story's leftover feature branch, so a later successful merge can
         # transitively land the earlier (parked) story's commits on the base.
-        f"1. Create branch: git fetch origin && git checkout -b feature/{story.id} {base_ref}\n"
+        f"1. Create branch: {fetch}git checkout -b feature/{story.id} {base_ref}\n"
+        + sandbox_note
         # Issue #214: if the branch cannot be created (it already exists, a worktree
         # conflict, etc.) the agent must NOT fall back to committing story work on the
         # currently checked-out branch (typically main). Fail the build immediately.
-        f"   If branch creation fails for any reason, emit BUILD_STATUS: FAILED "
+        + f"   If branch creation fails for any reason, emit BUILD_STATUS: FAILED "
         "immediately and do not commit on the current branch or any other branch.\n"
         # Issue #590: git answers a checkout on a dirty tree with "commit your
         # changes or stash them", and agents have taken the hint — a bare
@@ -4956,12 +4972,21 @@ def render_coverage_prompt(
             f"{'passed' if precheck.tests_passed else 'FAILED'}; {measured} "
             f"(threshold {opts.coverage_threshold}%).\n"
         )
+    # Issue #614: a contained coverage stage has no network — the branch is
+    # already checked out in the story clone, so a `git fetch` can only fail.
+    fetch_step = (
+        "You are in a network-less sandbox: the branch is already checked out; "
+        "do not run git fetch/pull/push. Fill coverage gaps"
+        if _story_sandboxed(opts)
+        else "Fetch the branch, fill coverage gaps"
+    )
     return (
         f"Coverage gate for story {story.id}: {story.title}.\n"
         f"Branch: feature/{story.id}. Threshold: {opts.coverage_threshold}%.\n"
         + section_block
         + precheck_block
-        + "Fetch the branch, fill coverage gaps, then commit with this exact, "
+        + fetch_step
+        + ", then commit with this exact, "
         "conventional-commit-compliant message — do not alter it:\n"
         f"   {commit_header}\n"
         f"Commit locally; the controller pushes and opens the {cr_terms.abbr}. "
@@ -6255,6 +6280,253 @@ def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
     return path
 
 
+# --- Issue #614: self-contained story clones for the container sandbox -------
+#
+# A linked worktree's ``.git`` is a file pointing into the primary ``.git``, so
+# git only works inside it if the primary ``.git`` is visible too — and the
+# sandbox must never mount it. A contained story therefore gets a standalone
+# ``git clone --local --no-hardlinks`` instead: objects are copied, never
+# hardlinked (a hardlinked object is the *same inode* as the primary's, so the
+# contained agent could overwrite it) and there are no alternates back into the
+# primary. ``origin`` keeps the real forge URL for the host-side push/merge
+# stages, and its remote-tracking refs are copied from the primary right after
+# the controller's own host-side ``git fetch origin``. The clone's ``.git`` is
+# writable by the contained agent, yet the controller (and the host-side
+# review/merge agents) later run git in it; :func:`reset_sandbox_clone_git`
+# rebuilds its config and hooks from trusted state after every contained
+# dispatch so nothing planted there ever executes on the host. The
+# ``sandbox-`` prefix keeps it clear of the ``agent-*`` orphan sweeper, and
+# living under ``_WORKTREE_SUBDIR`` keeps it out of the #607 fingerprint.
+_SANDBOX_CLONE_PREFIX = "sandbox-"
+
+
+def _git_slow(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """``git`` with a clone/fetch-sized ceiling (the 10s :func:`_git` is too tight)."""
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=300,
+    )
+
+
+def is_sandbox_clone(path: Path | None) -> bool:
+    """True when ``path`` is a self-contained story clone (its ``.git`` is a dir)."""
+    return path is not None and (Path(path) / ".git").is_dir()
+
+
+def create_story_sandbox_clone(root: Path, story_id: str, run_id: str) -> Path:
+    """Create (or re-attach) a story's self-contained clone for the sandbox (#614).
+
+    Detached at the same base :func:`create_story_worktree` would use, so the
+    build agent cuts ``feature/<id>`` inside it without ever fetching. Carries
+    the operator's git identity (the container has no ``~/.gitconfig``). A
+    directory that is already a clone is re-attached verbatim so a resumed story
+    keeps its in-flight commits. Raises :class:`WorktreeError` on any failure,
+    after removing the partial clone.
+    """
+    worktrees_dir = root.joinpath(*_WORKTREE_SUBDIR)
+    short_run = run_id.split("-")[0]
+    path = worktrees_dir / f"{_SANDBOX_CLONE_PREFIX}{short_run}-{story_id}"
+    if is_sandbox_clone(path):
+        reset_sandbox_clone_git(root, path)
+        return path
+    try:
+        worktrees_dir.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        base = _base_ref(root) or "HEAD"
+        base_sha = _git(root, "rev-parse", "--verify", f"{base}^{{commit}}")
+        if base_sha.returncode != 0:
+            raise WorktreeError(f"cannot resolve base {base!r} for {story_id}")
+        origin_url = _git(root, "remote", "get-url", "origin").stdout.strip()
+        origin_head = _git(
+            root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"
+        ).stdout.strip()
+        steps: list[tuple[Path, tuple[str, ...]]] = [
+            (root, (
+                "clone", "--local", "--no-hardlinks", "--no-checkout", "--quiet",
+                str(root), str(path),
+            )),
+            # Drop the clone's view of the *primary's* branches as origin/*.
+            (path, ("remote", "remove", "origin")),
+        ]
+        if origin_url:
+            steps += [
+                (path, ("remote", "add", "origin", origin_url)),
+                # The primary's freshly-fetched origin/* refs, minus the symref.
+                (path, (
+                    "fetch", "--no-tags", "--quiet", str(root),
+                    "+refs/remotes/origin/*:refs/remotes/origin/*",
+                    "^refs/remotes/origin/HEAD",
+                )),
+            ]
+        if origin_url and origin_head:
+            steps.append((path, ("symbolic-ref", "refs/remotes/origin/HEAD", origin_head)))
+        for key in ("user.name", "user.email"):
+            value = _git(root, "config", "--get", key).stdout.strip()
+            if value:
+                steps.append((path, ("config", key, value)))
+        # A story re-entered after its clone was torn down (build already DONE)
+        # resumes on the branch the primary holds, not on a bare base.
+        branch = f"feature/{story_id}"
+        if _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
+            steps += [
+                (path, ("fetch", "--no-tags", "--quiet", str(root),
+                        f"+refs/heads/{branch}:refs/heads/{branch}")),
+                (path, ("checkout", "--quiet", branch)),
+            ]
+        else:
+            steps.append((path, ("checkout", "--quiet", "--detach", base_sha.stdout.strip())))
+        for cwd, args in steps:
+            res = _git_slow(cwd, *args)
+            if res.returncode != 0:
+                raise WorktreeError(
+                    f"sandbox clone for {story_id} failed at `git {args[0]}`: "
+                    f"{res.stderr.strip()}"
+                )
+    except (OSError, subprocess.SubprocessError, WorktreeError) as exc:
+        shutil.rmtree(path, ignore_errors=True)
+        if isinstance(exc, WorktreeError):
+            raise
+        raise WorktreeError(f"sandbox clone for {story_id} failed: {exc}") from exc
+    return path
+
+
+# Gitdir entries that make git read config, hooks or objects from somewhere
+# other than the clone's own trusted files; none is ever created by the clone.
+_SANDBOX_GITDIR_REDIRECTS = ("commondir", "config.worktree", "objects/info/alternates")
+
+
+def _trusted_clone_config(root: Path) -> str:
+    """The clone's ``.git/config``, rebuilt from the primary's trusted values only."""
+    object_format = _git(root, "rev-parse", "--show-object-format").stdout.strip() or "sha1"
+    lines = [
+        "[core]",
+        f"\trepositoryformatversion = {0 if object_format == 'sha1' else 1}",
+        "\tbare = false",
+        "\tlogallrefupdates = true",
+    ]
+    filemode = _git(root, "config", "--get", "core.filemode").stdout.strip()
+    if filemode:
+        lines.append(f"\tfilemode = {filemode}")
+    if object_format != "sha1":
+        lines += ["[extensions]", f"\tobjectformat = {object_format}"]
+    origin_url = _git(root, "remote", "get-url", "origin").stdout.strip()
+    if origin_url:
+        lines += [
+            '[remote "origin"]',
+            f"\turl = {json.dumps(origin_url, ensure_ascii=False)}",
+            "\tfetch = +refs/heads/*:refs/remotes/origin/*",
+        ]
+    identity = [
+        (key, _git(root, "config", "--get", f"user.{key}").stdout.strip())
+        for key in ("name", "email")
+    ]
+    if any(value for _, value in identity):
+        lines.append("[user]")
+        lines += [
+            f"\t{key} = {json.dumps(value, ensure_ascii=False)}"
+            for key, value in identity if value
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def reset_sandbox_clone_git(root: Path, clone: Path) -> None:
+    """Rebuild a story clone's git config and hooks from trusted state (#614).
+
+    The clone is mounted read-write into the container, ``.git`` included, so a
+    contained agent can plant a hook, ``core.sshCommand``/``core.fsmonitor``/
+    ``core.hooksPath``/``credential.helper``, an ``[include]`` or a
+    ``commondir`` redirect — all of which would run on the *host* the next time
+    the controller pushes from the clone or a host-side review/merge agent runs
+    git there. This discards every such lever: ``.git/config`` is rewritten
+    from the primary's trusted values, ``hooks/`` is emptied and the gitdir
+    redirects are deleted. Refs, objects and the index (the agent's actual
+    work) are untouched. A ``.git`` that is no longer a real directory (swapped
+    for a symlink or a gitfile), or whose ``objects``/``refs`` became symlinks, is
+    refused with :class:`SandboxUnavailableError`
+    rather than trusted.
+    """
+    gitdir = Path(clone) / ".git"
+    # A symlinked objects/ or refs/ would point host-side git at an arbitrary
+    # host directory, so it is refused along with a swapped .git.
+    if (
+        gitdir.is_symlink() or not gitdir.is_dir()
+        or any((gitdir / sub).is_symlink() for sub in ("objects", "refs"))
+    ):
+        raise SandboxUnavailableError(
+            f"sandbox clone {clone} refused: its .git is no longer a plain "
+            "directory, so host-side git there cannot be trusted"
+        )
+    try:
+        config = gitdir / "config"
+        tmp = gitdir / "config.sdlc-trusted"
+        tmp.unlink(missing_ok=True)
+        tmp.write_text(_trusted_clone_config(root), encoding="utf-8")
+        os.replace(tmp, config)
+        hooks = gitdir / "hooks"
+        if hooks.is_symlink() or hooks.is_file():
+            hooks.unlink()
+        elif hooks.is_dir():
+            shutil.rmtree(hooks)
+        hooks.mkdir()
+        for rel in _SANDBOX_GITDIR_REDIRECTS:
+            target = gitdir / rel
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SandboxUnavailableError(
+            f"sandbox clone {clone} refused: could not reset its git config/hooks ({exc})"
+        ) from exc
+
+
+def sync_sandbox_branch(root: Path, clone: Path, story_id: str) -> bool:
+    """Fetch ``feature/<id>`` from a story clone back into the primary (#614).
+
+    Runs on the host after every contained dispatch, so the primary sees the
+    branch exactly as it would with a linked worktree (R10 artifact probes,
+    reconcile, teardown). A clone with no such branch yet is a no-op success.
+    Returns False — never raises — when the fetch fails (e.g. the operator has
+    that branch checked out) or the clone's git cannot be reset to trusted state
+    first, so the caller can keep the clone rather than lose unpushed commits.
+    """
+    branch = f"refs/heads/feature/{story_id}"
+    try:
+        reset_sandbox_clone_git(root, clone)
+    except SandboxUnavailableError:
+        return False
+    try:
+        if _git(clone, "rev-parse", "--verify", "--quiet", branch).returncode != 0:
+            return True
+        res = _git_slow(root, "fetch", "--no-tags", "--quiet", str(clone), f"+{branch}:{branch}")
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
+
+
+def _syncing_dispatch(dispatch: Callable[..., Any], root: Path, clone: Path, story_id: str):
+    """Wrap ``dispatch`` so each call is followed by :func:`sync_sandbox_branch`.
+
+    The clone's git is reset to trusted state first, and a clone that cannot be
+    reset fails the stage loud (:class:`SandboxUnavailableError`) — the next
+    host-side git in it (push, review, merge) must never meet a planted hook.
+    """
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return dispatch(*args, **kwargs)
+        finally:
+            reset_sandbox_clone_git(root, clone)
+            sync_sandbox_branch(root, clone, story_id)
+
+    return run
+
+
+def _story_sandboxed(opts: "BuildOptions") -> bool:
+    """Whether this run contains its writer stages (``--sandbox`` or ``$SDLC_SANDBOX``)."""
+    return sandbox_enabled(True if opts.sandbox else None)
+
+
 def _lock_story_worktree(root: Path, path: Path, story_id: str, run_id: str) -> None:
     """Lock a story worktree as in-use so the Stop-hook reaper spares it (#180).
 
@@ -6335,6 +6607,8 @@ def _prepare_story_workdir(
     * worktree creation fails: it degrades to the shared root and logs the
       reason rather than failing the build (best-effort, never fatal).
     """
+    if real_run and _story_sandboxed(opts):
+        return _prepare_sandbox_clone(story, ledger, run_id)
     if effective_concurrency(opts) == 1 or not real_run:
         return None
     root = Path.cwd()
@@ -6350,6 +6624,47 @@ def _prepare_story_workdir(
     ledger.event_log(
         run_id, story.id, "info", "controller",
         f"isolated build worktree ready at {path}",
+    )
+    return path
+
+
+def _prepare_sandbox_clone(story: "Story", ledger: "Ledger", run_id: str) -> Path | None:
+    """The contained story's clone — at any concurrency, never the shared root (#614).
+
+    The controller owns ``git fetch origin`` (on the host, with network) before
+    the clone is cut, so the in-container agent never needs the forge. A failed
+    fetch is a warning — the clone still branches from the last-fetched base. A
+    failed clone is an ``error`` and returns ``None``; dispatch then refuses to
+    contain the primary checkout, so the story fails loud instead of falling
+    back to an uncontained host run.
+    """
+    root = Path.cwd()
+    try:
+        fetch = _git_slow(root, "fetch", "--quiet", "origin")
+        fetch_err = "" if fetch.returncode == 0 else fetch.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        fetch_err = str(exc)
+    if fetch_err:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"sandbox: host-side `git fetch origin` failed ({fetch_err}); "
+            "branching from the last-fetched base",
+        )
+    try:
+        path = create_story_sandbox_clone(root, story.id, run_id)
+    except WorktreeError as exc:
+        ledger.event_log(
+            run_id, story.id, "error", "controller",
+            f"sandbox clone unavailable ({exc}); contained stages will refuse to "
+            "run rather than fall back to the host",
+        )
+        return None
+    ledger.set_story_worktree(run_id, story.id, str(path))
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"sandboxed story clone ready at {path} (build/coverage/bugfix run in a "
+        "container with only this clone mounted and no network; a stage that "
+        "needs the internet fails — there is no host fallback)",
     )
     return path
 
@@ -6381,6 +6696,17 @@ def _teardown_story_workdir(
         return
     path = ledger.story_worktree(run_id, story_id)
     if not path:
+        return
+    # Issue #614: a sandbox clone holds the only local copy of unpushed
+    # commits; if they cannot be fetched back to the primary, keep the clone.
+    if is_sandbox_clone(Path(path)) and not sync_sandbox_branch(
+        Path.cwd(), Path(path), story_id
+    ):
+        ledger.event_log(
+            run_id, story_id, "warn", "controller",
+            f"could not fetch feature/{story_id} back from sandbox clone {path}; "
+            "clone kept so no commit is lost",
+        )
         return
     if remove_story_worktree(Path.cwd(), Path(path)):
         ledger.event_log(
@@ -7735,6 +8061,11 @@ def _run_story(
     """
     if workdir is not None:
         dispatch = functools.partial(dispatch, cwd=workdir)
+        # Issue #614: a contained story commits in its own clone; fetch the
+        # branch back to the primary after every dispatch so host-side probes
+        # see it exactly as they would a linked worktree's.
+        if is_sandbox_clone(workdir):
+            dispatch = _syncing_dispatch(dispatch, Path.cwd(), workdir, story.id)
     stages = [s for s in _STAGES if not (s == "coverage" and opts.skip_coverage)]
     # Already-completed stages are skipped on resume; a fresh build skips none.
     pending = [s for s in stages if s not in done_stages]
@@ -7843,7 +8174,29 @@ def _run_story(
         # with the measured numbers injected into its prompt. The 90% criterion
         # itself is unchanged.
         precheck: coverage_precheck.PrecheckResult | None = None
-        if stage == "coverage" and story_class != change_class.DOCS_ONLY:
+        if (
+            stage == "coverage"
+            and story_class != change_class.DOCS_ONLY
+            and _story_sandboxed(opts)
+        ):
+            # #614 (review round 6): the pre-check runs the project's own test
+            # command — which the contained build agent may have rewritten
+            # (a committed conftest.py, a changed coverage command) — on the
+            # HOST, with the operator's environment, network and filesystem.
+            # That is the #607 escape by another door. A sandboxed run
+            # therefore never pre-checks: it always hands off to the contained
+            # coverage agent, and only the agent's verdict decides the stage.
+            ledger.event_log(
+                run_id, story.id, "info", "controller",
+                "coverage pre-check skipped: sandboxed run — the story's test "
+                "command never executes on the host; dispatching the contained "
+                "coverage agent",
+            )
+        if (
+            stage == "coverage"
+            and story_class != change_class.DOCS_ONLY
+            and not _story_sandboxed(opts)
+        ):
             precheck = coverage_precheck.run_precheck(
                 workdir or Path.cwd(), base_ref, f"feature/{story.id}",
                 timeout=opts.preflight_timeout,
@@ -7914,9 +8267,13 @@ def _run_story(
         # retry of it — reuses the same packet. None (no CR yet, host failure,
         # oversized) leaves the prompt on its fetch-it-yourself fallback.
         review_packet_block: str | None = None
-        if stage == "review" and pr_number is None and "coverage" in stages:
+        if stage == "review" and pr_number is None and (
+            "coverage" in stages or _story_sandboxed(opts)
+        ):
             # Issue #698: coverage is DONE but its deterministic CR open failed
-            # (the story parked and resume re-enters here). Retry it before
+            # (the story parked and resume re-enters here). Issue #614: a
+            # sandboxed --skip-coverage build cannot push, so this is where its
+            # CR is first opened. Retry it before
             # review — a review with no CR burns dispatches on a "PR #None"
             # prompt. On failure re-park without touching the review budget.
             pr_number = _open_story_cr(

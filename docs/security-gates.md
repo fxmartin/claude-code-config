@@ -487,16 +487,24 @@ When enabled, the resolved agent command (deny baseline, routed model, and all)
 is **wrapped** in a hardened `<runtime> run` invocation. The wrap is transparent:
 the prompt arrives on stdin and the `<<<RESULT_JSON>>>` envelope streams back on
 stdout exactly as on the host path, so the branch, commits, usage, and schema
-validation are **identical** — the result contract is unchanged. The worktree is
-the only bind mount, so the agent's commits land back on the host. The container:
+validation are **identical** — the result contract is unchanged. Only the writer
+roles (`build`, `coverage`, `bugfix`) are contained; review and merge stay on the
+host. A contained story runs in a **self-contained story clone** — never the
+primary checkout, never the primary `.git` (issue #614) — so an agent that
+`cd`s to the operator's checkout by absolute path (#607) finds nothing there.
+The controller fetches `origin` on the host before the agent starts and fetches
+the story branch back after each stage. The container:
 
 | Flag | Effect |
 |------|--------|
-| `--network none` | **no egress** by default — neither host nor internet is reachable |
+| `--network bridge` | ordinary egress by default — the contained claude CLI must reach the API; the sandbox contains the **filesystem** (only the story clone is mounted). Credentials: the host's `~/.claude/.credentials.json` is bind-mounted read-only, or `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` is forwarded; with neither, dispatch refuses |
 | `--cap-drop ALL` | all Linux capabilities dropped |
 | `--security-opt no-new-privileges` | no privilege escalation |
 | `--user <uid>:<gid>` | runs as the **non-root** host operator |
-| `-v <worktree>:/workspace:Z`, `-w /workspace` | per-story worktree mounted; agent runs there |
+| `--userns keep-id` (podman) | host uid mapped 1:1 so git accepts the mounted clone |
+| `--pull never` | only the deploy-pinned image runs |
+| `-v <story clone>:/workspace:Z`, `-w /workspace` | the story clone is the only writable mount; agent runs there |
+| `-v <uv/npm cache>:…:ro,z` | host package caches, read-only, tools set offline |
 | `--rm` | container discarded after the stage |
 
 **Fail-fast.** If `--sandbox` is requested with no container runtime on `PATH`,
@@ -504,8 +512,16 @@ dispatch raises `SandboxUnavailableError` **before any agent runs** — it never
 silently degrades to an unsandboxed host run. Runtime is auto-detected
 (`podman`→`docker`) or forced via `SDLC_SANDBOX_RUNTIME`.
 
+**Scope.** Only `sdlc build` contains its writer stages. A contained build never
+pushes: the controller pushes and opens the change request on the host (after
+coverage, or before review under `--skip-coverage`). `sdlc fix` has no story-clone
+wiring yet, so with `SDLC_SANDBOX` set it refuses to start rather than run
+uncontained.
+
 **Knobs.** `SDLC_SANDBOX` (opt-in, covers resumes), `SDLC_SANDBOX_IMAGE`
-(the image; must already contain `claude` — the controller never builds it),
+(override; the default is the `sha256:` image id `scripts/deploy.sh` pins per
+arch in `controller/src/sdlc/config/sandbox-image.yaml` after building
+`controller/sandbox/Containerfile` — unpinned → refuse),
 `SDLC_SANDBOX_RUNTIME` (force a runtime), `SDLC_SANDBOX_NETWORK` (egress mode;
 default `none` — point at a locked-down filtering network only for a stage that
 genuinely needs the API). Because egress is off by default, reaching the live API

@@ -1,0 +1,9 @@
+# Pinned sandbox image ids, one per host architecture (issue #614).
+#
+# Written by scripts/deploy.sh after it builds controller/sandbox/Containerfile;
+# do not hand-edit. Dispatch runs exactly the id recorded for this host's
+# architecture (`--pull never`) and refuses to contain an agent when it is
+# missing. Only a content-addressed `sha256:<64 hex>` id is honoured — a tag is
+# treated as unpinned. $SDLC_SANDBOX_IMAGE overrides this file.
+amd64:
+arm64:

@@ -2670,18 +2670,46 @@ then **wraps** it in a hardened `<runtime> run` invocation (`_apply_sandbox` /
 arrives on stdin and the agent's `stream-json` / `<<<RESULT_JSON>>>` envelope
 still streams out on stdout, so usage extraction, schema validation, the branch,
 and the commits are **byte-for-byte the host path's** — the result contract is
-unchanged. The worktree is bind-mounted, so commits the agent makes land back in
-the host worktree exactly as before.
+unchanged.
+
+**Containment, not detection (issue #614).** Only the code-writing roles —
+`build`, `coverage`, `bugfix` (`SANDBOXED_ROLES`) — are wrapped; review keeps the
+read-only deny floor (#685) on the host and merge stays on the host for forge
+auth. A contained story never gets a linked worktree (its `.git` file points
+into the primary `.git`, which is never mounted): `_prepare_story_workdir` cuts a
+self-contained `git clone --local --no-hardlinks` (no object file shared with
+the primary) at `.claude/worktrees/sandbox-<run>-<story>` at
+*any* concurrency, after the controller's own host-side `git fetch origin`, so
+the build prompt branches from the fetched base and never fetches. `origin`
+keeps the real forge URL for the host-side push/merge stages, and after every
+contained dispatch the controller fetches `feature/<id>` back into the primary.
+Before that fetch-back — and before any host-side git in the clone (the
+controller's push, the host review/merge agents) — `reset_sandbox_clone_git`
+rewrites the clone's `.git/config` from the primary's trusted values, empties
+`.git/hooks` and deletes `commondir`/`config.worktree`/alternates redirects, so a
+hook, `core.sshCommand`, `core.fsmonitor`, `core.hooksPath` or
+`credential.helper` planted by the contained agent never executes on the host. A
+clone whose `.git` is no longer a plain directory is refused, loud. A clone
+re-created for a story whose branch the primary already holds checks that
+branch out. Teardown keeps the clone if the fetch-back fails, so no unpushed
+commit is lost.
+Dispatch refuses (`SandboxUnavailableError`) to mount the primary checkout (the
+`cwd=None` shared-root path), any ancestor of it, or a linked worktree — so a
+`cd /abs/primary && git ...` escape (#607) cannot resolve inside the container.
+The #612 primary-checkout detector stays on as the belt.
 
 The container is locked down:
 
 | Flag | Effect |
 |------|--------|
-| `--network none` | **no egress** — a compromised agent can reach neither the host nor the internet (default) |
+| `--network bridge` | the runtime's ordinary network (default) — the contained agent is the claude CLI and must reach the API; what the sandbox contains is the **filesystem**. `SDLC_SANDBOX_NETWORK` points at an egress proxy network when one exists |
 | `--cap-drop ALL` | every Linux capability dropped |
 | `--security-opt no-new-privileges` | no privilege escalation inside the container |
 | `--user <uid>:<gid>` | runs as the **host operator's non-root uid/gid**, so mounted files stay owned by you |
-| `-v <worktree>:/workspace:Z` + `-w /workspace` | the per-story worktree is the only mount; the agent runs there |
+| `--userns keep-id` (podman only) | rootless podman maps that uid 1:1, otherwise git rejects the clone as "dubious ownership" |
+| `--pull never` | only the locally built, pinned image ever runs — dispatch never fetches one |
+| `-v <story clone>:/workspace:Z` + `-w /workspace` | the story's self-contained clone is the only writable mount; the agent runs there |
+| `-v <uv/npm cache>:/cache/{uv,npm}:ro,z` | host package caches, read-only, with `UV_OFFLINE=1` / `npm_config_offline=true` — mounted only if present |
 | `--rm` | the container is discarded after the stage |
 
 **Fail-fast (AC3).** If `--sandbox` is requested but no container runtime is on
@@ -2694,9 +2722,9 @@ it never silently falls back to an unsandboxed host run. Runtime is auto-detecte
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `SDLC_SANDBOX` | unset (off) | per-repo opt-in equivalent of `--sandbox`; also covers resumed runs |
-| `SDLC_SANDBOX_IMAGE` | `sdlc-agent-sandbox:latest` | the image the agent runs in (must already contain `claude` + toolchain; the controller never builds it) |
+| `SDLC_SANDBOX_IMAGE` | the pinned image id for this host's arch | override the image. The default is built from `controller/sandbox/Containerfile` by `scripts/deploy.sh`, which records its `sha256:` image id in `controller/src/sdlc/config/sandbox-image.yaml` (one line per arch — each host builds its own). No pin for this arch and no override → dispatch refuses; a tag is never honoured as a pin. The Containerfile itself builds from upstream tags, so two builds are not byte-identical — reproducibility lives in the recorded image id, not in the build |
 | `SDLC_SANDBOX_RUNTIME` | auto (`podman`→`docker`) | force a specific runtime |
-| `SDLC_SANDBOX_NETWORK` | `none` | egress mode — point at a locked-down filtering network only for a stage that genuinely needs the API ("explicit allowlist only if a stage needs it") |
+| `SDLC_SANDBOX_NETWORK` | `bridge` | network mode — point at an egress-filtering network when the host runs one; an allowlisted egress network is a later story |
 
 Because egress is off by default, an agent inside the sandbox cannot reach the
 Anthropic API unless the operator opts into a filtering egress network via
