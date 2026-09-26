@@ -35,7 +35,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
 | `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
-| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002), the one host-level rate-limit pause every repo shares (Story 32.2-001), and the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
+| `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise\|unpause` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002), the one host-level rate-limit pause every repo shares (Story 32.2-001), and the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
 | `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), the approval park + auto-resume (Story 32.2-002), one shared rate-limit window discovered and waited out once (Story 32.2-001), and the per-job budget breaker (Story 32.3-001). |
 | `sdlc/approval.py` | Read-only change-request approval probe — "is PR #N approved / merged / closed?" behind the queue's park (Story 32.2-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
@@ -1657,6 +1657,23 @@ reaches the job's own agents rather than just its parent.
   - **Surfaced as queue state.** `sdlc queue list` prints one banner above the
     table (and `--json` carries it under `pause`); the dashboard renders the
     same field as one banner. Never N parked rows.
+  - **Operator-declared reset (Story 32.2-003).** `sdlc queue unpause
+    [--dry-run]` is for after FX resets the Max limit or switches subscription.
+    It trusts the operator — no probe (after a switch the last probe result is
+    meaningless): `sdlc/unpause.py` deletes the `queue_state` row and, for every
+    registry run (`Registry.records()`, every repo) that is unfinished, not live
+    and `RATE_LIMITED`, appends a config event without `rate_limit_reset_at`,
+    moves its `RATE_LIMITED` stories and the run back to `IN_PROGRESS`, and logs
+    an `events` row with `source="operator"`. Clearing the run status matters as
+    much as the epoch: discovery reads a `RATE_LIMITED` run with no epoch as a
+    reset-less park and would reopen a `max_wait_s` window from it. A live
+    `queue run` needs no signal — it re-reads the row and the ledgers every
+    pass, so it resumes within one poll. The safety net is the next dispatch: a
+    window that is still closed re-parks the run with a fresh reset and the
+    queue re-pauses once, exactly as above. Each clear is recorded in
+    `queue_pause_clears` (timestamp, reason `operator`, the pause it dropped,
+    runs cleared). Nothing paused or parked prints "nothing to clear" and
+    writes nothing; `--dry-run` lists and writes nothing.
 - **The dashboard needs no change.** The job's subprocess registers itself the
   way any `sdlc build` does, so a queued job appears as an ordinary run. The
   scheduler never writes to the registry; it only reads it (joining a child's

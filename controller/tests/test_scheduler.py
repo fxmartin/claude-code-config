@@ -2151,6 +2151,88 @@ def test_a_run_that_parks_again_after_its_resume_opens_a_new_window(tmp_path) ->
 
 
 
+def test_a_live_scheduler_picks_up_an_operator_clear_within_one_poll(tmp_path) -> None:
+    """`sdlc queue unpause` from another shell lifts a waiting scheduler (32.2-003 AC2).
+
+    The scheduler re-reads the pause row and the ledgers each pass, so nothing
+    is subscribed to or restarted: the clear is simply what the next poll sees.
+    """
+    from sdlc.scheduler import SchedulerConfig
+    from sdlc.unpause import clear_rate_limit
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    reset_at = clock.now.timestamp() + 3600
+    job_id, run_id, db = _parked_job(store, registry, tmp_path, "alpha", reset_at=reset_at)
+    other = store.add_job(repo=_repo(tmp_path, "beta"), kind="fix", scope="42")
+
+    launcher = ResumingLauncher({run_id: db}, alive_polls=1)
+    notifier = RecordingNotifier()
+    polls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        polls["n"] += 1
+        if polls["n"] == 2:  # the operator, in another shell, well before the reset
+            assert store.dispatch_pause().is_active(clock()) is True
+            clear_rate_limit(store, registry, now=clock())
+            assert store.dispatch_pause() is None
+        clock.advance(seconds)
+        assert polls["n"] < 10, "scheduler never resumed after the clear"
+
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, sleeper=sleeper,
+        config=SchedulerConfig(slots=2, poll_seconds=10.0),
+    )
+
+    assert clock() < datetime.fromtimestamp(reset_at, timezone.utc)  # never waited it out
+    assert store.get_job(other).state == "done"
+    assert store.get_job(job_id).state == "done"
+    assert len(notifier.names("queue_paused")) == 1
+
+
+def test_an_unpause_on_a_still_closed_window_re_parks_once_without_a_loop(tmp_path) -> None:
+    """The operator was wrong: one re-park, one new pause — never a retry loop (32.2-003)."""
+    from sdlc.scheduler import SchedulerConfig
+    from sdlc.unpause import clear_rate_limit
+
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    clock = Clock()
+    job_id, run_id, db = _parked_job(
+        store, registry, tmp_path, "alpha", reset_at=clock.now.timestamp() + 3600
+    )
+    clear_rate_limit(store, registry, now=clock())
+
+    notifier = RecordingNotifier()
+
+    class ReParking(FakeLauncher):
+        def __call__(self, argv, cwd):
+            from sdlc.build import Ledger
+
+            if "resume" in list(argv):
+                ledger = Ledger(db)
+                ledger.event_log(
+                    run_id, "", "info", "config",
+                    json.dumps({"rate_limit_reset_at": clock.now.timestamp() + 7200}),
+                )
+                ledger.run_update_status(run_id, "RATE_LIMITED")
+            return super().__call__(argv, cwd)
+
+    launcher = ReParking(alive_polls=1)
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+        notifier=notifier, sleeper=_stop_after(clock, 12),
+        config=SchedulerConfig(slots=1, poll_seconds=10.0),
+    )
+
+    assert [cmd for cmd in launcher.commands if cmd[0] == "resume"] == [["resume", "--run", run_id]]
+    assert len(notifier.names("queue_paused")) == 1
+    assert store.dispatch_pause().is_active(clock()) is True
+    assert store.get_job(job_id).state == "running"
+
+
 def test_a_park_recording_a_later_reset_survives_the_served_window(tmp_path) -> None:
     """Spending served evidence must not swallow a *later* window.
 
