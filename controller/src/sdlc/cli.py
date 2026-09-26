@@ -263,11 +263,12 @@ Flags:
                             see docs/harness-adapters.md
   --thinking-cap=N          cap per-request thinking tokens (MAX_THINKING_TOKENS)
                             on every dispatched agent; 0 = no cap (default)
-  --sandbox                 run every dispatched agent inside a no-egress,
-                            cap-dropped, non-root container with the worktree
-                            mounted (recommended for untrusted repos); fails fast
-                            if no container runtime is present. SDLC_SANDBOX=1 is
-                            the per-repo config equivalent
+  --sandbox                 run the writer agents (build/coverage/bugfix) inside
+                            a no-egress, cap-dropped, non-root container with only
+                            a self-contained story clone mounted (recommended for
+                            untrusted repos); fails fast if no container runtime
+                            or pinned image is present. SDLC_SANDBOX=1 is the
+                            per-repo config equivalent
   --predict                 compute + record a per-story predicted token cost and
                             rework probability before dispatch, from the ledger's
                             own reconciled history, and reconcile prediction-vs-

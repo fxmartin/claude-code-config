@@ -10,6 +10,12 @@
 #   plugin     → `claude plugin update <plugin>@<marketplace>`
 #   controller → `uv tool install --force controller/`   (scripts/install-controller.sh)
 #
+# Before either, when podman or docker is on PATH, it builds the agent sandbox
+# image (controller/sandbox/Containerfile) for this host's architecture and pins
+# its image id in controller/src/sdlc/config/sandbox-image.yaml — the only image
+# SDLC_SANDBOX=1 will run (issue #614). Commit the updated pin. With no runtime
+# the step is skipped, and SDLC_SANDBOX=1 refuses to run on this host.
+#
 # Running only one leaves the other on whatever version it was last explicitly
 # updated to — a controller driving skills it no longer matches, or vice versa.
 # That drift is silent: `git pull` moves neither pointer. This script runs both,
@@ -23,6 +29,7 @@
 #   ./scripts/deploy.sh                  # plugin + controller
 #   ./scripts/deploy.sh --controller-only  # no Claude Code on this box
 #   ./scripts/deploy.sh --plugin-only
+#   ./scripts/deploy.sh --skip-sandbox-image  # do not (re)build the sandbox image
 #   ./scripts/deploy.sh --dry-run        # print what would run, change nothing
 #   ./scripts/deploy.sh --help
 #
@@ -50,12 +57,22 @@ PLUGIN_ID="autonomous-sdlc@fx-claude-config"
 # real `uv tool install`. Defaults to the real installer.
 INSTALL_CONTROLLER="${INSTALL_CONTROLLER:-${SCRIPT_DIR}/install-controller.sh}"
 
+# Sandbox image (issue #614). SANDBOX_RUNTIME forces the container runtime (and
+# is the tests' stub seam); unset auto-detects podman, then docker. The pin file
+# is controller package data, so it must be written BEFORE the controller
+# install for the installed CLI to carry it.
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SANDBOX_CONTAINERFILE="${SANDBOX_CONTAINERFILE:-${REPO_ROOT}/controller/sandbox/Containerfile}"
+SANDBOX_PIN_FILE="${SANDBOX_PIN_FILE:-${REPO_ROOT}/controller/src/sdlc/config/sandbox-image.yaml}"
+SANDBOX_TAG="sdlc-agent-sandbox:local"
+
 DO_CONTROLLER=true
 DO_PLUGIN=true
+DO_SANDBOX=true
 DRY_RUN=false
 
 usage() {
-  sed -n '6,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '6,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 log() { printf '==> %s\n' "$*"; }
@@ -67,6 +84,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)         DRY_RUN=true ;;
     --controller-only) DO_PLUGIN=false ;;
     --plugin-only)     DO_CONTROLLER=false ;;
+    --skip-sandbox-image) DO_SANDBOX=false ;;
     *)                 die "unknown flag: $1 (try --help)" ;;
   esac
   shift
@@ -75,6 +93,43 @@ done
 if [[ "${DO_CONTROLLER}" == false && "${DO_PLUGIN}" == false ]]; then
   die "--controller-only and --plugin-only are mutually exclusive"
 fi
+
+# The sandbox image belongs to the controller (its pin is controller package
+# data), so --plugin-only never builds it.
+[[ "${DO_CONTROLLER}" == true ]] || DO_SANDBOX=false
+
+# OCI architecture name for this host; each host builds and pins its own.
+sandbox_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *)             return 1 ;;
+  esac
+}
+
+# The runtime to build with: $SANDBOX_RUNTIME, else podman, else docker, else "".
+sandbox_runtime() {
+  if [[ -n "${SANDBOX_RUNTIME:-}" ]]; then
+    echo "${SANDBOX_RUNTIME}"
+  elif command -v podman >/dev/null 2>&1; then
+    echo podman
+  elif command -v docker >/dev/null 2>&1; then
+    echo docker
+  fi
+}
+
+# Record `<arch>: sha256:<id>` in the pin file, replacing any existing line for
+# that arch. Written via a temp file + mv (portable: no GNU/BSD `sed -i` split).
+write_sandbox_pin() {
+  local arch="$1" id="$2" tmp
+  tmp="$(mktemp "${SANDBOX_PIN_FILE}.XXXXXX")"
+  awk -v arch="${arch}" -v id="${id}" '
+    $0 ~ "^" arch ":" { print arch ": " id; done = 1; next }
+    { print }
+    END { if (!done) print arch ": " id }
+  ' "${SANDBOX_PIN_FILE}" >"${tmp}"
+  mv "${tmp}" "${SANDBOX_PIN_FILE}"
+}
 
 # Preflight — validate every precondition BEFORE mutating anything.
 #
@@ -90,11 +145,47 @@ if [[ "${DRY_RUN}" == false ]]; then
   if [[ "${DO_CONTROLLER}" == true && ! -x "${INSTALL_CONTROLLER}" ]]; then
     die "controller installer not found or not executable: ${INSTALL_CONTROLLER}"
   fi
+  if [[ "${DO_SANDBOX}" == true && -n "${SANDBOX_RUNTIME:-}" ]] \
+      && ! command -v "${SANDBOX_RUNTIME}" >/dev/null 2>&1; then
+    die "container runtime not found: ${SANDBOX_RUNTIME} (\$SANDBOX_RUNTIME)"
+  fi
+  if [[ "${DO_SANDBOX}" == true && -n "$(sandbox_runtime)" ]] && ! sandbox_arch >/dev/null; then
+    die "unsupported architecture for the sandbox image: $(uname -m)
+       Pass --skip-sandbox-image to deploy without it."
+  fi
   if [[ "${DO_PLUGIN}" == true ]] && ! command -v claude >/dev/null 2>&1; then
     die "claude not found on PATH; cannot update ${PLUGIN_ID}.
        Nothing was changed. Install Claude Code and re-run, or pass
        --controller-only to deploy the controller alone and accept that the
        plugin stays on its current version."
+  fi
+fi
+
+# 0. Sandbox image (issue #614). Built before either pointer moves: a failed
+#    build (base-image pull, npm) leaves the machine untouched. The pin is the
+#    image id — content-addressed, never a tag — so dispatch runs exactly this
+#    build and nothing a registry could later swap under the same name.
+if [[ "${DO_SANDBOX}" == true ]]; then
+  RUNTIME="$(sandbox_runtime)"
+  if [[ -z "${RUNTIME}" ]]; then
+    log "no podman/docker on PATH; sandbox image not built (SDLC_SANDBOX=1 will refuse on this host)"
+  elif [[ "${DRY_RUN}" == true ]]; then
+    log "[dry-run] would run: ${RUNTIME} build -t ${SANDBOX_TAG} -f ${SANDBOX_CONTAINERFILE}"
+    log "[dry-run] would pin its image id for $(sandbox_arch) in ${SANDBOX_PIN_FILE}"
+  else
+    ARCH="$(sandbox_arch)"
+    log "building sandbox image for ${ARCH} with ${RUNTIME}"
+    "${RUNTIME}" build -t "${SANDBOX_TAG}" -f "${SANDBOX_CONTAINERFILE}" \
+      "$(dirname "${SANDBOX_CONTAINERFILE}")" \
+      || die "sandbox image build failed; nothing else was changed"
+    IMAGE_ID="$("${RUNTIME}" image inspect --format '{{.Id}}' "${SANDBOX_TAG}")" \
+      || die "could not read the sandbox image id"
+    # podman prints the bare hex id, docker prefixes it with sha256:.
+    IMAGE_ID="sha256:${IMAGE_ID#sha256:}"
+    [[ "${IMAGE_ID}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || die "unexpected sandbox image id: ${IMAGE_ID}"
+    write_sandbox_pin "${ARCH}" "${IMAGE_ID}"
+    log "pinned ${ARCH} sandbox image ${IMAGE_ID} — commit ${SANDBOX_PIN_FILE#"${REPO_ROOT}/"}"
   fi
 fi
 

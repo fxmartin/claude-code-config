@@ -20,7 +20,6 @@ from sdlc.contracts import (
 )
 from sdlc.dispatch import (
     DEFAULT_AGENT_CMD,
-    DEFAULT_SANDBOX_IMAGE,
     DEFAULT_SANDBOX_NETWORK,
     DENY_BASELINE,
     DENY_BASELINE_ENV,
@@ -2212,6 +2211,17 @@ def test_sandbox_wrap_forwards_named_env_only(tmp_path) -> None:
     assert all(not v.startswith("SECRET") for v in forwarded)
 
 
+_PINNED = "sha256:" + "a" * 64
+
+
+@pytest.fixture
+def pinned_image(monkeypatch):
+    """Issue #614: the default image is the deploy-pinned id, never a tag."""
+    monkeypatch.setattr("sdlc.dispatch.pinned_sandbox_image", lambda arch=None: _PINNED)
+    monkeypatch.delenv(SANDBOX_IMAGE_ENV, raising=False)
+    return _PINNED
+
+
 def _sandbox_popen(seen):
     def fake_popen(cmd, **kwargs):
         seen["cmd"] = cmd
@@ -2219,13 +2229,13 @@ def _sandbox_popen(seen):
     return fake_popen
 
 
-def test_dispatch_sandbox_wraps_command_and_keeps_contract(monkeypatch) -> None:
+def test_dispatch_sandbox_wraps_command_and_keeps_contract(monkeypatch, tmp_path, pinned_image) -> None:
     """AC1+AC2: with `--sandbox` the agent runs in a hardened, no-egress container
     and the validated result is identical to the host path."""
     monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
     seen: dict = {}
     monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
-    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True, cwd=tmp_path)
     # The result contract is unchanged from the host path.
     assert result.data["branch_name"] == "feature/7.3-001"
     assert result.session_id == "sess-123"
@@ -2238,7 +2248,7 @@ def test_dispatch_sandbox_wraps_command_and_keeps_contract(monkeypatch) -> None:
     assert cmd[-len(_STREAM_CMD):] == _STREAM_CMD
 
 
-def test_dispatch_sandbox_off_runs_on_host_unchanged(monkeypatch) -> None:
+def test_dispatch_sandbox_off_runs_on_host_unchanged(monkeypatch, tmp_path, pinned_image) -> None:
     """sandbox=False leaves the host path byte-for-byte today's (no wrapping)."""
     seen: dict = {}
     monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
@@ -2246,7 +2256,7 @@ def test_dispatch_sandbox_off_runs_on_host_unchanged(monkeypatch) -> None:
     assert seen["cmd"] == _STREAM_CMD
 
 
-def test_dispatch_sandbox_fail_fast_without_runtime(monkeypatch) -> None:
+def test_dispatch_sandbox_fail_fast_without_runtime(monkeypatch, tmp_path, pinned_image) -> None:
     """AC3: requested sandbox with no runtime raises before any agent is launched."""
     monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: None)
     launched = {"popen": False}
@@ -2257,11 +2267,11 @@ def test_dispatch_sandbox_fail_fast_without_runtime(monkeypatch) -> None:
 
     monkeypatch.setattr(subprocess, "Popen", boom)
     with pytest.raises(SandboxUnavailableError):
-        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True, cwd=tmp_path)
     assert launched["popen"] is False
 
 
-def test_dispatch_sandbox_mounts_cwd_worktree(monkeypatch, tmp_path) -> None:
+def test_dispatch_sandbox_mounts_cwd_worktree(monkeypatch, tmp_path, pinned_image) -> None:
     """The per-story worktree (cwd) is the bind mount, so commits land on the host
     and the result contract round-trips (AC2)."""
     monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
@@ -2271,38 +2281,38 @@ def test_dispatch_sandbox_mounts_cwd_worktree(monkeypatch, tmp_path) -> None:
     assert f"{tmp_path}:/workspace:Z" in seen["cmd"]
 
 
-def test_dispatch_sandbox_via_env_config(monkeypatch) -> None:
+def test_dispatch_sandbox_via_env_config(monkeypatch, tmp_path, pinned_image) -> None:
     """`SDLC_SANDBOX=1` opts in without the flag (the per-repo config path, AC1)."""
     monkeypatch.setenv(SANDBOX_ENV, "1")
     monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
     seen: dict = {}
     monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
-    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, cwd=tmp_path)
     assert seen["cmd"][:2] == ["podman", "run"]
 
 
-def test_dispatch_sandbox_network_env_override(monkeypatch) -> None:
+def test_dispatch_sandbox_network_env_override(monkeypatch, tmp_path, pinned_image) -> None:
     """`SDLC_SANDBOX_NETWORK` swaps the no-egress default for a locked-down egress
     network when a stage genuinely needs the API (operator-controlled allowlist)."""
     monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setenv(SANDBOX_NETWORK_ENV, "sdlc-egress")
     seen: dict = {}
     monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
-    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True, cwd=tmp_path)
     assert seen["cmd"][seen["cmd"].index("--network") + 1] == "sdlc-egress"
 
 
-def test_dispatch_sandbox_uses_configured_image(monkeypatch) -> None:
+def test_dispatch_sandbox_uses_configured_image(monkeypatch, tmp_path, pinned_image) -> None:
     monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setenv(SANDBOX_IMAGE_ENV, "my-registry/agent:pinned")
     seen: dict = {}
     monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
-    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True, cwd=tmp_path)
     assert "my-registry/agent:pinned" in seen["cmd"]
     # default image is used when unset
     monkeypatch.delenv(SANDBOX_IMAGE_ENV, raising=False)
-    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
-    assert DEFAULT_SANDBOX_IMAGE in seen["cmd"]
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True, cwd=tmp_path)
+    assert _PINNED in seen["cmd"]
 
 
 def test_sandbox_wrap_falls_back_to_zero_uid_without_getuid(monkeypatch, tmp_path) -> None:
@@ -2314,7 +2324,7 @@ def test_sandbox_wrap_falls_back_to_zero_uid_without_getuid(monkeypatch, tmp_pat
     assert argv[argv.index("--user") + 1] == "0:0"
 
 
-def test_dispatch_sandbox_blank_env_falls_back_to_defaults(monkeypatch) -> None:
+def test_dispatch_sandbox_blank_env_falls_back_to_defaults(monkeypatch, tmp_path, pinned_image) -> None:
     """Whitespace-only `SDLC_SANDBOX_IMAGE` / `SDLC_SANDBOX_NETWORK` are treated as
     unset, so the built-in defaults apply (the `.strip() or DEFAULT` normalization)."""
     monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
@@ -2322,8 +2332,8 @@ def test_dispatch_sandbox_blank_env_falls_back_to_defaults(monkeypatch) -> None:
     monkeypatch.setenv(SANDBOX_NETWORK_ENV, "  ")
     seen: dict = {}
     monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
-    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True)
-    assert DEFAULT_SANDBOX_IMAGE in seen["cmd"]
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True, cwd=tmp_path)
+    assert _PINNED in seen["cmd"]
     assert seen["cmd"][seen["cmd"].index("--network") + 1] == DEFAULT_SANDBOX_NETWORK
 
 
