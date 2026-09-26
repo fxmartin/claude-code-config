@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.72.1] - 2026-09-26
+
+### Fixed
+
+- fix(build): keep polling merge gate when only risk gate is red (#719) (#722)
+
+
 ## [v2.72.0] - 2026-09-26
 
 ### Added
