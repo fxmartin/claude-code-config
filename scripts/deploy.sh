@@ -13,7 +13,9 @@
 # Before either, when podman or docker is on PATH, it builds the agent sandbox
 # image (controller/sandbox/Containerfile) for this host's architecture and pins
 # its image id in controller/src/sdlc/config/sandbox-image.yaml — the only image
-# SDLC_SANDBOX=1 will run (issue #614). Commit the updated pin. With no runtime
+# SDLC_SANDBOX=1 will run (issue #614). The pin is host-local — builds are not
+# reproducible, and two hosts of one arch would overwrite each other's id — so
+# it is marked skip-worktree and never committed. With no runtime
 # the step is skipped, and SDLC_SANDBOX=1 refuses to run on this host.
 #
 # Running only one leaves the other on whatever version it was last explicitly
@@ -72,7 +74,7 @@ DO_SANDBOX=true
 DRY_RUN=false
 
 usage() {
-  sed -n '6,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '6,48p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 log() { printf '==> %s\n' "$*"; }
@@ -185,7 +187,11 @@ if [[ "${DO_SANDBOX}" == true ]]; then
     [[ "${IMAGE_ID}" =~ ^sha256:[0-9a-f]{64}$ ]] \
       || die "unexpected sandbox image id: ${IMAGE_ID}"
     write_sandbox_pin "${ARCH}" "${IMAGE_ID}"
-    log "pinned ${ARCH} sandbox image ${IMAGE_ID} — commit ${SANDBOX_PIN_FILE#"${REPO_ROOT}/"}"
+    # Host-local pin: keep it out of `git status` (and the sdlc dirty-tree
+    # guard, #590). A pin file outside a git checkout makes this a no-op.
+    git -C "$(dirname "${SANDBOX_PIN_FILE}")" update-index --skip-worktree \
+      -- "${SANDBOX_PIN_FILE}" >/dev/null 2>&1 || true
+    log "pinned ${ARCH} sandbox image ${IMAGE_ID} (host-local; do not commit ${SANDBOX_PIN_FILE#"${REPO_ROOT}/"})"
   fi
 fi
 

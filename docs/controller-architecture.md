@@ -2677,12 +2677,22 @@ unchanged.
 read-only deny floor (#685) on the host and merge stays on the host for forge
 auth. A contained story never gets a linked worktree (its `.git` file points
 into the primary `.git`, which is never mounted): `_prepare_story_workdir` cuts a
-self-contained `git clone --local` at `.claude/worktrees/sandbox-<run>-<story>` at
+self-contained `git clone --local --no-hardlinks` (no object file shared with
+the primary) at `.claude/worktrees/sandbox-<run>-<story>` at
 *any* concurrency, after the controller's own host-side `git fetch origin`, so
 the build prompt branches from the fetched base and never fetches. `origin`
 keeps the real forge URL for the host-side push/merge stages, and after every
 contained dispatch the controller fetches `feature/<id>` back into the primary.
-Teardown keeps the clone if that fetch-back fails, so no unpushed commit is lost.
+Before that fetch-back — and before any host-side git in the clone (the
+controller's push, the host review/merge agents) — `reset_sandbox_clone_git`
+rewrites the clone's `.git/config` from the primary's trusted values, empties
+`.git/hooks` and deletes `commondir`/`config.worktree`/alternates redirects, so a
+hook, `core.sshCommand`, `core.fsmonitor`, `core.hooksPath` or
+`credential.helper` planted by the contained agent never executes on the host. A
+clone whose `.git` is no longer a plain directory is refused, loud. A clone
+re-created for a story whose branch the primary already holds checks that
+branch out. Teardown keeps the clone if the fetch-back fails, so no unpushed
+commit is lost.
 Dispatch refuses (`SandboxUnavailableError`) to mount the primary checkout (the
 `cwd=None` shared-root path), any ancestor of it, or a linked worktree — so a
 `cd /abs/primary && git ...` escape (#607) cannot resolve inside the container.

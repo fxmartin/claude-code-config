@@ -644,3 +644,122 @@ def test_fix_batch_refuses_to_start_under_sandbox_env(tmp_path, monkeypatch) -> 
     )
     assert result.status == "ABORTED"
     assert result.summary == SANDBOX_UNSUPPORTED_REASON
+
+
+# ---------------------------------------------------------------------------
+# Review: host-side git must never execute anything the contained agent planted
+# in the clone's .git (hooks, config, commondir) — and the clone must share no
+# object files with the primary.
+# ---------------------------------------------------------------------------
+
+def _plant_hostile_git(clone: Path, marker: Path) -> None:
+    """What a malicious contained build agent could leave behind in /workspace/.git."""
+    elsewhere = clone / "hooks-elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    for hook in (clone / ".git" / "hooks" / "pre-push", elsewhere / "pre-push"):
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+    evil = clone / "evil.sh"
+    evil.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+    evil.chmod(0o755)
+    _git(clone, "config", "core.sshCommand", str(evil))
+    _git(clone, "config", "core.fsmonitor", str(evil))
+    _git(clone, "config", "core.hooksPath", str(elsewhere))
+    _git(clone, "config", "credential.helper", f"!{evil}")
+
+
+def test_clone_does_not_hardlink_primary_objects(tmp_path) -> None:
+    primary = _repo_with_origin(tmp_path)
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    primary_inodes = {
+        p.stat().st_ino for p in (primary / ".git" / "objects").rglob("*") if p.is_file()
+    }
+    clone_inodes = {
+        p.stat().st_ino for p in (clone / ".git" / "objects").rglob("*") if p.is_file()
+    }
+    assert clone_inodes and not (primary_inodes & clone_inodes)
+
+
+def test_contained_dispatch_leaves_no_hostile_git_for_the_host(tmp_path) -> None:
+    primary = _repo_with_origin(tmp_path)
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    marker = tmp_path / "PWNED"
+
+    def agent(*args, **kwargs):
+        _git(clone, "checkout", "-b", "feature/61.4-001")
+        _git(clone, "commit", "--allow-empty", "-m", "feat: y")
+        _plant_hostile_git(clone, marker)
+        (clone / ".git" / "commondir").write_text(str(tmp_path / "elsewhere") + "\n")
+
+    _syncing_dispatch(agent, primary, clone, "61.4-001")("build", "p")
+    # The controller's own host-side push (as _open_story_cr runs it) and a
+    # host review agent's status call in the clone must run nothing planted.
+    _git(clone, "push", "-u", "origin", "feature/61.4-001")
+    _git(clone, "status")
+    assert not marker.exists()
+    assert not any((clone / ".git" / "hooks").iterdir())
+    assert not (clone / ".git" / "commondir").exists()
+    assert _git(clone, "remote", "get-url", "origin").stdout.strip() == str(tmp_path / "origin.git")
+    assert _git(clone, "config", "user.email").stdout.strip() == "t@example.com"
+    assert (
+        _git(primary, "rev-parse", "feature/61.4-001").stdout
+        == _git(clone, "rev-parse", "HEAD").stdout
+    )
+
+
+def test_teardown_sync_resets_hostile_git_before_touching_clone(tmp_path) -> None:
+    primary = _repo_with_origin(tmp_path)
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    marker = tmp_path / "PWNED"
+    _git(clone, "checkout", "-b", "feature/61.4-001")
+    _git(clone, "commit", "--allow-empty", "-m", "feat: y")
+    _plant_hostile_git(clone, marker)
+    assert sync_sandbox_branch(primary, clone, "61.4-001") is True
+    _git(clone, "push", "-u", "origin", "feature/61.4-001")
+    assert not marker.exists()
+
+
+def test_reattached_clone_is_reset_to_trusted_git(tmp_path) -> None:
+    primary = _repo_with_origin(tmp_path)
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    _plant_hostile_git(clone, tmp_path / "PWNED")
+    create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    for key in ("core.sshCommand", "core.fsmonitor", "core.hooksPath", "credential.helper"):
+        res = subprocess.run(
+            ["git", "-C", str(clone), "config", "--get", key],
+            capture_output=True, text=True,
+        )
+        assert res.returncode != 0, key
+    assert not (clone / ".git" / "hooks" / "pre-push").exists()
+
+
+def test_clone_whose_git_dir_was_swapped_is_refused(tmp_path) -> None:
+    primary = _repo_with_origin(tmp_path)
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    elsewhere = tmp_path / "elsewhere.git"
+    (clone / ".git").rename(elsewhere)
+    (clone / ".git").symlink_to(elsewhere)
+
+    def agent(*args, **kwargs):
+        return None
+
+    with pytest.raises(SandboxUnavailableError, match="refus"):
+        _syncing_dispatch(agent, primary, clone, "61.4-001")("build", "p")
+    assert sync_sandbox_branch(primary, clone, "61.4-001") is False
+
+
+def test_recreated_clone_checks_out_the_existing_story_branch(tmp_path) -> None:
+    """A torn-down story re-entered after build: coverage must see feature/<id>."""
+    primary = _repo_with_origin(tmp_path)
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    _git(clone, "checkout", "-b", "feature/61.4-001")
+    (clone / "built.txt").write_text("x\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "feat: built")
+    assert sync_sandbox_branch(primary, clone, "61.4-001") is True
+    import shutil as _shutil
+
+    _shutil.rmtree(clone)
+    again = create_story_sandbox_clone(primary, "61.4-001", "run2-y")
+    assert _git(again, "symbolic-ref", "--short", "HEAD").stdout.strip() == "feature/61.4-001"
+    assert (again / "built.txt").exists()

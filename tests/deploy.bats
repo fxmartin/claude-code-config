@@ -308,6 +308,22 @@ EOF
     [ "$output" = "1" ]
 }
 
+@test "the pin is host-local: it leaves no dirty tree to commit" {
+    git init -q "${TMP}/repo"
+    PIN_FILE="${TMP}/repo/sandbox-image.yaml"
+    printf '# pins\namd64:\narm64:\n' >"${PIN_FILE}"
+    git -C "${TMP}/repo" add sandbox-image.yaml
+    git -C "${TMP}/repo" -c user.name=t -c user.email=t@example.com commit -qm "chore: pins"
+    _run_deploy
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"— commit"* ]]
+    [[ "$output" == *"do not commit"* ]]
+    run grep "^${ARCH}:" "${PIN_FILE}"
+    [ "$output" = "${ARCH}: sha256:${FAKE_ID}" ]
+    run git -C "${TMP}/repo" status --porcelain
+    [ -z "$output" ]
+}
+
 @test "a docker-style sha256-prefixed id is not double-prefixed" {
     FAKE_IMAGE_ID="sha256:${FAKE_ID}" _run_deploy
     [ "$status" -eq 0 ]

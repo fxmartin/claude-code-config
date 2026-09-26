@@ -59,6 +59,7 @@ from sdlc.dispatch import (
     AgentResult,
     ContextOverflowError,
     RateLimitError,
+    SandboxUnavailableError,
     dispatch_agent,
     sandbox_enabled,
 )
@@ -6284,10 +6285,16 @@ def create_story_worktree(root: Path, story_id: str, run_id: str) -> Path:
 # A linked worktree's ``.git`` is a file pointing into the primary ``.git``, so
 # git only works inside it if the primary ``.git`` is visible too — and the
 # sandbox must never mount it. A contained story therefore gets a standalone
-# ``git clone --local`` instead: objects are hardlinked (cheap, no alternates
-# back into the primary), ``origin`` keeps the real forge URL for the host-side
-# push/merge stages, and its remote-tracking refs are copied from the primary
-# right after the controller's own host-side ``git fetch origin``. The
+# ``git clone --local --no-hardlinks`` instead: objects are copied, never
+# hardlinked (a hardlinked object is the *same inode* as the primary's, so the
+# contained agent could overwrite it) and there are no alternates back into the
+# primary. ``origin`` keeps the real forge URL for the host-side push/merge
+# stages, and its remote-tracking refs are copied from the primary right after
+# the controller's own host-side ``git fetch origin``. The clone's ``.git`` is
+# writable by the contained agent, yet the controller (and the host-side
+# review/merge agents) later run git in it; :func:`reset_sandbox_clone_git`
+# rebuilds its config and hooks from trusted state after every contained
+# dispatch so nothing planted there ever executes on the host. The
 # ``sandbox-`` prefix keeps it clear of the ``agent-*`` orphan sweeper, and
 # living under ``_WORKTREE_SUBDIR`` keeps it out of the #607 fingerprint.
 _SANDBOX_CLONE_PREFIX = "sandbox-"
@@ -6319,6 +6326,7 @@ def create_story_sandbox_clone(root: Path, story_id: str, run_id: str) -> Path:
     short_run = run_id.split("-")[0]
     path = worktrees_dir / f"{_SANDBOX_CLONE_PREFIX}{short_run}-{story_id}"
     if is_sandbox_clone(path):
+        reset_sandbox_clone_git(root, path)
         return path
     try:
         worktrees_dir.mkdir(parents=True, exist_ok=True)
@@ -6333,7 +6341,10 @@ def create_story_sandbox_clone(root: Path, story_id: str, run_id: str) -> Path:
             root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"
         ).stdout.strip()
         steps: list[tuple[Path, tuple[str, ...]]] = [
-            (root, ("clone", "--local", "--no-checkout", "--quiet", str(root), str(path))),
+            (root, (
+                "clone", "--local", "--no-hardlinks", "--no-checkout", "--quiet",
+                str(root), str(path),
+            )),
             # Drop the clone's view of the *primary's* branches as origin/*.
             (path, ("remote", "remove", "origin")),
         ]
@@ -6353,7 +6364,17 @@ def create_story_sandbox_clone(root: Path, story_id: str, run_id: str) -> Path:
             value = _git(root, "config", "--get", key).stdout.strip()
             if value:
                 steps.append((path, ("config", key, value)))
-        steps.append((path, ("checkout", "--quiet", "--detach", base_sha.stdout.strip())))
+        # A story re-entered after its clone was torn down (build already DONE)
+        # resumes on the branch the primary holds, not on a bare base.
+        branch = f"feature/{story_id}"
+        if _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
+            steps += [
+                (path, ("fetch", "--no-tags", "--quiet", str(root),
+                        f"+refs/heads/{branch}:refs/heads/{branch}")),
+                (path, ("checkout", "--quiet", branch)),
+            ]
+        else:
+            steps.append((path, ("checkout", "--quiet", "--detach", base_sha.stdout.strip())))
         for cwd, args in steps:
             res = _git_slow(cwd, *args)
             if res.returncode != 0:
@@ -6369,6 +6390,90 @@ def create_story_sandbox_clone(root: Path, story_id: str, run_id: str) -> Path:
     return path
 
 
+# Gitdir entries that make git read config, hooks or objects from somewhere
+# other than the clone's own trusted files; none is ever created by the clone.
+_SANDBOX_GITDIR_REDIRECTS = ("commondir", "config.worktree", "objects/info/alternates")
+
+
+def _trusted_clone_config(root: Path) -> str:
+    """The clone's ``.git/config``, rebuilt from the primary's trusted values only."""
+    object_format = _git(root, "rev-parse", "--show-object-format").stdout.strip() or "sha1"
+    lines = [
+        "[core]",
+        f"\trepositoryformatversion = {0 if object_format == 'sha1' else 1}",
+        "\tbare = false",
+        "\tlogallrefupdates = true",
+    ]
+    filemode = _git(root, "config", "--get", "core.filemode").stdout.strip()
+    if filemode:
+        lines.append(f"\tfilemode = {filemode}")
+    if object_format != "sha1":
+        lines += ["[extensions]", f"\tobjectformat = {object_format}"]
+    origin_url = _git(root, "remote", "get-url", "origin").stdout.strip()
+    if origin_url:
+        lines += [
+            '[remote "origin"]',
+            f"\turl = {json.dumps(origin_url, ensure_ascii=False)}",
+            "\tfetch = +refs/heads/*:refs/remotes/origin/*",
+        ]
+    identity = [
+        (key, _git(root, "config", "--get", f"user.{key}").stdout.strip())
+        for key in ("name", "email")
+    ]
+    if any(value for _, value in identity):
+        lines.append("[user]")
+        lines += [
+            f"\t{key} = {json.dumps(value, ensure_ascii=False)}"
+            for key, value in identity if value
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def reset_sandbox_clone_git(root: Path, clone: Path) -> None:
+    """Rebuild a story clone's git config and hooks from trusted state (#614).
+
+    The clone is mounted read-write into the container, ``.git`` included, so a
+    contained agent can plant a hook, ``core.sshCommand``/``core.fsmonitor``/
+    ``core.hooksPath``/``credential.helper``, an ``[include]`` or a
+    ``commondir`` redirect — all of which would run on the *host* the next time
+    the controller pushes from the clone or a host-side review/merge agent runs
+    git there. This discards every such lever: ``.git/config`` is rewritten
+    from the primary's trusted values, ``hooks/`` is emptied and the gitdir
+    redirects are deleted. Refs, objects and the index (the agent's actual
+    work) are untouched. A ``.git`` that is no longer a real directory (swapped
+    for a symlink or a gitfile) is refused with :class:`SandboxUnavailableError`
+    rather than trusted.
+    """
+    gitdir = Path(clone) / ".git"
+    if gitdir.is_symlink() or not gitdir.is_dir():
+        raise SandboxUnavailableError(
+            f"sandbox clone {clone} refused: its .git is no longer a plain "
+            "directory, so host-side git there cannot be trusted"
+        )
+    try:
+        config = gitdir / "config"
+        tmp = gitdir / "config.sdlc-trusted"
+        tmp.unlink(missing_ok=True)
+        tmp.write_text(_trusted_clone_config(root), encoding="utf-8")
+        os.replace(tmp, config)
+        hooks = gitdir / "hooks"
+        if hooks.is_symlink() or hooks.is_file():
+            hooks.unlink()
+        elif hooks.is_dir():
+            shutil.rmtree(hooks)
+        hooks.mkdir()
+        for rel in _SANDBOX_GITDIR_REDIRECTS:
+            target = gitdir / rel
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SandboxUnavailableError(
+            f"sandbox clone {clone} refused: could not reset its git config/hooks ({exc})"
+        ) from exc
+
+
 def sync_sandbox_branch(root: Path, clone: Path, story_id: str) -> bool:
     """Fetch ``feature/<id>`` from a story clone back into the primary (#614).
 
@@ -6376,10 +6481,14 @@ def sync_sandbox_branch(root: Path, clone: Path, story_id: str) -> bool:
     branch exactly as it would with a linked worktree (R10 artifact probes,
     reconcile, teardown). A clone with no such branch yet is a no-op success.
     Returns False — never raises — when the fetch fails (e.g. the operator has
-    that branch checked out), so the caller can keep the clone rather than lose
-    unpushed commits.
+    that branch checked out) or the clone's git cannot be reset to trusted state
+    first, so the caller can keep the clone rather than lose unpushed commits.
     """
     branch = f"refs/heads/feature/{story_id}"
+    try:
+        reset_sandbox_clone_git(root, clone)
+    except SandboxUnavailableError:
+        return False
     try:
         if _git(clone, "rev-parse", "--verify", "--quiet", branch).returncode != 0:
             return True
@@ -6390,12 +6499,18 @@ def sync_sandbox_branch(root: Path, clone: Path, story_id: str) -> bool:
 
 
 def _syncing_dispatch(dispatch: Callable[..., Any], root: Path, clone: Path, story_id: str):
-    """Wrap ``dispatch`` so each call is followed by :func:`sync_sandbox_branch`."""
+    """Wrap ``dispatch`` so each call is followed by :func:`sync_sandbox_branch`.
+
+    The clone's git is reset to trusted state first, and a clone that cannot be
+    reset fails the stage loud (:class:`SandboxUnavailableError`) — the next
+    host-side git in it (push, review, merge) must never meet a planted hook.
+    """
 
     def run(*args: Any, **kwargs: Any) -> Any:
         try:
             return dispatch(*args, **kwargs)
         finally:
+            reset_sandbox_clone_git(root, clone)
             sync_sandbox_branch(root, clone, story_id)
 
     return run
