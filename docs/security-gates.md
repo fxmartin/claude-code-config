@@ -512,6 +512,12 @@ dispatch raises `SandboxUnavailableError` **before any agent runs** — it never
 silently degrades to an unsandboxed host run. Runtime is auto-detected
 (`podman`→`docker`) or forced via `SDLC_SANDBOX_RUNTIME`.
 
+**Scope.** Only `sdlc build` contains its writer stages. A contained build never
+pushes: the controller pushes and opens the change request on the host (after
+coverage, or before review under `--skip-coverage`). `sdlc fix` has no story-clone
+wiring yet, so with `SDLC_SANDBOX` set it refuses to start rather than run
+uncontained.
+
 **Knobs.** `SDLC_SANDBOX` (opt-in, covers resumes), `SDLC_SANDBOX_IMAGE`
 (override; the default is the `sha256:` image id `scripts/deploy.sh` pins per
 arch in `controller/src/sdlc/config/sandbox-image.yaml` after building

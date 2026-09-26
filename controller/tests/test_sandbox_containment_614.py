@@ -396,8 +396,7 @@ def test_prepare_workdir_clone_failure_is_loud_not_a_fallback(tmp_path, monkeypa
     )
     assert workdir is None  # dispatch then refuses to mount the primary
     assert any(
-        e["level"] == "error" and "no host fallback" not in e["message"]
-        and "sandbox clone unavailable" in e["message"]
+        e["level"] == "error" and "sandbox clone unavailable" in e["message"]
         for e in ledger.recent_events(run_id, limit=50)
     )
 
@@ -548,3 +547,85 @@ def test_prepare_workdir_survives_host_fetch_exception(tmp_path, monkeypatch) ->
         e["level"] == "warn" and "no network" in e["message"]
         for e in ledger.recent_events(run_id, limit=50)
     )
+
+
+# ---------------------------------------------------------------------------
+# Review of #614: sandbox + --skip-coverage must still get a change request
+# ---------------------------------------------------------------------------
+
+def test_sandboxed_skip_coverage_prompt_commits_locally() -> None:
+    """A network-less build cannot push: the agent commits, the controller opens."""
+    prompt = render_build_prompt(
+        _story(), BuildOptions(sandbox=True, skip_coverage=True), close_link="Closes #9"
+    )
+    assert "Push and create" not in prompt
+    assert "Commit locally; the controller pushes and opens the PR before review." in prompt
+    assert "Closes #9" not in prompt
+
+
+def test_host_skip_coverage_prompt_still_pushes(monkeypatch) -> None:
+    monkeypatch.delenv(SANDBOX_ENV, raising=False)
+    prompt = render_build_prompt(_story(), BuildOptions(skip_coverage=True))
+    assert "6. Push and create PR" in prompt
+
+
+def test_sandboxed_skip_coverage_opens_cr_before_review(tmp_path, monkeypatch) -> None:
+    from sdlc import build as b
+    from test_build import _RaisingDispatcher
+
+    opens: list[str] = []
+
+    def fake_open(*args, **kwargs):
+        opens.append(kwargs["context"])
+        return 77
+
+    monkeypatch.setattr(b, "_open_story_cr", fake_open)
+    disp = _RaisingDispatcher(raise_on="none")
+    story = _story()
+    ledger, run_id = _ledger(tmp_path, story.id)
+    b._run_story(
+        story,
+        BuildOptions(scope="epic-61", skip_preflight=True, sandbox=True, skip_coverage=True),
+        ledger, run_id, disp, tmp_path, done_stages=frozenset({"build"}),
+    )
+    assert opens and opens[0] == "pre-review"
+    assert any(agent == "review" for agent, _ in disp.calls)
+
+
+# ---------------------------------------------------------------------------
+# Review of #614: `sdlc fix` has no clone wiring — refuse up front under the env
+# ---------------------------------------------------------------------------
+
+def _no_dispatch(*_args, **_kwargs):
+    raise AssertionError("nothing may be dispatched when the sandbox is refused")
+
+
+def test_fix_refuses_to_start_under_sandbox_env(tmp_path, monkeypatch) -> None:
+    from sdlc.fix_issue import SANDBOX_UNSUPPORTED_REASON, FixOptions, run_fix
+
+    monkeypatch.setenv(SANDBOX_ENV, "1")
+    result = run_fix(
+        FixOptions(issue=1), ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=_no_dispatch, preflight=lambda: True,
+        runner=_no_dispatch, root=tmp_path,
+    )
+    assert result.status == "ABORTED"
+    assert result.aborted
+    assert result.abort_reason == SANDBOX_UNSUPPORTED_REASON
+
+
+def test_fix_batch_refuses_to_start_under_sandbox_env(tmp_path, monkeypatch) -> None:
+    from sdlc.fix_issue import (
+        SANDBOX_UNSUPPORTED_REASON,
+        FixBatchOptions,
+        run_fix_batch,
+    )
+
+    monkeypatch.setenv(SANDBOX_ENV, "1")
+    result = run_fix_batch(
+        FixBatchOptions(target="all", concurrency=1), ledger=Ledger(tmp_path / "l.db"),
+        dispatcher=_no_dispatch, preflight=lambda: True,
+        runner=_no_dispatch, root=tmp_path,
+    )
+    assert result.status == "ABORTED"
+    assert result.summary == SANDBOX_UNSUPPORTED_REASON

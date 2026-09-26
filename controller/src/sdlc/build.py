@@ -4800,15 +4800,17 @@ def render_build_prompt(
     request targets. Both default to GitHub's wording, so the GitHub path is
     byte-identical to today (AC2).
     """
+    # Issue #614: a contained build has no network — the controller already ran
+    # `git fetch origin` on the host before cutting the story clone, and it (not
+    # the agent) pushes and opens the change request, even with --skip-coverage.
+    sandboxed = _story_sandboxed(opts)
+    agent_opens_cr = opts.skip_coverage and not sandboxed
     # Only inject the close-link when the build agent itself opens the change request.
     close_hint = (
         _close_link_instruction(close_link, cr_terms=cr_terms)
-        if opts.skip_coverage
+        if agent_opens_cr
         else ""
     )
-    # Issue #614: a contained build has no network — the controller already ran
-    # `git fetch origin` on the host before cutting the story clone.
-    sandboxed = _story_sandboxed(opts)
     fetch = "" if sandboxed else "git fetch origin && "
     sandbox_note = (
         "   You are in a network-less sandbox: the controller already fetched "
@@ -4820,11 +4822,11 @@ def render_build_prompt(
     push = (
         f"6. Push and create {cr_terms.abbr}{cr_terms.cli_hint}; "
         f"include the {cr_terms.ref_noun} in the result block."
-        if opts.skip_coverage
+        if agent_opens_cr
         # Story 27.3-001: the controller pushes and opens the change request
         # deterministically once the coverage gate completes — no agent does.
         else f"6. Commit locally; the controller pushes and opens the {cr_terms.abbr} "
-        "after the coverage gate."
+        + ("after the coverage gate." if not opts.skip_coverage else "before review.")
     )
     # Story 18.3-001: keep user-facing docs current with each story. When the
     # documentation-currency lens is enabled (the default), instruct the build
@@ -8113,9 +8115,13 @@ def _run_story(
         # retry of it — reuses the same packet. None (no CR yet, host failure,
         # oversized) leaves the prompt on its fetch-it-yourself fallback.
         review_packet_block: str | None = None
-        if stage == "review" and pr_number is None and "coverage" in stages:
+        if stage == "review" and pr_number is None and (
+            "coverage" in stages or _story_sandboxed(opts)
+        ):
             # Issue #698: coverage is DONE but its deterministic CR open failed
-            # (the story parked and resume re-enters here). Retry it before
+            # (the story parked and resume re-enters here). Issue #614: a
+            # sandboxed --skip-coverage build cannot push, so this is where its
+            # CR is first opened. Retry it before
             # review — a review with no CR burns dispatches on a "PR #None"
             # prompt. On failure re-park without touching the review budget.
             pr_number = _open_story_cr(
