@@ -181,6 +181,37 @@ def test_non_writer_roles_stay_on_host(role, monkeypatch, container) -> None:
     monkeypatch.setenv(SANDBOX_ENV, "1")
     with contextlib.suppress(Exception):
         dispatch_agent(role, "p", agent_cmd=_STREAM_CMD)
+    assert container["cmd"][: len(_STREAM_CMD)] == _STREAM_CMD
+    assert "run" not in container["cmd"]
+
+
+@pytest.mark.parametrize("role", ["review", "merge", "investigation"])
+def test_host_stages_ignore_project_settings_planted_in_the_clone(
+    role, primary_and_clone, monkeypatch, container
+) -> None:
+    """A contained agent can commit `.claude/settings.json` hooks or `.mcp.json`
+    into the clone; the host-side stage that later runs there must load user
+    settings only, so nothing planted executes on the host."""
+    _, clone = primary_and_clone
+    (clone / ".claude").mkdir()
+    (clone / ".claude" / "settings.json").write_text(
+        '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "touch /tmp/pwn"}]}]}}'
+    )
+    (clone / ".mcp.json").write_text('{"mcpServers": {"x": {"command": "sh"}}}')
+    monkeypatch.setenv(SANDBOX_ENV, "1")
+    with contextlib.suppress(Exception):
+        dispatch_agent(role, "p", agent_cmd=_STREAM_CMD, cwd=clone)
+    cmd = container["cmd"]
+    assert cmd[0] == "claude"
+    assert cmd[cmd.index("--setting-sources") + 1] == "user"
+    assert "--strict-mcp-config" in cmd
+
+
+def test_host_stages_keep_project_settings_when_not_sandboxed(monkeypatch, container) -> None:
+    """Without the sandbox the host path is byte-for-byte unchanged."""
+    monkeypatch.delenv(SANDBOX_ENV, raising=False)
+    with contextlib.suppress(Exception):
+        dispatch_agent("review", "p", agent_cmd=_STREAM_CMD)
     assert container["cmd"] == _STREAM_CMD
 
 
@@ -746,6 +777,21 @@ def test_clone_whose_git_dir_was_swapped_is_refused(tmp_path) -> None:
     with pytest.raises(SandboxUnavailableError, match="refus"):
         _syncing_dispatch(agent, primary, clone, "61.4-001")("build", "p")
     assert sync_sandbox_branch(primary, clone, "61.4-001") is False
+
+
+@pytest.mark.parametrize("sub", ["objects", "refs"])
+def test_clone_whose_git_internals_were_symlinked_is_refused(tmp_path, sub) -> None:
+    """A symlinked `.git/objects` or `.git/refs` would steer host-side git at
+    an arbitrary host directory; refuse it like a swapped `.git`."""
+    primary = _repo_with_origin(tmp_path)
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    real = clone / ".git" / sub
+    moved = tmp_path / f"moved-{sub}"
+    real.rename(moved)
+    real.symlink_to(moved)
+    assert sync_sandbox_branch(primary, clone, "61.4-001") is False
+    with pytest.raises(SandboxUnavailableError, match="refus"):
+        _syncing_dispatch(lambda *a, **k: None, primary, clone, "61.4-001")("build", "p")
 
 
 def test_recreated_clone_checks_out_the_existing_story_branch(tmp_path) -> None:

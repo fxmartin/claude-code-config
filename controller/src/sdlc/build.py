@@ -6441,11 +6441,17 @@ def reset_sandbox_clone_git(root: Path, clone: Path) -> None:
     from the primary's trusted values, ``hooks/`` is emptied and the gitdir
     redirects are deleted. Refs, objects and the index (the agent's actual
     work) are untouched. A ``.git`` that is no longer a real directory (swapped
-    for a symlink or a gitfile) is refused with :class:`SandboxUnavailableError`
+    for a symlink or a gitfile), or whose ``objects``/``refs`` became symlinks, is
+    refused with :class:`SandboxUnavailableError`
     rather than trusted.
     """
     gitdir = Path(clone) / ".git"
-    if gitdir.is_symlink() or not gitdir.is_dir():
+    # A symlinked objects/ or refs/ would point host-side git at an arbitrary
+    # host directory, so it is refused along with a swapped .git.
+    if (
+        gitdir.is_symlink() or not gitdir.is_dir()
+        or any((gitdir / sub).is_symlink() for sub in ("objects", "refs"))
+    ):
         raise SandboxUnavailableError(
             f"sandbox clone {clone} refused: its .git is no longer a plain "
             "directory, so host-side git there cannot be trusted"

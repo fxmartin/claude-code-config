@@ -860,6 +860,29 @@ def _parse_envelope(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+# Issue #614: in a sandboxed run the host-side stages (review, merge) run in
+# the story clone, whose working tree the contained agent wrote. Claude Code
+# loads ``.claude/settings.json`` hooks and ``.mcp.json`` servers from its cwd,
+# so a committed hook would execute on the host with full network and
+# filesystem. Loading user settings only, with no project MCP config, closes
+# that route back out of the sandbox.
+HOST_STAGE_ISOLATION_FLAGS: tuple[str, ...] = (
+    "--setting-sources", "user", "--strict-mcp-config",
+)
+
+
+def _isolate_host_stage(cmd: list[str]) -> list[str]:
+    """Append :data:`HOST_STAGE_ISOLATION_FLAGS` to a ``claude`` command.
+
+    Applied to any ``claude`` invocation, including an ``$SDLC_AGENT_CMD`` or
+    explicit override, because the risk is the cwd, not the posture the
+    operator chose. A non-claude harness is returned unchanged.
+    """
+    if not cmd or Path(cmd[0]).name != "claude" or "--setting-sources" in cmd:
+        return cmd
+    return [*cmd, *HOST_STAGE_ISOLATION_FLAGS]
+
+
 def dispatch_agent(
     agent_type: str,
     prompt: str,
@@ -918,7 +941,8 @@ def dispatch_agent(
     running unsandboxed (AC3). The result contract is identical to the host path
     (AC2). Default (``None`` with the env unset) is the host path, unchanged.
     Issue #614: only :data:`SANDBOXED_ROLES` (build/coverage/bugfix) are wrapped;
-    review and merge always run on the host.
+    review and merge always run on the host, with project settings and MCP
+    config ignored (:func:`_isolate_host_stage`) since the clone is untrusted.
 
     ``parser`` (Story 20.1-002) is the id of the per-harness output parser used to
     interpret the agent's stdout into the validated result. ``None`` selects the
@@ -931,8 +955,11 @@ def dispatch_agent(
     env = _dispatch_env(thinking_cap)
     # Issue #614: only the code-writing roles are contained; review and merge
     # stay on the host (read-only deny floor / forge auth) even when enabled.
-    if agent_type in SANDBOXED_ROLES and sandbox_enabled(sandbox):
-        cmd = _apply_sandbox(cmd, cwd=cwd, env=env)
+    if sandbox_enabled(sandbox):
+        if agent_type in SANDBOXED_ROLES:
+            cmd = _apply_sandbox(cmd, cwd=cwd, env=env)
+        else:
+            cmd = _isolate_host_stage(cmd)
     # Story 13.3-001: the agent runs under --dangerously-skip-permissions, so any
     # untrusted text woven into the prompt (story bodies, issue/PR comments) is a
     # prompt-injection surface. Sanitize the assembled prompt at this single
