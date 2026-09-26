@@ -2058,7 +2058,6 @@ def _run_e2e(
 # ---------------------------------------------------------------------------
 
 
-
 # Issue #614: the container sandbox contains the writer stages of ``sdlc build``
 # only — each story gets a self-contained clone and the controller owns every
 # fetch/push. The fix pipeline has none of that wiring (its agents fetch, push

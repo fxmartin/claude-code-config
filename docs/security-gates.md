@@ -497,7 +497,7 @@ the story branch back after each stage. The container:
 
 | Flag | Effect |
 |------|--------|
-| `--network none` | **no egress** by default — neither host nor internet is reachable |
+| `--network bridge` | ordinary egress by default — the contained claude CLI must reach the API; the sandbox contains the **filesystem** (only the story clone is mounted). Credentials: the host's `~/.claude/.credentials.json` is bind-mounted read-only, or `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` is forwarded; with neither, dispatch refuses |
 | `--cap-drop ALL` | all Linux capabilities dropped |
 | `--security-opt no-new-privileges` | no privilege escalation |
 | `--user <uid>:<gid>` | runs as the **non-root** host operator |

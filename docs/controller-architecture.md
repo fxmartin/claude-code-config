@@ -2702,7 +2702,7 @@ The container is locked down:
 
 | Flag | Effect |
 |------|--------|
-| `--network none` | **no egress** — a compromised agent can reach neither the host nor the internet (default) |
+| `--network bridge` | the runtime's ordinary network (default) — the contained agent is the claude CLI and must reach the API; what the sandbox contains is the **filesystem**. `SDLC_SANDBOX_NETWORK` points at an egress proxy network when one exists |
 | `--cap-drop ALL` | every Linux capability dropped |
 | `--security-opt no-new-privileges` | no privilege escalation inside the container |
 | `--user <uid>:<gid>` | runs as the **host operator's non-root uid/gid**, so mounted files stay owned by you |
@@ -2722,9 +2722,9 @@ it never silently falls back to an unsandboxed host run. Runtime is auto-detecte
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `SDLC_SANDBOX` | unset (off) | per-repo opt-in equivalent of `--sandbox`; also covers resumed runs |
-| `SDLC_SANDBOX_IMAGE` | the pinned image id for this host's arch | override the image. The default is built from `controller/sandbox/Containerfile` by `scripts/deploy.sh`, which records its `sha256:` image id in `controller/src/sdlc/config/sandbox-image.yaml` (one line per arch — each host builds its own). No pin for this arch and no override → dispatch refuses; a tag is never honoured as a pin |
+| `SDLC_SANDBOX_IMAGE` | the pinned image id for this host's arch | override the image. The default is built from `controller/sandbox/Containerfile` by `scripts/deploy.sh`, which records its `sha256:` image id in `controller/src/sdlc/config/sandbox-image.yaml` (one line per arch — each host builds its own). No pin for this arch and no override → dispatch refuses; a tag is never honoured as a pin. The Containerfile itself builds from upstream tags, so two builds are not byte-identical — reproducibility lives in the recorded image id, not in the build |
 | `SDLC_SANDBOX_RUNTIME` | auto (`podman`→`docker`) | force a specific runtime |
-| `SDLC_SANDBOX_NETWORK` | `none` | egress mode — point at a locked-down filtering network only for a stage that genuinely needs the API ("explicit allowlist only if a stage needs it") |
+| `SDLC_SANDBOX_NETWORK` | `bridge` | network mode — point at an egress-filtering network when the host runs one; an allowlisted egress network is a later story |
 
 Because egress is off by default, an agent inside the sandbox cannot reach the
 Anthropic API unless the operator opts into a filtering egress network via

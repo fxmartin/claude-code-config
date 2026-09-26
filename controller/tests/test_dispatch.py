@@ -7,6 +7,7 @@ import fnmatch
 import json
 import os
 import signal
+from pathlib import Path
 import subprocess
 import threading
 
@@ -2172,7 +2173,7 @@ def test_sandbox_wrap_builds_hardened_no_egress_argv(tmp_path) -> None:
     argv = sandbox_wrap(inner, runtime="podman", image="img:latest", mount=tmp_path)
     assert argv[:2] == ["podman", "run"]
     assert "--rm" in argv and "-i" in argv
-    assert argv[argv.index("--network") + 1] == DEFAULT_SANDBOX_NETWORK == "none"
+    assert argv[argv.index("--network") + 1] == DEFAULT_SANDBOX_NETWORK == "bridge"
     assert argv[argv.index("--cap-drop") + 1] == "ALL"
     assert argv[argv.index("--security-opt") + 1] == "no-new-privileges"
     assert "--user" in argv  # a non-root user is always pinned
@@ -2219,6 +2220,9 @@ def pinned_image(monkeypatch):
     """Issue #614: the default image is the deploy-pinned id, never a tag."""
     monkeypatch.setattr("sdlc.dispatch.pinned_sandbox_image", lambda arch=None: _PINNED)
     monkeypatch.delenv(SANDBOX_IMAGE_ENV, raising=False)
+    # #614: a credentials file is what lets the contained CLI sign in; fake one
+    # so the hermetic suite never depends on the developer's ~/.claude.
+    monkeypatch.setattr("sdlc.dispatch._host_sandbox_credentials", lambda: Path("/fake/.claude/.credentials.json"))
     return _PINNED
 
 
@@ -2243,7 +2247,7 @@ def test_dispatch_sandbox_wraps_command_and_keeps_contract(monkeypatch, tmp_path
     # The launched command is the hardened wrap, with the agent command at the tail.
     cmd = seen["cmd"]
     assert cmd[:2] == ["podman", "run"]
-    assert cmd[cmd.index("--network") + 1] == "none"
+    assert cmd[cmd.index("--network") + 1] == "bridge"
     assert cmd[cmd.index("--cap-drop") + 1] == "ALL"
     assert cmd[-len(_STREAM_CMD):] == _STREAM_CMD
 

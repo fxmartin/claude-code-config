@@ -8174,7 +8174,29 @@ def _run_story(
         # with the measured numbers injected into its prompt. The 90% criterion
         # itself is unchanged.
         precheck: coverage_precheck.PrecheckResult | None = None
-        if stage == "coverage" and story_class != change_class.DOCS_ONLY:
+        if (
+            stage == "coverage"
+            and story_class != change_class.DOCS_ONLY
+            and _story_sandboxed(opts)
+        ):
+            # #614 (review round 6): the pre-check runs the project's own test
+            # command — which the contained build agent may have rewritten
+            # (a committed conftest.py, a changed coverage command) — on the
+            # HOST, with the operator's environment, network and filesystem.
+            # That is the #607 escape by another door. A sandboxed run
+            # therefore never pre-checks: it always hands off to the contained
+            # coverage agent, and only the agent's verdict decides the stage.
+            ledger.event_log(
+                run_id, story.id, "info", "controller",
+                "coverage pre-check skipped: sandboxed run — the story's test "
+                "command never executes on the host; dispatching the contained "
+                "coverage agent",
+            )
+        if (
+            stage == "coverage"
+            and story_class != change_class.DOCS_ONLY
+            and not _story_sandboxed(opts)
+        ):
             precheck = coverage_precheck.run_precheck(
                 workdir or Path.cwd(), base_ref, f"feature/{story.id}",
                 timeout=opts.preflight_timeout,

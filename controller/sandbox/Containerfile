@@ -3,8 +3,11 @@
 #
 # Issue #614: with SDLC_SANDBOX=1 the controller runs writer agents inside this
 # image with only the story's self-contained clone bind-mounted at /workspace,
-# `--network none`, every capability dropped and the host uid:gid. A path
-# outside the story tree (the #607 escape) simply does not exist in here.
+# every capability dropped and the host uid:gid. A path outside the story tree
+# (the #607 escape) simply does not exist in here. The container sits on the
+# runtime's bridge network — the agent is the claude CLI and must reach the
+# API — and signs in with the host's ~/.claude/.credentials.json, bind-mounted
+# read-only under HOME (or a forwarded CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY).
 #
 # Toolchain: git, bats, python3 + uv, node + npm, and the claude CLI. Host uv
 # and npm caches are bind-mounted read-only at /cache/{uv,npm} at dispatch, so
@@ -33,7 +36,9 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 
 # The agent runs as the host operator's uid:gid, which has no passwd entry
 # here; give it a writable HOME so the claude CLI and git can keep state.
-RUN mkdir -p /home/agent && chmod 1777 /home/agent
+# ~/.claude is pre-created so the read-only credentials bind mount lands in a
+# directory the CLI can still write its own state next to.
+RUN mkdir -p /home/agent/.claude && chmod 1777 /home/agent /home/agent/.claude
 ENV HOME=/home/agent
 
 WORKDIR /workspace

@@ -96,6 +96,7 @@ def container(monkeypatch):
     monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr("sdlc.dispatch.pinned_sandbox_image", lambda arch=None: PINNED)
     monkeypatch.delenv(SANDBOX_IMAGE_ENV, raising=False)
+    monkeypatch.setattr("sdlc.dispatch._host_sandbox_credentials", lambda: Path("/fake/.claude/.credentials.json"))
     seen: dict = {}
     monkeypatch.setattr(subprocess, "Popen", _sandbox_popen(seen))
     return seen
@@ -274,7 +275,7 @@ def test_default_image_is_the_pin_and_never_pulled(tmp_path, container) -> None:
     cmd = container["cmd"]
     assert PINNED in cmd
     assert cmd[cmd.index("--pull") + 1] == "never"
-    assert cmd[cmd.index("--network") + 1] == "none"
+    assert cmd[cmd.index("--network") + 1] == "bridge"
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +305,10 @@ def test_missing_host_caches_are_not_mounted(tmp_path, monkeypatch, container) -
     story = tmp_path / "story"
     story.mkdir()
     dispatch_agent("build", "p", agent_cmd=_STREAM_CMD, sandbox=True, cwd=story)
-    assert _mount_sources(container["cmd"]) == [story.resolve()]
+    # The story clone and the (faked) credentials file — no cache mounts.
+    assert _mount_sources(container["cmd"]) == [
+        story.resolve(), Path("/fake/.claude/.credentials.json").resolve()
+    ]
     assert not (tmp_path / "absent-uv").exists()
 
 
@@ -809,3 +813,91 @@ def test_recreated_clone_checks_out_the_existing_story_branch(tmp_path) -> None:
     again = create_story_sandbox_clone(primary, "61.4-001", "run2-y")
     assert _git(again, "symbolic-ref", "--short", "HEAD").stdout.strip() == "feature/61.4-001"
     assert (again / "built.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Review round 6: the coverage pre-check must never run the agent's tests on the host
+# ---------------------------------------------------------------------------
+
+def test_sandboxed_run_never_runs_the_coverage_precheck_on_the_host(tmp_path, monkeypatch) -> None:
+    """The pre-check executes the project's test command — which the contained
+    build agent may have rewritten — on the HOST. In a sandboxed run that is the
+    #607 escape by another door, so the pre-check is skipped and the contained
+    coverage agent is dispatched instead."""
+    import sdlc.build as build_mod
+    import sdlc.change_class as change_class_mod
+    import sdlc.coverage_precheck as precheck_mod
+    from sdlc.build import run_build
+    from test_coverage_precheck import _CrOpener, _RecordingDispatcher, _stage_rows
+
+    monkeypatch.setattr(
+        change_class_mod, "changed_files", lambda root, base, branch: ["src/x.py"]
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("coverage pre-check must not run on the host in a sandboxed run")
+
+    monkeypatch.setattr(precheck_mod, "run_precheck", _boom)
+    monkeypatch.setattr(build_mod, "_open_story_cr", _CrOpener((300,)))
+    monkeypatch.setattr(build_mod, "_story_high_risk", lambda story, opts: False)
+    # The clone/container plumbing has its own tests above; here only the
+    # coverage-stage decision is under test, so the story runs in a plain dir.
+    monkeypatch.setattr(
+        build_mod, "_prepare_story_workdir",
+        lambda opts, story, ledger, run_id, real_run: None,
+    )
+    disp = _RecordingDispatcher()
+    ledger = Ledger(tmp_path / "ledger.db")
+    opts = BuildOptions(scope="epic-27", skip_preflight=True, sequential=True, sandbox=True)
+    run_build(
+        opts, queue=[_story("27.3-001")], ledger=ledger, dispatcher=disp,
+        preflight=lambda: True, root=tmp_path,
+    )
+
+    assert "coverage" in disp.calls, "the contained coverage agent must be dispatched"
+    assert _stage_rows(tmp_path)["coverage"][0] != "SKIPPED"
+    import sqlite3
+    msgs = [r[0] for r in sqlite3.connect(tmp_path / "ledger.db").execute("SELECT message FROM events")]
+    assert any("coverage pre-check skipped: sandboxed run" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Decision 2 (revised): bridge network, and the CLI's credentials go in deliberately
+# ---------------------------------------------------------------------------
+
+def test_credentials_file_is_mounted_read_only_under_container_home(tmp_path, monkeypatch, container) -> None:
+    creds = tmp_path / ".claude" / ".credentials.json"
+    creds.parent.mkdir()
+    creds.write_text("{}")
+    monkeypatch.setattr("sdlc.dispatch._host_sandbox_credentials", lambda: creds)
+    story = tmp_path / "story"
+    story.mkdir()
+    dispatch_agent("build", "p", agent_cmd=_STREAM_CMD, sandbox=True, cwd=story)
+    cmd = container["cmd"]
+    assert f"{creds}:/home/agent/.claude/.credentials.json:ro,z" in cmd
+    # Only the credentials file — never the rest of ~/.claude.
+    assert not any(a.endswith(":/home/agent/.claude:Z") or a.endswith(":/home/agent/.claude:ro,z") for a in cmd)
+
+
+def test_token_env_is_forwarded_when_no_credentials_file(tmp_path, monkeypatch, container) -> None:
+    """macOS keeps the OAuth token in the Keychain: the env token is the way in."""
+    monkeypatch.setattr("sdlc.dispatch._host_sandbox_credentials", lambda: None)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok-123")
+    story = tmp_path / "story"
+    story.mkdir()
+    dispatch_agent("build", "p", agent_cmd=_STREAM_CMD, sandbox=True, cwd=story)
+    cmd = container["cmd"]
+    env = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-e"]
+    assert "CLAUDE_CODE_OAUTH_TOKEN=tok-123" in env
+    assert not any(".credentials.json" in a for a in cmd)
+
+
+def test_no_credentials_at_all_refuses_to_contain(tmp_path, monkeypatch, container) -> None:
+    monkeypatch.setattr("sdlc.dispatch._host_sandbox_credentials", lambda: None)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    story = tmp_path / "story"
+    story.mkdir()
+    with pytest.raises(SandboxUnavailableError, match="no agent credentials"):
+        dispatch_agent("build", "p", agent_cmd=_STREAM_CMD, sandbox=True, cwd=story)
+    assert "cmd" not in container  # nothing was launched

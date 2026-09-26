@@ -559,18 +559,30 @@ _OCI_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "
 SANDBOXED_ROLES: frozenset[str] = frozenset({"build", "coverage", "bugfix"})
 # Force a specific container runtime; unset → auto-detect (podman, then docker).
 SANDBOX_RUNTIME_ENV = "SDLC_SANDBOX_RUNTIME"
-# Network mode for the container. Default ``none`` = no egress (AC1). The operator
-# can point this at a locked-down filtering network for the rare stage that
-# genuinely needs the API — "explicit allowlist only if a stage needs it" — but
-# the default keeps the agent fully off-network.
+# Network mode for the container. Issue #614, decision 2 (revised 2026-09-26):
+# the contained agent *is* the claude CLI and must reach the Anthropic API, so
+# the default is the runtime's ordinary ``bridge`` network. What this sandbox
+# delivers is FILESYSTEM containment — only the story clone is mounted, so the
+# #607 escape path does not exist in here. An operator who runs an egress proxy
+# can point this at it; an allowlisted egress network is a later story.
 SANDBOX_NETWORK_ENV = "SDLC_SANDBOX_NETWORK"
-DEFAULT_SANDBOX_NETWORK = "none"
+DEFAULT_SANDBOX_NETWORK = "bridge"
+# Issue #614: how the contained claude CLI signs in. The host's OAuth credentials
+# file (Linux keeps it on disk; the same Max subscription, rate-limit window and
+# cost accounting as host runs) is bind-mounted READ-ONLY into the container's
+# HOME (``/home/agent``, see controller/sandbox/Containerfile). Nothing else from
+# ``~/.claude`` goes in. When the file is absent — macOS keeps the token in the
+# Keychain — a token env var is forwarded instead; with neither, dispatch refuses
+# rather than launching an agent that cannot sign in.
+_SANDBOX_CREDENTIALS_FILE = ".claude/.credentials.json"
+_SANDBOX_HOME = "/home/agent"
+_SANDBOX_TOKEN_ENVS: tuple[str, ...] = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 # Runtimes tried, in order, when ``$SDLC_SANDBOX_RUNTIME`` is unset.
 _SANDBOX_RUNTIMES: tuple[str, ...] = ("podman", "docker")
 # Where the worktree is bind-mounted inside the container; the agent runs here.
 _SANDBOX_WORKDIR = "/workspace"
 # Issue #614: host package caches, bind-mounted read-only so dependency
-# resolution works with ``--network none``. Each entry is the host-side env var
+# resolution never has to reach a registry. Each entry is the host-side env var
 # that relocates the cache, its default under ``$HOME``, the in-container mount
 # point, and the env that points the in-container tool at it (offline).
 _SANDBOX_CACHES: tuple[tuple[str, str, str, dict[str, str]], ...] = (
@@ -638,14 +650,16 @@ def sandbox_wrap(
     env: dict[str, str] | None = None,
     forward_env: tuple[str, ...] = (),
     caches: tuple[Path | None, ...] = (),
+    credentials: Path | None = None,
 ) -> list[str]:
-    """Wrap ``cmd`` in a hardened, no-egress ``<runtime> run`` invocation (AC1).
+    """Wrap ``cmd`` in a hardened ``<runtime> run`` invocation (AC1).
 
     The worktree (``mount``) is bind-mounted at ``/workspace`` and becomes the
     agent's working directory, so branches/commits the agent makes land back in
     the host worktree and the ``<<<RESULT_JSON>>>`` envelope streams out over
     stdout exactly as on the host path (AC2 — the contract is unchanged). The
-    container has no network egress (``--network none`` by default), every Linux
+    container is on the runtime's ``bridge`` network by default (the agent must
+    reach the API; containment here is of the filesystem), has every Linux
     capability dropped (``--cap-drop ALL``), no privilege escalation
     (``--security-opt no-new-privileges``), and a non-root user matching the host
     uid/gid so mounted files stay owned by the operator. ``-i`` keeps stdin open so
@@ -657,7 +671,9 @@ def sandbox_wrap(
     already on the host (the pinned build) — dispatch never fetches one.
     ``caches`` are the host uv/npm cache directories (see
     :func:`_host_sandbox_caches`), paired positionally with ``_SANDBOX_CACHES``
-    and mounted read-only with the tools pointed at them offline.
+    and mounted read-only with the tools pointed at them offline. ``credentials``
+    is the host's ``~/.claude/.credentials.json``, mounted read-only at the same
+    path under the container HOME so the CLI signs in as the operator.
     """
     uid = os.getuid() if hasattr(os, "getuid") else 0
     gid = os.getgid() if hasattr(os, "getgid") else 0
@@ -683,6 +699,8 @@ def sandbox_wrap(
             continue
         argv += ["-v", f"{Path(host_dir)}:{target}:ro,z"]
         argv += [arg for item in tool_env.items() for arg in ("-e", "=".join(item))]
+    if credentials is not None:
+        argv += ["-v", f"{Path(credentials)}:{_SANDBOX_HOME}/{_SANDBOX_CREDENTIALS_FILE}:ro,z"]
     source = env if env is not None else os.environ
     for key in forward_env:
         value = source.get(key)
@@ -780,6 +798,12 @@ def _host_sandbox_caches() -> tuple[Path | None, ...]:
     return tuple(found)
 
 
+def _host_sandbox_credentials() -> Path | None:
+    """The host's claude OAuth credentials file, or None when it is not on disk."""
+    path = Path.home() / _SANDBOX_CREDENTIALS_FILE
+    return path if path.is_file() else None
+
+
 def _apply_sandbox(
     cmd: list[str], *, cwd: Path | None, env: dict[str, str] | None
 ) -> list[str]:
@@ -787,7 +811,7 @@ def _apply_sandbox(
 
     Reads the runtime (auto-detected or ``$SDLC_SANDBOX_RUNTIME``), image
     (``$SDLC_SANDBOX_IMAGE`` → the deploy-pinned image id, issue #614), and
-    network mode (``$SDLC_SANDBOX_NETWORK`` → ``none``) from the environment.
+    network mode (``$SDLC_SANDBOX_NETWORK`` → ``bridge``) from the environment.
     The bind mount is the per-story clone ``cwd``; ``None`` would mean the
     primary checkout and is refused (:func:`_check_sandbox_mount`). The
     thinking-token cap, when set on the dispatch ``env``, is forwarded into the
@@ -799,9 +823,20 @@ def _apply_sandbox(
     network = os.environ.get(SANDBOX_NETWORK_ENV, "").strip() or DEFAULT_SANDBOX_NETWORK
     mount = Path(cwd) if cwd is not None else Path.cwd()
     _check_sandbox_mount(mount)
+    credentials = _host_sandbox_credentials()
+    source = env if env is not None else os.environ
+    if credentials is None and not any(source.get(k) for k in _SANDBOX_TOKEN_ENVS):
+        raise SandboxUnavailableError(
+            "sandbox requested but there are no agent credentials to pass in: "
+            f"~/{_SANDBOX_CREDENTIALS_FILE} is not on disk and neither "
+            f"${_SANDBOX_TOKEN_ENVS[0]} nor ${_SANDBOX_TOKEN_ENVS[1]} is set — the "
+            "contained claude CLI could not sign in (on macOS the OAuth token lives "
+            f"in the Keychain: export {_SANDBOX_TOKEN_ENVS[0]})"
+        )
     return sandbox_wrap(
         cmd, runtime=runtime, image=image, mount=mount, network=network,
-        env=env, forward_env=(THINKING_CAP_ENV,), caches=_host_sandbox_caches(),
+        env=env, forward_env=(THINKING_CAP_ENV, *_SANDBOX_TOKEN_ENVS),
+        caches=_host_sandbox_caches(), credentials=credentials,
     )
 
 
