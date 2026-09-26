@@ -242,7 +242,7 @@ def test_pr_merged_branch_deleted_uses_gh(tmp_path: Path, monkeypatch) -> None:
     root = _init_repo(tmp_path)  # no feature/ branch exists at all
     monkeypatch.setattr(
         "sdlc.reconcile._gh_pr_state",
-        lambda pr_number, root: "MERGED" if pr_number == 102 else None,
+        lambda pr_number, root, branch=None: "MERGED" if pr_number == 102 else None,
     )
 
     db = tmp_path / "ledger.db"
@@ -263,7 +263,7 @@ def test_genuinely_unlanded_stays_parked(tmp_path: Path, monkeypatch) -> None:
     _checkout(root, "feature/99.1-005", new=True)
     _commit(root, "wip.py", "z = 3\n", "feat: wip (#99.1-005)")
     _checkout(root, "main")  # never merged anywhere
-    monkeypatch.setattr("sdlc.reconcile._gh_pr_state", lambda pr_number, root: None)
+    monkeypatch.setattr("sdlc.reconcile._gh_pr_state", lambda pr_number, root, branch=None: None)
 
     db = tmp_path / "ledger.db"
     run_id = _seed_run(db, [("99.1-005", "FAILED", 103)])
@@ -553,7 +553,7 @@ def test_awaiting_approval_unlanded_keeps_awaiting_terminal(
     _checkout(root, "feature/99.1-021", new=True)
     _commit(root, "pending.py", "p = 4\n", "feat: pending (#99.1-021)")
     _checkout(root, "main")  # work is NOT on main
-    monkeypatch.setattr("sdlc.reconcile._gh_pr_state", lambda pr_number, root: None)
+    monkeypatch.setattr("sdlc.reconcile._gh_pr_state", lambda pr_number, root, branch=None: None)
 
     db = tmp_path / "ledger.db"
     run_id = _seed_run(db, [("99.1-021", "AWAITING_APPROVAL", 121)])
@@ -724,7 +724,7 @@ def test_unlanded_story_stages_not_terminalized(tmp_path: Path, monkeypatch) -> 
     _checkout(root, "feature/99.1-035", new=True)
     _commit(root, "wip.py", "z = 3\n", "feat: wip (#99.1-035)")
     _checkout(root, "main")  # never merged
-    monkeypatch.setattr("sdlc.reconcile._gh_pr_state", lambda pr_number, root: None)
+    monkeypatch.setattr("sdlc.reconcile._gh_pr_state", lambda pr_number, root, branch=None: None)
     monkeypatch.setattr(
         "sdlc.reconcile._gh_pr_for_landing", lambda story_id, sha, root: 935
     )
@@ -792,6 +792,8 @@ def test_gh_pr_for_landing_prefers_head_ref_over_sha(
     seen_queries: list[str] = []
 
     def _fake_run(cmd, *_a, **_k):
+        if cmd[0] == "git":  # forge detection reads the origin remote
+            return _FakeProc(1)
         query = cmd[cmd.index("--search") + 1]
         seen_queries.append(query)
         if query.startswith("head:"):
@@ -1297,3 +1299,104 @@ def test_render_docs_defaults_root_to_cwd(tmp_path: Path, monkeypatch) -> None:
 
     assert list(rendered.values()) == [["99.1-001"]]
     assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+
+
+# --- issue #699: reconcile must consult the declared forge, never gh ---------
+
+
+def _declare_gitlab(root: Path) -> None:
+    (root / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://home-lab:8080\n", encoding="utf-8"
+    )
+
+
+def _fake_cli(monkeypatch, mr_json: str) -> list[list[str]]:
+    """Route every CLI call: `glab mr view` answers ``mr_json``; `gh` must not run."""
+    import sdlc.issue_host as ih
+
+    calls: list[list[str]] = []
+
+    def fake_runner(argv, timeout=None, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[0] == "glab":
+            return ih.RunResult(returncode=0, stdout=mr_json, stderr="")
+        return ih.RunResult(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(ih, "_default_runner", fake_runner)
+    # A direct `gh` shell-out from reconcile would bypass the runner seam.
+    monkeypatch.setattr(
+        reconcile_mod.subprocess,
+        "run",
+        lambda argv, *a, **k: calls.append(list(argv))
+        or subprocess.CompletedProcess(argv, 1, stdout="", stderr=""),
+    )
+    return calls
+
+
+def test_declared_gitlab_state_uses_glab_not_gh(tmp_path: Path, monkeypatch) -> None:
+    _declare_gitlab(tmp_path)
+    calls = _fake_cli(
+        monkeypatch,
+        '{"iid": 5, "state": "merged", "source_branch": "feature/10.2-001"}',
+    )
+
+    state = _gh_pr_state(5, tmp_path, expected_branch="feature/10.2-001")
+
+    assert state == "MERGED"
+    assert calls and all(c[0] == "glab" for c in calls)
+
+
+def test_declared_gitlab_open_mr_is_not_merged(tmp_path: Path, monkeypatch) -> None:
+    """MR !2 still open must never read as MERGED (run 3d984686)."""
+    _declare_gitlab(tmp_path)
+    _fake_cli(monkeypatch, '{"iid": 2, "state": "opened", "source_branch": "feature/10.1-003"}')
+
+    assert _gh_pr_state(2, tmp_path, expected_branch="feature/10.1-003") == "OPEN"
+
+
+def test_declared_gitlab_branch_mismatch_is_no_signal(tmp_path: Path, monkeypatch) -> None:
+    _declare_gitlab(tmp_path)
+    _fake_cli(monkeypatch, '{"iid": 5, "state": "merged", "source_branch": "feature/other"}')
+
+    assert _gh_pr_state(5, tmp_path, expected_branch="feature/10.2-001") is None
+
+
+def test_declared_gitlab_never_backfills_pr_via_gh(tmp_path: Path, monkeypatch) -> None:
+    from sdlc.reconcile import _gh_pr_for_landing
+
+    _declare_gitlab(tmp_path)
+    calls = _fake_cli(monkeypatch, "{}")
+
+    assert _gh_pr_for_landing("10.2-001", "abc", tmp_path) is None
+    assert not any(c[0] == "gh" for c in calls)
+
+
+def test_colliding_gh_pr_number_does_not_land_story(tmp_path: Path, monkeypatch) -> None:
+    """forge: gitlab + a `github` remote + MR iid colliding with an old PR: the
+    landing must come from the MR (open here), not from `gh pr view`."""
+    root = _init_repo(tmp_path)
+    _declare_gitlab(root)
+    _git(root, "remote", "add", "github", "https://github.com/x/y.git")
+    _fake_cli(monkeypatch, '{"iid": 5, "state": "opened", "source_branch": "feature/99.1-009"}')
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-009", "FAILED", 5)])
+    result = reconcile_run(Ledger(db), run_id, root=root, fetch=False)
+
+    assert result.reclassified == []
+    assert _status(db, run_id, "99.1-009") == "FAILED"
+
+
+def test_declared_gitlab_lookup_failure_is_no_signal(tmp_path: Path, monkeypatch) -> None:
+    import sdlc.issue_host as ih
+
+    _declare_gitlab(tmp_path)
+    monkeypatch.setattr(
+        ih,
+        "_default_runner",
+        lambda argv, timeout=None, cwd=None, env=None: ih.RunResult(
+            returncode=1, stdout="", stderr="glab: not found"
+        ),
+    )
+
+    assert _gh_pr_state(5, tmp_path, expected_branch="feature/10.2-001") is None

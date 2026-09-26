@@ -57,7 +57,7 @@ def _no_real_host_cli(monkeypatch):
     test_issue_host.py overrides this fixture to test the real runner.
     """
 
-    def _blocked(argv, timeout=None, cwd=None):
+    def _blocked(argv, timeout=None, cwd=None, env=None):
         # ``cwd`` mirrors the real `_default_runner` (Story 32.2-002's
         # `repo_runner` passes it), so the block raises IssueHostError — the
         # error every caller degrades on — rather than a TypeError.

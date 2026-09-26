@@ -384,3 +384,64 @@ def test_parse_ci_gate_rejects_bad_policy():
 def test_parse_ci_gate_rejects_negative_timeout():
     with pytest.raises(ValueError):
         parse_build_args(["--ci-gate-timeout=-1"])
+
+
+# --- issue #699: declared forge — no silent skip, merge verdict verified ------
+
+
+def _declare_gitlab(tmp_path, monkeypatch) -> None:
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://home-lab:8080\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("policy", "verdict"), [("allow", _GATE_PASS), ("deny", _GATE_BLOCK)]
+)
+def test_declared_forge_lookup_failure_follows_no_ci_policy(
+    tmp_path, monkeypatch, policy, verdict
+):
+    """An unresolvable CI status on a declared-forge repo is not a silent skip."""
+    _declare_gitlab(tmp_path, monkeypatch)
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(ci_gate_no_ci=policy),
+        status_fn=lambda: None, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.verdict == verdict
+
+
+def test_undeclared_forge_lookup_failure_still_skips(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: None, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.verdict == _GATE_SKIP
+
+
+def _cr(state, branch="feature/23.2-002"):
+    return ih.ChangeRequest(host=ih.GITLAB, ref="5", state=state, source_branch=branch)
+
+
+@pytest.mark.parametrize(
+    ("cr", "expected_ok"),
+    [
+        (_cr("merged"), True),
+        (_cr("open"), False),  # MR !5 still open, agent claimed "already merged"
+        (_cr("merged", branch="feature/other"), False),  # colliding number
+        (None, True),  # unverifiable → best-effort, unchanged behaviour
+    ],
+)
+def test_merge_verdict_is_verified_against_the_forge(tmp_path, monkeypatch, cr, expected_ok):
+    from sdlc.build import _merge_unverified_reason
+
+    monkeypatch.setattr(bi, "change_request_view", lambda *a, **k: cr)
+    reason = _merge_unverified_reason(_ledger(tmp_path), _story(), 5)
+    assert (reason is None) is expected_ok

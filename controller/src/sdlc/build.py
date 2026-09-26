@@ -5040,9 +5040,18 @@ def render_merge_prompt(
     # GitHub default leaves ``abbr="PR"`` and an empty ``merge_cli_hint`` so this
     # prompt is byte-identical to today on the GitHub path.
     abbr = cr_terms.abbr
+    # Issue #699: a non-GitHub forge's iid can collide with an old PR number on a
+    # `github` mirror remote, so say outright which CLI owns this reference.
+    forge_only = (
+        ""
+        if cr_terms.host == GITHUB_CR_TERMS.host
+        else f"Use the {cr_terms.host} CLI only — never `gh`; {abbr} #{pr_number} "
+        "is this repo's own, not a number from any other remote.\n"
+    )
     return (
         f"Merge the {abbr}{cr_terms.merge_cli_hint} for story {story.id}: "
         f"{story.title} ({abbr} #{pr_number}).\n"
+        + forge_only +
         "Rebase before merge to absorb baseline drift, then emit the result block.\n"
         # Run b8fdbc71 (story 27.1-003, merge attempt 3): the rebase restarted
         # the PR's required checks; the agent handed the wait to a background
@@ -5205,11 +5214,21 @@ def _run_merge_ci_gate(
         clock=clock,
     )
     verdict, reason = _evaluate_ci_gate(status, no_ci_policy=opts.ci_gate_no_ci)
+    if status is None and build_issue.forge_declared():
+        # Issue #699: on a repo that *declares* its forge an unresolvable status is
+        # a real lookup failure, not "unmapped" — follow the no-CI policy instead
+        # of silently shipping the merge ungated.
+        deny = opts.ci_gate_no_ci == "deny"
+        verdict = _GATE_BLOCK if deny else _GATE_PASS
+        reason = (
+            "CI status lookup failed on the declared forge (see warn log) — "
+            f"{'blocked' if deny else 'allowed'} by --ci-gate-no-ci={opts.ci_gate_no_ci}"
+        )
     # A no-CI allow is a notable warning (the merge ships ungated), a block is an
     # error, a clean pass/skip is informational.
     if verdict == _GATE_BLOCK:
         level = "error"
-    elif verdict == _GATE_PASS and status == CR_NONE:
+    elif verdict == _GATE_PASS and status in (CR_NONE, None):
         level = "warn"
     else:
         level = "info"
@@ -7977,6 +7996,11 @@ def _run_story(
                         precheck=precheck,
                         review_packet=review_packet_block,
                     )
+                    if ok and stage == "merge":
+                        # Issue #699: never mark DONE on an agent's word alone.
+                        unverified = _merge_unverified_reason(ledger, story, pr_number)
+                        if unverified:
+                            ok, failure, kind = False, unverified, "merge-unverified"
                 if ok:
                     ledger.stage_finish(
                         run_id, story.id, stage, attempt, "DONE", output_path=str(tpath)
@@ -9156,6 +9180,34 @@ def _extract_pr(result: AgentResult | None, current: int | None) -> int | None:
         return current
     pr = result.data.get("pr_number")
     return pr if isinstance(pr, int) else current
+
+
+def _merge_unverified_reason(
+    ledger: Ledger, story: Story, pr_number: int | None
+) -> str | None:
+    """Why an agent-reported merge cannot be trusted, or None when it holds (#699).
+
+    The agent's ``MERGED``/``SKIPPED`` verdict is checked against the CR on the
+    repo's forge: it must read ``merged`` and be the story's own
+    ``feature/<id>`` CR (an iid can collide with an unrelated PR number). An
+    unresolvable lookup is best-effort — it never blocks a merge on its own.
+    """
+    if pr_number is None:
+        return None
+    cr = build_issue.change_request_view(ledger, story.id, pr_number)
+    if cr is None:
+        return None
+    if cr.source_branch and cr.source_branch != f"feature/{story.id}":
+        return (
+            f"CR #{pr_number} on {cr.host} is from {cr.source_branch!r}, "
+            f"not feature/{story.id} — merge verdict rejected"
+        )
+    if cr.state != "merged":
+        return (
+            f"merge reported landed but CR #{pr_number} is {cr.state or 'unknown'} "
+            f"on {cr.host}"
+        )
+    return None
 
 
 def _extract_merge_sha(result: AgentResult | None) -> str | None:
