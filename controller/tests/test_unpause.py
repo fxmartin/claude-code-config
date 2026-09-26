@@ -164,3 +164,56 @@ def test_pause_only_clear_is_audited(tmp_path, monkeypatch) -> None:
     assert result.runs == [] and result.pause is not None
     assert store.dispatch_pause() is None
     assert store.pause_clears()[0]["runs_cleared"] == 0
+
+
+def test_finished_run_is_skipped(tmp_path, monkeypatch) -> None:
+    store, registry = _env(tmp_path, monkeypatch)
+    run_id, db = _parked_run(tmp_path, registry, "alpha")
+    record = registry.records()[0]
+    registry.register(
+        RunRecord(run_id=record.run_id, repo=record.repo, db=record.db, scope=record.scope,
+                  pid=record.pid, status="DONE", started_at="", finished_at="2026-09-27T00:00:00")
+    )
+
+    result = clear_rate_limit(store, registry, now=NOW)
+
+    assert result.nothing_to_clear
+    assert Ledger(db).run_row(run_id)["status"] == "RATE_LIMITED"
+
+
+def test_unreadable_ledger_does_not_block_other_runs(tmp_path, monkeypatch) -> None:
+    store, registry = _env(tmp_path, monkeypatch)
+    good, _ = _parked_run(tmp_path, registry, "alpha")
+    bad = tmp_path / "broken"
+    bad.mkdir()
+    (bad / ".sdlc-state.db").write_text("not a sqlite database")
+    registry.register(
+        RunRecord(run_id="broken-run", repo=str(bad), db=str(bad / ".sdlc-state.db"),
+                  scope="x", pid=_dead_pid(), status="IN_PROGRESS", started_at="")
+    )
+
+    result = clear_rate_limit(store, registry, now=NOW)
+
+    assert [r.run_id for r in result.runs] == [good]
+
+
+def test_run_without_a_valid_reset_epoch_is_still_re_armed(tmp_path, monkeypatch) -> None:
+    store, registry = _env(tmp_path, monkeypatch)
+    run_id, db = _parked_run(tmp_path, registry, "alpha", reset_at="soon")
+
+    result = clear_rate_limit(store, registry, now=NOW)
+
+    assert result.runs[0].reset_at is None
+    assert result.runs[0].to_dict() == {
+        "run_id": run_id, "repo": str(tmp_path / "alpha"), "reset_at": None, "stories": [],
+    }
+    assert Ledger(db).run_row(run_id)["status"] == "IN_PROGRESS"
+    assert store.pause_clears()[0]["runs_cleared"] == 1
+
+
+def test_pause_clears_is_empty_without_a_db_or_table(tmp_path) -> None:
+    assert QueueStore(tmp_path / "missing.db").pause_clears() == []
+    legacy = tmp_path / "legacy.db"
+    import sqlite3
+    sqlite3.connect(legacy).close()
+    assert QueueStore(legacy).pause_clears() == []
