@@ -527,3 +527,16 @@ def test_gate_times_out_when_others_stay_pending(tmp_path, monkeypatch):
     assert gate.verdict == _GATE_BLOCK
     assert gate.status == ih.CR_PENDING
     assert gate.polls > 1
+
+
+def test_gate_blocks_immediately_when_risk_gate_red_and_nothing_pending(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    _patch_checks(monkeypatch, [_view((_GATE, ih.CR_FAILED), ("smoke", ih.CR_SUCCESS))])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_FAILED, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.polls == 1
+    assert gate.status == ih.CR_FAILED
