@@ -3517,6 +3517,48 @@ def queue_requeue_cmd(
     raise typer.Exit(code=0)
 
 
+@queue_app.command("unpause")
+def queue_unpause_cmd(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List what would be cleared; write nothing."
+    ),
+) -> None:
+    """Declare the rate-limit window reset: clear the pause, re-arm parked runs.
+
+    Story 32.2-003. For after you reset the Max usage limit or switched
+    subscription. Clears the queue's shared `paused_until` and, for every run on
+    the host parked `RATE_LIMITED` (found through the registry, across every
+    repo), drops its persisted reset epoch and re-arms its `RATE_LIMITED`
+    stories — so the next `sdlc queue run` (a live one picks it up within one
+    poll) or `sdlc resume` dispatches at once, with no wait and no probe.
+
+    You are trusted: if the window is in fact still closed, the next dispatch
+    re-parks the run with a fresh reset and the queue re-pauses — once. Each
+    clear is audited on the queue (reason `operator`) and in every touched
+    ledger. Nothing paused or parked exits 0 with "nothing to clear".
+    """
+    from sdlc.queue import QueueStore, default_queue_path
+    from sdlc.registry import Registry
+    from sdlc.unpause import clear_rate_limit
+
+    store = QueueStore(default_queue_path())
+    result = clear_rate_limit(store, Registry(), dry_run=dry_run)
+    if result.nothing_to_clear:
+        typer.echo("nothing to clear")
+        raise typer.Exit(code=0)
+    verb = "would clear" if dry_run else "cleared"
+    if result.pause is not None:
+        detail = f" · {result.pause.reason}" if result.pause.reason else ""
+        typer.echo(f"{verb} queue pause until {result.pause.paused_until}{detail}")
+    for run in result.runs:
+        stories = ", ".join(run.stories) or "no stories"
+        typer.echo(
+            f"{verb} run {run.run_id[:8]} ({Path(run.repo).name}): "
+            f"reset epoch {run.reset_at}; re-armed {stories}"
+        )
+    raise typer.Exit(code=0)
+
+
 @queue_app.command("prioritise")
 def queue_prioritise_cmd(
     job_id: int = typer.Argument(..., help="Job id to reprioritise."),

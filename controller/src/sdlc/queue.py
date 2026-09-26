@@ -483,6 +483,19 @@ CREATE TABLE IF NOT EXISTS queue_state (
 );
 """
 
+# Story 32.2-003: the audit trail of operator-declared clears. ``queue_state``
+# is a single row deleted on resume, so without this the fact that an operator
+# lifted a pause (and what it was holding) would leave no trace at all.
+_PAUSE_CLEARS_DDL = """
+CREATE TABLE IF NOT EXISTS queue_pause_clears (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    cleared_at   TIMESTAMP NOT NULL,
+    reason       TEXT NOT NULL,
+    paused_until TIMESTAMP,
+    runs_cleared INTEGER NOT NULL DEFAULT 0
+);
+"""
+
 _SCHEMA_DDL = (
     """
 PRAGMA journal_mode = WAL;
@@ -518,6 +531,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
 """
     + _QUEUE_STATE_DDL
+    + _PAUSE_CLEARS_DDL
 )
 
 # Schema migrations applied after the base DDL, in the same
@@ -565,6 +579,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     # ``CREATE TABLE IF NOT EXISTS`` is a no-op and only the bookkeeping row is
     # written.
     (4, "queue_state_pause", "queue_state", [], _QUEUE_STATE_DDL),
+    # Story 32.2-003: the operator-clear audit table.
+    (5, "queue_pause_clears", "queue_pause_clears", [], _PAUSE_CLEARS_DDL),
 ]
 
 
@@ -949,6 +965,36 @@ class QueueStore:
             return
         with self._connect() as conn:
             conn.execute("DELETE FROM queue_state WHERE id = 1")
+
+    def record_pause_clear(
+        self,
+        *,
+        paused_until: str | None,
+        runs_cleared: int,
+        reason: str = "operator",
+        now: datetime | None = None,
+    ) -> None:
+        """Audit one operator-declared clear (Story 32.2-003): when, why, what."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO queue_pause_clears(cleared_at, reason, paused_until, "
+                "runs_cleared) VALUES (?, ?, ?, ?)",
+                (_at(now).isoformat(), reason, paused_until, runs_cleared),
+            )
+
+    def pause_clears(self) -> list[dict]:
+        """Every recorded operator clear, oldest first."""
+        if not self.db_path.exists():
+            return []
+        with self._connect() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT cleared_at, reason, paused_until, runs_cleared "
+                    "FROM queue_pause_clears ORDER BY id"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(r) for r in rows]
 
     def mark_pause_probed(self, *, now: datetime | None = None) -> None:
         """Stamp the last live-API re-probe, so the throttle survives a restart."""
