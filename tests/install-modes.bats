@@ -479,3 +479,25 @@ _run_install() {
     [ ! -e "${CLONE}/settings.json" ]
     rm -rf "${CLONE}"
 }
+
+@test "create_symlink warns when the source does not exist (#693)" {
+    run env SCRIPT_DIR="${BATS_TEST_DIRNAME}/.." CLAUDE_DIR="${FAKE_HOME}/.claude" DRY_RUN=false \
+        BACKUP_DIR="${FAKE_HOME}/bk" bash -c '
+        source "$SCRIPT_DIR/install/common.sh"
+        mkdir -p "$CLAUDE_DIR"
+        create_symlink "$CLAUDE_DIR/missing-src" "$CLAUDE_DIR/link"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"does not exist"*"dangle"* ]]
+    [ -L "${FAKE_HOME}/.claude/link" ]
+}
+
+@test "create_symlink stays quiet when the source exists (#693)" {
+    run env SCRIPT_DIR="${BATS_TEST_DIRNAME}/.." CLAUDE_DIR="${FAKE_HOME}/.claude" DRY_RUN=false \
+        BACKUP_DIR="${FAKE_HOME}/bk" bash -c '
+        source "$SCRIPT_DIR/install/common.sh"
+        mkdir -p "$CLAUDE_DIR"
+        : > "$CLAUDE_DIR/src"
+        create_symlink "$CLAUDE_DIR/src" "$CLAUDE_DIR/link"'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"dangle"* ]]
+}
