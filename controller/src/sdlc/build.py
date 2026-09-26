@@ -5152,7 +5152,7 @@ def _evaluate_ci_gate(status: str | None, *, no_ci_policy: str) -> tuple[str, st
     or a host error) skips the gate so the merge path is unchanged.
     """
     if status is None:
-        return _GATE_SKIP, "no resolvable CI source (unmapped or host error) — gate skipped"
+        return _GATE_SKIP, "CI status lookup failed (forge unresolved or host error; see warn log) — gate skipped"
     if status == CR_SUCCESS:
         return _GATE_PASS, "pipeline passed"
     if status in (CR_FAILED, CR_UNKNOWN):
@@ -5161,8 +5161,8 @@ def _evaluate_ci_gate(status: str | None, *, no_ci_policy: str) -> tuple[str, st
         return _GATE_BLOCK, "pipeline still running at timeout — merge blocked"
     if status == CR_NONE:
         if no_ci_policy == "deny":
-            return _GATE_BLOCK, "no CI configured — denied by --ci-gate-no-ci=deny"
-        return _GATE_PASS, "no CI configured — allowed by --ci-gate-no-ci=allow"
+            return _GATE_BLOCK, "no pipeline on the MR head (no CI config?) — denied by --ci-gate-no-ci=deny"
+        return _GATE_PASS, "no pipeline on the MR head (no CI config?) — allowed by --ci-gate-no-ci=allow"
     return _GATE_BLOCK, f"unexpected CI status {status!r} — merge blocked"
 
 

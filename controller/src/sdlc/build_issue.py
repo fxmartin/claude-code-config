@@ -110,6 +110,17 @@ def _repo_adapter(ledger: "Ledger", runner: Runner | None):
     """
     if not _mirrors_stories(ledger):
         return None
+    return _forge_adapter(runner)
+
+
+def _forge_adapter(runner: Runner | None):
+    """The adapter for the repo's own forge, with no mirror-evidence guard.
+
+    Change-request lookups (merge CI gate, CR terms/checks) already hold the CR
+    number, so they need the forge only — not a story mirror. Issue #696: gating
+    them on ``sdlc issues init`` left every merge un-gated in repos that never
+    mirrored stories. Raises :class:`IssueHostError` when the forge won't resolve.
+    """
     resolution = resolve_forge(Path.cwd())
     return get_adapter(
         resolution.host, runner=runner, instance_url=resolution.instance_url
@@ -220,8 +231,9 @@ def _cr_adapter(ledger: "Ledger", story_id: str, runner: Runner | None):
     if ledger.inventory_get_mapping(story_id) is not None:
         return None
     try:
-        return _repo_adapter(ledger, runner)
-    except IssueHostError:
+        return _forge_adapter(runner)
+    except IssueHostError as exc:
+        log.warning("CR lookup: cannot resolve the repo forge for %s: %s", story_id, exc)
         return None
 
 
@@ -296,7 +308,7 @@ def change_request_status(
             return None
         return adapter.cr_status(str(cr_ref))
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
-        log.debug("change_request_status failed for %s", story_id, exc_info=True)
+        log.warning("change_request_status failed for %s", story_id, exc_info=True)
         return None
 
 

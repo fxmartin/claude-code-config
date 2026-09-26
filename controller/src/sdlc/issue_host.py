@@ -1352,7 +1352,9 @@ class GitLabAdapter(IssueHostAdapter):
 
     def cr_status(self, ref: "str | ChangeRequest") -> str:
         out = self._run("mr", "view", _cr_ref_of(ref), "--output", "json").stdout
-        pipeline = _parse_json_object(out).get("pipeline")
+        row = _parse_json_object(out)
+        # `pipeline` can be null while `head_pipeline` is populated.
+        pipeline = row.get("pipeline") or row.get("head_pipeline")
         raw = pipeline.get("status") if isinstance(pipeline, dict) else None
         return _gitlab_pipeline_status(raw)
 
