@@ -458,3 +458,93 @@ def test_host_build_prompt_still_fetches(monkeypatch) -> None:
 
 def test_module_exposes_no_latest_default() -> None:
     assert not hasattr(dispatch_mod, "DEFAULT_SANDBOX_IMAGE")
+
+
+# ---------------------------------------------------------------------------
+# Failure seams: every error path fails loud or reports False — never raises raw
+# ---------------------------------------------------------------------------
+
+def test_pin_lookup_without_bundled_file_is_unpinned(monkeypatch) -> None:
+    monkeypatch.setattr("sdlc.role_routing.bundled_config_path", lambda name: None)
+    monkeypatch.delenv(SANDBOX_IMAGE_ENV, raising=False)
+    assert pinned_sandbox_image("arm64") is None
+
+
+def test_clone_replaces_a_stale_non_clone_directory(tmp_path) -> None:
+    primary = _repo_with_origin(tmp_path)
+    stale = primary / ".claude" / "worktrees" / "sandbox-run1-61.4-001"
+    stale.mkdir(parents=True)
+    (stale / "junk").write_text("x")
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    assert is_sandbox_clone(clone)
+    assert not (clone / "junk").exists()
+
+
+def test_clone_step_failure_names_the_git_step(tmp_path, monkeypatch) -> None:
+    from sdlc import build
+    from sdlc.build import WorktreeError
+
+    primary = _repo_with_origin(tmp_path)
+    real = build._git_slow
+
+    def failing(cwd, *args):
+        if args and args[0] == "checkout":
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        return real(cwd, *args)
+
+    monkeypatch.setattr(build, "_git_slow", failing)
+    with pytest.raises(WorktreeError, match="failed at `git checkout`.*boom"):
+        create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    assert not (primary / ".claude" / "worktrees" / "sandbox-run1-61.4-001").exists()
+
+
+def test_clone_os_error_is_wrapped(tmp_path, monkeypatch) -> None:
+    from sdlc import build
+    from sdlc.build import WorktreeError
+
+    primary = _repo_with_origin(tmp_path)
+
+    def explode(cwd, *args):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(build, "_git_slow", explode)
+    with pytest.raises(WorktreeError, match="disk gone"):
+        create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+
+
+def test_sync_reports_false_when_fetch_raises(tmp_path, monkeypatch) -> None:
+    from sdlc import build
+
+    primary = _repo_with_origin(tmp_path)
+    clone = create_story_sandbox_clone(primary, "61.4-001", "run1-x")
+    _git(clone, "switch", "-c", "feature/61.4-001")
+
+    def explode(cwd, *args):
+        raise OSError("nope")
+
+    monkeypatch.setattr(build, "_git_slow", explode)
+    assert sync_sandbox_branch(primary, clone, "61.4-001") is False
+
+
+def test_prepare_workdir_survives_host_fetch_exception(tmp_path, monkeypatch) -> None:
+    from sdlc import build
+
+    primary = _repo_with_origin(tmp_path)
+    monkeypatch.chdir(primary)
+    real = build._git_slow
+
+    def flaky(cwd, *args):
+        if args[:1] == ("fetch",) and args[-1] == "origin":
+            raise OSError("no network")
+        return real(cwd, *args)
+
+    monkeypatch.setattr(build, "_git_slow", flaky)
+    ledger, run_id = _ledger(tmp_path, "61.4-001")
+    workdir = _prepare_story_workdir(
+        BuildOptions(sandbox=True), _story(), ledger, run_id, real_run=True
+    )
+    assert workdir is not None and is_sandbox_clone(workdir)
+    assert any(
+        e["level"] == "warn" and "no network" in e["message"]
+        for e in ledger.recent_events(run_id, limit=50)
+    )
