@@ -160,3 +160,16 @@ def test_the_json_drain_summary_carries_reconciled(tmp_path, monkeypatch) -> Non
     payload = json.loads(result.output.strip().splitlines()[-1])
     assert payload["reconciled"] == 1
     assert payload["parked"] == 1
+
+
+def test_queue_run_self_update_is_opt_in(tmp_path, monkeypatch) -> None:
+    """Issue #709: only a drain over the controller's own repo reinstalls it."""
+    _isolate(tmp_path, monkeypatch)
+    seen = _capture(monkeypatch, SchedulerResult())
+
+    assert runner.invoke(app, ["queue", "run"]).exit_code == 0
+    assert seen["config"].self_update is False
+
+    result = runner.invoke(app, ["queue", "run", "--self-update"])
+    assert result.exit_code == 0, result.output
+    assert seen["config"].self_update is True

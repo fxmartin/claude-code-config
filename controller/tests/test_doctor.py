@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from sdlc.build import Ledger
@@ -1199,3 +1202,135 @@ def test_parse_semver_tolerates_a_prerelease_suffix() -> None:
     assert _parse_semver("2.57.0") == (2, 57, 0)
     assert _parse_semver("2.57.0rc1") == (2, 57, 0)
     assert _parse_semver("2.57") == (2, 57, 0)
+
+
+# --- Issue #709: the version guard reads the base ref, not the working tree ---
+
+
+def _git(root: Path, *args: str) -> str:
+    """Run git with an explicit identity — CI job containers carry no gitconfig."""
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+         "-C", str(root), *args],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def _controller_repo(root: Path, main_version: str) -> Path:
+    """A git repo whose ``main`` declares ``main_version`` and ships an installer."""
+    root.mkdir(parents=True, exist_ok=True)
+    _git(root, "init", "-q", "-b", "main")
+    _declare_checkout_version(root, main_version)
+    (root / "scripts").mkdir(exist_ok=True)
+    (root / "scripts" / "install-controller.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", f"release {main_version}")
+    return root
+
+
+def test_controller_version_reads_main_not_a_parked_feature_branch(tmp_path: Path) -> None:
+    """A parked merge leaves the checkout on an older branch — never 'installed ahead'."""
+    repo = _controller_repo(tmp_path / "repo", "2.71.2")
+    _git(repo, "checkout", "-q", "-b", "feature/issue-693")
+    _declare_checkout_version(repo, "2.71.2")
+    _git(repo, "checkout", "-q", "main")
+    _declare_checkout_version(repo, "2.71.4")
+    _git(repo, "commit", "-qam", "release 2.71.4")
+    _git(repo, "checkout", "-q", "feature/issue-693")
+
+    finding = check_controller_version(repo, installed_version="2.71.4")
+
+    assert finding.status == "CLEAN", finding.detail
+    assert "2.71.4" in finding.detail
+
+
+def test_controller_version_prefers_origin_main_over_local_main(tmp_path: Path) -> None:
+    upstream = _controller_repo(tmp_path / "upstream", "2.71.4")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True)
+    _declare_checkout_version(upstream, "2.71.5")
+    _git(upstream, "commit", "-qam", "release 2.71.5")
+    _git(clone, "fetch", "-q", "origin")
+
+    finding = check_controller_version(clone, installed_version="2.71.4")
+
+    assert finding.status == "WARN"
+    assert "checkout 2.71.5" in finding.detail
+    assert "install-controller.sh" in finding.remedy
+
+
+def test_base_ref_controller_version_is_none_outside_git(tmp_path: Path) -> None:
+    from sdlc.doctor import base_ref_controller_version
+
+    _declare_checkout_version(tmp_path, "2.71.4")
+    assert base_ref_controller_version(tmp_path) is None
+
+
+# --- Issue #709: self-update from a clean base-ref worktree -------------------
+
+
+class _Installer:
+    """Records the tree it was asked to install from, and what it declared."""
+
+    def __init__(self, ok: bool = True) -> None:
+        self.ok = ok
+        self.trees: list[Path] = []
+        self.versions: list[str] = []
+
+    def __call__(self, tree: Path) -> bool:
+        self.trees.append(tree)
+        text = (tree / "controller" / "pyproject.toml").read_text(encoding="utf-8")
+        self.versions.append(tomllib.loads(text)["project"]["version"])
+        assert (tree / "scripts" / "install-controller.sh").is_file()
+        return self.ok
+
+
+def test_self_update_installs_from_main_never_the_checked_out_branch(tmp_path: Path) -> None:
+    from sdlc.doctor import self_update_controller
+
+    repo = _controller_repo(tmp_path / "repo", "2.71.4")
+    _git(repo, "checkout", "-q", "-b", "feature/old")
+    _declare_checkout_version(repo, "2.71.2")
+    _git(repo, "commit", "-qam", "old branch")
+    installer = _Installer()
+
+    new = self_update_controller(repo, "2.71.3", installer=installer, fetch=False)
+
+    assert new == "2.71.4"
+    assert installer.versions == ["2.71.4"]
+    # The throwaway worktree is gone, and the operator's checkout is untouched.
+    assert not installer.trees[0].exists()
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "feature/old"
+    assert "2.71.4" not in _git(repo, "worktree", "list")
+
+
+@pytest.mark.parametrize("installed", ["2.71.4", "2.71.9"])
+def test_self_update_never_installs_when_main_is_not_ahead(
+    tmp_path: Path, installed: str,
+) -> None:
+    from sdlc.doctor import self_update_controller
+
+    repo = _controller_repo(tmp_path / "repo", "2.71.4")
+    installer = _Installer()
+
+    assert self_update_controller(repo, installed, installer=installer, fetch=False) is None
+    assert installer.trees == []
+
+
+def test_self_update_reports_none_when_the_installer_fails(tmp_path: Path) -> None:
+    from sdlc.doctor import self_update_controller
+
+    repo = _controller_repo(tmp_path / "repo", "2.71.4")
+    installer = _Installer(ok=False)
+
+    assert self_update_controller(repo, "2.71.3", installer=installer, fetch=False) is None
+    assert installer.trees and not installer.trees[0].exists()
+
+
+def test_self_update_is_a_no_op_outside_a_controller_repo(tmp_path: Path) -> None:
+    from sdlc.doctor import self_update_controller
+
+    installer = _Installer()
+    # fetch=True too: a repo with no controller pyproject never touches the network.
+    assert self_update_controller(tmp_path, "2.71.3", installer=installer) is None
+    assert installer.trees == []

@@ -2295,3 +2295,180 @@ def test_a_recorded_reset_outranks_another_run_s_max_wait_guess(tmp_path) -> Non
         datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
     )
     assert pause.source == "reset-epoch"
+
+
+# --- Issue #709: the drain applies its own reinstall remedy (--self-update) ---
+
+
+class _Release:
+    """The controller versions in play: what is installed, what `main` declares.
+
+    ``check`` mimics :func:`sdlc.doctor.check_controller_version`, including its
+    ``installed_version`` override; ``updater`` mimics
+    :func:`sdlc.doctor.self_update_controller` — it only ever installs when
+    ``main`` is ahead, and reports the version it installed.
+    """
+
+    def __init__(self, installed: str = "2.71.2", main: str = "2.71.2") -> None:
+        self.installed = installed
+        self.main = main
+        self.updates: list[tuple[str, str]] = []
+
+    def check(self, _root, *, installed_version: str | None = None) -> Finding:
+        installed = installed_version or self.installed
+        if installed == self.main:
+            return _clean(_root)
+        return Finding(
+            "install", "Installed controller vs checkout", "WARN",
+            f"installed {installed}, checkout {self.main}",
+            "reinstall from the checkout: bash scripts/install-controller.sh",
+        )
+
+    def updater(self, root, installed: str) -> str | None:
+        self.updates.append((str(root), installed))
+        if tuple(map(int, self.main.split("."))) <= tuple(map(int, installed.split("."))):
+            return None
+        return self.main
+
+
+class _ReleasingLauncher(FakeLauncher):
+    """Each job's merge cuts a release: `main` bumps as soon as it finishes."""
+
+    def __init__(self, release: _Release) -> None:
+        super().__init__(alive_polls=1)
+        self._release = release
+
+    def __call__(self, argv, cwd):
+        proc = super().__call__(argv, cwd)
+        release = self._release
+        poll = proc.poll
+
+        def poll_and_release():
+            code = poll()
+            if code is not None:
+                major, minor, patch = release.main.split(".")
+                release.main = f"{major}.{minor}.{int(patch) + 1}"
+            return code
+
+        proc.poll = poll_and_release
+        return proc
+
+
+def test_without_self_update_each_release_stalls_the_drain(tmp_path) -> None:
+    """The bug: a sibling's release parks every remaining job in the repo."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "controller")
+    first = store.add_job(repo=repo, kind="fix", scope="1")
+    second = store.add_job(repo=repo, kind="fix", scope="2")
+    release = _Release()
+
+    _run(store, tmp_path=tmp_path, launcher=_ReleasingLauncher(release),
+         config=SchedulerConfig(slots=1, poll_seconds=1.0),
+         version_check=release.check, self_updater=release.updater)
+
+    assert store.get_job(first).state == "done"
+    assert store.get_job(second).state == "blocked"
+    assert release.updates == []
+
+
+def test_self_update_reinstalls_after_a_release_and_the_drain_continues(tmp_path) -> None:
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "controller")
+    jobs = [store.add_job(repo=repo, kind="fix", scope=str(n)) for n in (1, 2, 3)]
+    release = _Release()
+    launcher = _ReleasingLauncher(release)
+
+    result = _run(store, tmp_path=tmp_path, launcher=launcher,
+                  config=SchedulerConfig(slots=1, poll_seconds=1.0, self_update=True),
+                  version_check=release.check, self_updater=release.updater,
+                  installed_version=release.installed)
+
+    assert [store.get_job(j).state for j in jobs] == ["done", "done", "done"]
+    assert result.started == 3
+    assert result.parked == 0
+    # Each release is picked up once, from the version the queue last installed.
+    assert [installed for _, installed in release.updates] == ["2.71.2", "2.71.3", "2.71.4"]
+
+
+def test_self_update_requeues_only_the_repos_version_guard_parks(tmp_path) -> None:
+    from sdlc.queue import VERSION_GUARD_REASON_PREFIX
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "controller")
+    other = _repo(tmp_path, "elsewhere")
+    guard_parked = store.add_job(repo=repo, kind="fix", scope="7")
+    store.finish_job(guard_parked, "blocked",
+                     reason=f"{VERSION_GUARD_REASON_PREFIX}installed 2.71.2, checkout 2.71.3")
+    rate_parked = store.add_job(repo=repo, kind="fix", scope="8")
+    store.finish_job(rate_parked, "blocked", reason="run status RATE_LIMITED")
+    elsewhere = store.add_job(repo=other, kind="fix", scope="9")
+    store.finish_job(elsewhere, "blocked",
+                     reason=f"{VERSION_GUARD_REASON_PREFIX}installed 2.71.2, checkout 2.71.3")
+    trigger = store.add_job(repo=repo, kind="fix", scope="1")
+    release = _Release()
+
+    _run(store, tmp_path=tmp_path, launcher=_ReleasingLauncher(release),
+         config=SchedulerConfig(slots=1, poll_seconds=1.0, self_update=True),
+         version_check=release.check, self_updater=release.updater,
+         installed_version=release.installed)
+
+    assert store.get_job(trigger).state == "done"
+    assert store.get_job(guard_parked).state == "done"
+    assert store.get_job(rate_parked).state == "blocked"
+    assert store.get_job(elsewhere).state == "blocked"
+
+
+def test_the_version_guard_reason_carries_a_stable_marker(tmp_path) -> None:
+    from sdlc.queue import VERSION_GUARD_REASON_PREFIX
+
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    release = _Release(main="2.71.3")
+
+    _run(store, tmp_path=tmp_path, launcher=FakeLauncher(), version_check=release.check)
+
+    assert (store.get_job(job_id).reason or "").startswith(VERSION_GUARD_REASON_PREFIX)
+
+
+def test_a_checkout_behind_the_installed_controller_stays_blocked(tmp_path) -> None:
+    """Never reinstall backwards: the updater declines, the job keeps its remedy."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "controller"), kind="fix", scope="1")
+    release = _Release(installed="2.71.4", main="2.71.2")
+    launcher = FakeLauncher()
+
+    _run(store, tmp_path=tmp_path, launcher=launcher,
+         config=SchedulerConfig(slots=1, poll_seconds=1.0, self_update=True),
+         version_check=release.check, self_updater=release.updater,
+         installed_version=release.installed)
+
+    assert launcher.calls == []
+    job = store.get_job(job_id)
+    assert job.state == "blocked"
+    assert "install-controller.sh" in (job.reason or "")
+    assert release.updates  # consulted, and it declined
+
+
+def test_a_stale_controller_takes_the_reinstall_path_before_the_first_launch(tmp_path) -> None:
+    """A release landed between drains: the first job reinstalls instead of parking."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "controller"), kind="fix", scope="1")
+    release = _Release(installed="2.71.2", main="2.71.3")
+    launcher = FakeLauncher()
+
+    _run(store, tmp_path=tmp_path, launcher=launcher,
+         config=SchedulerConfig(slots=1, poll_seconds=1.0, self_update=True),
+         version_check=release.check, self_updater=release.updater,
+         installed_version=release.installed)
+
+    assert len(launcher.calls) == 1
+    assert store.get_job(job_id).state == "done"

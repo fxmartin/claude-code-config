@@ -64,6 +64,11 @@ _PRIORITY_RANK = {name: rank for rank, name in enumerate(_PRIORITIES)}
 # (stale controller); ``needs_attention`` means the job was running fine as far
 # as the run knew and the *queue* stopped it. Two causes, two words, so
 # `queue list` says which happened.
+# Issue #709: every `blocked` reason the per-job version guard stamps starts
+# with this marker, so `sdlc queue run --self-update` can requeue exactly its
+# own guard parks after reinstalling — and nothing an operator must look at.
+VERSION_GUARD_REASON_PREFIX = "controller version guard: "
+
 _STATES = {
     "queued", "running", "done", "failed", "cancelled", "blocked", "parked",
     "needs_attention",

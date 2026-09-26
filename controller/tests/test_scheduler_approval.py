@@ -306,6 +306,36 @@ def test_a_stale_controller_never_resumes_a_parked_job(tmp_path) -> None:
     assert store.get_job(job_id).state == "blocked"
 
 
+def test_an_approved_park_with_a_stale_controller_self_updates_and_resumes(tmp_path) -> None:
+    """Issue #709: a sibling's release must not re-park an approved job."""
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    job_id = _parked_job(store, repo, run_id="run-a")
+    launcher = FakeLauncher(alive_polls=1, code=0)
+    updates: list[str] = []
+
+    def stale_until_updated(_root, *, installed_version=None) -> Finding:
+        if installed_version == "2.2.0":
+            return _clean(_root)
+        return Finding("install", "Installed controller vs checkout", "WARN",
+                       "installed 2.1.0, checkout 2.2.0", "reinstall the controller")
+
+    def updater(_root, installed: str) -> str | None:
+        updates.append(installed)
+        return "2.2.0"
+
+    _run(store, tmp_path=tmp_path, launcher=launcher,
+         config=SchedulerConfig(slots=2, poll_seconds=1.0, self_update=True),
+         version_check=stale_until_updated, self_updater=updater,
+         installed_version="2.1.0", approval_probe=Probe(_approved()))
+
+    assert updates[0] == "2.1.0"
+    assert launcher.verbs == [["resume", "--run", "run-a"]]
+    assert store.get_job(job_id).state != "blocked"
+
+
 # --- AC3: closed and hand-merged PRs ---------------------------------------
 
 

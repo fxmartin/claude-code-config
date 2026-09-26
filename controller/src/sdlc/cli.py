@@ -3346,6 +3346,14 @@ def queue_run_cmd(
         f"{int(MIN_APPROVAL_POLL_SECONDS)}-{int(MAX_APPROVAL_POLL_SECONDS)} so "
         "polling stays inside the host's API rate limits).",
     ),
+    self_update: bool = typer.Option(
+        False,
+        "--self-update",
+        help="When a job's repo's `main` declares a newer controller than the "
+        "installed one, reinstall from `main` (never the checked-out branch) and "
+        "requeue that repo's version-guard parks, instead of stalling the drain. "
+        "Only for a drain over this controller's own source repo.",
+    ),
     as_json: bool = typer.Option(
         False, "--json", help="Emit the drain summary as JSON."
     ),
@@ -3360,7 +3368,12 @@ def queue_run_cmd(
 
     A job whose repo's installed controller disagrees with its own
     `controller/pyproject.toml` is parked `blocked` with the reinstall remedy
-    rather than executed on stale code (Story 15.1-004).
+    rather than executed on stale code (Story 15.1-004). The version is read
+    from the repo's `origin/main` (else `main`), so a checkout left on a parked
+    feature branch is not mis-reported. With `--self-update` the queue applies
+    that remedy itself: after a job finishes, or before a stale launch, it
+    reinstalls from a clean `main` worktree when `main` is ahead — never when
+    the installed controller is ahead — and requeues the repo's guard parks.
 
     Each job is held to the budget frozen on it at enqueue — max `bugfix` rounds
     (read from the run's ledger) and a wall-clock cap per launch. Exceeding
@@ -3413,6 +3426,7 @@ def queue_run_cmd(
             follow=follow,
             poll_seconds=poll_interval,
             approval_poll_seconds=approval_poll_interval,
+            self_update=self_update,
         ),
         echo=typer.echo,
     )

@@ -24,6 +24,7 @@ from sdlc.queue import (
     JobRecord,
     QueuePause,
     QueueStore,
+    VERSION_GUARD_REASON_PREFIX,
     budget_breach,
     fix_rounds_exhausted,
 )
@@ -146,7 +147,11 @@ class JobProcess(Protocol):
 
 Launcher = Callable[[Sequence[str], Path], JobProcess]
 Clock = Callable[[], datetime]
-VersionCheck = Callable[[Path], object]
+VersionCheck = Callable[..., object]
+# ``(repo_root, installed_version) -> the version now installed``, or None when
+# nothing newer was installed. Issue #709's `--self-update` seam — the real one
+# is `sdlc.doctor.self_update_controller`.
+SelfUpdater = Callable[[Path, str], "str | None"]
 # One read of a parked job's change request: ``(repo_root, cr_number)`` →
 # verdict, or None when the host could not be read (Story 32.2-002).
 ApprovalProbe = Callable[[Path, int], "ApprovalVerdict | None"]
@@ -180,6 +185,11 @@ class SchedulerConfig:
     # Seconds between live-API re-probes while the queue waits out a rate-limit
     # window (Story 32.2-001).
     probe_interval_seconds: float = DEFAULT_PROBE_INTERVAL_SECONDS
+    # Issue #709: apply the version guard's reinstall remedy instead of
+    # stalling — reinstall from the repo's base ref when it carries a newer
+    # controller, then requeue that repo's guard-parked jobs. Opt-in: only a
+    # drain over this controller's own source repo should ever self-update.
+    self_update: bool = False
 
 
 @dataclass
@@ -686,6 +696,8 @@ class _Scheduler:
         probe: RateLimitProbe | None,
         echo: Callable[[str], None],
         identity: str,
+        self_updater: SelfUpdater | None = None,
+        installed_version: str | None = None,
     ) -> None:
         self._store = store
         self._config = config
@@ -701,6 +713,12 @@ class _Scheduler:
         self._probe = probe
         self._echo = echo
         self._identity = identity
+        self._self_updater = self_updater
+        # What a self-update last installed. The running scheduler keeps its
+        # own (stale) `sdlc.__version__`, so after a reinstall the version
+        # check must be told what is on PATH now.
+        self._installed_version = installed_version
+        self._self_updated = False
         self._in_flight: dict[int, _InFlight] = {}
         self._result = SchedulerResult()
         self._poll_interval = approval_poll_interval(config.approval_poll_seconds)
@@ -861,12 +879,19 @@ class _Scheduler:
         # with its own checkout would run this job on stale code. Park it with
         # the remedy instead — the check is cheap, offline, and repo-local, so
         # it runs for every job rather than once for the scheduler.
-        finding = self._version_check(Path(job.repo))
+        # Issue #709: with `--self-update`, try the remedy before parking — this
+        # is also the path a job returning from an approval park takes, so a
+        # sibling's release reinstalls rather than re-parking it.
+        finding = self._check_version(job.repo)
+        if getattr(finding, "status", "CLEAN") != "CLEAN" and self._self_update(job.repo):
+            finding = self._check_version(job.repo)
         status = getattr(finding, "status", "CLEAN")
         if status != "CLEAN":
             detail = getattr(finding, "detail", "")
             remedy = getattr(finding, "remedy", "")
-            reason = " — ".join(part for part in (detail, remedy) if part)
+            reason = VERSION_GUARD_REASON_PREFIX + " — ".join(
+                part for part in (detail, remedy) if part
+            )
             self._store.finish_job(job.id, "blocked", reason=reason)
             self._result.parked += 1
             self._echo(f"job {job.id} parked (blocked): {reason}")
@@ -910,6 +935,37 @@ class _Scheduler:
             f"{verb} job {job.id} ({job.kind} {job.scope}) in {job.repo} "
             f"[pid {proc.pid}, {cost} slot{'s' if cost != 1 else ''}]"
         )
+        return True
+
+    def _check_version(self, repo: str) -> object:
+        if not self._self_updated:
+            return self._version_check(Path(repo))
+        return self._version_check(Path(repo), installed_version=self._installed_version)
+
+    def _self_update(self, repo: str) -> bool:
+        """Reinstall from ``repo``'s base ref if it is ahead; requeue its guard parks.
+
+        True when a newer controller was installed. A no-op unless the drain
+        opted in with `--self-update`. The updater decides "ahead" and installs
+        from the base ref only, so a checkout behind the installed controller —
+        or parked on an older feature branch — is never installed from.
+        """
+        if not self._config.self_update or self._self_updater is None:
+            return False
+        if self._installed_version is None:
+            return False
+        installed = self._self_updater(Path(repo), self._installed_version)
+        if installed is None:
+            return False
+        self._installed_version = installed
+        self._self_updated = True
+        self._echo(f"controller self-updated to {installed} from {repo}'s base ref")
+        for job in self._store.list_jobs(repo=repo):
+            if job.state == "blocked" and (job.reason or "").startswith(
+                VERSION_GUARD_REASON_PREFIX
+            ):
+                self._store.requeue_job(job.id, now=self._clock())
+                self._echo(f"job {job.id} requeued after the controller self-update")
         return True
 
     def _reap(self) -> None:
@@ -960,6 +1016,8 @@ class _Scheduler:
                 self._result.failed += 1
             self._echo(f"job {job_id} finished: {state}")
             self._announce(entry.job, entry.run_id, state)
+            # Issue #709: a finished job in this repo may have cut a release.
+            self._self_update(entry.job.repo)
 
     @staticmethod
     def _finish_reason(
@@ -1601,6 +1659,8 @@ def run_queue(
     probe: RateLimitProbe | None | _Unset = _UNSET,
     echo: Callable[[str], None] | None = None,
     identity: str | None = None,
+    self_updater: SelfUpdater | None = None,
+    installed_version: str | None = None,
 ) -> SchedulerResult:
     """Drain the host queue: claim jobs under a lease and run them as subprocesses.
 
@@ -1628,14 +1688,17 @@ def run_queue(
     counts a run's burned bugfix rounds, ``plan_files`` reads the file set a
     run's investigation froze (the overlap graph's write side), ``probe`` is the
     live-API rate-limit check behind a held window (omit it for the real one;
-    pass ``None`` to wire none at all), and ``notifier`` is the Telegram path.
+    pass ``None`` to wire none at all), ``notifier`` is the Telegram path, and
+    ``self_updater`` is issue #709's reinstall-from-base-ref, consulted only
+    when ``config.self_update`` is set (``installed_version`` seeds it).
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from
     the env/file convention) wrapping this same foreground command.
     """
+    from sdlc import __version__
     from sdlc.build import default_rate_limit_probe
-    from sdlc.doctor import check_controller_version
+    from sdlc.doctor import check_controller_version, self_update_controller
     from sdlc.notify import notify
 
     scheduler = _Scheduler(
@@ -1653,5 +1716,7 @@ def run_queue(
         probe=default_rate_limit_probe if isinstance(probe, _Unset) else probe,
         echo=echo or print,
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
+        self_updater=self_updater or self_update_controller,
+        installed_version=installed_version or __version__,
     )
     return scheduler.run()
