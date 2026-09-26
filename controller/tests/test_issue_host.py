@@ -1200,3 +1200,10 @@ def test_gitlab_cr_find_only_open_mrs() -> None:
 def test_gitlab_cr_find_none_when_empty() -> None:
     runner = FakeRunner({"mr list": (0, "[]", "")})
     assert ih.GitLabAdapter(runner=runner).cr_find("feature/x") is None
+
+
+def test_base_adapter_cr_find_defaults_to_not_found() -> None:
+    # An adapter without a lookup must degrade to "not found" so the caller
+    # falls through to cr_create.
+    adapter = ih.GitHubAdapter(runner=FakeRunner({}))
+    assert ih.IssueHostAdapter.cr_find(adapter, "feature/x") is None
