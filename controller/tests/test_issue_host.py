@@ -1175,3 +1175,35 @@ def test_gitlab_adapter_http_instance_threads_the_config_dir_per_call(monkeypatc
     adapter.whoami()
     assert runner.envs[-1]["GITLAB_HOST"] == "http://127.0.0.1:8080"
     assert "GLAB_CONFIG_DIR" in runner.envs[-1]
+
+
+def test_github_cr_find_returns_open_cr_for_branch() -> None:
+    runner = FakeRunner({"pr list": (0, '[{"number": 5, "url": "u", "title": "t"}]', "")})
+    cr = ih.GitHubAdapter(runner=runner).cr_find("feature/x")
+    assert cr is not None and cr.ref == "5"
+    assert runner.calls[-1][:5] == ["gh", "pr", "list", "--head", "feature/x"]
+
+
+def test_github_cr_find_none_when_no_cr() -> None:
+    runner = FakeRunner({"pr list": (0, "[]", "")})
+    assert ih.GitHubAdapter(runner=runner).cr_find("feature/x") is None
+
+
+def test_gitlab_cr_find_only_open_mrs() -> None:
+    payload = '[{"iid": 3, "state": "merged"}, {"iid": 4, "state": "opened", "web_url": "u"}]'
+    runner = FakeRunner({"mr list": (0, payload, "")})
+    cr = ih.GitLabAdapter(runner=runner).cr_find("feature/x")
+    assert cr is not None and cr.ref == "4"
+    assert "--source-branch" in runner.calls[-1]
+
+
+def test_gitlab_cr_find_none_when_empty() -> None:
+    runner = FakeRunner({"mr list": (0, "[]", "")})
+    assert ih.GitLabAdapter(runner=runner).cr_find("feature/x") is None
+
+
+def test_base_adapter_cr_find_defaults_to_not_found() -> None:
+    # An adapter without a lookup must degrade to "not found" so the caller
+    # falls through to cr_create.
+    adapter = ih.GitHubAdapter(runner=FakeRunner({}))
+    assert ih.IssueHostAdapter.cr_find(adapter, "feature/x") is None
