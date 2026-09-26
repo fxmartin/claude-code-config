@@ -1,6 +1,6 @@
 # Epic 32: Development Queue
 
-> **Status: NOT STARTED (0/7)** — authored 2026-09-07 from `docs/development-queue-investigation.md`.
+> **Status: NOT STARTED (0/8)** — authored 2026-09-07 from `docs/development-queue-investigation.md`.
 > Thesis: `sdlc build` and `sdlc fix` are imperative, foreground, one-run-per-invocation commands —
 > whoever types them is the scheduler. Twelve stories shipped in the last 48 hours by a human typing
 > `build`, waiting, labelling, typing `resume`, and overnight by a shell `for` loop that was a queue
@@ -259,6 +259,58 @@ human steps per night; it is the one to demo.
 **Dependencies**: 32.1-002
 **Risk Level**: Medium
 
+##### Story 32.2-003: Operator-declared limit reset — clear the shared pause and re-arm parked runs
+**User Story**: As FX after resetting the Max usage limit or switching to another subscription, I want
+one command that clears the host queue's `paused_until` and re-arms every run parked `RATE_LIMITED`,
+so that dispatch resumes the moment I say so instead of at the persisted reset time or the next
+scheduled probe.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** the queue carries a `paused_until` in the future **When** `sdlc queue unpause` runs **Then**
+  the pause row is cleared, the command prints what it cleared, and the next `sdlc queue run` claims
+  immediately without waiting or probing.
+- **Given** a `sdlc queue run` is live and waiting out the pause **When** the pause is cleared from
+  another shell **Then** that scheduler resumes claiming within one poll interval, without a restart.
+- **Given** a run parked `RATE_LIMITED` with a persisted `rate_limit_reset_at` in the future **When**
+  `sdlc queue unpause` runs **Then** the run's reset epoch is cleared in its ledger and its
+  `RATE_LIMITED` stories are re-armed, so `sdlc resume` (or the queue's own resume of the parked job)
+  dispatches at once — no wait, no probe. Runs are discovered through the host registry across every
+  repo, and each cleared run is named in the output.
+- **Given** nothing is paused or parked **When** the command runs **Then** it exits 0 with
+  "nothing to clear" and changes nothing.
+- **Given** `--dry-run` **Then** every pause and run that would be cleared is listed and nothing is
+  written.
+- **Given** the operator was wrong and the window is still closed **When** the next dispatch hits the
+  limit **Then** the run re-parks `RATE_LIMITED` with a fresh reset and the queue re-pauses exactly as
+  in 32.2-001 — one re-park, one pause notification, never a retry loop.
+- **Given** any clear **Then** the queue records the clear with its timestamp and reason
+  (`operator`), and each touched ledger gets an `events` row with `source="operator"` naming what was
+  reset — the same audit shape `reconcile` uses.
+
+**Technical Notes**: Trust the operator by decision (2026-09-27): no probe before clearing — the
+next dispatch's own rate-limit detection is the safety net, and after a subscription switch the last
+probe result is meaningless anyway. State to clear lives in three places and nowhere else: the queue
+pause row (`queue.py`, `paused_until` + reason, Story 32.2-001), the per-run ledger config
+`rate_limit_reset_at` that `resume.py` honours (`resume.py:661`), and `RATE_LIMITED` story statuses
+(`resume.py:767,894`). The live scheduler caches the served pause (`scheduler.py:1493`) — it must
+re-read the row on each poll or subscribe to the clear, or the second criterion fails. Reuse the
+registry read `sdlc runs` uses to find parked runs; do not add a new run index. Name: `sdlc queue
+unpause` is proposed because the queue is the host-level owner of the shared window; a `sdlc resume
+--clear-rate-limit` alias for one run is acceptable if it reuses the same helper. Not in scope:
+changing when the queue probes (32.2-001), or any per-repo override of the shared window.
+
+**Definition of Done**:
+- [ ] `sdlc queue unpause [--dry-run]` clears the queue pause and re-arms parked runs host-wide
+- [ ] A live `queue run` picks the clear up within one poll; test with a fake clock
+- [ ] Ledger + queue audit rows; "nothing to clear" no-op; dry-run writes nothing
+- [ ] Re-park on a still-closed window proven by test (no loop)
+- [ ] `docs/controller-architecture.md` queue section and `sdlc queue --help` updated
+
+**Dependencies**: 32.2-001
+**Risk Level**: Low
+
 ### Feature 32.3: Policy & Visibility
 
 What gets built first, how much a job may cost, and where to look.
@@ -334,6 +386,6 @@ panel on the existing view, not a new view.
 immediately: it removes the step that cost the most human attention this week. 32.2-001 (shared
 rate-limit) can run in parallel with it. 32.1-003 (markers off the checkout) comes next and unlocks
 same-repo overlap for both 32.1-002's rule and 32.3-001's overlap logic. 32.3-001 then 32.3-002 close.
-Recommended order: 32.1-001 → 32.1-002 → 32.2-002 → 32.2-001 → 32.1-003 → 32.3-001 → 32.3-002.
+Recommended order: 32.1-001 → 32.1-002 → 32.2-002 → 32.2-001 → 32.2-003 → 32.1-003 → 32.3-001 → 32.3-002.
 Epic-30's `sdlc listen` should be re-planned to enqueue into this rather than own a queue; that
 reconciliation is a one-line note on 30.2-002, not a story here.
