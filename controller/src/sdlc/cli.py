@@ -548,6 +548,9 @@ Flags:
   --e2e-gate=warn|off       run the advisory E2E gate after review (default off)
   --skip-e2e                alias for --e2e-gate=off
   --host=github|gitlab      override host auto-detection (default: auto-detect from origin)
+  --ci-gate-timeout=SECS    merge CI gate: max wait for the PR/MR pipeline (default 1800)
+  --ci-gate-poll=SECS       merge CI gate: seconds between status polls (default 30)
+  --ci-gate-no-ci=allow|deny  merge CI gate: merge or refuse when no pipeline exists (default allow)
 
 \b
 Batch runs investigate every issue first, then serialize only issues that touch

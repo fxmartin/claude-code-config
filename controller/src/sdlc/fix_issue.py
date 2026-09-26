@@ -39,8 +39,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
-from sdlc import change_class, issue_host
+from sdlc import build_issue, change_class, issue_host
 from sdlc.build import (
+    _GATE_BLOCK,
     MAX_BUGFIX_ATTEMPTS,
     MAX_COMMITLINT_REASK,
     Ledger,
@@ -49,11 +50,13 @@ from sdlc.build import (
     _dispatch_ready_queue,
     _extract_pr,
     _merge_awaiting_approval,
+    _merge_gate_only_block,
     _record_stage_usage,
     _refresh_base_ref,
     _registry_finish,
     _registry_register,
     _reposition_head,
+    _run_merge_ci_gate,
     _stage_succeeded,
     _StoryDispatch,
     _StoryRunOutcome,
@@ -82,6 +85,7 @@ from sdlc.dispatch import (
 )
 from sdlc.harness import DEFAULT_HARNESS, resolve_harness
 from sdlc.issue_host import (
+    CR_FAILED,
     GITHUB_CR_TERMS,
     ChangeRequestTerms,
     IssueHostError,
@@ -204,6 +208,12 @@ class FixOptions:
     # `gitlab` substring for `issue_host.detect_host` to key on. None = auto
     # (today's behaviour). Validated against SUPPORTED_HOSTS at parse time.
     host: str | None = None
+    # Issue #713: the deterministic merge CI gate `sdlc build` runs (Story
+    # 23.2-002) — same knobs, same defaults, same `--ci-gate-*` flags. The merge
+    # agent is never dispatched until the CR's current head is green.
+    ci_gate_timeout_s: int = 1800
+    ci_gate_poll_s: int = 30
+    ci_gate_no_ci: str = "allow"
 
 
 @dataclass
@@ -244,6 +254,10 @@ class FixBatchOptions:
     # Issue #606: mirrors :class:`FixOptions` — resolved once for the whole
     # batch and threaded down per issue.
     host: str | None = None
+    # Issue #713: the merge CI gate knobs, threaded down per issue.
+    ci_gate_timeout_s: int = 1800
+    ci_gate_poll_s: int = 30
+    ci_gate_no_ci: str = "allow"
 
 
 @dataclass
@@ -1577,6 +1591,9 @@ def _fix_config(opts: FixOptions) -> dict:
         "model_overrides": dict(opts.model_overrides or {}),
         "harness_map": dict(opts.harness_map or {}),
         "host": opts.host,
+        "ci_gate_timeout_s": opts.ci_gate_timeout_s,
+        "ci_gate_poll_s": opts.ci_gate_poll_s,
+        "ci_gate_no_ci": opts.ci_gate_no_ci,
     }
 
 
@@ -1596,6 +1613,9 @@ def _options_from_fix_config(config: dict, issue_number: int) -> FixOptions:
         e2e_gate=str(config.get("e2e_gate", "off")),
         model_overrides=dict(overrides) if isinstance(overrides, dict) else {},
         host=str(host) if host else None,
+        ci_gate_timeout_s=int(config.get("ci_gate_timeout_s", 1800)),
+        ci_gate_poll_s=int(config.get("ci_gate_poll_s", 30)),
+        ci_gate_no_ci=str(config.get("ci_gate_no_ci", "allow")),
     )
 
 
@@ -1761,9 +1781,19 @@ def _run_stage_loop(
                 review_packet=review_packet_block, cr_terms=cr_terms,
             )
             try:
-                ok, result, failure, kind = _dispatch_fix_stage(
-                    stage, story, prompt, model, dispatch, tpath, opts
-                )
+                # Issue #713: gate the merge on the CR's CI status exactly as
+                # `sdlc build` does. Polled afresh on every attempt, so a bugfix
+                # push (a new head) is always re-read; a red/pending/denied head
+                # is a synthetic `ci-gate` failure routed to the bugfix loop, and
+                # the merge agent never runs over it.
+                gate = _run_merge_ci_gate(stage, ledger, run_id, story, pr_number, opts)
+                if gate is not None and gate.verdict == _GATE_BLOCK:
+                    ok, result, kind = False, None, "ci-gate"
+                    failure = _ci_gate_failure(ledger, story, pr_number, gate.reason)
+                else:
+                    ok, result, failure, kind = _dispatch_fix_stage(
+                        stage, story, prompt, model, dispatch, tpath, opts
+                    )
             except ContextOverflowError as exc:
                 ledger.stage_finish(
                     run_id, story.id, stage, attempt, "FAILED", "context-overflow", str(tpath)
@@ -1826,6 +1856,16 @@ def _run_stage_loop(
             _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
             ledger.event_log(run_id, story.id, "error", "controller", f"{stage} failed: {failure}")
 
+            # Issue #713 (mirrors build.py, Story 25.1-001): re-check a failed
+            # merge against the CR itself, so a red risk-gate check alone parks
+            # rather than burning bugfix attempts the loop cannot win.
+            if (
+                stage == "merge"
+                and kind != "awaiting_approval"
+                and _merge_gate_only_block(ledger, run_id, story, pr_number)
+            ):
+                kind = "awaiting_approval"
+
             # A merge blocked only by the high-risk approval gate is parked in a
             # distinct AWAITING_APPROVAL terminal — before any recovery, since the
             # bugfix loop cannot self-approve. Committed work / open PR preserved.
@@ -1857,6 +1897,15 @@ def _run_stage_loop(
             attempt += 1
 
     return "DONE", pr_number
+
+
+def _ci_gate_failure(
+    ledger: Ledger, story: Story, pr_number: int | None, reason: str
+) -> str:
+    """The CI-gate block reason, naming the red checks so the bugfix agent can act."""
+    view = build_issue.change_request_checks(ledger, story.id, pr_number)
+    failing = [name for name, status in view.checks if status == CR_FAILED] if view else []
+    return f"{reason}; failing checks: {', '.join(failing)}" if failing else reason
 
 
 def _render_core_prompt(
@@ -2761,6 +2810,9 @@ def _issue_options(batch: FixBatchOptions, number: int) -> FixOptions:
         model_overrides=dict(batch.model_overrides),
         harness_map=dict(batch.harness_map),
         host=batch.host,
+        ci_gate_timeout_s=batch.ci_gate_timeout_s,
+        ci_gate_poll_s=batch.ci_gate_poll_s,
+        ci_gate_no_ci=batch.ci_gate_no_ci,
     )
 
 
@@ -3406,6 +3458,18 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
             concurrency = int(arg.split("=", 1)[1])
             if concurrency < 1:
                 raise FixConfigError(f"--concurrency must be >= 1: {arg}")
+        elif arg.startswith("--ci-gate-timeout=") or arg.startswith("--ci-gate-poll="):
+            # Issue #713: the merge CI gate's bounded poll, mirroring `sdlc build`.
+            value = int(arg.split("=", 1)[1])
+            if value < 0:
+                raise FixConfigError(f"{arg.split('=', 1)[0]} must be non-negative: {arg}")
+            key = "ci_gate_timeout_s" if arg.startswith("--ci-gate-timeout=") else "ci_gate_poll_s"
+            kwargs[key] = value
+        elif arg.startswith("--ci-gate-no-ci="):
+            policy = arg.split("=", 1)[1]
+            if policy not in {"allow", "deny"}:
+                raise FixConfigError(f"invalid --ci-gate-no-ci: {policy} (expected allow|deny)")
+            kwargs["ci_gate_no_ci"] = policy
         elif arg.startswith("--host="):
             # Issue #606: override host auto-detection for a self-hosted origin
             # `issue_host.detect_host` cannot classify, mirroring `sdlc build

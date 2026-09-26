@@ -1587,6 +1587,181 @@ def test_run_fix_merge_awaiting_approval_parks(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #713: the deterministic merge CI gate on the fix path
+# ---------------------------------------------------------------------------
+
+
+def _stub_cr_status(monkeypatch, statuses: list[str | None]) -> list[int]:
+    """Serve ``statuses`` in order from the CR status seam; the last one repeats."""
+    import sdlc.build_issue as build_issue_mod
+
+    calls: list[int] = []
+
+    def _status(ledger, story_id, cr_ref, *, runner=None):
+        calls.append(int(cr_ref))
+        return statuses[min(len(calls) - 1, len(statuses) - 1)]
+
+    monkeypatch.setattr(build_issue_mod, "change_request_status", _status)
+    return calls
+
+
+def _run_gated_fix(tmp_path, dispatch, **opts) -> "FixResult":
+    return run_fix(
+        FixOptions(issue=1, ci_gate_poll_s=0, **opts),
+        ledger=_ledger(tmp_path),
+        dispatcher=dispatch,
+        preflight=lambda: True,
+        runner=FakeGh(_issue_json()),
+        root=tmp_path,
+    )
+
+
+def test_fix_merge_gate_red_head_never_dispatches_merge(tmp_path, monkeypatch) -> None:
+    from sdlc.issue_host import CR_FAILED
+
+    calls = _stub_cr_status(monkeypatch, [CR_FAILED])
+    dispatch = RecordingDispatcher()
+    result = _run_gated_fix(tmp_path, dispatch)
+    assert result.status == "FAILED"
+    assert "merge" not in dispatch.agents()
+    # A red pipeline routes into the bugfix loop, re-read after every push.
+    assert dispatch.counts["bugfix"] == 2
+    assert calls == [100, 100, 100]
+
+
+def test_fix_merge_gate_failure_names_the_failing_checks(tmp_path, monkeypatch) -> None:
+    import sdlc.build_issue as build_issue_mod
+    from sdlc.issue_host import CR_FAILED, CR_SUCCESS, ChangeRequestChecks
+
+    _stub_cr_status(monkeypatch, [CR_FAILED, CR_SUCCESS])
+    monkeypatch.setattr(
+        build_issue_mod, "change_request_checks",
+        lambda ledger, sid, ref, *, runner=None: ChangeRequestChecks(
+            labels=(), checks=(("lint", CR_SUCCESS), ("Smoke test", CR_FAILED)),
+        ),
+    )
+    prompts: dict[str, str] = {}
+
+    class _PromptRecorder(RecordingDispatcher):
+        def __call__(self, agent_type, prompt, **kwargs):
+            prompts.setdefault(agent_type, prompt)
+            return super().__call__(agent_type, prompt, **kwargs)
+
+    dispatch = _PromptRecorder()
+    result = _run_gated_fix(tmp_path, dispatch)
+    assert result.status == "DONE"
+    bugfix_prompt = prompts["bugfix"]
+    assert "Smoke test" in bugfix_prompt
+    assert "merge blocked" in bugfix_prompt
+
+
+def test_fix_merge_gate_pending_waits_then_merges(tmp_path, monkeypatch) -> None:
+    from sdlc.issue_host import CR_PENDING, CR_SUCCESS
+
+    calls = _stub_cr_status(monkeypatch, [CR_PENDING, CR_PENDING, CR_SUCCESS])
+    dispatch = RecordingDispatcher()
+    result = _run_gated_fix(tmp_path, dispatch)
+    assert result.status == "DONE"
+    assert dispatch.counts["merge"] == 1
+    assert "bugfix" not in dispatch.agents()
+    assert len(calls) == 3
+
+
+def test_fix_merge_gate_pending_at_timeout_blocks(tmp_path, monkeypatch) -> None:
+    from sdlc.issue_host import CR_PENDING
+
+    _stub_cr_status(monkeypatch, [CR_PENDING])
+    dispatch = RecordingDispatcher()
+    result = _run_gated_fix(tmp_path, dispatch, ci_gate_timeout_s=0)
+    assert result.status == "FAILED"
+    assert "merge" not in dispatch.agents()
+
+
+def test_fix_merge_gate_rereads_after_bugfix_push(tmp_path, monkeypatch) -> None:
+    from sdlc.issue_host import CR_FAILED, CR_SUCCESS
+
+    # Red on the first head, green on the head the bugfix loop pushed.
+    calls = _stub_cr_status(monkeypatch, [CR_FAILED, CR_SUCCESS])
+    dispatch = RecordingDispatcher()
+    result = _run_gated_fix(tmp_path, dispatch)
+    assert result.status == "DONE"
+    assert dispatch.counts["bugfix"] == 1
+    assert dispatch.counts["merge"] == 1
+    assert len(calls) == 2
+    # The merge agent is only ever dispatched after the green read.
+    agents = dispatch.agents()
+    assert agents.index("bugfix") < agents.index("merge")
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected", "merged"),
+    [("allow", "DONE", True), ("deny", "FAILED", False)],
+)
+def test_fix_merge_gate_honours_no_ci_policy(
+    tmp_path, monkeypatch, policy, expected, merged
+) -> None:
+    from sdlc.issue_host import CR_NONE
+
+    _stub_cr_status(monkeypatch, [CR_NONE])
+    dispatch = RecordingDispatcher()
+    result = _run_gated_fix(tmp_path, dispatch, ci_gate_no_ci=policy)
+    assert result.status == expected
+    assert ("merge" in dispatch.agents()) is merged
+
+
+def test_fix_merge_gate_risk_gate_only_block_parks(tmp_path, monkeypatch) -> None:
+    import sdlc.build_issue as build_issue_mod
+    from sdlc.issue_host import CR_FAILED, CR_SUCCESS, ChangeRequestChecks
+
+    _stub_cr_status(monkeypatch, [CR_FAILED])
+    monkeypatch.setattr(
+        build_issue_mod, "change_request_checks",
+        lambda ledger, sid, ref, *, runner=None: ChangeRequestChecks(
+            labels=("risk:high",),
+            checks=(("tests", CR_SUCCESS), ("High-risk file approval gate", CR_FAILED)),
+        ),
+    )
+    dispatch = RecordingDispatcher()
+    result = _run_gated_fix(tmp_path, dispatch)
+    assert result.status == "AWAITING_APPROVAL"
+    assert "merge" not in dispatch.agents()
+    assert "bugfix" not in dispatch.agents()
+
+
+def test_fix_ci_gate_flags_parse_and_thread_to_batch() -> None:
+    opts = parse_fix_args(
+        ["7", "--ci-gate-timeout=60", "--ci-gate-poll=5", "--ci-gate-no-ci=deny"]
+    )
+    assert (opts.ci_gate_timeout_s, opts.ci_gate_poll_s, opts.ci_gate_no_ci) == (
+        60, 5, "deny",
+    )
+    batch = parse_fix_args(["all", "--ci-gate-timeout=0", "--ci-gate-no-ci=deny"])
+    per_issue = fix_mod._issue_options(batch, 3)
+    assert per_issue.ci_gate_timeout_s == 0
+    assert per_issue.ci_gate_no_ci == "deny"
+
+
+@pytest.mark.parametrize(
+    "arg", ["--ci-gate-timeout=-1", "--ci-gate-poll=-1", "--ci-gate-no-ci=maybe"]
+)
+def test_fix_ci_gate_flags_reject_bad_values(arg) -> None:
+    with pytest.raises(FixConfigError):
+        parse_fix_args(["7", arg])
+
+
+def test_fix_ci_gate_options_survive_resume_config() -> None:
+    opts = FixOptions(issue=9, ci_gate_timeout_s=42, ci_gate_poll_s=3, ci_gate_no_ci="deny")
+    back = fix_mod._options_from_fix_config(fix_mod._fix_config(opts), 9)
+    assert (back.ci_gate_timeout_s, back.ci_gate_poll_s, back.ci_gate_no_ci) == (
+        42, 3, "deny",
+    )
+    legacy = fix_mod._options_from_fix_config({"issue": 9}, 9)
+    assert (legacy.ci_gate_timeout_s, legacy.ci_gate_poll_s, legacy.ci_gate_no_ci) == (
+        1800, 30, "allow",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Preflight + stop-condition orchestration
 # ---------------------------------------------------------------------------
 
