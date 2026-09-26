@@ -5175,13 +5175,21 @@ def _evaluate_ci_gate(status: str | None, *, no_ci_policy: str) -> tuple[str, st
     return _GATE_BLOCK, f"unexpected CI status {status!r} — merge blocked"
 
 
+class _CIGateOptions(Protocol):
+    """The merge CI gate's knobs — carried by both BuildOptions and FixOptions (#713)."""
+
+    ci_gate_timeout_s: int
+    ci_gate_poll_s: int
+    ci_gate_no_ci: str
+
+
 def _run_merge_ci_gate(
     stage: str,
     ledger: Ledger,
     run_id: str,
     story: Story,
     pr_number: int | None,
-    opts: BuildOptions,
+    opts: _CIGateOptions,
     *,
     status_fn: Callable[[], str | None] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
