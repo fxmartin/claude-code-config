@@ -544,6 +544,16 @@ def test_ci_status_warns_when_the_forge_will_not_resolve(tmp_path, monkeypatch, 
     assert "cannot resolve the repo forge" in caplog.text
 
 
+def test_ci_status_warns_when_the_host_call_fails(tmp_path, monkeypatch, caplog):
+    """A host error is logged at WARNING (not debug) and degrades to None."""
+    ledger = _never_mirrored_gitlab(tmp_path, monkeypatch)
+    runner = FakeRunner({"mr view": (1, "", "boom")})
+
+    with caplog.at_level("WARNING"):
+        assert bi.change_request_status(ledger, "29.4-004", 5, runner=runner) is None
+    assert "change_request_status failed" in caplog.text
+
+
 def test_recorded_but_unusable_host_never_falls_back(tmp_path, monkeypatch):
     """A story mapped to an unsupported host is not re-guessed onto another forge."""
     ledger = _mirror_repo(tmp_path, monkeypatch)
