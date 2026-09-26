@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.12] - 2026-09-26
+
+### Fixed
+
+- fix(sandbox): contain writer stages so a worktree escape is impossible (#717)
+
+
 ## [v2.71.11] - 2026-09-26
 
 ### Fixed
