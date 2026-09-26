@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.5] - 2026-09-26
+
+### Fixed
+
+- fix(install): seed settings.json from template so --core works (#706)
+
+
 ## [v2.71.4] - 2026-09-26
 
 ### Fixed
