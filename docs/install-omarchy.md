@@ -124,12 +124,17 @@ What each mode does on Arch:
 
 | Mode | Effect |
 |------|--------|
-| `--core` | Symlinks `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `settings.json`, … into `~/.claude/`, and `AGENTS.md` into `~/.codex/` for Codex |
+| `--core` | Symlinks `CLAUDE.md`, `agents/`, `commands/`, `hooks/`, `settings.json`, … into `~/.claude/`, and `AGENTS.md` into `~/.codex/` for Codex. Each repo skill is linked individually into `~/.claude/skills/`, which stays a real directory |
 | `--tools` | `sudo pacman -S --needed --noconfirm yazi bat fd ripgrep fzf zoxide ffmpeg imagemagick poppler 7zip jq ttf-nerd-fonts-symbols tmux` (packages Omarchy already ships are skipped) |
 | `--mcp` | Merges the Playwright + context7 MCP servers into `~/.claude.json` |
 | `--shell` | Appends `dev()` and `y()` to `~/.bashrc` (or `~/.zshrc` if zsh is your `$SHELL`) |
 
 `settings.json` is gitignored, so on first run `--core` seeds it from `settings.template.json` (never overwriting an existing one). The template enables auto permission mode (`permissions.defaultMode: "auto"`, `skipAutoPermissionPrompt: true`), which changes agent behaviour on the machine.
+
+Omarchy ships its own Claude skills (`omarchy`, `diagnose-crash`) as symlinks in
+`~/.claude/skills/`, and Claude Code keeps account-synced skills in `synced/`.
+`--core` preserves all of them: it only adds this repo's skills alongside, and
+`--uninstall` removes only the links it created.
 
 `dev <dir>` opens a tmux session named after the directory with three windows:
 `claude` (runs `claude` when the directory is a git repo), `terminal`, and
