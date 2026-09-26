@@ -131,6 +131,21 @@ class Runner(Protocol):
 
 
 @dataclass(frozen=True)
+class IssueComment:
+    """A comment on a host issue.
+
+    ``association`` is the GitHub ``authorAssociation`` (``OWNER``/``MEMBER``/
+    ``COLLABORATOR``/…); the GitLab adapter maps a project member with Developer
+    access or above to ``MEMBER`` and everyone else to ``NONE``, so callers can
+    judge trust uniformly across hosts.
+    """
+
+    author: str
+    association: str
+    body: str
+
+
+@dataclass(frozen=True)
 class Issue:
     """A host issue, normalised across GitHub and GitLab.
 
@@ -151,6 +166,7 @@ class Issue:
     assignees: tuple[str, ...] = ()
     body: str | None = None
     labels: tuple[str, ...] = ()
+    comments: tuple[IssueComment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1059,7 +1075,7 @@ class GitHubAdapter(IssueHostAdapter):
         ref = _ref_of(ref)
         out = self._run(
             "issue", "view", ref,
-            "--json", "number,url,title,state,body,labels,assignees",
+            "--json", "number,url,title,state,body,labels,assignees,comments",
         ).stdout
         row = _parse_json_object(out)
         if not row:
@@ -1073,6 +1089,7 @@ class GitHubAdapter(IssueHostAdapter):
             body=row.get("body"),
             labels=_label_names(row.get("labels")),
             assignees=tuple(a.get("login") for a in row.get("assignees") or []),
+            comments=_github_comments(row.get("comments")),
         )
 
     # -- change-request verbs (gh pr) --
@@ -1330,7 +1347,37 @@ class GitLabAdapter(IssueHostAdapter):
             body=row.get("description"),
             labels=_label_names(row.get("labels")),
             assignees=tuple(a.get("username") for a in row.get("assignees") or []),
+            comments=self._issue_comments(ref),
         )
+
+    def _issue_comments(self, ref: str) -> tuple[IssueComment, ...]:
+        """Human notes on the issue, oldest first; empty when they cannot be read.
+
+        Best-effort: a notes/members lookup failure must not break the issue
+        fetch, so the fix run degrades to today's body-only behaviour.
+        """
+        notes = self._invoke(
+            "api", f"projects/:id/issues/{ref}/notes?sort=asc&per_page=100"
+        )
+        if notes.returncode != 0:
+            return ()
+        members = self._invoke("api", "projects/:id/members/all?per_page=100")
+        trusted = {
+            m.get("username")
+            for m in _parse_json_array(members.stdout if members.returncode == 0 else "")
+            if isinstance(m.get("access_level"), int) and m["access_level"] >= 30
+        }
+        out: list[IssueComment] = []
+        for note in _parse_json_array(notes.stdout):
+            if note.get("system") or not note.get("body"):
+                continue
+            author = (note.get("author") or {}).get("username") or "unknown"
+            out.append(IssueComment(
+                author=author,
+                association="MEMBER" if author in trusted else "NONE",
+                body=note["body"],
+            ))
+        return tuple(out)
 
     # -- change-request verbs (glab mr) --
     def cr_find(self, source_branch: str) -> ChangeRequest | None:
@@ -1482,6 +1529,21 @@ def _parse_json_object(stdout: str | None) -> dict:
     except (json.JSONDecodeError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _github_comments(raw: object) -> tuple[IssueComment, ...]:
+    """Map `gh issue view --json comments` rows to :class:`IssueComment`s."""
+    if not isinstance(raw, list):
+        return ()
+    return tuple(
+        IssueComment(
+            author=(c.get("author") or {}).get("login") or "unknown",
+            association=c.get("authorAssociation") or "NONE",
+            body=c["body"],
+        )
+        for c in raw
+        if isinstance(c, dict) and c.get("body")
+    )
 
 
 def _label_names(labels: object) -> tuple[str, ...]:
