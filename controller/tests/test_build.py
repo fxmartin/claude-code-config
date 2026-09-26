@@ -6043,3 +6043,76 @@ def test_stage_usage_still_records_the_observed_model_when_usage_is_unavailable(
     row = _stage_usage_row(ledger, run_id, "s1", "build")
     assert row["input_tokens"] is None
     assert row["model"] == "some-model"
+
+
+# -- Issue #698: resume after a failed deterministic CR open ------------------
+
+
+def _run_review_entry(tmp_path, monkeypatch, open_result):
+    """Run `_run_story` re-entering at review (build/coverage DONE, no CR)."""
+    from sdlc import build as b
+
+    opens: list[str] = []
+
+    def fake_open(*args, **kwargs):
+        opens.append(kwargs["context"])
+        return open_result
+
+    monkeypatch.setattr(b, "_open_story_cr", fake_open)
+    disp = _RaisingDispatcher(raise_on="none")
+    story = _story("99.1-001")
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    ledger.inventory_upsert_specs(
+        [(story.id, story.epic_id, story.epic_id + ".1", story.title, story.points, "Low")]
+    )
+    run_id = ledger.run_create("epic-99", "sequential")
+    ledger.story_upsert(
+        run_id, story.id, story.epic_id, story.title, "P1", 1, "py",
+        f"feature/{story.id}", None, "IN_PROGRESS",
+    )
+    status = b._run_story(
+        story, BuildOptions(scope="epic-99", skip_preflight=True), ledger, run_id,
+        disp, tmp_path, done_stages=frozenset({"build", "coverage"}),
+    )
+    return status, disp, opens
+
+
+def test_review_entry_without_cr_parks_without_dispatching_review(
+    tmp_path, monkeypatch
+) -> None:
+    status, disp, opens = _run_review_entry(tmp_path, monkeypatch, None)
+    assert status == "NEEDS_ATTENTION"
+    assert opens == ["pre-review"]
+    assert not any(agent == "review" for agent, _ in disp.calls)
+
+
+def test_review_entry_without_cr_retries_open_then_reviews(
+    tmp_path, monkeypatch
+) -> None:
+    _status, disp, opens = _run_review_entry(tmp_path, monkeypatch, 77)
+    assert opens[0] == "pre-review"
+    assert any(agent != "bugfix" for agent, _ in disp.calls)
+
+
+def test_open_story_cr_reuses_existing_cr_for_branch(tmp_path, monkeypatch) -> None:
+    from sdlc.build import _open_story_cr
+
+    story = _story("05.1-001")
+    root = _repo_with_undetectable_origin(tmp_path, f"feature/{story.id}")
+    ledger = _mapped_ledger(tmp_path, story, "gitlab", "9")
+
+    class _Finder(_FakeCrAdapter):
+        def cr_find(self, source_branch):
+            return ih.ChangeRequest(host=self.host, ref="7", url="https://x/7")
+
+    fake = _Finder("gitlab")
+    monkeypatch.setattr(
+        ih, "get_adapter", lambda host, runner=None, instance_url=None: fake
+    )
+    pr = _open_story_cr(
+        story, ledger, "run-1", root, "origin/main", None, ih.GITLAB_CR_TERMS,
+        BuildOptions(), body="b", context="pre-review",
+    )
+    assert pr == 7
+    assert fake.created == []

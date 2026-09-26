@@ -796,6 +796,15 @@ class IssueHostAdapter(ABC):
         when the ref no longer resolves (deleted on the host)."""
 
     # -- change-request (PR/MR) verbs (Story 23.1-001) --
+    def cr_find(self, source_branch: str) -> "ChangeRequest | None":
+        """Return the open CR whose source is ``source_branch``, else ``None``.
+
+        Best-effort and non-abstract so a lookup-less adapter degrades to
+        "not found" — callers then fall through to :meth:`cr_create`. Lets a
+        retried CR open reuse the CR a previous attempt already created.
+        """
+        return None
+
     @abstractmethod
     def cr_create(
         self,
@@ -1067,6 +1076,22 @@ class GitHubAdapter(IssueHostAdapter):
         )
 
     # -- change-request verbs (gh pr) --
+    def cr_find(self, source_branch: str) -> ChangeRequest | None:
+        out = self._run(
+            "pr", "list", "--head", source_branch, "--state", "open",
+            "--json", "number,url,title,headRefName,baseRefName", "--limit", "1",
+        ).stdout
+        rows = _parse_json_array(out)
+        if not rows:
+            return None
+        row = rows[0]
+        return ChangeRequest(
+            host=self.host, ref=str(row.get("number")), url=row.get("url"),
+            title=row.get("title"), state="open",
+            source_branch=row.get("headRefName") or source_branch,
+            target_branch=row.get("baseRefName"),
+        )
+
     def cr_create(
         self,
         source_branch: str,
@@ -1308,6 +1333,24 @@ class GitLabAdapter(IssueHostAdapter):
         )
 
     # -- change-request verbs (glab mr) --
+    def cr_find(self, source_branch: str) -> ChangeRequest | None:
+        out = self._run(
+            "mr", "list", "--source-branch", source_branch, "--output", "json",
+        ).stdout
+        rows = [
+            r for r in _parse_json_array(out)
+            if _norm_state(r.get("state")) == "open"
+        ]
+        if not rows:
+            return None
+        row = rows[0]
+        return ChangeRequest(
+            host=self.host, ref=str(row.get("iid")), url=row.get("web_url"),
+            title=row.get("title"), state="open",
+            source_branch=row.get("source_branch") or source_branch,
+            target_branch=row.get("target_branch"),
+        )
+
     def cr_create(
         self,
         source_branch: str,
