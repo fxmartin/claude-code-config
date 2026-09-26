@@ -32,6 +32,8 @@ Always include:
 
 ## Step 3: Create GitHub Remote
 
+> GitLab master? Use the "GitLab-master variant" section at the end instead of Steps 3, 4 and 8.
+
 ```bash
 gh repo create <project-name> --<visibility> --source=. --remote=origin
 ```
@@ -256,3 +258,97 @@ Show the user:
 - Number of labels created (base + project-specific)
 - Files created: `.gitignore`, `CLAUDE.md`, `PROJECT-SEED.md`, `.sdlc-harness.yaml`
 - **Next step**: "Run `/brainstorm` to define product requirements. It will pick up your PROJECT-SEED.md automatically."
+
+## GitLab-master variant (Master repo = GitLab on home-lab)
+
+The GitHub answer keeps Steps 1-9 exactly as written above. On the GitLab path the
+forge is `http://gitlab.test` (`export GITLAB_HOST=gitlab.test`; `glab` runs as
+`root`). GitHub is only the mirror target: nothing is pushed or merged there.
+
+### Step 3 (GitLab): Create remotes
+
+```bash
+glab api -X POST projects -f name=<project-name> -f visibility=<visibility> \
+  -f initialize_with_readme=false -f default_branch=main
+git remote add origin http://gitlab.test/root/<project-name>.git
+gh repo create <project-name> --<visibility> --source=. --remote=github
+```
+
+`--source=. --remote=github` adds the mirror target as remote `github`; do not push to it.
+
+#### Credential helper (GitLab)
+
+Set repo-locally so the first push does not fail on "could not read Username":
+
+```bash
+git config --local credential.http://gitlab.test.helper '!glab auth git-credential'
+```
+
+### Step 4 (GitLab): Labels
+
+Issues and labels live on GitLab. Apply the same 26 base labels (and the 2-5
+project-specific ones) from Step 4 with one call per label — `glab` has no bulk
+apply. GitHub labels are not applied.
+
+```bash
+glab label create --name "<label>" --color "#<Color>" --description "<Description>"
+```
+
+### Step 6c (GitLab): Forge declaration and CI
+
+The sdlc controller cannot detect the forge from a `gitlab.test` remote, so without
+this file the first PR open fails and parks the story.
+
+#### .sdlc-forge.yaml (GitLab)
+
+```yaml
+# Declares the code host for the sdlc controller: origin is the local-ci-cd
+# GitLab on home-lab, whose hostname carries no "gitlab" tell for auto-detection
+# to key on.
+forge: gitlab
+gitlab_url: http://gitlab.test
+```
+
+Install `templates/gitlab-ci.yml` as `.gitlab-ci.yml` (Story 23.3-001 prerequisites
+apply). Keep `.github/workflows/ci.yml` where the stack generates one: it is the
+hosted fallback for the single-appliance risk, not a redundant gate.
+
+Add `.sdlc-forge.yaml` and `.gitlab-ci.yml` to the Step 7 `git add`.
+
+### CLAUDE.md additions (GitLab)
+
+Replace the "GitHub Operations" section with the following, and append the CI notes:
+
+```markdown
+## Source Control — local GitLab is master
+
+- `origin` is `http://gitlab.test/root/<project-name>.git`; the `github` remote is a
+  push-mirror target only. Never push to `github`; never merge on GitHub.
+- Change flow: branch → push `origin` → merge request on GitLab → appliance
+  pipeline green → merge on GitLab.
+- Issues and MRs live on GitLab — use `glab` (`GITLAB_HOST=gitlab.test`), not `gh`.
+
+## CI (offline)
+
+- Jobs use the platform's `GOMODCACHE` volume: never commit `vendor/`.
+- CI has no network: warm images and modules on home-lab (`local-ci-cd cache warm` /
+  `local-ci-cd cache warm-deps`) before the first pipeline.
+```
+
+### Step 8 (GitLab): Push
+
+```bash
+git push -u origin main
+```
+
+### Step 9 (GitLab): Summary additions
+
+In addition to the standard summary:
+- Master repo: GitLab `http://gitlab.test/root/<project-name>`; GitHub is the mirror target.
+- Mirror: when the `local-ci-cd` CLI and `LOCAL_CI_CD_MIRROR_GITHUB_TOKEN` are available
+  on this machine, run the command below; otherwise print it for the operator to run
+  on the appliance — never skip silently:
+  `local-ci-cd mirror add root/<project-name> --username x-access-token --token-env LOCAL_CI_CD_MIRROR_GITHUB_TOKEN`
+- Warn: mirrors run with `keep_divergent_refs`, so a GitHub-side merge silently strands GitLab.
+- Warn: CI is offline — run `local-ci-cd cache warm` / `cache warm-deps` on home-lab before the first pipeline.
+- Files created also include `.sdlc-forge.yaml` and `.gitlab-ci.yml`.

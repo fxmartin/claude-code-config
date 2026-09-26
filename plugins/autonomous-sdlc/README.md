@@ -18,7 +18,7 @@ Plus `fix-issue` for triaging GitHub issues and `resume-build-agents` for resumi
 
 | Skill | Invocation | Purpose |
 |---|---|---|
-| `project-init` | `/autonomous-sdlc:project-init [name]` | Bootstrap a new repo: git init, GitHub remote, labels, lightweight `CLAUDE.md`, `PROJECT-SEED.md` for handoff to brainstorm. |
+| `project-init` | `/autonomous-sdlc:project-init [name]` | Bootstrap a new repo: git init, GitLab-master (default) or GitHub remote, labels, `.sdlc-forge.yaml` for GitLab, lightweight `CLAUDE.md`, `PROJECT-SEED.md` for handoff to brainstorm. |
 | `brainstorm` | `/autonomous-sdlc:brainstorm [idea]` | Senior-PM interview-driven requirements discovery, produces `REQUIREMENTS.md`. |
 | `generate-epics` | `/autonomous-sdlc:generate-epics` | Bulk-generate epics + stories from an approved `REQUIREMENTS.md`. |
 | `create-epic` | `/autonomous-sdlc:create-epic <NN> [topic]` | Interactively create a single new epic with stories. |
