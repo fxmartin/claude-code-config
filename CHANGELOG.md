@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.3] - 2026-09-26
+
+### Fixed
+
+- fix(build): route merge and reconcile via the declared forge (#699) (#703)
+
+
 ## [v2.71.2] - 2026-09-26
 
 ### Fixed
