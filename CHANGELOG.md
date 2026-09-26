@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.7] - 2026-09-26
+
+### Fixed
+
+- fix(install): link skills per entry so foreign skills survive --core (#707)
+
+
 ## [v2.71.6] - 2026-09-26
 
 ### Fixed
