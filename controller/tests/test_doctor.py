@@ -1334,3 +1334,108 @@ def test_self_update_is_a_no_op_outside_a_controller_repo(tmp_path: Path) -> Non
     # fetch=True too: a repo with no controller pyproject never touches the network.
     assert self_update_controller(tmp_path, "2.71.3", installer=installer) is None
     assert installer.trees == []
+
+
+# --- Issue #709: coverage of the self-update edges ----------------------------
+
+
+def test_self_update_fetches_origin_main_before_deciding(tmp_path: Path) -> None:
+    from sdlc.doctor import self_update_controller
+
+    upstream = _controller_repo(tmp_path / "upstream", "2.71.4")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True)
+    _declare_checkout_version(upstream, "2.71.5")
+    _git(upstream, "commit", "-qam", "release 2.71.5")
+    installer = _Installer()
+
+    new = self_update_controller(clone, "2.71.4", installer=installer)
+
+    assert new == "2.71.5"
+    assert installer.versions == ["2.71.5"]
+
+
+def test_self_update_survives_a_failing_fetch(tmp_path: Path) -> None:
+    from sdlc.doctor import self_update_controller
+
+    repo = _controller_repo(tmp_path / "repo", "2.71.4")  # no `origin` remote
+    installer = _Installer()
+
+    assert self_update_controller(repo, "2.71.3", installer=installer) == "2.71.4"
+
+
+def test_self_update_swallows_a_git_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc import doctor
+
+    repo = _controller_repo(tmp_path / "repo", "2.71.4")
+    real_run = subprocess.run
+
+    def flaky(cmd, *a, **kw):  # noqa: ANN001
+        if "worktree" in cmd and "add" in cmd:
+            raise OSError("boom")
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(doctor.subprocess, "run", flaky)
+    installer = _Installer()
+
+    assert doctor.self_update_controller(repo, "2.71.3", installer=installer, fetch=False) is None
+    assert installer.trees == []
+
+
+def test_base_ref_lookup_tolerates_a_missing_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc import doctor
+
+    def gone(*a, **kw):  # noqa: ANN002, ANN003
+        raise OSError("no git")
+
+    monkeypatch.setattr(doctor.subprocess, "run", gone)
+
+    assert doctor.base_ref_controller_version(tmp_path) is None
+    assert doctor.self_update_controller(tmp_path, "1.0.0", fetch=False) is None
+
+
+def test_base_ref_version_is_none_for_an_unreadable_pyproject(tmp_path: Path) -> None:
+    from sdlc.doctor import base_ref_controller_version
+
+    repo = _controller_repo(tmp_path / "repo", "2.71.4")
+    (repo / "controller" / "pyproject.toml").write_text("not = [valid", encoding="utf-8")
+    _git(repo, "commit", "-qam", "break pyproject")
+
+    assert base_ref_controller_version(repo) is None
+
+
+def test_controller_version_falls_back_to_the_working_tree_outside_git(tmp_path: Path) -> None:
+    _declare_checkout_version(tmp_path, "2.71.4")
+    assert check_controller_version(tmp_path, installed_version="2.71.4").status == "CLEAN"
+
+    (tmp_path / "controller" / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    finding = check_controller_version(tmp_path, installed_version="2.71.4")
+    assert finding.status == "CLEAN"
+    assert "no readable" in finding.detail
+
+
+def test_run_install_script_reports_exit_status(tmp_path: Path) -> None:
+    from sdlc.doctor import _run_install_script
+
+    (tmp_path / "scripts").mkdir()
+    script = tmp_path / "scripts" / "install-controller.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    assert _run_install_script(tmp_path) is True
+    script.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
+    assert _run_install_script(tmp_path) is False
+
+
+def test_run_install_script_is_false_when_bash_cannot_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc import doctor
+
+    def gone(*a, **kw):  # noqa: ANN002, ANN003
+        raise OSError("no bash")
+
+    monkeypatch.setattr(doctor.subprocess, "run", gone)
+    assert doctor._run_install_script(tmp_path) is False
