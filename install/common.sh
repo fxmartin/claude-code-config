@@ -76,6 +76,10 @@ create_symlink() {
     return
   fi
 
+  if [ ! -e "$src" ]; then
+    warn "$name: source $src does not exist — link will dangle"
+  fi
+
   backup_if_exists "$dst"
 
   # Remove existing symlink pointing elsewhere so ln -s can replace it cleanly.

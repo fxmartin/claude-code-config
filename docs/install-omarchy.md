@@ -129,6 +129,8 @@ What each mode does on Arch:
 | `--mcp` | Merges the Playwright + context7 MCP servers into `~/.claude.json` |
 | `--shell` | Appends `dev()` and `y()` to `~/.bashrc` (or `~/.zshrc` if zsh is your `$SHELL`) |
 
+`settings.json` is gitignored, so on first run `--core` seeds it from `settings.template.json` (never overwriting an existing one). The template enables auto permission mode (`permissions.defaultMode: "auto"`, `skipAutoPermissionPrompt: true`), which changes agent behaviour on the machine.
+
 `dev <dir>` opens a tmux session named after the directory with three windows:
 `claude` (runs `claude` when the directory is a git repo), `terminal`, and
 `yazi`. Switch windows with `prefix + n` / `prefix + p`; running `dev` again

@@ -28,6 +28,10 @@ teardown() {
     # primary-root marker (#630/#642) — remove it so tests never leave the
     # working tree dirty.
     rm -f "${BATS_TEST_DIRNAME}/../.sdlc-primary-root"
+    # Likewise --core seeds the gitignored settings.json (#693); drop it only
+    # if this test created it.
+    [ -n "${SEEDED_SETTINGS:-}" ] && rm -f "${BATS_TEST_DIRNAME}/../settings.json"
+    return 0
 }
 
 # Run installer with a pristine HOME and no .env loaded.
@@ -86,19 +90,31 @@ _run_install() {
 }
 
 @test "--core creates the symlink set and exits 0" {
+    [ -e "${BATS_TEST_DIRNAME}/../settings.json" ] || SEEDED_SETTINGS=1
     _run_install --core
     [ "$status" -eq 0 ]
     [ -L "${FAKE_HOME}/.claude/CLAUDE.md" ]
+    [ -e "${FAKE_HOME}/.claude/CLAUDE.md" ]
     [ -L "${FAKE_HOME}/.claude/agents" ]
+    [ -e "${FAKE_HOME}/.claude/agents" ]
     [ -L "${FAKE_HOME}/.claude/commands" ]
+    [ -e "${FAKE_HOME}/.claude/commands" ]
     [ -L "${FAKE_HOME}/.claude/skills" ]
+    [ -e "${FAKE_HOME}/.claude/skills" ]
     [ -L "${FAKE_HOME}/.claude/hooks" ]
+    [ -e "${FAKE_HOME}/.claude/hooks" ]
     [ -L "${FAKE_HOME}/.claude/settings.json" ]
+    [ -e "${FAKE_HOME}/.claude/settings.json" ]
     [ -L "${FAKE_HOME}/.claude/statusline-command.sh" ]
+    [ -e "${FAKE_HOME}/.claude/statusline-command.sh" ]
     [ -L "${FAKE_HOME}/.claude/keybindings.json" ]
+    [ -e "${FAKE_HOME}/.claude/keybindings.json" ]
     [ -L "${FAKE_HOME}/.claude/reference-docs" ]
+    [ -e "${FAKE_HOME}/.claude/reference-docs" ]
     [ -L "${FAKE_HOME}/.claude/docs" ]
+    [ -e "${FAKE_HOME}/.claude/docs" ]
     [ -L "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config" ]
+    [ -e "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config" ]
 }
 
 @test "--core links AGENTS.md into ~/.codex for Codex" {
@@ -428,4 +444,38 @@ _run_install() {
     fi
     # Belt-and-braces: the directory itself was not created.
     [ ! -e "${FAKE_HOME}/.claude" ]
+}
+
+@test "--core seeds settings.json from the template in a fresh clone (#693)" {
+    CLONE="$(mktemp -d)"
+    git -C "${BATS_TEST_DIRNAME}/.." ls-files -z | (cd "${BATS_TEST_DIRNAME}/.." && xargs -0 -I{} cp --parents -P {} "${CLONE}" 2>/dev/null) || true
+    rm -f "${CLONE}/settings.json"
+    run env HOME="${FAKE_HOME}" CLAUDE_CONFIG_NO_ENV=1 bash "${CLONE}/install.sh" --core
+    [ "$status" -eq 0 ]
+    [ -e "${FAKE_HOME}/.claude/settings.json" ]
+    jq -e . "${FAKE_HOME}/.claude/settings.json" >/dev/null
+    rm -rf "${CLONE}"
+}
+
+@test "--core never overwrites an existing settings.json (#693)" {
+    CLONE="$(mktemp -d)"
+    git -C "${BATS_TEST_DIRNAME}/.." ls-files -z | (cd "${BATS_TEST_DIRNAME}/.." && xargs -0 -I{} cp --parents -P {} "${CLONE}" 2>/dev/null) || true
+    echo '{"sentinel": true}' > "${CLONE}/settings.json"
+    for _ in 1 2; do
+        run env HOME="${FAKE_HOME}" CLAUDE_CONFIG_NO_ENV=1 bash "${CLONE}/install.sh" --core
+        [ "$status" -eq 0 ]
+    done
+    [ "$(jq -r .sentinel "${CLONE}/settings.json")" = "true" ]
+    rm -rf "${CLONE}"
+}
+
+@test "--core --dry-run announces seeding and creates nothing (#693)" {
+    CLONE="$(mktemp -d)"
+    git -C "${BATS_TEST_DIRNAME}/.." ls-files -z | (cd "${BATS_TEST_DIRNAME}/.." && xargs -0 -I{} cp --parents -P {} "${CLONE}" 2>/dev/null) || true
+    rm -f "${CLONE}/settings.json"
+    run env HOME="${FAKE_HOME}" CLAUDE_CONFIG_NO_ENV=1 bash "${CLONE}/install.sh" --core --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cp"*"settings.template.json"* ]]
+    [ ! -e "${CLONE}/settings.json" ]
+    rm -rf "${CLONE}"
 }

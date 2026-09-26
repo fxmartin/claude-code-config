@@ -45,6 +45,14 @@ install_core_run() {
 
   ensure_dir "$CLAUDE_DIR"
 
+  # settings.json is gitignored and runtime-owned; nix seeds it on the Mac.
+  # Everywhere else, seed it from the template on first install. Never
+  # overwrite, or the symlink below would dangle (#693).
+  if [ ! -e "$SCRIPT_DIR/settings.json" ]; then
+    run cp "$SCRIPT_DIR/settings.template.json" "$SCRIPT_DIR/settings.json"
+    info "Seeded settings.json from settings.template.json"
+  fi
+
   create_symlink "$SCRIPT_DIR/CLAUDE.md"               "$CLAUDE_DIR/CLAUDE.md"
   create_symlink "$SCRIPT_DIR/agents"                  "$CLAUDE_DIR/agents"
   create_symlink "$SCRIPT_DIR/commands"                "$CLAUDE_DIR/commands"
