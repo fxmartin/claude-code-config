@@ -1,6 +1,6 @@
 ---
 name: project-init
-description: Bootstrap a new repo with git, GitHub remote, labels, CLAUDE.md, and a PROJECT-SEED.md for handoff to /brainstorm.
+description: Bootstrap a new repo with git, GitLab (default) or GitHub master remote, labels, CLAUDE.md, and a PROJECT-SEED.md for handoff to /brainstorm.
 user-invocable: true
 disable-model-invocation: true
 argument-hint: "[project-name]"
@@ -30,7 +30,14 @@ Before starting, verify:
 
 If any check fails, explain and ask the user how to proceed.
 
-## Interactive Discovery (5 questions max)
+**GitLab path** (Master repo = GitLab, the default): the checks are decided after
+the Master repo question, and `gh` is still required (it creates the `github`
+mirror-target repo). Also verify, and fail early with the remedy on a miss —
+never mid-run:
+- `GITLAB_HOST=gitlab.test glab auth status` — authenticated as `root`
+- `curl -sI http://gitlab.test/` — reachable (remedy: check tailscale / split DNS)
+
+## Interactive Discovery (6 questions max)
 
 Read `${CLAUDE_SKILL_DIR}/interactive-questions.md` for the full Q&A flow.
 
@@ -39,7 +46,11 @@ Ask questions **one at a time**, waiting for each answer. Gather only what's nee
 2. Tech stack (language, framework, runtime)
 3. Architecture style (web app, API, CLI, library, etc.)
 4. Repo visibility (public/private)
-5. Anything else? (optional catch-all)
+5. Master repo: GitLab on home-lab (default) | GitHub
+6. Anything else? (optional catch-all)
+
+The GitHub answer keeps exactly the original flow; GitLab-only steps are in
+`generation-rules.md` under "GitLab-master variant".
 
 Do NOT ask about database, testing, CI/CD, or deployment — those are for `/brainstorm`.
 
@@ -50,12 +61,16 @@ After the Q&A, read `${CLAUDE_SKILL_DIR}/generation-rules.md` for detailed steps
 Summary:
 1. Initialize git repo (`git init`)
 2. Create `.gitignore` appropriate to the detected tech stack
-3. Create GitHub remote (`gh repo create`)
-4. Apply the standard label set (26 base + project-specific labels)
+3. Create the remote: GitHub (`gh repo create`), or on the GitLab path a GitLab
+   project as `origin` plus a `github` mirror-target repo
+4. Apply the standard label set (26 base + project-specific labels) — `gh` on
+   GitHub, `glab label create` on GitLab
 5. Generate `CLAUDE.md` (lightweight — placeholders for sections filled later)
 6. Generate `PROJECT-SEED.md` (structured handoff file for brainstorm)
 6b. Generate `.sdlc-harness.yaml` (pins the agent harness so routing is declared,
     not inherited from whatever registry the installed controller happens to ship)
+6c. GitLab path only: write `.sdlc-forge.yaml`, set the repo-local credential
+    helper, install `.gitlab-ci.yml`
 7. Create initial commit
 8. Push to remote
 9. Display summary and suggest: **"Run `/brainstorm` to define product requirements"**

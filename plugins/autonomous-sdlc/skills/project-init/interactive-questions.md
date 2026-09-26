@@ -30,7 +30,12 @@ Use the answer to set the tone for CLAUDE.md and pick sensible defaults for late
 ### 4. Repo Visibility
 > Should the GitHub repository be **public** or **private**?
 
-### 5. Anything Else?
+### 5. Master Repo
+> Which forge is the master for this repo?
+> - **GitLab on home-lab (default)** — `origin` on `http://gitlab.test`, GitHub is a push-mirror target
+> - **GitHub** — today's flow, unchanged
+
+### 6. Anything Else?
 > Any additional context I should capture now? Constraints, team conventions, target platform, etc.
 >
 > (Skip if nothing comes to mind — `/brainstorm` will dig deeper.)
@@ -48,11 +53,12 @@ After gathering all answers, present a structured summary:
 > | **Stack** | `<language + framework + runtime>` |
 > | **Architecture** | `<style>` |
 > | **Visibility** | `<public/private>` |
+> | **Master repo** | `<GitLab on home-lab / GitHub>` |
 >
 > I'll create:
-> - Git repo + GitHub remote
+> - Git repo + remote (GitLab `origin` + `github` mirror target, or GitHub `origin`)
 > - `.gitignore` (tailored to stack)
-> - Standard GitHub issue labels
+> - Standard issue labels (on the master forge)
 > - `CLAUDE.md` (lightweight, to be enriched later)
 > - `PROJECT-SEED.md` (handoff file for `/brainstorm`)
 > - Initial commit + push
