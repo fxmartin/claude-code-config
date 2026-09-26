@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.11] - 2026-09-26
+
+### Fixed
+
+- fix(fix): gate sdlc fix merges on the deterministic ci check (#713) (#714)
+
+
 ## [v2.71.10] - 2026-09-26
 
 ### Fixed
