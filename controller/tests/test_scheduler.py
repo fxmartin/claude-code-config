@@ -2620,3 +2620,19 @@ def test_a_resume_that_exits_zero_on_a_terminal_run_is_never_done(tmp_path) -> N
     job = store.get_job(job_id)
     assert job.state == "blocked"
     assert "run terminal, nothing resumed" in (job.reason or "")
+
+
+def test_run_terminal_is_none_when_every_story_is_done_and_failed_is_named(tmp_path) -> None:
+    from sdlc.build import Ledger
+    from sdlc.scheduler import ledger_run_terminal
+
+    repo = _repo(tmp_path, "alpha")
+    db = str(Path(repo) / ".sdlc-state.db")
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("614", "fix")
+    ledger.story_upsert(run_id, "614", "", "t", "P0", None, "", "", None, "DONE")
+    assert ledger_run_terminal(db, run_id) is None  # nothing blocked: not a #716 case
+
+    ledger.story_upsert(run_id, "615", "", "t", "P0", None, "", "", None, "FAILED")
+    assert ledger_run_terminal(db, run_id) == "story FAILED"
