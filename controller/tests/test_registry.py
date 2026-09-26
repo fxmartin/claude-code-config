@@ -378,3 +378,43 @@ def test_format_live_owner_refusal_names_pid_and_started_at():
     assert "2026-08-11T09:00:00+00:00" in message
     assert "sdlc status" in message
     assert "sdlc resume --run abc123 --force" in message
+
+
+def _ledger_with_done(tmp_path, done: int, total: int):
+    from sdlc.build import Ledger
+
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-06", "parallel")
+    ledger.set_total(run_id, total)
+    for i in range(total):
+        status = "DONE" if i < done else "IN_PROGRESS"
+        ledger.story_upsert(run_id, f"6.1-{i:03d}", "6", "S", "high", 1, "backend", "", None, status)
+    return db, run_id
+
+
+def test_view_overlays_live_ledger_counts(tmp_path):
+    db, run_id = _ledger_with_done(tmp_path, done=3, total=8)
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record(run_id, pid=os.getpid(), db=str(db), completed=0, total=8))
+    [row] = reg.view()
+    assert (row["completed"], row["total"]) == (3, 8)
+
+
+def test_view_keeps_cached_counts_when_ledger_unreachable(tmp_path):
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(
+        _record("r1", pid=os.getpid(), db=str(tmp_path / "missing.db"), completed=2, total=5)
+    )
+    [row] = reg.view()
+    assert (row["completed"], row["total"]) == (2, 5)
+
+
+def test_view_keeps_cached_counts_when_ledger_corrupt(tmp_path):
+    bad = tmp_path / "bad.db"
+    bad.write_text("not a sqlite db")
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_record("r1", pid=os.getpid(), db=str(bad), completed=1, total=4))
+    [row] = reg.view()
+    assert (row["completed"], row["total"]) == (1, 4)

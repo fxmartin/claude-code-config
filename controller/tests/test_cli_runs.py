@@ -90,3 +90,26 @@ def test_runs_prune_removes_dead(tmp_path, monkeypatch):
     result = runner.invoke(app, ["runs", "--prune"])
     assert result.exit_code == 0
     assert {r.run_id for r in reg.records()} == {"11111111-aaaa"}
+
+
+def test_runs_json_shows_live_ledger_progress(tmp_path, monkeypatch):
+    from sdlc.build import Ledger
+
+    db = tmp_path / ".sdlc-state.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-06", "parallel")
+    ledger.set_total(run_id, 8)
+    for i in range(8):
+        status = "DONE" if i < 3 else "IN_PROGRESS"
+        ledger.story_upsert(run_id, f"6.1-{i:03d}", "6", "S", "high", 1, "backend", "", None, status)
+    path = tmp_path / "registry.json"
+    Registry(path).register(
+        RunRecord(run_id=run_id, repo=str(tmp_path), db=str(db), scope="epic-06",
+                  pid=os.getpid(), status="IN_PROGRESS", started_at="2026-06-20T10:00:00+00:00",
+                  total=8, completed=0)
+    )
+    monkeypatch.setenv("SDLC_REGISTRY", str(path))
+    result = runner.invoke(app, ["runs", "--json"])
+    row = json.loads(result.output)[0]
+    assert (row["completed"], row["total"]) == (3, 8)

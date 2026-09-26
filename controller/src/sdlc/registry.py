@@ -132,6 +132,26 @@ def format_live_owner_refusal(record: RunRecord) -> str:
     )
 
 
+def _live_counts(rec: RunRecord) -> tuple[int | None, int | None]:
+    """Live ``(done, total)`` from the run's own ledger, else the cached counts.
+
+    The registry's counts are only written at registration and close-out, so an
+    in-flight run would read ``0/N`` until it ends; the ledger is authoritative.
+    """
+    # Lazy import: build.py imports this module.
+    import sqlite3
+
+    from sdlc.build import Ledger
+
+    try:
+        for r in Ledger(rec.db).list_runs():
+            if r["id"] == rec.run_id:
+                return r["done"], r["total"]
+    except (OSError, sqlite3.Error):
+        pass  # unreachable ledger → keep the registry's cached counts
+    return rec.completed, rec.total
+
+
 class Registry:
     """Concurrency-safe accessor for the shared run registry file.
 
@@ -320,5 +340,7 @@ class Registry:
         for rec in self.records():
             row = rec.to_dict()
             row["state"] = derive_state(rec)
+            if not rec.finished_at:
+                row["completed"], row["total"] = _live_counts(rec)
             rows.append(row)
         return rows
