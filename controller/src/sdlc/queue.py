@@ -747,7 +747,10 @@ class QueueStore:
         * **A run exists** — the job returns to ``running`` with an already
           expired lease, so :meth:`expired_running_jobs` surfaces it to the next
           `sdlc queue run`, which re-enters through `sdlc resume --run <id>` and
-          picks each story up at the stage it stopped in.
+          picks each story up at the stage it stopped in. If the scheduler then
+          finds the run terminal (every story ``BLOCKED``/``FAILED``, nothing
+          resumable) it calls :meth:`restart_fresh` instead: a new run for the
+          same scope (#716).
 
         Refuses a ``running`` job (a live scheduler owns it — stop that
         scheduler instead) and a ``queued`` one (already armed; silently
@@ -783,6 +786,23 @@ class QueueStore:
                     "lease_until = NULL, reason = NULL, updated_at = ? WHERE id = ?",
                     (moment, job_id),
                 )
+
+    def restart_fresh(self, job_id: int, *, reason: str, now: datetime | None = None) -> None:
+        """Turn a reclaimable job back into a clean ``queued`` launch (#716).
+
+        For a job whose run is terminal (every story ``BLOCKED``/``FAILED``):
+        `sdlc resume` has nothing to pick up, so the scope must start a *new*
+        run that re-reads its inputs. Clears ``run_id`` and the lease;
+        ``options``, ``priority``, ``kind`` and ``scope`` are untouched.
+        """
+        moment = _at(now).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET state = 'queued', run_id = NULL, claimed_by = NULL, "
+                "lease_until = NULL, reason = ?, updated_at = ? "
+                "WHERE id = ? AND state = 'running'",
+                (reason, moment, job_id),
+            )
 
     def prioritise_job(self, job_id: int, priority_class: str) -> None:
         """Reorder a job by changing its priority class."""
