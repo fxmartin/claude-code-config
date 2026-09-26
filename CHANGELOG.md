@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.71.6] - 2026-09-26
+
+### Fixed
+
+- fix(registry): overlay live ledger counts in sdlc runs view (#701) (#708)
+
+
 ## [v2.71.5] - 2026-09-26
 
 ### Fixed
