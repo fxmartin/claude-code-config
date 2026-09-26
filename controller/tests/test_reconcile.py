@@ -1385,3 +1385,18 @@ def test_colliding_gh_pr_number_does_not_land_story(tmp_path: Path, monkeypatch)
 
     assert result.reclassified == []
     assert _status(db, run_id, "99.1-009") == "FAILED"
+
+
+def test_declared_gitlab_lookup_failure_is_no_signal(tmp_path: Path, monkeypatch) -> None:
+    import sdlc.issue_host as ih
+
+    _declare_gitlab(tmp_path)
+    monkeypatch.setattr(
+        ih,
+        "_default_runner",
+        lambda argv, timeout=None, cwd=None, env=None: ih.RunResult(
+            returncode=1, stdout="", stderr="glab: not found"
+        ),
+    )
+
+    assert _gh_pr_state(5, tmp_path, expected_branch="feature/10.2-001") is None
