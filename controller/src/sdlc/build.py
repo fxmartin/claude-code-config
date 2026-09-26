@@ -5342,6 +5342,15 @@ def _open_story_cr(
         )
         if close_link:
             body += f"\n\n{close_link}"
+        # Idempotent: a retried open (resume after a failed push, #698) reuses
+        # the CR a previous attempt already created. The lookup is best-effort —
+        # any failure falls through to a create.
+        try:
+            existing = adapter.cr_find(branch)
+        except Exception:  # noqa: BLE001
+            existing = None
+        if existing is not None:
+            return int(existing.ref)
         cr = adapter.cr_create(
             branch, title, body, target_branch=base_ref.removeprefix("origin/")
         )
@@ -7897,6 +7906,29 @@ def _run_story(
         # retry of it — reuses the same packet. None (no CR yet, host failure,
         # oversized) leaves the prompt on its fetch-it-yourself fallback.
         review_packet_block: str | None = None
+        if stage == "review" and pr_number is None and "coverage" in stages:
+            # Issue #698: coverage is DONE but its deterministic CR open failed
+            # (the story parked and resume re-enters here). Retry it before
+            # review — a review with no CR burns dispatches on a "PR #None"
+            # prompt. On failure re-park without touching the review budget.
+            pr_number = _open_story_cr(
+                story, ledger, run_id, workdir, base_ref, close_link, cr_terms,
+                opts,
+                body=(
+                    f"Change request for story {story.id} opened by the "
+                    "controller on review entry (issue #698)."
+                ),
+                context="pre-review",
+            )
+            if pr_number is None:
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    f"review not dispatched: no {cr_terms.abbr} and the "
+                    f"deterministic open failed — parking NEEDS_ATTENTION; "
+                    f"work preserved on feature/{story.id}, resume retries",
+                )
+                return "NEEDS_ATTENTION"
+            ledger.set_story_pr(run_id, story.id, pr_number)
         if stage == "review" and pr_number is not None:
             review_packet_block = _bake_review_packet(
                 story, pr_number, workdir, ledger, run_id, coverage_signals, cr_terms,
