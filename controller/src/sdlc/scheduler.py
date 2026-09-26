@@ -52,6 +52,7 @@ __all__ = [
     "job_argv",
     "ledger_fix_rounds",
     "ledger_plan_files",
+    "ledger_run_terminal",
     "run_queue",
 ]
 
@@ -162,6 +163,9 @@ FixRounds = Callable[[str, str], int]
 # same shape and the same reason: the overlap graph's *write* side is testable
 # without standing up a ledger (Story 32.3-001 AC2).
 PlanFiles = Callable[[str, str], list[str]]
+# ``(ledger_db_path, run_id) -> why the run is terminal, or None`` when it still
+# has resumable work (or cannot be read). Injectable for the same reason (#716).
+RunTerminal = Callable[[str, str], "str | None"]
 # Returns a `sdlc.capability.ProbeStatus`; typed loosely so importing this
 # module never drags in the harness/capability stack.
 RateLimitProbe = Callable[[], object]
@@ -278,6 +282,8 @@ class _InFlight:
     started_at: datetime
     budget: JobBudget
     fix_rounds_baseline: int = 0
+    # This launch was `sdlc resume` — its exit 0 may only mean "nothing to resume".
+    resumed: bool = False
     # Whether this launch has already copied the run's investigated file set
     # onto the queue row (AC2). Latches, so a job's footprint is read from its
     # ledger once rather than on every poll.
@@ -544,6 +550,39 @@ def ledger_fix_rounds(db_path: str, run_id: str) -> int:
         return 0
 
 
+def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
+    """Why ``run_id`` cannot be resumed, or ``None`` when resuming is right (#716).
+
+    A run whose stories are all terminal with at least one ``BLOCKED``/``FAILED``
+    has nothing for `sdlc resume` to pick up ("nothing to resume", exit 0) —
+    e.g. an investigation parked on a human decision. Returns ``"story
+    BLOCKED"`` (or ``FAILED``) then. A run with no stories, resumable work, or
+    an unreadable ledger returns ``None``: the existing resume behaviour.
+    """
+    from sdlc.build import Ledger
+    from sdlc.resume import _FIX_RUN_MODES, has_resumable_work
+
+    try:
+        ledger = Ledger(Path(db_path))
+        statuses = {str(r.get("status")) for r in ledger.story_rows(run_id)}
+        if not statuses:
+            return None
+        run_row = ledger.run_row(run_id) or {}
+        if str(run_row.get("mode") or "") in _FIX_RUN_MODES:
+            # `resume_fix` re-enters a story only mid-flight; a BLOCKED/FAILED
+            # one is a refusal ("nothing to resume"), not work it can pick up.
+            if statuses - {"DONE", "SKIPPED", "BLOCKED", "FAILED"}:
+                return None
+        elif has_resumable_work(ledger, run_id):
+            return None
+    except Exception:  # noqa: BLE001 - a ledger read must never fail a drain
+        return None
+    for status in ("BLOCKED", "FAILED"):
+        if status in statuses:
+            return f"story {status}"
+    return None
+
+
 def ledger_plan_files(db_path: str, run_id: str) -> list[str]:
     """The files ``run_id``'s investigation said it would modify (Story 32.3-001 AC2).
 
@@ -698,7 +737,9 @@ class _Scheduler:
         identity: str,
         self_updater: SelfUpdater | None = None,
         installed_version: str | None = None,
+        run_terminal: RunTerminal = ledger_run_terminal,
     ) -> None:
+        self._run_terminal_of = run_terminal
         self._store = store
         self._config = config
         self._registry = registry
@@ -826,6 +867,17 @@ class _Scheduler:
                 # work did not. Two drivers on one run is exactly what the
                 # registry guard exists to prevent.
                 continue
+            terminal = self._run_terminal(job.run_id)
+            if terminal is not None:
+                # #716: nothing to resume — a new run must re-read the scope.
+                self._store.restart_fresh(
+                    job.id, reason=f"run is terminal ({terminal}) — fresh run",
+                    now=self._clock(),
+                )
+                self._echo(
+                    f"job {job.id}: run is terminal ({terminal}) — starting a fresh run"
+                )
+                continue
             return job, True
 
         busy = self._store.running_repos()
@@ -926,6 +978,7 @@ class _Scheduler:
             job=job, proc=proc, slots=cost, run_id=job.run_id,
             last_renewed=self._clock(), started_at=self._clock(),
             budget=job.job_budget(), fix_rounds_baseline=job.fix_rounds_baseline,
+            resumed=action == "resume",
         )
         if action == "resume":
             self._result.resumed += 1
@@ -1015,6 +1068,18 @@ class _Scheduler:
                 pr_number = _awaiting_approval_pr(record)
                 if pr_number is not None:
                     self._park_for_approval(entry, pr_number)
+                    continue
+            if state == "done" and entry.resumed and entry.run_id:
+                # #716 safety net: `sdlc resume` exits 0 on "nothing to resume".
+                # A terminal run produced no merge and no park — never `done`.
+                terminal = self._run_terminal(entry.run_id)
+                if terminal is not None:
+                    self._store.finish_job(
+                        job_id, "blocked",
+                        reason=f"run terminal, nothing resumed ({terminal})",
+                    )
+                    self._result.parked += 1
+                    self._echo(f"job {job_id} finished: blocked (run terminal, nothing resumed)")
                     continue
             reason = self._finish_reason(state, code, run_status, entry.run_id,
                                          run_finished)
@@ -1134,6 +1199,13 @@ class _Scheduler:
                 continue
             self._store.record_files(job_id, files)
             entry.files_recorded = True
+
+    def _run_terminal(self, run_id: str) -> str | None:
+        """Why ``run_id`` has nothing to resume (#716), via its registry ledger."""
+        record = self._registry_record(run_id)
+        if record is None or not record.db:
+            return None
+        return self._run_terminal_of(record.db, run_id)
 
     def _run_fix_rounds(self, run_id: str) -> int:
         """Fix rounds burned by ``run_id``, via its registry-recorded ledger."""
@@ -1670,6 +1742,7 @@ def run_queue(
     approval_probe: ApprovalProbe | None = None,
     fix_rounds: FixRounds | None = None,
     plan_files: PlanFiles | None = None,
+    run_terminal: RunTerminal | None = None,
     probe: RateLimitProbe | None | _Unset = _UNSET,
     echo: Callable[[str], None] | None = None,
     identity: str | None = None,
@@ -1727,6 +1800,7 @@ def run_queue(
         approval_probe=approval_probe or _default_approval_probe,
         fix_rounds=fix_rounds or ledger_fix_rounds,
         plan_files=plan_files or ledger_plan_files,
+        run_terminal=run_terminal or ledger_run_terminal,
         probe=default_rate_limit_probe if isinstance(probe, _Unset) else probe,
         echo=echo or print,
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",

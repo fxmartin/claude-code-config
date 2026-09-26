@@ -686,3 +686,19 @@ def test_naive_timestamps_are_read_as_utc(tmp_path) -> None:
     # An extension is still measured against that naive instant, read as UTC.
     store.pause_dispatch(until=now + timedelta(seconds=1200), now=now)
     assert store.dispatch_pause().paused_until == (now + timedelta(seconds=1200)).isoformat()
+
+
+def test_restart_fresh_clears_the_run_and_keeps_the_scope(tmp_path) -> None:
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo=str(tmp_path), kind="fix", scope="614")
+    store.claim_job(job_id, claimed_by="x:1", lease_seconds=0)
+    store.attach_run(job_id, "run-1")
+
+    store.restart_fresh(job_id, reason="run is terminal")
+
+    job = store.get_job(job_id)
+    assert (job.state, job.run_id, job.claimed_by, job.lease_until) == ("queued", None, None, None)
+    assert (job.kind, job.scope) == ("fix", "614")

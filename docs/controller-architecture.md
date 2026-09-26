@@ -1595,7 +1595,9 @@ reaches the job's own agents rather than just its parent.
   dead end: `sdlc queue cancel` retires it and `sdlc queue requeue` re-arms it
   with its frozen options intact — and if it already opened a run, the requeue
   returns it to `running` with an expired lease so the next drain **resumes**
-  rather than restarts it.
+  rather than restarts it. A run whose stories are all terminal
+  (`BLOCKED`/`FAILED`, e.g. an investigation park) has nothing to resume, so the
+  drain restarts the scope as a fresh run instead (#716).
 - **Notify.** Each terminal fires the existing Telegram path under its own
   `queue_job_finished` event. Deliberately *not* `run_finished`: a drained job's
   own subprocess already emits that for its run (`finalize_run`), inheriting the

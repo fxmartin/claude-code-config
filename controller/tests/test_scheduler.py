@@ -2518,3 +2518,105 @@ def test_self_update_waits_until_no_sibling_job_is_in_flight(tmp_path) -> None:
     assert running_at_update, "the release was never applied"
     assert all(slow not in running for running in running_at_update)
     assert [store.get_job(j).state for j in (first, sibling, later)] == ["done"] * 3
+
+
+# --- #716: a requeued job whose run is terminal starts fresh --------------
+
+
+def _requeued_failed_job(store, tmp_path, registry, *, kind="fix", scope="614"):
+    """A `failed` job with an attached run, requeued the way an operator does."""
+    repo = _repo(tmp_path, "alpha")
+    job_id = store.add_job(repo=repo, kind=kind, scope=scope)
+    store.claim_job(job_id, claimed_by="dead:1", lease_seconds=0,
+                    now=datetime(2026, 9, 7, 11, 0, tzinfo=timezone.utc))
+    store.attach_run(job_id, "c5895280")
+    registry.register(
+        RunRecord(run_id="c5895280", repo=repo, db=str(Path(repo) / ".sdlc-state.db"),
+                  scope=scope, pid=_dead_pid(), status="IN_PROGRESS", started_at="")
+    )
+    store.finish_job(job_id, "failed", reason="run ABORTED")
+    store.requeue_job(job_id, now=datetime(2026, 9, 7, 11, 30, tzinfo=timezone.utc))
+    return job_id
+
+
+def test_requeue_of_an_investigation_blocked_run_starts_a_fresh_run(tmp_path) -> None:
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    job_id = _requeued_failed_job(store, tmp_path, registry)
+    launcher = FakeLauncher(alive_polls=1)
+    lines: list[str] = []
+
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, echo=lines.append, registry=registry,
+        run_terminal=lambda _db, _run_id: "story BLOCKED",
+    )
+
+    assert result.resumed == 0
+    assert result.started == 1
+    assert launcher.calls[0][0][-2:] == ["fix", "614"]
+    assert "resume" not in launcher.calls[0][0]
+    assert any("run is terminal (story BLOCKED)" in line for line in lines)
+    assert store.get_job(job_id).run_id is None
+
+
+def test_requeue_of_a_crashed_run_still_resumes(tmp_path) -> None:
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    _requeued_failed_job(store, tmp_path, registry)
+    launcher = FakeLauncher(alive_polls=1)
+
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, registry=registry,
+        run_terminal=lambda _db, _run_id: None,
+    )
+
+    assert result.resumed == 1
+    assert launcher.calls[0][0][-3:] == ["resume", "--run", "c5895280"]
+
+
+def test_an_unreadable_ledger_degrades_to_resume(tmp_path) -> None:
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    _requeued_failed_job(store, tmp_path, registry)
+    launcher = FakeLauncher(alive_polls=1)
+
+    # No injected seam: the default reads a ledger that does not exist.
+    result = _run(store, tmp_path=tmp_path, launcher=launcher, registry=registry)
+
+    assert result.resumed == 1
+    assert launcher.calls[0][0][-3:] == ["resume", "--run", "c5895280"]
+
+
+def test_the_default_run_terminal_reads_blocked_stories_from_the_ledger(tmp_path) -> None:
+    from sdlc.build import Ledger
+    from sdlc.scheduler import ledger_run_terminal
+
+    repo = _repo(tmp_path, "alpha")
+    db = str(Path(repo) / ".sdlc-state.db")
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("614", "fix")
+    ledger.story_upsert(run_id, "614", "", "t", "P0", None, "", "", None, "BLOCKED")
+
+    assert ledger_run_terminal(db, run_id) == "story BLOCKED"
+    ledger.story_upsert(run_id, "614", "", "t", "P0", None, "", "", None, "IN_PROGRESS")
+    assert ledger_run_terminal(db, run_id) is None
+    assert ledger_run_terminal(str(tmp_path / "missing.db"), run_id) is None
+
+
+def test_a_resume_that_exits_zero_on_a_terminal_run_is_never_done(tmp_path) -> None:
+    store = _store(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    job_id = _requeued_failed_job(store, tmp_path, registry)
+    launcher = FakeLauncher(alive_polls=1, code=0)
+    answers = iter([None, "story BLOCKED"])  # candidate check sees a resumable run
+
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher,
+        run_terminal=lambda _db, _run_id: next(answers, "story BLOCKED"),
+        registry=registry,
+    )
+
+    job = store.get_job(job_id)
+    assert job.state == "blocked"
+    assert "run terminal, nothing resumed" in (job.reason or "")
