@@ -22,7 +22,7 @@ class FakeRunner:
         self.default = default
         self.calls: list[list[str]] = []
 
-    def __call__(self, argv, timeout=None):
+    def __call__(self, argv, timeout=None, env=None):
         self.calls.append(list(argv))
         joined = " ".join(argv)
         for needle, result in self.mapping.items():
@@ -281,7 +281,8 @@ def test_change_request_checks_unmapped_returns_none(tmp_path):
     """An unmapped story yields None so the merge re-check degrades to a no-op."""
     ledger = _ledger(tmp_path)
     ledger.inventory_upsert_specs([("25.1-001", "25", "25.1", "t", 5, "Should")])
-    assert bi.change_request_checks(ledger, "25.1-001", 100, runner=FakeRunner()) is None
+    runner = FakeRunner(default=(1, "", "no forge here"))
+    assert bi.change_request_checks(ledger, "25.1-001", 100, runner=runner) is None
 
 
 def test_change_request_checks_reads_github_view(tmp_path):
@@ -496,8 +497,51 @@ def test_no_host_search_when_the_repo_never_mirrored(tmp_path, monkeypatch):
     runner = FakeRunner()
 
     assert bi.close_link(ledger, "29.4-004", runner=runner) is None
-    assert bi.change_request_status(ledger, "29.4-004", 7, runner=runner) is None
     assert runner.calls == []
+
+
+def _never_mirrored_gitlab(tmp_path, monkeypatch) -> Ledger:
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    (tmp_path / ".sdlc-forge.yaml").write_text(
+        "forge: gitlab\ngitlab_url: http://home-lab:8080\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    return ledger
+
+
+@pytest.mark.parametrize(
+    "pipeline,expected",
+    [
+        ('{"pipeline": {"status": "success"}}', ih.CR_SUCCESS),
+        ('{"pipeline": {"status": "failed"}}', ih.CR_FAILED),
+        ('{"pipeline": {"status": "running"}}', ih.CR_PENDING),
+        ('{"pipeline": null, "head_pipeline": {"status": "success"}}', ih.CR_SUCCESS),
+        ('{"pipeline": null}', ih.CR_NONE),
+    ],
+)
+def test_ci_status_resolves_without_a_story_mirror(
+    tmp_path, monkeypatch, pipeline, expected
+):
+    """Issue #696: a repo that never ran `sdlc issues init` still gets its CR gated."""
+    ledger = _never_mirrored_gitlab(tmp_path, monkeypatch)
+    runner = FakeRunner({"mr view": (0, pipeline, "")})
+
+    assert bi.change_request_status(ledger, "29.4-004", 5, runner=runner) == expected
+    assert not any("issue" in c for c in runner.calls)
+
+
+def test_ci_status_warns_when_the_forge_will_not_resolve(tmp_path, monkeypatch, caplog):
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    runner = FakeRunner()
+
+    with caplog.at_level("WARNING"):
+        assert bi.change_request_status(ledger, "29.4-004", 5, runner=runner) is None
+    assert runner.calls == []
+    assert "cannot resolve the repo forge" in caplog.text
 
 
 def test_recorded_but_unusable_host_never_falls_back(tmp_path, monkeypatch):
