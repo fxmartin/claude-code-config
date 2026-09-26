@@ -384,7 +384,7 @@ def test_github_issue_view_populates_body_and_labels() -> None:
     argv = runner.calls[-1]
     assert argv[:4] == ["gh", "issue", "view", "42"]
     assert "--json" in argv
-    assert "number,url,title,state,body,labels,assignees" in argv
+    assert "number,url,title,state,body,labels,assignees,comments" in argv
 
 
 def test_github_issue_view_accepts_issue_ref() -> None:
@@ -434,7 +434,7 @@ def test_gitlab_issue_view_populates_body_and_labels() -> None:
     assert issue.body == "x\n<!-- sdlc-story: 22.4-001 -->\ny"
     assert issue.labels == ("story", "blocked")
     assert issue.assignees == ("fx",)
-    argv = runner.calls[-1]
+    argv = runner.calls[0]
     assert argv[:4] == ["glab", "issue", "view", "8"]
     assert "--output" in argv and "json" in argv
 
@@ -1207,3 +1207,63 @@ def test_base_adapter_cr_find_defaults_to_not_found() -> None:
     # falls through to cr_create.
     adapter = ih.GitHubAdapter(runner=FakeRunner({}))
     assert ih.IssueHostAdapter.cr_find(adapter, "feature/x") is None
+
+
+# --- issue_view: comments (issue #715) ---------------------------------------
+
+
+def test_github_issue_view_maps_comments() -> None:
+    payload = json.dumps({
+        "number": 5, "state": "OPEN", "body": "b", "labels": [], "assignees": [],
+        "comments": [
+            {"author": {"login": "fx"}, "authorAssociation": "OWNER", "body": "decided"},
+            {"author": None, "authorAssociation": "NONE", "body": "drive-by"},
+            {"author": {"login": "x"}, "authorAssociation": "NONE", "body": ""},
+        ],
+    })
+    runner = FakeRunner({"issue view": (0, payload, "")})
+    issue = ih.GitHubAdapter(runner=runner).issue_view("5")
+    assert issue.comments == (
+        ih.IssueComment("fx", "OWNER", "decided"),
+        ih.IssueComment("unknown", "NONE", "drive-by"),
+    )
+
+
+def test_github_issue_view_without_comments_is_empty() -> None:
+    payload = json.dumps({"number": 5, "state": "OPEN", "body": "b"})
+    runner = FakeRunner({"issue view": (0, payload, "")})
+    assert ih.GitHubAdapter(runner=runner).issue_view("5").comments == ()
+
+
+def test_gitlab_issue_view_maps_notes_and_skips_system() -> None:
+    issue_payload = json.dumps({"iid": 8, "state": "opened", "description": "d"})
+    notes = json.dumps([
+        {"author": {"username": "fx"}, "body": "use option A", "system": False},
+        {"author": {"username": "bot"}, "body": "changed label", "system": True},
+        {"author": {"username": "rando"}, "body": "hi", "system": False},
+    ])
+    members = json.dumps([
+        {"username": "fx", "access_level": 40},
+        {"username": "rando", "access_level": 10},
+    ])
+    runner = FakeRunner({
+        "issue view": (0, issue_payload, ""),
+        "/notes": (0, notes, ""),
+        "members/all": (0, members, ""),
+    })
+    issue = ih.GitLabAdapter(runner=runner).issue_view("8")
+    assert issue.comments == (
+        ih.IssueComment("fx", "MEMBER", "use option A"),
+        ih.IssueComment("rando", "NONE", "hi"),
+    )
+
+
+def test_gitlab_issue_view_notes_failure_degrades_to_no_comments() -> None:
+    issue_payload = json.dumps({"iid": 8, "state": "opened", "description": "d"})
+    runner = FakeRunner({
+        "issue view": (0, issue_payload, ""),
+        "/notes": (1, "", "403"),
+    })
+    issue = ih.GitLabAdapter(runner=runner).issue_view("8")
+    assert issue.body == "d"
+    assert issue.comments == ()
