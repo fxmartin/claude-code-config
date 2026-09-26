@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.72.2] - 2026-09-26
+
+### Fixed
+
+- fix(queue): restart terminal run fresh instead of false done (#716) (#723)
+
+
 ## [v2.72.1] - 2026-09-26
 
 ### Fixed
