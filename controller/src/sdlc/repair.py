@@ -107,6 +107,14 @@ def is_allowed_root(repo_root: Path) -> bool:
 # files). A "." source is the repo root itself (the plugin marketplace link).
 # test_repair.py::test_managed_links_match_install_core_sh guards parity with
 # the installer so the two never silently diverge.
+#
+# `skills` is deliberately absent (#694): install/core.sh keeps
+# ~/.claude/skills a real directory and links each repo skill into it
+# individually, so distro-, runtime- and user-provided skills survive
+# `--core`. Managing it here as one directory symlink would make `repair`
+# collapse that directory back onto the repo and drop every foreign skill —
+# the exact defect #694 fixed. The per-skill links are the installer's to
+# restore (`./install.sh --core` is idempotent), not repair's.
 MANAGED_LINKS: tuple[tuple[str, str], ...] = (
     ("CLAUDE.md", "CLAUDE.md"),
     ("agents", "agents"),
@@ -116,7 +124,6 @@ MANAGED_LINKS: tuple[tuple[str, str], ...] = (
     ("keybindings.json", "keybindings.json"),
     ("reference-docs", "reference-docs"),
     ("docs", "docs"),
-    ("skills", "skills"),
     ("hooks", "hooks"),
     ("plugins/marketplaces/fx-claude-config", "."),
 )

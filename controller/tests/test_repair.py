@@ -380,7 +380,7 @@ def test_dry_run_changes_nothing(tmp_path: Path) -> None:
     repo = _seed_repo(tmp_path)
     claude_dir = tmp_path / "claude"
     _link_all(repo, claude_dir)
-    (claude_dir / "skills").unlink()
+    (claude_dir / "hooks").unlink()
 
     plan = build_plan(repo, claude_dir)
     results = apply_plan(plan, dry_run=True, backup_dir=tmp_path / "bk")
@@ -388,15 +388,15 @@ def test_dry_run_changes_nothing(tmp_path: Path) -> None:
     # Reported as a would-be restore…
     assert any(r.action is RepairAction.LINKED for r in results)
     # …but the filesystem is untouched.
-    assert not (claude_dir / "skills").exists()
-    assert _status_of(build_plan(repo, claude_dir), "skills") is ArtifactStatus.MISSING
+    assert not (claude_dir / "hooks").exists()
+    assert _status_of(build_plan(repo, claude_dir), "hooks") is ArtifactStatus.MISSING
 
 
 def test_repair_never_touches_unmanaged_files(tmp_path: Path) -> None:
     repo = _seed_repo(tmp_path)
     claude_dir = tmp_path / "claude"
     _link_all(repo, claude_dir)
-    (claude_dir / "skills").unlink()  # force at least one repair action
+    (claude_dir / "hooks").unlink()  # force at least one repair action
 
     # User-owned artifacts that are NOT in the managed set.
     user_file = claude_dir / "my-notes.md"
