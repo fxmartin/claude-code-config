@@ -2472,3 +2472,49 @@ def test_a_stale_controller_takes_the_reinstall_path_before_the_first_launch(tmp
 
     assert len(launcher.calls) == 1
     assert store.get_job(job_id).state == "done"
+
+
+class _SlowSiblingLauncher(_ReleasingLauncher):
+    """Jobs outside the controller repo outlive the controller's own jobs."""
+
+    def __init__(self, release: _Release, *, slow_repo: str) -> None:
+        super().__init__(release)
+        self._slow_repo = slow_repo
+
+    def __call__(self, argv, cwd):
+        proc = super().__call__(argv, cwd)
+        if str(cwd) == self._slow_repo:
+            proc._alive = 4
+        return proc
+
+
+def test_self_update_waits_until_no_sibling_job_is_in_flight(tmp_path) -> None:
+    """`uv tool install --force` swaps the env under running jobs — defer it.
+
+    With two slots a sibling job is often still running when a release lands;
+    the reinstall (and the requeue of guard parks) waits for the last one.
+    """
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "controller")
+    slow = _repo(tmp_path, "elsewhere")
+    first = store.add_job(repo=repo, kind="fix", scope="1")
+    sibling = store.add_job(repo=slow, kind="fix", scope="2")
+    later = store.add_job(repo=repo, kind="fix", scope="3")
+    release = _Release()
+    running_at_update: list[set[str]] = []
+
+    def updater(root, installed):
+        running_at_update.append(store.running_repos())
+        # Like the real one: only the controller's own source repo self-updates.
+        return release.updater(root, installed) if str(root) == repo else None
+
+    _run(store, tmp_path=tmp_path, launcher=_SlowSiblingLauncher(release, slow_repo=slow),
+         config=SchedulerConfig(slots=2, poll_seconds=1.0, self_update=True),
+         version_check=release.check, self_updater=updater,
+         installed_version=release.installed)
+
+    assert running_at_update, "the release was never applied"
+    assert all(slow not in running for running in running_at_update)
+    assert [store.get_job(j).state for j in (first, sibling, later)] == ["done"] * 3

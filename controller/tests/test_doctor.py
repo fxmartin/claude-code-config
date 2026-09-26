@@ -1439,3 +1439,26 @@ def test_run_install_script_is_false_when_bash_cannot_start(
 
     monkeypatch.setattr(doctor.subprocess, "run", gone)
     assert doctor._run_install_script(tmp_path) is False
+
+
+@pytest.mark.parametrize("error", [OSError("git vanished"),
+                                   subprocess.TimeoutExpired("git", 60)])
+def test_self_update_cleanup_failure_still_reports_the_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception,
+) -> None:
+    """A `worktree remove` that raises must not escape — the install stood."""
+    from sdlc import doctor
+
+    repo = _controller_repo(tmp_path / "repo", "2.71.4")
+    real_run = subprocess.run
+
+    def flaky(cmd, *a, **kw):
+        if "worktree" in cmd and "remove" in cmd:
+            raise error
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(doctor.subprocess, "run", flaky)
+    installer = _Installer()
+
+    assert doctor.self_update_controller(repo, "2.71.3", installer=installer, fetch=False) == "2.71.4"
+    assert not installer.trees[0].exists()

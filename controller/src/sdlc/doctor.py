@@ -337,10 +337,13 @@ def self_update_controller(
     except (OSError, subprocess.SubprocessError):
         return None
     finally:
-        subprocess.run(
-            ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(tree)],
-            capture_output=True, timeout=60, check=False,
-        )
+        try:
+            subprocess.run(
+                ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(tree)],
+                capture_output=True, timeout=60, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # the rmtree below still drops the tree; `git worktree prune` reaps it
         shutil.rmtree(tree.parent, ignore_errors=True)
 
 

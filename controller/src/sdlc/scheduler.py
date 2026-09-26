@@ -719,6 +719,9 @@ class _Scheduler:
         # check must be told what is on PATH now.
         self._installed_version = installed_version
         self._self_updated = False
+        # Repos whose self-update was deferred because a sibling job was still
+        # in flight; retried once the last one is reaped.
+        self._pending_self_update: set[str] = set()
         self._in_flight: dict[int, _InFlight] = {}
         self._result = SchedulerResult()
         self._poll_interval = approval_poll_interval(config.approval_poll_seconds)
@@ -954,6 +957,14 @@ class _Scheduler:
             return False
         if self._installed_version is None:
             return False
+        if self._in_flight:
+            # `uv tool install --force` replaces the tool's environment on disk;
+            # a running sibling (or this process's lazy imports) would load the
+            # new code mid-run. Defer until nothing is in flight — a job that
+            # meets the guard meanwhile parks with the marker and is requeued.
+            self._pending_self_update.add(repo)
+            return False
+        self._pending_self_update.discard(repo)
         installed = self._self_updater(Path(repo), self._installed_version)
         if installed is None:
             return False
@@ -1018,6 +1029,9 @@ class _Scheduler:
             self._announce(entry.job, entry.run_id, state)
             # Issue #709: a finished job in this repo may have cut a release.
             self._self_update(entry.job.repo)
+        if not self._in_flight:
+            for repo in sorted(self._pending_self_update):
+                self._self_update(repo)
 
     @staticmethod
     def _finish_reason(
