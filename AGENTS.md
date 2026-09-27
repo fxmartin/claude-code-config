@@ -152,9 +152,13 @@ flow still runs there.
   "gitlab" substring the hostname lacks. Keep it.
 - **Keep `.github/workflows/ci.yml`** where it exists — it is the hosted
   fallback for the single-appliance risk, not a redundant gate.
+- **New projects start on GitLab.** Create the project there, with `origin` at
+  `http://gitlab.test/root/<repo>.git`, and commit `.sdlc-forge.yaml`. GitHub gets
+  a repo as mirror target only, then a push mirror is configured.
+  Never create a new project on GitHub first.
 
-Mirror operations, credential rotation, and post-reboot recovery of the
-appliance: `~/.claude/reference-docs/source-control.md`.
+Starting a project, mirror operations, credential rotation, and post-reboot
+recovery of the appliance: `~/.claude/reference-docs/source-control.md`.
 
 ## Reference Materials
 - Claude source guidance: `~/.claude/CLAUDE.md`

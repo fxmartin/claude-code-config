@@ -62,3 +62,19 @@ setup() {
     run rg -n '^## GitLab CLI' "$SC_REF"
     [ "$status" -eq 0 ]
 }
+
+@test "the section says new projects start on GitLab" {
+    for f in "$CLAUDE_MD" "$AGENTS_MD"; do
+        run rg -n 'New projects start on GitLab' "$f"
+        [ "$status" -eq 0 ]
+        run rg -n 'Never create a new project on GitHub first' "$f"
+        [ "$status" -eq 0 ]
+    done
+}
+
+@test "the source-control reference documents how to start a new project" {
+    run rg -n '^## Starting a new project' "$SC_REF"
+    [ "$status" -eq 0 ]
+    run rg -n 'glab api -X POST projects' "$SC_REF"
+    [ "$status" -eq 0 ]
+}
