@@ -48,7 +48,7 @@ from sdlc.build import (
     WorktreeError,
     _commit_message,
     _dispatch_ready_queue,
-    _extract_pr,
+    _adopt_pr,
     _merge_awaiting_approval,
     _merge_gate_only_block,
     _record_stage_usage,
@@ -1865,7 +1865,7 @@ def _run_stage_loop(
             if ok:
                 ledger.stage_finish(run_id, story.id, stage, attempt, "DONE", output_path=str(tpath))
                 _record_stage_usage(ledger, run_id, story.id, stage, attempt, result)
-                pr_number = _extract_pr(result, pr_number)
+                pr_number = _adopt_pr(ledger, run_id, story.id, result, pr_number)
                 if pr_number is not None:
                     ledger.set_story_pr(run_id, story.id, pr_number)
                 # Issue #673: lint a commit-authoring stage's HEAD commit against
