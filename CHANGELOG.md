@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.73.1] - 2026-09-27
+
+### Fixed
+
+- fix(sdlc): park manual-acceptance stories at merge (#728) (#730)
+
+
 ## [v2.73.0] - 2026-09-26
 
 ### Added
