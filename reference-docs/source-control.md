@@ -59,6 +59,27 @@ Types: feat, fix, refactor, docs, test, chore, ci
 `nix-install` and `claude-code-config`: feature branch → changes with tests →
 `gh pr create` → review → squash merge (`gh pr merge --squash`).
 
+## Starting a new project
+
+Every new project starts on GitLab; never create it on GitHub first.
+`/project-init` follows this path by default (Master repo = GitLab).
+
+1. Create the GitLab project and point `origin` at it:
+
+       export GITLAB_HOST=gitlab.test
+       glab api -X POST projects -f name=<repo> -f visibility=private \
+         -f initialize_with_readme=false -f default_branch=main
+       git remote add origin http://gitlab.test/root/<repo>.git
+
+2. Commit `.sdlc-forge.yaml` (`forge: gitlab`, `gitlab_url: http://gitlab.test`)
+   and set `git config credential.helper libsecret` (Linux) so the first push
+   does not fail on "could not read Username".
+3. Create the mirror target, never pushing to it:
+   `gh repo create <repo> --private --source=. --remote=github`
+4. Configure the push mirror on the appliance — see "Mirrors" below — and
+   force the first sync; a new mirror sits at `update_status: none` until then.
+5. Verify: `main` on GitHub equals `main` on GitLab.
+
 ## GitLab CLI (`glab`)
 
 - `glab issue create --title ... --description ... --label ...` — issues live on GitLab
