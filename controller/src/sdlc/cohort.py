@@ -52,6 +52,14 @@ class Story:
     ac_count: int | None = None
     dep_depth: int | None = None
     scope_proxy: int | None = None
+    # Issue #728: True when the story's acceptance criteria call for a human's
+    # own subjective verdict (a manual/hand-run acceptance run), parsed from an
+    # explicit `**Manual**:`/`**Hand-Run**:` epic metadata line. The build.py
+    # merge-stage gate never dispatches an agent to merge such a story — no
+    # agent may record the human's verdict on their behalf — so it always
+    # parks AWAITING_APPROVAL there regardless of what build/coverage/review
+    # reported.
+    manual: bool = False
 
 
 def compute_cohorts(queue: list[Story]) -> list[list[Story]]:

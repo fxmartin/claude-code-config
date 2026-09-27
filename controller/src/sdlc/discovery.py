@@ -28,6 +28,13 @@ _DEP_NONE_MARKERS = {"none", "n/a", "na", "tbd"}
 # A story is shipped when its **Status**: line starts "Done", or when its
 # Definition-of-Done checklist exists and every box is checked.
 _STATUS = re.compile(r"^\*\*Status\*\*:\s*(.+?)\s*$")
+# Issue #728: a story flags itself manual-acceptance with an explicit
+# `**Manual**:`/`**Hand-Run**:` metadata line, the same convention as
+# `**Status**:`/`**Priority**:`. Any of `_MANUAL_TRUE_VALUES` (case-insensitive)
+# means true; a missing line or any other value (including "no"/"false") is
+# false, so this stays opt-in and every pre-728 epic is unchanged.
+_MANUAL = re.compile(r"^\*\*(?:Manual|Hand-Run)\*\*:\s*(.+?)\s*$")
+_MANUAL_TRUE_VALUES = {"yes", "true", "y", "hand-run", "manual"}
 _DOD_BOX = re.compile(r"^\s*-\s*\[([ xX])\]")
 # A bare scope that names exactly one story, e.g. `34.5-003`.
 _STORY_ID_SCOPE = re.compile(r"^[0-9]+\.[0-9]+-[0-9]+$")
@@ -239,6 +246,10 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
     parse. A feature the epic does not state enough to compute is ``None``
     (unknown), never ``0``. ``points`` is unchanged and stays a descriptive scope
     label, not a machine input.
+
+    Issue #728: a story is ``manual`` when it states an explicit
+    ``**Manual**:``/``**Hand-Run**:`` metadata line with a truthy value; every
+    other story defaults to ``False``.
     """
     text = epic_path.read_text(encoding="utf-8")
     epic_name = _epic_name(epic_path)
@@ -275,6 +286,7 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
                 agent_type=current.get("agent_type", "general-purpose"),
                 dependencies=current.get("dependencies", []),
                 done=_is_done(current),
+                manual=current.get("manual", False),
                 # Trailing blank lines are noise between stories, not spec.
                 section="\n".join(current["section_lines"]).rstrip(),
                 # Story 28.2-001 predictor features. `dep_depth` needs the whole
@@ -312,6 +324,8 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
                 current["dod_checked"] = current.get("dod_checked", 0) + 1
         elif m := _STATUS.match(line):
             current.setdefault("status", m.group(1))  # first Status line wins
+        elif m := _MANUAL.match(line):
+            current["manual"] = m.group(1).strip().lower() in _MANUAL_TRUE_VALUES
         elif m := _PRIORITY.match(line):
             current["priority"] = m.group(1)
         elif m := _POINTS.match(line):
