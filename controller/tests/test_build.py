@@ -1325,10 +1325,11 @@ def test_regression_end_state_matches_expected(tmp_path) -> None:
 # R4: done-skip + --rebuild
 # ---------------------------------------------------------------------------
 
-def _story(sid: str, *, deps=None, done=False) -> Story:
+def _story(sid: str, *, deps=None, done=False, manual=False) -> Story:
     return Story(
         sid, f"Story {sid}", sid.split(".", 1)[0].zfill(2), "x",
         "epic-x.md", "P1", 1, "py", deps or [], done,
+        manual=manual,
     )
 
 
@@ -5308,6 +5309,90 @@ def test_merge_gate_recheck_skipped_without_cr_ref(tmp_path, monkeypatch) -> Non
     ledger = Ledger(tmp_path / "l.db")
     ledger.init()
     assert _merge_gate_only_block(ledger, "run-1", _story("25.1-001"), None) is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #728: a manual-acceptance story's merge is gated deterministically —
+# no merge agent is ever dispatched, regardless of what it would have reported.
+# ---------------------------------------------------------------------------
+
+
+def test_manual_acceptance_block_predicate() -> None:
+    from sdlc.build import _manual_acceptance_block
+
+    assert _manual_acceptance_block(_story("9.4-002", manual=True)) is True
+    assert _manual_acceptance_block(_story("9.4-003", manual=False)) is False
+
+
+def test_manual_acceptance_story_parks_awaiting_approval_without_dispatching_merge(
+    tmp_path,
+) -> None:
+    """Issue #728: a manual-acceptance story never reaches the merge agent.
+
+    Regression for the bug where the build agent recorded a human's own
+    verdict itself and the run proceeded toward merge — only an unrelated
+    branch-push failure stopped it landing. build/coverage/review still run
+    (and leave their evidence attached) but the merge stage is never
+    dispatched.
+    """
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher()
+    opts = BuildOptions(scope="epic-09", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(
+        opts,
+        queue=[_story("09.4-002", manual=True)],
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    agent_types = {a for a, _ in dispatcher.calls}
+    assert {"build", "coverage", "review"}.issubset(agent_types)
+    assert not any(a == "merge" for a, _ in dispatcher.calls)
+    assert result.story_status["09.4-002"] == "AWAITING_APPROVAL"
+    assert result.awaiting_approval == 1
+    conn = _open(db)
+    assert conn.execute("SELECT status FROM runs").fetchone()[0] == "AWAITING_APPROVAL"
+
+
+def test_manual_acceptance_gate_ignores_agent_self_reported_merge(tmp_path) -> None:
+    """The gate is pre-dispatch and deterministic: even a merge agent primed to
+    report ``MERGED`` is never asked, so its self-report cannot move a
+    manual-acceptance story past this gate."""
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher(
+        overrides={
+            ("merge", "09.4-002"): {
+                "pr_number": 100, "merge_status": "MERGED",
+                "merge_sha": "cafef00d", "merged_at": "2026-06-12T00:00:00Z",
+            },
+        }
+    )
+    opts = BuildOptions(scope="epic-09", skip_preflight=True, sequential=True, auto=True)
+    result = run_build(
+        opts,
+        queue=[_story("09.4-002", manual=True)],
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert not any(a == "merge" for a, _ in dispatcher.calls)
+    assert result.story_status["09.4-002"] == "AWAITING_APPROVAL"
+
+
+def test_non_manual_story_merges_normally(tmp_path) -> None:
+    """A story with no manual marker is unaffected by the new gate (default False)."""
+    db = tmp_path / "ledger.db"
+    dispatcher = FakeDispatcher()
+    opts = BuildOptions(scope="epic-09", skip_preflight=True, sequential=True)
+    result = run_build(
+        opts,
+        queue=[_story("09.4-009", manual=False)],
+        ledger=Ledger(db),
+        dispatcher=dispatcher,
+        preflight=lambda: True,
+    )
+    assert any(a == "merge" for a, _ in dispatcher.calls)
+    assert result.story_status["09.4-009"] == "DONE"
 
 
 # ---------------------------------------------------------------------------

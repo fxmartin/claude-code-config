@@ -8140,6 +8140,27 @@ def _run_story(
         # display/routing offset only — the bounded bugfix budget (``bugfix_attempts``)
         # is unchanged, preserving its existing per-resume reset semantics.
         stage_escalation_base = start_escalation if idx == 0 else 0
+        # Issue #728: a manual-acceptance story's merge stage is never
+        # dispatched — deterministic and independent of any agent's
+        # self-report, so no agent can record the human's verdict on their
+        # behalf. build/coverage/review already ran and left their evidence
+        # (commits, CR) in place; only the merge itself is withheld pending
+        # FX's own approval.
+        if stage == "merge" and _manual_acceptance_block(story):
+            ledger.stage_start(
+                run_id, story.id, stage, attempt,
+                harness=_stage_harness(stage, opts), model=None,
+            )
+            ledger.stage_finish(
+                run_id, story.id, stage, attempt, "SKIPPED", "manual-acceptance",
+            )
+            ledger.event_log(
+                run_id, story.id, "warn", "controller",
+                "merge not dispatched: story flagged manual-acceptance "
+                "(issue #728) — parking AWAITING_APPROVAL with build/coverage/"
+                "review evidence attached; only FX's own approval may merge it",
+            )
+            return "AWAITING_APPROVAL"
         # Story 27.2-001: deterministic change-class gate. Classify once, from
         # the committed branch's real diff, when the first gated stage is
         # reached (post-build; a resumed review re-derives the same verdict
@@ -9417,6 +9438,19 @@ def _merge_gate_only_block(
         f"(risk:high unapproved, cr=#{pr_number}) — treating as awaiting approval",
     )
     return True
+
+
+def _manual_acceptance_block(story: Story) -> bool:
+    """True when ``story``'s merge stage must never be dispatched (issue #728).
+
+    A manual-acceptance story's acceptance criteria call for a human's own
+    subjective verdict (e.g. "same person across all 5 photos: yes or no").
+    Unlike the high-risk gate above, this reads only the epic-parsed
+    ``story.manual`` flag — never an agent's report — so nothing a build/
+    coverage/review agent writes (including a fabricated verdict) can move a
+    manual-acceptance story past this gate.
+    """
+    return story.manual
 
 
 def _record_stage_usage(

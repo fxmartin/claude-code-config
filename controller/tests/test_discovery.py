@@ -232,6 +232,81 @@ def test_done_detection(tmp_path) -> None:
     assert by_id["34.5-003"].done is False  # a box is unchecked, Status: Not Started
 
 
+# --- Issue #728: manual-acceptance stories ----------------------------------
+
+_EPIC_MANUAL = """# Epic 09: Sample
+
+##### Story 09.4-002: Manual acceptance run
+**Priority**: P1
+**Story Points**: 3
+**Manual**: yes
+**Dependencies**: None.
+
+Body text.
+
+##### Story 09.4-003: Hand-run via alternate marker
+**Priority**: P1
+**Story Points**: 3
+**Hand-Run**: true
+**Dependencies**: None.
+
+Body text.
+
+##### Story 09.4-004: Explicitly not manual
+**Priority**: P1
+**Story Points**: 3
+**Manual**: no
+**Dependencies**: None.
+
+Body text.
+
+##### Story 09.4-005: No marker at all
+**Priority**: P1
+**Story Points**: 3
+**Dependencies**: None.
+
+Body text.
+"""
+
+
+def _write_epic_manual(tmp_path):
+    stories = tmp_path / "docs" / "stories"
+    stories.mkdir(parents=True)
+    epic = stories / "epic-09-manual.md"
+    epic.write_text(_EPIC_MANUAL, encoding="utf-8")
+    return epic
+
+
+def test_manual_marker_parsed_true(tmp_path) -> None:
+    """Issue #728: an explicit `**Manual**: yes` line sets `Story.manual`."""
+    by_id = {s.id: s for s in parse_epic_file(_write_epic_manual(tmp_path))}
+    assert by_id["09.4-002"].manual is True
+
+
+def test_hand_run_marker_alias_parsed_true(tmp_path) -> None:
+    """The `**Hand-Run**:` label is accepted as a synonym for `**Manual**:`."""
+    by_id = {s.id: s for s in parse_epic_file(_write_epic_manual(tmp_path))}
+    assert by_id["09.4-003"].manual is True
+
+
+def test_manual_marker_falsy_value_is_not_manual(tmp_path) -> None:
+    """`**Manual**: no` is a real false, not an unknown/opt-in default."""
+    by_id = {s.id: s for s in parse_epic_file(_write_epic_manual(tmp_path))}
+    assert by_id["09.4-004"].manual is False
+
+
+def test_manual_defaults_false_when_no_marker(tmp_path) -> None:
+    """A story with no `**Manual**:`/`**Hand-Run**:` line defaults to False."""
+    by_id = {s.id: s for s in parse_epic_file(_write_epic_manual(tmp_path))}
+    assert by_id["09.4-005"].manual is False
+
+
+def test_manual_defaults_false_on_unrelated_epics(tmp_path) -> None:
+    """A regular epic with no manual markers at all is unaffected (Story 7.3-001)."""
+    by_id = {s.id: s for s in parse_epic_file(_write_epic(tmp_path))}
+    assert all(s.manual is False for s in by_id.values())
+
+
 # --- R2: single-story scope -------------------------------------------------
 
 
