@@ -13,7 +13,6 @@ from sdlc.build import (
     _evaluate_ci_gate,
     _GATE_BLOCK,
     _GATE_PASS,
-    _GATE_SKIP,
     _poll_cr_status,
     _run_merge_ci_gate,
     parse_build_args,
@@ -173,10 +172,11 @@ def test_evaluate_non_green_blocks(status):
     assert reason  # carries a human-readable cause
 
 
-def test_evaluate_none_status_skips():
-    """An unresolvable CI source (unmapped/host error) degrades to a no-op skip."""
-    verdict, _ = _evaluate_ci_gate(None, no_ci_policy="allow")
-    assert verdict == _GATE_SKIP
+def test_evaluate_none_status_blocks():
+    """#731: a failed lookup is never a pass — the gate fails closed."""
+    verdict, reason = _evaluate_ci_gate(None, no_ci_policy="allow")
+    assert verdict == _GATE_BLOCK
+    assert "lookup failed" in reason and "blocked" in reason
 
 
 def test_evaluate_no_ci_allows_by_default():
@@ -396,13 +396,12 @@ def _declare_gitlab(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
 
 
-@pytest.mark.parametrize(
-    ("policy", "verdict"), [("allow", _GATE_PASS), ("deny", _GATE_BLOCK)]
-)
-def test_declared_forge_lookup_failure_follows_no_ci_policy(
-    tmp_path, monkeypatch, policy, verdict
+@pytest.mark.parametrize("policy", ["allow", "deny"])
+def test_declared_forge_lookup_failure_blocks_under_either_policy(
+    tmp_path, monkeypatch, policy
 ):
-    """An unresolvable CI status on a declared-forge repo is not a silent skip."""
+    """#731 supersedes #699's allow branch: `--ci-gate-no-ci` governs a resolved
+    change request with no pipeline (CR_NONE), never a lookup that failed."""
     _declare_gitlab(tmp_path, monkeypatch)
     ledger = _ledger(tmp_path)
     run_id = ledger.run_create("epic-23", "build")
@@ -411,10 +410,12 @@ def test_declared_forge_lookup_failure_follows_no_ci_policy(
         "merge", ledger, run_id, _story(), 100, BuildOptions(ci_gate_no_ci=policy),
         status_fn=lambda: None, sleep_fn=clock.sleep, clock=clock,
     )
-    assert gate.verdict == verdict
+    assert gate.verdict == _GATE_BLOCK
 
 
-def test_undeclared_forge_lookup_failure_still_skips(tmp_path, monkeypatch):
+def test_undeclared_forge_lookup_failure_blocks(tmp_path, monkeypatch):
+    """#731: the run has a change request (pr_number is set), so an unresolvable
+    status is a lookup failure, not "unmapped" — block, do not skip."""
     monkeypatch.chdir(tmp_path)
     ledger = _ledger(tmp_path)
     run_id = ledger.run_create("epic-23", "build")
@@ -423,7 +424,59 @@ def test_undeclared_forge_lookup_failure_still_skips(tmp_path, monkeypatch):
         "merge", ledger, run_id, _story(), 100, BuildOptions(),
         status_fn=lambda: None, sleep_fn=clock.sleep, clock=clock,
     )
-    assert gate.verdict == _GATE_SKIP
+    assert gate.verdict == _GATE_BLOCK
+
+
+def test_lookup_failure_is_retried_before_blocking(tmp_path, monkeypatch):
+    """#731: a transient host error must not fail a good merge — a failed lookup
+    is polled again a bounded number of times; only a persistent one blocks."""
+    monkeypatch.chdir(tmp_path)
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("issue-728", "fix")
+    clock = _Clock()
+    calls: list[int] = []
+
+    def status():
+        calls.append(1)
+        return None
+
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 730, BuildOptions(),
+        status_fn=status, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.verdict == _GATE_BLOCK
+    assert len(calls) == 3
+    assert "lookup failed" in gate.reason
+    events = ledger.recent_events(run_id, limit=20)
+    assert any(e["level"] == "error" and "cr=#730" in e["message"] for e in events)
+
+
+def test_lookup_failure_with_no_wait_window_still_blocks(tmp_path, monkeypatch):
+    """`--ci-gate-timeout 0` is a single read: a failed one blocks, and says why."""
+    monkeypatch.chdir(tmp_path)
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("issue-728", "fix")
+    clock = _Clock()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 730, BuildOptions(ci_gate_timeout_s=0),
+        status_fn=lambda: None, sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.verdict == _GATE_BLOCK
+    assert "lookup failed" in gate.reason
+
+
+def test_transient_lookup_failure_recovers_to_pass(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("issue-728", "fix")
+    clock = _Clock()
+    answers = iter([None, ih.CR_SUCCESS])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 730, BuildOptions(),
+        status_fn=lambda: next(answers), sleep_fn=clock.sleep, clock=clock,
+    )
+    assert gate.verdict == _GATE_PASS
+
 
 
 def _cr(state, branch="feature/23.2-002"):

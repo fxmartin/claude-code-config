@@ -148,3 +148,27 @@ def _no_real_git_push(monkeypatch):
         )
 
     monkeypatch.setattr(build_mod, "_git_push", _blocked_push)
+
+
+@pytest.fixture(autouse=True)
+def _green_ci_by_default(monkeypatch):
+    """Give integration tests a green pipeline unless they supply a status.
+
+    The suite refuses to run ``gh``/``glab`` (see ``_no_real_host_cli``), so every
+    real CI-status lookup fails. Since issue #731 a failed lookup **blocks** the
+    merge — the gate fails closed — which would stop every test that drives a
+    story through its merge stage for reasons unrelated to the gate. This stub
+    turns only that harness-made failure into ``success``: a status a test
+    produces for real (a fake runner, a patched ``change_request_status``) is
+    passed through untouched, and the gate's own tests inject ``status_fn``.
+    """
+    import sdlc.build as build_mod
+    from sdlc import issue_host as cr_mod
+
+    real = build_mod._ci_status_lookup
+
+    def _lookup(ledger, story_id, pr_number):
+        status = real(ledger, story_id, pr_number)
+        return cr_mod.CR_SUCCESS if status is None else status
+
+    monkeypatch.setattr(build_mod, "_ci_status_lookup", _lookup)

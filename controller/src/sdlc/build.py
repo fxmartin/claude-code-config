@@ -5124,25 +5124,37 @@ def render_merge_prompt(
 # Story 23.2-002: gate the merge on the change request's CI/pipeline status
 # ---------------------------------------------------------------------------
 
-# The gate's three verdicts. ``pass`` lets the merge stage dispatch; ``block``
+# The gate's two verdicts. ``pass`` lets the merge stage dispatch; ``block``
 # routes the story into the bugfix loop (a red/timed-out pipeline is a fixable
-# failure, never a silent merge); ``skip`` means there is nothing host-side to
-# gate on (no mapping / no CR ref / unresolvable status) so the merge proceeds
-# exactly as today — the unmapped path stays byte-identical.
+# failure, never a silent merge). A story with no change request is not gated
+# at all (``_run_merge_ci_gate`` returns None). There is no ``skip`` verdict:
+# since issue #731 a status the gate cannot read blocks — an unreadable gate is
+# a closed one.
 _GATE_PASS = "pass"
 _GATE_BLOCK = "block"
-_GATE_SKIP = "skip"
 
 
 @dataclass(frozen=True)
 class _MergeCIGate:
     """The outcome of polling a change request's CI status before merge (Story 23.2-002)."""
 
-    verdict: str  # _GATE_PASS | _GATE_BLOCK | _GATE_SKIP
+    verdict: str  # _GATE_PASS | _GATE_BLOCK
     status: str | None  # the CR_* status observed (None when unresolvable)
     reason: str
     polls: int
     waited_s: float
+
+
+# Issue #731: a failed CI-status lookup is retried on its own short backoff —
+# not the CI poll interval, which paces a *running* pipeline — before the merge
+# gate gives up and blocks. Covers a transient host error; a permanent one (a
+# change-request number that does not exist) costs seconds, not the gate window.
+_CI_LOOKUP_BACKOFF_S: tuple[float, ...] = (2.0, 5.0)
+
+
+def _ci_status_lookup(ledger: "Ledger", story_id: str, pr_number: int) -> str | None:
+    """The merge gate's one read of a change request's CI status (the test seam)."""
+    return build_issue.change_request_status(ledger, story_id, pr_number)
 
 
 def _poll_cr_status(
@@ -5182,11 +5194,19 @@ def _evaluate_ci_gate(status: str | None, *, no_ci_policy: str) -> tuple[str, st
     Story 23.2-002: a green pipeline passes (AC3); a failed/unknown/timed-out
     (still-pending) pipeline blocks the merge (AC1/AC2); a resolved-but-absent CI
     signal (:data:`CR_NONE`) degrades per ``no_ci_policy`` — ``allow`` warns and
-    merges, ``deny`` blocks (AC4); an unresolvable status (None — unmapped story
-    or a host error) skips the gate so the merge path is unchanged.
+    merges, ``deny`` blocks (AC4); an unresolvable status (None — the lookup
+    itself failed) blocks (issue #731): the policy governs a change request with
+    no pipeline, never a gate that could not read one.
     """
     if status is None:
-        return _GATE_SKIP, "CI status lookup failed (forge unresolved or host error; see warn log) — gate skipped"
+        # Issue #731: the gate only runs for a story that HAS a change request,
+        # so an unresolvable status is a lookup that failed — a host error, or a
+        # change-request number that does not exist. Fail closed: a gate that
+        # cannot read CI must not let the merge through.
+        return _GATE_BLOCK, (
+            "CI status lookup failed (host error or unknown change request; "
+            "see warn log) — merge blocked"
+        )
     if status == CR_SUCCESS:
         return _GATE_PASS, "pipeline passed"
     if status in (CR_FAILED, CR_UNKNOWN):
@@ -5237,12 +5257,20 @@ def _run_merge_ci_gate(
     clock = clock or time.monotonic
 
     def _default_status() -> str | None:
-        return build_issue.change_request_status(ledger, story.id, pr_number)
+        return _ci_status_lookup(ledger, story.id, pr_number)
 
     raw_status_fn = status_fn or _default_status
 
     def _gated_status() -> str | None:
         status = raw_status_fn()
+        if status is None and opts.ci_gate_timeout_s > 0:
+            # Issue #731: tolerate a transient host error with a short, bounded
+            # retry. `--ci-gate-timeout 0` is a single read by contract: no retry.
+            for delay in _CI_LOOKUP_BACKOFF_S:
+                sleep_fn(delay)
+                status = raw_status_fn()
+                if status is not None:
+                    break
         if status == CR_FAILED:
             view = build_issue.change_request_checks(ledger, story.id, pr_number)
             if view is not None and _gate_red_others_pending(view):
@@ -5258,17 +5286,9 @@ def _run_merge_ci_gate(
         sleep_fn=sleep_fn,
         clock=clock,
     )
+    # Issue #731 supersedes #699's policy branch: a failed lookup blocks on any
+    # repo, declared forge or not. `--ci-gate-no-ci` keeps governing CR_NONE.
     verdict, reason = _evaluate_ci_gate(status, no_ci_policy=opts.ci_gate_no_ci)
-    if status is None and build_issue.forge_declared():
-        # Issue #699: on a repo that *declares* its forge an unresolvable status is
-        # a real lookup failure, not "unmapped" — follow the no-CI policy instead
-        # of silently shipping the merge ungated.
-        deny = opts.ci_gate_no_ci == "deny"
-        verdict = _GATE_BLOCK if deny else _GATE_PASS
-        reason = (
-            "CI status lookup failed on the declared forge (see warn log) — "
-            f"{'blocked' if deny else 'allowed'} by --ci-gate-no-ci={opts.ci_gate_no_ci}"
-        )
     # A no-CI allow is a notable warning (the merge ships ungated), a block is an
     # error, a clean pass/skip is informational.
     if verdict == _GATE_BLOCK:
@@ -8444,7 +8464,7 @@ def _run_story(
                     _reconcile_estimate(
                         ledger, run_id, story.id, stage, estimate, result
                     )
-                    pr_number = _extract_pr(result, pr_number)
+                    pr_number = _adopt_pr(ledger, run_id, story.id, result, pr_number)
                     if pr_number is not None:
                         ledger.set_story_pr(run_id, story.id, pr_number)
                     # Story 27.3-003: keep the coverage stage's reported signals
@@ -8547,7 +8567,9 @@ def _run_story(
                             run_id, story.id, stage, attempt, "DONE",
                             output_path=str(tpath),
                         )
-                        pr_number = _extract_pr(result_r, pr_number)
+                        pr_number = _adopt_pr(
+                            ledger, run_id, story.id, result_r, pr_number
+                        )
                         if pr_number is not None:
                             ledger.set_story_pr(run_id, story.id, pr_number)
                         # Story 23.2-003: an envelope-recovered merge still landed —
@@ -9632,10 +9654,43 @@ def _reconcile_estimate(
 
 
 def _extract_pr(result: AgentResult | None, current: int | None) -> int | None:
-    if result is None:
+    """The run's change-request number after a stage.
+
+    Issue #731: the number the controller already holds — it opened the change
+    request itself (Story 27.3-001) or recorded it from an earlier stage — is
+    authoritative. An agent's self-reported ``pr_number`` is adopted only when
+    the controller has none: on 2026-09-27 a reviewer reported the *issue*
+    number, it overwrote the real one, and the merge gate went blind.
+    """
+    if current is not None:
         return current
+    if result is None:
+        return None
     pr = result.data.get("pr_number")
-    return pr if isinstance(pr, int) else current
+    return pr if isinstance(pr, int) and not isinstance(pr, bool) else None
+
+
+def _adopt_pr(
+    ledger: "Ledger",
+    run_id: str,
+    story_id: str,
+    result: AgentResult | None,
+    current: int | None,
+) -> int | None:
+    """:func:`_extract_pr`, plus a ``warn`` event when the agent disagrees (#731)."""
+    reported = result.data.get("pr_number") if result is not None else None
+    if (
+        current is not None
+        and isinstance(reported, int)
+        and not isinstance(reported, bool)
+        and reported != current
+    ):
+        ledger.event_log(
+            run_id, story_id, "warn", "controller",
+            f"agent reported pr_number #{reported} but the controller's change "
+            f"request is #{current} — keeping #{current}",
+        )
+    return _extract_pr(result, current)
 
 
 def _merge_unverified_reason(

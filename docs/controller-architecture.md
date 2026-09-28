@@ -676,8 +676,22 @@ adapter) and only lets the merge proceed on green:
   branch/MR preserved (R10).
 - **`none`** (the project has no CI signal) → degrades per policy, not a hang:
   `--ci-gate-no-ci=allow` (the default) warns and merges, `--ci-gate-no-ci=deny` blocks.
-- An **unmapped story** (no host mapping, or no recorded `cr_ref`) → the gate is a
-  no-op and the merge path is byte-identical to before this story.
+- **The lookup itself fails** (a host error, or a change-request number the forge
+  does not know) → the gate **blocks** (issue #731). It retries on a short backoff
+  of its own (2 s, then 5 s) to ride out a transient error, then refuses the merge;
+  `--ci-gate-timeout=0` is a single read and does not retry. An unreadable gate is
+  a closed one: `--ci-gate-no-ci` governs a change request that has *no pipeline*,
+  never a gate that could not read one. This supersedes the issue #699 behaviour,
+  where a lookup failure on a declared forge followed that policy.
+- A story with **no recorded change request** → the gate is a no-op.
+
+**The change-request number is the controller's, not the agent's (issue #731).**
+Once the controller has opened or recorded a change request, an agent's
+self-reported `pr_number` never replaces it; it is adopted only when the
+controller has none. A mismatch keeps the controller's number and logs a `warn`
+event naming both. On 2026-09-27 a reviewer reported the *issue* number as
+`pr_number`; it overwrote the real one, the gate's lookup failed, the gate (then
+fail-open) skipped, and a merge landed with a check still pending.
 
 The poll is bounded so a never-finishing pipeline can never stall a run. Config
 (`sdlc build` flags):
