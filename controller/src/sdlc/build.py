@@ -5360,6 +5360,73 @@ def _story_cr_host_override(story: Story, ledger: Ledger, opts: BuildOptions) ->
     return mapping[0] if mapping else None
 
 
+_PUSH_REJECTION_MARKERS = ("non-fast-forward", "fetch first")
+
+
+def _push_story_branch(
+    root: Path, branch: str, *, lease_sha: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """``git push -u origin <branch>``, optionally force-with-lease on ``lease_sha``."""
+    cmd = ["git", "push", "-u"]
+    if lease_sha:
+        cmd.append(f"--force-with-lease={branch}:{lease_sha}")
+    cmd += ["origin", branch]
+    return subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=120)
+
+
+def _is_push_rejection(stderr: str) -> bool:
+    """True when git refused the push because the remote branch diverged."""
+    return "[rejected]" in stderr and any(m in stderr for m in _PUSH_REJECTION_MARKERS)
+
+
+def _reclaim_stale_branch(
+    story: Story,
+    ledger: Ledger,
+    run_id: str,
+    root: Path,
+    branch: str,
+    adapter: Any,
+    rejection: str,
+) -> None:
+    """Replace a leftover remote story branch with the retry's fresh work (#726).
+
+    A retry cuts ``feature/<id>`` fresh from base, so an earlier attempt's push
+    (made without a CR) is non-fast-forward. Force only when the remote tip is
+    known and no open CR exists for the branch; the push is a lease on that
+    exact tip, so anything that moved since is never clobbered. The old tip is
+    kept under ``refs/sdlc/stale/<id>/<sha>`` and in the event log. Raises the
+    original rejection whenever forcing is not provably safe, leaving the
+    caller's park-for-attention path unchanged.
+    """
+    ls = subprocess.run(
+        ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+        cwd=root, capture_output=True, text=True, timeout=60,
+    )
+    old_sha = ls.stdout.split()[0] if ls.returncode == 0 and ls.stdout.split() else ""
+    if not old_sha:
+        raise RuntimeError(rejection)
+    try:
+        open_cr = adapter.cr_find(branch)
+    except Exception:  # noqa: BLE001 — unknown CR state is never safe to force over
+        raise RuntimeError(rejection) from None
+    if open_cr is not None:
+        raise RuntimeError(rejection)
+    # Best-effort backup so the superseded work stays recoverable.
+    backup = f"refs/sdlc/stale/{story.id}/{old_sha}"
+    kept = subprocess.run(
+        ["git", "fetch", "origin", f"refs/heads/{branch}:{backup}"],
+        cwd=root, capture_output=True, text=True, timeout=120,
+    ).returncode == 0
+    forced = _push_story_branch(root, branch, lease_sha=old_sha)
+    if forced.returncode != 0:
+        raise RuntimeError(forced.stderr.strip() or rejection)
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"replaced stale remote {branch} (was {old_sha}, no open CR) with "
+        f"--force-with-lease; old tip {'kept at ' + backup if kept else 'not backed up'}",
+    )
+
+
 def _open_story_cr(
     story: Story,
     ledger: Ledger,
@@ -5385,20 +5452,32 @@ def _open_story_cr(
     root = workdir or Path.cwd()
     branch = f"feature/{story.id}"
     try:
-        push = subprocess.run(
-            ["git", "push", "-u", "origin", branch],
-            cwd=root, capture_output=True, text=True, timeout=120,
-        )
-        if push.returncode != 0:
-            raise RuntimeError(push.stderr.strip() or "git push failed")
         # Local import mirrors build_issue's adapter usage — keeps the host
         # adapter off this module's hot import path.
         from sdlc import issue_host
 
-        resolution = issue_host.resolve_forge(
-            root, override=_story_cr_host_override(story, ledger, opts)
-        )
-        adapter = issue_host.get_adapter(resolution.host, instance_url=resolution.instance_url)
+        def resolve_adapter() -> issue_host.IssueHostAdapter:
+            resolution = issue_host.resolve_forge(
+                root, override=_story_cr_host_override(story, ledger, opts)
+            )
+            return issue_host.get_adapter(
+                resolution.host, instance_url=resolution.instance_url
+            )
+
+        adapter: issue_host.IssueHostAdapter | None = None
+        push = _push_story_branch(root, branch)
+        if push.returncode != 0:
+            error = push.stderr.strip() or "git push failed"
+            if not _is_push_rejection(error):
+                raise RuntimeError(error)
+            # A rejection may just be a leftover branch from an earlier attempt
+            # (#726); reclaim it only when it provably has no open CR.
+            adapter = resolve_adapter()
+            _reclaim_stale_branch(
+                story, ledger, run_id, root, branch, adapter, error
+            )
+        if adapter is None:
+            adapter = resolve_adapter()
         title = build_commit_header(
             ctype="feat",
             scope=story.epic_name,
