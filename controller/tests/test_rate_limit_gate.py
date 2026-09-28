@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from sdlc.build import BuildOptions, Ledger, parse_build_args, run_build
+from sdlc.build import (
+    RATE_LIMIT_POLL_S,
+    BuildOptions,
+    Ledger,
+    parse_build_args,
+    run_build,
+)
 from sdlc.capability import ProbeStatus
 from sdlc.dispatch import RateLimitError
 from sdlc.rate_limit import RateLimitSignal
@@ -124,6 +130,65 @@ def test_reactive_429_within_cap_auto_waits_and_resumes(tmp_path: Path) -> None:
     assert Ledger(db).run_row(result.run_id)["status"] == "DONE"
     # It actually waited the retry-after in-process.
     assert sum(sleeps.calls) == 120
+
+
+def test_reactive_429_wait_ends_early_when_probe_reports_available(tmp_path: Path) -> None:
+    # Issue #727: a within-cap 429 pause must not sleep out the announced reset
+    # once the window has reopened early — the first poll probe resumes the run.
+    db = tmp_path / "ledger.db"
+    sleeps = _Sleeps()
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", "s1-001"),
+        signal=RateLimitSignal(source="retry-after", retry_after_s=7200),
+    )
+    result = run_build(
+        _opts(), queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=dispatcher, preflight=lambda: True, sleep_fn=sleeps,
+        rate_limit_probe=lambda: ProbeStatus.AVAILABLE,
+    )
+    assert result.rate_limited is False
+    assert result.completed == 3
+    assert Ledger(db).run_row(result.run_id)["status"] == "DONE"
+    assert sum(sleeps.calls) == RATE_LIMIT_POLL_S < 7200
+
+
+def test_reactive_429_wait_with_unavailable_probe_sleeps_full_duration(tmp_path: Path) -> None:
+    db = tmp_path / "ledger.db"
+    sleeps = _Sleeps()
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", "s1-001"),
+        signal=RateLimitSignal(source="retry-after", retry_after_s=900),
+    )
+    result = run_build(
+        _opts(), queue=_sample_queue(), ledger=Ledger(db),
+        dispatcher=dispatcher, preflight=lambda: True, sleep_fn=sleeps,
+        rate_limit_probe=lambda: ProbeStatus.UNAVAILABLE,
+    )
+    assert result.completed == 3
+    assert sum(sleeps.calls) == 900
+
+
+def test_injected_dispatcher_never_shells_out_to_the_default_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # An injected dispatcher means a test run: the real harness probe must not fire.
+    import sdlc.build as build_mod
+
+    def _forbidden() -> ProbeStatus:
+        raise AssertionError("default probe must not run under an injected dispatcher")
+
+    monkeypatch.setattr(build_mod, "default_rate_limit_probe", _forbidden)
+    dispatcher = RateLimitingDispatcher(
+        trip_on=("build", "s1-001"),
+        signal=RateLimitSignal(source="retry-after", retry_after_s=600),
+    )
+    sleeps = _Sleeps()
+    result = run_build(
+        _opts(), queue=_sample_queue(), ledger=Ledger(tmp_path / "ledger.db"),
+        dispatcher=dispatcher, preflight=lambda: True, sleep_fn=sleeps,
+    )
+    assert result.completed == 3
+    assert sum(sleeps.calls) == 600
 
 
 def test_reactive_429_does_not_burn_a_bugfix_attempt(tmp_path: Path) -> None:

@@ -20,6 +20,7 @@ from sdlc.build import (
     run_build,
     status_snapshot,
 )
+from sdlc.capability import ProbeStatus
 from sdlc.cli import app
 from sdlc.dispatch import RateLimitError
 from sdlc.rate_limit import RateLimitSignal
@@ -311,6 +312,79 @@ def test_rate_limit_wait_logs_countdown_across_poll_chunks(tmp_path: Path) -> No
             ).fetchall()
         ]
     assert any("until the window reopens" in m for m in msgs)
+
+
+def _wait_with_probe(tmp_path: Path, probe, wait_s: int):
+    """Run ``_rate_limit_wait`` with an injected probe; return (waited, sleeps, db, run_id)."""
+    db = tmp_path / "ledger.db"
+    ledger = Ledger(db)
+    ledger.init()
+    run_id = ledger.run_create("epic-99", "serial")
+    sleeps = _Sleeps()
+    waited = _rate_limit_wait(
+        ledger, run_id, RateLimitSignal(source="429"), wait_s,
+        sleep_fn=sleeps, story_id="s1-001", stage="build", probe=probe,
+    )
+    return waited, sleeps, db, run_id
+
+
+def test_rate_limit_wait_ends_early_when_probe_reports_available(tmp_path: Path) -> None:
+    # Issue #727: the user reset their limit early — the first poll chunk's probe
+    # sees an open window, so the wait stops there instead of sleeping ~2h.
+    wait_s = RATE_LIMIT_POLL_S * 4
+    waited, sleeps, db, run_id = _wait_with_probe(
+        tmp_path, lambda: ProbeStatus.AVAILABLE, wait_s
+    )
+    assert waited == RATE_LIMIT_POLL_S < wait_s
+    assert sleeps.calls == [RATE_LIMIT_POLL_S]
+    assert Ledger(db).run_row(run_id)["status"] == "IN_PROGRESS"
+    assert _stall_rows(db, run_id) == [
+        {"story_id": "s1-001", "stage": "build", "source": "429",
+         "waited_s": RATE_LIMIT_POLL_S},
+    ]
+    with Ledger(db)._connect_ro() as conn:  # noqa: SLF001 — test inspects the event log
+        msgs = [r["message"] for r in conn.execute(
+            "SELECT message FROM events WHERE run_id = ?", (run_id,)).fetchall()]
+    assert any("reopened early" in m for m in msgs)
+
+
+def test_rate_limit_wait_probes_once_per_poll_chunk(tmp_path: Path) -> None:
+    # Cadence guard: one tiny request per poll chunk, and none after the last.
+    calls: list[int] = []
+
+    def _probe() -> ProbeStatus:
+        calls.append(1)
+        return ProbeStatus.UNAVAILABLE
+
+    waited, _sleeps, _db, _run = _wait_with_probe(tmp_path, _probe, RATE_LIMIT_POLL_S * 3)
+    assert waited == RATE_LIMIT_POLL_S * 3
+    assert len(calls) == 2
+
+
+def _raising_probe() -> ProbeStatus:
+    raise RuntimeError("probe blew up")
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        lambda: ProbeStatus.UNAVAILABLE,
+        lambda: ProbeStatus.UNKNOWN,
+        _raising_probe,
+        None,
+    ],
+    ids=["unavailable", "unknown", "raises", "no-probe"],
+)
+def test_rate_limit_wait_keeps_waiting_without_an_available_verdict(
+    tmp_path: Path, probe
+) -> None:
+    # The gate protects a possibly closed quota window: only AVAILABLE ends the
+    # wait early; every other verdict (and no probe at all) waits the full time.
+    wait_s = RATE_LIMIT_POLL_S * 2 + 30
+    waited, sleeps, db, run_id = _wait_with_probe(tmp_path, probe, wait_s)
+    assert waited == wait_s
+    assert sum(sleeps.calls) == wait_s
+    assert Ledger(db).run_row(run_id)["status"] == "IN_PROGRESS"
 
 
 def test_park_resolves_reset_from_retry_after(tmp_path: Path) -> None:
