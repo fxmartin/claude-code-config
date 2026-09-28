@@ -2799,6 +2799,64 @@ def test_page_queue_renders_pr_link_for_parked_jobs_when_present() -> None:
     assert "pr_number" in body and "pr_url" in body
 
 
+def _render_queue_body() -> str:
+    from sdlc.dashboard import _PAGE
+
+    render_start = _PAGE.index("function renderQueue(")
+    return _PAGE[render_start:_PAGE.index("\n}", render_start)]
+
+
+def test_page_queue_panel_is_collapsible_and_collapsed_by_default() -> None:
+    """The panel is a native <details>: a long queue must not push the run's own
+    stories below the fold. `open` is emitted only from the remembered state,
+    which starts false — so a first visit renders collapsed."""
+    from sdlc.dashboard import _PAGE
+
+    body = _render_queue_body()
+    assert "<details class='queuewrap'" in body
+    assert "<summary>" in body
+    assert 'queueOpen ? " open" : ""' in body
+    assert "let queueOpen = false;" in _PAGE
+
+
+def test_page_queue_collapsed_summary_keeps_the_signal() -> None:
+    """Collapsed must still answer 'is anything moving?': the summary line carries
+    the per-state counts, the running count, and the rate-limit pause."""
+    body = _render_queue_body()
+    summary = body[body.index("<summary>"):body.index("</summary>")]
+    assert "queue-meta" in summary
+    assert "meta" in summary and "Development queue" in summary
+    meta_start = body.index("const meta =")
+    meta = body[meta_start:body.index(";\n", meta_start)]
+    assert "running" in meta and "paused" in meta and "byState[s].length" in meta
+
+
+def test_page_queue_open_state_survives_the_tick_rerender() -> None:
+    """renderQueue() rewrites the panel's innerHTML every tick, which would snap
+    an opened panel shut. The live <details> is read back before the rewrite, so
+    the DOM — not a possibly-late toggle event — is the source of truth."""
+    body = _render_queue_body()
+    read_back = body.index('el.querySelector("details")')
+    assert read_back < body.index("el.innerHTML = \"<details")
+    assert "setQueueOpen(" in body[read_back:]
+
+
+def test_page_queue_open_state_persists_guarded() -> None:
+    """The choice is remembered per browser under a namespaced key, with every
+    storage access guarded (the sidebar-toggle pattern)."""
+    from sdlc.dashboard import _PAGE
+
+    assert 'const QUEUE_OPEN_KEY = "sdlc.dashboard.queueOpen";' in _PAGE
+    fn_start = _PAGE.index("function setQueueOpen(")
+    fn = _PAGE[fn_start:_PAGE.index("\n}", fn_start)]
+    assert "try" in fn and "localStorage.setItem(QUEUE_OPEN_KEY" in fn
+    load_start = _PAGE.index("let queueOpen = false;")
+    load = _PAGE[load_start:_PAGE.index("\n", load_start + len("let queueOpen = false;") + 1)]
+    assert "try" in load and "localStorage.getItem(QUEUE_OPEN_KEY)" in load
+    # `toggle` does not bubble, so the delegated listener must capture.
+    assert '"toggle", e => setQueueOpen(e.target.open), true' in _PAGE
+
+
 def test_queue_view_carries_the_queue_level_pause(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
