@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.74.0] - 2026-09-28
+
+### Added
+
+- feat(settings): keep claude code transcripts for ten years (#735)
+
+
 ## [v2.73.4] - 2026-09-28
 
 ### Fixed
