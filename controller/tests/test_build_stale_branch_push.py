@@ -11,8 +11,10 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from sdlc import issue_host as ih
-from sdlc.build import BuildOptions, _open_story_cr
+from sdlc.build import BuildOptions, _open_story_cr, _reclaim_stale_branch
 
 from test_build import _FakeCrAdapter, _mapped_ledger, _repo_with_undetectable_origin, _story
 
@@ -180,3 +182,19 @@ def test_clean_first_push_makes_no_ls_remote_call(tmp_path, monkeypatch) -> None
     assert pr == 42
     assert not any("ls-remote" in c for c in calls)
     assert not any("--force-with-lease" in " ".join(c) for c in calls)
+
+
+def test_reclaim_without_a_remote_tip_never_forces(tmp_path) -> None:
+    """A rejection with no resolvable remote tip cannot be leased against."""
+    story = _story("09.4-002")
+    branch = f"feature/{story.id}"
+    root = _repo_with_undetectable_origin(tmp_path, branch)  # remote lacks the branch
+    adapter = _Adapter("gitlab")
+
+    with pytest.raises(RuntimeError, match="rejected-by-test"):
+        _reclaim_stale_branch(
+            story, _mapped_ledger(tmp_path, story, "gitlab", "9"), "run-1",
+            root, branch, adapter, "rejected-by-test",
+        )
+
+    assert adapter.find_calls == []
