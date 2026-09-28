@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.73.4] - 2026-09-28
+
+### Fixed
+
+- fix(build): probe during rate-limit wait to catch early reset (#727) (#734)
+
+
 ### Fixed
 
 - fix(build): probe the API during an in-process rate-limit wait (one tiny request per 5 min) so an early limit reset resumes the run instead of sleeping out the announced reset (#727)
