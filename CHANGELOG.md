@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.73.2] - 2026-09-28
+
+### Fixed
+
+- fix(build): trust the controller's pr number, fail the gate closed (#732)
+
+
 ## [v2.73.1] - 2026-09-27
 
 ### Fixed
