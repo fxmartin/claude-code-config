@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.74.1] - 2026-09-28
+
+### Fixed
+
+- fix(dashboard): collapse the development queue panel by default (#736) (#737)
+
+
 ## [v2.74.0] - 2026-09-28
 
 ### Added
