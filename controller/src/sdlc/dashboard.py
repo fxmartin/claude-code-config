@@ -562,7 +562,12 @@ _PAGE = """<!doctype html>
      changes are not this run's ledger events). */
   .queuewrap { margin: 16px 0; padding: 12px 14px; background: var(--mantle);
                border: 1px solid var(--surface); border-radius: 8px; }
-  .queuewrap h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  /* Issue #736: the panel is a <details>, collapsed by default, so a long queue
+     never pushes the run's own stories below the fold. */
+  .queuewrap > summary { cursor: pointer; }
+  .queuewrap[open] > summary { margin-bottom: 8px; }
+  .queuewrap h3 { display: inline; margin: 0; font-size: 13px; font-weight: 600; }
+  .queue-meta { margin-left: 8px; font-size: 12px; color: var(--sub); }
   .queuewrap.unavail { color: var(--sub); font-style: italic; }
   .queue-slots { margin-bottom: 8px; font-size: 12px; color: var(--sub); }
   .queue-pause { margin-bottom: 10px; padding: 6px 10px; border-radius: 6px;
@@ -1024,9 +1029,23 @@ function queuePrLink(j){
 function queueRepoLabel(repo){
   return repo ? esc(String(repo).split(/[\\/]/).pop()) : "-";
 }
+// Collapsed by default, remembered per browser (Issue #736). Persistence follows
+// the sidebar-toggle pattern: a namespaced key, every storage access guarded.
+const QUEUE_OPEN_KEY = "sdlc.dashboard.queueOpen";
+let queueOpen = false;
+try { queueOpen = localStorage.getItem(QUEUE_OPEN_KEY) === "1"; } catch (e) {}
+function setQueueOpen(open){
+  queueOpen = open;
+  try { localStorage.setItem(QUEUE_OPEN_KEY, open ? "1" : "0"); } catch (e) {}
+}
 function renderQueue(data){
   const el = document.getElementById("queue");
   if(!el) return;
+  // This rewrite runs every tick and would snap an opened panel shut. Read the
+  // live state back first: `toggle` is queued asynchronously, so it can land
+  // after the element it describes has already been replaced.
+  const cur = el.querySelector("details");
+  if(cur && cur.open !== queueOpen) setQueueOpen(cur.open);
   const jobs = (data && data.jobs) || [];
   const pause = data && data.pause;
   if(!jobs.length && !pause){
@@ -1053,9 +1072,14 @@ function renderQueue(data){
       + "<div class='queue-scroll'><table><tr><th>repo</th><th>scope</th><th>priority</th>"
       + "<th>age</th><th>PR</th></tr>"+rows+"</table></div></div>";
   }).join("");
-  el.innerHTML = "<div class='queuewrap'><h3>Development queue</h3>"
+  // The collapsed line must still answer "is anything moving?".
+  const meta = [running + " running"]
+    .concat(order.filter(s => s !== "running").map(s => esc(s) + " " + byState[s].length))
+    .concat(pause ? ["paused"] : []).join(" \\u00b7 ");
+  el.innerHTML = "<details class='queuewrap'" + (queueOpen ? " open" : "") + ">"
+    + "<summary><h3>Development queue</h3><span class='queue-meta'>" + meta + "</span></summary>"
     + "<div class='queue-slots'>slots in use: "+running+" running</div>"
-    + pauseHtml + groups + "</div>";
+    + pauseHtml + groups + "</details>";
 }
 
 function renderMain(d){
@@ -1437,6 +1461,8 @@ document.getElementById("toggleSide").addEventListener("click", () => {
   setSideHidden(!document.getElementById("buildsView").classList.contains("side-hidden"));
 });
 try { if(localStorage.getItem(SIDE_KEY) === "1") setSideHidden(true); } catch (e) {}
+// `toggle` does not bubble, so the delegated listener captures (Issue #736).
+document.getElementById("queue").addEventListener("toggle", e => setQueueOpen(e.target.open), true);
 document.getElementById("pfRefresh").addEventListener("click", refreshPortfolio);
 
 tick();          // immediate first paint
