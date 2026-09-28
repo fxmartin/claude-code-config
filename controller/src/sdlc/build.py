@@ -1194,6 +1194,7 @@ def _rate_limit_wait(
     sleep_fn: Callable[[float], None],
     story_id: str = "",
     stage: str | None = None,
+    probe: "Callable[[], ProbeStatus] | None" = None,
 ) -> int:
     """Wait in-process for the window to reopen, logging a periodic countdown.
 
@@ -1207,6 +1208,12 @@ def _rate_limit_wait(
     against ``story_id``/``stage`` (empty for a run-level or between-dispatch
     wait) — a ledger dimension of its own, distinct from agent runtime, so stage
     durations stay honest and quota-backoff outliers are diagnosable at a glance.
+
+    Issue #727: the announced reset is only a forecast — the user can reset their
+    limit early. When ``probe`` is wired, it runs after each poll chunk (one tiny
+    request per :data:`RATE_LIMIT_POLL_S`) and an ``AVAILABLE`` verdict ends the
+    wait at once; the stall row then records the shortened wait actually served.
+    Any other verdict, an error, or no probe keeps waiting — never fails open.
     """
     ledger.run_update_status(run_id, "RATE_LIMITED")
     ledger.event_log(
@@ -1215,12 +1222,16 @@ def _rate_limit_wait(
         "window to reopen, then auto-resuming this run (no manual resume needed).",
     )
     waited = 0
+    reopened_early = False
     while waited < wait_s:
         chunk = min(RATE_LIMIT_POLL_S, wait_s - waited)
         sleep_fn(chunk)
         waited += chunk
         remaining = wait_s - waited
         if remaining > 0:
+            if _wait_probe_reopened(probe):
+                reopened_early = True
+                break
             ledger.event_log(
                 run_id, "", "info", "controller",
                 f"rate-limit wait: ~{remaining}s until the window reopens.",
@@ -1229,9 +1240,28 @@ def _rate_limit_wait(
     ledger.run_update_status(run_id, "IN_PROGRESS")
     ledger.event_log(
         run_id, "", "success", "controller",
-        "rate-limit window reopened — resuming dispatch.",
+        "rate-limit re-probe succeeded — window reopened early (before the "
+        "announced reset), resuming dispatch."
+        if reopened_early
+        else "rate-limit window reopened — resuming dispatch.",
     )
     return waited
+
+
+def _wait_probe_reopened(probe: "Callable[[], ProbeStatus] | None") -> bool:
+    """True only when ``probe`` positively reports the window open (issue #727).
+
+    Fail-closed like :func:`_probe_parked_reset`: no probe, ``UNAVAILABLE``,
+    ``UNKNOWN`` or a raising probe all mean "keep waiting". Silent on purpose —
+    the caller already logs a countdown each chunk, and a per-chunk verdict line
+    would double the event-log noise of a multi-hour wait.
+    """
+    if probe is None:
+        return False
+    try:
+        return probe() is ProbeStatus.AVAILABLE
+    except Exception:  # noqa: BLE001 - a probe failure must never cut a wait short
+        return False
 
 
 def apply_rate_limit_park(
@@ -1337,7 +1367,9 @@ def _honor_parked_reset(
             status=None, parked=True, signal=signal, waited_s=0,
             probe_status=probe_status.value,
         )
-    _rate_limit_wait(ledger, run_id, signal, wait_s, sleep_fn=rl_ctx.sleep_fn)
+    _rate_limit_wait(
+        ledger, run_id, signal, wait_s, sleep_fn=rl_ctx.sleep_fn, probe=rl_ctx.probe,
+    )
     if rl_ctx.window is not None:
         rl_ctx.window.reopen(rl_ctx.clock(), ledger.run_usage_totals(run_id)["tokens"])
     return None
@@ -1800,7 +1832,7 @@ def _run_story_rate_limited(
                 )
             waited_total += _rate_limit_wait(
                 ledger, run_id, signal, wait_s, sleep_fn=ctx.sleep_fn,
-                story_id=story.id,
+                story_id=story.id, probe=ctx.probe,
             )
             ctx.window.reopen(ctx.clock(), ledger.run_usage_totals(run_id)["tokens"])
 
@@ -7121,6 +7153,7 @@ def run_build(
     root: Path | None = None,
     actor_adapter: "IssueHostAdapter | None" = None,
     dirty_check: Callable[[], list[str]] | None = None,
+    rate_limit_probe: Callable[[], ProbeStatus] | None = None,
 ) -> BuildResult:
     """Run the build-stories orchestration deterministically.
 
@@ -7142,6 +7175,11 @@ def run_build(
     before anything is dispatched. It defaults to the real git probe only on a
     *real* run — a run given an injected dispatcher launches no agent, so there is
     no shared checkout for one to stash behind the controller's back.
+
+    ``rate_limit_probe`` (issue #727) is the live-API check an in-process
+    rate-limit wait runs every poll chunk so an early limit reset resumes the run.
+    It defaults to :func:`default_rate_limit_probe` only on a *real* run; an
+    injected dispatcher gets no probe, so tests never shell out.
     """
     dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
     check_preflight = preflight or (lambda: default_preflight(timeout=opts.preflight_timeout))
@@ -7417,6 +7455,11 @@ def run_build(
     rl_ctx = _make_rate_limit_context(
         opts, clock=clock, sleep_fn=sleep_fn,
         baseline=ledger.run_usage_totals(run_id)["tokens"],
+        # Issue #727: probe during an in-process wait so an early limit reset
+        # resumes the run. An injected dispatcher (tests) must never shell out.
+        probe=rate_limit_probe or (
+            default_rate_limit_probe if dispatcher is None else None
+        ),
     )
     # Story 28.2-002: note a disabled predictor once here, before any story runs.
     _log_predictor_posture(ledger, run_id, opts)
@@ -8762,7 +8805,7 @@ def _run_story(
                     raise _RateLimitPark(signal=exc.signal, waited_s=rl_waited) from exc
                 rl_waited += _rate_limit_wait(
                     ledger, run_id, exc.signal, wait_s, sleep_fn=rl_ctx.sleep_fn,
-                    story_id=story.id, stage=stage,
+                    story_id=story.id, stage=stage, probe=rl_ctx.probe,
                 )
                 if rl_ctx.window is not None:
                     rl_ctx.window.reopen(
