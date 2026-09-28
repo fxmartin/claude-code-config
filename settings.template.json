@@ -94,6 +94,7 @@
     }
   },
   "feedbackSurveyRate": 0,
+  "cleanupPeriodDays": 3650,
   "agentPushNotifEnabled": false,
   "skipAutoPermissionPrompt": true,
   "voiceEnabled": true
