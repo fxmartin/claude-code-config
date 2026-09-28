@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.73.3] - 2026-09-28
+
+### Fixed
+
+- fix(build): replace a stale remote story branch on cr open (#726) (#733)
+
+
 ## [v2.73.2] - 2026-09-28
 
 ### Fixed
