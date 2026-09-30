@@ -31,7 +31,7 @@ def test_every_ladder_tier_has_a_model_id() -> None:
     assert set(TIER_MODEL_IDS) == set(TIER_LADDER)
     assert TIER_MODEL_IDS == {
         HAIKU: "claude-haiku-4-5",
-        SONNET: "claude-sonnet-5",
+        SONNET: "claude-sonnet-5-5",
         OPUS: "claude-opus-5-5",
     }
 
@@ -45,7 +45,7 @@ def test_resolve_model_id_maps_tiers_and_passes_everything_else() -> None:
 
 def test_balanced_build_dispatches_the_sonnet_id() -> None:
     opts = BuildOptions(scope="epic-34", skip_preflight=True, sequential=True)
-    assert _resolved_stage_model("build", _story(), opts) == "claude-sonnet-5"
+    assert _resolved_stage_model("build", _story(), opts) == "claude-sonnet-5-5"
 
 
 def test_alias_override_resolves_through_the_table() -> None:
@@ -68,7 +68,7 @@ def test_escalation_climbs_by_tier_then_dispatches_the_mapped_id() -> None:
     climbed = [escalate_model(HAIKU, n) for n in range(3)]
     assert climbed == [HAIKU, SONNET, OPUS]
     assert [resolve_model_id(t) for t in climbed] == [
-        "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5-5",
+        "claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5",
     ]
 
 
