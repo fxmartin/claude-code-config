@@ -51,6 +51,7 @@ from sdlc.cost_estimate import (
     estimate_stage,
     notional_cost,
     project_batch,
+    usage_cost,
 )
 from sdlc.discovery import canonical_scope
 from sdlc.doc_currency import doc_currency_enabled
@@ -4131,6 +4132,13 @@ def _aggregate_run_usage(breakdown: dict[str, list[dict]]) -> dict | None:
 
     Returns ``{input, output, cache_read, cache_creation, total_tokens,
     cost_usd}`` or None when no stage recorded any usage (a pre-capture run).
+
+    Story 34.2-001: an attempt with token counts is priced from the list-price
+    table for the model it ran on (:func:`usage_cost`, each token class at its
+    own rate), so the ``$`` rendered beside ``PRICE_TABLE_VINTAGE`` really came
+    from that table. A cost-only attempt (no token counts) keeps its reported
+    ``cost_usd``. The ledger column itself stays harness-reported — it is what
+    ``usage-reconcile`` checks against the session logs.
     """
     totals = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
     key_map = {
@@ -4141,12 +4149,23 @@ def _aggregate_run_usage(breakdown: dict[str, list[dict]]) -> dict | None:
     seen = False
     for attempts in breakdown.values():
         for a in attempts:
+            has_tokens = False
             for out_key, in_key in key_map.items():
                 v = a.get(in_key)
                 if v is not None:
                     totals[out_key] += v
-                    seen = True
-            c = a.get("cost_usd")
+                    seen = has_tokens = True
+            c = (
+                usage_cost(
+                    a.get("model"),
+                    input_tokens=a.get("input_tokens") or 0,
+                    output_tokens=a.get("output_tokens") or 0,
+                    cache_read_tokens=a.get("cache_read_tokens") or 0,
+                    cache_creation_tokens=a.get("cache_creation_tokens") or 0,
+                )
+                if has_tokens
+                else a.get("cost_usd")
+            )
             if c is not None:
                 cost += c
                 seen = True
