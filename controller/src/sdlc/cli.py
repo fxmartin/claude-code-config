@@ -1025,6 +1025,14 @@ def status(
         typer.echo(
             f"rate-limit stalls: {stall_s}s waited (not counted as agent runtime)"
         )
+    run_usage = snap["run"].get("usage") or {}
+    if run_usage.get("cost_usd") is not None:
+        from sdlc.cost_estimate import price_vintage_label
+
+        typer.echo(
+            f"cost: {price_vintage_label(run_usage['cost_usd'])} "
+            "(API-equivalent, not billed on subscription)"
+        )
     if stories:
         # Story 27.2-002 AC4: MODEL shows the tier(s) the story's stages ran on
         # (first-use order); "-" when routing was off (CLI default everywhere).

@@ -18,6 +18,7 @@ import yaml
 
 from sdlc import __version__ as INSTALLED_VERSION
 from sdlc.build import _MIGRATIONS, Ledger, list_stashes, status_snapshot
+from sdlc.cost_estimate import PRICE_TABLE_VINTAGE, price_id
 from sdlc.harness import DEFAULT_HARNESS
 from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
@@ -1275,6 +1276,43 @@ def check_model_routing(db_path: Path) -> Finding:
     )
 
 
+def check_model_pricing(db_path: Path) -> Finding:
+    """Warn once per model id the ledger ran that has no list price (34.2-001).
+
+    An unpriced id (a Codex free-form id, a model newer than the price table) is
+    costed at the opus default, so its `$` figures may be off; naming it lets the
+    operator add a table entry. Read-only, like every other doctor check.
+    """
+    name = "Model pricing"
+    if not db_path.exists():
+        return Finding("pricing", name, "CLEAN", "no ledger yet — no models to price")
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            models = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT model FROM stages "
+                    "WHERE model IS NOT NULL AND model != '' ORDER BY model"
+                )
+            ]
+    except sqlite3.DatabaseError:
+        # A corrupt/unreadable ledger is already a FAIL from check_ledger.
+        return Finding("pricing", name, "CLEAN", "ledger unreadable — pricing not checked")
+    unpriced = [m for m in models if price_id(m) is None]
+    if not unpriced:
+        return Finding(
+            "pricing", name, "CLEAN",
+            f"every model has a list price (table {PRICE_TABLE_VINTAGE})",
+        )
+    return Finding(
+        "pricing", name, "WARN",
+        "; ".join(
+            f"{m} has no list price; $ figures use the opus default" for m in unpriced
+        ),
+        "add the id to cost_estimate.MODEL_USD_PER_MILLION_TOKENS",
+    )
+
+
 def check_model_probe(
     *,
     runner=None,
@@ -1466,6 +1504,7 @@ def run_doctor(
         check_usage_agreement(db_path),
         check_model_coverage(db_path),
         check_model_routing(db_path),
+        check_model_pricing(db_path),
         check_stashes(repo_root),
         check_model_probe(),
     ]

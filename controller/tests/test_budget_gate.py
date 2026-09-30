@@ -127,7 +127,11 @@ def test_run_usage_totals_sums_recorded_stages(tmp_path: Path) -> None:
     )
     totals = ledger.run_usage_totals(run_id)
     assert totals["tokens"] == _SAMPLE_STAGE_TOKENS
-    assert totals["cost_usd"] == pytest.approx(0.05)
+    # Story 34.2-001: accrual is list-priced like the dashboard (unrouted ->
+    # opus default 4/20, cache read 0.20, cache write 5.0), not the reported 0.05.
+    assert totals["cost_usd"] == pytest.approx(
+        (100 * 4 + 20 * 20 + 4000 * 0.20 + 300 * 5.0) / 1_000_000
+    )
 
 
 # ---------------------------------------------------------------------------

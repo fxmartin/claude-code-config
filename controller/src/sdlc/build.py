@@ -43,14 +43,15 @@ from sdlc.contracts import (
     _result_wrapper,  # re-exported for build.py prompt rendering (issue #435 move)
 )
 from sdlc.cost_estimate import (
-    DEFAULT_USD_PER_MILLION_TOKENS,
-    MODEL_USD_PER_MILLION_TOKENS,
+    PRICE_TABLE_VINTAGE,
     BatchProjection,
     CostEstimateConfig,
     StageEstimate,
+    blended_usd_per_million,
     estimate_stage,
     notional_cost,
     project_batch,
+    usage_cost,
 )
 from sdlc.discovery import canonical_scope
 from sdlc.doc_currency import doc_currency_enabled
@@ -3630,7 +3631,8 @@ class Ledger:
 
         Sums the four per-stage token components and the notional ``cost_usd``
         across every recorded stage attempt for the run — the live accrual the
-        budget gate reads between stories. Returns ``{"tokens": int,
+        budget gate reads between stories. The cost is list-priced per attempt
+        (:func:`_priced_cost`, Story 34.2-001), matching the dashboard. Returns ``{"tokens": int,
         "cost_usd": float}``; both are 0 when no usage has been recorded yet, the
         ledger predates token capture, or the DB is absent, so the gate degrades
         to "no spend seen" rather than crashing.
@@ -3644,17 +3646,16 @@ class Ledger:
             }
             if "input_tokens" not in stage_cols:
                 return zero
-            row = conn.execute(
-                "SELECT "
-                "SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)"
-                "+COALESCE(cache_read_tokens,0)+COALESCE(cache_creation_tokens,0)) AS tok, "
-                "SUM(COALESCE(cost_usd,0)) AS cost "
+            model_sel = "model" if "model" in stage_cols else "NULL AS model"
+            rows = conn.execute(
+                "SELECT input_tokens, output_tokens, cache_read_tokens, "
+                f"cache_creation_tokens, cost_usd, {model_sel} "
                 "FROM stages WHERE run_id = ?",
                 (run_id,),
-            ).fetchone()
+            ).fetchall()
         return {
-            "tokens": int(row["tok"] or 0),
-            "cost_usd": float(row["cost"] or 0.0),
+            "tokens": sum(_sum_tokens(dict(r)) or 0 for r in rows),
+            "cost_usd": float(sum(_priced_cost(dict(r)) or 0.0 for r in rows)),
         }
 
     def story_rows(self, run_id: str) -> list[dict]:
@@ -3836,6 +3837,7 @@ class Ledger:
         for r in rows:
             d = dict(r)
             d["tokens"] = _sum_tokens(d)
+            d["cost_usd"] = _priced_cost(d)
             out.setdefault(d.pop("story_id"), []).append(d)
         return out
 
@@ -3967,14 +3969,11 @@ class Ledger:
             # Token columns are absent on a ledger created before this feature;
             # skip the rollup so a read-only viewer never hits "no such column".
             stage_cols = {r[1] for r in conn.execute("PRAGMA table_info(stages)").fetchall()}
-            usage = (
+            model_sel = "model" if "model" in stage_cols else "NULL AS model"
+            usage_rows = (
                 conn.execute(
-                    "SELECT run_id, "
-                    "SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)"
-                    "+COALESCE(cache_read_tokens,0)+COALESCE(cache_creation_tokens,0)) AS tok, "
-                    "SUM(COALESCE(cost_usd,0)) AS cost, "
-                    "COUNT(input_tokens) AS n_tok, COUNT(cost_usd) AS n_cost "
-                    "FROM stages GROUP BY run_id"
+                    "SELECT run_id, input_tokens, output_tokens, cache_read_tokens, "
+                    f"cache_creation_tokens, cost_usd, {model_sel} FROM stages"
                 ).fetchall()
                 if "input_tokens" in stage_cols else []
             )
@@ -3982,7 +3981,17 @@ class Ledger:
         counts: dict[str, dict[str, int]] = {}
         for g in grouped:
             counts.setdefault(g["run_id"], {})[g["status"]] = g["n"]
-        usage_by_run = {u["run_id"]: u for u in usage}
+        # Story 34.2-001: each attempt list-priced (:func:`_priced_cost`) so the
+        # runs-list total matches the run header; None stays "no usage recorded".
+        usage_by_run: dict[str, dict] = {}
+        for row in usage_rows:
+            d = dict(row)
+            acc = usage_by_run.setdefault(d["run_id"], {"tok": None, "cost": None})
+            tok, cost = _sum_tokens(d), _priced_cost(d)
+            if tok is not None:
+                acc["tok"] = (acc["tok"] or 0) + tok
+            if cost is not None:
+                acc["cost"] = (acc["cost"] or 0.0) + cost
 
         out: list[dict] = []
         for r in runs:
@@ -4003,8 +4012,8 @@ class Ledger:
                     "total": total,
                     "done": by_status.get("DONE", 0),
                     "failed": by_status.get("FAILED", 0),
-                    "total_tokens": (u["tok"] if u and u["n_tok"] else None),
-                    "total_cost_usd": (u["cost"] if u and u["n_cost"] else None),
+                    "total_tokens": u["tok"] if u else None,
+                    "total_cost_usd": u["cost"] if u else None,
                 }
             )
         return out
@@ -4127,11 +4136,37 @@ def _sum_tokens(row: dict) -> int | None:
     return sum(v or 0 for v in values)
 
 
+def _priced_cost(row: Mapping) -> float | None:
+    """The notional ``$`` every surface shows for one stage attempt (Story 34.2-001).
+
+    An attempt with token counts is priced from the list-price table for the
+    model it ran on (:func:`usage_cost`, each token class at its own rate), so
+    the ``$`` rendered beside ``PRICE_TABLE_VINTAGE`` really came from that
+    table. A cost-only attempt (no token counts) keeps its reported
+    ``cost_usd``. The ledger column itself stays harness-reported — it is what
+    ``usage-reconcile`` checks against the session logs. The run header, runs
+    list, per-story cell, per-stage tooltip and budget accrual all read through
+    here so one run never shows two different totals.
+    """
+    if all(row.get(k) is None for k in _TOKEN_FIELDS):
+        return row.get("cost_usd")
+    return usage_cost(
+        row.get("model"),
+        input_tokens=row.get("input_tokens") or 0,
+        output_tokens=row.get("output_tokens") or 0,
+        cache_read_tokens=row.get("cache_read_tokens") or 0,
+        cache_creation_tokens=row.get("cache_creation_tokens") or 0,
+    )
+
+
 def _aggregate_run_usage(breakdown: dict[str, list[dict]]) -> dict | None:
     """Sum token/cost usage across every stage attempt of a run.
 
     Returns ``{input, output, cache_read, cache_creation, total_tokens,
     cost_usd}`` or None when no stage recorded any usage (a pre-capture run).
+
+    Story 34.2-001: each attempt's ``cost_usd`` is already list-priced by
+    :meth:`Ledger.stage_breakdown` (:func:`_priced_cost`).
     """
     totals = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
     key_map = {
@@ -4321,6 +4356,8 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "routing": ledger.run_routing(rid),
         "concurrency": concurrency,
         "usage": run_usage,
+        # Story 34.2-001: the price table every `$` in `usage` was read against.
+        "price_vintage": PRICE_TABLE_VINTAGE,
         "stall_seconds": stalls["total_s"],
         # Issue #565: the ordered stage columns this run's snapshot actually
         # populated (see ``stage_names`` above), so the dashboard renders its
@@ -9845,9 +9882,7 @@ def _estimate_stage_cost(
             stage, harness=harness, model=model
         )
         historical = calibration[0] if calibration is not None else None
-        rate = MODEL_USD_PER_MILLION_TOKENS.get(
-            _model_tier(model), DEFAULT_USD_PER_MILLION_TOKENS
-        )
+        rate = blended_usd_per_million(model)
         est = estimate_stage(
             stage, prompt,
             config=CostEstimateConfig(usd_per_million_tokens=rate),

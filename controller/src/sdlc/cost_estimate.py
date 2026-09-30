@@ -6,6 +6,9 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import NamedTuple
+
+from sdlc.model_routing import TIER_MODEL_IDS
 
 # Heuristic: ~4 characters per token for mixed English+code prompts. Deliberately
 # crude — the estimate is *guidance*; the authoritative figure remains the
@@ -20,17 +23,92 @@ CHARS_PER_TOKEN = 4
 # the conversion easy to reason about ($15 ⇒ 1M tokens).
 DEFAULT_USD_PER_MILLION_TOKENS = 15.0
 
-# Blended notional list-price equivalents per Claude tier alias (simple average
-# of published input/output USD per Mtok, 2026-07: haiku $1/$5, sonnet $3/$15,
-# opus $5/$25). Guidance only — both harnesses bill by subscription, so this
-# stays an API-equivalent signal, never real spend. Unknown/unlabeled model ids
-# (Codex free-form ids, routing-off None) fall back to the opus-equivalent
-# DEFAULT_USD_PER_MILLION_TOKENS, preserving pre-#427 behavior.
-MODEL_USD_PER_MILLION_TOKENS: dict[str, float] = {
-    "haiku": 3.0,
-    "sonnet": 9.0,
-    "opus": 15.0,
+# Date the price table below was read from the published pricing page. Rendered
+# beside every `$` figure (dashboard run header, `sdlc status`) so a reader knows
+# which list prices produced it. Bump together with the table (Story 34.2-001).
+PRICE_TABLE_VINTAGE = "2026-09-30"
+
+
+class ModelRate(NamedTuple):
+    """List price in USD per million tokens for one model id."""
+
+    input: float
+    output: float
+    cache_read: float
+
+
+# Notional list-price equivalents keyed by exact model id (Story 34.2-001).
+# Guidance only — both harnesses bill by subscription, so this stays an
+# API-equivalent signal, never real spend. Tier aliases resolve through
+# ``model_routing.TIER_MODEL_IDS`` (:func:`price_id`). An id absent here costs at
+# the opus default (:data:`FALLBACK_PRICE_ID`) and `sdlc doctor` warns once per id.
+MODEL_USD_PER_MILLION_TOKENS: dict[str, ModelRate] = {
+    "claude-opus-5-5": ModelRate(4.0, 20.0, 0.20),
+    "claude-opus-5": ModelRate(5.0, 25.0, 0.50),
+    "claude-sonnet-5-5": ModelRate(2.0, 10.0, 0.20),
+    "claude-sonnet-5": ModelRate(2.0, 10.0, 0.20),
+    "claude-sonnet-4-6": ModelRate(3.0, 15.0, 0.30),
+    "claude-haiku-4-5": ModelRate(1.0, 5.0, 0.10),
 }
+
+# The entry an unpriced id (Codex free-form ids, a future model) costs at.
+FALLBACK_PRICE_ID = "claude-opus-5-5"
+
+# Cache writes (5-minute TTL) list at 1.25x the input rate.
+CACHE_WRITE_MULTIPLIER = 1.25
+
+
+def price_id(model: str | None) -> str | None:
+    """The :data:`MODEL_USD_PER_MILLION_TOKENS` key ``model`` prices under, or None.
+
+    Resolves a tier alias through the routing map, then matches the id exactly or
+    as a dated snapshot of a priced id (``claude-haiku-4-5-20251001``). None means
+    the id has no list price (including an unlabeled ``None`` model).
+    """
+    if not model:
+        return None
+    resolved = TIER_MODEL_IDS.get(model, model)
+    if resolved in MODEL_USD_PER_MILLION_TOKENS:
+        return resolved
+    matches = [k for k in MODEL_USD_PER_MILLION_TOKENS if resolved.startswith(k + "-")]
+    return max(matches, key=len) if matches else None
+
+
+def model_rate(model: str | None) -> ModelRate:
+    """The list rate for ``model``, falling back to the opus default if unpriced."""
+    return MODEL_USD_PER_MILLION_TOKENS[price_id(model) or FALLBACK_PRICE_ID]
+
+
+def blended_usd_per_million(model: str | None) -> float:
+    """Average of input/output rates, for estimates that only know a token total."""
+    rate = model_rate(model)
+    return (rate.input + rate.output) / 2
+
+
+def usage_cost(
+    model: str | None,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+) -> float:
+    """Notional dollars for one stage usage row, each token class at its own rate."""
+    rate = model_rate(model)
+    usd = (
+        input_tokens * rate.input
+        + output_tokens * rate.output
+        + cache_read_tokens * rate.cache_read
+        + cache_creation_tokens * rate.input * CACHE_WRITE_MULTIPLIER
+    ) / 1_000_000
+    return round(usd, 6)
+
+
+def price_vintage_label(cost_usd: float) -> str:
+    """``$0.231 · prices 2026-09-30`` — a `$` figure stamped with its price table."""
+    digits = 3 if cost_usd < 1 else 2
+    return f"${cost_usd:.{digits}f} · prices {PRICE_TABLE_VINTAGE}"
+
 
 # Per-stage multiplier: estimated *total* tokens (assembled prompt + the agent's
 # generated output + its tool round-trips) as a multiple of the prompt's own

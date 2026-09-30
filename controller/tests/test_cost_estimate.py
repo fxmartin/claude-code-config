@@ -25,6 +25,11 @@ from sdlc.cost_estimate import (
     DEFAULT_STAGE_FACTORS,
     DEFAULT_USD_PER_MILLION_TOKENS,
     MODEL_USD_PER_MILLION_TOKENS,
+    PRICE_TABLE_VINTAGE,
+    blended_usd_per_million,
+    price_id,
+    price_vintage_label,
+    usage_cost,
     CostEstimateConfig,
     StageEstimate,
     estimate_prompt_tokens,
@@ -343,22 +348,63 @@ def test_historical_tokens_backward_compat_null_rows(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "model,expected",
+    "model,key",
     [
-        ("haiku", MODEL_USD_PER_MILLION_TOKENS["haiku"]),
-        ("sonnet", MODEL_USD_PER_MILLION_TOKENS["sonnet"]),
-        ("opus", MODEL_USD_PER_MILLION_TOKENS["opus"]),
-        ("claude-opus-4-8", MODEL_USD_PER_MILLION_TOKENS["opus"]),  # full id normalises
-        ("gpt-5-codex", DEFAULT_USD_PER_MILLION_TOKENS),  # unknown → default
-        (None, DEFAULT_USD_PER_MILLION_TOKENS),  # routing off → default
-        ("", DEFAULT_USD_PER_MILLION_TOKENS),
+        ("claude-opus-5-5", "claude-opus-5-5"),
+        ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+        ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),  # dated snapshot
+        ("haiku", HAIKU_ID),  # tier aliases resolve through the routing map
+        ("sonnet", SONNET_ID),
+        ("opus", _IDS[_O]),
+        ("gpt-6-astra", None),  # no list price
+        (None, None),
+        ("", None),
     ],
 )
-def test_model_rate_lookup(model, expected) -> None:
-    rate = MODEL_USD_PER_MILLION_TOKENS.get(
-        _model_tier(model), DEFAULT_USD_PER_MILLION_TOKENS
+def test_price_id_resolution(model, key) -> None:
+    assert price_id(model) == key
+
+
+def test_table_has_per_id_rates_and_vintage() -> None:
+    assert PRICE_TABLE_VINTAGE == "2026-09-30"
+    t = MODEL_USD_PER_MILLION_TOKENS
+    assert (t["claude-opus-5-5"].input, t["claude-opus-5-5"].output) == (4, 20)
+    assert (t["claude-sonnet-5"].input, t["claude-sonnet-5"].output) == (2, 10)
+    assert (t["claude-haiku-4-5"].input, t["claude-haiku-4-5"].output) == (1, 5)
+    assert (t["claude-opus-5"].input, t["claude-opus-5"].output) == (5, 25)
+    assert (t["claude-sonnet-4-6"].input, t["claude-sonnet-4-6"].output) == (3, 15)
+    assert "claude-sonnet-5-5" in t
+
+
+def test_usage_cost_prices_each_token_class_separately() -> None:
+    cost = usage_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000, output_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
     )
-    assert rate == pytest.approx(expected)
+    assert cost == pytest.approx(4 + 20 + 0.20)  # cache read at the read rate
+
+
+def test_usage_cost_unknown_id_uses_opus_default() -> None:
+    kwargs = dict(input_tokens=500_000, output_tokens=100_000)
+    assert usage_cost("gpt-6-astra", **kwargs) == usage_cost("claude-opus-5-5", **kwargs)
+    assert usage_cost(None, **kwargs) == usage_cost("claude-opus-5-5", **kwargs)
+
+
+def test_price_vintage_label_renders_figure_beside_vintage() -> None:
+    assert price_vintage_label(0.231) == "$0.231 · prices 2026-09-30"
+    assert price_vintage_label(12.5) == "$12.50 · prices 2026-09-30"
+
+
+def test_blended_rate_is_input_output_average() -> None:
+    assert blended_usd_per_million("claude-opus-5-5") == pytest.approx(12.0)
+
+
+@pytest.mark.parametrize(
+    "model,expected", [("haiku", "haiku"), ("claude-opus-4-8", "opus"), ("gpt-5", "gpt-5")]
+)
+def test_model_tier_normalisation(model, expected) -> None:
+    assert _model_tier(model) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +450,7 @@ def test_estimate_stage_cost_uses_model_rate(tmp_path: Path) -> None:
     assert est.estimated_cost_usd == pytest.approx(
         notional_cost(
             est.estimated_tokens,
-            usd_per_million_tokens=MODEL_USD_PER_MILLION_TOKENS["haiku"],
+            usd_per_million_tokens=blended_usd_per_million("haiku"),
         )
     )
 
