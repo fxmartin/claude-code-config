@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.75.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): tier-to-model-id map with (#34.1-001) (#786)
+
+
 ## [v2.74.4] - 2026-09-30
 
 ### Fixed
