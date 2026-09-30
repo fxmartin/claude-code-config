@@ -559,3 +559,17 @@ def test_doctor_pricing_clean_when_all_priced(tmp_path) -> None:
     db = tmp_path / "ledger.db"
     _seed_run(db, routing=routing_snapshot(BALANCED), stories=1)
     assert check_model_pricing(db).status == "CLEAN"
+
+
+def test_doctor_pricing_clean_without_ledger(tmp_path) -> None:
+    finding = check_model_pricing(tmp_path / "absent.db")
+    assert finding.status == "CLEAN"
+    assert "no ledger" in finding.detail
+
+
+def test_doctor_pricing_clean_on_unreadable_ledger(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    db.write_bytes(b"not a sqlite database" * 100)
+    finding = check_model_pricing(db)
+    assert finding.status == "CLEAN"
+    assert "unreadable" in finding.detail

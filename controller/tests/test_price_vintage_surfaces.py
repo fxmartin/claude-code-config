@@ -38,3 +38,16 @@ def test_status_cli_prints_cost_with_vintage(tmp_path) -> None:
     )
     result = CliRunner().invoke(app, ["status", "--db", str(db), "--run", rid])
     assert f"$0.231 · prices {PRICE_TABLE_VINTAGE}" in result.output
+
+
+def test_status_cli_omits_cost_line_without_usage(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    db = tmp_path / "l.db"
+    ledger = Ledger(db)
+    ledger.init()
+    rid = ledger.run_create("epic-34", "serial")
+    result = CliRunner().invoke(app, ["status", "--db", str(db), "--run", rid])
+    assert "prices " not in result.output
