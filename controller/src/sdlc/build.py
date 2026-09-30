@@ -2273,6 +2273,7 @@ class Ledger:
         with self._connect() as conn:
             conn.executescript(_SCHEMA_DDL)
             _apply_migrations(conn)
+        _ensure_repo_ignores(self.db_path)  # keep ledger files out of git status (R9, #739)
 
     def ensure_migrated(self) -> None:
         """Bring a *pre-existing* ledger up to the current schema (idempotent).
@@ -5838,24 +5839,60 @@ _STAGES = ("build", "coverage", "review", "merge")
 _CANONICAL_STAGE_ORDER = ("investigation",) + _STAGES
 
 
+def _git_common_dir(start: Path) -> Path | None:
+    """The git dir whose ``info/exclude`` governs ``start``, or None outside a repo.
+
+    Pure filesystem, no subprocess (this runs on every ``Ledger.init()``, and
+    most test ledgers live outside any repo). A ``.git`` directory is the repo
+    itself. A ``.git`` *file* is a linked worktree (issue #739): it names its
+    private gitdir, whose ``commondir`` file points back at the shared git dir —
+    the only one git reads ``info/exclude`` from.
+    """
+    for d in (start, *start.parents):
+        dot_git = d / ".git"
+        if dot_git.is_dir():
+            return dot_git
+        if dot_git.is_file():
+            text = dot_git.read_text(encoding="utf-8").strip()
+            if not text.startswith("gitdir:"):
+                return None
+            private = Path(text[len("gitdir:"):].strip())
+            if not private.is_absolute():
+                private = (d / private).resolve()
+            common_file = private / "commondir"
+            if not common_file.is_file():
+                return private
+            common = Path(common_file.read_text(encoding="utf-8").strip())
+            return common if common.is_absolute() else (private / common).resolve()
+    return None
+
+
 def _ensure_repo_ignores(db_path: Path) -> None:
     """Keep the ledger files out of the target repo's ``git status`` (R9).
 
     Adds ``.sdlc-state.db*`` (covering the DB, its ``-shm``/``-wal`` sidecars, and
     the ``.sdlc-state.db.logs`` transcript dir) to the repo's
     ``.git/info/exclude`` — a *local* ignore that never modifies a tracked file,
-    so the controller never dirties the repo it is building in. Best-effort:
+    so the controller never dirties the repo it is building in. Runs from
+    :meth:`Ledger.init` so every creator is covered (issue #739: it was wired
+    into ``run_build`` only, and ``sdlc fix`` left ledgers untracked). A repo
+    whose own rules already ignore the ledger is left untouched. Best-effort:
     silently does nothing when there is no enclosing git repo.
     """
     pattern = ".sdlc-state.db*"
     try:
-        start = Path(db_path).resolve().parent
-        git_dir = next(
-            (d / ".git" for d in (start, *start.parents) if (d / ".git").is_dir()),
-            None,
-        )
+        db_path = Path(db_path).resolve()
+        start = db_path.parent
+        git_dir = _git_common_dir(start)
         if git_dir is None:
             return
+        try:
+            # Exit 0 = already ignored (by .gitignore or a prior exclude): nothing
+            # to write. 1 = not ignored; anything else = git could not say.
+            if _git(start, "check-ignore", "-q", db_path.name).returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
         exclude = git_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
         existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
@@ -7325,8 +7362,7 @@ def run_build(
             return BuildResult(preflight_failed=True)
 
     # --- Ledger bootstrap ----------------------------------------------------
-    ledger.init()
-    _ensure_repo_ignores(ledger.db_path)  # keep ledger files out of git status (R9)
+    ledger.init()  # also excludes the ledger files from git status (R9)
     # Story 17.3-001: the label is derived from the worker cap the executor will
     # actually use, so `--concurrency=1` reports `serial` rather than lying.
     mode = authoritative_mode(opts)

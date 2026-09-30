@@ -508,6 +508,45 @@ def check_ledger(db_path: Path) -> Finding:
     )
 
 
+def check_ledger_ignored(repo_root: Path, db_path: Path) -> Finding:
+    """Warn when the ledger would show up in the repo's ``git status`` (issue #739).
+
+    ``Ledger.init()`` excludes its own files, but a ledger created by an older
+    controller, or one whose exclude was lost with a re-clone, sits untracked
+    until the next run — visible as a dirty repo and one ``git add -A`` from a
+    committed SQLite database. Asked of git itself (``check-ignore``), so any
+    ignore source counts. CLEAN when there is no ledger yet, or the check cannot
+    run (no git, not a repo, ledger outside the repo): advisory only.
+    """
+    name = "Ledger ignored by git"
+    if not db_path.exists():
+        return Finding("ledger", name, "CLEAN", "no ledger yet — nothing to ignore")
+    try:
+        rel = db_path.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return Finding("ledger", name, "CLEAN", f"ledger lives outside {repo_root}")
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo_root), "check-ignore", "-q", str(rel)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return Finding("ledger", name, "CLEAN", "git unavailable — ignore status unknown")
+    if res.returncode == 0:
+        return Finding("ledger", name, "CLEAN", f"{rel} is ignored")
+    if res.returncode != 1:
+        return Finding("ledger", name, "CLEAN", f"{repo_root} is not a git repo")
+    return Finding(
+        "ledger",
+        name,
+        "WARN",
+        f"{rel} (and its -shm/-wal sidecars and .logs/ dir) is not ignored — "
+        "it shows as untracked in `git status` and a `git add -A` would commit it",
+        "the next `sdlc build`/`sdlc fix` adds `.sdlc-state.db*` to .git/info/exclude; "
+        "or add that line to .gitignore now",
+    )
+
+
 def check_queue(queue_path: Path) -> Finding:
     """Verify the host-level development queue is readable and current.
 
@@ -1387,6 +1426,7 @@ def run_doctor(
         check_install(claude_dir),
         check_controller_version(repo_root),
         check_ledger(db_path),
+        check_ledger_ignored(repo_root, db_path),
         check_queue(queue_path),
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
         check_config(repo_root),
