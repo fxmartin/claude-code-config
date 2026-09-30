@@ -31,7 +31,7 @@ TIER_LADDER: tuple[str, ...] = (HAIKU, SONNET, OPUS)
 # generation.
 TIER_MODEL_IDS: dict[str, str] = {
     HAIKU: "claude-haiku-4-5",
-    SONNET: "claude-sonnet-5",
+    SONNET: "claude-sonnet-5-5",
     OPUS: "claude-opus-5-5",
 }
 

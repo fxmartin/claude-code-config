@@ -3207,7 +3207,7 @@ of truth is `TIER_MODEL_IDS` in `sdlc/model_routing.py` (vintage 2026-09-30):
 | Tier | Model id |
 |------|----------|
 | `haiku` | `claude-haiku-4-5` |
-| `sonnet` | `claude-sonnet-5` |
+| `sonnet` | `claude-sonnet-5-5` |
 | `opus` | `claude-opus-5-5` |
 
 Existing `.sdlc-model-routing.yaml` files that say `opus` keep working (the alias
