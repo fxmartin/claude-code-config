@@ -1293,7 +1293,7 @@ def check_model_probe(
     statuses, cached = gather_statuses(runner=runner, state_dir=state_dir, now=now)
     label = {OK: "ok", ENTITLEMENT: "unavailable"}
     parts = [
-        f"{tier}={mid} ({label.get(statuses.get(mid), 'unknown')})"
+        f"{tier}={mid} ({label.get(statuses.get(mid, ''), 'unknown')})"
         for tier, mid in TIER_MODEL_IDS.items()
     ]
     detail = ", ".join(parts) + (" [cached]" if cached else "")
