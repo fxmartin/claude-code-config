@@ -227,3 +227,20 @@ EOF
     fi
     [ "${survived}" -eq 0 ]
 }
+
+# Story 34.3-001: the registry examples name the current OpenAI model, and no
+# stale gpt-5.x id survives outside CHANGELOG/stories.
+@test "34.3-001: harnesses.yaml examples name gpt-6-astra" {
+  reg="${BATS_TEST_DIRNAME}/../controller/src/sdlc/config/harnesses.yaml"
+  grep -q '#     default: gpt-6-astra' "$reg"
+  grep -q "OPENCODE_FLAGS='--model openai/gpt-6-astra'" "$reg"
+}
+
+@test "34.3-001: no gpt-5.x ids in controller/ scripts/ docs/" {
+  cd "${BATS_TEST_DIRNAME}/.."
+  run grep -rEn 'gpt-5\.[0-9]' controller scripts docs \
+    --exclude=CHANGELOG.md --exclude-dir=stories --exclude-dir=.venv \
+    --exclude-dir=node_modules --exclude-dir=__pycache__ --exclude-dir=.pytest_cache \
+    --exclude-dir=.ruff_cache --exclude-dir=.mypy_cache
+  [ "$status" -eq 1 ]
+}

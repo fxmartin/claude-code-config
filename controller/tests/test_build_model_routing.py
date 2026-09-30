@@ -653,7 +653,7 @@ def test_bugfix_stage_records_routed_model(tmp_path, monkeypatch) -> None:
 # A registry harness's own per-stage model id — deliberately distinct from every
 # Claude tier alias (HAIKU/SONNET/OPUS) so a row recording it can never be
 # confused with the Claude recovery tier the dispatch model arg still carries.
-CODEX_BUILD_MODEL = "gpt-5.5-codex"
+CODEX_BUILD_MODEL = "gpt-6-astra"
 
 
 def _fake_codex_harness():
