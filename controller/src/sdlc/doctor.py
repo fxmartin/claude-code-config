@@ -1275,6 +1275,37 @@ def check_model_routing(db_path: Path) -> Finding:
     )
 
 
+def check_model_probe(
+    *,
+    runner=None,
+    state_dir: Path | None = None,
+    now: datetime | None = None,
+) -> Finding:
+    """List each tier's model id and whether the live probe succeeded (Story 34.1-002).
+
+    Shares the 24h per-host probe cache with the build preflight, so a doctor run
+    right after a build costs no extra call. WARN when a current id is unusable
+    (the controller falls back to the previous generation).
+    """
+    from sdlc.model_probe import ENTITLEMENT, OK, gather_statuses
+    from sdlc.model_routing import TIER_MODEL_IDS
+
+    statuses, cached = gather_statuses(runner=runner, state_dir=state_dir, now=now)
+    label = {OK: "ok", ENTITLEMENT: "unavailable"}
+    parts = [
+        f"{tier}={mid} ({label.get(statuses.get(mid), 'unknown')})"
+        for tier, mid in TIER_MODEL_IDS.items()
+    ]
+    detail = ", ".join(parts) + (" [cached]" if cached else "")
+    bad = [m for m in TIER_MODEL_IDS.values() if statuses.get(m) == ENTITLEMENT]
+    if bad:
+        return Finding(
+            "model-probe", "Model entitlement", "WARN", detail,
+            "runs fall back to the previous-generation id; check your plan or the CLI version",
+        )
+    return Finding("model-probe", "Model entitlement", "CLEAN", detail)
+
+
 def check_stashes(repo_root: Path) -> Finding:
     """Surface stash entries as recoverable-but-invisible work (issue #590).
 
@@ -1436,6 +1467,7 @@ def run_doctor(
         check_model_coverage(db_path),
         check_model_routing(db_path),
         check_stashes(repo_root),
+        check_model_probe(),
     ]
     findings.extend(check_dependencies(dep_probe))
     findings.append(check_glab_dependency(repo_root, dep_probe))
