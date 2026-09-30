@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.76.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): tier detection and (#34.1-003)
+
+
 ## [v2.75.0] - 2026-09-30
 
 ### Added
