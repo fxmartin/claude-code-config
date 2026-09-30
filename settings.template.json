@@ -88,8 +88,8 @@
     },
     "fx-claude-config": {
       "source": {
-        "source": "github",
-        "repo": "fxmartin/claude-code-config"
+        "source": "directory",
+        "path": "~/Work/claude-code-config"
       }
     }
   },

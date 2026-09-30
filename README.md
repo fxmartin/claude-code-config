@@ -491,7 +491,7 @@ Each mode is **opt-in**, **idempotent**, and supports `--dry-run` for an exact p
 
 | Mode | Touches | Files added | Files modified |
 |------|---------|-------------|----------------|
-| `--core` | `~/.claude/`, `~/.codex/` | symlinks for `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `settings.json`, `statusline-command.sh`, `keybindings.json`, `reference-docs/`, `docs/`, `AGENTS.md` (into `~/.codex/`, for Codex), `plugins/marketplaces/fx-claude-config` | none |
+| `--core` | `~/.claude/`, `~/.codex/` | symlinks for `CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `settings.json`, `statusline-command.sh`, `keybindings.json`, `reference-docs/`, `docs/`, `AGENTS.md` (into `~/.codex/`, for Codex); removes the pre-#743 `plugins/marketplaces/fx-claude-config` symlink if present | none |
 | `--tools` | `/opt/homebrew/` (macOS), apt (WSL2; `--prefer-brew` opts back into brew), or pacman (Arch Linux / Omarchy) | `yazi`, `bat`, `fd`, `rg`, `fzf`, `zoxide`, `ffmpeg`, `imagemagick`, `poppler`, `sevenzip`, `jq`, optional Nerd Font; on WSL2 `yazi` falls back to `cargo install --locked yazi-fm`; on Arch `tmux` is added for `dev()` | `~/.config/yazi/yazi.toml`, `~/.config/yazi/init.lua` (created if absent) |
 | `--mcp` | `~/.claude.json` | merges `mcp/config.template.json` into existing JSON via `jq` | only the `mcpServers` key |
 | `--shell` | `~/.zshrc` (macOS / zsh) or `~/.bashrc` (WSL2 or Linux with non-zsh default) | nothing | appends `dev()` and `y()` shell functions if absent; on Linux `dev()` opens a tmux session (claude \| terminal \| yazi); on WSL2 `dev()` is a stub that prints `"cmux is macOS-only; this command is a no-op on WSL2"` |
@@ -547,14 +547,15 @@ Claude Code clones the repo into `~/.claude/plugins/marketplaces/fx-claude-confi
 /plugin marketplace update fx-claude-config
 ```
 
-#### Option B — Local clone + symlink (dev workflow)
+#### Option B — Local clone (dev workflow)
 
-Use this if you're authoring or iterating on the plugin's skills — edits to `plugins/autonomous-sdlc/skills/<name>/SKILL.md` land live in Claude Code without re-installing. `./install.sh` symlinks `~/.claude/plugins/marketplaces/fx-claude-config/` → this checkout. After it runs once:
+Use this if you're authoring or iterating on the plugin's skills. `settings.json` (seeded from `settings.template.json` by `./install.sh --core`) declares `fx-claude-config` as a `directory` marketplace at `~/Work/claude-code-config`, so the next Claude Code session registers it with no clone and nothing to refresh. Then:
 
 ```text
-/plugin marketplace add fx-claude-config
 /plugin install autonomous-sdlc@fx-claude-config
 ```
+
+Claude Code installs the plugin from a versioned copy under `~/.claude/plugins/cache/`, so a skill edit reaches a session only after `claude plugin update autonomous-sdlc@fx-claude-config` — which `./scripts/deploy.sh` runs for you. Earlier versions symlinked `~/.claude/plugins/marketplaces/fx-claude-config` → this checkout instead; Claude Code now flags that as a corrupted marketplace (#743), and `./install.sh --core` removes the old link.
 
 #### Verify either path
 

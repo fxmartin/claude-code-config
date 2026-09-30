@@ -66,19 +66,20 @@ _run_install() {
     [ "$status" -eq 0 ]
     for target in \
         CLAUDE.md agents commands settings.json statusline-command.sh \
-        keybindings.json reference-docs docs skills hooks AGENTS.md fx-claude-config \
+        keybindings.json reference-docs docs skills hooks AGENTS.md \
         codex-build-adapter.sh qwen-build-adapter.sh opencode-build-adapter.sh \
         overengineering-lens.sh
     do
         [[ "$output" == *"[dry-run]"*"${target}"* ]]
     done
-    # 16 ln -s lines expected (10 config items into ~/.claude + AGENTS.md into
-    # ~/.codex + 1 marketplace + 4 build adapters onto PATH, Story 21.3-001 +
-    # the opencode adapter of Story 29.2-001). Shared skills are committed
-    # relative symlinks inside commands/, so the installer no longer links them
-    # in separately (they would dirty the repo).
+    # 14 ln -s lines expected (10 config items into ~/.claude + AGENTS.md into
+    # ~/.codex + 4 build adapters onto PATH, Story 21.3-001 + the opencode
+    # adapter of Story 29.2-001). Shared skills are committed relative symlinks
+    # inside commands/, so the installer no longer links them in separately
+    # (they would dirty the repo). The marketplace is declared in settings.json
+    # as a directory source, not symlinked (#743).
     ln_lines="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
-    [ "$ln_lines" -eq 15 ]
+    [ "$ln_lines" -eq 14 ]
 }
 
 @test "--core --dry-run previews git submodule init" {
@@ -114,8 +115,40 @@ _run_install() {
     [ -e "${FAKE_HOME}/.claude/reference-docs" ]
     [ -L "${FAKE_HOME}/.claude/docs" ]
     [ -e "${FAKE_HOME}/.claude/docs" ]
-    [ -L "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config" ]
-    [ -e "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config" ]
+    # #743: no marketplace symlink — Claude Code flags a marketplaces/ entry
+    # that resolves outside ~/.claude/plugins as a corrupted installLocation.
+    [ ! -e "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config" ]
+}
+
+@test "--core removes the marketplace symlink an older install planted (#743)" {
+    REPO_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
+    mkdir -p "${FAKE_HOME}/.claude/plugins/marketplaces"
+    ln -s "${REPO_ROOT}" "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config"
+    # An unrelated entry of the same name is not ours to touch.
+    mkdir -p "${FAKE_HOME}/.claude/plugins/marketplaces/other-market"
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ ! -L "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config" ]
+    [ -d "${FAKE_HOME}/.claude/plugins/marketplaces/other-market" ]
+}
+
+@test "--core leaves a foreign marketplaces/fx-claude-config alone (#743)" {
+    mkdir -p "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config"
+    touch "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config/marker"
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ -f "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config/marker" ]
+}
+
+@test "settings declare fx-claude-config as a directory marketplace under ~/Work (#743)" {
+    # The tracked settings are shared across machines, so the path must be the
+    # portable tilde form (Claude Code expands ~; it does not expand $HOME).
+    for f in settings.json settings.template.json; do
+        run jq -r '.extraKnownMarketplaces["fx-claude-config"].source | "\(.source) \(.path)"' \
+            "${BATS_TEST_DIRNAME}/../${f}"
+        [ "$status" -eq 0 ]
+        [ "$output" = "directory ~/Work/claude-code-config" ]
+    done
 }
 
 @test "--core links AGENTS.md into ~/.codex for Codex" {
@@ -334,8 +367,8 @@ _run_install() {
     _run_install --all --dry-run
     [ "$status" -eq 0 ]
     all_ln="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
-    # 15 = the --core symlink set (tools/shell modes create no symlinks).
-    [ "$all_ln" -eq 15 ]
+    # 14 = the --core symlink set (tools/shell modes create no symlinks).
+    [ "$all_ln" -eq 14 ]
 }
 
 # ─── Backward-compat flags ───────────────────────────────────────────
@@ -353,12 +386,12 @@ _run_install() {
     _run_install --core --tools --shell --dry-run
     [ "$status" -eq 0 ]
     out_new="$output"
-    # Both should perform the same number of ln operations (15 core)
+    # Both should perform the same number of ln operations (14 core)
     # and neither should attempt the MCP jq merge.
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
-    [ "$legacy_ln" -eq 15 ]
-    [ "$new_ln" -eq 15 ]
+    [ "$legacy_ln" -eq 14 ]
+    [ "$new_ln" -eq 14 ]
     # Neither should mention writing to ~/.claude.json
     [[ "$out_legacy" != *"Merged MCP"* ]]
     [[ "$out_new" != *"Merged MCP"* ]]
@@ -379,8 +412,8 @@ _run_install() {
     out_new="$output"
     legacy_ln="$(printf '%s\n' "$out_legacy" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
     new_ln="$(printf '%s\n'    "$out_new"    | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
-    [ "$legacy_ln" -eq 15 ]
-    [ "$new_ln" -eq 15 ]
+    [ "$legacy_ln" -eq 14 ]
+    [ "$new_ln" -eq 14 ]
 }
 
 # ─── --uninstall ─────────────────────────────────────────────────────

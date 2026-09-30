@@ -4,11 +4,11 @@
 # The framework ships TWO install paths and both must work:
 #
 #   Path A (local clone + install.sh): `./install.sh --core` symlinks the repo
-#     into ~/.claude, including ~/.claude/plugins/marketplaces/fx-claude-config
-#     → that exposes the autonomous-sdlc plugin to Claude Code locally.
-#     This path is covered by scripts/smoke-test.sh; we re-assert the
-#     marketplace symlink contract here so a structural regression surfaces
-#     immediately.
+#     into ~/.claude, and settings.json declares fx-claude-config as a
+#     `directory` marketplace at ~/Work/claude-code-config (#743) → that
+#     exposes the autonomous-sdlc plugin to Claude Code locally. This path is
+#     covered by scripts/smoke-test.sh and tests/install-modes.bats; the
+#     manifest contracts below are shared with Path B.
 #
 #   Path B (GitHub-direct marketplace install): a user runs
 #     `/plugin marketplace add fxmartin/claude-code-config` then
