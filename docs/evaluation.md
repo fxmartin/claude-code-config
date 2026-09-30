@@ -131,7 +131,10 @@ the routing layer — this is how Story 34.4-003's benchmark gate
 (`docs/optimization/BASELINE.md` §6) compared the pre-epic and current
 tier maps on the same ticket set. `--effort` is a raw pin, not a routed
 decision (`model_routing.select_effort`) — pick a level the pinned model
-actually supports, or the harness rejects it.
+actually supports, or the harness rejects it. An effort pin on a harness that
+does not declare `effort_aware` (a registry harness, or an `SDLC_AGENT_CMD`
+override) aborts preflight instead of silently dropping the flag, and the
+scoreboard's `provenance` block records the pinned `effort` next to `model`.
 
 ## Scoreboard
 

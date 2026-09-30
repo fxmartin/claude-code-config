@@ -184,6 +184,10 @@ def test_eval_n_override_preserves_config_model(tmp_path: Path, monkeypatch) -> 
 def _patched_run_eval(monkeypatch):
     import sdlc.evaluate as evaluate_mod
 
+    # Resolve the built-in claude slot (effort_aware) regardless of the host's
+    # environment: an SDLC_AGENT_CMD override would reject an effort pin.
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+
     seen: dict[str, object] = {}
 
     def fake_run_eval(config, workspace, **kwargs):  # noqa: ANN001 — test double

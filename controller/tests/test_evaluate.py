@@ -1148,6 +1148,48 @@ def test_resolve_eval_harness_unsupported_model_pin_aborts(tmp_path: Path) -> No
         resolve_eval_harness(config, config_path=cfg)
 
 
+def test_resolve_eval_harness_unsupported_effort_pin_aborts(tmp_path: Path) -> None:
+    # Story 34.4-003 review: a harness that does not declare `effort_aware`
+    # drops the level, so a pinned effort must abort preflight — mirroring the
+    # model-pin check — rather than run silently as a no-effort arm.
+    cfg = _write_registry(
+        tmp_path,
+        "harnesses:\n  qwen:\n    command: 'qwen-build-adapter.sh --model {model}'\n"
+        "    parser: codex-exec\n    models:\n      default: qwen-max\n",
+    )
+    config = EvalConfig(
+        name="d",
+        target=Path("t"),
+        tickets=[Ticket(id="t1", prompt="p")],
+        harness="qwen",
+        effort="high",
+    )
+    with pytest.raises(EvalConfigError, match="cannot take an effort pin"):
+        resolve_eval_harness(config, config_path=cfg)
+
+
+def test_resolve_eval_harness_effort_pin_on_env_override_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An SDLC_AGENT_CMD override owns its own effort (effort_aware: False).
+    monkeypatch.setenv("SDLC_AGENT_CMD", "my-agent")
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], effort="high"
+    )
+    with pytest.raises(EvalConfigError, match="cannot take an effort pin"):
+        resolve_eval_harness(config, config_path=None)
+
+
+def test_resolve_eval_harness_effort_pin_on_builtin_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    config = EvalConfig(
+        name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], effort="high"
+    )
+    assert resolve_eval_harness(config, config_path=None).source == "builtin"
+
+
 def test_resolve_eval_harness_model_placeholder_supported_succeeds(tmp_path: Path) -> None:
     cfg = _write_registry(
         tmp_path,
@@ -1347,6 +1389,7 @@ def test_scoreboard_to_dict_includes_provenance_block_when_present() -> None:
         "timestamp": "2026-09-05T12:00:00Z",
         "cost_metered": True,
         "local_rate_usd_per_million_tokens": None,
+        "effort": None,
     }
 
 
@@ -1378,6 +1421,23 @@ def test_build_provenance_records_metered_and_local_rate() -> None:
     prov = build_provenance(config, metered=False, local_rate_usd_per_million_tokens=2.5)
     assert prov.cost_metered is False
     assert prov.local_rate_usd_per_million_tokens == 2.5
+
+
+def test_build_provenance_records_effort_pin() -> None:
+    """Story 34.4-003 review: two arms differing only in effort must not
+    produce indistinguishable provenance blocks."""
+    config = EvalConfig(
+        name="demo", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")], effort="medium"
+    )
+    prov = build_provenance(config, timestamp="2026-09-05T12:00:00Z", host="h/arm64")
+    assert prov.effort == "medium"
+    board = aggregate([_run("t1", 0, added=1)], "demo", provenance=prov)
+    assert scoreboard_to_dict(board)["provenance"]["effort"] == "medium"
+
+
+def test_build_provenance_defaults_effort_none() -> None:
+    config = EvalConfig(name="demo", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    assert build_provenance(config).effort is None
 
 
 def test_build_provenance_defaults_metered_true() -> None:
