@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.74.3] - 2026-09-30
+
+### Fixed
+
+- fix(build): apply the host-auth routing guard to --dry-run too (#741) (#746)
+- fix(ledger): exclude the ledger from git status in every repo (#739) (#744)
+
+
 ## [v2.74.2] - 2026-09-30
 
 ### Fixed
