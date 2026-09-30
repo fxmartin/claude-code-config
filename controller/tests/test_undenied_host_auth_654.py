@@ -262,6 +262,13 @@ def test_the_refusal_message_is_one_actionable_line() -> None:
     assert "#654" in msg
 
 
+def test_the_refusal_message_names_the_exact_mixed_routing_flag() -> None:
+    """Issue #741: the safe way forward is spelled out as a pasteable flag, one
+    `role=claude` per offending route, in the order reported."""
+    msg = format_undenied_host_auth([("merge", "codex"), ("review", "codex")], "sdlc build")
+    assert "`sdlc build --harness merge=claude,review=claude`" in msg
+
+
 def test_the_bypass_line_names_the_role_and_harness() -> None:
     line = format_undenied_bypass([("merge", "codex"), ("review", "codex")])
     assert "--allow-undenied" in line
@@ -301,6 +308,28 @@ def test_run_build_refuses_review_on_an_undenied_harness(tmp_path) -> None:
     result = _build(tmp_path, RecordingDispatcher(), harness_map={"review": "codex"})
     assert result.undenied_host_auth == [("review", "codex")]
     assert result.run_id is None
+
+
+def test_dry_run_refuses_the_same_undenied_routes_as_a_real_run(tmp_path) -> None:
+    """Issue #741: `harness.default: codex` passed --dry-run and then the real
+    build refused UNDENIED_HOST_AUTH. The guard is pure configuration — no
+    dispatch, no preflight, nothing written — so planning must apply it too."""
+    dispatch = RecordingDispatcher()
+
+    result = _build(tmp_path, dispatch, harness_map={"merge": "codex"}, dry_run=True)
+
+    assert result.undenied_host_auth == [("merge", "codex")]
+    assert result.dry_run is False
+    assert result.run_id is None and dispatch.agents() == []
+
+
+def test_dry_run_with_allow_undenied_plans_normally(tmp_path) -> None:
+    result = _build(
+        tmp_path, RecordingDispatcher(),
+        harness_map={"merge": "codex"}, dry_run=True, allow_undenied=True,
+    )
+    assert result.dry_run is True
+    assert result.undenied_host_auth == []
 
 
 def test_run_build_proceeds_with_build_on_an_undenied_harness(tmp_path) -> None:
@@ -380,19 +409,6 @@ def test_a_clean_run_logs_no_bypass_warning(tmp_path, capsys) -> None:
         dirty_check=lambda: [],
     )
     assert "--allow-undenied" not in capsys.readouterr().err
-
-
-def test_a_dry_run_is_unaffected(tmp_path) -> None:
-    """A dry run dispatches nothing, so it exposes no credentials to protect.
-
-    Mirrors the `--allow-dirty` guard's dry-run carve-out (issue #590): the
-    guards exist to stop a *dispatch*, and a dry run returns before either.
-    """
-    result = _build(
-        tmp_path, RecordingDispatcher(), dry_run=True, harness_map={"merge": "codex"}
-    )
-    assert result.dry_run is True
-    assert result.undenied_host_auth == []
 
 
 # ---------------------------------------------------------------------------

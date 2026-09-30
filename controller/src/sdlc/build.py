@@ -7291,6 +7291,25 @@ def run_build(
     if opts.limit:
         buildable = truncate_queue(buildable, opts.limit)
 
+    # --- Undenied host-auth routing guard (issue #654) -----------------------
+    # `DENY_BASELINE` decorates only the argv the controller assembles itself, so
+    # a registry harness rendering its own command template receives no deny
+    # rules at all. Routing a host-auth role (merge, and by default review) there
+    # gives an agent holding gh/glab credentials no secret/egress floor. FX's
+    # decision was to refuse rather than shim: a wrapper-level path guard that
+    # gives false confidence about .env/.ssh protection would be worse than the
+    # documented gap. Refused here — before the dry-run return, preflight, the
+    # ledger, and any dispatch — so nothing is written. The guard is pure
+    # configuration, so a plan must fail the same way execution would (issue
+    # #741: `harness.default: codex` passed --dry-run, then the real build
+    # refused). `--allow-undenied` is the explicit opt-out and is instead
+    # announced loudly below (see `_log_harness_preflight`).
+    from sdlc.role_routing import undenied_host_auth_routes
+
+    undenied = undenied_host_auth_routes(opts.harness_map)
+    if undenied and not opts.allow_undenied:
+        return BuildResult(undenied_host_auth=undenied, planned=len(buildable))
+
     # --- Dry run: report the buildable plan, dispatch nothing ----------------
     # A dry run is plan-only — it must not run the (possibly slow/failing)
     # preflight gate, so this returns before Phase 1.
@@ -7330,22 +7349,6 @@ def run_build(
         dirty = check_dirty()
         if dirty:
             return BuildResult(dirty_tree=dirty, planned=len(buildable))
-
-    # --- Undenied host-auth routing guard (issue #654) -----------------------
-    # `DENY_BASELINE` decorates only the argv the controller assembles itself, so
-    # a registry harness rendering its own command template receives no deny
-    # rules at all. Routing a host-auth role (merge, and by default review) there
-    # gives an agent holding gh/glab credentials no secret/egress floor. FX's
-    # decision was to refuse rather than shim: a wrapper-level path guard that
-    # gives false confidence about .env/.ssh protection would be worse than the
-    # documented gap. Refused here — before preflight, the ledger, and any
-    # dispatch — so nothing is written. `--allow-undenied` is the explicit opt-out
-    # and is instead announced loudly below (see `_log_harness_preflight`).
-    from sdlc.role_routing import undenied_host_auth_routes
-
-    undenied = undenied_host_auth_routes(opts.harness_map)
-    if undenied and not opts.allow_undenied:
-        return BuildResult(undenied_host_auth=undenied, planned=len(buildable))
 
     # --- Malformed forge declaration guard (Story 30.1-001 AC3) --------------
     # The repo's `.sdlc-forge.yaml` decides which forge every CR open, status

@@ -50,12 +50,40 @@ def test_build_rejects_unknown_flag(tmp_path, monkeypatch) -> None:
 
 
 def test_build_harness_routing_dry_run(tmp_path, monkeypatch) -> None:
-    """Story 20.2-001: a valid `--harness` map passes preflight and plans normally."""
+    """Story 20.2-001: a valid `--harness` map passes preflight and plans normally.
+    (Non-host-auth roles only: routing review to codex is refused, #654/#741.)"""
     _make_project(tmp_path)
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(
-        app, ["build", "epic-99", "--dry-run", "--harness", "build=claude,review=codex,qa=codex"]
+        app, ["build", "epic-99", "--dry-run", "--harness", "build=claude,qa=codex"]
     )
+    assert result.exit_code == 0, result.output
+    assert "dry run" in result.output.lower()
+
+
+def test_build_dry_run_refuses_a_codex_default_like_the_real_run(tmp_path, monkeypatch) -> None:
+    """Issue #741, as observed in omarchy-monitoring: `harness.default: codex`
+    expands into review/merge routes the Codex adapter cannot run safely. The
+    plan must say so, with the safe mixed-routing flag, instead of passing."""
+    _make_project(tmp_path)
+    (tmp_path / ".sdlc-harness.yaml").write_text("harness:\n  default: codex\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
+
+    assert result.exit_code == 1, result.output
+    assert "UNDENIED_HOST_AUTH" in result.output
+    assert "--harness merge=claude,review=claude" in result.output
+    assert "dry run:" not in result.output
+
+
+def test_build_dry_run_with_allow_undenied_plans_a_codex_default(tmp_path, monkeypatch) -> None:
+    _make_project(tmp_path)
+    (tmp_path / ".sdlc-harness.yaml").write_text("harness:\n  default: codex\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["build", "epic-99", "--dry-run", "--allow-undenied"])
+
     assert result.exit_code == 0, result.output
     assert "dry run" in result.output.lower()
 
@@ -83,22 +111,23 @@ def test_build_harness_unknown_role_rejected_in_parse(tmp_path, monkeypatch) -> 
 
 
 def test_build_repo_harness_default_applied(tmp_path, monkeypatch) -> None:
-    """Story 20.7-005 AC1: a repo `.sdlc-harness.yaml` default routes every role."""
+    """Story 20.7-005 AC1: a repo `.sdlc-harness.yaml` default routes every role.
+    Proven by the host-auth guard naming both merge and review on codex (#741)."""
     _make_project(tmp_path)
     (tmp_path / ".sdlc-harness.yaml").write_text(
         "harness:\n  default: codex\n", encoding="utf-8"
     )
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["build", "epic-99", "--dry-run"])
-    assert result.exit_code == 0, result.output
-    assert "dry run" in result.output.lower()
+    assert result.exit_code == 1, result.output
+    assert "merge=codex" in result.output and "review=codex" in result.output
 
 
 def test_build_repo_harness_per_role_honoured(tmp_path, monkeypatch) -> None:
     """Story 20.7-005 AC1: the file's per-role map (qa alias incl.) passes preflight."""
     _make_project(tmp_path)
     (tmp_path / ".sdlc-harness.yaml").write_text(
-        "harness:\n  default: claude\n  roles:\n    review: codex\n    qa: codex\n",
+        "harness:\n  default: claude\n  roles:\n    build: codex\n    qa: codex\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)

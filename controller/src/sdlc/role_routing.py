@@ -107,15 +107,19 @@ def format_undenied_host_auth(
 
     Names every offending ``role=harness`` pair, says what is missing and why it
     matters, and gives the two ways forward: route the role back to a harness
-    that carries the floor, or opt out explicitly with ``--allow-undenied``.
+    that carries the floor — as the exact ``--harness`` flag to paste, since a
+    repo-level ``harness.default`` is what usually produced the routes (issue
+    #741) — or opt out explicitly with ``--allow-undenied``.
     """
     pairs = ", ".join(f"{role}={harness}" for role, harness in routes)
+    reroute = ",".join(f"{role}={DEFAULT_HARNESS}" for role, _harness in routes)
     return (
         f"UNDENIED_HOST_AUTH: refusing to start — host-auth role(s) {pairs} are "
         "routed to a harness that renders no deny baseline, so a merge/review "
         "agent would hold gh/glab credentials with no secret/egress floor "
         "(~/.ssh, ~/.aws, **/.env, `gh pr merge --admin`). Route them to "
-        f"{DEFAULT_HARNESS}, or accept the gap explicitly with "
+        f"{DEFAULT_HARNESS} (`{command} --harness {reroute}`, or the same map in "
+        ".sdlc-harness.yaml), or accept the gap explicitly with "
         f"`{command} --allow-undenied` (issue #654)."
     )
 
