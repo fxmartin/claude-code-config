@@ -2118,6 +2118,20 @@ false confidence about `.env`/`.ssh` protection would be worse than the
 documented gap. `sdlc doctor`'s `check_deny_baseline` lists the undenied
 harnesses and warns when the repo's own pin routes a host-auth role to one.
 
+The guard applies to `--dry-run` too (issue #741). It is pure configuration —
+no dispatch, no preflight, nothing written — so a plan that would be refused at
+execution is refused at planning, with the same `UNDENIED_HOST_AUTH` line. That
+line names the exact reroute to paste (`--harness merge=claude,review=claude`,
+or the same map under `roles:` in `.sdlc-harness.yaml`). The consequence is
+worth stating plainly: **a fully Codex-, Qwen- or OpenCode-backed lifecycle is
+unsupported under this enforcement model.** `harness.default: <non-claude>`
+expands into `merge` and `review` routes the guard refuses, so the supported
+shape is mixed routing — `build`/`coverage`/`docs` on the alternate harness,
+`merge` (and `review`) on `claude`. Lifting that would require the alternate
+CLI to enforce an equivalent permission floor natively, which the controller
+cannot verify from outside; until then `--allow-undenied` is the only path, and
+it is a deliberate, announced acceptance of the gap, not a configuration.
+
 The `opencode` adapter (Story 29.2-001) is a stdin→CLI wrapper like
 `codex`/`qwen`, but — unlike them — it is **not** on the no-telemetry recipe:
 `scripts/opencode-build-adapter.sh` receives the prompt on stdin and passes it
