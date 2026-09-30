@@ -83,6 +83,7 @@ from sdlc.model_routing import (
     routing_config,
     routing_snapshot,
     select_model,
+    TIER_MODEL_IDS,
 )
 from sdlc.notify import notify
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
@@ -2769,7 +2770,7 @@ class Ledger:
         if harness is not None and model is not None:
             # Story 28.1-002 overwrites `model` with the *served* id the agent
             # reported ("claude-opus-4-8"), while callers ask by the routed tier
-            # alias ("opus"). Normalise both sides through `_model_price_key` so
+            # alias ("opus"). Normalise both sides through `_model_tier` so
             # the cohort keys on the tier: an exact match would miss forever and
             # silently degrade to the `harness` rung, merging escalated-Opus and
             # base-Sonnet history into one average. A registry model (`gpt-5`)
@@ -2780,7 +2781,7 @@ class Ledger:
                 (
                     "harness+model",
                     "harness = ? AND model IS NOT NULL AND _model_key(model) = ?",
-                    (harness, _model_price_key(model)),
+                    (harness, _model_tier(model)),
                 )
             )
         if harness is not None:
@@ -2797,7 +2798,7 @@ class Ledger:
             "  cache_read_tokens IS NOT NULL OR cache_creation_tokens IS NOT NULL)"
         )
         with self._connect_ro() as conn:
-            conn.create_function("_model_key", 1, _model_price_key, deterministic=True)
+            conn.create_function("_model_key", 1, _model_tier, deterministic=True)
             for tier, extra, params in tiers:
                 sql = base + (f" AND {extra}" if extra else "")
                 row = conn.execute(sql, (stage_name, *params)).fetchone()
@@ -9378,19 +9379,24 @@ def _resolved_recovery_model(
     return harness.resolve_model(harness_stage)
 
 
-def _model_price_key(model: str | None) -> str:
-    """Normalise a resolved model id to a ``MODEL_USD_PER_MILLION_TOKENS`` key.
+def _model_tier(model: str | None) -> str:
+    """Classify a model id into its tier for usage, cost and escalation grouping.
 
     Routing yields the Claude tier aliases (``haiku``/``sonnet``/``opus``)
-    directly, but an operator pin or per-repo override can name a full id (e.g.
-    ``claude-opus-4-8``); match those by the tier substring. A registry harness's
-    own model id (e.g. a Codex ``gpt-*``) matches no tier and returns unchanged,
-    so the rate lookup falls through to ``DEFAULT_USD_PER_MILLION_TOKENS``.
+    directly, but an operator pin, a served id or a per-repo override can name a
+    full id (e.g. ``claude-opus-4-8``, ``claude-fable-5-1``). The configured
+    ``TIER_MODEL_IDS`` are matched exactly first; any other Claude id falls to the
+    tier-substring rule, so older generations keep folding into their tier. A
+    registry harness's own id (e.g. ``gpt-6-astra``) matches no tier and returns
+    unchanged, so the rate lookup falls through to ``DEFAULT_USD_PER_MILLION_TOKENS``.
     """
     if not model:
         return ""
+    for tier, tier_id in TIER_MODEL_IDS.items():
+        if model == tier_id:
+            return tier
     lowered = model.lower()
-    for tier in ("haiku", "sonnet", "opus"):
+    for tier in ("haiku", "sonnet", "opus", "fable"):
         if tier in lowered:
             return tier
     return model
@@ -9795,7 +9801,7 @@ def _estimate_stage_cost(
         )
         historical = calibration[0] if calibration is not None else None
         rate = MODEL_USD_PER_MILLION_TOKENS.get(
-            _model_price_key(model), DEFAULT_USD_PER_MILLION_TOKENS
+            _model_tier(model), DEFAULT_USD_PER_MILLION_TOKENS
         )
         est = estimate_stage(
             stage, prompt,

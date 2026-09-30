@@ -11,7 +11,7 @@ from sdlc.build import (
     BuildOptions,
     Ledger,
     _estimate_stage_cost,
-    _model_price_key,
+    _model_tier,
     _reconcile_estimate,
     _resolved_stage_model,
     _result_total_tokens,
@@ -341,7 +341,7 @@ def test_historical_tokens_backward_compat_null_rows(tmp_path: Path) -> None:
 )
 def test_model_rate_lookup(model, expected) -> None:
     rate = MODEL_USD_PER_MILLION_TOKENS.get(
-        _model_price_key(model), DEFAULT_USD_PER_MILLION_TOKENS
+        _model_tier(model), DEFAULT_USD_PER_MILLION_TOKENS
     )
     assert rate == pytest.approx(expected)
 
