@@ -3212,10 +3212,34 @@ of truth is `TIER_MODEL_IDS` in `sdlc/model_routing.py` (vintage 2026-09-30):
 
 Existing `.sdlc-model-routing.yaml` files that say `opus` keep working (the alias
 maps through the same table; the routing banner prints `build=opus →
-claude-opus-5-5`), and a pinned full id (`build: claude-opus-4-8`) passes through
+claude-opus-5-5`, or `build=claude-opus-5-5@high` where an effort applies), and a pinned full id (`build: claude-opus-4-8`) passes through
 untouched. Escalation still climbs the ladder by tier and dispatches the mapped
 id. The built-in rate-limit probe (`harnesses.yaml` / `CLAUDE_RATE_LIMIT_PROBE`)
 reads the same table.
+
+### Per-stage effort (Story 34.4-001)
+
+The Balanced profile also carries a per-stage `--effort` level so Opus 5.5's
+`medium` default never silently under-thinks review and Haiku stages do not
+over-spend: `discovery: low, docs: low, coverage: medium, build: high, review:
+xhigh, merge: medium, bugfix: high`. A stage absent from the map (and every stage
+on Quality-first / Quota-max) passes no flag. Override per repo, additively, in
+`.sdlc-model-routing.yaml`:
+
+```yaml
+model_routing:
+  effort: {review: max}   # low | medium | high | xhigh | max
+```
+
+The level is frozen in the run's routing snapshot, printed in the banner
+(`review=claude-opus-5-5@max`) and recorded on the `stages.effort` ledger column
+(NULL = no flag passed). It is **omitted — never a CLI error —** with a `debug`
+event giving the reason when the routed model takes no `effort` (Haiku 4.5), the
+model is not a known tier, or the stage's harness does not declare
+`effort_aware: true` (codex and every other registry harness, and an
+`SDLC_AGENT_CMD` override, which owns its own command). On a cheap-first retry the
+level climbs one step per escalation step (`escalate_effort`, capped at `max`) and
+the escalation event names both the model and the effort.
 
 ### Live entitlement probe and previous-generation fallback (Story 34.1-002)
 
