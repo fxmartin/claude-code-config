@@ -1104,6 +1104,30 @@ def test_merge_gate_no_ci_allows_by_default(tmp_path, monkeypatch) -> None:
     assert result.completed == 1
 
 
+def test_merge_gate_no_ci_prompt_forbids_a_pipeline_wait(tmp_path, monkeypatch) -> None:
+    """Issue #740: on a no-pipeline MR the gate allowed the merge, but the agent
+    then invented its own pipeline wait, timed out and reported a false FAILED.
+    The gate's verdict must reach the merge agent: no pipeline, nothing to wait for."""
+    from sdlc import build_issue
+
+    monkeypatch.setattr(build_issue, "change_request_status", lambda *a, **k: ih.CR_NONE)
+    prompts: dict[str, str] = {}
+
+    class _PromptRecorder(FakeDispatcher):
+        def __call__(self, agent_type, prompt, story=None, **kwargs):
+            prompts.setdefault(agent_type, prompt)
+            return super().__call__(agent_type, prompt, story=story, **kwargs)
+
+    dispatcher = _PromptRecorder()
+    opts = BuildOptions(scope="epic-23", skip_preflight=True, sequential=True, auto=True)
+    run_build(opts, queue=_gate_story_queue(), ledger=Ledger(tmp_path / "ledger.db"),
+              dispatcher=dispatcher, preflight=lambda: True)
+    merge_prompt = prompts["merge"]
+    assert "no CI pipeline" in merge_prompt
+    assert "Do not poll" in merge_prompt
+    assert "required checks" not in merge_prompt
+
+
 def test_merge_gate_no_ci_deny_blocks(tmp_path, monkeypatch) -> None:
     """The no-CI policy is configurable: deny blocks a CI-less merge (AC4)."""
     from sdlc import build_issue
@@ -2570,15 +2594,63 @@ def test_result_wrapper_forbids_background_handoff() -> None:
 
 
 def test_merge_prompt_requires_synchronous_check_wait() -> None:
-    """The rebase the merge prompt mandates restarts the change request's
-    required checks; the agent must wait for them in the foreground and report
-    FAILED honestly if still pending — never defer to a background wait."""
+    """A head the merge agent pushes restarts the change request's required
+    checks; the agent must wait for them in the foreground and report FAILED
+    honestly if still pending — never defer to a background wait."""
     from sdlc.build import render_merge_prompt
 
     prompt = render_merge_prompt(_story("99.1-001"), 7)
     assert "restarts" in prompt
     assert "blocking foreground" in prompt
     assert 'merge_status="FAILED"' in prompt
+
+
+def test_merge_prompt_merges_as_is_and_never_rebases() -> None:
+    """Issue #738: a re-run branch carries merge commits of origin/main; the
+    mandated rebase replayed them into conflicts the forge did not see, and the
+    mergeable MR failed three times. Merge as-is; absorb drift only when the
+    forge says the branch is not mergeable, and then by merge, never rebase."""
+    from sdlc.build import render_merge_prompt
+
+    prompt = render_merge_prompt(_story("99.1-001"), 7)
+    assert "Rebase before merge" not in prompt
+    assert "do not rebase" in prompt
+    assert "git merge origin/main" in prompt
+    assert "never a rebase" in prompt
+
+
+def test_merge_prompt_no_ci_status_forbids_pipeline_wait() -> None:
+    """Issue #740: with the gate's CR_NONE status the prompt says there is no
+    pipeline to wait for, and drops the wait instruction that misled the agent."""
+    from sdlc.build import render_merge_prompt
+
+    prompt = render_merge_prompt(_story("99.1-001"), 7, cr_terms=ih.GITLAB_CR_TERMS,
+                                 ci_status=ih.CR_NONE)
+    assert "no CI pipeline" in prompt
+    assert "Do not poll" in prompt
+    assert "required checks" not in prompt
+
+
+def test_merge_prompt_passed_status_says_gate_verified_the_head() -> None:
+    """A green gate is stated as such — the wait applies only to a head the
+    agent pushes itself."""
+    from sdlc.build import render_merge_prompt
+
+    prompt = render_merge_prompt(_story("99.1-001"), 7, ci_status=ih.CR_SUCCESS)
+    assert "verified" in prompt
+    assert "blocking foreground" in prompt
+
+
+def test_render_stage_prompt_threads_ci_gate_into_merge_prompt() -> None:
+    from sdlc.build import _GATE_PASS, _MergeCIGate, _render_stage_prompt
+
+    gate = _MergeCIGate(verdict=_GATE_PASS, status=ih.CR_NONE, reason="no pipeline",
+                        polls=1, waited_s=0.0)
+    opts = BuildOptions(scope="epic-99")
+    with_gate = _render_stage_prompt("merge", _story("99.1-001"), opts, 7, ci_gate=gate)
+    without = _render_stage_prompt("merge", _story("99.1-001"), opts, 7)
+    assert "no CI pipeline" in with_gate
+    assert "no CI pipeline" not in without
 
 
 def test_review_prompt_distrusts_implementer_report() -> None:

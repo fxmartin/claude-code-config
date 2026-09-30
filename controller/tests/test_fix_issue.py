@@ -582,6 +582,30 @@ def test_render_merge_prompt_states_empty_string_convention() -> None:
     assert '""' in prompt
 
 
+def test_render_merge_prompt_merges_as_is_and_never_rebases() -> None:
+    """Issue #738 (agentic-coding-monitor #119, MR !102): the fix pipeline's
+    step 1 rebase replayed a re-run branch's merge commits into conflicts a
+    plain `glab mr merge` never saw. Merge as-is; drift is absorbed by merge."""
+    issue = FixIssue(38, "Bug", "b", "open", (), ())
+    prompt = render_merge_prompt(issue, 100)
+    assert "Rebase the branch onto" not in prompt
+    assert "update-branch --rebase" not in prompt
+    assert "do not rebase" in prompt
+    assert "git merge origin/main" in prompt
+    assert "2. Merge with: gh pr merge --squash --delete-branch.\n" in prompt
+
+
+def test_render_merge_prompt_no_ci_status_forbids_pipeline_wait() -> None:
+    """Issue #740 on the fix path: the gate's CR_NONE verdict reaches the agent."""
+    from sdlc.issue_host import CR_NONE, GITLAB_CR_TERMS
+
+    issue = FixIssue(38, "Bug", "b", "open", (), ())
+    prompt = render_merge_prompt(issue, 5, cr_terms=GITLAB_CR_TERMS, ci_status=CR_NONE)
+    assert "no CI pipeline" in prompt
+    assert "Do not poll" in prompt
+    assert "required checks" not in prompt
+
+
 def test_render_merge_prompt_default_is_byte_identical_to_pre_606() -> None:
     """GitHub's default `cr_terms` must render the exact pre-#606 merge prompt."""
     issue = FixIssue(38, "Bug", "b", "open", (), ())
@@ -1707,6 +1731,27 @@ def test_fix_merge_gate_honours_no_ci_policy(
     result = _run_gated_fix(tmp_path, dispatch, ci_gate_no_ci=policy)
     assert result.status == expected
     assert ("merge" in dispatch.agents()) is merged
+
+
+def test_fix_merge_gate_no_ci_verdict_reaches_the_merge_prompt(tmp_path, monkeypatch) -> None:
+    """Issue #740: the merge prompt is rendered with the gate's verdict, so a
+    no-pipeline allow tells the agent there is nothing to wait for."""
+    from sdlc.issue_host import CR_NONE
+
+    _stub_cr_status(monkeypatch, [CR_NONE])
+    prompts: dict[str, str] = {}
+
+    class _PromptRecorder(RecordingDispatcher):
+        def __call__(self, agent_type, prompt, **kwargs):
+            prompts.setdefault(agent_type, prompt)
+            return super().__call__(agent_type, prompt, **kwargs)
+
+    result = _run_gated_fix(tmp_path, _PromptRecorder(), ci_gate_no_ci="allow")
+    assert result.status == "DONE"
+    assert "no CI pipeline" in prompts["merge"]
+    assert "required checks" not in prompts["merge"]
+    # The gate's verdict is merge-only: no other stage prompt mentions it.
+    assert all("no CI pipeline" not in p for a, p in prompts.items() if a != "merge")
 
 
 def test_fix_merge_gate_risk_gate_only_block_parks(tmp_path, monkeypatch) -> None:

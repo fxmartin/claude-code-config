@@ -45,7 +45,7 @@ We also use the Codex mirror as an automated adversarial review layer for Claude
          │  ├─ Build agents   (×5, worktree-isolated, TDD)
          │  ├─ Coverage gate  (×5, enforces 90%+)
          │  ├─ Review agent   (×5, senior-code-reviewer)
-         │  └─ Merge agent    (sequential, rebase-before-merge)
+         │  └─ Merge agent    (sequential, CI-gated, merge-not-rebase)
          │      └─ Bugfix loop on failure (classify → fix → retry ×2)
          ▼
      /design-e2e · /execute-e2e-tests (Playwright, run at epic boundaries)
@@ -132,7 +132,7 @@ The skill is a **thin dispatcher** — argument parsing, control flow, and struc
      Stage 1: [build A, B, C, D, E]     ← parallel, each in own git worktree (TDD)
      Stage 2: [coverage A, B, C, D, E]  ← parallel, adds tests to hit 90%+
      Stage 3: [review A, B, C, D, E]    ← parallel, senior-code-reviewer
-     Stage 4: [merge A → B → C → D → E] ← sequential, rebase-before-merge
+     Stage 4: [merge A → B → C → D → E] ← sequential, CI-gated
    ```
 
    ![Parallel build workflow](docs/ParallelBuild.jpg)
@@ -303,7 +303,7 @@ It binds to **http://127.0.0.1:8787** by default (localhost-only).
 - **Mandatory senior-code-reviewer** — every PR flows through an architecture/security review before merge. Not a nice-to-have, not optional.
 - **TDD-first** — tests are written before implementation; the coverage gate fails the story when the coverage agent reports the suite below the threshold (default 90%).
 - **Worktree isolation** — five agents can genuinely run in parallel without clobbering each other's files, because each has its own checkout.
-- **Sequential merge with rebase** — Stage 4 serializes merges with rebase-before-merge, preventing the race conditions that kill naive parallel-merge setups.
+- **Sequential, CI-gated merge** — Stage 4 serializes merges, each gated on the change request's pipeline by the controller, preventing the race conditions that kill naive parallel-merge setups. Baseline drift is absorbed by merging `origin/main` in only when the forge reports a conflict — never by rebasing, which replays a re-run branch's merge commits into phantom conflicts (#738).
 - **Bugfix loop is a peer, not a god** — classifies failures, creates a GitHub issue (so there's an audit trail), fixes, retries. Two strikes and the story is marked `FAILED` rather than loop forever.
 - **Verifiable goals** — every skill enforces strong success criteria per step (test green, coverage ≥ N, review approved, merge clean), which is what makes unattended loops safe.
 - **Process discipline inside each agent's turn** — bugfix agents must state a root cause before fixing (schema-enforced in the bugfix contract), review findings are verified and disputable claims rather than orders, reviewers treat the implementer's self-report as unverified, and red/green pressure-tests prove these discipline prompts actually change agent behavior (Epic-26, patterns adapted from [obra/superpowers](https://github.com/obra/superpowers)).

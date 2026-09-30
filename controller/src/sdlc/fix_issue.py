@@ -53,6 +53,7 @@ from sdlc.build import (
     _merge_gate_only_block,
     _record_stage_usage,
     _refresh_base_ref,
+    render_merge_drift_block,
     _registry_finish,
     _registry_register,
     _reposition_head,
@@ -799,11 +800,15 @@ def render_merge_prompt(
     pr_number: int | None,
     *,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+    ci_status: str | None = None,
 ) -> str:
-    """Render the merge-agent prompt for a fix run (issue #436, #606)."""
+    """Render the merge-agent prompt for a fix run (issue #436, #606).
+
+    ``ci_status`` is the merge CI gate's observed CR status (issue #740); see
+    :func:`sdlc.build.render_merge_drift_block`.
+    """
     abbr = cr_terms.abbr
     is_github = cr_terms.host == issue_host.GITHUB
-    rebase_cmd = "gh pr update-branch --rebase" if is_github else "glab mr update --rebase"
     close_cmd = "gh issue close" if is_github else "glab issue close"
     reason_flag = " --reason completed" if is_github else ""
     return (
@@ -820,10 +825,14 @@ def render_merge_prompt(
         "parent or sibling directory (e.g. a git superproject) before running "
         "host-CLI/git commands: doing so queries the wrong repository.\n"
         + _untrusted_block(issue)
-        + "1. Rebase the branch onto the latest origin/main first to absorb "
-        f"baseline drift (`{rebase_cmd}`, or a manual rebase). If "
-        'the rebase conflicts, report merge_status FAILED with "REBASE_CONFLICT" '
-        "in block_reason and STOP.\n"
+        # Issue #738: step 1 used to mandate a rebase onto origin/main, which
+        # replayed a re-run branch's merge commits into conflicts the forge did
+        # not see. The shared drift block merges as-is and merges (never
+        # rebases) drift in only when the forge reports the CR not mergeable.
+        + "1. " + render_merge_drift_block(abbr, ci_status=ci_status)
+        + "If a `git merge origin/main` you had to run conflicts beyond what you "
+        'can resolve, report merge_status FAILED with "MERGE_CONFLICT" in '
+        "block_reason and STOP.\n"
         f"2. Merge with: {_cr_cli(cr_terms, 'merge')}.\n"
         f"3. Close the issue: {close_cmd} {issue.number}{reason_flag} "
         f'(and comment "Fixed in {abbr} #{pr_number}.").\n'
@@ -844,7 +853,7 @@ def render_merge_prompt(
         "merged_at to when) so the controller records the landing instead of "
         "treating the stage as failed.\n"
         # Story 29.1-001: same schema, same trap as the build pipeline's merge
-        # prompt. Both non-merged exits above (rebase conflict, high-risk block)
+        # prompt. Both non-merged exits above (merge conflict, high-risk block)
         # leave the agent with no sha/timestamp; null fails validation and the
         # resulting contract error buries the block_reason it just reported.
         "merge_sha and merged_at are always JSON strings: when nothing landed "
@@ -1814,10 +1823,6 @@ def _run_stage_loop(
                 )
                 return "NEEDS_ATTENTION", pr_number
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
-            prompt = _render_core_prompt(
-                stage, issue, inv, opts, pr_number,
-                review_packet=review_packet_block, cr_terms=cr_terms,
-            )
             try:
                 # Issue #713: gate the merge on the CR's CI status exactly as
                 # `sdlc build` does. Polled afresh on every attempt, so a bugfix
@@ -1829,6 +1834,13 @@ def _run_stage_loop(
                     ok, result, kind = False, None, "ci-gate"
                     failure = _ci_gate_failure(ledger, story, pr_number, gate.reason)
                 else:
+                    # Rendered after the gate (issue #740): the merge prompt
+                    # carries the gate's verdict on this head.
+                    prompt = _render_core_prompt(
+                        stage, issue, inv, opts, pr_number,
+                        review_packet=review_packet_block, cr_terms=cr_terms,
+                        ci_status=gate.status if gate is not None else None,
+                    )
                     ok, result, failure, kind = _dispatch_fix_stage(
                         stage, story, prompt, model, dispatch, tpath, opts
                     )
@@ -1955,6 +1967,7 @@ def _render_core_prompt(
     *,
     review_packet: str | None = None,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+    ci_status: str | None = None,
 ) -> str:
     """Render the fix prompt for one core pipeline stage."""
     if stage == "build":
@@ -1965,7 +1978,7 @@ def _render_core_prompt(
         return render_review_prompt(
             issue, pr_number, packet=review_packet, cr_terms=cr_terms
         )
-    return render_merge_prompt(issue, pr_number, cr_terms=cr_terms)
+    return render_merge_prompt(issue, pr_number, cr_terms=cr_terms, ci_status=ci_status)
 
 
 def _run_summary(
