@@ -326,3 +326,25 @@ def test_resolve_named_harness_requires_config() -> None:
     """A non-default named harness with no registry to resolve it is an error."""
     with pytest.raises(HarnessError):
         resolve_harness("codex")
+
+
+def test_codex_opt_in_model_routing_resolves_gpt_6_astra(tmp_path, monkeypatch) -> None:
+    """Story 34.3-001: a repo opting in (`--model {model}` + `models:`) routes
+    Codex to gpt-6-astra, the id the model-pin probe runs `codex exec` with."""
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    config = tmp_path / "harnesses.yaml"
+    config.write_text(
+        "harnesses:\n"
+        "  codex:\n"
+        '    command: "codex exec --model {model}"\n'
+        "    parser: codex-exec\n"
+        "    enabled: true\n"
+        "    models:\n"
+        "      default: gpt-6-astra\n"
+    )
+    assert resolve_agent_argv("codex", config_path=config) == [
+        "codex",
+        "exec",
+        "--model",
+        "gpt-6-astra",
+    ]
