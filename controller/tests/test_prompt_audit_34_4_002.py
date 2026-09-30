@@ -9,6 +9,8 @@ patterns the audit searched for being introduced later.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from sdlc import build, fix_issue
@@ -96,3 +98,12 @@ def test_bugfix_prompt_keeps_epic_26_pressure_test_rules() -> None:
 def test_review_prompts_keep_do_not_trust_rule() -> None:
     assert "Do not trust the implementer's report" in build.render_review_prompt(_STORY, 7)
     assert "Do NOT trust the implementer's report" in fix_issue.render_review_prompt(_ISSUE, 5)
+
+
+def test_plugin_skills_have_no_previous_generation_steering_patterns() -> None:
+    skills = sorted((Path(__file__).resolve().parents[2] / "plugins/autonomous-sdlc/skills").glob("*/SKILL.md"))
+    assert skills, "no plugin skills found to audit"
+    for skill in skills:
+        text = skill.read_text(encoding="utf-8").lower()
+        for pattern in _OBSOLETE:
+            assert pattern not in text, f"{skill.name}: {pattern}"
