@@ -40,6 +40,21 @@ def _mute_lifecycle_notifications(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_model_probe(monkeypatch):
+    """Never spend a real ``claude -p`` call on the model entitlement probe.
+
+    Reports "command not found", which the probe reads as inconclusive: no id is
+    substituted and no ``--fallback-model`` is added, so argv stays unchanged.
+    test_model_probe.py injects its own runner.
+    """
+    import sdlc.model_probe as probe_mod
+
+    monkeypatch.setattr(
+        probe_mod, "_default_runner", lambda argv, timeout_s=60: (127, "hermetic")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_host_cli(monkeypatch):
     """Block real ``gh``/``glab`` invocations for every test by default.
 

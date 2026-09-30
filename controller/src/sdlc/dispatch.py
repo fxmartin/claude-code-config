@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from sdlc.model_routing import fallback_model_for
 from sdlc.rate_limit import RateLimitSignal
 from sdlc.sanitize import sanitize_prompt
 
@@ -247,6 +248,11 @@ def resolve_agent_cmd(
         cmd += ["--disallowedTools", ",".join(deny)]
     if model:
         cmd += ["--model", model]
+        # Story 34.1-002: only a probe-verified current id carries a fallback, so
+        # a mid-run 404/overload degrades in place rather than failing the stage.
+        fallback = fallback_model_for(model)
+        if fallback:
+            cmd += ["--fallback-model", fallback]
     return cmd
 
 

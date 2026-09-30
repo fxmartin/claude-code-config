@@ -3217,6 +3217,23 @@ untouched. Escalation still climbs the ladder by tier and dispatches the mapped
 id. The built-in rate-limit probe (`harnesses.yaml` / `CLAUDE_RATE_LIMIT_PROBE`)
 reads the same table.
 
+### Live entitlement probe and previous-generation fallback (Story 34.1-002)
+
+At run start (skipped by `--skip-preflight` or a `$SDLC_AGENT_CMD` override) the
+controller runs `claude -p ok --model <id>` for each id in `TIER_MODEL_IDS`
+(`sdlc/model_probe.py`). A non-zero exit with model-not-found / entitlement
+wording substitutes the previous generation from `TIER_FALLBACK_IDS`
+(`claude-opus-5-5 → claude-opus-5`, `claude-sonnet-5-5 → claude-sonnet-5`,
+`claude-haiku-4-5 → claude-haiku-4-5`): a `warn` `harness` event names the
+substitution, the routing banner shows it (`opus → claude-opus-5 (claude-opus-5-5
+unavailable on this host)`), and the run proceeds. A rate-limit error is never
+read as an entitlement failure — the RATE_LIMITED path owns it — and a timeout or
+missing CLI is inconclusive (the current id stays). When the probe succeeds,
+dispatch adds `--fallback-model <previous id>` so a mid-run 404/overload degrades
+in place. Results are cached per host for 24h in
+`~/.local/state/sdlc/model-probe.json`, so parallel cohorts share one probe, and
+`sdlc doctor` lists each tier's id and probe result from the same cache.
+
 ### Cheap-first dispatch with model escalation on retry (Story 14.2-003)
 
 Routing makes the *common* path cheap; cheap-first makes the *stuck* path strong

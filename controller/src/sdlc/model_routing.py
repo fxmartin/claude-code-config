@@ -35,6 +35,44 @@ TIER_MODEL_IDS: dict[str, str] = {
     OPUS: "claude-opus-5-5",
 }
 
+# Current-generation id → previous-generation id (Story 34.1-002). Used twice:
+# when the live entitlement probe finds the current id unusable on this host, the
+# tier resolves to the fallback instead; and when the probe succeeds the fallback
+# rides along as ``--fallback-model`` so a mid-run 404/overload degrades in place.
+TIER_FALLBACK_IDS: dict[str, str] = {
+    "claude-opus-5-5": "claude-opus-5",
+    "claude-sonnet-5-5": "claude-sonnet-5",
+    "claude-haiku-4-5": "claude-haiku-4-5",
+}
+
+# Process-wide result of this run's entitlement probe (see ``sdlc.model_probe``).
+# ``_SUBSTITUTIONS`` maps an unusable current id to its fallback; ``_VERIFIED``
+# holds ids the probe proved usable. Empty until a probe runs, which keeps every
+# un-probed path (tests, resumes, routing off) byte-identical to before.
+_SUBSTITUTIONS: dict[str, str] = {}
+_VERIFIED: set[str] = set()
+
+
+def set_probe_state(substitutions: dict[str, str], verified: set[str]) -> None:
+    """Install the probe outcome that :func:`resolve_model_id` consults."""
+    _SUBSTITUTIONS.clear()
+    _SUBSTITUTIONS.update(substitutions)
+    _VERIFIED.clear()
+    _VERIFIED.update(verified)
+
+
+def reset_probe_state() -> None:
+    set_probe_state({}, set())
+
+
+def fallback_model_for(model_id: str | None) -> str | None:
+    """The ``--fallback-model`` id for a probe-verified ``model_id``, else ``None``."""
+    if not model_id or model_id not in _VERIFIED:
+        return None
+    fallback = TIER_FALLBACK_IDS.get(model_id)
+    return fallback if fallback and fallback != model_id else None
+
+
 # The single top-level key a per-repo override file uses.
 ROUTING_KEY = "model_routing"
 
@@ -300,7 +338,8 @@ def resolve_model_id(model: str | None) -> str | None:
     """
     if model is None:
         return None
-    return TIER_MODEL_IDS.get(model, model)
+    model_id = TIER_MODEL_IDS.get(model, model)
+    return _SUBSTITUTIONS.get(model_id, model_id)
 
 
 def escalate_model(base: str | None, steps: int) -> str | None:
@@ -557,7 +596,13 @@ def config_from_snapshot(snapshot: dict | None) -> ModelRoutingConfig | None:
 
 def _with_model_id(model: str) -> str:
     """Render ``model`` for the banner: ``opus → claude-opus-5-5`` for an alias."""
-    return f"{model} → {TIER_MODEL_IDS[model]}" if model in TIER_MODEL_IDS else model
+    if model not in TIER_MODEL_IDS:
+        return model
+    wanted = TIER_MODEL_IDS[model]
+    resolved = _SUBSTITUTIONS.get(wanted, wanted)
+    if resolved == wanted:
+        return f"{model} → {wanted}"
+    return f"{model} → {resolved} ({wanted} unavailable on this host)"
 
 
 def routing_banner(snapshot: dict) -> list[str]:

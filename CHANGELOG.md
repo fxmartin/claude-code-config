@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.78.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): live entitlement probe (#34.1-002) (#790)
+
+
+## [v2.77.1] - 2026-09-30
+
+### Fixed
+
+- fix(resume): register resumed runs with an iso start time and own scope (#787)
+
+
+## [v2.77.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): prompt audit of stage (#34.4-002)
+
+
+## [v2.76.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): tier detection and (#34.1-003)
+
+
+## [v2.75.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): tier-to-model-id map with (#34.1-001) (#786)
+
+
 ## [v2.74.4] - 2026-09-30
 
 ### Fixed
