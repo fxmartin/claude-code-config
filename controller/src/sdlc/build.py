@@ -7043,7 +7043,11 @@ def _registry_register(
     ``completed``/``started_at`` default to a fresh run's 0/now. Issue #683:
     ``sdlc resume`` passes the run's already-accrued counts instead, so
     re-registering the record under the resuming process's own pid does not
-    reset the dashboard's progress display back to 0.
+    reset the dashboard's progress display back to 0. A ``started_at`` taken
+    from the ledger arrives in SQLite's ``YYYY-MM-DD HH:MM:SS`` (UTC, no
+    offset); it is normalised to the registry's ISO-8601 form so the dashboard,
+    which sorts run rows by that string, keeps a resumed run in date order (a
+    space sorts before ``T``, which sank run 60c2947e to 26th on 2026-09-30).
     """
     try:
         registry.register(
@@ -7054,13 +7058,32 @@ def _registry_register(
                 scope=scope,
                 pid=os.getpid(),
                 status="IN_PROGRESS",
-                started_at=started_at,  # registry stamps the start time when blank
+                # registry stamps the start time when blank
+                started_at=_registry_iso(started_at),
                 total=total,
                 completed=completed,
             )
         )
     except OSError:
         pass
+
+
+def _registry_iso(stamp: str) -> str:
+    """``stamp`` as ISO-8601 with a UTC offset; blank and unparseable pass through.
+
+    The ledger writes ``datetime('now')`` — ``YYYY-MM-DD HH:MM:SS`` in UTC with
+    no offset — while the registry (and every ``sdlc build`` row) uses
+    ``datetime.isoformat()``; the two must not be mixed in one sortable column.
+    """
+    if not stamp:
+        return stamp
+    try:
+        parsed = datetime.fromisoformat(stamp.replace(" ", "T"))
+    except ValueError:
+        return stamp
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
 
 
 def _registry_finish(

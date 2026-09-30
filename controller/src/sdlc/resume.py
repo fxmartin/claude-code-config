@@ -606,10 +606,12 @@ def run_resume(
     # already exists (including one already pruned). Total/completed come from
     # the run row rather than being reset to a fresh-run 0/`len(run_queue)` —
     # the latter excludes already-shipped/SKIPPED stories — so the dashboard's
-    # progress does not shrink or reset on resume.
+    # progress does not shrink or reset on resume. The scope is the run's own
+    # (`sdlc resume --run <id>` is invoked with the CLI default `all`, which is
+    # not what the run built and is not how the dashboard should label it).
     if registry is not None:
         _registry_register(
-            registry, rid, scope, ledger.db_path,
+            registry, rid, run_row.get("scope") or scope, ledger.db_path,
             run_row.get("total_stories") or len(run_queue),
             repo=root or Path.cwd(),
             completed=run_row.get("completed") or 0,

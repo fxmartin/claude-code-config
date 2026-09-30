@@ -1392,11 +1392,58 @@ def test_resume_reregisters_own_pid_before_dispatch(tmp_path: Path) -> None:
     assert record.total == 2  # the run row's real total, not len(run_queue)
     assert record.completed == 1  # the pre-crash accrual, not reset to 0
     # Carried from the ledger's own started_at, not restamped to "now" and not
-    # left as the stale registry seed value from the crashed original run.
-    assert record.started_at == ledger_started_at
+    # left as the stale registry seed value from the crashed original run —
+    # but in the registry's ISO-8601 UTC form, not SQLite's `YYYY-MM-DD HH:MM:SS`
+    # (see test_resume_registers_iso_started_at_and_run_row_scope).
+    from datetime import datetime, timezone
+
+    expected = datetime.fromisoformat(ledger_started_at).replace(tzinfo=timezone.utc).isoformat()
+    assert record.started_at == expected
     # `sdlc doctor`/`sdlc runs --prune` derive state from this record; with the
     # live pid it must no longer read as crashed.
     assert derive_state(record) != "DEAD"
+
+
+def test_resume_registers_iso_started_at_and_run_row_scope(tmp_path: Path) -> None:
+    """Run 60c2947e (epic-34, 2026-09-30): after `sdlc resume --run <id>` the
+    dashboard listed the live run 26th, under scope `all`. Resume had copied the
+    ledger's `2026-09-30 18:27:06` verbatim into the registry — every `sdlc
+    build` row is ISO `…T…+00:00`, the sidebar sorts by string, and a space
+    sorts before `T` — and registered the CLI's default scope instead of the
+    run row's `epic-34`."""
+    _make_project(tmp_path)
+    db = tmp_path / ".sdlc-state.db"
+    run_id = _seed_interrupted(db)
+    ledger_started_at = Ledger(db).run_row(run_id)["started_at"]
+    assert "T" not in ledger_started_at  # the SQLite form this test is about
+
+    registered: list[RunRecord] = []
+
+    class _SpyRegistry(Registry):
+        def register(self, record: RunRecord) -> None:  # type: ignore[override]
+            registered.append(record)
+            super().register(record)
+
+    # Resumed by run id with the CLI's default scope, as an operator does.
+    result = run_resume(
+        "all",
+        run_id=run_id,
+        ledger=Ledger(db),
+        dispatcher=FakeDispatcher(),
+        root=tmp_path,
+        registry=_SpyRegistry(tmp_path / "registry.json"),
+    )
+
+    assert result.run_id == run_id
+    record = registered[0]
+    assert record.scope == "epic-99"  # the run row's scope, not the CLI default
+    assert "T" in record.started_at and record.started_at.endswith("+00:00")
+    # Same instant as the ledger's, so duration/sorting agree with build rows.
+    from datetime import datetime, timezone
+
+    assert datetime.fromisoformat(record.started_at) == datetime.fromisoformat(
+        ledger_started_at
+    ).replace(tzinfo=timezone.utc)
 
 
 def test_resume_registry_register_error_is_swallowed(tmp_path: Path) -> None:
