@@ -131,9 +131,13 @@ install_core_run() {
   # writing into it would replace the committed relative links with absolute
   # ones and dirty the repo on every run.
 
-  # Local marketplace — exposes the autonomous-sdlc plugin to Claude Code.
-  ensure_dir "$CLAUDE_DIR/plugins/marketplaces"
-  create_symlink "$SCRIPT_DIR" "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config"
+  # Local marketplace (#743). settings.json declares fx-claude-config as a
+  # `directory` marketplace at ~/Work/claude-code-config; Claude Code registers
+  # it on session start and installs the plugin from its own cache. Older
+  # installs planted a symlink here instead, which Claude Code now flags as a
+  # corrupted installLocation (it resolves outside ~/.claude/plugins) — remove
+  # ours if present. remove_symlink only unlinks a link pointing at this repo.
+  remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
 
   # Build-harness adapters on PATH (Story 21.3-001). The harness registry invokes
   # the Codex/Qwen/OpenCode workers by BARE NAME (e.g. `codex-build-adapter.sh`),
@@ -183,6 +187,7 @@ install_core_uninstall() {
   remove_symlink "$CODEX_DIR/AGENTS.md"                "$SCRIPT_DIR/AGENTS.md"
   # Shared-skill commands are committed relative symlinks inside commands/, so
   # removing the commands symlink above already unlinks them; nothing to do here.
+  # The marketplace symlink of pre-#743 installs, if it survived.
   remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
 
   # Build-harness adapters (Story 21.3-001). remove_symlink only unlinks a link

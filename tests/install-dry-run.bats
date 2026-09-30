@@ -57,7 +57,7 @@ _snapshot() {
     # Every config target install.sh links must show up in the dry-run report.
     for target in \
         CLAUDE.md agents commands settings.json statusline-command.sh \
-        keybindings.json reference-docs docs skills hooks AGENTS.md fx-claude-config \
+        keybindings.json reference-docs docs skills hooks AGENTS.md \
         codex-build-adapter.sh qwen-build-adapter.sh opencode-build-adapter.sh \
         overengineering-lens.sh
     do
@@ -75,7 +75,7 @@ _snapshot() {
     # directory symlink, so they are not linked separately (doing so would rewrite
     # them as absolute and dirty the repo).
     ln_lines="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
-    [ "$ln_lines" -eq 15 ]
+    [ "$ln_lines" -eq 14 ]
 }
 
 @test "dry-run leaves a pre-populated ~/.claude/skills untouched (#694)" {

@@ -130,12 +130,12 @@ else
 fi
 
 # Spot-check three representative symlinks: top-level file, top-level dir,
-# nested marketplace symlink. If these are right, the rest are right by
-# construction (core.sh links them all in a single function call).
+# nested dir. If these are right, the rest are right by construction (core.sh
+# links them all in a single function call).
 expected_links=(
   "$SMOKE_HOME/.claude/CLAUDE.md"
   "$SMOKE_HOME/.claude/agents"
-  "$SMOKE_HOME/.claude/plugins/marketplaces/fx-claude-config"
+  "$SMOKE_HOME/.claude/hooks"
 )
 links_ok=true
 for link in "${expected_links[@]}"; do
@@ -144,6 +144,13 @@ for link in "${expected_links[@]}"; do
     echo "    expected symlink missing: $link" >&2
   fi
 done
+# #743: the marketplace is declared in settings.json as a directory source,
+# never symlinked — Claude Code flags a marketplaces/ entry resolving outside
+# ~/.claude/plugins as a corrupted installLocation.
+if [ -e "$SMOKE_HOME/.claude/plugins/marketplaces/fx-claude-config" ]; then
+  links_ok=false
+  echo "    unexpected marketplace symlink: plugins/marketplaces/fx-claude-config" >&2
+fi
 if $links_ok; then
   record "install creates expected symlinks" pass
 else

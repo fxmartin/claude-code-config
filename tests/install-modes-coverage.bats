@@ -247,9 +247,9 @@ _run_install() {
 @test "--core --tools combination runs both modes without error" {
     _run_install --core --tools --dry-run
     [ "$status" -eq 0 ]
-    # Core dry-run lines present (15 = config set + marketplace + 4 adapters).
+    # Core dry-run lines present (14 = config set + 4 adapters; no marketplace symlink since #743).
     ln_lines="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
-    [ "$ln_lines" -eq 15 ]
+    [ "$ln_lines" -eq 14 ]
     # Tools output present (brew or apt mention)
     [[ "$output" == *"brew"* || "$output" == *"apt"* || "$output" == *"Homebrew"* || "$output" == *"pacman"* ]]
 }
@@ -258,6 +258,6 @@ _run_install() {
     _run_install --core --mcp --dry-run
     [ "$status" -eq 0 ]
     ln_lines="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
-    [ "$ln_lines" -eq 15 ]
+    [ "$ln_lines" -eq 14 ]
     [[ "$output" == *"MCP"* || "$output" == *"mcp"* ]]
 }
