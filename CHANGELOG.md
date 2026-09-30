@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.80.1] - 2026-09-30
+
+### Fixed
+
+- fix(merge): read a fresh empty check rollup as pending on repos with ci (#793)
+
+
 ## [v2.80.0] - 2026-09-30
 
 ### Added
