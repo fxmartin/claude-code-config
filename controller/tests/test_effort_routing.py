@@ -21,6 +21,7 @@ from sdlc.model_routing import (
     routing_banner,
     routing_snapshot,
     select_effort,
+    tier_of,
 )
 
 _PAYLOADS = {
@@ -237,3 +238,22 @@ def test_agent_cmd_env_drops_effort(tmp_path, monkeypatch) -> None:
         "build", _story(), BuildOptions(scope="epic-34", model_profile="balanced")
     )
     assert choice.level is None and "SDLC_AGENT_CMD" in choice.reason
+
+
+def test_tier_of_empty_model_is_none() -> None:
+    assert tier_of(None) is None
+    assert tier_of("") is None
+
+
+def test_registry_failure_keeps_effort(tmp_path, monkeypatch) -> None:
+    """Best-effort registry resolution: a broken registry must not drop the flag."""
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("registry unreadable")
+
+    monkeypatch.setattr(build_mod, "resolve_harness", _boom)
+    choice = build_mod._resolved_stage_effort(
+        "build", _story(),
+        BuildOptions(scope="epic-34", model_profile="balanced", harness_map={"build": "codex"}),
+    )
+    assert choice.level == "high"
