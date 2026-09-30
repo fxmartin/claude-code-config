@@ -57,7 +57,7 @@
 #   --model <id>   Per-stage model routing (mirrors the codex adapter): the
 #                  controller substitutes the stage's mapped model into the
 #                  `{model}` placeholder of the registry command and passes it
-#                  here as `provider/model` (e.g. `openai/gpt-5.6`); the wrapper
+#                  here as `provider/model` (e.g. `openai/gpt-6-astra`); the wrapper
 #                  forwards it as `opencode run --model <id>`. Omitted when the
 #                  harness routes no per-stage model.
 #

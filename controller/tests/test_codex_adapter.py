@@ -66,7 +66,7 @@ def test_codex_argv_never_invokes_claude() -> None:
 
 def test_shipped_codex_harness_pins_no_model_entitlement() -> None:
     """Issue #228: the shipped codex harness must run out of the box without
-    assuming a specific model entitlement. Hardcoding `gpt-5.4-codex*` made every
+    assuming a specific model entitlement. Hardcoding `gpt-6-astra*` made every
     stage 400 on a ChatGPT-account Codex. The default must let Codex use the
     account's own configured model (no `--model` baked into the argv); per-stage
     model routing stays an opt-in a user enables with their own ids."""

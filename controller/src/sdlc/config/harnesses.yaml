@@ -73,10 +73,10 @@ harnesses:
   # processes (AC3).
   codex:
     # Default: no `{model}` placeholder, so the adapter runs plain `codex exec`
-    # and Codex uses the model from your `~/.codex/config.toml` (e.g. `gpt-5.5`).
+    # and Codex uses the model from your `~/.codex/config.toml` (e.g. `gpt-6-astra`).
     # This is portable — it never assumes a model entitlement, so a build works on
     # any authenticated Codex out of the box (issue #228: the old hardcoded
-    # `gpt-5.4-codex*` ids 400'd on a ChatGPT-account Codex).
+    # `gpt-6-astra*` ids 400'd on a ChatGPT-account Codex).
     command: "codex-build-adapter.sh"
     parser: codex-exec
     enabled: true
@@ -92,12 +92,12 @@ harnesses:
     # and covers any unlisted stage (e.g. bugfix/reask). Example:
     #   command: "codex-build-adapter.sh --model {model}"
     #   models:
-    #     default: gpt-5.5
-    #     build: gpt-5.5
-    #     coverage: gpt-5.5
-    #     review: gpt-5.5
-    #     merge: gpt-5.5
-    #     adversarial: gpt-5.5
+    #     default: gpt-6-astra
+    #     build: gpt-6-astra
+    #     coverage: gpt-6-astra
+    #     review: gpt-6-astra
+    #     merge: gpt-6-astra
+    #     adversarial: gpt-6-astra
     capabilities:
       worktree_isolation: false
       parallel: false
@@ -229,7 +229,7 @@ harnesses:
     # adversarial run. An unreachable default is the more likely failure than
     # an unentitled pin, so the map below names ids verified on this host.
     # Not entitled to these? Override without editing this file (redeploy-safe):
-    #   export OPENCODE_FLAGS='--model <provider/model>'
+    #   export OPENCODE_FLAGS='--model openai/gpt-6-astra'
     command: "opencode-build-adapter.sh --model {model}"
     parser: opencode-json
     enabled: true

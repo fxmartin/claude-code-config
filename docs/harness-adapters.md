@@ -186,10 +186,10 @@ harness carries **its own model ids**.
 
 The **shipped default does not opt in**: the `codex` entry's `command` has no
 `{model}` placeholder, so Codex uses whatever model your `~/.codex/config.toml`
-declares (e.g. `gpt-5.5`). That keeps a build runnable on any authenticated Codex
+declares (e.g. `gpt-6-astra`). That keeps a build runnable on any authenticated Codex
 without assuming a model entitlement — **use model ids you actually have**, since a
 model your account can't serve fails the whole stage with a 400 (e.g. ChatGPT-account
-Codex rejects `gpt-5.4-codex`; verify any id with `echo hi | codex exec --model <id>`).
+Codex rejects `gpt-6-astra`; verify any id with `echo hi | codex exec --model <id>`).
 
 Opt in with two pieces: a `{model}` placeholder in `command`, and a `models:` map
 of stage → model id. The controller substitutes the stage's mapped model into the
@@ -201,12 +201,12 @@ codex:
   command: "codex-build-adapter.sh --model {model}"
   parser: codex-exec
   models:                  # use ids your account is entitled to (these are examples)
-    default: gpt-5.5       # required when command uses {model}
-    build: gpt-5.5
-    coverage: gpt-5.5      # point at a cheaper model for mechanical stages if you have one
-    review: gpt-5.5
-    merge: gpt-5.5
-    adversarial: gpt-5.5   # point at a stronger skeptic if you have one
+    default: gpt-6-astra       # required when command uses {model}
+    build: gpt-6-astra
+    coverage: gpt-6-astra      # point at a cheaper model for mechanical stages if you have one
+    review: gpt-6-astra
+    merge: gpt-6-astra
+    adversarial: gpt-6-astra   # point at a stronger skeptic if you have one
 ```
 
 Rules:
