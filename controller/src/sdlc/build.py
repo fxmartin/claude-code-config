@@ -78,6 +78,7 @@ from sdlc.model_routing import (
     escalate_model,
     is_routing_off,
     load_routing_config,
+    resolve_model_id,
     routing_banner,
     routing_config,
     routing_snapshot,
@@ -9319,8 +9320,8 @@ def _resolved_stage_model(
     Best-effort on the registry path: any resolve error degrades to the routed
     Claude model rather than failing a build.
     """
-    claude_model = _select_stage_model(
-        stage, story, opts, escalation_steps=escalation_steps
+    claude_model = resolve_model_id(
+        _select_stage_model(stage, story, opts, escalation_steps=escalation_steps)
     )
     if not opts.harness_map:
         return claude_model
@@ -9357,8 +9358,10 @@ def _resolved_recovery_model(
     path: any resolve error degrades to the routed Claude model, never failing a
     build.
     """
-    claude_model = _select_stage_model(
-        role_stage, story, opts, escalation_steps=escalation_steps
+    claude_model = resolve_model_id(
+        _select_stage_model(
+            role_stage, story, opts, escalation_steps=escalation_steps
+        )
     )
     if not opts.harness_map:
         return claude_model
@@ -10086,7 +10089,7 @@ def _reask_envelope(
     # records the RESOLVED (registry-aware) model — under a --harness map routing
     # `stage` to a registry harness, that harness runs its OWN model and ignores
     # the alias, so the alias would misreport what actually ran.
-    model = _select_stage_model("reask", story, opts)
+    model = resolve_model_id(_select_stage_model("reask", story, opts))
     # The re-ask re-dispatches the originating `stage` agent, so record it on the
     # harness that runs that stage (Story 20.2-002), not a notional "reask" role.
     ledger.stage_start(
@@ -10317,7 +10320,9 @@ def _run_bugfix(
     # records the RESOLVED (registry-aware) model — under a --harness map routing
     # `failed_stage` to a registry harness, that harness runs its OWN model and
     # ignores the alias, so the alias would misreport what actually ran.
-    model = _select_stage_model("bugfix", story, opts, escalation_steps=escalation_steps)
+    model = resolve_model_id(
+        _select_stage_model("bugfix", story, opts, escalation_steps=escalation_steps)
+    )
     # The bugfix re-dispatches the originating `failed_stage` agent, so record it
     # on that stage's harness (Story 20.2-002).
     ledger.stage_start(

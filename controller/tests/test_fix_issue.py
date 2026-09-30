@@ -63,6 +63,13 @@ from sdlc.issue_host import RunResult
 from sdlc.registry import Registry, RunRecord, default_registry_path
 from sdlc.ledger_view import Ledger
 
+from sdlc.model_routing import HAIKU as _H, OPUS as _O, SONNET as _S, TIER_MODEL_IDS as _IDS
+
+HAIKU_ID = _IDS[_H]
+SONNET_ID = _IDS[_S]
+OPUS_ID = _IDS[_O]
+
+
 
 # ---------------------------------------------------------------------------
 # Fake gh runner + fake dispatcher
@@ -660,39 +667,39 @@ def test_detect_agent_type_default(tmp_path) -> None:
 def test_fix_model_map_matches_balanced_profile() -> None:
     # Story 27.1-001: build/review/bugfix default to sonnet (Balanced alignment).
     opts = FixOptions(issue=1)
-    assert fix_model("investigation", opts) == "sonnet"
-    assert fix_model("build", opts) == "sonnet"
-    assert fix_model("coverage", opts) == "sonnet"
-    assert fix_model("review", opts) == "sonnet"
-    assert fix_model("merge", opts) == "haiku"
-    assert fix_model("bugfix", opts) == "sonnet"
-    assert fix_model("summary", opts) == "haiku"
+    assert fix_model("investigation", opts) == SONNET_ID
+    assert fix_model("build", opts) == SONNET_ID
+    assert fix_model("coverage", opts) == SONNET_ID
+    assert fix_model("review", opts) == SONNET_ID
+    assert fix_model("merge", opts) == HAIKU_ID
+    assert fix_model("bugfix", opts) == SONNET_ID
+    assert fix_model("summary", opts) == HAIKU_ID
 
 
 def test_fix_model_override_beats_map() -> None:
     opts = FixOptions(issue=1, model_overrides={"build": "opus"})
-    assert fix_model("build", opts) == "opus"
-    assert fix_model("review", opts) == "sonnet"  # unaffected
+    assert fix_model("build", opts) == OPUS_ID
+    assert fix_model("review", opts) == SONNET_ID  # unaffected
 
 
 def test_fix_model_escalates_code_stages_to_opus() -> None:
     opts = FixOptions(issue=1)
     for stage in ("build", "review", "bugfix"):
-        assert fix_model(stage, opts, escalate=True) == "opus", stage
+        assert fix_model(stage, opts, escalate=True) == OPUS_ID, stage
 
 
 def test_fix_model_escalation_leaves_other_stages_alone() -> None:
     opts = FixOptions(issue=1)
-    assert fix_model("investigation", opts, escalate=True) == "sonnet"
-    assert fix_model("coverage", opts, escalate=True) == "sonnet"
-    assert fix_model("merge", opts, escalate=True) == "haiku"
-    assert fix_model("summary", opts, escalate=True) == "haiku"
+    assert fix_model("investigation", opts, escalate=True) == SONNET_ID
+    assert fix_model("coverage", opts, escalate=True) == SONNET_ID
+    assert fix_model("merge", opts, escalate=True) == HAIKU_ID
+    assert fix_model("summary", opts, escalate=True) == HAIKU_ID
 
 
 def test_fix_model_override_beats_escalation() -> None:
     # The operator's explicit pin is the final word — even over escalation.
     opts = FixOptions(issue=1, model_overrides={"build": "haiku"})
-    assert fix_model("build", opts, escalate=True) == "haiku"
+    assert fix_model("build", opts, escalate=True) == HAIKU_ID
 
 
 def test_fix_escalates_on_high_complexity() -> None:
@@ -1343,9 +1350,9 @@ def test_run_fix_asserts_balanced_default_models(tmp_path) -> None:
     # carries its Balanced-aligned default model — no silent Opus.
     # (bugfix runs only on failure — asserted in the bugfix-recovery test.)
     for stage in ("investigation", "build", "coverage", "review", "merge", "summary"):
-        assert dispatch.model_for(stage) == FIX_STAGE_MODELS[stage], stage
-    assert dispatch.model_for("build") == "sonnet"
-    assert dispatch.model_for("review") == "sonnet"
+        assert dispatch.model_for(stage) == _IDS.get(FIX_STAGE_MODELS[stage]), stage
+    assert dispatch.model_for("build") == SONNET_ID
+    assert dispatch.model_for("review") == SONNET_ID
 
 
 def test_run_fix_high_complexity_escalates_code_stages_to_opus(tmp_path) -> None:
@@ -1371,11 +1378,11 @@ def test_run_fix_high_complexity_escalates_code_stages_to_opus(tmp_path) -> None
         root=tmp_path,
     )
     assert result.status == "DONE"
-    assert dispatch.model_for("build") == "opus"
-    assert dispatch.model_for("review") == "opus"
+    assert dispatch.model_for("build") == OPUS_ID
+    assert dispatch.model_for("review") == OPUS_ID
     # Non-escalatable stages keep their Balanced defaults.
-    assert dispatch.model_for("coverage") == "sonnet"
-    assert dispatch.model_for("merge") == "haiku"
+    assert dispatch.model_for("coverage") == SONNET_ID
+    assert dispatch.model_for("merge") == HAIKU_ID
 
 
 def test_run_fix_security_label_escalates_code_stages_to_opus(tmp_path) -> None:
@@ -1390,9 +1397,9 @@ def test_run_fix_security_label_escalates_code_stages_to_opus(tmp_path) -> None:
         root=tmp_path,
     )
     assert result.status == "DONE"
-    assert dispatch.model_for("build") == "opus"
-    assert dispatch.model_for("review") == "opus"
-    assert dispatch.model_for("merge") == "haiku"
+    assert dispatch.model_for("build") == OPUS_ID
+    assert dispatch.model_for("review") == OPUS_ID
+    assert dispatch.model_for("merge") == HAIKU_ID
 
 
 def test_run_fix_exactly_one_run_row(tmp_path) -> None:
@@ -1497,7 +1504,7 @@ def test_run_fix_bugfix_recovers_and_retries_stage(tmp_path) -> None:
     assert result.status == "DONE"
     assert dispatch.counts["build"] == 2
     assert dispatch.counts["bugfix"] == 1
-    assert dispatch.model_for("bugfix") == "sonnet"  # Balanced base tier (27.1-001)
+    assert dispatch.model_for("bugfix") == SONNET_ID  # Balanced base tier (27.1-001)
 
 
 def test_run_fix_bugfix_inherits_escalation_on_high_complexity(tmp_path) -> None:
@@ -1531,7 +1538,7 @@ def test_run_fix_bugfix_inherits_escalation_on_high_complexity(tmp_path) -> None
         root=tmp_path,
     )
     assert result.status == "DONE"
-    assert dispatch.model_for("bugfix") == "opus"
+    assert dispatch.model_for("bugfix") == OPUS_ID
 
 
 def test_run_fix_bugfix_bounded_at_two_then_fails(tmp_path) -> None:
@@ -3431,7 +3438,7 @@ def test_parse_fix_args_e2e_gate_batch_target() -> None:
 
 def test_fix_model_e2e_and_doc_update_are_sonnet() -> None:
     opts = FixOptions(issue=1)
-    assert fix_model("e2e", opts) == "sonnet"
+    assert fix_model("e2e", opts) == SONNET_ID
     assert FIX_STAGE_MODELS["doc_update"] == "sonnet"
 
 
@@ -3466,7 +3473,7 @@ def test_run_fix_e2e_warn_dispatches_between_review_and_merge(tmp_path) -> None:
     # E2E runs after review passes and before merge (skill Phase 7 ordering).
     assert agents.index("review") < agents.index("e2e") < agents.index("merge")
     # Opus-parity: the advisory gate runs on sonnet.
-    assert dispatch.model_for("e2e") == FIX_STAGE_MODELS["e2e"] == "sonnet"
+    assert dispatch.model_for("e2e") == SONNET_ID
 
 
 def test_run_fix_e2e_warn_fail_continues_to_merge(tmp_path) -> None:

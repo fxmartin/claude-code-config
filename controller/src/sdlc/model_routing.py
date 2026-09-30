@@ -23,6 +23,18 @@ OPUS = "opus"
 # climbs Haiku→Sonnet→Opus instead of retrying on the model that just failed.
 TIER_LADDER: tuple[str, ...] = (HAIKU, SONNET, OPUS)
 
+# Tier alias → exact model id (Story 34.1-001), the single source of truth. The
+# profiles keep speaking in tiers; the alias is resolved to an id only at the
+# point it leaves the routing layer (see :func:`resolve_model_id`), so a ledger
+# row and the `claude --model` argv name the precise model a stage ran on.
+# Vintage: 2026-09-30. Bump here (and the README routing table) on a new
+# generation.
+TIER_MODEL_IDS: dict[str, str] = {
+    HAIKU: "claude-haiku-4-5",
+    SONNET: "claude-sonnet-5",
+    OPUS: "claude-opus-5-5",
+}
+
 # The single top-level key a per-repo override file uses.
 ROUTING_KEY = "model_routing"
 
@@ -279,6 +291,18 @@ def select_model(
     return base
 
 
+def resolve_model_id(model: str | None) -> str | None:
+    """Map a tier alias to its exact model id; anything else passes through.
+
+    ``None`` (routing off) stays ``None`` and a full id pinned in a per-repo
+    override (``claude-opus-4-8``) or a registry harness's own model id is
+    returned untouched — today's escape hatch is preserved.
+    """
+    if model is None:
+        return None
+    return TIER_MODEL_IDS.get(model, model)
+
+
 def escalate_model(base: str | None, steps: int) -> str | None:
     """Bump ``base`` up the tier ladder by ``steps``, capped at the strongest tier.
 
@@ -531,6 +555,11 @@ def config_from_snapshot(snapshot: dict | None) -> ModelRoutingConfig | None:
     )
 
 
+def _with_model_id(model: str) -> str:
+    """Render ``model`` for the banner: ``opus → claude-opus-5-5`` for an alias."""
+    return f"{model} → {TIER_MODEL_IDS[model]}" if model in TIER_MODEL_IDS else model
+
+
 def routing_banner(snapshot: dict) -> list[str]:
     """Render the run-start routing banner for ``snapshot`` (one string per line).
 
@@ -548,7 +577,9 @@ def routing_banner(snapshot: dict) -> list[str]:
         ]
     else:
         stage_models = snapshot.get("stage_models") or {}
-        mapping = " ".join(f"{s}={m}" for s, m in sorted(stage_models.items()))
+        mapping = " ".join(
+            f"{s}={_with_model_id(m)}" for s, m in sorted(stage_models.items())
+        )
         # Legacy (pre-28.3-001) snapshots carry no prediction thresholds; render
         # them from the Balanced defaults config_from_snapshot would replay.
         tokens_bar = snapshot.get(

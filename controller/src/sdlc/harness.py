@@ -16,6 +16,7 @@ from typing import Any
 import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
+from sdlc.model_routing import HAIKU, TIER_MODEL_IDS
 
 from sdlc.dispatch import (
     DEFAULT_AGENT_CMD,
@@ -45,7 +46,7 @@ _CLAUDE_PARSER = "claude-stream-json"
 # as small as possible: one two-token prompt on the cheapest model. Declared
 # only for the Claude slots, whose CLI this is; a harness without one is simply
 # not probed (the gate then behaves exactly as it does today).
-CLAUDE_RATE_LIMIT_PROBE = "claude -p ok --model haiku"
+CLAUDE_RATE_LIMIT_PROBE = f"claude -p ok --model {TIER_MODEL_IDS[HAIKU]}"
 
 # Capability flags assumed for the built-in Claude harness (and an `SDLC_AGENT_CMD`
 # override, which is Claude under the hood for FX's environment). A registry-defined

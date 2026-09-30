@@ -3181,6 +3181,26 @@ identically. The `<<<RESULT_JSON>>>`
 contract and schema validation are untouched — routing changes only *which model*
 runs a stage, never how its output is parsed.
 
+### Tier → model-id map (Story 34.1-001)
+
+Profiles speak in tiers; the tier is resolved to an exact model id only where it
+leaves the routing layer, so the `claude --model` argv and the ledger's
+`stage_attempts.model` name the model a stage actually ran on. The single source
+of truth is `TIER_MODEL_IDS` in `sdlc/model_routing.py` (vintage 2026-09-30):
+
+| Tier | Model id |
+|------|----------|
+| `haiku` | `claude-haiku-4-5` |
+| `sonnet` | `claude-sonnet-5` |
+| `opus` | `claude-opus-5-5` |
+
+Existing `.sdlc-model-routing.yaml` files that say `opus` keep working (the alias
+maps through the same table; the routing banner prints `build=opus →
+claude-opus-5-5`), and a pinned full id (`build: claude-opus-4-8`) passes through
+untouched. Escalation still climbs the ladder by tier and dispatches the mapped
+id. The built-in rate-limit probe (`harnesses.yaml` / `CLAUDE_RATE_LIMIT_PROBE`)
+reads the same table.
+
 ### Cheap-first dispatch with model escalation on retry (Story 14.2-003)
 
 Routing makes the *common* path cheap; cheap-first makes the *stuck* path strong
@@ -3327,7 +3347,7 @@ detects on its own wording or on the parser's structured 429 envelope fields
 (issue #109's lesson, applied in reverse). Second, the gate — before honouring a
 persisted epoch, `_honor_parked_reset` runs one cheap live request through the
 harness's `rate_limit_probe` (`capability.probe_rate_limit`; the built-in Claude
-slot declares `claude -p ok --model haiku`). Only an `AVAILABLE` verdict — zero
+slot declares `claude -p ok --model claude-haiku-4-5`). Only an `AVAILABLE` verdict — zero
 exit *and* no rate-limit wording in the output — clears `rate_limit_reset_at` via
 a corrected config event and lets the run proceed. `UNAVAILABLE` (still closed)
 and `UNKNOWN` (no probe declared, or the probe itself errored) both keep the

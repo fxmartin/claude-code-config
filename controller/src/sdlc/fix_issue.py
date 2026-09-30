@@ -94,6 +94,7 @@ from sdlc.issue_host import (
     Runner,
     _default_runner,
 )
+from sdlc.model_routing import resolve_model_id
 from sdlc.notify import notify
 from sdlc.registry import Registry, format_live_owner_refusal
 from sdlc.story_render import STORY_LABEL
@@ -1122,10 +1123,10 @@ def fix_model(stage: str, opts: FixOptions, *, escalate: bool = False) -> str | 
     """
     override = opts.model_overrides.get(stage)
     if override:
-        return override
+        return resolve_model_id(override)
     if escalate and stage in FIX_ESCALATABLE_STAGES:
-        return FIX_ESCALATION_MODEL
-    return FIX_STAGE_MODELS.get(stage)
+        return resolve_model_id(FIX_ESCALATION_MODEL)
+    return resolve_model_id(FIX_STAGE_MODELS.get(stage))
 
 
 # ---------------------------------------------------------------------------
@@ -3406,7 +3407,9 @@ def _run_doc_update(
     merged = [o for o in outcomes if o.status == "DONE"]
     if not merged:
         return
-    model = batch.model_overrides.get("doc_update") or FIX_STAGE_MODELS.get("doc_update")
+    model = resolve_model_id(
+        batch.model_overrides.get("doc_update") or FIX_STAGE_MODELS.get("doc_update")
+    )
     tpath = logs_dir / "doc-update-1.log"
     result: AgentResult | None = None
     try:

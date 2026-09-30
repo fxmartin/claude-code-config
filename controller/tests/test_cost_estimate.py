@@ -34,6 +34,13 @@ from sdlc.cost_estimate import (
 
 from test_build import FakeDispatcher, _SAMPLE_STAGE_TOKENS, _sample_queue
 
+from sdlc.model_routing import HAIKU as _H, OPUS as _O, SONNET as _S, TIER_MODEL_IDS as _IDS
+
+HAIKU_ID = _IDS[_H]
+SONNET_ID = _IDS[_S]
+OPUS_ID = _IDS[_O]
+
+
 
 # ---------------------------------------------------------------------------
 # estimate_prompt_tokens — the chars/token heuristic
@@ -353,10 +360,10 @@ def test_resolved_stage_model_registry_error_falls_back_to_claude() -> None:
         model_overrides={"build": "opus"},  # pins _select_stage_model's return
     )
     story = _story()
-    assert _resolved_stage_model("build", story, opts) == "opus"
-    assert _resolved_stage_model("build", story, opts) == _select_stage_model(
+    assert _resolved_stage_model("build", story, opts) == OPUS_ID
+    assert _resolved_stage_model("build", story, opts) == _IDS[_select_stage_model(
         "build", story, opts
-    )
+    )]
 
 
 # ---------------------------------------------------------------------------

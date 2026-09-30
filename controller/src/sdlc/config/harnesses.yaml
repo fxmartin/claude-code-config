@@ -47,7 +47,7 @@ harnesses:
     # a reset epoch left behind by (say) a network blip is cleared and the run
     # continues; anything else keeps it parked. Mirrors the built-in slot's
     # `harness.CLAUDE_RATE_LIMIT_PROBE`.
-    rate_limit_probe: "claude -p ok --model haiku"
+    rate_limit_probe: "claude -p ok --model claude-haiku-4-5"
     capabilities:
       worktree_isolation: true
       parallel: true

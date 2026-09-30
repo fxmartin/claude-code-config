@@ -19,6 +19,7 @@ from sdlc.model_routing import (
     HAIKU,
     OPUS,
     SONNET,
+    TIER_MODEL_IDS,
     config_from_snapshot,
     is_routing_off,
     routing_banner,
@@ -26,6 +27,11 @@ from sdlc.model_routing import (
 )
 from sdlc.resume import ROUTING_OFF_SNAPSHOT, run_resume
 from sdlc.status import format_routing
+
+HAIKU_ID = TIER_MODEL_IDS[HAIKU]
+SONNET_ID = TIER_MODEL_IDS[SONNET]
+OPUS_ID = TIER_MODEL_IDS[OPUS]
+
 
 _PAYLOADS = {
     "build": {"branch_name": "feature/x", "build_status": "SUCCESS", "commit_sha": "a"},
@@ -82,7 +88,8 @@ def test_unset_profile_dispatches_the_balanced_map(tmp_path, monkeypatch) -> Non
     opts = BuildOptions(scope="epic-28", skip_preflight=True, sequential=True)
     disp, _ = _run(opts, tmp_path)
     assert disp.models == {
-        "build": SONNET, "coverage": SONNET, "review": SONNET, "merge": HAIKU,
+        "build": SONNET_ID, "coverage": SONNET_ID, "review": SONNET_ID,
+        "merge": HAIKU_ID,
     }
 
 
@@ -186,8 +193,8 @@ def test_per_stage_override_keeps_precedence_and_shows_in_the_banner(
         model_overrides={"merge": OPUS},
     )
     disp, ledger = _run(opts, tmp_path)
-    assert disp.models["merge"] == OPUS          # override beats the HAIKU default
-    assert disp.models["build"] == SONNET        # other stages still from the map
+    assert disp.models["merge"] == OPUS_ID          # override beats the HAIKU_ID default
+    assert disp.models["build"] == SONNET_ID        # other stages still from the map
 
     snapshot = ledger.run_routing(ledger.latest_run_id())
     # The snapshot states the *effective* map, i.e. after the override.
@@ -373,7 +380,7 @@ def test_resume_replays_the_frozen_snapshot_over_a_changed_config(
     )
     disp = _resume(tmp_path, db)
     # Still the frozen Balanced map, not the quality-first (all-Opus) edit.
-    assert disp.models["review"] == SONNET
+    assert disp.models["review"] == SONNET_ID
 
 
 def test_pre_change_run_resumes_routing_off_not_balanced(tmp_path, monkeypatch) -> None:
@@ -523,7 +530,8 @@ def test_a_broken_banner_never_fails_an_otherwise_good_build(
 
     # Every stage still dispatched on the Balanced map the run froze...
     assert disp.models == {
-        "build": SONNET, "coverage": SONNET, "review": SONNET, "merge": HAIKU,
+        "build": SONNET_ID, "coverage": SONNET_ID, "review": SONNET_ID,
+        "merge": HAIKU_ID,
     }
     assert ledger.run_routing(ledger.latest_run_id())["profile"] == "balanced"
     # ...the run simply has no banner to show for it.
