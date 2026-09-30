@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.78.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): live entitlement probe (#34.1-002) (#790)
+
+
 ## [v2.77.1] - 2026-09-30
 
 ### Fixed
