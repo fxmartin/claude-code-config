@@ -6,7 +6,8 @@
 > ledger records whatever the CLI resolved that day and no run is reproducible
 > by model. Around that alias layer everything has drifted a generation: the
 > cost table (`cost_estimate.py`) prices Sonnet at $3/$15 and Opus at $5/$25
-> (2026-07) while Sonnet 5 is $2/$10 and Opus 5.5 is $4/$20, so budgets
+> (2026-07) while Sonnet 5 is $2/$10, Opus 5.5 is $4/$20 and Sonnet 5.5 is
+> newer still, so budgets
 > over-refuse and every `$` on the dashboard overstates; tier detection
 > (`build._model_tier`) matches substrings and drops any id that is not
 > haiku/sonnet/opus; the Codex and OpenCode registry entries, adapter comments
@@ -17,15 +18,20 @@
 > defaults to `medium` effort, cannot disable thinking, and rejects forced
 > tool use.
 >
-> **Model facts this epic is written against**: Opus 5.5 = `claude-opus-5-5`
-> ($4/$20, cache read $0.20), Sonnet 5 = `claude-sonnet-5` ($2/$10), Haiku
-> 4.5 = `claude-haiku-4-5` ($1/$5), Opus 5 = `claude-opus-5` ($5/$25, the
-> fallback). All three target ids were **probed live on FX's plan on
-> 2026-09-30** (`claude -p ok --model <id>` answered and was billed as that
-> id), so the entitlement fallback in 34.1-002 guards the next launch, a plan
-> change or a mid-run outage — not a missing model today. **There is no
-> Sonnet 5.5.** Fable 5.1 is out of scope (2.5x Opus, `refusal` stop reason,
-> different prompting).
+> **Model facts this epic is written against** (probed live on FX's plan on
+> 2026-09-30 — `claude -p ok --model <id>` answered and was billed as that
+> id): Opus 5.5 = `claude-opus-5-5` ($4/$20, cache read $0.20), **Sonnet 5.5
+> = `claude-sonnet-5-5`** (list price to be confirmed from the pricing page
+> at build time — it post-dates the 2026-06 model table this epic was first
+> drafted from; Sonnet 5 = `claude-sonnet-5` is $2/$10), Haiku 4.5 =
+> `claude-haiku-4-5` ($1/$5). The Claude CLI's own aliases resolve today to
+> `opus → claude-opus-5-5`, `sonnet → claude-sonnet-5-5`, `haiku →
+> claude-haiku-4-5-20251001`, so the explicit map matches what runs already
+> get implicitly. Fallbacks: `claude-opus-5`, `claude-sonnet-5`,
+> `claude-haiku-4-5`. The entitlement fallback in 34.1-002 guards the next
+> launch, a plan change or a mid-run outage — not a missing model today.
+> Fable 5.1 is out of scope (2.5x Opus, `refusal` stop reason, different
+> prompting).
 >
 > **Decisions locked 2026-09-30** (FX): three tiers, Opus 5.5 on top, no
 > Fable tier; explicit ids are the new default but `opus`/`sonnet`/`haiku`
@@ -55,7 +61,8 @@ the delta before the new defaults ship.
 the work, not an alias. Honest money — the budget gate and dashboard figures
 stop overstating by 20–40% on Sonnet/Opus stages, so budgets stop refusing
 work they could afford. Cheaper, better defaults — Opus 5.5 costs 20% less
-than Opus 5 and Sonnet 5 a third less than Sonnet 4.6, and effort tuned per
+than Opus 5 and Sonnet 5 a third less than Sonnet 4.6 (Sonnet 5.5's price
+to be confirmed), and effort tuned per
 stage is the single biggest quality/cost lever the new generation exposes.
 One place to move when the next generation lands.
 **Success Metrics**:
@@ -87,7 +94,7 @@ not a CLI alias resolved at dispatch.
 
 ##### Story 34.1-001: Tier-to-model-id map with alias compatibility
 **User Story**: As FX reading a ledger row, I want every routed stage to name
-the exact model id it ran on (`claude-opus-5-5`, `claude-sonnet-5`,
+the exact model id it ran on (`claude-opus-5-5`, `claude-sonnet-5-5`,
 `claude-haiku-4-5`) so that a run is reproducible by model and a price can be
 attached to it, while my existing `.sdlc-model-routing.yaml` files that say
 `opus` keep working.
@@ -96,8 +103,8 @@ attached to it, while my existing `.sdlc-model-routing.yaml` files that say
 
 **Acceptance Criteria**:
 - **Given** the Balanced profile **When** a `build` stage dispatches **Then**
-  `claude -p … --model claude-sonnet-5` is the argv and the ledger's
-  `stage_attempts.model` reads `claude-sonnet-5`, not `sonnet`.
+  `claude -p … --model claude-sonnet-5-5` is the argv and the ledger's
+  `stage_attempts.model` reads `claude-sonnet-5-5`, not `sonnet`.
 - **Given** a per-repo override `model_routing: {build: opus}` **When** the
   run resolves routing **Then** `opus` maps through the same table to
   `claude-opus-5-5` and the routing banner prints both (`build=opus →
@@ -152,7 +159,7 @@ a mid-run outage never aborts a run.
 **Technical Notes**: Reuse the Story 31.1-001 harness preflight seam
 (`harness_preflight_model_pin_unsupported`) rather than a new probe path; the
 fallback table is `TIER_FALLBACK_IDS` next to `TIER_MODEL_IDS`
-(`claude-opus-5-5 → claude-opus-5`, `claude-sonnet-5 → claude-sonnet-4-6`,
+(`claude-opus-5-5 → claude-opus-5`, `claude-sonnet-5-5 → claude-sonnet-5`,
 `claude-haiku-4-5 → claude-haiku-4-5`). Probe result cached under
 `~/.local/state/sdlc/` so parallel cohorts do not each spend a call. Tests
 inject the probe; never call the CLI.
@@ -176,14 +183,14 @@ default.
 **Story Points**: 2
 
 **Acceptance Criteria**:
-- **Given** `build._model_tier("claude-sonnet-5")` **When** called **Then** it
+- **Given** `build._model_tier("claude-sonnet-5-5")` **When** called **Then** it
   returns `sonnet`; `claude-fable-5-1` returns `fable` (not `opus`, not the
   raw id); a registry id (`gpt-6-astra`) returns the id unchanged.
 - **Given** the historical usage average (`build.py` ~2770) **When** keyed by
   tier **Then** rows recorded under `claude-opus-4-8` and `claude-opus-5-5`
   fold into the same `opus` bucket.
 - **Given** `templates/skill-template.md` and `templates/command-template.md`
-  **When** read **Then** their `model:` example is `claude-sonnet-5`.
+  **When** read **Then** their `model:` example is `claude-sonnet-5-5`.
 
 **Technical Notes**: Replace the substring loop with a lookup that tries
 `TIER_MODEL_IDS` and `TIER_FALLBACK_IDS` values first, then the substring
@@ -205,7 +212,7 @@ pass through) so Codex ids are unaffected.
 ##### Story 34.2-001: Price table keyed by model id, stamped with its vintage
 **User Story**: As FX deciding whether a budget refusal is real, I want the
 notional `$` figures to use today's list price for the exact model that ran
-and to say which price table produced them, so that Sonnet 5 and Opus 5.5
+and to say which price table produced them, so that Sonnet 5.5 and Opus 5.5
 stages stop reading 20–50% too expensive.
 **Priority**: Must Have
 **Story Points**: 3
@@ -213,7 +220,8 @@ stages stop reading 20–50% too expensive.
 **Acceptance Criteria**:
 - **Given** `cost_estimate.MODEL_USD_PER_MILLION_TOKENS` **When** read **Then**
   it is keyed by model id with separate input/output rates
-  (`claude-opus-5-5`: 4/20, `claude-sonnet-5`: 2/10, `claude-haiku-4-5`: 1/5,
+  (`claude-opus-5-5`: 4/20, `claude-sonnet-5-5`: from the published pricing
+  page at build time, `claude-sonnet-5`: 2/10, `claude-haiku-4-5`: 1/5,
   `claude-opus-5`: 5/25, `claude-sonnet-4-6`: 3/15) and carries a
   `PRICE_TABLE_VINTAGE = "2026-09-30"` constant; tier aliases resolve through
   34.1-001's map.
