@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.82.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): benchmark gate before the (#34.4-003) (#797)
+
+
 ## [v2.81.1] - 2026-09-30
 
 ### Fixed
