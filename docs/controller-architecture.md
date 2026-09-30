@@ -2943,9 +2943,11 @@ tokens, notional `$`, and a `calibrated` flag):
   carries `PRICE_TABLE_VINTAGE`. Tier aliases resolve through
   `model_routing.TIER_MODEL_IDS`; a dated snapshot id matches its base id.
   `usage_cost()` prices a stage usage row per token class (cache writes at 1.25×
-  input); the run `$` (`_aggregate_run_usage`) sums it over every attempt with
-  token counts, while the ledger `cost_usd` column stays harness-reported for
-  `usage-reconcile`. The pre-dispatch estimate, which only knows a token total, uses the
+  input). Every displayed `$` — run header, runs list, per-story cell,
+  per-stage tooltip and the budget-gate accrual — reads each attempt through
+  `_priced_cost` (table price when it has token counts, reported `cost_usd`
+  otherwise), so one run never shows two totals; the ledger `cost_usd` column
+  stays harness-reported for `usage-reconcile`. The pre-dispatch estimate, which only knows a token total, uses the
   input/output average (`blended_usd_per_million`). The dashboard run header and
   `sdlc status` show the vintage beside the `$` (`$0.231 · prices 2026-09-30`).
   An id with no entry costs at the opus default and `sdlc doctor` warns once per

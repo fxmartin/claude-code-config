@@ -3030,7 +3030,14 @@ def test_stage_set_usage_persists_and_breakdown_exposes_tokens(tmp_path) -> None
     breakdown = ledger.stage_breakdown(run_id)
     build = breakdown["s1"][0]
     assert build["tokens"] == 4420
-    assert build["cost_usd"] == 0.07
+    # Story 34.2-001: the breakdown's `$` is list-priced (unrouted -> opus
+    # default 4/20, cache read 0.20, cache write 5.0); the persisted column
+    # keeps the harness-reported figure for usage-reconcile.
+    assert build["cost_usd"] == pytest.approx(
+        (100 * 4 + 20 * 20 + 4000 * 0.20 + 300 * 5.0) / 1_000_000
+    )
+    (raw,) = ledger.stage_usage_rows(run_id)
+    assert raw["cost_usd"] == 0.07
     assert build["session_id"] == "sess-x"
 
 
@@ -3368,7 +3375,9 @@ def test_final_usage_reconciles_over_live_accrual(tmp_path) -> None:
     assert row["input_tokens"] == 260
     assert row["output_tokens"] == 55
     assert row["cache_read_tokens"] == 4000
-    assert row["cost_usd"] == 0.09
+    # The persisted (harness-reported) cost; stage_breakdown list-prices it.
+    (raw,) = ledger.stage_usage_rows(run_id)
+    assert raw["cost_usd"] == 0.09
     assert row["session_id"] == "sess-final"
 
 
