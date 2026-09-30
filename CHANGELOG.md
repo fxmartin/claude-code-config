@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.74.4] - 2026-09-30
+
+### Fixed
+
+- fix(install): declare the marketplace as a directory source (#743) (#745)
+
+
 ## [v2.74.3] - 2026-09-30
 
 ### Fixed
