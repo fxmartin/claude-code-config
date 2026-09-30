@@ -43,11 +43,11 @@ from sdlc.contracts import (
     _result_wrapper,  # re-exported for build.py prompt rendering (issue #435 move)
 )
 from sdlc.cost_estimate import (
-    DEFAULT_USD_PER_MILLION_TOKENS,
-    MODEL_USD_PER_MILLION_TOKENS,
+    PRICE_TABLE_VINTAGE,
     BatchProjection,
     CostEstimateConfig,
     StageEstimate,
+    blended_usd_per_million,
     estimate_stage,
     notional_cost,
     project_batch,
@@ -4320,6 +4320,8 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "routing": ledger.run_routing(rid),
         "concurrency": concurrency,
         "usage": run_usage,
+        # Story 34.2-001: the price table every `$` in `usage` was read against.
+        "price_vintage": PRICE_TABLE_VINTAGE,
         "stall_seconds": stalls["total_s"],
         # Issue #565: the ordered stage columns this run's snapshot actually
         # populated (see ``stage_names`` above), so the dashboard renders its
@@ -9379,7 +9381,7 @@ def _resolved_recovery_model(
 
 
 def _model_price_key(model: str | None) -> str:
-    """Normalise a resolved model id to a ``MODEL_USD_PER_MILLION_TOKENS`` key.
+    """Normalise a resolved model id to its tier key (calibration history grouping).
 
     Routing yields the Claude tier aliases (``haiku``/``sonnet``/``opus``)
     directly, but an operator pin or per-repo override can name a full id (e.g.
@@ -9794,9 +9796,7 @@ def _estimate_stage_cost(
             stage, harness=harness, model=model
         )
         historical = calibration[0] if calibration is not None else None
-        rate = MODEL_USD_PER_MILLION_TOKENS.get(
-            _model_price_key(model), DEFAULT_USD_PER_MILLION_TOKENS
-        )
+        rate = blended_usd_per_million(model)
         est = estimate_stage(
             stage, prompt,
             config=CostEstimateConfig(usd_per_million_tokens=rate),

@@ -2937,6 +2937,18 @@ tokens, notional `$`, and a `calibrated` flag):
 - **Notional `$`.** Tokens convert to dollars at the same notional rate as the
   budget gate and render through `notional_cost_label`, so the `$` is never
   mistaken for real spend on the subscription.
+- **Price table (Story 34.2-001).** `MODEL_USD_PER_MILLION_TOKENS` is keyed by
+  exact model id (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-sonnet-5`,
+  `claude-haiku-4-5`, …) with separate input / output / cache-read rates, and
+  carries `PRICE_TABLE_VINTAGE`. Tier aliases resolve through
+  `model_routing.TIER_MODEL_IDS`; a dated snapshot id matches its base id.
+  `usage_cost()` prices a stage usage row per token class (cache writes at 1.25×
+  input); the pre-dispatch estimate, which only knows a token total, uses the
+  input/output average (`blended_usd_per_million`). The dashboard run header and
+  `sdlc status` show the vintage beside the `$` (`$0.231 · prices 2026-09-30`).
+  An id with no entry costs at the opus default and `sdlc doctor` warns once per
+  id (`Model pricing`). `DEFAULT_USD_PER_MILLION_TOKENS` (the budget-gate prior)
+  is unchanged for the routing-off path.
 
 `_estimate_stage_cost` (in `build.py`, called from `_run_story` before
 `_dispatch_stage`) renders the prompt, estimates, writes the estimate to the

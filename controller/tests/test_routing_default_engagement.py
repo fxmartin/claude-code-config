@@ -13,7 +13,7 @@ import sdlc.build as build_mod
 from sdlc.build import BuildOptions, Ledger, run_build, status_snapshot
 from sdlc.cohort import Story
 from sdlc.dispatch import AgentResult
-from sdlc.doctor import check_model_routing
+from sdlc.doctor import check_model_pricing, check_model_routing
 from sdlc.model_routing import (
     BALANCED,
     HAIKU,
@@ -536,3 +536,26 @@ def test_a_broken_banner_never_fails_an_otherwise_good_build(
     assert ledger.run_routing(ledger.latest_run_id())["profile"] == "balanced"
     # ...the run simply has no banner to show for it.
     assert _routing_events(ledger, ledger.latest_run_id()) == []
+
+
+def test_doctor_pricing_warns_once_per_unpriced_model(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    _seed_run(db, routing=routing_snapshot(BALANCED), stories=1)
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        for attempt, model in enumerate(["gpt-6-astra", "gpt-6-astra", "claude-opus-5-5"]):
+            conn.execute(
+                "INSERT INTO stages (run_id, story_id, stage_name, attempt, status, model) "
+                "SELECT id, 's1', 'build', ?, 'DONE', ? FROM runs LIMIT 1",
+                (attempt, model),
+            )
+    finding = check_model_pricing(db)
+    assert finding.status == "WARN"
+    assert finding.detail == "gpt-6-astra has no list price; $ figures use the opus default"
+
+
+def test_doctor_pricing_clean_when_all_priced(tmp_path) -> None:
+    db = tmp_path / "ledger.db"
+    _seed_run(db, routing=routing_snapshot(BALANCED), stories=1)
+    assert check_model_pricing(db).status == "CLEAN"

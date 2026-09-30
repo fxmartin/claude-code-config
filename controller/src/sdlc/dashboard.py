@@ -1135,7 +1135,7 @@ function renderMain(d){
     ? "<div class='muted small'>tokens "+humanTokens(u.total_tokens)
       + " (in "+humanTokens(u.input)+" &middot; out "+humanTokens(u.output)
       + " &middot; cache "+humanTokens((u.cache_read||0)+(u.cache_creation||0))+")"
-      + (u.cost_usd!=null ? " &middot; "+usd(u.cost_usd) : "") + "</div>"
+      + (u.cost_usd!=null ? " &middot; "+usd(u.cost_usd)+(run.price_vintage ? " &middot; prices "+esc(run.price_vintage) : "") : "") + "</div>"
     : "";
   const running = run.status === "IN_PROGRESS";
   // Run total duration (Story 11.2-005): "took" once finished, "elapsed" while
