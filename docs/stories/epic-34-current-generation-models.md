@@ -259,6 +259,7 @@ Document in `docs/controller-architecture.md` Epic-14 cost section.
 #### Stories
 
 ##### Story 34.3-001: Codex and OpenCode default to gpt-6-astra end-to-end
+**Status**: Done
 **User Story**: As FX routing a stage to Codex, I want the harness registry,
 adapters, docs and the commented per-stage example to name the model I am
 entitled to and run today (`gpt-6-astra`) so that a copied config works
