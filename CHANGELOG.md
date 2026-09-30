@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.74.2] - 2026-09-30
+
+### Fixed
+
+- fix(merge): merge as-is and pass the ci gate verdict to the agent (#740) (#742)
+
+
 ## [v2.74.1] - 2026-09-28
 
 ### Fixed
