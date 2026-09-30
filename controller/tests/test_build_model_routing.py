@@ -16,7 +16,11 @@ from sdlc.build import (
 )
 from sdlc.cohort import Story
 from sdlc.dispatch import AgentResult
-from sdlc.model_routing import BALANCED, HAIKU, OPUS, SONNET
+from sdlc.model_routing import BALANCED, HAIKU, OPUS, SONNET, TIER_MODEL_IDS
+
+HAIKU_ID = TIER_MODEL_IDS[HAIKU]
+SONNET_ID = TIER_MODEL_IDS[SONNET]
+OPUS_ID = TIER_MODEL_IDS[OPUS]
 
 _PAYLOADS = {
     "build": {"branch_name": "feature/x", "build_status": "SUCCESS", "commit_sha": "a"},
@@ -89,10 +93,10 @@ def test_balanced_profile_routes_each_stage(tmp_path, monkeypatch) -> None:
         model_profile="balanced",
     )
     disp = _run(opts, _story(points=1), tmp_path)
-    assert disp.models["build"] == SONNET
-    assert disp.models["coverage"] == SONNET
-    assert disp.models["review"] == SONNET
-    assert disp.models["merge"] == HAIKU
+    assert disp.models["build"] == SONNET_ID
+    assert disp.models["coverage"] == SONNET_ID
+    assert disp.models["review"] == SONNET_ID
+    assert disp.models["merge"] == HAIKU_ID
 
 
 def test_large_story_escalates_build_and_review_to_opus(tmp_path, monkeypatch) -> None:
@@ -102,11 +106,11 @@ def test_large_story_escalates_build_and_review_to_opus(tmp_path, monkeypatch) -
         model_profile="balanced",
     )
     disp = _run(opts, _story(points=13), tmp_path)
-    assert disp.models["build"] == OPUS
-    assert disp.models["review"] == OPUS
+    assert disp.models["build"] == OPUS_ID
+    assert disp.models["review"] == OPUS_ID
     # Non-escalatable stages keep their cheap tier even for a large story.
-    assert disp.models["coverage"] == SONNET
-    assert disp.models["merge"] == HAIKU
+    assert disp.models["coverage"] == SONNET_ID
+    assert disp.models["merge"] == HAIKU_ID
 
 
 def test_high_risk_story_escalates_review_to_opus(tmp_path, monkeypatch) -> None:
@@ -119,8 +123,8 @@ def test_high_risk_story_escalates_review_to_opus(tmp_path, monkeypatch) -> None
         model_profile="balanced",
     )
     disp = _run(opts, _story(points=1), tmp_path)
-    assert disp.models["review"] == OPUS
-    assert disp.models["build"] == SONNET  # build escalates on points, not live risk
+    assert disp.models["review"] == OPUS_ID
+    assert disp.models["build"] == SONNET_ID  # build escalates on points, not live risk
 
 
 def test_build_model_is_deterministic_regardless_of_branch_risk(
@@ -139,7 +143,7 @@ def test_build_model_is_deterministic_regardless_of_branch_risk(
         model_profile="balanced",
     )
     disp = _run(opts, _story(points=1), tmp_path)
-    assert disp.models["build"] == SONNET
+    assert disp.models["build"] == SONNET_ID
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +158,8 @@ def test_explicit_per_stage_override_wins_over_map(tmp_path, monkeypatch) -> Non
         model_profile="balanced", model_overrides={"merge": "opus"},
     )
     disp = _run(opts, _story(points=1), tmp_path)
-    assert disp.models["merge"] == OPUS  # override beats the HAIKU default
-    assert disp.models["build"] == SONNET  # other stages still from the map
+    assert disp.models["merge"] == OPUS_ID  # override beats the HAIKU_ID default
+    assert disp.models["build"] == SONNET_ID  # other stages still from the map
 
 
 def test_override_works_even_with_routing_off(tmp_path, monkeypatch) -> None:
@@ -166,7 +170,7 @@ def test_override_works_even_with_routing_off(tmp_path, monkeypatch) -> None:
         model_profile="off", model_overrides={"build": "haiku"},
     )
     disp = _run(opts, _story(points=1), tmp_path)
-    assert disp.models["build"] == HAIKU
+    assert disp.models["build"] == HAIKU_ID
     assert disp.models["coverage"] is None  # unrouted stage stays CLI-default
 
 
@@ -307,7 +311,7 @@ def test_bugfix_stage_receives_routed_model(tmp_path, monkeypatch) -> None:
     # Balanced's `bugfix` tier is Sonnet, but Story 14.2-003 escalates the first
     # bugfix attempt one tier (Sonnet → Opus) — a routed model, not the CLI
     # default. Full escalation behaviour is covered below.
-    assert bugfix_models[0] == OPUS
+    assert bugfix_models[0] == OPUS_ID
 
 
 def test_bugfix_override_wins_over_map(tmp_path, monkeypatch) -> None:
@@ -322,7 +326,7 @@ def test_bugfix_override_wins_over_map(tmp_path, monkeypatch) -> None:
         dispatcher=disp, preflight=lambda: True, root=tmp_path,
     )
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
-    assert bugfix_models[0] == HAIKU
+    assert bugfix_models[0] == HAIKU_ID
 
 
 # ---------------------------------------------------------------------------
@@ -383,8 +387,8 @@ def test_bugfix_retry_escalates_build_one_tier(tmp_path, monkeypatch) -> None:
     disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 1), tmp_path)
     build_models = [m for (a, m) in disp.calls if a == "build"]
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
-    assert build_models == [SONNET, OPUS]  # cheap first pass, escalated retry
-    assert bugfix_models == [OPUS]
+    assert build_models == [SONNET_ID, OPUS_ID]  # cheap first pass, escalated retry
+    assert bugfix_models == [OPUS_ID]
 
 
 def test_escalation_climbs_haiku_sonnet_opus(tmp_path, monkeypatch) -> None:
@@ -398,8 +402,8 @@ def test_escalation_climbs_haiku_sonnet_opus(tmp_path, monkeypatch) -> None:
     disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 2), tmp_path)
     build_models = [m for (a, m) in disp.calls if a == "build"]
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
-    assert build_models == [HAIKU, SONNET, OPUS]
-    assert bugfix_models == [SONNET, OPUS]
+    assert build_models == [HAIKU_ID, SONNET_ID, OPUS_ID]
+    assert bugfix_models == [SONNET_ID, OPUS_ID]
 
 
 def test_top_tier_stage_escalation_is_a_noop(tmp_path, monkeypatch) -> None:
@@ -413,8 +417,8 @@ def test_top_tier_stage_escalation_is_a_noop(tmp_path, monkeypatch) -> None:
     disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 1), tmp_path)
     build_models = [m for (a, m) in disp.calls if a == "build"]
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
-    assert build_models == [OPUS, OPUS]
-    assert bugfix_models == [OPUS]
+    assert build_models == [OPUS_ID, OPUS_ID]
+    assert bugfix_models == [OPUS_ID]
 
 
 def test_first_pass_success_does_not_escalate(tmp_path, monkeypatch) -> None:
@@ -427,7 +431,7 @@ def test_first_pass_success_does_not_escalate(tmp_path, monkeypatch) -> None:
     )
     disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 0), tmp_path)
     build_models = [m for (a, m) in disp.calls if a == "build"]
-    assert build_models == [SONNET]  # one cheap dispatch, no escalation
+    assert build_models == [SONNET_ID]  # one cheap dispatch, no escalation
     assert not [m for (a, m) in disp.calls if a == "bugfix"]
 
 
@@ -441,7 +445,7 @@ def test_explicit_override_is_not_escalated_on_retry(tmp_path, monkeypatch) -> N
     )
     disp = _run_disp(opts, _story(points=1), _FailNTimesDispatcher("build", 1), tmp_path)
     build_models = [m for (a, m) in disp.calls if a == "build"]
-    assert build_models == [HAIKU, HAIKU]  # pin held, not escalated
+    assert build_models == [HAIKU_ID, HAIKU_ID]  # pin held, not escalated
 
 
 def test_resumed_stage_routes_on_escalated_tier(tmp_path, monkeypatch) -> None:
@@ -467,7 +471,7 @@ def test_resumed_stage_routes_on_escalated_tier(tmp_path, monkeypatch) -> None:
     )
     build_models = [m for (a, m) in disp.calls if a == "build"]
     # Haiku base + 2 prior tier bumps → Opus on the very first resumed dispatch.
-    assert build_models[0] == OPUS
+    assert build_models[0] == OPUS_ID
 
 
 def test_escalation_is_recorded_in_ledger_events(tmp_path, monkeypatch) -> None:
@@ -493,7 +497,7 @@ def test_escalation_is_recorded_in_ledger_events(tmp_path, monkeypatch) -> None:
         ).fetchall()
     ]
     conn.close()
-    assert any("bugfix attempt" in m and "model=opus" in m for m in msgs)
+    assert any("bugfix attempt" in m and "model=claude-opus-5-5" in m for m in msgs)
     assert any("retry" in m and "escalated" in m and "model=opus" in m for m in msgs)
 
 
@@ -618,9 +622,9 @@ def test_reask_stage_records_routed_model(tmp_path, monkeypatch) -> None:
     )
     # The reask was dispatched with balanced's HAIKU reask tier ...
     reask_models = [m for (a, r, m) in disp.calls if r]
-    assert reask_models == [HAIKU]
+    assert reask_models == [HAIKU_ID]
     # ... and that model is persisted on the reask stage row (not NULL).
-    assert _stage_models(db, "reask") == [HAIKU]
+    assert _stage_models(db, "reask") == [HAIKU_ID]
 
 
 def test_bugfix_stage_records_routed_model(tmp_path, monkeypatch) -> None:
@@ -639,7 +643,7 @@ def test_bugfix_stage_records_routed_model(tmp_path, monkeypatch) -> None:
     )
     models = _stage_models(db, "bugfix")
     assert models, "no bugfix stage row was recorded"
-    assert models[0] == OPUS
+    assert models[0] == OPUS_ID
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +710,7 @@ def test_reask_row_records_registry_model_not_claude_alias(
     # The dispatch still carries the Claude recovery-tier alias (HAIKU) — the
     # registry harness ignores it, but the split is real: dispatch arg vs row.
     reask_models = [m for (a, r, m) in disp.calls if r]
-    assert reask_models == [HAIKU]
+    assert reask_models == [HAIKU_ID]
     # The row must record the model the registry harness ACTUALLY ran on.
     assert _stage_models(db, "reask") == [CODEX_BUILD_MODEL]
 
@@ -731,7 +735,7 @@ def test_bugfix_row_records_registry_model_not_claude_alias(
     )
     # The dispatch still carries the escalated Claude bugfix tier (OPUS).
     bugfix_models = [m for (a, m) in disp.calls if a == "bugfix"]
-    assert bugfix_models[0] == OPUS
+    assert bugfix_models[0] == OPUS_ID
     # The row must record the registry harness's own resolved model.
     models = _stage_models(db, "bugfix")
     assert models, "no bugfix stage row was recorded"
@@ -751,7 +755,7 @@ def test_resolved_recovery_model_registry_error_falls_back_to_claude() -> None:
     )
     story = _story()
     assert (
-        _resolved_recovery_model("reask", "build", story, opts) == "opus"
+        _resolved_recovery_model("reask", "build", story, opts) == OPUS_ID
     )
 
 
@@ -766,5 +770,5 @@ def test_resolved_recovery_model_builtin_harness_returns_claude_model() -> None:
     )
     story = _story()
     assert (
-        _resolved_recovery_model("bugfix", "build", story, opts) == "opus"
+        _resolved_recovery_model("bugfix", "build", story, opts) == OPUS_ID
     )
