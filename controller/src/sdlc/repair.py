@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import enum
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -104,9 +105,12 @@ def is_allowed_root(repo_root: Path) -> bool:
 # Each entry is (destination relative to the Claude config dir, source relative
 # to the repo root). `repair` restores exactly these symlinks and nothing else —
 # anything outside this set is never touched (no destructive action on user
-# files). A "." source is the repo root itself (the plugin marketplace link).
-# test_repair.py::test_managed_links_match_install_core_sh guards parity with
-# the installer so the two never silently diverge.
+# files). test_repair.py::test_managed_links_match_install_core_sh guards parity
+# with the installer so the two never silently diverge.
+#
+# The plugin marketplace is not a link since #743: settings.json declares it as
+# a `directory` source and Claude Code registers it itself (see
+# `default_repo_root` for how its record is read back).
 #
 # `skills` is deliberately absent (#694): install/core.sh keeps
 # ~/.claude/skills a real directory and links each repo skill into it
@@ -125,7 +129,6 @@ MANAGED_LINKS: tuple[tuple[str, str], ...] = (
     ("reference-docs", "reference-docs"),
     ("docs", "docs"),
     ("hooks", "hooks"),
-    ("plugins/marketplaces/fx-claude-config", "."),
 )
 
 
@@ -316,24 +319,46 @@ def default_repo_root() -> Path:
     Defense-in-depth (#179, #630): when ``__file__`` resolves inside an
     ephemeral agent worktree, or anywhere else that fails the ``is_allowed_root``
     allowlist (e.g. a scratch checkout under ``/private/tmp``), the derived root
-    is not trustworthy. Prefer the canonical install root recorded by the
-    healthy marketplace link so the repair still targets the stable checkout.
-    The ``build_plan`` guard is the primary protection if no healthy link is
-    available to fall back to.
+    is not trustworthy. Prefer the canonical install root Claude Code recorded
+    for the ``fx-claude-config`` marketplace so the repair still targets the
+    stable checkout: since #743 that is the ``installLocation`` of its
+    ``directory`` source in ``plugins/known_marketplaces.json``; a machine not
+    yet re-installed still carries the legacy ``plugins/marketplaces`` symlink.
+    The ``build_plan`` guard is the primary protection if neither is available.
     """
     derived = Path(__file__).resolve().parents[3]
     if not is_worktree_root(derived) and is_allowed_root(derived):
         return derived
 
-    marketplace = default_claude_dir() / "plugins" / "marketplaces" / "fx-claude-config"
+    for canonical in _recorded_marketplace_roots(default_claude_dir()):
+        if canonical.is_dir() and not is_worktree_root(canonical) and is_allowed_root(canonical):
+            return canonical
+    return derived
+
+
+def _recorded_marketplace_roots(claude_dir: Path) -> list[Path]:
+    """Where Claude Code says the ``fx-claude-config`` marketplace lives, resolved.
+
+    The ``known_marketplaces.json`` record first (the #743 directory source),
+    then the pre-#743 symlink. Malformed or absent records yield nothing — this
+    only feeds a fallback, so it must never raise.
+    """
+    roots: list[Path] = []
+    record = claude_dir / "plugins" / "known_marketplaces.json"
+    try:
+        entry = json.loads(record.read_text(encoding="utf-8")).get("fx-claude-config", {})
+        location = entry.get("installLocation") if isinstance(entry, dict) else None
+        if isinstance(location, str) and location:
+            roots.append(Path(location).expanduser().resolve())
+    except (OSError, ValueError, AttributeError):
+        pass
+    marketplace = claude_dir / "plugins" / "marketplaces" / "fx-claude-config"
     if marketplace.is_symlink():
         target = Path(os.readlink(marketplace))
         if not target.is_absolute():
             target = marketplace.parent / target
-        canonical = target.resolve()
-        if canonical.is_dir() and not is_worktree_root(canonical) and is_allowed_root(canonical):
-            return canonical
-    return derived
+        roots.append(target.resolve())
+    return roots
 
 
 def default_claude_dir() -> Path:

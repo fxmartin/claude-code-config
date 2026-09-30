@@ -43,8 +43,6 @@ def _seed_repo(root: Path) -> Path:
     repo.mkdir(parents=True, exist_ok=True)
     (repo / MARKER_FILENAME).touch()
     for _dest_rel, src_rel in MANAGED_LINKS:
-        if src_rel == ".":  # the marketplace link points at the repo root itself
-            continue
         target = repo / src_rel
         if _is_file_artifact(src_rel):
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -189,12 +187,60 @@ def test_default_paths_resolve() -> None:
 # --- default_repo_root: worktree fallback (#179 defense-in-depth) -----------
 
 
+def test_default_repo_root_fallback_known_marketplaces(tmp_path: Path, monkeypatch) -> None:
+    """Falls back to the canonical root Claude Code recorded for the marketplace.
+
+    Since #743 the marketplace is a `directory` source, not a symlink: Claude
+    Code writes its resolved path as ``installLocation`` in
+    ``plugins/known_marketplaces.json``. When ``__file__`` resolves inside a
+    worktree, ``default_repo_root`` reads that record back.
+    """
+    import json
+
+    import sdlc.repair as repair_mod
+
+    canonical = tmp_path / "stable-checkout"
+    canonical.mkdir()
+    (canonical / repair_mod.MARKER_FILENAME).touch()
+    claude_dir = tmp_path / "dot-claude"
+    (claude_dir / "plugins").mkdir(parents=True)
+    (claude_dir / "plugins" / "known_marketplaces.json").write_text(json.dumps({
+        "fx-claude-config": {
+            "source": {"source": "directory", "path": str(canonical)},
+            "installLocation": str(canonical),
+        }
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(repair_mod, "is_worktree_root", lambda p: p.resolve() != canonical.resolve())
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    assert repair_mod.default_repo_root() == canonical.resolve()
+
+
+@pytest.mark.parametrize("payload", ["not json", "[]", '{"fx-claude-config": {}}',
+                                     '{"fx-claude-config": {"installLocation": 7}}'])
+def test_default_repo_root_ignores_a_malformed_marketplace_record(
+    tmp_path: Path, monkeypatch, payload: str
+) -> None:
+    import sdlc.repair as repair_mod
+
+    claude_dir = tmp_path / "dot-claude"
+    (claude_dir / "plugins").mkdir(parents=True)
+    (claude_dir / "plugins" / "known_marketplaces.json").write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(repair_mod, "is_worktree_root", lambda p: True)
+    monkeypatch.setattr(repair_mod, "default_claude_dir", lambda: claude_dir)
+
+    derived = Path(repair_mod.__file__).resolve().parents[3]
+    assert repair_mod.default_repo_root() == derived
+
+
 def test_default_repo_root_fallback_absolute_marketplace(tmp_path: Path, monkeypatch) -> None:
     """Falls back to a canonical root via an absolute marketplace symlink.
 
-    When ``__file__`` resolves inside a worktree, ``default_repo_root`` follows
-    the ``plugins/marketplaces/fx-claude-config`` symlink back to the stable
-    checkout rather than returning the throwaway worktree path.
+    A machine not yet re-installed since #743 still carries the legacy
+    ``plugins/marketplaces/fx-claude-config`` symlink and no directory record;
+    ``default_repo_root`` follows it back to the stable checkout rather than
+    returning the throwaway worktree path.
     """
     import sdlc.repair as repair_mod
 
@@ -345,18 +391,19 @@ def test_apply_backs_up_real_file_then_links(tmp_path: Path) -> None:
     assert backed.backup_path.read_text(encoding="utf-8") == "USER DATA"
 
 
-def test_apply_creates_nested_marketplace_parent(tmp_path: Path) -> None:
+def test_apply_never_plants_a_marketplace_symlink(tmp_path: Path) -> None:
+    """#743: the marketplace is a `directory` source Claude Code registers from
+    settings.json. A symlink under plugins/marketplaces/ is what Claude Code
+    flags as a corrupted installLocation, so repair must not recreate one."""
     repo = _seed_repo(tmp_path)
     claude_dir = tmp_path / "claude"
-    # Nothing linked at all — the nested plugins/marketplaces parents are absent.
     claude_dir.mkdir()
 
     plan = build_plan(repo, claude_dir)
     apply_plan(plan, dry_run=False, backup_dir=tmp_path / "bk")
 
-    market = claude_dir / "plugins" / "marketplaces" / "fx-claude-config"
-    assert market.is_symlink()
-    assert Path(os.readlink(market)).resolve() == repo.resolve()
+    assert not (claude_dir / "plugins" / "marketplaces" / "fx-claude-config").exists()
+    assert all("marketplaces" not in a.rel_dest for a in plan.artifacts)
 
 
 def test_apply_is_idempotent(tmp_path: Path) -> None:
