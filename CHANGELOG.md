@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.77.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): prompt audit of stage (#34.4-002)
+
+
 ## [v2.76.0] - 2026-09-30
 
 ### Added
