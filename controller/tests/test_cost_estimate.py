@@ -11,7 +11,7 @@ from sdlc.build import (
     BuildOptions,
     Ledger,
     _estimate_stage_cost,
-    _model_price_key,
+    _model_tier,
     _reconcile_estimate,
     _resolved_stage_model,
     _result_total_tokens,
@@ -286,6 +286,21 @@ def test_historical_tokens_harness_model_tier_matches_served_id(tmp_path: Path) 
     assert tier == "harness+model"
 
 
+def test_historical_tokens_folds_opus_generations_into_one_bucket(tmp_path: Path) -> None:
+    # Story 34.1-003: rows recorded under different opus generations share the
+    # `opus` tier cohort, so a generation bump does not split the history.
+    ledger, run_id = _ledger_with_story(tmp_path)
+    for attempt, tokens, served in ((1, 400, "claude-opus-4-8"), (2, 800, "claude-opus-5-5")):
+        _done_stage(
+            ledger, run_id, "s1-001", "build", attempt, tokens,
+            harness="claude", model="opus",
+        )
+        ledger.stage_set_model(run_id, "s1-001", "build", attempt, served)
+    avg, tier = ledger.historical_stage_tokens("build", harness="claude", model="opus")
+    assert avg == pytest.approx(600.0)
+    assert tier == "harness+model"
+
+
 def test_historical_tokens_harness_model_tier_query_by_served_id(tmp_path: Path) -> None:
     # The symmetric case: an operator pin names the full id, while history was
     # recorded under the tier alias. Normalising both sides matches either way.
@@ -388,8 +403,8 @@ def test_blended_rate_is_input_output_average() -> None:
 @pytest.mark.parametrize(
     "model,expected", [("haiku", "haiku"), ("claude-opus-4-8", "opus"), ("gpt-5", "gpt-5")]
 )
-def test_model_price_key_tier_normalisation(model, expected) -> None:
-    assert _model_price_key(model) == expected
+def test_model_tier_normalisation(model, expected) -> None:
+    assert _model_tier(model) == expected
 
 
 # ---------------------------------------------------------------------------

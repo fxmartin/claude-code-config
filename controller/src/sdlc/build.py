@@ -84,6 +84,7 @@ from sdlc.model_routing import (
     routing_config,
     routing_snapshot,
     select_model,
+    TIER_MODEL_IDS,
 )
 from sdlc.notify import notify
 from sdlc.progress import ProgressCoalescer, UsageAccumulator, map_stream_event
@@ -2770,7 +2771,7 @@ class Ledger:
         if harness is not None and model is not None:
             # Story 28.1-002 overwrites `model` with the *served* id the agent
             # reported ("claude-opus-4-8"), while callers ask by the routed tier
-            # alias ("opus"). Normalise both sides through `_model_price_key` so
+            # alias ("opus"). Normalise both sides through `_model_tier` so
             # the cohort keys on the tier: an exact match would miss forever and
             # silently degrade to the `harness` rung, merging escalated-Opus and
             # base-Sonnet history into one average. A registry model (`gpt-5`)
@@ -2781,7 +2782,7 @@ class Ledger:
                 (
                     "harness+model",
                     "harness = ? AND model IS NOT NULL AND _model_key(model) = ?",
-                    (harness, _model_price_key(model)),
+                    (harness, _model_tier(model)),
                 )
             )
         if harness is not None:
@@ -2798,7 +2799,7 @@ class Ledger:
             "  cache_read_tokens IS NOT NULL OR cache_creation_tokens IS NOT NULL)"
         )
         with self._connect_ro() as conn:
-            conn.create_function("_model_key", 1, _model_price_key, deterministic=True)
+            conn.create_function("_model_key", 1, _model_tier, deterministic=True)
             for tier, extra, params in tiers:
                 sql = base + (f" AND {extra}" if extra else "")
                 row = conn.execute(sql, (stage_name, *params)).fetchone()
@@ -3985,12 +3986,12 @@ class Ledger:
         usage_by_run: dict[str, dict] = {}
         for row in usage_rows:
             d = dict(row)
-            u = usage_by_run.setdefault(d["run_id"], {"tok": None, "cost": None})
+            acc = usage_by_run.setdefault(d["run_id"], {"tok": None, "cost": None})
             tok, cost = _sum_tokens(d), _priced_cost(d)
             if tok is not None:
-                u["tok"] = (u["tok"] or 0) + tok
+                acc["tok"] = (acc["tok"] or 0) + tok
             if cost is not None:
-                u["cost"] = (u["cost"] or 0.0) + cost
+                acc["cost"] = (acc["cost"] or 0.0) + cost
 
         out: list[dict] = []
         for r in runs:
@@ -4694,6 +4695,25 @@ def _log_harness_preflight(
         for line in preflight.log_lines(label="default slot"):
             print(line, file=sys.stderr)
             ledger.event_log(run_id, "", level, "harness", line)
+    except Exception:
+        pass
+
+
+def _probe_tier_models(ledger: "Ledger", run_id: str, opts: "BuildOptions") -> None:
+    """Live-probe the tier model ids and warn on each fallback substitution (34.1-002).
+
+    Skipped with ``--skip-preflight`` and whenever ``$SDLC_AGENT_CMD`` owns the
+    command (it picks its own model). Best-effort: a probe failure must never
+    fail an otherwise-good build — the current ids simply stay in force.
+    """
+    if opts.skip_preflight or os.environ.get("SDLC_AGENT_CMD"):
+        return
+    try:
+        from sdlc.model_probe import probe_tier_models
+
+        for line in probe_tier_models().warnings:
+            print(line, file=sys.stderr)
+            ledger.event_log(run_id, "", "warn", "harness", line)
     except Exception:
         pass
 
@@ -7081,7 +7101,11 @@ def _registry_register(
     ``completed``/``started_at`` default to a fresh run's 0/now. Issue #683:
     ``sdlc resume`` passes the run's already-accrued counts instead, so
     re-registering the record under the resuming process's own pid does not
-    reset the dashboard's progress display back to 0.
+    reset the dashboard's progress display back to 0. A ``started_at`` taken
+    from the ledger arrives in SQLite's ``YYYY-MM-DD HH:MM:SS`` (UTC, no
+    offset); it is normalised to the registry's ISO-8601 form so the dashboard,
+    which sorts run rows by that string, keeps a resumed run in date order (a
+    space sorts before ``T``, which sank run 60c2947e to 26th on 2026-09-30).
     """
     try:
         registry.register(
@@ -7092,13 +7116,32 @@ def _registry_register(
                 scope=scope,
                 pid=os.getpid(),
                 status="IN_PROGRESS",
-                started_at=started_at,  # registry stamps the start time when blank
+                # registry stamps the start time when blank
+                started_at=_registry_iso(started_at),
                 total=total,
                 completed=completed,
             )
         )
     except OSError:
         pass
+
+
+def _registry_iso(stamp: str) -> str:
+    """``stamp`` as ISO-8601 with a UTC offset; blank and unparseable pass through.
+
+    The ledger writes ``datetime('now')`` — ``YYYY-MM-DD HH:MM:SS`` in UTC with
+    no offset — while the registry (and every ``sdlc build`` row) uses
+    ``datetime.isoformat()``; the two must not be mixed in one sortable column.
+    """
+    if not stamp:
+        return stamp
+    try:
+        parsed = datetime.fromisoformat(stamp.replace(" ", "T"))
+    except ValueError:
+        return stamp
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
 
 
 def _registry_finish(
@@ -7450,6 +7493,9 @@ def run_build(
     # `--model-<stage>` pin cannot reach this run. The banner makes the state
     # visible live (stderr) and post-hoc (a `routing` event), so routing can no
     # longer fail silent-and-expensive.
+    # Story 34.1-002: prove the tier ids on this host first, so a substituted
+    # (previous-generation) id is what the banner and every dispatch show.
+    _probe_tier_models(ledger, run_id, opts)
     routing = _resolve_run_routing(opts)
     opts.model_routing_snapshot = routing
     ledger.run_set_routing(run_id, routing)
@@ -9415,19 +9461,24 @@ def _resolved_recovery_model(
     return harness.resolve_model(harness_stage)
 
 
-def _model_price_key(model: str | None) -> str:
-    """Normalise a resolved model id to its tier key (calibration history grouping).
+def _model_tier(model: str | None) -> str:
+    """Classify a model id into its tier for usage, cost and escalation grouping.
 
     Routing yields the Claude tier aliases (``haiku``/``sonnet``/``opus``)
-    directly, but an operator pin or per-repo override can name a full id (e.g.
-    ``claude-opus-4-8``); match those by the tier substring. A registry harness's
-    own model id (e.g. a Codex ``gpt-*``) matches no tier and returns unchanged,
-    so the rate lookup falls through to ``DEFAULT_USD_PER_MILLION_TOKENS``.
+    directly, but an operator pin, a served id or a per-repo override can name a
+    full id (e.g. ``claude-opus-4-8``, ``claude-fable-5-1``). The configured
+    ``TIER_MODEL_IDS`` are matched exactly first; any other Claude id falls to the
+    tier-substring rule, so older generations keep folding into their tier. A
+    registry harness's own id (e.g. ``gpt-6-astra``) matches no tier and returns
+    unchanged, so the rate lookup falls through to ``DEFAULT_USD_PER_MILLION_TOKENS``.
     """
     if not model:
         return ""
+    for tier, tier_id in TIER_MODEL_IDS.items():
+        if model == tier_id:
+            return tier
     lowered = model.lower()
-    for tier in ("haiku", "sonnet", "opus"):
+    for tier in ("haiku", "sonnet", "opus", "fable"):
         if tier in lowered:
             return tier
     return model
