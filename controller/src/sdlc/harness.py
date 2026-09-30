@@ -368,6 +368,7 @@ def dispatch_on_harness(
     prompt: str,
     *,
     model: str | None = None,
+    effort: str | None = None,
     **dispatch_kwargs: Any,
 ) -> AgentResult:
     """Dispatch one agent onto a resolved harness through the unified seam.
@@ -388,11 +389,17 @@ def dispatch_on_harness(
     owns its own invocation surface and instead routes its own model per stage —
     here ``agent_type`` *is* the stage, so a registry harness with a ``{model}``
     placeholder launches with the model its ``models`` map assigns this stage
-    (Story 20.7-004). Extra ``dispatch_kwargs`` (e.g. ``cwd``, ``timeout``,
-    ``transcript_path``, ``on_progress``) pass straight through to
-    :func:`dispatch_agent`.
+    (Story 20.7-004). ``effort`` (Story 34.4-003) is threaded to
+    :meth:`HarnessConfig.to_argv` the same way ``model`` is — it decorates only
+    the built-in/``env`` argv (:meth:`to_argv`'s own docstring: a registry
+    harness ignores it) — so the pre-rendered ``argv`` this function hands to
+    :func:`dispatch_agent` as an explicit ``agent_cmd`` already carries any
+    ``--effort`` flag; ``dispatch_agent`` itself never sees a separate ``effort``
+    kwarg to (harmlessly, but confusingly) ignore in favour of the explicit argv.
+    Extra ``dispatch_kwargs`` (e.g. ``cwd``, ``timeout``, ``transcript_path``,
+    ``on_progress``) pass straight through to :func:`dispatch_agent`.
     """
-    argv = harness.to_argv(model=model, stage=agent_type)
+    argv = harness.to_argv(model=model, stage=agent_type, effort=effort)
     # Built-in / env slots are Claude under the hood; let dispatch pick its
     # default (stream-json) parser. A registry harness names its own parser.
     parser = None if harness.source in ("builtin", "env") else harness.parser

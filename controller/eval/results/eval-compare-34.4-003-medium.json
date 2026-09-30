@@ -1,0 +1,256 @@
+{
+  "baseline_name": "strutils-baseline",
+  "candidate_name": "strutils-baseline",
+  "tolerance": 0.1,
+  "tickets": [
+    {
+      "ticket_id": "add-capitalize",
+      "verdict": "better",
+      "excluded": [],
+      "metrics": [
+        {
+          "key": "loc_net_mean",
+          "label": "netLOC",
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "delta": 0.0,
+          "pct": null,
+          "direction": "neutral",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "tokens_mean",
+          "label": "tokens",
+          "baseline": 267204.0,
+          "candidate": 107168.0,
+          "delta": -160036.0,
+          "pct": -0.5989281597580874,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "cost_mean",
+          "label": "cost$",
+          "baseline": 0.21611400000000003,
+          "candidate": 0.1285016,
+          "delta": -0.08761240000000003,
+          "pct": -0.4053990023783745,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "wall_mean",
+          "label": "wall_s",
+          "baseline": 36.69345537300978,
+          "candidate": 13.205977390505723,
+          "delta": -23.48747798250406,
+          "pct": -0.6400999236441629,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "quality_pass_rate",
+          "label": "qual",
+          "baseline": 1.0,
+          "candidate": 1.0,
+          "delta": 0.0,
+          "pct": 0.0,
+          "direction": "neutral",
+          "comparable": true,
+          "reason": null
+        }
+      ]
+    },
+    {
+      "ticket_id": "add-count-vowels",
+      "verdict": "better",
+      "excluded": [],
+      "metrics": [
+        {
+          "key": "loc_net_mean",
+          "label": "netLOC",
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "delta": 0.0,
+          "pct": null,
+          "direction": "neutral",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "tokens_mean",
+          "label": "tokens",
+          "baseline": 216213.0,
+          "candidate": 106726.0,
+          "delta": -109487.0,
+          "pct": -0.5063849074754987,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "cost_mean",
+          "label": "cost$",
+          "baseline": 0.18661859999999997,
+          "candidate": 0.1252974,
+          "delta": -0.061321199999999965,
+          "pct": -0.3285910407644253,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "wall_mean",
+          "label": "wall_s",
+          "baseline": 24.241365093010245,
+          "candidate": 8.863011318491772,
+          "delta": -15.378353774518473,
+          "pct": -0.6343848094162267,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "quality_pass_rate",
+          "label": "qual",
+          "baseline": 1.0,
+          "candidate": 1.0,
+          "delta": 0.0,
+          "pct": 0.0,
+          "direction": "neutral",
+          "comparable": true,
+          "reason": null
+        }
+      ]
+    },
+    {
+      "ticket_id": "add-truncate",
+      "verdict": "better",
+      "excluded": [],
+      "metrics": [
+        {
+          "key": "loc_net_mean",
+          "label": "netLOC",
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "delta": 0.0,
+          "pct": null,
+          "direction": "neutral",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "tokens_mean",
+          "label": "tokens",
+          "baseline": 246904.0,
+          "candidate": 106939.5,
+          "delta": -139964.5,
+          "pct": -0.5668782198749311,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "cost_mean",
+          "label": "cost$",
+          "baseline": 0.19855485,
+          "candidate": 0.1265804,
+          "delta": -0.07197445,
+          "pct": -0.3624915231232075,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "wall_mean",
+          "label": "wall_s",
+          "baseline": 28.09183757098799,
+          "candidate": 9.991482789992006,
+          "delta": -18.100354780995985,
+          "pct": -0.6443279025537736,
+          "direction": "improved",
+          "comparable": true,
+          "reason": null
+        },
+        {
+          "key": "quality_pass_rate",
+          "label": "qual",
+          "baseline": 1.0,
+          "candidate": 1.0,
+          "delta": 0.0,
+          "pct": 0.0,
+          "direction": "neutral",
+          "comparable": true,
+          "reason": null
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "ticket_id": "OVERALL",
+    "verdict": "better",
+    "excluded": [],
+    "metrics": [
+      {
+        "key": "loc_net_mean",
+        "label": "netLOC",
+        "baseline": 0.0,
+        "candidate": 0.0,
+        "delta": 0.0,
+        "pct": null,
+        "direction": "neutral",
+        "comparable": true,
+        "reason": null
+      },
+      {
+        "key": "tokens_mean",
+        "label": "tokens",
+        "baseline": 243440.33333333334,
+        "candidate": 106944.5,
+        "delta": -136495.83333333334,
+        "pct": -0.5606952285364929,
+        "direction": "improved",
+        "comparable": true,
+        "reason": null
+      },
+      {
+        "key": "cost_mean",
+        "label": "cost$",
+        "baseline": 0.20042915000000003,
+        "candidate": 0.12679313333333334,
+        "delta": -0.07363601666666669,
+        "pct": -0.3673917524804485,
+        "direction": "improved",
+        "comparable": true,
+        "reason": null
+      },
+      {
+        "key": "wall_mean",
+        "label": "wall_s",
+        "baseline": 29.675552679002674,
+        "candidate": 10.6868238329965,
+        "delta": -18.988728846006175,
+        "pct": -0.6398778500068812,
+        "direction": "improved",
+        "comparable": true,
+        "reason": null
+      },
+      {
+        "key": "quality_pass_rate",
+        "label": "qual",
+        "baseline": 1.0,
+        "candidate": 1.0,
+        "delta": 0.0,
+        "pct": 0.0,
+        "direction": "neutral",
+        "comparable": true,
+        "reason": null
+      }
+    ]
+  },
+  "warnings": []
+}

@@ -1,0 +1,30 @@
+compare: strutils-baseline (baseline, harness=claude) vs strutils-baseline (candidate, harness=claude)  [tolerance 10%]
+wall_s is stall-adjusted agent time (rate-limit waits excluded).
+
+add-capitalize: BETTER
+  netLOC       0.0000 ->     0.0000  (    —) = same
+  tokens   267204.0000 -> 144557.5000  ( -46%) ↓ better
+  cost$        0.2161 ->     0.1418  ( -34%) ↓ better
+  wall_s      36.6935 ->    13.9799  ( -62%) ↓ better
+  qual         1.0000 ->     1.0000  (  +0%) = same
+
+add-count-vowels: BETTER
+  netLOC       0.0000 ->     0.0000  (    —) = same
+  tokens   216213.0000 -> 143314.5000  ( -34%) ↓ better
+  cost$        0.1866 ->     0.1370  ( -27%) ↓ better
+  wall_s      24.2414 ->    11.7095  ( -52%) ↓ better
+  qual         1.0000 ->     1.0000  (  +0%) = same
+
+add-truncate: BETTER
+  netLOC       0.0000 ->     0.0000  (    —) = same
+  tokens   246904.0000 -> 143358.5000  ( -42%) ↓ better
+  cost$        0.1986 ->     0.1374  ( -31%) ↓ better
+  wall_s      28.0918 ->    13.3087  ( -53%) ↓ better
+  qual         1.0000 ->     1.0000  (  +0%) = same
+
+OVERALL: BETTER
+  netLOC       0.0000 ->     0.0000  (    —) = same
+  tokens   243440.3333 -> 143743.5000  ( -41%) ↓ better
+  cost$        0.2004 ->     0.1387  ( -31%) ↓ better
+  wall_s      29.6756 ->    12.9994  ( -56%) ↓ better
+  qual         1.0000 ->     1.0000  (  +0%) = same

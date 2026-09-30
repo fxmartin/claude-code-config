@@ -1,5 +1,4 @@
 {
-  "_note": "Story 34.4-003 benchmark gate: live run on 2026-09-30 (sdlc eval --model claude-sonnet-5-5 --effort high --n 2 --json), the Epic-34 current-generation tier map at its shipped Balanced-profile build-stage default. Compared green against the pre-epic map (claude-sonnet-4-6, no effort) on the same ticket set: pass rate unchanged (100%), cost per completed ticket -31%, wall-clock -56% (see docs/optimization/BASELINE.md §6 and controller/eval/results/*-34.4-003*). Regenerate with: uv run sdlc eval --model claude-sonnet-5-5 --effort high --json > eval/baseline.json",
   "config_name": "strutils-baseline",
   "harness": "claude",
   "tickets": [

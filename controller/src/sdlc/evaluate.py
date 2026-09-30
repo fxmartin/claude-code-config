@@ -17,7 +17,12 @@ from typing import Any
 
 import yaml
 
-from sdlc.capability import ProbeRunner, ProbeStatus, probe_harness
+from sdlc.capability import (
+    ProbeRunner,
+    ProbeStatus,
+    probe_harness,
+    resolve_capabilities,
+)
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, _result_wrapper
 from sdlc.cost_estimate import DEFAULT_USD_PER_MILLION_TOKENS, notional_cost
 from sdlc.dispatch import AgentResult, RateLimitError, dispatch_agent
@@ -126,6 +131,13 @@ class EvalConfig:
     usd_per_million_tokens: float = DEFAULT_USD_PER_MILLION_TOKENS
     model: str | None = None
     harness: str | None = None
+    # Story 34.4-003: an optional `--effort` level for the build-stage dispatch,
+    # mirroring `model`. `None` (the default) adds no flag — matching the
+    # pre-Story-34.4-001 behaviour every existing eval config keeps, so the
+    # benchmark gate can pin one arm to "no effort" (the pre-epic map) and the
+    # other to a stated level (the new map's stage default) without a config
+    # ever silently picking one up on its own.
+    effort: str | None = None
 
     def __post_init__(self) -> None:
         # Issue #435: pin a concrete model so an eval never silently runs on the
@@ -252,6 +264,9 @@ class Provenance:
     # re-reads later.
     cost_metered: bool = True
     local_rate_usd_per_million_tokens: float | None = None
+    # Story 34.4-003: the pinned `--effort` level (``None`` = no flag), so two
+    # arms that differ only in effort never share an indistinguishable block.
+    effort: str | None = None
 
 
 def host_identifier() -> str:
@@ -298,6 +313,7 @@ def build_provenance(
         timestamp=timestamp if timestamp is not None else utc_timestamp(),
         cost_metered=metered,
         local_rate_usd_per_million_tokens=local_rate_usd_per_million_tokens,
+        effort=config.effort,
     )
 
 
@@ -376,6 +392,12 @@ def load_config(path: Path) -> EvalConfig:
     if harness is not None and (not isinstance(harness, str) or not harness):
         raise EvalConfigError("config 'harness' must be a non-empty string when set")
 
+    # Story 34.4-003: an optional `--effort` pin, parsed the same way as `model`.
+    # Absent means no flag (today's behaviour, unchanged).
+    effort = raw.get("effort")
+    if effort is not None and (not isinstance(effort, str) or not effort):
+        raise EvalConfigError("config 'effort' must be a non-empty string when set")
+
     raw_tickets = raw.get("tickets")
     if not isinstance(raw_tickets, list) or not raw_tickets:
         raise EvalConfigError("config 'tickets' is required and must be a non-empty list")
@@ -396,6 +418,7 @@ def load_config(path: Path) -> EvalConfig:
         agent_type=agent_type,
         model=model,
         harness=harness,
+        effort=effort,
     )
 
 
@@ -776,6 +799,7 @@ def _provenance_to_dict(p: Provenance) -> dict[str, Any]:
         "timestamp": p.timestamp,
         "cost_metered": p.cost_metered,
         "local_rate_usd_per_million_tokens": p.local_rate_usd_per_million_tokens,
+        "effort": p.effort,
     }
 
 
@@ -838,7 +862,10 @@ def resolve_eval_harness(
       authenticated on this machine (AC5);
     - a registry harness's command carries no ``{model}`` placeholder, so it
       cannot honour the eval's pinned ``model`` (AC6) — surfaced here rather than
-      silently dropped.
+      silently dropped;
+    - the eval pins an ``effort`` the harness does not declare ``effort_aware``
+      for (a registry harness, or an ``SDLC_AGENT_CMD`` override) — the level
+      would otherwise be dropped and the run mislabelled (Story 34.4-003).
     """
     try:
         harness = resolve_harness(config.harness, config_path=config_path, env=env)
@@ -865,6 +892,15 @@ def resolve_eval_harness(
             f"{config.model!r}); add a {{model}} placeholder and a 'models' map "
             f"to its entry in the harness registry, or drop the harness override "
             f"to run on the default claude harness"
+        )
+
+    effort_aware = resolve_capabilities(harness).get("effort_aware", False)
+    if config.effort is not None and not effort_aware:
+        raise EvalConfigError(
+            f"harness {harness.name!r} cannot take an effort pin (config effort="
+            f"{config.effort!r}); it does not declare effort_aware, so the level "
+            f"would be silently dropped — drop the effort pin or run on the "
+            f"default claude harness"
         )
 
     return harness
@@ -978,6 +1014,7 @@ def run_ticket(
                 prompt,
                 cwd=workdir,
                 model=config.model,
+                effort=config.effort,
                 timeout=timeout,
             )
         except RateLimitError as exc:

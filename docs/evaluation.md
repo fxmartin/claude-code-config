@@ -28,6 +28,10 @@ uv run sdlc eval --json --n 1
 
 # Run the same ticket set on another harness from the registry (Story 31.1-001).
 uv run sdlc eval --harness qwen --json
+
+# Pin a model + effort level for the build dispatch (Story 34.4-003) — e.g. to
+# benchmark one point in the routing map against another on the same tickets.
+uv run sdlc eval --model claude-sonnet-5 --effort high --json
 ```
 
 The default config is `controller/eval/eval-config.yaml`. Point `--config` at any
@@ -75,6 +79,7 @@ n: 3                         # runs per ticket (averages out model variance)
 seed: 1801                   # reproducibility provenance for the harness inputs
 agent_type: build            # which agent role to dispatch
 # harness: qwen               # optional harness pin (Story 31.1-001); default: claude
+# effort: high                # optional --effort pin (Story 34.4-003); default: no flag
 tickets:
   - id: add-capitalize
     prompt: >-
@@ -110,6 +115,26 @@ The harness is resolved and preflighted **once, before any ticket dispatches**
 
 See [`docs/harness-adapters.md`](harness-adapters.md) for the full registry
 format and the qwen/opencode/codex adapters.
+
+### Model and effort pins (issue #435, Story 34.4-003)
+
+`model:` in the config (or `--model` on the CLI, which wins over the config —
+CLI > config > the Balanced-profile default) pins a tier alias (`sonnet`) or a
+full model id (`claude-sonnet-5`) for the build-stage dispatch, so an eval run
+never silently rides the CLI's current default. `effort:` (or `--effort`)
+pins a `--effort` level (`low`…`max`) the same way; unlike `model:` it has no
+default — an eval config that never sets it adds no flag, matching every eval
+before this field existed. Pinning both lets one run stand in for a specific
+point in the routing map (e.g. `--model claude-sonnet-5 --effort high`
+reproduces the Balanced profile's build-stage default) without hand-editing
+the routing layer — this is how Story 34.4-003's benchmark gate
+(`docs/optimization/BASELINE.md` §6) compared the pre-epic and current
+tier maps on the same ticket set. `--effort` is a raw pin, not a routed
+decision (`model_routing.select_effort`) — pick a level the pinned model
+actually supports, or the harness rejects it. An effort pin on a harness that
+does not declare `effort_aware` (a registry harness, or an `SDLC_AGENT_CMD`
+override) aborts preflight instead of silently dropping the flag, and the
+scoreboard's `provenance` block records the pinned `effort` next to `model`.
 
 ## Scoreboard
 
