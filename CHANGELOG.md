@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.81.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): codex and opencode (#34.3-001) (#784)
+
+
 ## [v2.80.1] - 2026-09-30
 
 ### Fixed
