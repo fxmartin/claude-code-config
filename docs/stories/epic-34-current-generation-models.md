@@ -93,6 +93,7 @@ not a CLI alias resolved at dispatch.
 #### Stories
 
 ##### Story 34.1-001: Tier-to-model-id map with alias compatibility
+**Status**: Done
 **User Story**: As FX reading a ledger row, I want every routed stage to name
 the exact model id it ran on (`claude-opus-5-5`, `claude-sonnet-5-5`,
 `claude-haiku-4-5`) so that a run is reproducible by model and a price can be
@@ -134,6 +135,7 @@ the README routing table state the map and the vintage date.
 **Risk Level**: Medium
 
 ##### Story 34.1-002: Live entitlement probe with previous-generation fallback
+**Status**: Done
 **User Story**: As FX, I want the controller to prove an id works on this
 host before it becomes a run's default and to fall back to the previous
 generation when it does not, so that the next model launch, a plan change or
@@ -174,6 +176,7 @@ inject the probe; never call the CLI.
 **Risk Level**: Medium
 
 ##### Story 34.1-003: Tier detection and registry hygiene for explicit ids
+**Status**: Done
 **User Story**: As FX reading the dashboard and `sdlc status`, I want a full
 model id to classify into its tier everywhere the controller groups by tier
 (usage averages, cost estimates, escalation base), so that explicit ids do
@@ -210,6 +213,7 @@ pass through) so Codex ids are unaffected.
 #### Stories
 
 ##### Story 34.2-001: Price table keyed by model id, stamped with its vintage
+**Status**: Done
 **User Story**: As FX deciding whether a budget refusal is real, I want the
 notional `$` figures to use today's list price for the exact model that ran
 and to say which price table produced them, so that Sonnet 5.5 and Opus 5.5
@@ -296,6 +300,7 @@ generation is a one-line diff. Pricing for OpenAI ids is out of scope
 #### Stories
 
 ##### Story 34.4-001: Per-stage effort map in model routing
+**Status**: Done
 **User Story**: As FX paying for tokens, I want each stage to run at an effort
 level chosen for its job (mechanical stages low, build high, review/merge
 xhigh) and to be able to override it per repo like the model map, so that
@@ -337,6 +342,7 @@ Levels per model from the Anthropic thinking/effort table; Fable excluded.
 **Risk Level**: Medium
 
 ##### Story 34.4-002: Prompt audit of stage prompts and plugin skills
+**Status**: Done
 **User Story**: As FX, I want the build/coverage/review/merge/bugfix prompts
 and the plugin skills audited for instructions written for the previous model
 generation, so that the new models are not steered by rules that now reduce

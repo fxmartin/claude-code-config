@@ -261,6 +261,89 @@ def test_gate_polls_a_running_pipeline_then_merges(tmp_path):
     assert gate.polls == 2
 
 
+# --- registration grace: a fresh push has no checks registered yet ----------
+#
+# Run 60c2947e / story 34.4-001 (2026-09-30): a commitlint re-ask pushed a new
+# head seconds before the gate polled; GitHub's statusCheckRollup was still
+# empty, `_github_rollup_status` mapped it to CR_NONE, and the gate allowed the
+# merge "with no CI" on a repo carrying fourteen workflow checks. The merge agent
+# was then told nothing would appear, pushed, and hit branch protection.
+
+
+def _repo_with_workflows(tmp_path):
+    root = tmp_path / "repo"
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / ".github" / "workflows" / "ci.yml").write_text("on: [push]\n", encoding="utf-8")
+    return root
+
+
+def test_repo_has_ci_config_detects_github_and_gitlab(tmp_path):
+    from sdlc.build import _repo_has_ci_config
+
+    assert _repo_has_ci_config(_repo_with_workflows(tmp_path)) is True
+    gl = tmp_path / "gl"
+    gl.mkdir()
+    (gl / ".gitlab-ci.yml").write_text("stages: [test]\n", encoding="utf-8")
+    assert _repo_has_ci_config(gl) is True
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert _repo_has_ci_config(bare) is False
+    assert _repo_has_ci_config(None) is False
+
+
+def test_gate_treats_a_fresh_none_as_pending_when_the_repo_has_ci(tmp_path):
+    """CR_NONE on a repo with CI config is 'checks not registered yet': keep
+    polling, and pass on the green that follows instead of allowing blind."""
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    sequence = iter([ih.CR_NONE, ih.CR_NONE, ih.CR_PENDING, ih.CR_SUCCESS])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: next(sequence), sleep_fn=clock.sleep, clock=clock,
+        repo_root=_repo_with_workflows(tmp_path),
+    )
+    assert gate.verdict == _GATE_PASS
+    assert gate.status == ih.CR_SUCCESS
+    assert gate.polls == 4
+    assert gate.ci_configured is True
+
+
+def test_gate_falls_back_to_the_no_ci_policy_after_the_grace_window(tmp_path):
+    """A repo with CI config whose push legitimately triggers nothing (path
+    filters) must not hang: after the registration grace the policy applies."""
+    from sdlc.build import _CI_REGISTRATION_GRACE_S
+
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(ci_gate_no_ci="allow"),
+        status_fn=lambda: ih.CR_NONE, sleep_fn=clock.sleep, clock=clock,
+        repo_root=_repo_with_workflows(tmp_path),
+    )
+    assert gate.verdict == _GATE_PASS
+    assert gate.status == ih.CR_NONE
+    assert gate.waited_s >= _CI_REGISTRATION_GRACE_S
+    assert "no checks registered" in gate.reason
+
+
+def test_gate_none_without_ci_config_is_immediate(tmp_path):
+    """The #740 case is unchanged: no CI config → no grace, one poll, policy."""
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_NONE, sleep_fn=clock.sleep, clock=clock, repo_root=bare,
+    )
+    assert gate.verdict == _GATE_PASS
+    assert gate.polls == 1
+    assert gate.ci_configured is False
+
+
 def test_gate_no_ci_allow_vs_deny(tmp_path):
     ledger = _ledger(tmp_path)
     run_id = ledger.run_create("epic-23", "build")

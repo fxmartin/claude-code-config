@@ -2631,6 +2631,19 @@ def test_merge_prompt_no_ci_status_forbids_pipeline_wait() -> None:
     assert "required checks" not in prompt
 
 
+def test_merge_prompt_none_with_ci_config_expects_checks_after_a_push() -> None:
+    """Story 34.4-001: on a repo that HAS CI config, a `none` at gate time means
+    checks were not registered yet — the agent must not be told nothing will
+    ever appear; a head it pushes will start checks it has to wait for."""
+    from sdlc.build import render_merge_prompt
+
+    prompt = render_merge_prompt(_story("99.1-001"), 7, ci_status=ih.CR_NONE,
+                                 ci_configured=True)
+    assert "none will appear" not in prompt
+    assert "does have CI" in prompt
+    assert "required checks" in prompt and "blocking foreground" in prompt
+
+
 def test_merge_prompt_passed_status_says_gate_verified_the_head() -> None:
     """A green gate is stated as such — the wait applies only to a head the
     agent pushes itself."""
@@ -2645,7 +2658,7 @@ def test_render_stage_prompt_threads_ci_gate_into_merge_prompt() -> None:
     from sdlc.build import _GATE_PASS, _MergeCIGate, _render_stage_prompt
 
     gate = _MergeCIGate(verdict=_GATE_PASS, status=ih.CR_NONE, reason="no pipeline",
-                        polls=1, waited_s=0.0)
+                        polls=1, waited_s=0.0, ci_configured=False)
     opts = BuildOptions(scope="epic-99")
     with_gate = _render_stage_prompt("merge", _story("99.1-001"), opts, 7, ci_gate=gate)
     without = _render_stage_prompt("merge", _story("99.1-001"), opts, 7)

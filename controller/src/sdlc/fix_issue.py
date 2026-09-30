@@ -802,6 +802,7 @@ def render_merge_prompt(
     *,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
     ci_status: str | None = None,
+    ci_configured: bool = False,
 ) -> str:
     """Render the merge-agent prompt for a fix run (issue #436, #606).
 
@@ -830,7 +831,7 @@ def render_merge_prompt(
         # replayed a re-run branch's merge commits into conflicts the forge did
         # not see. The shared drift block merges as-is and merges (never
         # rebases) drift in only when the forge reports the CR not mergeable.
-        + "1. " + render_merge_drift_block(abbr, ci_status=ci_status)
+        + "1. " + render_merge_drift_block(abbr, ci_status=ci_status, ci_configured=ci_configured)
         + "If a `git merge origin/main` you had to run conflicts beyond what you "
         'can resolve, report merge_status FAILED with "MERGE_CONFLICT" in '
         "block_reason and STOP.\n"
@@ -1830,7 +1831,10 @@ def _run_stage_loop(
                 # push (a new head) is always re-read; a red/pending/denied head
                 # is a synthetic `ci-gate` failure routed to the bugfix loop, and
                 # the merge agent never runs over it.
-                gate = _run_merge_ci_gate(stage, ledger, run_id, story, pr_number, opts)
+                gate = _run_merge_ci_gate(
+                    stage, ledger, run_id, story, pr_number, opts,
+                    repo_root=root or Path.cwd(),
+                )
                 if gate is not None and gate.verdict == _GATE_BLOCK:
                     ok, result, kind = False, None, "ci-gate"
                     failure = _ci_gate_failure(ledger, story, pr_number, gate.reason)
@@ -1841,6 +1845,7 @@ def _run_stage_loop(
                         stage, issue, inv, opts, pr_number,
                         review_packet=review_packet_block, cr_terms=cr_terms,
                         ci_status=gate.status if gate is not None else None,
+                        ci_configured=gate.ci_configured if gate is not None else False,
                     )
                     ok, result, failure, kind = _dispatch_fix_stage(
                         stage, story, prompt, model, dispatch, tpath, opts
@@ -1969,6 +1974,7 @@ def _render_core_prompt(
     review_packet: str | None = None,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
     ci_status: str | None = None,
+    ci_configured: bool = False,
 ) -> str:
     """Render the fix prompt for one core pipeline stage."""
     if stage == "build":
@@ -1979,7 +1985,9 @@ def _render_core_prompt(
         return render_review_prompt(
             issue, pr_number, packet=review_packet, cr_terms=cr_terms
         )
-    return render_merge_prompt(issue, pr_number, cr_terms=cr_terms, ci_status=ci_status)
+    return render_merge_prompt(
+        issue, pr_number, cr_terms=cr_terms, ci_status=ci_status, ci_configured=ci_configured
+    )
 
 
 def _run_summary(
