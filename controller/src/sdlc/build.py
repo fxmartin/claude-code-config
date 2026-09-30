@@ -5083,11 +5083,64 @@ def render_review_prompt(
     )
 
 
+def render_merge_drift_block(abbr: str, *, ci_status: str | None = None) -> str:
+    """The merge agent's baseline-drift and pipeline-wait instructions.
+
+    Shared by the build and fix merge prompts (issues #738, #740). ``ci_status``
+    is the CR status the controller's merge CI gate observed on the current head
+    (:data:`CR_NONE`, :data:`CR_SUCCESS`, or None when the story was not gated),
+    so the agent is told what the controller already knows instead of
+    re-deriving it — the gate is the one source of truth on CI.
+    """
+    # Issue #738 (agentic-coding-monitor #119, MR !102): the mandated rebase
+    # replayed a re-run branch's merge commits of origin/main into conflicts a
+    # plain forge merge never saw, and a mergeable MR failed three attempts. A
+    # rewritten head also discards the pipeline result the gate just verified.
+    drift = (
+        f"Merge the {abbr} as it stands when the forge reports it mergeable — do "
+        "not rebase it: a branch from a re-run or a bugfix pass may carry merge "
+        "commits of origin/main, which a rebase replays into conflicts the forge "
+        "itself does not see, and a rewritten head discards the pipeline result "
+        "the controller just verified.\n"
+        f"Only if the forge reports the {abbr} NOT mergeable because it conflicts "
+        "with or is behind main, absorb the drift with `git merge origin/main` on "
+        "the branch (never a rebase), resolve, and push.\n"
+    )
+    if ci_status == CR_NONE:
+        # Issue #740: the gate allowed a no-pipeline MR, then the agent invented
+        # its own pipeline wait, timed out, and reported a false FAILED that
+        # blocked 13 dependents. Say outright that nothing will ever appear.
+        return drift + (
+            f"This {abbr} has no CI pipeline: the controller's CI gate checked "
+            "its head and allowed the merge on that basis. Do not poll, sleep, or "
+            "wait for a pipeline — none will appear, not even after a push. Merge "
+            f"as soon as the forge reports the {abbr} mergeable.\n"
+        )
+    verified = (
+        "The controller's CI gate verified that the pipeline on the current head "
+        "passed; with no new push there is nothing further to wait for.\n"
+        if ci_status == CR_SUCCESS
+        else ""
+    )
+    # Run b8fdbc71 (story 27.1-003, merge attempt 3): a rewritten head restarted
+    # the PR's required checks; the agent handed the wait to a background
+    # watcher + scheduled wakeup and ended its turn with no result block. The
+    # wait must stay synchronous — a deferred block is a contract violation in
+    # the one-shot dispatch.
+    return drift + verified + (
+        f"A head you push restarts the {abbr}'s required checks: wait for them "
+        "with a blocking foreground watch. If they are still running when you "
+        'must answer, report merge_status="FAILED" in the result block — never '
+        "hand the wait to a background task or scheduled wakeup.\n"
+    )
+
+
 def render_merge_prompt(
     story: Story,
     pr_number: int | None,
     *,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
+    ci_status: str | None = None,
 ) -> str:
     # Story 23.2-003: the merge stage is the last change-request prompt that was
     # GitHub-coupled. ``cr_terms`` picks the host noun (PR via gh / MR via glab)
@@ -5108,17 +5161,9 @@ def render_merge_prompt(
     return (
         f"Merge the {abbr}{cr_terms.merge_cli_hint} for story {story.id}: "
         f"{story.title} ({abbr} #{pr_number}).\n"
-        + forge_only +
-        "Rebase before merge to absorb baseline drift, then emit the result block.\n"
-        # Run b8fdbc71 (story 27.1-003, merge attempt 3): the rebase restarted
-        # the PR's required checks; the agent handed the wait to a background
-        # watcher + scheduled wakeup and ended its turn with no result block.
-        # The wait must stay synchronous — a deferred block is a contract
-        # violation in the one-shot dispatch.
-        f"A rebase restarts the {abbr}'s required checks: wait for them with a "
-        "blocking foreground watch. If they are still running when you must "
-        'answer, report merge_status="FAILED" in the result block — never '
-        "hand the wait to a background task or scheduled wakeup.\n"
+        + forge_only
+        + render_merge_drift_block(abbr, ci_status=ci_status)
+        + "Then emit the result block.\n"
         # Story 12.3-003: surface a high-risk human-approval block additively so
         # the controller parks AWAITING_APPROVAL instead of entering the bugfix
         # loop (which cannot self-approve). The instruction below is part of the
@@ -8566,7 +8611,7 @@ def _run_story(
                         on_progress=sink, escalation_steps=escalation_steps,
                         close_link=close_link, cr_terms=cr_terms, base_ref=base_ref,
                         precheck=precheck,
-                        review_packet=review_packet_block,
+                        review_packet=review_packet_block, ci_gate=gate,
                     )
                     if ok and stage == "merge":
                         # Issue #699: never mark DONE on an agent's word alone.
@@ -9324,6 +9369,7 @@ def _dispatch_stage(
     base_ref: str = "origin/main",
     precheck: "coverage_precheck.PrecheckResult | None" = None,
     review_packet: str | None = None,
+    ci_gate: _MergeCIGate | None = None,
 ) -> tuple[bool, AgentResult | None, str, str]:
     """Dispatch one stage's agent and classify the outcome.
 
@@ -9337,12 +9383,13 @@ def _dispatch_stage(
     streamed stage emits sub-stage progress to the ledger. ``precheck`` (Story
     27.3-001) carries the deterministic pre-check numbers into a dispatched
     coverage agent's prompt; ``None`` for every other stage or an inconclusive
-    pre-check.
+    pre-check. ``ci_gate`` (issue #740) is the merge CI gate's verdict on the
+    current head, told to the merge agent so it never re-derives it.
     """
     prompt = _render_stage_prompt(
         stage, story, opts, pr_number, close_link=close_link,
         cr_terms=cr_terms, base_ref=base_ref, precheck=precheck,
-        review_packet=review_packet,
+        review_packet=review_packet, ci_gate=ci_gate,
     )
     # Issue #427: resolve the effective model through the shared helper so
     # dispatch and the pre-dispatch estimate/ledger write can never diverge. For
@@ -9424,6 +9471,7 @@ def _render_stage_prompt(
     base_ref: str = "origin/main",
     precheck: "coverage_precheck.PrecheckResult | None" = None,
     review_packet: str | None = None,
+    ci_gate: _MergeCIGate | None = None,
 ) -> str:
     if stage == "build":
         return render_build_prompt(
@@ -9435,7 +9483,10 @@ def _render_stage_prompt(
         )
     if stage == "review":
         return render_review_prompt(story, pr_number, packet=review_packet)
-    return render_merge_prompt(story, pr_number, cr_terms=cr_terms)
+    return render_merge_prompt(
+        story, pr_number, cr_terms=cr_terms,
+        ci_status=ci_gate.status if ci_gate is not None else None,
+    )
 
 
 def _stage_succeeded(stage: str, data: dict) -> bool:
