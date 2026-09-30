@@ -126,6 +126,13 @@ class EvalConfig:
     usd_per_million_tokens: float = DEFAULT_USD_PER_MILLION_TOKENS
     model: str | None = None
     harness: str | None = None
+    # Story 34.4-003: an optional `--effort` level for the build-stage dispatch,
+    # mirroring `model`. `None` (the default) adds no flag — matching the
+    # pre-Story-34.4-001 behaviour every existing eval config keeps, so the
+    # benchmark gate can pin one arm to "no effort" (the pre-epic map) and the
+    # other to a stated level (the new map's stage default) without a config
+    # ever silently picking one up on its own.
+    effort: str | None = None
 
     def __post_init__(self) -> None:
         # Issue #435: pin a concrete model so an eval never silently runs on the
@@ -376,6 +383,12 @@ def load_config(path: Path) -> EvalConfig:
     if harness is not None and (not isinstance(harness, str) or not harness):
         raise EvalConfigError("config 'harness' must be a non-empty string when set")
 
+    # Story 34.4-003: an optional `--effort` pin, parsed the same way as `model`.
+    # Absent means no flag (today's behaviour, unchanged).
+    effort = raw.get("effort")
+    if effort is not None and (not isinstance(effort, str) or not effort):
+        raise EvalConfigError("config 'effort' must be a non-empty string when set")
+
     raw_tickets = raw.get("tickets")
     if not isinstance(raw_tickets, list) or not raw_tickets:
         raise EvalConfigError("config 'tickets' is required and must be a non-empty list")
@@ -396,6 +409,7 @@ def load_config(path: Path) -> EvalConfig:
         agent_type=agent_type,
         model=model,
         harness=harness,
+        effort=effort,
     )
 
 
@@ -978,6 +992,7 @@ def run_ticket(
                 prompt,
                 cwd=workdir,
                 model=config.model,
+                effort=config.effort,
                 timeout=timeout,
             )
         except RateLimitError as exc:

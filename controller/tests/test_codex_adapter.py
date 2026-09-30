@@ -208,6 +208,29 @@ def test_builtin_slot_decorates_argv_with_routed_model(monkeypatch) -> None:
     assert argv[-2:] == ["--model", "opus"]
 
 
+def test_builtin_slot_decorates_argv_with_effort(monkeypatch) -> None:
+    """`effort` flows into the built-in Claude argv via resolve_agent_cmd (Story 34.4-003)."""
+    captured = _capture_dispatch(monkeypatch)
+
+    builtin = resolve_harness()
+    dispatch_on_harness(builtin, "build", "prompt", model="sonnet", effort="high")
+
+    # resolve_agent_cmd appends `--effort high` after the routed model.
+    argv = captured["agent_cmd"]
+    assert argv[-2:] == ["--effort", "high"]
+    assert "--model" in argv and argv[argv.index("--model") + 1] == "sonnet"
+
+
+def test_builtin_slot_omits_effort_flag_when_none(monkeypatch) -> None:
+    """No `effort` passed -> no `--effort` flag, matching today's unchanged default."""
+    captured = _capture_dispatch(monkeypatch)
+
+    builtin = resolve_harness()
+    dispatch_on_harness(builtin, "build", "prompt")
+
+    assert "--effort" not in captured["agent_cmd"]
+
+
 def test_env_override_slot_routes_through_the_default_parser(monkeypatch) -> None:
     """An SDLC_AGENT_CMD override is Claude under the hood — parser=None, no codex-exec."""
     captured = _capture_dispatch(monkeypatch)

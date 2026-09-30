@@ -2679,6 +2679,30 @@ def eval_cmd(
         ),
         show_default=False,
     ),
+    model: str = typer.Option(
+        None,
+        "--model",
+        help=(
+            "Override the config's model pin (a tier alias or full id, e.g. "
+            "`sonnet` / `claude-sonnet-5`); wins over the config's `model:` "
+            "field (CLI > config > Balanced-profile default). Lets a benchmark "
+            "gate (Story 34.4-003) pin one run to a previous-generation id and "
+            "another to the current one without maintaining two config files."
+        ),
+        show_default=False,
+    ),
+    effort: str = typer.Option(
+        None,
+        "--effort",
+        help=(
+            "Override the config's `effort:` field with a `--effort` level for "
+            "the build-stage dispatch (e.g. `high`); wins over the config, "
+            "which defaults to no flag. This is a raw pin, unlike the routed "
+            "pipeline's `select_effort` (Story 34.4-001) — pick a level the "
+            "pinned `--model` actually supports, or the harness rejects it."
+        ),
+        show_default=False,
+    ),
     as_json: bool = typer.Option(
         False,
         "--json",
@@ -2747,6 +2771,7 @@ def eval_cmd(
             usd_per_million_tokens=config.usd_per_million_tokens,
             model=config.model,
             harness=config.harness,
+            effort=config.effort,
         )
 
     if harness is not None:
@@ -2760,6 +2785,35 @@ def eval_cmd(
             usd_per_million_tokens=config.usd_per_million_tokens,
             model=config.model,
             harness=harness,
+            effort=config.effort,
+        )
+
+    if model is not None:
+        config = EvalConfig(
+            name=config.name,
+            target=config.target,
+            tickets=config.tickets,
+            n=config.n,
+            seed=config.seed,
+            agent_type=config.agent_type,
+            usd_per_million_tokens=config.usd_per_million_tokens,
+            model=model,
+            harness=config.harness,
+            effort=config.effort,
+        )
+
+    if effort is not None:
+        config = EvalConfig(
+            name=config.name,
+            target=config.target,
+            tickets=config.tickets,
+            n=config.n,
+            seed=config.seed,
+            agent_type=config.agent_type,
+            usd_per_million_tokens=config.usd_per_million_tokens,
+            model=config.model,
+            harness=config.harness,
+            effort=effort,
         )
 
     # Story 31.1-001 AC4/AC5/AC6: resolve + preflight the harness before any

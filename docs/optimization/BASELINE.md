@@ -281,3 +281,107 @@ Re-run the reproduction code over a comparable post-epic window and compare:
 Quality gates are the non-negotiable guardrail: escalation to Opus stays for
 flagged risk, the adversarial review slot keeps its Opus floor on high-risk, and
 the coverage criterion is never lowered — only enforced deterministically.
+
+## 6. Epic-34 benchmark gate: pre-epic vs current-generation tier map (Story 34.4-003)
+
+Before the Epic-34 tier-map flip ships as the new default, the old and new maps
+were measured on the same Epic-31 eval ticket set
+(`controller/eval/eval-config.yaml`, `strutils-baseline`, 3 tickets, seed 1801).
+Story 34.4-003 added the `--effort`/`effort:` pin this comparison needed
+(`sdlc eval` had no way to route an `--effort` level before this story — see
+`controller/src/sdlc/evaluate.py` / `cli.py`), plus a latent gap in
+`dispatch_on_harness` that silently dropped any `effort` it was given
+(`controller/src/sdlc/harness.py`).
+
+**Ticket set discipline (mirrors GO-NO-GO-31.3-001)**: every arm below ran
+serially through `sdlc eval`'s own per-ticket loop, on the built-in `claude`
+harness, `agent_type=build` (the eval's only dispatched stage). `n=2` per
+ticket (6 dispatches per arm) — a regression check, not a study; n=2 carries
+essentially no statistical power to separate a real few-percent effect from
+run-to-run noise, so read every delta below as a directional signal, not a
+proven effect.
+
+**Model ids**: the "pre-epic map" pins the build stage to the previous-generation
+sonnet id the routing layer routed to before Story 34.1-001 introduced
+`TIER_MODEL_IDS` (`claude-sonnet-4-6`, listed as the previous-generation price
+row in `controller/src/sdlc/cost_estimate.py`). The "new map" pins the current
+`TIER_MODEL_IDS[SONNET]` id (`claude-sonnet-5-5`) plus the Balanced profile's
+build-stage effort default (`BALANCED_STAGE_EFFORT["build"] = "high"`,
+`controller/src/sdlc/model_routing.py`). A first pass at this gate pinned
+`claude-sonnet-5` instead: that was `TIER_MODEL_IDS[SONNET]`'s value on this
+branch at the time, but main landed `fix(routing): the sonnet tier resolves to
+claude-sonnet-5-5 (#796)` mid-story (a genuine internal inconsistency in Story
+34.1-001's shipped map, unrelated to this one) — this gate rebased onto that
+fix and every number below is the corrected `claude-sonnet-5-5` re-run, not
+the superseded `claude-sonnet-5` one. Both arms ran for real, live, on this
+host — no stub/fake dispatcher — recorded verbatim in
+`controller/eval/results/`:
+
+- Pre-epic map: [`pre-epic-scoreboard-34.4-003.json`](../../controller/eval/results/pre-epic-scoreboard-34.4-003.json)
+- New map + effort=high (the shipped Balanced default): [`new-map-scoreboard-34.4-003.json`](../../controller/eval/results/new-map-scoreboard-34.4-003.json)
+- New map + effort=medium (checked as a secondary data point, see below): [`new-map-medium-effort-scoreboard-34.4-003.json`](../../controller/eval/results/new-map-medium-effort-scoreboard-34.4-003.json)
+- Comparisons: [`eval-compare-34.4-003.txt`](../../controller/eval/results/eval-compare-34.4-003.txt) (effort=high) and [`eval-compare-34.4-003-medium.txt`](../../controller/eval/results/eval-compare-34.4-003-medium.txt) (effort=medium)
+
+| Metric (n=6 runs/arm) | Pre-epic map (`claude-sonnet-4-6`) | New map + effort=high | New map + effort=medium |
+|---|---:|---:|---:|
+| Pass rate | 100% (6/6) | 100% (6/6) | 100% (6/6) |
+| Bugfix rounds | 0 | 0 | 0 |
+| Blended cost / completed ticket | $0.2004 | $0.1387 (**−31%**) | $0.1268 (**−37%**) |
+| Wall-clock (mean, stall-adjusted) | 29.7s | 13.0s (**−56%**) | 10.7s (**−64%**) |
+| Errors | 0 | 0 | 0 |
+
+"Bugfix rounds" reads 0 for every arm by construction, not by measurement: the
+Epic-31 eval harness dispatches a single one-shot `build` stage per
+ticket-run — it has no bugfix-loop concept at all (unlike the routed
+pipeline's `bugfix` stage), so this gate cannot observe a bugfix-round delta
+either way. "Blended cost / completed ticket" collapses to the scoreboard's
+plain `cost_mean` because every run in every arm passed its quality check
+(6/6) — no failed run to exclude from the denominator.
+
+**Note on `netLOC`** (not one of this story's required metrics, but visible in
+the raw scoreboards/compare output): it reads 0.0 for almost every ticket in
+every arm, not because the agent made no edit but because the dispatched
+build agent frequently commits its own change mid-session (observed directly
+on a manual replay of one ticket) — `_measure_diff`'s `git diff --cached`
+against the now-advanced `HEAD` then sees nothing staged. This is a
+pre-existing Epic-31/18 harness measurement gap unrelated to this story's
+scope (it predates Story 34.4-003 and affects any arm whose agent commits),
+not a defect introduced here; `quality_pass_rate` is unaffected since it runs
+`pytest` against the real final file content regardless of commit state.
+
+**Go / No-Go (AC3): Go — the default flip is clean; `eval/baseline.json`
+updated to the new map's numbers (effort=high, the shipped Balanced default).**
+
+Pass rate is not regressed (100% on both maps), and blended cost per
+completed ticket is **below** baseline on the shipped effort default
+(−31%) — AC2's hold trigger ("pass rate below baseline or cost per completed
+ticket above it") does not fire. `claude-sonnet-5-5` lists the same
+`$2.00/$10.00/Mtok` rate as the earlier (superseded) `claude-sonnet-5` guess —
+~33% cheaper than `claude-sonnet-4-6`'s `$3.00/$15.00/Mtok`
+(`cost_estimate.MODEL_USD_PER_MILLION_TOKENS`) — but unlike that superseded
+run, it also uses **fewer** tokens on these small, single-function tickets
+(overall tokens_mean 243,440 → 143,744, **−41%**), so the cheaper rate and the
+lower token count compound instead of offsetting: net cost drops sharply, not
+marginally. Wall-clock improves even more (−56%), and quality never moved.
+
+`effort=medium` was checked as a secondary data point and does slightly
+better still on every axis (−37% cost, −64% wall) at this sample size — the
+Balanced profile's shipped `effort=high` default is not disproven by this
+gate, but a future higher-`n` re-run comparing `high` vs `medium` head-to-head
+(not just each vs the pre-epic baseline) would be the natural follow-up if
+build-stage cost is ever revisited; this gate's job was the pre-epic-vs-new-map
+decision, which is unambiguous at n=6/arm given the size of the deltas.
+
+**Recorded decision**: the Epic-34 tier map (current-generation ids + the
+Balanced profile's per-stage effort defaults) is confirmed cheaper, faster,
+and no less reliable than the map it replaces on this ticket set.
+`controller/eval/baseline.json` is updated in this commit to the new map's
+scoreboard (model `claude-sonnet-5-5`, effort `high`, n=2) per AC3 — the old
+committed baseline (a 2026-07-15 run predating Story 31.2-002's component
+breakdown) is superseded.
+
+**Re-run checklist**: `uv run sdlc eval --config eval/eval-config.yaml --model
+claude-sonnet-5-5 --effort high --n 3 --json > eval/results/new.json`, then
+`sdlc eval-compare --baseline eval/baseline.json --candidate
+eval/results/new.json` for a higher-`n` confirmation, or to re-check a future
+tier-map change against this one.

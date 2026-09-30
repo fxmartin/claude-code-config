@@ -38,6 +38,13 @@ agent_type: build
 # — before any ticket dispatches.
 # harness: qwen
 
+# Optional `--effort` pin for the build-stage dispatch (Story 34.4-003), e.g.
+# `low`/`medium`/`high`/`xhigh`/`max`. When omitted no flag is added (today's
+# unchanged default — no shipped eval config carries one). `--effort` on the
+# CLI wins over this field, mirroring `--model`'s precedence. A level the
+# pinned model does not support is rejected by the CLI, not silently dropped.
+# effort: high
+
 # Before comparing two scoreboards produced from this config (e.g. claude vs
 # qwen), read docs/harness-benchmarking-method.md (Story 31.3-002) — what each
 # metric measures, the known non-comparabilities (telemetry-less harnesses,

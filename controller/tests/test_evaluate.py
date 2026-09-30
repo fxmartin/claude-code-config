@@ -907,6 +907,78 @@ def test_load_config_rejects_empty_string_model(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Story 34.4-003 — an optional `--effort` pin, mirroring `model` above, so the
+# benchmark gate can run one arm with no effort flag (the pre-epic map) and
+# another pinned to a stated level (the new map's stage default).
+# ---------------------------------------------------------------------------
+
+
+def test_eval_config_effort_defaults_to_none() -> None:
+    config = EvalConfig(name="d", target=Path("t"), tickets=[Ticket(id="t1", prompt="p")])
+    # Unlike `model`, an unset effort stays None — no shipped default silently
+    # adds a flag no prior eval config ever carried.
+    assert config.effort is None
+
+
+def test_run_ticket_threads_effort_to_dispatcher(tmp_path: Path) -> None:
+    target = _sample_target(tmp_path)
+    config = EvalConfig(
+        name="demo",
+        target=target,
+        n=1,
+        effort="high",
+        tickets=[Ticket(id="t1", prompt="p")],
+    )
+    seen: dict[str, object] = {}
+
+    def capturing_dispatcher(
+        agent_type: str, prompt: str, *, cwd: Path, effort: str | None = None, **_: object
+    ) -> AgentResult:
+        seen["effort"] = effort
+        return AgentResult(agent_type=agent_type, data={}, raw="")
+
+    run_eval(config, tmp_path / "ws", dispatcher=capturing_dispatcher)
+    assert seen["effort"] == "high"
+
+
+def test_load_config_parses_explicit_effort(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\neffort: high\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    assert load_config(path).effort == "high"
+
+
+def test_load_config_absent_effort_is_none(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\ntickets:\n  - id: t1\n    prompt: p\n",
+    )
+    assert load_config(path).effort is None
+
+
+def test_load_config_rejects_non_string_effort(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "name: d\ntarget: target\neffort: 3\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="effort"):
+        load_config(path)
+
+
+def test_load_config_rejects_empty_string_effort(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        'name: d\ntarget: target\neffort: ""\n'
+        "tickets:\n  - id: t1\n    prompt: p\n",
+    )
+    with pytest.raises(EvalConfigError, match="effort"):
+        load_config(path)
+
+
+# ---------------------------------------------------------------------------
 # Story 31.1-001 — harness selection: config field, CLI precedence (in
 # test_cli_eval.py), registry resolution, scoreboard provenance, preflight
 # aborts, and per-harness dispatch.

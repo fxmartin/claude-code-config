@@ -174,6 +174,98 @@ def test_eval_n_override_preserves_config_model(tmp_path: Path, monkeypatch) -> 
 
 
 # ---------------------------------------------------------------------------
+# Story 34.4-003 — --model / --effort CLI overrides, mirroring --harness's
+# precedence (CLI > config > default), so a benchmark gate can pin the
+# pre-epic model map on one run and the new map + effort default on another
+# without maintaining two config files.
+# ---------------------------------------------------------------------------
+
+
+def _patched_run_eval(monkeypatch):
+    import sdlc.evaluate as evaluate_mod
+
+    seen: dict[str, object] = {}
+
+    def fake_run_eval(config, workspace, **kwargs):  # noqa: ANN001 — test double
+        seen["model"] = config.model
+        seen["effort"] = config.effort
+        return []
+
+    monkeypatch.setattr(evaluate_mod, "run_eval", fake_run_eval)
+    return seen
+
+
+def test_eval_model_cli_override_wins_over_config(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "eval.yaml"
+    target = tmp_path / "sample"
+    target.mkdir()
+    (target / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    config.write_text(
+        "name: cli-demo\ntarget: sample\nn: 1\nmodel: claude-sonnet-4-6\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+        encoding="utf-8",
+    )
+    seen = _patched_run_eval(monkeypatch)
+    result = runner.invoke(
+        app, ["eval", "--config", str(config), "--model", "claude-sonnet-5", "--json"]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert seen["model"] == "claude-sonnet-5"
+
+
+def test_eval_effort_cli_override_wins_over_config(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "eval.yaml"
+    target = tmp_path / "sample"
+    target.mkdir()
+    (target / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    config.write_text(
+        "name: cli-demo\ntarget: sample\nn: 1\neffort: low\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+        encoding="utf-8",
+    )
+    seen = _patched_run_eval(monkeypatch)
+    result = runner.invoke(
+        app, ["eval", "--config", str(config), "--effort", "high", "--json"]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert seen["effort"] == "high"
+
+
+def test_eval_absent_effort_override_keeps_config_effort(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = tmp_path / "eval.yaml"
+    target = tmp_path / "sample"
+    target.mkdir()
+    (target / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    config.write_text(
+        "name: cli-demo\ntarget: sample\nn: 1\neffort: high\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+        encoding="utf-8",
+    )
+    seen = _patched_run_eval(monkeypatch)
+    result = runner.invoke(app, ["eval", "--config", str(config), "--json"])
+    assert result.exit_code == 0, result.stdout
+    assert seen["effort"] == "high"
+
+
+def test_eval_n_override_preserves_config_effort(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "eval.yaml"
+    target = tmp_path / "sample"
+    target.mkdir()
+    (target / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    config.write_text(
+        "name: cli-demo\ntarget: sample\nn: 1\neffort: high\n"
+        "tickets:\n  - id: t1\n    prompt: p\n",
+        encoding="utf-8",
+    )
+    seen = _patched_run_eval(monkeypatch)
+    result = runner.invoke(app, ["eval", "--config", str(config), "--n", "2", "--json"])
+    assert result.exit_code == 0, result.stdout
+    assert seen["effort"] == "high"
+
+
+# ---------------------------------------------------------------------------
 # Story 31.1-001 — --harness CLI override, precedence, scoreboard provenance,
 # and preflight aborts (unknown/disabled harness, failed probe).
 # ---------------------------------------------------------------------------
