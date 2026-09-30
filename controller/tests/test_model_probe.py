@@ -18,6 +18,8 @@ from sdlc.model_routing import (
     routing_banner,
 )
 
+# conftest swaps the module attribute per test; keep the real function for its own tests.
+REAL_DEFAULT_RUNNER = model_probe._default_runner
 NOW = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
 NOT_FOUND = (1, "API Error: 404 not_found_error: model: claude-opus-5-5")
 RATE_LIMITED = (1, "API Error: 429 rate_limit_error: too many requests")
@@ -153,3 +155,45 @@ def test_doctor_finding_lists_each_tier(tmp_path):
 
     clean = check_model_probe(runner=_runner({}), state_dir=tmp_path / "x", now=NOW)
     assert clean.status == "CLEAN"
+
+
+def test_default_runner_maps_subprocess_outcomes(monkeypatch):
+    import subprocess
+
+    def missing(*a, **k):
+        raise FileNotFoundError
+
+    monkeypatch.setattr(model_probe.subprocess, "run", missing)
+    assert REAL_DEFAULT_RUNNER(["claude"]) == (127, "command not found: claude")
+
+    def slow(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
+
+    monkeypatch.setattr(model_probe.subprocess, "run", slow)
+    assert REAL_DEFAULT_RUNNER(["claude"]) == (124, "probe command timed out")
+
+    done = subprocess.CompletedProcess(["claude"], 1, stdout="out", stderr="")
+    monkeypatch.setattr(model_probe.subprocess, "run", lambda *a, **k: done)
+    assert REAL_DEFAULT_RUNNER(["claude"]) == (1, "out")
+
+
+def test_default_state_dir_is_under_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(model_probe.Path, "home", classmethod(lambda cls: tmp_path))
+    assert model_probe.default_state_dir() == tmp_path / ".local" / "state" / "sdlc"
+
+
+def test_store_cache_merges_and_recovers_from_non_dict(tmp_path):
+    path = tmp_path / "sub" / model_probe.CACHE_FILENAME
+    model_probe._store_cache(path, "a", NOW, {"m": "ok"})
+    model_probe._store_cache(path, "b", NOW, {"m": "ok"})
+    assert set(json.loads(path.read_text())) == {"a", "b"}
+    path.write_text("[1, 2]")
+    model_probe._store_cache(path, "c", NOW, {"m": "ok"})
+    assert set(json.loads(path.read_text())) == {"c"}
+
+
+def test_store_cache_swallows_write_errors(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    # parent is a regular file: mkdir fails regardless of euid
+    model_probe._store_cache(blocker / "x" / "c.json", "a", NOW, {"m": "ok"})
