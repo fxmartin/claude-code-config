@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.79.0] - 2026-09-30
+
+### Added
+
+- feat(current-generation-models): price table keyed by (#34.2-001)
+
+### Fixed
+
+- fix(current-generation-models): price table keyed by model (#34.2-001)
+- fix(current-generation-models): price table keyed by model (#34.2-001)
+- fix(current-generation-models): price table keyed by model (#34.2-001)
+
+
 ## [v2.78.0] - 2026-09-30
 
 ### Added
