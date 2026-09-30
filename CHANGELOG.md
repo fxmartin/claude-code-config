@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.81.1] - 2026-09-30
+
+### Fixed
+
+- fix(routing): the sonnet tier resolves to claude-sonnet-5-5 (#796)
+
+
 ## [v2.81.0] - 2026-09-30
 
 ### Added
