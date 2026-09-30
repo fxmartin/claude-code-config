@@ -5157,14 +5157,22 @@ def render_review_prompt(
     )
 
 
-def render_merge_drift_block(abbr: str, *, ci_status: str | None = None) -> str:
+def render_merge_drift_block(
+    abbr: str, *, ci_status: str | None = None, ci_configured: bool = False
+) -> str:
     """The merge agent's baseline-drift and pipeline-wait instructions.
 
     Shared by the build and fix merge prompts (issues #738, #740). ``ci_status``
     is the CR status the controller's merge CI gate observed on the current head
     (:data:`CR_NONE`, :data:`CR_SUCCESS`, or None when the story was not gated),
     so the agent is told what the controller already knows instead of
-    re-deriving it — the gate is the one source of truth on CI.
+    re-deriving it — the gate is the one source of truth on CI. ``ci_configured``
+    (story 34.4-001) says whether the repo carries CI config at all: a
+    :data:`CR_NONE` on a repo without any is "nothing will ever run" (issue
+    #740); on a repo with config it is "no checks registered on this head when
+    the gate looked", and a head the agent pushes will start checks it must wait
+    for — run 60c2947e pushed a drift merge under the stronger wording and hit
+    branch protection.
     """
     # Issue #738 (agentic-coding-monitor #119, MR !102): the mandated rebase
     # replayed a re-run branch's merge commits of origin/main into conflicts a
@@ -5180,7 +5188,7 @@ def render_merge_drift_block(abbr: str, *, ci_status: str | None = None) -> str:
         "with or is behind main, absorb the drift with `git merge origin/main` on "
         "the branch (never a rebase), resolve, and push.\n"
     )
-    if ci_status == CR_NONE:
+    if ci_status == CR_NONE and not ci_configured:
         # Issue #740: the gate allowed a no-pipeline MR, then the agent invented
         # its own pipeline wait, timed out, and reported a false FAILED that
         # blocked 13 dependents. Say outright that nothing will ever appear.
@@ -5190,12 +5198,20 @@ def render_merge_drift_block(abbr: str, *, ci_status: str | None = None) -> str:
             "wait for a pipeline — none will appear, not even after a push. Merge "
             f"as soon as the forge reports the {abbr} mergeable.\n"
         )
-    verified = (
-        "The controller's CI gate verified that the pipeline on the current head "
-        "passed; with no new push there is nothing further to wait for.\n"
-        if ci_status == CR_SUCCESS
-        else ""
-    )
+    if ci_status == CR_SUCCESS:
+        verified = (
+            "The controller's CI gate verified that the pipeline on the current head "
+            "passed; with no new push there is nothing further to wait for.\n"
+        )
+    elif ci_status == CR_NONE:
+        verified = (
+            "No checks were registered on the current head when the controller's CI "
+            f"gate looked, and it allowed the merge on that basis; this repo does have CI "
+            f"config, so merge the {abbr} as-is without waiting — but a head you push "
+            "will start checks.\n"
+        )
+    else:
+        verified = ""
     # Run b8fdbc71 (story 27.1-003, merge attempt 3): a rewritten head restarted
     # the PR's required checks; the agent handed the wait to a background
     # watcher + scheduled wakeup and ended its turn with no result block. The
@@ -5215,6 +5231,7 @@ def render_merge_prompt(
     *,
     cr_terms: ChangeRequestTerms = GITHUB_CR_TERMS,
     ci_status: str | None = None,
+    ci_configured: bool = False,
 ) -> str:
     # Story 23.2-003: the merge stage is the last change-request prompt that was
     # GitHub-coupled. ``cr_terms`` picks the host noun (PR via gh / MR via glab)
@@ -5236,7 +5253,7 @@ def render_merge_prompt(
         f"Merge the {abbr}{cr_terms.merge_cli_hint} for story {story.id}: "
         f"{story.title} ({abbr} #{pr_number}).\n"
         + forge_only
-        + render_merge_drift_block(abbr, ci_status=ci_status)
+        + render_merge_drift_block(abbr, ci_status=ci_status, ci_configured=ci_configured)
         + "Then emit the result block.\n"
         # Story 12.3-003: surface a high-risk human-approval block additively so
         # the controller parks AWAITING_APPROVAL instead of entering the bugfix
@@ -5294,6 +5311,31 @@ class _MergeCIGate:
     reason: str
     polls: int
     waited_s: float
+    # Whether the repo carries CI config at all (story 34.4-001): decides how a
+    # CR_NONE is read — "nothing will ever run" vs "checks not registered yet".
+    ci_configured: bool = False
+
+
+# Story 34.4-001, run 60c2947e: a commitlint re-ask pushed a new head seconds
+# before the gate polled; GitHub's statusCheckRollup was still empty, which
+# reads as CR_NONE, and the gate allowed the merge "with no CI" on a repo with
+# fourteen workflow checks. On a repo that has CI config, a CR_NONE is treated
+# as pending for this long before the no-CI policy applies — long enough for
+# GitHub/GitLab to register a just-pushed head's checks, short enough that a
+# push which legitimately triggers nothing (path filters) does not hang.
+_CI_REGISTRATION_GRACE_S = 120.0
+
+_CI_CONFIG_GLOBS = (".github/workflows/*.yml", ".github/workflows/*.yaml", ".gitlab-ci.yml")
+
+
+def _repo_has_ci_config(root: Path | None) -> bool:
+    """True when ``root`` carries GitHub workflow or GitLab CI configuration."""
+    if root is None:
+        return False
+    try:
+        return any(next(Path(root).glob(pattern), None) is not None for pattern in _CI_CONFIG_GLOBS)
+    except OSError:
+        return False
 
 
 # Issue #731: a failed CI-status lookup is retried on its own short backoff —
@@ -5390,6 +5432,7 @@ def _run_merge_ci_gate(
     status_fn: Callable[[], str | None] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
+    repo_root: Path | None = None,
 ) -> _MergeCIGate | None:
     """Poll the merge stage's CR pipeline and decide whether the merge may proceed.
 
@@ -5401,11 +5444,19 @@ def _run_merge_ci_gate(
     ``opts.ci_gate_timeout_s``, evaluates the gate, records the outcome in the
     ledger events, and returns the :class:`_MergeCIGate`. A ``_GATE_BLOCK`` tells
     the caller to route the story into the bugfix loop instead of merging.
+
+    ``repo_root`` (story 34.4-001) is where the repo's CI config is looked for:
+    on a repo that has one, a :data:`CR_NONE` inside
+    :data:`_CI_REGISTRATION_GRACE_S` of the first poll is read as "checks not
+    registered yet" and polled like :data:`CR_PENDING`, so a just-pushed head is
+    never merged as if the repo had no CI.
     """
     if stage != "merge" or pr_number is None:
         return None
     sleep_fn = sleep_fn or time.sleep
     clock = clock or time.monotonic
+    ci_configured = _repo_has_ci_config(repo_root)
+    gate_start = clock()
 
     def _default_status() -> str | None:
         return _ci_status_lookup(ledger, story.id, pr_number)
@@ -5428,6 +5479,14 @@ def _run_merge_ci_gate(
                 # Issue #719: a red risk gate makes the rollup "failed" while other
                 # checks still run — keep polling so the gate-only park can apply.
                 return CR_PENDING
+        if (
+            status == CR_NONE
+            and ci_configured
+            and clock() - gate_start < _CI_REGISTRATION_GRACE_S
+        ):
+            # Story 34.4-001: an empty rollup on a repo that has CI config is a
+            # head whose checks have not registered yet, not a repo without CI.
+            return CR_PENDING
         return status
 
     status, polls, waited = _poll_cr_status(
@@ -5440,6 +5499,11 @@ def _run_merge_ci_gate(
     # Issue #731 supersedes #699's policy branch: a failed lookup blocks on any
     # repo, declared forge or not. `--ci-gate-no-ci` keeps governing CR_NONE.
     verdict, reason = _evaluate_ci_gate(status, no_ci_policy=opts.ci_gate_no_ci)
+    if status == CR_NONE and ci_configured:
+        reason = (
+            f"no checks registered on the CR head after {int(waited)}s although the "
+            f"repo has CI config — {reason}"
+        )
     # A no-CI allow is a notable warning (the merge ships ungated), a block is an
     # error, a clean pass/skip is informational.
     if verdict == _GATE_BLOCK:
@@ -5454,7 +5518,8 @@ def _run_merge_ci_gate(
         f"waited={int(waited)}s, cr=#{pr_number})",
     )
     return _MergeCIGate(
-        verdict=verdict, status=status, reason=reason, polls=polls, waited_s=waited
+        verdict=verdict, status=status, reason=reason, polls=polls, waited_s=waited,
+        ci_configured=ci_configured,
     )
 
 
@@ -8745,7 +8810,8 @@ def _run_story(
                 # the normal merge dispatch. The gate is a no-op for non-merge
                 # stages, so build/coverage/review are unchanged.
                 gate = _run_merge_ci_gate(
-                    stage, ledger, run_id, story, pr_number, opts
+                    stage, ledger, run_id, story, pr_number, opts,
+                    repo_root=workdir or Path.cwd(),
                 )
                 if gate is not None and gate.verdict == _GATE_BLOCK:
                     ok, result, failure, kind = False, None, gate.reason, "ci-gate"
@@ -9707,6 +9773,7 @@ def _render_stage_prompt(
     return render_merge_prompt(
         story, pr_number, cr_terms=cr_terms,
         ci_status=ci_gate.status if ci_gate is not None else None,
+        ci_configured=ci_gate.ci_configured if ci_gate is not None else False,
     )
 
 
