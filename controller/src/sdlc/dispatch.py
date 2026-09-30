@@ -216,6 +216,7 @@ def resolve_agent_cmd(
     *,
     model: str | None = None,
     role: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     """The command to launch the agent: explicit arg → ``$SDLC_AGENT_CMD`` → default.
 
@@ -235,6 +236,10 @@ def resolve_agent_cmd(
 
     Issue #685: ``role`` is the dispatched agent type; a read-only role adds the
     destructive floor to the deny list (see :func:`resolve_deny_rules`).
+
+    Story 34.4-001: ``effort`` is the per-stage ``--effort`` level the routing map
+    chose. Like ``model`` it decorates only the built-in default command; an
+    explicit/env command owns its own effort, and ``None`` adds no flag.
     """
     if explicit is not None:
         return list(explicit)
@@ -247,6 +252,8 @@ def resolve_agent_cmd(
         cmd += ["--disallowedTools", ",".join(deny)]
     if model:
         cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
     return cmd
 
 
@@ -925,6 +932,7 @@ def dispatch_agent(
     story: Any | None = None,
     agent_cmd: list[str] | None = None,
     model: str | None = None,
+    effort: str | None = None,
     thinking_cap: int | None = None,
     timeout: int = DEFAULT_TIMEOUT_S,
     stall_timeout: float | None = DEFAULT_STALL_TIMEOUT_S,
@@ -986,7 +994,7 @@ def dispatch_agent(
     gets proper handling instead of the lossy plain-stdout fallback. An
     unregistered id fails fast with :class:`~sdlc.parsers.UnknownParserError`.
     """
-    cmd = resolve_agent_cmd(agent_cmd, model=model, role=agent_type)
+    cmd = resolve_agent_cmd(agent_cmd, model=model, role=agent_type, effort=effort)
     env = _dispatch_env(thinking_cap)
     # Issue #614: only the code-writing roles are contained; review and merge
     # stay on the host (read-only deny floor / forge auth) even when enabled.

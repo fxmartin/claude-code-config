@@ -75,7 +75,7 @@ def test_escalation_climbs_by_tier_then_dispatches_the_mapped_id() -> None:
 def test_routing_banner_prints_alias_and_id() -> None:
     snap = routing_snapshot(BALANCED, overrides={"build": "opus"})
     banner = "\n".join(routing_banner(snap))
-    assert "build=opus → claude-opus-5-5" in banner
+    assert "build=claude-opus-5-5@high" in banner  # 34.4-001: effort attached
     assert "merge=haiku → claude-haiku-4-5" in banner
 
 

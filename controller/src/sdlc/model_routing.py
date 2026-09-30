@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,32 @@ TIER_MODEL_IDS: dict[str, str] = {
     HAIKU: "claude-haiku-4-5",
     SONNET: "claude-sonnet-5",
     OPUS: "claude-opus-5-5",
+}
+
+# Story 34.4-001: effort levels, weakest → strongest, as `claude --effort` takes
+# them. Cheap-first retry escalation climbs this ladder one level per climbed
+# tier, capped at `max`.
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+# Levels each tier's model accepts (Anthropic thinking/effort table). Haiku 4.5
+# has no `effort` parameter at all, so the flag is omitted rather than risking a
+# CLI error. Fable is deliberately absent — it is not a routed tier.
+TIER_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
+    HAIKU: (),
+    SONNET: EFFORT_LEVELS,
+    OPUS: EFFORT_LEVELS,
+}
+
+# Balanced per-stage effort: mechanical stages low, build high, review xhigh so
+# Opus 5.5's `medium` default never silently under-thinks a review.
+BALANCED_STAGE_EFFORT: dict[str, str] = {
+    "discovery": "low",
+    "docs": "low",
+    "coverage": "medium",
+    "build": "high",
+    "review": "xhigh",
+    "merge": "medium",
+    "bugfix": "high",
 }
 
 # The single top-level key a per-repo override file uses.
@@ -131,6 +157,9 @@ class ModelRoutingConfig:
     # DEFAULT_* rationale). A confident prediction at/above either escalates.
     predicted_tokens_threshold: int = DEFAULT_PREDICTED_TOKENS_THRESHOLD
     rework_threshold: float = DEFAULT_REWORK_THRESHOLD
+    # Story 34.4-001: stage → `--effort` level. A stage absent here gets no flag
+    # (CLI default), so only profiles that opt in change today's argv.
+    stage_efforts: dict[str, str] = field(default_factory=dict)
 
 
 # --- Built-in profiles ------------------------------------------------------
@@ -154,6 +183,7 @@ BALANCED = ModelRoutingConfig(
         "reask": HAIKU,         # cheap envelope-only re-ask
     },
     points_threshold=8,
+    stage_efforts=dict(BALANCED_STAGE_EFFORT),
 )
 
 QUALITY_FIRST = ModelRoutingConfig(
@@ -331,6 +361,76 @@ def escalate_model(base: str | None, steps: int) -> str | None:
     return TIER_LADDER[min(idx + steps, len(TIER_LADDER) - 1)]
 
 
+def tier_of(model: str | None) -> str | None:
+    """The ladder tier a model alias or full id belongs to, else ``None``.
+
+    Matches a full id (``claude-opus-5-5``, a pinned ``claude-opus-4-8``) by its
+    tier substring, like the cost table does; a foreign id matches no tier.
+    """
+    if not model:
+        return None
+    lowered = model.lower()
+    for tier in TIER_LADDER:
+        if tier in lowered:
+            return tier
+    return None
+
+
+def escalate_effort(effort: str | None, steps: int) -> str | None:
+    """Climb ``effort`` ``steps`` levels, capped at ``max`` (Story 34.4-001)."""
+    if effort is None or steps <= 0 or effort not in EFFORT_LEVELS:
+        return effort
+    return EFFORT_LEVELS[min(EFFORT_LEVELS.index(effort) + steps, len(EFFORT_LEVELS) - 1)]
+
+
+@dataclass(frozen=True)
+class EffortChoice:
+    """The effort a dispatch carries; ``reason`` says why ``level`` is None.
+
+    ``reason`` is empty when no effort was configured for the stage (nothing to
+    explain) and set when a configured level was dropped, so the caller can log a
+    ``debug`` event instead of letting the CLI reject the flag.
+    """
+
+    level: str | None = None
+    reason: str = ""
+
+
+def select_effort(
+    stage: str,
+    config: ModelRoutingConfig | None,
+    model: str | None,
+    *,
+    escalation_steps: int = 0,
+) -> EffortChoice:
+    """Choose the ``--effort`` level for ``stage`` running on ``model``.
+
+    The mapped level is climbed ``escalation_steps`` levels (the cheap-first retry
+    lever, in step with :func:`escalate_model`) and then checked against what
+    ``model``'s tier accepts. A model that does not support it — Haiku 4.5 has no
+    ``effort`` — or one the router cannot identify yields no level plus a reason.
+    """
+    if config is None:
+        return EffortChoice()
+    base = config.stage_efforts.get(stage)
+    if base is None:
+        return EffortChoice()
+    level = escalate_effort(base, escalation_steps)
+    tier = tier_of(model)
+    if tier is None:
+        return EffortChoice(
+            reason=f"effort {level} omitted for {stage}: model {model or 'cli-default'} "
+            "is not a known tier"
+        )
+    supported = TIER_EFFORT_LEVELS[tier]
+    if level not in supported:
+        return EffortChoice(
+            reason=f"effort {level} omitted for {stage}: {model} does not "
+            + ("support effort" if not supported else f"support level {level}")
+        )
+    return EffortChoice(level=level)
+
+
 def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
     """Apply an additive override mapping onto ``base``, returning a new config.
 
@@ -343,7 +443,9 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
       escalation bar (Story 28.3-001);
     * ``rework_threshold`` — a number in [0, 1] replacing the predicted-rework
       escalation bar (Story 28.3-001);
-    * ``escalation_model`` — the model a stage escalates / is pinned to.
+    * ``escalation_model`` — the model a stage escalates / is pinned to;
+    * ``effort`` — a mapping of stage → effort level (``low``…``max``), merged
+      over the base profile's per-stage efforts (Story 34.4-001).
 
     The override is additive: any stage it omits keeps the base profile's value,
     so a repo can tune a single stage without restating the whole map. A
@@ -407,8 +509,20 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
             raise ValueError("'escalation_model' must be a string")
         escalation_model = section["escalation_model"]
 
+    stage_efforts = dict(cfg.stage_efforts)
+    efforts = section.get("effort", {})
+    if efforts:
+        if not isinstance(efforts, dict) or not all(
+            isinstance(k, str) and v in EFFORT_LEVELS for k, v in efforts.items()
+        ):
+            raise ValueError(
+                f"'effort' must be a mapping of stage → one of {list(EFFORT_LEVELS)}"
+            )
+        stage_efforts.update(efforts)
+
     return replace(
         cfg,
+        stage_efforts=stage_efforts,
         stage_models=stage_models,
         points_threshold=threshold,
         predicted_tokens_threshold=tokens_threshold,
@@ -497,6 +611,7 @@ def routing_snapshot(
         "predicted_tokens_threshold": config.predicted_tokens_threshold,
         "rework_threshold": config.rework_threshold,
         "escalation_model": config.escalation_model,
+        "stage_efforts": dict(config.stage_efforts),
         "escalatable_stages": sorted(config.escalatable_stages),
         "pinned_stages": sorted(config.pinned_stages),
         "overrides": overrides,
@@ -547,6 +662,9 @@ def config_from_snapshot(snapshot: dict | None) -> ModelRoutingConfig | None:
             snapshot.get("rework_threshold", BALANCED.rework_threshold)
         ),
         escalation_model=str(snapshot.get("escalation_model") or OPUS),
+        stage_efforts={
+            str(k): str(v) for k, v in (snapshot.get("stage_efforts") or {}).items()
+        },
         escalatable_stages=(
             frozenset(escalatable) if escalatable is not None
             else BALANCED.escalatable_stages
@@ -558,6 +676,18 @@ def config_from_snapshot(snapshot: dict | None) -> ModelRoutingConfig | None:
 def _with_model_id(model: str) -> str:
     """Render ``model`` for the banner: ``opus → claude-opus-5-5`` for an alias."""
     return f"{model} → {TIER_MODEL_IDS[model]}" if model in TIER_MODEL_IDS else model
+
+
+def _banner_entry(stage: str, model: str, effort: str | None) -> str:
+    """One ``stage=model`` banner token; ``stage=<id>@<effort>`` when effort applies.
+
+    The effort is shown only where the model's tier accepts it, so the banner
+    states what the dispatch will actually carry (Story 34.4-001).
+    """
+    tier = tier_of(model)
+    if effort and tier and effort in TIER_EFFORT_LEVELS[tier]:
+        return f"{stage}={TIER_MODEL_IDS.get(model, model)}@{effort}"
+    return f"{stage}={_with_model_id(model)}"
 
 
 def routing_banner(snapshot: dict) -> list[str]:
@@ -577,8 +707,9 @@ def routing_banner(snapshot: dict) -> list[str]:
         ]
     else:
         stage_models = snapshot.get("stage_models") or {}
+        efforts = snapshot.get("stage_efforts") or {}
         mapping = " ".join(
-            f"{s}={_with_model_id(m)}" for s, m in sorted(stage_models.items())
+            _banner_entry(s, m, efforts.get(s)) for s, m in sorted(stage_models.items())
         )
         # Legacy (pre-28.3-001) snapshots carry no prediction thresholds; render
         # them from the Balanced defaults config_from_snapshot would replay.

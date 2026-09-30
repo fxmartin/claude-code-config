@@ -54,6 +54,9 @@ harnesses:
       json_contract: true
       usage_tracking: true
       rate_limit_aware: true
+      # Story 34.4-001: the argv carries the routed `--effort <level>` (registry
+      # harnesses below omit this, so the level is dropped for them).
+      effort_aware: true
       # Issue #654: the ONLY slot that receives dispatch.DENY_BASELINE — the
       # controller assembles this argv itself (resolve_agent_cmd appends the
       # rules as --disallowedTools), so the Story 13.1-001 secret/egress floor

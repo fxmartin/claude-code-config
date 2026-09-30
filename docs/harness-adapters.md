@@ -100,6 +100,7 @@ crashing a parallel cohort mid-run.
 | `json_contract`      | Emits the `<<<RESULT_JSON>>>` block.                               |
 | `usage_tracking`     | Reports token usage / cost. Declaring it `false` (or omitting it) makes every token and cost figure for this harness **unavailable** — `—`, never `0` — in the ledger, scoreboard and dashboard, and makes the token/cost axes *not comparable* in `sdlc eval-compare` (31.2-002). Flip it to `true` when the adapter grows real usage telemetry; nothing else has to change. |
 | `rate_limit_aware`   | Surfaces a recoverable, time-based rate-limit signal.             |
+| `effort_aware`       | Accepts the routed `--effort <level>` (Story 34.4-001). Only the built-in `claude` slot declares it; omit it and the controller drops the per-stage effort for your harness (logged at `debug`). |
 | `deny_baseline`      | The harness's dispatched command carries the deny baseline (`dispatch.DENY_BASELINE` — the Story 13.1-001 secret/egress floor). **Only the built-in `claude` slot can honestly claim this**, because it is the one slot whose argv the controller assembles itself (`resolve_agent_cmd` appends the rules as `--disallowedTools`). Your harness renders its own command template, so it receives no deny rules at all — declare it `false` (or omit it). See [Host-auth roles and the deny baseline](#host-auth-roles-and-the-deny-baseline) below. |
 
 Optionally add a `probe:` command (a cheap "is the CLI installed/authenticated?"

@@ -75,6 +75,7 @@ from sdlc.model_routing import (
     ModelRoutingConfig,
     OVERRIDE_FILENAME as MODEL_ROUTING_OVERRIDE_FILENAME,
     config_from_snapshot,
+    EffortChoice,
     escalate_model,
     is_routing_off,
     load_routing_config,
@@ -82,6 +83,7 @@ from sdlc.model_routing import (
     routing_banner,
     routing_config,
     routing_snapshot,
+    select_effort,
     select_model,
 )
 from sdlc.notify import notify
@@ -242,6 +244,7 @@ CREATE TABLE IF NOT EXISTS stages (
     estimated_cost_usd  REAL,
     harness             TEXT,
     model               TEXT,
+    effort              TEXT,
     PRIMARY KEY (run_id, story_id, stage_name, attempt),
     FOREIGN KEY (run_id, story_id) REFERENCES stories(run_id, story_id) ON DELETE CASCADE
 );
@@ -659,6 +662,16 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         [
             ("harness_routing", "TEXT"),
         ],
+        None,
+    ),
+    # Migration 18 (Story 34.4-001) records the `--effort` level a stage attempt
+    # dispatched with. NULL means no level was passed (routing off, unmapped
+    # stage, or the model/harness does not support effort) — old rows stay NULL.
+    (
+        18,
+        "stage effort column",
+        "stages",
+        [("effort", "TEXT")],
         None,
     ),
 ]
@@ -2576,6 +2589,7 @@ class Ledger:
         attempt: int = 1,
         harness: str = DEFAULT_HARNESS,
         model: str | None = None,
+        effort: str | None = None,
     ) -> None:
         """Append an IN_PROGRESS stage attempt row.
 
@@ -2584,15 +2598,16 @@ class Ledger:
         keeping a run that passes no ``--harness`` map unchanged. ``model`` (Issue
         #427) records the resolved model id so history can be segmented per model;
         it is nullable and defaults to None (routing off / un-recorded), leaving
-        old rows and the default path unchanged.
+        old rows and the default path unchanged. ``effort`` (Story 34.4-001) is the
+        ``--effort`` level the dispatch carries, NULL when none was passed.
         """
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO stages "
                 "(run_id, story_id, stage_name, attempt, status, started_at, "
-                "harness, model) "
-                "VALUES (?, ?, ?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP, ?, ?)",
-                (run_id, story_id, stage_name, attempt, harness, model),
+                "harness, model, effort) "
+                "VALUES (?, ?, ?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP, ?, ?, ?)",
+                (run_id, story_id, stage_name, attempt, harness, model, effort),
             )
 
     def stage_next_attempt(self, run_id: str, story_id: str, stage_name: str) -> int:
@@ -8571,10 +8586,15 @@ def _run_story(
             resolved_model = _resolved_stage_model(
                 stage, story, opts, escalation_steps=escalation_steps
             )
+            effort_choice = _resolved_stage_effort(
+                stage, story, opts, escalation_steps=escalation_steps
+            )
             ledger.stage_start(
                 run_id, story.id, stage, attempt,
                 harness=stage_harness, model=resolved_model,
+                effort=effort_choice.level,
             )
+            _log_effort_omission(ledger, run_id, story.id, effort_choice)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             sink = _make_progress_sink(ledger, run_id, story.id, stage, attempt)
             # Story 14.1-002: estimate this stage's usage before dispatch, record
@@ -8630,7 +8650,8 @@ def _run_story(
                 ledger.event_log(
                     run_id, story.id, "info", "controller",
                     f"{stage} retry (attempt {attempt}) escalated to "
-                    f"model={esc_model or 'cli-default'} after {escalation_steps} "
+                    f"model={esc_model or 'cli-default'} "
+                    f"effort={effort_choice.level or 'default'} after {escalation_steps} "
                     "failed attempt(s) (Story 14.2-003 cheap-first)",
                 )
             try:
@@ -9099,7 +9120,10 @@ def _stage_capabilities(stage: str, opts: BuildOptions) -> Mapping[str, bool] | 
 
 
 def _harness_dispatch_kwargs(
-    harness_stage: str, opts: BuildOptions, model: str | None
+    harness_stage: str,
+    opts: BuildOptions,
+    model: str | None,
+    effort: str | None = None,
 ) -> dict[str, object]:
     """Per-role ``--harness`` routing → dispatch kwargs (Story 20.7-001).
 
@@ -9130,7 +9154,9 @@ def _harness_dispatch_kwargs(
         _stage_harness(harness_stage, opts), config_path=default_registry_path()
     )
     return {
-        "agent_cmd": harness.to_argv(model=model, stage=harness_stage),
+        "agent_cmd": harness.to_argv(
+            model=model, stage=harness_stage, effort=effort
+        ),
         "parser": None if harness.source in ("builtin", "env") else harness.parser,
     }
 
@@ -9378,6 +9404,65 @@ def _resolved_recovery_model(
     return harness.resolve_model(harness_stage)
 
 
+def _resolved_stage_effort(
+    stage: str,
+    story: Story,
+    opts: BuildOptions,
+    *,
+    escalation_steps: int = 0,
+    harness_stage: str | None = None,
+) -> EffortChoice:
+    """The ``--effort`` level ``stage`` dispatches with (Story 34.4-001).
+
+    The routing map's per-stage level, climbed with ``escalation_steps`` in step
+    with the tier, then dropped (with a reason the caller logs at ``debug``) when
+    the model cannot take it (Haiku 4.5) or the harness that runs it does not
+    declare ``effort_aware`` — a registry harness such as codex, or an
+    ``SDLC_AGENT_CMD`` override that owns its own command. ``harness_stage``
+    names the stage whose harness runs the dispatch (recovery stages re-dispatch
+    their originating stage's harness); it defaults to ``stage``.
+    """
+    model = resolve_model_id(
+        _select_stage_model(stage, story, opts, escalation_steps=escalation_steps)
+    )
+    choice = select_effort(
+        stage, _routing_config_for(opts), model, escalation_steps=escalation_steps
+    )
+    if choice.level is None:
+        return choice
+    harness_stage = harness_stage or stage
+    if opts.harness_map:
+        try:
+            from sdlc.capability import resolve_capabilities
+            from sdlc.role_routing import default_registry_path
+
+            harness = resolve_harness(
+                _stage_harness(harness_stage, opts),
+                config_path=default_registry_path(),
+            )
+            supported = resolve_capabilities(harness).get("effort_aware", False)
+            owner = f"harness {harness.name}"
+        except Exception:  # noqa: BLE001 - registry resolution is best-effort
+            return choice
+    else:
+        supported = not os.environ.get("SDLC_AGENT_CMD")
+        owner = "SDLC_AGENT_CMD"
+    if supported:
+        return choice
+    return EffortChoice(
+        reason=f"effort {choice.level} omitted for {stage}: {owner} does not "
+        "declare effort_aware"
+    )
+
+
+def _log_effort_omission(
+    ledger: Ledger, run_id: str, story_id: str, choice: EffortChoice
+) -> None:
+    """Say at ``debug`` why a configured effort level was not passed."""
+    if choice.level is None and choice.reason:
+        ledger.event_log(run_id, story_id, "debug", "controller", choice.reason)
+
+
 def _model_price_key(model: str | None) -> str:
     """Normalise a resolved model id to a ``MODEL_USD_PER_MILLION_TOKENS`` key.
 
@@ -9442,7 +9527,13 @@ def _dispatch_stage(
     model = _resolved_stage_model(stage, story, opts, escalation_steps=escalation_steps)
     # Story 20.7-001: route this stage to its mapped harness's argv/parser when a
     # `--harness` map is set; empty (the default path) leaves dispatch unchanged.
-    harness_kwargs = _harness_dispatch_kwargs(stage, opts, model)
+    effort = _resolved_stage_effort(
+        stage, story, opts, escalation_steps=escalation_steps
+    ).level
+    harness_kwargs = _harness_dispatch_kwargs(stage, opts, model, effort)
+    # Only a real level is passed, so a dispatcher without the kwarg is untouched.
+    if effort:
+        harness_kwargs["effort"] = effort
     try:
         result = dispatch(
             stage, prompt, story=story, model=model,
@@ -10323,6 +10414,11 @@ def _run_bugfix(
     model = resolve_model_id(
         _select_stage_model("bugfix", story, opts, escalation_steps=escalation_steps)
     )
+    # Story 34.4-001: bugfix effort climbs with the tier, like the model above.
+    effort_choice = _resolved_stage_effort(
+        "bugfix", story, opts, escalation_steps=escalation_steps,
+        harness_stage=failed_stage,
+    )
     # The bugfix re-dispatches the originating `failed_stage` agent, so record it
     # on that stage's harness (Story 20.2-002).
     ledger.stage_start(
@@ -10331,19 +10427,26 @@ def _run_bugfix(
         model=_resolved_recovery_model(
             "bugfix", failed_stage, story, opts, escalation_steps=escalation_steps
         ),
+        effort=effort_choice.level,
     )
+    _log_effort_omission(ledger, run_id, story.id, effort_choice)
     out = str(transcript_path) if transcript_path is not None else ""
     prompt = render_bugfix_prompt(story, failed_stage, failure)
     sink = _make_progress_sink(ledger, run_id, story.id, "bugfix", attempt)
     ledger.event_log(
         run_id, story.id, "info", "controller",
         f"bugfix attempt {attempt} for {failed_stage} on "
-        f"model={model or 'cli-default'} (escalation +{escalation_steps}, "
+        f"model={model or 'cli-default'} effort={effort_choice.level or 'default'} "
+        f"(escalation +{escalation_steps}, "
         "Story 14.2-003 cheap-first)",
     )
     # The bugfix re-dispatches the originating `failed_stage` agent, so route it
     # to that stage's harness (Story 20.7-001), matching its ledger record above.
-    harness_kwargs = _harness_dispatch_kwargs(failed_stage, opts, model)
+    harness_kwargs = _harness_dispatch_kwargs(
+        failed_stage, opts, model, effort_choice.level
+    )
+    if effort_choice.level:
+        harness_kwargs["effort"] = effort_choice.level
     try:
         result = dispatch(
             "bugfix", prompt, story=story, model=model,

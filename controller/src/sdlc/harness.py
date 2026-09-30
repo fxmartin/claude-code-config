@@ -58,6 +58,10 @@ _BUILTIN_CAPABILITIES: dict[str, bool] = {
     "json_contract": True,
     "usage_tracking": True,
     "rate_limit_aware": True,
+    # Story 34.4-001: the built-in slot's argv carries the routed `--effort`. A
+    # registry harness must declare this itself (non-canonical flag, like the
+    # extras preserved verbatim) or the controller drops the level for it.
+    "effort_aware": True,
     # Issue #654: the built-in slot's argv is assembled by
     # :func:`sdlc.dispatch.resolve_agent_cmd`, which appends the deny baseline as
     # ``--disallowedTools``. That is what makes this the one slot that genuinely
@@ -159,7 +163,11 @@ class HarnessConfig:
         return shlex.split(rendered) + list(self.flags)
 
     def to_argv(
-        self, *, model: str | None = None, stage: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        stage: str | None = None,
+        effort: str | None = None,
     ) -> list[str]:
         """The command to launch an agent on this harness.
 
@@ -176,11 +184,13 @@ class HarnessConfig:
         ``models`` map resolves *this harness's own* model id for ``stage`` (with a
         ``default`` fallback) and substitutes it. A registry entry without a
         ``{model}`` placeholder renders its static command unchanged — no
-        regression for harnesses that route a single fixed model.
+        regression for harnesses that route a single fixed model. ``effort``
+        (Story 34.4-001) likewise decorates only the built-in slot; a registry
+        harness ignores it (the caller drops it unless ``effort_aware``).
         """
         if self.source in ("builtin", "env"):
             # Issue #685: the stage is the role that picks the destructive floor.
-            return resolve_agent_cmd(model=model, role=stage)
+            return resolve_agent_cmd(model=model, role=stage, effort=effort)
         if "{model}" in self.command:
             # The loader guarantees a `{model}` command declares a `default`, so
             # an unmapped stage still resolves (never KeyError on .format()).
@@ -293,7 +303,10 @@ def _adhoc_env_harness(command: str) -> HarnessConfig:
         name=DEFAULT_HARNESS,
         command=command,
         parser=_CLAUDE_PARSER,
-        capabilities={**_BUILTIN_CAPABILITIES, "deny_baseline": False},
+        # The override owns its own model and effort, like its permission posture.
+        capabilities={
+            **_BUILTIN_CAPABILITIES, "deny_baseline": False, "effort_aware": False,
+        },
         source="env",
     )
 
