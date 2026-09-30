@@ -4662,6 +4662,25 @@ def _log_harness_preflight(
         pass
 
 
+def _probe_tier_models(ledger: "Ledger", run_id: str, opts: "BuildOptions") -> None:
+    """Live-probe the tier model ids and warn on each fallback substitution (34.1-002).
+
+    Skipped with ``--skip-preflight`` and whenever ``$SDLC_AGENT_CMD`` owns the
+    command (it picks its own model). Best-effort: a probe failure must never
+    fail an otherwise-good build — the current ids simply stay in force.
+    """
+    if opts.skip_preflight or os.environ.get("SDLC_AGENT_CMD"):
+        return
+    try:
+        from sdlc.model_probe import probe_tier_models
+
+        for line in probe_tier_models().warnings:
+            print(line, file=sys.stderr)
+            ledger.event_log(run_id, "", "warn", "harness", line)
+    except Exception:
+        pass
+
+
 def _log_controller_version_check(ledger: "Ledger", run_id: str, root: Path) -> None:
     """Warn beside the harness routing line when the installed `sdlc` is stale (15.1-004).
 
@@ -7437,6 +7456,9 @@ def run_build(
     # `--model-<stage>` pin cannot reach this run. The banner makes the state
     # visible live (stderr) and post-hoc (a `routing` event), so routing can no
     # longer fail silent-and-expensive.
+    # Story 34.1-002: prove the tier ids on this host first, so a substituted
+    # (previous-generation) id is what the banner and every dispatch show.
+    _probe_tier_models(ledger, run_id, opts)
     routing = _resolve_run_routing(opts)
     opts.model_routing_snapshot = routing
     ledger.run_set_routing(run_id, routing)
