@@ -140,15 +140,43 @@ _run_install() {
     [ -f "${FAKE_HOME}/.claude/plugins/marketplaces/fx-claude-config/marker" ]
 }
 
-@test "settings declare fx-claude-config as a directory marketplace under ~/Work (#743)" {
-    # The tracked settings are shared across machines, so the path must be the
+@test "the template declares fx-claude-config as a directory marketplace under ~/Work (#743)" {
+    # The tracked template is shared across machines, so its seed path is the
     # portable tilde form (Claude Code expands ~; it does not expand $HOME).
-    for f in settings.json settings.template.json; do
-        run jq -r '.extraKnownMarketplaces["fx-claude-config"].source | "\(.source) \(.path)"' \
-            "${BATS_TEST_DIRNAME}/../${f}"
-        [ "$status" -eq 0 ]
-        [ "$output" = "directory ~/Work/claude-code-config" ]
-    done
+    run jq -r '.extraKnownMarketplaces["fx-claude-config"].source | "\(.source) \(.path)"' \
+        "${BATS_TEST_DIRNAME}/../settings.template.json"
+    [ "$status" -eq 0 ]
+    [ "$output" = "directory ~/Work/claude-code-config" ]
+}
+
+@test "--core registers this checkout as the marketplace path in settings.json (#800)" {
+    # The ~/Work seed is only right on one machine; the nix-managed Macs keep
+    # the checkout under nix-install. --core writes the absolute SCRIPT_DIR into
+    # the per-machine (gitignored) settings.json, which nix and install.sh seed
+    # once and never overwrite.
+    REPO_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
+    [ -e "${REPO_ROOT}/settings.json" ] || SEEDED_SETTINGS=1
+    _run_install --core
+    [ "$status" -eq 0 ]
+    run jq -r '.extraKnownMarketplaces["fx-claude-config"].source | "\(.source) \(.path)"' \
+        "${REPO_ROOT}/settings.json"
+    [ "$output" = "directory ${REPO_ROOT}" ]
+    # Every other key survives the rewrite.
+    run jq -e '.enabledPlugins["autonomous-sdlc@fx-claude-config"] == true' "${REPO_ROOT}/settings.json"
+    [ "$status" -eq 0 ]
+    # Idempotent: a second run reports it is already registered.
+    _run_install --core
+    [[ "$output" == *"already points at this checkout"* ]]
+}
+
+@test "--core --dry-run previews the marketplace registration and writes nothing (#800)" {
+    REPO_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
+    before="$(cat "${REPO_ROOT}/settings.json" 2>/dev/null || true)"
+    _run_install --core --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[dry-run]"*"fx-claude-config"*"${REPO_ROOT}"* ]]
+    after="$(cat "${REPO_ROOT}/settings.json" 2>/dev/null || true)"
+    [ "$before" = "$after" ]
 }
 
 @test "--core links AGENTS.md into ~/.codex for Codex" {
