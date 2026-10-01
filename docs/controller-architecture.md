@@ -705,6 +705,25 @@ The poll is bounded so a never-finishing pipeline can never stall a run. Config
 The gate uses the same five normalised `cr_status` values on both hosts, so a red
 GitLab MR pipeline blocks the merge exactly as a failed GitHub Actions check does.
 
+Two refinements from the Epic-34 run (`60c2947e`, story 34.4-001):
+
+- **Registration grace (#793).** A just-pushed head has no checks registered for
+  a few seconds, and an empty rollup reads as `none`. On a repo that carries CI
+  config (`.github/workflows/*`, `.gitlab-ci.yml`) the gate treats `none` as
+  `pending` for `_CI_REGISTRATION_GRACE_S` (120 s) before the no-CI policy
+  applies, and the merge prompt's "nothing will appear" wording is reserved for
+  repos without any CI config.
+- **Re-gate on `CHECKS_PENDING` (#794).** The merge agent pushes a head itself
+  when it merges `origin/main` in for a real conflict; if the forge's checks on
+  it are still running when it must answer, it reports `merge_status="FAILED"`
+  with `block_reason="CHECKS_PENDING"`. That is a re-gate condition, not a
+  bugfix one: the stage loop logs `merge re-gate`, loops once, the gate polls
+  the new head to a terminal status, a green retries the merge and a red routes
+  to bugfix as usual. At most one re-gate per stage. Before any merge-stage
+  bugfix the controller fast-forwards the story branch to `origin/<branch>`
+  (`_sync_branch_to_remote`), so a bugfix push is never rejected
+  non-fast-forward over a head the merge agent advanced.
+
 ### Merge, close, and clean up — ending the loop on either host (Story 23.2-003)
 
 Once the gate is green the **merge** stage merges the change request via the

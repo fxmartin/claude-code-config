@@ -50,6 +50,7 @@ from sdlc.build import (
     _dispatch_ready_queue,
     _adopt_pr,
     _merge_awaiting_approval,
+    _merge_checks_pending,
     _merge_gate_only_block,
     _record_stage_usage,
     _refresh_base_ref,
@@ -59,6 +60,7 @@ from sdlc.build import (
     _reposition_head,
     _run_merge_ci_gate,
     _stage_succeeded,
+    _sync_branch_to_remote,
     _StoryDispatch,
     _StoryRunOutcome,
     create_story_worktree,
@@ -1166,11 +1168,12 @@ def _dispatch_fix_stage(
         return False, None, f"dispatch error: {exc}", "dispatch"
 
     if not _stage_succeeded(stage, result.data):
-        kind = (
-            "awaiting_approval"
-            if _merge_awaiting_approval(stage, result.data)
-            else "reported"
-        )
+        if _merge_awaiting_approval(stage, result.data):
+            kind = "awaiting_approval"
+        elif _merge_checks_pending(stage, result.data):
+            kind = "checks_pending"  # issue #794: re-gate, never bugfix
+        else:
+            kind = "reported"
         return False, result, f"{stage} reported a non-success status", kind
     return True, result, "", ""
 
@@ -1791,6 +1794,7 @@ def _run_stage_loop(
         # rather than overwrite the record of the crash).
         attempt = (start_attempts or {}).get(stage, 1)
         bugfix_attempts = 0
+        regated = False  # issue #794: one merge re-gate per stage
         # Story 27.3-003: bake the review packet once per review stage entry so
         # the dispatch and every retry reuse the same packet. None (no PR yet,
         # host failure, oversized) leaves the fetch-it-yourself fallback.
@@ -1933,12 +1937,36 @@ def _run_stage_loop(
                 )
                 return "AWAITING_APPROVAL", pr_number
 
+            # Issue #794: checks pending on a head the merge agent pushed — loop
+            # once more so the CI gate re-polls the new head and the merge is
+            # retried; a red gate then routes to bugfix as usual. See build.py.
+            if kind == "checks_pending" and not regated:
+                regated = True
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    "merge re-gate: checks pending on the head the merge agent "
+                    "pushed — re-polling the CI gate and retrying the merge "
+                    "instead of entering the bugfix loop (issue #794)",
+                )
+                attempt += 1
+                continue
+
             if bugfix_attempts >= MAX_BUGFIX_ATTEMPTS:
                 return "FAILED", pr_number
 
             bugfix_attempts += 1
             bugfix_seq += 1
             bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
+            if stage == "merge" and not _sync_branch_to_remote(
+                root or Path.cwd(), f"feature/{story.id}"
+            ):
+                # Issue #794: the merge agent may have advanced the remote branch.
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    f"could not fast-forward feature/{story.id} to its remote head "
+                    "before bugfix (diverged or no remote branch); the bugfix push "
+                    "may be rejected",
+                )
             fixed = _run_bugfix(
                 issue, inv, story, stage, failure, opts, ledger, run_id, dispatch, bpath, bugfix_seq
             )
