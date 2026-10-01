@@ -5220,8 +5220,10 @@ def render_merge_drift_block(
     return drift + verified + (
         f"A head you push restarts the {abbr}'s required checks: wait for them "
         "with a blocking foreground watch. If they are still running when you "
-        'must answer, report merge_status="FAILED" in the result block — never '
-        "hand the wait to a background task or scheduled wakeup.\n"
+        'must answer, report merge_status="FAILED" and set block_reason to '
+        '"CHECKS_PENDING" in the result block — the controller then re-polls the '
+        "checks itself and retries the merge — never hand the wait to a "
+        "background task or scheduled wakeup.\n"
     )
 
 
@@ -6393,6 +6395,31 @@ def list_stashes(root: Path) -> list[tuple[str, str]]:
         ref, _, subject = line.partition("\t")
         out.append((ref.strip(), subject.strip()))
     return out
+
+
+def _sync_branch_to_remote(root: Path, branch: str) -> bool:
+    """Fast-forward the local ``branch`` in ``root`` to ``origin/<branch>`` (issue #794).
+
+    The merge agent pushes to the story branch when it absorbs drift; a bugfix
+    worktree that still sits on the older head would then push non-fast-forward
+    and park the story. Fetches the branch and fast-forwards only — a diverged
+    local branch is left untouched (returns False), as is a branch with no
+    remote counterpart; nothing is ever rewritten. True when the local head
+    equals the remote head afterwards.
+    """
+    try:
+        fetched = subprocess.run(
+            ["git", "fetch", "origin", branch], cwd=root,
+            capture_output=True, text=True, timeout=120,
+        )
+        if fetched.returncode != 0:
+            return False
+        if _git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() != branch:
+            return False
+        ff = _git(root, "merge", "--ff-only", "FETCH_HEAD")
+        return ff.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _git_push(root: Path, branch: str) -> subprocess.CompletedProcess[str]:
@@ -8722,6 +8749,7 @@ def _run_story(
                 story, pr_number, workdir, ledger, run_id, coverage_signals, cr_terms,
                 opts,
             )
+        regated = False  # issue #794: one merge re-gate per stage
         while True:
             # Issue #427: resolve the (harness, model) for this dispatch *before*
             # the ledger write and the estimate, so both record the identical
@@ -8921,6 +8949,26 @@ def _run_story(
                     )
                     return "AWAITING_APPROVAL"
 
+                # Issue #794: the merge agent pushed a head (a drift merge for a
+                # real conflict) and the forge's checks on it were still running
+                # when it had to answer. Nothing is broken, so bugfix has nothing
+                # to fix — and its push from a stale worktree head would be
+                # rejected non-fast-forward (run 60c2947e, story 34.4-001). Loop
+                # once more: the CI gate at the top of the attempt polls the new
+                # head to a terminal status, a green retries the merge, a red is
+                # the ordinary `ci-gate` block that routes to bugfix. Once per
+                # stage: a second CHECKS_PENDING is an agent not making progress.
+                if kind == "checks_pending" and not regated:
+                    regated = True
+                    ledger.event_log(
+                        run_id, story.id, "warn", "controller",
+                        "merge re-gate: checks pending on the head the merge agent "
+                        "pushed — re-polling the CI gate and retrying the merge "
+                        "instead of entering the bugfix loop (issue #794)",
+                    )
+                    attempt += 1
+                    continue
+
                 # Story 12.1-001: a missing/malformed result envelope (contract
                 # error) usually means the agent did good work but failed only to
                 # emit the result block. Before any heavier recovery, issue a cheap,
@@ -8982,6 +9030,17 @@ def _run_story(
                 bugfix_attempts += 1
                 bugfix_seq += 1
                 bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
+                if stage == "merge":
+                    # Issue #794: the merge agent may have advanced the remote
+                    # branch (a drift merge); fast-forward the worktree first so
+                    # the bugfix commit is not pushed non-fast-forward over it.
+                    if not _sync_branch_to_remote(workdir or Path.cwd(), f"feature/{story.id}"):
+                        ledger.event_log(
+                            run_id, story.id, "warn", "controller",
+                            f"could not fast-forward feature/{story.id} to its remote "
+                            "head before bugfix (diverged or no remote branch); the "
+                            "bugfix push may be rejected",
+                        )
                 if not _run_bugfix(
                     story, stage, failure, opts, ledger, run_id, dispatch,
                     bpath, bugfix_seq,
@@ -9738,11 +9797,14 @@ def _dispatch_stage(
         # it ``awaiting_approval`` so the caller short-circuits before the bugfix
         # loop (which cannot self-approve) and parks it as a distinct,
         # non-FAILED terminal rather than exhausting into FAILED.
-        kind = (
-            "awaiting_approval"
-            if _merge_awaiting_approval(stage, result.data)
-            else "reported"
-        )
+        if _merge_awaiting_approval(stage, result.data):
+            kind = "awaiting_approval"
+        elif _merge_checks_pending(stage, result.data):
+            # Issue #794: checks pending on a head the merge agent pushed — the
+            # caller re-polls the CI gate and retries the merge, no bugfix.
+            kind = "checks_pending"
+        else:
+            kind = "reported"
         return False, result, _stage_failure_summary(stage, result.data), kind
     return True, result, "", ""
 
@@ -9849,6 +9911,36 @@ def _merge_awaiting_approval(stage: str, data: dict) -> bool:
         return True
     haystack = " ".join(str(data.get(k, "")) for k in _BLOCK_TEXT_FIELDS).upper()
     return any(marker in haystack for marker in _AWAITING_APPROVAL_MARKERS)
+
+
+# Issue #794: the merge agent pushed a head itself (a drift merge for a real
+# conflict) and had to answer while the forge's checks on it were still
+# running. The explicit marker is what the merge prompt asks for; the free-text
+# patterns are how run 60c2947e's agent (story 34.4-001) described the same
+# situation before the marker existed.
+_CHECKS_PENDING_MARKER = "CHECKS_PENDING"
+_CHECKS_PENDING_PATTERNS = (
+    "CHECKS_PENDING", "REQUIRES_PASSING_CHECKS", "CHECKS STILL RUNNING",
+    "CHECKS ARE STILL RUNNING", "CHECKS IN PROGRESS", "PIPELINE STILL RUNNING",
+)
+
+
+def _merge_checks_pending(stage: str, data: dict) -> bool:
+    """True when a non-success merge response says checks are pending on a head
+    the agent pushed (issue #794) — a re-gate condition, never a bugfix one.
+
+    Only the ``merge`` stage can report it. The explicit ``block_reason`` marker
+    is primary; the free-text fallback mirrors :func:`_merge_awaiting_approval`
+    so an agent that narrates the block is still routed correctly. A high-risk
+    block is checked first by the caller and never reaches here.
+    """
+    if stage != "merge":
+        return False
+    reason = str(data.get("block_reason", "")).strip().upper()
+    if reason == _CHECKS_PENDING_MARKER:
+        return True
+    haystack = " ".join(str(data.get(k, "")) for k in _BLOCK_TEXT_FIELDS).upper()
+    return any(pattern in haystack for pattern in _CHECKS_PENDING_PATTERNS)
 
 
 # The check/job name the high-risk gate publishes on a change request, per
