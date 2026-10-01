@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.82.3] - 2026-10-01
+
+### Fixed
+
+- fix(dashboard): reload the page once when the served version changes (#803)
+
+
 ## [v2.82.2] - 2026-10-01
 
 ### Fixed
