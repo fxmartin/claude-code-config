@@ -853,13 +853,31 @@ async function tick(){
       fetch("/api/queue",{cache:"no-store"}),
     ]);
     renderRuns(await runsR.json());
-    renderMain(await statR.json());
+    const stat = await statR.json();
+    renderMain(stat);
     renderGithub(await ghR.json());
     renderQueue(await qR.json());
     document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+    maybeReloadForNewVersion(stat.version);
   }catch(e){
     document.getElementById("updated").textContent = "reconnecting…";
   }
+}
+
+// Issue #802: the page is fetched once and only its data refreshes, so a tab
+// left open kept running v2.73.4's markup through six deploys. The version this
+// page was rendered with is baked in at serve time; when a successful status
+// tick reports a different one, the server was redeployed and restarted under
+// us — reload once to pick up the new page. Only called after the status JSON
+// parsed (inside tick's try), so a reconnecting tick can never trigger it, and
+// the once-guard keeps a persistent mismatch from looping.
+const PAGE_VERSION = "__SDLC_VERSION__";
+let reloadRequested = false;
+function maybeReloadForNewVersion(served){
+  if(!served || reloadRequested) return;
+  if("v" + served === PAGE_VERSION) return;
+  reloadRequested = true;
+  location.reload();
 }
 
 // RUNS sidebar status filter (Story 19.2-003). Persistence mirrors the
@@ -1515,6 +1533,9 @@ class _Handler(BaseHTTPRequestHandler):
             # run's stories (wave + deps recorded by 11.2-007) so the client can
             # paint columns/edges without a graph library.
             snap["dag"] = dag_layout(snap.get("stories", []))
+            # Issue #802: the page compares this against the version it was
+            # rendered with and reloads itself when a redeploy changed it.
+            snap["version"] = __version__
             self._json(snap)
         elif path == "/api/runs":
             if self.server.registry is not None:
