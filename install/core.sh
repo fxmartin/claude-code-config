@@ -65,6 +65,42 @@ unlink_skill_entries() {
   fi
 }
 
+# register_local_marketplace(): point settings.json's fx-claude-config
+# marketplace at this checkout (#800). Rewrites only that one key, in place,
+# via jq; a missing settings.json (nothing seeded yet) or a missing jq degrades
+# to a note rather than a failure, since Claude Code still works off the seed.
+register_local_marketplace() {
+  local settings="$SCRIPT_DIR/settings.json"
+  local key='.extraKnownMarketplaces["fx-claude-config"].source'
+  if [ ! -f "$settings" ]; then
+    info "settings.json not seeded yet; marketplace path left for the next --core"
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "jq not found; marketplace path in settings.json left as-is (#800)"
+    return 0
+  fi
+  local current
+  current="$(jq -r "$key.path // empty" "$settings" 2>/dev/null || true)"
+  if [ "$current" = "$SCRIPT_DIR" ]; then
+    info "marketplace fx-claude-config already points at this checkout"
+    return 0
+  fi
+  if [ "${DRY_RUN:-false}" = "true" ]; then
+    echo "  [dry-run] jq: settings.json ${key} → {directory, $SCRIPT_DIR}"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp "$settings.XXXXXX")"
+  if jq --arg p "$SCRIPT_DIR" "$key = {source: \"directory\", path: \$p}" "$settings" >"$tmp"; then
+    mv "$tmp" "$settings"
+    info "Registered marketplace fx-claude-config → directory $SCRIPT_DIR (Claude Code picks it up on next start)"
+  else
+    rm -f "$tmp"
+    warn "could not rewrite settings.json; marketplace path left as-is"
+  fi
+}
+
 install_core_run() {
   # Guard (#179): refuse to install from an ephemeral build worktree. --core
   # symlinks every managed ~/.claude entry to $SCRIPT_DIR; if SCRIPT_DIR is a
@@ -131,12 +167,17 @@ install_core_run() {
   # writing into it would replace the committed relative links with absolute
   # ones and dirty the repo on every run.
 
-  # Local marketplace (#743). settings.json declares fx-claude-config as a
-  # `directory` marketplace at ~/Work/claude-code-config; Claude Code registers
-  # it on session start and installs the plugin from its own cache. Older
-  # installs planted a symlink here instead, which Claude Code now flags as a
-  # corrupted installLocation (it resolves outside ~/.claude/plugins) — remove
-  # ours if present. remove_symlink only unlinks a link pointing at this repo.
+  # Local marketplace (#743, #800). settings.json declares fx-claude-config as
+  # a `directory` marketplace; Claude Code registers it on session start and
+  # installs the plugin from its own cache. The template seeds ~/Work/…, which
+  # is only right on one machine — the nix-managed Macs keep this checkout
+  # under nix-install — so register THIS checkout's absolute path in the
+  # per-machine settings.json (gitignored; seeded once, never overwritten, by
+  # this script and by nix alike). Older installs planted a symlink under
+  # plugins/marketplaces instead, which Claude Code now flags as a corrupted
+  # installLocation — remove ours if present (remove_symlink only unlinks a
+  # link pointing at this repo).
+  register_local_marketplace
   remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
 
   # Build-harness adapters on PATH (Story 21.3-001). The harness registry invokes

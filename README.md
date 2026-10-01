@@ -549,7 +549,7 @@ Claude Code clones the repo into `~/.claude/plugins/marketplaces/fx-claude-confi
 
 #### Option B — Local clone (dev workflow)
 
-Use this if you're authoring or iterating on the plugin's skills. `settings.json` (seeded from `settings.template.json` by `./install.sh --core`) declares `fx-claude-config` as a `directory` marketplace at `~/Work/claude-code-config`, so the next Claude Code session registers it with no clone and nothing to refresh. Then:
+Use this if you're authoring or iterating on the plugin's skills. `./install.sh --core` registers this checkout's absolute path as the `fx-claude-config` `directory` marketplace in the machine's own `settings.json` (seeded once from `settings.template.json`, whose `~/Work/claude-code-config` default is only right where the checkout lives there — the nix-managed Macs keep it under `nix-install`, #800), so the next Claude Code session registers it with no clone and nothing to refresh. Then:
 
 ```text
 /plugin install autonomous-sdlc@fx-claude-config
