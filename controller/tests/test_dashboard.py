@@ -287,6 +287,47 @@ def test_api_status_includes_project(tmp_path: Path) -> None:
     assert "name" in project and "url" in project      # name falls back to repo dir
 
 
+def test_api_status_carries_the_controller_version(tmp_path: Path) -> None:
+    """Issue #802: the page compares this against the version it was rendered
+    with, so a redeploy + dashboard restart reaches every open tab."""
+    from sdlc import __version__
+
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/status")
+    assert json.loads(body)["version"] == __version__
+
+
+def test_api_status_carries_the_version_with_no_run(tmp_path: Path) -> None:
+    from sdlc import __version__
+
+    db = tmp_path / ".sdlc-state.db"
+    with _running(db) as base:
+        _s, _c, body = _get(base + "/api/status")
+    assert json.loads(body)["version"] == __version__
+
+
+def test_page_reloads_itself_once_when_the_served_version_changes() -> None:
+    """Issue #802: a tab opened days ago kept showing v2.73.4 and the old queue
+    panel through six deploys. The page bakes the version it was rendered with,
+    compares on every successful status tick, and reloads once on a mismatch —
+    never on a failed tick, never more than once per page life."""
+    from sdlc.dashboard import _PAGE
+
+    assert 'const PAGE_VERSION = "__SDLC_VERSION__";' in _PAGE
+    tick_start = _PAGE.index("async function tick()")
+    tick_body = _PAGE[tick_start:_PAGE.index("\n}", tick_start)]
+    assert "maybeReloadForNewVersion(" in tick_body
+    fn_start = _PAGE.index("function maybeReloadForNewVersion(")
+    fn = _PAGE[fn_start:_PAGE.index("\n}", fn_start)]
+    assert "PAGE_VERSION" in fn and "location.reload()" in fn
+    assert "reloadRequested" in fn  # the once-guard
+    # The comparison runs after the status JSON parsed, inside the try — so a
+    # reconnecting tick (catch) can never reach it.
+    assert tick_body.index("maybeReloadForNewVersion(") < tick_body.index("}catch(e){")
+
+
 def test_page_has_runs_and_latte_theme() -> None:
     from sdlc.dashboard import _PAGE
 
