@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.82.2] - 2026-10-01
+
+### Fixed
+
+- fix(install): register the marketplace at this checkout, per machine (#801)
+
+
 ## [v2.82.1] - 2026-10-01
 
 ### Fixed
