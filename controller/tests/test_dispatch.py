@@ -1099,6 +1099,54 @@ def test_streaming_dispatch_late_watchdog_does_not_false_timeout(monkeypatch) ->
     assert not fake.killed  # a completed child is never killed by the watchdog
 
 
+# Run 3ccbe6cb (story 35.1-003, merge attempt 1): a Bash call the CLI moved to
+# the background finished after the agent's answer, so headless Claude re-invoked
+# it for a follow-up turn — a second `init` and a second `result` event whose
+# text was a prose recap with no block.
+_FOLLOW_UP_INIT = json.dumps({"type": "system", "subtype": "init"}) + "\n"
+
+
+def test_streaming_dispatch_keeps_block_from_earlier_result_event(monkeypatch) -> None:
+    """A follow-up turn's block-less result must not discard the agent's answer."""
+    lines = list(_STREAM_PREAMBLE) + [
+        _stream_result_event(_wrap(_VALID_BUILD), cost=0.25),
+        _FOLLOW_UP_INIT,
+        _stream_result_event("Build complete — summary above.", cost=0.27,
+                             session_id="sess-123"),
+    ]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["branch_name"] == "feature/7.3-001"
+    # The last event is still the envelope: its cost is the session's cumulative.
+    assert result.cost_usd == 0.27
+    assert "summary above" in result.raw
+
+
+def test_streaming_dispatch_later_result_block_wins(monkeypatch) -> None:
+    """A follow-up turn that restates the block supersedes the earlier one."""
+    restated = {**_VALID_BUILD, "commit_sha": "def456"}
+    lines = [
+        _stream_result_event(_wrap(_VALID_BUILD)),
+        _FOLLOW_UP_INIT,
+        _stream_result_event(_wrap(restated)),
+    ]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    result = dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert result.data["commit_sha"] == "def456"
+
+
+def test_streaming_dispatch_error_in_follow_up_result_still_raises(monkeypatch) -> None:
+    """An error envelope on the last result event is honoured, not papered over."""
+    lines = [
+        _stream_result_event(_wrap(_VALID_BUILD)),
+        _FOLLOW_UP_INIT,
+        _stream_result_event("hit limit", is_error=True),
+    ]
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakePopen(lines))
+    with pytest.raises(AgentDispatchError, match="hit limit"):
+        dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+
+
 def test_streaming_dispatch_falls_back_when_no_result_event(monkeypatch) -> None:
     """A streaming cmd whose output carries no result event degrades to captured parsing."""
     # No line is a `type==result` event; the wrapped block arrives as plain text.

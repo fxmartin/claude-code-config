@@ -1274,7 +1274,7 @@ def _dispatch_streaming(
 
     transcript = _StreamTranscript(transcript_path)
     raw_lines: list[str] = []
-    result_event: dict[str, Any] | None = None
+    result_events: list[dict[str, Any]] = []
     # Issue #120: a structured 429 surfaces its absolute window-reset epoch on a
     # separate ``rate_limit_event`` stream line (``rate_limit_info.resetsAt``),
     # not in the terminal result envelope. Capture it as it passes so the
@@ -1303,7 +1303,7 @@ def _dispatch_streaming(
                 if event is not None:
                     _emit_progress(on_progress, event)
                     if event.get("type") == "result":
-                        result_event = event
+                        result_events.append(event)
                     elif event.get("type") == "rate_limit_event":
                         captured = _extract_resets_at(event)
                         if captured is not None:
@@ -1362,11 +1362,36 @@ def _dispatch_streaming(
         stderr,
         returncode,
         transcript_path,
-        envelope=result_event,
+        envelope=_merge_result_events(result_events),
         streaming=True,
         stream_resets_at=stream_resets_at,
         parser=parser,
     )
+
+
+def _merge_result_events(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The terminal envelope of a stream that may carry several ``result`` events.
+
+    Headless Claude re-invokes the agent for a follow-up turn when a background
+    task finishes after its turn ended — including a foreground Bash call the CLI
+    moved to the background at its tool timeout — and each turn emits its own
+    ``result`` event. Run 3ccbe6cb (story 35.1-003, merge attempt 1): the first
+    turn merged the PR and emitted a valid block; the follow-up turn answered the
+    late task notification with a prose recap, and keeping only the last event
+    failed a landed merge on a missing marker.
+
+    The last event stays the envelope — its ``is_error``, cumulative cost and
+    session are the session's final word — but its ``result`` text becomes every
+    turn's text in order, so the contract parser's last-well-formed-block rule
+    finds the agent's answer and a follow-up that restates the block still wins.
+    """
+    if not events:
+        return None
+    last = events[-1]
+    if len(events) == 1 or last.get("is_error"):
+        return last
+    texts = (str(event.get("result") or "") for event in events)
+    return {**last, "result": "\n\n".join(text for text in texts if text)}
 
 
 def _interpret(
