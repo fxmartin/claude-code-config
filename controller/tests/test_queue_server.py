@@ -23,6 +23,8 @@ from sdlc.queue_server import (
     WhoisUnavailable,
     make_server,
     parse_bind,
+    serve,
+    tailscale_whois,
 )
 
 LOOPBACK = ("127.0.0.0/8",)
@@ -499,3 +501,129 @@ def test_serve_refuses_to_start_without_an_allowlist_or_token(tmp_path, monkeypa
     result = CliRunner().invoke(app, ["queue", "serve", "--bind", "127.0.0.1:0"])
     assert result.exit_code == 2
     assert "allow" in result.output.lower()
+
+
+# --- coverage gaps: whois, serve(), HTTP edge cases ------------------------------
+
+
+class _Proc:
+    def __init__(self, returncode=0, stdout="", stderr="") -> None:
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _fake_run(monkeypatch, result) -> None:
+    def run(*_a, **_k):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr("sdlc.queue_server.subprocess.run", run)
+
+
+def test_tailscale_whois_returns_the_login_name(monkeypatch) -> None:
+    payload = json.dumps({"UserProfile": {"LoginName": "fx@example.com"}})
+    _fake_run(monkeypatch, _Proc(stdout=payload))
+    assert tailscale_whois("100.64.0.1") == "fx@example.com"
+
+
+@pytest.mark.parametrize("stdout", ["not json", "{}", '{"UserProfile": null}', '{"UserProfile": {"LoginName": ""}}'])
+def test_tailscale_whois_without_a_login_is_none(monkeypatch, stdout) -> None:
+    _fake_run(monkeypatch, _Proc(stdout=stdout))
+    assert tailscale_whois("100.64.0.1") is None
+
+
+@pytest.mark.parametrize("failure", [OSError("no tailscale"), _Proc(returncode=1, stderr="down")])
+def test_tailscale_whois_cli_failure_is_unavailable(monkeypatch, failure) -> None:
+    _fake_run(monkeypatch, failure)
+    with pytest.raises(WhoisUnavailable):
+        tailscale_whois("100.64.0.1")
+
+
+def test_policy_refuses_unparseable_peer_and_missing_identity(store) -> None:
+    assert not _policy().authorize("not-an-ip", None).allowed
+    assert not _policy(whois=lambda ip: None).authorize("127.0.0.1", None).allowed
+    token_only = AccessPolicy(token="s3cret", networks=LOOPBACK)
+    assert not token_only.authorize("127.0.0.1", "wrong").allowed
+    assert token_only.authorize("127.0.0.1", "s3cret").allowed
+
+
+def test_bearer_token_header_admits_through_the_http_layer(store) -> None:
+    running = _Running(store, AccessPolicy(token="s3cret", networks=LOOPBACK))
+    try:
+        assert running.call("GET", "/jobs")[0] == 403
+        assert running.call("GET", "/jobs", headers={"Authorization": "Bearer s3cret"})[0] == 200
+    finally:
+        running.stop()
+
+
+def test_wrong_method_is_405_and_bad_job_id_is_404(api) -> None:
+    assert api.call("GET", "/jobs/1/cancel")[0] == 405
+    assert api.call("GET", "/pause")[0] == 405
+    assert api.call("POST", "/jobs/abc/cancel")[0] == 404
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"repo": "r", "kind": "k", "scope": "s", "requirements": {"nope": "x"}},
+        {"repo": "r", "kind": "k", "scope": "s", "options": "notalist"},
+        {"repo": "r", "kind": "k", "scope": "s", "host": ""},
+    ],
+)
+def test_add_job_validates_optional_fields(api, body) -> None:
+    assert api.call("POST", "/jobs", body)[0] == 400
+
+
+@pytest.mark.parametrize("lease", [0, -5, True, "60", 10**9])
+def test_claim_rejects_bad_lease(api, lease) -> None:
+    assert api.call("POST", "/jobs/claim", {"worker": "w", "lease_seconds": lease})[0] == 400
+
+
+def test_bad_content_length_is_400(api) -> None:
+    import http.client
+
+    host, port = api.url.removeprefix("http://").split(":")
+    for value in ("abc", "-1"):
+        conn = http.client.HTTPConnection(host, int(port), timeout=10)
+        conn.putrequest("POST", "/jobs")
+        conn.putheader("Content-Length", value)
+        conn.endheaders()
+        assert conn.getresponse().status == 400
+        conn.close()
+
+
+def test_json_body_that_is_not_an_object_is_400(api) -> None:
+    req = urllib.request.Request(api.url + "/jobs", data=b"[1]", method="POST")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=10)
+    assert exc.value.code == 400
+
+
+def test_handler_bug_is_500_and_locked_store_is_503(api, store, monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise RuntimeError("bug")
+
+    def locked(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "list_jobs", boom)
+    assert api.call("GET", "/jobs")[0] == 500
+    monkeypatch.setattr(store, "list_jobs", locked)
+    assert api.call("GET", "/jobs")[0] == 503
+
+
+def test_serve_runs_until_interrupted_and_closes_the_server(store, monkeypatch) -> None:
+    calls: list[str] = []
+
+    class _Fake:
+        server_address = ("127.0.0.1", 1234)
+
+        def serve_forever(self) -> None:
+            raise KeyboardInterrupt
+
+        def server_close(self) -> None:
+            calls.append("closed")
+
+    monkeypatch.setattr("sdlc.queue_server.make_server", lambda *a, **k: _Fake())
+    serve(store, _policy(), "127.0.0.1", 0)
+    assert calls == ["closed"]
