@@ -440,17 +440,28 @@ class QueueClient:
         run_id: str | None = None,
         repo: str | None = None,
         source: str | None = None,
+        pool: str | None = None,
     ) -> bool:
         body: dict[str, Any] = {"until": until.isoformat()}
-        optional = {"reason": reason, "run_id": run_id, "repo": repo, "source": source}
+        optional = {
+            "reason": reason, "run_id": run_id, "repo": repo, "source": source, "pool": pool,
+        }
         body.update({key: value for key, value in optional.items() if value is not None})
         payload = self._call("POST", "/pause", body)
         return bool(payload and payload.get("opened"))
 
-    def dispatch_pause(self) -> QueuePause | None:
-        """The live window; the service already reports an elapsed one as none."""
-        pause = self._snapshot().get("pause")
-        return QueuePause(**_fields(QueuePause, pause)) if isinstance(pause, dict) else None
+    def dispatch_pause(self, pool: str | None = None) -> QueuePause | None:
+        """``pool``'s live window; the service already omits an elapsed one."""
+        return next((p for p in self.dispatch_pauses() if p.pool == pool), None)
 
-    def clear_pause(self) -> None:
-        self._call("DELETE", "/pause")
+    def dispatch_pauses(self) -> list[QueuePause]:
+        """Every live window, one per paused pool."""
+        snapshot = self._snapshot()
+        pauses = snapshot.get("pauses")
+        if not isinstance(pauses, list):  # a server from before pool pauses
+            single = snapshot.get("pause")
+            pauses = [single] if isinstance(single, dict) else []
+        return [QueuePause(**_fields(QueuePause, p)) for p in pauses if isinstance(p, dict)]
+
+    def clear_pause(self, pool: str | None = None) -> None:
+        self._call("DELETE", "/pause" + (f"?pool={quote(pool, safe='')}" if pool else ""))

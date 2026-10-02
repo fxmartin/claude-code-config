@@ -280,7 +280,9 @@ def queue_view() -> dict:
     source, per Story 32.3-002 AC3). `pause` is the host-level rate-limit window
     (Story 32.2-001) — the queue's own state, not a job's, which is exactly why
     it sits beside the rows rather than among them. An elapsed window is
-    reported as no pause at all, so the banner can never go stale. With a fleet
+    reported as no pause at all, so the banner can never go stale. `pauses` is one
+    entry per paused subscription pool (Story 35.2-003); `pause` stays the first.
+    With a fleet
     queue configured (Story 35.1-002) this is the fleet's queue, via the same
     `open_queue()` factory every other consumer uses. A host that
     has never enqueued anything degrades to an empty list rather than conjuring
@@ -288,17 +290,16 @@ def queue_view() -> dict:
     """
     try:
         store = open_queue()
-        pause = store.dispatch_pause()
-        if pause is not None and not pause.is_active():
-            pause = None
+        pauses = [p for p in store.dispatch_pauses() if p.is_active()]
         return {
-            "pause": pause.to_dict() if pause else None,
+            "pause": pauses[0].to_dict() if pauses else None,
+            "pauses": [p.to_dict() for p in pauses],
             "jobs": [r.to_dict() for r in store.list_jobs()],
         }
     except QueueError as exc:
         # A configured fleet queue that is down must not 500 the page: show an
         # empty queue plus why, and the next poll recovers on its own.
-        return {"pause": None, "jobs": [], "error": str(exc)}
+        return {"pause": None, "pauses": [], "jobs": [], "error": str(exc)}
 
 
 # --- live transport: change detection (Story 11.2-003) ---------------------
@@ -1073,8 +1074,9 @@ function renderQueue(data){
   const cur = el.querySelector("details");
   if(cur && cur.open !== queueOpen) setQueueOpen(cur.open);
   const jobs = (data && data.jobs) || [];
-  const pause = data && data.pause;
-  if(!jobs.length && !pause){
+  // One window per paused pool (Story 35.2-003); an older server sends only `pause`.
+  const pauses = (data && data.pauses) || (data && data.pause ? [data.pause] : []);
+  if(!jobs.length && !pauses.length){
     el.innerHTML = "<div class='queuewrap unavail'>no queue</div>";
     return;
   }
@@ -1082,11 +1084,11 @@ function renderQueue(data){
   jobs.forEach(j => { (byState[j.state] = byState[j.state] || []).push(j); });
   const order = QUEUE_STATE_ORDER.filter(s => byState[s])
     .concat(Object.keys(byState).filter(s => !QUEUE_STATE_ORDER.includes(s)).sort());
-  const pauseHtml = pause
-    ? "<div class='queue-pause'>queue paused (rate limited)"
+  const pauseHtml = pauses.map(pause =>
+    "<div class='queue-pause'>queue paused (rate limited)"
+      + (pause.pool ? " · pool " + esc(pause.pool) : "")
       + (pause.paused_until ? " · resumes " + esc(fmtLocal(pause.paused_until)) : "")
-      + (pause.reason ? " · " + esc(pause.reason) : "") + "</div>"
-    : "";
+      + (pause.reason ? " · " + esc(pause.reason) : "") + "</div>").join("");
   const running = jobs.filter(j => j.state === "running").length;
   const groups = order.map(state => {
     const rows = byState[state].map(j =>
@@ -1101,7 +1103,7 @@ function renderQueue(data){
   // The collapsed line must still answer "is anything moving?".
   const meta = [running + " running"]
     .concat(order.filter(s => s !== "running").map(s => esc(s) + " " + byState[s].length))
-    .concat(pause ? ["paused"] : []).join(" \\u00b7 ");
+    .concat(pauses.length ? ["paused"] : []).join(" \\u00b7 ");
   el.innerHTML = "<details class='queuewrap'" + (queueOpen ? " open" : "") + ">"
     + "<summary><h3>Development queue</h3><span class='queue-meta'>" + meta + "</span></summary>"
     + "<div class='queue-slots'>slots in use: "+running+" running</div>"

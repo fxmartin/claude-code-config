@@ -64,7 +64,7 @@ _REQUEST_TIMEOUT_SECONDS = 30
 WHOIS_CACHE_SECONDS = 60
 _WHOIS_TIMEOUT_SECONDS = 5
 _MAX_LEASE_SECONDS = 24 * 3600
-_REQUIREMENT_KEYS = frozenset({"repo", "harness", "sandbox"})
+_REQUIREMENT_KEYS = frozenset({"repo", "origin", "harness", "sandbox"})
 
 
 class BindError(ValueError):
@@ -362,12 +362,13 @@ class _Routes:
         # Same envelope `sdlc queue list --json` emits: the pause lives beside
         # the jobs, not in one of them, and an elapsed window is not state.
         repo = query.get("repo", [None])[0]
-        pause = self.store.dispatch_pause()
-        if pause is not None and not pause.is_active():
-            pause = None
+        pauses = [p for p in self.store.dispatch_pauses() if p.is_active()]
         jobs = self.store.list_jobs(repo)
         return 200, {
-            "pause": pause.to_dict() if pause else None,
+            # `pause` is the first live window (the one-pool shape of Story
+            # 32.2-001); `pauses` is one entry per paused pool (Story 35.2-003).
+            "pause": pauses[0].to_dict() if pauses else None,
+            "pauses": [p.to_dict() for p in pauses],
             "jobs": [job.to_dict() for job in jobs],
         }
 
@@ -488,18 +489,21 @@ class _Routes:
             raise _ApiError(400, f"until must be an ISO-8601 timestamp, got {raw!r}") from exc
         if until.tzinfo is None:
             until = until.replace(tzinfo=timezone.utc)
+        pool = _text(body, "pool")
         opened = self.store.pause_dispatch(
             until=until,
             reason=_text(body, "reason"),
             run_id=_text(body, "run_id"),
             repo=_text(body, "repo"),
             source=_text(body, "source"),
+            pool=pool,
         )
-        recorded = self.store.dispatch_pause()
+        recorded = self.store.dispatch_pause(pool)
         return 200, {"opened": opened, "pause": recorded.to_dict() if recorded else None}
 
-    def resume(self, _query: Any, _body: Body) -> Reply:
-        self.store.clear_pause()
+    def resume(self, query: dict[str, list[str]], _body: Body) -> Reply:
+        # `?pool=P` lifts one pool's window; no pool lifts every window.
+        self.store.clear_pause(query.get("pool", [None])[0] or None)
         return 200, {"pause": None}
 
 

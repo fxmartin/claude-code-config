@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import shutil
 import socket
 import sqlite3
@@ -42,6 +43,7 @@ __all__ = [
     "check_harness_pin",
     "check_model_coverage",
     "check_model_routing",
+    "check_queue_service",
     "check_stashes",
     "check_usage_agreement",
     "run_doctor",
@@ -86,6 +88,14 @@ DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
         "install osv-scanner — https://google.github.io/osv-scanner",
     ),
 )
+
+# Story 35.1-003: the LaunchAgent that keeps `sdlc queue serve` resident on
+# home-lab (template: templates/launchd/com.fxmartin.sdlc-queue.plist).
+QUEUE_SERVICE_LABEL = "com.fxmartin.sdlc-queue"
+
+# How long the liveness probe waits for the service's socket. A local/tailnet
+# connect that has not answered in this long is as good as down for a health line.
+_QUEUE_SERVICE_PROBE_TIMEOUT_S = 3.0
 
 # Status severity ordering: a report's overall status is the worst of its parts.
 _SEVERITY = {"CLEAN": 0, "WARN": 1, "FAIL": 2}
@@ -754,6 +764,130 @@ def check_queue(queue_path: Path) -> Finding:
         "CLEAN",
         f"schema current; {breakdown} (host-wide)",
     )
+
+
+def default_queue_service_plist() -> Path:
+    """Where `launchctl` loads the queue service's LaunchAgent from."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{QUEUE_SERVICE_LABEL}.plist"
+
+
+def _tcp_probe(host: str, port: int) -> bool:
+    """True when something accepts a TCP connection on ``host:port``.
+
+    Deliberately not an HTTP call: the service refuses unauthenticated callers
+    (and logs each refusal), and doctor stays read-only and quiet.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=_QUEUE_SERVICE_PROBE_TIMEOUT_S):
+            return True
+    except OSError:
+        return False
+
+
+def _plist_bind(args: list[str]) -> str | None:
+    """The ``--bind`` value in a ProgramArguments list (`--bind X` or `--bind=X`)."""
+    for i, arg in enumerate(args):
+        if arg == "--bind":
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg.startswith("--bind="):
+            return arg.removeprefix("--bind=")
+    return None
+
+
+def _service_store_path(env: dict[str, str]) -> Path:
+    """The queue file the service resolves, from the plist's own environment.
+
+    launchd starts it with a bare environment, so this repeats
+    ``default_queue_path``'s order against the plist's variables rather than
+    the shell's — the two disagreeing is exactly what the caller warns about.
+    """
+    if env.get("SDLC_QUEUE_PATH"):
+        return Path(env["SDLC_QUEUE_PATH"])
+    if env.get("XDG_STATE_HOME"):
+        return Path(env["XDG_STATE_HOME"]) / "sdlc" / "queue.db"
+    return Path.home() / ".sdlc" / "queue.db"
+
+
+def check_queue_service(
+    plist_path: Path,
+    *,
+    probe: Callable[[str, int], bool] = _tcp_probe,
+    queue_path: Path | None = None,
+) -> Finding:
+    """Report whether the fleet queue service is up, where, and on which store.
+
+    Story 35.1-003. The installed LaunchAgent plist is the source of truth for
+    the bind address and the store, so doctor reads it rather than guessing:
+
+    * **CLEAN, not installed** — no plist: this host does not serve the queue
+      (every machine but home-lab), so the check is not applicable.
+    * **FAIL** — a plist that cannot be read or names no ``--bind``, or a bind
+      nothing is listening on (the service is down or crash-looping).
+    * **WARN** — running, but on a store other than the one this shell's
+      `sdlc queue` verbs use: jobs enqueued locally would never be served.
+    * **CLEAN** — running; the detail names the bind and the store path.
+
+    ``queue_path`` is the shell's own store (default: ``default_queue_path()``).
+    """
+    name = "Queue service"
+    if not plist_path.is_file():
+        return Finding(
+            "queue-service", name, "CLEAN",
+            f"not installed — this host does not serve the fleet queue "
+            f"(no {plist_path.name})",
+        )
+    try:
+        plist = plistlib.loads(plist_path.read_bytes())
+        args = [str(a) for a in plist.get("ProgramArguments", [])]
+        env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
+        err_log = str(plist.get("StandardErrorPath") or "")
+    # Doctor is a diagnostic: a plist it cannot use is this check's FAIL, never a
+    # crash of `sdlc doctor` / `sdlc status --markdown`. plistlib's errors are not
+    # a closed set (expat's ExpatError, an IndexError for a stray <key>) and a
+    # scalar ProgramArguments is a TypeError, so no exception tuple stays complete.
+    except Exception as exc:  # noqa: BLE001
+        return Finding(
+            "queue-service", name, "FAIL",
+            f"{plist_path} is unreadable: {exc}",
+            "reinstall it from templates/launchd/com.fxmartin.sdlc-queue.plist",
+        )
+    bind = _plist_bind(args)
+    if bind is None:
+        return Finding(
+            "queue-service", name, "FAIL",
+            f"{plist_path} runs no `--bind` — `sdlc queue serve` will not start",
+            "reinstall it from templates/launchd/com.fxmartin.sdlc-queue.plist",
+        )
+
+    store = _service_store_path(env)
+    host, _, port = bind.rpartition(":")
+    try:
+        alive = probe(host.strip("[]"), int(port))
+    except ValueError:
+        alive = False
+    if not alive:
+        remedy = f"launchctl kickstart -k gui/$(id -u)/{QUEUE_SERVICE_LABEL}"
+        # The plist says where stderr goes; without StandardErrorPath launchd
+        # discards it, so there is no log to point at.
+        if err_log:
+            remedy += f"; then read {err_log}"
+        return Finding(
+            "queue-service", name, "FAIL",
+            f"nothing is listening on {bind} (store {store})",
+            remedy,
+        )
+
+    local = queue_path if queue_path is not None else default_queue_path()
+    detail = f"running, listening on {bind}; store {store}"
+    if store != local:
+        return Finding(
+            "queue-service", name, "WARN",
+            f"{detail} — but this shell's `sdlc queue` uses {local}, so jobs "
+            "enqueued here are not served",
+            f"point both at one file: set SDLC_QUEUE_PATH={store} in your shell "
+            "(or in the plist's EnvironmentVariables)",
+        )
+    return Finding("queue-service", name, "CLEAN", detail)
 
 
 def check_runs(
@@ -1592,6 +1726,7 @@ def run_doctor(
     claude_dir: Path | None = None,
     db_path: Path | None = None,
     queue_path: Path | None = None,
+    queue_service_plist: Path | None = None,
     registry: Registry | None = None,
     dep_probe: Callable[[str], bool] | None = None,
     now: datetime | None = None,
@@ -1608,6 +1743,7 @@ def run_doctor(
     claude_dir = claude_dir or (Path.home() / ".claude")
     db_path = db_path or default_db_path()
     queue_path = queue_path or default_queue_path()
+    queue_service_plist = queue_service_plist or default_queue_service_plist()
     registry = registry or Registry()
     dep_probe = dep_probe or _default_dep_probe
 
@@ -1617,6 +1753,7 @@ def run_doctor(
         check_ledger(db_path),
         check_ledger_ignored(repo_root, db_path),
         check_queue(queue_path),
+        check_queue_service(queue_service_plist, queue_path=queue_path),
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
         check_config(repo_root),
         check_harness_pin(repo_root),

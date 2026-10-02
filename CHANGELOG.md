@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.88.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): `--enqueue` targets the fleet, with (#35.3-001)
+
+### Fixed
+
+- fix(fleet-execution): `--enqueue` targets the fleet, with (#35.3-001)
+- fix(fleet-execution): `--enqueue` targets the fleet, with (#35.3-001)
+
+
+## [v2.87.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): rate-limit pauses per subscription (#35.2-003)
+
+
+## [v2.86.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): resident service on home-lab (#35.1-003)
+
+### Fixed
+
+- fix(fleet-execution): resident service on home-lab (#35.1-003)
+- fix(fleet-execution): resident service on home-lab (#35.1-003)
+
+
+## [v2.85.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): worker registration and (#35.2-001)
+
+
 ## [v2.84.0] - 2026-10-02
 
 ### Added

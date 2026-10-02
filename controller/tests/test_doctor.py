@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import plistlib
+import socket
 import sqlite3
 import subprocess
 import tomllib
@@ -22,6 +24,7 @@ from sdlc.doctor import (
     check_controller_version,
     check_harness_pin,
     check_model_coverage,
+    check_queue_service,
     check_usage_agreement,
     run_doctor,
     worst_status,
@@ -30,6 +33,16 @@ from sdlc.model_backfill import backfill_models
 from sdlc.registry import Registry, RunRecord
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_queue_service(monkeypatch, tmp_path):
+    """Keep `run_doctor` off the developer's real LaunchAgent plist (35.1-003).
+
+    On home-lab the plist exists and the service is up; anywhere else it is
+    absent. Either way an un-isolated run would make these tests host-dependent.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
 # --- fixtures ---------------------------------------------------------------
@@ -1462,6 +1475,236 @@ def test_self_update_cleanup_failure_still_reports_the_install(
 
     assert doctor.self_update_controller(repo, "2.71.3", installer=installer, fetch=False) == "2.71.4"
     assert not installer.trees[0].exists()
+
+
+# --- queue service (Story 35.1-003) -----------------------------------------
+
+
+def _service_plist(
+    tmp_path: Path,
+    *,
+    bind: str = "100.101.102.103:8790",
+    store: str | None = None,
+    err_log: str | None = None,
+) -> Path:
+    env = {"SDLC_QUEUE_PATH": store} if store else {}
+    body: dict[str, object] = {
+        "Label": "com.fxmartin.sdlc-queue",
+        "ProgramArguments": ["/usr/local/bin/sdlc", "queue", "serve", "--bind", bind],
+        "EnvironmentVariables": env,
+    }
+    if err_log:
+        body["StandardErrorPath"] = err_log
+    path = tmp_path / "com.fxmartin.sdlc-queue.plist"
+    path.write_bytes(plistlib.dumps(body))
+    return path
+
+
+def test_queue_service_not_installed_is_not_applicable(tmp_path: Path) -> None:
+    finding = check_queue_service(tmp_path / "absent.plist", probe=lambda h, p: False)
+    assert (finding.check, finding.status) == ("queue-service", "CLEAN")
+    assert "not installed" in finding.detail
+
+
+def test_queue_service_running_reports_bind_and_store(tmp_path: Path) -> None:
+    store = str(tmp_path / "queue.db")  # the shell's own, via _isolated_queue
+    seen: list[tuple[str, int]] = []
+
+    def probe(host: str, port: int) -> bool:
+        seen.append((host, port))
+        return True
+
+    finding = check_queue_service(_service_plist(tmp_path, store=store), probe=probe)
+    assert finding.status == "CLEAN"
+    assert seen == [("100.101.102.103", 8790)]
+    assert "running" in finding.detail
+    assert "100.101.102.103:8790" in finding.detail
+    assert store in finding.detail
+
+
+def test_queue_service_down_fails_with_a_remedy(tmp_path: Path) -> None:
+    finding = check_queue_service(_service_plist(tmp_path), probe=lambda h, p: False)
+    assert finding.status == "FAIL"
+    assert "100.101.102.103:8790" in finding.detail
+    assert "launchctl kickstart" in finding.remedy
+
+
+def test_queue_service_down_points_at_the_plists_own_error_log(tmp_path: Path) -> None:
+    # A custom or nix-rendered install may log elsewhere; the plist says where.
+    plist = _service_plist(tmp_path, err_log="/srv/logs/sdlc-queue.err")
+    finding = check_queue_service(plist, probe=lambda h, p: False)
+    assert "/srv/logs/sdlc-queue.err" in finding.remedy
+    assert ".local/state/sdlc" not in finding.remedy
+
+
+def test_queue_service_down_without_an_error_log_names_none(tmp_path: Path) -> None:
+    # No StandardErrorPath: launchd discards stderr, so there is no file to read.
+    finding = check_queue_service(_service_plist(tmp_path), probe=lambda h, p: False)
+    assert "launchctl kickstart" in finding.remedy
+    assert "err.log" not in finding.remedy
+
+
+def test_queue_service_store_follows_launchds_bare_environment(tmp_path: Path) -> None:
+    # No SDLC_QUEUE_PATH/XDG_STATE_HOME in the plist: the service resolves the
+    # registry-sibling default under HOME, not whatever this shell exports.
+    finding = check_queue_service(_service_plist(tmp_path), probe=lambda h, p: True)
+    assert str(Path.home() / ".sdlc" / "queue.db") in finding.detail
+
+
+def test_queue_service_store_honours_the_plists_xdg_state_home(tmp_path: Path) -> None:
+    path = tmp_path / "xdg.plist"
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "ProgramArguments": ["sdlc", "queue", "serve", "--bind=100.64.0.9:8790"],
+                "EnvironmentVariables": {"XDG_STATE_HOME": "/srv/state"},
+            }
+        )
+    )
+    finding = check_queue_service(path, probe=lambda h, p: True)
+    assert "/srv/state/sdlc/queue.db" in finding.detail
+    assert "100.64.0.9:8790" in finding.detail
+
+
+def test_queue_service_store_differing_from_the_shells_warns(tmp_path: Path) -> None:
+    other = str(tmp_path / "elsewhere" / "queue.db")
+    finding = check_queue_service(
+        _service_plist(tmp_path, store=other), probe=lambda h, p: True
+    )
+    assert finding.status == "WARN"
+    assert other in finding.detail
+    assert "SDLC_QUEUE_PATH" in finding.remedy
+
+
+def test_queue_service_plist_without_a_bind_fails(tmp_path: Path) -> None:
+    path = tmp_path / "bad.plist"
+    path.write_bytes(plistlib.dumps({"ProgramArguments": ["/usr/local/bin/sdlc"]}))
+    finding = check_queue_service(path, probe=lambda h, p: True)
+    assert finding.status == "FAIL"
+    assert "--bind" in finding.detail
+
+
+def test_queue_service_unreadable_plist_fails(tmp_path: Path) -> None:
+    path = tmp_path / "junk.plist"
+    path.write_text("not a plist", encoding="utf-8")
+    assert check_queue_service(path, probe=lambda h, p: True).status == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Cut short, e.g. an interrupted `sed ... > plist` install.
+        (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n'
+            "<key>Label</key>\n<string>com.fxmartin.sdlc-queue</string>\n"
+        ),
+        # Well-formed shape, but an unescaped `&` in a hand-edited value.
+        (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+            "<key>A</key><string>a & b</string></dict></plist>\n"
+        ),
+        # Valid XML and a valid plist, but ProgramArguments is not an array.
+        (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+            "<key>ProgramArguments</key><integer>5</integer></dict></plist>\n"
+        ),
+        # Valid XML that plistlib's parser trips over (a key outside any dict).
+        (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">'
+            "<key>Label</key></plist>\n"
+        ),
+    ],
+    ids=["truncated", "unescaped-ampersand", "scalar-program-arguments", "stray-key"],
+)
+def test_queue_service_malformed_plist_fails(tmp_path: Path, body: str) -> None:
+    # Whatever plistlib or the shape coercion raises (ExpatError, TypeError,
+    # IndexError, ...) must read as FAIL, not crash `sdlc doctor` (and `sdlc
+    # status --markdown`).
+    path = tmp_path / "half-written.plist"
+    path.write_text(body, encoding="utf-8")
+    finding = check_queue_service(path, probe=lambda h, p: True)
+    assert finding.status == "FAIL"
+    assert "unreadable" in finding.detail
+
+
+def test_queue_service_default_probe_sees_a_real_listener(tmp_path: Path) -> None:
+    store = str(tmp_path / "queue.db")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        plist = _service_plist(tmp_path, bind=f"127.0.0.1:{port}", store=store)
+        up = check_queue_service(plist)
+    assert up.status == "CLEAN"
+    # The listener is closed now, so the same bind is refused.
+    assert check_queue_service(plist).status == "FAIL"
+
+
+def test_run_doctor_includes_the_queue_service_finding(tmp_path: Path) -> None:
+    # run_doctor uses the real probe, so point it at a loopback port just freed:
+    # refused at once, and never a packet off-host (a tailnet/CGNAT address would
+    # route out the default gateway and burn the whole probe timeout).
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = reserved.getsockname()[1]
+    plist = _service_plist(
+        tmp_path, bind=f"127.0.0.1:{port}", store=str(tmp_path / "queue.db")
+    )
+    report = _doctor(tmp_path, queue_service_plist=plist)
+    assert _finding(report, "queue-service").status == "FAIL"
+
+
+def test_run_doctor_queue_service_defaults_to_the_launchagents_plist(
+    tmp_path: Path,
+) -> None:
+    # HOME is a fresh tmp dir (autouse fixture): no plist, so not applicable.
+    assert _finding(_doctor(tmp_path), "queue-service").status == "CLEAN"
+
+
+def _plist_with_args(tmp_path: Path, args: list[str]) -> Path:
+    path = tmp_path / "com.fxmartin.sdlc-queue.plist"
+    path.write_bytes(plistlib.dumps({"ProgramArguments": args}))
+    return path
+
+
+def test_queue_service_non_numeric_port_reads_as_down(tmp_path: Path) -> None:
+    plist = _plist_with_args(tmp_path, ["sdlc", "queue", "serve", "--bind", "host:notaport"])
+    finding = check_queue_service(plist, probe=lambda h, p: True)
+    assert finding.status == "FAIL"
+    assert "nothing is listening on host:notaport" in finding.detail
+
+
+def test_queue_service_accepts_the_equals_bind_form(tmp_path: Path) -> None:
+    seen: list[tuple[str, int]] = []
+    plist = _plist_with_args(tmp_path, ["sdlc", "queue", "serve", "--bind=10.0.0.1:9000"])
+    finding = check_queue_service(
+        plist,
+        probe=lambda h, p: seen.append((h, p)) or True,
+        queue_path=Path.home() / ".sdlc" / "queue.db",
+    )
+    assert seen == [("10.0.0.1", 9000)]
+    assert finding.status == "CLEAN"
+
+
+def test_queue_service_strips_ipv6_brackets_for_the_probe(tmp_path: Path) -> None:
+    seen: list[tuple[str, int]] = []
+    plist = _plist_with_args(tmp_path, ["sdlc", "queue", "serve", "--bind", "[::1]:9000"])
+    check_queue_service(plist, probe=lambda h, p: seen.append((h, p)) or True)
+    assert seen == [("::1", 9000)]
+
+
+def test_queue_service_dangling_bind_flag_fails(tmp_path: Path) -> None:
+    plist = _plist_with_args(tmp_path, ["sdlc", "queue", "serve", "--bind"])
+    finding = check_queue_service(plist, probe=lambda h, p: True)
+    assert finding.status == "FAIL"
+    assert "--bind" in finding.detail
+
+
+def test_queue_service_store_falls_back_to_xdg_then_home() -> None:
+    from sdlc.doctor import _service_store_path
+
+    assert _service_store_path({"XDG_STATE_HOME": "/x"}) == Path("/x/sdlc/queue.db")
+    assert _service_store_path({}) == Path.home() / ".sdlc" / "queue.db"
 
 
 # --- Story 35.2-004: the resident worker is registered and online -----------------------
