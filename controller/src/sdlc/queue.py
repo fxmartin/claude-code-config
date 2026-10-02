@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sqlite3
@@ -12,21 +13,28 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 __all__ = [
+    "CODEX_POOL",
     "DEFAULT_BUDGETS",
+    "HEARTBEAT_SECONDS",
+    "OFFLINE_AFTER_SECONDS",
     "PRIORITY_CLASSES",
+    "UNSATISFIABLE_REASON_PREFIX",
     "JobBudget",
     "JobRecord",
     "QueuePause",
+    "QueueBackend",
     "QueueError",
     "QueueStore",
+    "WorkerRecord",
     "budget_breach",
     "budget_for",
     "default_priority",
     "default_queue_path",
     "fix_rounds_exhausted",
+    "job_needs",
     "overlap_dependencies",
 ]
 
@@ -508,6 +516,24 @@ CREATE TABLE IF NOT EXISTS queue_pause_clears (
 );
 """
 
+# Story 35.2-001: the worker registry. One row per fleet worker, rewritten by
+# every heartbeat. The list columns are JSON text so a capability can grow
+# without a migration; ``last_heartbeat`` is what "online" is judged from.
+_WORKERS_DDL = """
+CREATE TABLE IF NOT EXISTS workers (
+    name           TEXT PRIMARY KEY,
+    host           TEXT NOT NULL,
+    pools          TEXT NOT NULL DEFAULT '[]',
+    harnesses      TEXT NOT NULL DEFAULT '[]',
+    sandbox        TEXT,
+    repos          TEXT NOT NULL DEFAULT '[]',
+    slots          INTEGER NOT NULL DEFAULT 1,
+    slots_free     INTEGER NOT NULL DEFAULT 1,
+    registered_at  TIMESTAMP NOT NULL,
+    last_heartbeat TIMESTAMP NOT NULL
+);
+"""
+
 _SCHEMA_DDL = (
     """
 PRAGMA journal_mode = WAL;
@@ -548,6 +574,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
 """
     + _QUEUE_STATE_DDL
     + _PAUSE_CLEARS_DDL
+    + _WORKERS_DDL
 )
 
 # Schema migrations applied after the base DDL, in the same
@@ -613,6 +640,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
         ],
         None,
     ),
+    # Story 35.2-001: the worker registry table, for a queue.db written before it.
+    (7, "fleet_workers", "workers", [], _WORKERS_DDL),
 ]
 
 
@@ -659,6 +688,246 @@ def _at(now: datetime | None) -> datetime:
     expiry deterministically instead of sleeping out a real 90-second lease.
     """
     return now if now is not None else datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Fleet workers (Story 35.2-001): what a worker advertises, and the pure rules
+# that decide whether it may run a job. No store, no clock — `claim_next`, the
+# scheduler and the "why is this job stuck" stamp all ask the same two questions
+# of the same functions, so they cannot drift apart.
+# ---------------------------------------------------------------------------
+
+# A worker heartbeats this often; silent for three beats it is offline and the
+# leases it held become reclaimable.
+HEARTBEAT_SECONDS = 30
+OFFLINE_AFTER_SECONDS = 3 * HEARTBEAT_SECONDS
+
+# The pool every worker that runs a `codex` stage must declare: Codex is one
+# shared subscription, not a per-machine one.
+CODEX_POOL = "codex-shared"
+
+# Every reason this module stamps on a queued job starts with this, which is how
+# it recognises (and clears) its own and leaves anyone else's alone.
+UNSATISFIABLE_REASON_PREFIX = "no eligible worker"
+
+# `requirements.sandbox` is a string: these read as "not needed" / "any runtime";
+# anything else names the runtime the worker must have (e.g. ``podman``).
+_SANDBOX_NOT_NEEDED = frozenset({"", "0", "false", "no", "none", "off"})
+_SANDBOX_ANY = frozenset({"1", "true", "yes", "on", "any", "container", "sandbox"})
+
+
+@dataclass(frozen=True)
+class WorkerRecord:
+    """One row of the ``workers`` table: a worker's last advertised capabilities."""
+
+    name: str
+    host: str
+    registered_at: str
+    last_heartbeat: str
+    pools: list[str] = dataclasses.field(default_factory=list)
+    harnesses: list[str] = dataclasses.field(default_factory=list)
+    sandbox: str | None = None
+    repos: list[str] = dataclasses.field(default_factory=list)
+    slots: int = 1
+    slots_free: int = 1
+
+    def is_online(self, now: datetime | None = None) -> bool:
+        """Heard from within :data:`OFFLINE_AFTER_SECONDS` (three missed beats)."""
+        try:
+            beat = datetime.fromisoformat(self.last_heartbeat)
+        except ValueError:
+            return False
+        if beat.tzinfo is None:
+            beat = beat.replace(tzinfo=timezone.utc)
+        return (_at(now) - beat).total_seconds() <= OFFLINE_AFTER_SECONDS
+
+    def to_dict(self, now: datetime | None = None) -> dict:
+        return {**dataclasses.asdict(self), "online": self.is_online(now)}
+
+
+_Check = Callable[[WorkerRecord], bool]
+_Need = tuple[str, _Check]
+
+
+def _csv(value: str | None) -> list[str]:
+    """``"claude, codex"`` → ``["claude", "codex"]`` (ordered, de-duplicated)."""
+    seen: dict[str, None] = {}
+    for part in (value or "").split(","):
+        if part.strip():
+            seen[part.strip()] = None
+    return list(seen)
+
+
+def _job_requirements(job: JobRecord) -> dict[str, str]:
+    if not job.requirements:
+        return {}
+    try:
+        data = json.loads(job.requirements)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items() if value is not None}
+
+
+def _on_host(host: str) -> _Check:
+    return lambda worker: worker.host == host
+
+
+def _has_repo(repo: str) -> _Check:
+    return lambda worker: repo in worker.repos
+
+
+def _has_harness(harness: str) -> _Check:
+    return lambda worker: harness in worker.harnesses
+
+
+def _in_pool(pool: str) -> _Check:
+    return lambda worker: pool in worker.pools
+
+
+def _has_sandbox(runtime: str | None) -> _Check:
+    """Any container runtime (``None``), or exactly the named one."""
+    if runtime is None:
+        return lambda worker: bool(worker.sandbox)
+    return lambda worker: (worker.sandbox or "").lower() == runtime
+
+
+def job_needs(job: JobRecord) -> list[_Need]:
+    """What a worker must have to run ``job``, as ``(label, satisfied-by)`` pairs.
+
+    The labels are what `sdlc queue list` prints when nobody can run the job, so
+    they read as needs: ``repo X``, ``harness codex``, ``sandbox``, ``host H``,
+    ``pool P``. A job that routes any stage to ``codex`` (``harness`` may list
+    several, ``claude,codex``) also needs the :data:`CODEX_POOL`.
+    """
+    needs: list[_Need] = []
+    if job.host:
+        needs.append((f"host {job.host}", _on_host(job.host)))
+    requirements = _job_requirements(job)
+    if requirements.get("repo"):
+        needs.append((f"repo {requirements['repo']}", _has_repo(requirements["repo"])))
+    harnesses = _csv(requirements.get("harness"))
+    for harness in harnesses:
+        needs.append((f"harness {harness}", _has_harness(harness)))
+    sandbox = requirements.get("sandbox", "").strip().lower()
+    if sandbox not in _SANDBOX_NOT_NEEDED:
+        if sandbox in _SANDBOX_ANY:
+            needs.append(("sandbox", _has_sandbox(None)))
+        else:
+            needs.append((f"sandbox {sandbox}", _has_sandbox(sandbox)))
+    pools = ([job.pool] if job.pool else []) + ([CODEX_POOL] if "codex" in harnesses else [])
+    for pool in dict.fromkeys(pools):
+        needs.append((f"pool {pool}", _in_pool(pool)))
+    return needs
+
+
+def _may_run(needs: Sequence[_Need], worker: WorkerRecord) -> bool:
+    return all(satisfied(worker) for _, satisfied in needs)
+
+
+def _unsatisfiable_reason(job: JobRecord, online: Sequence[WorkerRecord]) -> str | None:
+    """``no eligible worker (needs …)`` when no online worker may run ``job``."""
+    needs = job_needs(job)
+    if not needs or any(_may_run(needs, worker) for worker in online):
+        return None
+    # Name what nobody has; when every need is met somewhere but never all at
+    # once, the whole list is the honest answer.
+    missing = [label for label, ok in needs if not any(ok(w) for w in online)]
+    return f"{UNSATISFIABLE_REASON_PREFIX} (needs {', '.join(missing or [l for l, _ in needs])})"
+
+
+class QueueBackend(Protocol):
+    """What a queue consumer needs from "the queue" — local SQLite or the fleet.
+
+    Story 35.1-002. The verbs the `sdlc queue serve` API exposes, no more:
+    :class:`QueueStore` (a file on this host) and
+    :class:`sdlc.queue_client.QueueClient` (the same verbs over HTTP) both
+    satisfy it, and :func:`sdlc.queue_client.open_queue` picks one. The
+    scheduler's internals (parks, polls, overlap holds) are not here: they have no
+    service route, so `sdlc queue run` stays on a :class:`QueueStore`.
+    """
+
+    def init(self) -> None: ...
+
+    def ensure_migrated(self) -> None: ...
+
+    def add_job(
+        self,
+        *,
+        repo: str,
+        kind: str,
+        scope: str,
+        priority: str | None = None,
+        options_json: str | None = None,
+        labels: Iterable[str] = (),
+        host: str | None = None,
+        pool: str | None = None,
+        requirements_json: str | None = None,
+    ) -> int: ...
+
+    def get_job(self, job_id: int) -> JobRecord | None: ...
+
+    def list_jobs(self, repo: str | None = None) -> list[JobRecord]: ...
+
+    def claim_next(
+        self,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        host: str | None = None,
+        pools: Iterable[str] | None = None,
+    ) -> JobRecord | None: ...
+
+    def renew_lease(self, job_id: int, *, claimed_by: str, lease_seconds: int) -> bool: ...
+
+    def release_claim(
+        self, job_id: int, *, claimed_by: str, reason: str | None = None
+    ) -> None: ...
+
+    def finish_job(
+        self,
+        job_id: int,
+        state: str,
+        *,
+        reason: str | None = None,
+        claimed_by: str | None = None,
+    ) -> bool: ...
+
+    def cancel_job(self, job_id: int) -> None: ...
+
+    def requeue_job(self, job_id: int) -> None: ...
+
+    def prioritise_job(self, job_id: int, priority_class: str) -> None: ...
+
+    def pause_dispatch(
+        self,
+        *,
+        until: datetime,
+        reason: str | None = None,
+        run_id: str | None = None,
+        repo: str | None = None,
+        source: str | None = None,
+    ) -> bool: ...
+
+    def dispatch_pause(self) -> QueuePause | None: ...
+
+    def clear_pause(self) -> None: ...
+
+    def register_worker(
+        self,
+        name: str,
+        *,
+        host: str,
+        pools: Iterable[str] = (),
+        harnesses: Iterable[str] = (),
+        sandbox: str | None = None,
+        repos: Iterable[str] = (),
+        slots: int = 1,
+        slots_free: int | None = None,
+    ) -> WorkerRecord: ...
+
+    def list_workers(self) -> list[WorkerRecord]: ...
 
 
 class QueueStore:
@@ -1260,10 +1529,14 @@ class QueueStore:
 
         A job pinned to a ``host`` goes only to a worker on that host; a job in
         a ``pool`` only to a worker serving it. An unpinned/unpooled job goes
-        anywhere. ``requirements`` are recorded but not matched here — capability
-        matching belongs to the worker-registry story that introduces what a
-        worker advertises.
+        anywhere. A claimer that has registered (:meth:`register_worker`, Story
+        35.2-001) is matched on its advertised repos, harnesses, sandbox, host
+        and pools instead, and the least-loaded eligible worker gets the job;
+        an unregistered claimer keeps the host/pool-only rules above.
         """
+        moment = _at(now)
+        self.expire_offline_leases(now=moment)
+        self.stamp_unsatisfiable(now=moment)
         pause = self.dispatch_pause()
         if pause is not None and pause.is_active(now):
             return None
@@ -1273,11 +1546,19 @@ class QueueStore:
             fix_busy_repos=self.running_repos(kind="fix"),
             now=now,
         )
+        registered = self.get_worker(claimed_by)
+        if registered is not None:
+            # A registered worker is matched on what it advertised (Story
+            # 35.2-001), not on what this call says: the registry is the truth.
+            candidates = self.claimable_for_worker(claimed_by, candidates, now=moment)
+        else:
+            candidates = [
+                job
+                for job in candidates
+                if (job.host is None or job.host == host)
+                and (job.pool is None or job.pool in served)
+            ]
         for job in candidates:
-            if job.host is not None and job.host != host:
-                continue
-            if job.pool is not None and job.pool not in served:
-                continue
             claimed = self.claim_job(
                 job.id,
                 claimed_by=claimed_by,
@@ -1286,8 +1567,181 @@ class QueueStore:
                 worker=claimed_by,
             )
             if claimed is not None:
+                if registered is not None:
+                    self._take_slot(claimed_by)
                 return claimed
         return None
+
+    # --- the worker registry (Story 35.2-001) ------------------------------
+
+    def register_worker(
+        self,
+        name: str,
+        *,
+        host: str,
+        pools: Iterable[str] = (),
+        harnesses: Iterable[str] = (),
+        sandbox: str | None = None,
+        repos: Iterable[str] = (),
+        slots: int = 1,
+        slots_free: int | None = None,
+        now: datetime | None = None,
+    ) -> WorkerRecord:
+        """Record (or refresh) a worker's capabilities — registration *is* the heartbeat.
+
+        One verb for both because a heartbeat should carry the current picture
+        anyway (a repo cloned since the last beat, a slot freed): the first call
+        creates the row, every later one rewrites it and keeps ``registered_at``.
+        Each call also sweeps the fleet — leases held by workers that have gone
+        silent are made reclaimable, and queued jobs are re-judged for whether
+        anyone can run them — so those states move on the beat, not on a timer.
+        """
+        name = name.strip()
+        host = host.strip()
+        if not name:
+            raise QueueError("worker name must not be blank")
+        if not host:
+            raise QueueError("worker host must not be blank")
+        if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:
+            raise QueueError(f"worker slots must be a positive integer, got {slots!r}")
+        free = slots if slots_free is None else max(0, min(int(slots_free), slots))
+        moment = _at(now).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO workers(name, host, pools, harnesses, sandbox, repos, slots, "
+                "slots_free, registered_at, last_heartbeat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET host = excluded.host, pools = excluded.pools, "
+                "harnesses = excluded.harnesses, sandbox = excluded.sandbox, "
+                "repos = excluded.repos, slots = excluded.slots, "
+                "slots_free = excluded.slots_free, last_heartbeat = excluded.last_heartbeat",
+                (
+                    name,
+                    host,
+                    json.dumps(list(pools)),
+                    json.dumps(list(harnesses)),
+                    sandbox or None,
+                    json.dumps(list(repos)),
+                    slots,
+                    free,
+                    moment,
+                    moment,
+                ),
+            )
+        self.expire_offline_leases(now=now)
+        self.stamp_unsatisfiable(now=now)
+        record = self.get_worker(name)
+        assert record is not None  # just written
+        return record
+
+    def get_worker(self, name: str) -> WorkerRecord | None:
+        return next((w for w in self.list_workers() if w.name == name), None)
+
+    def list_workers(self) -> list[WorkerRecord]:
+        """Every registered worker, by name. A queue.db without the table lists none."""
+        if not self.db_path.exists():
+            return []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute("SELECT * FROM workers ORDER BY name").fetchall()
+        except sqlite3.OperationalError:  # no `workers` table yet: nothing has registered
+            return []
+        return [_row_to_worker(row) for row in rows]
+
+    def _take_slot(self, name: str) -> None:
+        """Count a fresh claim against the worker until its next heartbeat says otherwise."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET slots_free = MAX(0, slots_free - 1) WHERE name = ?", (name,)
+            )
+
+    def expire_offline_leases(self, *, now: datetime | None = None) -> int:
+        """Make the leases of silent workers reclaimable; how many jobs that freed.
+
+        A worker that misses three heartbeats is presumed gone, so its running
+        jobs' leases are cut to now — :meth:`expired_running_jobs` then offers
+        them to whoever drives the queue, which still checks the run's own pid
+        before resuming, so a worker that merely lost its network loses nothing.
+        """
+        moment = _at(now)
+        offline = [w.name for w in self.list_workers() if not w.is_online(moment)]
+        if not offline:
+            return 0
+        marks = ", ".join("?" for _ in offline)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET lease_until = ?, updated_at = ? "
+                f"WHERE state = 'running' AND worker IN ({marks}) "
+                "AND (lease_until IS NULL OR lease_until > ?)",
+                (moment.isoformat(), moment.isoformat(), *offline, moment.isoformat()),
+            )
+            return cur.rowcount
+
+    def stamp_unsatisfiable(self, *, now: datetime | None = None) -> int:
+        """Say, on each queued job nobody can run, what it is missing; how many changed.
+
+        Judged against the *online* workers only, and only once any worker has
+        ever registered — a host that never ran the fleet keeps its queue
+        untouched. A job that becomes runnable has its stamp removed; any other
+        reason on the job (``repo busy``, an overlap hold) is left as found.
+        """
+        workers = self.list_workers()
+        if not workers:
+            return 0
+        moment = _at(now)
+        online = [w for w in workers if w.is_online(moment)]
+        changed = 0
+        for job in (j for j in self.list_jobs() if j.state == "queued"):
+            reason = _unsatisfiable_reason(job, online)
+            if reason is not None and job.reason != reason:
+                self.set_reason(job.id, reason)
+                changed += 1
+            elif (
+                reason is None
+                and job.reason is not None
+                and job.reason.startswith(UNSATISFIABLE_REASON_PREFIX)
+            ):
+                self.set_reason(job.id, None)
+                changed += 1
+        return changed
+
+    def claimable_for_worker(
+        self,
+        name: str,
+        candidates: Iterable[JobRecord],
+        *,
+        slots_free: int | None = None,
+        now: datetime | None = None,
+    ) -> list[JobRecord]:
+        """The candidates (dispatch order kept) worker ``name`` may take right now.
+
+        A job is kept when the worker meets every need (:func:`job_needs`) *and*
+        no other online worker that also meets them has strictly more free slots
+        — least loaded first, with a tie left to whoever asks first. A worker
+        with no free slot keeps nothing. ``slots_free`` overrides the last
+        heartbeat's figure for a caller (the scheduler) that knows better.
+        """
+        candidates = list(candidates)
+        workers = self.list_workers()
+        me = next((w for w in workers if w.name == name), None)
+        if me is None:
+            return candidates
+        if slots_free is not None:
+            me = dataclasses.replace(me, slots_free=slots_free)
+        if me.slots_free <= 0:
+            return []
+        moment = _at(now)
+        rivals = [
+            w
+            for w in workers
+            if w.name != name and w.is_online(moment) and w.slots_free > me.slots_free
+        ]
+        kept: list[JobRecord] = []
+        for job in candidates:
+            needs = job_needs(job)
+            if _may_run(needs, me) and not any(_may_run(needs, rival) for rival in rivals):
+                kept.append(job)
+        return kept
+
 
     def reclaim_job(
         self,
@@ -1685,6 +2139,28 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         pool=_optional_column(row, "pool"),
         requirements=_optional_column(row, "requirements"),
         worker=_optional_column(row, "worker"),
+    )
+
+
+def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
+    def _names(column: str) -> list[str]:
+        try:
+            parsed = json.loads(row[column] or "[]")
+        except ValueError:
+            return []
+        return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+    return WorkerRecord(
+        name=row["name"],
+        host=row["host"],
+        registered_at=row["registered_at"],
+        last_heartbeat=row["last_heartbeat"],
+        pools=_names("pools"),
+        harnesses=_names("harnesses"),
+        sandbox=row["sandbox"],
+        repos=_names("repos"),
+        slots=int(row["slots"]),
+        slots_free=int(row["slots_free"]),
     )
 
 

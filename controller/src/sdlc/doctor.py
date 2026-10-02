@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import shutil
 import socket
@@ -25,7 +26,8 @@ from sdlc.harness import DEFAULT_HARNESS
 from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
 from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
-from sdlc.queue import default_queue_path
+from sdlc.queue import QueueError, default_queue_path
+from sdlc.queue_client import QueueClient, QueueRefused, resolve_queue_url
 from sdlc.registry import Registry, derive_state
 
 __all__ = [
@@ -557,6 +559,61 @@ def check_ledger_ignored(repo_root: Path, db_path: Path) -> Finding:
         "the next `sdlc build`/`sdlc fix` adds `.sdlc-state.db*` to .git/info/exclude; "
         "or add that line to .gitignore now",
     )
+
+
+def check_fleet_queue(client: QueueClient) -> Finding:
+    """Probe the fleet queue (Story 35.1-002): reachable, identity accepted, version.
+
+    One ``GET /health``: any answer proves reachability, a 200 proves the
+    service's identity gate admitted this machine, and its body carries the
+    controller version the service runs.
+    """
+    name = "Fleet queue"
+    try:
+        health = client.health()
+    except QueueRefused:
+        return Finding(
+            "fleet-queue",
+            name,
+            "FAIL",
+            f"{client.url} is reachable but identity not accepted (403)",
+            "add this machine's tailnet login to the service's --allow / SDLC_QUEUE_ALLOW, "
+            "or set SDLC_QUEUE_TOKEN to the service's shared secret",
+        )
+    except QueueError as exc:
+        return Finding(
+            "fleet-queue",
+            name,
+            "FAIL",
+            str(exc),
+            "check `sdlc queue serve` is running on the host and its tailnet address "
+            "matches SDLC_QUEUE_URL; unset SDLC_QUEUE_URL to use the local queue",
+        )
+    version = health.get("controller_version")
+    shown = f"v{version}" if version else "unknown version"
+    return Finding(
+        "fleet-queue",
+        name,
+        "CLEAN",
+        f"{client.url} reachable · identity accepted · service controller {shown}",
+    )
+
+
+def check_fleet_queue_configured() -> Finding | None:
+    """:func:`check_fleet_queue` for the configured URL, or ``None`` when there is none."""
+    try:
+        url = resolve_queue_url()
+    except QueueError as exc:
+        return Finding(
+            "fleet-queue",
+            "Fleet queue",
+            "FAIL",
+            str(exc),
+            "fix SDLC_QUEUE_URL / .sdlc-queue.yaml / ~/.sdlc-fleet.yaml (queue_url: http://host:8790)",
+        )
+    if url is None:
+        return None
+    return check_fleet_queue(QueueClient(url, token=os.environ.get("SDLC_QUEUE_TOKEN") or None))
 
 
 def check_queue(queue_path: Path) -> Finding:
@@ -1648,4 +1705,7 @@ def run_doctor(
     ]
     findings.extend(check_dependencies(dep_probe))
     findings.append(check_glab_dependency(repo_root, dep_probe))
+    fleet = check_fleet_queue_configured()
+    if fleet is not None:
+        findings.append(fleet)
     return DoctorReport(findings=findings)

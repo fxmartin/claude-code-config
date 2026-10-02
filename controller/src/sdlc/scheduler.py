@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, cast
 
 from sdlc.approval import ApprovalVerdict, poll_approval
 from sdlc.queue import (
+    HEARTBEAT_SECONDS,
     JobBudget,
     JobRecord,
     QueuePause,
@@ -33,6 +34,7 @@ from sdlc.risk_gate import RISK_APPROVED_LABEL
 
 if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
     from sdlc.build import Ledger
+    from sdlc.queue_worker import WorkerProfile
 
 __all__ = [
     "DEFAULT_APPROVAL_POLL_SECONDS",
@@ -194,6 +196,12 @@ class SchedulerConfig:
     # controller, then requeue that repo's guard-parked jobs. Opt-in: only a
     # drain over this controller's own source repo should ever self-update.
     self_update: bool = False
+    # Story 35.2-001: run as a named fleet worker. The scheduler registers this
+    # profile when it starts, heartbeats every HEARTBEAT_SECONDS with its live
+    # free-slot count, and claims only jobs the profile may run (repo, harness,
+    # sandbox, host pin, pools) — least-loaded eligible worker first. ``None``
+    # (the default) is the unchanged single-host drain.
+    worker: "WorkerProfile | None" = None
 
 
 @dataclass
@@ -760,6 +768,7 @@ class _Scheduler:
         # check must be told what is on PATH now.
         self._installed_version = installed_version
         self._self_updated = False
+        self._last_beat: datetime | None = None
         # Repos whose self-update was deferred because a sibling job was still
         # in flight; retried once the last one is reaped.
         self._pending_self_update: set[str] = set()
@@ -771,6 +780,7 @@ class _Scheduler:
 
     def run(self) -> SchedulerResult:
         try:
+            self._heartbeat(force=True)
             while True:
                 self._attach_runs()
                 self._record_plan_files()
@@ -779,6 +789,7 @@ class _Scheduler:
                 self._renew()
                 self._check_rate_limit()
                 polled = self._poll_parked()
+                self._heartbeat()
                 progressed = self._fill_slots() or polled
                 self._stamp_repo_busy()
                 if (
@@ -798,6 +809,32 @@ class _Scheduler:
 
     def _used_slots(self) -> int:
         return sum(entry.slots for entry in self._in_flight.values())
+
+    def _free_slots(self) -> int:
+        return max(0, self._config.slots - self._used_slots())
+
+    def _heartbeat(self, *, force: bool = False) -> None:
+        """Register as a fleet worker, then re-register every HEARTBEAT_SECONDS.
+
+        Registration *is* the heartbeat (:meth:`QueueStore.register_worker`), so
+        the beat also carries the current free-slot count and sweeps the fleet:
+        silent peers' leases are freed and unrunnable jobs are labelled. A no-op
+        for a plain drain with no ``worker`` profile.
+        """
+        profile = self._config.worker
+        if profile is None:
+            return
+        now = self._clock()
+        if (
+            not force
+            and self._last_beat is not None
+            and (now - self._last_beat).total_seconds() < HEARTBEAT_SECONDS
+        ):
+            return
+        profile.register_with(
+            self._store, slots=self._config.slots, slots_free=self._free_slots(), now=now
+        )
+        self._last_beat = now
 
     def _fill_slots(self) -> bool:
         """Claim and launch while slots and claimable work remain.
@@ -823,20 +860,23 @@ class _Scheduler:
             if used and used + cost > self._config.slots:
                 break
             now = self._clock()
+            worker = self._config.worker.name if self._config.worker is not None else None
             if resume:
                 claimed = self._store.reclaim_job(
                     job.id, claimed_by=self._identity,
-                    lease_seconds=self._config.lease_seconds, now=now,
+                    lease_seconds=self._config.lease_seconds, now=now, worker=worker,
                 )
             else:
                 claimed = self._store.claim_job(
                     job.id, claimed_by=self._identity,
-                    lease_seconds=self._config.lease_seconds, now=now,
+                    lease_seconds=self._config.lease_seconds, now=now, worker=worker,
                 )
             if claimed is None:
                 continue  # lost the race to another scheduler — try the next one
             self._start(claimed, action="resume" if resume else "start", cost=cost)
             progressed = True
+            # Peers weigh load by the last beat, so tell them about the slot just taken.
+            self._heartbeat(force=True)
         return progressed
 
     def _next_candidate(self) -> tuple[JobRecord, bool] | None:
@@ -882,9 +922,17 @@ class _Scheduler:
 
         busy = self._store.running_repos()
         fix_busy = self._store.running_repos(kind="fix")
-        for job in self._store.peek_claimable(
+        candidates = self._store.peek_claimable(
             busy_repos=busy, fix_busy_repos=fix_busy, now=self._clock()
-        ):
+        )
+        profile = self._config.worker
+        if profile is not None:
+            # A fleet worker only takes what it may run — and defers to a
+            # less-loaded peer — judged on the slots it has free *now*.
+            candidates = self._store.claimable_for_worker(
+                profile.name, candidates, slots_free=self._free_slots(), now=self._clock()
+            )
+        for job in candidates:
             return job, False
         return None
 

@@ -40,6 +40,22 @@ def _mute_lifecycle_notifications(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_fleet_queue(monkeypatch, tmp_path_factory):
+    """Keep every test on the local SQLite queue unless it opts into a fleet URL.
+
+    `SDLC_QUEUE_URL`, a `.sdlc-queue.yaml` or a developer's real
+    `~/.sdlc-fleet.yaml` would otherwise route queue consumers to a live
+    service (Story 35.1-002). Tests that exercise the switch set the variable.
+    """
+    import sdlc.queue_client as queue_client
+
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    monkeypatch.delenv("SDLC_QUEUE_TOKEN", raising=False)
+    nohome = tmp_path_factory.mktemp("no-fleet-home")
+    monkeypatch.setattr(queue_client, "_home", lambda: nohome)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_model_probe(monkeypatch):
     """Never spend a real ``claude -p`` call on the model entitlement probe.
 

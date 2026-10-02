@@ -37,7 +37,9 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 | `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise\|unpause` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002), the one host-level rate-limit pause every repo shares (Story 32.2-001), and the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
 | `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), the approval park + auto-resume (Story 32.2-002), one shared rate-limit window discovered and waited out once (Story 32.2-001), and the per-job budget breaker (Story 32.3-001). |
-| `sdlc/queue_server.py` | `sdlc queue serve` — the queue store behind a tailnet-only HTTP API (stdlib `ThreadingHTTPServer`): one route per `QueueStore` verb, a bind that refuses wildcards, and the `tailscale whois` identity gate (Story 35.1-001). |
+| `sdlc/queue_client.py` | `QueueClient` (the `QueueBackend` verbs over HTTP), the `SDLC_QUEUE_URL` / `.sdlc-queue.yaml` / `~/.sdlc-fleet.yaml` switch and the `open_queue()` factory every queue consumer opens its store through (Story 35.1-002). |
+| `sdlc/queue_server.py` | `sdlc queue serve` — the queue store behind a tailnet-only HTTP API (stdlib `ThreadingHTTPServer`): one route per `QueueStore` verb, a bind that refuses wildcards, and the `tailscale whois` identity gate (Story 35.1-001); plus the worker registry routes (Story 35.2-001). |
+| `sdlc/queue_worker.py` | What a fleet worker advertises — `WorkerProfile` and `detect_worker_profile`: host, declared pools, harnesses whose CLI answers, the container runtime, and the git clones under `~/Work` (Story 35.2-001). |
 | `sdlc/approval.py` | Read-only change-request approval probe — "is PR #N approved / merged / closed?" behind the queue's park (Story 32.2-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
@@ -1737,9 +1739,11 @@ what `sdlc queue list --json` emits.
 
 | Route | Store method | Notes |
 |-------|--------------|-------|
+| `GET /health` | — | `{ok, controller_version}` — a 200 means the identity gate admitted the caller; what `sdlc doctor` probes (Story 35.1-002) |
 | `GET /jobs[?repo=PATH]` | `list_jobs` | `{pause, jobs}`, the `queue list --json` envelope |
 | `POST /jobs` | `add_job` | `repo, kind, scope` + optional `priority, options[], labels[], host, pool, requirements{repo,harness,sandbox}`; 201 |
 | `POST /jobs/claim` | `claim_next` | `worker` + optional `lease_seconds, host, pools[]`; the best claimable job, or 204. Held while the queue is paused. |
+| `POST /workers` · `GET /workers` | `register_worker` · `list_workers` | register a worker, or heartbeat (the same call): `worker, host` + optional `pools[], harnesses[], sandbox, repos[], slots, slots_free`; `GET` returns `{workers}` with an `online` flag each (Story 35.2-001, see below) |
 | `POST /jobs/{id}/renew` · `/release` | `renew_lease` · `release_claim` | `worker` must hold the claim, else 409 |
 | `POST /jobs/{id}/finish` | `finish_job` | `state` (a terminal), optional `reason`, `worker` (when given, it must still hold the claim as the state is written — the check is in the UPDATE — else 409) |
 | `POST /jobs/{id}/cancel` · `/requeue` | `cancel_job` · `requeue_job` | a refused state change is 409 |
@@ -1751,14 +1755,65 @@ that is not `Content-Type: application/json` 415.
 `claim_next` is `peek_claimable` in dispatch order, filtered to the caller's
 `host`/`pools` (a job pinned to a `host` goes only there; a `pool` job only to a
 worker serving it), then the existing guarded `claim_job` UPDATE — so the lease
-transaction is still what picks the winner. `requirements` is stored, not yet
-matched; capability matching lands with the worker registry (Story 35.2).
+transaction is still what picks the winner. A claimer that has registered as a
+worker (below) is instead matched on what it registered, `requirements`
+included.
 
-Pins are honoured by `/jobs/claim` only. `sdlc queue run` still claims through
-`peek_claimable`/`claim_job` with no `host`/`pool` filter, so a drain on the
-serving host takes a job pinned elsewhere, and reclaims a fleet claim whose
-lease lapsed, until Story 35.2-001 brings pin matching to the drain loop. Do not
-run a local drain on the serving host while pinned jobs are queued.
+Pins and requirements are honoured by `/jobs/claim` and by a drain started with
+`sdlc queue run --worker`. A plain `sdlc queue run` (no `--worker`) still claims
+through `peek_claimable`/`claim_job` with no `host`/`pool`/`requirements`
+filter, so a plain drain on the serving host takes a job pinned elsewhere, and
+reclaims a fleet claim whose lease lapsed. Do not run a plain local drain on the
+serving host while pinned jobs are queued; run it as a worker.
+
+### Workers and capability-matched claims (Story 35.2-001)
+
+`sdlc queue run --worker m3max --pool claude-m3 --pool codex-shared [--host
+NAME]` makes a drain a fleet worker. At start it registers
+`{worker, host, pools, harnesses, sandbox, repos, slots, slots_free}` and then
+re-registers every 30 s (registration *is* the heartbeat), carrying the live
+free-slot count (`--slots` minus the slots running jobs hold):
+
+- `harnesses` — the bundled registry's enabled harnesses whose CLI answers
+  doctor's dependency probe (`claude`, `codex`, …);
+- `sandbox` — the container runtime `--sandbox` would use (`podman`/`docker`),
+  or none;
+- `repos` — names of the git clones directly under `~/Work`;
+- `host` — the short hostname unless `--host` says otherwise; a job's `--host`
+  pin matches it;
+- `pools` — free-form and declared, never detected, because only the operator
+  knows which subscription a machine is signed in to. The recommended names are
+  `claude-m3`, `claude-shared` and `codex-shared`.
+
+**Online/offline.** A worker silent for three heartbeats (90 s) is `offline`
+(`sdlc queue workers`). On every registration and claim the service cuts the
+leases of jobs held by offline workers to now, so they surface as expired
+running jobs for whoever drives the queue — which still checks the run's pid
+before resuming, so a worker that only lost its network loses nothing.
+
+**Eligibility.** A job needs: its `host` pin to equal the worker's host; its
+`pool` to be among the worker's; `requirements.repo` to be among its repos;
+every `requirements.harness` to be among its harnesses (`harness` may list
+several, `claude,codex`); and `requirements.sandbox` to be met (`true`/
+`container` = any runtime, `podman`/`docker` = that runtime, `false`/empty = not
+needed). A job with `codex` among its harnesses also needs the `codex-shared`
+pool. A worker with no free slot claims nothing.
+
+**Ordering.** Eligible first, then *least loaded*: a worker defers a job when
+another online, eligible worker has strictly more free slots (a tie goes to
+whoever asks first); then the usual priority class, then age. A claimer that
+never registered keeps the 35.1-001 rules (host and pool only).
+
+**Unsatisfiable jobs.** When no *online* worker can run a queued job, it stays
+`queued` and its `reason` reads `no eligible worker (needs repo X, sandbox)` —
+the needs nobody has, or all of them when each is met somewhere but never
+together. It is stamped on enqueue and re-judged on every heartbeat and claim,
+and cleared the moment a capable worker appears. Only `sdlc queue list`'s reason
+line and `--json` carry it; a host that never registered a worker is untouched.
+
+`--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`);
+like the rest of `sdlc queue run` it refuses while `SDLC_QUEUE_URL` is set. The
+registry (`workers` table, migration 7) lives with the jobs it serves.
 
 **Single writer.** The service's handlers take one write lock, so within the
 service a claim's peek-then-UPDATE never interleaves with another's. It is not
@@ -1870,6 +1925,43 @@ launchd.user.agents.sdlc-queue.serviceConfig = {
 nullable: an older `queue.db` upgrades in place and its rows read as "run
 anywhere, held by nobody". `worker` is set by the claim verbs and cleared with
 `claimed_by`.
+
+## Using the fleet queue (`QueueClient`, Story 35.1-002)
+
+Remote execution is additive: every queue consumer (`sdlc queue list|add|cancel|
+requeue|prioritise`, `build/fix --enqueue`, `sdlc doctor`, the dashboard's
+`/api/queue`) opens its store through `open_queue()` in `sdlc/queue_client.py`,
+which returns the local `QueueStore` unless a queue URL is configured, in which
+case it returns a `QueueClient`. Both satisfy the `QueueBackend` Protocol in
+`queue.py` — the verbs the service exposes — so the callers cannot tell them
+apart.
+
+**Configuration**, highest precedence first (mirroring `.sdlc-forge.yaml`):
+
+1. `SDLC_QUEUE_URL=http://home-lab.<tailnet>:8790` (blank counts as unset).
+2. `queue_url:` in `.sdlc-queue.yaml` in the working directory.
+3. `queue_url:` in `~/.sdlc-fleet.yaml`.
+4. None — the local SQLite queue, exactly as before.
+
+A URL that is set but malformed is an error, never a silent fallback to local.
+The client sends `Authorization: Bearer $SDLC_QUEUE_TOKEN` when the variable is
+set (the same secret `sdlc queue serve` reads); otherwise the service identifies
+the machine through Tailscale.
+
+**Failure contract.** `QueueClient` uses `urllib` (no new dependency) with a
+10 s timeout and one retry on a connection error — a read after any transport
+error, a write only when the connection never opened (a reset after the request
+went out may mean it landed, and replaying `add` would enqueue twice). An
+unreachable service or 5xx raises `QueueUnavailable`, a 403 `QueueRefused`; both
+name the URL, and the CLI shows one `error:` line (exit 2). `--enqueue` with the
+service down fails — it never enqueues locally — while a plain `sdlc build`
+never opens the queue and is unaffected.
+
+`sdlc queue run` and `sdlc queue unpause` need scheduler/ledger verbs the service
+does not expose, so with a fleet queue configured they refuse (exit 2) rather
+than drain the wrong queue; `sdlc queue serve` always serves the local store.
+`sdlc doctor` adds a `fleet-queue` finding — reachable, identity accepted, the
+service's controller version — only when a URL is configured.
 
 ## The approval park (`parked`, Story 32.2-002)
 

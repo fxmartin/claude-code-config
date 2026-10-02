@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.85.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): worker registration and (#35.2-001)
+
+
+## [v2.84.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): `queueclient` and the (#35.1-002)
+
+
+## [v2.83.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): `sdlc queue serve` — the store (#35.1-001) (#817)
+
+
 ## [v2.82.3] - 2026-10-01
 
 ### Fixed
