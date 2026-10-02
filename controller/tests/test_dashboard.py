@@ -17,6 +17,10 @@ import pytest
 from sdlc.build import Ledger
 from sdlc.dashboard import make_server
 
+# `shutdown()` blocks until `serve_forever` next polls its stop flag; the
+# stdlib's 0.5s default idled every live-server test half a second.
+_FAST_SHUTDOWN = {"poll_interval": 0.01}
+
 
 def _seed(db_path: Path) -> str:
     ledger = Ledger(db_path)
@@ -39,7 +43,7 @@ def _running(db_path: Path, *, sse_poll: float | None = None, sse_heartbeat: flo
         server.sse_poll_interval = sse_poll  # type: ignore[attr-defined]
     if sse_heartbeat is not None:
         server.sse_heartbeat_interval = sse_heartbeat  # type: ignore[attr-defined]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
     thread.start()
     host, port = server.server_address
     try:
@@ -216,7 +220,7 @@ def test_api_status_includes_pr_base(tmp_path: Path) -> None:
     _seed(db)
     server = make_server(db, host="127.0.0.1", port=0)
     server.project_url = "https://github.com/g/r"  # override resolved value
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
     thread.start()
     try:
         _s, _c, body = _get(f"http://127.0.0.1:{server.server_address[1]}/api/status")
@@ -838,7 +842,7 @@ def test_live_styling_distinct_from_selection() -> None:
 def _running_registry(registry):
     """Run the dashboard in registry-discovery mode (no single ``--db``)."""
     server = make_server(db_path=None, host="127.0.0.1", port=0, registry=registry)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_address[1]}"
@@ -941,7 +945,7 @@ def test_db_mode_preserves_single_run_browser(tmp_path: Path) -> None:
     old, new = _seed_two(db)
     server = make_server(db, host="127.0.0.1", port=0)
     assert server.registry is None  # single-db mode, not registry discovery
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
     thread.start()
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -1944,7 +1948,7 @@ def _running_registry_gh(registry, cache):
     """Registry-mode dashboard with an injected GitHub stats cache."""
     server = make_server(db_path=None, host="127.0.0.1", port=0, registry=registry)
     server.github_cache = cache  # type: ignore[attr-defined]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_address[1]}"
@@ -2027,7 +2031,7 @@ def test_api_github_single_db_mode(tmp_path: Path) -> None:
     server = make_server(db, host="127.0.0.1", port=0)
     cache = _StubCache()
     server.github_cache = cache  # type: ignore[attr-defined]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
     thread.start()
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -2951,3 +2955,32 @@ def test_queue_view_lists_one_pause_per_paused_pool(
     from sdlc.dashboard import _PAGE
 
     assert "pause.pool" in _PAGE and "data.pauses" in _PAGE
+
+
+def test_page_queue_rows_show_their_worker_and_pool() -> None:
+    """Story 35.4-003: each row names the worker holding it and the pool it spends from."""
+    body = _render_queue_body()
+    assert "<th>worker</th><th>pool</th>" in body
+    assert "j.worker" in body and "j.pool" in body
+
+
+def test_page_queue_renders_one_banner_per_paused_pool() -> None:
+    body = _render_queue_body()
+    assert "pauses.map(pause =>" in body
+    assert "queue paused (rate limited)" in body
+    assert '" · pool " + esc(pause.pool)' in body
+
+
+def test_queue_view_carries_worker_and_pool_per_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc.dashboard import queue_view
+
+    store = _seed_queue(tmp_path, monkeypatch)
+    job_id = store.add_job(repo="/r", kind="build", scope="s", pool="claude-shared")
+    store.claim_next(claimed_by="home-lab-1", lease_seconds=60, pools=["claude-shared"])
+
+    [job] = queue_view()["jobs"]
+    assert (job["id"], job["pool"], job["worker"], job["claimed_by"]) == (
+        job_id, "claude-shared", "home-lab-1", "home-lab-1",
+    )

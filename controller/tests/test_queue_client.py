@@ -28,6 +28,9 @@ from sdlc.queue_server import AccessPolicy, make_server
 
 runner = CliRunner()
 TOKEN = "s3cret-token"
+# `shutdown()` blocks until `serve_forever` next polls its stop flag; the
+# stdlib's 0.5s default idled every live-server test half a second.
+_FAST_SHUTDOWN = {"poll_interval": 0.01}
 
 
 class _Live:
@@ -37,7 +40,7 @@ class _Live:
         policy = AccessPolicy(token=TOKEN, networks=("127.0.0.0/8",))
         self.server = make_server(store, policy, "127.0.0.1", 0)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self.server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -132,8 +135,13 @@ def test_resolve_file_without_the_key_means_none(tmp_path: Path) -> None:
     assert resolve_queue_url(cwd=tmp_path, home=tmp_path / "home") is None
 
 
-def test_resolve_malformed_env_is_a_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SDLC_QUEUE_URL", "home-lab:8790")
+# `http://[::1` makes urlsplit itself raise ValueError: it must still surface as
+# the config error every caller catches, never a bare ValueError.
+@pytest.mark.parametrize("url", ["home-lab:8790", "http://[::1"])
+def test_resolve_malformed_env_is_a_config_error(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_URL", url)
     with pytest.raises(QueueConfigError):
         resolve_queue_url()
 
@@ -260,8 +268,19 @@ def test_client_unknown_job_and_refused_moves_are_queue_errors(client: QueueClie
         client.cancel_job(4242)
     job_id = client.add_job(repo="/r", kind="build", scope="s")
     client.claim_next(claimed_by="w", lease_seconds=60)
+    client.finish_job(job_id, "done", claimed_by="w")
     with pytest.raises(QueueError, match="cannot cancel"):
         client.cancel_job(job_id)
+
+
+def test_client_cancel_of_a_running_job_flags_it_for_its_worker(client: QueueClient) -> None:
+    job_id = client.add_job(repo="/r", kind="build", scope="s")
+    client.claim_next(claimed_by="w", lease_seconds=60)
+    client.cancel_job(job_id)
+    job = client.get_job(job_id)
+    assert job is not None and job.state == "running" and job.cancel_requested is True
+    assert client.finish_job(job_id, "cancelled", claimed_by="w") is True
+    assert client.get_job(job_id).state == "cancelled"  # type: ignore[union-attr]
 
 
 def test_client_pause_lifecycle(client: QueueClient) -> None:
@@ -488,8 +507,9 @@ def test_queue_run_refuses_a_remote_queue(
     assert "SDLC_QUEUE_URL" in result.output
 
 
-def test_malformed_url_is_one_error_line(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SDLC_QUEUE_URL", "home-lab:8790")
+@pytest.mark.parametrize("url", ["home-lab:8790", "http://[::1"])
+def test_malformed_url_is_one_error_line(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_URL", url)
     result = runner.invoke(app, ["queue", "list"])
     assert result.exit_code == 2 and "SDLC_QUEUE_URL" in result.output
 
@@ -645,3 +665,43 @@ def test_client_claims_hold_only_the_paused_pool(client: QueueClient) -> None:
     assert client.claim_next(claimed_by="xps", lease_seconds=60) is None
     client.clear_pause("claude-shared")
     assert client.claim_next(claimed_by="xps", lease_seconds=60) is not None
+
+
+def test_cancel_of_a_running_job_from_the_xps_signals_its_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live: _Live, store: QueueStore
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "local.db"))
+    monkeypatch.setenv("SDLC_QUEUE_URL", live.url)
+    monkeypatch.setenv("SDLC_QUEUE_TOKEN", TOKEN)
+    job_id = store.add_job(repo=str(tmp_path), kind="build", scope="epic-3")
+    store.claim_next(claimed_by="home-lab", lease_seconds=60)
+
+    cancel = runner.invoke(app, ["queue", "cancel", str(job_id)])
+
+    assert cancel.exit_code == 0, cancel.output
+    assert "cancel requested" in cancel.output and "worker" in cancel.output
+    assert store.get_job(job_id).cancel_requested is True  # type: ignore[union-attr]
+    listing = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    assert listing["jobs"][0]["cancel_requested"] is True
+    assert not (tmp_path / "local.db").exists()
+
+
+def test_unpause_pool_from_the_xps_resumes_only_that_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live: _Live, store: QueueStore
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "local.db"))
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(tmp_path / "registry.json"))
+    monkeypatch.setenv("SDLC_QUEUE_URL", live.url)
+    monkeypatch.setenv("SDLC_QUEUE_TOKEN", TOKEN)
+    until = datetime.now(timezone.utc) + timedelta(hours=1)
+    for pool in ("claude-shared", "codex-shared"):
+        store.pause_dispatch(until=until, pool=pool)
+
+    result = runner.invoke(app, ["queue", "unpause", "--pool", "claude-shared"])
+
+    assert result.exit_code == 0, result.output
+    assert [p.pool for p in store.dispatch_pauses()] == ["codex-shared"]
+    listing = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    assert [p["pool"] for p in listing["pauses"]] == ["codex-shared"]

@@ -27,6 +27,7 @@ from sdlc.queue import (
     WorkerRecord,
     default_queue_path,
 )
+from sdlc.registry import WORKER_ENV, RunRecord
 
 __all__ = [
     "QUEUE_CONFIG_FILENAME",
@@ -39,6 +40,7 @@ __all__ = [
     "QueueRequestError",
     "QueueUnavailable",
     "open_queue",
+    "push_fleet_run",
     "resolve_queue_url",
 ]
 
@@ -52,6 +54,9 @@ QUEUE_CONFIG_FILENAME = ".sdlc-queue.yaml"
 USER_CONFIG_FILENAME = ".sdlc-fleet.yaml"
 
 REQUEST_TIMEOUT_SECONDS = 10
+# A run's registry push rides on the worker's own critical path (build start,
+# finish), so it gets a short leash: the local file is authoritative anyway.
+PUSH_TIMEOUT_SECONDS = 3
 
 _Opener = Callable[[urllib.request.Request, float], Any]
 
@@ -89,7 +94,10 @@ def _clean_url(raw: object, source: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise QueueConfigError(f"{source}: queue_url must be a non-empty URL")
     url = raw.strip().rstrip("/")
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:  # urlsplit's own refusal, e.g. an unclosed `http://[::1`
+        raise QueueConfigError(f"{source}: {url!r} is not a valid URL ({exc})") from exc
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise QueueConfigError(
             f"{source}: {url!r} is not an http(s) URL (e.g. http://home-lab.<tailnet>:8790)"
@@ -202,9 +210,10 @@ class QueueClient:
 
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
         data = json.dumps(body).encode() if body is not None else None
-        # One retry. A read replays safely after any transport error; a write
-        # only when the connection never opened — a reset after the request
-        # went out may mean it landed, and replaying `add` would enqueue twice.
+        # One retry. A read replays safely after any transport error, and so does
+        # a PUT (an idempotent upsert); any other write only when the connection
+        # never opened — a reset after the request went out may mean it landed,
+        # and replaying `add` would enqueue twice.
         for attempt in (1, 2):
             req = urllib.request.Request(self.url + path, data=data, method=method)
             if data is not None:
@@ -218,7 +227,7 @@ class QueueClient:
                 return exc.code, self._decode(self._body_of(exc))
             except (OSError, http.client.HTTPException) as exc:
                 reason = getattr(exc, "reason", exc)
-                replayable = method in ("GET", "DELETE") or _failed_before_send(reason)
+                replayable = method in ("GET", "PUT", "DELETE") or _failed_before_send(reason)
                 if attempt == 1 and replayable:
                     continue
                 raise QueueUnavailable(f"fleet queue {self.url} unreachable: {reason}") from exc
@@ -379,6 +388,17 @@ class QueueClient:
             raise QueueUnavailable(f"fleet queue {self.url} sent a malformed worker record")
         return WorkerRecord(**_fields(WorkerRecord, payload))
 
+    def put_fleet_run(self, record: RunRecord) -> None:
+        """``PUT /runs`` — push one run's record to the fleet registry (Story 35.4-001)."""
+        self._call("PUT", "/runs", record.to_dict())
+
+    def list_fleet_runs(self) -> list[dict[str, Any]]:
+        """``GET /runs`` — every pushed run, each with its worker's ``worker_online`` flag."""
+        payload = self._call("GET", "/runs")
+        if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
+            raise QueueUnavailable(f"fleet queue {self.url} sent a malformed run list")
+        return [row for row in payload["runs"] if isinstance(row, dict)]
+
     def renew_lease(self, job_id: int, *, claimed_by: str, lease_seconds: int) -> bool:
         try:
             self._call(
@@ -465,3 +485,32 @@ class QueueClient:
 
     def clear_pause(self, pool: str | None = None) -> None:
         self._call("DELETE", "/pause" + (f"?pool={quote(pool, safe='')}" if pool else ""))
+
+
+# ---------------------------------------------------------------------------
+# Fleet registry push (Story 35.4-001)
+# ---------------------------------------------------------------------------
+
+
+def fleet_worker_name() -> str:
+    """Who this process pushes runs as: ``SDLC_WORKER``, else the short hostname."""
+    return os.environ.get(WORKER_ENV, "").strip() or socket.gethostname().split(".")[0]
+
+
+def push_fleet_run(record: RunRecord) -> None:
+    """Best-effort ``PUT /runs`` of ``record``; a no-op with no fleet configured.
+
+    The worker's local registry file stays authoritative, so no failure here —
+    a down service, a refused identity, a malformed ``SDLC_QUEUE_URL`` — may
+    reach the build that called it: the fleet view just stays a push behind.
+    """
+    try:
+        url = resolve_queue_url()
+        if url is None:
+            return
+        client = QueueClient(
+            url, token=os.environ.get(QUEUE_TOKEN_ENV) or None, timeout=PUSH_TIMEOUT_SECONDS
+        )
+        client.put_fleet_run(dataclasses.replace(record, worker=record.worker or fleet_worker_name()))
+    except (QueueError, OSError, ValueError):
+        pass

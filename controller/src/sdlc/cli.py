@@ -3863,10 +3863,19 @@ def queue_run_cmd(
 def queue_cancel_cmd(
     job_id: int = typer.Argument(..., help="Job id to cancel."),
 ) -> None:
-    """Cancel a `queued`, `parked` or `blocked` job. Refuses a `running` one.
+    """Cancel a `queued`, `parked` or `blocked` job, or ask a `running` one to stop.
 
     `parked` is the approval wait (Story 32.2-002): cancelling one abandons the
     wait, leaving the change request exactly as it is for a human to finish.
+
+    Story 35.4-003: cancelling a `running` job does not kill anything from
+    here — it flags the job on the queue (the fleet's, with `SDLC_QUEUE_URL`
+    set, so this works from the XPS). The worker holding it sees the flag on its
+    next pass, terminates the run's whole process group (SIGTERM, then SIGKILL)
+    and releases the lease; `sdlc queue list` then shows the job `cancelled`.
+    Until then it reads `running` with `cancel requested` beneath it. If that
+    worker is gone but its run is still alive, nothing else may kill the run: the
+    job stays flagged until the run ends, then reads `cancelled` — never resumed.
     """
     from sdlc.queue_client import open_queue
 
@@ -3877,6 +3886,13 @@ def queue_cancel_cmd(
     except QueueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+    job = store.get_job(job_id)
+    if job is not None and job.state == "running":
+        typer.echo(
+            f"cancel requested: job {job_id} — its worker ({job.worker or job.claimed_by}) "
+            "stops the run and releases the lease on its next pass"
+        )
+        raise typer.Exit(code=0)
     typer.echo(f"cancelled: job {job_id}")
     raise typer.Exit(code=0)
 
@@ -4042,6 +4058,11 @@ def queue_serve_cmd(
                                      -> a claim by a registered worker is matched
                                      on these (see `queue run --worker`)
       GET    /workers                {workers} with an `online` flag each
+      PUT    /runs                   a build pushes its run record (the registry.json
+                                     fields + worker) on start and finish; a worker
+                                     on this store writes its runs' rows directly
+      GET    /runs                   {runs}: each with its worker's `worker_online`
+                                     (the XPS dashboard's fleet view)
       POST   /jobs/{id}/renew        worker, \\[lease_seconds]
       POST   /jobs/{id}/release      worker, \\[reason]
       POST   /jobs/{id}/finish       state, \\[reason, worker]

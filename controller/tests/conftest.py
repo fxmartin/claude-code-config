@@ -46,11 +46,14 @@ def _no_fleet_queue(monkeypatch, tmp_path_factory):
     `SDLC_QUEUE_URL`, a `.sdlc-queue.yaml` or a developer's real
     `~/.sdlc-fleet.yaml` would otherwise route queue consumers to a live
     service (Story 35.1-002). Tests that exercise the switch set the variable.
+    `SDLC_WORKER` is set for every job a fleet worker launches (Story 35.4-001),
+    so a suite run inside one would otherwise name every run it registers.
     """
     import sdlc.queue_client as queue_client
 
     monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
     monkeypatch.delenv("SDLC_QUEUE_TOKEN", raising=False)
+    monkeypatch.delenv("SDLC_WORKER", raising=False)
     nohome = tmp_path_factory.mktemp("no-fleet-home")
     monkeypatch.setattr(queue_client, "_home", lambda: nohome)
 
