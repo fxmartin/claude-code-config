@@ -880,7 +880,7 @@ def test_bearer_token_header_admits_through_the_http_layer(store) -> None:
 
 def test_wrong_method_is_405_and_bad_job_id_is_404(api) -> None:
     assert api.call("GET", "/jobs/1/cancel")[0] == 405
-    assert api.call("GET", "/pause")[0] == 405
+    assert api.call("GET", "/jobs/claim")[0] == 405
     assert api.call("POST", "/jobs/abc/cancel")[0] == 404
 
 

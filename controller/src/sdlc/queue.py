@@ -949,12 +949,15 @@ def _unsatisfiable_reason(job: JobRecord, online: Sequence[WorkerRecord]) -> str
 class QueueBackend(Protocol):
     """What a queue consumer needs from "the queue" — local SQLite or the fleet.
 
-    Story 35.1-002. The verbs the `sdlc queue serve` API exposes, no more:
-    :class:`QueueStore` (a file on this host) and
-    :class:`sdlc.queue_client.QueueClient` (the same verbs over HTTP) both
-    satisfy it, and :func:`sdlc.queue_client.open_queue` picks one. The
-    scheduler's internals (parks, polls, overlap holds) are not here: they have no
-    service route, so `sdlc queue run` stays on a :class:`QueueStore`.
+    Story 35.1-002 declared the verbs `sdlc queue serve` exposed; Story 35.2-005
+    widens it to everything the scheduler (`sdlc queue run`) reads and writes, so
+    a worker drains the fleet queue through :class:`sdlc.queue_client.QueueClient`
+    exactly as a local drain uses :class:`QueueStore`. Both satisfy it, and
+    :func:`sdlc.queue_client.open_queue` picks one.
+
+    ``now`` is accepted wherever the store takes one so the scheduler's injected
+    clock stays coherent with a local store; a remote backend ignores it — the
+    service's own clock arbitrates leases, so every worker is judged by one.
     """
 
     def init(self) -> None: ...
@@ -988,10 +991,85 @@ class QueueBackend(Protocol):
         pools: Iterable[str] | None = None,
     ) -> JobRecord | None: ...
 
-    def renew_lease(self, job_id: int, *, claimed_by: str, lease_seconds: int) -> bool: ...
+    # --- the scheduler's reads (Story 35.2-005) ------------------------------
+
+    def peek_claimable(
+        self,
+        *,
+        busy_repos: "set[str] | frozenset[str] | None" = None,
+        fix_busy_repos: "set[str] | frozenset[str] | None" = None,
+        now: datetime | None = None,
+    ) -> list[JobRecord]: ...
+
+    def claimable_for_worker(
+        self,
+        name: str,
+        candidates: Iterable[JobRecord],
+        *,
+        slots_free: int | None = None,
+        now: datetime | None = None,
+    ) -> list[JobRecord]: ...
+
+    def expired_running_jobs(self, *, now: datetime | None = None) -> list[JobRecord]: ...
+
+    def due_parked_jobs(self, *, now: datetime | None = None) -> list[JobRecord]: ...
+
+    def running_repos(
+        self, *, kind: str | None = None, excluding: int | None = None
+    ) -> set[str]: ...
+
+    def overlap_holds(self) -> dict[int, int]: ...
+
+    def get_worker(self, name: str) -> WorkerRecord | None: ...
+
+    # --- claims and leases ----------------------------------------------------
+
+    def claim_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+        worker: str | None = None,
+    ) -> JobRecord | None: ...
+
+    def reclaim_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+        worker: str | None = None,
+    ) -> JobRecord | None: ...
+
+    def take_parked_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+        worker: str | None = None,
+    ) -> JobRecord | None: ...
+
+    def renew_lease(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> bool: ...
 
     def release_claim(
-        self, job_id: int, *, claimed_by: str, reason: str | None = None
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        reason: str | None = None,
+        now: datetime | None = None,
     ) -> None: ...
 
     def finish_job(
@@ -1003,11 +1081,40 @@ class QueueBackend(Protocol):
         claimed_by: str | None = None,
     ) -> bool: ...
 
+    # --- the scheduler's job bookkeeping --------------------------------------
+
+    def park_job(
+        self,
+        job_id: int,
+        *,
+        pr_number: int,
+        reason: str,
+        poll_after: datetime | None,
+    ) -> bool: ...
+
+    def schedule_poll(self, job_id: int, poll_after: datetime | None) -> None: ...
+
+    def set_reason(self, job_id: int, reason: str | None) -> None: ...
+
+    def attach_run(self, job_id: int, run_id: str) -> None: ...
+
+    def record_sync(self, job_id: int, *, repo: str, sha: str) -> None: ...
+
+    def record_files(self, job_id: int, paths: Iterable[str]) -> None: ...
+
+    def record_fix_rounds_baseline(self, job_id: int, rounds: int) -> None: ...
+
+    def restart_fresh(
+        self, job_id: int, *, reason: str, now: datetime | None = None
+    ) -> None: ...
+
     def cancel_job(self, job_id: int) -> None: ...
 
-    def requeue_job(self, job_id: int) -> None: ...
+    def requeue_job(self, job_id: int, *, now: datetime | None = None) -> None: ...
 
     def prioritise_job(self, job_id: int, priority_class: str) -> None: ...
+
+    # --- the shared rate-limit windows ----------------------------------------
 
     def pause_dispatch(
         self,
@@ -1018,13 +1125,20 @@ class QueueBackend(Protocol):
         repo: str | None = None,
         source: str | None = None,
         pool: str | None = None,
+        now: datetime | None = None,
     ) -> bool: ...
 
     def dispatch_pause(self, pool: str | None = None) -> QueuePause | None: ...
 
     def dispatch_pauses(self) -> list[QueuePause]: ...
 
+    def mark_pause_probed(
+        self, pool: str | None = None, *, now: datetime | None = None
+    ) -> None: ...
+
     def clear_pause(self, pool: str | None = None) -> None: ...
+
+    # --- workers and the fleet run registry -----------------------------------
 
     def register_worker(
         self,
@@ -1037,11 +1151,12 @@ class QueueBackend(Protocol):
         repos: Iterable[str] = (),
         slots: int = 1,
         slots_free: int | None = None,
+        now: datetime | None = None,
     ) -> WorkerRecord: ...
 
     def list_workers(self) -> list[WorkerRecord]: ...
 
-    def put_fleet_run(self, record: RunRecord) -> None: ...
+    def put_fleet_run(self, record: RunRecord, *, now: datetime | None = None) -> None: ...
 
     def list_fleet_runs(self) -> list[dict[str, Any]]: ...
 

@@ -508,13 +508,50 @@ def test_queue_list_unreachable_is_one_error_line(
     assert url in result.output and "Traceback" not in result.output
 
 
-def test_queue_run_refuses_a_remote_queue(
+def test_queue_run_without_a_worker_name_refuses_a_remote_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Story 35.2-005: a fleet drain is a registered worker (its claim is matched
+    # on what it registered); a bare `queue run` would claim by hand-picked id.
     monkeypatch.setenv("SDLC_QUEUE_URL", "http://h:8790")
     result = runner.invoke(app, ["queue", "run"])
     assert result.exit_code == 2
-    assert "SDLC_QUEUE_URL" in result.output
+    assert "SDLC_QUEUE_URL" in result.output and "--worker" in result.output
+
+
+def test_queue_run_as_a_worker_drains_the_fleet_queue_through_the_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live: _Live
+) -> None:
+    from sdlc.scheduler import SchedulerResult
+
+    monkeypatch.setenv("SDLC_QUEUE_URL", live.url)
+    monkeypatch.setenv("SDLC_QUEUE_TOKEN", TOKEN)
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "local.db"))
+    seen: dict = {}
+
+    def fake_run_queue(backend, **kwargs):
+        seen["store"] = backend
+        seen.update(kwargs)
+        return SchedulerResult()
+
+    monkeypatch.setattr("sdlc.scheduler.run_queue", fake_run_queue)
+
+    result = runner.invoke(app, ["queue", "run", "--worker", "m3max", "--pool", "claude-m3"])
+
+    assert result.exit_code == 0, result.output
+    assert isinstance(seen["store"], QueueClient) and seen["store"].url == live.url
+    assert seen["identity"] == "m3max" and seen["config"].worker.name == "m3max"
+    assert not (tmp_path / "local.db").exists()  # nothing touched the local store
+
+
+def test_queue_run_against_an_unreachable_fleet_is_one_error_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _dead_url()
+    monkeypatch.setenv("SDLC_QUEUE_URL", url)
+    result = runner.invoke(app, ["queue", "run", "--worker", "m3max"])
+    assert result.exit_code == 2
+    assert url in result.output and "Traceback" not in result.output
 
 
 @pytest.mark.parametrize("url", ["home-lab:8790", "http://[::1"])

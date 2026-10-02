@@ -1818,7 +1818,7 @@ def test_fleet_worker_sharing_the_shells_store_is_clean(tmp_path) -> None:
 
 def test_fleet_worker_is_looked_up_in_the_store_its_plist_pins(tmp_path) -> None:
     # launchd starts the worker with the plist's environment, not this shell's,
-    # and `queue run` is local-only: a worker heartbeating in its pinned store is
+    # and this plist names no fleet queue: a worker heartbeating in its pinned store is
     # online, however this shell resolves its own queue. But jobs enqueued here
     # land in a file it never drains, so the shell must be told.
     from sdlc.doctor import check_fleet_worker_installed
@@ -1842,7 +1842,7 @@ def test_fleet_worker_is_looked_up_in_the_store_its_plist_pins(tmp_path) -> None
 def test_fleet_worker_warns_while_this_shell_enqueues_to_a_fleet_queue(tmp_path, monkeypatch) -> None:
     # The same split by another route: with SDLC_QUEUE_URL exported here,
     # `--enqueue` lands on the fleet service, which launchd's bare environment
-    # never points the worker at — and `queue run` cannot drain it yet anyway.
+    # never points the worker at.
     from sdlc.doctor import check_fleet_worker_installed
 
     store = tmp_path / "queue.db"
@@ -1858,6 +1858,97 @@ def test_fleet_worker_warns_while_this_shell_enqueues_to_a_fleet_queue(tmp_path,
     assert "m3max" in finding.detail and "online" in finding.detail
     assert "http://home-lab:8790" in finding.detail
     assert "SDLC_QUEUE_URL" in finding.remedy
+
+
+def _plist_with_fleet_url(tmp_path, *, url: str | None = "http://home-lab:8790", token: str | None = None):
+    """A worker plist that, as well as pinning a store, names the fleet queue it drains."""
+    path = tmp_path / "com.fxmartin.sdlc-worker.plist"
+    env = {"SDLC_QUEUE_PATH": str(tmp_path / "unused.db")}
+    if url is not None:
+        env["SDLC_QUEUE_URL"] = url
+    if token is not None:
+        env["SDLC_QUEUE_TOKEN"] = token
+    path.write_bytes(plistlib.dumps({"Label": "com.fxmartin.sdlc-worker", "EnvironmentVariables": env}))
+    return path
+
+
+def test_fleet_worker_draining_the_fleet_queue_is_asked_of_the_service(tmp_path, monkeypatch) -> None:
+    # Story 35.2-005: a worker whose plist names the service registers *there*, so
+    # that is where doctor looks — not the pinned local file, and not a WARN about
+    # the shell's own store.
+    from sdlc.doctor import check_fleet_worker_installed
+    from sdlc.queue import QueueStore
+    from sdlc.queue_client import QueueClient
+
+    seen: dict[str, object] = {}
+    fleet = QueueStore(tmp_path / "service.db")
+    fleet.init()
+    fleet.register_worker("m3max", host="m3")
+
+    def list_workers(self):
+        seen["url"], seen["token"] = self.url, self._token
+        return fleet.list_workers()
+
+    monkeypatch.setattr(QueueClient, "list_workers", list_workers)
+
+    finding = check_fleet_worker_installed(
+        agent_path=_plist_with_fleet_url(tmp_path, token="tok"), host="m3",
+        queue_path=tmp_path / "elsewhere.db",
+    )
+
+    assert finding is not None and finding.status == "CLEAN"
+    assert "m3max" in finding.detail and "online" in finding.detail
+    assert seen == {"url": "http://home-lab:8790", "token": "tok"}
+
+
+def test_fleet_worker_is_a_failure_when_its_fleet_queue_is_unreachable(tmp_path, monkeypatch) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+    from sdlc.queue_client import QueueClient, QueueUnavailable
+
+    def down(self):
+        raise QueueUnavailable(f"fleet queue {self.url} unreachable: refused")
+
+    monkeypatch.setattr(QueueClient, "list_workers", down)
+
+    finding = check_fleet_worker_installed(agent_path=_plist_with_fleet_url(tmp_path), host="m3")
+
+    assert finding is not None and finding.status == "FAIL"
+    assert "http://home-lab:8790" in finding.detail
+
+
+def test_fleet_worker_reads_the_users_fleet_file_as_launchd_would(tmp_path, monkeypatch) -> None:
+    # launchd's bare environment carries no SDLC_QUEUE_URL, but the worker still
+    # reads ~/.sdlc-fleet.yaml — and not the cwd file of whoever runs doctor.
+    import sdlc.queue_client as queue_client
+    from sdlc.doctor import check_fleet_worker_installed
+    from sdlc.queue_client import QueueClient
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".sdlc-fleet.yaml").write_text("queue_url: http://from-file:8790\n")
+    monkeypatch.setattr(queue_client, "_home", lambda: home)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    (cwd / ".sdlc-queue.yaml").write_text("queue_url: http://not-the-workers:8790\n")
+    monkeypatch.chdir(cwd)
+    asked: list[str] = []
+    monkeypatch.setattr(QueueClient, "list_workers", lambda self: asked.append(self.url) or [])
+
+    finding = check_fleet_worker_installed(agent_path=_plist_with_fleet_url(tmp_path, url=None), host="m3")
+
+    assert asked == ["http://from-file:8790"]
+    assert finding is not None and finding.status == "FAIL"  # nothing registered there
+
+
+def test_fleet_worker_with_an_unusable_fleet_url_fails_instead_of_crashing(tmp_path) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+
+    finding = check_fleet_worker_installed(
+        agent_path=_plist_with_fleet_url(tmp_path, url="not a url"), host="m3"
+    )
+
+    assert finding is not None and finding.status == "FAIL"
+    assert "SDLC_QUEUE_URL" in finding.detail
 
 
 def test_fleet_worker_leaves_a_malformed_queue_url_to_the_fleet_queue_finding(
