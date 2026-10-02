@@ -1804,19 +1804,34 @@ def test_fleet_worker_check_fails_when_the_queue_cannot_be_opened(tmp_path, monk
 def test_run_doctor_reports_the_worker_only_when_its_launch_agent_is_installed(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
     monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
     monkeypatch.chdir(tmp_path)
     claude_dir, repo_root = _healthy_install(tmp_path)
 
-    report = run_doctor(
-        repo_root=repo_root,
-        claude_dir=claude_dir,
-        db_path=tmp_path / "ledger.db",
-        queue_path=tmp_path / "queue.db",
-        registry=Registry(tmp_path / "registry.json"),
-        dep_probe=lambda _b: True,
-    )
+    def doctor(worker_plist: Path) -> DoctorReport:
+        return run_doctor(
+            repo_root=repo_root,
+            claude_dir=claude_dir,
+            db_path=tmp_path / "ledger.db",
+            queue_path=tmp_path / "queue.db",
+            registry=Registry(tmp_path / "registry.json"),
+            dep_probe=lambda _b: True,
+            worker_plist=worker_plist,
+        )
 
-    assert not any(f.check == "fleet-worker" for f in report.findings)
+    assert not any(f.check == "fleet-worker" for f in doctor(tmp_path / "absent.plist").findings)
+
+    agent = tmp_path / "com.fxmartin.sdlc-worker.plist"
+    agent.write_text("<plist/>", encoding="utf-8")
+    # Installed, but nothing has registered in this empty queue.
+    assert _finding(doctor(agent), "fleet-worker").status == "FAIL"
+
+
+def test_doctor_never_reads_a_real_worker_launch_agent_under_test() -> None:
+    # A developer Mac with the worker installed must not leak its live queue into
+    # the suite: conftest points the default at a path that does not exist.
+    from sdlc.doctor import default_worker_plist
+
+    assert not default_worker_plist().exists()
+    assert default_worker_plist().name == "com.fxmartin.sdlc-worker.plist"

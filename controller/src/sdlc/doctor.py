@@ -616,7 +616,14 @@ def check_fleet_queue_configured() -> Finding | None:
     return check_fleet_queue(QueueClient(url, token=os.environ.get("SDLC_QUEUE_TOKEN") or None))
 
 
-WORKER_LAUNCH_AGENT = "com.fxmartin.sdlc-worker.plist"
+# Story 35.2-004: the LaunchAgent that keeps a fleet worker resident on the M3
+# Max (template: templates/launchd/com.fxmartin.sdlc-worker.plist).
+WORKER_LABEL = "com.fxmartin.sdlc-worker"
+
+
+def default_worker_plist() -> Path:
+    """Where `launchctl` loads the resident worker's LaunchAgent from."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{WORKER_LABEL}.plist"
 
 
 def check_fleet_worker(list_workers: Callable[[], list[WorkerRecord]], *, host: str) -> Finding:
@@ -627,7 +634,7 @@ def check_fleet_worker(list_workers: Callable[[], list[WorkerRecord]], *, host: 
     """
     name = "Fleet worker"
     remedy = (
-        "check the LaunchAgent is loaded (`launchctl print gui/$(id -u)/com.fxmartin.sdlc-worker`) "
+        f"check the LaunchAgent is loaded (`launchctl print gui/$(id -u)/{WORKER_LABEL}`) "
         "and read ~/.local/state/sdlc/worker.log"
     )
     try:
@@ -666,7 +673,7 @@ def check_fleet_worker_installed(
     """
     from sdlc.queue_client import open_queue
 
-    path = agent_path or Path.home() / "Library" / "LaunchAgents" / WORKER_LAUNCH_AGENT
+    path = agent_path or default_worker_plist()
     if not path.exists():
         return None
     try:
@@ -1727,6 +1734,7 @@ def run_doctor(
     db_path: Path | None = None,
     queue_path: Path | None = None,
     queue_service_plist: Path | None = None,
+    worker_plist: Path | None = None,
     registry: Registry | None = None,
     dep_probe: Callable[[str], bool] | None = None,
     now: datetime | None = None,
@@ -1744,6 +1752,7 @@ def run_doctor(
     db_path = db_path or default_db_path()
     queue_path = queue_path or default_queue_path()
     queue_service_plist = queue_service_plist or default_queue_service_plist()
+    worker_plist = worker_plist or default_worker_plist()
     registry = registry or Registry()
     dep_probe = dep_probe or _default_dep_probe
 
@@ -1770,7 +1779,7 @@ def run_doctor(
     fleet = check_fleet_queue_configured()
     if fleet is not None:
         findings.append(fleet)
-    worker = check_fleet_worker_installed()
+    worker = check_fleet_worker_installed(agent_path=worker_plist)
     if worker is not None:
         findings.append(worker)
     return DoctorReport(findings=findings)

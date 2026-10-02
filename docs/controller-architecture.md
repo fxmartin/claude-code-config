@@ -1817,19 +1817,42 @@ line and `--json` carry it; a host that never registered a worker is untouched.
 
 `templates/launchd/com.fxmartin.sdlc-worker.plist` runs `sdlc queue run --worker
 m3max --pool claude-m3 --pool codex-shared --follow` as a LaunchAgent so the Mac
-drains the queue whenever it is on. Install it by copying it into
-`~/Library/LaunchAgents/` and `launchctl bootstrap gui/$(id -u)` it; it starts
-at load, and `KeepAlive` restarts it on any exit (throttled to 30 s). `--follow`
-keeps the drain heartbeating while idle, which is what keeps it `online`.
+drains its queue whenever it is on. It has the 35.1-003 service's shape (an
+absolute argv, a pinned environment, launchd's own log keys). The install in
+the template's header fills its `__HOME__` and `__USER__` placeholders with
+`sed`, writes the result to `~/Library/LaunchAgents/` and loads it with
+`launchctl bootstrap gui/$(id -u)`. It starts at load, and `KeepAlive` restarts
+it on any exit (throttled to 30 s). `--follow` keeps the drain heartbeating
+while idle, which is what keeps it `online`.
 
-- **Logs** go to `~/.local/state/sdlc/worker.log` (the wrapper `mkdir`s the
-  directory and redirects, since launchd does not expand `~`/`$HOME`).
+- **Logs** go to `~/.local/state/sdlc/worker.log`: `StandardOutPath` and
+  `StandardErrorPath` name the same file, so progress and errors read in order.
+  launchd does not create the directory; the install's `mkdir -p` does.
+- **State is pinned.** launchd starts the worker with a bare environment, which
+  resolves `~/.sdlc/queue.db` and `~/.sdlc/registry.json`. The plist sets
+  `SDLC_QUEUE_PATH` and `XDG_STATE_HOME`, so the worker and every job it
+  launches use `~/.local/state/sdlc/` — the files a shell exporting
+  `XDG_STATE_HOME=$HOME/.local/state` reads with `sdlc queue`, `sdlc doctor`
+  and the dashboard.
+- **Interactive priority.** Each job is the agent's child and inherits its
+  launchd resource class, so `ProcessType` is `Interactive`. `Background` (the
+  queue service's class) means low CPU priority and throttled disk I/O, on
+  Apple Silicon efficiency cores only, and even the unset default throttles CPU
+  and I/O; either would push a long build towards its queue wall-clock budget.
 - **Awake while a job runs.** On macOS (`platform.system() == "Darwin"`, with
   `caffeinate` on PATH) a worker prefixes each job it launches with
   `caffeinate -i`, so the idle-sleep assertion lives exactly as long as the job
-  and the Mac may sleep between jobs. Elsewhere nothing is added; the Linux
-  equivalent (`systemd-inhibit`) is a follow-up for a Linux worker. A plain
-  drain without `--worker` is not wrapped.
+  and the Mac may sleep between jobs. `-i` holds off idle sleep only: closing
+  the lid still sleeps the MacBook unless it runs in clamshell mode (on power,
+  with an external display), so keep the M3 Max open or docked. Elsewhere
+  nothing is added; the Linux equivalent (`systemd-inhibit`) is a follow-up for
+  a Linux worker. A plain drain without `--worker` is not wrapped.
+- **This Mac's queue only, for now.** `sdlc queue run` claims from the local
+  store alone (see below). While a fleet queue is configured — `SDLC_QUEUE_URL`,
+  or `queue_url:` in `~/.sdlc-fleet.yaml` — the worker refuses with exit 2 and
+  `KeepAlive` restarts it every 30 s; without one it drains only the jobs
+  enqueued on this Mac. A job enqueued from the XPS reaches it once `queue run`
+  can claim through `QueueClient`, which is not built yet.
 - **Upgrades.** The guard (Story 15.1-004/32.1-004) compares a checkout
   with the version the worker *imported*, so a resident `--follow` worker would
   otherwise park every framework job on its own staleness and never exit. Each
@@ -1843,10 +1866,16 @@ keeps the drain heartbeating while idle, which is what keeps it `online`.
   is behind the checkout, a restart cures nothing: the per-job guard still
   parks the job `blocked` with the reinstall remedy, and the worker exits once
   that reinstall lands. A plain drain without `--worker` never probes.
+  Reinstall while the worker is idle (nothing `running` in `sdlc queue list`):
+  `uv tool install --force` replaces the environment its running jobs still
+  import from lazily — the hazard `--self-update` (#709) defers around.
 - **`sdlc doctor`** adds a `Fleet worker` finding on a machine that has the
   LaunchAgent installed: `CLEAN` when a worker for this host is registered and
   online, `FAIL` when none has registered, it has gone offline, or the queue
-  cannot be read. A machine without the plist gets no finding.
+  cannot be read. A machine without the plist gets no finding. It looks for
+  `~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist`
+  (`default_worker_plist`); `run_doctor(worker_plist=…)` overrides that, as
+  `queue_service_plist` does for 35.1-003.
 
 `--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`);
 like the rest of `sdlc queue run` it refuses while `SDLC_QUEUE_URL` is set. The

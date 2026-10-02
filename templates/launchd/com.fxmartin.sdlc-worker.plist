@@ -1,30 +1,95 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Story 35.2-004: the M3 Max's resident fleet worker. Install with
-       cp templates/launchd/com.fxmartin.sdlc-worker.plist ~/Library/LaunchAgents/
-       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist
-     launchd does not expand ~ or $HOME in its own keys, so the shell below does the
-     expansion and owns the log redirect. `sdlc queue run` holds a `caffeinate -i`
-     assertion around each job it launches (macOS only), so the Mac may sleep while idle. -->
+<!--
+  LaunchAgent that keeps a fleet worker (`sdlc queue run` as worker m3max,
+  Story 35.2-001) resident on the M3 Max — Story 35.2-004. Same shape as
+  com.fxmartin.sdlc-queue.plist (Story 35.1-003).
+
+  Substitute the two __PLACEHOLDERS__ below; launchd expands neither `~` nor
+  `$VARS`, so every path is absolute:
+
+    __HOME__  the account's home, e.g. /Users/fxmartin
+    __USER__  the account's login, for nix-darwin's per-user profile on PATH
+
+  Install:
+
+    mkdir -p ~/.local/state/sdlc
+    sed -e "s|__HOME__|$HOME|g" -e "s|__USER__|$USER|g" \
+        templates/launchd/com.fxmartin.sdlc-worker.plist \
+        > ~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist
+
+  SDLC_QUEUE_PATH and XDG_STATE_HOME are pinned because launchd starts the
+  worker with a bare environment: unpinned, it would drain ~/.sdlc/queue.db and
+  record its runs in ~/.sdlc/registry.json, where a shell exporting
+  XDG_STATE_HOME=$HOME/.local/state (and its `sdlc doctor` and dashboard) never
+  looks. Its jobs inherit both.
+
+  The worker drains this Mac's own queue. `sdlc queue run` does not yet claim
+  from the fleet queue: while SDLC_QUEUE_URL or a `queue_url:` in
+  ~/.sdlc-fleet.yaml is set it refuses with exit 2, and KeepAlive restarts it
+  every ThrottleInterval — so a job enqueued on another machine does not reach
+  this worker yet.
+
+  Each job runs under `caffeinate -i` (macOS only): the Mac may idle-sleep
+  between jobs, and a closed lid still sleeps it unless it runs in clamshell
+  mode on power with an external display.
+-->
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>com.fxmartin.sdlc-worker</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>mkdir -p "$HOME/.local/state/sdlc" &amp;&amp; export PATH="$HOME/.local/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/opt/homebrew/bin:$PATH" &amp;&amp; exec sdlc queue run --worker m3max --pool claude-m3 --pool codex-shared --follow >>"$HOME/.local/state/sdlc/worker.log" 2>&amp;1</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <!-- Restart on any exit — including exit 75, which the worker takes once the
-         controller is reinstalled under it, so the restart runs the new code. -->
-    <key>KeepAlive</key>
-    <true/>
-    <key>ThrottleInterval</key>
-    <integer>30</integer>
-    <key>ProcessType</key>
-    <string>Background</string>
+  <!-- Keep this label: `sdlc doctor` finds the agent by its file name, and its
+       remedy addresses the agent by it. -->
+  <key>Label</key>
+  <string>com.fxmartin.sdlc-worker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/sdlc</string>
+    <string>queue</string>
+    <string>run</string>
+    <string>--worker</string>
+    <string>m3max</string>
+    <string>--pool</string>
+    <string>claude-m3</string>
+    <string>--pool</string>
+    <string>codex-shared</string>
+    <string>--follow</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/etc/profiles/per-user/__USER__/bin:/run/current-system/sw/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>SDLC_QUEUE_PATH</key>
+    <string>__HOME__/.local/state/sdlc/queue.db</string>
+    <key>XDG_STATE_HOME</key>
+    <string>__HOME__/.local/state</string>
+  </dict>
+
+  <!-- Start when loaded (at login), and restart on any exit — including exit
+       75, which the worker takes once the controller is reinstalled under it,
+       so the restart runs the new code. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!-- One log for both streams, so the worker's progress (stdout) and its
+       errors (stderr) read in order. -->
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/sdlc/worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/sdlc/worker.log</string>
+
+  <!-- Interactive, not Background: every job is this agent's child and
+       inherits its resource class. Background means low CPU priority and
+       throttled disk I/O (efficiency cores only on Apple Silicon), and even
+       the unset default throttles CPU and I/O; either stretches a 30-90 min
+       build towards its queue wall-clock budget. The lightweight queue service
+       (35.1-003) rightly stays Background. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
 </dict>
 </plist>
