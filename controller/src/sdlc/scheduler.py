@@ -898,17 +898,12 @@ class _Scheduler:
         for job in self._store.expired_running_jobs(now=self._clock()):
             if job.id in self._in_flight or self._job_paused(job):
                 continue
-            if job.cancel_requested:
-                # Cancelled while its holder was already gone: nothing to stop,
-                # and resuming it would undo the operator's decision.
-                self._store.finish_job(job.id, "cancelled", reason="cancelled by operator")
-                self._echo(f"job {job.id} cancelled: its worker was gone")
-                continue
             if job.run_id is None:
                 # Claimed but never started a run — nothing to resume, so put it
                 # back in the queue and let the normal claim path take it. Take
                 # ownership first: the previous holder may have already dropped
-                # its `claimed_by`, and only the owner may release a claim.
+                # its `claimed_by`, and only the owner may release a claim. (The
+                # release retires a cancelled one instead.)
                 if self._store.reclaim_job(
                     job.id, claimed_by=self._identity,
                     lease_seconds=self._config.lease_seconds, now=self._clock(),
@@ -921,7 +916,15 @@ class _Scheduler:
             if self._run_is_live(job.run_id):
                 # The run's own pid still answers — the lease lapsed but the
                 # work did not. Two drivers on one run is exactly what the
-                # registry guard exists to prevent.
+                # registry guard exists to prevent. A cancel waits here too:
+                # only the run's holder can stop it, and retiring the job under
+                # it would leave the run going, unwatched, behind a `cancelled` row.
+                continue
+            if job.cancel_requested:
+                # Cancelled once its holder and its run were both gone: nothing
+                # to stop, and resuming it would undo the operator's decision.
+                self._store.finish_job(job.id, "cancelled", reason="cancelled by operator")
+                self._echo(f"job {job.id} cancelled: its worker was gone")
                 continue
             terminal = self._run_terminal(job.run_id)
             if terminal is not None:
@@ -1250,10 +1253,14 @@ class _Scheduler:
         agents the run spawned die with it. Only then is the job finished
         ``cancelled``, which drops the claim and the lease; the run itself is
         left as it stood, for `sdlc resume` should FX ever want it back.
+
+        A row already reading ``cancelled`` is the same order: a peer drain
+        retired the job while this holder stalled past its lease, but the run's
+        process is still this holder's, and nobody else can stop it.
         """
         for job_id, entry in list(self._in_flight.items()):
             current = self._store.get_job(job_id)
-            if current is None or not current.cancel_requested:
+            if current is None or not (current.cancel_requested or current.state == "cancelled"):
                 continue
             del self._in_flight[job_id]
             try:
@@ -1343,7 +1350,8 @@ class _Scheduler:
             job.id, pr_number=pr_number, reason=reason, poll_after=self._next_poll()
         ):
             # Story 35.4-003: its cancel landed as the run exited, so `_reap` got
-            # here before `_honour_cancels` could — the store retired it instead.
+            # here before `_honour_cancels` could, or a peer drain retired it while
+            # this holder stalled — either way the store keeps it cancelled.
             self._echo(f"job {job.id} cancelled: the run had already stopped on #{pr_number}")
             return
         self._result.parked += 1

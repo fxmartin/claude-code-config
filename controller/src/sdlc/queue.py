@@ -1141,7 +1141,7 @@ class QueueStore:
         if job.state not in _CANCELLABLE_STATES:
             raise QueueError(
                 f"cannot cancel job {job_id}: state is {job.state} "
-                f"(cancellable: {', '.join(sorted(_CANCELLABLE_STATES))})"
+                f"(cancellable: {', '.join(sorted(_CANCELLABLE_STATES | {'running'}))})"
             )
         self._set_state(job_id, "cancelled")
 
@@ -1966,11 +1966,13 @@ class QueueStore:
             if job.cancel_requested:
                 # The operator already said stop: handing the job back would
                 # have the next scheduler resume (or restart) what was cancelled.
+                # The release's own reason (an interrupt, a rate-limit wait)
+                # would read as if the job were coming back, so it is not kept.
                 conn.execute(
                     "UPDATE jobs SET state = 'cancelled', claimed_by = NULL, worker = NULL, "
                     "lease_until = NULL, cancel_requested = 0, reason = ?, updated_at = ? "
                     "WHERE id = ? AND claimed_by = ?",
-                    (reason, moment, job_id, claimed_by),
+                    ("cancelled by operator", moment, job_id, claimed_by),
                 )
             elif job.run_id:
                 conn.execute(
@@ -2059,6 +2061,8 @@ class QueueStore:
         ``cancelled`` instead, and ``False`` returned: parking would hand it back
         for an approval to resume — the very thing the operator stopped — the
         same call :meth:`release_claim` makes. Its ``pr_number`` is still kept.
+        So is a job already ``cancelled``: a peer drain retired it while its
+        holder stalled, and that holder's late park must not bring it back.
 
         Refuses a job with no ``run_id``: without a run there is nothing for an
         approval to release, and a job that never started belongs in ``queued``.
@@ -2077,7 +2081,7 @@ class QueueStore:
             cancelled = conn.execute(
                 "UPDATE jobs SET state = 'cancelled', claimed_by = NULL, worker = NULL, "
                 "lease_until = NULL, cancel_requested = 0, pr_number = ?, reason = ?, "
-                "updated_at = ? WHERE id = ? AND cancel_requested = 1",
+                "updated_at = ? WHERE id = ? AND (cancel_requested = 1 OR state = 'cancelled')",
                 (pr_number, "cancelled by operator", _now_iso(), job_id),
             ).rowcount
             if cancelled:

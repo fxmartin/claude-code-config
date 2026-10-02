@@ -1765,10 +1765,16 @@ before `_renew`, so a lease is never extended on a doomed job), stops the run th
 `JobProcess.stop()` — the process-group SIGTERM→SIGKILL kill of Story 13.4-001 —
 and finishes the job `cancelled` (`finish_job` accepts it as the holder's
 acknowledgement), which clears the claim, lease and flag. A claim released with
-the flag set (worker interrupted) or reclaimed after its lease lapsed retires
-the job rather than resuming it, and so does a run that stops `AWAITING_APPROVAL`
-before its holder saw the flag: `park_job` finishes it `cancelled` instead of
-parking it for an approval to resume. `requeue` and an approval's take-back clear
+the flag set (worker interrupted) retires the job rather than resuming it, and
+so does a lapsed lease — but only once the run is gone too. A job whose run's
+pid still answers is not retired: only its holder can stop that run, and
+retiring the row under it would leave the run going, unwatched, behind a
+`cancelled` row — so it stays flagged until the run ends, then is retired, never
+resumed. A holder that finds its job already `cancelled` (a peer drain retired it
+while the holder stalled past its lease) still stops its run. A run that stops
+`AWAITING_APPROVAL` before its holder saw the flag, or after a peer retired the
+job, is not parked: `park_job` leaves it `cancelled` rather than parking it for
+an approval to resume. `requeue` and an approval's take-back clear
 any leftover flag, so a re-armed job is never re-cancelled. The run's own ledger
 is left as it stood. A `queue run` started before this change does not read the
 flag — restart it after upgrading, or a cancel only waits for the run to end.

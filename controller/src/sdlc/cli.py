@@ -3698,7 +3698,9 @@ def queue_cancel_cmd(
     set, so this works from the XPS). The worker holding it sees the flag on its
     next pass, terminates the run's whole process group (SIGTERM, then SIGKILL)
     and releases the lease; `sdlc queue list` then shows the job `cancelled`.
-    Until then it reads `running` with `cancel requested` beneath it.
+    Until then it reads `running` with `cancel requested` beneath it. If that
+    worker is gone but its run is still alive, nothing else may kill the run: the
+    job stays flagged until the run ends, then reads `cancelled` — never resumed.
     """
     from sdlc.queue_client import open_queue
 

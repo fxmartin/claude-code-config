@@ -255,6 +255,9 @@ def test_releasing_a_flagged_claim_retires_the_job(tmp_path) -> None:
 
     job = store.get_job(job_id)
     assert (job.state, job.claimed_by, job.cancel_requested) == ("cancelled", None, False)
+    # The release's own reason ("scheduler interrupted", a rate-limit wait, ...)
+    # would read as if the job were coming back.
+    assert job.reason == "cancelled by operator"
 
 
 def test_parking_a_flagged_job_honours_the_cancel(tmp_path) -> None:
@@ -281,6 +284,28 @@ def test_parking_a_flagged_job_honours_the_cancel(tmp_path) -> None:
     store.requeue_job(job_id)
     job = store.get_job(job_id)
     assert (job.state, job.cancel_requested) == ("running", False)
+
+
+def test_parking_a_job_a_peer_already_retired_keeps_it_cancelled(tmp_path) -> None:
+    """A stalled holder's run stopped AWAITING_APPROVAL while a peer drain retired
+    the cancelled job — consuming the flag. The holder's late park must not bring
+    the job back for an approval to resume."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.attach_run(job_id, "run-1")
+    store.cancel_job(job_id)
+    store.finish_job(job_id, "cancelled", reason="cancelled by operator")  # the peer's retire
+
+    parked = store.park_job(job_id, pr_number=12, reason="awaiting approval", poll_after=None)
+
+    job = store.get_job(job_id)
+    assert parked is False
+    assert (job.state, job.cancel_requested, job.pr_number) == ("cancelled", False, 12)
+    assert job.reason == "cancelled by operator"
 
 
 def test_parking_an_unflagged_job_reports_the_park(tmp_path) -> None:
@@ -366,8 +391,10 @@ def test_cancel_refuses_a_finished_job(tmp_path) -> None:
     job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
     store.claim_next(claimed_by="w1", lease_seconds=60)
     store.finish_job(job_id, "done")
-    with pytest.raises(QueueError, match="cannot cancel"):
+    with pytest.raises(QueueError, match="cannot cancel") as refused:
         store.cancel_job(job_id)
+    # A running job is cancellable too (Story 35.4-003), so the hint must say so.
+    assert "running" in str(refused.value).split("cancellable:")[1]
 
 
 def test_a_queue_db_from_before_cancel_requested_upgrades_in_place(tmp_path) -> None:
