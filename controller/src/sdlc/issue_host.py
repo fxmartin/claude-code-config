@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import yaml
 
@@ -341,6 +341,24 @@ def _remote_url(root: str | Path) -> str | None:
     if out.returncode != 0:
         return None
     return out.stdout.strip()
+
+
+def strip_remote_credentials(remote: str) -> str:
+    """``remote`` without any credential embedded in its URL userinfo (35.3-001).
+
+    For http(s) the whole userinfo goes — a token can sit in either the user or
+    the password slot (``https://oauth2:glpat-…@`` / ``https://ghp_…@``). Other
+    scheme URLs (``ssh://``) keep the login user, which a clone needs and which is
+    no secret, and lose only a password. scp-like remotes and local paths carry
+    no URL userinfo and are returned unchanged.
+    """
+    parts = urlsplit(remote)
+    if "@" not in parts.netloc:
+        return remote
+    userinfo, _, hostport = parts.netloc.rpartition("@")
+    user = userinfo.partition(":")[0]
+    keep = f"{user}@" if user and parts.scheme not in ("http", "https") else ""
+    return urlunsplit(parts._replace(netloc=keep + hostport))
 
 
 # scp-like remote: git@host:owner/sub/repo.git

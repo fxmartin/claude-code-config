@@ -302,11 +302,28 @@ def test_cancel_requeue_prioritise(api) -> None:
     assert json.loads(bumped["budget"])["max_fix_rounds"] == 8
 
 
+def test_cancel_of_a_running_job_sets_cancel_requested(api) -> None:
+    """Story 35.4-003: the service flags it; the holding worker stops it on heartbeat."""
+    job = _add(api)
+    api.call("POST", "/jobs/claim", {"worker": "w"})
+    status, flagged = api.call("POST", f"/jobs/{job['id']}/cancel")
+    assert status == 200
+    assert flagged["state"] == "running" and flagged["cancel_requested"] is True
+    status, listing = api.call("GET", "/jobs")
+    assert listing["jobs"][0]["cancel_requested"] is True
+    # The holder acknowledges by finishing it cancelled.
+    status, done = api.call(
+        "POST", f"/jobs/{job['id']}/finish", {"state": "cancelled", "worker": "w"}
+    )
+    assert status == 200 and done["state"] == "cancelled" and done["cancel_requested"] is False
+
+
 def test_state_refusals_are_409_and_bad_values_400(api) -> None:
     job = _add(api)
     assert api.call("POST", f"/jobs/{job['id']}/requeue")[0] == 409  # already queued
     api.call("POST", "/jobs/claim", {"worker": "w"})
-    assert api.call("POST", f"/jobs/{job['id']}/cancel")[0] == 409  # running
+    api.call("POST", f"/jobs/{job['id']}/finish", {"state": "done", "worker": "w"})
+    assert api.call("POST", f"/jobs/{job['id']}/cancel")[0] == 409  # finished
     assert api.call("POST", f"/jobs/{job['id']}/prioritise", {"priority": "asap"})[0] == 400
 
 

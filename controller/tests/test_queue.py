@@ -61,6 +61,8 @@ def test_init_creates_wal_schema(tmp_path) -> None:
             "budget", "files", "fix_rounds_baseline",
             # Story 35.1-001: fleet pin, pool, requirements and claim holder.
             "host", "pool", "requirements", "worker",
+            # Story 35.4-003: an operator's cancel aimed at a running job.
+            "cancel_requested",
         }
     finally:
         conn.close()
@@ -187,16 +189,228 @@ def test_cancel_marks_queued_job_cancelled(tmp_path) -> None:
     assert store.list_jobs()[0].state == "cancelled"
 
 
-def test_cancel_refuses_running_job(tmp_path) -> None:
-    from sdlc.queue import QueueError, QueueStore
+def test_cancel_of_a_running_job_asks_its_holder_to_stop(tmp_path) -> None:
+    """Story 35.4-003: a held `running` job is flagged, not retired — its worker
+    must kill the run's process group before the job may go terminal."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    assert store.get_job(job_id).cancel_requested is False
+
+    store.cancel_job(job_id)
+
+    job = store.get_job(job_id)
+    assert (job.state, job.claimed_by, job.cancel_requested) == ("running", "w1", True)
+    assert job.reason == "cancel requested"
+    assert job.to_dict()["cancel_requested"] is True
+
+
+def test_cancel_of_an_unheld_running_job_retires_it_at_once(tmp_path) -> None:
+    """No holder means nobody would ever see the flag."""
+    from sdlc.queue import QueueStore
 
     store = QueueStore(tmp_path / "queue.db")
     store.init()
     job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
     store._set_state(job_id, "running")
-    with pytest.raises(QueueError):
+
+    store.cancel_job(job_id)
+
+    assert store.get_job(job_id).state == "cancelled"
+
+
+def test_finish_job_accepts_cancelled_and_clears_the_flag(tmp_path) -> None:
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.cancel_job(job_id)
+
+    assert store.finish_job(job_id, "cancelled", reason="cancelled by operator", claimed_by="w1")
+
+    job = store.get_job(job_id)
+    assert (job.state, job.claimed_by, job.lease_until, job.cancel_requested) == (
+        "cancelled", None, None, False,
+    )
+    store.requeue_job(job_id)
+    assert store.get_job(job_id).cancel_requested is False
+
+
+def test_releasing_a_flagged_claim_retires_the_job(tmp_path) -> None:
+    """A worker that goes away mid-cancel must not hand the job back to the queue."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.cancel_job(job_id)
+
+    store.release_claim(job_id, claimed_by="w1", reason="scheduler interrupted")
+
+    job = store.get_job(job_id)
+    assert (job.state, job.claimed_by, job.cancel_requested) == ("cancelled", None, False)
+    # The release's own reason ("scheduler interrupted", a rate-limit wait, ...)
+    # would read as if the job were coming back.
+    assert job.reason == "cancelled by operator"
+
+
+def test_parking_a_flagged_job_honours_the_cancel(tmp_path) -> None:
+    """The run reached AWAITING_APPROVAL in the pass its cancel landed. Parking
+    would hand the job back for an approval to resume — what FX just stopped —
+    and leave the flag to re-cancel any later requeue."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.attach_run(job_id, "run-1")
+    store.cancel_job(job_id)
+
+    parked = store.park_job(job_id, pr_number=12, reason="awaiting approval", poll_after=None)
+
+    job = store.get_job(job_id)
+    assert parked is False
+    assert (job.state, job.claimed_by, job.lease_until, job.cancel_requested) == (
+        "cancelled", None, None, False,
+    )
+    assert job.pr_number == 12
+    store.requeue_job(job_id)
+    job = store.get_job(job_id)
+    assert (job.state, job.cancel_requested) == ("running", False)
+
+
+def test_parking_a_job_a_peer_already_retired_keeps_it_cancelled(tmp_path) -> None:
+    """A stalled holder's run stopped AWAITING_APPROVAL while a peer drain retired
+    the cancelled job — consuming the flag. The holder's late park must not bring
+    the job back for an approval to resume."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.attach_run(job_id, "run-1")
+    store.cancel_job(job_id)
+    store.finish_job(job_id, "cancelled", reason="cancelled by operator")  # the peer's retire
+
+    parked = store.park_job(job_id, pr_number=12, reason="awaiting approval", poll_after=None)
+
+    job = store.get_job(job_id)
+    assert parked is False
+    assert (job.state, job.cancel_requested, job.pr_number) == ("cancelled", False, 12)
+    assert job.reason == "cancelled by operator"
+
+
+def test_parking_an_unflagged_job_reports_the_park(tmp_path) -> None:
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.attach_run(job_id, "run-1")
+
+    assert store.park_job(job_id, pr_number=12, reason="awaiting approval", poll_after=None)
+    assert store.get_job(job_id).state == "parked"
+
+
+def test_requeue_and_take_back_clear_a_stale_cancel_flag(tmp_path) -> None:
+    """A flag left on a non-running row — e.g. a scheduler older than migration 9
+    finishing a flagged job — must not cancel the job's next run."""
+    import sqlite3
+
+    from sdlc.queue import QueueStore
+
+    path = tmp_path / "queue.db"
+    store = QueueStore(path)
+    store.init()
+    never_ran = store.add_job(repo="/a", kind="build", scope="epic-1")
+    resumable = store.add_job(repo="/b", kind="build", scope="epic-2")
+    parked = store.add_job(repo="/c", kind="build", scope="epic-3")
+    for job_id in (never_ran, resumable, parked):
+        store.claim_job(job_id, claimed_by="w1", lease_seconds=60)
+    store.attach_run(resumable, "run-b")
+    store.attach_run(parked, "run-c")
+    store.finish_job(never_ran, "failed")
+    store.finish_job(resumable, "failed")
+    store.park_job(parked, pr_number=12, reason="awaiting approval", poll_after=None)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE jobs SET cancel_requested = 1")
+
+    store.requeue_job(never_ran)
+    store.requeue_job(resumable)
+    taken = store.take_parked_job(parked, claimed_by="w2", lease_seconds=60)
+
+    assert (store.get_job(never_ran).state, store.get_job(never_ran).cancel_requested) == (
+        "queued", False,
+    )
+    assert (store.get_job(resumable).state, store.get_job(resumable).cancel_requested) == (
+        "running", False,
+    )
+    assert (taken.state, taken.cancel_requested) == ("running", False)
+
+
+def test_an_unheld_job_reclaimed_mid_cancel_is_flagged_not_retired(tmp_path, monkeypatch) -> None:
+    """A scheduler that reclaims the job between cancel's read and its write now
+    holds a live run: retiring the row under it would orphan that run (its renew
+    fails on the state guard and it drops the job unkilled), so the new holder
+    is asked to stop it instead."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store._set_state(job_id, "running")
+    read = store.get_job
+
+    def read_then_lose_the_race(job_id: int):
+        job = read(job_id)
+        store.reclaim_job(job_id, claimed_by="w2", lease_seconds=60)
+        return job
+
+    monkeypatch.setattr(store, "get_job", read_then_lose_the_race)
+    store.cancel_job(job_id)
+    monkeypatch.undo()
+
+    job = store.get_job(job_id)
+    assert (job.state, job.claimed_by, job.cancel_requested) == ("running", "w2", True)
+
+
+def test_cancel_refuses_a_finished_job(tmp_path) -> None:
+    from sdlc.queue import QueueError, QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.finish_job(job_id, "done")
+    with pytest.raises(QueueError, match="cannot cancel") as refused:
         store.cancel_job(job_id)
-    assert store.list_jobs()[0].state == "running"
+    # A running job is cancellable too (Story 35.4-003), so the hint must say so.
+    assert "running" in str(refused.value).split("cancellable:")[1]
+
+
+def test_a_queue_db_from_before_cancel_requested_upgrades_in_place(tmp_path) -> None:
+    import sqlite3
+
+    from sdlc.queue import QueueStore
+
+    path = tmp_path / "queue.db"
+    store = QueueStore(path)
+    store.init()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE jobs DROP COLUMN cancel_requested")
+        conn.execute("DELETE FROM _migrations WHERE version = 9")
+    store.ensure_migrated()
+    job_id = store.add_job(repo="/repo", kind="build", scope="s")
+    assert store.get_job(job_id).cancel_requested is False
 
 
 def test_cancel_unknown_id_raises(tmp_path) -> None:
@@ -336,6 +550,30 @@ def test_apply_migrations_reruns_a_version_whose_recorded_name_disagrees(
         assert name == "add_worker_note"
     finally:
         conn.close()
+
+
+def test_every_shipped_migration_is_recorded_once_under_its_own_version(tmp_path) -> None:
+    """Two stories built in parallel can each append "the next" version — 35.4-001's
+    ``fleet_runs`` and 35.4-003's ``job_cancel_requested`` both took 9. The
+    name-aware runner does not crash on the duplicate: it re-runs one of the pair
+    on every open and flips the bookkeeping row between their names, so
+    `sdlc doctor` reports a healthy queue.db as a migration behind on every other
+    open. Run against the real ``_MIGRATIONS`` so a colliding append fails here."""
+    from sdlc.queue import _MIGRATIONS, QueueStore
+
+    db = tmp_path / "queue.db"
+    store = QueueStore(db)
+    store.init()
+    store.init()  # a second open must find every migration already recorded as-is
+
+    conn = sqlite3.connect(db)
+    try:
+        recorded = conn.execute(
+            "SELECT version, name FROM _migrations ORDER BY version"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert recorded == [(version, name) for version, name, *_ in _MIGRATIONS]
 
 
 # ---------------------------------------------------------------------------

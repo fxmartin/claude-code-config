@@ -79,6 +79,26 @@ def test_host_from_remote(remote, expected) -> None:
     assert ih.host_from_remote(remote) is expected
 
 
+@pytest.mark.parametrize(
+    "remote,expected",
+    [
+        # http(s): user and password are both credential slots (a PAT can be either).
+        ("https://oauth2:glpat-SECRET@gitlab.com/root/x.git", "https://gitlab.com/root/x.git"),
+        ("https://ghp_SECRET@github.com/fx/r.git", "https://github.com/fx/r.git"),
+        ("http://u:p@gitlab.test:8080/root/x.git", "http://gitlab.test:8080/root/x.git"),
+        # ssh: the login user is needed to clone and is no secret; a password is dropped.
+        ("ssh://git:SECRET@gitlab.com:2222/root/x.git", "ssh://git@gitlab.com:2222/root/x.git"),
+        ("ssh://git@github.com/fx/r.git", "ssh://git@github.com/fx/r.git"),
+        # Nothing to strip: scp-like, plain URL, local path.
+        ("git@github.com:fx/r.git", "git@github.com:fx/r.git"),
+        ("http://gitlab.test/root/x.git", "http://gitlab.test/root/x.git"),
+        ("/srv/git/x.git", "/srv/git/x.git"),
+    ],
+)
+def test_strip_remote_credentials(remote, expected) -> None:
+    assert ih.strip_remote_credentials(remote) == expected
+
+
 def test_detect_host_reads_origin(monkeypatch) -> None:
     monkeypatch.setattr(ih, "_remote_url", lambda root: "git@github.com:fx/r.git")
     assert ih.detect_host(".") == ih.GITHUB

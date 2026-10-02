@@ -595,6 +595,25 @@ def test_interrupting_a_worker_marks_the_runs_it_stopped_dead_on_the_fleet(
     assert [(r[0], r[2]) for r in _fleet(local)] == [("run-w", "DEAD")]
 
 
+def test_a_job_the_operator_cancels_reads_dead_on_the_fleet(worker_host) -> None:
+    local, registry = worker_host
+    (queued,) = local.list_jobs()
+    seen: list[list[tuple]] = []
+
+    def cancel_from_the_xps() -> None:
+        seen.append(_fleet(local))
+        if len(seen) == 3:  # `sdlc queue cancel` on the running job (Story 35.4-003)
+            local.cancel_job(queued.id)
+
+    job = _Job(polls=10**6, during=cancel_from_the_xps)
+    _drain_as_worker(local, registry, job)
+
+    assert job.stopped and local.get_job(queued.id).state == "cancelled"
+    assert seen[0] == [("run-w", "m3max", "IN_PROGRESS", 2, None)]
+    # Its worker stays online, so a row left IN_PROGRESS would read live for good.
+    assert [(r[0], r[2]) for r in _fleet(local)] == [("run-w", "DEAD")]
+
+
 def test_a_resume_reaches_the_fleet_when_it_re_registers_not_as_the_stale_record(
     tmp_path: Path,
 ) -> None:

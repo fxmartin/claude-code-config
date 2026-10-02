@@ -2955,3 +2955,32 @@ def test_queue_view_lists_one_pause_per_paused_pool(
     from sdlc.dashboard import _PAGE
 
     assert "pause.pool" in _PAGE and "data.pauses" in _PAGE
+
+
+def test_page_queue_rows_show_their_worker_and_pool() -> None:
+    """Story 35.4-003: each row names the worker holding it and the pool it spends from."""
+    body = _render_queue_body()
+    assert "<th>worker</th><th>pool</th>" in body
+    assert "j.worker" in body and "j.pool" in body
+
+
+def test_page_queue_renders_one_banner_per_paused_pool() -> None:
+    body = _render_queue_body()
+    assert "pauses.map(pause =>" in body
+    assert "queue paused (rate limited)" in body
+    assert '" · pool " + esc(pause.pool)' in body
+
+
+def test_queue_view_carries_worker_and_pool_per_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc.dashboard import queue_view
+
+    store = _seed_queue(tmp_path, monkeypatch)
+    job_id = store.add_job(repo="/r", kind="build", scope="s", pool="claude-shared")
+    store.claim_next(claimed_by="home-lab-1", lease_seconds=60, pools=["claude-shared"])
+
+    [job] = queue_view()["jobs"]
+    assert (job["id"], job["pool"], job["worker"], job["claimed_by"]) == (
+        job_id, "claude-shared", "home-lab-1", "home-lab-1",
+    )

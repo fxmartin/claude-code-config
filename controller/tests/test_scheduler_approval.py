@@ -224,6 +224,103 @@ def test_an_awaiting_approval_run_with_no_pr_stays_blocked(tmp_path) -> None:
     assert job.reason == "run status AWAITING_APPROVAL"
 
 
+def test_a_cancel_landing_as_the_run_parks_cancels_the_job(tmp_path) -> None:
+    """Story 35.4-003: `_reap` runs before `_honour_cancels`, so a run reaching
+    AWAITING_APPROVAL in the pass its cancel lands is reaped, never stopped. The
+    park must honour the cancel — else an approval resumes (and merges) what FX
+    cancelled — and a later requeue must resume the job, not re-cancel it."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    run_id, db = _ledger_with_parked_story(repo)
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
+    registry = Registry(tmp_path / "registry.json")
+    launcher = FakeLauncher(alive_polls=2, code=1)
+    clock = Clock()
+    events: list[tuple[str, dict]] = []
+    lines: list[str] = []
+    passes = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        passes["n"] += 1
+        if passes["n"] == 1:
+            registry.register(RunRecord(
+                run_id=run_id, repo=repo, db=db, scope="epic-3",
+                pid=launcher.procs[0].pid, status="IN_PROGRESS", started_at="",
+            ))
+        elif passes["n"] == 2:
+            registry.mark_finished(run_id, "AWAITING_APPROVAL", completed=0)
+        elif passes["n"] == 3:
+            store.cancel_job(job_id)  # from the XPS, just before the child is reaped
+        clock.advance(seconds)
+
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, sleeper=sleeper,
+        registry=registry, notifier=lambda ev, **f: events.append((ev, f)),
+        echo=lines.append, approval_probe=Probe(_approved()),
+    )
+
+    job = store.get_job(job_id)
+    assert (job.state, job.cancel_requested, job.pr_number) == ("cancelled", False, 12)
+    assert result.parked == 0
+    assert "queue_job_parked" not in [ev for ev, _ in events]
+    assert any(f"job {job_id} cancelled" in line for line in lines)
+
+    store.requeue_job(job_id, now=clock())
+    clock.advance(1)  # the requeued lease is born expired; let a drain see it lapsed
+    _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+         approval_probe=Probe(_approved()))
+
+    assert launcher.verbs[1:] == [["resume", "--run", run_id]]
+
+
+def test_a_holder_does_not_re_park_a_job_a_peer_retired_cancelled(tmp_path) -> None:
+    """Story 35.4-003: the holder stalls past its lease while its run stops
+    AWAITING_APPROVAL, FX cancels, and a peer drain — the run no longer live —
+    retires the job. The holder's late reap must leave it `cancelled`: parking
+    it again would hand an approval the merge FX cancelled."""
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    run_id, db = _ledger_with_parked_story(repo)
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3")
+    registry = Registry(tmp_path / "registry.json")
+    launcher = FakeLauncher(alive_polls=1, code=1)
+    clock = Clock()
+    events: list[tuple[str, dict]] = []
+    passes = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        passes["n"] += 1
+        if passes["n"] == 1:
+            registry.register(RunRecord(
+                run_id=run_id, repo=repo, db=db, scope="epic-3",
+                pid=launcher.procs[0].pid, status="IN_PROGRESS", started_at="",
+            ))
+        elif passes["n"] == 2:
+            registry.mark_finished(run_id, "AWAITING_APPROVAL", completed=0)
+            clock.advance(120)  # the holder stalls past its 90 s lease...
+            store.cancel_job(job_id)  # ...FX cancels from the XPS...
+            _run(store, tmp_path=tmp_path, launcher=FakeLauncher(), clock=clock,
+                 registry=registry, identity="peer")  # ...and a peer drain runs
+        clock.advance(seconds)
+
+    result = _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, sleeper=sleeper,
+        registry=registry, notifier=lambda ev, **f: events.append((ev, f)),
+        approval_probe=Probe(_approved()), identity="holder",
+    )
+
+    job = store.get_job(job_id)
+    assert (job.state, job.pr_number) == ("cancelled", 12)
+    assert result.parked == 0
+    assert "queue_job_parked" not in [ev for ev, _ in events]
+
+    clock.advance(3600)  # well past any approval poll
+    _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock, registry=registry,
+         approval_probe=Probe(_approved()))
+
+    assert len(launcher.calls) == 1  # the approval resumed nothing
+
+
 # --- AC4: parked jobs hold no slot -----------------------------------------
 
 
