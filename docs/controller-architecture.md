@@ -1965,6 +1965,32 @@ fleet queue configured it refuses (exit 2) rather than drain the wrong queue
 `sdlc doctor` adds a `fleet-queue` finding — reachable, identity accepted, the
 service's controller version — only when a URL is configured.
 
+### The fleet run registry (Story 35.4-001)
+
+The per-host `registry.json` cannot show a run on another machine, so the service
+holds a second table, `fleet_runs` (migration 9): one row per run id, the
+`RunRecord` fields plus `worker` and `updated_at`. The worker's local file stays
+authoritative for the worker; the table is the fleet's summary.
+
+- **Push.** `_registry_register` / `_registry_finish` (and so `build`, `fix` and
+  `resume`) call `queue_client.push_fleet_run` after the local write, and the
+  worker's 30 s heartbeat re-pushes each in-flight run with its done/total read
+  live from the ledger. `PUT /runs` is an upsert (so the client may replay it
+  once); a finished row is final — a stale in-progress push cannot reopen it.
+  The push is best-effort with a 3 s timeout and never fails the build. The
+  `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its jobs), else
+  the short hostname when a fleet URL is configured.
+- **Read.** `GET /runs` returns `{runs}`, each flagged `worker_online` from the
+  `workers` table (`null` when the worker never registered — unknown, not gone).
+- **Dashboard.** `/api/runs` merges the fleet's runs into the local registry view
+  and dedupes by run id (the local row wins). `derive_state(record, remote=True,
+  worker_online=…)` judges a remote run by its worker's heartbeat instead of a pid
+  that names a process on another machine. Selecting a remote run serves a
+  header-only snapshot built from the pushed record. `/api/fleet` reports
+  `{configured, available, error}`; unreachable, the page keeps the local runs and
+  shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
+  `/api/runs`, `/api/fleet` and the SSE change token.
+
 ### Pause per subscription pool (Story 35.2-003)
 
 With a fleet, one rate limit is one *subscription's* limit, not the host's: two

@@ -283,6 +283,8 @@ It binds to **http://127.0.0.1:8787** by default (localhost-only).
 
 **One pane, every repo.** Launched without `--db`, the dashboard reads the host-level run registry (`~/.sdlc/registry.json`) and discovers runs across all your repos; each is still backed by its own per-repo ledger, so there is no cross-run data bleed. Point it at a single run's ledger with `--db <path>` to scope it to one repo.
 
+**One pane, every worker (Story 35.4-001).** With `SDLC_QUEUE_URL` set (see `sdlc queue serve`), every run on every fleet worker shows up on the one dashboard. Each worker still writes its own local registry — which stays authoritative for that worker — and also `PUT`s the record to the service's `/runs` on start, on each 30 s heartbeat (refreshing done/total) and on finish. The dashboard merges the fleet's runs into its own, de-duplicated by run id, and the sidebar names the worker beside the repo (`📁 repo @ worker`). A remote run is `DEAD` when its worker's heartbeat goes silent (not by a local pid), and its detail pane shows the pushed done/total only — the worker's ledger is not reachable from here. If the service is unreachable the local runs still render and a muted "fleet unavailable" line appears. `queue run --worker NAME` hands `NAME` to the jobs it launches as `SDLC_WORKER`; a bare `sdlc build` on a machine with a fleet configured is named for its short hostname.
+
 **Live, not polled-by-hand.** Updates stream over Server-Sent Events driven by a ~1 s ledger change-token, with a 2.5 s polling fallback if the browser can't hold an SSE connection; the elapsed timer ticks every second so an in-flight run always reads true.
 
 | Flag | Effect |

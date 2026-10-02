@@ -3867,6 +3867,10 @@ def queue_serve_cmd(
                                      -> a claim by a registered worker is matched
                                      on these (see `queue run --worker`)
       GET    /workers                {workers} with an `online` flag each
+      PUT    /runs                   a worker pushes a run record (the registry.json
+                                     fields + worker) on start, heartbeat and finish
+      GET    /runs                   {runs}: each with its worker's `worker_online`
+                                     (the XPS dashboard's fleet view)
       POST   /jobs/{id}/renew        worker, \\[lease_seconds]
       POST   /jobs/{id}/release      worker, \\[reason]
       POST   /jobs/{id}/finish       state, \\[reason, worker]

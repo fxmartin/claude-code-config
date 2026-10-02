@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
+from sdlc.registry import RunRecord
+
 __all__ = [
     "CODEX_POOL",
     "DEFAULT_BUDGETS",
@@ -567,6 +569,27 @@ CREATE TABLE IF NOT EXISTS workers (
 );
 """
 
+# Story 35.4-001: the fleet view of runs. One row per run any worker has pushed,
+# keyed by run id, so a worker's repeated pushes (start, heartbeat, finish) rewrite
+# one row. The run's detail stays in the worker's own ledger — this is the page-one
+# summary the XPS dashboard merges, with `updated_at` for when it was last heard.
+_FLEET_RUNS_DDL = """
+CREATE TABLE IF NOT EXISTS fleet_runs (
+    run_id      TEXT PRIMARY KEY,
+    worker      TEXT NOT NULL,
+    repo        TEXT NOT NULL,
+    db          TEXT NOT NULL,
+    scope       TEXT NOT NULL,
+    pid         INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    total       INTEGER,
+    completed   INTEGER,
+    updated_at  TIMESTAMP NOT NULL
+);
+"""
+
 _SCHEMA_DDL = (
     """
 PRAGMA journal_mode = WAL;
@@ -609,6 +632,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
     + _PAUSE_CLEARS_DDL
     + _WORKERS_DDL
     + _QUEUE_PAUSES_DDL
+    + _FLEET_RUNS_DDL
 )
 
 # Schema migrations applied after the base DDL, in the same
@@ -678,6 +702,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (7, "fleet_workers", "workers", [], _WORKERS_DDL),
     # Story 35.2-003: per-pool pause windows, replacing ``queue_state``'s one row.
     (8, "queue_pauses", "queue_pauses", [], _QUEUE_PAUSES_DDL + _QUEUE_PAUSES_BACKFILL),
+    # Story 35.4-001: the fleet run registry table, for a queue.db written before it.
+    (9, "fleet_runs", "fleet_runs", [], _FLEET_RUNS_DDL),
 ]
 
 
@@ -986,6 +1012,10 @@ class QueueBackend(Protocol):
     ) -> WorkerRecord: ...
 
     def list_workers(self) -> list[WorkerRecord]: ...
+
+    def put_fleet_run(self, record: RunRecord) -> None: ...
+
+    def list_fleet_runs(self) -> list[dict[str, Any]]: ...
 
 
 class QueueStore:
@@ -1738,6 +1768,53 @@ class QueueStore:
         except sqlite3.OperationalError:  # no `workers` table yet: nothing has registered
             return []
         return [_row_to_worker(row) for row in rows]
+
+    # --- the fleet run registry (Story 35.4-001) ------------------------------
+
+    def put_fleet_run(self, record: RunRecord, *, now: datetime | None = None) -> None:
+        """Insert or refresh the fleet row for ``record.run_id``.
+
+        A worker pushes on start, on each heartbeat and on finish, so this is an
+        upsert. A finished row is final: a stale in-progress push that arrives
+        after the finish (a heartbeat racing it) must not reopen the run.
+        """
+        worker = (record.worker or "").strip()
+        if not worker:
+            raise QueueError("a fleet run record must name its worker")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO fleet_runs(run_id, worker, repo, db, scope, pid, status, "
+                "started_at, finished_at, total, completed, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET worker = excluded.worker, "
+                "repo = excluded.repo, db = excluded.db, scope = excluded.scope, "
+                "pid = excluded.pid, status = excluded.status, "
+                "started_at = excluded.started_at, finished_at = excluded.finished_at, "
+                "total = excluded.total, completed = excluded.completed, "
+                "updated_at = excluded.updated_at "
+                "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL",
+                (
+                    record.run_id, worker, record.repo, record.db, record.scope, record.pid,
+                    record.status, record.started_at, record.finished_at, record.total,
+                    record.completed, _at(now).isoformat(),
+                ),
+            )
+
+    def list_fleet_runs(self) -> list[dict[str, Any]]:
+        """Every pushed run, newest start first, as :meth:`RunRecord.to_dict` + ``updated_at``.
+
+        A queue.db without the table lists none: nothing has pushed yet.
+        """
+        if not self.db_path.exists():
+            return []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM fleet_runs ORDER BY started_at DESC, run_id"
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(row) for row in rows]
 
     def _take_slot(self, name: str) -> None:
         """Count a fresh claim against the worker until its next heartbeat says otherwise."""

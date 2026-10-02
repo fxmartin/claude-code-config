@@ -7,22 +7,29 @@ import fcntl
 import json
 import os
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 __all__ = [
+    "WORKER_ENV",
     "Registry",
     "RunRecord",
     "default_registry_path",
     "derive_state",
     "format_live_owner_refusal",
+    "live_record",
     "pid_alive",
 ]
 
 # Registry filename under the chosen state directory.
 _REGISTRY_NAME = "registry.json"
+
+# Names the fleet worker a run belongs to (Story 35.4-001). `sdlc queue run
+# --worker NAME` hands it to every job it launches, so the run's registry
+# record — and the fleet view the XPS dashboard builds from it — says whose it is.
+WORKER_ENV = "SDLC_WORKER"
 
 
 def default_registry_path() -> Path:
@@ -60,6 +67,9 @@ class RunRecord:
     finished_at: str | None = None
     total: int | None = None
     completed: int | None = None
+    # The fleet worker that owns the run (Story 35.4-001); None for a run that
+    # never touched a fleet. A registry.json from before it simply lacks the key.
+    worker: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -96,15 +106,24 @@ def pid_alive(pid: object) -> bool:
     return True
 
 
-def derive_state(record: RunRecord) -> str:
+def derive_state(
+    record: RunRecord, *, remote: bool = False, worker_online: bool | None = None
+) -> str:
     """The run's *effective* state for display.
 
     A finished run keeps its recorded terminal status. An unfinished run whose
     pid is gone is reported ``DEAD`` (crashed) so it does not linger as
     "in progress" forever; otherwise the live status stands.
+
+    A ``remote`` run (Story 35.4-001) ran on another machine, so its pid says
+    nothing here: its worker's heartbeat is the liveness witness instead.
+    ``worker_online`` is ``None`` when no heartbeat is known (the worker never
+    registered), and the recorded status stands rather than a guessed ``DEAD``.
     """
     if record.finished_at:
         return record.status
+    if remote:
+        return "DEAD" if worker_online is False else record.status
     if not pid_alive(record.pid):
         return "DEAD"
     return record.status
@@ -150,6 +169,16 @@ def _live_counts(rec: RunRecord) -> tuple[int | None, int | None]:
     except (OSError, sqlite3.Error):
         pass  # unreachable ledger → keep the registry's cached counts
     return rec.completed, rec.total
+
+
+def live_record(record: RunRecord) -> RunRecord:
+    """``record`` with its counts read live from the run's own ledger.
+
+    What a worker pushes on each heartbeat (Story 35.4-001): the fleet view
+    cannot reach the ledger, so the pushed counts are the only ones it has.
+    """
+    completed, total = _live_counts(record)
+    return replace(record, completed=completed, total=total)
 
 
 class Registry:

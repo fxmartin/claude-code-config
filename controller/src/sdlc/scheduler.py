@@ -13,7 +13,7 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, cast
@@ -30,7 +30,8 @@ from sdlc.queue import (
     fix_rounds_exhausted,
     job_pools,
 )
-from sdlc.registry import Registry, RunRecord, pid_alive
+from sdlc.queue_client import push_fleet_run
+from sdlc.registry import WORKER_ENV, Registry, RunRecord, live_record, pid_alive
 from sdlc.risk_gate import RISK_APPROVED_LABEL
 
 if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
@@ -640,15 +641,29 @@ def ledger_plan_files(db_path: str, run_id: str) -> list[str]:
     return sorted(files)
 
 
-def _default_launcher(argv: Sequence[str], cwd: Path) -> JobProcess:
+def _default_launcher(
+    argv: Sequence[str], cwd: Path, env: dict[str, str] | None = None
+) -> JobProcess:
     """Spawn a job as a detached process group under ``cwd``.
 
     Runs as a subprocess, never in-process, so a job's crash cannot take the
     scheduler down with it and a process-group kill reaches the job's own
-    agents.
+    agents. ``env`` replaces the inherited environment when given.
     """
-    proc = subprocess.Popen(list(argv), cwd=str(cwd), start_new_session=True)
+    proc = subprocess.Popen(list(argv), cwd=str(cwd), start_new_session=True, env=env)
     return _PopenProcess(proc)
+
+
+def _launcher_for(config: "SchedulerConfig") -> Launcher:
+    """The launcher a drain uses when none is injected.
+
+    A fleet worker's jobs inherit its name as ``SDLC_WORKER`` (Story 35.4-001),
+    so each run's registry record — and the fleet view — says whose run it is.
+    """
+    if config.worker is None:
+        return _default_launcher
+    name = config.worker.name
+    return lambda argv, cwd: _default_launcher(argv, cwd, {**os.environ, WORKER_ENV: name})
 
 
 def _utc_now() -> datetime:
@@ -844,6 +859,20 @@ class _Scheduler:
             self._store, slots=self._config.slots, slots_free=self._free_slots(), now=now
         )
         self._last_beat = now
+        self._push_in_flight_runs(profile.name)
+
+    def _push_in_flight_runs(self, worker: str) -> None:
+        """Refresh the fleet's view of each run in flight (Story 35.4-001).
+
+        The fleet cannot reach this worker's ledgers, so the live done/total
+        ride the heartbeat: each beat re-pushes the registry record with the
+        counts read now. Best-effort — a down service only leaves the view stale.
+        """
+        for entry in self._in_flight.values():
+            record = self._registry_record(entry.run_id) if entry.run_id else None
+            if record is None or record.finished_at:
+                continue
+            push_fleet_run(replace(live_record(record), worker=worker))
 
     def _fill_slots(self) -> bool:
         """Claim and launch while slots and claimable work remain.
@@ -1919,7 +1948,7 @@ def run_queue(
         store,
         config=config or SchedulerConfig(),
         registry=registry if registry is not None else Registry(),
-        launcher=launcher or _default_launcher,
+        launcher=launcher or _launcher_for(config or SchedulerConfig()),
         clock=clock or _utc_now,
         sleeper=sleeper or time.sleep,
         notifier=notifier or notify,
