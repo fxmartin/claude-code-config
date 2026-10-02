@@ -2705,7 +2705,7 @@ def test_queue_view_empty_when_no_store(tmp_path: Path, monkeypatch: pytest.Monk
     from sdlc.dashboard import queue_view
 
     monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
-    assert queue_view() == {"pause": None, "jobs": []}
+    assert queue_view() == {"pause": None, "pauses": [], "jobs": []}
     assert not (tmp_path / "queue.db").exists()
 
 
@@ -2728,7 +2728,7 @@ def test_api_queue_empty_returns_empty_array(tmp_path: Path, monkeypatch: pytest
         status, ctype, body = _get(base + "/api/queue")
     assert status == 200
     assert "application/json" in ctype
-    assert json.loads(body) == {"pause": None, "jobs": []}
+    assert json.loads(body) == {"pause": None, "pauses": [], "jobs": []}
 
 
 def test_api_queue_matches_cli_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2929,3 +2929,25 @@ def test_queue_view_drops_an_elapsed_pause(
     now = datetime.now(timezone.utc)
     store.pause_dispatch(until=now - timedelta(seconds=1), now=now - timedelta(seconds=2))
     assert queue_view()["pause"] is None
+
+
+def test_queue_view_lists_one_pause_per_paused_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 35.2-003: the banner shows a line per pool, not one queue-wide pause."""
+    from datetime import datetime, timedelta, timezone
+
+    from sdlc.dashboard import queue_view
+
+    store = _seed_queue(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    for pool in ("claude-shared", "codex-shared"):
+        store.pause_dispatch(until=now + timedelta(seconds=600), pool=pool, now=now)
+    store.pause_dispatch(until=now - timedelta(seconds=1), pool="claude-m3", now=now - timedelta(seconds=2))
+
+    view = queue_view()
+    assert sorted(p["pool"] for p in view["pauses"]) == ["claude-shared", "codex-shared"]
+    assert view["pause"] is not None
+    from sdlc.dashboard import _PAGE
+
+    assert "pause.pool" in _PAGE and "data.pauses" in _PAGE

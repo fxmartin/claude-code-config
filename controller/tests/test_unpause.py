@@ -217,3 +217,96 @@ def test_pause_clears_is_empty_without_a_db_or_table(tmp_path) -> None:
     import sqlite3
     sqlite3.connect(legacy).close()
     assert QueueStore(legacy).pause_clears() == []
+
+
+# --- Story 35.2-003: unpause by pool ---------------------------------------
+
+
+def _pool_pause(store, pool):
+    store.pause_dispatch(until=NOW + timedelta(hours=3), reason="rate limited", pool=pool, now=NOW)
+
+
+def test_unpause_with_a_pool_resumes_only_that_pool(tmp_path, monkeypatch) -> None:
+    store, _ = _env(tmp_path, monkeypatch)
+    store.init()
+    _pool_pause(store, "claude-shared")
+    _pool_pause(store, "codex-shared")
+
+    result = runner.invoke(app, ["queue", "unpause", "--pool", "claude-shared"])
+
+    assert result.exit_code == 0, result.output
+    assert "cleared queue pause (claude-shared)" in result.output
+    assert [p.pool for p in store.dispatch_pauses()] == ["codex-shared"]
+    assert store.pause_clears()[0]["reason"] == "operator (pool claude-shared)"
+
+
+def test_unpause_with_a_pool_re_arms_only_runs_of_that_pool(tmp_path, monkeypatch) -> None:
+    store, registry = _env(tmp_path, monkeypatch)
+    store.init()
+    shared_run, shared_db = _parked_run(tmp_path, registry, "alpha")
+    m3_run, m3_db = _parked_run(tmp_path, registry, "beta")
+    for repo, run_id, pool in (("alpha", shared_run, "claude-shared"), ("beta", m3_run, "claude-m3")):
+        job_id = store.add_job(repo=str(tmp_path / repo), kind="build", scope="epic-3", pool=pool)
+        store.claim_job(job_id, claimed_by="w", lease_seconds=60, now=NOW)
+        store.attach_run(job_id, run_id)
+    _pool_pause(store, "claude-shared")
+    _pool_pause(store, "claude-m3")
+
+    result = clear_rate_limit(store, registry, pool="claude-shared", now=NOW)
+
+    assert [r.run_id for r in result.runs] == [shared_run]
+    assert Ledger(shared_db).run_row(shared_run)["status"] == "IN_PROGRESS"
+    assert Ledger(m3_db).run_row(m3_run)["status"] == "RATE_LIMITED"
+    assert [p.pool for p in store.dispatch_pauses()] == ["claude-m3"]
+
+
+def test_unpause_without_a_pool_clears_every_window(tmp_path, monkeypatch) -> None:
+    store, registry = _env(tmp_path, monkeypatch)
+    store.init()
+    _pool_pause(store, "claude-shared")
+    _pool_pause(store, "codex-shared")
+
+    result = clear_rate_limit(store, registry, now=NOW)
+
+    assert {p.pool for p in result.pauses} == {"claude-shared", "codex-shared"}
+    assert store.dispatch_pauses() == []
+    assert len(store.pause_clears()) == 2
+
+
+def test_unpausing_a_pool_that_is_not_paused_is_nothing_to_clear(tmp_path, monkeypatch) -> None:
+    store, registry = _env(tmp_path, monkeypatch)
+    store.init()
+    _pool_pause(store, "codex-shared")
+
+    result = runner.invoke(app, ["queue", "unpause", "--pool", "claude-shared"])
+
+    assert "nothing to clear" in result.output
+    assert [p.pool for p in store.dispatch_pauses()] == ["codex-shared"]
+
+
+def test_unpause_by_pool_works_against_a_fleet_queue(tmp_path, monkeypatch) -> None:
+    """From the XPS the pause lives behind the queue service, not a local file."""
+    from sdlc.queue import QueueBackend
+
+    class FleetQueue:
+        """Just enough of the HTTP client: no audit route, like the real one."""
+
+        def __init__(self, inner: QueueStore) -> None:
+            self.inner = inner
+
+        def __getattr__(self, name):
+            if name == "record_pause_clear":
+                raise AttributeError(name)
+            return getattr(self.inner, name)
+
+    store, registry = _env(tmp_path, monkeypatch)
+    store.init()
+    _pool_pause(store, "claude-shared")
+    _pool_pause(store, "codex-shared")
+    fleet: QueueBackend = FleetQueue(store)  # type: ignore[assignment]
+
+    result = clear_rate_limit(fleet, registry, pool="claude-shared", now=NOW)
+
+    assert [p.pool for p in result.pauses] == ["claude-shared"]
+    assert [p.pool for p in store.dispatch_pauses()] == ["codex-shared"]
+    assert store.pause_clears() == []  # the audit table is the service's, not ours

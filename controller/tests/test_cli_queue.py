@@ -403,3 +403,19 @@ def test_queue_list_ignores_an_elapsed_pause(tmp_path, monkeypatch) -> None:
     result = runner.invoke(app, ["queue", "list"])
     assert "queue paused" not in result.output.lower()
     assert json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)["pause"] is None
+
+
+def test_queue_list_prints_one_line_per_paused_pool(tmp_path, monkeypatch) -> None:
+    """Story 35.2-003: each paused pool is its own banner line and JSON entry."""
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    store, _ = _pause(tmp_path, pool="claude-shared")
+    _pause(tmp_path, pool="codex-shared")
+
+    result = runner.invoke(app, ["queue", "list"])
+    lines = [ln for ln in result.output.splitlines() if ln.startswith("queue paused")]
+    assert len(lines) == 2
+    assert any("(claude-shared)" in ln for ln in lines)
+    assert any("(codex-shared)" in ln for ln in lines)
+
+    payload = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
+    assert sorted(p["pool"] for p in payload["pauses"]) == ["claude-shared", "codex-shared"]

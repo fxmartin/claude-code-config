@@ -148,6 +148,7 @@ def test_get_jobs_matches_queue_list_json_shape(api, store) -> None:
     assert status == 200
     assert payload == {
         "pause": None,
+        "pauses": [],
         "jobs": [r.to_dict() for r in store.list_jobs()],
     }
     assert [j["scope"] for j in payload["jobs"]] == ["epic-2", "epic-1"]
@@ -721,7 +722,7 @@ def test_serve_help_states_the_api_bind_rules_and_identity_model() -> None:
                    "Origin", "415",
                    # Optional fields survive Rich markup rendering.
                    "[lease_seconds, host, pools]", "[reason, worker]",
-                   "[reason, run_id, repo, source]"):
+                   "[reason, run_id, repo, source, pool]"):
         assert needle in text, needle
 
 
@@ -1002,3 +1003,22 @@ def test_an_unsatisfiable_job_shows_its_reason_in_the_job_list(api) -> None:
     assert job["state"] == "queued"
     listed = api.call("GET", "/jobs")[1]["jobs"][0]
     assert listed["reason"] == "no eligible worker (needs repo agentic-coding-monitor, sandbox)"
+
+
+def test_pause_routes_are_per_pool(api) -> None:
+    """Story 35.2-003: POST /pause takes a pool, DELETE /pause?pool= lifts just it."""
+    until = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    assert api.call("POST", "/pause", {"until": until, "pool": "claude-shared"})[1]["opened"]
+    assert api.call("POST", "/pause", {"until": until, "pool": "codex-shared"})[1]["opened"]
+
+    status, listing = api.call("GET", "/jobs")
+    assert status == 200
+    assert {p["pool"] for p in listing["pauses"]} == {"claude-shared", "codex-shared"}
+    assert listing["pause"] is not None  # the first window, for one-pool readers
+
+    assert api.call("DELETE", "/pause?pool=claude-shared")[0] == 200
+    assert [p["pool"] for p in api.call("GET", "/jobs")[1]["pauses"]] == ["codex-shared"]
+
+    assert api.call("DELETE", "/pause")[0] == 200
+    listing = api.call("GET", "/jobs")[1]
+    assert listing["pauses"] == [] and listing["pause"] is None

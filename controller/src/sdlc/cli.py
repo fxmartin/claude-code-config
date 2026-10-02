@@ -3483,22 +3483,24 @@ def queue_list_cmd(
     A rate-limit pause (Story 32.2-001) is reported as the **queue's** own
     state — one banner above the table — because that is what it is: one Max
     window shared by every repo, waited out once, not N independently parked
-    runs. ``--json`` emits ``{"pause": …|null, "jobs": [...]}`` for the same
-    reason: the pause needs somewhere to live that is not a job.
+    runs. ``--json`` emits ``{"pause": …|null, "pauses": [...], "jobs": [...]}``
+    for the same reason: the pause needs somewhere to live that is not a job.
+    With subscription pools (Story 35.2-003) each paused pool is its own line and
+    its own entry in ``pauses``; ``pause`` stays the first, for older readers.
     """
     from sdlc.queue_client import open_queue
 
     store = open_queue()
     rows = store.list_jobs()
     now = datetime.now(timezone.utc)
-    pause = store.dispatch_pause()
-    if pause is not None and not pause.is_active(now):
-        pause = None  # the window already reopened — not the queue's state now
+    # A window that already reopened is not the queue's state now.
+    pauses = [p for p in store.dispatch_pauses() if p.is_active(now)]
     if as_json:
         typer.echo(
             json.dumps(
                 {
-                    "pause": pause.to_dict() if pause else None,
+                    "pause": pauses[0].to_dict() if pauses else None,
+                    "pauses": [p.to_dict() for p in pauses],
                     "jobs": [r.to_dict() for r in rows],
                 },
                 default=str,
@@ -3506,9 +3508,10 @@ def queue_list_cmd(
         )
         raise typer.Exit(code=0)
 
-    if pause is not None:
+    for pause in pauses:  # one line per paused pool
         detail = f" · {pause.reason}" if pause.reason else ""
-        typer.echo(f"queue paused until {pause.paused_until}{detail}")
+        label = f" ({pause.pool})" if pause.pool else ""
+        typer.echo(f"queue paused{label} until {pause.paused_until}{detail}")
 
     if not rows:
         typer.echo("no jobs queued.")
@@ -3910,6 +3913,11 @@ def queue_unpause_cmd(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List what would be cleared; write nothing."
     ),
+    pool: str | None = typer.Option(
+        None,
+        "--pool",
+        help="Resume only this subscription pool (e.g. claude-shared); the others stay paused.",
+    ),
 ) -> None:
     """Declare the rate-limit window reset: clear the pause, re-arm parked runs.
 
@@ -3924,19 +3932,26 @@ def queue_unpause_cmd(
     re-parks the run with a fresh reset and the queue re-pauses — once. Each
     clear is audited on the queue (reason `operator`) and in every touched
     ledger. Nothing paused or parked exits 0 with "nothing to clear".
+
+    Story 35.2-003: on a fleet queue each subscription pool has its own window.
+    `--pool NAME` resumes just that pool — from any machine, against the fleet
+    queue — and re-arms only this host's runs that spend from it; without it
+    every pool resumes. Fleet clears are not written to the audit table, which
+    lives in the queue service's `queue.db`.
     """
+    from sdlc.queue_client import open_queue
     from sdlc.registry import Registry
     from sdlc.unpause import clear_rate_limit
 
-    store = _local_queue("unpause")
-    result = clear_rate_limit(store, Registry(), dry_run=dry_run)
+    result = clear_rate_limit(open_queue(), Registry(), pool=pool, dry_run=dry_run)
     if result.nothing_to_clear:
         typer.echo("nothing to clear")
         raise typer.Exit(code=0)
     verb = "would clear" if dry_run else "cleared"
-    if result.pause is not None:
-        detail = f" · {result.pause.reason}" if result.pause.reason else ""
-        typer.echo(f"{verb} queue pause until {result.pause.paused_until}{detail}")
+    for paused in result.pauses:
+        detail = f" · {paused.reason}" if paused.reason else ""
+        label = f" ({paused.pool})" if paused.pool else ""
+        typer.echo(f"{verb} queue pause{label} until {paused.paused_until}{detail}")
     for run in result.runs:
         stories = ", ".join(run.stories) or "no stories"
         typer.echo(
@@ -4005,7 +4020,7 @@ def queue_serve_cmd(
     \b
     API (JSON bodies; errors are {"error": "..."}):
       GET    /health                 {ok, controller_version} — `sdlc doctor`
-      GET    /jobs[?repo=PATH]       {pause, jobs} — `queue list --json`
+      GET    /jobs[?repo=PATH]       {pause, pauses, jobs} — `queue list --json`
       POST   /jobs                   add: repo, kind, scope, \\[priority, options,
                                      labels, host, pool, requirements] -> 201
       POST   /jobs/claim             worker, \\[lease_seconds, host, pools]
@@ -4021,8 +4036,8 @@ def queue_serve_cmd(
       POST   /jobs/{id}/cancel
       POST   /jobs/{id}/requeue
       POST   /jobs/{id}/prioritise   priority
-      POST   /pause                  until, \\[reason, run_id, repo, source]
-      DELETE /pause
+      POST   /pause                  until, \\[reason, run_id, repo, source, pool]
+      DELETE /pause[?pool=P]         one pool's window, or every window
     404 unknown job/route · 400 bad input · 409 not the claim holder or state
     refuses the move · 403 refused identity or a browser · 415 a body that is
     not Content-Type: application/json.
