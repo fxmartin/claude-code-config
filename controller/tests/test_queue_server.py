@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import urllib.error
@@ -710,7 +711,11 @@ def test_fleet_migration_adds_columns_to_an_old_queue_and_is_idempotent(tmp_path
 def test_serve_help_states_the_api_bind_rules_and_identity_model() -> None:
     result = CliRunner().invoke(app, ["queue", "serve", "--help"])
     assert result.exit_code == 0, result.output
-    text = " ".join(result.output.split())
+    # Typer forces Rich colour when GITHUB_ACTIONS is set, and its option
+    # highlighter styles `--allow` as two spans (`-` + `-allow`), so match on
+    # the rendered text with the SGR escapes stripped.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    text = " ".join(plain.split())
     for needle in ("POST /jobs/claim", "DELETE /pause", "never binds 0.0.0.0",
                    "tailscale whois", "SDLC_QUEUE_TOKEN", "--allow", "403",
                    "Origin", "415",
