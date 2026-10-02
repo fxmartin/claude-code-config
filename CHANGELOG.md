@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.93.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): resident worker on the m3 max (#35.2-004) (#822)
+
+
 ## [v2.92.0] - 2026-10-02
 
 ### Added
