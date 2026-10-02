@@ -476,3 +476,54 @@ def test_the_modal_still_fetches_the_dashboards_own_api_logs() -> None:
     # The XPS dashboard fetches the worker server-side, so the page keeps one origin.
     fn = _PAGE[_PAGE.index("async function openSession("):]
     assert 'fetch("/api/logs" + q' in fn[: fn.index("\n}\n")]
+
+
+@contextmanager
+def _raw_worker(response: bytes):
+    """A one-shot worker that answers any request with fixed raw HTTP bytes."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def answer() -> None:
+        conn, _ = srv.accept()
+        conn.recv(4096)
+        conn.sendall(response)
+        conn.close()
+
+    threading.Thread(target=answer, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.getsockname()[1]}"
+    finally:
+        srv.close()
+
+
+def _ok(body: bytes) -> bytes:
+    return b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n" + body
+
+
+def test_a_worker_answering_a_json_non_object_is_unreachable() -> None:
+    from sdlc.dashboard import _fetch_worker_json, _WorkerUnreachable
+
+    with _raw_worker(_ok(b"[1, 2]")) as origin:
+        with pytest.raises(_WorkerUnreachable, match="not a dashboard response"):
+            _fetch_worker_json(origin, "/api/logs", {"run": "r"})
+
+
+def test_a_worker_answer_over_the_size_cap_is_refused(monkeypatch) -> None:
+    from sdlc import dashboard
+    from sdlc.dashboard import _fetch_worker_json, _WorkerUnreachable
+
+    monkeypatch.setattr(dashboard, "_WORKER_LOGS_MAX_BYTES", 8)
+    with _raw_worker(_ok(b'{"transcripts": []}')) as origin:
+        with pytest.raises(_WorkerUnreachable, match="more than a transcript viewer"):
+            _fetch_worker_json(origin, "/api/logs", {"run": "r"})
+
+
+def test_a_worker_redirect_is_an_error_not_a_hop_to_another_host() -> None:
+    from sdlc.dashboard import _fetch_worker_json, _WorkerUnreachable
+
+    redirect = b"HTTP/1.0 302 Found\r\nLocation: http://169.254.169.254/\r\n\r\n"
+    with _raw_worker(redirect) as origin:
+        with pytest.raises(_WorkerUnreachable, match="did not answer"):
+            _fetch_worker_json(origin, "/api/logs", {"run": "r"})
