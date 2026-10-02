@@ -1597,3 +1597,49 @@ def test_run_doctor_queue_service_defaults_to_the_launchagents_plist(
 ) -> None:
     # HOME is a fresh tmp dir (autouse fixture): no plist, so not applicable.
     assert _finding(_doctor(tmp_path), "queue-service").status == "CLEAN"
+
+
+def _plist_with_args(tmp_path: Path, args: list[str]) -> Path:
+    path = tmp_path / "com.fxmartin.sdlc-queue.plist"
+    path.write_bytes(plistlib.dumps({"ProgramArguments": args}))
+    return path
+
+
+def test_queue_service_non_numeric_port_reads_as_down(tmp_path: Path) -> None:
+    plist = _plist_with_args(tmp_path, ["sdlc", "queue", "serve", "--bind", "host:notaport"])
+    finding = check_queue_service(plist, probe=lambda h, p: True)
+    assert finding.status == "FAIL"
+    assert "nothing is listening on host:notaport" in finding.detail
+
+
+def test_queue_service_accepts_the_equals_bind_form(tmp_path: Path) -> None:
+    seen: list[tuple[str, int]] = []
+    plist = _plist_with_args(tmp_path, ["sdlc", "queue", "serve", "--bind=10.0.0.1:9000"])
+    finding = check_queue_service(
+        plist,
+        probe=lambda h, p: seen.append((h, p)) or True,
+        queue_path=Path.home() / ".sdlc" / "queue.db",
+    )
+    assert seen == [("10.0.0.1", 9000)]
+    assert finding.status == "CLEAN"
+
+
+def test_queue_service_strips_ipv6_brackets_for_the_probe(tmp_path: Path) -> None:
+    seen: list[tuple[str, int]] = []
+    plist = _plist_with_args(tmp_path, ["sdlc", "queue", "serve", "--bind", "[::1]:9000"])
+    check_queue_service(plist, probe=lambda h, p: seen.append((h, p)) or True)
+    assert seen == [("::1", 9000)]
+
+
+def test_queue_service_dangling_bind_flag_fails(tmp_path: Path) -> None:
+    plist = _plist_with_args(tmp_path, ["sdlc", "queue", "serve", "--bind"])
+    finding = check_queue_service(plist, probe=lambda h, p: True)
+    assert finding.status == "FAIL"
+    assert "--bind" in finding.detail
+
+
+def test_queue_service_store_falls_back_to_xdg_then_home() -> None:
+    from sdlc.doctor import _service_store_path
+
+    assert _service_store_path({"XDG_STATE_HOME": "/x"}) == Path("/x/sdlc/queue.db")
+    assert _service_store_path({}) == Path.home() / ".sdlc" / "queue.db"
