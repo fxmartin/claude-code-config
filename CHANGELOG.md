@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.88.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): `--enqueue` targets the fleet, with (#35.3-001)
+
+### Fixed
+
+- fix(fleet-execution): `--enqueue` targets the fleet, with (#35.3-001)
+- fix(fleet-execution): `--enqueue` targets the fleet, with (#35.3-001)
+
+
 ## [v2.87.0] - 2026-10-02
 
 ### Added
