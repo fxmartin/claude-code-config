@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.94.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): repo auto-sync before dispatch (#35.2-002)
+
+### Fixed
+
+- fix(fleet-execution): repo auto-sync before dispatch (#35.2-002)
+- fix(fleet-execution): repo auto-sync before dispatch (#35.2-002)
+- fix(fleet-execution): repo auto-sync before dispatch (#35.2-002)
+- fix(fleet-execution): repo auto-sync before dispatch (#35.2-002)
+
+
 ## [v2.93.0] - 2026-10-02
 
 ### Added
