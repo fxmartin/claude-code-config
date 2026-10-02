@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.86.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): resident service on home-lab (#35.1-003)
+
+### Fixed
+
+- fix(fleet-execution): resident service on home-lab (#35.1-003)
+- fix(fleet-execution): resident service on home-lab (#35.1-003)
+
+
 ## [v2.85.0] - 2026-10-02
 
 ### Added
