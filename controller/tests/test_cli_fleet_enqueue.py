@@ -236,6 +236,37 @@ def test_known_workers_is_none_when_the_route_is_missing(fleet) -> None:
     assert QueueClient(fleet.url, token=TOKEN).known_workers() is None
 
 
+def test_known_workers_rejects_a_malformed_registry() -> None:
+    from sdlc.queue_client import QueueUnavailable
+
+    client = QueueClient("http://q:1", opener=lambda req, timeout: _Resp(200, {"workers": [{"worker": "m3max"}]}))
+    with pytest.raises(QueueUnavailable, match="malformed worker list"):
+        client.known_workers()
+
+
+def test_known_workers_propagates_a_server_error() -> None:
+    from sdlc.queue_client import QueueUnavailable
+
+    client = QueueClient("http://q:1", opener=lambda req, timeout: _Resp(500, {"error": "boom"}))
+    with pytest.raises(QueueUnavailable):
+        client.known_workers()
+
+
+def test_known_workers_propagates_a_client_error() -> None:
+    from sdlc.queue_client import QueueRequestError
+
+    client = QueueClient("http://q:1", opener=lambda req, timeout: _Resp(400, {"error": "bad"}))
+    with pytest.raises(QueueRequestError):
+        client.known_workers()
+
+
+def test_invalid_repo_harness_file_is_a_parse_error(fleet, repo) -> None:
+    (repo / ".sdlc-harness.yaml").write_text("harness:\n  default: [unclosed\n")
+    result = runner.invoke(app, ["build", "12.4-005", "--enqueue"])
+    assert result.exit_code == 2
+    assert fleet.list_jobs() == []
+
+
 # --- AC3: list columns -------------------------------------------------------
 
 
