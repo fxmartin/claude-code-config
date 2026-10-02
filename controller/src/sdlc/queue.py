@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 __all__ = [
+    "CANCEL_REQUESTED_REASON",
     "CODEX_POOL",
     "DEFAULT_BUDGETS",
     "HEARTBEAT_SECONDS",
@@ -41,6 +42,10 @@ __all__ = [
 # Queue filename under the chosen state directory — a sibling of registry.json
 # under the same host state dir (registry.py's default_registry_path()).
 _QUEUE_NAME = "queue.db"
+
+# What `queue list` shows beside a ``running`` job whose cancel is on its way to
+# the worker (Story 35.4-003).
+CANCEL_REQUESTED_REASON = "cancel requested"
 
 # How long a contended writer waits out the WAL writer lock before erroring
 # "database is locked". Mirrors the ledger's LEDGER_BUSY_TIMEOUT_MS
@@ -87,12 +92,13 @@ _STATES = {
 # outcome the scheduler reports.
 _TERMINAL_STATES = {"done", "failed", "blocked", "needs_attention"}
 
-# States an operator may retire. ``queued`` is the everyday case; ``blocked``
+# States an operator may retire at once. ``queued`` is the everyday case; ``blocked``
 # is here because Story 32.1-002 introduced that park and it would otherwise be
 # a dead end; ``parked`` is here because Story 32.2-002's approval wait must be
 # abandonable when FX decides the change request is not going to be approved. A
-# ``running`` job belongs to a live scheduler and its child, and a
-# ``done``/``failed`` job is history worth keeping — neither is cancellable.
+# ``running`` job belongs to a live scheduler and its child, so cancelling it
+# only *asks* that holder to stop (``cancel_requested``, Story 35.4-003); a
+# ``done``/``failed`` job is history worth keeping and is not cancellable.
 _CANCELLABLE_STATES = {"queued", "blocked", "parked", "needs_attention"}
 
 # States an operator may re-arm with :meth:`QueueStore.requeue_job`. ``queued``
@@ -380,6 +386,10 @@ class JobRecord:
     pool: str | None = None
     requirements: str | None = None
     worker: str | None = None
+    # Story 35.4-003: an operator asked for this ``running`` job to stop. The
+    # holder sees it on its next pass, kills the run's process group and
+    # finishes the job ``cancelled``.
+    cancel_requested: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -405,6 +415,7 @@ class JobRecord:
             "pool": self.pool,
             "requirements": self.requirements,
             "worker": self.worker,
+            "cancel_requested": self.cancel_requested,
         }
 
     def job_budget(self) -> JobBudget:
@@ -594,7 +605,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     host        TEXT,
     pool        TEXT,
     requirements TEXT,
-    worker      TEXT
+    worker      TEXT,
+    cancel_requested INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -679,6 +691,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (7, "fleet_workers", "workers", [], _WORKERS_DDL),
     # Story 35.2-003: per-pool pause windows, replacing ``queue_state``'s one row.
     (8, "queue_pauses", "queue_pauses", [], _QUEUE_PAUSES_DDL + _QUEUE_PAUSES_BACKFILL),
+    # Story 35.4-003: a cancel aimed at a running job, for its worker to act on.
+    (9, "job_cancel_requested", "jobs", [("cancel_requested", "INTEGER")], None),
 ]
 
 
@@ -1093,21 +1107,42 @@ class QueueStore:
             return int(cur.lastrowid)
 
     def cancel_job(self, job_id: int) -> None:
-        """Retire a job that is not live; refuse a ``running`` one.
+        """Retire a job that is not live; ask the holder of a ``running`` one to stop.
 
         ``queued`` is the everyday case. A *parked* job (``blocked`` — Story
         32.1-002's version-check terminal) is accepted too: it is not live, so
         cancelling it is safe, and without this it would sit in `queue list`
         forever with no way out. A ``running`` job still belongs to a scheduler
-        and its child process, so it is refused — stop the scheduler instead.
+        and its child process, so it is only *flagged* (Story 35.4-003): the
+        holder sees ``cancel_requested`` on its next pass, kills the run's
+        process group and finishes the job ``cancelled``. A ``running`` job
+        nobody holds has no one to read the flag, so it is retired outright.
         """
         job = self.get_job(job_id)
         if job is None:
             raise QueueError(f"unknown job id: {job_id}")
+        if job.state == "running":
+            with self._connect() as conn:
+                # The holder is re-checked in the UPDATE itself: a scheduler that
+                # reclaimed the job since the read above now drives a live run,
+                # and retiring the row under it would orphan that run.
+                retired = conn.execute(
+                    "UPDATE jobs SET state = 'cancelled', cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ? AND state = 'running' AND claimed_by IS NULL",
+                    (_now_iso(), job_id),
+                ).rowcount
+                if not retired:
+                    # Only the holder may stop a live run, so this just leaves it a note.
+                    conn.execute(
+                        "UPDATE jobs SET cancel_requested = 1, reason = ?, updated_at = ? "
+                        "WHERE id = ? AND state = 'running'",
+                        (CANCEL_REQUESTED_REASON, _now_iso(), job_id),
+                    )
+            return
         if job.state not in _CANCELLABLE_STATES:
             raise QueueError(
                 f"cannot cancel job {job_id}: state is {job.state} "
-                f"(cancellable: {', '.join(sorted(_CANCELLABLE_STATES))})"
+                f"(cancellable: {', '.join(sorted(_CANCELLABLE_STATES | {'running'}))})"
             )
         self._set_state(job_id, "cancelled")
 
@@ -1155,17 +1190,21 @@ class QueueStore:
                 f"(requeueable: {', '.join(sorted(_REQUEUEABLE_STATES))})"
             )
         moment = _at(now).isoformat()
+        # The requeue *is* the operator's newer word, so any cancel flag left on
+        # the row is stale — kept, it would re-cancel the job on its next pass.
         with self._connect() as conn:
             if job.run_id:
                 conn.execute(
                     "UPDATE jobs SET state = 'running', claimed_by = NULL, worker = NULL, "
-                    "lease_until = ?, reason = NULL, updated_at = ? WHERE id = ?",
+                    "lease_until = ?, reason = NULL, cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ?",
                     (moment, moment, job_id),
                 )
             else:
                 conn.execute(
                     "UPDATE jobs SET state = 'queued', claimed_by = NULL, worker = NULL, "
-                    "lease_until = NULL, reason = NULL, updated_at = ? WHERE id = ?",
+                    "lease_until = NULL, reason = NULL, cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ?",
                     (moment, job_id),
                 )
 
@@ -1925,7 +1964,18 @@ class QueueStore:
             return
         moment = _at(now).isoformat()
         with self._connect() as conn:
-            if job.run_id:
+            if job.cancel_requested:
+                # The operator already said stop: handing the job back would
+                # have the next scheduler resume (or restart) what was cancelled.
+                # The release's own reason (an interrupt, a rate-limit wait)
+                # would read as if the job were coming back, so it is not kept.
+                conn.execute(
+                    "UPDATE jobs SET state = 'cancelled', claimed_by = NULL, worker = NULL, "
+                    "lease_until = NULL, cancel_requested = 0, reason = ?, updated_at = ? "
+                    "WHERE id = ? AND claimed_by = ?",
+                    ("cancelled by operator", moment, job_id, claimed_by),
+                )
+            elif job.run_id:
                 conn.execute(
                     "UPDATE jobs SET claimed_by = NULL, worker = NULL, lease_until = ?, reason = ?, "
                     "updated_at = ? WHERE id = ? AND claimed_by = ?",
@@ -1959,20 +2009,23 @@ class QueueStore:
 
         The four terminals are ``done``, ``failed``, ``blocked`` (the run parked
         itself, or the scheduler refused to start it) and ``needs_attention``
-        (the queue's own budget breaker stopped it).
+        (the queue's own budget breaker stopped it); ``cancelled`` is also
+        accepted, for a holder that has stopped a job whose cancel was requested.
 
         ``claimed_by`` (Story 35.1-001) stamps the job only while that holder
         still owns the claim, checked in the UPDATE itself — a check read first
         could be overtaken by another process's reclaim.
         """
-        if state not in _TERMINAL_STATES:
+        finishable = _TERMINAL_STATES | {"cancelled"}  # the holder's ack of a cancel request
+        if state not in finishable:
             raise QueueError(
                 f"invalid terminal state: {state!r} "
-                f"(expected one of {sorted(_TERMINAL_STATES)})"
+                f"(expected one of {sorted(finishable)})"
             )
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = ?, claimed_by = NULL, worker = NULL, lease_until = NULL, "
+                "cancel_requested = 0, "
                 "reason = ?, updated_at = ? WHERE id = ? AND (? IS NULL OR claimed_by = ?)",
                 (state, reason, _now_iso(), job_id, claimed_by, claimed_by),
             )
@@ -1995,7 +2048,7 @@ class QueueStore:
         pr_number: int,
         reason: str,
         poll_after: datetime | None,
-    ) -> None:
+    ) -> bool:
         """Park a job on ``pr_number`` pending a human's approval.
 
         ``AWAITING_APPROVAL`` is terminal for a *run* — ``build.py`` stops there
@@ -2004,6 +2057,13 @@ class QueueStore:
         keeps its ``run_id`` (so the resume that follows is a resume, never a
         restart), records the CR to watch, and drops its claim and lease so its
         repo and its agent slot go straight back to the pool.
+
+        A job whose cancel was requested (Story 35.4-003) is finished
+        ``cancelled`` instead, and ``False`` returned: parking would hand it back
+        for an approval to resume — the very thing the operator stopped — the
+        same call :meth:`release_claim` makes. Its ``pr_number`` is still kept.
+        So is a job already ``cancelled``: a peer drain retired it while its
+        holder stalled, and that holder's late park must not bring it back.
 
         Refuses a job with no ``run_id``: without a run there is nothing for an
         approval to release, and a job that never started belongs in ``queued``.
@@ -2016,6 +2076,17 @@ class QueueStore:
                 f"cannot park job {job_id}: it opened no run to resume later"
             )
         with self._connect() as conn:
+            # One transaction: a cancel landing mid-park is either honoured here
+            # or refused by cancel_job's ``state = 'running'`` guard — never left
+            # on a parked row for a take-back or a requeue to act on later.
+            cancelled = conn.execute(
+                "UPDATE jobs SET state = 'cancelled', claimed_by = NULL, worker = NULL, "
+                "lease_until = NULL, cancel_requested = 0, pr_number = ?, reason = ?, "
+                "updated_at = ? WHERE id = ? AND (cancel_requested = 1 OR state = 'cancelled')",
+                (pr_number, "cancelled by operator", _now_iso(), job_id),
+            ).rowcount
+            if cancelled:
+                return False
             conn.execute(
                 "UPDATE jobs SET state = 'parked', claimed_by = NULL, worker = NULL, "
                 "lease_until = NULL, pr_number = ?, poll_after = ?, reason = ?, "
@@ -2028,6 +2099,7 @@ class QueueStore:
                     job_id,
                 ),
             )
+        return True
 
     def schedule_poll(self, job_id: int, poll_after: datetime | None) -> None:
         """Set the earliest instant this job's change request may be read again.
@@ -2075,8 +2147,8 @@ class QueueStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = 'running', claimed_by = ?, lease_until = ?, "
-                "poll_after = NULL, reason = NULL, updated_at = ?, worker = ? "
-                "WHERE id = ? AND state = 'parked' "
+                "poll_after = NULL, reason = NULL, cancel_requested = 0, updated_at = ?, "
+                "worker = ? WHERE id = ? AND state = 'parked' "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM jobs AS busy "
                 "  WHERE busy.repo = jobs.repo AND busy.state = 'running'"
@@ -2232,6 +2304,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         pool=_optional_column(row, "pool"),
         requirements=_optional_column(row, "requirements"),
         worker=_optional_column(row, "worker"),
+        cancel_requested=bool(_optional_column(row, "cancel_requested")),
     )
 
 

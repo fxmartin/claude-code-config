@@ -1748,12 +1748,36 @@ what `sdlc queue list --json` emits.
 | `POST /workers` · `GET /workers` | `register_worker` · `list_workers` | register a worker, or heartbeat (the same call): `worker, host` + optional `pools[], harnesses[], sandbox, repos[], slots, slots_free`; `GET` returns `{workers}` with an `online` flag each (Story 35.2-001, see below) |
 | `POST /jobs/{id}/renew` · `/release` | `renew_lease` · `release_claim` | `worker` must hold the claim, else 409 |
 | `POST /jobs/{id}/finish` | `finish_job` | `state` (a terminal), optional `reason`, `worker` (when given, it must still hold the claim as the state is written — the check is in the UPDATE — else 409) |
-| `POST /jobs/{id}/cancel` · `/requeue` | `cancel_job` · `requeue_job` | a refused state change is 409 |
+| `POST /jobs/{id}/cancel` · `/requeue` | `cancel_job` · `requeue_job` | a refused state change is 409. Cancel of a `running` held job answers 200 with the job still `running` and `cancel_requested: true` (Story 35.4-003, below) |
 | `POST /jobs/{id}/prioritise` | `prioritise_job` | `priority` |
 | `POST /pause` · `DELETE /pause[?pool=P]` | `pause_dispatch` · `clear_pause` | `until` (ISO-8601) + optional `reason, run_id, repo, source, pool`; returns `{opened, pause}`. `DELETE` is the bare `clear_pause` (one pool's window with `?pool=`, else every window) — no audit row, no re-arm of `RATE_LIMITED` runs — so it is not `sdlc queue unpause` |
 
 An unknown job is 404, bad input 400, an oversized (> 1 MiB) body 413, a body
 that is not `Content-Type: application/json` 415.
+
+**Cancelling a running job (Story 35.4-003).** The queue never kills a process —
+the run lives on the worker's machine. `cancel_job` on a `running` job that has a
+holder sets `jobs.cancel_requested` (migration 9) and writes `cancel requested`
+as its reason; a `running` job nobody holds is retired at once (the UPDATE
+re-checks that no one holds it, so a job reclaimed meanwhile is flagged
+instead). The holding scheduler reads the flag every pass (`_honour_cancels`,
+before `_renew`, so a lease is never extended on a doomed job), stops the run through
+`JobProcess.stop()` — the process-group SIGTERM→SIGKILL kill of Story 13.4-001 —
+and finishes the job `cancelled` (`finish_job` accepts it as the holder's
+acknowledgement), which clears the claim, lease and flag. A claim released with
+the flag set (worker interrupted) retires the job rather than resuming it, and
+so does a lapsed lease — but only once the run is gone too. A job whose run's
+pid still answers is not retired: only its holder can stop that run, and
+retiring the row under it would leave the run going, unwatched, behind a
+`cancelled` row — so it stays flagged until the run ends, then is retired, never
+resumed. A holder that finds its job already `cancelled` (a peer drain retired it
+while the holder stalled past its lease) still stops its run. A run that stops
+`AWAITING_APPROVAL` before its holder saw the flag, or after a peer retired the
+job, is not parked: `park_job` leaves it `cancelled` rather than parking it for
+an approval to resume. `requeue` and an approval's take-back clear
+any leftover flag, so a re-armed job is never re-cancelled. The run's own ledger
+is left as it stood. A `queue run` started before this change does not read the
+flag — restart it after upgrading, or a cancel only waits for the run to end.
 `claim_next` is `peek_claimable` in dispatch order, filtered to the caller's
 `host`/`pools` (a job pinned to a `host` goes only there; a `pool` job only to a
 worker serving it), then the existing guarded `claim_job` UPDATE — so the lease
