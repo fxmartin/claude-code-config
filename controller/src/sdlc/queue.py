@@ -1400,12 +1400,23 @@ class QueueStore:
                 (run_id, _now_iso(), job_id),
             )
 
-    def finish_job(self, job_id: int, state: str, *, reason: str | None = None) -> None:
-        """Stamp a job terminal and drop its lease.
+    def finish_job(
+        self,
+        job_id: int,
+        state: str,
+        *,
+        reason: str | None = None,
+        claimed_by: str | None = None,
+    ) -> bool:
+        """Stamp a job terminal and drop its lease; ``False`` when nothing matched.
 
         The four terminals are ``done``, ``failed``, ``blocked`` (the run parked
         itself, or the scheduler refused to start it) and ``needs_attention``
         (the queue's own budget breaker stopped it).
+
+        ``claimed_by`` (Story 35.1-001) stamps the job only while that holder
+        still owns the claim, checked in the UPDATE itself — a check read first
+        could be overtaken by another process's reclaim.
         """
         if state not in _TERMINAL_STATES:
             raise QueueError(
@@ -1413,11 +1424,12 @@ class QueueStore:
                 f"(expected one of {sorted(_TERMINAL_STATES)})"
             )
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE jobs SET state = ?, claimed_by = NULL, worker = NULL, lease_until = NULL, "
-                "reason = ?, updated_at = ? WHERE id = ?",
-                (state, reason, _now_iso(), job_id),
+                "reason = ?, updated_at = ? WHERE id = ? AND (? IS NULL OR claimed_by = ?)",
+                (state, reason, _now_iso(), job_id, claimed_by, claimed_by),
             )
+            return cur.rowcount == 1
 
     def set_reason(self, job_id: int, reason: str | None) -> None:
         """Record why a job is not progressing (e.g. ``repo busy``) without moving it."""

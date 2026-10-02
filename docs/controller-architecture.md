@@ -1741,12 +1741,13 @@ what `sdlc queue list --json` emits.
 | `POST /jobs` | `add_job` | `repo, kind, scope` + optional `priority, options[], labels[], host, pool, requirements{repo,harness,sandbox}`; 201 |
 | `POST /jobs/claim` | `claim_next` | `worker` + optional `lease_seconds, host, pools[]`; the best claimable job, or 204. Held while the queue is paused. |
 | `POST /jobs/{id}/renew` · `/release` | `renew_lease` · `release_claim` | `worker` must hold the claim, else 409 |
-| `POST /jobs/{id}/finish` | `finish_job` | `state` (a terminal), optional `reason`, `worker` (checked against the holder when given) |
+| `POST /jobs/{id}/finish` | `finish_job` | `state` (a terminal), optional `reason`, `worker` (when given, it must still hold the claim as the state is written — the check is in the UPDATE — else 409) |
 | `POST /jobs/{id}/cancel` · `/requeue` | `cancel_job` · `requeue_job` | a refused state change is 409 |
 | `POST /jobs/{id}/prioritise` | `prioritise_job` | `priority` |
-| `POST /pause` · `DELETE /pause` | `pause_dispatch` · `clear_pause` | `until` (ISO-8601) + optional `reason, run_id, repo, source`; returns `{opened, pause}` |
+| `POST /pause` · `DELETE /pause` | `pause_dispatch` · `clear_pause` | `until` (ISO-8601) + optional `reason, run_id, repo, source`; returns `{opened, pause}`. `DELETE` is the bare `clear_pause` — no audit row, no re-arm of `RATE_LIMITED` runs — so it is not `sdlc queue unpause` |
 
-An unknown job is 404, bad input 400, an oversized (> 1 MiB) body 413.
+An unknown job is 404, bad input 400, an oversized (> 1 MiB) body 413, a body
+that is not `Content-Type: application/json` 415.
 `claim_next` is `peek_claimable` in dispatch order, filtered to the caller's
 `host`/`pools` (a job pinned to a `host` goes only there; a `pool` job only to a
 worker serving it), then the existing guarded `claim_job` UPDATE — so the lease
@@ -1771,8 +1772,11 @@ literal in the tailnet space (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) or
 loopback (unreachable from the tailnet; for local development). Hostnames,
 LAN and public addresses are refused — by the CLI and again by `make_server`.
 A bind that fails (address in use, tailnet address not up) exits 2 with the
-reason. Each socket read has a 30-second deadline, so a stalled request cannot
-pin a handler thread.
+reason. Each socket read has a 30-second deadline, so a connection that goes
+silent is dropped rather than holding a handler thread. The deadline is per
+read, not per request: a peer that sends a byte inside every window still holds
+its thread (one per connection, uncapped), and only the tailnet-only bind limits
+who can do that.
 
 **Identity model.** A request is served only when all of these hold, else it is
 refused with 403 and a `WARNING` log line naming the peer and the reason:
@@ -1782,7 +1786,22 @@ refused with 403 and a `WARNING` log line naming the peer and the reason:
 2. either it presents `Authorization: Bearer $SDLC_QUEUE_TOKEN` — the shared
    secret for a host without the Tailscale CLI — or `tailscale whois --json
    <peer-ip>` returns a `UserProfile.LoginName` in the allowlist (`--allow`,
-   repeatable, plus comma-separated `SDLC_QUEUE_ALLOW`).
+   repeatable, plus comma-separated `SDLC_QUEUE_ALLOW`), and
+3. no browser sent it: it carries no `Origin` header (checked first).
+
+Gate (3) exists because whois vouches for a machine, not a program. A browser
+on an allowlisted host would lend that identity to any page it renders, and a
+page can POST cross-site with no CORS preflight (a `text/plain` form, a
+`no-cors` fetch) — enough to enqueue a build, pause the fleet or cancel a job.
+Browsers attach `Origin` to every POST and DELETE (`null` when they withhold the
+page) and a page cannot strip it; urllib, curl and the queue client never send
+it. A request body must also be `Content-Type: application/json` (415
+otherwise): no page can send that type cross-site without a preflight, which the
+service never answers, so it backs up (3) for a client that omits `Origin`. One
+gap stays open: a DNS-rebinding page can still *read* `GET /jobs`, because a
+same-origin GET carries no `Origin` and browsers send the `Sec-Fetch-*` headers
+only to HTTPS or localhost origins, never to `http://<tailnet-ip>`. That exposes
+job metadata, never a write; closing it needs a `Host` allowlist.
 
 The token never bypasses (1). Whois answers are cached per peer IP for 60 seconds
 (errors are not cached); a whois that cannot run admits nobody. With no allowlist
@@ -1791,7 +1810,8 @@ refused too (header values arrive latin-1 decoded, so it could never match). A
 gate that errors on a request answers 403, never a dropped connection. Tagged
 nodes carry no user login, so they authenticate by token. On a loopback bind,
 gate (1) admits loopback peers instead of the tailnet. Whois cannot vouch for a
-loopback peer, so local development authenticates by token. Add
+loopback peer, so local development authenticates by token, and a loopback bind
+without `SDLC_QUEUE_TOKEN` refuses to start. Add
 `SDLC_QUEUE_PATH` to point the service at a non-default store.
 
 **Schema.** One additive migration (`fleet_job_columns`) adds `host` (pin),

@@ -89,6 +89,23 @@ def _add(api, **overrides):
     return job
 
 
+def _raw(api, method: str, path: str, body: bytes = b"", headers=None):
+    """One request with exactly these headers — what a browser sends, not urllib.
+
+    Returns ``(status, lower-cased headers, raw body)``.
+    """
+    import http.client
+
+    host, port = api.url.removeprefix("http://").split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=10)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read()
+    finally:
+        conn.close()
+
+
 # --- routes ------------------------------------------------------------------
 
 
@@ -182,6 +199,15 @@ def test_claim_with_nothing_queued_is_204(api) -> None:
     assert body is None
 
 
+def test_a_204_carries_no_content_length(api) -> None:
+    # RFC 9110 §8.6: a server MUST NOT send Content-Length in a 204.
+    status, headers, raw = _raw(
+        api, "POST", "/jobs/claim", b'{"worker": "w"}', {"Content-Type": "application/json"}
+    )
+    assert status == 204 and raw == b""
+    assert "content-length" not in headers
+
+
 def test_claim_requires_a_worker(api) -> None:
     _add(api)
     assert api.call("POST", "/jobs/claim", {})[0] == 400
@@ -223,6 +249,39 @@ def test_finish_rejects_non_terminal_state(api) -> None:
     job = _add(api)
     api.call("POST", "/jobs/claim", {"worker": "w"})
     assert api.call("POST", f"/jobs/{job['id']}/finish", {"state": "queued"})[0] == 400
+
+
+def test_finish_cannot_land_on_a_claim_reclaimed_after_the_holder_check(
+    api, store, monkeypatch
+) -> None:
+    # m3max's lease lapsed and a local `sdlc queue run` reclaimed the job
+    # between the route reading the holder and writing the terminal state.
+    job = _add(api)
+    api.call("POST", "/jobs/claim", {"worker": "m3max", "lease_seconds": 60})
+    stale = store.get_job(job["id"])
+    later = datetime.now(timezone.utc) + timedelta(seconds=120)
+    store.reclaim_job(job["id"], claimed_by="local:1", lease_seconds=600, now=later)
+    real_get = store.get_job
+    reads = iter([stale])
+    monkeypatch.setattr(store, "get_job", lambda job_id: next(reads, None) or real_get(job_id))
+
+    status, _ = api.call("POST", f"/jobs/{job['id']}/finish", {"state": "done", "worker": "m3max"})
+
+    assert status == 409
+    held = real_get(job["id"])
+    assert (held.state, held.claimed_by) == ("running", "local:1")
+
+
+def test_finish_job_with_a_holder_writes_only_while_it_still_holds(store) -> None:
+    job_id = store.add_job(repo="/r/a", kind="build", scope="epic-1")
+    store.claim_job(job_id, claimed_by="m3max", lease_seconds=60)
+    later = datetime.now(timezone.utc) + timedelta(seconds=120)
+    store.reclaim_job(job_id, claimed_by="local:1", lease_seconds=600, now=later)
+
+    assert store.finish_job(job_id, "done", claimed_by="m3max") is False
+    assert store.get_job(job_id).state == "running"
+    assert store.finish_job(job_id, "done", claimed_by="local:1") is True
+    assert store.get_job(job_id).state == "done"
 
 
 def test_cancel_requeue_prioritise(api) -> None:
@@ -281,7 +340,12 @@ def test_pause_rejects_a_bad_timestamp(api) -> None:
 
 def test_unknown_route_404_malformed_and_oversized_bodies(api) -> None:
     assert api.call("GET", "/nope")[0] == 404
-    req = urllib.request.Request(api.url + "/jobs", data=b"{not json", method="POST")
+    req = urllib.request.Request(
+        api.url + "/jobs",
+        data=b"{not json",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req, timeout=10)
     assert exc.value.code == 400
@@ -307,6 +371,102 @@ def test_concurrent_claims_give_each_job_exactly_one_winner(api, store) -> None:
     assert sorted(won) == sorted(ids)  # every job claimed, none twice
     assert sum(1 for status, _ in results if status == 204) == 6
     assert {j.state for j in store.list_jobs()} == {"running"}
+
+
+def test_claim_next_loses_a_raced_job_to_its_claimer_and_takes_the_next(store) -> None:
+    # The service's lock never sees a local `sdlc queue run`: its claim can land
+    # between claim_next's peek and its UPDATE. The guarded UPDATE must refuse
+    # us, leave the job with its winner, and let us move on to the next one.
+    raced = store.add_job(repo="/r/a", kind="build", scope="epic-1")
+    spare = store.add_job(repo="/r/b", kind="build", scope="epic-2")
+    real_claim = store.claim_job
+
+    def claim_after_a_local_drain(job_id, **kwargs):
+        if job_id == raced:
+            assert real_claim(job_id, claimed_by="local:1", lease_seconds=60) is not None
+        return real_claim(job_id, **kwargs)
+
+    store.claim_job = claim_after_a_local_drain
+
+    won = store.claim_next(claimed_by="m3max", lease_seconds=60)
+
+    assert won is not None and won.id == spare and won.claimed_by == "m3max"
+    assert store.get_job(raced).claimed_by == "local:1"
+
+
+# --- browser-originated requests ----------------------------------------------
+
+# What a hostile page can send with no CORS preflight: a text/plain form whose
+# field name/value split forges a JSON body, the same as a urlencoded form, and
+# a body-less POST to a job verb.
+_FORGED_JOB = b'{"repo":"/r/x","kind":"build","scope":"all","options":["--auto"],"pad":"=x"}'
+
+
+@pytest.mark.parametrize(
+    "path,body,content_type",
+    [
+        ("/jobs", _FORGED_JOB, "text/plain"),
+        ("/jobs", _FORGED_JOB, "application/x-www-form-urlencoded"),
+        ("/pause", b'{"until":"2099-01-01T00:00:00+00:00","pad":"=x"}', "text/plain"),
+        ("/jobs/1/cancel", b"", "text/plain"),
+    ],
+)
+def test_a_cross_site_browser_post_is_403_and_writes_nothing(
+    api, store, caplog, path, body, content_type
+) -> None:
+    seeded = store.add_job(repo="/r/a", kind="build", scope="epic-1")  # id 1
+    with caplog.at_level("WARNING", logger="sdlc.queue_server"):
+        status, _, _ = _raw(
+            api, "POST", path, body,
+            {"Origin": "http://evil.example", "Content-Type": content_type},
+        )
+    assert status == 403
+    assert [(j.id, j.state) for j in store.list_jobs()] == [(seeded, "queued")]
+    assert store.dispatch_pause() is None
+    assert "refused" in caplog.text and "Origin" in caplog.text
+
+
+@pytest.mark.parametrize("origin", ["null", "service"])
+def test_any_origin_is_refused_even_null_or_the_service_own(api, store, origin) -> None:
+    # `null` is what a browser sends when it withholds the page; the service's
+    # own origin is what a DNS-rebinding page's same-origin POST carries.
+    origin = api.url if origin == "service" else origin
+    body = json.dumps({"repo": "/r/a", "kind": "build", "scope": "epic-1"}).encode()
+    status, _, _ = _raw(
+        api, "POST", "/jobs", body, {"Origin": origin, "Content-Type": "application/json"}
+    )
+    assert status == 403
+    assert store.list_jobs() == []
+
+
+def test_a_request_body_must_be_json_or_it_is_415(api, store) -> None:
+    # Backs up the Origin gate for a client that omits Origin: no page can send
+    # application/json cross-site without a preflight the service never answers.
+    body = json.dumps({"repo": "/r/a", "kind": "build", "scope": "epic-1"}).encode()
+    assert _raw(api, "POST", "/jobs", body, {"Content-Type": "text/plain"})[0] == 415
+    assert _raw(api, "POST", "/jobs", body)[0] == 415  # no Content-Type at all
+    assert store.list_jobs() == []
+    status, _, _ = _raw(
+        api, "POST", "/jobs", body, {"Content-Type": "application/json; charset=utf-8"}
+    )
+    assert status == 201
+
+
+def test_control_characters_from_a_peer_are_escaped_in_the_log(store, caplog) -> None:
+    import socket
+
+    # A refused peer: its request line is logged before any identity is known.
+    running = _Running(store, _policy(whois=lambda ip: "stranger@example.com"))
+    host, port = running.url.removeprefix("http://").split(":")
+    try:
+        with caplog.at_level("INFO", logger="sdlc.queue_server"):
+            with socket.create_connection((host, int(port)), timeout=10) as sock:
+                sock.sendall(b"GET /jobs\x1b[2J HTTP/1.0\r\n\r\n")
+                assert sock.recv(4096).startswith(b"HTTP/1.0 403")
+    finally:
+        running.stop()
+    assert "\x1b" not in caplog.text
+    assert caplog.text.count("\\x1b[2J") >= 2  # the refusal and the access line
 
 
 # --- identity / 403 -----------------------------------------------------------
@@ -552,7 +712,11 @@ def test_serve_help_states_the_api_bind_rules_and_identity_model() -> None:
     assert result.exit_code == 0, result.output
     text = " ".join(result.output.split())
     for needle in ("POST /jobs/claim", "DELETE /pause", "never binds 0.0.0.0",
-                   "tailscale whois", "SDLC_QUEUE_TOKEN", "--allow", "403"):
+                   "tailscale whois", "SDLC_QUEUE_TOKEN", "--allow", "403",
+                   "Origin", "415",
+                   # Optional fields survive Rich markup rendering.
+                   "[lease_seconds, host, pools]", "[reason, worker]",
+                   "[reason, run_id, repo, source]"):
         assert needle in text, needle
 
 
@@ -593,6 +757,20 @@ def test_serve_on_loopback_admits_loopback_peers_by_token(tmp_path, monkeypatch)
     assert policy.authorize("127.0.0.1", "s3cret").allowed
     assert not policy.authorize("127.0.0.1", "wrong").allowed
     assert not policy.authorize("100.64.0.1", "s3cret").allowed
+
+
+def test_serve_on_loopback_without_a_token_refuses_to_start(tmp_path, monkeypatch) -> None:
+    # Whois cannot vouch for a loopback peer, so an allowlist alone would start
+    # a server that answers every call with 403.
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.delenv("SDLC_QUEUE_TOKEN", raising=False)
+    captured = _capture_serve(monkeypatch)
+    result = CliRunner().invoke(
+        app, ["queue", "serve", "--bind", "127.0.0.1:0", "--allow", "fx@example.com"]
+    )
+    assert result.exit_code == 2
+    assert "SDLC_QUEUE_TOKEN" in result.output
+    assert captured == {}  # never started
 
 
 def test_serve_on_a_tailnet_address_admits_only_tailnet_peers(tmp_path, monkeypatch) -> None:
@@ -711,7 +889,9 @@ def test_bad_content_length_is_400(api) -> None:
 
 
 def test_json_body_that_is_not_an_object_is_400(api) -> None:
-    req = urllib.request.Request(api.url + "/jobs", data=b"[1]", method="POST")
+    req = urllib.request.Request(
+        api.url + "/jobs", data=b"[1]", method="POST", headers={"Content-Type": "application/json"}
+    )
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req, timeout=10)
     assert exc.value.code == 400
@@ -731,12 +911,17 @@ def test_handler_bug_is_500_and_locked_store_is_503(api, store, monkeypatch) -> 
 
 
 def test_serve_runs_until_interrupted_and_closes_the_server(store, monkeypatch) -> None:
+    import signal
+
     calls: list[str] = []
+    before = signal.getsignal(signal.SIGTERM)
+    while_serving: list[object] = []
 
     class _Fake:
         server_address = ("127.0.0.1", 1234)
 
         def serve_forever(self) -> None:
+            while_serving.append(signal.getsignal(signal.SIGTERM))
             raise KeyboardInterrupt
 
         def server_close(self) -> None:
@@ -745,3 +930,5 @@ def test_serve_runs_until_interrupted_and_closes_the_server(store, monkeypatch) 
     monkeypatch.setattr("sdlc.queue_server.make_server", lambda *a, **k: _Fake())
     serve(store, _policy(), "127.0.0.1", 0)
     assert calls == ["closed"]
+    assert while_serving != [before]  # `kill` takes the graceful path while serving...
+    assert signal.getsignal(signal.SIGTERM) == before  # ...and the handler is handed back

@@ -3651,6 +3651,7 @@ def queue_prioritise_cmd(
     raise typer.Exit(code=0)
 
 
+# The help's `\\[` escapes stop Rich markup swallowing the `[optional]` API fields.
 @queue_app.command("serve")
 def queue_serve_cmd(
     bind: str = typer.Option(
@@ -3678,20 +3679,21 @@ def queue_serve_cmd(
     \b
     API (JSON bodies; errors are {"error": "..."}):
       GET    /jobs[?repo=PATH]       {pause, jobs} — `queue list --json`
-      POST   /jobs                   add: repo, kind, scope, [priority, options,
+      POST   /jobs                   add: repo, kind, scope, \\[priority, options,
                                      labels, host, pool, requirements] -> 201
-      POST   /jobs/claim             worker, [lease_seconds, host, pools]
+      POST   /jobs/claim             worker, \\[lease_seconds, host, pools]
                                      -> job, or 204 when nothing is claimable
-      POST   /jobs/{id}/renew        worker, [lease_seconds]
-      POST   /jobs/{id}/release      worker, [reason]
-      POST   /jobs/{id}/finish       state, [reason, worker]
+      POST   /jobs/{id}/renew        worker, \\[lease_seconds]
+      POST   /jobs/{id}/release      worker, \\[reason]
+      POST   /jobs/{id}/finish       state, \\[reason, worker]
       POST   /jobs/{id}/cancel
       POST   /jobs/{id}/requeue
       POST   /jobs/{id}/prioritise   priority
-      POST   /pause                  until, [reason, run_id, repo, source]
+      POST   /pause                  until, \\[reason, run_id, repo, source]
       DELETE /pause
     404 unknown job/route · 400 bad input · 409 not the claim holder or state
-    refuses the move · 403 refused identity.
+    refuses the move · 403 refused identity or a browser · 415 a body that is
+    not Content-Type: application/json.
 
     Bind rules: the service never binds 0.0.0.0 (or `::`); `--bind` must be a
     tailnet IP or loopback, and the same check runs again inside the server.
@@ -3705,7 +3707,12 @@ def queue_serve_cmd(
     nobody. With no allowlist and no token the service will not start. On a
     loopback bind (local development) the peer gate admits loopback instead
     of the tailnet; whois cannot vouch for a loopback peer, so it needs the
-    token.
+    token and will not start without one.
+
+    Browser-originated requests are refused (403) whatever the identity: any
+    request carrying an `Origin` header, which browsers attach to every POST
+    and DELETE and curl/urllib never send. Whois names a machine, not a
+    program, so this keeps a web page from spending the host's identity.
     """
     import ipaddress
     import logging
@@ -3728,11 +3735,18 @@ def queue_serve_cmd(
         # A loopback socket is reachable only from this host, so its peers are
         # loopback; gating them on the tailnet ranges would refuse every call.
         loopback = ipaddress.ip_address(host).is_loopback
+        token = os.environ.get("SDLC_QUEUE_TOKEN")
         policy = AccessPolicy(
             allow=allowed,
-            token=os.environ.get("SDLC_QUEUE_TOKEN"),
+            token=token,
             networks=LOOPBACK_NETWORKS if loopback else TAILNET_NETWORKS,
         )
+        if loopback and not token:
+            # An allowlist alone would start a server that refuses every call.
+            raise ValueError(
+                "a loopback --bind needs SDLC_QUEUE_TOKEN: tailscale whois "
+                "cannot vouch for a loopback peer"
+            )
     except (BindError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc

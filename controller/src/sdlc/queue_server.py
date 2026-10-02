@@ -55,7 +55,9 @@ MAX_BODY_BYTES = 1024 * 1024
 _DRAIN_LIMIT = 16 * 1024 * 1024
 # Per-socket-read deadline. The identity gate only runs once headers are in, so
 # without it any tailnet peer — allowlisted or not — could pin a handler thread
-# with a request that never finishes.
+# with a connection that goes silent. It bounds each read, not the request: a
+# peer that sends a byte inside every window still holds its thread, and only
+# the tailnet-only bind limits who can do that.
 _REQUEST_TIMEOUT_SECONDS = 30
 
 WHOIS_CACHE_SECONDS = 60
@@ -252,6 +254,16 @@ class AccessPolicy:
 # ---------------------------------------------------------------------------
 
 
+# Control characters as \xNN, as http.server's own log_message writes them
+# (gh-100001): request lines come from peers the gate has not vouched for yet.
+_CONTROL_ESCAPES = {c: rf"\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))}
+_CONTROL_ESCAPES[ord("\\")] = r"\\"
+
+
+def _printable(text: str) -> str:
+    return text.translate(_CONTROL_ESCAPES)
+
+
 class _ApiError(Exception):
     def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
@@ -390,12 +402,16 @@ class _Routes:
         job = _job(self.store, job_id)
         state = _required(body, "state")
         worker = _text(body, "worker")
-        if worker is not None:
-            _held_by(job, worker)
         try:
-            self.store.finish_job(job_id, state, reason=_text(body, "reason"))
+            # The holder check rides in the UPDATE itself: checked on a read
+            # first, a local reclaim could land in between and be overwritten.
+            finished = self.store.finish_job(
+                job_id, state, reason=_text(body, "reason"), claimed_by=worker
+            )
         except QueueError as exc:
             raise _ApiError(400, str(exc)) from exc
+        if not finished:
+            raise _ApiError(409, f"job {job.id} is not claimed by {worker!r}")
         return 200, _job(self.store, job_id).to_dict()
 
     def cancel(self, job_id: int, _body: Body) -> Reply:
@@ -491,17 +507,21 @@ class _Handler(BaseHTTPRequestHandler):
         self._dispatch("DELETE")
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        logger.info("%s - %s", self.address_string(), format % args)
+        logger.info("%s - %s", self.address_string(), _printable(format % args))
 
     def _dispatch(self, method: str) -> None:
         peer = self.client_address[0]
-        try:
-            decision = self.server.policy.authorize(peer, self._bearer())
-        except Exception as exc:  # noqa: BLE001 — the gate fails closed: a crash is a refusal
-            # The type only: an encode error's repr would carry the presented secret.
-            decision = Decision(False, f"authorization error ({type(exc).__name__})")
+        decision = self._browser_refusal()
+        if decision is None:
+            try:
+                decision = self.server.policy.authorize(peer, self._bearer())
+            except Exception as exc:  # noqa: BLE001 — the gate fails closed: a crash is a refusal
+                # The type only: an encode error's repr would carry the presented secret.
+                decision = Decision(False, f"authorization error ({type(exc).__name__})")
         if not decision.allowed:
-            logger.warning("refused %s %s from %s: %s", method, self.path, peer, decision.detail)
+            logger.warning(
+                "refused %s %s from %s: %s", method, _printable(self.path), peer, decision.detail
+            )
             self._send(403, {"error": "forbidden"})
             return
         try:
@@ -527,10 +547,25 @@ class _Handler(BaseHTTPRequestHandler):
             logger.error("queue store busy/unavailable: %s", exc)
             self._send(503, {"error": "queue store unavailable"})
         except Exception:  # noqa: BLE001 — a handler bug must answer 500, not drop the socket
-            logger.exception("unhandled error on %s %s", method, self.path)
+            logger.exception("unhandled error on %s %s", method, _printable(self.path))
             self._send(500, {"error": "internal error"})
         else:
             self._send(status, payload)
+
+    def _browser_refusal(self) -> Decision | None:
+        """A refusal when a browser sent the request, else ``None``.
+
+        Whois vouches for the machine, not the program: a browser on an
+        allowlisted host lends that identity to every page it renders, and a
+        page may POST cross-site with no CORS preflight (a text/plain form, a
+        no-cors fetch). Browsers attach ``Origin`` to every POST and DELETE —
+        ``null`` when they withhold the page — and a page cannot strip it;
+        urllib, curl and the queue client never send it.
+        """
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return None
+        return Decision(False, f"browser-originated request (Origin {origin!r})")
 
     def _bearer(self) -> str | None:
         header = self.headers.get("Authorization", "")
@@ -554,8 +589,14 @@ class _Handler(BaseHTTPRequestHandler):
             raise _ApiError(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
         if length == 0:
             return {}
+        raw = self.rfile.read(length)  # read before any refusal: the client sees the status
+        # No page can send application/json cross-site without a preflight, which
+        # this service never answers — so this backs up the Origin check for a
+        # client that omits Origin.
+        if self.headers.get_content_type() != "application/json":
+            raise _ApiError(415, "request body must be Content-Type: application/json")
         try:
-            parsed = json.loads(self.rfile.read(length))
+            parsed = json.loads(raw)
         except ValueError as exc:
             raise _ApiError(400, "request body is not valid JSON") from exc
         if not isinstance(parsed, dict):
@@ -567,7 +608,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         if raw:
             self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
+        if status != 204:  # RFC 9110 §8.6: a 204 must not carry Content-Length
+            self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         if raw:
             self.wfile.write(raw)
@@ -612,9 +654,9 @@ def serve(store: QueueStore, policy: AccessPolicy, host: str, port: int) -> None
         raise KeyboardInterrupt
 
     try:
-        signal.signal(signal.SIGTERM, _graceful)  # so `kill` shuts down cleanly
+        previous = signal.signal(signal.SIGTERM, _graceful)  # so `kill` shuts down cleanly
     except ValueError:
-        pass  # not the main thread (e.g. under test)
+        previous = None  # not the main thread (e.g. under test)
     logger.info("queue service listening on %s:%s (store: %s)", bound_host, bound_port, store.db_path)
     try:
         server.serve_forever()
@@ -622,3 +664,5 @@ def serve(store: QueueStore, policy: AccessPolicy, host: str, port: int) -> None
         pass
     finally:
         server.server_close()
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)  # hand the caller its handler back

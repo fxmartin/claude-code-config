@@ -100,6 +100,7 @@ module = [
     "sdlc.parsers",
     "sdlc.portability",
     "sdlc.progress",
+    "sdlc.queue_server",
     "sdlc.rate_limit",
     "sdlc.repair",
     "sdlc.review_packet",
