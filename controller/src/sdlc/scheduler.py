@@ -955,7 +955,10 @@ class _Scheduler:
         if ended:
             record = replace(record, status=derive_state(record))
         try:
-            self._store.put_fleet_run(replace(record, worker=profile.name), now=self._clock())
+            self._store.put_fleet_run(
+                replace(record, worker=profile.name, dashboard_url=profile.dashboard_url),
+                now=self._clock(),
+            )
         except (QueueError, sqlite3.Error) as exc:
             self._echo(f"fleet view: could not record run {run_id}: {exc}")
 
@@ -1475,7 +1478,7 @@ class _Scheduler:
             return
         self._result.parked += 1
         self._echo(f"job {job.id} parked: awaiting approval on #{pr_number}")
-        self._notify(
+        self._notify_event(
             "queue_job_parked",
             repo=Path(job.repo).name,
             subject=f"queue job {job.id} ({job.kind} {job.scope})",
@@ -1571,7 +1574,7 @@ class _Scheduler:
         if launched and action == "resume":
             # Announced only once the resume is genuinely in flight — a version
             # check that blocks the job announces its own terminal instead.
-            self._notify(
+            self._notify_event(
                 "queue_job_resumed",
                 repo=Path(job.repo).name,
                 subject=f"queue job {job.id} ({job.kind} {job.scope})",
@@ -1784,6 +1787,12 @@ class _Scheduler:
             ),
         )
 
+    def _notify_event(self, event: str, **fields: object) -> None:
+        """Notify, naming this worker when the drain runs as a fleet worker (35.4-004)."""
+        if self._config.worker is not None:
+            fields["worker"] = self._config.worker.name
+        self._notify(event, **fields)
+
     def _pause_dispatch(self, park: "_RateLimitPark") -> None:
         """Cache the window on the queue and announce it — at most once."""
         now = self._clock()
@@ -1812,10 +1821,11 @@ class _Scheduler:
             f"queue paused: rate limited (run {park.run_id[:8]}) — {scope} is "
             f"claimed until {until.isoformat()}"
         )
-        self._notify(
+        self._notify_event(
             "queue_paused",
             repo=Path(park.repo).name,
             subject=_queue_subject(park.pool),
+            pool=park.pool,
             reset_at=until.isoformat(),
             detail=detail,
             run=park.run_id,
@@ -1829,10 +1839,11 @@ class _Scheduler:
             "queue resumed: the rate-limit window reopened"
             + (f" for pool {pause.pool}" if pause.pool else "")
         )
-        self._notify(
+        self._notify_event(
             "queue_resumed",
             repo=Path(pause.repo).name if pause.repo else "",
             subject=_queue_subject(pause.pool),
+            pool=pause.pool,
             paused_until=pause.paused_until,
             run=pause.run_id or "",
         )
@@ -2018,7 +2029,7 @@ class _Scheduler:
         double-notified with two near-identical messages. ``queue_job_finished``
         renders through the same formatter machinery and says which job it is.
         """
-        self._notify(
+        self._notify_event(
             "queue_job_finished",
             repo=Path(job.repo).name,
             subject=f"queue job {job.id} ({job.kind} {job.scope})",

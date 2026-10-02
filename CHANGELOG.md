@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.92.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): remote transcripts and console log (#35.4-002)
+
+
+## [v2.91.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): telegram names the worker and the (#35.4-004)
+
+
 ## [v2.90.0] - 2026-10-02
 
 ### Added

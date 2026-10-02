@@ -22,8 +22,11 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+
+from sdlc.registry import WORKER_ENV
 
 # The .env fallback location, matching where install.sh / the cmux bridge keep
 # the shared bot credentials. Patched in tests.
@@ -290,6 +293,38 @@ _TITLE_FIELDS: dict[str, set[str]] = {
 }
 
 
+# Pause events whose ``pool`` is worth pairing with the time it resumes.
+_PAUSE_EVENTS = {"queue_paused", "rate_limited"}
+
+
+def _resumes(reset_at: object) -> str:
+    """``reset_at`` as a readable time: epoch seconds → UTC ISO, anything else as given."""
+    if isinstance(reset_at, (int, float)) and not isinstance(reset_at, bool):
+        try:
+            return datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            pass
+    return str(reset_at)
+
+
+def _attribution(event: str, fields: dict[str, object]) -> tuple[str, set[str]]:
+    """The ``worker=… pool=… resumes …`` line, plus the fields it consumed.
+
+    Both ``worker`` and ``pool`` are optional and absent in local mode, where
+    this renders nothing — so a single-machine message is unchanged.
+    """
+    parts: list[str] = []
+    consumed: set[str] = set()
+    for key in ("worker", "pool"):
+        if fields.get(key):
+            parts.append(f"{key}={fields[key]}")
+            consumed.add(key)
+    if fields.get("pool") and event in _PAUSE_EVENTS and fields.get("reset_at"):
+        parts.append(f"resumes {_resumes(fields['reset_at'])}")
+        consumed.add("reset_at")
+    return " ".join(parts), consumed
+
+
 def _rich_body(event: str, fields: dict[str, object]) -> str:
     """Body for a formatted event: count tally, leftover fields, run id.
 
@@ -299,10 +334,13 @@ def _rich_body(event: str, fields: dict[str, object]) -> str:
     crash the notifier.
     """
     lines = []
+    where, where_fields = _attribution(event, fields)
+    if where:
+        lines.append(where)
     tally = " ".join(f"{key}={fields[key]}" for key in _COUNT_KEYS if key in fields)
     if tally:
         lines.append(tally)
-    consumed = _TITLE_FIELDS.get(event, set()) | set(_COUNT_KEYS) | {"run"}
+    consumed = _TITLE_FIELDS.get(event, set()) | set(_COUNT_KEYS) | {"run"} | where_fields
     leftover = " ".join(
         f"{key}={value}" for key, value in fields.items() if key not in consumed
     )
@@ -326,6 +364,10 @@ def notify(event: str, *, sender: Sender | None = None, **fields: object) -> Non
     ``story_failed``) render a human-readable one-line title from whichever
     optional structured fields (``repo``, ``subject``, ``detail``, ``pr``,
     ``duration``, ...) the call site supplied; missing ones are simply omitted.
+    ``worker`` (which fleet worker) and ``pool`` (which subscription paused)
+    are two such fields, rendered as ``worker=<name>`` / ``pool=<name> resumes
+    <time>``; ``worker`` defaults to ``SDLC_WORKER`` and both are absent in
+    local mode.
     Unknown events, and any formatter failure, fall back to the legacy
     title-cased slug plus a generic ``key=value`` body — so a new or malformed
     call site can never crash the notifier. No-ops when muted (``SDLC_NOTIFY``
@@ -335,6 +377,8 @@ def notify(event: str, *, sender: Sender | None = None, **fields: object) -> Non
     try:
         if not _enabled():
             return
+        if not fields.get("worker") and os.environ.get(WORKER_ENV, "").strip():
+            fields["worker"] = os.environ[WORKER_ENV].strip()
         formatter = _FORMATTERS.get(event)
         title: str | None = None
         if formatter is not None:

@@ -3720,6 +3720,13 @@ def queue_run_cmd(
         help="Host name to register, matched by a job's `--host` pin (default: "
         "this machine's short hostname). Needs --worker.",
     ),
+    dashboard_url: str | None = typer.Option(
+        None,
+        "--dashboard-url",
+        help="Origin of this worker's dashboard, e.g. http://m3max.<tailnet>:8787 "
+        "(`sdlc dashboard --host <tailnet-ip>`). Pushed with each run so the XPS "
+        "dashboard can open its transcripts. Needs --worker.",
+    ),
 ) -> None:
     """Drain the host queue in the foreground — claim jobs and run them.
 
@@ -3782,11 +3789,13 @@ def queue_run_cmd(
     what it registered, a `codex` stage also needing the `codex-shared` pool —
     and defers a job to an eligible peer with more free slots. A job nobody can
     run stays `queued`, with `no eligible worker (needs …)` in `sdlc queue
-    list`. `--slots` is the worker's cap. Works on the queue this host owns:
-    with `SDLC_QUEUE_URL` set it refuses, like the rest of this verb. Once the
-    controller is reinstalled under a worker (Story 35.2-004) it claims nothing
-    more, lets its running jobs finish and exits 75, so a supervisor
-    (`KeepAlive`) restarts it on the new code.
+    list`. `--slots` is the worker's cap. `--dashboard-url` advertises the
+    worker's own dashboard origin (Story 35.4-002) in each run it pushes, so the
+    XPS dashboard's "view session" reads that worker's transcripts. Works on the
+    queue this host owns: with `SDLC_QUEUE_URL` set it refuses, like the rest of
+    this verb. Once the controller is reinstalled under a worker (Story
+    35.2-004) it claims nothing more, lets its running jobs finish and exits 75,
+    so a supervisor (`KeepAlive`) restarts it on the new code.
 
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
@@ -3794,15 +3803,19 @@ def queue_run_cmd(
     """
     from sdlc.scheduler import SchedulerConfig, run_queue
 
-    if worker is None and (pool or host is not None):
-        typer.echo("error: --pool and --host only apply with --worker NAME", err=True)
+    if worker is None and (pool or host is not None or dashboard_url is not None):
+        typer.echo(
+            "error: --pool, --host and --dashboard-url only apply with --worker NAME", err=True
+        )
         raise typer.Exit(code=2)
     profile = None
     if worker is not None:
         from sdlc.queue_worker import detect_worker_profile
 
         try:
-            profile = detect_worker_profile(worker, pools=pool, host=host)
+            profile = detect_worker_profile(
+                worker, pools=pool, host=host, dashboard_url=dashboard_url
+            )
         except ValueError as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(code=2) from exc

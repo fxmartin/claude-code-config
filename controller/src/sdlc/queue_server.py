@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from sdlc import __version__
 from sdlc.queue import JobRecord, QueueError, QueueStore
-from sdlc.registry import RunRecord
+from sdlc.registry import RunRecord, normalize_dashboard_url
 from sdlc.scheduler import DEFAULT_LEASE_SECONDS
 
 __all__ = [
@@ -425,6 +425,12 @@ class _Routes:
         total = _int(body, "total")
         completed = _int(body, "completed")
         pid = _int(body, "pid")
+        dashboard_url = _text(body, "dashboard_url")
+        if dashboard_url is not None:
+            try:
+                dashboard_url = normalize_dashboard_url(dashboard_url)
+            except ValueError as exc:
+                raise _ApiError(400, str(exc)) from exc
         record = RunRecord(
             run_id=_required(body, "run_id"),
             repo=_required(body, "repo"),
@@ -437,6 +443,7 @@ class _Routes:
             total=total,
             completed=completed,
             worker=_required(body, "worker"),
+            dashboard_url=dashboard_url,
         )
         try:
             self.store.put_fleet_run(record)

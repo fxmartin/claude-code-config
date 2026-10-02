@@ -11,8 +11,10 @@ from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import urlsplit
 
 __all__ = [
+    "DASHBOARD_URL_ENV",
     "WORKER_ENV",
     "Registry",
     "RunRecord",
@@ -20,6 +22,7 @@ __all__ = [
     "derive_state",
     "format_live_owner_refusal",
     "live_record",
+    "normalize_dashboard_url",
     "pid_alive",
 ]
 
@@ -30,6 +33,34 @@ _REGISTRY_NAME = "registry.json"
 # --worker NAME` hands it to every job it launches, so the run's registry
 # record — and the fleet view the XPS dashboard builds from it — says whose it is.
 WORKER_ENV = "SDLC_WORKER"
+
+# The tailnet origin a worker's `sdlc dashboard --host <tailnet-ip>` answers on
+# (Story 35.4-002), advertised in the run's fleet record so the XPS can read the
+# worker's transcripts. A queue worker advertises it with `queue run --dashboard-url`;
+# a bare `sdlc build` pushing to the fleet reads it from this variable.
+DASHBOARD_URL_ENV = "SDLC_DASHBOARD_URL"
+
+
+def normalize_dashboard_url(url: str) -> str:
+    """``url`` as a bare ``scheme://host[:port]`` origin, or ``ValueError``.
+
+    The XPS dashboard fetches this origin on a pushed record's say-so, so it must
+    be nothing but an http(s) origin: no credentials, path, query or fragment to
+    steer the request anywhere but the worker's own ``/api/logs``.
+    """
+    text = (url or "").strip()
+    try:
+        parts = urlsplit(text)
+        host, _port = parts.hostname, parts.port  # `.port` raises on a non-numeric port
+    except ValueError as exc:
+        raise ValueError(f"dashboard url {text!r} is malformed: {exc}") from exc
+    if parts.scheme not in ("http", "https") or not host:
+        raise ValueError(f"dashboard url {text!r} must look like http://host:port")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("dashboard url must not carry credentials")
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise ValueError(f"dashboard url {text!r} must be an origin, with no path or query")
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def default_registry_path() -> Path:
@@ -70,6 +101,8 @@ class RunRecord:
     # The fleet worker that owns the run (Story 35.4-001); None for a run that
     # never touched a fleet. A registry.json from before it simply lacks the key.
     worker: str | None = None
+    # The worker's dashboard origin (Story 35.4-002); None when it advertises none.
+    dashboard_url: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

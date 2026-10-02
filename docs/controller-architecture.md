@@ -1669,6 +1669,11 @@ reaches the job's own agents rather than just its parent.
     `queue_paused` notify and one `queue_resumed`, not one per job. A later
     signal carrying a longer wait extends the window; a shorter one never
     shortens it.
+  - **Attributable pings (35.4-004).** `notify.py` takes two optional fields:
+    `worker` (defaults to `SDLC_WORKER`, which `queue run --worker` hands each
+    job) renders `worker=<name>`, and `pool` renders `pool=<name> resumes <time>`
+    on `queue_paused`/`rate_limited`. Both are absent in local mode, where the
+    message is unchanged.
   - **A served window's evidence is spent.** Only as many parks as there are
     free slots get resumed, so the rest stay `running` with a ledger that still
     says `RATE_LIMITED`. Lifting the pause therefore re-words their `reason`
@@ -2122,6 +2127,21 @@ authoritative for the worker; the table is the fleet's summary.
   shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
   `/api/runs`, `/api/fleet` and the SSE change token; a failed fetch is kept
   for 30 s, so an offline service stalls the page at most once per window.
+- **Transcripts (Story 35.4-002).** A run's row also carries `dashboard_url` (migration
+  11): the origin of its worker's own dashboard, started with `sdlc dashboard --host
+  <tailnet-ip>`. A worker advertises it with `queue run --worker NAME --dashboard-url
+  http://NAME.<tailnet>:8787`; a bare build reads `SDLC_DASHBOARD_URL`. It is
+  normalised to a bare `http(s)://host[:port]` origin (`registry.normalize_dashboard_url`)
+  at the CLI, at `PUT /runs` (400 otherwise) and again where it is used. "view
+  session" on a remote run makes the XPS dashboard fetch the worker's `/api/logs`
+  server-side (5 s, no redirects, no env proxy) and relay it with `worker` and
+  `origin`, so the modal says who served it and the page stays on one origin — the
+  worker's logs are not opened to cross-origin reads. Path confinement is the
+  worker's, untouched: its `/api/logs` and `/log` resolve inside that run's
+  `<db>.logs`; the XPS reads nothing from its own disk for a remote run. With no
+  story it gathers every story of the run. A worker that does not answer (or never
+  advertised a URL) gives `error` plus `logs_root`, the `<db>.logs` directory on
+  the worker, which the modal shows. Nothing passes through the queue service.
 
 ### Pause per subscription pool (Story 35.2-003)
 

@@ -598,7 +598,8 @@ CREATE TABLE IF NOT EXISTS fleet_runs (
     finished_at TEXT,
     total       INTEGER,
     completed   INTEGER,
-    updated_at  TIMESTAMP NOT NULL
+    updated_at  TIMESTAMP NOT NULL,
+    dashboard_url TEXT
 );
 """
 
@@ -719,6 +720,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (9, "job_cancel_requested", "jobs", [("cancel_requested", "INTEGER")], None),
     # Story 35.4-001: the fleet run registry table, for a queue.db written before it.
     (10, "fleet_runs", "fleet_runs", [], _FLEET_RUNS_DDL),
+    # Story 35.4-002: the worker's dashboard origin, for a fleet_runs written before it.
+    (11, "fleet_run_dashboard_url", "fleet_runs", [("dashboard_url", "TEXT")], None),
 ]
 
 
@@ -1827,20 +1830,20 @@ class QueueStore:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO fleet_runs(run_id, worker, repo, db, scope, pid, status, "
-                "started_at, finished_at, total, completed, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "started_at, finished_at, total, completed, updated_at, dashboard_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET worker = excluded.worker, "
                 "repo = excluded.repo, db = excluded.db, scope = excluded.scope, "
                 "pid = excluded.pid, status = excluded.status, "
                 "started_at = excluded.started_at, finished_at = excluded.finished_at, "
                 "total = excluded.total, completed = excluded.completed, "
-                "updated_at = excluded.updated_at "
+                "updated_at = excluded.updated_at, dashboard_url = excluded.dashboard_url "
                 "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL "
                 "OR excluded.pid != fleet_runs.pid",
                 (
                     record.run_id, worker, record.repo, record.db, record.scope, record.pid,
                     record.status, record.started_at, record.finished_at, record.total,
-                    record.completed, _at(now).isoformat(),
+                    record.completed, _at(now).isoformat(), record.dashboard_url,
                 ),
             )
 
