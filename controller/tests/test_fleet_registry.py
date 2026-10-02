@@ -217,6 +217,33 @@ def test_put_runs_rejects_bad_input_with_400(live: _Live) -> None:
     assert put({**good, "pid": True}) == 400
 
 
+def test_a_malformed_run_list_is_reported_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = QueueClient("http://fleet.invalid", token=TOKEN)
+    monkeypatch.setattr(client, "_call", lambda *a, **k: {"runs": "not-a-list"})
+    with pytest.raises(QueueUnavailable, match="malformed run list"):
+        client.list_fleet_runs()
+    monkeypatch.setattr(client, "_call", lambda *a, **k: {"runs": [{"run_id": "a"}, 7]})
+    assert client.list_fleet_runs() == [{"run_id": "a"}]
+
+
+def test_put_runs_turns_a_store_rejection_into_400(
+    live: _Live, store: QueueStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(record: RunRecord) -> None:
+        raise QueueError("refused")
+
+    monkeypatch.setattr(store, "put_fleet_run", refuse)
+    req = urllib.request.Request(
+        live.url + "/runs", data=json.dumps(_record().to_dict()).encode(), method="PUT",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=10)
+    assert exc.value.code == 400
+
+
 def test_the_client_replays_a_put_once_because_it_is_an_idempotent_upsert(live: _Live) -> None:
     # PUT is an idempotent upsert, so the one retry is safe for it.
     attempts = []
