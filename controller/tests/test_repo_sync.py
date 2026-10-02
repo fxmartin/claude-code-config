@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -268,6 +269,104 @@ def test_repo_origin_reads_the_origin_url_and_none_when_there_is_none(
     assert repo_origin(tmp_path / "missing") is None
     git(tmp_path, "init", "-q", "bare-less")
     assert repo_origin(tmp_path / "bare-less") is None
+
+
+def test_malformed_or_non_object_requirements_count_as_no_recorded_origin(
+    tmp_path, forge, work_dir
+) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    job = _job(tmp_path, clone, None)
+    for raw in ("{not json", json.dumps(["origin"]), json.dumps({"origin": "  "})):
+        prepared = prepare_repo(replace(job, requirements=raw), work_dir=work_dir)
+        assert prepared == PreparedRepo(path=clone, sha=None)
+
+
+def test_many_dirty_files_are_summarised_in_the_refusal(tmp_path, forge, work_dir) -> None:
+    from sdlc.build import _DIRTY_TREE_MAX_LISTED
+
+    clone = _clone(forge, work_dir / "proj")
+    extra = _DIRTY_TREE_MAX_LISTED + 3
+    for i in range(extra):
+        commit(clone, f"f{i}.txt")
+    for i in range(extra):
+        (clone / f"f{i}.txt").write_text("changed\n", encoding="utf-8")
+    job = _job(tmp_path, clone, forge.url)
+
+    with pytest.raises(RepoRefused) as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert "(+3 more)" in refusal.value.reason
+
+
+def test_git_that_cannot_run_is_a_refusal_not_a_crash(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    from sdlc import queue_worker
+
+    clone = _clone(forge, work_dir / "proj")
+    job = _job(tmp_path, clone, forge.url)
+    real = queue_worker._git
+
+    def failing(root, *args):
+        if args[0] == "fetch":
+            raise subprocess.TimeoutExpired(cmd="git fetch", timeout=1)
+        return real(root, *args)
+
+    monkeypatch.setattr(queue_worker, "_git", failing)
+    with pytest.raises(RepoRefused, match="git fetch failed"):
+        prepare_repo(job, work_dir=work_dir)
+
+
+def test_an_unreadable_head_after_syncing_is_a_refusal(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    from sdlc import queue_worker
+
+    clone = _clone(forge, work_dir / "proj")
+    job = _job(tmp_path, clone, forge.url)
+    real = queue_worker._git
+
+    def no_head(root, *args):
+        if args[0] == "rev-parse":
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        return real(root, *args)
+
+    monkeypatch.setattr(queue_worker, "_git", no_head)
+    with pytest.raises(RepoRefused, match="could not read HEAD"):
+        prepare_repo(job, work_dir=work_dir)
+
+
+def test_a_clone_that_cannot_launch_git_is_a_refusal(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    from sdlc import queue_worker
+
+    job = _job(tmp_path, work_dir / "absent", forge.url)
+
+    def boom(*_a, **_k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(queue_worker.subprocess, "run", boom)
+    with pytest.raises(RepoRefused, match="could not clone"):
+        prepare_repo(job, work_dir=work_dir)
+
+
+def test_origin_requirements_records_the_origin_json_or_none(tmp_path, forge, work_dir) -> None:
+    from sdlc.queue_worker import origin_requirements
+
+    clone = _clone(forge, work_dir / "proj")
+    assert json.loads(origin_requirements(clone)) == {"origin": forge.url}
+    assert origin_requirements(tmp_path / "missing") is None
+
+
+def test_repo_origin_is_none_when_git_cannot_run(tmp_path, monkeypatch) -> None:
+    from sdlc import queue_worker
+
+    def boom(*_a, **_k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(queue_worker.subprocess, "run", boom)
+    assert repo_origin(tmp_path) is None
 
 
 # --- the scheduler: the sync runs after the claim, before the launch ----------
