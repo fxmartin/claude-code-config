@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -512,6 +514,71 @@ def test_ctrl_c_stops_the_children_and_releases_every_lease(tmp_path) -> None:
     job = store.get_job(started)
     assert job.claimed_by is None
     assert job.state == "queued"  # no run was ever attached — safe to restart
+
+
+def test_sigterm_takes_the_ctrl_c_path(tmp_path) -> None:
+    """Story 35.2-004: launchd stops the resident worker with SIGTERM, not Ctrl-C.
+
+    `launchctl bootout` (every reinstall of the plist) and `kickstart -k` send
+    it. Unhandled, it kills the drain outright: its jobs, each in a session of
+    its own that launchd's process-group cleanup never reaches, run on with no
+    budget and no slot, their rows `running` on a live lease.
+    """
+    store = _store(tmp_path)
+    started = store.add_job(repo=_repo(tmp_path, "alpha"), kind="build", scope="epic-3")
+    launcher = FakeLauncher(alive_polls=99)
+    clock = Clock()
+    calls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        clock.advance(seconds)
+        if calls["n"] == 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+        assert calls["n"] < 10, "SIGTERM never stopped the drain"
+
+    # Stands in for the default disposition, which would kill pytest itself.
+    absorbed: list[int] = []
+
+    def absorb(signum, _frame) -> None:
+        absorbed.append(signum)
+
+    previous = signal.signal(signal.SIGTERM, absorb)
+    try:
+        result = _run(store, tmp_path=tmp_path, launcher=launcher, clock=clock, sleeper=sleeper)
+        after = signal.getsignal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert absorbed == []  # the drain's own handler took it…
+    assert after is absorb  # …and handed the caller its handler back
+    assert result.interrupted is True
+    assert launcher.procs[0].stopped is True
+    job = store.get_job(started)
+    assert job.claimed_by is None
+    assert job.state == "queued"
+
+
+def test_a_drain_off_the_main_thread_runs_without_a_sigterm_handler(tmp_path) -> None:
+    # Only the main thread may install a signal handler (ValueError elsewhere);
+    # a drain driven from another thread must run, not crash on it.
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    before = signal.getsignal(signal.SIGTERM)
+    results: list = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(
+            _run(store, tmp_path=tmp_path, launcher=FakeLauncher(alive_polls=1))
+        )
+    )
+    thread.start()
+    thread.join(timeout=60)
+
+    assert not thread.is_alive()
+    assert results and results[0].done == 1
+    assert store.get_job(job_id).state == "done"
+    assert signal.getsignal(signal.SIGTERM) is before
 
 
 def test_ctrl_c_leaves_a_started_run_resumable(tmp_path) -> None:

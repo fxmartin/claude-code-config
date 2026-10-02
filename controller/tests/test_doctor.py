@@ -1705,3 +1705,266 @@ def test_queue_service_store_falls_back_to_xdg_then_home() -> None:
 
     assert _service_store_path({"XDG_STATE_HOME": "/x"}) == Path("/x/sdlc/queue.db")
     assert _service_store_path({}) == Path.home() / ".sdlc" / "queue.db"
+
+
+# --- Story 35.2-004: the resident worker is registered and online -----------------------
+
+
+def _worker_record(host: str, *, seconds_ago: float):
+    from sdlc.queue import WorkerRecord
+
+    beat = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+    return WorkerRecord(name="m3max", host=host, registered_at=beat, last_heartbeat=beat)
+
+
+def _worker_plist(tmp_path: Path, *, store: Path) -> Path:
+    """An installed worker LaunchAgent that pins ``store``, as the template does."""
+    path = tmp_path / "com.fxmartin.sdlc-worker.plist"
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.fxmartin.sdlc-worker",
+                "ProgramArguments": ["/Users/fx/.local/bin/sdlc", "queue", "run", "--worker", "m3max"],
+                "EnvironmentVariables": {"SDLC_QUEUE_PATH": str(store)},
+            }
+        )
+    )
+    return path
+
+
+def _heartbeat(store: Path, *, host: str = "m3") -> None:
+    """What the resident worker does every 30 s: register itself in ``store``."""
+    from sdlc.queue import QueueStore
+
+    queue = QueueStore(store)
+    queue.init()
+    queue.register_worker("m3max", host=host)
+
+
+def test_fleet_worker_online_is_clean() -> None:
+    from sdlc.doctor import check_fleet_worker
+
+    finding = check_fleet_worker(lambda: [_worker_record("m3", seconds_ago=5)], host="m3")
+
+    assert finding.status == "CLEAN"
+    assert "m3max" in finding.detail and "online" in finding.detail
+
+
+def test_fleet_worker_that_stopped_heartbeating_fails() -> None:
+    from sdlc.doctor import check_fleet_worker
+
+    finding = check_fleet_worker(lambda: [_worker_record("m3", seconds_ago=600)], host="m3")
+
+    assert finding.status == "FAIL"
+    assert "offline" in finding.detail
+    assert "worker.log" in finding.remedy
+
+
+def test_fleet_worker_never_registered_fails() -> None:
+    from sdlc.doctor import check_fleet_worker
+
+    # A worker on another host does not count for this one.
+    finding = check_fleet_worker(lambda: [_worker_record("xps", seconds_ago=5)], host="m3")
+
+    assert finding.status == "FAIL"
+    assert "not registered" in finding.detail
+
+
+def test_fleet_worker_unreachable_queue_fails() -> None:
+    from sdlc.doctor import check_fleet_worker
+    from sdlc.queue import QueueError
+
+    def boom():
+        raise QueueError("fleet queue unreachable")
+
+    finding = check_fleet_worker(boom, host="m3")
+
+    assert finding.status == "FAIL"
+    assert "unreachable" in finding.detail
+
+
+def test_fleet_worker_check_is_skipped_without_the_launch_agent(tmp_path) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+
+    assert check_fleet_worker_installed(agent_path=tmp_path / "absent.plist") is None
+
+
+def test_fleet_worker_check_runs_when_the_launch_agent_is_installed(tmp_path) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+
+    agent = _worker_plist(tmp_path, store=tmp_path / "queue.db")
+
+    finding = check_fleet_worker_installed(agent_path=agent, host="m3")
+
+    assert finding is not None
+    assert finding.status == "FAIL"  # installed, but nothing has registered in an empty queue
+    assert "not registered" in finding.detail
+
+
+def test_fleet_worker_sharing_the_shells_store_is_clean(tmp_path) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+
+    store = tmp_path / "queue.db"
+    _heartbeat(store)
+
+    finding = check_fleet_worker_installed(
+        agent_path=_worker_plist(tmp_path, store=store), host="m3", queue_path=store
+    )
+
+    assert finding is not None
+    assert finding.status == "CLEAN"
+    assert "m3max" in finding.detail and "online" in finding.detail
+
+
+def test_fleet_worker_is_looked_up_in_the_store_its_plist_pins(tmp_path) -> None:
+    # launchd starts the worker with the plist's environment, not this shell's,
+    # and `queue run` is local-only: a worker heartbeating in its pinned store is
+    # online, however this shell resolves its own queue. But jobs enqueued here
+    # land in a file it never drains, so the shell must be told.
+    from sdlc.doctor import check_fleet_worker_installed
+
+    pinned = tmp_path / "state" / "sdlc" / "queue.db"
+    pinned.parent.mkdir(parents=True)
+    _heartbeat(pinned)
+    shells = tmp_path / "home" / ".sdlc" / "queue.db"
+
+    finding = check_fleet_worker_installed(
+        agent_path=_worker_plist(tmp_path, store=pinned), host="m3", queue_path=shells
+    )
+
+    assert finding is not None
+    assert finding.status == "WARN"
+    assert "m3max" in finding.detail and "online" in finding.detail
+    assert str(shells) in finding.detail
+    assert f"SDLC_QUEUE_PATH={pinned}" in finding.remedy
+
+
+def test_fleet_worker_warns_while_this_shell_enqueues_to_a_fleet_queue(tmp_path, monkeypatch) -> None:
+    # The same split by another route: with SDLC_QUEUE_URL exported here,
+    # `--enqueue` lands on the fleet service, which launchd's bare environment
+    # never points the worker at — and `queue run` cannot drain it yet anyway.
+    from sdlc.doctor import check_fleet_worker_installed
+
+    store = tmp_path / "queue.db"
+    _heartbeat(store)
+    monkeypatch.setenv("SDLC_QUEUE_URL", "http://home-lab:8790")
+
+    finding = check_fleet_worker_installed(
+        agent_path=_worker_plist(tmp_path, store=store), host="m3", queue_path=store
+    )
+
+    assert finding is not None
+    assert finding.status == "WARN"
+    assert "m3max" in finding.detail and "online" in finding.detail
+    assert "http://home-lab:8790" in finding.detail
+    assert "SDLC_QUEUE_URL" in finding.remedy
+
+
+def test_fleet_worker_leaves_a_malformed_queue_url_to_the_fleet_queue_finding(
+    tmp_path, monkeypatch
+) -> None:
+    # `--enqueue` fails loudly on it rather than going anywhere, and the
+    # `fleet-queue` finding already FAILs it — this one must not crash on it.
+    from sdlc.doctor import check_fleet_worker_installed
+
+    store = tmp_path / "queue.db"
+    _heartbeat(store)
+    monkeypatch.setenv("SDLC_QUEUE_URL", "not a url")
+
+    finding = check_fleet_worker_installed(
+        agent_path=_worker_plist(tmp_path, store=store), host="m3", queue_path=store
+    )
+
+    assert finding is not None
+    assert finding.status == "CLEAN"
+
+
+def test_fleet_worker_on_a_corrupt_store_fails_instead_of_crashing(tmp_path) -> None:
+    # `QueueStore.list_workers` absorbs only a missing table; a file that is not
+    # a database raises sqlite3.DatabaseError, which must not escape doctor.
+    from sdlc.doctor import check_fleet_worker_installed
+
+    store = tmp_path / "queue.db"
+    store.write_bytes(b"this is not a sqlite database " * 8)
+
+    finding = check_fleet_worker_installed(
+        agent_path=_worker_plist(tmp_path, store=store), host="m3", queue_path=store
+    )
+
+    assert finding is not None
+    assert finding.status == "FAIL"
+    assert "not a database" in finding.detail
+
+
+@pytest.mark.parametrize("body", [b"not a plist", b"<plist/>"], ids=["junk", "no-dict"])
+def test_fleet_worker_unreadable_plist_fails(tmp_path, body: bytes) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+
+    agent = tmp_path / "com.fxmartin.sdlc-worker.plist"
+    agent.write_bytes(body)
+
+    finding = check_fleet_worker_installed(agent_path=agent, host="m3")
+
+    assert finding is not None
+    assert finding.status == "FAIL"
+    assert "unreadable" in finding.detail
+    assert "templates/launchd/com.fxmartin.sdlc-worker.plist" in finding.remedy
+
+
+def test_run_doctor_reports_the_worker_only_when_its_launch_agent_is_installed(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    claude_dir, repo_root = _healthy_install(tmp_path)
+
+    def doctor(worker_plist: Path) -> DoctorReport:
+        return run_doctor(
+            repo_root=repo_root,
+            claude_dir=claude_dir,
+            db_path=tmp_path / "ledger.db",
+            queue_path=tmp_path / "queue.db",
+            registry=Registry(tmp_path / "registry.json"),
+            dep_probe=lambda _b: True,
+            worker_plist=worker_plist,
+        )
+
+    assert not any(f.check == "fleet-worker" for f in doctor(tmp_path / "absent.plist").findings)
+
+    agent = _worker_plist(tmp_path, store=tmp_path / "queue.db")
+    # Installed, but nothing has registered in this empty queue.
+    finding = _finding(doctor(agent), "fleet-worker")
+    assert finding.status == "FAIL"
+    assert "not registered" in finding.detail
+
+
+def test_run_doctor_reports_a_corrupt_queue_with_the_worker_installed(tmp_path) -> None:
+    # Doctor is safe to run anywhere: with the worker installed, the corrupt store
+    # `check_queue` already reports must stay a finding, not become a traceback
+    # out of `sdlc doctor` / `sdlc status --markdown`.
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    store = tmp_path / "queue.db"
+    store.write_bytes(b"this is not a sqlite database " * 8)
+
+    report = run_doctor(
+        repo_root=repo_root,
+        claude_dir=claude_dir,
+        db_path=tmp_path / "ledger.db",
+        queue_path=store,
+        registry=Registry(tmp_path / "registry.json"),
+        dep_probe=lambda _b: True,
+        worker_plist=_worker_plist(tmp_path, store=store),
+    )
+
+    assert _finding(report, "queue").status == "FAIL"
+    assert _finding(report, "fleet-worker").status == "FAIL"
+
+
+def test_doctor_never_reads_a_real_worker_launch_agent_under_test() -> None:
+    # A developer Mac with the worker installed must not leak its live queue into
+    # the suite: conftest points the default at a path that does not exist.
+    from sdlc.doctor import default_worker_plist
+
+    assert not default_worker_plist().exists()
+    assert default_worker_plist().name == "com.fxmartin.sdlc-worker.plist"
