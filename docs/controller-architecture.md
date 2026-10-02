@@ -1669,6 +1669,11 @@ reaches the job's own agents rather than just its parent.
     `queue_paused` notify and one `queue_resumed`, not one per job. A later
     signal carrying a longer wait extends the window; a shorter one never
     shortens it.
+  - **Attributable pings (35.4-004).** `notify.py` takes two optional fields:
+    `worker` (defaults to `SDLC_WORKER`, which `queue run --worker` hands each
+    job) renders `worker=<name>`, and `pool` renders `pool=<name> resumes <time>`
+    on `queue_paused`/`rate_limited`. Both are absent in local mode, where the
+    message is unchanged.
   - **A served window's evidence is spent.** Only as many parks as there are
     free slots get resumed, so the rest stay `running` with a ledger that still
     says `RATE_LIMITED`. Lifting the pause therefore re-words their `reason`

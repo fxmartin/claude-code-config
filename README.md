@@ -348,6 +348,8 @@ Long-running autonomous runs mirror lifecycle milestones to Telegram so you can 
 - **Skills** call [`hooks/notify-telegram.sh`](hooks/notify-telegram.sh) `"<title>" "<body>"` at milestones (fix-issue started/complete, requirements/stories/epic created).
 - **The controller** (`sdlc build`/`resume`) emits run-lifecycle notifications directly via `notify.py` (run started / finished / rate-limited / first story failure) — gated to one-per-run for failures so your phone doesn't buzz 47 times during a bad run.
 
+On a fleet, a run message carries `worker=<name>` (the worker that ran it, from `SDLC_WORKER`), and a rate-limit pause carries `pool=<name>` and `resumes <time>` so the notice is attributable to a subscription. Local mode omits both fields.
+
 Both paths are best-effort and Telegram-only: credentials come from `$TELEGRAM_BOT_TOKEN` / `$TELEGRAM_CHAT_ID` (env first, then `~/.claude/config/.env`), and every call is a silent no-op when unconfigured.
 
 ---

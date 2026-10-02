@@ -95,6 +95,9 @@ def test_a_park_pauses_only_the_pool_of_the_worker_that_held_it(tmp_path) -> Non
     assert len(launcher.calls) >= 1
     (event,) = notifier.names("queue_paused")
     assert event["subject"] == f"development queue ({SHARED})"
+    # Story 35.4-004: the ping names the pool that paused and the worker that saw it.
+    assert event["pool"] == SHARED
+    assert event["worker"] == "m3max"
 
 
 def test_a_probe_success_on_a_worker_of_the_pool_reopens_it_for_everyone(tmp_path) -> None:
