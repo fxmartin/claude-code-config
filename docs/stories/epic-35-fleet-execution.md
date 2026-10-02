@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: NOT STARTED (0/12)** — authored 2026-10-02. Thesis: a build pins
+> **Status: IN PROGRESS (12/13)** — authored 2026-10-02; 35.2-005 added 2026-10-03. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 12 | **Total Points**: 41 | **MVP Stories**: 7 (28 pts)
+**Total Stories**: 13 | **Total Points**: 46 | **MVP Stories**: 8 (33 pts)
 
 ## Features in This Epic
 
@@ -335,6 +335,60 @@ follow-up for a Linux worker.
 **Dependencies**: 35.2-001
 **Risk Level**: Low
 
+##### Story 35.2-005: Worker drains the fleet queue over HTTP
+**User Story**: As FX, I want `sdlc queue run --worker` on the M3 Max to claim
+jobs from the fleet queue on home-lab so that a job enqueued from the XPS
+actually runs on the Mac — the epic's first success metric, which 35.1–35.4 as
+shipped do not meet.
+**Priority**: Must Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** `SDLC_QUEUE_URL` (or `~/.sdlc-fleet.yaml`) configured on a worker
+  **When** `sdlc queue run --worker m3max --pool … --follow` starts **Then**
+  it registers, heartbeats, claims, renews, releases, finishes, parks,
+  reclaims, records sync/files/fix-rounds and pushes fleet runs **through the
+  `QueueClient`** against the service — it no longer refuses a fleet URL.
+- **Given** the scheduler's store surface (`peek_claimable`, `claim_job`,
+  `claimable_for_worker`, `reclaim_job`, `expired_running_jobs`,
+  `running_repos`, `overlap_holds`, `park_job`, `take_parked_job`,
+  `due_parked_jobs`, `schedule_poll`, `set_reason`, `attach_run`,
+  `record_sync`, `record_files`, `record_fix_rounds_baseline`,
+  `restart_fresh`, `requeue_job`, `dispatch_pause(s)`, `mark_pause_probed`,
+  `get_worker`) **When** a fleet URL is configured **Then** every one of them
+  has a route on `sdlc queue serve` and a `QueueClient` method, and the
+  scheduler is typed against `QueueBackend`, not `QueueStore`.
+- **Given** a worker whose network drops mid-job **When** its lease lapses
+  **Then** the service surfaces the job as expired and another eligible
+  worker reclaims it only once the run's pid is confirmed gone on the
+  original worker's next heartbeat (the 35.2-001 rule, now over HTTP).
+- **Given** no fleet URL **When** `sdlc queue run` starts **Then** behaviour is
+  byte-identical to today (local store).
+- **Given** the MVP acceptance test **When** `sdlc build <story> --enqueue`
+  runs on the XPS with the M3 Max worker online **Then** the job is claimed by
+  `m3max`, the PR merges, and the run shows on the XPS dashboard with
+  `worker=m3max`.
+
+**Technical Notes**: The refusal lives in `scheduler.py` (~`:985`) and the
+`queue run` CLI; `QueueBackend` (queue.py) currently declares only six
+methods — widen it to the scheduler's surface. Routes follow the 35.1-001
+shape (one per store method, `JobRecord.to_dict()` JSON, 409 on a lost
+claim). Worker-side writes that today go "straight into the store"
+(`put_fleet_run`, registration) already have routes. Keep `QueueStore` as the
+local implementation; `QueueClient` becomes the second full implementation.
+Update the worker plist header and `docs/controller-architecture.md`
+("stays local-only" paragraphs) accordingly.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: each new route against a live in-process `serve`; scheduler
+      against a `QueueClient` end to end (claim → run → finish) with a fake
+      job process; lease lapse + reclaim over HTTP; local mode unchanged
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.1-001, 35.1-002, 35.2-001, 35.4-001
+**Risk Level**: High
+
 ### Feature 35.3: Launch from the XPS
 
 #### Stories
@@ -494,7 +548,11 @@ rate-limit notice is attributable to a subscription.
 ## Epic Sequencing
 
 1. **MVP (XPS → M3 Max end to end)**: 35.1-001 → 35.1-002 → 35.2-001 →
-   35.2-002 → 35.3-001 → 35.2-004 → 35.4-001. Exit: the first success metric.
+   35.2-002 → 35.3-001 → 35.2-004 → 35.4-001 → **35.2-005**. Exit: the first
+   success metric. (Added 2026-10-03: the first twelve stories shipped with
+   `queue run` refusing a fleet URL, so a worker drained only its own host's
+   store; the service's host was the only possible worker. 35.2-005 closes
+   that gap.)
 2. **Pools and the second worker**: 35.2-003, then home-lab joins as a worker
    in pool `claude-shared` (no new story — it is 35.2-004's plist on a second
    Mac).
