@@ -59,6 +59,20 @@ def _no_fleet_queue(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_worker_launch_agent(monkeypatch, tmp_path_factory):
+    """Keep a developer Mac's installed worker LaunchAgent out of `sdlc doctor` (Story 35.2-004).
+
+    Where `~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist` exists, doctor
+    reads that machine's live queue for its `fleet-worker` finding. Tests that
+    exercise the check pass `agent_path` / `worker_plist` explicitly.
+    """
+    from sdlc import doctor
+
+    absent = tmp_path_factory.getbasetemp() / "no-launch-agents" / f"{doctor.WORKER_LABEL}.plist"
+    monkeypatch.setattr(doctor, "default_worker_plist", lambda: absent)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_model_probe(monkeypatch):
     """Never spend a real ``claude -p`` call on the model entitlement probe.
 

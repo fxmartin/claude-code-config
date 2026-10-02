@@ -88,6 +88,28 @@ def test_queue_run_exits_one_when_a_job_failed(tmp_path, monkeypatch) -> None:
     assert result.exit_code == 1
 
 
+def test_queue_run_exits_75_when_the_worker_must_restart(tmp_path, monkeypatch) -> None:
+    """Story 35.2-004: the LaunchAgent's KeepAlive restarts it on the new controller."""
+    _isolate(tmp_path, monkeypatch)
+    _capture(monkeypatch, SchedulerResult(started=1, done=1, failed=1, restart=True))
+
+    result = runner.invoke(app, ["queue", "run"])
+    assert result.exit_code == 75
+    assert "restart" in result.stderr.lower()
+
+
+def test_the_restart_notice_leaves_the_json_payload_last_on_stdout(tmp_path, monkeypatch) -> None:
+    """Story 35.2-004: `--json` callers read stdout's last line; the notice goes to stderr."""
+    _isolate(tmp_path, monkeypatch)
+    _capture(monkeypatch, SchedulerResult(restart=True))
+
+    result = runner.invoke(app, ["queue", "run", "--json"])
+
+    assert result.exit_code == 75
+    assert json.loads(result.stdout.strip().splitlines()[-1])["restart"] is True
+    assert "restart" in result.stderr.lower()
+
+
 def test_queue_run_creates_the_store_when_absent(tmp_path, monkeypatch) -> None:
     """A host that never enqueued anything can still start a drain."""
     _isolate(tmp_path, monkeypatch)

@@ -26,7 +26,7 @@ from sdlc.harness import DEFAULT_HARNESS
 from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
 from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
-from sdlc.queue import QueueError, default_queue_path
+from sdlc.queue import QueueError, QueueStore, WorkerRecord, default_queue_path
 from sdlc.queue_client import QueueClient, QueueRefused, resolve_queue_url
 from sdlc.registry import Registry, derive_state
 
@@ -614,6 +614,118 @@ def check_fleet_queue_configured() -> Finding | None:
     if url is None:
         return None
     return check_fleet_queue(QueueClient(url, token=os.environ.get("SDLC_QUEUE_TOKEN") or None))
+
+
+# Story 35.2-004: the LaunchAgent that keeps a fleet worker resident on the M3
+# Max (template: templates/launchd/com.fxmartin.sdlc-worker.plist).
+WORKER_LABEL = "com.fxmartin.sdlc-worker"
+
+
+def default_worker_plist() -> Path:
+    """Where `launchctl` loads the resident worker's LaunchAgent from."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{WORKER_LABEL}.plist"
+
+
+def check_fleet_worker(list_workers: Callable[[], list[WorkerRecord]], *, host: str) -> Finding:
+    """Is this machine's resident worker registered with the queue and online? (Story 35.2-004)
+
+    Matches on ``host`` rather than a worker name: the LaunchAgent template owns
+    the name, and "a worker for this machine is heartbeating" is the question.
+    """
+    name = "Fleet worker"
+    remedy = (
+        f"check the LaunchAgent is loaded (`launchctl print gui/$(id -u)/{WORKER_LABEL}`) "
+        "and read ~/.local/state/sdlc/worker.log"
+    )
+    try:
+        workers = [w for w in list_workers() if w.host == host]
+    # A local store that is not a database raises sqlite3.DatabaseError
+    # (`list_workers` absorbs only a missing table). `check_queue` reports the
+    # file itself; this check must FAIL beside it, never crash `sdlc doctor`.
+    except (QueueError, sqlite3.DatabaseError) as exc:
+        return Finding("fleet-worker", name, "FAIL", f"could not list workers: {exc}", remedy)
+    if not workers:
+        return Finding(
+            "fleet-worker", name, "FAIL", f"not registered — no worker for host {host}", remedy
+        )
+    online = [w for w in workers if w.is_online()]
+    if not online:
+        newest = max(workers, key=lambda w: w.last_heartbeat)
+        return Finding(
+            "fleet-worker",
+            name,
+            "FAIL",
+            f"{newest.name} is registered but offline (last heartbeat {newest.last_heartbeat})",
+            remedy,
+        )
+    return Finding(
+        "fleet-worker",
+        name,
+        "CLEAN",
+        f"{', '.join(w.name for w in online)} registered and online ({host})",
+    )
+
+
+def check_fleet_worker_installed(
+    *,
+    agent_path: Path | None = None,
+    host: str | None = None,
+    queue_path: Path | None = None,
+) -> Finding | None:
+    """:func:`check_fleet_worker`, but only on a machine that installed the worker LaunchAgent.
+
+    ``None`` elsewhere: a laptop that never runs a resident worker has nothing
+    to report, and doctor must not nag it.
+
+    The worker registers in the store its plist pins — launchd starts it with
+    the plist's environment, and `sdlc queue run` is local-only — so that store
+    is the one asked, not this shell's. When the two differ (``queue_path``,
+    default ``default_queue_path()``), an online worker is a WARN: jobs enqueued
+    from this shell land in a file it never drains. So is a fleet queue this
+    shell resolves (``resolve_queue_url``): its enqueues go to the service,
+    which `sdlc queue run` cannot drain yet.
+    """
+    path = agent_path or default_worker_plist()
+    if not path.exists():
+        return None
+    try:
+        plist = plistlib.loads(path.read_bytes())
+        env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
+    # As in check_queue_service: plistlib's errors are not a closed set, and a
+    # plist that is not a dict fails on `.get` — a FAIL either way, never a crash.
+    except Exception as exc:  # noqa: BLE001
+        return Finding(
+            "fleet-worker", "Fleet worker", "FAIL",
+            f"{path} is unreadable: {exc}",
+            "reinstall it from templates/launchd/com.fxmartin.sdlc-worker.plist",
+        )
+    store = _service_store_path(env)
+    finding = check_fleet_worker(
+        QueueStore(store).list_workers, host=host or socket.gethostname().split(".")[0]
+    )
+    if finding.status != "CLEAN":
+        return finding
+    try:
+        url = resolve_queue_url()
+    except QueueError:
+        url = None  # malformed: `--enqueue` refuses it and the fleet-queue finding FAILs it
+    if url is not None:
+        return Finding(
+            "fleet-worker", "Fleet worker", "WARN",
+            f"{finding.detail} — but this shell enqueues to the fleet queue at {url}, which "
+            "`sdlc queue run` does not drain yet, so jobs enqueued here never reach it",
+            "unset SDLC_QUEUE_URL (and any queue_url: in .sdlc-queue.yaml / "
+            "~/.sdlc-fleet.yaml) to enqueue to this Mac's worker",
+        )
+    local = queue_path if queue_path is not None else default_queue_path()
+    if store == local:
+        return finding
+    return Finding(
+        "fleet-worker", "Fleet worker", "WARN",
+        f"{finding.detail} — but it drains {store} and this shell's `sdlc queue` uses "
+        f"{local}, so jobs enqueued here never reach it",
+        f"point both at one file: set SDLC_QUEUE_PATH={store} in your shell",
+    )
 
 
 def check_queue(queue_path: Path) -> Finding:
@@ -1665,6 +1777,7 @@ def run_doctor(
     db_path: Path | None = None,
     queue_path: Path | None = None,
     queue_service_plist: Path | None = None,
+    worker_plist: Path | None = None,
     registry: Registry | None = None,
     dep_probe: Callable[[str], bool] | None = None,
     now: datetime | None = None,
@@ -1682,6 +1795,7 @@ def run_doctor(
     db_path = db_path or default_db_path()
     queue_path = queue_path or default_queue_path()
     queue_service_plist = queue_service_plist or default_queue_service_plist()
+    worker_plist = worker_plist or default_worker_plist()
     registry = registry or Registry()
     dep_probe = dep_probe or _default_dep_probe
 
@@ -1708,4 +1822,7 @@ def run_doctor(
     fleet = check_fleet_queue_configured()
     if fleet is not None:
         findings.append(fleet)
+    worker = check_fleet_worker_installed(agent_path=worker_plist, queue_path=queue_path)
+    if worker is not None:
+        findings.append(worker)
     return DoctorReport(findings=findings)
