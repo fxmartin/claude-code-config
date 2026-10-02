@@ -17,10 +17,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from sdlc import __version__
-from sdlc.queue import JobRecord, QueueError, QueueStore
+from sdlc.queue import JobRecord, QueueError, QueueStore, WorkerRecord
 from sdlc.registry import RunRecord, normalize_dashboard_url
 from sdlc.scheduler import DEFAULT_LEASE_SECONDS
 
@@ -319,6 +319,20 @@ def _int(body: Body, key: str, *, default: int | None = None) -> int | None:
     return value
 
 
+def _timestamp(body: Body, key: str) -> datetime | None:
+    """``body[key]`` as an aware datetime; absent or ``null`` is ``None`` (a naive one is UTC)."""
+    raw = body.get(key)
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise _ApiError(400, f"{key} must be an ISO-8601 timestamp or null")
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise _ApiError(400, f"{key} must be an ISO-8601 timestamp, got {raw!r}") from exc
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
 def _requirements_json(body: Body) -> str | None:
     value = body.get("requirements")
     if value is None:
@@ -349,8 +363,17 @@ def _held_by(job: JobRecord, worker: str) -> None:
 class _Routes:
     """One method per endpoint, each a thin mapping onto the same-named store verb."""
 
-    def __init__(self, store: QueueStore) -> None:
+    def __init__(self, store: QueueStore, clock: Callable[[], datetime] | None = None) -> None:
         self.store = store
+        self._clock = clock
+
+    def _now(self) -> datetime | None:
+        """The service's own time for every lease decision — one clock for the whole fleet.
+
+        ``None`` lets the store read the wall clock; a test injects one so a lease
+        can lapse without sleeping.
+        """
+        return self._clock() if self._clock is not None else None
 
     # --- reads ---------------------------------------------------------
 
@@ -363,7 +386,7 @@ class _Routes:
         # Same envelope `sdlc queue list --json` emits: the pause lives beside
         # the jobs, not in one of them, and an elapsed window is not state.
         repo = query.get("repo", [None])[0]
-        pauses = [p for p in self.store.dispatch_pauses() if p.is_active()]
+        pauses = [p for p in self.store.dispatch_pauses() if p.is_active(self._now())]
         jobs = self.store.list_jobs(repo)
         return 200, {
             # `pause` is the first live window (the one-pool shape of Story
@@ -410,6 +433,7 @@ class _Routes:
                 repos=_string_list(body, "repos") or (),
                 slots=_int(body, "slots", default=1) or 0,
                 slots_free=_int(body, "slots_free"),
+                now=self._now(),
             )
         except QueueError as exc:
             raise _ApiError(400, str(exc)) from exc
@@ -446,7 +470,7 @@ class _Routes:
             dashboard_url=dashboard_url,
         )
         try:
-            self.store.put_fleet_run(record)
+            self.store.put_fleet_run(record, now=self._now())
         except QueueError as exc:
             raise _ApiError(400, str(exc)) from exc
         return 200, {"ok": True}
@@ -457,7 +481,8 @@ class _Routes:
         ``worker_online`` is ``None`` for a worker that never registered — no
         heartbeat to judge by — so a reader does not mistake "unknown" for "gone".
         """
-        online = {w.name: w.is_online() for w in self.store.list_workers()}
+        now = self._now()
+        online = {w.name: w.is_online(now) for w in self.store.list_workers()}
         runs = [
             {**row, "worker_online": online.get(row["worker"])}
             for row in self.store.list_fleet_runs()
@@ -470,20 +495,25 @@ class _Routes:
             lease_seconds=_lease(body),
             host=_text(body, "host"),
             pools=_string_list(body, "pools"),
+            now=self._now(),
         )
         return (200, claimed.to_dict()) if claimed is not None else (204, None)
 
     def renew(self, job_id: int, body: Body) -> Reply:
         worker = _required(body, "worker")
         job = _job(self.store, job_id)
-        if not self.store.renew_lease(job_id, claimed_by=worker, lease_seconds=_lease(body)):
+        if not self.store.renew_lease(
+            job_id, claimed_by=worker, lease_seconds=_lease(body), now=self._now()
+        ):
             raise _ApiError(409, f"job {job.id} is not claimed by {worker!r}")
         return 200, _job(self.store, job_id).to_dict()
 
     def release(self, job_id: int, body: Body) -> Reply:
         worker = _required(body, "worker")
         _held_by(_job(self.store, job_id), worker)
-        self.store.release_claim(job_id, claimed_by=worker, reason=_text(body, "reason"))
+        self.store.release_claim(
+            job_id, claimed_by=worker, reason=_text(body, "reason"), now=self._now()
+        )
         return 200, _job(self.store, job_id).to_dict()
 
     def finish(self, job_id: int, body: Body) -> Reply:
@@ -513,7 +543,7 @@ class _Routes:
     def requeue(self, job_id: int, _body: Body) -> Reply:
         _job(self.store, job_id)
         try:
-            self.store.requeue_job(job_id)
+            self.store.requeue_job(job_id, now=self._now())
         except QueueError as exc:
             raise _ApiError(409, str(exc)) from exc
         return 200, _job(self.store, job_id).to_dict()
@@ -524,6 +554,146 @@ class _Routes:
             self.store.prioritise_job(job_id, _required(body, "priority"))
         except QueueError as exc:
             raise _ApiError(400, str(exc)) from exc
+        return 200, _job(self.store, job_id).to_dict()
+
+    # --- the scheduler's surface (Story 35.2-005) ----------------------
+    #
+    # One route per store verb `sdlc queue run` uses, so a worker drains this
+    # queue through the QueueClient the way a local drain uses the store. The
+    # lease verbs answer 409 when the guarded UPDATE lost — the loser's normal
+    # outcome, not an error — and every "now" is this service's own clock.
+
+    def peek_claimable(self, query: dict[str, list[str]], _body: Body) -> Reply:
+        jobs = self.store.peek_claimable(
+            busy_repos=set(query.get("busy", ())),
+            fix_busy_repos=set(query.get("fix_busy", ())),
+            now=self._now(),
+        )
+        return 200, {"jobs": [job.to_dict() for job in jobs]}
+
+    def eligible(self, _query: Any, body: Body) -> Reply:
+        """Which of ``job_ids`` (dispatch order kept) ``worker`` may take right now."""
+        ids = body.get("job_ids")
+        if not isinstance(ids, list) or not all(
+            isinstance(i, int) and not isinstance(i, bool) for i in ids
+        ):
+            raise _ApiError(400, "job_ids must be a list of integers")
+        # A job that vanished between the caller's peek and now is simply not a candidate.
+        candidates = [job for job in map(self.store.get_job, ids) if job is not None]
+        kept = self.store.claimable_for_worker(
+            _required(body, "worker"),
+            candidates,
+            slots_free=_int(body, "slots_free"),
+            now=self._now(),
+        )
+        return 200, {"jobs": [job.to_dict() for job in kept]}
+
+    def expired_running(self, _query: Any, _body: Body) -> Reply:
+        jobs = self.store.expired_running_jobs(now=self._now())
+        return 200, {"jobs": [job.to_dict() for job in jobs]}
+
+    def due_parked(self, _query: Any, _body: Body) -> Reply:
+        jobs = self.store.due_parked_jobs(now=self._now())
+        return 200, {"jobs": [job.to_dict() for job in jobs]}
+
+    def running_repos(self, query: dict[str, list[str]], _body: Body) -> Reply:
+        excluding = query.get("excluding", [None])[0]
+        try:
+            excluded = int(excluding) if excluding is not None else None
+        except ValueError as exc:
+            raise _ApiError(400, "excluding must be an integer") from exc
+        repos = self.store.running_repos(
+            kind=query.get("kind", [None])[0] or None, excluding=excluded
+        )
+        return 200, {"repos": sorted(repos)}
+
+    def overlap_holds(self, _query: Any, _body: Body) -> Reply:
+        # JSON object keys are strings; the client turns them back into ints.
+        return 200, {"holds": {str(job): holder for job, holder in self.store.overlap_holds().items()}}
+
+    def get_worker(self, name: str) -> WorkerRecord:
+        worker = self.store.get_worker(name)
+        if worker is None:
+            raise _ApiError(404, f"unknown worker: {name}")
+        return worker
+
+    def _lease_take(self, job_id: int, body: Body, verb: str) -> Reply:
+        job = _job(self.store, job_id)
+        taken = getattr(self.store, verb)(
+            job_id,
+            claimed_by=_required(body, "claimed_by"),
+            lease_seconds=_lease(body),
+            now=self._now(),
+            worker=_text(body, "worker"),
+        )
+        if taken is None:
+            raise _ApiError(409, f"job {job.id} could not be taken (state {job.state})")
+        return 200, taken.to_dict()
+
+    def claim_one(self, job_id: int, body: Body) -> Reply:
+        return self._lease_take(job_id, body, "claim_job")
+
+    def reclaim(self, job_id: int, body: Body) -> Reply:
+        return self._lease_take(job_id, body, "reclaim_job")
+
+    def take(self, job_id: int, body: Body) -> Reply:
+        return self._lease_take(job_id, body, "take_parked_job")
+
+    def park(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        pr_number = _int(body, "pr_number")
+        if pr_number is None:
+            raise _ApiError(400, "pr_number is required")
+        try:
+            parked = self.store.park_job(
+                job_id,
+                pr_number=pr_number,
+                reason=_required(body, "reason"),
+                poll_after=_timestamp(body, "poll_after"),
+            )
+        except QueueError as exc:
+            raise _ApiError(409, str(exc)) from exc
+        return 200, {"parked": parked, "job": _job(self.store, job_id).to_dict()}
+
+    def poll(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        self.store.schedule_poll(job_id, _timestamp(body, "poll_after"))
+        return 200, _job(self.store, job_id).to_dict()
+
+    def reason(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        self.store.set_reason(job_id, _text(body, "reason"))
+        return 200, _job(self.store, job_id).to_dict()
+
+    def run(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        self.store.attach_run(job_id, _required(body, "run_id"))
+        return 200, _job(self.store, job_id).to_dict()
+
+    def sync(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        self.store.record_sync(job_id, repo=_required(body, "repo"), sha=_required(body, "sha"))
+        return 200, _job(self.store, job_id).to_dict()
+
+    def files(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        paths = _string_list(body, "paths")
+        if paths is None:
+            raise _ApiError(400, "paths is required")
+        self.store.record_files(job_id, paths)
+        return 200, _job(self.store, job_id).to_dict()
+
+    def fix_rounds(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        rounds = _int(body, "rounds")
+        if rounds is None:
+            raise _ApiError(400, "rounds is required")
+        self.store.record_fix_rounds_baseline(job_id, rounds)
+        return 200, _job(self.store, job_id).to_dict()
+
+    def restart(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        self.store.restart_fresh(job_id, reason=_required(body, "reason"), now=self._now())
         return 200, _job(self.store, job_id).to_dict()
 
     # --- the shared rate-limit pause -----------------------------------
@@ -544,9 +714,23 @@ class _Routes:
             repo=_text(body, "repo"),
             source=_text(body, "source"),
             pool=pool,
+            now=self._now(),
         )
         recorded = self.store.dispatch_pause(pool)
         return 200, {"opened": opened, "pause": recorded.to_dict() if recorded else None}
+
+    def pauses(self, _query: Any, _body: Body) -> Reply:
+        """Every recorded window, *raw*: an elapsed one is still listed.
+
+        The scheduler tells "the window just reopened" (announce it, clear the
+        row) from "never paused" (say nothing) by that row's survival, so unlike
+        the `GET /jobs` snapshot this does not filter on ``is_active``.
+        """
+        return 200, {"pauses": [p.to_dict() for p in self.store.dispatch_pauses()]}
+
+    def pause_probed(self, _query: Any, body: Body) -> Reply:
+        self.store.mark_pause_probed(_text(body, "pool"), now=self._now())
+        return 200, {"ok": True}
 
     def resume(self, query: dict[str, list[str]], _body: Body) -> Reply:
         # `?pool=P` lifts one pool's window; no pool lifts every window.
@@ -554,8 +738,26 @@ class _Routes:
         return 200, {"pause": None}
 
 
-# The `/jobs/{id}/<verb>` endpoints; each names the _Routes method it maps onto.
-_JOB_VERBS = ("renew", "release", "finish", "cancel", "requeue", "prioritise")
+# The `/jobs/{id}/<verb>` endpoints: URL verb -> the _Routes method it maps onto.
+_JOB_VERBS = {
+    "renew": "renew",
+    "release": "release",
+    "finish": "finish",
+    "cancel": "cancel",
+    "requeue": "requeue",
+    "prioritise": "prioritise",
+    "claim": "claim_one",
+    "reclaim": "reclaim",
+    "take": "take",
+    "park": "park",
+    "poll": "poll",
+    "reason": "reason",
+    "run": "run",
+    "sync": "sync",
+    "files": "files",
+    "fix-rounds": "fix_rounds",
+    "restart": "restart",
+}
 
 
 def _route(method: str, path: str, routes: _Routes) -> Callable[[dict[str, list[str]], Body], Reply]:
@@ -565,11 +767,19 @@ def _route(method: str, path: str, routes: _Routes) -> Callable[[dict[str, list[
         ("GET", ("jobs",)): routes.list_jobs,
         ("POST", ("jobs",)): routes.add_job,
         ("POST", ("jobs", "claim")): routes.claim,
+        ("GET", ("jobs", "claimable")): routes.peek_claimable,
+        ("POST", ("jobs", "eligible")): routes.eligible,
+        ("GET", ("jobs", "expired")): routes.expired_running,
+        ("GET", ("jobs", "due")): routes.due_parked,
+        ("GET", ("jobs", "running-repos")): routes.running_repos,
+        ("GET", ("jobs", "holds")): routes.overlap_holds,
         ("GET", ("workers",)): routes.list_workers,
         ("POST", ("workers",)): routes.register_worker,
         ("GET", ("runs",)): routes.list_runs,
         ("PUT", ("runs",)): routes.put_run,
+        ("GET", ("pause",)): routes.pauses,
         ("POST", ("pause",)): routes.pause,
+        ("POST", ("pause", "probed")): routes.pause_probed,
         ("DELETE", ("pause",)): routes.resume,
     }
     handler = table.get((method, tuple(parts)))
@@ -582,10 +792,15 @@ def _route(method: str, path: str, routes: _Routes) -> Callable[[dict[str, list[
             job_id = int(parts[1])
         except ValueError as exc:
             raise _ApiError(404, f"no such route: {path}") from exc
-        verb = getattr(routes, parts[2])
+        verb = getattr(routes, _JOB_VERBS[parts[2]])
         return lambda _query, body: verb(job_id, body)
     if any(key[1] == tuple(parts) for key in table):
         raise _ApiError(405, f"{method} not allowed on {path}")
+    if len(parts) == 2 and parts[0] == "workers":
+        if method != "GET":
+            raise _ApiError(405, f"{method} not allowed on {path}")
+        name = unquote(parts[1])
+        return lambda _query, _body: (200, routes.get_worker(name).to_dict(routes._now()))
     raise _ApiError(404, f"no such route: {path}")
 
 
@@ -717,14 +932,20 @@ class _Handler(BaseHTTPRequestHandler):
 class _QueueServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], store: QueueStore, policy: AccessPolicy) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        store: QueueStore,
+        policy: AccessPolicy,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         # The socket family follows the bind address, so a tailnet IPv6 bind works.
         self.address_family = (
             socket.AF_INET6 if ipaddress.ip_address(address[0]).version == 6 else socket.AF_INET
         )
         super().__init__(address, _Handler)
         self.policy = policy
-        self.routes = _Routes(store)
+        self.routes = _Routes(store, clock)
         self.write_lock = threading.Lock()
 
 
@@ -733,15 +954,18 @@ def make_server(
     policy: AccessPolicy,
     host: str,
     port: int = 8790,
+    *,
+    clock: Callable[[], datetime] | None = None,
 ) -> ThreadingHTTPServer:
     """Build (but do not start) the queue service bound to ``host:port``.
 
     ``host`` must be a tailnet address or loopback — never a wildcard — and the
     store is created/migrated here so a request never meets a stale schema.
+    ``clock`` replaces the wall clock every lease decision reads (tests only).
     """
     _check_bind_host(host)
     store.init()
-    return _QueueServer((host, port), store, policy)
+    return _QueueServer((host, port), store, policy, clock)
 
 
 def serve(store: QueueStore, policy: AccessPolicy, host: str, port: int) -> None:

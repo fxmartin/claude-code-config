@@ -253,7 +253,7 @@ def test_a_malformed_run_list_is_reported_as_unavailable(
 def test_put_runs_turns_a_store_rejection_into_400(
     live: _Live, store: QueueStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def refuse(record: RunRecord) -> None:
+    def refuse(record: RunRecord, **_: object) -> None:
         raise QueueError("refused")
 
     monkeypatch.setattr(store, "put_fleet_run", refuse)

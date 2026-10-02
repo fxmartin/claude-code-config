@@ -1900,12 +1900,13 @@ keeps it `online`.
   lease. `ExitTimeOut` is 60 s: stopping two jobs one after the other can take
   40 s, and launchd's default (typically 20 s) would SIGKILL the worker
   part-way.
-- **This Mac's queue only, for now.** `sdlc queue run` claims from the local
-  store alone (see below). While a fleet queue is configured — `SDLC_QUEUE_URL`,
-  or `queue_url:` in `~/.sdlc-fleet.yaml` — the worker refuses with exit 2 and
-  `KeepAlive` restarts it every 30 s; without one it drains only the jobs
-  enqueued on this Mac. A job enqueued from the XPS reaches it once `queue run`
-  can claim through `QueueClient`, which is not built yet.
+- **Which queue it drains (Story 35.2-005).** Without a fleet URL the worker
+  drains this Mac's own `queue.db`. With one — `SDLC_QUEUE_URL` in the plist's
+  `EnvironmentVariables`, or `queue_url:` in `~/.sdlc-fleet.yaml`, which the
+  agent reads as the user — it drains the fleet queue on home-lab through
+  `QueueClient` (see "The scheduler over HTTP" below), so a job enqueued from the
+  XPS runs here. Put `SDLC_QUEUE_TOKEN` in the plist too if the Mac has no
+  Tailscale CLI for the service's identity gate.
 - **Upgrades.** The guard (Story 15.1-004/32.1-004) compares a checkout
   with the version the worker *imported*, so a resident `--follow` worker would
   otherwise park every framework job on its own staleness and never exit. Each
@@ -1929,18 +1930,19 @@ keeps it `online`.
   plist's `EnvironmentVariables`, as for the 35.1-003 service), not the
   shell's: `CLEAN` when a worker for this host is registered there and online;
   `WARN` when it is, but this shell's `sdlc queue` resolves a different file,
-  with the `SDLC_QUEUE_PATH` to export, or a fleet queue (`SDLC_QUEUE_URL`, or
-  `queue_url:` in `.sdlc-queue.yaml` / `~/.sdlc-fleet.yaml`) that `queue run`
-  cannot drain yet; `FAIL` when none has registered, it has
+  with the `SDLC_QUEUE_PATH` to export, or a fleet queue this shell enqueues to
+  that the worker's plist does not point at; when the plist (or
+  `~/.sdlc-fleet.yaml`) names a fleet queue the service is asked instead of the
+  file; `FAIL` when none has registered, it has
   gone offline, or the plist or the store cannot be read (a corrupt `queue.db`
   is a finding, never a doctor crash). A machine without the plist gets no
   finding. It looks for `~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist`
   (`default_worker_plist`); `run_doctor(worker_plist=…)` overrides that, as
   `queue_service_plist` does for 35.1-003.
 
-`--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`);
-like the rest of `sdlc queue run` it refuses while `SDLC_QUEUE_URL` is set. The
-registry (`workers` table, migration 7) lives with the jobs it serves.
+`--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`) or,
+with a fleet URL, on the service's (Story 35.2-005). The registry (`workers`
+table, migration 7) lives with the jobs it serves.
 
 **Repo auto-sync before dispatch (Story 35.2-002).** `sdlc build --enqueue`,
 `sdlc fix --enqueue` and `sdlc queue add` record the clone's `origin`
@@ -2197,7 +2199,48 @@ older meaning — the forge override, handed to the run as `--host=<forge>` — 
 a machine named `github` or `gitlab` cannot be pinned. `sdlc queue list` gained
 `WORKER`, `HOST` and `POOL` columns, each as wide as its longest value.
 
-`sdlc queue run` stays local-only and refuses while a fleet queue is configured; `sdlc queue unpause --pool` works against it (Story 35.2-003); `sdlc queue serve` always serves the local store.
+`sdlc queue run --worker` drains it (Story 35.2-005, next section) and a bare `queue run` refuses while a fleet queue is configured; `sdlc queue unpause --pool` works against it (Story 35.2-003); `sdlc queue serve` always serves the local store.
+
+### The scheduler over HTTP (Story 35.2-005)
+
+`QueueBackend` (`queue.py`) is the whole surface the scheduler reads and writes —
+not just the verbs 35.1 exposed — and `_Scheduler` is typed against it.
+`QueueStore` is the local implementation, `QueueClient` the second full one, and
+`open_queue()` picks between them, so `sdlc queue run` takes the same path with
+or without `SDLC_QUEUE_URL`; without it nothing differs from the local drain.
+Every verb the scheduler uses has a route on `sdlc queue serve` (listed in its
+`--help`) and a client method: `peek_claimable`, `claimable_for_worker`,
+`expired_running_jobs`, `due_parked_jobs`, `running_repos`, `overlap_holds`,
+`get_worker`, the three lease takes (`claim_job`, `reclaim_job`,
+`take_parked_job` — `409` is a lost race and reads as `None`), `park_job`,
+`schedule_poll`, `set_reason`, `attach_run`, `record_sync`, `record_files`,
+`record_fix_rounds_baseline`, `restart_fresh`, `mark_pause_probed`, and a *raw*
+`GET /pause` (an elapsed window stays listed, which is how the worker tells a
+resume from never-paused). `now` is accepted and ignored by the client: the
+service's clock (`make_server(clock=…)` in tests) judges every lease, so a
+worker's clock skew cannot decide who owns a job.
+
+- **A network drop does not end a drain.** A transport failure
+  (`QueueUnavailable`) ends only the pass it hit: the worker keeps its running
+  jobs, says `fleet queue unreachable` once, retries every `--poll-interval`, and
+  renews its leases when the service answers. A child that exits during the
+  outage stays in flight until its finish is recorded. A one-shot drain with
+  nothing running that cannot reach the service exits 2 instead of looping;
+  `--follow` waits. Ctrl-C during an outage stops the children and lets the
+  leases lapse.
+- **Lapsed lease, registered peer's job.** The service shows it as expired
+  (`expired_running_jobs`), but only the holder can tell whether the run's pid
+  still answers, so a peer leaves it alone — a cancel included, as for any live
+  run. On its next heartbeat the holder
+  releases every expired job of its own whose run is gone (`worker` cleared);
+  then any eligible worker with a free slot reclaims it — the holder resuming its
+  own run, a peer starting a fresh one, since the run's ledger is on the holder's
+  disk and `sdlc resume --run` cannot reach it. A claim by an identity that never
+  registered has no holder to wait for and keeps the pre-fleet rule (reclaim after
+  the run's own pid check). A registered holder that never comes back leaves its
+  job `running` until it does — `sdlc queue workers` shows it `offline`.
+- **Fleet drain needs `--worker`.** A bare `queue run` against a fleet queue
+  would claim without the eligibility match; it exits 2 naming the flag.
 `sdlc doctor` adds a `fleet-queue` finding — reachable, identity accepted, the
 service's controller version — only when a URL is configured.
 
@@ -2208,10 +2251,10 @@ holds a second table, `fleet_runs` (migration 10): one row per run id, the
 `RunRecord` fields plus `worker` and `updated_at`. The worker's local file stays
 authoritative for the worker; the table is the fleet's summary.
 
-- **Worker writes.** `queue run --worker` drains the queue its host owns and
-  refuses a fleet URL, so neither it nor its jobs can reach `/runs`. Like its
-  heartbeat registration, the worker writes each run's row straight into that
-  store (`QueueStore.put_fleet_run`, named for the worker): when `_attach_runs`
+- **Worker writes.** `queue run --worker` pushes each run's row through its
+  queue backend (`put_fleet_run`, named for the worker — `PUT /runs` when the
+  backend is the `QueueClient`, a direct write on the host that owns the store),
+  like its heartbeat registration: when `_attach_runs`
   links the run to its job, on each 30 s heartbeat with done/total read live from
   the ledger, and once the job's process is gone — reaped, stopped by its budget,
   by an operator's cancel (Story 35.4-003), or by Ctrl-C. That last write carries

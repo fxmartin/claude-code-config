@@ -34,11 +34,15 @@
   `sdlc doctor` reads the worker's store from this plist and warns while the
   shell's differs.
 
-  The worker drains this Mac's own queue. `sdlc queue run` does not yet claim
-  from the fleet queue: while SDLC_QUEUE_URL or a `queue_url:` in
-  ~/.sdlc-fleet.yaml is set it refuses with exit 2, and KeepAlive restarts it
-  every ThrottleInterval — so a job enqueued on another machine does not reach
-  this worker yet.
+  Which queue it drains: this Mac's own (the SDLC_QUEUE_PATH above) unless a
+  fleet queue is named — SDLC_QUEUE_URL (add it to EnvironmentVariables with
+  SDLC_QUEUE_TOKEN if this Mac has no Tailscale CLI for the identity gate) or a
+  `queue_url:` in ~/.sdlc-fleet.yaml, which the agent reads as you. Then
+  this worker drains the fleet queue on home-lab over HTTP
+  (Story 35.2-005): it registers, heartbeats, claims, renews and finishes there,
+  so a job enqueued on the XPS runs on this Mac. A fleet drain must be a named
+  worker (this plist's ProgramArguments name m3max); a lost network keeps its
+  jobs running, and KeepAlive restarts it only if it exits.
 
   Each job runs under `caffeinate -i` (macOS only): the Mac may idle-sleep
   between jobs, and a closed lid still sleeps it unless it runs in clamshell

@@ -25,14 +25,15 @@ from sdlc.queue import (
     HEARTBEAT_SECONDS,
     JobBudget,
     JobRecord,
+    QueueBackend,
     QueueError,
     QueuePause,
-    QueueStore,
     VERSION_GUARD_REASON_PREFIX,
     budget_breach,
     fix_rounds_exhausted,
     job_pools,
 )
+from sdlc.queue_client import QueueUnavailable
 from sdlc.registry import (
     WORKER_ENV,
     Registry,
@@ -688,7 +689,7 @@ def ledger_plan_files(db_path: str, run_id: str) -> list[str]:
     reaching into the pipeline. `fix_issue` already freezes each investigation
     plan as a ``fix-plan`` event (issue #547) precisely so a resume can recover
     it; ``files_to_modify`` is the field
-    :meth:`QueueStore.overlap_holds` builds its graph from, so the queue reads
+    :meth:`QueueBackend.overlap_holds` builds its graph from, so the queue reads
     the same frozen plan instead of asking the job subprocess to write back —
     a job stays ignorant of the queue that spawned it.
 
@@ -831,7 +832,7 @@ class _Scheduler:
 
     def __init__(
         self,
-        store: QueueStore,
+        store: QueueBackend,
         *,
         config: SchedulerConfig,
         registry: Registry,
@@ -909,36 +910,66 @@ class _Scheduler:
     # --- the loop ---------------------------------------------------------
 
     def run(self) -> SchedulerResult:
+        outage = False
         try:
-            self._heartbeat(force=True)
             while True:
-                self._attach_runs()
-                self._record_plan_files()
-                self._reap()
-                self._enforce_budgets()
-                self._honour_cancels()
-                self._renew()
-                self._check_rate_limit()
-                self._check_upgrade()
-                polled = self._poll_parked()
-                self._heartbeat()
-                progressed = self._fill_slots() or polled
-                self._stamp_repo_busy()
-                if self._restart_pending and not self._in_flight:
-                    self._result.restart = True
-                    break
-                if (
-                    not self._in_flight
-                    and not progressed
-                    and not self._config.follow
-                    and not self._waiting_out_window()
-                ):
-                    break
+                try:
+                    stop = self._pass()
+                except QueueUnavailable as exc:
+                    # Story 35.2-005: a fleet worker's queue is across a network. A
+                    # job that is running keeps running, and its leases are
+                    # renewed once the service answers again, so an outage must
+                    # not take the drain down with it — unless there is nothing
+                    # to keep alive and nothing to wait for: a one-shot drain
+                    # that cannot reach its queue has no business looping.
+                    if not self._in_flight and not self._config.follow:
+                        raise
+                    if not outage:
+                        outage = True
+                        self._echo(
+                            f"fleet queue unreachable — retrying every "
+                            f"{self._config.poll_seconds:g}s while "
+                            f"{len(self._in_flight)} job(s) keep running: {exc}"
+                        )
+                else:
+                    if outage:
+                        outage = False
+                        self._echo("fleet queue reachable again")
+                    if stop:
+                        break
                 self._sleep(self._config.poll_seconds)
         except KeyboardInterrupt:
             self._result.interrupted = True
             self._shutdown()
         return self._result
+
+    def _pass(self) -> bool:
+        """One turn of the loop; True when the drain is done."""
+        if self._last_beat is None and self._heartbeat(force=True):
+            # register before anything else; retried every pass until it lands
+            self._release_dead_holdings()
+        self._attach_runs()
+        self._record_plan_files()
+        self._reap()
+        self._enforce_budgets()
+        self._honour_cancels()
+        self._renew()
+        self._check_rate_limit()
+        self._check_upgrade()
+        polled = self._poll_parked()
+        if self._heartbeat():
+            self._release_dead_holdings()
+        progressed = self._fill_slots() or polled
+        self._stamp_repo_busy()
+        if self._restart_pending and not self._in_flight:
+            self._result.restart = True
+            return True
+        return (
+            not self._in_flight
+            and not progressed
+            and not self._config.follow
+            and not self._waiting_out_window()
+        )
 
     # --- admission --------------------------------------------------------
 
@@ -951,24 +982,24 @@ class _Scheduler:
             return 0
         return max(0, self._config.slots - self._used_slots())
 
-    def _heartbeat(self, *, force: bool = False) -> None:
+    def _heartbeat(self, *, force: bool = False) -> bool:
         """Register as a fleet worker, then re-register every HEARTBEAT_SECONDS.
 
-        Registration *is* the heartbeat (:meth:`QueueStore.register_worker`), so
+        Registration *is* the heartbeat (:meth:`QueueBackend.register_worker`), so
         the beat also carries the current free-slot count and sweeps the fleet:
         silent peers' leases are freed and unrunnable jobs are labelled. A no-op
-        for a plain drain with no ``worker`` profile.
+        for a plain drain with no ``worker`` profile. True when a beat went out.
         """
         profile = self._config.worker
         if profile is None:
-            return
+            return False
         now = self._clock()
         if (
             not force
             and self._last_beat is not None
             and (now - self._last_beat).total_seconds() < HEARTBEAT_SECONDS
         ):
-            return
+            return False
         profile.register_with(
             self._store, slots=self._config.slots, slots_free=self._free_slots(), now=now
         )
@@ -977,15 +1008,43 @@ class _Scheduler:
         # every in-flight run's live done/total to its fleet row.
         for entry in self._in_flight.values():
             self._push_run(entry.run_id)
+        return True
+
+    def _release_dead_holdings(self) -> None:
+        """On a beat, hand back the jobs this worker holds whose run is gone (Story 35.2-005).
+
+        A worker whose network dropped keeps its claim on a job past the lease: the
+        service shows it as expired, but a peer cannot tell from another machine
+        whether the run's process still answers, so it leaves the job alone — only
+        the holder can look. This is the holder looking, on its first beat after
+        the drop: a job it holds, that none of its own in-flight children drives
+        and whose run's pid no longer answers, is released (``worker`` cleared,
+        lease already lapsed), which is what lets any eligible worker — this one
+        included — reclaim it. A run whose pid still answers is kept: its holder
+        is about to renew, or resume it.
+        """
+        profile = self._config.worker
+        if profile is None:
+            return
+        for job in self._store.expired_running_jobs(now=self._clock()):
+            if job.worker != profile.name or job.claimed_by is None or job.id in self._in_flight:
+                continue
+            if job.run_id and self._run_is_live(job.run_id):
+                continue
+            self._store.release_claim(
+                job.id, claimed_by=job.claimed_by,
+                reason="worker back online: its run is gone", now=self._clock(),
+            )
+            self._echo(f"job {job.id}: run is gone — claim released for any eligible worker")
 
     def _push_run(self, run_id: str | None, *, ended: bool = False) -> None:
         """Write ``run_id``'s registry record to the fleet view (Story 35.4-001).
 
-        A worker drains the queue its own host owns — the store `sdlc queue
-        serve` publishes — and refuses a fleet URL, so neither it nor the jobs it
-        launches can `PUT /runs`. Like its heartbeat registration, it writes the
-        row straight into that store: when a run is linked to its job (start), on
-        each heartbeat, and once the job's process is gone (``ended``).
+        A worker's queue is the fleet's (`SDLC_QUEUE_URL`, through the
+        :class:`~sdlc.queue_client.QueueClient`) or, on the host that owns it, the
+        store itself; either way the row goes through the backend, like its
+        heartbeat registration: when a run is linked to its job (start), on each
+        heartbeat, and once the job's process is gone (``ended``).
 
         An ended record carries this worker's own :func:`derive_state`, so a run
         whose process exited unfinished — killed, crashed, parked on a limit,
@@ -1066,8 +1125,18 @@ class _Scheduler:
         Reclaimable work comes first: a run that already exists is half-paid
         for, and leaving it parked behind fresh work is how a night stalls.
         """
+        profile = self._config.worker
         for job in self._store.expired_running_jobs(now=self._clock()):
             if job.id in self._in_flight or self._job_paused(job):
+                continue
+            if profile is not None and self._held_by_registered_peer(job):
+                # Story 35.2-005: a lapsed lease on a *peer's* job. Its holder may
+                # merely have lost its network, and its run's pid is on a machine
+                # this one cannot ask — so the job stays the holder's until the
+                # holder's next beat confirms the run gone and releases it
+                # (:meth:`_release_dead_holdings`) — a cancel waits for that too,
+                # as it waits for any live run: retiring the job under a run that
+                # is still going would leave it unwatched behind a `cancelled` row.
                 continue
             if job.run_id is None:
                 # Claimed but never started a run — nothing to resume, so put it
@@ -1108,6 +1177,11 @@ class _Scheduler:
                     f"job {job.id}: run is terminal ({terminal}) — starting a fresh run"
                 )
                 continue
+            if profile is not None and self._registry_record(job.run_id) is None:
+                # A run on another machine's disk: nothing here to `sdlc resume`.
+                if self._restart_foreign_run(job):
+                    continue
+                continue
             return job, True
 
         busy = self._store.running_repos()
@@ -1135,6 +1209,46 @@ class _Scheduler:
                 return job, False
         return None
 
+    def _held_by_registered_peer(self, job: JobRecord) -> bool:
+        """Whether ``job`` is held by another *registered* worker.
+
+        Only such a holder can come back and confirm its run gone. A claim by an
+        identity that never registered (a plain drain, a worker long since
+        removed) has nobody to wait for, and keeps the pre-fleet rule: reclaim,
+        after the run's own pid check.
+        """
+        profile = self._config.worker
+        if profile is None or job.worker in (None, profile.name):
+            return False
+        return self._store.get_worker(job.worker) is not None
+
+    def _restart_foreign_run(self, job: JobRecord) -> bool:
+        """Take over a released job whose run lives on another worker, as a fresh launch.
+
+        Only an eligible worker with a slot free does (the same test a claim
+        applies); the take is the guarded reclaim, so two workers racing for the
+        job produce one winner. The job goes back to ``queued`` and the normal
+        claim path — repo sync, version guard, launch — starts its scope anew.
+        """
+        assert self._config.worker is not None
+        eligible = self._store.claimable_for_worker(
+            self._config.worker.name, [job], slots_free=self._free_slots(), now=self._clock()
+        )
+        if not eligible:
+            return False
+        taken = self._store.reclaim_job(
+            job.id, claimed_by=self._identity,
+            lease_seconds=self._config.lease_seconds, now=self._clock(),
+            worker=self._config.worker.name,
+        )
+        if taken is None:
+            return False
+        self._store.restart_fresh(
+            job.id, reason="run was on another worker — fresh run", now=self._clock()
+        )
+        self._echo(f"job {job.id}: its run {job.run_id} is on another worker — starting a fresh run")
+        return True
+
     def _stamp_repo_busy(self) -> None:
         """Explain a job that could have run but was held back.
 
@@ -1142,7 +1256,7 @@ class _Scheduler:
         out loud in `sdlc queue list`: its repo is already busy (Story 32.1-002
         AC2), or it overlaps the files of an unfinished peer in that repo
         (Story 32.3-001 AC2). The overlap set is read separately because
-        :meth:`QueueStore.peek_claimable` has already filtered those jobs out —
+        :meth:`QueueBackend.peek_claimable` has already filtered those jobs out —
         by construction they are not candidates, so they would otherwise go
         unexplained.
 
@@ -1453,66 +1567,78 @@ class _Scheduler:
             if code is None:
                 continue
             del self._in_flight[job_id]
-            self._push_run(entry.run_id, ended=True)
-            if entry.run_id and self._rate_limit_park(job_id, entry.run_id) is not None:
-                # Story 32.2-001: a run that parked itself on a closed window
-                # exits non-zero, but it is *paused*, not finished. Stamping it
-                # terminal would need a manual `sdlc queue requeue` to undo, so
-                # the claim is handed back the `release_claim` way — state
-                # ``running`` with an expired lease — and the reclaim path
-                # resumes it through `sdlc resume` once the window reopens.
-                # `_check_rate_limit` records the host pause from the same
-                # ledger read on the next pass.
-                self._store.release_claim(
-                    job_id, claimed_by=self._identity,
-                    reason=_PARKED_REASON,
-                    now=self._clock(),
-                )
-                self._echo(f"job {job_id} paused: rate-limited, awaiting the window")
-                continue
-            record = (
-                self._registry_record(entry.run_id) if entry.run_id else None
-            )
-            run_status = record.status if record is not None else None
-            run_finished = bool(record.finished_at) if record is not None else True
-            state = terminal_job_state(code, run_status, run_finished=run_finished)
-            # Story 32.2-002: `AWAITING_APPROVAL` is terminal for the run — it
-            # must stay so, the bugfix loop cannot self-approve — but not for the
-            # job. When the change request behind it is knowable, the queue takes
-            # over the wait instead of stamping a `blocked` dead end.
-            if state == "blocked" and run_status == "AWAITING_APPROVAL":
-                pr_number = _awaiting_approval_pr(record)
-                if pr_number is not None:
-                    self._park_for_approval(entry, pr_number)
-                    continue
-            if state == "done" and entry.resumed and entry.run_id:
-                # #716 safety net: `sdlc resume` exits 0 on "nothing to resume".
-                # A terminal run produced no merge and no park — never `done`.
-                terminal = self._run_terminal(entry.run_id)
-                if terminal is not None:
-                    self._store.finish_job(
-                        job_id, "blocked",
-                        reason=f"run terminal, nothing resumed ({terminal})",
-                    )
-                    self._result.parked += 1
-                    self._echo(f"job {job_id} finished: blocked (run terminal, nothing resumed)")
-                    continue
-            reason = self._finish_reason(state, code, run_status, entry.run_id,
-                                         run_finished)
-            self._store.finish_job(job_id, state, reason=reason)
-            if state == "done":
-                self._result.done += 1
-            elif state == "blocked":
-                self._result.parked += 1
-            else:
-                self._result.failed += 1
-            self._echo(f"job {job_id} finished: {state}")
-            self._announce(entry.job, entry.run_id, state)
-            # Issue #709: a finished job in this repo may have cut a release.
-            self._self_update(entry.job.repo)
+            try:
+                self._finish_reaped(job_id, entry, code)
+            except QueueUnavailable:
+                # The child is gone but the queue never heard how it ended: keep it
+                # in flight, so the next pass that reaches the service finishes it
+                # (a job dropped here would sit `running` until its lease lapsed,
+                # then be resumed as if it had crashed).
+                self._in_flight[job_id] = entry
+                raise
         if not self._in_flight:
             for repo in sorted(self._pending_self_update):
                 self._self_update(repo)
+
+    def _finish_reaped(self, job_id: int, entry: _InFlight, code: int) -> None:
+        """Record how ``entry``'s exited child ended: park, pause or finish the job."""
+        self._push_run(entry.run_id, ended=True)
+        if entry.run_id and self._rate_limit_park(job_id, entry.run_id) is not None:
+            # Story 32.2-001: a run that parked itself on a closed window
+            # exits non-zero, but it is *paused*, not finished. Stamping it
+            # terminal would need a manual `sdlc queue requeue` to undo, so
+            # the claim is handed back the `release_claim` way — state
+            # ``running`` with an expired lease — and the reclaim path
+            # resumes it through `sdlc resume` once the window reopens.
+            # `_check_rate_limit` records the host pause from the same
+            # ledger read on the next pass.
+            self._store.release_claim(
+                job_id, claimed_by=self._identity,
+                reason=_PARKED_REASON,
+                now=self._clock(),
+            )
+            self._echo(f"job {job_id} paused: rate-limited, awaiting the window")
+            return
+        record = (
+            self._registry_record(entry.run_id) if entry.run_id else None
+        )
+        run_status = record.status if record is not None else None
+        run_finished = bool(record.finished_at) if record is not None else True
+        state = terminal_job_state(code, run_status, run_finished=run_finished)
+        # Story 32.2-002: `AWAITING_APPROVAL` is terminal for the run — it
+        # must stay so, the bugfix loop cannot self-approve — but not for the
+        # job. When the change request behind it is knowable, the queue takes
+        # over the wait instead of stamping a `blocked` dead end.
+        if state == "blocked" and run_status == "AWAITING_APPROVAL":
+            pr_number = _awaiting_approval_pr(record)
+            if pr_number is not None:
+                self._park_for_approval(entry, pr_number)
+                return
+        if state == "done" and entry.resumed and entry.run_id:
+            # #716 safety net: `sdlc resume` exits 0 on "nothing to resume".
+            # A terminal run produced no merge and no park — never `done`.
+            terminal = self._run_terminal(entry.run_id)
+            if terminal is not None:
+                self._store.finish_job(
+                    job_id, "blocked",
+                    reason=f"run terminal, nothing resumed ({terminal})",
+                )
+                self._result.parked += 1
+                self._echo(f"job {job_id} finished: blocked (run terminal, nothing resumed)")
+                return
+        reason = self._finish_reason(state, code, run_status, entry.run_id,
+                                     run_finished)
+        self._store.finish_job(job_id, state, reason=reason)
+        if state == "done":
+            self._result.done += 1
+        elif state == "blocked":
+            self._result.parked += 1
+        else:
+            self._result.failed += 1
+        self._echo(f"job {job_id} finished: {state}")
+        self._announce(entry.job, entry.run_id, state)
+        # Issue #709: a finished job in this repo may have cut a release.
+        self._self_update(entry.job.repo)
 
     @staticmethod
     def _finish_reason(
@@ -1555,7 +1681,7 @@ class _Scheduler:
         construction. Fix rounds are read cumulatively off the run's ledger and
         a resume re-enters the **same** run, so the count that fired the breaker
         is still there on the next poll: the rounds burned are banked as the
-        job's baseline (:meth:`QueueStore.record_fix_rounds_baseline`) and the
+        job's baseline (:meth:`QueueBackend.record_fix_rounds_baseline`) and the
         cap is measured from it. A requeue then buys exactly one more class
         budget rather than an immediate re-park — or an uncapped job.
 
@@ -1582,9 +1708,15 @@ class _Scheduler:
             except OSError as exc:
                 self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
             self._push_run(entry.run_id, ended=True)
-            if fix_rounds_exhausted(entry.budget, rounds):
-                self._store.record_fix_rounds_baseline(job_id, burned)
-            self._store.finish_job(job_id, "needs_attention", reason=reason)
+            try:
+                if fix_rounds_exhausted(entry.budget, rounds):
+                    self._store.record_fix_rounds_baseline(job_id, burned)
+                self._store.finish_job(job_id, "needs_attention", reason=reason)
+            except QueueUnavailable:
+                # The child is stopped; leave it in flight so `_reap` finishes the
+                # job (as whatever its exit says) once the service answers again.
+                self._in_flight[job_id] = entry
+                raise
             self._result.parked += 1
             self._echo(f"job {job_id} parked (needs_attention): {reason}")
             self._announce(entry.job, entry.run_id, "needs_attention")
@@ -1615,16 +1747,20 @@ class _Scheduler:
             except OSError as exc:
                 self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
             self._push_run(entry.run_id, ended=True)
-            self._store.finish_job(
-                job_id, "cancelled", reason="cancelled by operator",
-                claimed_by=self._identity,
-            )
+            try:
+                self._store.finish_job(
+                    job_id, "cancelled", reason="cancelled by operator",
+                    claimed_by=self._identity,
+                )
+            except QueueUnavailable:
+                self._in_flight[job_id] = entry  # still ours to finish; the next pass retries
+                raise
             self._echo(f"job {job_id} cancelled: run stopped, lease released")
 
     def _record_plan_files(self) -> None:
         """Copy each in-flight job's investigated file set onto its row (AC2).
 
-        The production writer behind :meth:`QueueStore.overlap_holds`: without
+        The production writer behind :meth:`QueueBackend.overlap_holds`: without
         it the ``files`` column would stay NULL on every job and the overlap
         graph would be all singletons, so two jobs racing the same paths would
         never serialise.
@@ -2280,22 +2416,32 @@ class _Scheduler:
             except OSError as exc:
                 self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
             self._push_run(entry.run_id, ended=True)
+            if self._release_on_shutdown(job_id):
+                self._echo(f"job {job_id}: lease released")
+        self._in_flight.clear()
+        if self._interrupted_sync is not None and self._release_on_shutdown(self._interrupted_sync):
+            self._echo(f"job {self._interrupted_sync}: lease released (interrupted mid-sync)")
+
+    def _release_on_shutdown(self, job_id: int) -> bool:
+        """Hand ``job_id``'s lease back; False when the fleet queue could not be reached.
+
+        An unreachable service must not turn a clean stop into a traceback — the
+        child is already stopped, its lease lapses on its own, and the reclaim
+        path (which checks the run's pid first) takes the job from there.
+        """
+        try:
             self._store.release_claim(
                 job_id, claimed_by=self._identity,
                 reason="scheduler interrupted", now=self._clock(),
             )
-            self._echo(f"job {job_id}: lease released")
-        self._in_flight.clear()
-        if self._interrupted_sync is not None:
-            self._store.release_claim(
-                self._interrupted_sync, claimed_by=self._identity,
-                reason="scheduler interrupted", now=self._clock(),
-            )
-            self._echo(f"job {self._interrupted_sync}: lease released (interrupted mid-sync)")
+        except QueueUnavailable as exc:
+            self._echo(f"job {job_id}: could not release the lease ({exc}); it will lapse")
+            return False
+        return True
 
 
 def run_queue(
-    store: QueueStore,
+    store: QueueBackend,
     *,
     config: SchedulerConfig | None = None,
     registry: Registry | None = None,

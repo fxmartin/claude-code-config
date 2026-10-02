@@ -13,8 +13,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
-from urllib.parse import quote, urlsplit
+from typing import Any, Callable, Iterable, Mapping
+from urllib.parse import quote, urlencode, urlsplit
 
 import yaml
 
@@ -119,7 +119,12 @@ def _url_from_file(path: Path) -> str | None:
     return _clean_url(raw["queue_url"], path.name)
 
 
-def resolve_queue_url(*, cwd: Path | None = None, home: Path | None = None) -> str | None:
+def resolve_queue_url(
+    *,
+    cwd: Path | None = None,
+    home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
     """The fleet queue's base URL, or ``None`` for the local SQLite store.
 
     Precedence is env > file > none. A blank ``SDLC_QUEUE_URL`` counts as unset,
@@ -127,11 +132,18 @@ def resolve_queue_url(*, cwd: Path | None = None, home: Path | None = None) -> s
     A value that is set but malformed raises :class:`QueueConfigError` rather
     than quietly falling back — a typo must not turn a fleet enqueue into a
     local one.
+
+    ``environ`` resolves for *another process* — a LaunchAgent's own environment,
+    say — in which case that process's working directory is unknown and the
+    repo-level file is skipped; only its variable and the per-user file count.
     """
-    env = os.environ.get(QUEUE_URL_ENV, "").strip()
+    env = (os.environ if environ is None else environ).get(QUEUE_URL_ENV, "").strip()
     if env:
         return _clean_url(env, QUEUE_URL_ENV)
-    for path in ((cwd or Path.cwd()) / QUEUE_CONFIG_FILENAME, (home or _home()) / USER_CONFIG_FILENAME):
+    candidates = [(home or _home()) / USER_CONFIG_FILENAME]
+    if environ is None:
+        candidates.insert(0, (cwd or Path.cwd()) / QUEUE_CONFIG_FILENAME)
+    for path in candidates:
         if path.is_file():
             url = _url_from_file(path)
             if url is not None:
@@ -182,8 +194,11 @@ class QueueClient:
     """:class:`~sdlc.queue.QueueBackend` over HTTP — the fleet queue's remote face.
 
     Each verb is one request to the route of the same name on `sdlc queue
-    serve`. The service owns the store, so :meth:`init` and
-    :meth:`ensure_migrated` are no-ops here. Requests carry
+    serve` — the scheduler's whole surface included (Story 35.2-005), so a
+    worker drains the fleet queue through this class. The service owns the
+    store, so :meth:`init` and :meth:`ensure_migrated` are no-ops here, and the
+    ``now`` the local store takes is accepted but ignored: the service's clock
+    judges every lease, so no worker's skew decides who owns a job. Requests carry
     ``Authorization: Bearer <token>`` when a token is configured (otherwise the
     service identifies this host through Tailscale).
 
@@ -361,6 +376,7 @@ class QueueClient:
         repos: Iterable[str] = (),
         slots: int = 1,
         slots_free: int | None = None,
+        now: datetime | None = None,
     ) -> WorkerRecord:
         """``POST /workers`` — register this worker, or heartbeat if it already has."""
         body: dict[str, Any] = {
@@ -388,7 +404,7 @@ class QueueClient:
             raise QueueUnavailable(f"fleet queue {self.url} sent a malformed worker record")
         return WorkerRecord(**_fields(WorkerRecord, payload))
 
-    def put_fleet_run(self, record: RunRecord) -> None:
+    def put_fleet_run(self, record: RunRecord, *, now: datetime | None = None) -> None:
         """``PUT /runs`` — push one run's record to the fleet registry (Story 35.4-001)."""
         self._call("PUT", "/runs", record.to_dict())
 
@@ -399,7 +415,14 @@ class QueueClient:
             raise QueueUnavailable(f"fleet queue {self.url} sent a malformed run list")
         return [row for row in payload["runs"] if isinstance(row, dict)]
 
-    def renew_lease(self, job_id: int, *, claimed_by: str, lease_seconds: int) -> bool:
+    def renew_lease(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
         try:
             self._call(
                 "POST",
@@ -412,7 +435,14 @@ class QueueClient:
             raise
         return True
 
-    def release_claim(self, job_id: int, *, claimed_by: str, reason: str | None = None) -> None:
+    def release_claim(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
         body: dict[str, Any] = {"worker": claimed_by}
         if reason is not None:
             body["reason"] = reason
@@ -446,7 +476,7 @@ class QueueClient:
     def cancel_job(self, job_id: int) -> None:
         self._call("POST", f"/jobs/{job_id}/cancel")
 
-    def requeue_job(self, job_id: int) -> None:
+    def requeue_job(self, job_id: int, *, now: datetime | None = None) -> None:
         self._call("POST", f"/jobs/{job_id}/requeue")
 
     def prioritise_job(self, job_id: int, priority_class: str) -> None:
@@ -461,6 +491,7 @@ class QueueClient:
         repo: str | None = None,
         source: str | None = None,
         pool: str | None = None,
+        now: datetime | None = None,
     ) -> bool:
         body: dict[str, Any] = {"until": until.isoformat()}
         optional = {
@@ -471,20 +502,181 @@ class QueueClient:
         return bool(payload and payload.get("opened"))
 
     def dispatch_pause(self, pool: str | None = None) -> QueuePause | None:
-        """``pool``'s live window; the service already omits an elapsed one."""
+        """``pool``'s recorded window — raw, like the store's: an elapsed one is still returned."""
         return next((p for p in self.dispatch_pauses() if p.pool == pool), None)
 
     def dispatch_pauses(self) -> list[QueuePause]:
-        """Every live window, one per paused pool."""
-        snapshot = self._snapshot()
-        pauses = snapshot.get("pauses")
-        if not isinstance(pauses, list):  # a server from before pool pauses
-            single = snapshot.get("pause")
-            pauses = [single] if isinstance(single, dict) else []
+        """Every recorded window, one per pool (``GET /pause``).
+
+        Raw on purpose, as the store's is: the scheduler announces a resume off a
+        window that has elapsed but is still on record, which the `GET /jobs`
+        snapshot (live windows only) cannot show it.
+        """
+        payload = self._call("GET", "/pause")
+        pauses = payload.get("pauses") if isinstance(payload, dict) else None
+        if not isinstance(pauses, list):
+            raise QueueUnavailable(f"fleet queue {self.url} sent a malformed pause list")
         return [QueuePause(**_fields(QueuePause, p)) for p in pauses if isinstance(p, dict)]
+
+    def mark_pause_probed(self, pool: str | None = None, *, now: datetime | None = None) -> None:
+        """``POST /pause/probed`` — stamp ``pool``'s last live-API re-probe."""
+        self._call("POST", "/pause/probed", {"pool": pool} if pool else {})
 
     def clear_pause(self, pool: str | None = None) -> None:
         self._call("DELETE", "/pause" + (f"?pool={quote(pool, safe='')}" if pool else ""))
+
+    # --- the scheduler's surface (Story 35.2-005) -----------------------------
+
+    def _jobs(self, path: str, body: dict[str, Any] | None = None, *, method: str = "GET") -> list[JobRecord]:
+        payload = self._call(method, path, body)
+        if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+            raise QueueUnavailable(f"fleet queue {self.url} sent a malformed job list")
+        return [self._job(item) for item in payload["jobs"]]
+
+    def peek_claimable(
+        self,
+        *,
+        busy_repos: "set[str] | frozenset[str] | None" = None,
+        fix_busy_repos: "set[str] | frozenset[str] | None" = None,
+        now: datetime | None = None,
+    ) -> list[JobRecord]:
+        """``GET /jobs/claimable`` — candidates in dispatch order, minus the busy repos."""
+        params = [("busy", repo) for repo in sorted(busy_repos or ())]
+        params += [("fix_busy", repo) for repo in sorted(fix_busy_repos or ())]
+        return self._jobs("/jobs/claimable" + (f"?{urlencode(params)}" if params else ""))
+
+    def claimable_for_worker(
+        self,
+        name: str,
+        candidates: Iterable[JobRecord],
+        *,
+        slots_free: int | None = None,
+        now: datetime | None = None,
+    ) -> list[JobRecord]:
+        """``POST /jobs/eligible`` — which candidates ``name`` may take, order kept.
+
+        Sends job ids, not records: the service re-reads each, so it judges the
+        row as it is now rather than as this worker last saw it.
+        """
+        body: dict[str, Any] = {"worker": name, "job_ids": [job.id for job in candidates]}
+        if slots_free is not None:
+            body["slots_free"] = slots_free
+        return self._jobs("/jobs/eligible", body, method="POST")
+
+    def expired_running_jobs(self, *, now: datetime | None = None) -> list[JobRecord]:
+        return self._jobs("/jobs/expired")
+
+    def due_parked_jobs(self, *, now: datetime | None = None) -> list[JobRecord]:
+        return self._jobs("/jobs/due")
+
+    def running_repos(
+        self, *, kind: str | None = None, excluding: int | None = None
+    ) -> set[str]:
+        params = {key: value for key, value in (("kind", kind), ("excluding", excluding)) if value is not None}
+        payload = self._call("GET", "/jobs/running-repos" + (f"?{urlencode(params)}" if params else ""))
+        repos = payload.get("repos") if isinstance(payload, dict) else None
+        if not isinstance(repos, list):
+            raise QueueUnavailable(f"fleet queue {self.url} sent a malformed repo list")
+        return {repo for repo in repos if isinstance(repo, str)}
+
+    def overlap_holds(self) -> dict[int, int]:
+        payload = self._call("GET", "/jobs/holds")
+        holds = payload.get("holds") if isinstance(payload, dict) else None
+        if not isinstance(holds, dict):
+            raise QueueUnavailable(f"fleet queue {self.url} sent a malformed overlap graph")
+        return {int(job): int(holder) for job, holder in holds.items()}
+
+    def get_worker(self, name: str) -> WorkerRecord | None:
+        try:
+            return self._worker(self._call("GET", f"/workers/{quote(name, safe='')}"))
+        except QueueRequestError as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    def _take(self, verb: str, job_id: int, claimed_by: str, lease_seconds: int, worker: str | None) -> JobRecord | None:
+        """The three lease-taking verbs: a lost race (409) or a vanished job (404) is ``None``."""
+        body: dict[str, Any] = {"claimed_by": claimed_by, "lease_seconds": lease_seconds}
+        if worker is not None:
+            body["worker"] = worker
+        try:
+            return self._job(self._call("POST", f"/jobs/{job_id}/{verb}", body))
+        except QueueRequestError as exc:
+            if exc.status in (404, 409):
+                return None
+            raise
+
+    def claim_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+        worker: str | None = None,
+    ) -> JobRecord | None:
+        return self._take("claim", job_id, claimed_by, lease_seconds, worker)
+
+    def reclaim_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+        worker: str | None = None,
+    ) -> JobRecord | None:
+        return self._take("reclaim", job_id, claimed_by, lease_seconds, worker)
+
+    def take_parked_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+        worker: str | None = None,
+    ) -> JobRecord | None:
+        return self._take("take", job_id, claimed_by, lease_seconds, worker)
+
+    def park_job(
+        self, job_id: int, *, pr_number: int, reason: str, poll_after: datetime | None
+    ) -> bool:
+        payload = self._call(
+            "POST",
+            f"/jobs/{job_id}/park",
+            {
+                "pr_number": pr_number,
+                "reason": reason,
+                "poll_after": poll_after.isoformat() if poll_after is not None else None,
+            },
+        )
+        return bool(isinstance(payload, dict) and payload.get("parked"))
+
+    def schedule_poll(self, job_id: int, poll_after: datetime | None) -> None:
+        self._call(
+            "POST",
+            f"/jobs/{job_id}/poll",
+            {"poll_after": poll_after.isoformat() if poll_after is not None else None},
+        )
+
+    def set_reason(self, job_id: int, reason: str | None) -> None:
+        self._call("POST", f"/jobs/{job_id}/reason", {"reason": reason})
+
+    def attach_run(self, job_id: int, run_id: str) -> None:
+        self._call("POST", f"/jobs/{job_id}/run", {"run_id": run_id})
+
+    def record_sync(self, job_id: int, *, repo: str, sha: str) -> None:
+        self._call("POST", f"/jobs/{job_id}/sync", {"repo": repo, "sha": sha})
+
+    def record_files(self, job_id: int, paths: Iterable[str]) -> None:
+        self._call("POST", f"/jobs/{job_id}/files", {"paths": sorted({str(p) for p in paths})})
+
+    def record_fix_rounds_baseline(self, job_id: int, rounds: int) -> None:
+        self._call("POST", f"/jobs/{job_id}/fix-rounds", {"rounds": rounds})
+
+    def restart_fresh(self, job_id: int, *, reason: str, now: datetime | None = None) -> None:
+        self._call("POST", f"/jobs/{job_id}/restart", {"reason": reason})
 
 
 # ---------------------------------------------------------------------------

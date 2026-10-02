@@ -8,7 +8,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, Callable
 
 import typer
 
@@ -25,9 +25,6 @@ from sdlc.scheduler import (
     MAX_APPROVAL_POLL_SECONDS,
     MIN_APPROVAL_POLL_SECONDS,
 )
-
-if TYPE_CHECKING:
-    from sdlc.queue import QueueStore
 
 # The full set of planned subcommands with one-line descriptions. `--help`
 # renders these even while the bodies are stubs, so the surface area is visible
@@ -3433,23 +3430,6 @@ def _queue_errors(func: Callable[..., None]) -> Callable[..., None]:
     return wrapper
 
 
-def _local_queue(verb: str) -> QueueStore:
-    """The local store, for a verb that has no fleet-queue route yet."""
-    from sdlc.queue import QueueStore
-    from sdlc.queue_client import open_queue
-
-    store = open_queue()
-    if not isinstance(store, QueueStore):
-        typer.echo(
-            f"error: `sdlc queue {verb}` works on the local queue only; a fleet queue "
-            f"is configured ({getattr(store, 'url', '?')}) — unset SDLC_QUEUE_URL "
-            "(and any .sdlc-queue.yaml / ~/.sdlc-fleet.yaml) to use it",
-            err=True,
-        )
-        raise typer.Exit(code=2)
-    return store
-
-
 def _format_age(now: datetime, created_at: str) -> str:
     """A short human age like ``3m``/``2h``/``5d`` from an ISO `created_at`."""
     try:
@@ -3801,8 +3781,19 @@ def queue_run_cmd(
     list`. `--slots` is the worker's cap. `--dashboard-url` advertises the
     worker's own dashboard origin (Story 35.4-002) in each run it pushes, so the
     XPS dashboard's "view session" reads that worker's transcripts. Works on the
-    queue this host owns: with `SDLC_QUEUE_URL` set it refuses, like the rest of
-    this verb. Once the controller is reinstalled under a worker (Story
+    queue this host owns, and — Story 35.2-005 — on the fleet's: with
+    `SDLC_QUEUE_URL` (or `queue_url:` in `.sdlc-queue.yaml` /
+    `~/.sdlc-fleet.yaml`) set, every step above (register, heartbeat, claim,
+    renew, release, finish, park, reclaim, sync/files/fix-round records, the
+    fleet run push) goes to `sdlc queue serve` over HTTP, so a job enqueued on
+    the XPS runs here. A fleet drain must be a worker (`--worker NAME`): the
+    claim is matched on what it registered. A worker whose network drops keeps
+    its jobs running and its leases renewing once the service answers; a lease
+    that lapses meanwhile is reclaimed by a peer only after this worker's next
+    beat finds the run's process gone (it never takes a job whose run may still
+    be going), and then as a fresh run — the old one's ledger lives here. A
+    one-shot drain that cannot reach the service at all exits 2; `--follow`
+    keeps retrying. Once the controller is reinstalled under a worker (Story
     35.2-004) it claims nothing more, lets its running jobs finish and exits 75,
     so a supervisor (`KeepAlive`) restarts it on the new code.
 
@@ -3849,7 +3840,21 @@ def queue_run_cmd(
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(code=2) from exc
 
-    store = _local_queue("run")
+    from sdlc.queue_client import QueueClient, open_queue
+
+    store = open_queue()
+    if isinstance(store, QueueClient) and worker is None:
+        # Without a registered profile the drain would claim by hand-picked job
+        # id, bypassing the eligibility match (repos, harness, pins, pools) the
+        # fleet queue exists to enforce.
+        typer.echo(
+            f"error: SDLC_QUEUE_URL points `sdlc queue run` at the fleet queue "
+            f"({store.url}); drain it as a worker: `sdlc queue run --worker NAME "
+            "--pool POOL` (or unset SDLC_QUEUE_URL, and any .sdlc-queue.yaml / "
+            "~/.sdlc-fleet.yaml, to drain the local queue)",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     store.init()
 
     result = run_queue(
@@ -4104,7 +4109,7 @@ def queue_serve_cmd(
       GET    /workers                {workers} with an `online` flag each
       PUT    /runs                   a build pushes its run record (the registry.json
                                      fields + worker) on start and finish; a worker
-                                     on this store writes its runs' rows directly
+                                     pushes its runs' rows the same way
       GET    /runs                   {runs}: each with its worker's `worker_online`
                                      (the XPS dashboard's fleet view)
       POST   /jobs/{id}/renew        worker, \\[lease_seconds]
@@ -4115,6 +4120,31 @@ def queue_serve_cmd(
       POST   /jobs/{id}/prioritise   priority
       POST   /pause                  until, \\[reason, run_id, repo, source, pool]
       DELETE /pause[?pool=P]         one pool's window, or every window
+      GET    /pause                  {pauses}: every recorded window, elapsed ones
+                                     too (what a worker announces a resume from)
+
+    The scheduler routes (Story 35.2-005) — what `sdlc queue run --worker`
+    drives through the QueueClient, one per store verb; the service's own clock
+    judges every lease:
+      GET    /workers/{name}         one worker, or 404
+      GET    /jobs/claimable[?busy=PATH&fix_busy=PATH]   {jobs} in dispatch order
+      POST   /jobs/eligible          worker, job_ids, \\[slots_free] -> {jobs} it may take
+      GET    /jobs/expired           {jobs}: running with a lapsed lease
+      GET    /jobs/due               {jobs}: parked, change request due a re-read
+      GET    /jobs/running-repos[?kind=K&excluding=ID]   {repos}
+      GET    /jobs/holds             {holds}: file-overlap holds {job: holder}
+      POST   /jobs/{id}/claim        claimed_by, \\[lease_seconds, worker]  (409: lost)
+      POST   /jobs/{id}/reclaim      same, for a lapsed lease
+      POST   /jobs/{id}/take         same, for a parked job
+      POST   /jobs/{id}/park         pr_number, reason, \\[poll_after]
+      POST   /jobs/{id}/poll         \\[poll_after]
+      POST   /jobs/{id}/reason       \\[reason]
+      POST   /jobs/{id}/run          run_id
+      POST   /jobs/{id}/sync         repo, sha
+      POST   /jobs/{id}/files        paths
+      POST   /jobs/{id}/fix-rounds   rounds
+      POST   /jobs/{id}/restart      reason
+      POST   /pause/probed           \\[pool]
     404 unknown job/route · 400 bad input · 409 not the claim holder or state
     refuses the move · 403 refused identity or a browser · 415 a body that is
     not Content-Type: application/json.

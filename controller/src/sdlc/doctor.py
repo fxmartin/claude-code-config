@@ -27,7 +27,7 @@ from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
 from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
 from sdlc.queue import QueueError, QueueStore, WorkerRecord, default_queue_path
-from sdlc.queue_client import QueueClient, QueueRefused, resolve_queue_url
+from sdlc.queue_client import QUEUE_TOKEN_ENV, QueueClient, QueueRefused, resolve_queue_url
 from sdlc.registry import Registry, derive_state
 
 __all__ = [
@@ -677,13 +677,16 @@ def check_fleet_worker_installed(
     ``None`` elsewhere: a laptop that never runs a resident worker has nothing
     to report, and doctor must not nag it.
 
-    The worker registers in the store its plist pins — launchd starts it with
-    the plist's environment, and `sdlc queue run` is local-only — so that store
-    is the one asked, not this shell's. When the two differ (``queue_path``,
-    default ``default_queue_path()``), an online worker is a WARN: jobs enqueued
-    from this shell land in a file it never drains. So is a fleet queue this
-    shell resolves (``resolve_queue_url``): its enqueues go to the service,
-    which `sdlc queue run` cannot drain yet.
+    launchd starts the worker with the plist's environment, not this shell's, so
+    that is what decides which queue it drains. When the plist (or the per-user
+    ``~/.sdlc-fleet.yaml`` it reads) names a fleet queue (Story 35.2-005) the
+    worker registers *there*, and that service is the one asked. Otherwise it
+    registers in the store its plist pins, which is asked instead; when that
+    differs from this shell's (``queue_path``, default ``default_queue_path()``),
+    an online worker is a WARN: jobs enqueued from this shell land in a file it
+    never drains. So is a fleet queue only this shell resolves
+    (``resolve_queue_url``): its enqueues go to a service the worker is not
+    pointed at.
     """
     path = agent_path or default_worker_plist()
     if not path.exists():
@@ -699,10 +702,21 @@ def check_fleet_worker_installed(
             f"{path} is unreadable: {exc}",
             "reinstall it from templates/launchd/com.fxmartin.sdlc-worker.plist",
         )
+    host = host or socket.gethostname().split(".")[0]
+    try:
+        worker_url = resolve_queue_url(environ=env)
+    except QueueError as exc:
+        return Finding(
+            "fleet-worker", "Fleet worker", "FAIL",
+            f"the worker's fleet queue URL is unusable: {exc}",
+            "fix queue_url: in ~/.sdlc-fleet.yaml, or SDLC_QUEUE_URL in the worker's plist",
+        )
+    if worker_url is not None:
+        # The worker drains the service, so it is the service that knows it.
+        token = env.get(QUEUE_TOKEN_ENV) or os.environ.get(QUEUE_TOKEN_ENV) or None
+        return check_fleet_worker(QueueClient(worker_url, token=token).list_workers, host=host)
     store = _service_store_path(env)
-    finding = check_fleet_worker(
-        QueueStore(store).list_workers, host=host or socket.gethostname().split(".")[0]
-    )
+    finding = check_fleet_worker(QueueStore(store).list_workers, host=host)
     if finding.status != "CLEAN":
         return finding
     try:
@@ -713,9 +727,11 @@ def check_fleet_worker_installed(
         return Finding(
             "fleet-worker", "Fleet worker", "WARN",
             f"{finding.detail} — but this shell enqueues to the fleet queue at {url}, which "
-            "`sdlc queue run` does not drain yet, so jobs enqueued here never reach it",
-            "unset SDLC_QUEUE_URL (and any queue_url: in .sdlc-queue.yaml / "
-            "~/.sdlc-fleet.yaml) to enqueue to this Mac's worker",
+            "the worker is not pointed at (launchd's environment does not carry it), so jobs "
+            "enqueued here never reach it",
+            "set SDLC_QUEUE_URL in the worker plist's EnvironmentVariables (or queue_url: in "
+            "~/.sdlc-fleet.yaml) so it drains the fleet queue, or unset it here to enqueue "
+            "to this Mac's own queue",
         )
     local = queue_path if queue_path is not None else default_queue_path()
     if store == local:
