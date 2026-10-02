@@ -274,6 +274,10 @@ def _remote_run_row(fleet_row: dict) -> dict | None:
 _FLEET_CACHE_SECONDS = 2.0
 # The page ticks every few seconds; a slow service must not stall it.
 _FLEET_TIMEOUT_SECONDS = 3
+# An offline tailnet peer blackholes rather than refuses, so a failed fetch costs
+# a full timeout (twice: a GET retries once) under the view's lock. Back off for
+# longer than a tick so a dead service stalls the page at most once per window.
+_FLEET_FAILURE_CACHE_SECONDS = 30.0
 
 
 class _FleetView:
@@ -283,11 +287,18 @@ class _FleetView:
     ``SDLC_QUEUE_URL`` the fleet is simply not configured (``available`` stays
     true: nothing is wrong). With one, an unreachable or refusing service gives
     ``available: False`` and the reason, and no runs — the local runs still render
-    and the page says "fleet unavailable".
+    and the page says "fleet unavailable". That failure is kept for
+    ``failure_ttl`` before the service is asked again.
     """
 
-    def __init__(self, ttl: float = _FLEET_CACHE_SECONDS, clock=time.monotonic) -> None:
+    def __init__(
+        self,
+        ttl: float = _FLEET_CACHE_SECONDS,
+        clock=time.monotonic,
+        failure_ttl: float = _FLEET_FAILURE_CACHE_SECONDS,
+    ) -> None:
         self._ttl = ttl
+        self._failure_ttl = failure_ttl
         self._clock = clock
         self._lock = threading.Lock()
         self._fetched_at: float | None = None
@@ -300,7 +311,8 @@ class _FleetView:
     def snapshot(self) -> dict:
         with self._lock:
             now = self._clock()
-            if self._fetched_at is None or now - self._fetched_at >= self._ttl:
+            ttl = self._ttl if self._snapshot.get("available", True) else self._failure_ttl
+            if self._fetched_at is None or now - self._fetched_at >= ttl:
                 self._snapshot = self._fetch()
                 self._fetched_at = now
             return self._snapshot

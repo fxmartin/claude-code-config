@@ -1775,8 +1775,11 @@ class QueueStore:
         """Insert or refresh the fleet row for ``record.run_id``.
 
         A worker pushes on start, on each heartbeat and on finish, so this is an
-        upsert. A finished row is final: a stale in-progress push that arrives
-        after the finish (a heartbeat racing it) must not reopen the run.
+        upsert. A finished row is final against its own process: a stale
+        in-progress push that arrives after the finish (a heartbeat racing it)
+        carries the finished run's pid and must not reopen the run. A different
+        pid is ``sdlc resume`` re-registering the run from a new process, and
+        that does reopen it.
         """
         worker = (record.worker or "").strip()
         if not worker:
@@ -1792,7 +1795,8 @@ class QueueStore:
                 "started_at = excluded.started_at, finished_at = excluded.finished_at, "
                 "total = excluded.total, completed = excluded.completed, "
                 "updated_at = excluded.updated_at "
-                "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL",
+                "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL "
+                "OR excluded.pid != fleet_runs.pid",
                 (
                     record.run_id, worker, record.repo, record.db, record.scope, record.pid,
                     record.status, record.started_at, record.finished_at, record.total,

@@ -1976,7 +1976,9 @@ authoritative for the worker; the table is the fleet's summary.
   `resume`) call `queue_client.push_fleet_run` after the local write, and the
   worker's 30 s heartbeat re-pushes each in-flight run with its done/total read
   live from the ledger. `PUT /runs` is an upsert (so the client may replay it
-  once); a finished row is final — a stale in-progress push cannot reopen it.
+  once); a finished row is final against its own pid — a stale in-progress
+  heartbeat cannot reopen it, while `resume` (a new process, so a new pid)
+  does.
   The push is best-effort with a 3 s timeout and never fails the build. The
   `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its jobs), else
   the short hostname when a fleet URL is configured.
@@ -1989,7 +1991,8 @@ authoritative for the worker; the table is the fleet's summary.
   header-only snapshot built from the pushed record. `/api/fleet` reports
   `{configured, available, error}`; unreachable, the page keeps the local runs and
   shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
-  `/api/runs`, `/api/fleet` and the SSE change token.
+  `/api/runs`, `/api/fleet` and the SSE change token; a failed fetch is kept
+  for 30 s, so an offline service stalls the page at most once per window.
 
 ### Pause per subscription pool (Story 35.2-003)
 

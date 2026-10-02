@@ -149,10 +149,28 @@ def test_a_late_in_progress_push_cannot_reopen_a_finished_run(store: QueueStore)
     store.put_fleet_run(
         _record(status="DONE", finished_at="2026-10-02T11:00:00+00:00", completed=5)
     )
-    store.put_fleet_run(_record(status="IN_PROGRESS", completed=4))  # a stale heartbeat push
+    # A stale heartbeat push: it read the record before the finish, so it carries
+    # the finished run's own pid.
+    store.put_fleet_run(_record(status="IN_PROGRESS", completed=4))
     (row,) = store.list_fleet_runs()
     assert (row["status"], row["completed"]) == ("DONE", 5)
     assert row["finished_at"]
+
+
+def test_a_resume_reopens_a_finished_run_and_its_later_pushes_land(store: QueueStore) -> None:
+    # `sdlc resume` re-registers the same run id from a new process (resume.py), so
+    # a different pid is a resume, not a stale heartbeat — the row must reopen.
+    store.put_fleet_run(_record(completed=1))
+    store.put_fleet_run(
+        _record(status="FAILED", finished_at="2026-10-02T11:00:00+00:00", completed=2)
+    )
+    store.put_fleet_run(_record(pid=5151, completed=3))
+    (row,) = store.list_fleet_runs()
+    assert (row["status"], row["completed"], row["pid"]) == ("IN_PROGRESS", 3, 5151)
+    assert row["finished_at"] is None
+    store.put_fleet_run(_record(pid=5151, completed=4))  # the resumed run's heartbeat
+    (row,) = store.list_fleet_runs()
+    assert (row["status"], row["completed"]) == ("IN_PROGRESS", 4)
 
 
 def test_a_queue_db_written_before_the_fleet_registry_upgrades_in_place(tmp_path: Path) -> None:
@@ -329,6 +347,27 @@ def test_finish_pushes_the_terminal_record(
     (remote,) = store.list_fleet_runs()
     assert (remote["status"], remote["completed"]) == ("DONE", 4)
     assert remote["finished_at"]
+
+
+def test_resuming_a_finished_run_reopens_it_on_the_fleet(
+    tmp_path: Path, live: _Live, store: QueueStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc.build import _registry_finish, _registry_register
+
+    _fleet_env(monkeypatch, live.url)
+    monkeypatch.setenv(WORKER_ENV, "m3max")
+    registry = Registry(tmp_path / "registry.json")
+    monkeypatch.setattr("sdlc.build.os.getpid", lambda: 4242)
+    _registry_register(registry, "run-9", "epic-9", tmp_path / "l.db", 4, repo=tmp_path)
+    _registry_finish(registry, "run-9", "AWAITING_APPROVAL", 2)
+    # `sdlc resume` is a new process re-registering the same run id (resume.py).
+    monkeypatch.setattr("sdlc.build.os.getpid", lambda: 5151)
+    _registry_register(
+        registry, "run-9", "epic-9", tmp_path / "l.db", 4, repo=tmp_path, completed=2
+    )
+
+    (remote,) = store.list_fleet_runs()
+    assert (remote["status"], remote["pid"], remote["finished_at"]) == ("IN_PROGRESS", 5151, None)
 
 
 def test_a_down_service_does_not_fail_register_or_finish(
@@ -590,6 +629,35 @@ def test_the_fleet_is_fetched_once_per_tick_not_once_per_endpoint(
         _get_json(base + "/api/runs")
         _get_json(base + "/api/fleet")
     assert len(calls) == 1
+
+
+def test_a_failed_fleet_fetch_backs_off_so_a_dead_peer_does_not_stall_every_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sdlc.dashboard import _FleetView
+
+    # A blackholed tailnet peer costs a full client timeout per fetch, under the
+    # view's lock: a failure must be cached longer than a success, not re-tried
+    # on the very next tick.
+    now = [0.0]
+    fetches: list[dict] = []
+    outcome = [{"configured": True, "available": False, "error": "down", "runs": []}]
+    monkeypatch.setattr(
+        _FleetView, "_fetch", staticmethod(lambda: fetches.append(outcome[0]) or outcome[0])
+    )
+    view = _FleetView(ttl=2.0, failure_ttl=30.0, clock=lambda: now[0])
+
+    view.snapshot()
+    now[0] = 5.0
+    view.snapshot()
+    assert len(fetches) == 1  # still inside the failure back-off
+    now[0] = 31.0
+    outcome[0] = {"configured": True, "available": True, "error": None, "runs": []}
+    view.snapshot()
+    assert len(fetches) == 2  # back-off over: the service is asked again
+    now[0] = 34.0
+    view.snapshot()
+    assert len(fetches) == 3  # a healthy fleet keeps the short tick cache
 
 
 def test_selecting_a_remote_run_returns_a_snapshot_built_from_the_pushed_record(
