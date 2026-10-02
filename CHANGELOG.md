@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.83.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): `sdlc queue serve` — the store (#35.1-001) (#817)
+
+
 ## [v2.82.3] - 2026-10-01
 
 ### Fixed
