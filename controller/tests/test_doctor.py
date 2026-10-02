@@ -1539,6 +1539,25 @@ def test_fleet_worker_check_runs_when_the_launch_agent_is_installed(tmp_path, mo
     assert "not registered" in finding.detail
 
 
+def test_fleet_worker_check_fails_when_the_queue_cannot_be_opened(tmp_path, monkeypatch) -> None:
+    from sdlc import queue_client
+    from sdlc.doctor import check_fleet_worker_installed
+    from sdlc.queue import QueueError
+
+    def _unopenable():
+        raise QueueError("queue backend unavailable")
+
+    monkeypatch.setattr(queue_client, "open_queue", _unopenable)
+    agent = tmp_path / "com.fxmartin.sdlc-worker.plist"
+    agent.write_text("<plist/>", encoding="utf-8")
+
+    finding = check_fleet_worker_installed(agent_path=agent, host="m3")
+
+    assert finding is not None
+    assert finding.status == "FAIL"
+    assert "queue backend unavailable" in finding.detail
+
+
 def test_run_doctor_reports_the_worker_only_when_its_launch_agent_is_installed(
     tmp_path, monkeypatch
 ) -> None:
