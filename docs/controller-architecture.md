@@ -1981,7 +1981,8 @@ went out may mean it landed, and replaying `add` would enqueue twice). An
 unreachable service or 5xx raises `QueueUnavailable`, a 403 `QueueRefused`; both
 name the URL, and the CLI shows one `error:` line (exit 2). `--enqueue` with the
 service down fails — it never enqueues locally — while a plain `sdlc build`
-never opens the queue and is unaffected.
+never opens the queue and does not depend on it: with a URL configured it only
+pushes its run record to the fleet registry, best-effort (Story 35.4-001, below).
 
 **Targeting the fleet (Story 35.3-001).** On a fleet queue `--enqueue` adds
 `requirements` to the job — `{repo, origin, harness, sandbox}`, all strings:
@@ -2009,6 +2010,47 @@ a machine named `github` or `gitlab` cannot be pinned. `sdlc queue list` gained
 `sdlc queue run` stays local-only and refuses while a fleet queue is configured; `sdlc queue unpause --pool` works against it (Story 35.2-003); `sdlc queue serve` always serves the local store.
 `sdlc doctor` adds a `fleet-queue` finding — reachable, identity accepted, the
 service's controller version — only when a URL is configured.
+
+### The fleet run registry (Story 35.4-001)
+
+The per-host `registry.json` cannot show a run on another machine, so the service
+holds a second table, `fleet_runs` (migration 10): one row per run id, the
+`RunRecord` fields plus `worker` and `updated_at`. The worker's local file stays
+authoritative for the worker; the table is the fleet's summary.
+
+- **Worker writes.** `queue run --worker` drains the queue its host owns and
+  refuses a fleet URL, so neither it nor its jobs can reach `/runs`. Like its
+  heartbeat registration, the worker writes each run's row straight into that
+  store (`QueueStore.put_fleet_run`, named for the worker): when `_attach_runs`
+  links the run to its job, on each 30 s heartbeat with done/total read live from
+  the ledger, and once the job's process is gone — reaped, stopped by its budget,
+  by an operator's cancel (Story 35.4-003), or by Ctrl-C. That last write carries
+  the worker's own `derive_state`, so a run that exited unfinished (killed,
+  crashed, parked) reads `DEAD` on the fleet as it does on the worker's dashboard.
+  A failed write is logged, never fatal to the drain.
+- **Build pushes.** `_registry_register` / `_registry_finish` (and so `build`,
+  `fix` and `resume`) call `queue_client.push_fleet_run` after the local write;
+  it reaches the service only where a fleet URL is configured, so it is a no-op
+  inside a worker's jobs. The push never fails the build: 3 s per attempt, and
+  `PUT /runs` is replayed once, so an unreachable service can hold a build's start
+  or finish for about 6 s. A record the local write could not store is not
+  pushed. The `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its
+  jobs), else the short hostname. Nothing outlives a build that dies outside a
+  worker, so its row keeps its last pushed status (its own host shows `DEAD`).
+- **Upsert.** `PUT /runs` and the worker's writes share one upsert: a finished
+  row is final against its own pid — a stale in-progress write cannot reopen it,
+  while `resume` (a new process, so a new pid) does.
+- **Read.** `GET /runs` returns `{runs}`, each flagged `worker_online` from the
+  `workers` table (`null` when the worker never registered — unknown, not gone).
+- **Dashboard.** `/api/runs` merges the fleet's runs into the local registry view
+  and dedupes by run id (the local row wins). `derive_state(record, remote=True,
+  worker_online=…)` judges a remote run by its worker's heartbeat instead of a pid
+  that names a process on another machine. Selecting a remote run serves a
+  header-only snapshot built from the pushed record. `/api/fleet` reports
+  `{configured, available, error}`; unreachable, the page keeps the local runs and
+  shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
+  `/api/runs`, `/api/fleet` and the SSE change token; a failed fetch is kept
+  for 30 s, so an offline service stalls the page at most once per window.
 
 ### Pause per subscription pool (Story 35.2-003)
 

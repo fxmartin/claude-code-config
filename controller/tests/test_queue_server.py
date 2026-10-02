@@ -29,6 +29,9 @@ from sdlc.queue_server import (
 )
 
 LOOPBACK = ("127.0.0.0/8",)
+# `shutdown()` blocks until `serve_forever` next polls its stop flag; the
+# stdlib's 0.5s default idled every live-server test half a second.
+_FAST_SHUTDOWN = {"poll_interval": 0.01}
 
 
 class _Running:
@@ -37,7 +40,7 @@ class _Running:
     def __init__(self, store: QueueStore, policy: AccessPolicy) -> None:
         self.server = make_server(store, policy, "127.0.0.1", 0)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self.server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
         self._thread.start()
 
     def call(self, method: str, path: str, body=None, headers=None):

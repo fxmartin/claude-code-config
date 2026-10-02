@@ -552,6 +552,30 @@ def test_apply_migrations_reruns_a_version_whose_recorded_name_disagrees(
         conn.close()
 
 
+def test_every_shipped_migration_is_recorded_once_under_its_own_version(tmp_path) -> None:
+    """Two stories built in parallel can each append "the next" version — 35.4-001's
+    ``fleet_runs`` and 35.4-003's ``job_cancel_requested`` both took 9. The
+    name-aware runner does not crash on the duplicate: it re-runs one of the pair
+    on every open and flips the bookkeeping row between their names, so
+    `sdlc doctor` reports a healthy queue.db as a migration behind on every other
+    open. Run against the real ``_MIGRATIONS`` so a colliding append fails here."""
+    from sdlc.queue import _MIGRATIONS, QueueStore
+
+    db = tmp_path / "queue.db"
+    store = QueueStore(db)
+    store.init()
+    store.init()  # a second open must find every migration already recorded as-is
+
+    conn = sqlite3.connect(db)
+    try:
+        recorded = conn.execute(
+            "SELECT version, name FROM _migrations ORDER BY version"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert recorded == [(version, name) for version, name, *_ in _MIGRATIONS]
+
+
 # ---------------------------------------------------------------------------
 # Story 32.1-003: per-repo exclusivity relaxed for build/build, kept for any
 # combination touching a fix job (fix runs in the repo root, exclusive always).

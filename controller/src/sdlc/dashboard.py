@@ -22,6 +22,7 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Iterable
 from urllib.parse import parse_qs, urlsplit
 
 from sdlc import __version__, github_stats
@@ -35,7 +36,7 @@ from sdlc.issue_host import (
 )
 from sdlc.portfolio import portfolio_view
 from sdlc.queue import QueueError
-from sdlc.queue_client import open_queue
+from sdlc.queue_client import QUEUE_TOKEN_ENV, QueueClient, open_queue, resolve_queue_url
 from sdlc.registry import Registry, RunRecord, derive_state
 
 # scp-like remote: git@host:owner/sub/repo.git
@@ -178,7 +179,9 @@ def repo_host(root: str | Path) -> str:
 
 
 def _registry_runs_view(
-    registry: Registry, github: "github_stats.GitHubStatsCache | None" = None
+    registry: Registry,
+    github: "github_stats.GitHubStatsCache | None" = None,
+    fleet_rows: Iterable[dict] = (),
 ) -> list[dict]:
     """Normalize the host-level registry into the runs-browser row shape.
 
@@ -192,10 +195,18 @@ def _registry_runs_view(
     summary (issues/PRs/CI) for its repo. The repo→slug resolution and the cache
     read are **deduped per repo** within one view, so N runs in one repo cost a
     single slug lookup and a single (cached) fetch — never one per run.
+
+    ``fleet_rows`` (Story 35.4-001) are the runs workers pushed to the fleet
+    registry. They merge in by run id: a run this host also has locally keeps its
+    local row (the local ledger is the authority), the rest are remote runs whose
+    state comes from their worker's heartbeat and whose counts are the pushed
+    ones. Every row carries ``worker`` (``None`` for a run no worker owns).
     """
     rows: list[dict] = []
     gh_by_repo: dict[str, dict] = {}
+    local_ids: set[str] = set()
     for rec in registry.records():
+        local_ids.add(rec.run_id)
         done, total = rec.completed, rec.total
         try:
             for r in Ledger(rec.db).list_runs():
@@ -214,6 +225,7 @@ def _registry_runs_view(
             "duration_seconds": _duration_seconds(rec.started_at, rec.finished_at),
             "done": done,
             "total": total,
+            "worker": rec.worker,
         }
         if github is not None:
             if rec.repo not in gh_by_repo:
@@ -221,8 +233,110 @@ def _registry_runs_view(
                 gh_by_repo[rec.repo] = github.get(repo_slug(rec.repo), host, instance_url)
             row["github"] = gh_by_repo[rec.repo]
         rows.append(row)
+    for fleet_row in fleet_rows:
+        remote = _remote_run_row(fleet_row)
+        if remote is not None and remote["id"] not in local_ids:
+            rows.append(remote)
     rows.sort(key=lambda r: (r["started_at"] or ""), reverse=True)
     return rows
+
+
+def _remote_run_row(fleet_row: dict) -> dict | None:
+    """A fleet-registry row in the runs-browser shape, or ``None`` if it is garbled.
+
+    The worker's ledger is not reachable from here, so ``done``/``total`` are the
+    counts the worker last pushed, and ``status`` is judged by the worker's
+    heartbeat (``worker_online``) rather than by a pid that names a process on
+    another machine. No ``github`` summary: the repo path is the worker's, not ours.
+    """
+    try:
+        rec = RunRecord.from_dict(fleet_row)
+    except (TypeError, ValueError):
+        return None  # a garbled row could never render — skip it, never fail the page
+    return {
+        "id": rec.run_id,
+        "repo": rec.repo,
+        "scope": rec.scope,
+        "status": derive_state(rec, remote=True, worker_online=fleet_row.get("worker_online")),
+        "started_at": rec.started_at,
+        "finished_at": rec.finished_at,
+        "duration_seconds": _duration_seconds(rec.started_at, rec.finished_at),
+        "done": rec.completed,
+        "total": rec.total,
+        "worker": rec.worker,
+    }
+
+
+# --- the fleet registry as the dashboard reads it (Story 35.4-001) -----------
+# One fetch per tick is shared by /api/runs, /api/fleet and the SSE change token,
+# so a page that polls all three still costs the service a single GET /runs.
+
+_FLEET_CACHE_SECONDS = 2.0
+# The page ticks every few seconds; a slow service must not stall it.
+_FLEET_TIMEOUT_SECONDS = 3
+# An offline tailnet peer blackholes rather than refuses, so a failed fetch costs
+# a full timeout (twice: a GET retries once) under the view's lock. Back off for
+# longer than a tick so a dead service stalls the page at most once per window.
+_FLEET_FAILURE_CACHE_SECONDS = 30.0
+
+
+class _FleetView:
+    """The fleet registry, fetched at most once per ``ttl`` and never raising.
+
+    ``snapshot()`` is ``{configured, available, error, runs}``. With no
+    ``SDLC_QUEUE_URL`` the fleet is simply not configured (``available`` stays
+    true: nothing is wrong). With one, an unreachable or refusing service gives
+    ``available: False`` and the reason, and no runs — the local runs still render
+    and the page says "fleet unavailable". That failure is kept for
+    ``failure_ttl`` before the service is asked again.
+    """
+
+    def __init__(
+        self,
+        ttl: float = _FLEET_CACHE_SECONDS,
+        clock=time.monotonic,
+        failure_ttl: float = _FLEET_FAILURE_CACHE_SECONDS,
+    ) -> None:
+        self._ttl = ttl
+        self._failure_ttl = failure_ttl
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._fetched_at: float | None = None
+        self._snapshot: dict = {}
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._fetched_at = None
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            now = self._clock()
+            ttl = self._ttl if self._snapshot.get("available", True) else self._failure_ttl
+            if self._fetched_at is None or now - self._fetched_at >= ttl:
+                self._snapshot = self._fetch()
+                self._fetched_at = now
+            return self._snapshot
+
+    @staticmethod
+    def _fetch() -> dict:
+        try:
+            url = resolve_queue_url()
+            if url is None:
+                return {"configured": False, "available": True, "error": None, "runs": []}
+            client = QueueClient(
+                url, token=os.environ.get(QUEUE_TOKEN_ENV) or None, timeout=_FLEET_TIMEOUT_SECONDS
+            )
+            return {
+                "configured": True, "available": True, "error": None,
+                "runs": client.list_fleet_runs(),
+            }
+        except QueueError as exc:
+            return {"configured": True, "available": False, "error": str(exc), "runs": []}
+
+    def status(self) -> dict:
+        """``snapshot()`` without the rows: what ``/api/fleet`` serves."""
+        snap = self.snapshot()
+        return {k: snap[k] for k in ("configured", "available", "error")}
 
 
 # --- wave-column dependency DAG (Story 11.2-008) ---------------------------
@@ -328,6 +442,14 @@ def _change_token(server) -> str:
             except (OSError, sqlite3.Error):
                 tok = "0"
             parts.append(f"{rec.run_id}:{derive_state(rec)}:{tok}")
+        fleet = getattr(server, "fleet", None)
+        if fleet is not None:
+            # A remote run has no ledger here, so its pushed progress is the signal.
+            for row in fleet.snapshot()["runs"]:
+                parts.append(
+                    f"fleet:{row.get('run_id')}:{row.get('status')}:{row.get('completed')}"
+                    f":{row.get('worker_online')}"
+                )
         return "|".join(parts)
     db_path = getattr(server, "db_path", None)
     if db_path is None:
@@ -548,6 +670,8 @@ _PAGE = """<!doctype html>
              border: 1px solid var(--surface); border-radius: 8px; }
   .ghpanel h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
   .ghpanel.unavail { color: var(--sub); font-style: italic; }
+  /* Story 35.4-001: the muted "fleet unavailable" line — the GitHub panel's precedent. */
+  .fleetnote { margin: 6px 0; color: var(--sub); font-size: 12px; font-style: italic; }
   /* Story 11.2-008: wave-column dependency DAG. Columns = cohort waves, nodes =
      stories, edges = SVG connectors. position:relative anchors the absolute edge
      overlay; nodes flow as normal columns so no per-pixel layout maths leak in. */
@@ -678,6 +802,7 @@ _PAGE = """<!doctype html>
     <div class="side" id="side"><h2>Runs</h2>
       <div class="side-chips" id="sideChips"></div>
       <div id="sideHint"></div>
+      <div id="fleetNote"></div>
       <div id="runs"></div>
     </div>
     <div class="main">
@@ -855,13 +980,15 @@ function activityRow(s, totalCols){
 async function tick(){
   try{
     const q = sel ? ("?run=" + encodeURIComponent(sel)) : "";
-    const [runsR, statR, ghR, qR] = await Promise.all([
+    const [runsR, statR, ghR, qR, fleetR] = await Promise.all([
       fetch("/api/runs",{cache:"no-store"}),
       fetch("/api/status"+q,{cache:"no-store"}),
       fetch("/api/github"+q,{cache:"no-store"}),
       fetch("/api/queue",{cache:"no-store"}),
+      fetch("/api/fleet",{cache:"no-store"}),
     ]);
     renderRuns(await runsR.json());
+    renderFleet(await fleetR.json());
     const stat = await statR.json();
     renderMain(stat);
     renderGithub(await ghR.json());
@@ -939,6 +1066,15 @@ function renderSideChips(runs){
   }).join("");
   el.innerHTML = "<span class='fchip fchip-all"+(allOn?" fchip-on":"")+"' data-status=''>all</span>" + chips;
 }
+// Story 35.4-001: the fleet registry is a second source behind /api/runs. When it
+// is configured but unreachable the local runs still render; this says so, muted.
+function renderFleet(f){
+  const el = document.getElementById("fleetNote");
+  if(!el) return;
+  el.innerHTML = (f && f.configured && !f.available)
+    ? "<div class='fleetnote' title='"+esc(f.error||"")+"'>fleet unavailable</div>"
+    : "";
+}
 function renderRuns(runs){
   lastRuns = runs || [];
   renderSideChips(lastRuns);
@@ -962,8 +1098,10 @@ function renderRuns(runs){
       + (r.duration_seconds!=null ? " &middot; " + humanDuration(r.duration_seconds) : "")
       + (r.total_tokens!=null ? " &middot; " + humanTokens(r.total_tokens) + " tok" : "")
       + (r.total_cost_usd!=null ? " &middot; " + usd(r.total_cost_usd) : "");
+    // Story 35.4-001: a fleet run names its worker beside the repo ("📁 repo @ worker").
     const repo = r.repo
-      ? "<div class='muted small'>📁 " + esc(String(r.repo).split(/[\\\\/]/).pop()) + "</div>"
+      ? "<div class='muted small'>📁 " + esc(String(r.repo).split(/[\\\\/]/).pop())
+        + (r.worker ? " @ " + esc(r.worker) : "") + "</div>"
       : "";
     const gh = ("github" in r) ? ghBadge(r.github) : "";
     // Story 19.2-001: tag active (building) runs with run--live so they stand
@@ -1550,9 +1688,22 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(snap)
         elif path == "/api/runs":
             if self.server.registry is not None:
-                self._json(_registry_runs_view(self.server.registry, self.server.github_cache))
+                self._json(
+                    _registry_runs_view(
+                        self.server.registry,
+                        self.server.github_cache,
+                        self._fleet_runs(),
+                    )
+                )
             else:
                 self._json(Ledger(self.server.db_path).list_runs())
+        elif path == "/api/fleet":
+            fleet = getattr(self.server, "fleet", None)
+            self._json(
+                fleet.status()
+                if fleet is not None
+                else {"configured": False, "available": True, "error": None}
+            )
         elif path == "/api/github":
             self._json(self._github_stats(run))
         elif path == "/api/portfolio":
@@ -1592,6 +1743,10 @@ class _Handler(BaseHTTPRequestHandler):
         runs in two repos never bleed into one another's detail view.
         """
         rec = self._resolve_run(run_id)
+        if rec is None and run_id:
+            remote = self._remote_status(run_id)
+            if remote is not None:
+                return remote
         if rec is None:
             return {
                 "db": None,
@@ -1607,6 +1762,44 @@ class _Handler(BaseHTTPRequestHandler):
         snap["pr_base"] = project_url
         snap["project"] = {"name": _project_name(project_url, Path(rec.db)), "url": project_url}
         return snap
+
+    def _fleet_runs(self) -> list[dict]:
+        fleet = getattr(self.server, "fleet", None)
+        return fleet.snapshot()["runs"] if fleet is not None else []
+
+    def _remote_status(self, run_id: str) -> dict | None:
+        """A snapshot of a fleet run from its pushed record, or None if unknown.
+
+        The worker's ledger is not reachable from here, so there are no stories
+        or events to show — only the run header and the done/total the worker
+        last pushed (Story 35.4-001).
+        """
+        for fleet_row in self._fleet_runs():
+            if fleet_row.get("run_id") != run_id:
+                continue
+            row = _remote_run_row(fleet_row)
+            if row is None:
+                return None
+            counts = {**_EMPTY_COUNTS, "total": row["total"] or 0, "done": row["done"] or 0}
+            return {
+                "db": None,
+                "run": {
+                    "id": row["id"],
+                    "scope": row["scope"],
+                    "mode": "remote",
+                    "status": row["status"],
+                    "started_at": row["started_at"],
+                    "finished_at": row["finished_at"],
+                    "duration_seconds": row["duration_seconds"],
+                    "worker": row["worker"],
+                },
+                "counts": counts,
+                "stories": [],
+                "events": [],
+                "pr_base": None,
+                "project": {"name": Path(row["repo"]).name, "url": None},
+            }
+        return None
 
     # --- GitHub repo health (Story 11.2-006) -------------------------------
 
@@ -1894,6 +2087,8 @@ def make_server(
         # with "no such column", exactly as a single --db ledger would.
         _migrate_registry_ledgers(reg)
         server.registry = reg  # type: ignore[attr-defined]
+        # Story 35.4-001: the fleet's runs, merged into the registry view.
+        server.fleet = _FleetView()  # type: ignore[attr-defined]
         server.db_path = None  # type: ignore[attr-defined]
         server.project_url = None  # type: ignore[attr-defined]
         server.project_name = None  # type: ignore[attr-defined]
