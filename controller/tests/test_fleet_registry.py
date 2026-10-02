@@ -25,6 +25,9 @@ from sdlc.queue_server import make_server as make_queue_server
 from sdlc.registry import WORKER_ENV, Registry, RunRecord, derive_state
 
 TOKEN = "s3cret-token"
+# `shutdown()` blocks until `serve_forever` next polls its stop flag; the
+# stdlib's 0.5s default idled every live-server test half a second.
+_FAST_SHUTDOWN = {"poll_interval": 0.01}
 
 
 def _record(run_id: str = "run-1", **overrides) -> RunRecord:
@@ -58,7 +61,7 @@ class _Live:
         policy = AccessPolicy(token=TOKEN, networks=("127.0.0.0/8",))
         self.server = make_queue_server(store, policy, "127.0.0.1", 0)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self.server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -759,7 +762,7 @@ def test_remote_rows_sort_with_local_ones_newest_first(tmp_path: Path) -> None:
 @contextmanager
 def _dashboard(registry: Registry):
     server = make_server(db_path=None, host="127.0.0.1", port=0, registry=registry)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_address[1]}"
