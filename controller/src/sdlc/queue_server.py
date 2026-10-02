@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from sdlc import __version__
 from sdlc.queue import JobRecord, QueueError, QueueStore
+from sdlc.registry import RunRecord
 from sdlc.scheduler import DEFAULT_LEASE_SECONDS
 
 __all__ = [
@@ -64,7 +65,7 @@ _REQUEST_TIMEOUT_SECONDS = 30
 WHOIS_CACHE_SECONDS = 60
 _WHOIS_TIMEOUT_SECONDS = 5
 _MAX_LEASE_SECONDS = 24 * 3600
-_REQUIREMENT_KEYS = frozenset({"repo", "harness", "sandbox", "origin"})
+_REQUIREMENT_KEYS = frozenset({"repo", "origin", "harness", "sandbox"})
 
 
 class BindError(ValueError):
@@ -362,12 +363,13 @@ class _Routes:
         # Same envelope `sdlc queue list --json` emits: the pause lives beside
         # the jobs, not in one of them, and an elapsed window is not state.
         repo = query.get("repo", [None])[0]
-        pause = self.store.dispatch_pause()
-        if pause is not None and not pause.is_active():
-            pause = None
+        pauses = [p for p in self.store.dispatch_pauses() if p.is_active()]
         jobs = self.store.list_jobs(repo)
         return 200, {
-            "pause": pause.to_dict() if pause else None,
+            # `pause` is the first live window (the one-pool shape of Story
+            # 32.2-001); `pauses` is one entry per paused pool (Story 35.2-003).
+            "pause": pauses[0].to_dict() if pauses else None,
+            "pauses": [p.to_dict() for p in pauses],
             "jobs": [job.to_dict() for job in jobs],
         }
 
@@ -415,6 +417,45 @@ class _Routes:
 
     def list_workers(self, _query: Any, _body: Body) -> Reply:
         return 200, {"workers": [worker.to_dict() for worker in self.store.list_workers()]}
+
+    # --- the fleet run registry (Story 35.4-001) -----------------------
+
+    def put_run(self, _query: Any, body: Body) -> Reply:
+        """Upsert one run's record, as a build pushes it on start and finish."""
+        total = _int(body, "total")
+        completed = _int(body, "completed")
+        pid = _int(body, "pid")
+        record = RunRecord(
+            run_id=_required(body, "run_id"),
+            repo=_required(body, "repo"),
+            db=_text(body, "db") or "",
+            scope=_required(body, "scope"),
+            pid=pid if pid is not None else 0,
+            status=_required(body, "status"),
+            started_at=_required(body, "started_at"),
+            finished_at=_text(body, "finished_at"),
+            total=total,
+            completed=completed,
+            worker=_required(body, "worker"),
+        )
+        try:
+            self.store.put_fleet_run(record)
+        except QueueError as exc:
+            raise _ApiError(400, str(exc)) from exc
+        return 200, {"ok": True}
+
+    def list_runs(self, _query: Any, _body: Body) -> Reply:
+        """Every pushed run, each flagged with whether its worker is still heartbeating.
+
+        ``worker_online`` is ``None`` for a worker that never registered — no
+        heartbeat to judge by — so a reader does not mistake "unknown" for "gone".
+        """
+        online = {w.name: w.is_online() for w in self.store.list_workers()}
+        runs = [
+            {**row, "worker_online": online.get(row["worker"])}
+            for row in self.store.list_fleet_runs()
+        ]
+        return 200, {"runs": runs}
 
     def claim(self, _query: Any, body: Body) -> Reply:
         claimed = self.store.claim_next(
@@ -488,18 +529,21 @@ class _Routes:
             raise _ApiError(400, f"until must be an ISO-8601 timestamp, got {raw!r}") from exc
         if until.tzinfo is None:
             until = until.replace(tzinfo=timezone.utc)
+        pool = _text(body, "pool")
         opened = self.store.pause_dispatch(
             until=until,
             reason=_text(body, "reason"),
             run_id=_text(body, "run_id"),
             repo=_text(body, "repo"),
             source=_text(body, "source"),
+            pool=pool,
         )
-        recorded = self.store.dispatch_pause()
+        recorded = self.store.dispatch_pause(pool)
         return 200, {"opened": opened, "pause": recorded.to_dict() if recorded else None}
 
-    def resume(self, _query: Any, _body: Body) -> Reply:
-        self.store.clear_pause()
+    def resume(self, query: dict[str, list[str]], _body: Body) -> Reply:
+        # `?pool=P` lifts one pool's window; no pool lifts every window.
+        self.store.clear_pause(query.get("pool", [None])[0] or None)
         return 200, {"pause": None}
 
 
@@ -516,6 +560,8 @@ def _route(method: str, path: str, routes: _Routes) -> Callable[[dict[str, list[
         ("POST", ("jobs", "claim")): routes.claim,
         ("GET", ("workers",)): routes.list_workers,
         ("POST", ("workers",)): routes.register_worker,
+        ("GET", ("runs",)): routes.list_runs,
+        ("PUT", ("runs",)): routes.put_run,
         ("POST", ("pause",)): routes.pause,
         ("DELETE", ("pause",)): routes.resume,
     }
@@ -545,6 +591,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self._dispatch("POST")
+
+    def do_PUT(self) -> None:
+        self._dispatch("PUT")
 
     def do_DELETE(self) -> None:
         self._dispatch("DELETE")

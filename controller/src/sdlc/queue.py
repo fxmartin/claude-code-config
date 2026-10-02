@@ -15,7 +15,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
+from sdlc.registry import RunRecord
+
 __all__ = [
+    "CANCEL_REQUESTED_REASON",
     "CODEX_POOL",
     "DEFAULT_BUDGETS",
     "HEARTBEAT_SECONDS",
@@ -41,6 +44,10 @@ __all__ = [
 # Queue filename under the chosen state directory — a sibling of registry.json
 # under the same host state dir (registry.py's default_registry_path()).
 _QUEUE_NAME = "queue.db"
+
+# What `queue list` shows beside a ``running`` job whose cancel is on its way to
+# the worker (Story 35.4-003).
+CANCEL_REQUESTED_REASON = "cancel requested"
 
 # How long a contended writer waits out the WAL writer lock before erroring
 # "database is locked". Mirrors the ledger's LEDGER_BUSY_TIMEOUT_MS
@@ -87,12 +94,13 @@ _STATES = {
 # outcome the scheduler reports.
 _TERMINAL_STATES = {"done", "failed", "blocked", "needs_attention"}
 
-# States an operator may retire. ``queued`` is the everyday case; ``blocked``
+# States an operator may retire at once. ``queued`` is the everyday case; ``blocked``
 # is here because Story 32.1-002 introduced that park and it would otherwise be
 # a dead end; ``parked`` is here because Story 32.2-002's approval wait must be
 # abandonable when FX decides the change request is not going to be approved. A
-# ``running`` job belongs to a live scheduler and its child, and a
-# ``done``/``failed`` job is history worth keeping — neither is cancellable.
+# ``running`` job belongs to a live scheduler and its child, so cancelling it
+# only *asks* that holder to stop (``cancel_requested``, Story 35.4-003); a
+# ``done``/``failed`` job is history worth keeping and is not cancellable.
 _CANCELLABLE_STATES = {"queued", "blocked", "parked", "needs_attention"}
 
 # States an operator may re-arm with :meth:`QueueStore.requeue_job`. ``queued``
@@ -373,12 +381,17 @@ class JobRecord:
     fix_rounds_baseline: int = 0
     # Story 35.1-001 (fleet execution). ``host`` pins the job to one machine and
     # ``pool`` to one subscription pool (both nullable = anywhere); ``requirements``
-    # is JSON text — ``{repo, harness, sandbox}`` — a worker must satisfy;
+    # is JSON text — ``{repo, harness, sandbox}`` a worker must satisfy, plus the
+    # ``origin`` it clones from (Story 35.3-001);
     # ``worker`` is the fleet worker that holds the claim right now.
     host: str | None = None
     pool: str | None = None
     requirements: str | None = None
     worker: str | None = None
+    # Story 35.4-003: an operator asked for this ``running`` job to stop. The
+    # holder sees it on its next pass, kills the run's process group and
+    # finishes the job ``cancelled``.
+    cancel_requested: bool = False
     # Story 35.2-002: the sha the worker's clone was fast-forwarded to before the
     # job was dispatched — what the build actually started from. ``None`` until a
     # worker has synced the repo for this job.
@@ -408,6 +421,7 @@ class JobRecord:
             "pool": self.pool,
             "requirements": self.requirements,
             "worker": self.worker,
+            "cancel_requested": self.cancel_requested,
             "synced_sha": self.synced_sha,
         }
 
@@ -444,7 +458,9 @@ class QueuePause:
     ``run_id``/``repo``/``source`` name whichever run *discovered* the window, so
     an operator can go read the authoritative story in that run's ledger.
     ``probed_at`` is the last live-API re-probe, throttling the probe across
-    passes, restarts and peer schedulers.
+    passes, restarts and peer schedulers. ``pool`` (Story 35.2-003) is the one
+    subscription pool the window belongs to; ``None`` is the pool-less window of
+    a local queue, which holds every claim.
     """
 
     paused_until: str
@@ -454,6 +470,7 @@ class QueuePause:
     repo: str | None = None
     source: str | None = None
     probed_at: str | None = None
+    pool: str | None = None
 
     def is_active(self, now: datetime | None = None) -> bool:
         """Whether dispatch is still held at ``now``.
@@ -479,6 +496,7 @@ class QueuePause:
             "repo": self.repo,
             "source": self.source,
             "probed_at": self.probed_at,
+            "pool": self.pool,
         }
 
 
@@ -506,6 +524,35 @@ CREATE TABLE IF NOT EXISTS queue_state (
     paused_at    TIMESTAMP,
     probed_at    TIMESTAMP
 );
+"""
+
+# Story 35.2-003: one rate-limit window per subscription pool. ``queue_state``'s
+# single row could only say "the host is paused"; with two Claude subscriptions and
+# a Codex one, a park must hold only the pool that hit it. ``pool`` is the key, with
+# '' standing for the pool-less window of a local queue (the degenerate one-pool
+# case of Story 32.2-001), so it stays a plain primary key rather than a nullable
+# one SQLite would let repeat.
+_QUEUE_PAUSES_DDL = """
+CREATE TABLE IF NOT EXISTS queue_pauses (
+    pool         TEXT PRIMARY KEY,
+    paused_until TIMESTAMP,
+    reason       TEXT,
+    run_id       TEXT,
+    repo         TEXT,
+    source       TEXT,
+    paused_at    TIMESTAMP,
+    probed_at    TIMESTAMP
+);
+"""
+
+# A queue.db written before pools carries its window in ``queue_state``: move it
+# across as the pool-less pause, so an upgrade mid-window keeps waiting it out.
+_QUEUE_PAUSES_BACKFILL = """
+INSERT OR IGNORE INTO queue_pauses(pool, paused_until, reason, run_id, repo, source,
+                                   paused_at, probed_at)
+    SELECT '', paused_until, reason, run_id, repo, source, paused_at, probed_at
+    FROM queue_state WHERE id = 1;
+DELETE FROM queue_state;
 """
 
 # Story 32.2-003: the audit trail of operator-declared clears. ``queue_state``
@@ -539,6 +586,27 @@ CREATE TABLE IF NOT EXISTS workers (
 );
 """
 
+# Story 35.4-001: the fleet view of runs. One row per run any worker has pushed,
+# keyed by run id, so a worker's repeated pushes (start, heartbeat, finish) rewrite
+# one row. The run's detail stays in the worker's own ledger — this is the page-one
+# summary the XPS dashboard merges, with `updated_at` for when it was last heard.
+_FLEET_RUNS_DDL = """
+CREATE TABLE IF NOT EXISTS fleet_runs (
+    run_id      TEXT PRIMARY KEY,
+    worker      TEXT NOT NULL,
+    repo        TEXT NOT NULL,
+    db          TEXT NOT NULL,
+    scope       TEXT NOT NULL,
+    pid         INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    total       INTEGER,
+    completed   INTEGER,
+    updated_at  TIMESTAMP NOT NULL
+);
+"""
+
 _SCHEMA_DDL = (
     """
 PRAGMA journal_mode = WAL;
@@ -566,6 +634,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     pool        TEXT,
     requirements TEXT,
     worker      TEXT,
+    cancel_requested INTEGER,
     synced_sha  TEXT
 );
 
@@ -581,6 +650,8 @@ CREATE INDEX IF NOT EXISTS idx_jobs_repo  ON jobs(repo);
     + _QUEUE_STATE_DDL
     + _PAUSE_CLEARS_DDL
     + _WORKERS_DDL
+    + _QUEUE_PAUSES_DDL
+    + _FLEET_RUNS_DDL
 )
 
 # Schema migrations applied after the base DDL, in the same
@@ -648,8 +719,14 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     ),
     # Story 35.2-001: the worker registry table, for a queue.db written before it.
     (7, "fleet_workers", "workers", [], _WORKERS_DDL),
+    # Story 35.2-003: per-pool pause windows, replacing ``queue_state``'s one row.
+    (8, "queue_pauses", "queue_pauses", [], _QUEUE_PAUSES_DDL + _QUEUE_PAUSES_BACKFILL),
+    # Story 35.4-003: a cancel aimed at a running job, for its worker to act on.
+    (9, "job_cancel_requested", "jobs", [("cancel_requested", "INTEGER")], None),
+    # Story 35.4-001: the fleet run registry table, for a queue.db written before it.
+    (10, "fleet_runs", "fleet_runs", [], _FLEET_RUNS_DDL),
     # Story 35.2-002: the sha a worker's clone was synced to before dispatch.
-    (8, "job_synced_sha", "jobs", [("synced_sha", "TEXT")], None),
+    (11, "job_synced_sha", "jobs", [("synced_sha", "TEXT")], None),
 ]
 
 
@@ -830,6 +907,25 @@ def job_needs(job: JobRecord) -> list[_Need]:
     return needs
 
 
+def job_pools(job: JobRecord, worker_pools: Iterable[str] = ()) -> list[str]:
+    """The subscription pools ``job`` would spend from when run by that worker.
+
+    Story 35.2-003: the pool of each harness its routed stages use. A Claude
+    stage spends the job's pinned ``pool``, else the worker's declared Claude
+    pool (its first pool that is not :data:`CODEX_POOL`); a ``codex`` stage
+    spends :data:`CODEX_POOL`. A job that names no harness is a Claude job. The
+    answer is empty for a worker with no Claude pool, so such a job is held only
+    by a pool-less (local) pause.
+    """
+    harnesses = _csv(_job_requirements(job).get("harness"))
+    pools: list[str] = [job.pool] if job.pool else []
+    if not job.pool and (not harnesses or "claude" in harnesses):
+        pools += [p for p in worker_pools if p != CODEX_POOL][:1]
+    if "codex" in harnesses:
+        pools.append(CODEX_POOL)
+    return list(dict.fromkeys(pools))
+
+
 def _may_run(needs: Sequence[_Need], worker: WorkerRecord) -> bool:
     return all(satisfied(worker) for _, satisfied in needs)
 
@@ -916,11 +1012,14 @@ class QueueBackend(Protocol):
         run_id: str | None = None,
         repo: str | None = None,
         source: str | None = None,
+        pool: str | None = None,
     ) -> bool: ...
 
-    def dispatch_pause(self) -> QueuePause | None: ...
+    def dispatch_pause(self, pool: str | None = None) -> QueuePause | None: ...
 
-    def clear_pause(self) -> None: ...
+    def dispatch_pauses(self) -> list[QueuePause]: ...
+
+    def clear_pause(self, pool: str | None = None) -> None: ...
 
     def register_worker(
         self,
@@ -936,6 +1035,10 @@ class QueueBackend(Protocol):
     ) -> WorkerRecord: ...
 
     def list_workers(self) -> list[WorkerRecord]: ...
+
+    def put_fleet_run(self, record: RunRecord) -> None: ...
+
+    def list_fleet_runs(self) -> list[dict[str, Any]]: ...
 
 
 class QueueStore:
@@ -1042,21 +1145,42 @@ class QueueStore:
             return int(cur.lastrowid)
 
     def cancel_job(self, job_id: int) -> None:
-        """Retire a job that is not live; refuse a ``running`` one.
+        """Retire a job that is not live; ask the holder of a ``running`` one to stop.
 
         ``queued`` is the everyday case. A *parked* job (``blocked`` — Story
         32.1-002's version-check terminal) is accepted too: it is not live, so
         cancelling it is safe, and without this it would sit in `queue list`
         forever with no way out. A ``running`` job still belongs to a scheduler
-        and its child process, so it is refused — stop the scheduler instead.
+        and its child process, so it is only *flagged* (Story 35.4-003): the
+        holder sees ``cancel_requested`` on its next pass, kills the run's
+        process group and finishes the job ``cancelled``. A ``running`` job
+        nobody holds has no one to read the flag, so it is retired outright.
         """
         job = self.get_job(job_id)
         if job is None:
             raise QueueError(f"unknown job id: {job_id}")
+        if job.state == "running":
+            with self._connect() as conn:
+                # The holder is re-checked in the UPDATE itself: a scheduler that
+                # reclaimed the job since the read above now drives a live run,
+                # and retiring the row under it would orphan that run.
+                retired = conn.execute(
+                    "UPDATE jobs SET state = 'cancelled', cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ? AND state = 'running' AND claimed_by IS NULL",
+                    (_now_iso(), job_id),
+                ).rowcount
+                if not retired:
+                    # Only the holder may stop a live run, so this just leaves it a note.
+                    conn.execute(
+                        "UPDATE jobs SET cancel_requested = 1, reason = ?, updated_at = ? "
+                        "WHERE id = ? AND state = 'running'",
+                        (CANCEL_REQUESTED_REASON, _now_iso(), job_id),
+                    )
+            return
         if job.state not in _CANCELLABLE_STATES:
             raise QueueError(
                 f"cannot cancel job {job_id}: state is {job.state} "
-                f"(cancellable: {', '.join(sorted(_CANCELLABLE_STATES))})"
+                f"(cancellable: {', '.join(sorted(_CANCELLABLE_STATES | {'running'}))})"
             )
         self._set_state(job_id, "cancelled")
 
@@ -1104,17 +1228,21 @@ class QueueStore:
                 f"(requeueable: {', '.join(sorted(_REQUEUEABLE_STATES))})"
             )
         moment = _at(now).isoformat()
+        # The requeue *is* the operator's newer word, so any cancel flag left on
+        # the row is stale — kept, it would re-cancel the job on its next pass.
         with self._connect() as conn:
             if job.run_id:
                 conn.execute(
                     "UPDATE jobs SET state = 'running', claimed_by = NULL, worker = NULL, "
-                    "lease_until = ?, reason = NULL, updated_at = ? WHERE id = ?",
+                    "lease_until = ?, reason = NULL, cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ?",
                     (moment, moment, job_id),
                 )
             else:
                 conn.execute(
                     "UPDATE jobs SET state = 'queued', claimed_by = NULL, worker = NULL, "
-                    "lease_until = NULL, reason = NULL, updated_at = ? WHERE id = ?",
+                    "lease_until = NULL, reason = NULL, cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ?",
                     (moment, job_id),
                 )
 
@@ -1221,7 +1349,7 @@ class QueueStore:
             )
 
 
-    # --- host-level dispatch pause (Story 32.2-001) -----------------------
+    # --- dispatch pauses, one window per pool (Stories 32.2-001, 35.2-003) --
 
     def pause_dispatch(
         self,
@@ -1231,15 +1359,18 @@ class QueueStore:
         run_id: str | None = None,
         repo: str | None = None,
         source: str | None = None,
+        pool: str | None = None,
         now: datetime | None = None,
     ) -> bool:
-        """Hold all dispatch until ``until``. ``True`` when *this* call opened it.
+        """Hold dispatch for ``pool`` until ``until``. ``True`` when *this* call opened it.
 
-        One window for the whole host: the Max subscription every repo shares is
-        exhausted once, so the queue records the reset once and every scheduler
-        reads it. The return value is what keeps the announcement singular — the
-        caller notifies only on ``True``, so a second job hitting the same wall
-        inside the window is silent rather than one notify per repo.
+        One window per subscription pool: a subscription is exhausted once, so
+        the queue records the reset once and every scheduler reads it. ``pool``
+        omitted is the pool-less window of a local queue, which holds every
+        claim — the single-pause behaviour of Story 32.2-001. The return value is
+        what keeps the announcement singular — the caller notifies only on
+        ``True``, so a second job hitting the same wall inside the window is
+        silent rather than one notify per repo.
 
         An already-open window is *extended* to the later reset and never
         shortened: a second signal carrying a longer wait is new information,
@@ -1248,7 +1379,7 @@ class QueueStore:
         way — it is the one whose ledger holds the authoritative story.
         """
         moment = _at(now)
-        existing = self.dispatch_pause()
+        existing = self.dispatch_pause(pool)
         active = existing is not None and existing.is_active(moment)
         if active:
             assert existing is not None  # narrowed by `active`
@@ -1258,28 +1389,42 @@ class QueueStore:
             if until > current:
                 with self._connect() as conn:
                     conn.execute(
-                        "UPDATE queue_state SET paused_until = ? WHERE id = 1",
-                        (until.isoformat(),),
+                        "UPDATE queue_pauses SET paused_until = ? WHERE pool = ?",
+                        (until.isoformat(), pool or ""),
                     )
             return False
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO queue_state(id, paused_until, reason, run_id, repo, "
-                "source, paused_at, probed_at) VALUES (1, ?, ?, ?, ?, ?, ?, NULL) "
-                "ON CONFLICT(id) DO UPDATE SET paused_until = excluded.paused_until, "
+                "INSERT INTO queue_pauses(pool, paused_until, reason, run_id, repo, "
+                "source, paused_at, probed_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(pool) DO UPDATE SET paused_until = excluded.paused_until, "
                 "reason = excluded.reason, run_id = excluded.run_id, "
                 "repo = excluded.repo, source = excluded.source, "
                 "paused_at = excluded.paused_at, probed_at = NULL",
-                (until.isoformat(), reason, run_id, repo, source, moment.isoformat()),
+                (
+                    pool or "", until.isoformat(), reason, run_id, repo, source,
+                    moment.isoformat(),
+                ),
             )
         return True
 
-    def clear_pause(self) -> None:
-        """Resume dispatch — drop the recorded window (idempotent)."""
+    def clear_pause(self, pool: str | None = None) -> None:
+        """Resume dispatch (idempotent): one ``pool``'s window, or every window.
+
+        Note the asymmetry with :meth:`dispatch_pause`, where ``None`` names the
+        pool-less window: a clear that names no pool is the operator's "resume
+        everything", and the only clear a local queue ever needs.
+        """
         if not self.db_path.exists():
             return
         with self._connect() as conn:
-            conn.execute("DELETE FROM queue_state WHERE id = 1")
+            try:
+                if pool is None:
+                    conn.execute("DELETE FROM queue_pauses")
+                else:
+                    conn.execute("DELETE FROM queue_pauses WHERE pool = ?", (pool,))
+            except sqlite3.OperationalError:
+                return  # a queue.db from before the table — nothing recorded
 
     def record_pause_clear(
         self,
@@ -1311,16 +1456,18 @@ class QueueStore:
                 return []
         return [dict(r) for r in rows]
 
-    def mark_pause_probed(self, *, now: datetime | None = None) -> None:
-        """Stamp the last live-API re-probe, so the throttle survives a restart."""
+    def mark_pause_probed(
+        self, pool: str | None = None, *, now: datetime | None = None
+    ) -> None:
+        """Stamp ``pool``'s last live-API re-probe, so the throttle survives a restart."""
         with self._connect() as conn:
             conn.execute(
-                "UPDATE queue_state SET probed_at = ? WHERE id = 1",
-                (_at(now).isoformat(),),
+                "UPDATE queue_pauses SET probed_at = ? WHERE pool = ?",
+                (_at(now).isoformat(), pool or ""),
             )
 
-    def dispatch_pause(self) -> QueuePause | None:
-        """The recorded window, or ``None`` when none was ever recorded.
+    def dispatch_pause(self, pool: str | None = None) -> QueuePause | None:
+        """``pool``'s recorded window (``None`` = the pool-less one), or ``None``.
 
         Deliberately *raw*: an elapsed window is still returned, because the
         difference between "was paused, the window just reopened" (announce a
@@ -1328,28 +1475,34 @@ class QueueStore:
         keeps the resume notification singular. Callers ask
         :meth:`QueuePause.is_active` for the live question.
         """
+        return next((p for p in self.dispatch_pauses() if p.pool == pool), None)
+
+    def dispatch_pauses(self) -> list[QueuePause]:
+        """Every recorded window, one per pool, oldest pause first (raw, see above)."""
         if not self.db_path.exists():
-            return None
+            return []
         with self._connect() as conn:
             try:
-                row = conn.execute(
-                    "SELECT * FROM queue_state WHERE id = 1"
-                ).fetchone()
+                rows = conn.execute(
+                    "SELECT * FROM queue_pauses ORDER BY paused_at, pool"
+                ).fetchall()
             except sqlite3.OperationalError:
-                # A queue.db from before this story that no writer has migrated
+                # A queue.db from before this table that no writer has migrated
                 # yet — not paused, and a read must never create the table.
-                return None
-        if row is None:
-            return None
-        return QueuePause(
-            paused_until=row["paused_until"],
-            paused_at=row["paused_at"],
-            reason=row["reason"],
-            run_id=row["run_id"],
-            repo=row["repo"],
-            source=row["source"],
-            probed_at=row["probed_at"],
-        )
+                return []
+        return [
+            QueuePause(
+                paused_until=row["paused_until"],
+                paused_at=row["paused_at"],
+                reason=row["reason"],
+                run_id=row["run_id"],
+                repo=row["repo"],
+                source=row["source"],
+                probed_at=row["probed_at"],
+                pool=row["pool"] or None,
+            )
+            for row in rows
+        ]
 
     # --- claims + leases (Story 32.1-002) ---------------------------------
 
@@ -1532,8 +1685,10 @@ class QueueStore:
         guarded :meth:`claim_job` UPDATE — which stays the sole arbiter, so two
         workers racing for one row still produce exactly one winner and the
         loser simply tries the next candidate. A held dispatch window
-        (:meth:`dispatch_pause`) yields nothing: the pause is the queue's, not
-        any one worker's.
+        (:meth:`dispatch_pause`) is the queue's, not any one worker's: a
+        pool-less window yields nothing, and a pool's window yields none of the
+        jobs that would spend from that pool (:func:`job_pools`) — the claimer's
+        other pools keep flowing.
 
         A job pinned to a ``host`` goes only to a worker on that host; a job in
         a ``pool`` only to a worker serving it. An unpinned/unpooled job goes
@@ -1545,9 +1700,9 @@ class QueueStore:
         moment = _at(now)
         self.expire_offline_leases(now=moment)
         self.stamp_unsatisfiable(now=moment)
-        pause = self.dispatch_pause()
-        if pause is not None and pause.is_active(now):
-            return None
+        paused = {p.pool for p in self.dispatch_pauses() if p.is_active(moment)}
+        if None in paused:
+            return None  # the pool-less (local) window holds every claim
         served = set(pools or ())
         candidates = self.peek_claimable(
             busy_repos=self.running_repos(),
@@ -1555,6 +1710,13 @@ class QueueStore:
             now=now,
         )
         registered = self.get_worker(claimed_by)
+        if paused:
+            # A pool's window holds only the jobs that would spend from it
+            # (Story 35.2-003); the same worker keeps claiming from the others.
+            worker_pools = registered.pools if registered is not None else list(pools or ())
+            candidates = [
+                job for job in candidates if paused.isdisjoint(job_pools(job, worker_pools))
+            ]
         if registered is not None:
             # A registered worker is matched on what it advertised (Story
             # 35.2-001), not on what this call says: the registry is the truth.
@@ -1654,6 +1816,57 @@ class QueueStore:
         except sqlite3.OperationalError:  # no `workers` table yet: nothing has registered
             return []
         return [_row_to_worker(row) for row in rows]
+
+    # --- the fleet run registry (Story 35.4-001) ------------------------------
+
+    def put_fleet_run(self, record: RunRecord, *, now: datetime | None = None) -> None:
+        """Insert or refresh the fleet row for ``record.run_id``.
+
+        A worker pushes on start, on each heartbeat and on finish, so this is an
+        upsert. A finished row is final against its own process: a stale
+        in-progress push that arrives after the finish (a heartbeat racing it)
+        carries the finished run's pid and must not reopen the run. A different
+        pid is ``sdlc resume`` re-registering the run from a new process, and
+        that does reopen it.
+        """
+        worker = (record.worker or "").strip()
+        if not worker:
+            raise QueueError("a fleet run record must name its worker")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO fleet_runs(run_id, worker, repo, db, scope, pid, status, "
+                "started_at, finished_at, total, completed, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET worker = excluded.worker, "
+                "repo = excluded.repo, db = excluded.db, scope = excluded.scope, "
+                "pid = excluded.pid, status = excluded.status, "
+                "started_at = excluded.started_at, finished_at = excluded.finished_at, "
+                "total = excluded.total, completed = excluded.completed, "
+                "updated_at = excluded.updated_at "
+                "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL "
+                "OR excluded.pid != fleet_runs.pid",
+                (
+                    record.run_id, worker, record.repo, record.db, record.scope, record.pid,
+                    record.status, record.started_at, record.finished_at, record.total,
+                    record.completed, _at(now).isoformat(),
+                ),
+            )
+
+    def list_fleet_runs(self) -> list[dict[str, Any]]:
+        """Every pushed run, newest start first, as :meth:`RunRecord.to_dict` + ``updated_at``.
+
+        A queue.db without the table lists none: nothing has pushed yet.
+        """
+        if not self.db_path.exists():
+            return []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM fleet_runs ORDER BY started_at DESC, run_id"
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(row) for row in rows]
 
     def _take_slot(self, name: str) -> None:
         """Count a fresh claim against the worker until its next heartbeat says otherwise."""
@@ -1840,7 +2053,18 @@ class QueueStore:
             return
         moment = _at(now).isoformat()
         with self._connect() as conn:
-            if job.run_id:
+            if job.cancel_requested:
+                # The operator already said stop: handing the job back would
+                # have the next scheduler resume (or restart) what was cancelled.
+                # The release's own reason (an interrupt, a rate-limit wait)
+                # would read as if the job were coming back, so it is not kept.
+                conn.execute(
+                    "UPDATE jobs SET state = 'cancelled', claimed_by = NULL, worker = NULL, "
+                    "lease_until = NULL, cancel_requested = 0, reason = ?, updated_at = ? "
+                    "WHERE id = ? AND claimed_by = ?",
+                    ("cancelled by operator", moment, job_id, claimed_by),
+                )
+            elif job.run_id:
                 conn.execute(
                     "UPDATE jobs SET claimed_by = NULL, worker = NULL, lease_until = ?, reason = ?, "
                     "updated_at = ? WHERE id = ? AND claimed_by = ?",
@@ -1888,20 +2112,23 @@ class QueueStore:
 
         The four terminals are ``done``, ``failed``, ``blocked`` (the run parked
         itself, or the scheduler refused to start it) and ``needs_attention``
-        (the queue's own budget breaker stopped it).
+        (the queue's own budget breaker stopped it); ``cancelled`` is also
+        accepted, for a holder that has stopped a job whose cancel was requested.
 
         ``claimed_by`` (Story 35.1-001) stamps the job only while that holder
         still owns the claim, checked in the UPDATE itself — a check read first
         could be overtaken by another process's reclaim.
         """
-        if state not in _TERMINAL_STATES:
+        finishable = _TERMINAL_STATES | {"cancelled"}  # the holder's ack of a cancel request
+        if state not in finishable:
             raise QueueError(
                 f"invalid terminal state: {state!r} "
-                f"(expected one of {sorted(_TERMINAL_STATES)})"
+                f"(expected one of {sorted(finishable)})"
             )
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = ?, claimed_by = NULL, worker = NULL, lease_until = NULL, "
+                "cancel_requested = 0, "
                 "reason = ?, updated_at = ? WHERE id = ? AND (? IS NULL OR claimed_by = ?)",
                 (state, reason, _now_iso(), job_id, claimed_by, claimed_by),
             )
@@ -1924,7 +2151,7 @@ class QueueStore:
         pr_number: int,
         reason: str,
         poll_after: datetime | None,
-    ) -> None:
+    ) -> bool:
         """Park a job on ``pr_number`` pending a human's approval.
 
         ``AWAITING_APPROVAL`` is terminal for a *run* — ``build.py`` stops there
@@ -1933,6 +2160,13 @@ class QueueStore:
         keeps its ``run_id`` (so the resume that follows is a resume, never a
         restart), records the CR to watch, and drops its claim and lease so its
         repo and its agent slot go straight back to the pool.
+
+        A job whose cancel was requested (Story 35.4-003) is finished
+        ``cancelled`` instead, and ``False`` returned: parking would hand it back
+        for an approval to resume — the very thing the operator stopped — the
+        same call :meth:`release_claim` makes. Its ``pr_number`` is still kept.
+        So is a job already ``cancelled``: a peer drain retired it while its
+        holder stalled, and that holder's late park must not bring it back.
 
         Refuses a job with no ``run_id``: without a run there is nothing for an
         approval to release, and a job that never started belongs in ``queued``.
@@ -1945,6 +2179,17 @@ class QueueStore:
                 f"cannot park job {job_id}: it opened no run to resume later"
             )
         with self._connect() as conn:
+            # One transaction: a cancel landing mid-park is either honoured here
+            # or refused by cancel_job's ``state = 'running'`` guard — never left
+            # on a parked row for a take-back or a requeue to act on later.
+            cancelled = conn.execute(
+                "UPDATE jobs SET state = 'cancelled', claimed_by = NULL, worker = NULL, "
+                "lease_until = NULL, cancel_requested = 0, pr_number = ?, reason = ?, "
+                "updated_at = ? WHERE id = ? AND (cancel_requested = 1 OR state = 'cancelled')",
+                (pr_number, "cancelled by operator", _now_iso(), job_id),
+            ).rowcount
+            if cancelled:
+                return False
             conn.execute(
                 "UPDATE jobs SET state = 'parked', claimed_by = NULL, worker = NULL, "
                 "lease_until = NULL, pr_number = ?, poll_after = ?, reason = ?, "
@@ -1957,6 +2202,7 @@ class QueueStore:
                     job_id,
                 ),
             )
+        return True
 
     def schedule_poll(self, job_id: int, poll_after: datetime | None) -> None:
         """Set the earliest instant this job's change request may be read again.
@@ -2004,8 +2250,8 @@ class QueueStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = 'running', claimed_by = ?, lease_until = ?, "
-                "poll_after = NULL, reason = NULL, updated_at = ?, worker = ? "
-                "WHERE id = ? AND state = 'parked' "
+                "poll_after = NULL, reason = NULL, cancel_requested = 0, updated_at = ?, "
+                "worker = ? WHERE id = ? AND state = 'parked' "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM jobs AS busy "
                 "  WHERE busy.repo = jobs.repo AND busy.state = 'running'"
@@ -2168,6 +2414,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         pool=_optional_column(row, "pool"),
         requirements=_optional_column(row, "requirements"),
         worker=_optional_column(row, "worker"),
+        cancel_requested=bool(_optional_column(row, "cancel_requested")),
         synced_sha=_optional_column(row, "synced_sha"),
     )
 

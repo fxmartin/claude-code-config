@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -23,13 +24,22 @@ from sdlc.queue import (
     HEARTBEAT_SECONDS,
     JobBudget,
     JobRecord,
+    QueueError,
     QueuePause,
     QueueStore,
     VERSION_GUARD_REASON_PREFIX,
     budget_breach,
     fix_rounds_exhausted,
+    job_pools,
 )
-from sdlc.registry import Registry, RunRecord, pid_alive
+from sdlc.registry import (
+    WORKER_ENV,
+    Registry,
+    RunRecord,
+    derive_state,
+    live_record,
+    pid_alive,
+)
 from sdlc.risk_gate import RISK_APPROVED_LABEL
 
 if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
@@ -234,6 +244,11 @@ class SchedulerResult:
         }
 
 
+def _queue_subject(pool: str | None) -> str:
+    """How a queue-wide event names itself: the queue, and the pool when scoped."""
+    return f"development queue ({pool})" if pool else "development queue"
+
+
 @dataclass
 class _RateLimitPark:
     """One run's rate-limit state, read from its own ledger (Story 32.2-001).
@@ -259,6 +274,9 @@ class _RateLimitPark:
     db: Path
     reset_at: float | None
     max_wait_s: int
+    # The subscription pool whose window this park closed (Story 35.2-003);
+    # ``None`` on a local queue, where the one window holds everything.
+    pool: str | None = None
 
     def window_until(self, now: datetime) -> datetime:
         """The instant dispatch may resume."""
@@ -631,15 +649,29 @@ def ledger_plan_files(db_path: str, run_id: str) -> list[str]:
     return sorted(files)
 
 
-def _default_launcher(argv: Sequence[str], cwd: Path) -> JobProcess:
+def _default_launcher(
+    argv: Sequence[str], cwd: Path, env: dict[str, str] | None = None
+) -> JobProcess:
     """Spawn a job as a detached process group under ``cwd``.
 
     Runs as a subprocess, never in-process, so a job's crash cannot take the
     scheduler down with it and a process-group kill reaches the job's own
-    agents.
+    agents. ``env`` replaces the inherited environment when given.
     """
-    proc = subprocess.Popen(list(argv), cwd=str(cwd), start_new_session=True)
+    proc = subprocess.Popen(list(argv), cwd=str(cwd), start_new_session=True, env=env)
     return _PopenProcess(proc)
+
+
+def _launcher_for(config: "SchedulerConfig") -> Launcher:
+    """The launcher a drain uses when none is injected.
+
+    A fleet worker's jobs inherit its name as ``SDLC_WORKER`` (Story 35.4-001),
+    so each run's registry record — and the fleet view — says whose run it is.
+    """
+    if config.worker is None:
+        return _default_launcher
+    name = config.worker.name
+    return lambda argv, cwd: _default_launcher(argv, cwd, {**os.environ, WORKER_ENV: name})
 
 
 def _utc_now() -> datetime:
@@ -794,6 +826,7 @@ class _Scheduler:
                 self._record_plan_files()
                 self._reap()
                 self._enforce_budgets()
+                self._honour_cancels()
                 self._renew()
                 self._check_rate_limit()
                 polled = self._poll_parked()
@@ -843,6 +876,42 @@ class _Scheduler:
             self._store, slots=self._config.slots, slots_free=self._free_slots(), now=now
         )
         self._last_beat = now
+        # The fleet cannot read this worker's ledgers, so each beat also carries
+        # every in-flight run's live done/total to its fleet row.
+        for entry in self._in_flight.values():
+            self._push_run(entry.run_id)
+
+    def _push_run(self, run_id: str | None, *, ended: bool = False) -> None:
+        """Write ``run_id``'s registry record to the fleet view (Story 35.4-001).
+
+        A worker drains the queue its own host owns — the store `sdlc queue
+        serve` publishes — and refuses a fleet URL, so neither it nor the jobs it
+        launches can `PUT /runs`. Like its heartbeat registration, it writes the
+        row straight into that store: when a run is linked to its job (start), on
+        each heartbeat, and once the job's process is gone (``ended``).
+
+        An ended record carries this worker's own :func:`derive_state`, so a run
+        whose process exited unfinished — killed, crashed, parked on a limit,
+        stopped by its budget, by an operator's cancel or by Ctrl-C — reads
+        ``DEAD`` on the fleet as it does on this host's dashboard, instead of live
+        for good; a resume reopens it. While the job runs, a finished record is
+        the previous launch's (a resume has yet to re-register) and is left to the
+        exit push. Best-effort, like the rest of the fleet view; a no-op for a
+        plain drain.
+        """
+        profile = self._config.worker
+        if profile is None or not run_id:
+            return
+        record = self._registry_record(run_id)
+        if record is None or (record.finished_at and not ended):
+            return
+        record = live_record(record)
+        if ended:
+            record = replace(record, status=derive_state(record))
+        try:
+            self._store.put_fleet_run(replace(record, worker=profile.name), now=self._clock())
+        except (QueueError, sqlite3.Error) as exc:
+            self._echo(f"fleet view: could not record run {run_id}: {exc}")
 
     def _fill_slots(self) -> bool:
         """Claim and launch while slots and claimable work remain.
@@ -897,13 +966,14 @@ class _Scheduler:
         for, and leaving it parked behind fresh work is how a night stalls.
         """
         for job in self._store.expired_running_jobs(now=self._clock()):
-            if job.id in self._in_flight:
+            if job.id in self._in_flight or self._job_paused(job):
                 continue
             if job.run_id is None:
                 # Claimed but never started a run — nothing to resume, so put it
                 # back in the queue and let the normal claim path take it. Take
                 # ownership first: the previous holder may have already dropped
-                # its `claimed_by`, and only the owner may release a claim.
+                # its `claimed_by`, and only the owner may release a claim. (The
+                # release retires a cancelled one instead.)
                 if self._store.reclaim_job(
                     job.id, claimed_by=self._identity,
                     lease_seconds=self._config.lease_seconds, now=self._clock(),
@@ -916,7 +986,15 @@ class _Scheduler:
             if self._run_is_live(job.run_id):
                 # The run's own pid still answers — the lease lapsed but the
                 # work did not. Two drivers on one run is exactly what the
-                # registry guard exists to prevent.
+                # registry guard exists to prevent. A cancel waits here too:
+                # only the run's holder can stop it, and retiring the job under
+                # it would leave the run going, unwatched, behind a `cancelled` row.
+                continue
+            if job.cancel_requested:
+                # Cancelled once its holder and its run were both gone: nothing
+                # to stop, and resuming it would undo the operator's decision.
+                self._store.finish_job(job.id, "cancelled", reason="cancelled by operator")
+                self._echo(f"job {job.id} cancelled: its worker was gone")
                 continue
             terminal = self._run_terminal(job.run_id)
             if terminal is not None:
@@ -936,6 +1014,9 @@ class _Scheduler:
         candidates = self._store.peek_claimable(
             busy_repos=busy, fix_busy_repos=fix_busy, now=self._clock()
         )
+        paused = self._paused_pools()
+        if paused:
+            candidates = [job for job in candidates if not self._job_paused(job, paused)]
         profile = self._config.worker
         if profile is not None:
             # A fleet worker only takes what it may run — and defers to a
@@ -1167,6 +1248,7 @@ class _Scheduler:
             if code is None:
                 continue
             del self._in_flight[job_id]
+            self._push_run(entry.run_id, ended=True)
             if entry.run_id and self._rate_limit_park(job_id, entry.run_id) is not None:
                 # Story 32.2-001: a run that parked itself on a closed window
                 # exits non-zero, but it is *paused*, not finished. Stamping it
@@ -1294,12 +1376,45 @@ class _Scheduler:
                 entry.proc.stop()
             except OSError as exc:
                 self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            self._push_run(entry.run_id, ended=True)
             if fix_rounds_exhausted(entry.budget, rounds):
                 self._store.record_fix_rounds_baseline(job_id, burned)
             self._store.finish_job(job_id, "needs_attention", reason=reason)
             self._result.parked += 1
             self._echo(f"job {job_id} parked (needs_attention): {reason}")
             self._announce(entry.job, entry.run_id, "needs_attention")
+
+    def _honour_cancels(self) -> None:
+        """Stop every in-flight job an operator has cancelled (Story 35.4-003).
+
+        ``sdlc queue cancel`` on a ``running`` job only sets ``cancel_requested``
+        on the queue — from the XPS the job's process is on another machine — so
+        its holder reads the flag here, every pass, before :meth:`_renew` can
+        extend a lease on a job about to die. The stop is :meth:`JobProcess.stop`:
+        the whole process group, SIGTERM then SIGKILL (Story 13.4-001), so the
+        agents the run spawned die with it. Only then is the job finished
+        ``cancelled``, which drops the claim and the lease; the run itself is
+        left as it stood, for `sdlc resume` should FX ever want it back.
+
+        A row already reading ``cancelled`` is the same order: a peer drain
+        retired the job while this holder stalled past its lease, but the run's
+        process is still this holder's, and nobody else can stop it.
+        """
+        for job_id, entry in list(self._in_flight.items()):
+            current = self._store.get_job(job_id)
+            if current is None or not (current.cancel_requested or current.state == "cancelled"):
+                continue
+            del self._in_flight[job_id]
+            try:
+                entry.proc.stop()
+            except OSError as exc:
+                self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            self._push_run(entry.run_id, ended=True)
+            self._store.finish_job(
+                job_id, "cancelled", reason="cancelled by operator",
+                claimed_by=self._identity,
+            )
+            self._echo(f"job {job_id} cancelled: run stopped, lease released")
 
     def _record_plan_files(self) -> None:
         """Copy each in-flight job's investigated file set onto its row (AC2).
@@ -1374,9 +1489,14 @@ class _Scheduler:
             f"{int(self._poll_interval)}s for the `{RISK_APPROVED_LABEL}` label "
             f"or an approving review"
         )
-        self._store.park_job(
+        if not self._store.park_job(
             job.id, pr_number=pr_number, reason=reason, poll_after=self._next_poll()
-        )
+        ):
+            # Story 35.4-003: its cancel landed as the run exited, so `_reap` got
+            # here before `_honour_cancels` could, or a peer drain retired it while
+            # this holder stalled — either way the store keeps it cancelled.
+            self._echo(f"job {job.id} cancelled: the run had already stopped on #{pr_number}")
+            return
         self._result.parked += 1
         self._echo(f"job {job.id} parked: awaiting approval on #{pr_number}")
         self._notify(
@@ -1420,6 +1540,8 @@ class _Scheduler:
             used = self._used_slots()
             if job.repo in busy or (used and used + cost > self._config.slots):
                 continue
+            if self._job_paused(job):
+                continue  # its pool's window is shut; re-read once it reopens
             if job.pr_number is None:
                 # A park with no CR cannot be polled. Push its next poll out so
                 # it does not re-list every pass; `sdlc queue cancel/requeue`
@@ -1498,26 +1620,68 @@ class _Scheduler:
         about that): nothing here *decides* a rate limit, it only reads the
         verdict `build.py` already wrote and caches its reset time.
         """
-        pause = self._store.dispatch_pause()
-        if pause is not None:
-            if pause.is_active(self._clock()) and not self._window_reopened(pause):
-                return
+        now = self._clock()
+        paused = {pause.pool: pause for pause in self._store.dispatch_pauses()}
+        for pause in paused.values():
+            if pause.is_active(now) and not self._window_reopened(pause):
+                continue
             self._resume_dispatch(pause)
-            return
-        parks = self._discover_rate_limit()
-        # A park that recorded a reset carries evidence; a reset-less one only
-        # carries the max-wait *guess*. Sizing the shared window off the guess
-        # while another run holds the real reset would stall every repo for the
-        # five-hour cap, so the guess is used only when nothing better exists.
-        candidates = [park for park in parks if park.reset_at is not None] or parks
-        if candidates:
-            now = self._clock()
+        # A pool with a window on record — still open or just lifted — is left
+        # for the next pass: one window per limit, each pool on its own.
+        by_pool: dict[str | None, list[_RateLimitPark]] = {}
+        for park in self._discover_rate_limit():
+            if park.pool not in paused:
+                by_pool.setdefault(park.pool, []).append(park)
+        for parks in by_pool.values():
+            # A park that recorded a reset carries evidence; a reset-less one only
+            # carries the max-wait *guess*. Sizing the shared window off the guess
+            # while another run holds the real reset would stall every repo for the
+            # five-hour cap, so the guess is used only when nothing better exists.
+            candidates = [park for park in parks if park.reset_at is not None] or parks
             latest = max(candidates, key=lambda park: park.window_until(now))
             self._pause_dispatch(latest)
 
     def _dispatch_paused(self) -> bool:
+        """Whether the pool-less window — the one that holds every claim — is open."""
         pause = self._store.dispatch_pause()
         return pause is not None and pause.is_active(self._clock())
+
+    def _paused_pools(self) -> set[str | None]:
+        """The pools with a live window (``None`` is the pool-less one)."""
+        now = self._clock()
+        return {p.pool for p in self._store.dispatch_pauses() if p.is_active(now)}
+
+    def _job_pools(self, job: JobRecord) -> list[str]:
+        """The pools ``job`` spends from, as its *last holder* declared them.
+
+        A job a worker already held is judged by that worker's pools — so a run
+        parked in ``claude-shared`` is not quietly resumed on the M3's pool while
+        the shared window is shut — and by this scheduler's own when nobody (or
+        nobody registered) held it. A scheduler with no worker profile is a local
+        queue, whose single window is the pool-less one: no pools to name.
+        """
+        profile = self._config.worker
+        if profile is None:
+            return []
+        holder = self._store.get_worker(job.worker) if job.worker else None
+        return job_pools(job, holder.pools if holder is not None else profile.pools)
+
+    def _job_paused(self, job: JobRecord, paused: set[str | None] | None = None) -> bool:
+        """Whether ``job`` would spend from a pool whose window is shut.
+
+        The pool-less window is handled by :meth:`_dispatch_paused`.
+        """
+        paused = self._paused_pools() if paused is None else paused
+        return bool(paused) and not paused.isdisjoint(self._job_pools(job))
+
+    def _park_pool(self, job: JobRecord) -> str | None:
+        """The pool a parked job's window belongs to: the one it was spending from.
+
+        ``None`` for a local queue — Story 32.2-001's single window — and for a
+        job whose worker has no pool to name.
+        """
+        pools = self._job_pools(job)
+        return pools[0] if pools else None
 
     def _waiting_out_window(self) -> bool:
         """Whether a one-shot drain must stay alive to see the window reopen.
@@ -1528,7 +1692,7 @@ class _Scheduler:
         while there is work the reopened window would actually let through, so a
         pause discovered on an otherwise empty queue still exits.
         """
-        if not self._dispatch_paused():
+        if not self._paused_pools():
             return False
         now = self._clock()
         return bool(
@@ -1583,6 +1747,7 @@ class _Scheduler:
                 continue  # spent evidence: this park's window was already served
             park = self._rate_limit_park(job.id, job.run_id)
             if park is not None:
+                park.pool = self._park_pool(job)
                 parks.append(park)
         return parks
 
@@ -1635,19 +1800,21 @@ class _Scheduler:
             run_id=park.run_id,
             repo=park.repo,
             source=park.source,
+            pool=park.pool,
             now=now,
         )
         if not opened:
             return  # another job already discovered this window — stay silent
         self._result.paused += 1
+        scope = f"no job in pool {park.pool}" if park.pool else "no job"
         self._echo(
-            f"queue paused: rate limited (run {park.run_id[:8]}) — no job is "
+            f"queue paused: rate limited (run {park.run_id[:8]}) — {scope} is "
             f"claimed until {until.isoformat()}"
         )
         self._notify(
             "queue_paused",
             repo=Path(park.repo).name,
-            subject="development queue",
+            subject=_queue_subject(park.pool),
             reset_at=until.isoformat(),
             detail=detail,
             run=park.run_id,
@@ -1656,12 +1823,15 @@ class _Scheduler:
     def _resume_dispatch(self, pause: QueuePause) -> None:
         """Lift the pause and announce it — once, for the whole queue."""
         self._spend_served_parks(pause)
-        self._store.clear_pause()
-        self._echo("queue resumed: the rate-limit window reopened")
+        self._store.clear_pause(pause.pool)
+        self._echo(
+            "queue resumed: the rate-limit window reopened"
+            + (f" for pool {pause.pool}" if pause.pool else "")
+        )
         self._notify(
             "queue_resumed",
             repo=Path(pause.repo).name if pause.repo else "",
-            subject="development queue",
+            subject=_queue_subject(pause.pool),
             paused_until=pause.paused_until,
             run=pause.run_id or "",
         )
@@ -1694,6 +1864,8 @@ class _Scheduler:
         served = _as_datetime(pause.paused_until)
         now = self._clock()
         for park in self._discover_rate_limit():
+            if park.pool != pause.pool:
+                continue  # another pool's evidence: its own window is still to serve
             if (
                 served is not None
                 and park.reset_at is not None
@@ -1715,29 +1887,44 @@ class _Scheduler:
         so a five-hour blind wait costs a handful of tiny requests rather than
         one per poll.
         """
-        if self._probe is None or not self._due_for_probe(pause):
+        if self._probe is None or not self._serves(pause) or not self._due_for_probe(pause):
             return False
-        self._store.mark_pause_probed(now=self._clock())
+        self._store.mark_pause_probed(pause.pool, now=self._clock())
         from sdlc.build import _probe_parked_reset
         from sdlc.capability import ProbeStatus
 
         ledger = self._pause_ledger(pause)
-        if ledger is None:
+        if ledger is None and pause.pool is None:
             return False
         reset_at = _as_float(pause.paused_until)
         try:
-            status = _probe_parked_reset(
-                ledger,
-                pause.run_id or "",
-                # Structurally all that function reads is ``.probe`` — see
-                # :class:`_ProbeContext`. The cast keeps the reuse honest
-                # without constructing a whole BuildOptions to satisfy a type.
-                cast(Any, _ProbeContext(probe=self._probe)),
-                reset_at if reset_at is not None else 0.0,
-            )
+            if ledger is None:
+                # A pool's window may have been discovered on another host, whose
+                # ledger this one cannot reach. Any worker of the pool is entitled
+                # to test it (Story 35.2-003); there is just nowhere to log it.
+                status = self._probe()
+            else:
+                status = _probe_parked_reset(
+                    ledger,
+                    pause.run_id or "",
+                    # Structurally all that function reads is ``.probe`` — see
+                    # :class:`_ProbeContext`. The cast keeps the reuse honest
+                    # without constructing a whole BuildOptions to satisfy a type.
+                    cast(Any, _ProbeContext(probe=self._probe)),
+                    reset_at if reset_at is not None else 0.0,
+                )
         except Exception:  # noqa: BLE001 - a probe must never fail a drain
             return False
         return status is ProbeStatus.AVAILABLE
+
+    def _serves(self, pause: QueuePause) -> bool:
+        """Whether this scheduler's credentials are the ones ``pause`` concerns.
+
+        A probe answers for the subscription it runs under, so a worker outside
+        the paused pool must not reopen it. A local queue has one pool: always.
+        """
+        profile = self._config.worker
+        return pause.pool is None or profile is None or pause.pool in profile.pools
 
     def _due_for_probe(self, pause: QueuePause) -> bool:
         last = pause.probed_at or pause.paused_at
@@ -1804,6 +1991,7 @@ class _Scheduler:
                 continue
             self._in_flight[job_id].run_id = record.run_id
             self._store.attach_run(job_id, record.run_id)
+            self._push_run(record.run_id)  # the run's start, on the fleet now — not a beat later
 
     def _registry_record(self, run_id: str) -> RunRecord | None:
         for record in self._registry.records():
@@ -1850,6 +2038,7 @@ class _Scheduler:
                 entry.proc.stop()
             except OSError as exc:
                 self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            self._push_run(entry.run_id, ended=True)
             self._store.release_claim(
                 job_id, claimed_by=self._identity,
                 reason="scheduler interrupted", now=self._clock(),
@@ -1924,7 +2113,7 @@ def run_queue(
         store,
         config=config or SchedulerConfig(),
         registry=registry if registry is not None else Registry(),
-        launcher=launcher or _default_launcher,
+        launcher=launcher or _launcher_for(config or SchedulerConfig()),
         clock=clock or _utc_now,
         sleeper=sleeper or time.sleep,
         notifier=notifier or notify,

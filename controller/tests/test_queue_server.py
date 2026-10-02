@@ -29,6 +29,9 @@ from sdlc.queue_server import (
 )
 
 LOOPBACK = ("127.0.0.0/8",)
+# `shutdown()` blocks until `serve_forever` next polls its stop flag; the
+# stdlib's 0.5s default idled every live-server test half a second.
+_FAST_SHUTDOWN = {"poll_interval": 0.01}
 
 
 class _Running:
@@ -37,7 +40,7 @@ class _Running:
     def __init__(self, store: QueueStore, policy: AccessPolicy) -> None:
         self.server = make_server(store, policy, "127.0.0.1", 0)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self.server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
         self._thread.start()
 
     def call(self, method: str, path: str, body=None, headers=None):
@@ -148,6 +151,7 @@ def test_get_jobs_matches_queue_list_json_shape(api, store) -> None:
     assert status == 200
     assert payload == {
         "pause": None,
+        "pauses": [],
         "jobs": [r.to_dict() for r in store.list_jobs()],
     }
     assert [j["scope"] for j in payload["jobs"]] == ["epic-2", "epic-1"]
@@ -298,11 +302,28 @@ def test_cancel_requeue_prioritise(api) -> None:
     assert json.loads(bumped["budget"])["max_fix_rounds"] == 8
 
 
+def test_cancel_of_a_running_job_sets_cancel_requested(api) -> None:
+    """Story 35.4-003: the service flags it; the holding worker stops it on heartbeat."""
+    job = _add(api)
+    api.call("POST", "/jobs/claim", {"worker": "w"})
+    status, flagged = api.call("POST", f"/jobs/{job['id']}/cancel")
+    assert status == 200
+    assert flagged["state"] == "running" and flagged["cancel_requested"] is True
+    status, listing = api.call("GET", "/jobs")
+    assert listing["jobs"][0]["cancel_requested"] is True
+    # The holder acknowledges by finishing it cancelled.
+    status, done = api.call(
+        "POST", f"/jobs/{job['id']}/finish", {"state": "cancelled", "worker": "w"}
+    )
+    assert status == 200 and done["state"] == "cancelled" and done["cancel_requested"] is False
+
+
 def test_state_refusals_are_409_and_bad_values_400(api) -> None:
     job = _add(api)
     assert api.call("POST", f"/jobs/{job['id']}/requeue")[0] == 409  # already queued
     api.call("POST", "/jobs/claim", {"worker": "w"})
-    assert api.call("POST", f"/jobs/{job['id']}/cancel")[0] == 409  # running
+    api.call("POST", f"/jobs/{job['id']}/finish", {"state": "done", "worker": "w"})
+    assert api.call("POST", f"/jobs/{job['id']}/cancel")[0] == 409  # finished
     assert api.call("POST", f"/jobs/{job['id']}/prioritise", {"priority": "asap"})[0] == 400
 
 
@@ -721,7 +742,7 @@ def test_serve_help_states_the_api_bind_rules_and_identity_model() -> None:
                    "Origin", "415",
                    # Optional fields survive Rich markup rendering.
                    "[lease_seconds, host, pools]", "[reason, worker]",
-                   "[reason, run_id, repo, source]"):
+                   "[reason, run_id, repo, source, pool]"):
         assert needle in text, needle
 
 
@@ -1002,3 +1023,22 @@ def test_an_unsatisfiable_job_shows_its_reason_in_the_job_list(api) -> None:
     assert job["state"] == "queued"
     listed = api.call("GET", "/jobs")[1]["jobs"][0]
     assert listed["reason"] == "no eligible worker (needs repo agentic-coding-monitor, sandbox)"
+
+
+def test_pause_routes_are_per_pool(api) -> None:
+    """Story 35.2-003: POST /pause takes a pool, DELETE /pause?pool= lifts just it."""
+    until = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    assert api.call("POST", "/pause", {"until": until, "pool": "claude-shared"})[1]["opened"]
+    assert api.call("POST", "/pause", {"until": until, "pool": "codex-shared"})[1]["opened"]
+
+    status, listing = api.call("GET", "/jobs")
+    assert status == 200
+    assert {p["pool"] for p in listing["pauses"]} == {"claude-shared", "codex-shared"}
+    assert listing["pause"] is not None  # the first window, for one-pool readers
+
+    assert api.call("DELETE", "/pause?pool=claude-shared")[0] == 200
+    assert [p["pool"] for p in api.call("GET", "/jobs")[1]["pauses"]] == ["codex-shared"]
+
+    assert api.call("DELETE", "/pause")[0] == 200
+    listing = api.call("GET", "/jobs")[1]
+    assert listing["pauses"] == [] and listing["pause"] is None

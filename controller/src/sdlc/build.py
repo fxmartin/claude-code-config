@@ -104,7 +104,7 @@ from sdlc.issue_host import (
     IssueHostAdapter,
 )
 from sdlc.risk_gate import RISK_APPROVED_LABEL, RISK_LABEL
-from sdlc.registry import Registry, RunRecord
+from sdlc.registry import WORKER_ENV, Registry, RunRecord
 from sdlc.usage import usage_is_tracked
 
 # Maximum bugfix iterations per story before giving up — mirrors the skill's
@@ -7215,22 +7215,46 @@ def _registry_register(
     space sorts before ``T``, which sank run 60c2947e to 26th on 2026-09-30).
     """
     try:
-        registry.register(
-            RunRecord(
-                run_id=run_id,
-                repo=str(Path(repo or Path.cwd()).resolve()),
-                db=str(Path(db_path).resolve()),
-                scope=scope,
-                pid=os.getpid(),
-                status="IN_PROGRESS",
-                # registry stamps the start time when blank
-                started_at=_registry_iso(started_at),
-                total=total,
-                completed=completed,
-            )
+        record = RunRecord(
+            run_id=run_id,
+            repo=str(Path(repo or Path.cwd()).resolve()),
+            db=str(Path(db_path).resolve()),
+            scope=scope,
+            pid=os.getpid(),
+            status="IN_PROGRESS",
+            # registry stamps the start time when blank
+            started_at=_registry_iso(started_at),
+            total=total,
+            completed=completed,
+            worker=_registry_worker(),
         )
+        registry.register(record)
     except OSError:
-        pass
+        # Nor is it pushed: the finish push reads the record back from this
+        # file, so a fleet row the file lacks could never be closed.
+        return
+    # Story 35.4-001: the fleet gets the record too, but the local file above
+    # stays authoritative — the push is best-effort and never fails the run.
+    from sdlc.queue_client import push_fleet_run
+
+    push_fleet_run(record)
+
+
+def _registry_worker() -> str | None:
+    """The fleet worker this run belongs to, or None when no fleet is in play.
+
+    ``SDLC_WORKER`` (set by ``queue run --worker`` for the jobs it launches) wins;
+    a bare ``sdlc build`` on a machine with a fleet queue configured is named for
+    its short hostname, so the fleet view never shows a nameless run.
+    """
+    from sdlc.queue_client import QueueConfigError, fleet_worker_name, resolve_queue_url
+
+    if os.environ.get(WORKER_ENV, "").strip():
+        return os.environ[WORKER_ENV].strip()
+    try:
+        return fleet_worker_name() if resolve_queue_url() is not None else None
+    except (QueueConfigError, OSError):  # a deleted cwd must not cost the local record
+        return None
 
 
 def _registry_iso(stamp: str) -> str:
@@ -7259,6 +7283,25 @@ def _registry_finish(
         registry.mark_finished(run_id, status, completed=completed)
     except OSError:
         pass
+    _push_finished_run(registry, run_id)
+
+
+def _push_finished_run(registry: Registry, run_id: str) -> None:
+    """Push a just-finished run's terminal record to the fleet (Story 35.4-001).
+
+    Reads the record back from the local file — the authority — so the push says
+    exactly what the worker's own registry now says. Best-effort, like the rest.
+    """
+    from sdlc.queue_client import push_fleet_run, resolve_queue_url
+
+    try:
+        if resolve_queue_url() is None:
+            return  # no fleet: leave the local registry untouched by this path
+        record = next((r for r in registry.records() if r.run_id == run_id), None)
+    except Exception:  # noqa: BLE001 — a bad fleet config or unreadable cache must not fail a build
+        return
+    if record is not None:
+        push_fleet_run(record)
 
 
 def _story_features(story: Story) -> dict[str, int | None]:

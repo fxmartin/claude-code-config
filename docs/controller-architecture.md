@@ -861,10 +861,11 @@ The client groups jobs by `state` (known states ordered first, any future
 state sorted after), shows each job's repo/scope/priority/age, and computes
 **slot usage** as a live count of `running` jobs (there is no configured slot
 *cap* to show a fraction against yet — that lands with the scheduler in Story
-32.1-002). The rate-limit pause is read off `data.pause` — the **queue's** own
+32.1-002). The rate-limit pause is read off `data.pauses` (`data.pause` for an older server) — the **queue's** own
 state, never a job's — and rendered as a single banner with its reset time
 (`paused_until`) and reason: one Max window shared by every repo is one pause,
-not N independently parked rows (Story 32.2-001 AC4). An elapsed window is
+not N independently parked rows (Story 32.2-001 AC4) — and one banner line
+per paused subscription pool (Story 35.2-003). An elapsed window is
 reported as no pause at all, so the banner can never go stale. Forward
 compatibility still applies to
 `pr_number`/`pr_url`: rendered as a link when a job carries them (Story
@@ -1645,7 +1646,8 @@ reaches the job's own agents rather than just its parent.
   not of the run that happened to find it. Each pass asks the queue one question
   — which `running` jobs' runs are parked `RATE_LIMITED` in their own ledgers? —
   and caches the *latest* reset epoch any of them recorded as the queue's
-  `paused_until` (a single-row `queue_state` table). Every park is read, not
+  `paused_until` (one `queue_pauses` row per pool — a single pool-less row on a local queue; see
+  *Pause per subscription pool* below). Every park is read, not
   just the first: parked jobs routinely outnumber free slots, and a window sized
   off one park would be lifted while another's ledger still records a later
   reset — a second pause, from evidence the resumed job had already disproved.
@@ -1696,7 +1698,7 @@ reaches the job's own agents rather than just its parent.
   - **Operator-declared reset (Story 32.2-003).** `sdlc queue unpause
     [--dry-run]` is for after FX resets the Max limit or switches subscription.
     It trusts the operator — no probe (after a switch the last probe result is
-    meaningless): `sdlc/unpause.py` deletes the `queue_state` row and, for every
+    meaningless): `sdlc/unpause.py` deletes the `queue_pauses` row(s) and, for every
     registry run (`Registry.records()`, every repo) that is unfinished, not live
     and `RATE_LIMITED`, appends a config event without `rate_limit_reset_at`,
     moves its `RATE_LIMITED` stories and the run back to `IN_PROGRESS`, and logs
@@ -1741,17 +1743,41 @@ what `sdlc queue list --json` emits.
 |-------|--------------|-------|
 | `GET /health` | — | `{ok, controller_version}` — a 200 means the identity gate admitted the caller; what `sdlc doctor` probes (Story 35.1-002) |
 | `GET /jobs[?repo=PATH]` | `list_jobs` | `{pause, jobs}`, the `queue list --json` envelope |
-| `POST /jobs` | `add_job` | `repo, kind, scope` + optional `priority, options[], labels[], host, pool, requirements{repo,harness,sandbox}`; 201 |
+| `POST /jobs` | `add_job` | `repo, kind, scope` + optional `priority, options[], labels[], host, pool, requirements{repo,origin,harness,sandbox}`; 201 |
 | `POST /jobs/claim` | `claim_next` | `worker` + optional `lease_seconds, host, pools[]`; the best claimable job, or 204. Held while the queue is paused. |
 | `POST /workers` · `GET /workers` | `register_worker` · `list_workers` | register a worker, or heartbeat (the same call): `worker, host` + optional `pools[], harnesses[], sandbox, repos[], slots, slots_free`; `GET` returns `{workers}` with an `online` flag each (Story 35.2-001, see below) |
 | `POST /jobs/{id}/renew` · `/release` | `renew_lease` · `release_claim` | `worker` must hold the claim, else 409 |
 | `POST /jobs/{id}/finish` | `finish_job` | `state` (a terminal), optional `reason`, `worker` (when given, it must still hold the claim as the state is written — the check is in the UPDATE — else 409) |
-| `POST /jobs/{id}/cancel` · `/requeue` | `cancel_job` · `requeue_job` | a refused state change is 409 |
+| `POST /jobs/{id}/cancel` · `/requeue` | `cancel_job` · `requeue_job` | a refused state change is 409. Cancel of a `running` held job answers 200 with the job still `running` and `cancel_requested: true` (Story 35.4-003, below) |
 | `POST /jobs/{id}/prioritise` | `prioritise_job` | `priority` |
-| `POST /pause` · `DELETE /pause` | `pause_dispatch` · `clear_pause` | `until` (ISO-8601) + optional `reason, run_id, repo, source`; returns `{opened, pause}`. `DELETE` is the bare `clear_pause` — no audit row, no re-arm of `RATE_LIMITED` runs — so it is not `sdlc queue unpause` |
+| `POST /pause` · `DELETE /pause[?pool=P]` | `pause_dispatch` · `clear_pause` | `until` (ISO-8601) + optional `reason, run_id, repo, source, pool`; returns `{opened, pause}`. `DELETE` is the bare `clear_pause` (one pool's window with `?pool=`, else every window) — no audit row, no re-arm of `RATE_LIMITED` runs — so it is not `sdlc queue unpause` |
 
 An unknown job is 404, bad input 400, an oversized (> 1 MiB) body 413, a body
 that is not `Content-Type: application/json` 415.
+
+**Cancelling a running job (Story 35.4-003).** The queue never kills a process —
+the run lives on the worker's machine. `cancel_job` on a `running` job that has a
+holder sets `jobs.cancel_requested` (migration 9) and writes `cancel requested`
+as its reason; a `running` job nobody holds is retired at once (the UPDATE
+re-checks that no one holds it, so a job reclaimed meanwhile is flagged
+instead). The holding scheduler reads the flag every pass (`_honour_cancels`,
+before `_renew`, so a lease is never extended on a doomed job), stops the run through
+`JobProcess.stop()` — the process-group SIGTERM→SIGKILL kill of Story 13.4-001 —
+and finishes the job `cancelled` (`finish_job` accepts it as the holder's
+acknowledgement), which clears the claim, lease and flag. A claim released with
+the flag set (worker interrupted) retires the job rather than resuming it, and
+so does a lapsed lease — but only once the run is gone too. A job whose run's
+pid still answers is not retired: only its holder can stop that run, and
+retiring the row under it would leave the run going, unwatched, behind a
+`cancelled` row — so it stays flagged until the run ends, then is retired, never
+resumed. A holder that finds its job already `cancelled` (a peer drain retired it
+while the holder stalled past its lease) still stops its run. A run that stops
+`AWAITING_APPROVAL` before its holder saw the flag, or after a peer retired the
+job, is not parked: `park_job` leaves it `cancelled` rather than parking it for
+an approval to resume. `requeue` and an approval's take-back clear
+any leftover flag, so a re-armed job is never re-cancelled. The run's own ledger
+is left as it stood. A `queue run` started before this change does not read the
+flag — restart it after upgrading, or a cancel only waits for the run to end.
 `claim_next` is `peek_claimable` in dispatch order, filtered to the caller's
 `host`/`pools` (a job pinned to a `host` goes only there; a `pool` job only to a
 worker serving it), then the existing guarded `claim_job` UPDATE — so the lease
@@ -1859,7 +1885,7 @@ then prepares the clone *after* claiming a fresh job and *before* launching it
    it, so it is neither launched twice nor parked by the scheduler that lost
    it (a `blocked` refusal is stamped only while the claim is still its
    own) — then records the clone path as the job's
-   `repo` and the resulting sha as its `synced_sha` (migration 8, in `sdlc queue
+   `repo` and the resulting sha as its `synced_sha` (migration 11, in `sdlc queue
    list --json`), and launches the job there. Run attach, resume, reconcile and
    the approval probe all read `repo`, so they follow the clone, not the path
    the enqueuing machine recorded.
@@ -1921,6 +1947,57 @@ loopback peer, so local development authenticates by token, and a loopback bind
 without `SDLC_QUEUE_TOKEN` refuses to start. Add
 `SDLC_QUEUE_PATH` to point the service at a non-default store.
 
+**Resident service (Story 35.1-003).** On home-lab the service runs under
+launchd from `templates/launchd/com.fxmartin.sdlc-queue.plist`: `RunAtLoad` +
+`KeepAlive` (so it comes back at login after a reboot, and whenever it exits),
+logs in `~/.local/state/sdlc/queue-service.{out,err}.log`, no secret in the
+file. A controller reinstall does not restart it: the running service keeps the
+old code until `launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-queue`.
+The template's header documents the three substitutions and the install
+commands; `nix-install` renders the same shape from the snippet below. The plist pins
+`SDLC_QUEUE_PATH` because launchd's environment is bare — export the same value
+in the shell so local `sdlc queue` verbs write the file the service serves.
+`sdlc doctor` reads the installed plist (`check_queue_service`, finding
+`queue-service`): **CLEAN** with the bind address and store path when the bind
+accepts a TCP connection (or "not installed" off home-lab), **FAIL** when
+nothing listens or the plist is unusable (remedy: `launchctl kickstart -k
+gui/$(id -u)/com.fxmartin.sdlc-queue`, then the log the plist's own
+`StandardErrorPath` names), **WARN** when the service's store is not
+the one this shell's `sdlc queue` uses. The probe is a bare connect, not an HTTP
+call: the API refuses unauthenticated callers and doctor stays read-only. This
+supersedes the 30.3-001 pattern for the queue; `sdlc listen` keeps its own.
+
+**nix-install wiring.** The nix side lands in `nix-install` (home-lab only) and
+mirrors the template. Keep the label: doctor finds the agent as
+`~/Library/LaunchAgents/com.fxmartin.sdlc-queue.plist`, and its remedy and the
+recovery runbook address it by that label. nix-darwin names the plist after
+`serviceConfig.Label`, and its default — `org.nixos.sdlc-queue`, the convention
+every other nix-install agent follows — would read to doctor as "not
+installed". `homeDir`, `tailnetIp` and `allowedLogins` stand for the template's
+three placeholders, and `~/.local/state/sdlc/` must be created first, as the
+template's install does (an activation `mkdir -p`, like nix-install's for
+`~/.local/log`).
+
+```nix
+launchd.user.agents.sdlc-queue.serviceConfig = {
+  Label = "com.fxmartin.sdlc-queue"; # not nix-darwin's org.nixos.* default
+  ProgramArguments = [
+    "${homeDir}/.local/bin/sdlc" "queue" "serve" "--bind" "${tailnetIp}:8790"
+  ];
+  EnvironmentVariables = {
+    PATH = "${homeDir}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    SDLC_QUEUE_PATH = "${homeDir}/.local/state/sdlc/queue.db";
+    SDLC_QUEUE_ALLOW = allowedLogins;
+  };
+  RunAtLoad = true;
+  KeepAlive = true;
+  ThrottleInterval = 10;
+  StandardOutPath = "${homeDir}/.local/state/sdlc/queue-service.out.log";
+  StandardErrorPath = "${homeDir}/.local/state/sdlc/queue-service.err.log";
+  ProcessType = "Background";
+};
+```
+
 **Schema.** One additive migration (`fleet_job_columns`) adds `host` (pin),
 `pool`, `requirements` (JSON) and `worker` (who holds the claim) to `jobs`, all
 nullable: an older `queue.db` upgrades in place and its rows read as "run
@@ -1956,13 +2033,106 @@ went out may mean it landed, and replaying `add` would enqueue twice). An
 unreachable service or 5xx raises `QueueUnavailable`, a 403 `QueueRefused`; both
 name the URL, and the CLI shows one `error:` line (exit 2). `--enqueue` with the
 service down fails — it never enqueues locally — while a plain `sdlc build`
-never opens the queue and is unaffected.
+never opens the queue and does not depend on it: with a URL configured it only
+pushes its run record to the fleet registry, best-effort (Story 35.4-001, below).
 
-`sdlc queue run` and `sdlc queue unpause` need scheduler/ledger verbs the service
-does not expose, so with a fleet queue configured they refuse (exit 2) rather
-than drain the wrong queue; `sdlc queue serve` always serves the local store.
+**Targeting the fleet (Story 35.3-001).** On a fleet queue `--enqueue` adds
+`requirements` to the job — `{repo, origin, harness, sandbox}`, all strings:
+`repo` is the checkout's directory name, `origin` its `git remote get-url origin`
+(omitted when there is none; it is what lets a worker clone the repo) with any
+URL credential stripped — `https://oauth2:<token>@host/…` is recorded as
+`https://host/…`, an `ssh://` login user is kept — since the service never holds
+a token and the worker clones with its own forge login, `harness`
+the comma-joined set of harnesses the role routing reaches (resolved as the run
+resolves it: `--harness` over the repo `.sdlc-harness.yaml` over the harness
+registry's `default:`; a role none of them names counts as the built-in
+`claude`), `sandbox` `container` when `--sandbox` was passed. `--host <host>` /
+`--pool <pool>` (also `=` form) are enqueue-only: they are stripped from the
+frozen flags and recorded as the job's `host` pin and `pool`, which the claim
+matcher honours. They need a fleet queue (otherwise exit 2: nothing would honour
+them), and a `--host` is checked against the hosts of the workers registered
+with the service (`GET /workers`, Story 35.2-001 — a pin matches a worker's
+host, not its name): unknown → exit 2 listing the registered workers, and a
+service that cannot list them fails the enqueue rather than accept a pin no
+worker may ever claim. A `github`/`gitlab` value, in either form, keeps its
+older meaning — the forge override, handed to the run as `--host=<forge>` — so
+a machine named `github` or `gitlab` cannot be pinned. `sdlc queue list` gained
+`WORKER`, `HOST` and `POOL` columns, each as wide as its longest value.
+
+`sdlc queue run` stays local-only and refuses while a fleet queue is configured; `sdlc queue unpause --pool` works against it (Story 35.2-003); `sdlc queue serve` always serves the local store.
 `sdlc doctor` adds a `fleet-queue` finding — reachable, identity accepted, the
 service's controller version — only when a URL is configured.
+
+### The fleet run registry (Story 35.4-001)
+
+The per-host `registry.json` cannot show a run on another machine, so the service
+holds a second table, `fleet_runs` (migration 10): one row per run id, the
+`RunRecord` fields plus `worker` and `updated_at`. The worker's local file stays
+authoritative for the worker; the table is the fleet's summary.
+
+- **Worker writes.** `queue run --worker` drains the queue its host owns and
+  refuses a fleet URL, so neither it nor its jobs can reach `/runs`. Like its
+  heartbeat registration, the worker writes each run's row straight into that
+  store (`QueueStore.put_fleet_run`, named for the worker): when `_attach_runs`
+  links the run to its job, on each 30 s heartbeat with done/total read live from
+  the ledger, and once the job's process is gone — reaped, stopped by its budget,
+  by an operator's cancel (Story 35.4-003), or by Ctrl-C. That last write carries
+  the worker's own `derive_state`, so a run that exited unfinished (killed,
+  crashed, parked) reads `DEAD` on the fleet as it does on the worker's dashboard.
+  A failed write is logged, never fatal to the drain.
+- **Build pushes.** `_registry_register` / `_registry_finish` (and so `build`,
+  `fix` and `resume`) call `queue_client.push_fleet_run` after the local write;
+  it reaches the service only where a fleet URL is configured, so it is a no-op
+  inside a worker's jobs. The push never fails the build: 3 s per attempt, and
+  `PUT /runs` is replayed once, so an unreachable service can hold a build's start
+  or finish for about 6 s. A record the local write could not store is not
+  pushed. The `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its
+  jobs), else the short hostname. Nothing outlives a build that dies outside a
+  worker, so its row keeps its last pushed status (its own host shows `DEAD`).
+- **Upsert.** `PUT /runs` and the worker's writes share one upsert: a finished
+  row is final against its own pid — a stale in-progress write cannot reopen it,
+  while `resume` (a new process, so a new pid) does.
+- **Read.** `GET /runs` returns `{runs}`, each flagged `worker_online` from the
+  `workers` table (`null` when the worker never registered — unknown, not gone).
+- **Dashboard.** `/api/runs` merges the fleet's runs into the local registry view
+  and dedupes by run id (the local row wins). `derive_state(record, remote=True,
+  worker_online=…)` judges a remote run by its worker's heartbeat instead of a pid
+  that names a process on another machine. Selecting a remote run serves a
+  header-only snapshot built from the pushed record. `/api/fleet` reports
+  `{configured, available, error}`; unreachable, the page keeps the local runs and
+  shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
+  `/api/runs`, `/api/fleet` and the SSE change token; a failed fetch is kept
+  for 30 s, so an offline service stalls the page at most once per window.
+
+### Pause per subscription pool (Story 35.2-003)
+
+With a fleet, one rate limit is one *subscription's* limit, not the host's: two
+Claude Max pools and a Codex pool each have their own window. `queue_pauses`
+(migration 8, which also moves an old `queue_state` row across) holds one row per
+`pool`; `''` is the pool-less window of a local queue, so Story 32.2-001's single
+pause is simply the one-pool case and `SDLC_QUEUE_URL` unset behaves as before.
+
+- **What a job spends from** (`queue.job_pools`): the job's pinned `pool`, else
+  the claiming worker's declared Claude pool (its first pool that is not
+  `codex-shared`), plus `codex-shared` when a routed stage uses `codex`.
+- **Claims.** `claim_next` yields nothing while a pool-less window is open;
+  otherwise it drops only the jobs whose pools intersect a paused pool, so
+  `claude-m3` keeps building while `claude-shared` waits for its window. The
+  scheduler applies the same filter to fresh claims, resumes and approval polls,
+  judging a previously held job by its last holder's pools.
+- **Discovery.** A `RATE_LIMITED` park is attributed to the pool of the worker
+  that held its job; one window per pool, sized off that pool's latest reset.
+- **Probe.** Any scheduler whose worker serves a paused pool may run the early
+  reset probe (a worker outside the pool must not — its credentials say nothing
+  about it). Success deletes that pool's row, which releases every worker of the
+  pool at once; with no ledger reachable for a window another host found, the
+  probe still runs and simply has nowhere to log its verdict.
+- **Operator.** `sdlc queue unpause --pool P` clears just that pool — against the
+  fleet queue (`DELETE /pause?pool=P`) when one is configured — and re-arms only
+  this host's parked runs whose queue job spends from `P`. `queue list` and the
+  dashboard print one line per paused pool; `--json`/`GET /jobs` carry `pauses`
+  (and `pause`, the first, for older readers). Fleet clears are not written to
+  `queue_pause_clears`, which lives in the service's `queue.db`.
 
 ## The approval park (`parked`, Story 32.2-002)
 
