@@ -4,7 +4,7 @@
   LaunchAgent that keeps `sdlc queue serve` (the fleet queue service,
   Story 35.1-001) resident on home-lab — Story 35.1-003.
 
-  Substitute the four __PLACEHOLDERS__ below; launchd expands neither `~` nor
+  Substitute the three __PLACEHOLDERS__ below; launchd expands neither `~` nor
   `$VARS`, so every path is absolute:
 
     __HOME__        the account's home, e.g. /Users/fxmartin
@@ -13,7 +13,8 @@
     __LOGIN__       the Tailscale login(s) allowed to call the API
                     (comma-separated, read as $SDLC_QUEUE_ALLOW)
 
-  Install (or let nix-install render the same shape declaratively):
+  Install (or let nix-install render the same shape from the nix-darwin
+  snippet in docs/controller-architecture.md):
 
     mkdir -p ~/.local/state/sdlc
     sed -e "s|__HOME__|$HOME|g" -e "s|__TAILNET_IP__|$(tailscale ip -4)|g" \
@@ -33,6 +34,8 @@
 -->
 <plist version="1.0">
 <dict>
+  <!-- Keep this label: `sdlc doctor` finds the agent by its file name, and its
+       remedy and the recovery runbook address the agent by it. -->
   <key>Label</key>
   <string>com.fxmartin.sdlc-queue</string>
 
@@ -55,7 +58,7 @@
     <string>__LOGIN__</string>
   </dict>
 
-  <!-- Start at load/boot, and restart whenever it exits (crash, reinstall). -->
+  <!-- Start when loaded (at login), and restart whenever it exits. -->
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

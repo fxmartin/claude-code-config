@@ -1816,20 +1816,54 @@ without `SDLC_QUEUE_TOKEN` refuses to start. Add
 
 **Resident service (Story 35.1-003).** On home-lab the service runs under
 launchd from `templates/launchd/com.fxmartin.sdlc-queue.plist`: `RunAtLoad` +
-`KeepAlive` (so it survives a reboot and a controller reinstall), logs in
-`~/.local/state/sdlc/queue-service.{out,err}.log`, no secret in the file. The
-template's header documents the four substitutions and the install commands; the
-nix wiring that renders the same shape lands in `nix-install`. The plist pins
+`KeepAlive` (so it comes back at login after a reboot, and whenever it exits),
+logs in `~/.local/state/sdlc/queue-service.{out,err}.log`, no secret in the
+file. A controller reinstall does not restart it: the running service keeps the
+old code until `launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-queue`.
+The template's header documents the three substitutions and the install
+commands; `nix-install` renders the same shape from the snippet below. The plist pins
 `SDLC_QUEUE_PATH` because launchd's environment is bare — export the same value
 in the shell so local `sdlc queue` verbs write the file the service serves.
 `sdlc doctor` reads the installed plist (`check_queue_service`, finding
 `queue-service`): **CLEAN** with the bind address and store path when the bind
 accepts a TCP connection (or "not installed" off home-lab), **FAIL** when
 nothing listens or the plist is unusable (remedy: `launchctl kickstart -k
-gui/$(id -u)/com.fxmartin.sdlc-queue`), **WARN** when the service's store is not
+gui/$(id -u)/com.fxmartin.sdlc-queue`, then the log the plist's own
+`StandardErrorPath` names), **WARN** when the service's store is not
 the one this shell's `sdlc queue` uses. The probe is a bare connect, not an HTTP
 call: the API refuses unauthenticated callers and doctor stays read-only. This
 supersedes the 30.3-001 pattern for the queue; `sdlc listen` keeps its own.
+
+**nix-install wiring.** The nix side lands in `nix-install` (home-lab only) and
+mirrors the template. Keep the label: doctor finds the agent as
+`~/Library/LaunchAgents/com.fxmartin.sdlc-queue.plist`, and its remedy and the
+recovery runbook address it by that label. nix-darwin names the plist after
+`serviceConfig.Label`, and its default — `org.nixos.sdlc-queue`, the convention
+every other nix-install agent follows — would read to doctor as "not
+installed". `homeDir`, `tailnetIp` and `allowedLogins` stand for the template's
+three placeholders, and `~/.local/state/sdlc/` must be created first, as the
+template's install does (an activation `mkdir -p`, like nix-install's for
+`~/.local/log`).
+
+```nix
+launchd.user.agents.sdlc-queue.serviceConfig = {
+  Label = "com.fxmartin.sdlc-queue"; # not nix-darwin's org.nixos.* default
+  ProgramArguments = [
+    "${homeDir}/.local/bin/sdlc" "queue" "serve" "--bind" "${tailnetIp}:8790"
+  ];
+  EnvironmentVariables = {
+    PATH = "${homeDir}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    SDLC_QUEUE_PATH = "${homeDir}/.local/state/sdlc/queue.db";
+    SDLC_QUEUE_ALLOW = allowedLogins;
+  };
+  RunAtLoad = true;
+  KeepAlive = true;
+  ThrottleInterval = 10;
+  StandardOutPath = "${homeDir}/.local/state/sdlc/queue-service.out.log";
+  StandardErrorPath = "${homeDir}/.local/state/sdlc/queue-service.err.log";
+  ProcessType = "Background";
+};
+```
 
 **Schema.** One additive migration (`fleet_job_columns`) adds `host` (pin),
 `pool`, `requirements` (JSON) and `worker` (who holds the claim) to `jobs`, all

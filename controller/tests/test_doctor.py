@@ -1481,19 +1481,22 @@ def test_self_update_cleanup_failure_still_reports_the_install(
 
 
 def _service_plist(
-    tmp_path: Path, *, bind: str = "100.101.102.103:8790", store: str | None = None
+    tmp_path: Path,
+    *,
+    bind: str = "100.101.102.103:8790",
+    store: str | None = None,
+    err_log: str | None = None,
 ) -> Path:
     env = {"SDLC_QUEUE_PATH": store} if store else {}
+    body: dict[str, object] = {
+        "Label": "com.fxmartin.sdlc-queue",
+        "ProgramArguments": ["/usr/local/bin/sdlc", "queue", "serve", "--bind", bind],
+        "EnvironmentVariables": env,
+    }
+    if err_log:
+        body["StandardErrorPath"] = err_log
     path = tmp_path / "com.fxmartin.sdlc-queue.plist"
-    path.write_bytes(
-        plistlib.dumps(
-            {
-                "Label": "com.fxmartin.sdlc-queue",
-                "ProgramArguments": ["/usr/local/bin/sdlc", "queue", "serve", "--bind", bind],
-                "EnvironmentVariables": env,
-            }
-        )
-    )
+    path.write_bytes(plistlib.dumps(body))
     return path
 
 
@@ -1524,6 +1527,21 @@ def test_queue_service_down_fails_with_a_remedy(tmp_path: Path) -> None:
     assert finding.status == "FAIL"
     assert "100.101.102.103:8790" in finding.detail
     assert "launchctl kickstart" in finding.remedy
+
+
+def test_queue_service_down_points_at_the_plists_own_error_log(tmp_path: Path) -> None:
+    # A custom or nix-rendered install may log elsewhere; the plist says where.
+    plist = _service_plist(tmp_path, err_log="/srv/logs/sdlc-queue.err")
+    finding = check_queue_service(plist, probe=lambda h, p: False)
+    assert "/srv/logs/sdlc-queue.err" in finding.remedy
+    assert ".local/state/sdlc" not in finding.remedy
+
+
+def test_queue_service_down_without_an_error_log_names_none(tmp_path: Path) -> None:
+    # No StandardErrorPath: launchd discards stderr, so there is no file to read.
+    finding = check_queue_service(_service_plist(tmp_path), probe=lambda h, p: False)
+    assert "launchctl kickstart" in finding.remedy
+    assert "err.log" not in finding.remedy
 
 
 def test_queue_service_store_follows_launchds_bare_environment(tmp_path: Path) -> None:
@@ -1585,12 +1603,23 @@ def test_queue_service_unreadable_plist_fails(tmp_path: Path) -> None:
             '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
             "<key>A</key><string>a & b</string></dict></plist>\n"
         ),
+        # Valid XML and a valid plist, but ProgramArguments is not an array.
+        (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+            "<key>ProgramArguments</key><integer>5</integer></dict></plist>\n"
+        ),
+        # Valid XML that plistlib's parser trips over (a key outside any dict).
+        (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">'
+            "<key>Label</key></plist>\n"
+        ),
     ],
-    ids=["truncated", "unescaped-ampersand"],
+    ids=["truncated", "unescaped-ampersand", "scalar-program-arguments", "stray-key"],
 )
-def test_queue_service_malformed_xml_plist_fails(tmp_path: Path, body: str) -> None:
-    # plistlib lets expat's ExpatError escape for XML it cannot parse; that must
-    # read as FAIL, not crash `sdlc doctor` (and `sdlc status --markdown`).
+def test_queue_service_malformed_plist_fails(tmp_path: Path, body: str) -> None:
+    # Whatever plistlib or the shape coercion raises (ExpatError, TypeError,
+    # IndexError, ...) must read as FAIL, not crash `sdlc doctor` (and `sdlc
+    # status --markdown`).
     path = tmp_path / "half-written.plist"
     path.write_text(body, encoding="utf-8")
     finding = check_queue_service(path, probe=lambda h, p: True)

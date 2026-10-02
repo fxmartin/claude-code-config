@@ -15,7 +15,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
-from xml.parsers.expat import ExpatError
 
 import yaml
 
@@ -722,11 +721,12 @@ def check_queue_service(
         plist = plistlib.loads(plist_path.read_bytes())
         args = [str(a) for a in plist.get("ProgramArguments", [])]
         env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
-    # plistlib raises InvalidFileException only for input that is not a plist at
-    # all; XML it cannot parse (truncated, unescaped `&`) escapes as ExpatError.
-    except (
-        OSError, plistlib.InvalidFileException, ExpatError, ValueError, AttributeError,
-    ) as exc:
+        err_log = str(plist.get("StandardErrorPath") or "")
+    # Doctor is a diagnostic: a plist it cannot use is this check's FAIL, never a
+    # crash of `sdlc doctor` / `sdlc status --markdown`. plistlib's errors are not
+    # a closed set (expat's ExpatError, an IndexError for a stray <key>) and a
+    # scalar ProgramArguments is a TypeError, so no exception tuple stays complete.
+    except Exception as exc:  # noqa: BLE001
         return Finding(
             "queue-service", name, "FAIL",
             f"{plist_path} is unreadable: {exc}",
@@ -747,11 +747,15 @@ def check_queue_service(
     except ValueError:
         alive = False
     if not alive:
+        remedy = f"launchctl kickstart -k gui/$(id -u)/{QUEUE_SERVICE_LABEL}"
+        # The plist says where stderr goes; without StandardErrorPath launchd
+        # discards it, so there is no log to point at.
+        if err_log:
+            remedy += f"; then read {err_log}"
         return Finding(
             "queue-service", name, "FAIL",
             f"nothing is listening on {bind} (store {store})",
-            f"launchctl kickstart -k gui/$(id -u)/{QUEUE_SERVICE_LABEL}; "
-            "then read ~/.local/state/sdlc/queue-service.err.log",
+            remedy,
         )
 
     local = queue_path if queue_path is not None else default_queue_path()
