@@ -52,7 +52,7 @@ def test_template_passes_plutil_lint() -> None:
 
 
 def test_worker_starts_at_boot_and_is_restarted_on_exit(plist) -> None:
-    # KeepAlive is what turns the stale-controller refusal into a restart.
+    # KeepAlive restarts the worker after it exits 75 on a controller upgrade.
     assert plist["RunAtLoad"] is True
     assert plist["KeepAlive"] is True
     assert plist["ThrottleInterval"] >= 10  # a crash loop must not spin

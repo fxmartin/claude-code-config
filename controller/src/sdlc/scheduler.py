@@ -156,6 +156,10 @@ VersionCheck = Callable[..., object]
 # nothing newer was installed. Issue #709's `--self-update` seam — the real one
 # is `sdlc.doctor.self_update_controller`.
 SelfUpdater = Callable[[Path, str], "str | None"]
+# ``() -> the controller version a restart would load``, or None when it cannot
+# be read right now (Story 35.2-004). The real one is
+# :func:`installed_controller_version`.
+InstalledProbe = Callable[[], "str | None"]
 # One read of a parked job's change request: ``(repo_root, cr_number)`` →
 # verdict, or None when the host could not be read (Story 32.2-002).
 ApprovalProbe = Callable[[Path, int], "ApprovalVerdict | None"]
@@ -221,6 +225,9 @@ class SchedulerResult:
     # jobs: N repos sharing one closed window is still one pause.
     paused: int = 0
     interrupted: bool = False
+    # A worker the controller was reinstalled under stopped claiming, let its
+    # jobs finish and exited so its supervisor restarts it (Story 35.2-004).
+    restart: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -232,6 +239,7 @@ class SchedulerResult:
             "parked": self.parked,
             "paused": self.paused,
             "interrupted": self.interrupted,
+            "restart": self.restart,
         }
 
 
@@ -361,6 +369,24 @@ def keep_awake_prefix(
         return []
     binary = which("caffeinate")
     return [binary, "-i"] if binary else []
+
+
+def installed_controller_version() -> str | None:
+    """The controller version a restart of this process would load, or None.
+
+    ``sdlc.__version__`` is fixed at import, so a long-lived worker never sees
+    a reinstall through it (Story 35.2-004). Re-resolving reads the installed
+    metadata afresh — its lookup is keyed on the site-packages mtime, so a
+    `uv tool install --force` shows up without restarting. A read that lands
+    mid-reinstall can meet a half-written environment: unknown is never a
+    reason to restart, so any failure is None.
+    """
+    import sdlc
+
+    try:
+        return sdlc._resolve_version()
+    except Exception:  # noqa: BLE001 - see the docstring: unknown, not an error
+        return None
 
 
 def _frozen_options(job: JobRecord) -> list[str]:
@@ -762,8 +788,13 @@ class _Scheduler:
         self_updater: SelfUpdater | None = None,
         installed_version: str | None = None,
         run_terminal: RunTerminal = ledger_run_terminal,
+        installed_probe: InstalledProbe = installed_controller_version,
     ) -> None:
         self._run_terminal_of = run_terminal
+        self._installed_probe = installed_probe
+        # Set once a worker sees the controller reinstalled under it: it claims
+        # nothing more and exits when its in-flight jobs are done.
+        self._restart_pending = False
         self._store = store
         self._config = config
         self._registry = registry
@@ -804,10 +835,14 @@ class _Scheduler:
                 self._enforce_budgets()
                 self._renew()
                 self._check_rate_limit()
+                self._check_upgrade()
                 polled = self._poll_parked()
                 self._heartbeat()
                 progressed = self._fill_slots() or polled
                 self._stamp_repo_busy()
+                if self._restart_pending and not self._in_flight:
+                    self._result.restart = True
+                    break
                 if (
                     not self._in_flight
                     and not progressed
@@ -827,6 +862,9 @@ class _Scheduler:
         return sum(entry.slots for entry in self._in_flight.values())
 
     def _free_slots(self) -> int:
+        if self._restart_pending:
+            # It will claim nothing more, so peers must not defer to it.
+            return 0
         return max(0, self._config.slots - self._used_slots())
 
     def _heartbeat(self, *, force: bool = False) -> None:
@@ -859,9 +897,10 @@ class _Scheduler:
         entirely: the Max plan every repo shares is exhausted, so claiming *any*
         job — fresh or resumed — would only spend into a window that is already
         closed. Jobs already in flight are left alone; a run that parked itself
-        is the one that knows how to wait.
+        is the one that knows how to wait. A worker awaiting its restart
+        (Story 35.2-004) claims nothing either.
         """
-        if self._dispatch_paused():
+        if self._dispatch_paused() or self._restart_pending:
             return False
         progressed = False
         # Bounded so a pathological race (every claim lost to another
@@ -1343,9 +1382,10 @@ class _Scheduler:
         same reason it closes :meth:`_fill_slots`: resuming an approved job
         launches an agent against the one Max window every repo shares, and that
         window is shut. The parks keep their ``poll_after`` and are re-read on
-        the pass after the window reopens.
+        the pass after the window reopens. A worker awaiting its restart leaves
+        them for its successor.
         """
-        if self._dispatch_paused():
+        if self._dispatch_paused() or self._restart_pending:
             return False
         due = self._store.due_parked_jobs(now=self._clock())
         if not due:
@@ -1451,6 +1491,30 @@ class _Scheduler:
             now = self._clock()
             latest = max(candidates, key=lambda park: park.window_until(now))
             self._pause_dispatch(latest)
+
+    def _check_upgrade(self) -> None:
+        """Stop claiming once the controller is reinstalled under this worker.
+
+        Story 35.2-004: the version guard compares against the version this
+        process imported, so after an upgrade a resident `--follow` worker would
+        park every framework job on its own staleness and never exit — and its
+        LaunchAgent's KeepAlive only restarts a worker that exits. Seeing the
+        installed version move off the one it runs, it claims nothing more, lets
+        its in-flight jobs finish and exits; the restarted worker runs the new
+        code. Workers only: a plain drain has no supervisor to restart it.
+        """
+        if self._config.worker is None or self._restart_pending:
+            return
+        installed = self._installed_probe()
+        if installed is None or installed == self._installed_version:
+            return
+        self._restart_pending = True
+        self._heartbeat(force=True)  # tell peers now that it has no free slot
+        self._echo(
+            f"controller reinstalled under this worker ({self._installed_version} -> "
+            f"{installed}) — claiming nothing more; exiting for a restart once "
+            f"{len(self._in_flight)} in-flight job(s) finish"
+        )
 
     def _dispatch_paused(self) -> bool:
         pause = self._store.dispatch_pause()
@@ -1814,6 +1878,7 @@ def run_queue(
     identity: str | None = None,
     self_updater: SelfUpdater | None = None,
     installed_version: str | None = None,
+    installed_probe: InstalledProbe | None = None,
 ) -> SchedulerResult:
     """Drain the host queue: claim jobs under a lease and run them as subprocesses.
 
@@ -1844,6 +1909,8 @@ def run_queue(
     pass ``None`` to wire none at all), ``notifier`` is the Telegram path, and
     ``self_updater`` is issue #709's reinstall-from-base-ref, consulted only
     when ``config.self_update`` is set (``installed_version`` seeds it).
+    ``installed_probe`` re-reads the installed controller version so a fleet
+    worker can exit for a restart after an upgrade (Story 35.2-004).
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from
@@ -1872,5 +1939,6 @@ def run_queue(
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
         self_updater=self_updater or self_update_controller,
         installed_version=installed_version or __version__,
+        installed_probe=installed_probe or installed_controller_version,
     )
     return scheduler.run()

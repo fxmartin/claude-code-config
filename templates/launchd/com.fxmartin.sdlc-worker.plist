@@ -18,7 +18,8 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <!-- Restart on any exit — including the stale-controller refusal after an upgrade. -->
+    <!-- Restart on any exit — including exit 75, which the worker takes once the
+         controller is reinstalled under it, so the restart runs the new code. -->
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>

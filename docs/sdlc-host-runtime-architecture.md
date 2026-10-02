@@ -465,6 +465,12 @@ The Mac Studio is treated as an always-on agent workstation, and this host is
 would be fought or orphaned by `darwin-rebuild`; all machine-level services are
 declared as nix modules.
 
+One deliberate exception: the fleet worker ships as a template,
+`templates/launchd/com.fxmartin.sdlc-worker.plist` (Story 35.2-004; see
+`controller-architecture.md`). It is a per-user agent copied into
+`~/Library/LaunchAgents` by hand, not a machine-level service; declaring it
+through `nix-install` instead is a follow-up.
+
 Already managed by `nix-install` (verified):
 
 - Tailscale (managed cask)

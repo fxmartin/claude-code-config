@@ -88,6 +88,16 @@ def test_queue_run_exits_one_when_a_job_failed(tmp_path, monkeypatch) -> None:
     assert result.exit_code == 1
 
 
+def test_queue_run_exits_75_when_the_worker_must_restart(tmp_path, monkeypatch) -> None:
+    """Story 35.2-004: the LaunchAgent's KeepAlive restarts it on the new controller."""
+    _isolate(tmp_path, monkeypatch)
+    _capture(monkeypatch, SchedulerResult(started=1, done=1, failed=1, restart=True))
+
+    result = runner.invoke(app, ["queue", "run"])
+    assert result.exit_code == 75
+    assert "restart" in result.output.lower()
+
+
 def test_queue_run_creates_the_store_when_absent(tmp_path, monkeypatch) -> None:
     """A host that never enqueued anything can still start a drain."""
     _isolate(tmp_path, monkeypatch)

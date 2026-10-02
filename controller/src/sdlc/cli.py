@@ -3617,7 +3617,10 @@ def queue_run_cmd(
     and defers a job to an eligible peer with more free slots. A job nobody can
     run stays `queued`, with `no eligible worker (needs …)` in `sdlc queue
     list`. `--slots` is the worker's cap. Works on the queue this host owns:
-    with `SDLC_QUEUE_URL` set it refuses, like the rest of this verb.
+    with `SDLC_QUEUE_URL` set it refuses, like the rest of this verb. Once the
+    controller is reinstalled under a worker (Story 35.2-004) it claims nothing
+    more, lets its running jobs finish and exits 75, so a supervisor
+    (`KeepAlive`) restarts it on the new code.
 
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
@@ -3677,6 +3680,15 @@ def queue_run_cmd(
         # (a LaunchAgent, a shell loop) can tell an operator Ctrl-C from a real
         # failure.
         raise typer.Exit(code=130)
+    if result.restart:
+        # Story 35.2-004: the controller was reinstalled under this worker. 75
+        # (EX_TEMPFAIL, "try again") is the exit the LaunchAgent's KeepAlive
+        # turns into a restart on the new code.
+        typer.echo(
+            "controller reinstalled under this worker — exiting so its supervisor "
+            "restarts it on the new code"
+        )
+        raise typer.Exit(code=75)
     raise typer.Exit(code=1 if result.failed else 0)
 
 

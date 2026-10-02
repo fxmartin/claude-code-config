@@ -1828,11 +1828,19 @@ keeps the drain heartbeating while idle, which is what keeps it `online`.
   and the Mac may sleep between jobs. Elsewhere nothing is added; the Linux
   equivalent (`systemd-inhibit`) is a follow-up for a Linux worker. A plain
   drain without `--worker` is not wrapped.
-- **Upgrades.** The per-job version guard (Story 15.1-004/32.1-004) is
-  unchanged: after a controller upgrade a worker whose installed controller
-  disagrees with the repo's checkout parks that job `blocked` with the remedy
-  instead of running on stale code, and the LaunchAgent restarts the worker on
-  exit.
+- **Upgrades.** The guard (Story 15.1-004/32.1-004) compares a checkout
+  with the version the worker *imported*, so a resident `--follow` worker would
+  otherwise park every framework job on its own staleness and never exit. Each
+  pass a worker re-reads the installed controller version
+  (`installed_controller_version`); once it differs from the one it runs, the
+  worker claims nothing more (fresh or parked) and heartbeats no free slot, so
+  peers stop deferring to it; it lets its in-flight jobs finish and exits
+  **75** — which `KeepAlive` turns into a restart on the new code. Queued jobs
+  are left untouched for the restarted worker. An unreadable
+  install (mid-reinstall) is never a reason to restart. When the install itself
+  is behind the checkout, a restart cures nothing: the per-job guard still
+  parks the job `blocked` with the reinstall remedy, and the worker exits once
+  that reinstall lands. A plain drain without `--worker` never probes.
 - **`sdlc doctor`** adds a `Fleet worker` finding on a machine that has the
   LaunchAgent installed: `CLEAN` when a worker for this host is registered and
   online, `FAIL` when none has registered, it has gone offline, or the queue

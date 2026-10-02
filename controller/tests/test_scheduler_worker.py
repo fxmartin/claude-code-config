@@ -306,3 +306,155 @@ def test_a_plain_drain_is_not_wrapped_in_caffeinate(tmp_path, monkeypatch) -> No
     )
 
     assert launcher.calls[0][0][0] != "caffeinate"
+
+
+# --- Story 35.2-004: a worker the controller was reinstalled under exits for a restart ---
+
+
+class _BoundedClock(Clock):
+    """A sleeper that fails the test instead of spinning a `--follow` drain forever."""
+
+    def __init__(self, passes: int = 50) -> None:
+        super().__init__()
+        self._passes = passes
+
+    def advance(self, seconds: float) -> None:
+        self._passes -= 1
+        assert self._passes > 0, "the drain never exited"
+        super().advance(seconds)
+
+
+def _resident(store, tmp_path, *, probe, launcher=None, slots=2):
+    clock = _BoundedClock()
+    launcher = launcher or FakeLauncher(alive_polls=1)
+    result = run_queue(
+        store,
+        config=SchedulerConfig(
+            slots=slots, poll_seconds=1.0, follow=True, worker=_profile(repos=["alpha", "beta"]),
+        ),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=launcher,
+        clock=clock,
+        sleeper=clock.advance,
+        notifier=lambda *a, **k: None,
+        version_check=_clean,
+        echo=lambda _line: None,
+        identity="m3max",
+        installed_version="2.84.0",
+        installed_probe=probe,
+    )
+    return result, launcher
+
+
+def test_a_worker_exits_for_a_restart_once_the_controller_is_reinstalled(tmp_path) -> None:
+    # `--follow` would otherwise park every job on the guard and never exit,
+    # so KeepAlive would never get the chance to restart it on the new code.
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+
+    result, launcher = _resident(store, tmp_path, probe=lambda: "2.85.0")
+
+    assert result.restart is True
+    assert launcher.calls == []  # never runs a job on the stale code
+    job = store.get_job(job_id)
+    assert job.state == "queued"  # untouched — the restarted worker takes it
+    assert result.parked == 0
+
+
+def test_a_worker_lets_its_running_job_finish_before_it_exits(tmp_path) -> None:
+    store = _store(tmp_path)
+    first = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    second = store.add_job(repo=_repo(tmp_path, "beta"), kind="fix", scope="2")
+    probes = iter(["2.84.0"])
+
+    result, launcher = _resident(
+        store, tmp_path, probe=lambda: next(probes, "2.85.0"),
+        launcher=FakeLauncher(alive_polls=3), slots=1,
+    )
+
+    assert result.restart is True
+    assert len(launcher.calls) == 1
+    assert store.get_job(first).state == "done"  # reaped, not abandoned
+    assert store.get_job(second).state == "queued"
+
+
+def test_a_draining_worker_advertises_no_free_slots(tmp_path) -> None:
+    # Peers defer a job to a less-loaded eligible worker; one that will claim
+    # nothing more must not look less loaded while its last job finishes.
+    store = _store(tmp_path)
+    store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    probes = iter(["2.84.0"])
+
+    result, _ = _resident(
+        store, tmp_path, probe=lambda: next(probes, "2.85.0"),
+        launcher=FakeLauncher(alive_polls=5), slots=2,
+    )
+
+    assert result.restart is True
+    assert store.get_worker("m3max").slots_free == 0
+
+
+def test_an_unreadable_install_is_no_reason_to_restart(tmp_path) -> None:
+    # A probe mid-reinstall can meet a half-written environment.
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    clock = Clock()
+    launcher = FakeLauncher(alive_polls=1)
+
+    result = run_queue(
+        store,
+        config=SchedulerConfig(slots=2, poll_seconds=1.0, worker=_profile(repos=["alpha"])),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=launcher,
+        clock=clock,
+        sleeper=clock.advance,
+        notifier=lambda *a, **k: None,
+        version_check=_clean,
+        echo=lambda _line: None,
+        identity="m3max",
+        installed_version="2.84.0",
+        installed_probe=lambda: None,
+    )
+
+    assert result.restart is False
+    assert len(launcher.calls) == 1
+    assert store.get_job(job_id).state == "done"
+
+
+def test_a_plain_drain_never_probes_the_install(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    clock = Clock()
+    probed: list[int] = []
+
+    result = run_queue(
+        store,
+        config=SchedulerConfig(slots=2, poll_seconds=1.0),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=FakeLauncher(alive_polls=1),
+        clock=clock,
+        sleeper=clock.advance,
+        notifier=lambda *a, **k: None,
+        version_check=_clean,
+        echo=lambda _line: None,
+        installed_version="2.84.0",
+        installed_probe=lambda: probed.append(1) or "2.85.0",
+    )
+
+    assert probed == []
+    assert result.restart is False
+    assert store.get_job(job_id).state == "done"
+
+
+def test_installed_controller_version_rereads_the_install(monkeypatch) -> None:
+    import sdlc
+    from sdlc.scheduler import installed_controller_version
+
+    monkeypatch.setattr(sdlc, "_resolve_version", lambda: "2.85.0")
+    assert installed_controller_version() == "2.85.0"
+
+    def half_written() -> str:
+        raise FileNotFoundError("pyproject.toml")
+
+    monkeypatch.setattr(sdlc, "_resolve_version", half_written)
+    assert installed_controller_version() is None
