@@ -1339,9 +1339,13 @@ class _Scheduler:
             f"{int(self._poll_interval)}s for the `{RISK_APPROVED_LABEL}` label "
             f"or an approving review"
         )
-        self._store.park_job(
+        if not self._store.park_job(
             job.id, pr_number=pr_number, reason=reason, poll_after=self._next_poll()
-        )
+        ):
+            # Story 35.4-003: its cancel landed as the run exited, so `_reap` got
+            # here before `_honour_cancels` could — the store retired it instead.
+            self._echo(f"job {job.id} cancelled: the run had already stopped on #{pr_number}")
+            return
         self._result.parked += 1
         self._echo(f"job {job.id} parked: awaiting approval on #{pr_number}")
         self._notify(

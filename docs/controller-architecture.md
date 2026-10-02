@@ -1758,14 +1758,20 @@ that is not `Content-Type: application/json` 415.
 **Cancelling a running job (Story 35.4-003).** The queue never kills a process —
 the run lives on the worker's machine. `cancel_job` on a `running` job that has a
 holder sets `jobs.cancel_requested` (migration 9) and writes `cancel requested`
-as its reason; a `running` job nobody holds is retired at once. The holding
-scheduler reads the flag every pass (`_honour_cancels`, before `_renew`, so a
-lease is never extended on a doomed job), stops the run through
+as its reason; a `running` job nobody holds is retired at once (the UPDATE
+re-checks that no one holds it, so a job reclaimed meanwhile is flagged
+instead). The holding scheduler reads the flag every pass (`_honour_cancels`,
+before `_renew`, so a lease is never extended on a doomed job), stops the run through
 `JobProcess.stop()` — the process-group SIGTERM→SIGKILL kill of Story 13.4-001 —
 and finishes the job `cancelled` (`finish_job` accepts it as the holder's
 acknowledgement), which clears the claim, lease and flag. A claim released with
 the flag set (worker interrupted) or reclaimed after its lease lapsed retires
-the job rather than resuming it. The run's own ledger is left as it stood.
+the job rather than resuming it, and so does a run that stops `AWAITING_APPROVAL`
+before its holder saw the flag: `park_job` finishes it `cancelled` instead of
+parking it for an approval to resume. `requeue` and an approval's take-back clear
+any leftover flag, so a re-armed job is never re-cancelled. The run's own ledger
+is left as it stood. A `queue run` started before this change does not read the
+flag — restart it after upgrading, or a cancel only waits for the run to end.
 `claim_next` is `peek_claimable` in dispatch order, filtered to the caller's
 `host`/`pools` (a job pinned to a `host` goes only there; a `pool` job only to a
 worker serving it), then the existing guarded `claim_job` UPDATE — so the lease

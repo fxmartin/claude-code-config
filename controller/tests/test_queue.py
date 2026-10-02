@@ -257,6 +257,107 @@ def test_releasing_a_flagged_claim_retires_the_job(tmp_path) -> None:
     assert (job.state, job.claimed_by, job.cancel_requested) == ("cancelled", None, False)
 
 
+def test_parking_a_flagged_job_honours_the_cancel(tmp_path) -> None:
+    """The run reached AWAITING_APPROVAL in the pass its cancel landed. Parking
+    would hand the job back for an approval to resume — what FX just stopped —
+    and leave the flag to re-cancel any later requeue."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.attach_run(job_id, "run-1")
+    store.cancel_job(job_id)
+
+    parked = store.park_job(job_id, pr_number=12, reason="awaiting approval", poll_after=None)
+
+    job = store.get_job(job_id)
+    assert parked is False
+    assert (job.state, job.claimed_by, job.lease_until, job.cancel_requested) == (
+        "cancelled", None, None, False,
+    )
+    assert job.pr_number == 12
+    store.requeue_job(job_id)
+    job = store.get_job(job_id)
+    assert (job.state, job.cancel_requested) == ("running", False)
+
+
+def test_parking_an_unflagged_job_reports_the_park(tmp_path) -> None:
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.attach_run(job_id, "run-1")
+
+    assert store.park_job(job_id, pr_number=12, reason="awaiting approval", poll_after=None)
+    assert store.get_job(job_id).state == "parked"
+
+
+def test_requeue_and_take_back_clear_a_stale_cancel_flag(tmp_path) -> None:
+    """A flag left on a non-running row — e.g. a scheduler older than migration 9
+    finishing a flagged job — must not cancel the job's next run."""
+    import sqlite3
+
+    from sdlc.queue import QueueStore
+
+    path = tmp_path / "queue.db"
+    store = QueueStore(path)
+    store.init()
+    never_ran = store.add_job(repo="/a", kind="build", scope="epic-1")
+    resumable = store.add_job(repo="/b", kind="build", scope="epic-2")
+    parked = store.add_job(repo="/c", kind="build", scope="epic-3")
+    for job_id in (never_ran, resumable, parked):
+        store.claim_job(job_id, claimed_by="w1", lease_seconds=60)
+    store.attach_run(resumable, "run-b")
+    store.attach_run(parked, "run-c")
+    store.finish_job(never_ran, "failed")
+    store.finish_job(resumable, "failed")
+    store.park_job(parked, pr_number=12, reason="awaiting approval", poll_after=None)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE jobs SET cancel_requested = 1")
+
+    store.requeue_job(never_ran)
+    store.requeue_job(resumable)
+    taken = store.take_parked_job(parked, claimed_by="w2", lease_seconds=60)
+
+    assert (store.get_job(never_ran).state, store.get_job(never_ran).cancel_requested) == (
+        "queued", False,
+    )
+    assert (store.get_job(resumable).state, store.get_job(resumable).cancel_requested) == (
+        "running", False,
+    )
+    assert (taken.state, taken.cancel_requested) == ("running", False)
+
+
+def test_an_unheld_job_reclaimed_mid_cancel_is_flagged_not_retired(tmp_path, monkeypatch) -> None:
+    """A scheduler that reclaims the job between cancel's read and its write now
+    holds a live run: retiring the row under it would orphan that run (its renew
+    fails on the state guard and it drops the job unkilled), so the new holder
+    is asked to stop it instead."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store._set_state(job_id, "running")
+    read = store.get_job
+
+    def read_then_lose_the_race(job_id: int):
+        job = read(job_id)
+        store.reclaim_job(job_id, claimed_by="w2", lease_seconds=60)
+        return job
+
+    monkeypatch.setattr(store, "get_job", read_then_lose_the_race)
+    store.cancel_job(job_id)
+    monkeypatch.undo()
+
+    job = store.get_job(job_id)
+    assert (job.state, job.claimed_by, job.cancel_requested) == ("running", "w2", True)
+
+
 def test_cancel_refuses_a_finished_job(tmp_path) -> None:
     from sdlc.queue import QueueError, QueueStore
 

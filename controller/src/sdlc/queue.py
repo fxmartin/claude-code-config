@@ -1120,16 +1120,25 @@ class QueueStore:
         job = self.get_job(job_id)
         if job is None:
             raise QueueError(f"unknown job id: {job_id}")
-        if job.state == "running" and job.claimed_by is not None:
-            # Only the holder may stop a live run, so this just leaves it a note.
+        if job.state == "running":
             with self._connect() as conn:
-                conn.execute(
-                    "UPDATE jobs SET cancel_requested = 1, reason = ?, updated_at = ? "
-                    "WHERE id = ? AND state = 'running'",
-                    (CANCEL_REQUESTED_REASON, _now_iso(), job_id),
-                )
+                # The holder is re-checked in the UPDATE itself: a scheduler that
+                # reclaimed the job since the read above now drives a live run,
+                # and retiring the row under it would orphan that run.
+                retired = conn.execute(
+                    "UPDATE jobs SET state = 'cancelled', cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ? AND state = 'running' AND claimed_by IS NULL",
+                    (_now_iso(), job_id),
+                ).rowcount
+                if not retired:
+                    # Only the holder may stop a live run, so this just leaves it a note.
+                    conn.execute(
+                        "UPDATE jobs SET cancel_requested = 1, reason = ?, updated_at = ? "
+                        "WHERE id = ? AND state = 'running'",
+                        (CANCEL_REQUESTED_REASON, _now_iso(), job_id),
+                    )
             return
-        if job.state not in _CANCELLABLE_STATES | {"running"}:
+        if job.state not in _CANCELLABLE_STATES:
             raise QueueError(
                 f"cannot cancel job {job_id}: state is {job.state} "
                 f"(cancellable: {', '.join(sorted(_CANCELLABLE_STATES))})"
@@ -1180,17 +1189,21 @@ class QueueStore:
                 f"(requeueable: {', '.join(sorted(_REQUEUEABLE_STATES))})"
             )
         moment = _at(now).isoformat()
+        # The requeue *is* the operator's newer word, so any cancel flag left on
+        # the row is stale — kept, it would re-cancel the job on its next pass.
         with self._connect() as conn:
             if job.run_id:
                 conn.execute(
                     "UPDATE jobs SET state = 'running', claimed_by = NULL, worker = NULL, "
-                    "lease_until = ?, reason = NULL, updated_at = ? WHERE id = ?",
+                    "lease_until = ?, reason = NULL, cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ?",
                     (moment, moment, job_id),
                 )
             else:
                 conn.execute(
                     "UPDATE jobs SET state = 'queued', claimed_by = NULL, worker = NULL, "
-                    "lease_until = NULL, reason = NULL, updated_at = ? WHERE id = ?",
+                    "lease_until = NULL, reason = NULL, cancel_requested = 0, updated_at = ? "
+                    "WHERE id = ?",
                     (moment, job_id),
                 )
 
@@ -2032,7 +2045,7 @@ class QueueStore:
         pr_number: int,
         reason: str,
         poll_after: datetime | None,
-    ) -> None:
+    ) -> bool:
         """Park a job on ``pr_number`` pending a human's approval.
 
         ``AWAITING_APPROVAL`` is terminal for a *run* — ``build.py`` stops there
@@ -2041,6 +2054,11 @@ class QueueStore:
         keeps its ``run_id`` (so the resume that follows is a resume, never a
         restart), records the CR to watch, and drops its claim and lease so its
         repo and its agent slot go straight back to the pool.
+
+        A job whose cancel was requested (Story 35.4-003) is finished
+        ``cancelled`` instead, and ``False`` returned: parking would hand it back
+        for an approval to resume — the very thing the operator stopped — the
+        same call :meth:`release_claim` makes. Its ``pr_number`` is still kept.
 
         Refuses a job with no ``run_id``: without a run there is nothing for an
         approval to release, and a job that never started belongs in ``queued``.
@@ -2053,6 +2071,17 @@ class QueueStore:
                 f"cannot park job {job_id}: it opened no run to resume later"
             )
         with self._connect() as conn:
+            # One transaction: a cancel landing mid-park is either honoured here
+            # or refused by cancel_job's ``state = 'running'`` guard — never left
+            # on a parked row for a take-back or a requeue to act on later.
+            cancelled = conn.execute(
+                "UPDATE jobs SET state = 'cancelled', claimed_by = NULL, worker = NULL, "
+                "lease_until = NULL, cancel_requested = 0, pr_number = ?, reason = ?, "
+                "updated_at = ? WHERE id = ? AND cancel_requested = 1",
+                (pr_number, "cancelled by operator", _now_iso(), job_id),
+            ).rowcount
+            if cancelled:
+                return False
             conn.execute(
                 "UPDATE jobs SET state = 'parked', claimed_by = NULL, worker = NULL, "
                 "lease_until = NULL, pr_number = ?, poll_after = ?, reason = ?, "
@@ -2065,6 +2094,7 @@ class QueueStore:
                     job_id,
                 ),
             )
+        return True
 
     def schedule_poll(self, job_id: int, poll_after: datetime | None) -> None:
         """Set the earliest instant this job's change request may be read again.
@@ -2112,8 +2142,8 @@ class QueueStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = 'running', claimed_by = ?, lease_until = ?, "
-                "poll_after = NULL, reason = NULL, updated_at = ?, worker = ? "
-                "WHERE id = ? AND state = 'parked' "
+                "poll_after = NULL, reason = NULL, cancel_requested = 0, updated_at = ?, "
+                "worker = ? WHERE id = ? AND state = 'parked' "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM jobs AS busy "
                 "  WHERE busy.repo = jobs.repo AND busy.state = 'running'"
