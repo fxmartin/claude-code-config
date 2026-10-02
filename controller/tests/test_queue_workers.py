@@ -403,3 +403,53 @@ def test_claimable_for_worker_filters_candidates_and_uses_the_live_slot_count(st
     assert store.claimable_for_worker("m3max", candidates, now=T0) == []
     kept = store.claimable_for_worker("m3max", candidates, slots_free=1, now=T0)
     assert [j.id for j in kept] == [mine]
+
+
+# --- helper edge cases (coverage gate) --------------------------------------
+
+
+def test_is_online_false_on_garbled_heartbeat() -> None:
+    from sdlc.queue import WorkerRecord
+
+    rec = WorkerRecord(name="w", host="h", registered_at="x", last_heartbeat="not-a-date")
+    assert rec.is_online(T0) is False
+
+
+def test_is_online_treats_naive_heartbeat_as_utc() -> None:
+    from sdlc.queue import WorkerRecord
+
+    rec = WorkerRecord(name="w", host="h", registered_at="x", last_heartbeat="2026-10-02T12:00:00")
+    assert rec.is_online(_later(1)) is True
+
+
+@pytest.mark.parametrize("raw", ["not json", "[1, 2]"])
+def test_job_requirements_ignores_malformed_payload(raw: str) -> None:
+    from sdlc.queue import JobRecord, _job_requirements
+
+    job = JobRecord(**{**_minimal_job_kwargs(), "requirements": raw})
+    assert _job_requirements(job) == {}
+
+
+def test_job_requirements_drops_null_values() -> None:
+    from sdlc.queue import JobRecord, _job_requirements
+
+    job = JobRecord(
+        **{**_minimal_job_kwargs(), "requirements": json.dumps({"repo": "r", "x": None})}
+    )
+    assert _job_requirements(job) == {"repo": "r"}
+
+
+def test_pause_clears_empty_without_db(tmp_path) -> None:
+    assert QueueStore(tmp_path / "absent.db").pause_clears() == []
+
+
+def _minimal_job_kwargs() -> dict:
+    import dataclasses
+
+    from sdlc.queue import JobRecord
+
+    kwargs = {}
+    for f in dataclasses.fields(JobRecord):
+        if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
+            kwargs[f.name] = 0 if f.type in ("int", int) else "x"
+    return kwargs
