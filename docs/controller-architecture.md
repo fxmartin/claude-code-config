@@ -39,7 +39,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), the approval park + auto-resume (Story 32.2-002), one shared rate-limit window discovered and waited out once (Story 32.2-001), and the per-job budget breaker (Story 32.3-001). |
 | `sdlc/queue_client.py` | `QueueClient` (the `QueueBackend` verbs over HTTP), the `SDLC_QUEUE_URL` / `.sdlc-queue.yaml` / `~/.sdlc-fleet.yaml` switch and the `open_queue()` factory every queue consumer opens its store through (Story 35.1-002). |
 | `sdlc/queue_server.py` | `sdlc queue serve` — the queue store behind a tailnet-only HTTP API (stdlib `ThreadingHTTPServer`): one route per `QueueStore` verb, a bind that refuses wildcards, and the `tailscale whois` identity gate (Story 35.1-001); plus the worker registry routes (Story 35.2-001). |
-| `sdlc/queue_worker.py` | What a fleet worker advertises — `WorkerProfile` and `detect_worker_profile`: host, declared pools, harnesses whose CLI answers, the container runtime, and the git clones under `~/Work` (Story 35.2-001). |
+| `sdlc/queue_worker.py` | What a fleet worker advertises — `WorkerProfile` and `detect_worker_profile`: host, declared pools, harnesses whose CLI answers, the container runtime, and the git clones under `~/Work` (Story 35.2-001); `prepare_repo`, the pre-dispatch clone sync (Story 35.2-002). |
 | `sdlc/approval.py` | Read-only change-request approval probe — "is PR #N approved / merged / closed?" behind the queue's park (Story 32.2-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
@@ -1814,6 +1814,32 @@ line and `--json` carry it; a host that never registered a worker is untouched.
 `--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`);
 like the rest of `sdlc queue run` it refuses while `SDLC_QUEUE_URL` is set. The
 registry (`workers` table, migration 7) lives with the jobs it serves.
+
+**Repo auto-sync before dispatch (Story 35.2-002).** `sdlc build --enqueue`,
+`sdlc fix --enqueue` and `sdlc queue add` record the clone's `origin`
+(`git remote get-url origin`) in the job's `requirements` — offline, so a job
+is self-describing. A `--worker` drain then prepares the clone *after* claiming
+a fresh job and *before* launching it (a resumed run re-enters its own tree and
+is never synced):
+
+1. absent clone → `git clone <recorded origin>` (at the job's own path if that
+   directory exists on this host, else under `~/Work/<name>` — a path recorded
+   on another machine means nothing here; git reaches the forge with the
+   worker's own `gh`/`glab` credential helper);
+2. the clone's `origin` must be the recorded one (compared by host + path, so
+   `git@host:o/r.git`, `ssh://…` and `https://…` agree) — otherwise the job is
+   parked `blocked` with `origin mismatch: <path> has origin A but the job
+   records B`;
+3. a tracked-dirty tree (`dirty_tree_paths`; untracked scratch is ignored) sends
+   the job back to `queued` with a `DIRTY_WORKING_TREE` reason — the #590 rule,
+   never a stash — and the next poll retries it;
+4. `git fetch origin && git checkout -q main && git merge --ff-only origin/main`;
+   a `main` that cannot fast-forward parks the job `blocked`, untouched;
+5. the resulting sha is recorded in the job's `synced_sha` (migration 8, in
+   `sdlc queue list --json`) and the job launches in that clone.
+
+A job that records no origin (enqueued before this story, or from a repo with
+no remote) and a drain without `--worker` are not synced.
 
 **Single writer.** The service's handlers take one write lock, so within the
 service a claim's peek-then-UPDATE never interleaves with another's. It is not

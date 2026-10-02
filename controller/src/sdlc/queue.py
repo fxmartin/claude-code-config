@@ -379,6 +379,10 @@ class JobRecord:
     pool: str | None = None
     requirements: str | None = None
     worker: str | None = None
+    # Story 35.2-002: the sha the worker's clone was fast-forwarded to before the
+    # job was dispatched — what the build actually started from. ``None`` until a
+    # worker has synced the repo for this job.
+    synced_sha: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -404,6 +408,7 @@ class JobRecord:
             "pool": self.pool,
             "requirements": self.requirements,
             "worker": self.worker,
+            "synced_sha": self.synced_sha,
         }
 
     def job_budget(self) -> JobBudget:
@@ -560,7 +565,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     host        TEXT,
     pool        TEXT,
     requirements TEXT,
-    worker      TEXT
+    worker      TEXT,
+    synced_sha  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -642,6 +648,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     ),
     # Story 35.2-001: the worker registry table, for a queue.db written before it.
     (7, "fleet_workers", "workers", [], _WORKERS_DDL),
+    # Story 35.2-002: the sha a worker's clone was synced to before dispatch.
+    (8, "job_synced_sha", "jobs", [("synced_sha", "TEXT")], None),
 ]
 
 
@@ -1846,6 +1854,14 @@ class QueueStore:
                     (reason, moment, job_id, claimed_by),
                 )
 
+    def record_synced_sha(self, job_id: int, sha: str) -> None:
+        """Record the sha a worker brought the job's clone to before dispatch (Story 35.2-002)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET synced_sha = ?, updated_at = ? WHERE id = ?",
+                (sha, _now_iso(), job_id),
+            )
+
     def attach_run(self, job_id: int, run_id: str) -> None:
         """Link the job to the run its subprocess opened (Story 32.1-001 AC5)."""
         with self._connect() as conn:
@@ -2139,6 +2155,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         pool=_optional_column(row, "pool"),
         requirements=_optional_column(row, "requirements"),
         worker=_optional_column(row, "worker"),
+        synced_sha=_optional_column(row, "synced_sha"),
     )
 
 

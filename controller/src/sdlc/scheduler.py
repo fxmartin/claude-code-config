@@ -34,7 +34,7 @@ from sdlc.risk_gate import RISK_APPROVED_LABEL
 
 if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
     from sdlc.build import Ledger
-    from sdlc.queue_worker import WorkerProfile
+    from sdlc.queue_worker import PreparedRepo, RepoPreparer, WorkerProfile
 
 __all__ = [
     "DEFAULT_APPROVAL_POLL_SECONDS",
@@ -746,8 +746,16 @@ class _Scheduler:
         self_updater: SelfUpdater | None = None,
         installed_version: str | None = None,
         run_terminal: RunTerminal = ledger_run_terminal,
+        prepare_repo: "RepoPreparer | None" = None,
     ) -> None:
         self._run_terminal_of = run_terminal
+        # Story 35.2-002: a fleet worker syncs the job's clone before dispatch.
+        self._prepare_repo = prepare_repo
+        # Jobs the sync sent back to `queued` during this `_fill_slots` pass, so
+        # the same pass does not claim them again; and the last reason echoed per
+        # job, so a dirty tree retried every poll is announced once, not forever.
+        self._refused: set[int] = set()
+        self._refusal_echoed: dict[int, str] = {}
         self._store = store
         self._config = config
         self._registry = registry
@@ -848,6 +856,7 @@ class _Scheduler:
         if self._dispatch_paused():
             return False
         progressed = False
+        self._refused.clear()
         # Bounded so a pathological race (every claim lost to another
         # scheduler) can never spin this pass forever.
         for _ in range(64):
@@ -874,7 +883,9 @@ class _Scheduler:
             if claimed is None:
                 continue  # lost the race to another scheduler — try the next one
             self._start(claimed, action="resume" if resume else "start", cost=cost)
-            progressed = True
+            # A job the repo sync handed back to `queued` made no progress, and
+            # counting it would keep a drain alive on a dirty tree forever.
+            progressed = progressed or claimed.id not in self._refused
             # Peers weigh load by the last beat, so tell them about the slot just taken.
             self._heartbeat(force=True)
         return progressed
@@ -933,7 +944,8 @@ class _Scheduler:
                 profile.name, candidates, slots_free=self._free_slots(), now=self._clock()
             )
         for job in candidates:
-            return job, False
+            if job.id not in self._refused:
+                return job, False
         return None
 
     def _stamp_repo_busy(self) -> None:
@@ -985,9 +997,17 @@ class _Scheduler:
         # Issue #709: with `--self-update`, try the remedy before parking — this
         # is also the path a job returning from an approval park takes, so a
         # sibling's release reinstalls rather than re-parking it.
-        finding = self._check_version(job.repo)
-        if getattr(finding, "status", "CLEAN") != "CLEAN" and self._self_update(job.repo):
-            finding = self._check_version(job.repo)
+        cwd = Path(job.repo)
+        if action == "start" and self._config.worker is not None:
+            # Story 35.2-002: a fresh job starts from the forge's `main`. Resumes
+            # are left alone — a half-done run must re-enter the tree it left.
+            prepared = self._prepare(job)
+            if prepared is None:
+                return False
+            cwd = prepared.path
+        finding = self._check_version(str(cwd))
+        if getattr(finding, "status", "CLEAN") != "CLEAN" and self._self_update(str(cwd)):
+            finding = self._check_version(str(cwd))
         status = getattr(finding, "status", "CLEAN")
         if status != "CLEAN":
             detail = getattr(finding, "detail", "")
@@ -1014,7 +1034,7 @@ class _Scheduler:
             else job_argv(job, resume=action == "resume")
         )
         try:
-            proc = self._launcher(argv, Path(job.repo))
+            proc = self._launcher(argv, cwd)
         except OSError as exc:
             self._store.finish_job(job.id, "failed", reason=f"could not launch: {exc}")
             self._result.failed += 1
@@ -1040,6 +1060,38 @@ class _Scheduler:
             f"[pid {proc.pid}, {cost} slot{'s' if cost != 1 else ''}]"
         )
         return True
+
+    def _prepare(self, job: JobRecord) -> "PreparedRepo | None":
+        """Sync the job's clone to the forge's ``main``; ``None`` when the job was refused.
+
+        A dirty tree goes back to ``queued`` with the #590 reason (the owner
+        tidies it; the next poll retries). Anything else needs an operator —
+        wrong origin, diverged ``main``, no clone — so the job parks ``blocked``.
+        """
+        from sdlc.queue_worker import RepoRefused, prepare_repo
+
+        prepare = self._prepare_repo or prepare_repo
+        try:
+            prepared = prepare(job)
+        except RepoRefused as exc:
+            if exc.retryable:
+                self._store.release_claim(
+                    job.id, claimed_by=self._identity, reason=exc.reason, now=self._clock()
+                )
+                self._refused.add(job.id)
+                if self._refusal_echoed.get(job.id) != exc.reason:
+                    self._refusal_echoed[job.id] = exc.reason
+                    self._echo(f"job {job.id} back to queued: {exc.reason}")
+                return None
+            self._store.finish_job(job.id, "blocked", reason=exc.reason)
+            self._result.parked += 1
+            self._echo(f"job {job.id} parked (blocked): {exc.reason}")
+            self._announce(job, None, "blocked")
+            return None
+        self._refusal_echoed.pop(job.id, None)
+        if prepared.sha:
+            self._store.record_synced_sha(job.id, prepared.sha)
+        return prepared
 
     def _check_version(self, repo: str) -> object:
         if not self._self_updated:
@@ -1796,6 +1848,7 @@ def run_queue(
     identity: str | None = None,
     self_updater: SelfUpdater | None = None,
     installed_version: str | None = None,
+    prepare_repo: "RepoPreparer | None" = None,
 ) -> SchedulerResult:
     """Drain the host queue: claim jobs under a lease and run them as subprocesses.
 
@@ -1825,7 +1878,9 @@ def run_queue(
     live-API rate-limit check behind a held window (omit it for the real one;
     pass ``None`` to wire none at all), ``notifier`` is the Telegram path, and
     ``self_updater`` is issue #709's reinstall-from-base-ref, consulted only
-    when ``config.self_update`` is set (``installed_version`` seeds it).
+    when ``config.self_update`` is set (``installed_version`` seeds it), and
+    ``prepare_repo`` is Story 35.2-002's pre-dispatch clone sync, run only for a
+    fleet worker (``config.worker``).
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from
@@ -1854,5 +1909,6 @@ def run_queue(
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
         self_updater=self_updater or self_update_controller,
         installed_version=installed_version or __version__,
+        prepare_repo=prepare_repo,
     )
     return scheduler.run()

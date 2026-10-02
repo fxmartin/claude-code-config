@@ -64,7 +64,7 @@ _REQUEST_TIMEOUT_SECONDS = 30
 WHOIS_CACHE_SECONDS = 60
 _WHOIS_TIMEOUT_SECONDS = 5
 _MAX_LEASE_SECONDS = 24 * 3600
-_REQUIREMENT_KEYS = frozenset({"repo", "harness", "sandbox"})
+_REQUIREMENT_KEYS = frozenset({"repo", "harness", "sandbox", "origin"})
 
 
 class BindError(ValueError):

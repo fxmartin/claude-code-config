@@ -95,3 +95,57 @@ def test_build_without_enqueue_is_unaffected(tmp_path, monkeypatch) -> None:
 
     store = QueueStore(tmp_path / "queue.db")
     assert store.list_jobs() == []
+
+
+def _git_init_with_origin(path, url: str | None) -> None:
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    if url:
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin", url], check=True)
+
+
+def test_build_enqueue_records_the_origin_so_the_job_is_self_describing(
+    tmp_path, monkeypatch
+) -> None:
+    """Story 35.2-002: a worker clones from, and checks against, this recorded origin."""
+    _make_project(tmp_path)
+    _git_init_with_origin(tmp_path, "http://gitlab.test/root/proj.git")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+
+    result = runner.invoke(app, ["build", "epic-99", "--enqueue"])
+    assert result.exit_code == 0, result.output
+
+    from sdlc.queue import QueueStore
+
+    (job,) = QueueStore(tmp_path / "queue.db").list_jobs()
+    assert json.loads(job.requirements or "{}") == {"origin": "http://gitlab.test/root/proj.git"}
+
+
+def test_build_enqueue_without_an_origin_records_no_requirements(tmp_path, monkeypatch) -> None:
+    _make_project(tmp_path)
+    _git_init_with_origin(tmp_path, None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+
+    result = runner.invoke(app, ["build", "epic-99", "--enqueue"])
+    assert result.exit_code == 0, result.output
+
+    from sdlc.queue import QueueStore
+
+    (job,) = QueueStore(tmp_path / "queue.db").list_jobs()
+    assert job.requirements is None
+
+
+def test_queue_add_records_the_origin_of_the_repo(tmp_path, monkeypatch) -> None:
+    _git_init_with_origin(tmp_path, "http://gitlab.test/root/proj.git")
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+
+    result = runner.invoke(app, ["queue", "add", "fix", "42", "--repo", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+
+    from sdlc.queue import QueueStore
+
+    (job,) = QueueStore(tmp_path / "queue.db").list_jobs()
+    assert json.loads(job.requirements or "{}") == {"origin": "http://gitlab.test/root/proj.git"}

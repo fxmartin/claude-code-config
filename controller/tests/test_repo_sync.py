@@ -1,0 +1,436 @@
+# ABOUTME: Tests for a fleet worker's repo auto-sync before dispatch (Story 35.2-002).
+# ABOUTME: Real bare-origin fixtures: fast-forward, clone-if-absent, dirty refusal, origin mismatch.
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from datetime import datetime, timedelta, timezone
+from functools import partial
+from pathlib import Path
+
+import pytest
+
+from sdlc.doctor import Finding
+from sdlc.queue import QueueStore
+from sdlc.queue_worker import (
+    PreparedRepo,
+    RepoRefused,
+    WorkerProfile,
+    prepare_repo,
+    repo_origin,
+    same_origin,
+)
+from sdlc.registry import Registry
+from sdlc.scheduler import SchedulerConfig, run_queue
+
+_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+}
+
+
+def git(cwd: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", *args], cwd=cwd, env=_ENV, capture_output=True, text=True, check=True
+    )
+    return done.stdout.strip()
+
+
+def commit(repo: Path, name: str, text: str = "x\n") -> str:
+    (repo / name).write_text(text, encoding="utf-8")
+    git(repo, "add", name)
+    git(repo, "commit", "-q", "-m", f"add {name}")
+    return git(repo, "rev-parse", "HEAD")
+
+
+class Forge:
+    """A bare ``origin`` plus the seed clone that advances its ``main``."""
+
+    def __init__(self, root: Path) -> None:
+        self.bare = root / "forge" / "proj.git"
+        self.bare.mkdir(parents=True)
+        git(self.bare, "init", "-q", "--bare", "-b", "main")
+        self.seed = root / "seed"
+        git(root, "clone", "-q", str(self.bare), str(self.seed))
+        git(self.seed, "checkout", "-q", "-b", "main")
+        commit(self.seed, "README.md")
+        git(self.seed, "push", "-q", "origin", "main")
+
+    @property
+    def url(self) -> str:
+        return str(self.bare)
+
+    def advance(self, name: str = "next.txt") -> str:
+        sha = commit(self.seed, name)
+        git(self.seed, "push", "-q", "origin", "main")
+        return sha
+
+
+@pytest.fixture
+def forge(tmp_path: Path) -> Forge:
+    return Forge(tmp_path)
+
+
+@pytest.fixture
+def work_dir(tmp_path: Path) -> Path:
+    path = tmp_path / "Work"
+    path.mkdir()
+    return path
+
+
+def _clone(forge: Forge, where: Path) -> Path:
+    git(where.parent, "clone", "-q", forge.url, str(where))
+    return where
+
+
+def _job(tmp_path: Path, repo: Path, origin: str | None, **fields):
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    requirements = json.dumps({"origin": origin}) if origin else None
+    job_id = store.add_job(
+        repo=str(repo), kind="build", scope="epic-1", requirements_json=requirements, **fields
+    )
+    job = store.get_job(job_id)
+    assert job is not None
+    return job
+
+
+# --- prepare_repo: the building blocks, against real git ---------------------
+
+
+def test_a_stale_clone_is_fast_forwarded_to_the_forge_main(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    new_head = forge.advance()
+    job = _job(tmp_path, clone, forge.url)
+
+    prepared = prepare_repo(job, work_dir=work_dir)
+
+    assert prepared == PreparedRepo(path=clone, sha=new_head)
+    assert git(clone, "rev-parse", "HEAD") == new_head
+    assert (clone / "next.txt").exists()
+
+
+def test_a_clone_on_a_feature_branch_is_brought_back_to_main(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    git(clone, "checkout", "-q", "-b", "feature/old")
+    new_head = forge.advance()
+    job = _job(tmp_path, clone, forge.url)
+
+    prepared = prepare_repo(job, work_dir=work_dir)
+
+    assert prepared.sha == new_head
+    assert git(clone, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+
+
+def test_an_absent_repo_is_cloned_from_the_recorded_origin(tmp_path, forge, work_dir) -> None:
+    target = work_dir / "proj"
+    job = _job(tmp_path, target, forge.url)
+
+    prepared = prepare_repo(job, work_dir=work_dir)
+
+    assert prepared.path == target
+    assert prepared.sha == git(forge.seed, "rev-parse", "HEAD")
+    assert git(target, "remote", "get-url", "origin") == forge.url
+    assert git(target, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+
+
+def test_a_repo_path_from_another_machine_is_cloned_under_the_work_dir(
+    tmp_path, forge, work_dir
+) -> None:
+    """The job's recorded path may not exist here; the clone lands in ``work_dir``."""
+    job = _job(tmp_path, Path("/Users/someone-else/Work/proj"), forge.url)
+
+    prepared = prepare_repo(job, work_dir=work_dir)
+
+    assert prepared.path == work_dir / "proj"
+    assert (prepared.path / ".git").exists()
+
+
+def test_a_tracked_dirty_file_refuses_the_job_and_is_never_stashed(
+    tmp_path, forge, work_dir
+) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    (clone / "README.md").write_text("my uncommitted work\n", encoding="utf-8")
+    forge.advance()
+    head_before = git(clone, "rev-parse", "HEAD")
+    job = _job(tmp_path, clone, forge.url)
+
+    with pytest.raises(RepoRefused) as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is True  # back to `queued`, not parked
+    assert "DIRTY_WORKING_TREE" in refusal.value.reason
+    assert "README.md" in refusal.value.reason
+    assert git(clone, "stash", "list") == ""
+    assert git(clone, "rev-parse", "HEAD") == head_before
+    assert (clone / "README.md").read_text(encoding="utf-8") == "my uncommitted work\n"
+
+
+def test_untracked_scratch_files_do_not_refuse_the_job(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    (clone / "scratch.txt").write_text("notes\n", encoding="utf-8")
+    new_head = forge.advance()
+
+    prepared = prepare_repo(_job(tmp_path, clone, forge.url), work_dir=work_dir)
+
+    assert prepared.sha == new_head
+
+
+def test_a_different_origin_refuses_the_job_naming_both_urls(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    elsewhere = "http://gitlab.test/root/other.git"
+    job = _job(tmp_path, clone, elsewhere)
+
+    with pytest.raises(RepoRefused) as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is False
+    assert "origin mismatch" in refusal.value.reason
+    assert forge.url in refusal.value.reason
+    assert elsewhere in refusal.value.reason
+
+
+def test_a_diverged_local_main_is_refused_and_left_untouched(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    local_only = commit(clone, "local.txt")
+    forge.advance()
+    job = _job(tmp_path, clone, forge.url)
+
+    with pytest.raises(RepoRefused) as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is False
+    assert "fast-forward" in refusal.value.reason
+    assert git(clone, "rev-parse", "HEAD") == local_only
+
+
+def test_a_failed_clone_refuses_the_job(tmp_path, work_dir) -> None:
+    job = _job(tmp_path, work_dir / "proj", str(tmp_path / "no-such-forge.git"))
+
+    with pytest.raises(RepoRefused) as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert "clone" in refusal.value.reason
+    assert not (work_dir / "proj").exists()
+
+
+def test_a_job_that_records_no_origin_is_left_alone(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    head = git(clone, "rev-parse", "HEAD")
+    forge.advance()
+
+    prepared = prepare_repo(_job(tmp_path, clone, None), work_dir=work_dir)
+
+    assert prepared == PreparedRepo(path=clone, sha=None)
+    assert git(clone, "rev-parse", "HEAD") == head
+
+
+def test_a_directory_that_is_not_a_clone_refuses_the_job(tmp_path, forge, work_dir) -> None:
+    not_a_clone = work_dir / "proj"
+    not_a_clone.mkdir()
+
+    with pytest.raises(RepoRefused) as refusal:
+        prepare_repo(_job(tmp_path, not_a_clone, forge.url), work_dir=work_dir)
+
+    assert refusal.value.retryable is False
+    assert "not a git clone" in refusal.value.reason
+
+
+# --- origin helpers -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "same"),
+    [
+        ("http://gitlab.test/root/proj.git", "http://gitlab.test/root/proj", True),
+        ("http://gitlab.test/root/proj.git/", "http://GitLab.test/root/proj.git", True),
+        ("git@github.com:fxmartin/proj.git", "https://github.com/fxmartin/proj", True),
+        ("ssh://git@gitlab.test/root/proj.git", "http://gitlab.test/root/proj.git", True),
+        ("http://gitlab.test/root/proj.git", "http://gitlab.test/root/other.git", False),
+        ("http://gitlab.test/root/proj.git", "https://github.com/root/proj.git", False),
+        ("/srv/forge/proj.git", "/srv/forge/proj.git", True),
+        ("/srv/forge/proj.git", "/srv/other/proj.git", False),
+    ],
+)
+def test_origin_urls_compare_by_host_and_path(left: str, right: str, same: bool) -> None:
+    assert same_origin(left, right) is same
+
+
+def test_repo_origin_reads_the_origin_url_and_none_when_there_is_none(
+    tmp_path, forge, work_dir
+) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    assert repo_origin(clone) == forge.url
+    assert repo_origin(tmp_path / "missing") is None
+    git(tmp_path, "init", "-q", "bare-less")
+    assert repo_origin(tmp_path / "bare-less") is None
+
+
+# --- the scheduler: the sync runs after the claim, before the launch ----------
+
+
+class FakeProc:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self._polls = 1
+
+    def poll(self) -> int | None:
+        if self._polls > 0:
+            self._polls -= 1
+            return None
+        return 0
+
+    def stop(self) -> None:
+        self._polls = 0
+
+
+class FakeLauncher:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], str]] = []
+
+    def __call__(self, argv, cwd):
+        self.calls.append((list(argv), str(cwd)))
+        return FakeProc(90000 + len(self.calls))
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+def _clean(_root) -> Finding:
+    return Finding("install", "Installed controller vs checkout", "CLEAN", "matches")
+
+
+def _drain(tmp_path, store, work_dir, *, worker: bool = True, **kwargs):
+    clock = Clock()
+    launcher = FakeLauncher()
+    profile = WorkerProfile(name="xps", host="omarchy-xps13") if worker else None
+    result = run_queue(
+        store,
+        config=SchedulerConfig(slots=2, poll_seconds=1.0, worker=profile),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=launcher,
+        clock=clock,
+        sleeper=clock.advance,
+        notifier=lambda *a, **k: None,
+        version_check=_clean,
+        echo=lambda _line: None,
+        identity="xps",
+        prepare_repo=partial(prepare_repo, work_dir=work_dir),
+        **kwargs,
+    )
+    return result, launcher
+
+
+def _enqueue(store: QueueStore, repo: Path, origin: str | None) -> int:
+    return store.add_job(
+        repo=str(repo), kind="build", scope="epic-1",
+        requirements_json=json.dumps({"origin": origin}) if origin else None,
+    )
+
+
+def test_the_worker_syncs_then_launches_in_the_clone_and_records_the_sha(
+    tmp_path, forge, work_dir
+) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    new_head = forge.advance()
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, clone, forge.url)
+
+    _, launcher = _drain(tmp_path, store, work_dir)
+
+    assert [cwd for _, cwd in launcher.calls] == [str(clone)]
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job.synced_sha == new_head
+    assert job.to_dict()["synced_sha"] == new_head
+
+
+def test_the_worker_clones_an_absent_repo_and_launches_there(tmp_path, forge, work_dir) -> None:
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, work_dir / "proj", forge.url)
+
+    _, launcher = _drain(tmp_path, store, work_dir)
+
+    assert [cwd for _, cwd in launcher.calls] == [str(work_dir / "proj")]
+    job = store.get_job(job_id)
+    assert job is not None and job.synced_sha == git(forge.seed, "rev-parse", "HEAD")
+
+
+def test_a_dirty_clone_sends_the_job_back_to_queued_with_the_reason(
+    tmp_path, forge, work_dir
+) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    (clone / "README.md").write_text("dirty\n", encoding="utf-8")
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, clone, forge.url)
+
+    result, launcher = _drain(tmp_path, store, work_dir)
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert (job.state, job.claimed_by, job.worker) == ("queued", None, None)
+    assert "DIRTY_WORKING_TREE" in (job.reason or "")
+    assert launcher.calls == []
+    assert result.started == 0
+    assert git(clone, "stash", "list") == ""
+
+
+def test_an_origin_mismatch_blocks_the_job_naming_the_mismatch(
+    tmp_path, forge, work_dir
+) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, clone, "http://gitlab.test/root/other.git")
+
+    _, launcher = _drain(tmp_path, store, work_dir)
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job.state == "blocked"
+    assert "origin mismatch" in (job.reason or "")
+    assert launcher.calls == []
+
+
+def test_a_plain_drain_never_touches_the_clone(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    head = git(clone, "rev-parse", "HEAD")
+    forge.advance()
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, clone, forge.url)
+
+    _, launcher = _drain(tmp_path, store, work_dir, worker=False)
+
+    assert len(launcher.calls) == 1
+    assert git(clone, "rev-parse", "HEAD") == head
+    job = store.get_job(job_id)
+    assert job is not None and job.synced_sha is None
+
+
+def test_a_job_with_no_recorded_origin_launches_unsynced(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, clone, None)
+
+    _, launcher = _drain(tmp_path, store, work_dir)
+
+    assert len(launcher.calls) == 1
+    job = store.get_job(job_id)
+    assert job is not None and job.synced_sha is None

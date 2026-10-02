@@ -61,6 +61,8 @@ def test_init_creates_wal_schema(tmp_path) -> None:
             "budget", "files", "fix_rounds_baseline",
             # Story 35.1-001: fleet pin, pool, requirements and claim holder.
             "host", "pool", "requirements", "worker",
+            # Story 35.2-002: the sha a worker synced the clone to.
+            "synced_sha",
         }
     finally:
         conn.close()

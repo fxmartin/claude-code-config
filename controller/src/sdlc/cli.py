@@ -181,6 +181,7 @@ def _enqueue_job(*, kind: str, scope: str, cli_args: list[str]) -> None:
     or a later `sdlc queue prioritise`.
     """
     from sdlc.queue_client import open_queue
+    from sdlc.queue_worker import origin_requirements
 
     # Story 35.1-002: with a fleet queue configured the job goes there — and if
     # that service is down this fails, it never falls back to the local queue
@@ -189,8 +190,11 @@ def _enqueue_job(*, kind: str, scope: str, cli_args: list[str]) -> None:
         store = open_queue()
         store.init()
         repo = str(Path.cwd().resolve())
+        # Story 35.2-002: record the forge this clone came from, so a worker can
+        # clone it (or check its own clone against it) without trusting a path.
         job_id = store.add_job(
-            repo=repo, kind=kind, scope=scope, options_json=json.dumps(cli_args)
+            repo=repo, kind=kind, scope=scope, options_json=json.dumps(cli_args),
+            requirements_json=origin_requirements(Path(repo)),
         )
     except QueueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -3476,6 +3480,7 @@ def queue_add_cmd(
     `sdlc queue run`; a malformed or non-positive value is ignored.
     """
     from sdlc.queue_client import open_queue
+    from sdlc.queue_worker import origin_requirements
 
     store = open_queue()
     store.init()
@@ -3484,6 +3489,7 @@ def queue_add_cmd(
         job_id = store.add_job(
             repo=repo_path, kind=kind, scope=scope, priority=priority,
             options_json=options, labels=label,
+            requirements_json=origin_requirements(Path(repo_path)),
         )
     except QueueError as exc:
         typer.echo(f"error: {exc}", err=True)
