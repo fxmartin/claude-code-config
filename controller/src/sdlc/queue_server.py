@@ -421,7 +421,7 @@ class _Routes:
     # --- the fleet run registry (Story 35.4-001) -----------------------
 
     def put_run(self, _query: Any, body: Body) -> Reply:
-        """Upsert one run's record, as a worker pushes it on start/heartbeat/finish."""
+        """Upsert one run's record, as a build pushes it on start and finish."""
         total = _int(body, "total")
         completed = _int(body, "completed")
         pid = _int(body, "pid")

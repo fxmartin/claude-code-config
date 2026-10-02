@@ -1957,7 +1957,8 @@ went out may mean it landed, and replaying `add` would enqueue twice). An
 unreachable service or 5xx raises `QueueUnavailable`, a 403 `QueueRefused`; both
 name the URL, and the CLI shows one `error:` line (exit 2). `--enqueue` with the
 service down fails — it never enqueues locally — while a plain `sdlc build`
-never opens the queue and is unaffected.
+never opens the queue and does not depend on it: with a URL configured it only
+pushes its run record to the fleet registry, best-effort (Story 35.4-001, below).
 
 `sdlc queue run` needs scheduler verbs the service does not expose, so with a
 fleet queue configured it refuses (exit 2) rather than drain the wrong queue
@@ -1972,16 +1973,28 @@ holds a second table, `fleet_runs` (migration 9): one row per run id, the
 `RunRecord` fields plus `worker` and `updated_at`. The worker's local file stays
 authoritative for the worker; the table is the fleet's summary.
 
-- **Push.** `_registry_register` / `_registry_finish` (and so `build`, `fix` and
-  `resume`) call `queue_client.push_fleet_run` after the local write, and the
-  worker's 30 s heartbeat re-pushes each in-flight run with its done/total read
-  live from the ledger. `PUT /runs` is an upsert (so the client may replay it
-  once); a finished row is final against its own pid — a stale in-progress
-  heartbeat cannot reopen it, while `resume` (a new process, so a new pid)
-  does.
-  The push is best-effort with a 3 s timeout and never fails the build. The
-  `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its jobs), else
-  the short hostname when a fleet URL is configured.
+- **Worker writes.** `queue run --worker` drains the queue its host owns and
+  refuses a fleet URL, so neither it nor its jobs can reach `/runs`. Like its
+  heartbeat registration, the worker writes each run's row straight into that
+  store (`QueueStore.put_fleet_run`, named for the worker): when `_attach_runs`
+  links the run to its job, on each 30 s heartbeat with done/total read live from
+  the ledger, and once the job's process is gone — reaped, stopped by its budget,
+  or stopped by Ctrl-C. That last write carries the worker's own `derive_state`,
+  so a run that exited unfinished (killed, crashed, parked) reads `DEAD` on the
+  fleet as it does on the worker's dashboard. A failed write is logged, never
+  fatal to the drain.
+- **Build pushes.** `_registry_register` / `_registry_finish` (and so `build`,
+  `fix` and `resume`) call `queue_client.push_fleet_run` after the local write;
+  it reaches the service only where a fleet URL is configured, so it is a no-op
+  inside a worker's jobs. The push never fails the build: 3 s per attempt, and
+  `PUT /runs` is replayed once, so an unreachable service can hold a build's start
+  or finish for about 6 s. A record the local write could not store is not
+  pushed. The `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its
+  jobs), else the short hostname. Nothing outlives a build that dies outside a
+  worker, so its row keeps its last pushed status (its own host shows `DEAD`).
+- **Upsert.** `PUT /runs` and the worker's writes share one upsert: a finished
+  row is final against its own pid — a stale in-progress write cannot reopen it,
+  while `resume` (a new process, so a new pid) does.
 - **Read.** `GET /runs` returns `{runs}`, each flagged `worker_online` from the
   `workers` table (`null` when the worker never registered — unknown, not gone).
 - **Dashboard.** `/api/runs` merges the fleet's runs into the local registry view

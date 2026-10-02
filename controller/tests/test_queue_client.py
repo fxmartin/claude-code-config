@@ -132,8 +132,13 @@ def test_resolve_file_without_the_key_means_none(tmp_path: Path) -> None:
     assert resolve_queue_url(cwd=tmp_path, home=tmp_path / "home") is None
 
 
-def test_resolve_malformed_env_is_a_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SDLC_QUEUE_URL", "home-lab:8790")
+# `http://[::1` makes urlsplit itself raise ValueError: it must still surface as
+# the config error every caller catches, never a bare ValueError.
+@pytest.mark.parametrize("url", ["home-lab:8790", "http://[::1"])
+def test_resolve_malformed_env_is_a_config_error(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_URL", url)
     with pytest.raises(QueueConfigError):
         resolve_queue_url()
 
@@ -488,8 +493,9 @@ def test_queue_run_refuses_a_remote_queue(
     assert "SDLC_QUEUE_URL" in result.output
 
 
-def test_malformed_url_is_one_error_line(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SDLC_QUEUE_URL", "home-lab:8790")
+@pytest.mark.parametrize("url", ["home-lab:8790", "http://[::1"])
+def test_malformed_url_is_one_error_line(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_URL", url)
     result = runner.invoke(app, ["queue", "list"])
     assert result.exit_code == 2 and "SDLC_QUEUE_URL" in result.output
 

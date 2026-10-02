@@ -9,6 +9,7 @@ import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -312,8 +313,11 @@ def test_push_never_raises_when_the_service_is_down(monkeypatch: pytest.MonkeyPa
     push_fleet_run(_record())  # must not raise: the local file stays authoritative
 
 
-def test_push_never_raises_on_a_malformed_fleet_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SDLC_QUEUE_URL", "not-a-url")
+@pytest.mark.parametrize("url", ["not-a-url", "http://[::1"])
+def test_push_never_raises_on_a_malformed_fleet_url(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_URL", url)
     push_fleet_run(_record())
 
 
@@ -383,6 +387,37 @@ def test_a_down_service_does_not_fail_register_or_finish(
     assert (local.status, local.completed) == ("DONE", 4)
 
 
+def test_a_malformed_fleet_url_never_costs_a_build_its_local_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc.build import _registry_register
+
+    # urlsplit raises a bare ValueError on an unclosed IPv6 bracket; a plain build
+    # only reads the fleet config to name itself, so it must shrug that off.
+    monkeypatch.setenv("SDLC_QUEUE_URL", "http://[::1")
+    registry = Registry(tmp_path / "registry.json")
+    _registry_register(registry, "run-9", "epic-9", tmp_path / "l.db", 4, repo=tmp_path)
+    (local,) = registry.records()
+    assert (local.run_id, local.worker) == ("run-9", None)
+
+
+def test_an_unreadable_cwd_never_costs_a_build_its_local_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc.build import _registry_register
+
+    def deleted(cls) -> Path:
+        raise FileNotFoundError("the working directory was deleted")
+
+    registry = Registry(tmp_path / "registry.json")
+    monkeypatch.setattr(Path, "cwd", classmethod(deleted))
+    # With `repo` given the cwd only feeds the fleet lookup: the run still registers.
+    _registry_register(registry, "run-9", "epic-9", tmp_path / "l.db", 4, repo=tmp_path)
+    # Without it the record cannot be placed — skipped, never a failed build.
+    _registry_register(registry, "run-8", "epic-8", tmp_path / "l.db", 4)
+    assert [r.run_id for r in registry.records()] == ["run-9"]
+
+
 def test_without_a_fleet_the_local_record_has_no_worker(tmp_path: Path) -> None:
     from sdlc.build import _registry_register
 
@@ -391,37 +426,63 @@ def test_without_a_fleet_the_local_record_has_no_worker(tmp_path: Path) -> None:
     assert registry.records()[0].worker is None
 
 
-# --- the worker's heartbeat refreshes the counts ----------------------------------
+# --- a worker writes its runs into the fleet table it serves ---------------------
+# `queue run --worker` refuses a fleet URL, so a worker drains the queue its own
+# host owns — the store `sdlc queue serve` publishes — and its jobs inherit no URL
+# to push to. These drive a real `run_queue` and read that store, never a stub.
+
+# Above both Linux's and macOS's pid_max, so never a live process: a job that has
+# exited, as `derive_state` sees it.
+_GONE_PID = 2**22 + 12345
 
 
-def test_the_workers_heartbeat_pushes_each_in_flight_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+class _Job:
+    """A worker-launched job's process: in flight for ``polls`` passes, then exits ``code``."""
+
+    def __init__(self, *, polls: int, code: int = 0, during=None) -> None:
+        self.pid = _GONE_PID
+        self._polls = polls
+        self._code = code
+        self._during = during  # run on each in-flight pass, to look at the store mid-run
+        self.stopped = False
+
+    def poll(self) -> int | None:
+        if self.stopped:
+            return -9
+        if self._polls <= 0:
+            return self._code
+        self._polls -= 1
+        if self._during is not None:
+            self._during()
+        return None
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+@pytest.fixture
+def worker_host(tmp_path: Path):
+    """The serving host's queue with one job, and the run record its job registers."""
+    local = QueueStore(tmp_path / "queue.db")
+    local.init()
+    repo = str((tmp_path / "alpha").resolve())
+    Path(repo).mkdir()
+    local.add_job(repo=repo, kind="fix", scope="1")
+    registry = Registry(tmp_path / "registry.json")
+    # What the job's own `_registry_register` writes: its pid is the child's.
+    registry.register(
+        _record("run-w", repo=repo, db=str(tmp_path / "ledger.db"), pid=_GONE_PID,
+                worker=None, completed=2)
+    )
+    return local, registry
+
+
+def _drain_as_worker(
+    local: QueueStore, registry: Registry, job: _Job, *,
+    worker: bool = True, poll_seconds: float = 1.0, sleeper=None, echo=None,
 ) -> None:
     from sdlc.queue_worker import WorkerProfile
     from sdlc.scheduler import SchedulerConfig, run_queue
-
-    pushed: list[RunRecord] = []
-    monkeypatch.setattr("sdlc.scheduler.push_fleet_run", pushed.append)
-    local = QueueStore(tmp_path / "queue.db")
-    local.init()
-    repo = tmp_path / "alpha"
-    repo.mkdir()
-    local.add_job(repo=str(repo.resolve()), kind="fix", scope="1")
-    registry = Registry(tmp_path / "registry.json")
-    # What the job subprocess registers: pid 90001 is FakeLauncher's first child.
-    registry.register(
-        _record("run-live", repo=str(repo.resolve()), pid=90001, worker=None, completed=2)
-    )
-
-    class Slow:
-        pid = 90001
-        polls = 0
-
-        def poll(self):
-            self.polls += 1
-            return None if self.polls < 70 else 0
-
-        def stop(self) -> None: ...
 
     now = [datetime(2026, 10, 2, 12, 0, 0, tzinfo=timezone.utc)]
 
@@ -431,25 +492,170 @@ def test_the_workers_heartbeat_pushes_each_in_flight_run(
     def clean(_root) -> Finding:
         return Finding("install", "Installed controller vs checkout", "CLEAN", "matches")
 
+    profile = WorkerProfile(name="m3max", host="h", pools=["p"], harnesses=["claude"])
     run_queue(
         local,
         config=SchedulerConfig(
-            slots=1, poll_seconds=1.0,
-            worker=WorkerProfile(name="m3max", host="h", pools=["p"], harnesses=["claude"]),
+            slots=1, poll_seconds=poll_seconds, worker=profile if worker else None
         ),
         registry=registry,
-        launcher=lambda argv, cwd: Slow(),
+        launcher=lambda argv, cwd: job,
         clock=lambda: now[0],
-        sleeper=advance,
+        sleeper=sleeper or advance,
         notifier=lambda *a, **k: None,
         version_check=clean,
-        echo=lambda _line: None,
+        echo=echo or (lambda _line: None),
         identity="m3max",
     )
 
-    assert pushed, "a heartbeat while the run was in flight should have pushed it"
-    assert {(r.run_id, r.worker) for r in pushed} == {("run-live", "m3max")}
-    assert pushed[0].completed == 2
+
+def _fleet(local: QueueStore) -> list[tuple]:
+    return [
+        (r["run_id"], r["worker"], r["status"], r["completed"], r["finished_at"])
+        for r in local.list_fleet_runs()
+    ]
+
+
+def test_a_workers_run_is_on_the_fleet_from_its_start_and_each_beat_refreshes_it(
+    worker_host,
+) -> None:
+    local, registry = worker_host
+    seen: list[list[tuple]] = []
+
+    def look() -> None:
+        seen.append(_fleet(local))
+        if len(seen) == 10:
+            # The run advances; with no ledger here the registry counts stand in.
+            registry.register(replace(registry.records()[0], completed=3))
+
+    _drain_as_worker(local, registry, _Job(polls=40, during=look))
+
+    # Pushed when the scheduler linked the run — long before the first 30 s beat.
+    assert seen[0] == [("run-w", "m3max", "IN_PROGRESS", 2, None)]
+    assert seen[25] == seen[0]  # no beat yet: nothing new to say
+    # The 30 s heartbeat re-pushed it with the counts read then.
+    assert seen[-1] == [("run-w", "m3max", "IN_PROGRESS", 3, None)]
+
+
+@pytest.mark.parametrize(
+    ("finishes", "code", "status"),
+    [(True, 0, "DONE"), (False, 137, "DEAD")],
+    ids=["finished", "killed"],
+)
+def test_when_a_workers_job_exits_the_fleet_row_says_what_its_own_dashboard_says(
+    worker_host, finishes: bool, code: int, status: str
+) -> None:
+    local, registry = worker_host
+
+    def finish() -> None:
+        if finishes:  # the job's own `_registry_finish`, before it exits
+            registry.mark_finished("run-w", "DONE", completed=5)
+
+    _drain_as_worker(local, registry, _Job(polls=3, code=code, during=finish))
+
+    (record,) = registry.records()
+    assert derive_state(record) == status  # what the worker's own dashboard shows
+    ((run_id, worker, pushed, completed, finished_at),) = _fleet(local)
+    assert (run_id, worker, pushed) == ("run-w", "m3max", status)
+    assert (completed, bool(finished_at)) == ((5, True) if finishes else (2, False))
+
+
+def test_a_job_the_budget_stops_reads_dead_on_the_fleet(worker_host) -> None:
+    local, registry = worker_host
+    (queued,) = local.list_jobs()
+    job = _Job(polls=10**6)
+
+    # One pass longer than the wall-clock cap trips the breaker on the next one.
+    _drain_as_worker(
+        local, registry, job, poll_seconds=queued.job_budget().wall_clock_seconds + 1
+    )
+
+    assert job.stopped and local.get_job(queued.id).state == "needs_attention"
+    assert [(r[0], r[2]) for r in _fleet(local)] == [("run-w", "DEAD")]
+
+
+def test_interrupting_a_worker_marks_the_runs_it_stopped_dead_on_the_fleet(
+    worker_host,
+) -> None:
+    local, registry = worker_host
+    job = _Job(polls=10**6)
+    passes = [0]
+
+    def ctrl_c_on_the_third_pass(_seconds: float) -> None:
+        passes[0] += 1
+        if passes[0] == 3:
+            raise KeyboardInterrupt
+
+    _drain_as_worker(local, registry, job, sleeper=ctrl_c_on_the_third_pass)
+
+    assert job.stopped
+    assert [(r[0], r[2]) for r in _fleet(local)] == [("run-w", "DEAD")]
+
+
+def test_a_resume_reaches_the_fleet_when_it_re_registers_not_as_the_stale_record(
+    tmp_path: Path,
+) -> None:
+    local = QueueStore(tmp_path / "queue.db")
+    local.init()
+    repo = str((tmp_path / "alpha").resolve())
+    Path(repo).mkdir()
+    job_id = local.add_job(repo=repo, kind="build", scope="epic-1")
+    # A killed scheduler's claim, long lapsed by the time this worker starts.
+    local.claim_job(
+        job_id, claimed_by="dead:1", lease_seconds=90,
+        now=datetime(2026, 10, 2, 11, 55, 0, tzinfo=timezone.utc),
+    )
+    local.attach_run(job_id, "run-w")
+    registry = Registry(tmp_path / "registry.json")
+    # The previous launch's record: finished, its ledger unreadable, so it resumes.
+    stale = _record("run-w", repo=repo, db=str(tmp_path / "ledger.db"), pid=_GONE_PID,
+                    worker=None, status="FAILED", finished_at="2026-10-02T11:50:00+00:00")
+    registry.register(stale)
+    seen: list[list[tuple]] = []
+
+    def look() -> None:
+        seen.append(_fleet(local))
+        if len(seen) == 40:  # `sdlc resume` re-registers under its own pid
+            registry.register(
+                replace(stale, pid=_GONE_PID + 1, status="IN_PROGRESS", finished_at=None,
+                        completed=3)
+            )
+
+    _drain_as_worker(local, registry, _Job(polls=80, during=look))
+
+    assert seen[35] == []  # the 30 s beat passed over the stale terminal record
+    assert seen[-1] == [("run-w", "m3max", "IN_PROGRESS", 3, None)]  # the 60 s beat
+
+
+def test_a_failed_fleet_write_is_logged_and_never_stalls_the_drain(
+    worker_host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    local, registry = worker_host
+
+    def locked(record: RunRecord, *, now=None) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(local, "put_fleet_run", locked)
+    lines: list[str] = []
+
+    def finish() -> None:
+        registry.mark_finished("run-w", "DONE", completed=5)
+
+    _drain_as_worker(local, registry, _Job(polls=3, during=finish), echo=lines.append)
+
+    # The fleet view is a mirror: the job itself still finished as usual.
+    assert [job.state for job in local.list_jobs()] == ["done"]
+    assert any(
+        "fleet view: could not record run run-w: database is locked" in line for line in lines
+    )
+
+
+def test_a_plain_drain_is_no_fleet_worker_and_writes_no_fleet_rows(worker_host) -> None:
+    local, registry = worker_host
+    _drain_as_worker(local, registry, _Job(polls=3, code=137), worker=False)
+    assert local.list_fleet_runs() == []
 
 
 def test_the_default_launcher_hands_a_job_its_workers_name(
@@ -606,10 +812,11 @@ def test_an_unreachable_service_still_renders_local_runs_and_says_so(
     assert "unreachable" in fleet["error"]
 
 
+@pytest.mark.parametrize("url", ["not-a-url", "http://[::1"])
 def test_a_malformed_fleet_url_degrades_instead_of_failing_the_page(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str
 ) -> None:
-    monkeypatch.setenv("SDLC_QUEUE_URL", "not-a-url")
+    monkeypatch.setenv("SDLC_QUEUE_URL", url)
     registry = _local_registry(tmp_path, _record("local-1", worker=None, pid=1))
     with _dashboard(registry) as base:
         assert [r["id"] for r in _get_json(base + "/api/runs")] == ["local-1"]

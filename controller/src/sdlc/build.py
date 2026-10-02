@@ -7214,23 +7214,25 @@ def _registry_register(
     which sorts run rows by that string, keeps a resumed run in date order (a
     space sorts before ``T``, which sank run 60c2947e to 26th on 2026-09-30).
     """
-    record = RunRecord(
-        run_id=run_id,
-        repo=str(Path(repo or Path.cwd()).resolve()),
-        db=str(Path(db_path).resolve()),
-        scope=scope,
-        pid=os.getpid(),
-        status="IN_PROGRESS",
-        # registry stamps the start time when blank
-        started_at=_registry_iso(started_at),
-        total=total,
-        completed=completed,
-        worker=_registry_worker(),
-    )
     try:
+        record = RunRecord(
+            run_id=run_id,
+            repo=str(Path(repo or Path.cwd()).resolve()),
+            db=str(Path(db_path).resolve()),
+            scope=scope,
+            pid=os.getpid(),
+            status="IN_PROGRESS",
+            # registry stamps the start time when blank
+            started_at=_registry_iso(started_at),
+            total=total,
+            completed=completed,
+            worker=_registry_worker(),
+        )
         registry.register(record)
     except OSError:
-        pass
+        # Nor is it pushed: the finish push reads the record back from this
+        # file, so a fleet row the file lacks could never be closed.
+        return
     # Story 35.4-001: the fleet gets the record too, but the local file above
     # stays authoritative — the push is best-effort and never fails the run.
     from sdlc.queue_client import push_fleet_run
@@ -7251,7 +7253,7 @@ def _registry_worker() -> str | None:
         return os.environ[WORKER_ENV].strip()
     try:
         return fleet_worker_name() if resolve_queue_url() is not None else None
-    except QueueConfigError:
+    except (QueueConfigError, OSError):  # a deleted cwd must not cost the local record
         return None
 
 

@@ -94,7 +94,10 @@ def _clean_url(raw: object, source: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise QueueConfigError(f"{source}: queue_url must be a non-empty URL")
     url = raw.strip().rstrip("/")
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:  # urlsplit's own refusal, e.g. an unclosed `http://[::1`
+        raise QueueConfigError(f"{source}: {url!r} is not a valid URL ({exc})") from exc
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise QueueConfigError(
             f"{source}: {url!r} is not an http(s) URL (e.g. http://home-lab.<tailnet>:8790)"
