@@ -27,7 +27,7 @@ from sdlc.queue import (
     WorkerRecord,
     default_queue_path,
 )
-from sdlc.registry import WORKER_ENV, RunRecord
+from sdlc.registry import DASHBOARD_URL_ENV, WORKER_ENV, RunRecord, normalize_dashboard_url
 
 __all__ = [
     "QUEUE_CONFIG_FILENAME",
@@ -497,6 +497,14 @@ def fleet_worker_name() -> str:
     return os.environ.get(WORKER_ENV, "").strip() or socket.gethostname().split(".")[0]
 
 
+def _advertised_dashboard_url() -> str | None:
+    """``SDLC_DASHBOARD_URL`` as an origin; unset or malformed advertises nothing."""
+    try:
+        return normalize_dashboard_url(os.environ[DASHBOARD_URL_ENV])
+    except (KeyError, ValueError):
+        return None
+
+
 def push_fleet_run(record: RunRecord) -> None:
     """Best-effort ``PUT /runs`` of ``record``; a no-op with no fleet configured.
 
@@ -511,6 +519,12 @@ def push_fleet_run(record: RunRecord) -> None:
         client = QueueClient(
             url, token=os.environ.get(QUEUE_TOKEN_ENV) or None, timeout=PUSH_TIMEOUT_SECONDS
         )
-        client.put_fleet_run(dataclasses.replace(record, worker=record.worker or fleet_worker_name()))
+        client.put_fleet_run(
+            dataclasses.replace(
+                record,
+                worker=record.worker or fleet_worker_name(),
+                dashboard_url=record.dashboard_url or _advertised_dashboard_url(),
+            )
+        )
     except (QueueError, OSError, ValueError):
         pass

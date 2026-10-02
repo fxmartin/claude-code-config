@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
+from sdlc.registry import normalize_dashboard_url
+
 if TYPE_CHECKING:
     from sdlc.queue import QueueBackend, WorkerRecord
 
@@ -34,6 +36,9 @@ class WorkerProfile:
     harnesses: list[str] = field(default_factory=list)
     sandbox: str | None = None
     repos: list[str] = field(default_factory=list)
+    # Where this worker's `sdlc dashboard --host <tailnet-ip>` answers (Story 35.4-002);
+    # stamped on each run it pushes so the XPS can read the run's transcripts.
+    dashboard_url: str | None = None
 
     def register_with(
         self, queue: "QueueBackend", *, slots: int, slots_free: int, **extra: Any
@@ -104,6 +109,7 @@ def detect_worker_profile(
     work_dir: Path | None = None,
     probe: Callable[[str], bool] | None = None,
     runtime: Callable[[], str] | None = None,
+    dashboard_url: str | None = None,
 ) -> WorkerProfile:
     """Probe this machine for what it can run.
 
@@ -123,6 +129,8 @@ def detect_worker_profile(
     if any(not pool for pool in declared):
         raise ValueError("a pool name must not be blank")
 
+    origin = normalize_dashboard_url(dashboard_url) if dashboard_url is not None else None
+
     check = probe or _default_dep_probe
     harnesses = [harness for harness, binary in _harness_binaries().items() if check(binary)]
     try:
@@ -136,4 +144,5 @@ def detect_worker_profile(
         harnesses=harnesses,
         sandbox=sandbox,
         repos=_clones(work_dir if work_dir is not None else default_work_dir()),
+        dashboard_url=origin,
     )
