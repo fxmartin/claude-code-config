@@ -37,6 +37,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 | `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise\|unpause` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002), the one host-level rate-limit pause every repo shares (Story 32.2-001), and the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
 | `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), the approval park + auto-resume (Story 32.2-002), one shared rate-limit window discovered and waited out once (Story 32.2-001), and the per-job budget breaker (Story 32.3-001). |
+| `sdlc/queue_client.py` | `QueueClient` (the `QueueBackend` verbs over HTTP), the `SDLC_QUEUE_URL` / `.sdlc-queue.yaml` / `~/.sdlc-fleet.yaml` switch and the `open_queue()` factory every queue consumer opens its store through (Story 35.1-002). |
 | `sdlc/queue_server.py` | `sdlc queue serve` — the queue store behind a tailnet-only HTTP API (stdlib `ThreadingHTTPServer`): one route per `QueueStore` verb, a bind that refuses wildcards, and the `tailscale whois` identity gate (Story 35.1-001). |
 | `sdlc/approval.py` | Read-only change-request approval probe — "is PR #N approved / merged / closed?" behind the queue's park (Story 32.2-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
@@ -1737,6 +1738,7 @@ what `sdlc queue list --json` emits.
 
 | Route | Store method | Notes |
 |-------|--------------|-------|
+| `GET /health` | — | `{ok, controller_version}` — a 200 means the identity gate admitted the caller; what `sdlc doctor` probes (Story 35.1-002) |
 | `GET /jobs[?repo=PATH]` | `list_jobs` | `{pause, jobs}`, the `queue list --json` envelope |
 | `POST /jobs` | `add_job` | `repo, kind, scope` + optional `priority, options[], labels[], host, pool, requirements{repo,harness,sandbox}`; 201 |
 | `POST /jobs/claim` | `claim_next` | `worker` + optional `lease_seconds, host, pools[]`; the best claimable job, or 204. Held while the queue is paused. |
@@ -1819,6 +1821,43 @@ without `SDLC_QUEUE_TOKEN` refuses to start. Add
 nullable: an older `queue.db` upgrades in place and its rows read as "run
 anywhere, held by nobody". `worker` is set by the claim verbs and cleared with
 `claimed_by`.
+
+## Using the fleet queue (`QueueClient`, Story 35.1-002)
+
+Remote execution is additive: every queue consumer (`sdlc queue list|add|cancel|
+requeue|prioritise`, `build/fix --enqueue`, `sdlc doctor`, the dashboard's
+`/api/queue`) opens its store through `open_queue()` in `sdlc/queue_client.py`,
+which returns the local `QueueStore` unless a queue URL is configured, in which
+case it returns a `QueueClient`. Both satisfy the `QueueBackend` Protocol in
+`queue.py` — the verbs the service exposes — so the callers cannot tell them
+apart.
+
+**Configuration**, highest precedence first (mirroring `.sdlc-forge.yaml`):
+
+1. `SDLC_QUEUE_URL=http://home-lab.<tailnet>:8790` (blank counts as unset).
+2. `queue_url:` in `.sdlc-queue.yaml` in the working directory.
+3. `queue_url:` in `~/.sdlc-fleet.yaml`.
+4. None — the local SQLite queue, exactly as before.
+
+A URL that is set but malformed is an error, never a silent fallback to local.
+The client sends `Authorization: Bearer $SDLC_QUEUE_TOKEN` when the variable is
+set (the same secret `sdlc queue serve` reads); otherwise the service identifies
+the machine through Tailscale.
+
+**Failure contract.** `QueueClient` uses `urllib` (no new dependency) with a
+10 s timeout and one retry on a connection error — a read after any transport
+error, a write only when the connection never opened (a reset after the request
+went out may mean it landed, and replaying `add` would enqueue twice). An
+unreachable service or 5xx raises `QueueUnavailable`, a 403 `QueueRefused`; both
+name the URL, and the CLI shows one `error:` line (exit 2). `--enqueue` with the
+service down fails — it never enqueues locally — while a plain `sdlc build`
+never opens the queue and is unaffected.
+
+`sdlc queue run` and `sdlc queue unpause` need scheduler/ledger verbs the service
+does not expose, so with a fleet queue configured they refuse (exit 2) rather
+than drain the wrong queue; `sdlc queue serve` always serves the local store.
+`sdlc doctor` adds a `fleet-queue` finding — reachable, identity accepted, the
+service's controller version — only when a URL is configured.
 
 ## The approval park (`parked`, Story 32.2-002)
 

@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlsplit
 
+from sdlc import __version__
 from sdlc.queue import JobRecord, QueueError, QueueStore
 from sdlc.scheduler import DEFAULT_LEASE_SECONDS
 
@@ -343,6 +344,11 @@ class _Routes:
 
     # --- reads ---------------------------------------------------------
 
+    def health(self, _query: Any, _body: Body) -> Reply:
+        # Reaching a handler means the identity gate already admitted the caller,
+        # so a 200 here is `sdlc doctor`'s "reachable, identity accepted".
+        return 200, {"ok": True, "controller_version": __version__}
+
     def list_jobs(self, query: dict[str, list[str]], _body: Body) -> Reply:
         # Same envelope `sdlc queue list --json` emits: the pause lives beside
         # the jobs, not in one of them, and an elapsed window is not state.
@@ -470,6 +476,7 @@ _JOB_VERBS = ("renew", "release", "finish", "cancel", "requeue", "prioritise")
 def _route(method: str, path: str, routes: _Routes) -> Callable[[dict[str, list[str]], Body], Reply]:
     parts = [p for p in path.split("/") if p]
     table: dict[tuple[str, tuple[str, ...]], Callable[[dict[str, list[str]], Body], Reply]] = {
+        ("GET", ("health",)): routes.health,
         ("GET", ("jobs",)): routes.list_jobs,
         ("POST", ("jobs",)): routes.add_job,
         ("POST", ("jobs", "claim")): routes.claim,
