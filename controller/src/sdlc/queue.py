@@ -363,6 +363,14 @@ class JobRecord:
     budget: str | None = None
     files: str | None = None
     fix_rounds_baseline: int = 0
+    # Story 35.1-001 (fleet execution). ``host`` pins the job to one machine and
+    # ``pool`` to one subscription pool (both nullable = anywhere); ``requirements``
+    # is JSON text — ``{repo, harness, sandbox}`` — a worker must satisfy;
+    # ``worker`` is the fleet worker that holds the claim right now.
+    host: str | None = None
+    pool: str | None = None
+    requirements: str | None = None
+    worker: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -384,6 +392,10 @@ class JobRecord:
             "budget": self.budget,
             "files": self.files,
             "fix_rounds_baseline": self.fix_rounds_baseline,
+            "host": self.host,
+            "pool": self.pool,
+            "requirements": self.requirements,
+            "worker": self.worker,
         }
 
     def job_budget(self) -> JobBudget:
@@ -518,7 +530,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     poll_after  TIMESTAMP,
     budget      TEXT,
     files       TEXT,
-    fix_rounds_baseline INTEGER
+    fix_rounds_baseline INTEGER,
+    host        TEXT,
+    pool        TEXT,
+    requirements TEXT,
+    worker      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -581,6 +597,22 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (4, "queue_state_pause", "queue_state", [], _QUEUE_STATE_DDL),
     # Story 32.2-003: the operator-clear audit table.
     (5, "queue_pause_clears", "queue_pause_clears", [], _PAUSE_CLEARS_DDL),
+    # Story 35.1-001: fleet columns — the host pin, the subscription pool, the
+    # requirements a worker must meet, and which worker holds the claim. All
+    # nullable, so an older queue.db upgrades in place and its rows read as
+    # "run anywhere, held by nobody".
+    (
+        6,
+        "fleet_job_columns",
+        "jobs",
+        [
+            ("host", "TEXT"),
+            ("pool", "TEXT"),
+            ("requirements", "TEXT"),
+            ("worker", "TEXT"),
+        ],
+        None,
+    ),
 ]
 
 
@@ -691,6 +723,9 @@ class QueueStore:
         priority: str | None = None,
         options_json: str | None = None,
         labels: Iterable[str] = (),
+        host: str | None = None,
+        pool: str | None = None,
+        requirements_json: str | None = None,
     ) -> int:
         """Insert a fresh ``queued`` job and return its id.
 
@@ -719,9 +754,12 @@ class QueueStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO jobs(repo, kind, scope, priority, state, options, "
-                "created_at, updated_at, budget) "
-                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
-                (repo, kind, scope, priority, options_json, now, now, budget),
+                "created_at, updated_at, budget, host, pool, requirements) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    repo, kind, scope, priority, options_json, now, now, budget,
+                    host, pool, requirements_json,
+                ),
             )
             assert cur.lastrowid is not None  # INSERT always assigns a rowid
             return int(cur.lastrowid)
@@ -792,13 +830,13 @@ class QueueStore:
         with self._connect() as conn:
             if job.run_id:
                 conn.execute(
-                    "UPDATE jobs SET state = 'running', claimed_by = NULL, "
+                    "UPDATE jobs SET state = 'running', claimed_by = NULL, worker = NULL, "
                     "lease_until = ?, reason = NULL, updated_at = ? WHERE id = ?",
                     (moment, moment, job_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE jobs SET state = 'queued', claimed_by = NULL, "
+                    "UPDATE jobs SET state = 'queued', claimed_by = NULL, worker = NULL, "
                     "lease_until = NULL, reason = NULL, updated_at = ? WHERE id = ?",
                     (moment, job_id),
                 )
@@ -814,7 +852,7 @@ class QueueStore:
         moment = _at(now).isoformat()
         with self._connect() as conn:
             conn.execute(
-                "UPDATE jobs SET state = 'queued', run_id = NULL, claimed_by = NULL, "
+                "UPDATE jobs SET state = 'queued', run_id = NULL, claimed_by = NULL, worker = NULL, "
                 "lease_until = NULL, reason = ?, updated_at = ? "
                 "WHERE id = ? AND state = 'running'",
                 (reason, moment, job_id),
@@ -1146,8 +1184,12 @@ class QueueStore:
         claimed_by: str,
         lease_seconds: int,
         now: datetime | None = None,
+        worker: str | None = None,
     ) -> JobRecord | None:
         """Take a ``queued`` job under a lease; ``None`` when someone beat us.
+
+        ``worker`` (Story 35.1-001) records which fleet worker holds the claim;
+        a local scheduler leaves it ``None``.
 
         The single guarded UPDATE the story specifies — ``WHERE state='queued'
         AND (lease_until IS NULL OR lease_until < now)``. SQLite's write lock
@@ -1176,7 +1218,7 @@ class QueueStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = 'running', claimed_by = ?, lease_until = ?, "
-                "reason = NULL, updated_at = ? "
+                "reason = NULL, updated_at = ?, worker = ? "
                 "WHERE id = ? AND state = 'queued' "
                 "AND (lease_until IS NULL OR lease_until < ?) "
                 "AND NOT EXISTS ("
@@ -1188,6 +1230,7 @@ class QueueStore:
                     claimed_by,
                     (moment + timedelta(seconds=lease_seconds)).isoformat(),
                     moment.isoformat(),
+                    worker,
                     job_id,
                     moment.isoformat(),
                 ),
@@ -1196,6 +1239,56 @@ class QueueStore:
                 return None
         return self.get_job(job_id)
 
+    def claim_next(
+        self,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        host: str | None = None,
+        pools: Iterable[str] | None = None,
+        now: datetime | None = None,
+    ) -> JobRecord | None:
+        """Claim the best job this worker may run; ``None`` when there is none.
+
+        The fleet's one claim verb (Story 35.1-001): :meth:`peek_claimable` in
+        dispatch order, filtered to what ``host``/``pools`` may run, then the
+        guarded :meth:`claim_job` UPDATE — which stays the sole arbiter, so two
+        workers racing for one row still produce exactly one winner and the
+        loser simply tries the next candidate. A held dispatch window
+        (:meth:`dispatch_pause`) yields nothing: the pause is the queue's, not
+        any one worker's.
+
+        A job pinned to a ``host`` goes only to a worker on that host; a job in
+        a ``pool`` only to a worker serving it. An unpinned/unpooled job goes
+        anywhere. ``requirements`` are recorded but not matched here — capability
+        matching belongs to the worker-registry story that introduces what a
+        worker advertises.
+        """
+        pause = self.dispatch_pause()
+        if pause is not None and pause.is_active(now):
+            return None
+        served = set(pools or ())
+        candidates = self.peek_claimable(
+            busy_repos=self.running_repos(),
+            fix_busy_repos=self.running_repos(kind="fix"),
+            now=now,
+        )
+        for job in candidates:
+            if job.host is not None and job.host != host:
+                continue
+            if job.pool is not None and job.pool not in served:
+                continue
+            claimed = self.claim_job(
+                job.id,
+                claimed_by=claimed_by,
+                lease_seconds=lease_seconds,
+                now=now,
+                worker=claimed_by,
+            )
+            if claimed is not None:
+                return claimed
+        return None
+
     def reclaim_job(
         self,
         job_id: int,
@@ -1203,6 +1296,7 @@ class QueueStore:
         claimed_by: str,
         lease_seconds: int,
         now: datetime | None = None,
+        worker: str | None = None,
     ) -> JobRecord | None:
         """Take over a ``running`` job whose lease lapsed; ``None`` if it did not.
 
@@ -1215,13 +1309,14 @@ class QueueStore:
         moment = _at(now)
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE jobs SET claimed_by = ?, lease_until = ?, updated_at = ? "
-                "WHERE id = ? AND state = 'running' "
+                "UPDATE jobs SET claimed_by = ?, lease_until = ?, updated_at = ?, "
+                "worker = ? WHERE id = ? AND state = 'running' "
                 "AND (lease_until IS NULL OR lease_until < ?)",
                 (
                     claimed_by,
                     (moment + timedelta(seconds=lease_seconds)).isoformat(),
                     moment.isoformat(),
+                    worker,
                     job_id,
                     moment.isoformat(),
                 ),
@@ -1285,13 +1380,13 @@ class QueueStore:
         with self._connect() as conn:
             if job.run_id:
                 conn.execute(
-                    "UPDATE jobs SET claimed_by = NULL, lease_until = ?, reason = ?, "
+                    "UPDATE jobs SET claimed_by = NULL, worker = NULL, lease_until = ?, reason = ?, "
                     "updated_at = ? WHERE id = ? AND claimed_by = ?",
                     (moment, reason, moment, job_id, claimed_by),
                 )
             else:
                 conn.execute(
-                    "UPDATE jobs SET state = 'queued', claimed_by = NULL, "
+                    "UPDATE jobs SET state = 'queued', claimed_by = NULL, worker = NULL, "
                     "lease_until = NULL, reason = ?, updated_at = ? "
                     "WHERE id = ? AND claimed_by = ?",
                     (reason, moment, job_id, claimed_by),
@@ -1305,12 +1400,23 @@ class QueueStore:
                 (run_id, _now_iso(), job_id),
             )
 
-    def finish_job(self, job_id: int, state: str, *, reason: str | None = None) -> None:
-        """Stamp a job terminal and drop its lease.
+    def finish_job(
+        self,
+        job_id: int,
+        state: str,
+        *,
+        reason: str | None = None,
+        claimed_by: str | None = None,
+    ) -> bool:
+        """Stamp a job terminal and drop its lease; ``False`` when nothing matched.
 
         The four terminals are ``done``, ``failed``, ``blocked`` (the run parked
         itself, or the scheduler refused to start it) and ``needs_attention``
         (the queue's own budget breaker stopped it).
+
+        ``claimed_by`` (Story 35.1-001) stamps the job only while that holder
+        still owns the claim, checked in the UPDATE itself — a check read first
+        could be overtaken by another process's reclaim.
         """
         if state not in _TERMINAL_STATES:
             raise QueueError(
@@ -1318,11 +1424,12 @@ class QueueStore:
                 f"(expected one of {sorted(_TERMINAL_STATES)})"
             )
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE jobs SET state = ?, claimed_by = NULL, lease_until = NULL, "
-                "reason = ?, updated_at = ? WHERE id = ?",
-                (state, reason, _now_iso(), job_id),
+            cur = conn.execute(
+                "UPDATE jobs SET state = ?, claimed_by = NULL, worker = NULL, lease_until = NULL, "
+                "reason = ?, updated_at = ? WHERE id = ? AND (? IS NULL OR claimed_by = ?)",
+                (state, reason, _now_iso(), job_id, claimed_by, claimed_by),
             )
+            return cur.rowcount == 1
 
     def set_reason(self, job_id: int, reason: str | None) -> None:
         """Record why a job is not progressing (e.g. ``repo busy``) without moving it."""
@@ -1363,7 +1470,7 @@ class QueueStore:
             )
         with self._connect() as conn:
             conn.execute(
-                "UPDATE jobs SET state = 'parked', claimed_by = NULL, "
+                "UPDATE jobs SET state = 'parked', claimed_by = NULL, worker = NULL, "
                 "lease_until = NULL, pr_number = ?, poll_after = ?, reason = ?, "
                 "updated_at = ? WHERE id = ?",
                 (
@@ -1400,6 +1507,7 @@ class QueueStore:
         claimed_by: str,
         lease_seconds: int,
         now: datetime | None = None,
+        worker: str | None = None,
     ) -> JobRecord | None:
         """Take a ``parked`` job back under a lease; ``None`` when we may not.
 
@@ -1420,7 +1528,7 @@ class QueueStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = 'running', claimed_by = ?, lease_until = ?, "
-                "poll_after = NULL, reason = NULL, updated_at = ? "
+                "poll_after = NULL, reason = NULL, updated_at = ?, worker = ? "
                 "WHERE id = ? AND state = 'parked' "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM jobs AS busy "
@@ -1430,6 +1538,7 @@ class QueueStore:
                     claimed_by,
                     (moment + timedelta(seconds=lease_seconds)).isoformat(),
                     moment.isoformat(),
+                    worker,
                     job_id,
                 ),
             )
@@ -1572,6 +1681,10 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         budget=_optional_column(row, "budget"),
         files=_optional_column(row, "files"),
         fix_rounds_baseline=int(_optional_column(row, "fix_rounds_baseline") or 0),
+        host=_optional_column(row, "host"),
+        pool=_optional_column(row, "pool"),
+        requirements=_optional_column(row, "requirements"),
+        worker=_optional_column(row, "worker"),
     )
 
 
