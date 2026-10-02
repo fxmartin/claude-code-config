@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.95.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): worker drains the fleet queue over (#35.2-005)
+
+
 ## [v2.94.0] - 2026-10-02
 
 ### Added
