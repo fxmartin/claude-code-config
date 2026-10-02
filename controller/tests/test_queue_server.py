@@ -937,3 +937,68 @@ def test_serve_runs_until_interrupted_and_closes_the_server(store, monkeypatch) 
     assert calls == ["closed"]
     assert while_serving != [before]  # `kill` takes the graceful path while serving...
     assert signal.getsignal(signal.SIGTERM) == before  # ...and the handler is handed back
+
+
+# --- workers (Story 35.2-001) -------------------------------------------------
+
+
+def _register(api, name="m3max", **overrides):
+    body = {
+        "worker": name,
+        "host": "macbook-pro-m3-max",
+        "pools": ["claude-m3"],
+        "harnesses": ["claude"],
+        "repos": ["agentic-coding-monitor"],
+        "sandbox": "podman",
+        "slots": 2,
+        "slots_free": 2,
+    }
+    body.update(overrides)
+    return api.call("POST", "/workers", body)
+
+
+def test_post_workers_registers_and_get_workers_lists_with_online(api) -> None:
+    status, record = _register(api)
+    assert status == 200
+    assert record["name"] == "m3max" and record["online"] is True
+    assert record["pools"] == ["claude-m3"] and record["sandbox"] == "podman"
+
+    status, listing = api.call("GET", "/workers")
+    assert status == 200
+    assert [w["name"] for w in listing["workers"]] == ["m3max"]
+
+
+def test_posting_again_is_a_heartbeat_not_a_second_worker(api) -> None:
+    _register(api, slots_free=2)
+    _register(api, slots_free=0)
+    workers = api.call("GET", "/workers")[1]["workers"]
+    assert len(workers) == 1 and workers[0]["slots_free"] == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"slots": 0}, {"slots": "2"}, {"pools": "claude-m3"}, {"host": ""}, {"worker": " "}],
+    ids=["zero-slots", "string-slots", "pools-not-a-list", "blank-host", "blank-name"],
+)
+def test_bad_worker_input_is_400(api, overrides) -> None:
+    assert _register(api, **overrides)[0] == 400
+
+
+def test_claim_by_a_registered_worker_is_capability_matched(api) -> None:
+    _register(api, "no-clone", repos=["other"])
+    _register(api, "has-clone", repos=["agentic-coding-monitor"])
+    job = _add(api, requirements={"repo": "agentic-coding-monitor", "harness": "claude"})
+
+    assert api.call("POST", "/jobs/claim", {"worker": "no-clone"})[0] == 204
+    status, got = api.call("POST", "/jobs/claim", {"worker": "has-clone"})
+    assert status == 200 and got["id"] == job["id"] and got["worker"] == "has-clone"
+
+
+def test_an_unsatisfiable_job_shows_its_reason_in_the_job_list(api) -> None:
+    _register(api, repos=["other"], sandbox=None)
+    job = _add(api, requirements={"repo": "agentic-coding-monitor", "sandbox": "true"})
+
+    # Stamped on enqueue, before any claim or heartbeat.
+    assert job["state"] == "queued"
+    listed = api.call("GET", "/jobs")[1]["jobs"][0]
+    assert listed["reason"] == "no eligible worker (needs repo agentic-coding-monitor, sandbox)"

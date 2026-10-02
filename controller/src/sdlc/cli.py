@@ -15,7 +15,7 @@ import typer
 from sdlc import __version__
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
 from sdlc.eval_compare import DEFAULT_TOLERANCE
-from sdlc.queue import QueueError
+from sdlc.queue import HEARTBEAT_SECONDS, QueueError
 # `sdlc queue run`'s defaults live with the scheduler, so `--help` prints the
 # real figures rather than a copy that can drift (Story 32.1-002).
 from sdlc.scheduler import (
@@ -3519,6 +3519,64 @@ def queue_list_cmd(
             f"{_format_age(now, r.created_at):<6}{pr_disp:<7}{run_disp:<14}"
             f"{r.worker or '-':<12}{r.host or '-':<14}{r.pool or '-':<16}{r.repo}"
         )
+        # Why it is standing still (Story 35.2-001: "no eligible worker (needs
+        # repo X, sandbox)"; also `repo busy`, a version-guard remedy, …).
+        if r.reason:
+            typer.echo(f"      \u2514 {r.reason}")
+    raise typer.Exit(code=0)
+
+
+def _format_since(now: datetime, moment: str) -> str:
+    """``12s ago`` / ``3m ago`` / ``2h ago`` / ``5d ago`` for an ISO timestamp."""
+    try:
+        then = datetime.fromisoformat(moment)
+    except ValueError:
+        return "?"
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=now.tzinfo)
+    seconds = max(0, int((now - then).total_seconds()))
+    for limit, unit, size in ((60, "s", 1), (3600, "m", 60), (86400, "h", 3600)):
+        if seconds < limit:
+            return f"{seconds // size}{unit} ago"
+    return f"{seconds // 86400}d ago"
+
+
+@queue_app.command("workers")
+@_queue_errors
+def queue_workers_cmd(
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the workers as JSON: {workers: [...]} with every capability."
+    ),
+) -> None:
+    """List the fleet's registered workers (Story 35.2-001).
+
+    One row per worker that `sdlc queue run --worker` has registered with this
+    queue — the fleet's (``SDLC_QUEUE_URL``) when one is configured, else the
+    local one: its host, the subscription pools it serves, free/total agent
+    slots as of its last heartbeat, how long ago that was, and whether it is
+    `online`. A worker silent for three heartbeats (90 s) is `offline`, and the
+    leases it held become reclaimable. `--json` adds the harnesses, sandbox
+    runtime and repos each worker advertised.
+    """
+    from sdlc.queue_client import open_queue
+
+    workers = open_queue().list_workers()
+    now = datetime.now(timezone.utc)
+    if as_json:
+        typer.echo(json.dumps({"workers": [w.to_dict(now) for w in workers]}, default=str))
+        raise typer.Exit(code=0)
+    if not workers:
+        typer.echo("no workers registered.")
+        raise typer.Exit(code=0)
+    typer.echo(
+        f"{'NAME':<16}{'HOST':<20}{'POOLS':<34}{'SLOTS':<8}{'HEARTBEAT':<12}STATUS"
+    )
+    for w in workers:
+        typer.echo(
+            f"{w.name:<16}{w.host:<20}{','.join(w.pools) or '-':<34}"
+            f"{f'{w.slots_free}/{w.slots}':<8}{_format_since(now, w.last_heartbeat):<12}"
+            f"{'online' if w.is_online(now) else 'offline'}"
+        )
     raise typer.Exit(code=0)
 
 
@@ -3622,6 +3680,25 @@ def queue_run_cmd(
     as_json: bool = typer.Option(
         False, "--json", help="Emit the drain summary as JSON."
     ),
+    worker: str | None = typer.Option(
+        None,
+        "--worker",
+        help="Run as a named fleet worker (Story 35.2-001): register this "
+        "machine's repos, harnesses and sandbox with the queue, heartbeat every "
+        f"{HEARTBEAT_SECONDS}s, and claim only jobs it can run.",
+    ),
+    pool: list[str] = typer.Option(
+        [],
+        "--pool",
+        help="Subscription pool this worker serves, repeatable (e.g. claude-m3, "
+        "claude-shared, codex-shared). Needs --worker.",
+    ),
+    host: str | None = typer.Option(
+        None,
+        "--host",
+        help="Host name to register, matched by a job's `--host` pin (default: "
+        "this machine's short hostname). Needs --worker.",
+    ),
 ) -> None:
     """Drain the host queue in the foreground — claim jobs and run them.
 
@@ -3674,11 +3751,37 @@ def queue_run_cmd(
     merging fails the job with `reason=pr closed`. Without `--follow` a drain
     polls its parks once and exits, leaving them in the queue for the next run.
 
+    With `--worker NAME` the drain is a fleet worker (Story 35.2-001). It
+    registers `{worker, host, pools, harnesses, sandbox, repos under ~/Work,
+    slots_free}` (`--pool`/`--host` declare the pools and host name) and
+    heartbeats every 30 s with its live free-slot count; a worker silent for
+    three beats is `offline` in `sdlc queue workers` and its leases become
+    reclaimable. It claims only jobs it is eligible for — the job's
+    `requirements` (repo, harness, sandbox), `--host` pin and `--pool` met by
+    what it registered, a `codex` stage also needing the `codex-shared` pool —
+    and defers a job to an eligible peer with more free slots. A job nobody can
+    run stays `queued`, with `no eligible worker (needs …)` in `sdlc queue
+    list`. `--slots` is the worker's cap. Works on the queue this host owns:
+    with `SDLC_QUEUE_URL` set it refuses, like the rest of this verb.
+
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
     deliberately not built into the controller.
     """
     from sdlc.scheduler import SchedulerConfig, run_queue
+
+    if worker is None and (pool or host is not None):
+        typer.echo("error: --pool and --host only apply with --worker NAME", err=True)
+        raise typer.Exit(code=2)
+    profile = None
+    if worker is not None:
+        from sdlc.queue_worker import detect_worker_profile
+
+        try:
+            profile = detect_worker_profile(worker, pools=pool, host=host)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
 
     store = _local_queue("run")
     store.init()
@@ -3691,8 +3794,12 @@ def queue_run_cmd(
             poll_seconds=poll_interval,
             approval_poll_seconds=approval_poll_interval,
             self_update=self_update,
+            worker=profile,
         ),
         echo=typer.echo,
+        # The worker name is the claim holder, so the queue's `worker` column,
+        # the lease renewals and the registry row all name the same party.
+        identity=profile.name if profile is not None else None,
     )
 
     if as_json:
@@ -3885,6 +3992,11 @@ def queue_serve_cmd(
                                      labels, host, pool, requirements] -> 201
       POST   /jobs/claim             worker, \\[lease_seconds, host, pools]
                                      -> job, or 204 when nothing is claimable
+      POST   /workers                register or heartbeat: worker, host, \\[pools,
+                                     harnesses, sandbox, repos, slots, slots_free]
+                                     -> a claim by a registered worker is matched
+                                     on these (see `queue run --worker`)
+      GET    /workers                {workers} with an `online` flag each
       POST   /jobs/{id}/renew        worker, \\[lease_seconds]
       POST   /jobs/{id}/release      worker, \\[reason]
       POST   /jobs/{id}/finish       state, \\[reason, worker]

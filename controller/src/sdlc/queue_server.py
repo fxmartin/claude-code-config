@@ -309,6 +309,15 @@ def _string_list(body: Body, key: str) -> list[str] | None:
     return value
 
 
+def _int(body: Body, key: str, *, default: int | None = None) -> int | None:
+    value = body.get(key, default)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _ApiError(400, f"{key} must be an integer")
+    return value
+
+
 def _requirements_json(body: Body) -> str | None:
     value = body.get("requirements")
     if value is None:
@@ -380,7 +389,32 @@ class _Routes:
             )
         except QueueError as exc:
             raise _ApiError(400, str(exc)) from exc
+        # Say at once, rather than at the next heartbeat, when no worker can run it.
+        self.store.stamp_unsatisfiable()
         return 201, _job(self.store, job_id).to_dict()
+
+    # --- workers (Story 35.2-001) --------------------------------------
+
+    def register_worker(self, _query: Any, body: Body) -> Reply:
+        """Register a worker; calling it again is the heartbeat."""
+        sandbox = _text(body, "sandbox")
+        try:
+            record = self.store.register_worker(
+                _required(body, "worker"),
+                host=_required(body, "host"),
+                pools=_string_list(body, "pools") or (),
+                harnesses=_string_list(body, "harnesses") or (),
+                sandbox=sandbox,
+                repos=_string_list(body, "repos") or (),
+                slots=_int(body, "slots", default=1) or 0,
+                slots_free=_int(body, "slots_free"),
+            )
+        except QueueError as exc:
+            raise _ApiError(400, str(exc)) from exc
+        return 200, record.to_dict()
+
+    def list_workers(self, _query: Any, _body: Body) -> Reply:
+        return 200, {"workers": [worker.to_dict() for worker in self.store.list_workers()]}
 
     def claim(self, _query: Any, body: Body) -> Reply:
         claimed = self.store.claim_next(
@@ -480,6 +514,8 @@ def _route(method: str, path: str, routes: _Routes) -> Callable[[dict[str, list[
         ("GET", ("jobs",)): routes.list_jobs,
         ("POST", ("jobs",)): routes.add_job,
         ("POST", ("jobs", "claim")): routes.claim,
+        ("GET", ("workers",)): routes.list_workers,
+        ("POST", ("workers",)): routes.register_worker,
         ("POST", ("pause",)): routes.pause,
         ("DELETE", ("pause",)): routes.resume,
     }
