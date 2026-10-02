@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.85.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): worker registration and (#35.2-001)
+
+
 ## [v2.84.0] - 2026-10-02
 
 ### Added
