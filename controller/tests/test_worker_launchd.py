@@ -62,11 +62,25 @@ def test_the_install_sed_fills_every_placeholder() -> None:
     assert set(re.findall(r"__[A-Z_]+__", body)) <= substituted
 
 
-def test_worker_starts_at_boot_and_is_restarted_on_exit(plist) -> None:
-    # KeepAlive restarts the worker after it exits 75 on a controller upgrade.
+def test_worker_starts_at_login_and_is_restarted_on_exit(plist) -> None:
+    # A LaunchAgent loads at login, not boot. KeepAlive restarts the worker after
+    # it exits 75 on a controller upgrade.
     assert plist["RunAtLoad"] is True
     assert plist["KeepAlive"] is True
     assert plist["ThrottleInterval"] >= 10  # a crash loop must not spin
+
+
+def test_launchd_waits_out_a_full_shutdown_before_sigkill(plist) -> None:
+    # `launchctl bootout` and `kickstart -k` stop the worker with SIGTERM, which
+    # takes the Ctrl-C path: one in-flight job after another gets SIGTERM, then
+    # SIGKILL after a grace, and only then is its lease released. launchd's
+    # default ExitTimeOut (typically 20 s) would SIGKILL the worker part-way
+    # and strand the jobs it had not reached yet.
+    from sdlc.scheduler import _STOP_GRACE_SECONDS, DEFAULT_SLOTS
+
+    argv = plist["ProgramArguments"]
+    slots = int(argv[argv.index("--slots") + 1]) if "--slots" in argv else DEFAULT_SLOTS
+    assert plist["ExitTimeOut"] > slots * 2 * _STOP_GRACE_SECONDS
 
 
 def test_jobs_run_at_interactive_priority(plist) -> None:

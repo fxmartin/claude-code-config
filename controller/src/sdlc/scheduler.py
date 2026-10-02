@@ -382,6 +382,15 @@ def keep_awake_prefix(
     Prefixed to a worker's job argv so the idle-sleep assertion lives exactly as
     long as the job does — the Mac may sleep between jobs. ``caffeinate`` is
     macOS-only; the Linux equivalent (``systemd-inhibit``) is a follow-up.
+
+    A wrapper here must *become* the job, not run it as a child: the pid the
+    launcher returns is the join key :meth:`_Scheduler._attach_runs` matches to
+    the pid `run_build`/`run_fix` register, and its exit code is read as the
+    job's. ``caffeinate`` keeps both — its original process execs the command
+    while a forked child holds the assertion (``forkChild`` in Apple's
+    ``caffeinate.c``). ``systemd-inhibit`` runs the command as its child, so as
+    a drop-in it would silently break run linking, and with it resume,
+    rate-limit and approval parking and the fleet view.
     """
     if (system or platform.system()) != "Darwin":
         return []
@@ -846,6 +855,9 @@ class _Scheduler:
         # own (stale) `sdlc.__version__`, so after a reinstall the version
         # check must be told what is on PATH now.
         self._installed_version = installed_version
+        # The version this process started on, i.e. the scheduler it runs. A
+        # self-update moves `_installed_version`, never this (Story 35.2-004).
+        self._running_version = installed_version
         self._self_updated = False
         self._last_beat: datetime | None = None
         # Repos whose self-update was deferred because a sibling job was still
@@ -1630,17 +1642,19 @@ class _Scheduler:
         LaunchAgent's KeepAlive only restarts a worker that exits. Seeing the
         installed version move off the one it runs, it claims nothing more, lets
         its in-flight jobs finish and exits; the restarted worker runs the new
-        code. Workers only: a plain drain has no supervisor to restart it.
+        code. That includes its own `--self-update`, which points the guard at
+        the new install but leaves this process on the old scheduler. Workers
+        only: a plain drain has no supervisor to restart it.
         """
         if self._config.worker is None or self._restart_pending:
             return
         installed = self._installed_probe()
-        if installed is None or installed == self._installed_version:
+        if installed is None or installed == self._running_version:
             return
         self._restart_pending = True
         self._heartbeat(force=True)  # tell peers now that it has no free slot
         self._echo(
-            f"controller reinstalled under this worker ({self._installed_version} -> "
+            f"controller reinstalled under this worker ({self._running_version} -> "
             f"{installed}) — claiming nothing more; exiting for a restart once "
             f"{len(self._in_flight)} in-flight job(s) finish"
         )
@@ -2038,7 +2052,7 @@ class _Scheduler:
         )
 
     def _shutdown(self) -> None:
-        """Ctrl-C: stop every child, then hand its lease back (AC5).
+        """Ctrl-C or SIGTERM: stop every child, then hand its lease back (AC5).
 
         Stopping first and releasing second is deliberate — a lease released
         while its child is still alive would invite a second scheduler to drive
@@ -2141,4 +2155,21 @@ def run_queue(
         installed_version=installed_version or __version__,
         installed_probe=installed_probe or installed_controller_version,
     )
-    return scheduler.run()
+
+    # Story 35.2-004: launchd stops a resident worker with SIGTERM (`launchctl
+    # bootout`, `kickstart -k`), not Ctrl-C. Unhandled, it kills the drain
+    # outright, and its jobs — each in a session of its own, out of reach of
+    # launchd's process-group cleanup — run on unsupervised, their leases live.
+    # As `sdlc queue serve` does, take the Ctrl-C path instead.
+    def _graceful(*_: object) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGTERM, _graceful)
+    except ValueError:
+        previous = None  # not the main thread
+    try:
+        return scheduler.run()
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)  # hand the caller its handler back

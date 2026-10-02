@@ -681,7 +681,9 @@ def check_fleet_worker_installed(
     the plist's environment, and `sdlc queue run` is local-only — so that store
     is the one asked, not this shell's. When the two differ (``queue_path``,
     default ``default_queue_path()``), an online worker is a WARN: jobs enqueued
-    from this shell land in a file it never drains.
+    from this shell land in a file it never drains. So is a fleet queue this
+    shell resolves (``resolve_queue_url``): its enqueues go to the service,
+    which `sdlc queue run` cannot drain yet.
     """
     path = agent_path or default_worker_plist()
     if not path.exists():
@@ -701,8 +703,22 @@ def check_fleet_worker_installed(
     finding = check_fleet_worker(
         QueueStore(store).list_workers, host=host or socket.gethostname().split(".")[0]
     )
+    if finding.status != "CLEAN":
+        return finding
+    try:
+        url = resolve_queue_url()
+    except QueueError:
+        url = None  # malformed: `--enqueue` refuses it and the fleet-queue finding FAILs it
+    if url is not None:
+        return Finding(
+            "fleet-worker", "Fleet worker", "WARN",
+            f"{finding.detail} — but this shell enqueues to the fleet queue at {url}, which "
+            "`sdlc queue run` does not drain yet, so jobs enqueued here never reach it",
+            "unset SDLC_QUEUE_URL (and any queue_url: in .sdlc-queue.yaml / "
+            "~/.sdlc-fleet.yaml) to enqueue to this Mac's worker",
+        )
     local = queue_path if queue_path is not None else default_queue_path()
-    if finding.status != "CLEAN" or store == local:
+    if store == local:
         return finding
     return Finding(
         "fleet-worker", "Fleet worker", "WARN",

@@ -379,6 +379,50 @@ def test_a_worker_lets_its_running_job_finish_before_it_exits(tmp_path) -> None:
     assert store.get_job(second).state == "queued"
 
 
+def test_a_worker_that_self_updated_exits_for_a_restart(tmp_path) -> None:
+    # `--self-update` reinstalls under the worker itself. Its jobs launch the new
+    # install, but the drain still runs the scheduler it imported — so it must
+    # restart like after any other reinstall, not run the old one for good.
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    install = {"version": "2.84.0"}
+
+    def self_updater(_repo, installed: str) -> str | None:
+        if installed == "2.85.0":
+            return None  # nothing newer on the base ref
+        install["version"] = "2.85.0"
+        return "2.85.0"
+
+    def version_check(_repo, installed_version: str | None = None) -> Finding:
+        status = "CLEAN" if installed_version == "2.85.0" else "WARN"
+        return Finding("install", "Installed controller vs checkout", status, "2.85.0 released")
+
+    clock = _BoundedClock()
+    launcher = FakeLauncher(alive_polls=1)
+    result = run_queue(
+        store,
+        config=SchedulerConfig(
+            slots=2, poll_seconds=1.0, follow=True, self_update=True,
+            worker=_profile(repos=["alpha"]),
+        ),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=launcher,
+        clock=clock,
+        sleeper=clock.advance,
+        notifier=lambda *a, **k: None,
+        version_check=version_check,
+        echo=lambda _line: None,
+        identity="m3max",
+        self_updater=self_updater,
+        installed_version="2.84.0",
+        installed_probe=lambda: install["version"],
+    )
+
+    assert result.restart is True
+    assert len(launcher.calls) == 1  # the job it updated for ran, on the new install
+    assert store.get_job(job_id).state == "done"
+
+
 def test_a_draining_worker_advertises_no_free_slots(tmp_path) -> None:
     # Peers defer a job to a less-loaded eligible worker; one that will claim
     # nothing more must not look less loaded while its last job finishes.

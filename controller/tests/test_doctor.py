@@ -1839,6 +1839,46 @@ def test_fleet_worker_is_looked_up_in_the_store_its_plist_pins(tmp_path) -> None
     assert f"SDLC_QUEUE_PATH={pinned}" in finding.remedy
 
 
+def test_fleet_worker_warns_while_this_shell_enqueues_to_a_fleet_queue(tmp_path, monkeypatch) -> None:
+    # The same split by another route: with SDLC_QUEUE_URL exported here,
+    # `--enqueue` lands on the fleet service, which launchd's bare environment
+    # never points the worker at — and `queue run` cannot drain it yet anyway.
+    from sdlc.doctor import check_fleet_worker_installed
+
+    store = tmp_path / "queue.db"
+    _heartbeat(store)
+    monkeypatch.setenv("SDLC_QUEUE_URL", "http://home-lab:8790")
+
+    finding = check_fleet_worker_installed(
+        agent_path=_worker_plist(tmp_path, store=store), host="m3", queue_path=store
+    )
+
+    assert finding is not None
+    assert finding.status == "WARN"
+    assert "m3max" in finding.detail and "online" in finding.detail
+    assert "http://home-lab:8790" in finding.detail
+    assert "SDLC_QUEUE_URL" in finding.remedy
+
+
+def test_fleet_worker_leaves_a_malformed_queue_url_to_the_fleet_queue_finding(
+    tmp_path, monkeypatch
+) -> None:
+    # `--enqueue` fails loudly on it rather than going anywhere, and the
+    # `fleet-queue` finding already FAILs it — this one must not crash on it.
+    from sdlc.doctor import check_fleet_worker_installed
+
+    store = tmp_path / "queue.db"
+    _heartbeat(store)
+    monkeypatch.setenv("SDLC_QUEUE_URL", "not a url")
+
+    finding = check_fleet_worker_installed(
+        agent_path=_worker_plist(tmp_path, store=store), host="m3", queue_path=store
+    )
+
+    assert finding is not None
+    assert finding.status == "CLEAN"
+
+
 def test_fleet_worker_on_a_corrupt_store_fails_instead_of_crashing(tmp_path) -> None:
     # `QueueStore.list_workers` absorbs only a missing table; a file that is not
     # a database raises sqlite3.DatabaseError, which must not escape doctor.

@@ -85,6 +85,16 @@
   <key>ThrottleInterval</key>
   <integer>30</integer>
 
+  <!-- launchd stops the worker with SIGTERM (`launchctl bootout`, which every
+       reinstall of this plist runs, or `kickstart -k`) and sends SIGKILL after
+       ExitTimeOut. The worker takes SIGTERM like Ctrl-C: it stops its running
+       jobs one after another (SIGTERM, then SIGKILL after 10 s) and releases
+       each lease. With two in flight that can take 40 s; launchd's default
+       (system-defined, typically 20 s) would cut it short and leave the
+       second job running unwatched. -->
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+
   <!-- One log for both streams, so the worker's progress (stdout) and its
        errors (stderr) read in order. -->
   <key>StandardOutPath</key>

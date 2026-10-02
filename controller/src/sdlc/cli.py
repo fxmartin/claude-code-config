@@ -3767,8 +3767,9 @@ def queue_run_cmd(
 
     A killed scheduler loses nothing: the next `sdlc queue run` reclaims every
     job whose lease lapsed and re-enters it through `sdlc resume` — never from
-    scratch — while a job whose run pid still answers is left alone. Ctrl-C
-    stops the jobs it started and hands their leases back (exit 130).
+    scratch — while a job whose run pid still answers is left alone. Ctrl-C,
+    or SIGTERM (what launchd sends to stop a LaunchAgent), stops the jobs it
+    started and hands their leases back (exit 130).
 
     A job whose run stops `AWAITING_APPROVAL` is recorded `parked` with its
     PR/MR number and holds no slot (Story 32.2-002). Its change request is
@@ -3862,10 +3863,12 @@ def queue_run_cmd(
     if result.restart:
         # Story 35.2-004: the controller was reinstalled under this worker. 75
         # (EX_TEMPFAIL, "try again") is the exit the LaunchAgent's KeepAlive
-        # turns into a restart on the new code.
+        # turns into a restart on the new code. stderr, so `--json` keeps its
+        # payload last on stdout (it carries `"restart": true` already).
         typer.echo(
             "controller reinstalled under this worker — exiting so its supervisor "
-            "restarts it on the new code"
+            "restarts it on the new code",
+            err=True,
         )
         raise typer.Exit(code=75)
     raise typer.Exit(code=1 if result.failed else 0)
