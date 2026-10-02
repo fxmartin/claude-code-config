@@ -324,6 +324,40 @@ def test_cancelling_a_running_job_kills_its_run_and_releases_the_lease(tmp_path)
     assert any("job" in line and "cancelled" in line for line in lines)
 
 
+class _UnstoppableProc(_CancelProc):
+    """A job whose process-group kill fails (e.g. the group is already gone)."""
+
+    def stop(self) -> None:
+        self.stopped += 1
+        raise OSError("no such process group")
+
+
+def test_a_failed_kill_still_finishes_the_cancel_and_releases_the_lease(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    clock = Clock()
+    proc = _UnstoppableProc()
+    lines: list[str] = []
+
+    run_queue(
+        store,
+        config=SchedulerConfig(slots=1, poll_seconds=1.0, worker=_profile()),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=lambda argv, cwd: proc,
+        clock=clock,
+        sleeper=_cancel_after(store, job_id, clock, passes=3),
+        notifier=lambda *a, **k: None,
+        version_check=_clean,
+        echo=lines.append,
+        identity="m3max",
+    )
+
+    job = store.get_job(job_id)
+    assert proc.stopped == 1
+    assert (job.state, job.claimed_by, job.lease_until) == ("cancelled", None, None)
+    assert any("could not stop pid" in line for line in lines)
+
+
 def test_a_cancel_flagged_job_is_not_resumed_after_its_worker_died(tmp_path) -> None:
     store = _store(tmp_path)
     job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
