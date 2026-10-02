@@ -37,6 +37,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
 | `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise\|unpause` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002), the one host-level rate-limit pause every repo shares (Story 32.2-001), and the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
 | `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), the approval park + auto-resume (Story 32.2-002), one shared rate-limit window discovered and waited out once (Story 32.2-001), and the per-job budget breaker (Story 32.3-001). |
+| `sdlc/queue_server.py` | `sdlc queue serve` — the queue store behind a tailnet-only HTTP API (stdlib `ThreadingHTTPServer`): one route per `QueueStore` verb, a bind that refuses wildcards, and the `tailscale whois` identity gate (Story 35.1-001). |
 | `sdlc/approval.py` | Read-only change-request approval probe — "is PR #N approved / merged / closed?" behind the queue's park (Story 32.2-002). |
 | `sdlc/clean.py` | Safe workspace garbage collection — dry-run-by-default reclamation of orphan worktrees, merged branches, and stale transcript logs, registry/pid-aware (Story 15.3-001). |
 | `sdlc/doctor.py` | Read-side health-check across install/ledger/runs/config/deps — powers `sdlc doctor` (Story 15.1-001). |
@@ -1721,6 +1722,68 @@ reaches the job's own agents rather than just its parent.
   env/file convention) wrapping this same foreground verb. `--follow` keeps the
   loop alive on an empty queue so an intake — the `sdlc listen` supervisor this
   loop becomes — can enqueue into a scheduler that is already draining.
+
+## The fleet queue service (`sdlc queue serve`, Story 35.1-001)
+
+`sdlc queue serve --bind <tailnet-ip>:8790 --allow <login>` puts the host queue
+(`queue.db`, the same file every `sdlc queue` verb reads) behind an HTTP API so
+a job enqueued on one machine can be claimed on another — no second database.
+It is `sdlc/queue_server.py`: stdlib `ThreadingHTTPServer`, the pattern
+`dashboard.py` uses, no new dependency.
+
+**API.** One route per `QueueStore` method of the same name; JSON in, JSON out,
+errors as `{"error": "..."}`. Job responses are `JobRecord.to_dict()` — exactly
+what `sdlc queue list --json` emits.
+
+| Route | Store method | Notes |
+|-------|--------------|-------|
+| `GET /jobs[?repo=PATH]` | `list_jobs` | `{pause, jobs}`, the `queue list --json` envelope |
+| `POST /jobs` | `add_job` | `repo, kind, scope` + optional `priority, options[], labels[], host, pool, requirements{repo,harness,sandbox}`; 201 |
+| `POST /jobs/claim` | `claim_next` | `worker` + optional `lease_seconds, host, pools[]`; the best claimable job, or 204. Held while the queue is paused. |
+| `POST /jobs/{id}/renew` · `/release` | `renew_lease` · `release_claim` | `worker` must hold the claim, else 409 |
+| `POST /jobs/{id}/finish` | `finish_job` | `state` (a terminal), optional `reason`, `worker` (checked against the holder when given) |
+| `POST /jobs/{id}/cancel` · `/requeue` | `cancel_job` · `requeue_job` | a refused state change is 409 |
+| `POST /jobs/{id}/prioritise` | `prioritise_job` | `priority` |
+| `POST /pause` · `DELETE /pause` | `pause_dispatch` · `clear_pause` | `until` (ISO-8601) + optional `reason, run_id, repo, source`; returns `{opened, pause}` |
+
+An unknown job is 404, bad input 400, an oversized (> 1 MiB) body 413.
+`claim_next` is `peek_claimable` in dispatch order, filtered to the caller's
+`host`/`pools` (a job pinned to a `host` goes only there; a `pool` job only to a
+worker serving it), then the existing guarded `claim_job` UPDATE — so the lease
+transaction is still what picks the winner. `requirements` is stored, not yet
+matched; capability matching lands with the worker registry (Story 35.2).
+
+**Single writer.** Every mutation in the fleet passes through this one process,
+and the handlers take one write lock, so a claim's peek-then-UPDATE never
+interleaves with another writer's. Concurrent `/jobs/claim` calls give each job
+exactly one winner.
+
+**Bind rules.** The service never binds `0.0.0.0` or `::`. `--bind` must be an IP
+literal in the tailnet space (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) or
+loopback (unreachable from the tailnet; for local development). Hostnames,
+LAN and public addresses are refused — by the CLI and again by `make_server`.
+
+**Identity model.** A request is served only when all of these hold, else it is
+refused with 403 and a `WARNING` log line naming the peer and the reason:
+
+1. the peer address is on the tailnet (an IPv4-mapped IPv6 peer is judged as its
+   IPv4), and
+2. either it presents `Authorization: Bearer $SDLC_QUEUE_TOKEN` — the shared
+   secret for a host without the Tailscale CLI — or `tailscale whois --json
+   <peer-ip>` returns a `UserProfile.LoginName` in the allowlist (`--allow`,
+   repeatable, plus comma-separated `SDLC_QUEUE_ALLOW`).
+
+The token never bypasses (1). Whois answers are cached per peer IP for 60 seconds
+(errors are not cached); a whois that cannot run admits nobody. With no allowlist
+and no token the service refuses to start. Tagged nodes carry no user login, so
+they authenticate by token. Add `SDLC_QUEUE_PATH` to point the service at a
+non-default store.
+
+**Schema.** One additive migration (`fleet_job_columns`) adds `host` (pin),
+`pool`, `requirements` (JSON) and `worker` (who holds the claim) to `jobs`, all
+nullable: an older `queue.db` upgrades in place and its rows read as "run
+anywhere, held by nobody". `worker` is set by the claim verbs and cleared with
+`claimed_by`.
 
 ## The approval park (`parked`, Story 32.2-002)
 

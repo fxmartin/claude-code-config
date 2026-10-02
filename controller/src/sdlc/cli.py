@@ -3651,5 +3651,76 @@ def queue_prioritise_cmd(
     raise typer.Exit(code=0)
 
 
+@queue_app.command("serve")
+def queue_serve_cmd(
+    bind: str = typer.Option(
+        ...,
+        "--bind",
+        help="<ip>:<port> to listen on — a tailnet address (100.64.0.0/10, "
+        "fd7a:115c:a1e0::/48) or loopback, e.g. 100.101.102.103:8790. "
+        "Wildcards, LAN/public addresses and hostnames are refused.",
+    ),
+    allow: list[str] = typer.Option(
+        [],
+        "--allow",
+        help="Tailscale login name allowed to call the API, repeatable "
+        "(also read, comma-separated, from $SDLC_QUEUE_ALLOW).",
+    ),
+) -> None:
+    """Serve the host queue to the tailnet over HTTP (Story 35.1-001).
+
+    One queue, reachable from every machine on the tailnet: a job enqueued
+    anywhere can be claimed anywhere. The service is a thin front on the same
+    `queue.db` (`SDLC_QUEUE_PATH`) every other `sdlc queue` verb uses, and every
+    route maps one-to-one onto the `QueueStore` method of the same name,
+    returning the `JobRecord` JSON `sdlc queue list --json` emits.
+
+    \b
+    API (JSON bodies; errors are {"error": "..."}):
+      GET    /jobs[?repo=PATH]       {pause, jobs} — `queue list --json`
+      POST   /jobs                   add: repo, kind, scope, [priority, options,
+                                     labels, host, pool, requirements] -> 201
+      POST   /jobs/claim             worker, [lease_seconds, host, pools]
+                                     -> job, or 204 when nothing is claimable
+      POST   /jobs/{id}/renew        worker, [lease_seconds]
+      POST   /jobs/{id}/release      worker, [reason]
+      POST   /jobs/{id}/finish       state, [reason, worker]
+      POST   /jobs/{id}/cancel
+      POST   /jobs/{id}/requeue
+      POST   /jobs/{id}/prioritise   priority
+      POST   /pause                  until, [reason, run_id, repo, source]
+      DELETE /pause
+    404 unknown job/route · 400 bad input · 409 not the claim holder or state
+    refuses the move · 403 refused identity.
+
+    Bind rules: the service never binds 0.0.0.0 (or `::`); `--bind` must be a
+    tailnet IP or loopback, and the same check runs again inside the server.
+
+    Identity model: a request is served only when (1) its peer address is on
+    the tailnet, and (2) either it carries `Authorization: Bearer
+    $SDLC_QUEUE_TOKEN` (the shared-secret fallback for a host without the
+    Tailscale CLI) or `tailscale whois --json <peer-ip>` names a login in the
+    allowlist (`--allow`). Anything else is refused with 403 and logged. Whois
+    answers are cached per peer IP for a minute; a failing whois admits
+    nobody. With no allowlist and no token the service will not start.
+    """
+    import logging
+    import os
+
+    from sdlc.queue import QueueStore, default_queue_path
+    from sdlc.queue_server import AccessPolicy, BindError, parse_bind, serve
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    allowed = [*allow, *os.environ.get("SDLC_QUEUE_ALLOW", "").split(",")]
+    try:
+        host, port = parse_bind(bind)
+        policy = AccessPolicy(allow=allowed, token=os.environ.get("SDLC_QUEUE_TOKEN"))
+    except (BindError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    serve(QueueStore(default_queue_path()), policy, host, port)
+    raise typer.Exit(code=0)
+
+
 if __name__ == "__main__":
     app()

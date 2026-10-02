@@ -59,6 +59,8 @@ def test_init_creates_wal_schema(tmp_path) -> None:
             # file set the repo-scoped overlap graph is built from, and the
             # fix rounds already banked when the breaker last parked the job.
             "budget", "files", "fix_rounds_baseline",
+            # Story 35.1-001: fleet pin, pool, requirements and claim holder.
+            "host", "pool", "requirements", "worker",
         }
     finally:
         conn.close()
