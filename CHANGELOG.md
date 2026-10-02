@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.89.0] - 2026-10-02
+
+### Added
+
+- feat(fleet-execution): queue control from the xps (#35.4-003)
+
+### Fixed
+
+- fix(fleet-execution): queue control from the xps (#35.4-003)
+- fix(fleet-execution): queue control from the xps (#35.4-003)
+
+
 ## [v2.88.0] - 2026-10-02
 
 ### Added
