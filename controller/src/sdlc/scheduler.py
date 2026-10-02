@@ -45,7 +45,7 @@ from sdlc.risk_gate import RISK_APPROVED_LABEL
 
 if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
     from sdlc.build import Ledger
-    from sdlc.queue_worker import WorkerProfile
+    from sdlc.queue_worker import RepoPreparer, RepoRefused, WorkerProfile
 
 __all__ = [
     "DEFAULT_APPROVAL_POLL_SECONDS",
@@ -120,6 +120,17 @@ _RATE_LIMITED = "RATE_LIMITED"
 # same use of `reason` as `_stamp_repo_busy`'s "repo busy".
 _PARKED_REASON = "rate-limited: waiting for the shared window to reopen"
 _WINDOW_SERVED_REASON = "rate-limited: the window reopened — awaiting a free slot"
+
+# Story 35.2-002: how long a sync refused for a reason that clears on its own — a
+# dirty tree, a held lock, a forge that is down — waits before its next try,
+# doubling per refusal up to the cap and reset by a sync that succeeds. Retried
+# on every poll instead, one job costs a claim and a `git status` — or a fetch
+# that can hold the drain for the whole git timeout — every two seconds for as
+# long as the cause lasts. Like the busy-clone wait it is this worker's own view
+# (its clone, its credentials, its route to the forge), so it lives in memory,
+# not in the store its peers read.
+_SYNC_RETRY_SECONDS = 30.0
+_SYNC_RETRY_MAX_SECONDS = 600.0
 
 # Registry *terminal* statuses that mean parked-for-a-human rather than failed:
 # the run reached an end state, but one a human decision reopens (approve the
@@ -323,6 +334,15 @@ class _InFlight:
     # onto the queue row (AC2). Latches, so a job's footprint is read from its
     # ledger once rather than on every poll.
     files_recorded: bool = False
+
+
+@dataclass(frozen=True)
+class _SyncRetry:
+    """When a refused sync may be tried again, the wait that set it, and the refusal."""
+
+    not_before: datetime
+    wait: float
+    reason: str
 
 
 class _PopenProcess:
@@ -829,9 +849,28 @@ class _Scheduler:
         self_updater: SelfUpdater | None = None,
         installed_version: str | None = None,
         run_terminal: RunTerminal = ledger_run_terminal,
+        prepare_repo: "RepoPreparer | None" = None,
         installed_probe: InstalledProbe = installed_controller_version,
     ) -> None:
         self._run_terminal_of = run_terminal
+        # Story 35.2-002: a fleet worker syncs the job's clone before dispatch.
+        self._prepare_repo = prepare_repo
+        # Jobs the sync sent back to `queued` during this `_fill_slots` pass, so
+        # the same pass does not claim them again; and the last reason echoed per
+        # job, so a dirty tree retried on each wait is announced once, not forever.
+        self._refused: set[int] = set()
+        self._refusal_echoed: dict[int, str] = {}
+        # Jobs the sync found their clone busy for, and that clone: such a job
+        # stays queued, unclaimed, until the clone is free (not re-claimed and
+        # handed back on every poll while another run holds it).
+        self._waiting_on: dict[int, str] = {}
+        # Every other refusal that clears on its own waits out a doubling retry
+        # clock, keyed `clone <repo>` for the clone's own causes and `origin
+        # <host/path>` when the forge failed it — then every job on that origin
+        # waits on the one forge, not one fetch per job.
+        self._sync_retry: dict[str, _SyncRetry] = {}
+        # The job whose sync a Ctrl-C or SIGTERM cut short: claimed, never launched.
+        self._interrupted_sync: int | None = None
         self._installed_probe = installed_probe
         # Set once a worker sees the controller reinstalled under it: it claims
         # nothing more and exits when its in-flight jobs are done.
@@ -987,6 +1026,7 @@ class _Scheduler:
         if self._dispatch_paused() or self._restart_pending:
             return False
         progressed = False
+        self._refused.clear()
         # Bounded so a pathological race (every claim lost to another
         # scheduler) can never spin this pass forever.
         for _ in range(64):
@@ -1013,7 +1053,9 @@ class _Scheduler:
             if claimed is None:
                 continue  # lost the race to another scheduler — try the next one
             self._start(claimed, action="resume" if resume else "start", cost=cost)
-            progressed = True
+            # A job the repo sync handed back to `queued` made no progress, and
+            # counting it would keep a drain alive on a dirty tree forever.
+            progressed = progressed or claimed.id not in self._refused
             # Peers weigh load by the last beat, so tell them about the slot just taken.
             self._heartbeat(force=True)
         return progressed
@@ -1083,8 +1125,14 @@ class _Scheduler:
             candidates = self._store.claimable_for_worker(
                 profile.name, candidates, slots_free=self._free_slots(), now=self._clock()
             )
+        if any(job.id in self._waiting_on for job in candidates):
+            in_use = self._clones_in_use()
+            candidates = [job for job in candidates if self._waiting_on.get(job.id) not in in_use]
+        if self._sync_retry:
+            candidates = self._past_sync_waits(candidates)
         for job in candidates:
-            return job, False
+            if job.id not in self._refused:
+                return job, False
         return None
 
     def _stamp_repo_busy(self) -> None:
@@ -1136,6 +1184,13 @@ class _Scheduler:
         # Issue #709: with `--self-update`, try the remedy before parking — this
         # is also the path a job returning from an approval park takes, so a
         # sibling's release reinstalls rather than re-parking it.
+        if action == "start" and self._config.worker is not None:
+            # Story 35.2-002: a fresh job starts from the forge's `main`. Resumes
+            # are left alone — a half-done run must re-enter the tree it left.
+            prepared = self._prepare(job)
+            if prepared is None:
+                return False
+            job = prepared
         finding = self._check_version(job.repo)
         if getattr(finding, "status", "CLEAN") != "CLEAN" and self._self_update(job.repo):
             finding = self._check_version(job.repo)
@@ -1193,6 +1248,165 @@ class _Scheduler:
             f"[pid {proc.pid}, {cost} slot{'s' if cost != 1 else ''}]"
         )
         return True
+
+    def _prepare(self, job: JobRecord) -> JobRecord | None:
+        """Sync the job's clone to the forge's ``main``; ``None`` when the job was refused.
+
+        Returns the job as it will run: its ``repo`` is the clone the sync used,
+        persisted, because a path recorded on another machine means nothing here
+        and every later step (run attach, resume, reconcile, the approval probe,
+        per-repo exclusivity) reads ``job.repo``.
+
+        A dirty tree goes back to ``queued`` with the #590 reason (the owner
+        tidies it), as do a forge that is slow or unreachable and a lock another
+        git process holds — each retried once a doubling wait is up
+        (:meth:`_defer_sync`) — and a clone another live job or run is using,
+        which the job then waits out unclaimed. Anything else needs an operator
+        — wrong origin, a diverged default branch, no clone — so the job parks
+        ``blocked``.
+        """
+        from sdlc.queue_worker import RepoBusy, RepoRefused, prepare_repo
+
+        prepare = self._prepare_repo or prepare_repo
+        # Not the claim's rule (a build only stays clear of a fix): two builds
+        # may share a repo because neither writes to its checkout mid-run, and
+        # the sync does. So nothing else live may hold the clone — this job is
+        # `running` already, from its claim.
+        busy = self._clones_in_use(excluding=job.id)
+        try:
+            prepared = prepare(job, busy_repos=busy, keepalive=lambda: self._keep_alive(job))
+        except KeyboardInterrupt:
+            # Claimed, never launched: `_shutdown` hands this lease back with
+            # the launched jobs', rather than leave it to lapse.
+            self._interrupted_sync = job.id
+            raise
+        except RepoRefused as exc:
+            # Refused or not, the sync held the loop up: renew what is running.
+            self._renew()
+            if isinstance(exc, RepoBusy):
+                self._waiting_on[job.id] = exc.repo
+            else:
+                self._waiting_on.pop(job.id, None)
+                if exc.retryable:
+                    self._defer_sync(job, exc)
+            if exc.retryable:
+                self._store.release_claim(
+                    job.id, claimed_by=self._identity, reason=exc.reason, now=self._clock()
+                )
+                self._refused.add(job.id)
+                if self._refusal_echoed.get(job.id) != exc.reason:
+                    self._refusal_echoed[job.id] = exc.reason
+                    self._echo(f"job {job.id} back to queued: {exc.reason}")
+                return None
+            # Only while the claim is still ours: a slow sync can outlive the
+            # lease, and parking a job a peer reclaimed would strand its run.
+            if not self._store.finish_job(
+                job.id, "blocked", reason=exc.reason, claimed_by=self._identity
+            ):
+                self._echo(f"job {job.id}: lease lost during the repo sync, not parked")
+                return None
+            self._result.parked += 1
+            self._echo(f"job {job.id} parked (blocked): {exc.reason}")
+            self._announce(job, None, "blocked")
+            return None
+        self._waiting_on.pop(job.id, None)
+        self._refusal_echoed.pop(job.id, None)
+        for key in self._sync_keys(job):
+            self._sync_retry.pop(key, None)
+        if not prepared.sha:
+            return job
+        # The sync runs inline and a first clone can take minutes, past the
+        # leases it held up. Re-assert this claim before launching — a peer that
+        # reclaimed the job meanwhile owns it now — and the running jobs' too.
+        self._renew()
+        if not self._store.renew_lease(
+            job.id, claimed_by=self._identity,
+            lease_seconds=self._config.lease_seconds, now=self._clock(),
+        ):
+            self._echo(f"job {job.id}: lease lost during the repo sync, not launched")
+            return None
+        repo = str(prepared.path)
+        self._store.record_sync(job.id, repo=repo, sha=prepared.sha)
+        return replace(job, repo=repo, synced_sha=prepared.sha)
+
+    def _clones_in_use(self, *, excluding: int | None = None) -> set[str]:
+        """Every clone a live job or run on this host works in — what a sync may not touch.
+
+        The queue's own ``running`` jobs (but ``excluding``), plus every live run
+        in the host registry: a `sdlc fix` or `sdlc build --sequential` started by
+        hand works in the clone too, and is no queue job. Live is the registry's
+        own test — unfinished, its pid answering — as ``find_live_owner`` applies it.
+        """
+        live_runs = {
+            record.repo
+            for record in self._registry.records()
+            if not record.finished_at and pid_alive(record.pid)
+        }
+        return self._store.running_repos(excluding=excluding) | live_runs
+
+    @staticmethod
+    def _sync_keys(job: JobRecord) -> list[str]:
+        """The retry clocks ``job``'s sync answers to: its clone's, then its forge's."""
+        from sdlc.queue_worker import sync_origin
+
+        origin = sync_origin(job)
+        return [f"clone {job.repo}"] + ([f"origin {origin}"] if origin else [])
+
+    def _defer_sync(self, job: JobRecord, exc: "RepoRefused") -> None:
+        """Hold ``job``'s next sync back for a wait that doubles per refusal, to a cap.
+
+        The clone's own causes — a dirty tree, a held lock — hold back that
+        clone. A forge that failed the fetch or clone holds back every job on its
+        origin: they would all fail alike, and each fetch to a forge that hangs
+        blocks the drain for the whole git timeout.
+        """
+        from sdlc.queue_worker import ForgeUnavailable
+
+        clone, *forge = self._sync_keys(job)
+        key = forge[0] if forge and isinstance(exc, ForgeUnavailable) else clone
+        last = self._sync_retry.get(key)
+        wait = (
+            _SYNC_RETRY_SECONDS if last is None
+            else min(last.wait * 2, _SYNC_RETRY_MAX_SECONDS)
+        )
+        self._sync_retry[key] = _SyncRetry(
+            not_before=self._clock() + timedelta(seconds=wait), wait=wait, reason=exc.reason
+        )
+
+    def _past_sync_waits(self, candidates: list[JobRecord]) -> list[JobRecord]:
+        """``candidates`` less the jobs whose clone or forge is still waiting out a refusal.
+
+        Each one held back says why in `sdlc queue list`, as `repo busy` does —
+        for a job behind a down forge, a refusal it never got to see itself.
+        """
+        now = self._clock()
+        kept: list[JobRecord] = []
+        for job in candidates:
+            waits = (self._sync_retry.get(key) for key in self._sync_keys(job))
+            retry = next((w for w in waits if w is not None and now < w.not_before), None)
+            if retry is None:
+                kept.append(job)
+            elif job.reason != retry.reason:
+                self._store.set_reason(job.id, retry.reason)
+        return kept
+
+    def _keep_alive(self, job: JobRecord) -> None:
+        """Stay a live worker while a slow fetch or clone for ``job`` blocks the drain.
+
+        Called from the sync's keepalive thread while this one is parked in git
+        (Story 35.2-002): the heartbeat keeps peers from reading this worker
+        offline and cutting its leases, and the renewals keep both its running
+        jobs and the claim it is syncing for out of a peer's reclaim.
+        """
+        try:
+            self._heartbeat()
+            self._renew()
+            self._store.renew_lease(
+                job.id, claimed_by=self._identity,
+                lease_seconds=self._config.lease_seconds, now=self._clock(),
+            )
+        except (QueueError, sqlite3.Error) as exc:
+            self._echo(f"job {job.id}: could not keep the worker alive during its sync: {exc}")
 
     def _check_version(self, repo: str) -> object:
         if not self._self_updated:
@@ -2056,7 +2270,8 @@ class _Scheduler:
 
         Stopping first and releasing second is deliberate — a lease released
         while its child is still alive would invite a second scheduler to drive
-        the same run.
+        the same run. A job whose repo sync the interrupt cut short has no child
+        yet, only its claim, and that goes back too (Story 35.2-002).
         """
         self._echo("interrupted — stopping jobs and releasing leases")
         for job_id, entry in list(self._in_flight.items()):
@@ -2071,6 +2286,12 @@ class _Scheduler:
             )
             self._echo(f"job {job_id}: lease released")
         self._in_flight.clear()
+        if self._interrupted_sync is not None:
+            self._store.release_claim(
+                self._interrupted_sync, claimed_by=self._identity,
+                reason="scheduler interrupted", now=self._clock(),
+            )
+            self._echo(f"job {self._interrupted_sync}: lease released (interrupted mid-sync)")
 
 
 def run_queue(
@@ -2092,6 +2313,7 @@ def run_queue(
     identity: str | None = None,
     self_updater: SelfUpdater | None = None,
     installed_version: str | None = None,
+    prepare_repo: "RepoPreparer | None" = None,
     installed_probe: InstalledProbe | None = None,
 ) -> SchedulerResult:
     """Drain the host queue: claim jobs under a lease and run them as subprocesses.
@@ -2122,7 +2344,9 @@ def run_queue(
     live-API rate-limit check behind a held window (omit it for the real one;
     pass ``None`` to wire none at all), ``notifier`` is the Telegram path, and
     ``self_updater`` is issue #709's reinstall-from-base-ref, consulted only
-    when ``config.self_update`` is set (``installed_version`` seeds it).
+    when ``config.self_update`` is set (``installed_version`` seeds it), and
+    ``prepare_repo`` is Story 35.2-002's pre-dispatch clone sync, run only for a
+    fleet worker (``config.worker``).
     ``installed_probe`` re-reads the installed controller version so a fleet
     worker can exit for a restart after an upgrade (Story 35.2-004).
 
@@ -2153,6 +2377,7 @@ def run_queue(
         identity=identity or f"{socket.gethostname()}:{os.getpid()}",
         self_updater=self_updater or self_update_controller,
         installed_version=installed_version or __version__,
+        prepare_repo=prepare_repo,
         installed_probe=installed_probe or installed_controller_version,
     )
 

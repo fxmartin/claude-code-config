@@ -392,6 +392,10 @@ class JobRecord:
     # holder sees it on its next pass, kills the run's process group and
     # finishes the job ``cancelled``.
     cancel_requested: bool = False
+    # Story 35.2-002: the sha the worker's clone was fast-forwarded to before the
+    # job was dispatched — what the build actually started from. ``None`` until a
+    # worker has synced the repo for this job.
+    synced_sha: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -418,6 +422,7 @@ class JobRecord:
             "requirements": self.requirements,
             "worker": self.worker,
             "cancel_requested": self.cancel_requested,
+            "synced_sha": self.synced_sha,
         }
 
     def job_budget(self) -> JobBudget:
@@ -630,7 +635,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     pool        TEXT,
     requirements TEXT,
     worker      TEXT,
-    cancel_requested INTEGER
+    cancel_requested INTEGER,
+    synced_sha  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -722,6 +728,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (10, "fleet_runs", "fleet_runs", [], _FLEET_RUNS_DDL),
     # Story 35.4-002: the worker's dashboard origin, for a fleet_runs written before it.
     (11, "fleet_run_dashboard_url", "fleet_runs", [("dashboard_url", "TEXT")], None),
+    # Story 35.2-002: the sha a worker's clone was synced to before dispatch.
+    (12, "job_synced_sha", "jobs", [("synced_sha", "TEXT")], None),
 ]
 
 
@@ -879,13 +887,15 @@ def job_needs(job: JobRecord) -> list[_Need]:
     The labels are what `sdlc queue list` prints when nobody can run the job, so
     they read as needs: ``repo X``, ``harness codex``, ``sandbox``, ``host H``,
     ``pool P``. A job that routes any stage to ``codex`` (``harness`` may list
-    several, ``claude,codex``) also needs the :data:`CODEX_POOL`.
+    several, ``claude,codex``) also needs the :data:`CODEX_POOL`. A job that
+    records its ``origin`` does not need a worker that already has the clone:
+    the worker clones it from there before dispatch (Story 35.2-002).
     """
     needs: list[_Need] = []
     if job.host:
         needs.append((f"host {job.host}", _on_host(job.host)))
     requirements = _job_requirements(job)
-    if requirements.get("repo"):
+    if requirements.get("repo") and not requirements.get("origin"):
         needs.append((f"repo {requirements['repo']}", _has_repo(requirements["repo"])))
     harnesses = _csv(requirements.get("harness"))
     for harness in harnesses:
@@ -2073,6 +2083,20 @@ class QueueStore:
                     (reason, moment, job_id, claimed_by),
                 )
 
+    def record_sync(self, job_id: int, *, repo: str, sha: str) -> None:
+        """Record the clone a worker synced for the job, and its sha, before dispatch.
+
+        Story 35.2-002. ``repo`` replaces the recorded path: one written on
+        another machine means nothing on this worker, and every later step — run
+        attach, resume, reconcile, the approval probe, per-repo exclusivity —
+        reads ``repo``.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET repo = ?, synced_sha = ?, updated_at = ? WHERE id = ?",
+                (repo, sha, _now_iso(), job_id),
+            )
+
     def attach_run(self, job_id: int, run_id: str) -> None:
         """Link the job to the run its subprocess opened (Story 32.1-001 AC5)."""
         with self._connect() as conn:
@@ -2328,7 +2352,9 @@ class QueueStore:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
-    def running_repos(self, *, kind: str | None = None) -> set[str]:
+    def running_repos(
+        self, *, kind: str | None = None, excluding: int | None = None
+    ) -> set[str]:
         """Repo paths with a ``running`` job — the per-repo exclusivity set (AC2).
 
         Read from the store rather than from one scheduler's in-memory state so
@@ -2336,14 +2362,19 @@ class QueueStore:
         runs in one repo. ``kind`` narrows to running jobs of that kind only —
         the scheduler uses ``kind="fix"`` (Story 32.1-003) to compute the
         ``fix_busy_repos`` half of :meth:`peek_claimable`'s exclusivity check.
+        ``excluding`` leaves one job out: a claimed job is ``running`` itself,
+        and the repo sync (Story 35.2-002) asks which *other* jobs hold a clone.
         """
         if not self.db_path.exists():
             return set()
         query = "SELECT DISTINCT repo FROM jobs WHERE state = 'running'"
-        params: tuple[str, ...] = ()
+        params: tuple[str | int, ...] = ()
         if kind is not None:
             query += " AND kind = ?"
-            params = (kind,)
+            params += (kind,)
+        if excluding is not None:
+            query += " AND id != ?"
+            params += (excluding,)
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return {row["repo"] for row in rows}
@@ -2389,6 +2420,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         requirements=_optional_column(row, "requirements"),
         worker=_optional_column(row, "worker"),
         cancel_requested=bool(_optional_column(row, "cancel_requested")),
+        synced_sha=_optional_column(row, "synced_sha"),
     )
 
 

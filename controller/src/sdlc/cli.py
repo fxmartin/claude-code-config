@@ -270,8 +270,11 @@ def _enqueue_job(
     :func:`_job_requirements`) and the optional ``host`` pin / ``pool``. The pin
     is checked against the service's worker registry (Story 35.2-001); a pin or
     pool with no fleet queue configured is refused, since nothing would honour it.
+    A local job carries only its ``origin`` (Story 35.2-002), which is what a
+    worker syncs or clones the repo from before dispatch.
     """
     from sdlc.queue_client import QueueClient, open_queue
+    from sdlc.queue_worker import origin_requirements
 
     # Story 35.1-002: with a fleet queue configured the job goes there — and if
     # that service is down this fails, it never falls back to the local queue
@@ -288,15 +291,18 @@ def _enqueue_job(
             _require_known_host(store, host)
         store.init()
         repo = str(Path.cwd().resolve())
-        fleet_fields: dict[str, Any] = {}
-        if fleet:
-            fleet_fields = {
-                "host": host,
-                "pool": pool,
-                "requirements_json": json.dumps(_job_requirements(cli_args, harness_map or {})),
-            }
+        # One requirements value either way. A fleet job's already carries the
+        # origin; a local job records just that (Story 35.2-002), so a worker can
+        # clone the repo, or check its own clone against it, without a path.
+        requirements_json = (
+            json.dumps(_job_requirements(cli_args, harness_map or {}))
+            if fleet
+            else origin_requirements(Path(repo))
+        )
+        fleet_fields: dict[str, Any] = {"host": host, "pool": pool} if fleet else {}
         job_id = store.add_job(
-            repo=repo, kind=kind, scope=scope, options_json=json.dumps(cli_args), **fleet_fields
+            repo=repo, kind=kind, scope=scope, options_json=json.dumps(cli_args),
+            requirements_json=requirements_json, **fleet_fields
         )
     except QueueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -3642,6 +3648,7 @@ def queue_add_cmd(
     `sdlc queue run`; a malformed or non-positive value is ignored.
     """
     from sdlc.queue_client import open_queue
+    from sdlc.queue_worker import origin_requirements
 
     store = open_queue()
     store.init()
@@ -3650,6 +3657,7 @@ def queue_add_cmd(
         job_id = store.add_job(
             repo=repo_path, kind=kind, scope=scope, priority=priority,
             options_json=options, labels=label,
+            requirements_json=origin_requirements(Path(repo_path)),
         )
     except QueueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -3797,6 +3805,26 @@ def queue_run_cmd(
     this verb. Once the controller is reinstalled under a worker (Story
     35.2-004) it claims nothing more, lets its running jobs finish and exits 75,
     so a supervisor (`KeepAlive`) restarts it on the new code.
+
+    Before launching a fresh job a worker syncs its clone (Story 35.2-002):
+    `git fetch origin && git checkout -q main && git merge --ff-only
+    origin/main` — the branch `origin/HEAD` names in place of `main` when the
+    forge's default is another — recording the sha as the job's `synced_sha`.
+    A missing clone is cloned from the origin the job recorded at enqueue
+    (never with a credential: the worker's own `gh`/`glab` login is used) —
+    under `~/Work/<name>` when the recorded path does not exist here, which
+    then becomes the job's repo — so a job that records its origin needs no
+    worker that already has the clone. A tracked-dirty tree
+    (`DIRTY_WORKING_TREE`, never stashed), a forge that is unreachable or slow
+    (a failed or timed-out fetch or clone) or a lock another git process holds
+    sends the job back to `queued`, retried after a wait that doubles from 30 s
+    to 10 min (a forge's failure holds back every job on that origin); so does
+    a clone another live job or run on this host is using (`repo busy` — the
+    sync writes to its checkout, so even two builds take turns, and a `sdlc
+    fix` started by hand counts), and the job then waits for it unclaimed. An `origin mismatch`, a default branch
+    that cannot fast-forward or a directory that is no clone parks it
+    `blocked`. While a fetch or clone is in flight the worker keeps beating
+    and renewing its leases. A resumed run is never synced.
 
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
