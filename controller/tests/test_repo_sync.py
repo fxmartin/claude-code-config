@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import sys
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -20,7 +23,6 @@ from sdlc.queue_worker import (
     RepoRefused,
     WorkerProfile,
     prepare_repo,
-    repo_origin,
     same_origin,
 )
 from sdlc.registry import Registry, RunRecord
@@ -361,14 +363,14 @@ def test_origin_urls_compare_by_host_and_path(left: str, right: str, same: bool)
     assert same_origin(left, right) is same
 
 
-def test_repo_origin_reads_the_origin_url_and_none_when_there_is_none(
-    tmp_path, forge, work_dir
-) -> None:
+def test_a_clone_with_no_origin_remote_is_an_origin_mismatch(tmp_path, forge, work_dir) -> None:
     clone = _clone(forge, work_dir / "proj")
-    assert repo_origin(clone) == forge.url
-    assert repo_origin(tmp_path / "missing") is None
-    git(tmp_path, "init", "-q", "bare-less")
-    assert repo_origin(tmp_path / "bare-less") is None
+    git(clone, "remote", "remove", "origin")
+
+    with pytest.raises(RepoRefused, match=r"has origin \(none\)") as refusal:
+        prepare_repo(_job(tmp_path, clone, forge.url), work_dir=work_dir)
+
+    assert refusal.value.retryable is False
 
 
 def test_malformed_or_non_object_requirements_count_as_no_recorded_origin(
@@ -607,14 +609,95 @@ def test_a_failed_clone_names_the_origin_without_its_credential(
     assert "s3cret" not in refusal.value.reason
 
 
-def test_repo_origin_is_none_when_git_cannot_run(tmp_path, monkeypatch) -> None:
+def test_a_checkout_held_up_by_another_git_s_lock_is_retried_not_parked(
+    tmp_path, forge, work_dir
+) -> None:
+    """An IDE's brief ``index.lock`` clears on its own; `blocked` would need an operator."""
+    clone = _clone(forge, work_dir / "proj")
+    git(clone, "checkout", "-q", "-b", "feature/old")
+    forge.advance()
+    (clone / ".git" / "index.lock").write_text("", encoding="utf-8")
+
+    with pytest.raises(RepoRefused, match="index.lock") as refusal:
+        prepare_repo(_job(tmp_path, clone, forge.url), work_dir=work_dir)
+
+    assert refusal.value.retryable is True
+    assert git(clone, "branch", "--show-current") == "feature/old"
+
+
+# --- a slow fetch or clone keeps the worker alive -------------------------------
+
+
+def _keepalive_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "sdlc-sync-keepalive"]
+
+
+def test_a_slow_fetch_calls_the_keepalive_until_it_returns(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    """The drain is blocked on the fetch, which can outlast the lease and the offline window."""
     from sdlc import queue_worker
 
-    def boom(*_a, **_k):
-        raise FileNotFoundError("git")
+    clone = _clone(forge, work_dir / "proj")
+    monkeypatch.setattr(queue_worker, "_KEEPALIVE_SECONDS", 0.01)
+    beat = threading.Event()
+    real = queue_worker._git
 
-    monkeypatch.setattr(queue_worker.subprocess, "run", boom)
-    assert repo_origin(tmp_path) is None
+    def slow_fetch(root, *args):
+        if args[0] == "fetch":
+            assert beat.wait(30), "no keepalive while the fetch was in flight"
+        return real(root, *args)
+
+    monkeypatch.setattr(queue_worker, "_git", slow_fetch)
+    prepared = prepare_repo(
+        _job(tmp_path, clone, forge.url), work_dir=work_dir, keepalive=beat.set
+    )
+
+    assert prepared.sha == git(forge.seed, "rev-parse", "HEAD")
+    assert _keepalive_threads() == []
+
+
+def test_a_slow_clone_calls_the_keepalive_until_it_returns(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    from sdlc import queue_worker
+
+    monkeypatch.setattr(queue_worker, "_KEEPALIVE_SECONDS", 0.01)
+    beat = threading.Event()
+    real = queue_worker.subprocess.run
+
+    def slow_clone(argv, **kwargs):
+        if argv[:2] == ["git", "clone"]:
+            assert beat.wait(30), "no keepalive while the clone was in flight"
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(queue_worker.subprocess, "run", slow_clone)
+    prepared = prepare_repo(
+        _job(tmp_path, work_dir / "proj", forge.url), work_dir=work_dir, keepalive=beat.set
+    )
+
+    assert prepared.path == work_dir / "proj"
+    assert _keepalive_threads() == []
+
+
+def test_a_clone_interrupted_mid_way_leaves_nothing_behind(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    """Ctrl-C kills git with SIGKILL, which cannot clean up; a half clone reads as dirty."""
+    from sdlc import queue_worker
+
+    target = work_dir / "proj"
+
+    def interrupted(argv, **_kwargs):
+        (target / ".git").mkdir(parents=True)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(queue_worker.subprocess, "run", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        prepare_repo(_job(tmp_path, target, forge.url), work_dir=work_dir, keepalive=lambda: None)
+
+    assert not target.exists()
+    assert _keepalive_threads() == []
 
 
 # --- the scheduler: the sync runs after the claim, before the launch ----------
@@ -679,18 +762,20 @@ class RegisteringLauncher(FakeLauncher):
 
 def _drain(
     tmp_path, store, work_dir, *, worker: bool = True, clock=None, launcher=None,
-    registry=None, preparer=None, **kwargs,
+    registry=None, preparer=None, profile=None, follow: bool = False, sleeper=None,
+    **kwargs,
 ):
     clock = clock or Clock()
     launcher = launcher or FakeLauncher()
-    profile = WorkerProfile(name="xps", host="omarchy-xps13") if worker else None
+    if profile is None and worker:
+        profile = WorkerProfile(name="xps", host="omarchy-xps13")
     result = run_queue(
         store,
-        config=SchedulerConfig(slots=2, poll_seconds=1.0, worker=profile),
+        config=SchedulerConfig(slots=2, poll_seconds=1.0, follow=follow, worker=profile),
         registry=registry or Registry(tmp_path / "registry.json"),
         launcher=launcher,
         clock=clock,
-        sleeper=clock.advance,
+        sleeper=sleeper or clock.advance,
         notifier=lambda *a, **k: None,
         version_check=_clean,
         echo=lambda _line: None,
@@ -915,6 +1000,148 @@ def test_a_build_live_in_the_clone_keeps_its_branch_when_a_second_build_is_claim
     assert git(clone, "branch", "--show-current") == "feature/1.1-001"
 
 
+# --- a clone in use by any live run on this host, queue job or not ----------------
+
+
+def _foreground_run(registry: Registry, clone: Path, *, run_id: str, pid: int) -> None:
+    """A run started by hand in the clone — registered as `run_build`/`run_fix` do."""
+    registry.register(
+        RunRecord(run_id=run_id, repo=str(clone.resolve()), db=str(clone / ".sdlc-state.db"),
+                  scope="42", pid=pid, status="IN_PROGRESS", started_at="")
+    )
+
+
+def test_a_foreground_run_live_in_the_clone_keeps_its_branch(tmp_path, forge, work_dir) -> None:
+    """A hand-run `sdlc fix` works in the repo root and is no queue job; the registry sees it."""
+    clone = _clone(forge, work_dir / "proj")
+    git(clone, "checkout", "-q", "-b", "fix/42")  # clean, between two of its commits
+    forge.advance()
+    registry = Registry(tmp_path / "registry.json")
+    _foreground_run(registry, clone, run_id="by-hand", pid=os.getpid())
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, clone, forge.url)
+
+    result, launcher = _drain(tmp_path, store, work_dir, registry=registry)
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert (job.state, job.claimed_by) == ("queued", None)
+    assert "repo busy" in (job.reason or "")
+    assert (launcher.calls, result.started) == ([], 0)
+    assert git(clone, "branch", "--show-current") == "fix/42"
+
+
+def test_a_finished_or_dead_run_does_not_hold_the_clone(tmp_path, forge, work_dir) -> None:
+    clone = _clone(forge, work_dir / "proj")
+    new_head = forge.advance()
+    registry = Registry(tmp_path / "registry.json")
+    _foreground_run(registry, clone, run_id="finished", pid=os.getpid())
+    registry.mark_finished("finished", "DONE")
+    gone = subprocess.Popen([sys.executable, "-c", ""])
+    gone.wait()
+    _foreground_run(registry, clone, run_id="crashed", pid=gone.pid)
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, clone, forge.url)
+
+    _, launcher = _drain(tmp_path, store, work_dir, registry=registry)
+
+    assert [cwd for _, cwd in launcher.calls] == [str(clone)]
+    job = store.get_job(job_id)
+    assert job is not None and job.synced_sha == new_head
+
+
+class CountingStore(QueueStore):
+    """Counts each job's claims, to tell one claim from a claim on every poll."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.claims: list[int] = []
+
+    def claim_job(self, job_id, **kwargs):
+        self.claims.append(job_id)
+        return super().claim_job(job_id, **kwargs)
+
+
+def test_a_job_waiting_on_a_busy_clone_is_not_claimed_again_until_the_clone_frees(
+    tmp_path, forge, work_dir
+) -> None:
+    """One claim learns the clone is busy; the polls after it leave the job queued."""
+    clone = _clone(forge, work_dir / "proj")
+    store = CountingStore(tmp_path / "queue.db")
+    store.init()
+    clock = Clock()
+    holder = _enqueue(store, clone, forge.url)
+    assert store.claim_job(holder, claimed_by="peer", lease_seconds=3600, now=clock()) is not None
+    waiting = _enqueue(store, clone, forge.url)
+    polls = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        clock.advance(seconds)
+        polls["n"] += 1
+        if polls["n"] == 5:
+            assert store.finish_job(holder, "done", claimed_by="peer")  # the clone frees up
+        if polls["n"] >= 8:
+            raise KeyboardInterrupt
+
+    _, launcher = _drain(tmp_path, store, work_dir, clock=clock, follow=True, sleeper=sleeper)
+
+    assert store.claims.count(waiting) == 2  # the claim that found it busy, then the launch
+    assert [cwd for _, cwd in launcher.calls] == [str(clone)]
+
+
+# --- a fleet job, in 35.3-001's enqueue shape, on a worker without the clone ---------
+
+
+def test_a_worker_without_the_clone_takes_a_fleet_job_and_clones_it(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    """`--enqueue` on a fleet records `repo` as a need; the recorded origin meets it (AC2).
+
+    Enqueued from another machine through the live service, so the job names the
+    repo and its origin but no path this worker has — and this worker has no clone.
+    """
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+    from sdlc.queue_server import AccessPolicy, make_server
+
+    service = QueueStore(tmp_path / "service.db")
+    service.init()
+    server = make_server(
+        service, AccessPolicy(token="t0ken", networks=("127.0.0.0/8",)), "127.0.0.1", 0
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    (tmp_path / "laptop").mkdir()
+    laptop = _clone(forge, tmp_path / "laptop" / "proj")
+    try:
+        with monkeypatch.context() as env:
+            env.chdir(laptop)
+            env.setenv("SDLC_QUEUE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+            env.setenv("SDLC_QUEUE_TOKEN", "t0ken")
+            result = CliRunner().invoke(app, ["build", "epic-1", "--enqueue"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+    assert result.exit_code == 0, result.output
+    shutil.rmtree(laptop)  # the enqueuing machine's path means nothing on this worker
+    (job,) = service.list_jobs()
+    assert json.loads(job.requirements or "{}") == {
+        "repo": "proj", "origin": forge.url, "harness": "claude"
+    }
+
+    profile = WorkerProfile(name="xps", host="omarchy-xps13", harnesses=["claude"])
+    _, launcher = _drain(tmp_path, service, work_dir, profile=profile)
+
+    assert [cwd for _, cwd in launcher.calls] == [str(work_dir / "proj")]
+    synced = service.get_job(job.id)
+    assert synced is not None
+    assert synced.synced_sha == git(forge.seed, "rev-parse", "HEAD")
+
+
 # --- a slow sync must not outlive the claim it runs under ---------------------
 
 
@@ -996,6 +1223,61 @@ def test_a_slow_sync_renews_every_lease_it_held_up(tmp_path, work_dir) -> None:
            preparer=slow_sync)
 
     assert leases and all(lease > clock() for lease in leases.values()), leases
+
+
+def test_a_slow_sync_keeps_the_worker_online_and_every_lease_live(tmp_path, work_dir) -> None:
+    """A peer looking mid-sync sees a live worker and live leases, so it reclaims nothing.
+
+    Without the keepalive the worker misses its heartbeats, a peer's sweep cuts
+    its leases, and the job it just launched — no run attached yet — is
+    released and launched a second time.
+    """
+    forges = {name: Forge(tmp_path / name) for name in ("one", "two")}
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    _enqueue(store, work_dir / "one", forges["one"].url)  # launched first, then held up
+    second = _enqueue(store, work_dir / "two", forges["two"].url)
+    clock = Clock()
+    seen: dict[str, object] = {}
+
+    def slow_sync(job, *, keepalive, **kwargs):
+        if job.id == second:
+            for _ in range(60):  # ten minutes of a slow clone, beaten in 10 s slices
+                clock.advance(10)
+                keepalive()
+            worker = store.get_worker("xps")
+            seen["online"] = worker is not None and worker.is_online(clock())
+            seen["reclaimable"] = [lapsed.id for lapsed in store.expired_running_jobs(now=clock())]
+        return prepare_repo(job, work_dir=work_dir, keepalive=keepalive, **kwargs)
+
+    _, launcher = _drain(tmp_path, store, work_dir, clock=clock, preparer=slow_sync)
+
+    assert seen == {"online": True, "reclaimable": []}
+    assert len(launcher.calls) == 2
+
+
+def test_a_refused_slow_sync_still_renews_the_leases_it_held_up(tmp_path, work_dir) -> None:
+    forges = {name: Forge(tmp_path / name) for name in ("one", "two", "three")}
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    first, second, third = (
+        _enqueue(store, work_dir / name, forge.url) for name, forge in forges.items()
+    )
+    clock = Clock()
+    seen: dict[str, datetime] = {}
+
+    def sync(job, **kwargs):
+        if job.id == second:
+            clock.advance(600)  # far past the 90 s lease of the job already running
+            raise RepoRefused("could not fetch origin in two: timed out", retryable=True)
+        if job.id == third:
+            lease = store.get_job(first).lease_until
+            seen["first"], seen["now"] = datetime.fromisoformat(lease), clock()
+        return prepare_repo(job, work_dir=work_dir, **kwargs)
+
+    _drain(tmp_path, store, work_dir, clock=clock, preparer=sync)
+
+    assert seen and seen["first"] > seen["now"], seen
 
 
 def test_queue_run_help_describes_the_pre_dispatch_sync() -> None:

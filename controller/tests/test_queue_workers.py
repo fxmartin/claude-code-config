@@ -182,6 +182,38 @@ def test_a_job_goes_only_to_a_worker_that_has_the_repo(store) -> None:
     assert claimed.worker == "has-clone"
 
 
+def test_a_job_that_records_its_origin_goes_to_a_worker_without_the_clone(store) -> None:
+    """Story 35.2-002: the worker clones the repo from that origin before dispatch."""
+    _register(store, "no-clone", repos=["something-else"])
+    job_id = _job(
+        store,
+        repo="agentic-coding-monitor",
+        origin="http://gitlab.test/root/agentic-coding-monitor.git",
+        harness="claude",
+    )
+
+    claimed = store.claim_next(claimed_by="no-clone", lease_seconds=90, now=T0)
+    assert claimed is not None and claimed.id == job_id
+
+
+def test_a_recorded_origin_is_never_stamped_as_a_missing_repo(store) -> None:
+    from sdlc.queue import job_needs
+
+    _register(store, "no-clone", repos=[])
+    job_id = _job(
+        store,
+        repo="agentic-coding-monitor",
+        origin="http://gitlab.test/root/agentic-coding-monitor.git",
+        harness="claude",
+    )
+
+    store.stamp_unsatisfiable(now=T0)
+
+    job = store.get_job(job_id)
+    assert job.reason is None
+    assert [label for label, _ in job_needs(job)] == ["harness claude"]
+
+
 def test_a_job_goes_only_to_a_worker_with_the_harness(store) -> None:
     _register(store, "claude-only", harnesses=["claude"])
     _job(store, harness="codex")

@@ -887,13 +887,15 @@ def job_needs(job: JobRecord) -> list[_Need]:
     The labels are what `sdlc queue list` prints when nobody can run the job, so
     they read as needs: ``repo X``, ``harness codex``, ``sandbox``, ``host H``,
     ``pool P``. A job that routes any stage to ``codex`` (``harness`` may list
-    several, ``claude,codex``) also needs the :data:`CODEX_POOL`.
+    several, ``claude,codex``) also needs the :data:`CODEX_POOL`. A job that
+    records its ``origin`` does not need a worker that already has the clone:
+    the worker clones it from there before dispatch (Story 35.2-002).
     """
     needs: list[_Need] = []
     if job.host:
         needs.append((f"host {job.host}", _on_host(job.host)))
     requirements = _job_requirements(job)
-    if requirements.get("repo"):
+    if requirements.get("repo") and not requirements.get("origin"):
         needs.append((f"repo {requirements['repo']}", _has_repo(requirements["repo"])))
     harnesses = _csv(requirements.get("harness"))
     for harness in harnesses:

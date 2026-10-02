@@ -788,6 +788,10 @@ class _Scheduler:
         # job, so a dirty tree retried every poll is announced once, not forever.
         self._refused: set[int] = set()
         self._refusal_echoed: dict[int, str] = {}
+        # Jobs the sync found their clone busy for, and that clone: such a job
+        # stays queued, unclaimed, until the clone is free (not re-claimed and
+        # handed back on every poll while another run holds it).
+        self._waiting_on: dict[int, str] = {}
         self._store = store
         self._config = config
         self._registry = registry
@@ -1027,6 +1031,9 @@ class _Scheduler:
             candidates = self._store.claimable_for_worker(
                 profile.name, candidates, slots_free=self._free_slots(), now=self._clock()
             )
+        if any(job.id in self._waiting_on for job in candidates):
+            in_use = self._clones_in_use()
+            candidates = [job for job in candidates if self._waiting_on.get(job.id) not in in_use]
         for job in candidates:
             if job.id not in self._refused:
                 return job, False
@@ -1153,22 +1160,29 @@ class _Scheduler:
         per-repo exclusivity) reads ``job.repo``.
 
         A dirty tree goes back to ``queued`` with the #590 reason (the owner
-        tidies it; the next poll retries), as do a clone another live job is
-        using and a forge that is slow or unreachable. Anything else needs an
-        operator — wrong origin, a diverged default branch, no clone — so the
-        job parks ``blocked``.
+        tidies it; the next poll retries), as do a forge that is slow or
+        unreachable and a lock another git process holds — and a clone another
+        live job or run is using, which the job then waits out unclaimed. Anything
+        else needs an operator — wrong origin, a diverged default branch, no
+        clone — so the job parks ``blocked``.
         """
-        from sdlc.queue_worker import RepoRefused, prepare_repo
+        from sdlc.queue_worker import RepoBusy, RepoRefused, prepare_repo
 
         prepare = self._prepare_repo or prepare_repo
         # Not the claim's rule (a build only stays clear of a fix): two builds
         # may share a repo because neither writes to its checkout mid-run, and
-        # the sync does. So no *other* live job may hold the clone — this one is
+        # the sync does. So nothing else live may hold the clone — this job is
         # `running` already, from its claim.
-        busy = self._store.running_repos(excluding=job.id)
+        busy = self._clones_in_use(excluding=job.id)
         try:
-            prepared = prepare(job, busy_repos=busy)
+            prepared = prepare(job, busy_repos=busy, keepalive=lambda: self._keep_alive(job))
         except RepoRefused as exc:
+            # Refused or not, the sync held the loop up: renew what is running.
+            self._renew()
+            if isinstance(exc, RepoBusy):
+                self._waiting_on[job.id] = exc.repo
+            else:
+                self._waiting_on.pop(job.id, None)
             if exc.retryable:
                 self._store.release_claim(
                     job.id, claimed_by=self._identity, reason=exc.reason, now=self._clock()
@@ -1189,6 +1203,7 @@ class _Scheduler:
             self._echo(f"job {job.id} parked (blocked): {exc.reason}")
             self._announce(job, None, "blocked")
             return None
+        self._waiting_on.pop(job.id, None)
         self._refusal_echoed.pop(job.id, None)
         if not prepared.sha:
             return job
@@ -1205,6 +1220,39 @@ class _Scheduler:
         repo = str(prepared.path)
         self._store.record_sync(job.id, repo=repo, sha=prepared.sha)
         return replace(job, repo=repo, synced_sha=prepared.sha)
+
+    def _clones_in_use(self, *, excluding: int | None = None) -> set[str]:
+        """Every clone a live job or run on this host works in — what a sync may not touch.
+
+        The queue's own ``running`` jobs (but ``excluding``), plus every live run
+        in the host registry: a `sdlc fix` or `sdlc build --sequential` started by
+        hand works in the clone too, and is no queue job. Live is the registry's
+        own test — unfinished, its pid answering — as ``find_live_owner`` applies it.
+        """
+        live_runs = {
+            record.repo
+            for record in self._registry.records()
+            if not record.finished_at and pid_alive(record.pid)
+        }
+        return self._store.running_repos(excluding=excluding) | live_runs
+
+    def _keep_alive(self, job: JobRecord) -> None:
+        """Stay a live worker while a slow fetch or clone for ``job`` blocks the drain.
+
+        Called from the sync's keepalive thread while this one is parked in git
+        (Story 35.2-002): the heartbeat keeps peers from reading this worker
+        offline and cutting its leases, and the renewals keep both its running
+        jobs and the claim it is syncing for out of a peer's reclaim.
+        """
+        try:
+            self._heartbeat()
+            self._renew()
+            self._store.renew_lease(
+                job.id, claimed_by=self._identity,
+                lease_seconds=self._config.lease_seconds, now=self._clock(),
+            )
+        except (QueueError, sqlite3.Error) as exc:
+            self._echo(f"job {job.id}: could not keep the worker alive during its sync: {exc}")
 
     def _check_version(self, repo: str) -> object:
         if not self._self_updated:
