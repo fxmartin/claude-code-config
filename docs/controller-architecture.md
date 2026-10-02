@@ -1753,15 +1753,26 @@ worker serving it), then the existing guarded `claim_job` UPDATE — so the leas
 transaction is still what picks the winner. `requirements` is stored, not yet
 matched; capability matching lands with the worker registry (Story 35.2).
 
-**Single writer.** Every mutation in the fleet passes through this one process,
-and the handlers take one write lock, so a claim's peek-then-UPDATE never
-interleaves with another writer's. Concurrent `/jobs/claim` calls give each job
-exactly one winner.
+Pins are honoured by `/jobs/claim` only. `sdlc queue run` still claims through
+`peek_claimable`/`claim_job` with no `host`/`pool` filter, so a drain on the
+serving host takes a job pinned elsewhere, and reclaims a fleet claim whose
+lease lapsed, until Story 35.2-001 brings pin matching to the drain loop. Do not
+run a local drain on the serving host while pinned jobs are queued.
+
+**Single writer.** The service's handlers take one write lock, so within the
+service a claim's peek-then-UPDATE never interleaves with another's. It is not
+the only writer: local `sdlc queue` verbs and `sdlc queue run` still write
+`queue.db` directly. What makes concurrent `/jobs/claim` calls — and any local
+claimer — give each job exactly one winner is `claim_job`'s guarded UPDATE under
+SQLite's write lock.
 
 **Bind rules.** The service never binds `0.0.0.0` or `::`. `--bind` must be an IP
 literal in the tailnet space (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) or
 loopback (unreachable from the tailnet; for local development). Hostnames,
 LAN and public addresses are refused — by the CLI and again by `make_server`.
+A bind that fails (address in use, tailnet address not up) exits 2 with the
+reason. Each socket read has a 30-second deadline, so a stalled request cannot
+pin a handler thread.
 
 **Identity model.** A request is served only when all of these hold, else it is
 refused with 403 and a `WARNING` log line naming the peer and the reason:
@@ -1775,9 +1786,13 @@ refused with 403 and a `WARNING` log line naming the peer and the reason:
 
 The token never bypasses (1). Whois answers are cached per peer IP for 60 seconds
 (errors are not cached); a whois that cannot run admits nobody. With no allowlist
-and no token the service refuses to start. Tagged nodes carry no user login, so
-they authenticate by token. Add `SDLC_QUEUE_PATH` to point the service at a
-non-default store.
+and no token the service refuses to start, and a non-ASCII `SDLC_QUEUE_TOKEN` is
+refused too (header values arrive latin-1 decoded, so it could never match). A
+gate that errors on a request answers 403, never a dropped connection. Tagged
+nodes carry no user login, so they authenticate by token. On a loopback bind,
+gate (1) admits loopback peers instead of the tailnet. Whois cannot vouch for a
+loopback peer, so local development authenticates by token. Add
+`SDLC_QUEUE_PATH` to point the service at a non-default store.
 
 **Schema.** One additive migration (`fleet_job_columns`) adds `host` (pin),
 `pool`, `requirements` (JSON) and `worker` (who holds the claim) to `jobs`, all

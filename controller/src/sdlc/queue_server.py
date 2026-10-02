@@ -23,6 +23,7 @@ from sdlc.queue import JobRecord, QueueError, QueueStore
 from sdlc.scheduler import DEFAULT_LEASE_SECONDS
 
 __all__ = [
+    "LOOPBACK_NETWORKS",
     "TAILNET_NETWORKS",
     "AccessPolicy",
     "BindError",
@@ -39,11 +40,12 @@ logger = logging.getLogger("sdlc.queue_server")
 # Tailscale's address space: the CGNAT block IPv4 nodes live in and the ULA
 # prefix IPv6 nodes live in. A peer outside these is not on the tailnet.
 TAILNET_NETWORKS: tuple[str, ...] = ("100.64.0.0/10", "fd7a:115c:a1e0::/48")
+LOOPBACK_NETWORKS: tuple[str, ...] = ("127.0.0.0/8", "::1/128")
 
 # The service may also *bind* loopback — unreachable from the tailnet, so no
 # exposure, and what makes local development and tests possible. It is never a
 # valid *peer* unless the policy is built to trust it explicitly.
-_BIND_NETWORKS = TAILNET_NETWORKS + ("127.0.0.0/8", "::1/128")
+_BIND_NETWORKS = TAILNET_NETWORKS + LOOPBACK_NETWORKS
 
 # Requests are small JSON documents; a megabyte is generous and bounds what an
 # authorised-but-buggy client can make a handler thread buffer.
@@ -51,6 +53,10 @@ MAX_BODY_BYTES = 1024 * 1024
 # How much of an oversized body is read-and-discarded before answering 413, so
 # the client sees the status rather than a reset connection.
 _DRAIN_LIMIT = 16 * 1024 * 1024
+# Per-socket-read deadline. The identity gate only runs once headers are in, so
+# without it any tailnet peer — allowlisted or not — could pin a handler thread
+# with a request that never finishes.
+_REQUEST_TIMEOUT_SECONDS = 30
 
 WHOIS_CACHE_SECONDS = 60
 _WHOIS_TIMEOUT_SECONDS = 5
@@ -188,6 +194,11 @@ class AccessPolicy:
                 "access policy needs an identity allowlist (--allow / SDLC_QUEUE_ALLOW) "
                 "or a token (SDLC_QUEUE_TOKEN); refusing to serve everyone"
             )
+        if self._token and not self._token.isascii():
+            # http.server decodes header values as latin-1, so a non-ASCII
+            # secret could never match what a client sends: refuse it up front
+            # rather than serve a token gate that admits nobody.
+            raise ValueError("SDLC_QUEUE_TOKEN must be ASCII")
         self._networks = _networks(networks)
         self._whois = whois
         self._ttl = ttl
@@ -204,7 +215,13 @@ class AccessPolicy:
             addr = addr.ipv4_mapped
         if not any(addr in net for net in self._networks):
             return Decision(False, "peer is not on the tailnet")
-        if self._token and bearer is not None and hmac.compare_digest(bearer, self._token):
+        # Compare bytes: compare_digest raises TypeError on non-ASCII str, and a
+        # peer chooses what its Authorization header carries.
+        if (
+            self._token
+            and bearer is not None
+            and hmac.compare_digest(bearer.encode(), self._token.encode())
+        ):
             return Decision(True, "token")
         if not self._allow:
             return Decision(False, "no valid token and no identity allowlist")
@@ -462,6 +479,7 @@ def _route(method: str, path: str, routes: _Routes) -> Callable[[dict[str, list[
 
 class _Handler(BaseHTTPRequestHandler):
     server: "_QueueServer"
+    timeout = _REQUEST_TIMEOUT_SECONDS
 
     def do_GET(self) -> None:
         self._dispatch("GET")
@@ -477,7 +495,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         peer = self.client_address[0]
-        decision = self.server.policy.authorize(peer, self._bearer())
+        try:
+            decision = self.server.policy.authorize(peer, self._bearer())
+        except Exception as exc:  # noqa: BLE001 — the gate fails closed: a crash is a refusal
+            # The type only: an encode error's repr would carry the presented secret.
+            decision = Decision(False, f"authorization error ({type(exc).__name__})")
         if not decision.allowed:
             logger.warning("refused %s %s from %s: %s", method, self.path, peer, decision.detail)
             self._send(403, {"error": "forbidden"})
@@ -489,12 +511,16 @@ class _Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 status, payload = handler(parse_qs(url.query), body)
             else:
-                # Single writer by construction: every mutation in the fleet
-                # funnels through this one process, and this lock makes the
-                # funnel one-at-a-time — a claim's peek-then-UPDATE never
-                # interleaves with another writer's, whatever the thread count.
+                # Single writer within this service: the lock makes its handlers
+                # one-at-a-time, so one claim's peek-then-UPDATE never interleaves
+                # with another's, whatever the thread count. Local `sdlc queue`
+                # verbs and `sdlc queue run` still write queue.db directly, so
+                # claim safety across processes rests on claim_job's guarded
+                # UPDATE, not on this lock.
                 with self.server.write_lock:
                     status, payload = handler(parse_qs(url.query), body)
+        except TimeoutError:
+            raise  # a stalled client: http.server logs it and hangs up — not a 500
         except _ApiError as exc:
             self._send(exc.status, {"error": exc.message})
         except sqlite3.OperationalError as exc:

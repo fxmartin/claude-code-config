@@ -3702,23 +3702,45 @@ def queue_serve_cmd(
     Tailscale CLI) or `tailscale whois --json <peer-ip>` names a login in the
     allowlist (`--allow`). Anything else is refused with 403 and logged. Whois
     answers are cached per peer IP for a minute; a failing whois admits
-    nobody. With no allowlist and no token the service will not start.
+    nobody. With no allowlist and no token the service will not start. On a
+    loopback bind (local development) the peer gate admits loopback instead
+    of the tailnet; whois cannot vouch for a loopback peer, so it needs the
+    token.
     """
+    import ipaddress
     import logging
     import os
 
     from sdlc.queue import QueueStore, default_queue_path
-    from sdlc.queue_server import AccessPolicy, BindError, parse_bind, serve
+    from sdlc.queue_server import (
+        LOOPBACK_NETWORKS,
+        TAILNET_NETWORKS,
+        AccessPolicy,
+        BindError,
+        parse_bind,
+        serve,
+    )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     allowed = [*allow, *os.environ.get("SDLC_QUEUE_ALLOW", "").split(",")]
     try:
         host, port = parse_bind(bind)
-        policy = AccessPolicy(allow=allowed, token=os.environ.get("SDLC_QUEUE_TOKEN"))
+        # A loopback socket is reachable only from this host, so its peers are
+        # loopback; gating them on the tailnet ranges would refuse every call.
+        loopback = ipaddress.ip_address(host).is_loopback
+        policy = AccessPolicy(
+            allow=allowed,
+            token=os.environ.get("SDLC_QUEUE_TOKEN"),
+            networks=LOOPBACK_NETWORKS if loopback else TAILNET_NETWORKS,
+        )
     except (BindError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
-    serve(QueueStore(default_queue_path()), policy, host, port)
+    try:
+        serve(QueueStore(default_queue_path()), policy, host, port)
+    except OSError as exc:  # address in use, tailnet address not up, ...
+        typer.echo(f"error: cannot serve on {bind}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     raise typer.Exit(code=0)
 
 

@@ -407,6 +407,75 @@ def test_policy_without_allowlist_or_token_is_refused_at_construction() -> None:
         AccessPolicy(allow=[], token=None)
 
 
+def test_non_ascii_bearer_is_refused_not_raised() -> None:
+    # hmac.compare_digest raises TypeError on non-ASCII str; the gate must answer.
+    policy = AccessPolicy(token="s3cret", networks=LOOPBACK)
+    assert not policy.authorize("127.0.0.1", "sécret").allowed
+    assert policy.authorize("127.0.0.1", "s3cret").allowed
+
+
+def test_non_ascii_token_is_refused_at_construction() -> None:
+    # Header values arrive latin-1 decoded, so a non-ASCII secret could never match.
+    with pytest.raises(ValueError, match="ASCII"):
+        AccessPolicy(token="sécret", networks=LOOPBACK)
+
+
+def test_non_ascii_authorization_header_is_403_and_logged(store, caplog) -> None:
+    import http.client
+
+    running = _Running(store, AccessPolicy(token="s3cret", networks=LOOPBACK))
+    host, port = running.url.removeprefix("http://").split(":")
+    try:
+        conn = http.client.HTTPConnection(host, int(port), timeout=10)
+        with caplog.at_level("WARNING", logger="sdlc.queue_server"):
+            conn.putrequest("GET", "/jobs")
+            conn.putheader("Authorization", "Bearer sécret".encode())
+            conn.endheaders()
+            assert conn.getresponse().status == 403
+        conn.close()
+        assert "refused" in caplog.text
+    finally:
+        running.stop()
+
+
+def test_a_crashing_authorizer_fails_closed_with_403(store, caplog) -> None:
+    def broken(ip):
+        raise RuntimeError("whois exploded")
+
+    running = _Running(store, _policy(whois=broken))
+    try:
+        with caplog.at_level("WARNING", logger="sdlc.queue_server"):
+            assert running.call("GET", "/jobs")[0] == 403
+        assert "refused" in caplog.text and "RuntimeError" in caplog.text
+    finally:
+        running.stop()
+
+
+@pytest.mark.parametrize(
+    "partial",
+    [
+        b"GET /jobs HTTP/1.1\r\nHost: x\r\n",  # headers never finish
+        b"POST /jobs HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n{}",  # body never finishes
+    ],
+)
+def test_a_stalled_request_is_timed_out_not_held_forever(store, monkeypatch, partial) -> None:
+    import socket
+
+    from sdlc import queue_server
+
+    assert queue_server._Handler.timeout is not None  # the shipped default bounds a handler
+    monkeypatch.setattr(queue_server._Handler, "timeout", 0.2)
+    running = _Running(store, _policy())
+    host, port = running.url.removeprefix("http://").split(":")
+    try:
+        with socket.create_connection((host, int(port)), timeout=10) as sock:
+            sock.sendall(partial)
+            # The server hangs up on the stalled client: EOF, and no 500 answer.
+            assert sock.recv(4096) == b""
+    finally:
+        running.stop()
+
+
 # --- bind rules ----------------------------------------------------------------
 
 
@@ -501,6 +570,55 @@ def test_serve_refuses_to_start_without_an_allowlist_or_token(tmp_path, monkeypa
     result = CliRunner().invoke(app, ["queue", "serve", "--bind", "127.0.0.1:0"])
     assert result.exit_code == 2
     assert "allow" in result.output.lower()
+
+
+def _capture_serve(monkeypatch) -> dict:
+    captured: dict = {}
+
+    def fake_serve(store, policy, host, port) -> None:
+        captured.update(policy=policy, host=host, port=port)
+
+    monkeypatch.setattr("sdlc.queue_server.serve", fake_serve)
+    return captured
+
+
+def test_serve_on_loopback_admits_loopback_peers_by_token(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.setenv("SDLC_QUEUE_TOKEN", "s3cret")
+    monkeypatch.delenv("SDLC_QUEUE_ALLOW", raising=False)
+    captured = _capture_serve(monkeypatch)
+    result = CliRunner().invoke(app, ["queue", "serve", "--bind", "127.0.0.1:0"])
+    assert result.exit_code == 0, result.output
+    policy = captured["policy"]
+    assert policy.authorize("127.0.0.1", "s3cret").allowed
+    assert not policy.authorize("127.0.0.1", "wrong").allowed
+    assert not policy.authorize("100.64.0.1", "s3cret").allowed
+
+
+def test_serve_on_a_tailnet_address_admits_only_tailnet_peers(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.setenv("SDLC_QUEUE_TOKEN", "s3cret")
+    captured = _capture_serve(monkeypatch)
+    result = CliRunner().invoke(app, ["queue", "serve", "--bind", "100.101.102.103:8790"])
+    assert result.exit_code == 0, result.output
+    policy = captured["policy"]
+    assert policy.authorize("100.64.0.1", "s3cret").allowed
+    assert not policy.authorize("127.0.0.1", "s3cret").allowed
+
+
+def test_serve_reports_a_bind_failure_without_a_traceback(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.setenv("SDLC_QUEUE_TOKEN", "s3cret")
+
+    def in_use(*_a, **_k) -> None:
+        raise OSError(98, "Address already in use")
+
+    monkeypatch.setattr("sdlc.queue_server.serve", in_use)
+    result = CliRunner().invoke(app, ["queue", "serve", "--bind", "127.0.0.1:8790"])
+    assert result.exit_code == 2
+    assert "Address already in use" in result.output
+    assert "127.0.0.1:8790" in result.output
+    assert not isinstance(result.exception, OSError)
 
 
 # --- coverage gaps: whois, serve(), HTTP edge cases ------------------------------
