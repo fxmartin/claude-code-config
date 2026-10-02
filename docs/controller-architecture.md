@@ -1818,35 +1818,47 @@ registry (`workers` table, migration 7) lives with the jobs it serves.
 **Repo auto-sync before dispatch (Story 35.2-002).** `sdlc build --enqueue`,
 `sdlc fix --enqueue` and `sdlc queue add` record the clone's `origin`
 (`git remote get-url origin`) in the job's `requirements` — offline, so a job
-is self-describing. A `--worker` drain then prepares the clone *after* claiming
-a fresh job and *before* launching it (a resumed run re-enters its own tree and
-is never synced):
+is self-describing — and without credentials: a job is stored, served to every
+queue client and printed by `sdlc queue list`, so an http(s) URL loses its
+whole userinfo (`https://oauth2:<token>@…`, or a GitHub token alone in the user
+slot) and an ssh URL keeps its `git@` user but no password. A `--worker` drain
+then prepares the clone *after* claiming a fresh job and *before* launching it
+(a resumed run re-enters its own tree and is never synced):
 
 1. the clone is the job's own path if that directory exists on this host, else
-   `~/Work/<name>` — a path recorded on another machine means nothing here. A
-   clone reached under that other name must pass the claim's per-repo
-   exclusivity too: one already running a conflicting job (any job for a `fix`,
-   a `fix` for a `build`) sends the job back to `queued` with `repo busy`,
-   before git touches the clone;
+   `~/Work/<name>` — a path recorded on another machine means nothing here.
+   Under either name the clone must be free of every *other* live job: the sync
+   checks out and fast-forwards it, a write to the shared checkout that the
+   claim's build/build overlap (Story 32.1-003) assumes no job makes mid-run —
+   and a `fix`, or a `--sequential` build on `feature/<id>`, works in that very
+   checkout. So a clone another job holds sends the job back to `queued` with
+   `repo busy`, before git touches it, and two builds in one repo take turns on
+   a worker;
 2. absent clone → `git clone -- <recorded origin>` (an origin starting with `-`
    is refused; git reaches the forge with the worker's own `gh`/`glab`
    credential helper);
 3. the clone's `origin` must be the recorded one (compared by host + path, so
    `git@host:o/r.git`, `ssh://…` and `https://…` agree) — otherwise the job is
    parked `blocked` with `origin mismatch: <path> has origin A but the job
-   records B`;
+   records B`, both shown without credentials;
 4. a tracked-dirty tree (`dirty_tree_paths`; untracked scratch is ignored) sends
    the job back to `queued` with a `DIRTY_WORKING_TREE` reason — the #590 rule,
    never a stash — and the next poll retries it;
-5. `git fetch origin && git checkout -q main && git merge --ff-only origin/main`;
-   a `main` that cannot fast-forward parks the job `blocked`, untouched (the
-   reason says "diverged" only when `merge-base --is-ancestor` confirms it — a
-   merge also aborts on local changes to the exempt progress render). A git
-   call that times out is transient: the job goes back to `queued`, and a
-   timed-out clone's half-written directory is removed first;
+5. `git fetch origin && git checkout -q <default> && git merge --ff-only
+   origin/<default>`, where `<default>` is the branch `origin/HEAD` names — the
+   ref the build cuts story branches from (Story 23.2-001) — else `main`; a
+   default branch that cannot fast-forward parks the job `blocked`, untouched
+   (the reason says "diverged" only when `merge-base --is-ancestor` confirms it
+   — a merge also aborts on local changes to the exempt progress render). A
+   fetch or clone that fails or times out is the forge, not the job — down,
+   rebooting, a credential to renew — so the job goes back to `queued` with
+   git's error as its reason, and a timed-out clone's half-written directory is
+   removed first; a forge outage leaves the queue `queued`, never `blocked`;
 6. the scheduler renews the claim (and every running job's lease the sync held
    up) before launching — a peer that reclaimed the job during a slow clone owns
-   it, so it is not launched twice — then records the clone path as the job's
+   it, so it is neither launched twice nor parked by the scheduler that lost
+   it (a `blocked` refusal is stamped only while the claim is still its
+   own) — then records the clone path as the job's
    `repo` and the resulting sha as its `synced_sha` (migration 8, in `sdlc queue
    list --json`), and launches the job there. Run attach, resume, reconcile and
    the approval probe all read `repo`, so they follow the clone, not the path

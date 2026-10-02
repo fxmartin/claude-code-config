@@ -2101,7 +2101,9 @@ class QueueStore:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
-    def running_repos(self, *, kind: str | None = None) -> set[str]:
+    def running_repos(
+        self, *, kind: str | None = None, excluding: int | None = None
+    ) -> set[str]:
         """Repo paths with a ``running`` job — the per-repo exclusivity set (AC2).
 
         Read from the store rather than from one scheduler's in-memory state so
@@ -2109,14 +2111,19 @@ class QueueStore:
         runs in one repo. ``kind`` narrows to running jobs of that kind only —
         the scheduler uses ``kind="fix"`` (Story 32.1-003) to compute the
         ``fix_busy_repos`` half of :meth:`peek_claimable`'s exclusivity check.
+        ``excluding`` leaves one job out: a claimed job is ``running`` itself,
+        and the repo sync (Story 35.2-002) asks which *other* jobs hold a clone.
         """
         if not self.db_path.exists():
             return set()
         query = "SELECT DISTINCT repo FROM jobs WHERE state = 'running'"
-        params: tuple[str, ...] = ()
+        params: tuple[str | int, ...] = ()
         if kind is not None:
             query += " AND kind = ?"
-            params = (kind,)
+            params += (kind,)
+        if excluding is not None:
+            query += " AND id != ?"
+            params += (excluding,)
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return {row["repo"] for row in rows}

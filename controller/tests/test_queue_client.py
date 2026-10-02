@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import threading
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -428,6 +429,14 @@ def test_enqueue_with_live_url_lands_on_the_service(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live: _Live, store: QueueStore
 ) -> None:
     _project(tmp_path)
+    # A real clone always has an origin, so a real enqueue always sends it in
+    # `requirements` (Story 35.2-002) — the service must take it, not 400 the job.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         "http://gitlab.test/root/proj.git"],
+        check=True,
+    )
     monkeypatch.chdir(tmp_path)
     local = tmp_path / "queue.db"
     monkeypatch.setenv("SDLC_QUEUE_PATH", str(local))
@@ -440,6 +449,7 @@ def test_enqueue_with_live_url_lands_on_the_service(
     [job] = store.list_jobs()
     assert job.kind == "build" and job.scope == "epic-99"
     assert job.repo == str(tmp_path.resolve())
+    assert json.loads(job.requirements or "{}") == {"origin": "http://gitlab.test/root/proj.git"}
     assert not local.exists()
 
 

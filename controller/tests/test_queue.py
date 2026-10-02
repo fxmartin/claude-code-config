@@ -435,6 +435,21 @@ def test_running_repos_filters_by_kind(tmp_path) -> None:
     assert store.running_repos(kind="build") == {build_repo}
 
 
+def test_running_repos_can_leave_out_the_job_asking(tmp_path) -> None:
+    """Story 35.2-002: a claimed job is `running` itself, so its own sync must not count it."""
+    store = _store(tmp_path)
+    repo = str(tmp_path / "alpha")
+    mine = store.add_job(repo=repo, kind="build", scope="epic-1")
+    store.claim_job(mine, claimed_by="w1", lease_seconds=90)
+
+    assert store.running_repos(excluding=mine) == set()
+
+    other = store.add_job(repo=repo, kind="build", scope="epic-2")
+    store.claim_job(other, claimed_by="w2", lease_seconds=90)
+    assert store.running_repos(excluding=mine) == {repo}
+    assert store.running_repos(kind="fix", excluding=mine) == set()
+
+
 def test_row_to_record_reads_a_pre_32_3_001_row_without_crashing(tmp_path) -> None:
     """A jobs table from before Story 32.3-001 has no `budget`/`files` columns;
     `_optional_column` must degrade that absence to `None` rather than raising."""

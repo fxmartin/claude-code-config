@@ -49,17 +49,18 @@ def commit(repo: Path, name: str, text: str = "x\n") -> str:
 
 
 class Forge:
-    """A bare ``origin`` plus the seed clone that advances its ``main``."""
+    """A bare ``origin`` plus the seed clone that advances its default branch."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, branch: str = "main") -> None:
+        self.branch = branch
         self.bare = root / "forge" / "proj.git"
         self.bare.mkdir(parents=True)
-        git(self.bare, "init", "-q", "--bare", "-b", "main")
+        git(self.bare, "init", "-q", "--bare", "-b", branch)
         self.seed = root / "seed"
         git(root, "clone", "-q", str(self.bare), str(self.seed))
-        git(self.seed, "checkout", "-q", "-b", "main")
+        git(self.seed, "checkout", "-q", "-b", branch)
         commit(self.seed, "README.md")
-        git(self.seed, "push", "-q", "origin", "main")
+        git(self.seed, "push", "-q", "origin", branch)
 
     @property
     def url(self) -> str:
@@ -67,8 +68,15 @@ class Forge:
 
     def advance(self, name: str = "next.txt") -> str:
         sha = commit(self.seed, name)
-        git(self.seed, "push", "-q", "origin", "main")
+        git(self.seed, "push", "-q", "origin", self.branch)
         return sha
+
+    def go_down(self) -> None:
+        """Stop answering, as a rebooting forge does: git calls to it fail at once."""
+        self.bare.rename(self.bare.with_name("offline.git"))
+
+    def come_back(self) -> None:
+        self.bare.with_name("offline.git").rename(self.bare)
 
 
 @pytest.fixture
@@ -255,13 +263,60 @@ def test_an_ancestry_check_that_cannot_run_names_no_divergence(
 
 
 def test_a_failed_clone_refuses_the_job(tmp_path, work_dir) -> None:
+    """A forge that cannot be reached fails the clone at once; like a fetch, it is retried."""
     job = _job(tmp_path, work_dir / "proj", str(tmp_path / "no-such-forge.git"))
 
     with pytest.raises(RepoRefused) as refusal:
         prepare_repo(job, work_dir=work_dir)
 
     assert "clone" in refusal.value.reason
+    assert refusal.value.retryable is True
     assert not (work_dir / "proj").exists()
+
+
+def test_a_forge_that_cannot_be_reached_sends_the_job_back_with_git_s_error(
+    tmp_path, forge, work_dir
+) -> None:
+    """A forge that is down fails `git fetch` at once, not by timing out — and comes back."""
+    clone = _clone(forge, work_dir / "proj")
+    job = _job(tmp_path, clone, forge.url)
+    forge.go_down()
+
+    with pytest.raises(RepoRefused, match="could not fetch origin") as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is True
+    assert "Could not read from remote repository" in refusal.value.reason
+
+
+def test_a_clone_another_live_job_is_using_is_refused_before_git_touches_it(
+    tmp_path, forge, work_dir
+) -> None:
+    """The sync checks out and fast-forwards the clone itself — a write to its checkout."""
+    clone = _clone(forge, work_dir / "proj")
+    git(clone, "checkout", "-q", "-b", "feature/1.1-001")
+    forge.advance()
+
+    with pytest.raises(RepoRefused, match="repo busy") as refusal:
+        prepare_repo(
+            _job(tmp_path, clone, forge.url), work_dir=work_dir, busy_repos={str(clone)}
+        )
+
+    assert refusal.value.retryable is True
+    assert git(clone, "branch", "--show-current") == "feature/1.1-001"
+
+
+def test_a_forge_whose_default_branch_is_not_main_syncs_that_branch(tmp_path, work_dir) -> None:
+    """The build cuts story branches from ``origin/HEAD`` (Story 23.2-001); so does the sync."""
+    forge = Forge(tmp_path, branch="trunk")
+    clone = _clone(forge, work_dir / "proj")
+    git(clone, "checkout", "-q", "-b", "feature/old")
+    new_head = forge.advance()
+
+    prepared = prepare_repo(_job(tmp_path, clone, forge.url), work_dir=work_dir)
+
+    assert prepared.sha == new_head
+    assert git(clone, "branch", "--show-current") == "trunk"
 
 
 def test_a_job_that_records_no_origin_is_left_alone(tmp_path, forge, work_dir) -> None:
@@ -486,6 +541,72 @@ def test_origin_requirements_records_the_origin_json_or_none(tmp_path, forge, wo
     assert origin_requirements(tmp_path / "missing") is None
 
 
+@pytest.mark.parametrize(
+    ("configured", "recorded"),
+    [
+        ("https://oauth2:s3cret@gitlab.test/root/proj.git", "https://gitlab.test/root/proj.git"),
+        # A GitHub token rides in the user slot, so http(s) drops the whole userinfo.
+        ("https://ghp_s3cret@github.com/fx/proj.git", "https://github.com/fx/proj.git"),
+        ("http://gitlab.test:8080/root/proj.git", "http://gitlab.test:8080/root/proj.git"),
+        # An ssh user is the forge's account (`git`), not a secret — dropping it
+        # would break the clone; only a password goes.
+        (
+            "ssh://git:s3cret@gitlab.test:2222/root/proj.git",
+            "ssh://git@gitlab.test:2222/root/proj.git",
+        ),
+        ("ssh://git@gitlab.test/root/proj.git", "ssh://git@gitlab.test/root/proj.git"),
+        ("git@github.com:fx/proj.git", "git@github.com:fx/proj.git"),
+        ("/srv/forge/proj.git", "/srv/forge/proj.git"),
+    ],
+)
+def test_the_recorded_origin_never_carries_a_credential(
+    tmp_path, configured: str, recorded: str
+) -> None:
+    """The job is stored, served by `GET /jobs` and printed by `queue list --json`."""
+    from sdlc.queue_worker import origin_requirements
+
+    git(tmp_path, "init", "-q", "proj")
+    git(tmp_path / "proj", "remote", "add", "origin", configured)
+
+    assert json.loads(origin_requirements(tmp_path / "proj")) == {"origin": recorded}
+
+
+def test_an_origin_mismatch_names_both_origins_without_their_credentials(
+    tmp_path, forge, work_dir
+) -> None:
+    """The reason is a field every queue client reads; a worker's token must not land there."""
+    clone = _clone(forge, work_dir / "proj")
+    git(clone, "remote", "set-url", "origin", "https://oauth2:s3cret@gitlab.test/root/mine.git")
+    job = _job(tmp_path, clone, "https://x-access-token:t0ken@gitlab.test/root/other.git")
+
+    with pytest.raises(RepoRefused, match="origin mismatch") as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert "https://gitlab.test/root/mine.git" in refusal.value.reason
+    assert "https://gitlab.test/root/other.git" in refusal.value.reason
+    assert "s3cret" not in refusal.value.reason
+    assert "t0ken" not in refusal.value.reason
+
+
+def test_a_failed_clone_names_the_origin_without_its_credential(
+    tmp_path, work_dir, monkeypatch
+) -> None:
+    from sdlc import queue_worker
+
+    monkeypatch.setattr(
+        queue_worker.subprocess, "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 128, "", "fatal: not found"),
+    )
+    job = _job(tmp_path, work_dir / "proj", "https://oauth2:s3cret@gitlab.test/root/proj.git")
+
+    with pytest.raises(
+        RepoRefused, match="could not clone https://gitlab.test/root/proj.git"
+    ) as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert "s3cret" not in refusal.value.reason
+
+
 def test_repo_origin_is_none_when_git_cannot_run(tmp_path, monkeypatch) -> None:
     from sdlc import queue_worker
 
@@ -654,6 +775,30 @@ def test_an_origin_mismatch_blocks_the_job_naming_the_mismatch(
     assert launcher.calls == []
 
 
+def test_a_forge_outage_leaves_the_queue_queued_and_it_drains_once_the_forge_is_back(
+    tmp_path, forge, work_dir
+) -> None:
+    """The GitLab box rebooting must not park every queued job for a manual requeue."""
+    clone = _clone(forge, work_dir / "proj")
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    ids = [_enqueue(store, clone, forge.url) for _ in range(3)]
+    forge.go_down()
+
+    result, launcher = _drain(tmp_path, store, work_dir)
+
+    jobs = [store.get_job(job_id) for job_id in ids]
+    assert [job.state for job in jobs if job] == ["queued"] * 3
+    assert all("could not fetch origin" in (job.reason or "") for job in jobs if job)
+    assert (launcher.calls, result.parked) == ([], 0)
+
+    forge.come_back()
+    _, launcher = _drain(tmp_path, store, work_dir)
+
+    # One at a time: each waits `repo busy` while another holds the clone.
+    assert [cwd for _, cwd in launcher.calls] == [str(clone)] * 3
+
+
 def test_a_plain_drain_never_touches_the_clone(tmp_path, forge, work_dir) -> None:
     clone = _clone(forge, work_dir / "proj")
     head = git(clone, "rev-parse", "HEAD")
@@ -739,6 +884,37 @@ def test_a_remapped_clone_already_running_a_fix_is_left_alone(
     assert git(clone, "branch", "--show-current") == "fix/42"
 
 
+def test_a_build_live_in_the_clone_keeps_its_branch_when_a_second_build_is_claimed(
+    tmp_path, forge, work_dir
+) -> None:
+    """A `--sequential` build works in the clone itself, on `feature/<id>`.
+
+    The claim lets two builds share a repo (Story 32.1-003) because neither
+    writes to the shared checkout mid-run. The sync does, so the second build
+    waits for the clone instead of switching the first one's checkout to `main`.
+    """
+    clone = _clone(forge, work_dir / "proj")
+    git(clone, "checkout", "-q", "-b", "feature/1.1-001")  # clean, between two commits
+    forge.advance()
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    first = _enqueue(store, clone, forge.url)
+    assert store.claim_job(
+        first, claimed_by="peer", lease_seconds=3600, now=Clock()()
+    ) is not None
+    second = _enqueue(store, clone, forge.url)
+
+    result, launcher = _drain(tmp_path, store, work_dir)
+
+    job = store.get_job(second)
+    assert job is not None
+    assert (job.state, job.claimed_by) == ("queued", None)
+    assert "repo busy" in (job.reason or "")
+    assert launcher.calls == []
+    assert result.started == 0
+    assert git(clone, "branch", "--show-current") == "feature/1.1-001"
+
+
 # --- a slow sync must not outlive the claim it runs under ---------------------
 
 
@@ -764,6 +940,32 @@ def test_a_job_reclaimed_by_a_peer_during_a_slow_sync_is_not_launched(
     assert result.started == 0
     job = store.get_job(job_id)
     assert job is not None and job.claimed_by == "peer"
+
+
+def test_a_job_reclaimed_during_a_slow_sync_is_not_parked_by_the_scheduler_that_lost_it(
+    tmp_path, forge, work_dir
+) -> None:
+    """Parking a job a peer now runs would strand the peer's run behind `blocked`."""
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, work_dir / "proj", forge.url)
+    clock = Clock()
+
+    def slow_then_refused(job, **_kwargs):
+        clock.advance(600)  # far past the 90 s lease
+        assert store.reclaim_job(
+            job.id, claimed_by="peer", lease_seconds=3600, now=clock()
+        ) is not None
+        raise RepoRefused("could not fast-forward to origin/main in proj: not possible")
+
+    result, launcher = _drain(
+        tmp_path, store, work_dir, clock=clock, preparer=slow_then_refused
+    )
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert (job.state, job.claimed_by) == ("running", "peer")
+    assert (launcher.calls, result.parked) == ([], 0)
 
 
 def test_a_slow_sync_renews_every_lease_it_held_up(tmp_path, work_dir) -> None:

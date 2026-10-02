@@ -1069,16 +1069,19 @@ class _Scheduler:
         per-repo exclusivity) reads ``job.repo``.
 
         A dirty tree goes back to ``queued`` with the #590 reason (the owner
-        tidies it; the next poll retries), as do a clone already busy with
-        another job and a git timeout. Anything else needs an operator — wrong
-        origin, diverged ``main``, no clone — so the job parks ``blocked``.
+        tidies it; the next poll retries), as do a clone another live job is
+        using and a forge that is slow or unreachable. Anything else needs an
+        operator — wrong origin, a diverged default branch, no clone — so the
+        job parks ``blocked``.
         """
         from sdlc.queue_worker import RepoRefused, prepare_repo
 
         prepare = self._prepare_repo or prepare_repo
-        # The same rule `peek_claimable` applied to the recorded path: a fix
-        # shares its clone with nothing, a build only stays clear of a fix.
-        busy = self._store.running_repos(kind=None if job.kind == "fix" else "fix")
+        # Not the claim's rule (a build only stays clear of a fix): two builds
+        # may share a repo because neither writes to its checkout mid-run, and
+        # the sync does. So no *other* live job may hold the clone — this one is
+        # `running` already, from its claim.
+        busy = self._store.running_repos(excluding=job.id)
         try:
             prepared = prepare(job, busy_repos=busy)
         except RepoRefused as exc:
@@ -1091,7 +1094,13 @@ class _Scheduler:
                     self._refusal_echoed[job.id] = exc.reason
                     self._echo(f"job {job.id} back to queued: {exc.reason}")
                 return None
-            self._store.finish_job(job.id, "blocked", reason=exc.reason)
+            # Only while the claim is still ours: a slow sync can outlive the
+            # lease, and parking a job a peer reclaimed would strand its run.
+            if not self._store.finish_job(
+                job.id, "blocked", reason=exc.reason, claimed_by=self._identity
+            ):
+                self._echo(f"job {job.id}: lease lost during the repo sync, not parked")
+                return None
             self._result.parked += 1
             self._echo(f"job {job.id} parked (blocked): {exc.reason}")
             self._announce(job, None, "blocked")

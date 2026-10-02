@@ -14,7 +14,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from sdlc.queue import JobRecord, QueueBackend, WorkerRecord
@@ -160,28 +160,31 @@ def detect_worker_profile(
 # Repo auto-sync before dispatch (Story 35.2-002)
 #
 # A worker may not have touched a repo in days, or ever. Before a claimed job is
-# launched the worker brings its clone to the forge's ``main`` — cloning it if it
-# is absent — so a build never starts from a stale or missing tree. The enqueuer
-# records the clone's ``origin`` in the job's ``requirements`` so the job is
-# self-describing: the worker clones from, and checks against, what the job says
-# rather than guessing from a path that is only meaningful on the enqueuing host.
+# launched the worker brings its clone to the forge's default branch (``main``)
+# — cloning it if it is absent — so a build never starts from a stale or missing
+# tree. The enqueuer records the clone's ``origin`` in the job's ``requirements``
+# so the job is self-describing: the worker clones from, and checks against, what
+# the job says rather than guessing from a path only the enqueuing host knows.
 # ---------------------------------------------------------------------------
 
 # Network-bound git calls (fetch, clone) get the push ceiling; local plumbing is
 # quick. ``GIT_TERMINAL_PROMPT=0`` makes a missing credential fail instead of
 # hanging a headless worker on a username prompt.
 _GIT_TIMEOUT_SECONDS = 120
-_BASE_BRANCH = "main"
+
+# An ssh URL needs its user: ``git@`` is the forge's account name, not a secret.
+_SSH_SCHEMES = frozenset({"ssh", "git+ssh", "ssh+git"})
 
 
 class RepoRefused(Exception):
     """The worker will not run this job against its clone.
 
     ``retryable`` separates the refusals that clear without an operator — a
-    dirty checkout its owner tidies, a clone already busy with another job, a
-    git call that timed out against a slow forge; the job goes back to
-    ``queued`` — from the ones that need an operator decision (wrong origin,
-    a ``main`` that cannot fast-forward, no clone — the job is parked
+    dirty checkout its owner tidies, a clone another live job is using, a forge
+    that is slow or unreachable (a fetch or clone that failed or timed out);
+    the job goes back to ``queued`` — from the ones that need an operator
+    decision (wrong origin, a default branch that cannot check out or
+    fast-forward, a directory that is no clone — the job is parked
     ``blocked``).
     """
 
@@ -233,6 +236,26 @@ def same_origin(left: str, right: str) -> bool:
     return _origin_key(left) == _origin_key(right)
 
 
+def _without_credentials(url: str) -> str:
+    """``url`` with no secret in it: what a job may record and a reason may print.
+
+    A job is stored, served to every queue client and printed by `queue list`,
+    yet an ``origin`` can embed a token (``https://oauth2:<token>@host/…``, or a
+    GitHub token alone in the user slot). An http(s) URL loses its whole
+    userinfo — the worker's credential helper supplies its own; an ssh URL keeps
+    its user and loses only a password. An scp-style ``git@host:path`` or a
+    local path cannot carry a secret and comes back as it is. Identity is
+    unchanged: :func:`same_origin` already ignores the userinfo.
+    """
+    parts = urlsplit(url)
+    if not (parts.scheme and parts.netloc) or "@" not in parts.netloc:
+        return url
+    userinfo, _, host = parts.netloc.rpartition("@")
+    user = userinfo.partition(":")[0]
+    keep = f"{user}@" if parts.scheme in _SSH_SCHEMES and user else ""
+    return urlunsplit(parts._replace(netloc=keep + host))
+
+
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -258,9 +281,13 @@ def repo_origin(root: Path) -> str | None:
 
 
 def origin_requirements(root: Path) -> str | None:
-    """The ``requirements`` JSON an enqueue records for ``root`` (``None`` without an origin)."""
+    """The ``requirements`` JSON an enqueue records for ``root`` (``None`` without an origin).
+
+    The origin is recorded without credentials (:func:`_without_credentials`):
+    a job never carries a token, and a worker clones with its own.
+    """
     origin = repo_origin(root)
-    return json.dumps({"origin": origin}) if origin else None
+    return json.dumps({"origin": _without_credentials(origin)}) if origin else None
 
 
 def _recorded_origin(job: "JobRecord") -> str | None:
@@ -284,14 +311,26 @@ def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         raise RepoRefused(f"git {args[0]} failed in {root}: {exc}") from exc
 
 
-def _diverged_hint(root: Path) -> str:
+def _default_branch(root: Path) -> str:
+    """The forge's default branch: the one ``origin/HEAD`` names, else ``main``.
+
+    The ref the build cuts story branches from (Story 23.2-001), so a repo whose
+    default is not ``main`` syncs instead of parking every job ``blocked``.
+    """
+    from sdlc.build import _origin_default_ref
+
+    return _origin_default_ref(root).removeprefix("origin/")
+
+
+def _diverged_hint(root: Path, branch: str) -> str:
     """Name the divergence only when there is one: a merge also aborts on local changes."""
     try:
-        res = _git(root, "merge-base", "--is-ancestor", "HEAD", f"origin/{_BASE_BRANCH}")
+        res = _git(root, "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}")
     except (OSError, subprocess.SubprocessError):
         return ""
     # Exit 1 is git's "not an ancestor"; anything else is no verdict at all.
-    return " (local main has diverged from origin/main)" if res.returncode == 1 else ""
+    diverged = f" (local {branch} has diverged from origin/{branch})"
+    return diverged if res.returncode == 1 else ""
 
 
 def _dirty_refusal(root: Path, paths: list[str]) -> RepoRefused:
@@ -310,10 +349,11 @@ def _dirty_refusal(root: Path, paths: list[str]) -> RepoRefused:
 
 
 def _clone(origin: str, target: Path) -> None:
+    shown = _without_credentials(origin)
     # The origin comes from a job body; one shaped like an option
     # (`--upload-pack=…`) must never reach git's argument parser.
     if origin.startswith("-"):
-        raise RepoRefused(f"refusing to clone {origin!r}: an origin that reads as a git option")
+        raise RepoRefused(f"refusing to clone {shown!r}: an origin that reads as a git option")
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
         # Plain `git clone`: the worker's own `gh`/`glab` credentials reach git
@@ -330,37 +370,49 @@ def _clone(origin: str, target: Path) -> None:
         # The timeout SIGKILLs git, so it cannot remove its half-written clone —
         # which the retry would otherwise find and judge as a (dirty) clone.
         shutil.rmtree(target, ignore_errors=True)
+        # Not `exc`: its text is the argv, origin and all.
         raise RepoRefused(
-            f"could not clone {origin} into {target}: timed out: {exc}", retryable=True
+            f"could not clone {shown} into {target}: "
+            f"timed out after {_GIT_TIMEOUT_SECONDS}s",
+            retryable=True,
         ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RepoRefused(f"could not clone {origin} into {target}: {exc}") from exc
+        raise RepoRefused(f"could not clone {shown} into {target}: {exc}") from exc
     if res.returncode != 0:
+        # The forge, not the job: down, rebooting, a credential to renew. That
+        # clears without anyone touching the job, so it goes back to be retried.
         raise RepoRefused(
-            f"could not clone {origin} into {target}: {res.stderr.strip() or 'git clone failed'}"
+            f"could not clone {shown} into {target}: "
+            f"{res.stderr.strip() or 'git clone failed'}",
+            retryable=True,
         )
 
 
 def prepare_repo(
     job: "JobRecord", *, work_dir: Path | None = None, busy_repos: Collection[str] = ()
 ) -> PreparedRepo:
-    """Bring the job's clone to the forge's ``main`` before it is dispatched.
+    """Bring the job's clone to the forge's default branch before it is dispatched.
 
     ``git fetch origin && git checkout -q main && git merge --ff-only
-    origin/main``, then the resulting sha. The clone is the job's own path when
-    that exists on this machine, otherwise ``work_dir/<name>`` (``~/Work``): a
-    path recorded on another machine means nothing here. An absent clone is made
-    from the origin the job recorded at enqueue.
+    origin/main``, then the resulting sha — with the branch ``origin/HEAD``
+    names in place of ``main`` when the forge's default is another. The clone
+    is the job's own path when that exists on this machine, otherwise
+    ``work_dir/<name>`` (``~/Work``): a path recorded on another machine means
+    nothing here. An absent clone is made from the origin the job recorded at
+    enqueue.
 
-    ``busy_repos`` are the clones the claim's per-repo exclusivity rule says this
-    job must not share. The claim judged the job's *recorded* path, so a clone
-    reached under another name is checked here, before git touches it.
+    ``busy_repos`` are the clones other live jobs are using. The sync checks out
+    and fast-forwards the clone itself — a write to the shared checkout, which
+    the claim's build/build overlap (Story 32.1-003) assumes no job makes
+    mid-run — so a clone in that set is refused before git touches it, under
+    whichever path the job reached it.
 
     Refuses (:class:`RepoRefused`) rather than repairing: a tracked-dirty tree
     (never stashed — the #590 rule), an ``origin`` that is not the one the job
-    records, a ``main`` that cannot fast-forward, a directory that is no clone.
-    A job that recorded no origin predates this sync (or came from a repo with no
-    remote) and is returned untouched.
+    records, a forge that cannot be reached, a default branch that cannot
+    fast-forward, a directory that is no clone. A job that recorded no origin
+    predates this sync (or came from a repo with no remote) and is returned
+    untouched.
     """
     from sdlc.build import dirty_tree_paths
 
@@ -373,7 +425,7 @@ def prepare_repo(
     # Resolved, because a run registers under its resolved cwd and the scheduler
     # matches the two to link the job to its run.
     target = (declared if declared.exists() else root / declared.name).resolve()
-    if target != declared and str(target) in busy_repos:
+    if str(target) in busy_repos:
         raise RepoRefused(f"repo busy: {target} is already running a job", retryable=True)
     if not target.exists():
         _clone(recorded, target)
@@ -382,20 +434,33 @@ def prepare_repo(
 
     actual = repo_origin(target)
     if actual is None or not same_origin(actual, recorded):
+        # The reason is shared with every queue client: no credential in it.
         raise RepoRefused(
-            f"origin mismatch: {target} has origin {actual or '(none)'} "
-            f"but the job records {recorded}"
+            f"origin mismatch: {target} has origin "
+            f"{_without_credentials(actual) if actual else '(none)'} "
+            f"but the job records {_without_credentials(recorded)}"
         )
     if paths := dirty_tree_paths(target):
         raise _dirty_refusal(target, paths)
 
-    for args in (("fetch", "origin"), ("checkout", "-q", _BASE_BRANCH),
-                 ("merge", "--ff-only", f"origin/{_BASE_BRANCH}")):
+    fetch = _run_git(target, "fetch", "origin")
+    if fetch.returncode != 0:
+        # The forge, not this clone: down, rebooting, a credential to renew.
+        # That clears without anyone touching the job, so it is retried.
+        raise RepoRefused(
+            f"could not fetch origin in {target}: {(fetch.stderr or fetch.stdout).strip()}",
+            retryable=True,
+        )
+    branch = _default_branch(target)
+    steps: tuple[tuple[str, ...], ...] = (
+        ("checkout", "-q", branch), ("merge", "--ff-only", f"origin/{branch}"),
+    )
+    for args in steps:
         res = _run_git(target, *args)
         if res.returncode != 0:
             detail = (res.stderr or res.stdout).strip()
-            hint = _diverged_hint(target) if args[0] == "merge" else ""
-            step = "fast-forward to origin/main" if args[0] == "merge" else " ".join(args)
+            hint = _diverged_hint(target, branch) if args[0] == "merge" else ""
+            step = f"fast-forward to origin/{branch}" if args[0] == "merge" else " ".join(args)
             raise RepoRefused(f"could not {step} in {target}{hint}: {detail}")
     head = _run_git(target, "rev-parse", "HEAD")
     if head.returncode != 0 or not head.stdout.strip():

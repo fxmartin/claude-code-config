@@ -3627,13 +3627,18 @@ def queue_run_cmd(
 
     Before launching a fresh job a worker syncs its clone (Story 35.2-002):
     `git fetch origin && git checkout -q main && git merge --ff-only
-    origin/main`, recording the sha as the job's `synced_sha`. A missing clone
-    is cloned from the origin the job recorded at enqueue — under `~/Work/<name>`
-    when the recorded path does not exist here, which then becomes the job's
-    repo. A tracked-dirty tree (`DIRTY_WORKING_TREE`, never stashed), a clone
-    already running a conflicting job, or a git timeout sends the job back to
-    `queued`; an `origin mismatch`, a `main` that cannot fast-forward or a failed
-    clone parks it `blocked`. A resumed run is never synced.
+    origin/main` — the branch `origin/HEAD` names in place of `main` when the
+    forge's default is another — recording the sha as the job's `synced_sha`.
+    A missing clone is cloned from the origin the job recorded at enqueue
+    (never with a credential: the worker's own `gh`/`glab` login is used) —
+    under `~/Work/<name>` when the recorded path does not exist here, which
+    then becomes the job's repo. A tracked-dirty tree (`DIRTY_WORKING_TREE`,
+    never stashed), a clone another live job is using (`repo busy` — the sync
+    writes to its checkout, so even two builds take turns), or a forge that is
+    unreachable or slow (a failed or timed-out fetch or clone) sends the job
+    back to `queued`; an `origin mismatch`, a default branch that cannot
+    fast-forward or a directory that is no clone parks it `blocked`. A resumed
+    run is never synced.
 
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
