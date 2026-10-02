@@ -615,3 +615,33 @@ def test_a_registered_client_claim_is_capability_matched(client: QueueClient) ->
     client.register_worker("m3max", host="m3", repos=["agentic-coding-monitor"], slots=1)
     claimed = client.claim_next(claimed_by="m3max", lease_seconds=90)
     assert claimed is not None and claimed.id == job_id
+
+
+def test_client_pool_pauses_are_independent_and_clear_by_pool(client: QueueClient) -> None:
+    """Story 35.2-003: one window per pool, over the wire."""
+    until = datetime.now(timezone.utc) + timedelta(minutes=30)
+    assert client.pause_dispatch(until=until, reason="r", pool="claude-shared") is True
+    assert client.pause_dispatch(until=until, reason="r", pool="codex-shared") is True
+    assert client.pause_dispatch(until=until, reason="again", pool="claude-shared") is False
+    assert client.dispatch_pause() is None  # nothing pool-less
+    assert client.dispatch_pause("claude-shared").pool == "claude-shared"
+    assert {p.pool for p in client.dispatch_pauses()} == {"claude-shared", "codex-shared"}
+
+    client.clear_pause("claude-shared")  # `queue unpause --pool`, from any machine
+
+    assert [p.pool for p in client.dispatch_pauses()] == ["codex-shared"]
+    client.clear_pause()
+    assert client.dispatch_pauses() == []
+
+
+def test_client_claims_hold_only_the_paused_pool(client: QueueClient) -> None:
+    until = datetime.now(timezone.utc) + timedelta(minutes=30)
+    client.register_worker(
+        "xps", host="xps", pools=["claude-shared"], harnesses=["claude"], repos=["r"],
+        slots=1, slots_free=1,
+    )
+    client.add_job(repo="/r/r", kind="build", scope="s", pool="claude-shared")
+    client.pause_dispatch(until=until, pool="claude-shared")
+    assert client.claim_next(claimed_by="xps", lease_seconds=60) is None
+    client.clear_pause("claude-shared")
+    assert client.claim_next(claimed_by="xps", lease_seconds=60) is not None

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sdlc.queue import QueuePause, QueueStore
+from sdlc.queue import QueueBackend, QueuePause, QueueStore, job_pools
 from sdlc.registry import Registry, pid_alive
 
 _RATE_LIMITED = "RATE_LIMITED"
@@ -38,13 +38,18 @@ class ClearedRun:
 
 @dataclass
 class UnpauseResult:
-    pause: QueuePause | None
+    pauses: list[QueuePause]
     runs: list[ClearedRun]
     dry_run: bool
 
     @property
+    def pause(self) -> QueuePause | None:
+        """The first cleared window — the whole story on a one-pool (local) queue."""
+        return self.pauses[0] if self.pauses else None
+
+    @property
     def nothing_to_clear(self) -> bool:
-        return self.pause is None and not self.runs
+        return not self.pauses and not self.runs
 
 
 def _reset_epoch(config: dict) -> float | None:
@@ -54,14 +59,30 @@ def _reset_epoch(config: dict) -> float | None:
         return None
 
 
+def _run_pools(store: QueueBackend) -> dict[str, set[str]]:
+    """``run_id`` → the pools its queue job spends from (Story 35.2-003)."""
+    pools_of = {w.name: w.pools for w in store.list_workers()}
+    return {
+        job.run_id: set(job_pools(job, pools_of.get(job.worker or "", ())))
+        for job in store.list_jobs()
+        if job.run_id
+    }
+
+
 def clear_rate_limit(
-    store: QueueStore,
+    store: QueueBackend,
     registry: Registry,
     *,
+    pool: str | None = None,
     dry_run: bool = False,
     now: datetime | None = None,
 ) -> UnpauseResult:
     """Trust the operator: drop the pause and re-arm parked runs, no probe.
+
+    ``pool`` (Story 35.2-003) scopes the declaration to one subscription pool:
+    only that pool's window is cleared, and only runs whose queue job spends
+    from it are re-armed — a run the queue cannot attribute to the pool is left
+    parked. No pool clears every window and every parked run, as before.
 
     The next dispatch's own rate-limit detection is the safety net — a window
     that is in fact still closed re-parks the run with a fresh reset, and the
@@ -75,11 +96,18 @@ def clear_rate_limit(
     from sdlc.build import Ledger  # heavy module; only needed on this path
 
     moment = now or datetime.now(timezone.utc)
-    pause = store.dispatch_pause()
+    if pool is None:
+        pauses = store.dispatch_pauses()
+    else:
+        found = store.dispatch_pause(pool)
+        pauses = [found] if found is not None else []
+    in_pool = _run_pools(store) if pool is not None else {}
     cleared: list[ClearedRun] = []
     for record in registry.records():
         if record.finished_at or pid_alive(record.pid):
             continue  # finished, or waiting in-process and will resume itself
+        if pool is not None and pool not in in_pool.get(record.run_id, ()):
+            continue  # another pool's run (or one the queue cannot attribute)
         try:
             ledger = Ledger(Path(record.db))
             row = ledger.run_row(record.run_id)
@@ -109,14 +137,19 @@ def clear_rate_limit(
             f"{len(stories)} RATE_LIMITED story(ies) {stories}",
         )
 
-    result = UnpauseResult(pause=pause, runs=cleared, dry_run=dry_run)
+    result = UnpauseResult(pauses=pauses, runs=cleared, dry_run=dry_run)
     if not dry_run and not result.nothing_to_clear:
         store.init()  # a runs-only clear on a host with no queue.db still audits
-        store.clear_pause()
-        store.record_pause_clear(
-            paused_until=pause.paused_until if pause else None,
-            runs_cleared=len(cleared),
-            reason=_REASON,
-            now=moment,
-        )
+        store.clear_pause(pool)
+        # The audit table lives in the queue.db; a fleet queue has no route for it.
+        if isinstance(store, QueueStore):
+            reason = _REASON if pool is None else f"{_REASON} (pool {pool})"
+            # One row per window cleared, the re-armed runs counted on the first.
+            for index, paused in enumerate(pauses or [None]):
+                store.record_pause_clear(
+                    paused_until=paused.paused_until if paused else None,
+                    runs_cleared=len(cleared) if index == 0 else 0,
+                    reason=reason,
+                    now=moment,
+                )
     return result
