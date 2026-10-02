@@ -1462,3 +1462,99 @@ def test_self_update_cleanup_failure_still_reports_the_install(
 
     assert doctor.self_update_controller(repo, "2.71.3", installer=installer, fetch=False) == "2.71.4"
     assert not installer.trees[0].exists()
+
+
+# --- Story 35.2-004: the resident worker is registered and online -----------------------
+
+
+def _worker_record(host: str, *, seconds_ago: float):
+    from sdlc.queue import WorkerRecord
+
+    beat = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+    return WorkerRecord(name="m3max", host=host, registered_at=beat, last_heartbeat=beat)
+
+
+def test_fleet_worker_online_is_clean() -> None:
+    from sdlc.doctor import check_fleet_worker
+
+    finding = check_fleet_worker(lambda: [_worker_record("m3", seconds_ago=5)], host="m3")
+
+    assert finding.status == "CLEAN"
+    assert "m3max" in finding.detail and "online" in finding.detail
+
+
+def test_fleet_worker_that_stopped_heartbeating_fails() -> None:
+    from sdlc.doctor import check_fleet_worker
+
+    finding = check_fleet_worker(lambda: [_worker_record("m3", seconds_ago=600)], host="m3")
+
+    assert finding.status == "FAIL"
+    assert "offline" in finding.detail
+    assert "worker.log" in finding.remedy
+
+
+def test_fleet_worker_never_registered_fails() -> None:
+    from sdlc.doctor import check_fleet_worker
+
+    # A worker on another host does not count for this one.
+    finding = check_fleet_worker(lambda: [_worker_record("xps", seconds_ago=5)], host="m3")
+
+    assert finding.status == "FAIL"
+    assert "not registered" in finding.detail
+
+
+def test_fleet_worker_unreachable_queue_fails() -> None:
+    from sdlc.doctor import check_fleet_worker
+    from sdlc.queue import QueueError
+
+    def boom():
+        raise QueueError("fleet queue unreachable")
+
+    finding = check_fleet_worker(boom, host="m3")
+
+    assert finding.status == "FAIL"
+    assert "unreachable" in finding.detail
+
+
+def test_fleet_worker_check_is_skipped_without_the_launch_agent(tmp_path) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+
+    assert check_fleet_worker_installed(agent_path=tmp_path / "absent.plist") is None
+
+
+def test_fleet_worker_check_runs_when_the_launch_agent_is_installed(tmp_path, monkeypatch) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    agent = tmp_path / "com.fxmartin.sdlc-worker.plist"
+    agent.write_text("<plist/>", encoding="utf-8")
+
+    finding = check_fleet_worker_installed(agent_path=agent, host="m3")
+
+    assert finding is not None
+    assert finding.status == "FAIL"  # installed, but nothing has registered in an empty queue
+    assert "not registered" in finding.detail
+
+
+def test_run_doctor_reports_the_worker_only_when_its_launch_agent_is_installed(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    claude_dir, repo_root = _healthy_install(tmp_path)
+
+    report = run_doctor(
+        repo_root=repo_root,
+        claude_dir=claude_dir,
+        db_path=tmp_path / "ledger.db",
+        queue_path=tmp_path / "queue.db",
+        registry=Registry(tmp_path / "registry.json"),
+        dep_probe=lambda _b: True,
+    )
+
+    assert not any(f.check == "fleet-worker" for f in report.findings)

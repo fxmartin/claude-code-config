@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -24,7 +25,7 @@ from sdlc.harness import DEFAULT_HARNESS
 from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
 from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
-from sdlc.queue import QueueError, default_queue_path
+from sdlc.queue import QueueError, WorkerRecord, default_queue_path
 from sdlc.queue_client import QueueClient, QueueRefused, resolve_queue_url
 from sdlc.registry import Registry, derive_state
 
@@ -603,6 +604,68 @@ def check_fleet_queue_configured() -> Finding | None:
     if url is None:
         return None
     return check_fleet_queue(QueueClient(url, token=os.environ.get("SDLC_QUEUE_TOKEN") or None))
+
+
+WORKER_LAUNCH_AGENT = "com.fxmartin.sdlc-worker.plist"
+
+
+def check_fleet_worker(list_workers: Callable[[], list[WorkerRecord]], *, host: str) -> Finding:
+    """Is this machine's resident worker registered with the queue and online? (Story 35.2-004)
+
+    Matches on ``host`` rather than a worker name: the LaunchAgent template owns
+    the name, and "a worker for this machine is heartbeating" is the question.
+    """
+    name = "Fleet worker"
+    remedy = (
+        "check the LaunchAgent is loaded (`launchctl print gui/$(id -u)/com.fxmartin.sdlc-worker`) "
+        "and read ~/.local/state/sdlc/worker.log"
+    )
+    try:
+        workers = [w for w in list_workers() if w.host == host]
+    except QueueError as exc:
+        return Finding("fleet-worker", name, "FAIL", f"could not list workers: {exc}", remedy)
+    if not workers:
+        return Finding(
+            "fleet-worker", name, "FAIL", f"not registered — no worker for host {host}", remedy
+        )
+    online = [w for w in workers if w.is_online()]
+    if not online:
+        newest = max(workers, key=lambda w: w.last_heartbeat)
+        return Finding(
+            "fleet-worker",
+            name,
+            "FAIL",
+            f"{newest.name} is registered but offline (last heartbeat {newest.last_heartbeat})",
+            remedy,
+        )
+    return Finding(
+        "fleet-worker",
+        name,
+        "CLEAN",
+        f"{', '.join(w.name for w in online)} registered and online ({host})",
+    )
+
+
+def check_fleet_worker_installed(
+    *, agent_path: Path | None = None, host: str | None = None
+) -> Finding | None:
+    """:func:`check_fleet_worker`, but only on a machine that installed the worker LaunchAgent.
+
+    ``None`` elsewhere: a laptop that never runs a resident worker has nothing
+    to report, and doctor must not nag it.
+    """
+    from sdlc.queue_client import open_queue
+
+    path = agent_path or Path.home() / "Library" / "LaunchAgents" / WORKER_LAUNCH_AGENT
+    if not path.exists():
+        return None
+    try:
+        queue = open_queue()
+    except QueueError as exc:
+        return Finding("fleet-worker", "Fleet worker", "FAIL", str(exc))
+    return check_fleet_worker(
+        queue.list_workers, host=host or socket.gethostname().split(".")[0]
+    )
 
 
 def check_queue(queue_path: Path) -> Finding:
@@ -1570,4 +1633,7 @@ def run_doctor(
     fleet = check_fleet_queue_configured()
     if fleet is not None:
         findings.append(fleet)
+    worker = check_fleet_worker_installed()
+    if worker is not None:
+        findings.append(worker)
     return DoctorReport(findings=findings)

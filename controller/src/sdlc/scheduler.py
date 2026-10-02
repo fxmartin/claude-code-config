@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import signal
 import socket
@@ -345,6 +346,21 @@ def controller_argv() -> list[str]:
     if binary:
         return [binary]
     return [sys.executable, "-m", "sdlc.cli"]
+
+
+def keep_awake_prefix(
+    *, system: str | None = None, which: Callable[[str], str | None] = shutil.which
+) -> list[str]:
+    """``caffeinate -i`` on macOS, else nothing (Story 35.2-004).
+
+    Prefixed to a worker's job argv so the idle-sleep assertion lives exactly as
+    long as the job does — the Mac may sleep between jobs. ``caffeinate`` is
+    macOS-only; the Linux equivalent (``systemd-inhibit``) is a follow-up.
+    """
+    if (system or platform.system()) != "Darwin":
+        return []
+    binary = which("caffeinate")
+    return [binary, "-i"] if binary else []
 
 
 def _frozen_options(job: JobRecord) -> list[str]:
@@ -1013,6 +1029,8 @@ class _Scheduler:
             reconcile_argv(job) if action == "reconcile"
             else job_argv(job, resume=action == "resume")
         )
+        if self._config.worker is not None:
+            argv = [*keep_awake_prefix(), *argv]
         try:
             proc = self._launcher(argv, Path(job.repo))
         except OSError as exc:

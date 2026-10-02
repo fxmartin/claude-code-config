@@ -1811,6 +1811,33 @@ together. It is stamped on enqueue and re-judged on every heartbeat and claim,
 and cleared the moment a capable worker appears. Only `sdlc queue list`'s reason
 line and `--json` carry it; a host that never registered a worker is untouched.
 
+### Resident worker on the M3 Max (Story 35.2-004)
+
+`templates/launchd/com.fxmartin.sdlc-worker.plist` runs `sdlc queue run --worker
+m3max --pool claude-m3 --pool codex-shared --follow` as a LaunchAgent so the Mac
+drains the queue whenever it is on. Install it by copying it into
+`~/Library/LaunchAgents/` and `launchctl bootstrap gui/$(id -u)` it; it starts
+at load, and `KeepAlive` restarts it on any exit (throttled to 30 s). `--follow`
+keeps the drain heartbeating while idle, which is what keeps it `online`.
+
+- **Logs** go to `~/.local/state/sdlc/worker.log` (the wrapper `mkdir`s the
+  directory and redirects, since launchd does not expand `~`/`$HOME`).
+- **Awake while a job runs.** On macOS (`platform.system() == "Darwin"`, with
+  `caffeinate` on PATH) a worker prefixes each job it launches with
+  `caffeinate -i`, so the idle-sleep assertion lives exactly as long as the job
+  and the Mac may sleep between jobs. Elsewhere nothing is added; the Linux
+  equivalent (`systemd-inhibit`) is a follow-up for a Linux worker. A plain
+  drain without `--worker` is not wrapped.
+- **Upgrades.** The per-job version guard (Story 15.1-004/32.1-004) is
+  unchanged: after a controller upgrade a worker whose installed controller
+  disagrees with the repo's checkout parks that job `blocked` with the remedy
+  instead of running on stale code, and the LaunchAgent restarts the worker on
+  exit.
+- **`sdlc doctor`** adds a `Fleet worker` finding on a machine that has the
+  LaunchAgent installed: `CLEAN` when a worker for this host is registered and
+  online, `FAIL` when none has registered, it has gone offline, or the queue
+  cannot be read. A machine without the plist gets no finding.
+
 `--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`);
 like the rest of `sdlc queue run` it refuses while `SDLC_QUEUE_URL` is set. The
 registry (`workers` table, migration 7) lives with the jobs it serves.

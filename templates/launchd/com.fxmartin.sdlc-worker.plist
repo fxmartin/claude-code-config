@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Story 35.2-004: the M3 Max's resident fleet worker. Install with
+       cp templates/launchd/com.fxmartin.sdlc-worker.plist ~/Library/LaunchAgents/
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist
+     launchd does not expand ~ or $HOME in its own keys, so the shell below does the
+     expansion and owns the log redirect. `sdlc queue run` holds a `caffeinate -i`
+     assertion around each job it launches (macOS only), so the Mac may sleep while idle. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fxmartin.sdlc-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>mkdir -p "$HOME/.local/state/sdlc" &amp;&amp; export PATH="$HOME/.local/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/opt/homebrew/bin:$PATH" &amp;&amp; exec sdlc queue run --worker m3max --pool claude-m3 --pool codex-shared --follow >>"$HOME/.local/state/sdlc/worker.log" 2>&amp;1</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart on any exit — including the stale-controller refusal after an upgrade. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

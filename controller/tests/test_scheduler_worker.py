@@ -259,3 +259,50 @@ def test_a_less_loaded_peer_gets_the_job_instead(tmp_path) -> None:
 
     assert launcher.calls == []
     assert store.get_job(job_id).state == "queued"
+
+
+# --- Story 35.2-004: a caffeinate assertion for the lifetime of each worker job ---------
+
+
+def test_keep_awake_prefix_is_caffeinate_on_macos_only() -> None:
+    from sdlc.scheduler import keep_awake_prefix
+
+    assert keep_awake_prefix(system="Darwin", which=lambda _: "/usr/bin/caffeinate") == [
+        "/usr/bin/caffeinate", "-i",
+    ]
+    assert keep_awake_prefix(system="Linux", which=lambda _: "/usr/bin/caffeinate") == []
+    assert keep_awake_prefix(system="Darwin", which=lambda _: None) == []
+
+
+def test_a_worker_job_runs_under_the_keep_awake_prefix(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("sdlc.scheduler.keep_awake_prefix", lambda: ["caffeinate", "-i"])
+    store = _store(tmp_path)
+    store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+
+    launcher, _ = _drain(store, tmp_path, profile=_profile(repos=["alpha"]))
+
+    argv, _cwd = launcher.calls[0]
+    assert argv[:2] == ["caffeinate", "-i"]
+    assert "fix" in argv[2:]
+
+
+def test_a_plain_drain_is_not_wrapped_in_caffeinate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("sdlc.scheduler.keep_awake_prefix", lambda: ["caffeinate", "-i"])
+    store = _store(tmp_path)
+    store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    launcher = FakeLauncher()
+    clock = Clock()
+
+    run_queue(
+        store,
+        config=SchedulerConfig(slots=2, poll_seconds=1.0),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=launcher,
+        clock=clock,
+        sleeper=clock.advance,
+        notifier=lambda *a, **k: None,
+        version_check=_clean,
+        echo=lambda _line: None,
+    )
+
+    assert launcher.calls[0][0][0] != "caffeinate"
