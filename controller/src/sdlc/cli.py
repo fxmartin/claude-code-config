@@ -3,16 +3,19 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 
 import typer
 
 from sdlc import __version__
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
 from sdlc.eval_compare import DEFAULT_TOLERANCE
+from sdlc.queue import QueueError
 # `sdlc queue run`'s defaults live with the scheduler, so `--help` prints the
 # real figures rather than a copy that can drift (Story 32.1-002).
 from sdlc.scheduler import (
@@ -22,6 +25,9 @@ from sdlc.scheduler import (
     MAX_APPROVAL_POLL_SECONDS,
     MIN_APPROVAL_POLL_SECONDS,
 )
+
+if TYPE_CHECKING:
+    from sdlc.queue import QueueStore
 
 # The full set of planned subcommands with one-line descriptions. `--help`
 # renders these even while the bodies are stubs, so the surface area is visible
@@ -174,14 +180,21 @@ def _enqueue_job(*, kind: str, scope: str, cli_args: list[str]) -> None:
     the bug-over-enhancement half of that order needs `sdlc queue add --label`
     or a later `sdlc queue prioritise`.
     """
-    from sdlc.queue import QueueStore, default_queue_path
+    from sdlc.queue_client import open_queue
 
-    store = QueueStore(default_queue_path())
-    store.init()
-    repo = str(Path.cwd().resolve())
-    job_id = store.add_job(
-        repo=repo, kind=kind, scope=scope, options_json=json.dumps(cli_args)
-    )
+    # Story 35.1-002: with a fleet queue configured the job goes there — and if
+    # that service is down this fails, it never falls back to the local queue
+    # (a job silently stranded on this machine is the worse outcome).
+    try:
+        store = open_queue()
+        store.init()
+        repo = str(Path.cwd().resolve())
+        job_id = store.add_job(
+            repo=repo, kind=kind, scope=scope, options_json=json.dumps(cli_args)
+        )
+    except QueueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     typer.echo(f"queued: job {job_id} ({kind} {scope}) in {repo}")
 
 
@@ -3241,6 +3254,42 @@ queue_app = typer.Typer(
 app.add_typer(queue_app, name="queue")
 
 
+def _queue_errors(func: Callable[..., None]) -> Callable[..., None]:
+    """Turn a refused/unreachable queue into one `error:` line and exit 2.
+
+    The local store raises `QueueError` only for bad input; the fleet client also
+    raises it for a down or refusing service, which no verb should show as a
+    traceback.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> None:
+        try:
+            func(*args, **kwargs)
+        except QueueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+
+    return wrapper
+
+
+def _local_queue(verb: str) -> QueueStore:
+    """The local store, for a verb that has no fleet-queue route yet."""
+    from sdlc.queue import QueueStore
+    from sdlc.queue_client import open_queue
+
+    store = open_queue()
+    if not isinstance(store, QueueStore):
+        typer.echo(
+            f"error: `sdlc queue {verb}` works on the local queue only; a fleet queue "
+            f"is configured ({getattr(store, 'url', '?')}) — unset SDLC_QUEUE_URL "
+            "(and any .sdlc-queue.yaml / ~/.sdlc-fleet.yaml) to use it",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return store
+
+
 def _format_age(now: datetime, created_at: str) -> str:
     """A short human age like ``3m``/``2h``/``5d`` from an ISO `created_at`."""
     try:
@@ -3258,6 +3307,7 @@ def _format_age(now: datetime, created_at: str) -> str:
 
 
 @queue_app.command("list")
+@_queue_errors
 def queue_list_cmd(
     as_json: bool = typer.Option(
         False, "--json", help="Emit the queue as JSON: {pause, jobs}."
@@ -3266,6 +3316,8 @@ def queue_list_cmd(
     """List every job on the host across every repo.
 
     Reads ``$XDG_STATE_HOME/sdlc/queue.db`` (``SDLC_QUEUE_PATH`` overrides it).
+    With ``SDLC_QUEUE_URL`` set (or ``queue_url:`` in ``.sdlc-queue.yaml`` /
+    ``~/.sdlc-fleet.yaml``) it reads the fleet queue instead (Story 35.1-002).
     Never mutates the store — a host that has never enqueued anything reports
     "no jobs queued" rather than creating an empty one. Sorted highest-priority
     first, then FIFO within a priority class.
@@ -3280,9 +3332,9 @@ def queue_list_cmd(
     runs. ``--json`` emits ``{"pause": …|null, "jobs": [...]}`` for the same
     reason: the pause needs somewhere to live that is not a job.
     """
-    from sdlc.queue import QueueStore, default_queue_path
+    from sdlc.queue_client import open_queue
 
-    store = QueueStore(default_queue_path())
+    store = open_queue()
     rows = store.list_jobs()
     now = datetime.now(timezone.utc)
     pause = store.dispatch_pause()
@@ -3326,6 +3378,7 @@ def queue_list_cmd(
 
 
 @queue_app.command("add")
+@_queue_errors
 def queue_add_cmd(
     kind: str = typer.Argument(..., help="build|fix"),
     scope: str = typer.Argument(
@@ -3364,9 +3417,9 @@ def queue_add_cmd(
     the per-class defaults host-wide and are read *at this point*, not at
     `sdlc queue run`; a malformed or non-positive value is ignored.
     """
-    from sdlc.queue import QueueError, QueueStore, default_queue_path
+    from sdlc.queue_client import open_queue
 
-    store = QueueStore(default_queue_path())
+    store = open_queue()
     store.init()
     repo_path = str((repo or Path.cwd()).resolve())
     try:
@@ -3382,6 +3435,7 @@ def queue_add_cmd(
 
 
 @queue_app.command("run")
+@_queue_errors
 def queue_run_cmd(
     slots: int = typer.Option(
         DEFAULT_SLOTS,
@@ -3479,10 +3533,9 @@ def queue_run_cmd(
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
     deliberately not built into the controller.
     """
-    from sdlc.queue import QueueStore, default_queue_path
     from sdlc.scheduler import SchedulerConfig, run_queue
 
-    store = QueueStore(default_queue_path())
+    store = _local_queue("run")
     store.init()
 
     result = run_queue(
@@ -3521,6 +3574,7 @@ def queue_run_cmd(
 
 
 @queue_app.command("cancel")
+@_queue_errors
 def queue_cancel_cmd(
     job_id: int = typer.Argument(..., help="Job id to cancel."),
 ) -> None:
@@ -3529,9 +3583,9 @@ def queue_cancel_cmd(
     `parked` is the approval wait (Story 32.2-002): cancelling one abandons the
     wait, leaving the change request exactly as it is for a human to finish.
     """
-    from sdlc.queue import QueueError, QueueStore, default_queue_path
+    from sdlc.queue_client import open_queue
 
-    store = QueueStore(default_queue_path())
+    store = open_queue()
     store.ensure_migrated()
     try:
         store.cancel_job(job_id)
@@ -3543,6 +3597,7 @@ def queue_cancel_cmd(
 
 
 @queue_app.command("requeue")
+@_queue_errors
 def queue_requeue_cmd(
     job_id: int = typer.Argument(..., help="Job id to put back in the queue."),
 ) -> None:
@@ -3564,9 +3619,9 @@ def queue_requeue_cmd(
     progress rather than being stopped again on its first poll — and the breaker
     still fires an allowance later if it is still thrashing.
     """
-    from sdlc.queue import QueueError, QueueStore, default_queue_path
+    from sdlc.queue_client import open_queue
 
-    store = QueueStore(default_queue_path())
+    store = open_queue()
     store.ensure_migrated()
     try:
         store.requeue_job(job_id)
@@ -3580,6 +3635,7 @@ def queue_requeue_cmd(
 
 
 @queue_app.command("unpause")
+@_queue_errors
 def queue_unpause_cmd(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List what would be cleared; write nothing."
@@ -3599,11 +3655,10 @@ def queue_unpause_cmd(
     clear is audited on the queue (reason `operator`) and in every touched
     ledger. Nothing paused or parked exits 0 with "nothing to clear".
     """
-    from sdlc.queue import QueueStore, default_queue_path
     from sdlc.registry import Registry
     from sdlc.unpause import clear_rate_limit
 
-    store = QueueStore(default_queue_path())
+    store = _local_queue("unpause")
     result = clear_rate_limit(store, Registry(), dry_run=dry_run)
     if result.nothing_to_clear:
         typer.echo("nothing to clear")
@@ -3622,6 +3677,7 @@ def queue_unpause_cmd(
 
 
 @queue_app.command("prioritise")
+@_queue_errors
 def queue_prioritise_cmd(
     job_id: int = typer.Argument(..., help="Job id to reprioritise."),
     priority_class: str = typer.Argument(..., help="low|normal|high|urgent"),
@@ -3638,9 +3694,9 @@ def queue_prioritise_cmd(
     The rounds a job has already burned are not erased by the move — a class
     change reprices the work, it does not forgive the spend.
     """
-    from sdlc.queue import QueueError, QueueStore, default_queue_path
+    from sdlc.queue_client import open_queue
 
-    store = QueueStore(default_queue_path())
+    store = open_queue()
     store.ensure_migrated()
     try:
         store.prioritise_job(job_id, priority_class)
@@ -3678,6 +3734,7 @@ def queue_serve_cmd(
 
     \b
     API (JSON bodies; errors are {"error": "..."}):
+      GET    /health                 {ok, controller_version} — `sdlc doctor`
       GET    /jobs[?repo=PATH]       {pause, jobs} — `queue list --json`
       POST   /jobs                   add: repo, kind, scope, \\[priority, options,
                                      labels, host, pool, requirements] -> 201

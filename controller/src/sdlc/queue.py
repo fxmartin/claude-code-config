@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence
 
 __all__ = [
     "DEFAULT_BUDGETS",
@@ -20,6 +20,7 @@ __all__ = [
     "JobBudget",
     "JobRecord",
     "QueuePause",
+    "QueueBackend",
     "QueueError",
     "QueueStore",
     "budget_breach",
@@ -659,6 +660,84 @@ def _at(now: datetime | None) -> datetime:
     expiry deterministically instead of sleeping out a real 90-second lease.
     """
     return now if now is not None else datetime.now(timezone.utc)
+
+
+class QueueBackend(Protocol):
+    """What a queue consumer needs from "the queue" — local SQLite or the fleet.
+
+    Story 35.1-002. The verbs the `sdlc queue serve` API exposes, no more:
+    :class:`QueueStore` (a file on this host) and
+    :class:`sdlc.queue_client.QueueClient` (the same verbs over HTTP) both
+    satisfy it, and :func:`sdlc.queue_client.open_queue` picks one. The
+    scheduler's internals (parks, polls, overlap holds) are not here: they have no
+    service route, so `sdlc queue run` stays on a :class:`QueueStore`.
+    """
+
+    def init(self) -> None: ...
+
+    def ensure_migrated(self) -> None: ...
+
+    def add_job(
+        self,
+        *,
+        repo: str,
+        kind: str,
+        scope: str,
+        priority: str | None = None,
+        options_json: str | None = None,
+        labels: Iterable[str] = (),
+        host: str | None = None,
+        pool: str | None = None,
+        requirements_json: str | None = None,
+    ) -> int: ...
+
+    def get_job(self, job_id: int) -> JobRecord | None: ...
+
+    def list_jobs(self, repo: str | None = None) -> list[JobRecord]: ...
+
+    def claim_next(
+        self,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+        host: str | None = None,
+        pools: Iterable[str] | None = None,
+    ) -> JobRecord | None: ...
+
+    def renew_lease(self, job_id: int, *, claimed_by: str, lease_seconds: int) -> bool: ...
+
+    def release_claim(
+        self, job_id: int, *, claimed_by: str, reason: str | None = None
+    ) -> None: ...
+
+    def finish_job(
+        self,
+        job_id: int,
+        state: str,
+        *,
+        reason: str | None = None,
+        claimed_by: str | None = None,
+    ) -> bool: ...
+
+    def cancel_job(self, job_id: int) -> None: ...
+
+    def requeue_job(self, job_id: int) -> None: ...
+
+    def prioritise_job(self, job_id: int, priority_class: str) -> None: ...
+
+    def pause_dispatch(
+        self,
+        *,
+        until: datetime,
+        reason: str | None = None,
+        run_id: str | None = None,
+        repo: str | None = None,
+        source: str | None = None,
+    ) -> bool: ...
+
+    def dispatch_pause(self) -> QueuePause | None: ...
+
+    def clear_pause(self) -> None: ...
 
 
 class QueueStore:

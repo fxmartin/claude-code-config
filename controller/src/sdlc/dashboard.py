@@ -34,7 +34,8 @@ from sdlc.issue_host import (
     load_repo_forge_declaration,
 )
 from sdlc.portfolio import portfolio_view
-from sdlc.queue import QueueStore, default_queue_path
+from sdlc.queue import QueueError
+from sdlc.queue_client import open_queue
 from sdlc.registry import Registry, RunRecord, derive_state
 
 # scp-like remote: git@host:owner/sub/repo.git
@@ -279,18 +280,25 @@ def queue_view() -> dict:
     source, per Story 32.3-002 AC3). `pause` is the host-level rate-limit window
     (Story 32.2-001) — the queue's own state, not a job's, which is exactly why
     it sits beside the rows rather than among them. An elapsed window is
-    reported as no pause at all, so the banner can never go stale. A host that
+    reported as no pause at all, so the banner can never go stale. With a fleet
+    queue configured (Story 35.1-002) this is the fleet's queue, via the same
+    `open_queue()` factory every other consumer uses. A host that
     has never enqueued anything degrades to an empty list rather than conjuring
     a `queue.db`, matching `QueueStore.list_jobs`'s read-never-creates contract.
     """
-    store = QueueStore(default_queue_path())
-    pause = store.dispatch_pause()
-    if pause is not None and not pause.is_active():
-        pause = None
-    return {
-        "pause": pause.to_dict() if pause else None,
-        "jobs": [r.to_dict() for r in store.list_jobs()],
-    }
+    try:
+        store = open_queue()
+        pause = store.dispatch_pause()
+        if pause is not None and not pause.is_active():
+            pause = None
+        return {
+            "pause": pause.to_dict() if pause else None,
+            "jobs": [r.to_dict() for r in store.list_jobs()],
+        }
+    except QueueError as exc:
+        # A configured fleet queue that is down must not 500 the page: show an
+        # empty queue plus why, and the next poll recovers on its own.
+        return {"pause": None, "jobs": [], "error": str(exc)}
 
 
 # --- live transport: change detection (Story 11.2-003) ---------------------
