@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import plistlib
+import socket
 import sqlite3
 import subprocess
 import tomllib
@@ -22,6 +24,7 @@ from sdlc.doctor import (
     check_controller_version,
     check_harness_pin,
     check_model_coverage,
+    check_queue_service,
     check_usage_agreement,
     run_doctor,
     worst_status,
@@ -30,6 +33,16 @@ from sdlc.model_backfill import backfill_models
 from sdlc.registry import Registry, RunRecord
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_queue_service(monkeypatch, tmp_path):
+    """Keep `run_doctor` off the developer's real LaunchAgent plist (35.1-003).
+
+    On home-lab the plist exists and the service is up; anywhere else it is
+    absent. Either way an un-isolated run would make these tests host-dependent.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
 # --- fixtures ---------------------------------------------------------------
@@ -1462,3 +1475,125 @@ def test_self_update_cleanup_failure_still_reports_the_install(
 
     assert doctor.self_update_controller(repo, "2.71.3", installer=installer, fetch=False) == "2.71.4"
     assert not installer.trees[0].exists()
+
+
+# --- queue service (Story 35.1-003) -----------------------------------------
+
+
+def _service_plist(
+    tmp_path: Path, *, bind: str = "100.101.102.103:8790", store: str | None = None
+) -> Path:
+    env = {"SDLC_QUEUE_PATH": store} if store else {}
+    path = tmp_path / "com.fxmartin.sdlc-queue.plist"
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.fxmartin.sdlc-queue",
+                "ProgramArguments": ["/usr/local/bin/sdlc", "queue", "serve", "--bind", bind],
+                "EnvironmentVariables": env,
+            }
+        )
+    )
+    return path
+
+
+def test_queue_service_not_installed_is_not_applicable(tmp_path: Path) -> None:
+    finding = check_queue_service(tmp_path / "absent.plist", probe=lambda h, p: False)
+    assert (finding.check, finding.status) == ("queue-service", "CLEAN")
+    assert "not installed" in finding.detail
+
+
+def test_queue_service_running_reports_bind_and_store(tmp_path: Path) -> None:
+    store = str(tmp_path / "queue.db")  # the shell's own, via _isolated_queue
+    seen: list[tuple[str, int]] = []
+
+    def probe(host: str, port: int) -> bool:
+        seen.append((host, port))
+        return True
+
+    finding = check_queue_service(_service_plist(tmp_path, store=store), probe=probe)
+    assert finding.status == "CLEAN"
+    assert seen == [("100.101.102.103", 8790)]
+    assert "running" in finding.detail
+    assert "100.101.102.103:8790" in finding.detail
+    assert store in finding.detail
+
+
+def test_queue_service_down_fails_with_a_remedy(tmp_path: Path) -> None:
+    finding = check_queue_service(_service_plist(tmp_path), probe=lambda h, p: False)
+    assert finding.status == "FAIL"
+    assert "100.101.102.103:8790" in finding.detail
+    assert "launchctl kickstart" in finding.remedy
+
+
+def test_queue_service_store_follows_launchds_bare_environment(tmp_path: Path) -> None:
+    # No SDLC_QUEUE_PATH/XDG_STATE_HOME in the plist: the service resolves the
+    # registry-sibling default under HOME, not whatever this shell exports.
+    finding = check_queue_service(_service_plist(tmp_path), probe=lambda h, p: True)
+    assert str(Path.home() / ".sdlc" / "queue.db") in finding.detail
+
+
+def test_queue_service_store_honours_the_plists_xdg_state_home(tmp_path: Path) -> None:
+    path = tmp_path / "xdg.plist"
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "ProgramArguments": ["sdlc", "queue", "serve", "--bind=100.64.0.9:8790"],
+                "EnvironmentVariables": {"XDG_STATE_HOME": "/srv/state"},
+            }
+        )
+    )
+    finding = check_queue_service(path, probe=lambda h, p: True)
+    assert "/srv/state/sdlc/queue.db" in finding.detail
+    assert "100.64.0.9:8790" in finding.detail
+
+
+def test_queue_service_store_differing_from_the_shells_warns(tmp_path: Path) -> None:
+    other = str(tmp_path / "elsewhere" / "queue.db")
+    finding = check_queue_service(
+        _service_plist(tmp_path, store=other), probe=lambda h, p: True
+    )
+    assert finding.status == "WARN"
+    assert other in finding.detail
+    assert "SDLC_QUEUE_PATH" in finding.remedy
+
+
+def test_queue_service_plist_without_a_bind_fails(tmp_path: Path) -> None:
+    path = tmp_path / "bad.plist"
+    path.write_bytes(plistlib.dumps({"ProgramArguments": ["/usr/local/bin/sdlc"]}))
+    finding = check_queue_service(path, probe=lambda h, p: True)
+    assert finding.status == "FAIL"
+    assert "--bind" in finding.detail
+
+
+def test_queue_service_unreadable_plist_fails(tmp_path: Path) -> None:
+    path = tmp_path / "junk.plist"
+    path.write_text("not a plist", encoding="utf-8")
+    assert check_queue_service(path, probe=lambda h, p: True).status == "FAIL"
+
+
+def test_queue_service_default_probe_sees_a_real_listener(tmp_path: Path) -> None:
+    store = str(tmp_path / "queue.db")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        plist = _service_plist(tmp_path, bind=f"127.0.0.1:{port}", store=store)
+        up = check_queue_service(plist)
+    assert up.status == "CLEAN"
+    # The listener is closed now, so the same bind is refused.
+    assert check_queue_service(plist).status == "FAIL"
+
+
+def test_run_doctor_includes_the_queue_service_finding(tmp_path: Path) -> None:
+    plist = _service_plist(tmp_path, store=str(tmp_path / "queue.db"))
+    report = _doctor(tmp_path, queue_service_plist=plist)
+    # Nothing listens on the fixture's tailnet address, so the check is live here.
+    assert _finding(report, "queue-service").status == "FAIL"
+
+
+def test_run_doctor_queue_service_defaults_to_the_launchagents_plist(
+    tmp_path: Path,
+) -> None:
+    # HOME is a fresh tmp dir (autouse fixture): no plist, so not applicable.
+    assert _finding(_doctor(tmp_path), "queue-service").status == "CLEAN"

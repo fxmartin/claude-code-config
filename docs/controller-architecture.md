@@ -1814,6 +1814,23 @@ loopback peer, so local development authenticates by token, and a loopback bind
 without `SDLC_QUEUE_TOKEN` refuses to start. Add
 `SDLC_QUEUE_PATH` to point the service at a non-default store.
 
+**Resident service (Story 35.1-003).** On home-lab the service runs under
+launchd from `templates/launchd/com.fxmartin.sdlc-queue.plist`: `RunAtLoad` +
+`KeepAlive` (so it survives a reboot and a controller reinstall), logs in
+`~/.local/state/sdlc/queue-service.{out,err}.log`, no secret in the file. The
+template's header documents the four substitutions and the install commands; the
+nix wiring that renders the same shape lands in `nix-install`. The plist pins
+`SDLC_QUEUE_PATH` because launchd's environment is bare — export the same value
+in the shell so local `sdlc queue` verbs write the file the service serves.
+`sdlc doctor` reads the installed plist (`check_queue_service`, finding
+`queue-service`): **CLEAN** with the bind address and store path when the bind
+accepts a TCP connection (or "not installed" off home-lab), **FAIL** when
+nothing listens or the plist is unusable (remedy: `launchctl kickstart -k
+gui/$(id -u)/com.fxmartin.sdlc-queue`), **WARN** when the service's store is not
+the one this shell's `sdlc queue` uses. The probe is a bare connect, not an HTTP
+call: the API refuses unauthenticated callers and doctor stays read-only. This
+supersedes the 30.3-001 pattern for the queue; `sdlc listen` keeps its own.
+
 **Schema.** One additive migration (`fleet_job_columns`) adds `host` (pin),
 `pool`, `requirements` (JSON) and `worker` (who holds the claim) to `jobs`, all
 nullable: an older `queue.db` upgrades in place and its rows read as "run

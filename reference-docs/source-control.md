@@ -127,3 +127,14 @@ Until those land, on `home-lab`:
     local-ci-cd up
 
 `up` rewrites the plist for the current build; GitLab readiness takes 4–6 minutes.
+
+The fleet queue service (`sdlc queue serve`, epic 35) is a KeepAlive LaunchAgent
+(`com.fxmartin.sdlc-queue`, template `templates/launchd/` in claude-code-config),
+so it normally returns on its own at login. Check it:
+
+    sdlc doctor            # "Queue service": running, bind address, store path
+    launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-queue   # if it is not
+    tail ~/.local/state/sdlc/queue-service.err.log
+
+It binds the tailnet address, so it can fail to start until Tailscale is up;
+launchd retries every 10 seconds.

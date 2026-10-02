@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent that keeps `sdlc queue serve` (the fleet queue service,
+  Story 35.1-001) resident on home-lab — Story 35.1-003.
+
+  Substitute the four __PLACEHOLDERS__ below; launchd expands neither `~` nor
+  `$VARS`, so every path is absolute:
+
+    __HOME__        the account's home, e.g. /Users/fxmartin
+    __TAILNET_IP__  home-lab's tailnet address (`tailscale ip -4`); the service
+                    refuses wildcard, LAN and public binds
+    __LOGIN__       the Tailscale login(s) allowed to call the API
+                    (comma-separated, read as $SDLC_QUEUE_ALLOW)
+
+  Install (or let nix-install render the same shape declaratively):
+
+    mkdir -p ~/.local/state/sdlc
+    sed -e "s|__HOME__|$HOME|g" -e "s|__TAILNET_IP__|$(tailscale ip -4)|g" \
+        -e "s|__LOGIN__|you@example.com|g" \
+        templates/launchd/com.fxmartin.sdlc-queue.plist \
+        > ~/Library/LaunchAgents/com.fxmartin.sdlc-queue.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fxmartin.sdlc-queue.plist
+
+  No secret lives here. home-lab has the Tailscale CLI, so the allowlist alone
+  gates the API; a host without it would supply SDLC_QUEUE_TOKEN through the
+  environment, never this file.
+
+  SDLC_QUEUE_PATH is pinned because launchd starts the service with a bare
+  environment: export the same value in your shell (or XDG_STATE_HOME
+  =$HOME/.local/state) so `sdlc queue add` writes the file the service serves.
+  `sdlc doctor` warns when the two differ.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fxmartin.sdlc-queue</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/sdlc</string>
+    <string>queue</string>
+    <string>serve</string>
+    <string>--bind</string>
+    <string>__TAILNET_IP__:8790</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>SDLC_QUEUE_PATH</key>
+    <string>__HOME__/.local/state/sdlc/queue.db</string>
+    <key>SDLC_QUEUE_ALLOW</key>
+    <string>__LOGIN__</string>
+  </dict>
+
+  <!-- Start at load/boot, and restart whenever it exits (crash, reinstall). -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- A bind that fails because the tailnet is not up yet must not spin. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/sdlc/queue-service.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/sdlc/queue-service.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
