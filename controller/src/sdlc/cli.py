@@ -3625,6 +3625,16 @@ def queue_run_cmd(
     list`. `--slots` is the worker's cap. Works on the queue this host owns:
     with `SDLC_QUEUE_URL` set it refuses, like the rest of this verb.
 
+    Before launching a fresh job a worker syncs its clone (Story 35.2-002):
+    `git fetch origin && git checkout -q main && git merge --ff-only
+    origin/main`, recording the sha as the job's `synced_sha`. A missing clone
+    is cloned from the origin the job recorded at enqueue — under `~/Work/<name>`
+    when the recorded path does not exist here, which then becomes the job's
+    repo. A tracked-dirty tree (`DIRTY_WORKING_TREE`, never stashed), a clone
+    already running a conflicting job, or a git timeout sends the job back to
+    `queued`; an `origin mismatch`, a `main` that cannot fast-forward or a failed
+    clone parks it `blocked`. A resumed run is never synced.
+
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
     deliberately not built into the controller.

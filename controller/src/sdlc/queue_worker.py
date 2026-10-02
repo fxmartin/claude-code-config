@@ -8,11 +8,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Protocol
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -176,10 +177,12 @@ _BASE_BRANCH = "main"
 class RepoRefused(Exception):
     """The worker will not run this job against its clone.
 
-    ``retryable`` separates the one refusal a human fixes by tidying their own
-    tree (a dirty checkout — the job goes back to ``queued``) from the ones that
-    need an operator decision (wrong origin, diverged ``main``, no clone — the
-    job is parked ``blocked``).
+    ``retryable`` separates the refusals that clear without an operator — a
+    dirty checkout its owner tidies, a clone already busy with another job, a
+    git call that timed out against a slow forge; the job goes back to
+    ``queued`` — from the ones that need an operator decision (wrong origin,
+    a ``main`` that cannot fast-forward, no clone — the job is parked
+    ``blocked``).
     """
 
     def __init__(self, reason: str, *, retryable: bool = False) -> None:
@@ -196,7 +199,12 @@ class PreparedRepo:
     sha: str | None
 
 
-RepoPreparer = Callable[["JobRecord"], PreparedRepo]
+class RepoPreparer(Protocol):
+    """The shape of :func:`prepare_repo`, the scheduler's injectable sync seam."""
+
+    def __call__(
+        self, job: "JobRecord", *, busy_repos: Collection[str] = ...
+    ) -> PreparedRepo: ...
 
 _SCP_URL = re.compile(r"^(?:[^@/]+@)?(?P<host>[^:/]+):(?P<path>.+)$")
 
@@ -267,11 +275,23 @@ def _recorded_origin(job: "JobRecord") -> str | None:
 
 
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """:func:`_git`, with a timeout or missing git surfaced as a refusal."""
+    """:func:`_git`, with a timeout (retryable) or missing git surfaced as a refusal."""
     try:
         return _git(root, *args)
+    except subprocess.TimeoutExpired as exc:
+        raise RepoRefused(f"git {args[0]} timed out in {root}: {exc}", retryable=True) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RepoRefused(f"git {args[0]} failed in {root}: {exc}") from exc
+
+
+def _diverged_hint(root: Path) -> str:
+    """Name the divergence only when there is one: a merge also aborts on local changes."""
+    try:
+        res = _git(root, "merge-base", "--is-ancestor", "HEAD", f"origin/{_BASE_BRANCH}")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    # Exit 1 is git's "not an ancestor"; anything else is no verdict at all.
+    return " (local main has diverged from origin/main)" if res.returncode == 1 else ""
 
 
 def _dirty_refusal(root: Path, paths: list[str]) -> RepoRefused:
@@ -290,18 +310,29 @@ def _dirty_refusal(root: Path, paths: list[str]) -> RepoRefused:
 
 
 def _clone(origin: str, target: Path) -> None:
+    # The origin comes from a job body; one shaped like an option
+    # (`--upload-pack=…`) must never reach git's argument parser.
+    if origin.startswith("-"):
+        raise RepoRefused(f"refusing to clone {origin!r}: an origin that reads as a git option")
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
         # Plain `git clone`: the worker's own `gh`/`glab` credentials reach git
         # through the credential helpers `gh auth setup-git` / `glab auth
         # git-credential` install, so no token is handled here.
         res = subprocess.run(
-            ["git", "clone", "-q", origin, str(target)],
+            ["git", "clone", "-q", "--", origin, str(target)],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_SECONDS,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
+    except subprocess.TimeoutExpired as exc:
+        # The timeout SIGKILLs git, so it cannot remove its half-written clone —
+        # which the retry would otherwise find and judge as a (dirty) clone.
+        shutil.rmtree(target, ignore_errors=True)
+        raise RepoRefused(
+            f"could not clone {origin} into {target}: timed out: {exc}", retryable=True
+        ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RepoRefused(f"could not clone {origin} into {target}: {exc}") from exc
     if res.returncode != 0:
@@ -310,14 +341,20 @@ def _clone(origin: str, target: Path) -> None:
         )
 
 
-def prepare_repo(job: "JobRecord", *, work_dir: Path | None = None) -> PreparedRepo:
+def prepare_repo(
+    job: "JobRecord", *, work_dir: Path | None = None, busy_repos: Collection[str] = ()
+) -> PreparedRepo:
     """Bring the job's clone to the forge's ``main`` before it is dispatched.
 
     ``git fetch origin && git checkout -q main && git merge --ff-only
-    origin/main``, then the resulting sha. An absent clone is made from the
-    origin the job recorded at enqueue — at the job's own path when this machine
-    has that directory's parent, otherwise under ``work_dir`` (``~/Work``): a
-    path recorded on another machine means nothing here.
+    origin/main``, then the resulting sha. The clone is the job's own path when
+    that exists on this machine, otherwise ``work_dir/<name>`` (``~/Work``): a
+    path recorded on another machine means nothing here. An absent clone is made
+    from the origin the job recorded at enqueue.
+
+    ``busy_repos`` are the clones the claim's per-repo exclusivity rule says this
+    job must not share. The claim judged the job's *recorded* path, so a clone
+    reached under another name is checked here, before git touches it.
 
     Refuses (:class:`RepoRefused`) rather than repairing: a tracked-dirty tree
     (never stashed — the #590 rule), an ``origin`` that is not the one the job
@@ -333,7 +370,11 @@ def prepare_repo(job: "JobRecord", *, work_dir: Path | None = None) -> PreparedR
         return PreparedRepo(path=declared, sha=None)
 
     root = work_dir if work_dir is not None else default_work_dir()
-    target = declared if declared.exists() else root / declared.name
+    # Resolved, because a run registers under its resolved cwd and the scheduler
+    # matches the two to link the job to its run.
+    target = (declared if declared.exists() else root / declared.name).resolve()
+    if target != declared and str(target) in busy_repos:
+        raise RepoRefused(f"repo busy: {target} is already running a job", retryable=True)
     if not target.exists():
         _clone(recorded, target)
     elif not (target / ".git").exists():
@@ -353,7 +394,7 @@ def prepare_repo(job: "JobRecord", *, work_dir: Path | None = None) -> PreparedR
         res = _run_git(target, *args)
         if res.returncode != 0:
             detail = (res.stderr or res.stdout).strip()
-            hint = " (local main has diverged from origin/main)" if args[0] == "merge" else ""
+            hint = _diverged_hint(target) if args[0] == "merge" else ""
             step = "fast-forward to origin/main" if args[0] == "merge" else " ".join(args)
             raise RepoRefused(f"could not {step} in {target}{hint}: {detail}")
     head = _run_git(target, "rev-parse", "HEAD")

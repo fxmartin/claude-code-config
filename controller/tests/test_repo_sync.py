@@ -23,7 +23,7 @@ from sdlc.queue_worker import (
     repo_origin,
     same_origin,
 )
-from sdlc.registry import Registry
+from sdlc.registry import Registry, RunRecord
 from sdlc.scheduler import SchedulerConfig, run_queue
 
 _ENV = {
@@ -206,7 +206,52 @@ def test_a_diverged_local_main_is_refused_and_left_untouched(tmp_path, forge, wo
 
     assert refusal.value.retryable is False
     assert "fast-forward" in refusal.value.reason
+    assert "diverged" in refusal.value.reason
     assert git(clone, "rev-parse", "HEAD") == local_only
+
+
+def test_a_merge_stopped_by_local_changes_is_not_called_divergence(
+    tmp_path, forge, work_dir
+) -> None:
+    """The progress render is exempt from the dirty check yet can still abort the merge."""
+    view = "docs/stories/.build-progress.md"
+    (forge.seed / "docs" / "stories").mkdir(parents=True)
+    forge.advance(view)
+    clone = _clone(forge, work_dir / "proj")
+    commit(forge.seed, view, "newer render\n")
+    git(forge.seed, "push", "-q", "origin", "main")
+    (clone / view).write_text("local render\n", encoding="utf-8")
+    job = _job(tmp_path, clone, forge.url)
+
+    with pytest.raises(RepoRefused) as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is False
+    assert "fast-forward" in refusal.value.reason
+    assert "diverged" not in refusal.value.reason
+
+
+def test_an_ancestry_check_that_cannot_run_names_no_divergence(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    from sdlc import queue_worker
+
+    clone = _clone(forge, work_dir / "proj")
+    job = _job(tmp_path, clone, forge.url)
+    real = queue_worker._git
+
+    def merge_fails(root, *args):
+        if args[0] == "merge":
+            return subprocess.CompletedProcess(args, 1, "", "merge refused")
+        if args[0] == "merge-base":
+            raise FileNotFoundError("git")
+        return real(root, *args)
+
+    monkeypatch.setattr(queue_worker, "_git", merge_fails)
+    with pytest.raises(RepoRefused, match="merge refused") as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert "diverged" not in refusal.value.reason
 
 
 def test_a_failed_clone_refuses_the_job(tmp_path, work_dir) -> None:
@@ -309,12 +354,94 @@ def test_git_that_cannot_run_is_a_refusal_not_a_crash(
 
     def failing(root, *args):
         if args[0] == "fetch":
-            raise subprocess.TimeoutExpired(cmd="git fetch", timeout=1)
+            raise FileNotFoundError("git")
         return real(root, *args)
 
     monkeypatch.setattr(queue_worker, "_git", failing)
-    with pytest.raises(RepoRefused, match="git fetch failed"):
+    with pytest.raises(RepoRefused, match="git fetch failed") as refusal:
         prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is False
+
+
+def test_a_git_timeout_sends_the_job_back_to_be_retried(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    """A slow forge is transient: retry the job rather than park it for an operator."""
+    from sdlc import queue_worker
+
+    clone = _clone(forge, work_dir / "proj")
+    job = _job(tmp_path, clone, forge.url)
+    real = queue_worker._git
+
+    def slow(root, *args):
+        if args[0] == "fetch":
+            raise subprocess.TimeoutExpired(cmd="git fetch", timeout=1)
+        return real(root, *args)
+
+    monkeypatch.setattr(queue_worker, "_git", slow)
+    with pytest.raises(RepoRefused, match="git fetch timed out") as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is True
+
+
+def test_a_clone_that_times_out_leaves_nothing_behind_and_is_retried(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    """A killed `git clone` cannot clean up after itself; a half clone would read as dirty."""
+    from sdlc import queue_worker
+
+    target = work_dir / "proj"
+    job = _job(tmp_path, target, forge.url)
+
+    def killed(argv, **_kwargs):
+        (target / ".git").mkdir(parents=True)
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
+
+    monkeypatch.setattr(queue_worker.subprocess, "run", killed)
+    with pytest.raises(RepoRefused, match="timed out") as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is True
+    assert not target.exists()
+
+
+def test_an_origin_that_reads_as_a_git_option_is_never_handed_to_git(
+    tmp_path, work_dir, monkeypatch
+) -> None:
+    from sdlc import queue_worker
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        queue_worker.subprocess, "run", lambda argv, **_k: calls.append(list(argv))
+    )
+    job = _job(tmp_path, work_dir / "proj", "--upload-pack=touch pwned")
+
+    with pytest.raises(RepoRefused, match="git option") as refusal:
+        prepare_repo(job, work_dir=work_dir)
+
+    assert refusal.value.retryable is False
+    assert calls == []
+
+
+def test_the_clone_ends_option_parsing_before_the_origin(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    from sdlc import queue_worker
+
+    seen: list[list[str]] = []
+    real = queue_worker.subprocess.run
+
+    def spy(argv, **kwargs):
+        seen.append(list(argv))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(queue_worker.subprocess, "run", spy)
+    prepare_repo(_job(tmp_path, work_dir / "proj", forge.url), work_dir=work_dir)
+
+    clone_argv = next(argv for argv in seen if argv[:2] == ["git", "clone"])
+    assert clone_argv[-3:] == ["--", forge.url, str(work_dir / "proj")]
 
 
 def test_an_unreadable_head_after_syncing_is_a_refusal(
@@ -411,14 +538,35 @@ def _clean(_root) -> Finding:
     return Finding("install", "Installed controller vs checkout", "CLEAN", "matches")
 
 
-def _drain(tmp_path, store, work_dir, *, worker: bool = True, **kwargs):
-    clock = Clock()
-    launcher = FakeLauncher()
+class RegisteringLauncher(FakeLauncher):
+    """Registers each run the way `run_build` does: under the cwd it really runs in."""
+
+    def __init__(self, registry: Registry, db: Path) -> None:
+        super().__init__()
+        self.registry = registry
+        self.db = db
+
+    def __call__(self, argv, cwd):
+        proc = super().__call__(argv, cwd)
+        self.registry.register(
+            RunRecord(run_id=f"run-{proc.pid}", repo=str(Path(cwd).resolve()),
+                      db=str(self.db), scope="epic-1", pid=proc.pid,
+                      status="IN_PROGRESS", started_at="")
+        )
+        return proc
+
+
+def _drain(
+    tmp_path, store, work_dir, *, worker: bool = True, clock=None, launcher=None,
+    registry=None, preparer=None, **kwargs,
+):
+    clock = clock or Clock()
+    launcher = launcher or FakeLauncher()
     profile = WorkerProfile(name="xps", host="omarchy-xps13") if worker else None
     result = run_queue(
         store,
         config=SchedulerConfig(slots=2, poll_seconds=1.0, worker=profile),
-        registry=Registry(tmp_path / "registry.json"),
+        registry=registry or Registry(tmp_path / "registry.json"),
         launcher=launcher,
         clock=clock,
         sleeper=clock.advance,
@@ -426,7 +574,7 @@ def _drain(tmp_path, store, work_dir, *, worker: bool = True, **kwargs):
         version_check=_clean,
         echo=lambda _line: None,
         identity="xps",
-        prepare_repo=partial(prepare_repo, work_dir=work_dir),
+        prepare_repo=preparer or partial(prepare_repo, work_dir=work_dir),
         **kwargs,
     )
     return result, launcher
@@ -533,3 +681,131 @@ def test_a_job_with_no_recorded_origin_launches_unsynced(tmp_path, forge, work_d
     assert len(launcher.calls) == 1
     job = store.get_job(job_id)
     assert job is not None and job.synced_sha is None
+
+
+# --- a path recorded on another machine: the clone is what every later step sees ---
+
+
+def _elsewhere(tmp_path: Path) -> Path:
+    """Where the enqueuing machine keeps the clone — a path that does not exist here."""
+    return tmp_path / "Users" / "fx" / "Work" / "proj"
+
+
+def test_a_job_from_another_machine_is_tracked_in_the_clone_it_ran_in(
+    tmp_path, forge, work_dir
+) -> None:
+    """Run attach, resume, reconcile and the approval probe all read ``job.repo``."""
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, _elsewhere(tmp_path), forge.url)
+    registry = Registry(tmp_path / "registry.json")
+    launcher = RegisteringLauncher(registry, tmp_path / "ledger.db")
+
+    _drain(tmp_path, store, work_dir, launcher=launcher, registry=registry)
+
+    clone = work_dir / "proj"
+    assert [cwd for _, cwd in launcher.calls] == [str(clone)]
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job.repo == str(clone)
+    assert job.run_id == "run-90001"
+
+
+def test_a_remapped_clone_already_running_a_fix_is_left_alone(
+    tmp_path, forge, work_dir
+) -> None:
+    """The claim's per-repo exclusivity saw the foreign path; the clone must pass it too."""
+    clone = _clone(forge, work_dir / "proj")
+    git(clone, "checkout", "-q", "-b", "fix/42")  # a fix runs in the repo root
+    forge.advance()
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    fix_id = store.add_job(repo=str(clone), kind="fix", scope="42")
+    assert store.claim_job(
+        fix_id, claimed_by="peer", lease_seconds=3600, now=Clock()()
+    ) is not None
+    build_id = _enqueue(store, _elsewhere(tmp_path), forge.url)
+
+    result, launcher = _drain(tmp_path, store, work_dir)
+
+    build = store.get_job(build_id)
+    assert build is not None
+    assert (build.state, build.claimed_by, build.repo) == (
+        "queued", None, str(_elsewhere(tmp_path))
+    )
+    assert "repo busy" in (build.reason or "")
+    assert launcher.calls == []
+    assert result.started == 0
+    assert git(clone, "branch", "--show-current") == "fix/42"
+
+
+# --- a slow sync must not outlive the claim it runs under ---------------------
+
+
+def test_a_job_reclaimed_by_a_peer_during_a_slow_sync_is_not_launched(
+    tmp_path, forge, work_dir
+) -> None:
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, work_dir / "proj", forge.url)
+    clock = Clock()
+
+    def slow_sync(job, **kwargs):
+        prepared = prepare_repo(job, work_dir=work_dir, **kwargs)
+        clock.advance(600)  # far past the 90 s lease
+        assert store.reclaim_job(
+            job.id, claimed_by="peer", lease_seconds=3600, now=clock()
+        ) is not None
+        return prepared
+
+    result, launcher = _drain(tmp_path, store, work_dir, clock=clock, preparer=slow_sync)
+
+    assert launcher.calls == []
+    assert result.started == 0
+    job = store.get_job(job_id)
+    assert job is not None and job.claimed_by == "peer"
+
+
+def test_a_slow_sync_renews_every_lease_it_held_up(tmp_path, work_dir) -> None:
+    """The just-synced job and the job already running both launch under a live lease."""
+    forges = {name: Forge(tmp_path / name) for name in ("one", "two")}
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    first = _enqueue(store, work_dir / "one", forges["one"].url)
+    second = _enqueue(store, work_dir / "two", forges["two"].url)
+    clock = Clock()
+    leases: dict[int, datetime] = {}
+
+    def slow_sync(job, **kwargs):
+        prepared = prepare_repo(job, work_dir=work_dir, **kwargs)
+        if job.id == second:
+            clock.advance(600)  # far past the 90 s lease of the job already running
+        return prepared
+
+    class LeaseReadingLauncher(FakeLauncher):
+        def __call__(self, argv, cwd):
+            if len(self.calls) == 1:  # launching the second job
+                for job_id in (first, second):
+                    lease = store.get_job(job_id).lease_until
+                    leases[job_id] = datetime.fromisoformat(lease)
+            return super().__call__(argv, cwd)
+
+    _drain(tmp_path, store, work_dir, clock=clock, launcher=LeaseReadingLauncher(),
+           preparer=slow_sync)
+
+    assert leases and all(lease > clock() for lease in leases.values()), leases
+
+
+def test_queue_run_help_describes_the_pre_dispatch_sync() -> None:
+    import re
+
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    result = CliRunner().invoke(app, ["queue", "run", "--help"])
+    assert result.exit_code == 0, result.output
+    text = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", result.output).split())
+    for needle in ("git merge --ff-only origin/main", "DIRTY_WORKING_TREE",
+                   "origin mismatch"):
+        assert needle in text, needle

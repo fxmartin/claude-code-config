@@ -1822,21 +1822,35 @@ is self-describing. A `--worker` drain then prepares the clone *after* claiming
 a fresh job and *before* launching it (a resumed run re-enters its own tree and
 is never synced):
 
-1. absent clone → `git clone <recorded origin>` (at the job's own path if that
-   directory exists on this host, else under `~/Work/<name>` — a path recorded
-   on another machine means nothing here; git reaches the forge with the
-   worker's own `gh`/`glab` credential helper);
-2. the clone's `origin` must be the recorded one (compared by host + path, so
+1. the clone is the job's own path if that directory exists on this host, else
+   `~/Work/<name>` — a path recorded on another machine means nothing here. A
+   clone reached under that other name must pass the claim's per-repo
+   exclusivity too: one already running a conflicting job (any job for a `fix`,
+   a `fix` for a `build`) sends the job back to `queued` with `repo busy`,
+   before git touches the clone;
+2. absent clone → `git clone -- <recorded origin>` (an origin starting with `-`
+   is refused; git reaches the forge with the worker's own `gh`/`glab`
+   credential helper);
+3. the clone's `origin` must be the recorded one (compared by host + path, so
    `git@host:o/r.git`, `ssh://…` and `https://…` agree) — otherwise the job is
    parked `blocked` with `origin mismatch: <path> has origin A but the job
    records B`;
-3. a tracked-dirty tree (`dirty_tree_paths`; untracked scratch is ignored) sends
+4. a tracked-dirty tree (`dirty_tree_paths`; untracked scratch is ignored) sends
    the job back to `queued` with a `DIRTY_WORKING_TREE` reason — the #590 rule,
    never a stash — and the next poll retries it;
-4. `git fetch origin && git checkout -q main && git merge --ff-only origin/main`;
-   a `main` that cannot fast-forward parks the job `blocked`, untouched;
-5. the resulting sha is recorded in the job's `synced_sha` (migration 8, in
-   `sdlc queue list --json`) and the job launches in that clone.
+5. `git fetch origin && git checkout -q main && git merge --ff-only origin/main`;
+   a `main` that cannot fast-forward parks the job `blocked`, untouched (the
+   reason says "diverged" only when `merge-base --is-ancestor` confirms it — a
+   merge also aborts on local changes to the exempt progress render). A git
+   call that times out is transient: the job goes back to `queued`, and a
+   timed-out clone's half-written directory is removed first;
+6. the scheduler renews the claim (and every running job's lease the sync held
+   up) before launching — a peer that reclaimed the job during a slow clone owns
+   it, so it is not launched twice — then records the clone path as the job's
+   `repo` and the resulting sha as its `synced_sha` (migration 8, in `sdlc queue
+   list --json`), and launches the job there. Run attach, resume, reconcile and
+   the approval probe all read `repo`, so they follow the clone, not the path
+   the enqueuing machine recorded.
 
 A job that records no origin (enqueued before this story, or from a repo with
 no remote) and a drain without `--worker` are not synced.

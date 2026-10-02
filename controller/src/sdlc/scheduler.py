@@ -13,7 +13,7 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, cast
@@ -34,7 +34,7 @@ from sdlc.risk_gate import RISK_APPROVED_LABEL
 
 if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
     from sdlc.build import Ledger
-    from sdlc.queue_worker import PreparedRepo, RepoPreparer, WorkerProfile
+    from sdlc.queue_worker import RepoPreparer, WorkerProfile
 
 __all__ = [
     "DEFAULT_APPROVAL_POLL_SECONDS",
@@ -997,17 +997,16 @@ class _Scheduler:
         # Issue #709: with `--self-update`, try the remedy before parking — this
         # is also the path a job returning from an approval park takes, so a
         # sibling's release reinstalls rather than re-parking it.
-        cwd = Path(job.repo)
         if action == "start" and self._config.worker is not None:
             # Story 35.2-002: a fresh job starts from the forge's `main`. Resumes
             # are left alone — a half-done run must re-enter the tree it left.
             prepared = self._prepare(job)
             if prepared is None:
                 return False
-            cwd = prepared.path
-        finding = self._check_version(str(cwd))
-        if getattr(finding, "status", "CLEAN") != "CLEAN" and self._self_update(str(cwd)):
-            finding = self._check_version(str(cwd))
+            job = prepared
+        finding = self._check_version(job.repo)
+        if getattr(finding, "status", "CLEAN") != "CLEAN" and self._self_update(job.repo):
+            finding = self._check_version(job.repo)
         status = getattr(finding, "status", "CLEAN")
         if status != "CLEAN":
             detail = getattr(finding, "detail", "")
@@ -1034,7 +1033,7 @@ class _Scheduler:
             else job_argv(job, resume=action == "resume")
         )
         try:
-            proc = self._launcher(argv, cwd)
+            proc = self._launcher(argv, Path(job.repo))
         except OSError as exc:
             self._store.finish_job(job.id, "failed", reason=f"could not launch: {exc}")
             self._result.failed += 1
@@ -1061,18 +1060,27 @@ class _Scheduler:
         )
         return True
 
-    def _prepare(self, job: JobRecord) -> "PreparedRepo | None":
+    def _prepare(self, job: JobRecord) -> JobRecord | None:
         """Sync the job's clone to the forge's ``main``; ``None`` when the job was refused.
 
+        Returns the job as it will run: its ``repo`` is the clone the sync used,
+        persisted, because a path recorded on another machine means nothing here
+        and every later step (run attach, resume, reconcile, the approval probe,
+        per-repo exclusivity) reads ``job.repo``.
+
         A dirty tree goes back to ``queued`` with the #590 reason (the owner
-        tidies it; the next poll retries). Anything else needs an operator —
-        wrong origin, diverged ``main``, no clone — so the job parks ``blocked``.
+        tidies it; the next poll retries), as do a clone already busy with
+        another job and a git timeout. Anything else needs an operator — wrong
+        origin, diverged ``main``, no clone — so the job parks ``blocked``.
         """
         from sdlc.queue_worker import RepoRefused, prepare_repo
 
         prepare = self._prepare_repo or prepare_repo
+        # The same rule `peek_claimable` applied to the recorded path: a fix
+        # shares its clone with nothing, a build only stays clear of a fix.
+        busy = self._store.running_repos(kind=None if job.kind == "fix" else "fix")
         try:
-            prepared = prepare(job)
+            prepared = prepare(job, busy_repos=busy)
         except RepoRefused as exc:
             if exc.retryable:
                 self._store.release_claim(
@@ -1089,9 +1097,21 @@ class _Scheduler:
             self._announce(job, None, "blocked")
             return None
         self._refusal_echoed.pop(job.id, None)
-        if prepared.sha:
-            self._store.record_synced_sha(job.id, prepared.sha)
-        return prepared
+        if not prepared.sha:
+            return job
+        # The sync runs inline and a first clone can take minutes, past the
+        # leases it held up. Re-assert this claim before launching — a peer that
+        # reclaimed the job meanwhile owns it now — and the running jobs' too.
+        self._renew()
+        if not self._store.renew_lease(
+            job.id, claimed_by=self._identity,
+            lease_seconds=self._config.lease_seconds, now=self._clock(),
+        ):
+            self._echo(f"job {job.id}: lease lost during the repo sync, not launched")
+            return None
+        repo = str(prepared.path)
+        self._store.record_sync(job.id, repo=repo, sha=prepared.sha)
+        return replace(job, repo=repo, synced_sha=prepared.sha)
 
     def _check_version(self, repo: str) -> object:
         if not self._self_updated:

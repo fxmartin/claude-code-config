@@ -1854,12 +1854,18 @@ class QueueStore:
                     (reason, moment, job_id, claimed_by),
                 )
 
-    def record_synced_sha(self, job_id: int, sha: str) -> None:
-        """Record the sha a worker brought the job's clone to before dispatch (Story 35.2-002)."""
+    def record_sync(self, job_id: int, *, repo: str, sha: str) -> None:
+        """Record the clone a worker synced for the job, and its sha, before dispatch.
+
+        Story 35.2-002. ``repo`` replaces the recorded path: one written on
+        another machine means nothing on this worker, and every later step — run
+        attach, resume, reconcile, the approval probe, per-repo exclusivity —
+        reads ``repo``.
+        """
         with self._connect() as conn:
             conn.execute(
-                "UPDATE jobs SET synced_sha = ?, updated_at = ? WHERE id = ?",
-                (sha, _now_iso(), job_id),
+                "UPDATE jobs SET repo = ?, synced_sha = ?, updated_at = ? WHERE id = ?",
+                (repo, sha, _now_iso(), job_id),
             )
 
     def attach_run(self, job_id: int, run_id: str) -> None:
