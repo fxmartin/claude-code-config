@@ -1743,7 +1743,7 @@ what `sdlc queue list --json` emits.
 |-------|--------------|-------|
 | `GET /health` | — | `{ok, controller_version}` — a 200 means the identity gate admitted the caller; what `sdlc doctor` probes (Story 35.1-002) |
 | `GET /jobs[?repo=PATH]` | `list_jobs` | `{pause, jobs}`, the `queue list --json` envelope |
-| `POST /jobs` | `add_job` | `repo, kind, scope` + optional `priority, options[], labels[], host, pool, requirements{repo,harness,sandbox}`; 201 |
+| `POST /jobs` | `add_job` | `repo, kind, scope` + optional `priority, options[], labels[], host, pool, requirements{repo,origin,harness,sandbox}`; 201 |
 | `POST /jobs/claim` | `claim_next` | `worker` + optional `lease_seconds, host, pools[]`; the best claimable job, or 204. Held while the queue is paused. |
 | `POST /workers` · `GET /workers` | `register_worker` · `list_workers` | register a worker, or heartbeat (the same call): `worker, host` + optional `pools[], harnesses[], sandbox, repos[], slots, slots_free`; `GET` returns `{workers}` with an `online` flag each (Story 35.2-001, see below) |
 | `POST /jobs/{id}/renew` · `/release` | `renew_lease` · `release_claim` | `worker` must hold the claim, else 409 |
@@ -1959,9 +1959,30 @@ name the URL, and the CLI shows one `error:` line (exit 2). `--enqueue` with the
 service down fails — it never enqueues locally — while a plain `sdlc build`
 never opens the queue and is unaffected.
 
-`sdlc queue run` needs scheduler verbs the service does not expose, so with a
-fleet queue configured it refuses (exit 2) rather than drain the wrong queue
-(`sdlc queue unpause` works against it — Story 35.2-003); `sdlc queue serve` always serves the local store.
+**Targeting the fleet (Story 35.3-001).** On a fleet queue `--enqueue` adds
+`requirements` to the job — `{repo, origin, harness, sandbox}`, all strings:
+`repo` is the checkout's directory name, `origin` its `git remote get-url origin`
+(omitted when there is none; it is what lets a worker clone the repo) with any
+URL credential stripped — `https://oauth2:<token>@host/…` is recorded as
+`https://host/…`, an `ssh://` login user is kept — since the service never holds
+a token and the worker clones with its own forge login, `harness`
+the comma-joined set of harnesses the role routing reaches (resolved as the run
+resolves it: `--harness` over the repo `.sdlc-harness.yaml` over the harness
+registry's `default:`; a role none of them names counts as the built-in
+`claude`), `sandbox` `container` when `--sandbox` was passed. `--host <host>` /
+`--pool <pool>` (also `=` form) are enqueue-only: they are stripped from the
+frozen flags and recorded as the job's `host` pin and `pool`, which the claim
+matcher honours. They need a fleet queue (otherwise exit 2: nothing would honour
+them), and a `--host` is checked against the hosts of the workers registered
+with the service (`GET /workers`, Story 35.2-001 — a pin matches a worker's
+host, not its name): unknown → exit 2 listing the registered workers, and a
+service that cannot list them fails the enqueue rather than accept a pin no
+worker may ever claim. A `github`/`gitlab` value, in either form, keeps its
+older meaning — the forge override, handed to the run as `--host=<forge>` — so
+a machine named `github` or `gitlab` cannot be pinned. `sdlc queue list` gained
+`WORKER`, `HOST` and `POOL` columns, each as wide as its longest value.
+
+`sdlc queue run` stays local-only and refuses while a fleet queue is configured; `sdlc queue unpause --pool` works against it (Story 35.2-003); `sdlc queue serve` always serves the local store.
 `sdlc doctor` adds a `fleet-queue` finding — reachable, identity accepted, the
 service's controller version — only when a URL is configured.
 

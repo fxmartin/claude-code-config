@@ -373,7 +373,8 @@ class JobRecord:
     fix_rounds_baseline: int = 0
     # Story 35.1-001 (fleet execution). ``host`` pins the job to one machine and
     # ``pool`` to one subscription pool (both nullable = anywhere); ``requirements``
-    # is JSON text — ``{repo, harness, sandbox}`` — a worker must satisfy;
+    # is JSON text — ``{repo, harness, sandbox}`` a worker must satisfy, plus the
+    # ``origin`` it clones from (Story 35.3-001);
     # ``worker`` is the fleet worker that holds the claim right now.
     host: str | None = None
     pool: str | None = None
