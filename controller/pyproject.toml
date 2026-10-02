@@ -101,6 +101,7 @@ module = [
     "sdlc.portability",
     "sdlc.progress",
     "sdlc.queue_server",
+    "sdlc.queue_worker",
     "sdlc.rate_limit",
     "sdlc.repair",
     "sdlc.review_packet",

@@ -18,7 +18,15 @@ from urllib.parse import quote, urlsplit
 
 import yaml
 
-from sdlc.queue import JobRecord, QueueBackend, QueueError, QueuePause, QueueStore, default_queue_path
+from sdlc.queue import (
+    JobRecord,
+    QueueBackend,
+    QueueError,
+    QueuePause,
+    QueueStore,
+    WorkerRecord,
+    default_queue_path,
+)
 
 __all__ = [
     "QUEUE_CONFIG_FILENAME",
@@ -332,6 +340,44 @@ class QueueClient:
             body["pools"] = list(pools)
         payload = self._call("POST", "/jobs/claim", body)
         return self._job(payload) if payload is not None else None
+
+    def register_worker(
+        self,
+        name: str,
+        *,
+        host: str,
+        pools: Iterable[str] = (),
+        harnesses: Iterable[str] = (),
+        sandbox: str | None = None,
+        repos: Iterable[str] = (),
+        slots: int = 1,
+        slots_free: int | None = None,
+    ) -> WorkerRecord:
+        """``POST /workers`` — register this worker, or heartbeat if it already has."""
+        body: dict[str, Any] = {
+            "worker": name,
+            "host": host,
+            "pools": list(pools),
+            "harnesses": list(harnesses),
+            "repos": list(repos),
+            "slots": slots,
+        }
+        if sandbox is not None:
+            body["sandbox"] = sandbox
+        if slots_free is not None:
+            body["slots_free"] = slots_free
+        return self._worker(self._call("POST", "/workers", body))
+
+    def list_workers(self) -> list[WorkerRecord]:
+        payload = self._call("GET", "/workers")
+        if not isinstance(payload, dict) or not isinstance(payload.get("workers"), list):
+            raise QueueUnavailable(f"fleet queue {self.url} sent a malformed worker list")
+        return [self._worker(item) for item in payload["workers"]]
+
+    def _worker(self, payload: Any) -> WorkerRecord:
+        if not isinstance(payload, dict):
+            raise QueueUnavailable(f"fleet queue {self.url} sent a malformed worker record")
+        return WorkerRecord(**_fields(WorkerRecord, payload))
 
     def renew_lease(self, job_id: int, *, claimed_by: str, lease_seconds: int) -> bool:
         try:
