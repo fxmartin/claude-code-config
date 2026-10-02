@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from xml.parsers.expat import ExpatError
 
 import yaml
 
@@ -721,7 +722,11 @@ def check_queue_service(
         plist = plistlib.loads(plist_path.read_bytes())
         args = [str(a) for a in plist.get("ProgramArguments", [])]
         env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
-    except (OSError, plistlib.InvalidFileException, ValueError, AttributeError) as exc:
+    # plistlib raises InvalidFileException only for input that is not a plist at
+    # all; XML it cannot parse (truncated, unescaped `&`) escapes as ExpatError.
+    except (
+        OSError, plistlib.InvalidFileException, ExpatError, ValueError, AttributeError,
+    ) as exc:
         return Finding(
             "queue-service", name, "FAIL",
             f"{plist_path} is unreadable: {exc}",

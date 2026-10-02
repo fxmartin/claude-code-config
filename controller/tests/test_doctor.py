@@ -1572,6 +1572,32 @@ def test_queue_service_unreadable_plist_fails(tmp_path: Path) -> None:
     assert check_queue_service(path, probe=lambda h, p: True).status == "FAIL"
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Cut short, e.g. an interrupted `sed ... > plist` install.
+        (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n'
+            "<key>Label</key>\n<string>com.fxmartin.sdlc-queue</string>\n"
+        ),
+        # Well-formed shape, but an unescaped `&` in a hand-edited value.
+        (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+            "<key>A</key><string>a & b</string></dict></plist>\n"
+        ),
+    ],
+    ids=["truncated", "unescaped-ampersand"],
+)
+def test_queue_service_malformed_xml_plist_fails(tmp_path: Path, body: str) -> None:
+    # plistlib lets expat's ExpatError escape for XML it cannot parse; that must
+    # read as FAIL, not crash `sdlc doctor` (and `sdlc status --markdown`).
+    path = tmp_path / "half-written.plist"
+    path.write_text(body, encoding="utf-8")
+    finding = check_queue_service(path, probe=lambda h, p: True)
+    assert finding.status == "FAIL"
+    assert "unreadable" in finding.detail
+
+
 def test_queue_service_default_probe_sees_a_real_listener(tmp_path: Path) -> None:
     store = str(tmp_path / "queue.db")
     with socket.socket() as listener:
@@ -1586,9 +1612,16 @@ def test_queue_service_default_probe_sees_a_real_listener(tmp_path: Path) -> Non
 
 
 def test_run_doctor_includes_the_queue_service_finding(tmp_path: Path) -> None:
-    plist = _service_plist(tmp_path, store=str(tmp_path / "queue.db"))
+    # run_doctor uses the real probe, so point it at a loopback port just freed:
+    # refused at once, and never a packet off-host (a tailnet/CGNAT address would
+    # route out the default gateway and burn the whole probe timeout).
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = reserved.getsockname()[1]
+    plist = _service_plist(
+        tmp_path, bind=f"127.0.0.1:{port}", store=str(tmp_path / "queue.db")
+    )
     report = _doctor(tmp_path, queue_service_plist=plist)
-    # Nothing listens on the fixture's tailnet address, so the check is live here.
     assert _finding(report, "queue-service").status == "FAIL"
 
 
