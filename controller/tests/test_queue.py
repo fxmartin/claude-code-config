@@ -61,6 +61,8 @@ def test_init_creates_wal_schema(tmp_path) -> None:
             "budget", "files", "fix_rounds_baseline",
             # Story 35.1-001: fleet pin, pool, requirements and claim holder.
             "host", "pool", "requirements", "worker",
+            # Story 35.4-003: an operator's cancel aimed at a running job.
+            "cancel_requested",
         }
     finally:
         conn.close()
@@ -187,16 +189,100 @@ def test_cancel_marks_queued_job_cancelled(tmp_path) -> None:
     assert store.list_jobs()[0].state == "cancelled"
 
 
-def test_cancel_refuses_running_job(tmp_path) -> None:
-    from sdlc.queue import QueueError, QueueStore
+def test_cancel_of_a_running_job_asks_its_holder_to_stop(tmp_path) -> None:
+    """Story 35.4-003: a held `running` job is flagged, not retired — its worker
+    must kill the run's process group before the job may go terminal."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    assert store.get_job(job_id).cancel_requested is False
+
+    store.cancel_job(job_id)
+
+    job = store.get_job(job_id)
+    assert (job.state, job.claimed_by, job.cancel_requested) == ("running", "w1", True)
+    assert job.reason == "cancel requested"
+    assert job.to_dict()["cancel_requested"] is True
+
+
+def test_cancel_of_an_unheld_running_job_retires_it_at_once(tmp_path) -> None:
+    """No holder means nobody would ever see the flag."""
+    from sdlc.queue import QueueStore
 
     store = QueueStore(tmp_path / "queue.db")
     store.init()
     job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
     store._set_state(job_id, "running")
-    with pytest.raises(QueueError):
+
+    store.cancel_job(job_id)
+
+    assert store.get_job(job_id).state == "cancelled"
+
+
+def test_finish_job_accepts_cancelled_and_clears_the_flag(tmp_path) -> None:
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.cancel_job(job_id)
+
+    assert store.finish_job(job_id, "cancelled", reason="cancelled by operator", claimed_by="w1")
+
+    job = store.get_job(job_id)
+    assert (job.state, job.claimed_by, job.lease_until, job.cancel_requested) == (
+        "cancelled", None, None, False,
+    )
+    store.requeue_job(job_id)
+    assert store.get_job(job_id).cancel_requested is False
+
+
+def test_releasing_a_flagged_claim_retires_the_job(tmp_path) -> None:
+    """A worker that goes away mid-cancel must not hand the job back to the queue."""
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.cancel_job(job_id)
+
+    store.release_claim(job_id, claimed_by="w1", reason="scheduler interrupted")
+
+    job = store.get_job(job_id)
+    assert (job.state, job.claimed_by, job.cancel_requested) == ("cancelled", None, False)
+
+
+def test_cancel_refuses_a_finished_job(tmp_path) -> None:
+    from sdlc.queue import QueueError, QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.finish_job(job_id, "done")
+    with pytest.raises(QueueError, match="cannot cancel"):
         store.cancel_job(job_id)
-    assert store.list_jobs()[0].state == "running"
+
+
+def test_a_queue_db_from_before_cancel_requested_upgrades_in_place(tmp_path) -> None:
+    import sqlite3
+
+    from sdlc.queue import QueueStore
+
+    path = tmp_path / "queue.db"
+    store = QueueStore(path)
+    store.init()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE jobs DROP COLUMN cancel_requested")
+        conn.execute("DELETE FROM _migrations WHERE version = 9")
+    store.ensure_migrated()
+    job_id = store.add_job(repo="/repo", kind="build", scope="s")
+    assert store.get_job(job_id).cancel_requested is False
 
 
 def test_cancel_unknown_id_raises(tmp_path) -> None:

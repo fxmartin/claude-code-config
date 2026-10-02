@@ -586,7 +586,7 @@ _PAGE = """<!doctype html>
   /* Issue #655's lesson applied from the start: wide content scrolls inside its
      own panel, never the page — a horizontal scrollbar on the table, not `.main`. */
   .queue-scroll { overflow-x: auto; padding-bottom: 6px; }
-  .queue-scroll table { min-width: 640px; }
+  .queue-scroll table { min-width: 760px; }
   /* Story 11.2-010: in-dashboard transcript viewer. A "view session" control
      per story opens a modal listing that story's stage transcripts and renders
      each inline — no leaving the page. The new-tab /log link stays as fallback. */
@@ -1094,11 +1094,12 @@ function renderQueue(data){
     const rows = byState[state].map(j =>
       "<tr><td>"+queueRepoLabel(j.repo)+"</td><td>"+esc(j.scope)+"</td>"
       + "<td>"+esc(j.priority)+"</td><td>"+queueAge(j.created_at)+"</td>"
+      + "<td>"+esc(j.worker || j.claimed_by || "-")+"</td><td>"+esc(j.pool || "-")+"</td>"
       + "<td>"+queuePrLink(j)+"</td></tr>"
     ).join("");
     return "<div class='queue-group'><h4>"+esc(state)+" ("+byState[state].length+")</h4>"
       + "<div class='queue-scroll'><table><tr><th>repo</th><th>scope</th><th>priority</th>"
-      + "<th>age</th><th>PR</th></tr>"+rows+"</table></div></div>";
+      + "<th>age</th><th>worker</th><th>pool</th><th>PR</th></tr>"+rows+"</table></div></div>";
   }).join("");
   // The collapsed line must still answer "is anything moving?".
   const meta = [running + " running"]

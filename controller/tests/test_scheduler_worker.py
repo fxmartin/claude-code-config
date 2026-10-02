@@ -259,3 +259,93 @@ def test_a_less_loaded_peer_gets_the_job_instead(tmp_path) -> None:
 
     assert launcher.calls == []
     assert store.get_job(job_id).state == "queued"
+
+
+# --- Story 35.4-003: cancel of a running job reaches the worker's kill path ---
+
+
+class _CancelProc:
+    """A job that runs until stopped, recording the stop (the process-group kill)."""
+
+    pid = 424243
+
+    def __init__(self) -> None:
+        self.stopped = 0
+        self._dead = False
+
+    def poll(self):
+        return 0 if self._dead else None
+
+    def stop(self) -> None:
+        self.stopped += 1
+        self._dead = True
+
+
+def _cancel_after(store, job_id, clock, *, passes: int):
+    """A sleeper that lets ``passes`` pass, then cancels the job from 'the XPS'."""
+    seen = {"n": 0}
+
+    def sleeper(seconds: float) -> None:
+        clock.advance(seconds)
+        seen["n"] += 1
+        if seen["n"] == passes:
+            store.cancel_job(job_id)
+        if seen["n"] > passes + 20:  # a stuck cancel must fail the test, not hang it
+            raise KeyboardInterrupt
+
+    return sleeper
+
+
+def test_cancelling_a_running_job_kills_its_run_and_releases_the_lease(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    clock = Clock()
+    proc = _CancelProc()
+    lines: list[str] = []
+
+    result = run_queue(
+        store,
+        config=SchedulerConfig(slots=1, poll_seconds=1.0, worker=_profile()),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=lambda argv, cwd: proc,
+        clock=clock,
+        sleeper=_cancel_after(store, job_id, clock, passes=3),
+        notifier=lambda *a, **k: None,
+        version_check=_clean,
+        echo=lines.append,
+        identity="m3max",
+    )
+
+    job = store.get_job(job_id)
+    assert proc.stopped == 1
+    assert (job.state, job.claimed_by, job.worker, job.lease_until) == ("cancelled", None, None, None)
+    assert job.cancel_requested is False
+    assert not result.interrupted and result.failed == 0
+    assert any("job" in line and "cancelled" in line for line in lines)
+
+
+def test_a_cancel_flagged_job_is_not_resumed_after_its_worker_died(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    clock = Clock()
+    store.claim_next(claimed_by="dead-worker", lease_seconds=10, now=clock())
+    store.attach_run(job_id, "run-1")
+    store.cancel_job(job_id)
+    clock.advance(60)  # the lease lapsed: a reclaim candidate
+    launcher = FakeLauncher()
+
+    run_queue(
+        store,
+        config=SchedulerConfig(slots=1, poll_seconds=1.0, worker=_profile()),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=launcher,
+        clock=clock,
+        sleeper=clock.advance,
+        notifier=lambda *a, **k: None,
+        version_check=_clean,
+        echo=lambda _line: None,
+        identity="m3max",
+    )
+
+    assert launcher.calls == []
+    assert store.get_job(job_id).state == "cancelled"

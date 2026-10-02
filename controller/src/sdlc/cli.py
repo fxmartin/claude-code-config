@@ -3688,10 +3688,17 @@ def queue_run_cmd(
 def queue_cancel_cmd(
     job_id: int = typer.Argument(..., help="Job id to cancel."),
 ) -> None:
-    """Cancel a `queued`, `parked` or `blocked` job. Refuses a `running` one.
+    """Cancel a `queued`, `parked` or `blocked` job, or ask a `running` one to stop.
 
     `parked` is the approval wait (Story 32.2-002): cancelling one abandons the
     wait, leaving the change request exactly as it is for a human to finish.
+
+    Story 35.4-003: cancelling a `running` job does not kill anything from
+    here — it flags the job on the queue (the fleet's, with `SDLC_QUEUE_URL`
+    set, so this works from the XPS). The worker holding it sees the flag on its
+    next pass, terminates the run's whole process group (SIGTERM, then SIGKILL)
+    and releases the lease; `sdlc queue list` then shows the job `cancelled`.
+    Until then it reads `running` with `cancel requested` beneath it.
     """
     from sdlc.queue_client import open_queue
 
@@ -3702,6 +3709,13 @@ def queue_cancel_cmd(
     except QueueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+    job = store.get_job(job_id)
+    if job is not None and job.state == "running":
+        typer.echo(
+            f"cancel requested: job {job_id} — its worker ({job.worker or job.claimed_by}) "
+            "stops the run and releases the lease on its next pass"
+        )
+        raise typer.Exit(code=0)
     typer.echo(f"cancelled: job {job_id}")
     raise typer.Exit(code=0)
 

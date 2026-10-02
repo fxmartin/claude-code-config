@@ -795,6 +795,7 @@ class _Scheduler:
                 self._record_plan_files()
                 self._reap()
                 self._enforce_budgets()
+                self._honour_cancels()
                 self._renew()
                 self._check_rate_limit()
                 polled = self._poll_parked()
@@ -896,6 +897,12 @@ class _Scheduler:
         """
         for job in self._store.expired_running_jobs(now=self._clock()):
             if job.id in self._in_flight or self._job_paused(job):
+                continue
+            if job.cancel_requested:
+                # Cancelled while its holder was already gone: nothing to stop,
+                # and resuming it would undo the operator's decision.
+                self._store.finish_job(job.id, "cancelled", reason="cancelled by operator")
+                self._echo(f"job {job.id} cancelled: its worker was gone")
                 continue
             if job.run_id is None:
                 # Claimed but never started a run — nothing to resume, so put it
@@ -1231,6 +1238,33 @@ class _Scheduler:
             self._result.parked += 1
             self._echo(f"job {job_id} parked (needs_attention): {reason}")
             self._announce(entry.job, entry.run_id, "needs_attention")
+
+    def _honour_cancels(self) -> None:
+        """Stop every in-flight job an operator has cancelled (Story 35.4-003).
+
+        ``sdlc queue cancel`` on a ``running`` job only sets ``cancel_requested``
+        on the queue — from the XPS the job's process is on another machine — so
+        its holder reads the flag here, every pass, before :meth:`_renew` can
+        extend a lease on a job about to die. The stop is :meth:`JobProcess.stop`:
+        the whole process group, SIGTERM then SIGKILL (Story 13.4-001), so the
+        agents the run spawned die with it. Only then is the job finished
+        ``cancelled``, which drops the claim and the lease; the run itself is
+        left as it stood, for `sdlc resume` should FX ever want it back.
+        """
+        for job_id, entry in list(self._in_flight.items()):
+            current = self._store.get_job(job_id)
+            if current is None or not current.cancel_requested:
+                continue
+            del self._in_flight[job_id]
+            try:
+                entry.proc.stop()
+            except OSError as exc:
+                self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            self._store.finish_job(
+                job_id, "cancelled", reason="cancelled by operator",
+                claimed_by=self._identity,
+            )
+            self._echo(f"job {job_id} cancelled: run stopped, lease released")
 
     def _record_plan_files(self) -> None:
         """Copy each in-flight job's investigated file set onto its row (AC2).
