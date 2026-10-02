@@ -307,6 +307,27 @@ class QueueClient:
         except ValueError as exc:
             raise QueueError(f"{name} is not valid JSON: {exc}") from exc
 
+    def known_workers(self) -> dict[str, str] | None:
+        """``{worker: host}`` from the service's worker registry (``GET /workers``).
+
+        ``None`` when the service has no registry route (it predates Story
+        35.2-001): the caller then has nothing to validate a ``--host`` against
+        and must accept it rather than guess.
+        """
+        try:
+            payload = self._call("GET", "/workers")
+        except QueueRequestError as exc:
+            if exc.status in (404, 405):
+                return None
+            raise
+        workers = payload.get("workers") if isinstance(payload, dict) else None
+        if not isinstance(workers, list) or not all(
+            isinstance(w, dict) and isinstance(w.get("worker"), str) and isinstance(w.get("host"), str)
+            for w in workers
+        ):
+            raise QueueUnavailable(f"fleet queue {self.url} sent a malformed worker list")
+        return {w["worker"]: w["host"] for w in workers}
+
     def get_job(self, job_id: int) -> JobRecord | None:
         # The service has no single-job read; the list is small and this is rare.
         for job in self.list_jobs():

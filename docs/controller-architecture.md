@@ -1853,6 +1853,23 @@ name the URL, and the CLI shows one `error:` line (exit 2). `--enqueue` with the
 service down fails — it never enqueues locally — while a plain `sdlc build`
 never opens the queue and is unaffected.
 
+**Targeting the fleet (Story 35.3-001).** On a fleet queue `--enqueue` adds
+`requirements` to the job — `{repo, origin, harness, sandbox}`, all strings:
+`repo` is the checkout's directory name, `origin` its `git remote get-url origin`
+(omitted when there is none; it is what lets a worker clone the repo), `harness`
+the comma-joined set of harnesses the role routing reaches (`--harness` over the
+repo `.sdlc-harness.yaml`; a role neither names counts as the default `claude`),
+`sandbox` `container` when `--sandbox` was passed. `--host <host>` / `--pool
+<pool>` (also `=` form) are enqueue-only: they are stripped from the frozen
+flags and recorded as the job's `host` pin and `pool`, which the claim matcher
+already honours. They need a fleet queue (otherwise exit 2: nothing would honour
+them), and a `--host` is checked against the service's worker registry
+(`GET /workers` → `{"workers": [{"worker", "host", …}]}`, Story 35.2-001) —
+unknown → exit 2 listing the known workers. A service without that route cannot
+validate, so the pin is accepted. `--host=github|gitlab` keeps its older meaning
+(the forge override), so a worker cannot be pinned by the host name `github` or
+`gitlab`. `sdlc queue list` gained `WORKER`, `HOST` and `POOL` columns.
+
 `sdlc queue run` and `sdlc queue unpause` need scheduler/ledger verbs the service
 does not expose, so with a fleet queue configured they refuse (exit 2) rather
 than drain the wrong queue; `sdlc queue serve` always serves the local store.
