@@ -229,13 +229,14 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    # 10, not the 5 every other job uses: this is the only job that runs the
-    # full controller suite (3.8k tests), and at 5 it was cancelling mid-run on
-    # both OSes — ubuntu at 5m17s and macOS at 5m22s on the same afternoon, with
-    # the ubuntu rerun then passing in 2m24s. Normal runs land at 2m30s-4m30s,
-    # so the old cap left under a minute of headroom against ordinary runner
-    # variance and failed as a timeout, which reads like a real defect.
-    timeout-minutes: 10
+    # 20, not the 5 every other job uses: this is the only job that runs the
+    # full controller suite. At 5 it was cancelling mid-run on both OSes with
+    # 3.8k tests (ubuntu 5m17s, macOS 5m22s); raised to 10. By Epic 35 the suite
+    # is 5.6k tests and the macOS runner needed 9m48s for the tests alone, so
+    # PR #825's job was cancelled at 10 after every test had passed — a cap
+    # with no headroom reads like a real defect. Normal runs now land at
+    # 4-10 min depending on runner; 20 keeps a full run's worth of headroom.
+    timeout-minutes: 20
     # Fail fast on leaked secrets before standing up the controller (9.2-001).
     needs: secrets-scan
     steps:
