@@ -25,6 +25,15 @@
   XDG_STATE_HOME=$HOME/.local/state (and its `sdlc doctor` and dashboard) never
   looks. Its jobs inherit both.
 
+  Export the same value in your shell profile (macOS sets no XDG_STATE_HOME),
+  so `sdlc queue add` and every enqueue write the queue this worker drains and
+  the dashboard reads the registry its runs land in:
+
+    export XDG_STATE_HOME="$HOME/.local/state"
+
+  `sdlc doctor` reads the worker's store from this plist and warns while the
+  shell's differs.
+
   The worker drains this Mac's own queue. `sdlc queue run` does not yet claim
   from the fleet queue: while SDLC_QUEUE_URL or a `queue_url:` in
   ~/.sdlc-fleet.yaml is set it refuses with exit 2, and KeepAlive restarts it

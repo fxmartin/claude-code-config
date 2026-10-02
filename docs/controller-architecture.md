@@ -1857,7 +1857,10 @@ while idle, which is what keeps it `online`.
   `SDLC_QUEUE_PATH` and `XDG_STATE_HOME`, so the worker and every job it
   launches use `~/.local/state/sdlc/` — the files a shell exporting
   `XDG_STATE_HOME=$HOME/.local/state` reads with `sdlc queue`, `sdlc doctor`
-  and the dashboard.
+  and the dashboard. macOS sets no `XDG_STATE_HOME`, so export it in your shell
+  profile, as the template's header says: otherwise `sdlc queue add` and
+  `--enqueue` write `~/.sdlc/queue.db`, which the worker never drains, and its
+  runs stay off this shell's dashboard.
 - **Interactive priority.** Each job is the agent's child and inherits its
   launchd resource class, so `ProcessType` is `Interactive`. `Background` (the
   queue service's class) means low CPU priority and throttled disk I/O, on
@@ -1894,10 +1897,14 @@ while idle, which is what keeps it `online`.
   `uv tool install --force` replaces the environment its running jobs still
   import from lazily — the hazard `--self-update` (#709) defers around.
 - **`sdlc doctor`** adds a `Fleet worker` finding on a machine that has the
-  LaunchAgent installed: `CLEAN` when a worker for this host is registered and
-  online, `FAIL` when none has registered, it has gone offline, or the queue
-  cannot be read. A machine without the plist gets no finding. It looks for
-  `~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist`
+  LaunchAgent installed. It asks the store the plist pins (resolved from the
+  plist's `EnvironmentVariables`, as for the 35.1-003 service), not the
+  shell's: `CLEAN` when a worker for this host is registered there and online;
+  `WARN` when it is, but this shell's `sdlc queue` resolves a different file,
+  with the `SDLC_QUEUE_PATH` to export; `FAIL` when none has registered, it has
+  gone offline, or the plist or the store cannot be read (a corrupt `queue.db`
+  is a finding, never a doctor crash). A machine without the plist gets no
+  finding. It looks for `~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist`
   (`default_worker_plist`); `run_doctor(worker_plist=…)` overrides that, as
   `queue_service_plist` does for 35.1-003.
 

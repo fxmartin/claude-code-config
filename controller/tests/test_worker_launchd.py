@@ -99,6 +99,19 @@ def test_worker_state_resolves_where_an_xdg_shell_looks(plist, monkeypatch) -> N
     assert Path(rendered["StandardOutPath"]).parent == state
 
 
+def test_a_shell_following_the_header_enqueues_where_the_worker_drains(plist, monkeypatch) -> None:
+    # macOS sets no XDG_STATE_HOME: unless the shell exports what the header says,
+    # `sdlc queue add` and `--enqueue` write ~/.sdlc/queue.db, which the worker
+    # never drains, and `sdlc doctor` warns about the split.
+    header, _, _ = TEMPLATE.read_text(encoding="utf-8").partition("-->")
+    exported = re.search(r'export XDG_STATE_HOME="\$HOME/([^"]+)"', header)
+    assert exported is not None
+    monkeypatch.delenv("SDLC_QUEUE_PATH", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", f"{HOME}/{exported.group(1)}")
+
+    assert default_queue_path() == Path(_rendered(plist)["EnvironmentVariables"]["SDLC_QUEUE_PATH"])
+
+
 def test_path_reaches_the_tools_a_job_runs(plist) -> None:
     # launchd's own PATH is only /usr/bin:/bin:/usr/sbin:/sbin. Jobs need sdlc and
     # claude (~/.local/bin), nix-darwin and Homebrew tools, and /usr/bin's caffeinate.
