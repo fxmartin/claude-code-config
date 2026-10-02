@@ -483,6 +483,7 @@ def worker_host(tmp_path: Path):
 def _drain_as_worker(
     local: QueueStore, registry: Registry, job: _Job, *,
     worker: bool = True, poll_seconds: float = 1.0, sleeper=None, echo=None,
+    dashboard_url: str | None = None,
 ) -> None:
     from sdlc.queue_worker import WorkerProfile
     from sdlc.scheduler import SchedulerConfig, run_queue
@@ -495,7 +496,9 @@ def _drain_as_worker(
     def clean(_root) -> Finding:
         return Finding("install", "Installed controller vs checkout", "CLEAN", "matches")
 
-    profile = WorkerProfile(name="m3max", host="h", pools=["p"], harnesses=["claude"])
+    profile = WorkerProfile(
+        name="m3max", host="h", pools=["p"], harnesses=["claude"], dashboard_url=dashboard_url
+    )
     run_queue(
         local,
         config=SchedulerConfig(
@@ -538,6 +541,14 @@ def test_a_workers_run_is_on_the_fleet_from_its_start_and_each_beat_refreshes_it
     assert seen[25] == seen[0]  # no beat yet: nothing new to say
     # The 30 s heartbeat re-pushed it with the counts read then.
     assert seen[-1] == [("run-w", "m3max", "IN_PROGRESS", 3, None)]
+
+
+def test_a_workers_run_row_carries_the_dashboard_url_it_advertises(worker_host) -> None:
+    # Story 35.4-002: the XPS reads a remote run's transcripts from this origin.
+    local, registry = worker_host
+    url = "http://m3max.tail1234.ts.net:8787"
+    _drain_as_worker(local, registry, _Job(polls=1), dashboard_url=url)
+    assert [r["dashboard_url"] for r in local.list_fleet_runs()] == [url]
 
 
 @pytest.mark.parametrize(

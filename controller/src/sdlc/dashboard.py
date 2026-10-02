@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import html
+import http.client
 import json
 import os
 import re
@@ -19,11 +20,13 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from sdlc import __version__, github_stats
 from sdlc.build import _EMPTY_COUNTS, Ledger, _duration_seconds, status_snapshot
@@ -37,7 +40,7 @@ from sdlc.issue_host import (
 from sdlc.portfolio import portfolio_view
 from sdlc.queue import QueueError
 from sdlc.queue_client import QUEUE_TOKEN_ENV, QueueClient, open_queue, resolve_queue_url
-from sdlc.registry import Registry, RunRecord, derive_state
+from sdlc.registry import Registry, RunRecord, derive_state, normalize_dashboard_url
 
 # scp-like remote: git@host:owner/sub/repo.git
 _SCP_REMOTE = re.compile(r"^[\w.-]+@([\w.-]+):(.+?)(?:\.git)?/?$")
@@ -337,6 +340,101 @@ class _FleetView:
         """``snapshot()`` without the rows: what ``/api/fleet`` serves."""
         snap = self.snapshot()
         return {k: snap[k] for k in ("configured", "available", "error")}
+
+
+# --- a remote run's transcripts, read from its worker (Story 35.4-002) ---------
+# The worker's own dashboard (`sdlc dashboard --host <tailnet-ip>`) owns the
+# transcripts and their path confinement; the XPS only relays what that dashboard
+# says. Fetching server-side keeps the page on one origin (no CORS opening on the
+# worker's logs) and lets "the worker is down" be told apart from any browser error.
+
+_WORKER_LOGS_TIMEOUT_SECONDS = 5
+# A transcript is text a person reads; a worker sending more than this is not one.
+_WORKER_LOGS_MAX_BYTES = 64 * 1024 * 1024
+_TRANSCRIPT_FIELDS = ("stage", "attempt", "status", "path", "exists", "content")
+
+
+class _WorkerUnreachable(Exception):
+    """The worker's dashboard did not give a usable answer; the message says why."""
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A worker may not bounce the XPS to another host: a 3xx is an error."""
+
+    def redirect_request(self, *args, **kwargs):  # noqa: D401 - urllib hook
+        return None
+
+
+# `ProxyHandler({})`: a tailnet peer is reached directly, never via an env proxy.
+_WORKER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
+
+
+def _fetch_worker_json(origin: str, path: str, query: dict[str, str]) -> dict:
+    url = f"{origin}{path}?{urlencode(query)}"
+    try:
+        with _WORKER_OPENER.open(url, timeout=_WORKER_LOGS_TIMEOUT_SECONDS) as resp:
+            body = resp.read(_WORKER_LOGS_MAX_BYTES + 1)
+        if len(body) > _WORKER_LOGS_MAX_BYTES:
+            raise _WorkerUnreachable(f"{origin} sent more than a transcript viewer can show")
+        payload = json.loads(body)
+    except _WorkerUnreachable:
+        raise
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        # URLError/HTTPError/timeouts are OSErrors; bad JSON is a ValueError.
+        reason = getattr(exc, "reason", None) or exc
+        raise _WorkerUnreachable(f"{origin} did not answer: {reason}") from exc
+    if not isinstance(payload, dict):
+        raise _WorkerUnreachable(f"{origin} did not answer: not a dashboard response")
+    return payload
+
+
+def _remote_logs_payload(fleet_row: dict, run_id: str, story_id: str) -> dict:
+    """What ``/api/logs`` serves for a run that lives on a worker.
+
+    Always carries ``worker`` and ``origin`` (who served it). When the worker's
+    dashboard cannot be read, ``transcripts`` is empty, ``error`` says why and
+    ``logs_root`` is the directory on the worker where the transcripts live, so
+    the operator knows where to look without ssh-ing around for it.
+    """
+    db = fleet_row.get("db")
+    payload: dict = {
+        "run": run_id,
+        "story": story_id,
+        "transcripts": [],
+        "worker": fleet_row.get("worker"),
+        "origin": None,
+        "logs_root": f"{db}.logs" if db else None,
+    }
+    try:
+        origin = normalize_dashboard_url(fleet_row.get("dashboard_url") or "")
+    except ValueError:
+        payload["error"] = (
+            f"worker {payload['worker']} has not advertised a usable dashboard URL "
+            "(start its queue with `sdlc queue run --worker NAME --dashboard-url URL`)"
+        )
+        return payload
+    payload["origin"] = origin
+    try:
+        if story_id:
+            story_ids = [story_id]
+        else:
+            status = _fetch_worker_json(origin, "/api/status", {"run": run_id})
+            story_ids = [
+                s["story_id"]
+                for s in status.get("stories") or []
+                if isinstance(s, dict) and isinstance(s.get("story_id"), str)
+            ]
+        transcripts = []
+        for sid in story_ids:
+            remote = _fetch_worker_json(origin, "/api/logs", {"story": sid, "run": run_id})
+            for t in remote.get("transcripts") or []:
+                if isinstance(t, dict):
+                    transcripts.append({"story": sid, **{k: t.get(k) for k in _TRANSCRIPT_FIELDS}})
+    except _WorkerUnreachable as exc:
+        payload["error"] = str(exc)
+        return payload
+    payload["transcripts"] = transcripts
+    return payload
 
 
 # --- wave-column dependency DAG (Story 11.2-008) ---------------------------
@@ -1318,7 +1416,12 @@ function renderMain(d){
     : "";
   document.getElementById("head").innerHTML =
     "run <code>"+esc(run.id.slice(0,8))+"</code> &middot; "+badge(run.status)
-    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode) + durLine + stallLine + cfgline + usageLine;
+    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode) + durLine + stallLine + cfgline + usageLine
+    // Story 35.4-002: a fleet run's stories live in its worker's ledger, so there
+    // is no per-story row to click — one run-level control reads the worker instead.
+    + (run.mode === "remote"
+        ? " <a class='view-session' data-story='' title='read this run\\u2019s transcripts from "+esc(run.worker||"its worker")+"'>view session</a>"
+        : "");
   // Anchor the local ticker: while running, count up from the server-computed
   // elapsed at fetch using the browser clock, so the value advances smoothly
   // even when the ledger (and the SSE transport) is momentarily quiet.
@@ -1470,8 +1573,10 @@ setInterval(tick, GH_REFRESH_INTERVAL);
 // FX reads what each `claude -p` session did without hunting for .log files or
 // leaving the page. Content comes from /api/logs (the same path-confined logs
 // root as /log); the new-tab /log link is preserved per transcript as fallback.
-function logHref(path){
-  return "/log?path=" + encodeURIComponent(path)
+// `origin` is a remote run's worker dashboard (Story 35.4-002): the XPS holds no
+// copy of that file, so the new-tab link goes to the worker's own path-confined /log.
+function logHref(path, origin){
+  return (origin || "") + "/log?path=" + encodeURIComponent(path)
     + (sel ? "&run=" + encodeURIComponent(sel) : "");
 }
 // Guard against out-of-order fetches: clicking a second story (or reselecting a
@@ -1504,15 +1609,25 @@ function renderTranscriptContent(text){
 }
 function renderTranscripts(d){
   const ts = (d && d.transcripts) || [];
+  // Story 35.4-002: a run that lives on a fleet worker is read from that worker's
+  // dashboard, and the modal says whose it is. A worker that cannot be read is
+  // named too, with the directory on it that holds the transcripts.
+  const served = d && d.worker
+    ? "<p class='muted small'>served by <code>"+esc(d.worker)+"</code>"
+      + (d.origin ? " (<code>"+esc(d.origin)+"</code>)" : "") + "</p>"
+    : "";
+  if(d && d.error)
+    return served + "<p class='empty'>The worker's dashboard could not be read: "+esc(d.error)+"</p>"
+      + (d.logs_root ? "<p class='muted small'>log root on the worker: <code>"+esc(d.logs_root)+"</code></p>" : "");
   if(!ts.length)
-    return "<p class='empty'>No transcripts for this story yet \\u2014 it has not started, "
+    return served + "<p class='empty'>No transcripts for this story yet \\u2014 it has not started, "
       + "or no stage has written a session log.</p>";
-  return ts.map((t, i) => {
-    const head = "<code>"+esc(t.stage||"?")+"</code>"
+  return served + ts.map((t, i) => {
+    const head = (t.story ? "<code>"+esc(t.story)+"</code> " : "") + "<code>"+esc(t.stage||"?")+"</code>"
       + (t.attempt ? " <span class='muted small'>attempt "+esc(t.attempt)+"</span>" : "")
       + " " + badge(t.status||"PENDING");
     const link = t.path
-      ? "<div class='tlink'><a href='"+logHref(t.path)+"' target='_blank' rel='noopener'>open in new tab</a></div>"
+      ? "<div class='tlink'><a href='"+esc(logHref(t.path, d && d.origin))+"' target='_blank' rel='noopener'>open in new tab</a></div>"
       : "";
     const inner = t.exists
       ? link + "<pre>"+renderTranscriptContent(t.content)+"</pre>"
@@ -1524,7 +1639,7 @@ function renderTranscripts(d){
 async function openSession(storyId){
   const myReq = ++sessionReq;  // claim the latest-open token for this click
   const modal = document.getElementById("sessionModal");
-  document.getElementById("sessionTitle").textContent = "Session transcripts \\u00b7 " + storyId;
+  document.getElementById("sessionTitle").textContent = "Session transcripts \\u00b7 " + (storyId || "all stories");
   const bodyEl = document.getElementById("sessionBody");
   bodyEl.innerHTML = "<p class='muted'>loading\\u2026</p>";
   modal.hidden = false;
@@ -1545,6 +1660,12 @@ async function openSession(storyId){
 function closeSession(){ sessionReq++; document.getElementById("sessionModal").hidden = true; }
 // Delegated: the stories table re-renders every tick, so bind on its container.
 document.getElementById("stories").addEventListener("click", e => {
+  const el = e.target.closest(".view-session");
+  if(!el) return;
+  e.preventDefault();
+  openSession(el.dataset.story);
+});
+document.getElementById("head").addEventListener("click", e => {
   const el = e.target.closest(".view-session");
   if(!el) return;
   e.preventDefault();
@@ -1984,6 +2105,12 @@ class _Handler(BaseHTTPRequestHandler):
         so the client shows a placeholder, never an error. An unknown / blank
         story, or an unreachable ledger, returns an empty list (HTTP 200).
         """
+        in_discovery_mode = getattr(self.server, "registry", None) is not None
+        if run_id and in_discovery_mode and self._resolve_run(run_id) is None:
+            fleet_row = next((r for r in self._fleet_runs() if r.get("run_id") == run_id), None)
+            if fleet_row is not None:
+                self._json(_remote_logs_payload(fleet_row, run_id, story_id))
+                return
         rid, db_path = self._resolve_run_db(run_id)
         root = self._logs_root(run_id)
         payload: dict = {"run": rid, "story": story_id, "transcripts": []}

@@ -901,7 +901,10 @@ class _Scheduler:
         if ended:
             record = replace(record, status=derive_state(record))
         try:
-            self._store.put_fleet_run(replace(record, worker=profile.name), now=self._clock())
+            self._store.put_fleet_run(
+                replace(record, worker=profile.name, dashboard_url=profile.dashboard_url),
+                now=self._clock(),
+            )
         except (QueueError, sqlite3.Error) as exc:
             self._echo(f"fleet view: could not record run {run_id}: {exc}")
 
