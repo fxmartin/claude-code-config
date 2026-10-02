@@ -285,6 +285,8 @@ It binds to **http://127.0.0.1:8787** by default (localhost-only).
 
 **One pane, every worker (Story 35.4-001).** With `SDLC_QUEUE_URL` set (see `sdlc queue serve`), every run on every fleet worker shows up on the one dashboard. Each worker still writes its own local registry — which stays authoritative for that worker — and also writes each run into the fleet registry of the queue it drains (the store `sdlc queue serve` publishes): when the run starts, on each 30 s heartbeat (refreshing done/total) and when its job exits. A build on a machine with a fleet URL configured `PUT`s its record to the service's `/runs` on start and finish instead. The dashboard merges the fleet's runs into its own, de-duplicated by run id, and the sidebar names the worker beside the repo (`📁 repo @ worker`). A remote run is `DEAD` when its worker's heartbeat goes silent (not by a local pid) or when its job exited without finishing — killed, crashed, stopped by its budget — just as the worker's own dashboard shows it; its detail pane shows the pushed done/total only — the worker's ledger is not reachable from here. If the service is unreachable the local runs still render and a muted "fleet unavailable" line appears. `queue run --worker NAME` hands `NAME` to the jobs it launches as `SDLC_WORKER`; a bare `sdlc build` on a machine with a fleet configured is named for its short hostname.
 
+**Remote transcripts (Story 35.4-002).** Run `sdlc dashboard --host <tailnet-ip>` on each worker and start its queue with `sdlc queue run --worker NAME --dashboard-url http://NAME.<tailnet>:8787` (a bare build: `SDLC_DASHBOARD_URL`); the URL travels in the run's fleet record. Selecting a remote run on the XPS shows a **view session** link in its header: the XPS reads that worker's `/api/logs` over the tailnet — confined to the run's logs root exactly as the worker's own `/log` — and the modal says which worker served it. If the worker's dashboard is down (or never advertised a URL) the modal says so and shows the worker's log root path.
+
 **Live, not polled-by-hand.** Updates stream over Server-Sent Events driven by a ~1 s ledger change-token, with a 2.5 s polling fallback if the browser can't hold an SSE connection; the elapsed timer ticks every second so an in-flight run always reads true.
 
 | Flag | Effect |
@@ -345,6 +347,8 @@ Long-running autonomous runs mirror lifecycle milestones to Telegram so you can 
 
 - **Skills** call [`hooks/notify-telegram.sh`](hooks/notify-telegram.sh) `"<title>" "<body>"` at milestones (fix-issue started/complete, requirements/stories/epic created).
 - **The controller** (`sdlc build`/`resume`) emits run-lifecycle notifications directly via `notify.py` (run started / finished / rate-limited / first story failure) — gated to one-per-run for failures so your phone doesn't buzz 47 times during a bad run.
+
+On a fleet, a run message carries `worker=<name>` (the worker that ran it, from `SDLC_WORKER`), and a rate-limit pause carries `pool=<name>` and `resumes <time>` so the notice is attributable to a subscription. Local mode omits both fields.
 
 Both paths are best-effort and Telegram-only: credentials come from `$TELEGRAM_BOT_TOKEN` / `$TELEGRAM_CHAT_ID` (env first, then `~/.claude/config/.env`), and every call is a silent no-op when unconfigured.
 

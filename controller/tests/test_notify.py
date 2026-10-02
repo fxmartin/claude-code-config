@@ -22,6 +22,7 @@ def _isolate_env(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok123")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat456")
     monkeypatch.delenv("SDLC_NOTIFY", raising=False)
+    monkeypatch.delenv("SDLC_WORKER", raising=False)
 
 
 def _collector():
@@ -653,3 +654,69 @@ def test_queue_resumed_announces_the_window_reopening():
     assert "development queue" in text
     assert "resum" in text.lower()
     assert "subject=" not in text
+
+
+# --- worker / pool attribution (Story 35.4-004) ---------------------------------
+
+
+def _text(event: str, **fields: object) -> str:
+    captured: list[bytes] = []
+    notify_mod.notify(event, sender=lambda url, payload: captured.append(payload), **fields)
+    return json.loads(captured[0].decode("utf-8"))["text"]
+
+
+@pytest.mark.parametrize("event", ["run_started", "run_finished"])
+def test_a_run_event_names_its_worker(event):
+    text = _text(event, repo="alpha", subject="build epic-01", terminal="DONE", worker="xps")
+    assert "worker=xps" in text
+
+
+@pytest.mark.parametrize("event", ["run_started", "run_finished", "rate_limited", "queue_paused"])
+def test_local_mode_messages_carry_no_worker_or_pool(event):
+    text = _text(event, repo="alpha", subject="build epic-01", terminal="DONE")
+    assert "worker=" not in text
+    assert "pool=" not in text
+    assert "resumes" not in text
+
+
+def test_a_run_event_takes_its_worker_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SDLC_WORKER", "m3max")
+    assert "worker=m3max" in _text("run_started", repo="alpha", subject="build epic-01")
+
+
+def test_an_explicit_worker_beats_the_environment(monkeypatch):
+    monkeypatch.setenv("SDLC_WORKER", "m3max")
+    text = _text("run_started", subject="build epic-01", worker="xps")
+    assert "worker=xps" in text and "m3max" not in text
+
+
+def test_a_rate_limit_pause_names_the_pool_and_when_it_resumes():
+    text = _text(
+        "queue_paused",
+        repo="alpha",
+        subject="development queue (claude-shared)",
+        reset_at="2026-09-07T17:00:00+00:00",
+        worker="xps",
+        pool="claude-shared",
+    )
+    assert "worker=xps" in text
+    assert "pool=claude-shared" in text
+    assert "resumes 2026-09-07T17:00:00+00:00" in text
+
+
+def test_a_run_rate_limit_resumes_in_readable_time_when_the_pool_is_known():
+    text = _text("rate_limited", repo="alpha", reset_at=1700000000, pool="claude-shared")
+    assert "pool=claude-shared" in text
+    assert "resumes 2023-11-14T22:13:20+00:00" in text
+    assert "reset_at=" not in text
+
+
+def test_a_pool_without_a_reset_time_names_the_pool_only():
+    text = _text("queue_resumed", subject="development queue", pool="claude-shared")
+    assert "pool=claude-shared" in text
+    assert "resumes" not in text
+
+
+def test_an_out_of_range_epoch_reset_falls_back_to_the_raw_value():
+    text = _text("rate_limited", repo="alpha", reset_at=10**30, pool="claude-shared")
+    assert f"resumes {10**30}" in text
