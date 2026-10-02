@@ -172,3 +172,39 @@ def test_a_local_queue_still_pauses_everything_with_one_poolless_window(tmp_path
     assert [p.pool for p in store.dispatch_pauses()] == [None]
     assert launcher.calls == []
     assert store.get_job(other).state == "queued"
+
+
+def test_a_parked_job_in_a_paused_pool_is_not_polled_until_the_window_reopens(tmp_path) -> None:
+    from sdlc.scheduler import _Scheduler
+
+    store = _store(tmp_path)
+    clock = Clock()
+    job = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1", pool=SHARED)
+    store.claim_next(claimed_by="test:1", lease_seconds=60, now=clock())
+    store.attach_run(job, "run-1")
+    store.park_job(job, pr_number=7, reason="awaiting approval", poll_after=None)
+    store.pause_dispatch(
+        until=clock.now + timedelta(hours=1), reason="rate limited",
+        run_id="remote-run", pool=SHARED, now=clock(),
+    )
+    reads: list[int] = []
+
+    def approval_probe(_root, pr):
+        reads.append(pr)
+        return None
+
+    scheduler = _Scheduler(
+        store, config=SchedulerConfig(slots=2, worker=_profile("xps", SHARED)),
+        registry=Registry(tmp_path / "registry.json"),
+        launcher=FakeLauncher(), clock=clock, sleeper=lambda _s: None,
+        notifier=lambda *a, **k: None, version_check=_clean, probe=None,
+        approval_probe=approval_probe,
+        fix_rounds=lambda _db, _run: 0, plan_files=lambda _db, _run: [],
+        echo=lambda _line: None, identity="test:1",
+    )
+
+    assert scheduler._poll_parked() is False
+    assert reads == []  # the shut pool's CR is not read; its window is
+    clock.advance(7200)
+    scheduler._poll_parked()
+    assert reads == [7]

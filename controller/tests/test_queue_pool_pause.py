@@ -225,3 +225,11 @@ def test_a_legacy_single_pause_row_survives_the_migration(tmp_path) -> None:
     assert pause is not None and pause.pool is None
     assert pause.reason == "old" and pause.run_id == "run-1"
     assert pause.paused_until == _later(900).isoformat()
+
+
+def test_clearing_a_pool_on_a_queue_db_without_the_pause_table_is_a_noop(tmp_path) -> None:
+    path = tmp_path / "queue.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+
+    QueueStore(path).clear_pause("claude-shared")  # must not raise on the pre-pause schema
