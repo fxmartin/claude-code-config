@@ -1856,7 +1856,10 @@ never opens the queue and is unaffected.
 **Targeting the fleet (Story 35.3-001).** On a fleet queue `--enqueue` adds
 `requirements` to the job — `{repo, origin, harness, sandbox}`, all strings:
 `repo` is the checkout's directory name, `origin` its `git remote get-url origin`
-(omitted when there is none; it is what lets a worker clone the repo), `harness`
+(omitted when there is none; it is what lets a worker clone the repo) with any
+URL credential stripped — `https://oauth2:<token>@host/…` is recorded as
+`https://host/…`, an `ssh://` login user is kept — since the service never holds
+a token and the worker clones with its own forge login, `harness`
 the comma-joined set of harnesses the role routing reaches (`--harness` over the
 repo `.sdlc-harness.yaml`; a role neither names counts as the default `claude`),
 `sandbox` `container` when `--sandbox` was passed. `--host <host>` / `--pool

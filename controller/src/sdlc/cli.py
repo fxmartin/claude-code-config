@@ -209,10 +209,12 @@ def _job_requirements(cli_args: list[str], harness_map: dict[str, str]) -> dict[
     reaches — ``--harness`` over the repo ``.sdlc-harness.yaml``, with any role
     neither names left on the default — so a worker lacking one of them can be
     skipped. ``origin`` is what lets a worker that does not have the clone fetch
-    it (35.2-002); a repo with no ``origin`` remote simply omits it.
+    it (35.2-002); a repo with no ``origin`` remote simply omits it. It is
+    recorded with any URL credential stripped — the queue service never holds a
+    token, and the worker clones with its own forge login.
     """
     from sdlc.harness import DEFAULT_HARNESS, HarnessError
-    from sdlc.issue_host import _remote_url
+    from sdlc.issue_host import _remote_url, strip_remote_credentials
     from sdlc.role_routing import PIPELINE_ROLES, RoleRoutingError, apply_repo_harness_defaults
 
     try:
@@ -227,7 +229,7 @@ def _job_requirements(cli_args: list[str], harness_map: dict[str, str]) -> dict[
     requirements = {"repo": root.name, "harness": ",".join(sorted(harnesses))}
     origin = _remote_url(root)
     if origin:
-        requirements["origin"] = origin
+        requirements["origin"] = strip_remote_credentials(origin)
     if "--sandbox" in cli_args:
         requirements["sandbox"] = "container"
     return requirements

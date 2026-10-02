@@ -92,6 +92,21 @@ def test_fix_enqueue_lands_on_fleet(fleet, repo) -> None:
     assert json.loads(job.requirements)["origin"] == ORIGIN
 
 
+def test_credentialed_origin_never_reaches_the_queue(fleet, repo) -> None:
+    # Epic 35: the queue service never holds credentials — jobs carry no tokens.
+    secret = "glpat-SECRET"
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "set-url", "origin", f"https://oauth2:{secret}@gitlab.test/root/widgets.git"],
+        check=True,
+    )
+    result = runner.invoke(app, ["build", "12.4-005", "--enqueue"])
+    assert result.exit_code == 0, result.output
+    job = _only_job(fleet)
+    assert json.loads(job.requirements)["origin"] == "https://gitlab.test/root/widgets.git"
+    assert secret not in job.requirements
+    assert secret not in result.output
+
+
 def test_origin_less_repo_still_enqueues_without_origin(fleet, tmp_path, monkeypatch) -> None:
     bare = tmp_path / "plain"
     bare.mkdir()
