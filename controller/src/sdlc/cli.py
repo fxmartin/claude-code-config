@@ -3817,10 +3817,11 @@ def queue_run_cmd(
     worker that already has the clone. A tracked-dirty tree
     (`DIRTY_WORKING_TREE`, never stashed), a forge that is unreachable or slow
     (a failed or timed-out fetch or clone) or a lock another git process holds
-    sends the job back to `queued`; so does a clone another live job or run on
-    this host is using (`repo busy` — the sync writes to its checkout, so even
-    two builds take turns, and a `sdlc fix` started by hand counts), and the
-    job then waits for it unclaimed. An `origin mismatch`, a default branch
+    sends the job back to `queued`, retried after a wait that doubles from 30 s
+    to 10 min (a forge's failure holds back every job on that origin); so does
+    a clone another live job or run on this host is using (`repo busy` — the
+    sync writes to its checkout, so even two builds take turns, and a `sdlc
+    fix` started by hand counts), and the job then waits for it unclaimed. An `origin mismatch`, a default branch
     that cannot fast-forward or a directory that is no clone parks it
     `blocked`. While a fetch or clone is in flight the worker keeps beating
     and renewing its leases. A resumed run is never synced.

@@ -1978,7 +1978,7 @@ launching it (a resumed run re-enters its own tree and is never synced):
    records B`, both shown without credentials;
 4. a tracked-dirty tree (`dirty_tree_paths`; untracked scratch is ignored) sends
    the job back to `queued` with a `DIRTY_WORKING_TREE` reason — the #590 rule,
-   never a stash — and the next poll retries it;
+   never a stash — to be retried once its wait is up (see *Retries* below);
 5. `git fetch origin && git checkout -q <default> && git merge --ff-only
    origin/<default>`, where `<default>` is the branch `origin/HEAD` names — the
    ref the build cuts story branches from (Story 23.2-001) — else `main`; a
@@ -1989,8 +1989,9 @@ launching it (a resumed run re-enters its own tree and is never synced):
    refreshing its status: `….lock': File exists`) clears on its own, so that
    job goes back to `queued` instead. A fetch or clone that fails or times out
    is the forge, not the job — down, rebooting, a credential to renew — so the
-   job goes back to `queued` with git's error as its reason; a forge outage
-   leaves the queue `queued`, never `blocked`;
+   job goes back to `queued` with git's error as its reason, and every job on
+   that origin waits on the forge with it; a forge outage leaves the queue
+   `queued`, never `blocked`;
 6. the scheduler renews the claim (and every running job's lease the sync held
    up) before launching — a peer that reclaimed the job during a slow clone owns
    it, so it is neither launched twice nor parked by the scheduler that lost
@@ -2001,14 +2002,31 @@ launching it (a resumed run re-enters its own tree and is never synced):
    Run attach, resume, reconcile and the approval probe all read `repo`, so
    they follow the clone, not the path the enqueuing machine recorded.
 
+**Retries.** A refusal that clears on its own — a dirty tree, a held lock, a
+forge that failed the fetch or clone — is not retried on the next poll: every
+2 s, one job would cost a claim and a `git status`, or a fetch that holds the
+drain for up to the git timeout, for as long as the cause lasts. It waits 30 s
+instead, doubling per refusal up to 10 min, and a sync that succeeds resets the
+wait. A dirty tree or a lock holds back that clone; a forge's failure holds back
+every job on its origin (compared as in step 3), so an outage costs one fetch
+per wait, not one per queued job. A job held back is left unclaimed and its
+reason names the refusal it waits on, one it may never have hit itself. The
+waits are the worker's own view — its clone, its credentials, its route to the
+forge — kept in memory: a new `sdlc queue run` tries every job at once, and a
+plain drain never stays up to wait one out (the job stays `queued` for the next
+run, like any refused job), while a `--follow` worker retries it when its wait
+is up. A clone in use waits for the clone instead (step 1).
+
 **A slow forge.** The sync runs inline in the drain loop, and a fetch or clone
 may take up to the 120 s git timeout — longer than the 90 s lease and the 90 s
 offline window. So while one is in flight a side thread (`_kept_alive`, every
 10 s) heartbeats, renews the running jobs' leases and holds the claim being
 synced for: a peer never reads the worker offline, nor reclaims and relaunches
 its work, mid-sync. Reaping, budgets and cancels still wait for the git call to
-return. A first clone that cannot finish inside the timeout is retried and so
-never completes — clone such a repo under `~/Work` by hand once.
+return, which the retry wait keeps to one call per origin per wait. A first
+clone that cannot finish inside the timeout is retried and so never completes —
+clone such a repo under `~/Work` by hand once. Ctrl-C mid-sync hands that job's
+claim back with the rest, rather than leaving it to lapse.
 
 A job that records no origin (enqueued before this story, or from a repo with
 no remote) and a drain without `--worker` are not synced.

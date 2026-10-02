@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ import pytest
 from sdlc.doctor import Finding
 from sdlc.queue import QueueStore
 from sdlc.queue_worker import (
+    ForgeUnavailable,
     PreparedRepo,
     RepoRefused,
     WorkerProfile,
@@ -174,6 +176,7 @@ def test_a_tracked_dirty_file_refuses_the_job_and_is_never_stashed(
         prepare_repo(job, work_dir=work_dir)
 
     assert refusal.value.retryable is True  # back to `queued`, not parked
+    assert not isinstance(refusal.value, ForgeUnavailable)  # the clone's, not the forge's
     assert "DIRTY_WORKING_TREE" in refusal.value.reason
     assert "README.md" in refusal.value.reason
     assert git(clone, "stash", "list") == ""
@@ -272,6 +275,7 @@ def test_a_failed_clone_refuses_the_job(tmp_path, work_dir) -> None:
         prepare_repo(job, work_dir=work_dir)
 
     assert "clone" in refusal.value.reason
+    assert isinstance(refusal.value, ForgeUnavailable)
     assert refusal.value.retryable is True
     assert not (work_dir / "proj").exists()
 
@@ -284,7 +288,7 @@ def test_a_forge_that_cannot_be_reached_sends_the_job_back_with_git_s_error(
     job = _job(tmp_path, clone, forge.url)
     forge.go_down()
 
-    with pytest.raises(RepoRefused, match="could not fetch origin") as refusal:
+    with pytest.raises(ForgeUnavailable, match="could not fetch origin") as refusal:
         prepare_repo(job, work_dir=work_dir)
 
     assert refusal.value.retryable is True
@@ -437,7 +441,7 @@ def test_a_git_timeout_sends_the_job_back_to_be_retried(
         return real(root, *args)
 
     monkeypatch.setattr(queue_worker, "_git", slow)
-    with pytest.raises(RepoRefused, match="git fetch timed out") as refusal:
+    with pytest.raises(ForgeUnavailable, match="git fetch timed out") as refusal:
         prepare_repo(job, work_dir=work_dir)
 
     assert refusal.value.retryable is True
@@ -457,7 +461,7 @@ def test_a_clone_that_times_out_leaves_nothing_behind_and_is_retried(
         raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
 
     monkeypatch.setattr(queue_worker.subprocess, "run", killed)
-    with pytest.raises(RepoRefused, match="timed out") as refusal:
+    with pytest.raises(ForgeUnavailable, match="timed out") as refusal:
         prepare_repo(job, work_dir=work_dir)
 
     assert refusal.value.retryable is True
@@ -533,6 +537,18 @@ def test_a_clone_that_cannot_launch_git_is_a_refusal(
     monkeypatch.setattr(queue_worker.subprocess, "run", boom)
     with pytest.raises(RepoRefused, match="could not clone"):
         prepare_repo(job, work_dir=work_dir)
+
+
+def test_a_work_dir_that_cannot_hold_the_clone_is_a_refusal_not_a_crash(tmp_path, forge) -> None:
+    """The drain catches refusals only: an `OSError` here would take the whole worker down."""
+    not_a_dir = tmp_path / "Work"
+    not_a_dir.write_text("", encoding="utf-8")  # a file where the clone's parent should be
+    job = _job(tmp_path, tmp_path / "elsewhere" / "proj", forge.url)
+
+    with pytest.raises(RepoRefused, match="could not clone") as refusal:
+        prepare_repo(job, work_dir=not_a_dir)
+
+    assert refusal.value.retryable is False  # an operator's to fix: parked `blocked`
 
 
 def test_origin_requirements_records_the_origin_json_or_none(tmp_path, forge, work_dir) -> None:
@@ -622,6 +638,7 @@ def test_a_checkout_held_up_by_another_git_s_lock_is_retried_not_parked(
         prepare_repo(_job(tmp_path, clone, forge.url), work_dir=work_dir)
 
     assert refusal.value.retryable is True
+    assert not isinstance(refusal.value, ForgeUnavailable)
     assert git(clone, "branch", "--show-current") == "feature/old"
 
 
@@ -763,7 +780,7 @@ class RegisteringLauncher(FakeLauncher):
 def _drain(
     tmp_path, store, work_dir, *, worker: bool = True, clock=None, launcher=None,
     registry=None, preparer=None, profile=None, follow: bool = False, sleeper=None,
-    **kwargs,
+    echo=None, **kwargs,
 ):
     clock = clock or Clock()
     launcher = launcher or FakeLauncher()
@@ -778,7 +795,7 @@ def _drain(
         sleeper=sleeper or clock.advance,
         notifier=lambda *a, **k: None,
         version_check=_clean,
-        echo=lambda _line: None,
+        echo=echo or (lambda _line: None),
         identity="xps",
         prepare_repo=preparer or partial(prepare_repo, work_dir=work_dir),
         **kwargs,
@@ -860,22 +877,49 @@ def test_an_origin_mismatch_blocks_the_job_naming_the_mismatch(
     assert launcher.calls == []
 
 
+def _fetches(monkeypatch, clock: Clock) -> list[datetime]:
+    """When, on ``clock``, each `git fetch` the sync runs was made."""
+    from sdlc import queue_worker
+
+    made: list[datetime] = []
+    real = queue_worker._git
+
+    def recording(root, *args):
+        if args[0] == "fetch":
+            made.append(clock())
+        return real(root, *args)
+
+    monkeypatch.setattr(queue_worker, "_git", recording)
+    return made
+
+
+def _gaps(moments: list[datetime]) -> list[float]:
+    return [(later - earlier).total_seconds() for earlier, later in zip(moments, moments[1:])]
+
+
 def test_a_forge_outage_leaves_the_queue_queued_and_it_drains_once_the_forge_is_back(
-    tmp_path, forge, work_dir
+    tmp_path, forge, work_dir, monkeypatch
 ) -> None:
-    """The GitLab box rebooting must not park every queued job for a manual requeue."""
+    """The GitLab box rebooting must not park every queued job for a manual requeue.
+
+    Nor cost a fetch per queued job: the forge failed the first one's, so the
+    others on that origin wait on it too — and `queue list` says why.
+    """
     clone = _clone(forge, work_dir / "proj")
     store = QueueStore(tmp_path / "queue.db")
     store.init()
     ids = [_enqueue(store, clone, forge.url) for _ in range(3)]
     forge.go_down()
+    clock = Clock()
+    fetches = _fetches(monkeypatch, clock)
 
-    result, launcher = _drain(tmp_path, store, work_dir)
+    result, launcher = _drain(tmp_path, store, work_dir, clock=clock)
 
     jobs = [store.get_job(job_id) for job_id in ids]
     assert [job.state for job in jobs if job] == ["queued"] * 3
     assert all("could not fetch origin" in (job.reason or "") for job in jobs if job)
     assert (launcher.calls, result.parked) == ([], 0)
+    assert len(fetches) == 1
 
     forge.come_back()
     _, launcher = _drain(tmp_path, store, work_dir)
@@ -1053,14 +1097,16 @@ def test_a_finished_or_dead_run_does_not_hold_the_clone(tmp_path, forge, work_di
 
 
 class CountingStore(QueueStore):
-    """Counts each job's claims, to tell one claim from a claim on every poll."""
+    """Each job's claims, and when, to tell one claim from a claim on every poll."""
 
     def __init__(self, path: Path) -> None:
         super().__init__(path)
         self.claims: list[int] = []
+        self.claimed_at: list[datetime] = []
 
     def claim_job(self, job_id, **kwargs):
         self.claims.append(job_id)
+        self.claimed_at.append(kwargs["now"])
         return super().claim_job(job_id, **kwargs)
 
 
@@ -1089,6 +1135,105 @@ def test_a_job_waiting_on_a_busy_clone_is_not_claimed_again_until_the_clone_free
 
     assert store.claims.count(waiting) == 2  # the claim that found it busy, then the launch
     assert [cwd for _, cwd in launcher.calls] == [str(clone)]
+
+
+# --- a refusal that clears on its own is retried on a doubling wait ------------------
+
+
+def test_a_down_forge_is_fetched_once_per_doubling_wait_not_per_job_per_poll(
+    tmp_path, forge, work_dir, monkeypatch
+) -> None:
+    """A `--follow` worker must not fetch a down forge on every poll, once per queued job.
+
+    A fetch to a forge that hangs holds the drain for up to the git timeout, so
+    the jobs on that origin wait on one fetch together and the wait doubles to
+    a cap; the first fetch that succeeds lets them all through.
+    """
+    clones = [_clone(forge, work_dir / name) for name in ("proj", "proj-2")]
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    for clone in clones:
+        _enqueue(store, clone, forge.url)
+    forge.go_down()
+    clock = Clock()
+    start = clock()
+    fetches = _fetches(monkeypatch, clock)
+    back = start + timedelta(seconds=2200)
+
+    def sleeper(_seconds: float) -> None:
+        clock.advance(5)
+        if clock() == back:
+            forge.come_back()
+        if clock() >= start + timedelta(seconds=2800):
+            raise KeyboardInterrupt
+
+    _, launcher = _drain(tmp_path, store, work_dir, clock=clock, follow=True, sleeper=sleeper)
+
+    during = [moment for moment in fetches if moment < back]
+    assert _gaps(during) == [30, 60, 120, 240, 480, 600, 600]  # one fetch per wait, capped
+    assert sorted(cwd for _, cwd in launcher.calls) == sorted(map(str, clones))
+
+
+def test_a_dirty_clone_is_rechecked_once_per_doubling_wait_and_launches_once_tidied(
+    tmp_path, forge, work_dir
+) -> None:
+    """A clone left dirty overnight costs a claim and a `git status` per wait, not per poll."""
+    clone = _clone(forge, work_dir / "proj")
+    (clone / "README.md").write_text("my uncommitted work\n", encoding="utf-8")
+    store = CountingStore(tmp_path / "queue.db")
+    store.init()
+    _enqueue(store, clone, forge.url)
+    clock = Clock()
+    start = clock()
+
+    def sleeper(_seconds: float) -> None:
+        clock.advance(5)
+        if clock() == start + timedelta(seconds=100):
+            git(clone, "checkout", "--", "README.md")  # its owner tidies it
+        if clock() >= start + timedelta(seconds=300):
+            raise KeyboardInterrupt
+
+    _, launcher = _drain(tmp_path, store, work_dir, clock=clock, follow=True, sleeper=sleeper)
+
+    assert _gaps(store.claimed_at) == [30, 60, 120]  # dirty at 0, 30 and 90 s; clean at 210 s
+    assert [cwd for _, cwd in launcher.calls] == [str(clone)]
+    assert git(clone, "stash", "list") == ""
+
+
+class LongRunningLauncher(FakeLauncher):
+    """Each process it starts runs for ``passes`` scheduler passes."""
+
+    def __init__(self, passes: int) -> None:
+        super().__init__()
+        self.passes = passes
+
+    def __call__(self, argv, cwd):
+        proc = super().__call__(argv, cwd)
+        proc._polls = self.passes
+        return proc
+
+
+def test_a_plain_drain_retries_a_refused_job_on_its_wait_and_does_not_wait_it_out(
+    tmp_path, work_dir
+) -> None:
+    """A running sibling keeps a plain drain polling, not re-syncing the refused job each poll.
+
+    Once the sibling is done nothing holds the drain open for the refused job:
+    it stays queued for the next `sdlc queue run`, as any refused job does.
+    """
+    down, up = Forge(tmp_path / "down"), Forge(tmp_path / "up")
+    store = CountingStore(tmp_path / "queue.db")
+    store.init()
+    refused = _enqueue(store, _clone(down, work_dir / "down"), down.url)
+    _enqueue(store, _clone(up, work_dir / "up"), up.url)
+    down.go_down()
+
+    result, _ = _drain(tmp_path, store, work_dir, launcher=LongRunningLauncher(passes=40))
+
+    assert store.claims.count(refused) == 2  # at 0 s, then once its 30 s wait was up
+    assert result.started == 1
+    job = store.get_job(refused)
+    assert job is not None and job.state == "queued"
 
 
 # --- a fleet job, in 35.3-001's enqueue shape, on a worker without the clone ---------
@@ -1280,6 +1425,55 @@ def test_a_refused_slow_sync_still_renews_the_leases_it_held_up(tmp_path, work_d
     assert seen and seen["first"] > seen["now"], seen
 
 
+def test_a_keepalive_that_cannot_reach_the_store_says_so_and_the_sync_goes_on(
+    tmp_path, forge, work_dir
+) -> None:
+    """A busy `queue.db` mid-sync is reported by the side thread, never raised out of it."""
+
+    class LockedOnce(QueueStore):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.locked = True
+
+        def renew_lease(self, job_id, **kwargs):
+            if self.locked:
+                self.locked = False
+                raise sqlite3.OperationalError("database is locked")
+            return super().renew_lease(job_id, **kwargs)
+
+    store = LockedOnce(tmp_path / "queue.db")
+    store.init()
+    _enqueue(store, _clone(forge, work_dir / "proj"), forge.url)
+    lines: list[str] = []
+
+    def sync(job, *, keepalive, **kwargs):
+        keepalive()  # what the side thread does while git runs
+        return prepare_repo(job, work_dir=work_dir, keepalive=keepalive, **kwargs)
+
+    _, launcher = _drain(tmp_path, store, work_dir, preparer=sync, echo=lines.append)
+
+    assert any("could not keep the worker alive during its sync" in line for line in lines)
+    assert len(launcher.calls) == 1
+
+
+def test_ctrl_c_during_a_sync_hands_the_claim_back(tmp_path, forge, work_dir) -> None:
+    """Ctrl-C hands back every lease the drain holds — the one it is syncing under too."""
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = _enqueue(store, _clone(forge, work_dir / "proj"), forge.url)
+
+    def interrupted(_job, **_kwargs):
+        raise KeyboardInterrupt
+
+    result, launcher = _drain(tmp_path, store, work_dir, preparer=interrupted)
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert (job.state, job.claimed_by) == ("queued", None)
+    assert result.interrupted is True
+    assert launcher.calls == []
+
+
 def test_queue_run_help_describes_the_pre_dispatch_sync() -> None:
     import re
 
@@ -1291,5 +1485,5 @@ def test_queue_run_help_describes_the_pre_dispatch_sync() -> None:
     assert result.exit_code == 0, result.output
     text = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", result.output).split())
     for needle in ("git merge --ff-only origin/main", "DIRTY_WORKING_TREE",
-                   "origin mismatch"):
+                   "origin mismatch", "retried after a wait that doubles"):
         assert needle in text, needle

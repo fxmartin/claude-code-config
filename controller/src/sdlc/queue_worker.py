@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sdlc.queue import JobRecord, QueueBackend, WorkerRecord
 
 __all__ = [
+    "ForgeUnavailable",
     "PreparedRepo",
     "RepoBusy",
     "RepoPreparer",
@@ -34,6 +35,7 @@ __all__ = [
     "origin_requirements",
     "prepare_repo",
     "same_origin",
+    "sync_origin",
 ]
 
 
@@ -196,9 +198,9 @@ class RepoRefused(Exception):
     ``retryable`` separates the refusals that clear without an operator — a
     dirty checkout its owner tidies, a clone another live job or run is using
     (:class:`RepoBusy`), a forge that is slow or unreachable (a fetch or clone
-    that failed or timed out), a lock another git process holds; the job goes
-    back to ``queued`` — from the ones that need an operator
-    decision (wrong origin, a default branch that cannot check out or
+    that failed or timed out: :class:`ForgeUnavailable`), a lock another git
+    process holds; the job goes back to ``queued`` — from the ones that need an
+    operator decision (wrong origin, a default branch that cannot check out or
     fast-forward, a directory that is no clone — the job is parked
     ``blocked``).
     """
@@ -207,6 +209,19 @@ class RepoRefused(Exception):
         super().__init__(reason)
         self.reason = reason
         self.retryable = retryable
+
+
+class ForgeUnavailable(RepoRefused):
+    """A fetch or clone of the job's origin failed or timed out: the forge, not this clone.
+
+    Down, rebooting, unreachable, a credential to renew — it clears without
+    anyone touching the job. Every job on that origin would fail the same way,
+    so the scheduler holds them back together rather than probing a down forge
+    once per job.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason, retryable=True)
 
 
 class RepoBusy(RepoRefused):
@@ -329,6 +344,16 @@ def _recorded_origin(job: "JobRecord") -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def sync_origin(job: "JobRecord") -> str | None:
+    """The forge ``job``'s sync fetches from, as ``host/path``; ``None`` if it is never synced.
+
+    Spelled the way :func:`same_origin` compares, so two jobs naming one repo
+    by different URLs (ssh on one machine, https on another) share one forge.
+    """
+    recorded = _recorded_origin(job)
+    return _origin_key(recorded) if recorded is not None else None
+
+
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """:func:`_git`, with a timeout (retryable) or missing git surfaced as a refusal."""
     try:
@@ -384,7 +409,12 @@ def _clone(origin: str, target: Path) -> None:
     # (`--upload-pack=…`) must never reach git's argument parser.
     if origin.startswith("-"):
         raise RepoRefused(f"refusing to clone {shown!r}: an origin that reads as a git option")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # This host's to fix, not the forge's — and the drain catches refusals
+        # only, so an `OSError` let through here would stop the whole worker.
+        raise RepoRefused(f"could not clone {shown} into {target}: {exc}") from exc
     try:
         # Plain `git clone`: the worker's own `gh`/`glab` credentials reach git
         # through the credential helpers `gh auth setup-git` / `glab auth
@@ -401,10 +431,9 @@ def _clone(origin: str, target: Path) -> None:
         # which the retry would otherwise find and judge as a (dirty) clone.
         shutil.rmtree(target, ignore_errors=True)
         # Not `exc`: its text is the argv, origin and all.
-        raise RepoRefused(
+        raise ForgeUnavailable(
             f"could not clone {shown} into {target}: "
-            f"timed out after {_GIT_TIMEOUT_SECONDS}s",
-            retryable=True,
+            f"timed out after {_GIT_TIMEOUT_SECONDS}s"
         ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RepoRefused(f"could not clone {shown} into {target}: {exc}") from exc
@@ -416,10 +445,9 @@ def _clone(origin: str, target: Path) -> None:
     if res.returncode != 0:
         # The forge, not the job: down, rebooting, a credential to renew. That
         # clears without anyone touching the job, so it goes back to be retried.
-        raise RepoRefused(
+        raise ForgeUnavailable(
             f"could not clone {shown} into {target}: "
-            f"{res.stderr.strip() or 'git clone failed'}",
-            retryable=True,
+            f"{res.stderr.strip() or 'git clone failed'}"
         )
 
 
@@ -488,14 +516,20 @@ def prepare_repo(
     if paths := dirty_tree_paths(target):
         raise _dirty_refusal(target, paths)
 
-    with _kept_alive(keepalive):
-        fetch = _run_git(target, "fetch", "origin")
+    try:
+        with _kept_alive(keepalive):
+            fetch = _run_git(target, "fetch", "origin")
+    except RepoRefused as exc:
+        # A timeout is a forge that hangs, not this clone; git that cannot run
+        # at all is this host's to fix, and stays a refusal that parks the job.
+        if exc.retryable:
+            raise ForgeUnavailable(exc.reason) from exc
+        raise
     if fetch.returncode != 0:
         # The forge, not this clone: down, rebooting, a credential to renew.
         # That clears without anyone touching the job, so it is retried.
-        raise RepoRefused(
-            f"could not fetch origin in {target}: {(fetch.stderr or fetch.stdout).strip()}",
-            retryable=True,
+        raise ForgeUnavailable(
+            f"could not fetch origin in {target}: {(fetch.stderr or fetch.stdout).strip()}"
         )
     branch = _default_branch(target)
     steps: tuple[tuple[str, ...], ...] = (
