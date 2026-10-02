@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -11,9 +12,10 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from sdlc.cli import app
+import sdlc.role_routing as rr
+from sdlc.cli import _split_fleet_flags, app
 from sdlc.queue import QueueStore
-from sdlc.queue_client import QueueClient
+from sdlc.queue_client import QueueClient, QueueRequestError
 from sdlc.queue_server import AccessPolicy, make_server
 
 runner = CliRunner()
@@ -55,6 +57,11 @@ def _only_job(store: QueueStore):
     return jobs[0]
 
 
+def _register_worker(fleet, name: str, host: str, **capabilities) -> None:
+    """Register a worker through the live service's real ``POST /workers`` (Story 35.2-001)."""
+    QueueClient(fleet.url, token=TOKEN).register_worker(name, host=host, **capabilities)
+
+
 # --- AC1: payload shape ------------------------------------------------------
 
 
@@ -76,6 +83,15 @@ def test_requirements_harness_comes_from_flag_and_repo_file(fleet, repo) -> None
     assert result.exit_code == 0, result.output
     # CLI flag > repo file per role; the set of distinct harnesses the job routes to.
     assert json.loads(_only_job(fleet).requirements)["harness"] == "claude,codex,gemini"
+
+
+def test_requirements_harness_includes_the_registry_default(fleet, repo, monkeypatch) -> None:
+    # The same resolution the run itself does (Issue #551): a registry `default:`
+    # fills every role the flag and the repo file leave unnamed.
+    monkeypatch.setattr(rr, "registry_default_harness", lambda _path: "codex")
+    result = runner.invoke(app, ["build", "12.4-005", "--enqueue", "--harness", "review=claude"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(_only_job(fleet).requirements)["harness"] == "claude,codex"
 
 
 def test_requirements_record_the_sandbox_flag(fleet, repo) -> None:
@@ -130,6 +146,7 @@ def test_local_enqueue_is_unchanged_without_a_fleet(tmp_path, monkeypatch) -> No
 
 @pytest.mark.parametrize("pin", [["--host", "home-lab"], ["--host=home-lab"]])
 def test_host_pin_recorded(fleet, repo, pin) -> None:
+    _register_worker(fleet, "lab", "home-lab")
     result = runner.invoke(app, ["build", "12.4-005", "--enqueue", *pin])
     assert result.exit_code == 0, result.output
     job = _only_job(fleet)
@@ -148,42 +165,65 @@ def test_pool_recorded_for_fix(fleet, repo, pool) -> None:
     assert not any(a.startswith("--pool") or a == "claude-shared" for a in json.loads(job.options))
 
 
-def test_forge_host_flag_stays_a_forge_flag(fleet, repo) -> None:
-    result = runner.invoke(app, ["build", "12.4-005", "--enqueue", "--host=gitlab"])
+@pytest.mark.parametrize(
+    "forge,frozen",
+    [(["--host=gitlab"], "--host=gitlab"), (["--host", "gitlab"], "--host=gitlab"), (["--host", "GitHub"], "--host=GitHub")],
+)
+def test_forge_host_flag_stays_a_forge_flag(fleet, repo, forge, frozen) -> None:
+    # The value, not the form, decides: `--host gitlab` is the forge override too.
+    result = runner.invoke(app, ["build", "12.4-005", "--enqueue", *forge])
     assert result.exit_code == 0, result.output
     job = _only_job(fleet)
     assert job.host is None
-    assert "--host=gitlab" in json.loads(job.options)
+    assert frozen in json.loads(job.options)
 
 
-def test_unknown_host_lists_known_workers(fleet, repo, monkeypatch) -> None:
-    monkeypatch.setattr(QueueClient, "known_workers", lambda self: {"m3max": "macbook-pro-m3-max", "lab": "home-lab"})
+def test_space_form_forge_host_is_not_a_pin(fleet, repo) -> None:
+    # Review repro: this queued a job pinned to a machine called "gitlab" (which no
+    # worker would ever claim) and silently dropped the forge override.
+    result = runner.invoke(app, ["fix", "123", "--enqueue", "--host", "gitlab"])
+    assert result.exit_code == 0, result.output
+    job = _only_job(fleet)
+    assert job.host is None
+    assert json.loads(job.options) == ["123", "--host=gitlab"]
+
+
+def test_unknown_host_lists_known_workers(fleet, repo) -> None:
+    _register_worker(fleet, "m3max", "macbook-pro-m3-max")
+    _register_worker(fleet, "lab", "home-lab")
     result = runner.invoke(app, ["build", "12.4-005", "--enqueue", "--host", "nowhere"])
     assert result.exit_code == 2
     assert "nowhere" in result.output
-    assert "m3max" in result.output and "home-lab" in result.output
+    assert "m3max (host macbook-pro-m3-max)" in result.output and "lab (host home-lab)" in result.output
     assert fleet.list_jobs() == []
 
 
-def test_known_host_is_accepted(fleet, repo, monkeypatch) -> None:
-    monkeypatch.setattr(QueueClient, "known_workers", lambda self: {"lab": "home-lab"})
-    result = runner.invoke(app, ["build", "12.4-005", "--enqueue", "--host=home-lab"])
-    assert result.exit_code == 0, result.output
-    assert _only_job(fleet).host == "home-lab"
+def test_pin_names_a_worker_host_not_a_worker_name(fleet, repo) -> None:
+    # 35.2-001 matches a pin on the worker's host, so a worker's name is no pin.
+    _register_worker(fleet, "lab", "home-lab")
+    result = runner.invoke(app, ["build", "12.4-005", "--enqueue", "--host=lab"])
+    assert result.exit_code == 2
+    assert "lab (host home-lab)" in result.output
+    assert fleet.list_jobs() == []
 
 
-def test_empty_registry_rejects_any_pin(fleet, repo, monkeypatch) -> None:
-    monkeypatch.setattr(QueueClient, "known_workers", lambda self: {})
+def test_empty_registry_rejects_any_pin(fleet, repo) -> None:
     result = runner.invoke(app, ["fix", "1", "--enqueue", "--host", "home-lab"])
     assert result.exit_code == 2
     assert "no workers" in result.output.lower()
+    assert fleet.list_jobs() == []
 
 
-def test_service_without_registry_accepts_the_pin(fleet, repo) -> None:
-    # The live service has no /workers route yet (35.2-001): nothing to validate against.
+def test_service_that_cannot_list_workers_refuses_the_pin(fleet, repo, monkeypatch) -> None:
+    # A pin is never accepted unchecked: an unverifiable pin may strand the job.
+    def no_registry(self):
+        raise QueueRequestError(404, "unknown route: GET /workers")
+
+    monkeypatch.setattr(QueueClient, "list_workers", no_registry)
     result = runner.invoke(app, ["fix", "1", "--enqueue", "--host", "home-lab"])
-    assert result.exit_code == 0, result.output
-    assert _only_job(fleet).host == "home-lab"
+    assert result.exit_code == 2
+    assert "GET /workers" in result.output
+    assert fleet.list_jobs() == []
 
 
 # --- flag validation ---------------------------------------------------------
@@ -196,6 +236,22 @@ def test_fleet_flags_rejected_without_enqueue(fleet, repo, verb, target, flags) 
     assert result.exit_code == 2
     assert "--enqueue" in result.output
     assert fleet.list_jobs() == []
+
+
+def test_pin_without_enqueue_names_the_pin_and_the_forge_override(fleet, repo) -> None:
+    # `--host` alone is not enqueue-only (the forge override is not), so say which
+    # value was taken as a pin and where the forge override went.
+    result = runner.invoke(app, ["fix", "123", "--host", "home-lab"])
+    assert result.exit_code == 2
+    assert "--enqueue is required for --host home-lab" in result.output
+    assert "--host github|gitlab" in result.output
+    assert fleet.list_jobs() == []
+
+
+@pytest.mark.parametrize("forge", [["--host", "gitlab"], ["--host=gitlab"]])
+def test_forge_host_needs_no_enqueue(forge) -> None:
+    # Handed to the run's own parser in the one form it takes.
+    assert _split_fleet_flags(["123", *forge], enqueue=False) == (["123", "--host=gitlab"], None, None)
 
 
 @pytest.mark.parametrize("flags", [["--pool"], ["--host"], ["--pool="], ["--host="]])
@@ -223,58 +279,6 @@ def test_fleet_down_never_falls_back_to_local(tmp_path, monkeypatch, repo) -> No
     assert not (tmp_path / "queue.db").exists()
 
 
-# --- known_workers (client) --------------------------------------------------
-
-
-class _Resp:
-    def __init__(self, status: int, body: object) -> None:
-        self.status = status
-        self._raw = json.dumps(body).encode()
-
-    def read(self) -> bytes:
-        return self._raw
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc) -> None:
-        return None
-
-
-def test_known_workers_maps_worker_to_host() -> None:
-    body = {"workers": [{"worker": "m3max", "host": "mbp", "pools": []}, {"worker": "lab", "host": "home-lab"}]}
-    client = QueueClient("http://q:1", opener=lambda req, timeout: _Resp(200, body))
-    assert client.known_workers() == {"m3max": "mbp", "lab": "home-lab"}
-
-
-def test_known_workers_is_none_when_the_route_is_missing(fleet) -> None:
-    assert QueueClient(fleet.url, token=TOKEN).known_workers() is None
-
-
-def test_known_workers_rejects_a_malformed_registry() -> None:
-    from sdlc.queue_client import QueueUnavailable
-
-    client = QueueClient("http://q:1", opener=lambda req, timeout: _Resp(200, {"workers": [{"worker": "m3max"}]}))
-    with pytest.raises(QueueUnavailable, match="malformed worker list"):
-        client.known_workers()
-
-
-def test_known_workers_propagates_a_server_error() -> None:
-    from sdlc.queue_client import QueueUnavailable
-
-    client = QueueClient("http://q:1", opener=lambda req, timeout: _Resp(500, {"error": "boom"}))
-    with pytest.raises(QueueUnavailable):
-        client.known_workers()
-
-
-def test_known_workers_propagates_a_client_error() -> None:
-    from sdlc.queue_client import QueueRequestError
-
-    client = QueueClient("http://q:1", opener=lambda req, timeout: _Resp(400, {"error": "bad"}))
-    with pytest.raises(QueueRequestError):
-        client.known_workers()
-
-
 def test_invalid_repo_harness_file_is_a_parse_error(fleet, repo) -> None:
     (repo / ".sdlc-harness.yaml").write_text("harness:\n  default: [unclosed\n")
     result = runner.invoke(app, ["build", "12.4-005", "--enqueue"])
@@ -285,18 +289,35 @@ def test_invalid_repo_harness_file_is_a_parse_error(fleet, repo) -> None:
 # --- AC3: list columns -------------------------------------------------------
 
 
-def test_queue_list_shows_worker_host_pool_columns(fleet, repo) -> None:
-    runner.invoke(app, ["fix", "123", "--enqueue", "--host", "home-lab", "--pool", "claude-shared"])
-    fleet.claim_next(claimed_by="m3max", lease_seconds=60, host="home-lab", pools=["claude-shared"])
+def _cells(output: str) -> dict[str, str]:
+    """`sdlc queue list`'s first job row, cut at the header's column starts."""
+    header, row = output.splitlines()[0:2]
+    columns = [(m.group(), m.start()) for m in re.finditer(r"\S+", header)]
+    ends = [start for _, start in columns[1:]] + [None]
+    return {name: row[start:end].strip() for (name, start), end in zip(columns, ends)}
+
+
+@pytest.mark.parametrize(
+    "worker,host,pool",
+    [
+        # The M3 Max's 18-character host name ran into POOL: `macbook-pro-m3-maxclaude-shared`.
+        ("m3max", "macbook-pro-m3-max", "claude-shared"),
+        ("a-worker-name-past-twelve", "a-host-name-past-fourteen", "a-pool-name-past-sixteen"),
+    ],
+)
+def test_queue_list_shows_worker_host_pool_columns(fleet, repo, worker, host, pool) -> None:
+    _register_worker(fleet, worker, host, pools=[pool], harnesses=["claude"], repos=["widgets"])
+    enqueued = runner.invoke(app, ["fix", "123", "--enqueue", "--host", host, "--pool", pool])
+    assert enqueued.exit_code == 0, enqueued.output
+    assert fleet.claim_next(claimed_by=worker, lease_seconds=60, host=host, pools=[pool]) is not None
     result = runner.invoke(app, ["queue", "list"])
     assert result.exit_code == 0, result.output
-    header, row = result.output.splitlines()[0:2]
-    for column in ("WORKER", "HOST", "POOL"):
-        assert column in header
-    assert "m3max" in row and "home-lab" in row and "claude-shared" in row
+    cells = _cells(result.output)
+    assert (cells["WORKER"], cells["HOST"], cells["POOL"]) == (worker, host, pool)
+    assert cells["REPO"] == str(repo.resolve())
 
 
 def test_queue_list_dashes_empty_fleet_columns(fleet, repo) -> None:
     runner.invoke(app, ["fix", "123", "--enqueue"])
-    row = runner.invoke(app, ["queue", "list"]).output.splitlines()[1]
-    assert row.split().count("-") >= 3
+    cells = _cells(runner.invoke(app, ["queue", "list"]).output)
+    assert (cells["WORKER"], cells["HOST"], cells["POOL"]) == ("-", "-", "-")

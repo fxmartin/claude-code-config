@@ -15,7 +15,7 @@ import typer
 from sdlc import __version__
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
 from sdlc.eval_compare import DEFAULT_TOLERANCE
-from sdlc.queue import HEARTBEAT_SECONDS, QueueError
+from sdlc.queue import HEARTBEAT_SECONDS, QueueBackend, QueueError
 # `sdlc queue run`'s defaults live with the scheduler, so `--help` prints the
 # real figures rather than a copy that can drift (Story 32.1-002).
 from sdlc.scheduler import (
@@ -167,12 +167,13 @@ _FLEET_FLAGS = ("--host", "--pool")
 def _split_fleet_flags(args: list[str], *, enqueue: bool) -> tuple[list[str], str | None, str | None]:
     """Pull the fleet-only ``--host <host>`` / ``--pool <pool>`` out of the flag vector (35.3-001).
 
-    ``--host=github|gitlab`` predates the fleet (issues #606/#608: the forge
-    override) and stays in ``args`` for the run's own parser; any other
-    ``--host`` value is a fleet pin. A worker named ``github`` or ``gitlab``
-    therefore cannot be pinned by name. Both flags take ``--flag value`` or
-    ``--flag=value`` and are rejected without ``--enqueue`` — a run that starts
-    now has no queue to steer.
+    Both flags take ``--flag value`` or ``--flag=value``, and the value — never
+    the form — decides what a ``--host`` is: ``github``/``gitlab`` is the forge
+    override that predates the fleet (issues #606/#608) and goes back into
+    ``args`` as ``--host=<forge>``, the one form the run's own parser takes; any
+    other value is a fleet pin. A machine named ``github`` or ``gitlab``
+    therefore cannot be pinned. Pin and pool are rejected without ``--enqueue``
+    — a run that starts now has no queue to steer.
     """
     from sdlc.issue_host import SUPPORTED_HOSTS
 
@@ -184,18 +185,24 @@ def _split_fleet_flags(args: list[str], *, enqueue: bool) -> tuple[list[str], st
         if flag not in _FLEET_FLAGS:
             rest.append(arg)
             continue
-        if eq and flag == "--host" and inline.lower() in SUPPORTED_HOSTS:
-            rest.append(arg)
-            continue
         value = inline if eq else next(tokens, "")
         if not value or value.startswith("--"):
             typer.echo(f"error: {flag} requires a value", err=True)
             raise typer.Exit(code=2)
+        if flag == "--host" and value.lower() in SUPPORTED_HOSTS:
+            rest.append(f"--host={value}")
+            continue
         values[flag] = value
     if values and not enqueue:
+        given = " and ".join(f"{flag} {value}" for flag, value in sorted(values.items()))
+        forge = (
+            " (--host github|gitlab, the forge override, needs no --enqueue)"
+            if "--host" in values
+            else ""
+        )
         typer.echo(
-            f"error: {' and '.join(sorted(values))} only apply with --enqueue "
-            "(they steer a fleet queue job; a run that starts now has no queue)",
+            f"error: --enqueue is required for {given}: a fleet pin or pool steers a "
+            f"queued job, and a run that starts now has no queue{forge}",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -206,22 +213,19 @@ def _job_requirements(cli_args: list[str], harness_map: dict[str, str]) -> dict[
     """What a worker must have to run this job: repo name + origin, harness(es), sandbox (35.3-001).
 
     ``harness`` is the comma-joined set of harnesses the job's role routing
-    reaches — ``--harness`` over the repo ``.sdlc-harness.yaml``, with any role
-    neither names left on the default — so a worker lacking one of them can be
-    skipped. ``origin`` is what lets a worker that does not have the clone fetch
-    it (35.2-002); a repo with no ``origin`` remote simply omits it. It is
-    recorded with any URL credential stripped — the queue service never holds a
-    token, and the worker clones with its own forge login.
+    reaches — resolved by :func:`_effective_harness_map`, exactly as the run
+    will resolve it, with any role still unnamed left on the default — so a
+    worker lacking one of them can be skipped. ``origin`` is what lets a worker
+    that does not have the clone fetch it (35.2-002); a repo with no ``origin``
+    remote simply omits it. It is recorded with any URL credential stripped —
+    the queue service never holds a token, and the worker clones with its own
+    forge login.
     """
-    from sdlc.harness import DEFAULT_HARNESS, HarnessError
+    from sdlc.harness import DEFAULT_HARNESS
     from sdlc.issue_host import _remote_url, strip_remote_credentials
-    from sdlc.role_routing import PIPELINE_ROLES, RoleRoutingError, apply_repo_harness_defaults
+    from sdlc.role_routing import PIPELINE_ROLES
 
-    try:
-        routed = apply_repo_harness_defaults(harness_map)
-    except (RoleRoutingError, HarnessError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+    routed = _effective_harness_map(harness_map)
     harnesses = set(routed.values())
     if not harnesses or set(PIPELINE_ROLES) - set(routed):
         harnesses.add(DEFAULT_HARNESS)
@@ -264,7 +268,7 @@ def _enqueue_job(
 
     Story 35.3-001: on a fleet queue the job also carries ``requirements`` (see
     :func:`_job_requirements`) and the optional ``host`` pin / ``pool``. The pin
-    is checked against the service's worker registry when it has one; a pin or
+    is checked against the service's worker registry (Story 35.2-001); a pin or
     pool with no fleet queue configured is refused, since nothing would honour it.
     """
     from sdlc.queue_client import QueueClient, open_queue
@@ -302,12 +306,17 @@ def _enqueue_job(
     typer.echo(f"queued: job {job_id} ({kind} {scope}){where} in {repo}{pinned}")
 
 
-def _require_known_host(store: Any, host: str) -> None:
-    """Refuse a ``--host`` no registered worker runs on, naming the ones that do."""
-    workers = store.known_workers()
-    if workers is None or host in workers.values():
-        return  # no registry to check against (pre-35.2-001 service), or a match
-    known = ", ".join(f"{worker} (host {h})" for worker, h in sorted(workers.items()))
+def _require_known_host(store: QueueBackend, host: str) -> None:
+    """Refuse a ``--host`` no registered worker runs on, naming the ones that do.
+
+    A pin is matched on a worker's ``host`` (Story 35.2-001's claim matching), so
+    that is what is checked — a worker's name is not a host. A service that
+    cannot list its workers fails the enqueue: an unchecked pin may strand the job.
+    """
+    workers = store.list_workers()
+    if any(worker.host == host for worker in workers):
+        return
+    known = ", ".join(f"{worker.name} (host {worker.host})" for worker in workers)
     raise QueueError(
         f"unknown host {host!r}: " + (f"known workers: {known}" if known else "no workers are registered")
     )
@@ -335,14 +344,15 @@ Flags:
   --enqueue                 record a `queued` job in the host queue
                              ($XDG_STATE_HOME/sdlc/queue.db) instead of running
                              now; no run starts. Manage it with `sdlc queue`,
-                             drain it with `sdlc queue run`. Omitted: runs now
+                             drain it with `sdlc queue run`. Omitted: runs now.
                              With SDLC_QUEUE_URL set the job goes to the fleet
                              queue instead, with the repo, origin URL and the
                              harness/sandbox it needs recorded (Story 35.3-001)
   --host=WORKER-HOST        --enqueue only: pin the fleet job to the machine
                              named (`--host home-lab` or `--host=home-lab`); an
                              unknown host is refused, listing the known workers.
-                             `--host=github|gitlab` below still overrides the forge
+                             `--host github|gitlab` (either form) is still the
+                             forge override below
   --pool=POOL               --enqueue only: run the fleet job only on a worker
                              serving that subscription pool (e.g. claude-shared)
   --dry-run                 plan only; dispatch nothing
@@ -677,14 +687,15 @@ Flags:
   --enqueue                 record a `queued` job in the host queue
                              ($XDG_STATE_HOME/sdlc/queue.db) instead of running
                              now; no run starts. Manage it with `sdlc queue`,
-                             drain it with `sdlc queue run`. Omitted: runs now
+                             drain it with `sdlc queue run`. Omitted: runs now.
                              With SDLC_QUEUE_URL set the job goes to the fleet
                              queue instead, with the repo, origin URL and the
                              harness/sandbox it needs recorded (Story 35.3-001)
   --host=WORKER-HOST        --enqueue only: pin the fleet job to the machine
                              named (`--host home-lab` or `--host=home-lab`); an
                              unknown host is refused, listing the known workers.
-                             `--host=github|gitlab` below still overrides the forge
+                             `--host github|gitlab` (either form) is still the
+                             forge override (issue #606)
   --pool=POOL               --enqueue only: run the fleet job only on a worker
                              serving that subscription pool (e.g. claude-shared)
   --limit=N                 batch only: cap the issue set (`next` defaults to 1)
@@ -3503,10 +3514,16 @@ def queue_list_cmd(
         typer.echo("no jobs queued.")
         raise typer.Exit(code=0)
 
+    # WORKER/HOST/POOL (Story 35.3-001) widen to their longest value: a fleet
+    # host name like `macbook-pro-m3-max` outgrows any fixed width, and a value
+    # that fills its column runs straight into the next one.
+    worker_w = max([12] + [len(r.worker or "-") + 2 for r in rows])
+    host_w = max([14] + [len(r.host or "-") + 2 for r in rows])
+    pool_w = max([16] + [len(r.pool or "-") + 2 for r in rows])
     typer.echo(
         f"{'ID':<6}{'STATE':<16}{'PRIORITY':<10}{'BUDGET':<9}{'KIND':<7}"
         f"{'SCOPE':<16}{'AGE':<6}{'PR':<7}{'RUN':<14}"
-        f"{'WORKER':<12}{'HOST':<14}{'POOL':<16}REPO"
+        f"{'WORKER':<{worker_w}}{'HOST':<{host_w}}{'POOL':<{pool_w}}REPO"
     )
     for r in rows:
         run_disp = (r.run_id or "-")[:12]
@@ -3517,7 +3534,8 @@ def queue_list_cmd(
             f"{r.id:<6}{r.state:<16}{r.priority:<10}{r.job_budget().label():<9}"
             f"{r.kind:<7}{r.scope:<16}"
             f"{_format_age(now, r.created_at):<6}{pr_disp:<7}{run_disp:<14}"
-            f"{r.worker or '-':<12}{r.host or '-':<14}{r.pool or '-':<16}{r.repo}"
+            f"{r.worker or '-':<{worker_w}}{r.host or '-':<{host_w}}"
+            f"{r.pool or '-':<{pool_w}}{r.repo}"
         )
         # Why it is standing still (Story 35.2-001: "no eligible worker (needs
         # repo X, sandbox)"; also `repo busy`, a version-guard remedy, …).
