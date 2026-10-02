@@ -715,3 +715,8 @@ def test_a_pool_without_a_reset_time_names_the_pool_only():
     text = _text("queue_resumed", subject="development queue", pool="claude-shared")
     assert "pool=claude-shared" in text
     assert "resumes" not in text
+
+
+def test_an_out_of_range_epoch_reset_falls_back_to_the_raw_value():
+    text = _text("rate_limited", repo="alpha", reset_at=10**30, pool="claude-shared")
+    assert f"resumes {10**30}" in text
