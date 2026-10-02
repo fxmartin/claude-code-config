@@ -576,3 +576,42 @@ def test_run_doctor_adds_the_finding_only_when_a_url_is_set(
     monkeypatch.setenv("SDLC_QUEUE_TOKEN", TOKEN)
     with_url = run_doctor(**kwargs)  # type: ignore[arg-type]
     assert "fleet-queue" in {f.check for f in with_url.findings}
+
+
+# --- workers (Story 35.2-001) -------------------------------------------------
+
+
+def test_register_worker_round_trips_and_heartbeats_in_place(client: QueueClient) -> None:
+    first = client.register_worker(
+        "m3max",
+        host="macbook-pro-m3-max",
+        pools=["claude-m3", "codex-shared"],
+        harnesses=["claude", "codex"],
+        sandbox="podman",
+        repos=["agentic-coding-monitor"],
+        slots=2,
+        slots_free=2,
+    )
+    beat = client.register_worker("m3max", host="macbook-pro-m3-max", slots=2, slots_free=1)
+
+    assert first.pools == ["claude-m3", "codex-shared"] and first.sandbox == "podman"
+    assert beat.registered_at == first.registered_at
+    assert [(w.name, w.slots_free) for w in client.list_workers()] == [("m3max", 1)]
+
+
+def test_register_worker_refused_input_is_a_request_error(client: QueueClient) -> None:
+    with pytest.raises(qc.QueueRequestError) as caught:
+        client.register_worker("m3max", host="h", slots=0)
+    assert caught.value.status == 400
+
+
+def test_a_registered_client_claim_is_capability_matched(client: QueueClient) -> None:
+    client.register_worker("lab", host="home-lab", repos=["other"], slots=1)
+    job_id = client.add_job(
+        repo="/r/a", kind="build", scope="1", requirements_json='{"repo": "agentic-coding-monitor"}'
+    )
+
+    assert client.claim_next(claimed_by="lab", lease_seconds=90) is None
+    client.register_worker("m3max", host="m3", repos=["agentic-coding-monitor"], slots=1)
+    claimed = client.claim_next(claimed_by="m3max", lease_seconds=90)
+    assert claimed is not None and claimed.id == job_id
