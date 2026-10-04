@@ -18,6 +18,16 @@ from sdlc.model_routing import TIER_MODEL_IDS
 NOW = datetime(2026, 10, 4, 9, 0, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_worker_self_check():
+    """Override the conftest stub: this module tests the real ``run_self_check``.
+
+    Every call here injects its runner, home, state dir and environment, so no
+    real agent turn runs and nothing outside ``tmp_path`` is written.
+    """
+    yield
+
+
 def _home(tmp_path: Path) -> tuple[Path, Path]:
     home = tmp_path / "home"
     claude = home / ".claude"

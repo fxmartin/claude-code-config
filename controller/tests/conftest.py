@@ -88,6 +88,25 @@ def _no_real_model_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_worker_self_check(monkeypatch):
+    """Never run a real agent turn for a fleet worker's self-check (Story 35.2-007).
+
+    `sdlc queue run --worker` probes with `claude -p` before it registers, reads
+    the real ``~/.claude`` for the TCC verdict and writes ``~/.local/state/sdlc``.
+    A probe that fails — no `claude` on a CI runner — keeps the worker retrying
+    every 60 s, so a CLI test driving the real drain would never return. A passing
+    probe keeps the pre-35.2-007 drain unchanged. test_worker_selfcheck.py
+    overrides this to test the real function with injected runners and paths.
+    """
+    import sdlc.worker_selfcheck as selfcheck_mod
+
+    def _passed(**_kwargs):
+        return selfcheck_mod.SelfCheckResult(ok=True, at="2026-01-01T00:00:00+00:00")
+
+    monkeypatch.setattr(selfcheck_mod, "run_self_check", _passed)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_host_cli(monkeypatch):
     """Block real ``gh``/``glab`` invocations for every test by default.
 
