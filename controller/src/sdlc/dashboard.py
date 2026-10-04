@@ -210,14 +210,16 @@ def _registry_runs_view(
     local_ids: set[str] = set()
     for rec in registry.records():
         local_ids.add(rec.run_id)
-        done, total = rec.completed, rec.total
+        done, total, phase = rec.completed, rec.total, rec.phase
         try:
-            for r in Ledger(rec.db).list_runs():
+            ledger = Ledger(rec.db)
+            for r in ledger.list_runs():
                 if r["id"] == rec.run_id:
                     done, total = r["done"], r["total"]
                     break
+            phase = None if rec.finished_at else ledger.run_phase(rec.run_id)
         except (OSError, sqlite3.Error):
-            pass  # unreachable ledger → keep the registry's cached counts
+            pass  # unreachable ledger → keep the registry's cached counts and phase
         row = {
             "id": rec.run_id,
             "repo": rec.repo,
@@ -229,6 +231,7 @@ def _registry_runs_view(
             "done": done,
             "total": total,
             "worker": rec.worker,
+            "phase": phase,
         }
         if github is not None:
             if rec.repo not in gh_by_repo:
@@ -267,6 +270,8 @@ def _remote_run_row(fleet_row: dict) -> dict | None:
         "done": rec.completed,
         "total": rec.total,
         "worker": rec.worker,
+        # The phase the worker last pushed (Story 35.4-005); a finished run has none.
+        "phase": None if rec.finished_at else rec.phase,
     }
 
 
@@ -945,6 +950,9 @@ let lastRuns = [];
 // up locally from the server-computed elapsed (runtimeBase) captured at fetch
 // (runtimeAnchor). null disables the ticker (finished run / no timestamps).
 let runtimeBase = null, runtimeAnchor = null;
+// The same ticker for a running preflight's elapsed (Story 35.4-005): a two-minute
+// suite must visibly advance between transport pushes, which a quiet ledger sends none of.
+let preflightBase = null, preflightAnchor = null;
 function esc(s){return String(s==null?"":s).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));}
 // Story 11.2-009: display labels decouple the rendered text from the ledger
 // status vocabulary. A story marked IN_PROGRESS the moment its first stage starts
@@ -1039,6 +1047,22 @@ function humanDuration(s){
   if(h>0) return h+"h "+String(m).padStart(2,"0")+"m";
   if(m>0) return m+"m "+String(sec).padStart(2,"0")+"s";
   return sec+"s";
+}
+// Story 35.4-005: the preflight gate as the run header states it. A live gate shows
+// its command and a ticking elapsed (`#preflight-elapsed`), a passed one its
+// duration, a red one its PRE_FLIGHT_* reason. A remote run's ledger is out of
+// reach, so only its pushed phase says it is in preflight; a run with no
+// preflight events (skipped, or older) falls back to the frozen option.
+function preflightLine(run, cfg){
+  const pf = run.preflight;
+  if(pf && pf.state === "running"){
+    return "preflight: running ("+(pf.command ? esc(pf.command)+", " : "")
+      + "<span id='preflight-elapsed'>"+esc(humanDuration(pf.duration_seconds))+"</span>)";
+  }
+  if(pf && pf.state === "passed") return "preflight: passed ("+esc(humanDuration(pf.duration_seconds))+")";
+  if(pf && pf.state === "failed") return "preflight: failed &mdash; "+esc(pf.reason||"");
+  if(run.phase === "preflight") return "preflight: running";
+  return Object.keys(cfg).length ? "preflight: "+esc(cfg.preflight||"?") : "";
 }
 function stageCell(st){
   let title = (st.attempt?("attempt "+st.attempt):"") + (st.failure_category?(" · "+esc(st.failure_category)):"");
@@ -1199,7 +1223,10 @@ function renderRuns(runs){
     // Story 35.4-001: a fleet run names its worker beside the repo ("📁 repo @ worker").
     const repo = r.repo
       ? "<div class='muted small'>📁 " + esc(String(r.repo).split(/[\\\\/]/).pop())
-        + (r.worker ? " @ " + esc(r.worker) : "") + "</div>"
+        + (r.worker ? " @ " + esc(r.worker) : "")
+        // Story 35.4-005: a run in preflight or closing says so; the default
+        // `stories` phase is just "running", which the live marker already says.
+        + (r.phase && r.phase !== "stories" ? " &middot; " + esc(r.phase) : "") + "</div>"
       : "";
     const gh = ("github" in r) ? ghBadge(r.github) : "";
     // Story 19.2-001: tag active (building) runs with run--live so they stand
@@ -1363,12 +1390,15 @@ function renderMain(d){
     return;
   }
   const cfg = run.config || {};
+  const pfLine = preflightLine(run, cfg);
   let cfgline = "";
   if(Object.keys(cfg).length){
     const qa = cfg.skip_coverage ? "QA gate: off" : ("QA gate: on ("+esc(cfg.coverage_threshold)+"%)");
-    cfgline = "<div class='muted small'>preflight: "+esc(cfg.preflight||"?")+" &middot; "+qa
+    cfgline = "<div class='muted small'>"+pfLine+" &middot; "+qa
       + (cfg.rebuild ? " &middot; rebuild" : "")
       + (cfg.limit ? (" &middot; limit "+esc(cfg.limit)) : "") + "</div>";
+  } else if(pfLine){
+    cfgline = "<div class='muted small'>"+pfLine+"</div>";
   }
   // Story 28.4-001: the routing config that *governed* this run, read from the
   // run row's frozen snapshot. Off is called out loudly (it means every stage
@@ -1430,6 +1460,9 @@ function renderMain(d){
   } else {
     runtimeBase = null; runtimeAnchor = null;
   }
+  const pfRunning = run.preflight && run.preflight.state === "running" && run.preflight.duration_seconds!=null;
+  preflightBase = pfRunning ? run.preflight.duration_seconds : null;
+  preflightAnchor = pfRunning ? Date.now() : null;
   const total = c.total||0, done = c.done||0;
   document.getElementById("bar").style.width = (total? Math.round(100*done/total):0) + "%";
   document.getElementById("chips").innerHTML = ORDER
@@ -1549,6 +1582,10 @@ function connectStream(){
 }
 // Advance the in-progress run's elapsed once a second between transport pushes.
 function tickRuntime(){
+  if(preflightBase!=null && preflightAnchor!=null){
+    const pel = document.getElementById("preflight-elapsed");
+    if(pel) pel.textContent = humanDuration(preflightBase + (Date.now()-preflightAnchor)/1000);
+  }
   if(runtimeBase==null || runtimeAnchor==null) return;
   const el = document.getElementById("runtime");
   if(!el) return;
@@ -1913,6 +1950,9 @@ class _Handler(BaseHTTPRequestHandler):
                     "finished_at": row["finished_at"],
                     "duration_seconds": row["duration_seconds"],
                     "worker": row["worker"],
+                    # The worker's phase as last pushed (Story 35.4-005); its ledger
+                    # is out of reach, so there is no command or elapsed to show.
+                    "phase": row["phase"],
                 },
                 "counts": counts,
                 "stories": [],

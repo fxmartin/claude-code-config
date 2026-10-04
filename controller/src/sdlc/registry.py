@@ -103,6 +103,10 @@ class RunRecord:
     worker: str | None = None
     # The worker's dashboard origin (Story 35.4-002); None when it advertises none.
     dashboard_url: str | None = None
+    # Where the run is right now (Story 35.4-005): ``preflight`` | ``stories`` |
+    # ``closing``; None for a finished run or one a registry from before this
+    # field wrote. The fleet view shows it beside the worker.
+    phase: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -204,14 +208,29 @@ def _live_counts(rec: RunRecord) -> tuple[int | None, int | None]:
     return rec.completed, rec.total
 
 
+def _live_phase(rec: RunRecord) -> str | None:
+    """The run's phase from its own ledger, else the cached one (Story 35.4-005)."""
+    import sqlite3
+
+    from sdlc.build import Ledger
+
+    try:
+        return Ledger(rec.db).run_phase(rec.run_id)
+    except (OSError, sqlite3.Error):
+        return rec.phase  # unreachable ledger → keep the registry's cached phase
+
+
 def live_record(record: RunRecord) -> RunRecord:
-    """``record`` with its counts read live from the run's own ledger.
+    """``record`` with its counts and phase read live from the run's own ledger.
 
     What a worker pushes on each heartbeat (Story 35.4-001): the fleet view
-    cannot reach the ledger, so the pushed counts are the only ones it has.
+    cannot reach the ledger, so the pushed counts and phase are all it has.
     """
     completed, total = _live_counts(record)
-    return replace(record, completed=completed, total=total)
+    return replace(
+        record, completed=completed, total=total,
+        phase=None if record.finished_at else _live_phase(record),
+    )
 
 
 class Registry:
@@ -297,11 +316,23 @@ class Registry:
                 if row.get("run_id") == run_id:
                     row["status"] = status
                     row["finished_at"] = _now_iso()
+                    row["phase"] = None  # a finished run is in no phase
                     if completed is not None:
                         row["completed"] = completed
             return rows
 
         self._mutate(_finish)
+
+    def set_phase(self, run_id: str, phase: str | None) -> None:
+        """Record which phase ``run_id`` is in (Story 35.4-005); a no-op if unknown."""
+
+        def _set(rows: list[dict]) -> list[dict]:
+            for row in rows:
+                if row.get("run_id") == run_id:
+                    row["phase"] = phase
+            return rows
+
+        self._mutate(_set)
 
     def prune(self, *, include_finished: bool = False) -> int:
         """Drop dead (crashed) entries; optionally also drop finished ones.

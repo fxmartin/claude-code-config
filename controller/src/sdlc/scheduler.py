@@ -66,6 +66,7 @@ __all__ = [
     "job_argv",
     "ledger_fix_rounds",
     "ledger_plan_files",
+    "ledger_preflight_failure",
     "ledger_run_terminal",
     "run_queue",
 ]
@@ -646,6 +647,24 @@ def ledger_fix_rounds(db_path: str, run_id: str) -> int:
         return Ledger(Path(db_path)).stage_attempt_count(run_id, "bugfix")
     except Exception:
         return 0
+
+
+def ledger_preflight_failure(db_path: str, run_id: str) -> str | None:
+    """The ``PRE_FLIGHT_*`` reason ``run_id`` was stamped FAILED with, or ``None`` (Story 35.4-005).
+
+    What a job that never got past its preflight gate should say it died of —
+    ``run status FAILED`` names nothing an operator can act on. Reads the run's
+    own ledger; any read failure degrades to ``None`` (the generic reason).
+    """
+    from sdlc.build import Ledger
+
+    try:
+        state = Ledger(Path(db_path)).preflight_state(run_id)
+    except Exception:  # noqa: BLE001 - a ledger read must never fail a drain
+        return None
+    if state is not None and state["state"] == "failed":
+        return str(state["reason"]) if state["reason"] else None
+    return None
 
 
 def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
@@ -1628,6 +1647,9 @@ class _Scheduler:
                 return
         reason = self._finish_reason(state, code, run_status, entry.run_id,
                                      run_finished)
+        if state == "failed" and record is not None and record.db and entry.run_id:
+            # Story 35.4-005: a run that died in preflight says why, not just FAILED.
+            reason = ledger_preflight_failure(record.db, entry.run_id) or reason
         self._store.finish_job(job_id, state, reason=reason)
         if state == "done":
             self._result.done += 1

@@ -1832,7 +1832,10 @@ def test_run_fix_preflight_failure_returns_early(tmp_path) -> None:
     )
     assert result.preflight_failed is True
     assert dispatch.calls == []  # no dispatch when preflight is red
-    assert not db.exists()  # no run row created before preflight passes
+    # Story 35.4-005: preflight is a run phase, so a red gate leaves a FAILED run
+    # (with its reason — see test_preflight_phase) rather than no run at all.
+    assert _run_count(db) == 1
+    assert result.status == "FAILED"
 
 
 def test_run_fix_skip_preflight_does_not_call_preflight(tmp_path) -> None:
@@ -3060,7 +3063,8 @@ def test_batch_preflight_failure_returns_early(tmp_path) -> None:
     )
     assert result.preflight_failed is True
     assert dispatch.calls == []
-    assert not db.exists()
+    assert _run_count(db) == 1  # Story 35.4-005: a FAILED run, not no run
+    assert result.status == "FAILED"
 
 
 def test_batch_notify_run_started_failure_is_non_fatal(tmp_path, monkeypatch) -> None:

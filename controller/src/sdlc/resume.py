@@ -32,11 +32,14 @@ from sdlc.build import (
     apply_cost_gate_pause,
     apply_rate_limit_park,
     authoritative_mode,
+    default_preflight,
     default_rate_limit_probe,
     effective_concurrency,
     _filter_git_landed,
     finalize_run,
     persist_cohort_structure,
+    preflight_command_text,
+    run_preflight_phase,
 )
 from sdlc.capability import ProbeStatus
 from sdlc.cohort import Story, compute_cohorts
@@ -130,6 +133,9 @@ class ResumeResult:
     # honest "no work left"): this is "work is already in flight elsewhere".
     refused: bool = False
     refusal_reason: str = ""
+    # Story 35.4-005: the run was interrupted in preflight, the resume re-ran the
+    # gate, and it failed — the run is stamped FAILED with the PRE_FLIGHT_* reason.
+    preflight_failed: bool = False
 
 
 # The run modes that mark a fix-issue run (Issue #547). ``fix`` is what the
@@ -148,6 +154,7 @@ def _resume_fix_run(
     registry: "Registry | None" = None,
     runner=None,
     force: bool = False,
+    preflight: Callable[[], bool] | None = None,
 ) -> ResumeResult:
     """Delegate a fix-issue run to :func:`sdlc.fix_issue.resume_fix` (#547).
 
@@ -170,6 +177,7 @@ def _resume_fix_run(
     result = resume_fix(
         run_id, ledger=ledger, dispatcher=dispatcher, runner=runner,
         render_view=render_view, root=root, registry=registry, force=force,
+        preflight=preflight,
     )
     if result.live_owner_blocked:
         return ResumeResult(run_id=run_id, refused=True, refusal_reason=result.abort_reason)
@@ -371,6 +379,8 @@ def _options_from_config(
         # predicting + reconciling its remaining stories. Defaults to off for
         # runs that predate the field — unchanged behaviour.
         predict=bool(config.get("predict", False)),
+        # Story 35.4-005: the timeout a re-run of an interrupted preflight uses.
+        preflight_timeout=int(config.get("preflight_timeout", 1800) or 1800),
     )
 
 
@@ -392,6 +402,7 @@ def run_resume(
     rate_limit_probe: Callable[[], ProbeStatus] | None = None,
     runner=None,
     force: bool = False,
+    preflight: Callable[[], bool] | None = None,
 ) -> ResumeResult:
     """Resume the most recent interrupted run for ``scope`` from the ledger.
 
@@ -437,6 +448,11 @@ def run_resume(
     record immediately followed by ``0 done, 1 failed`` for the same run).
     ``force`` is the documented override, "only if that pid is gone". The check
     covers the fix-mode delegation below too, since it runs before that branch.
+
+    Story 35.4-005: a run interrupted *in* preflight dispatched nothing, so it is
+    resumed by re-running preflight (``preflight`` is the seam, as in
+    :func:`run_build`) — never by skipping it. A red or timed-out gate stamps the
+    run FAILED with its reason and returns ``preflight_failed``.
     """
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
@@ -627,6 +643,23 @@ def run_resume(
         )
     except Exception:
         pass
+
+    # Story 35.4-005: the run died while its gate was running, so nothing was
+    # dispatched and the gate is still owed — re-run it before any story is.
+    if (ledger.preflight_state(rid) or {}).get("state") == "running":
+        preflight_failures: list[str] = []
+        check_preflight = preflight or (
+            lambda: default_preflight(
+                timeout=opts.preflight_timeout, on_failure=preflight_failures.append
+            )
+        )
+        if run_preflight_phase(
+            ledger, rid, check_preflight, preflight_failures,
+            command="preflight" if preflight else preflight_command_text(),
+            registry=registry, repo=(root or Path.cwd()).name,
+            subject=f"resume {scope}", render_view=render_view,
+        ) is not None:
+            return ResumeResult(run_id=rid, preflight_failed=True)
 
     logs_dir = Path(f"{ledger.db_path}.logs") / rid
     cohorts = compute_cohorts(run_queue)

@@ -57,7 +57,29 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
 
 1. **Preflight** — `default_preflight` shells out to the detected test command
    (`uv run pytest`, `npm test`, `make test`, or `bats test/`). A red suite
-   aborts the run before any agent is dispatched (skip with `--skip-preflight`).
+   stops the run before any agent is dispatched (skip with `--skip-preflight`).
+
+   **Preflight is a run phase (Story 35.4-005).** Once the guards that need no
+   run have passed (dry-run, undenied host-auth, forge declaration, dirty tree,
+   parked conflicts), `sdlc build` / `sdlc fix` / `sdlc fix all` open the run —
+   ledger row, local registry record and, on a fleet, the pushed fleet record —
+   *then* run the gate as the run's first phase. The run reads `IN_PROGRESS` with
+   `phase: preflight`, and the dashboard header (and `sdlc status`) show
+   `preflight: running (<command>, <elapsed>)` live, then
+   `preflight: passed (<duration>)`; the run id, registry record and counts are
+   the same ones the rest of the pipeline carries. A red or timed-out gate stamps
+   the run `FAILED` with the `PRE_FLIGHT_RED` / `PRE_FLIGHT_TIMEOUT` line (and the
+   command) as an `error` event, finishes its registry and fleet records `FAILED`,
+   finishes the fleet job `failed` with that reason, and sends it to Telegram — it
+   no longer leaves *no* run at all. `sdlc resume` of a run interrupted in
+   preflight re-runs the gate (nothing was dispatched) rather than skipping it.
+
+   `status_snapshot` carries `run.phase` (`preflight` | `stories` | `closing`;
+   none once finished) and `run.preflight` (`state`, `command`,
+   `duration_seconds`, `reason`), both derived from the ledger's `preflight`
+   events. `/api/runs` rows carry `phase`, and the fleet record's `phase` is
+   refreshed on each worker heartbeat, so the runs sidebar names a remote run's
+   worker *and* its phase.
    The whole command is bounded by `--preflight-timeout` (default 600s), and when
    the project ships `pytest-timeout` the detected pytest command also gets a
    per-test bound (`--timeout=60 --timeout-method=thread`, `PER_TEST_TIMEOUT`) so
@@ -2284,6 +2306,11 @@ authoritative for the worker; the table is the fleet's summary.
   shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
   `/api/runs`, `/api/fleet` and the SSE change token; a failed fetch is kept
   for 30 s, so an offline service stalls the page at most once per window.
+- **Phase (Story 35.4-005).** A run's row also carries `phase` (migration 13):
+  `preflight` while its gate runs, then `stories`, then `closing`, empty once the run
+  is finished. A build pushes it as the phase changes and a worker refreshes it from
+  the run's own ledger on each heartbeat, so the runs sidebar shows a remote run in
+  preflight beside its worker without anyone reading the worker's ledger.
 - **Transcripts (Story 35.4-002).** A run's row also carries `dashboard_url` (migration
   11): the origin of its worker's own dashboard, started with `sdlc dashboard --host
   <tailnet-ip>`. A worker advertises it with `queue run --worker NAME --dashboard-url

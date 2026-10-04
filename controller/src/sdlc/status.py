@@ -8,7 +8,9 @@ from pathlib import Path
 from sdlc.build import Ledger
 from sdlc.model_routing import BALANCED, is_routing_off
 
-__all__ = ["state_report", "format_state", "format_markdown", "format_routing"]
+__all__ = [
+    "state_report", "format_state", "format_markdown", "format_routing", "format_preflight",
+]
 
 
 def state_report(ledger: Ledger, run_id: str) -> list[dict]:
@@ -53,6 +55,29 @@ def format_state(rows: list[dict]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+def format_preflight(preflight: dict | None, *, phase: str | None = None) -> str | None:
+    """The run's preflight gate as one line, or ``None`` when it never ran one (Story 35.4-005).
+
+    Mirrors the dashboard header: ``preflight: running (<command>, <elapsed>)``,
+    ``preflight: passed (<duration>)`` or ``preflight: failed — <PRE_FLIGHT_*
+    reason>``. A remote run carries only its ``phase``, which still says it is in
+    preflight.
+    """
+    if not preflight:
+        return "preflight: running" if phase == "preflight" else None
+    state = preflight.get("state")
+    seconds = preflight.get("duration_seconds")
+    took = f"{seconds}s" if seconds is not None else "?"
+    if state == "running":
+        command = preflight.get("command")
+        return f"preflight: running ({command + ', ' if command else ''}{took})"
+    if state == "passed":
+        return f"preflight: passed ({took})"
+    if state == "failed":
+        return f"preflight: failed — {preflight.get('reason') or 'no reason recorded'}"
+    return None
+
+
 # Story 15.1-002: portable markdown handoff (`sdlc status --markdown`)
 # ---------------------------------------------------------------------------
 
@@ -187,6 +212,10 @@ def format_markdown(
             f"(scope={run.get('scope', '?')}, mode={run.get('mode', '?')})"
         )
         lines.append("")
+        preflight_line = format_preflight(run.get("preflight"), phase=run.get("phase"))
+        if preflight_line:
+            lines.append(preflight_line)
+            lines.append("")
         lines.append(
             f"{counts.get('done', 0)}/{counts.get('total', 0)} done, "
             f"{counts.get('failed', 0)} failed, {counts.get('blocked', 0)} blocked, "

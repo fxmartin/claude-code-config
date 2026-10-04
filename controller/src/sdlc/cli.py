@@ -1028,6 +1028,15 @@ def resume(
         typer.echo(result.refusal_reason, err=True)
         raise typer.Exit(code=1)
 
+    if result.preflight_failed:
+        typer.echo(
+            "PRE_FLIGHT_FAILURE: the preflight gate did not pass on resume — see the "
+            "PRE_FLIGHT_TIMEOUT or PRE_FLIGHT_RED line above for which. "
+            "The run is marked FAILED; fix before building.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     if result.nothing_to_resume:
         if result.run_id is None:
             # Issue #679: latest_resumable_run deliberately never auto-picks a
@@ -1188,6 +1197,15 @@ def status(
         f"{counts['blocked']} blocked, {counts['in_progress']} in progress  "
         f"(scope={snap['run'].get('scope', '?')}, {snap['run'].get('mode', '?')}{workers})"
     )
+    # Story 35.4-005: the preflight gate, named while it runs and — for a run it
+    # failed — with the PRE_FLIGHT_* reason, which no story row can carry.
+    from sdlc.status import format_preflight
+
+    preflight_line = format_preflight(
+        snap["run"].get("preflight"), phase=snap["run"].get("phase")
+    )
+    if preflight_line:
+        typer.echo(preflight_line)
     # Story 27.3-004: rate-limit stall time, kept apart from stage durations so
     # quota backoff is diagnosable at a glance. Silent when the run never stalled.
     stall_s = snap["run"].get("stall_seconds") or 0
@@ -4108,8 +4126,9 @@ def queue_serve_cmd(
                                      on these (see `queue run --worker`)
       GET    /workers                {workers} with an `online` flag each
       PUT    /runs                   a build pushes its run record (the registry.json
-                                     fields + worker) on start and finish; a worker
-                                     pushes its runs' rows the same way
+                                     fields + worker + phase) on start, on each phase
+                                     change and on finish; a worker pushes its runs'
+                                     rows the same way
       GET    /runs                   {runs}: each with its worker's `worker_online`
                                      (the XPS dashboard's fleet view)
       POST   /jobs/{id}/renew        worker, \\[lease_seconds]

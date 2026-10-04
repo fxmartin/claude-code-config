@@ -604,7 +604,8 @@ CREATE TABLE IF NOT EXISTS fleet_runs (
     total       INTEGER,
     completed   INTEGER,
     updated_at  TIMESTAMP NOT NULL,
-    dashboard_url TEXT
+    dashboard_url TEXT,
+    phase       TEXT
 );
 """
 
@@ -730,6 +731,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (11, "fleet_run_dashboard_url", "fleet_runs", [("dashboard_url", "TEXT")], None),
     # Story 35.2-002: the sha a worker's clone was synced to before dispatch.
     (12, "job_synced_sha", "jobs", [("synced_sha", "TEXT")], None),
+    # Story 35.4-005: the phase a pushed run is in, for a fleet_runs written before it.
+    (13, "fleet_run_phase", "fleet_runs", [("phase", "TEXT")], None),
 ]
 
 
@@ -1955,20 +1958,22 @@ class QueueStore:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO fleet_runs(run_id, worker, repo, db, scope, pid, status, "
-                "started_at, finished_at, total, completed, updated_at, dashboard_url) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "started_at, finished_at, total, completed, updated_at, dashboard_url, phase) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET worker = excluded.worker, "
                 "repo = excluded.repo, db = excluded.db, scope = excluded.scope, "
                 "pid = excluded.pid, status = excluded.status, "
                 "started_at = excluded.started_at, finished_at = excluded.finished_at, "
                 "total = excluded.total, completed = excluded.completed, "
-                "updated_at = excluded.updated_at, dashboard_url = excluded.dashboard_url "
+                "updated_at = excluded.updated_at, dashboard_url = excluded.dashboard_url, "
+                "phase = excluded.phase "
                 "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL "
                 "OR excluded.pid != fleet_runs.pid",
                 (
                     record.run_id, worker, record.repo, record.db, record.scope, record.pid,
                     record.status, record.started_at, record.finished_at, record.total,
                     record.completed, _at(now).isoformat(), record.dashboard_url,
+                    record.phase,
                 ),
             )
 

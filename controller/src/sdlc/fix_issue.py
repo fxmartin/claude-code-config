@@ -65,6 +65,8 @@ from sdlc.build import (
     _StoryRunOutcome,
     create_story_worktree,
     default_preflight,
+    preflight_command_text,
+    run_preflight_phase,
     dirty_tree_paths,
     finalize_run,
     operator_files_damage,
@@ -2174,7 +2176,8 @@ def run_fix(
     """Run the single-issue fix orchestration deterministically (issue #436).
 
     Phases: fetch the issue → apply stop conditions (abort cleanly, no run row) →
-    preflight → one ``run_create`` (scope ``issue-<N>``) → investigation →
+    one ``run_create`` (scope ``issue-<N>``) → preflight (a phase of that run,
+    Story 35.4-005: red stamps it FAILED with the reason) → investigation →
     build/coverage/review/merge with the bounded bugfix loop → best-effort summary
     → close-out. Every stage transition is written to the ledger before the next
     begins, and the run is closed on every exit path.
@@ -2263,11 +2266,6 @@ def run_fix(
             issue=opts.issue, undenied_host_auth=undenied, status="ABORTED"
         )
 
-    # --- Preflight ------------------------------------------------------------
-    check_preflight = preflight or (lambda: default_preflight())
-    if not opts.skip_preflight and not check_preflight():
-        return FixResult(issue=opts.issue, preflight_failed=True, status="FAILED")
-
     scope = f"issue-{opts.issue}"
     # --- Live-owner guard (issue #595) ----------------------------------------
     # Two processes (`sdlc fix` / `sdlc resume`) must never drive the same run at
@@ -2328,6 +2326,53 @@ def run_fix(
     except Exception:  # noqa: BLE001
         pass
 
+    # --- Preflight ------------------------------------------------------------
+    # Story 35.4-005: a phase of the run just opened above, not a gate in front of
+    # it — a long suite is watchable and a red one stamps this run FAILED with its
+    # reason. Still before the first dispatch (and the operator-files snapshot).
+    if not opts.skip_preflight:
+        failures: list[str] = []
+        check_preflight = preflight or (
+            lambda: default_preflight(on_failure=failures.append)
+        )
+        if run_preflight_phase(
+            ledger, run_id, check_preflight, failures,
+            command="preflight" if preflight else preflight_command_text(),
+            registry=registry, repo=(root or Path.cwd()).name,
+            subject=story.title, render_view=render_view,
+        ) is not None:
+            return FixResult(
+                issue=opts.issue, run_id=run_id, preflight_failed=True, status="FAILED"
+            )
+
+    return _investigate_and_finish_fix(
+        issue, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
+        host=host, instance_url=instance_url, render_view=render_view,
+        registry=registry,
+    )
+
+
+def _investigate_and_finish_fix(
+    issue: FixIssue,
+    story: Story,
+    opts: FixOptions,
+    ledger: Ledger,
+    run_id: str,
+    dispatch,
+    logs_dir: Path,
+    *,
+    root: Path | None,
+    host: str,
+    instance_url: str | None,
+    render_view=None,
+    registry: Registry | None = None,
+) -> FixResult:
+    """Everything after preflight: investigate, run the stage loop, close out.
+
+    Shared by :func:`run_fix` and a :func:`resume_fix` of a run that was
+    interrupted *in* preflight (Story 35.4-005) — nothing was dispatched, so it
+    re-runs the gate and then carries on exactly as a fresh fix does.
+    """
     # Issue #685: snapshot the operator's dirty/untracked files before the first
     # agent runs, so the stage loop can prove `--allow-dirty` kept its promise.
     protected_files = operator_files_snapshot(root or Path.cwd())
@@ -2439,6 +2484,7 @@ def resume_fix(
     logs_dir: Path | None = None,
     registry: Registry | None = None,
     force: bool = False,
+    preflight=None,
 ) -> FixResult:
     """Re-enter an interrupted `sdlc fix` run at the stage it died in (Issue #547).
 
@@ -2461,6 +2507,11 @@ def resume_fix(
     to finish the same run is what left a real ledger self-contradictory (a
     ``1 done`` finish immediately followed by ``0 done, 1 failed`` for the same
     run). ``force`` is the documented override, "only if that pid is gone".
+
+    Story 35.4-005: a run interrupted *in* preflight has no plan to recover and
+    nothing was dispatched, so it is resumed by re-running preflight (``preflight``
+    is the seam, as in :func:`run_fix`) and then investigating as a fresh fix
+    would — not refused, and not by skipping the gate.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
@@ -2494,7 +2545,10 @@ def resume_fix(
     opts.harness_map = ledger.run_harness_routing(run_id)
 
     plan = _recover_fix_plan(ledger, run_id)
-    if plan is None:
+    preflight_interrupted = plan is None and (
+        (ledger.preflight_state(run_id) or {}).get("state") == "running"
+    )
+    if plan is None and not preflight_interrupted:
         reason = (
             f"run {run_id[:8]} recorded no investigation plan (it predates the "
             f"Issue #547 freeze) — re-run `sdlc fix {issue_number}` instead; the "
@@ -2541,6 +2595,27 @@ def resume_fix(
             registry, run_id, scope, ledger.db_path, 1, repo=root or Path.cwd()
         )
 
+    if preflight_interrupted:
+        failures: list[str] = []
+        check_preflight = preflight or (
+            lambda: default_preflight(on_failure=failures.append)
+        )
+        if run_preflight_phase(
+            ledger, run_id, check_preflight, failures,
+            command="preflight" if preflight else preflight_command_text(),
+            registry=registry, repo=(root or Path.cwd()).name,
+            subject=story.title, render_view=render_view,
+        ) is not None:
+            return FixResult(
+                issue=issue_number, run_id=run_id, preflight_failed=True, status="FAILED"
+            )
+        return _investigate_and_finish_fix(
+            issue, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
+            host=host, instance_url=instance_url, render_view=render_view,
+            registry=registry,
+        )
+
+    assert plan is not None  # only a preflight-interrupted run lacks one, handled above
     terminal, pr_number = _run_stage_loop(
         issue, plan, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
         host=host, instance_url=instance_url, done_stages=done_stages,
@@ -3097,8 +3172,9 @@ def run_fix_batch(
 ) -> FixBatchResult:
     """Run the batch fix orchestration deterministically (issue #436, PR2).
 
-    Phases: preflight → select open issues → one ``run_create`` (scope
-    ``issues-all`` / ``issues-<n1>,<n2>``) → investigate every issue under bounded
+    Phases: select open issues → one ``run_create`` (scope
+    ``issues-all`` / ``issues-<n1>,<n2>``) → preflight (a phase of that run,
+    Story 35.4-005) → investigate every issue under bounded
     concurrency (dropping stop/blocked/failed ones) → synthesize file-overlap
     dependencies → drive the per-issue build→coverage→review→merge pipeline through
     the Epic-24 ready queue (overlapping issues serialize, independent ones run
@@ -3161,11 +3237,6 @@ def run_fix_batch(
             ),
         )
 
-    # --- Preflight ------------------------------------------------------------
-    check_preflight = preflight or (lambda: default_preflight())
-    if not batch.skip_preflight and not check_preflight():
-        return FixBatchResult(preflight_failed=True, status="FAILED")
-
     # --- Selection (no run row when nothing is selectable) --------------------
     try:
         candidates = select_batch_issues(
@@ -3227,6 +3298,23 @@ def run_fix_batch(
         )
     except Exception:  # noqa: BLE001
         pass
+
+    # --- Preflight ------------------------------------------------------------
+    # Story 35.4-005: after selection (it needs the run row to exist, and there is
+    # no point opening one when nothing is selectable) but before the first
+    # dispatch. See :func:`run_fix`.
+    if not batch.skip_preflight:
+        failures: list[str] = []
+        check_preflight = preflight or (
+            lambda: default_preflight(on_failure=failures.append)
+        )
+        if run_preflight_phase(
+            ledger, run_id, check_preflight, failures,
+            command="preflight" if preflight else preflight_command_text(),
+            registry=registry, repo=(root or Path.cwd()).name,
+            subject=f"fix batch {batch.target}", render_view=render_view,
+        ) is not None:
+            return FixBatchResult(run_id=run_id, preflight_failed=True, status="FAILED")
 
     # --- Investigate every issue (bounded concurrency) ------------------------
     ready, dropped = _investigate_all(
