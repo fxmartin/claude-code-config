@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (13/17)** — authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs. Thesis: a build pins
+> **Status: IN PROGRESS (13/18)** — authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 17 | **Total Points**: 62 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 18 | **Total Points**: 67 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -496,6 +496,78 @@ agent before any signal reached the queue.
 **Dependencies**: 35.2-001, 35.2-005
 **Risk Level**: Medium
 
+##### Story 35.2-008: Resident Linux worker on the Hetzner dev box
+**User Story**: As FX, I want the Hetzner `dev-server` to drain the
+`claude-shared` pool as a third worker, so that a shared-pool job runs even
+when both Macs are busy or gated by a GUI dialog I cannot answer from 3000 km
+away — and so the fleet has one worker with no Keychain, no TCC and no
+outbound filter in front of its agents.
+**Priority**: Should Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** the dev box as found on 2026-10-04 — Ubuntu 24.04 x86_64, 4 CPU /
+  7 GB, Determinate Nix, `nix develop ~/.config/nix-dev-env` providing
+  `claude` 2.1.289 (logged in to the shared Max), `gh` 2.102.0 (logged in),
+  `uv`, `node`; no `sdlc`, no `autonomous-sdlc` plugin, no clone, no fleet
+  config **When** the documented bootstrap runs inside that dev shell
+  (`install.sh --core` + `scripts/deploy.sh`, or a `scripts/fleet-bootstrap.sh`
+  if those assume macOS paths) **Then** `sdlc` is a `uv tool`, the
+  `fx-claude-config` marketplace and `autonomous-sdlc` plugin are installed,
+  `~/.sdlc-fleet.yaml` names the queue, and `sdlc doctor` is CLEAN.
+- **Given** `templates/systemd/sdlc-worker.service` (a `systemd --user` unit;
+  `loginctl enable-linger` already on) installed **When** the box boots
+  **Then** `nix develop ~/.config/nix-dev-env -c sdlc queue run --worker dev
+  --pool claude-shared --follow` runs with `Restart=always`, reads
+  `SDLC_QUEUE_TOKEN` from an `EnvironmentFile` (0600) only as the fallback —
+  on Linux the `tailscale` CLI works unattended, so `tailscale whois`
+  (`tag:trusted`) is the primary identity and the #833 misreport does not
+  apply — and logs to the journal. `caffeinate`/`systemd-inhibit` are not
+  needed on a server and the 35.2-004 note says so.
+- **Given** a job enqueued from the XPS with repo
+  `/home/fxmartin/Work/claude-code-config` **When** `dev` claims it **Then**
+  the worker resolves the clone under *its* home (`/home/fx/Work/…`) exactly
+  as the Macs map it to `/Users/fxmartin/…` — the first worker whose user
+  name differs from the XPS's, so the home-relative mapping of 35.2-002 is
+  proven, not assumed.
+- **Given** the worker registers **When** `sdlc queue workers` runs on the XPS
+  **Then** it lists `dev` (host `dev-server`, pool `claude-shared`, harness
+  `claude`; `codex-shared` only once Codex is installed there — capability
+  registration decides, not the unit file), and a `claude-shared` job goes to
+  the least-loaded of `home-lab`/`dev`.
+- **Given** the 35.2-006 and 35.2-007 self-checks **When** the worker starts
+  on Linux **Then** both pass without a GUI (`GIT_TERMINAL_PROMPT=0`, `gh auth
+  setup-git`; the TCC check is skipped off-macOS) and the probe completes
+  from the unit's own context.
+- **Given** a story job for this repo **When** it runs on `dev` **Then** the
+  controller's own suites pass on x86_64 Linux as they do on arm64 CI, and
+  the run ends in a merged PR shown on the XPS dashboard with worker `dev`.
+- **Given** `README.md` / `docs/controller-architecture.md` **When** updated
+  **Then** the fleet section documents the Linux worker, the nix-shell
+  wrapper, and how to reach the box (Tailscale SSH policy denies the XPS and
+  public port 22 is home-IP-only — operate via `ssh -J home-lab`, or widen the
+  ACL in `nix-install`).
+
+**Technical Notes**: The unit's `ExecStart` must go through
+`/nix/var/nix/profiles/default/bin/nix develop <flake> -c …` because every
+tool lives in the dev shell, not on the login PATH; `~/.local/bin` (uv tools)
+must be on the unit's PATH. Pools are a capability of the login present on
+the box: the shared Max (`mail@fxmartin.me`, Max 20x) → `claude-shared`.
+Found 2026-10-04 while the M3 Max was gated by Little Snitch (`gh` blocked
+outbound; alerts refuse remote-desktop input by design; FileVault forbids a
+remote reboot) — the day's fifth GUI-only gate, none of which exists on a
+headless Linux box. Relaxes the Non-Goal "provisioning the Hetzner box".
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: unit template renders/validates; home-relative repo mapping for
+      a differing user name; pool list derived from capabilities; doctor
+      finding on Linux; bootstrap script idempotent (bats)
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-004, 35.2-005, 35.2-006
+**Risk Level**: Medium
+
 ### Feature 35.3: Launch from the XPS
 
 #### Stories
@@ -786,11 +858,14 @@ dashboard) — one decision for the story.
    can run an agent from its own launchd context before registering, and
    refuses with the cause (TCC-protected `~/.claude`, pending GUI dialog)
    instead of failing stories 300 s at a time.
+7. **From the Little Snitch gate (2026-10-04)**: 35.2-008 — the Hetzner dev
+   box joins `claude-shared` as a headless Linux worker, so a shared-pool job
+   never waits on a dialog only a physical keyboard can answer.
 
 ## Non-Goals
 
-- Provisioning or testing the Hetzner box — the design admits it (shared
-  token fallback, capability registration); a later story adds it.
+- Fleet hosts beyond the two Macs and the Hetzner dev box (35.2-008); Codex
+  on the dev box until it is installed there.
 - Postgres or any new storage technology; the service wraps the SQLite store.
 - Webhook/label intake — Epic 30 enqueues *into* this queue; the listener is
   not built here.
