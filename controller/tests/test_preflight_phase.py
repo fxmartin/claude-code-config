@@ -689,3 +689,111 @@ def test_a_workers_heartbeat_push_carries_the_runs_phase(tmp_path) -> None:
         registry=registry, config=SchedulerConfig(slots=2, poll_seconds=1.0, worker=profile),
     )
     assert seen == ["preflight"]
+
+
+# ---------------------------------------------------------------------------
+# Gap coverage: best-effort edges, CLI surfaces, status renderings
+# ---------------------------------------------------------------------------
+
+
+def _fresh_run(tmp_path: Path) -> tuple[Ledger, str]:
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    return ledger, ledger.run_create("epic-1", "serial")
+
+
+def test_preflight_phase_survives_a_failing_notifier_and_view(tmp_path, monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(build_mod, "notify", boom)
+    ledger, run_id = _fresh_run(tmp_path)
+    reason = build_mod.run_preflight_phase(
+        ledger, run_id, lambda: False, [], command="make test", render_view=boom,
+    )
+    assert reason.startswith("PRE_FLIGHT_RED")
+    assert ledger.run_row(run_id)["status"] == "FAILED"
+
+
+def test_preflight_phase_renders_the_view_on_failure(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(build_mod, "notify", lambda *a, **k: None)
+    ledger, run_id = _fresh_run(tmp_path)
+    rendered: list[str] = []
+    build_mod.run_preflight_phase(
+        ledger, run_id, lambda: False, [], command="make test", render_view=rendered.append,
+    )
+    assert rendered == [run_id]
+
+
+def test_registry_phase_tolerates_an_unwritable_registry() -> None:
+    class Broken:
+        def set_phase(self, *_a):
+            raise OSError("read-only")
+
+    build_mod._registry_phase(Broken(), "run-1", "preflight")  # must not raise
+    build_mod._registry_phase(None, "run-1", "preflight")
+
+
+def test_format_preflight_edge_cases() -> None:
+    assert format_preflight({"state": "running"}) == "preflight: running (?)"
+    assert format_preflight({"state": "failed"}) == "preflight: failed — no reason recorded"
+    assert format_preflight({"state": "mystery"}) is None
+
+
+def test_live_phase_falls_back_to_the_cached_one_when_ledger_unreadable(tmp_path) -> None:
+    bad = tmp_path / "not-a-db"
+    bad.write_text("garbage")
+    record = _record(db=str(bad), phase="preflight")
+    assert live_record(record).phase == "preflight"
+
+
+def test_ledger_preflight_failure_degrades_to_none_on_unreadable_ledger(tmp_path) -> None:
+    bad = tmp_path / "not-a-db"
+    bad.write_text("garbage")
+    assert ledger_preflight_failure(str(bad), "run-1") is None
+
+
+def test_ledger_preflight_failure_without_a_reason_is_none(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        Ledger, "preflight_state", lambda self, run_id: {"state": "failed", "reason": ""}
+    )
+    assert ledger_preflight_failure(str(tmp_path / "l.db"), "run-1") is None
+
+
+def test_cli_resume_reports_a_preflight_failure(tmp_path, monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    import sdlc.resume as resume_mod
+    from sdlc.cli import app
+    from sdlc.resume import ResumeResult
+
+    monkeypatch.setattr(
+        resume_mod, "run_resume",
+        lambda *a, **k: ResumeResult(run_id="r1", preflight_failed=True),
+    )
+    result = CliRunner().invoke(app, ["resume", "--db", str(tmp_path / ".sdlc-state.db")])
+    assert result.exit_code == 1
+    assert "PRE_FLIGHT_FAILURE" in result.output
+
+
+def test_cli_status_prints_the_preflight_header(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    ledger, run_id = _fresh_run(tmp_path)
+    ledger.event_log(run_id, "", "info", "preflight", "started: make test")
+    result = CliRunner().invoke(app, ["status", "--db", str(ledger.db_path)])
+    assert result.exit_code == 0, result.output
+    assert "preflight: running (make test," in result.output
+
+
+def test_status_markdown_carries_the_preflight_line(tmp_path) -> None:
+    from sdlc.status import format_markdown
+
+    ledger, run_id = _fresh_run(tmp_path)
+    ledger.event_log(run_id, "", "info", "preflight", "started: make test")
+    snap = status_snapshot(ledger)
+    doctor = {"summary": {"ok": 0, "warn": 0, "fail": 0}, "checks": [], "install": None}
+    md = format_markdown(snap, doctor)
+    assert "preflight: running (make test," in md
