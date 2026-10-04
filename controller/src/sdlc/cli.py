@@ -3713,7 +3713,7 @@ def queue_run_cmd(
         "--dashboard-url",
         help="Origin of this worker's dashboard, e.g. http://m3max.<tailnet>:8787 "
         "(`sdlc dashboard --host <tailnet-ip>`). Pushed with each run so the XPS "
-        "dashboard can open its transcripts. Needs --worker.",
+        "dashboard can show its detail and open its transcripts. Needs --worker.",
     ),
 ) -> None:
     """Drain the host queue in the foreground — claim jobs and run them.

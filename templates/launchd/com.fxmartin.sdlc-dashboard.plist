@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent that keeps this fleet worker's own dashboard (`sdlc dashboard` bound to
+  its tailnet address) running beside the worker — Story 35.4-006. The XPS
+  dashboard relays a remote run's stories, stages, events and cost from it, so
+  it must be up whenever com.fxmartin.sdlc-worker.plist is (that agent
+  advertises this one with its dashboard-url argument).
+
+  A sibling agent rather than a child of the worker: a worker restart (it exits
+  75 on every controller upgrade) must not blank the XPS's view of the runs it
+  is finishing, and a dashboard crash must not take jobs down with it.
+
+  Substitute the three __PLACEHOLDERS__ below (launchd expands neither `~` nor
+  `$VARS`); __TAILNET_IP__ and the port must match the worker's dashboard-url:
+
+    __HOME__        the account's home, e.g. /Users/fxmartin
+    __USER__        the account's login, for nix-darwin's per-user profile on PATH
+    __TAILNET_IP__  this Mac's tailnet address (`tailscale ip -4`)
+
+  Install:
+
+    mkdir -p ~/.local/state/sdlc
+    sed -e "s|__HOME__|$HOME|g" -e "s|__USER__|$USER|g" \
+        -e "s|__TAILNET_IP__|$(tailscale ip -4)|g" \
+        templates/launchd/com.fxmartin.sdlc-dashboard.plist \
+        > ~/Library/LaunchAgents/com.fxmartin.sdlc-dashboard.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fxmartin.sdlc-dashboard.plist
+
+  It binds the tailnet address only, never 0.0.0.0: the dashboard has no login of
+  its own, so the tailnet ACL is its access control (XPS → M3 Max is trusted →
+  trusted; XPS → home-lab needs tcp:8787). XDG_STATE_HOME is pinned to the
+  worker's so it reads the same registry and ledgers its runs land in.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fxmartin.sdlc-dashboard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/sdlc</string>
+    <string>dashboard</string>
+    <string>--host</string>
+    <string>__TAILNET_IP__</string>
+    <string>--port</string>
+    <string>8787</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/etc/profiles/per-user/__USER__/bin:/run/current-system/sw/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>XDG_STATE_HOME</key>
+    <string>__HOME__/.local/state</string>
+  </dict>
+
+  <!-- Start at login. KeepAlive covers a crash and the exit that follows a
+       controller reinstall; the throttle keeps a missing tailnet address (the
+       bind fails until Tailscale is up) from spinning. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/sdlc/dashboard.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/sdlc/dashboard.log</string>
+
+  <!-- A read-only viewer: it should never compete with a build for CPU. -->
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

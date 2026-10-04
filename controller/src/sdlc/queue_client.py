@@ -697,6 +697,18 @@ def _advertised_dashboard_url() -> str | None:
         return None
 
 
+def _repo_origin(repo: str) -> str | None:
+    """``repo``'s ``origin`` remote with any credential stripped, or None.
+
+    Pushed so the dashboard can resolve the repo's forge on a machine that has no
+    checkout of it (Story 35.4-006); a token in the URL must never reach the fleet.
+    """
+    from sdlc.issue_host import _remote_url, strip_remote_credentials
+
+    remote = _remote_url(repo)
+    return strip_remote_credentials(remote) if remote else None
+
+
 def push_fleet_run(record: RunRecord) -> None:
     """Best-effort ``PUT /runs`` of ``record``; a no-op with no fleet configured.
 
@@ -716,6 +728,7 @@ def push_fleet_run(record: RunRecord) -> None:
                 record,
                 worker=record.worker or fleet_worker_name(),
                 dashboard_url=record.dashboard_url or _advertised_dashboard_url(),
+                origin=record.origin or _repo_origin(record.repo),
             )
         )
     except (QueueError, OSError, ValueError):

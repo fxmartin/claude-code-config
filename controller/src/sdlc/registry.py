@@ -103,6 +103,9 @@ class RunRecord:
     worker: str | None = None
     # The worker's dashboard origin (Story 35.4-002); None when it advertises none.
     dashboard_url: str | None = None
+    # The repo's git ``origin`` remote, credentials stripped (Story 35.4-006), so a
+    # machine without the worker's checkout can still name the repo's forge.
+    origin: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

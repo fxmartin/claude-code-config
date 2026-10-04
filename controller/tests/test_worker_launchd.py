@@ -22,7 +22,11 @@ from sdlc.scheduler import SchedulerResult
 runner = CliRunner()
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "templates/launchd/com.fxmartin.sdlc-worker.plist"
+DASHBOARD_TEMPLATE = (
+    Path(__file__).resolve().parents[2] / "templates/launchd/com.fxmartin.sdlc-dashboard.plist"
+)
 HOME = "/Users/fx"
+TAILNET_IP = "100.64.0.9"
 
 
 @pytest.fixture(scope="module")
@@ -34,7 +38,8 @@ def plist() -> dict:
 def _rendered(plist: dict) -> dict:
     """The plist as the header's install `sed` writes it for user ``fx``."""
     text = plistlib.dumps(plist).decode()
-    return plistlib.loads(text.replace("__HOME__", HOME).replace("__USER__", "fx").encode())
+    text = text.replace("__HOME__", HOME).replace("__USER__", "fx").replace("__TAILNET_IP__", TAILNET_IP)
+    return plistlib.loads(text.encode())
 
 
 def test_template_is_a_valid_plist(plist) -> None:
@@ -151,7 +156,8 @@ def test_worker_argv_names_the_m3max_and_both_pools(plist) -> None:
     assert argv[0] == "__HOME__/.local/bin/sdlc"
     assert argv[1:] == [
         "queue", "run",
-        "--worker", "m3max", "--pool", "claude-m3", "--pool", "codex-shared", "--follow",
+        "--worker", "m3max", "--pool", "claude-m3", "--pool", "codex-shared",
+        "--dashboard-url", "http://__TAILNET_IP__:8787", "--follow",
     ]
 
 
@@ -181,3 +187,74 @@ def test_template_argv_is_accepted_by_queue_run(plist, tmp_path, monkeypatch) ->
     assert seen["pools"] == ["claude-m3", "codex-shared"]
     # Heartbeating while idle is what keeps `sdlc doctor` seeing it online.
     assert seen["config"].follow is True
+
+
+# --- the sibling dashboard agent (Story 35.4-006) -------------------------------------
+
+
+@pytest.fixture(scope="module")
+def dashboard_plist() -> dict:
+    with DASHBOARD_TEMPLATE.open("rb") as fh:
+        return plistlib.load(fh)
+
+
+def test_dashboard_template_is_a_valid_plist(dashboard_plist) -> None:
+    assert dashboard_plist["Label"] == "com.fxmartin.sdlc-dashboard"
+    assert DASHBOARD_TEMPLATE.name == f"{dashboard_plist['Label']}.plist"
+    assert dashboard_plist["RunAtLoad"] is True and dashboard_plist["KeepAlive"] is True
+
+
+@pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil is macOS-only")
+def test_dashboard_template_passes_plutil_lint() -> None:
+    subprocess.run(["plutil", "-lint", str(DASHBOARD_TEMPLATE)], check=True, capture_output=True)
+
+
+@pytest.mark.parametrize("template", [TEMPLATE, DASHBOARD_TEMPLATE])
+def test_both_install_seds_fill_every_placeholder(template: Path) -> None:
+    header, _, body = template.read_text(encoding="utf-8").partition("-->")
+    substituted = set(re.findall(r"s\|(__[A-Z_]+__)\|", header))
+    assert "__TAILNET_IP__" in substituted
+    assert set(re.findall(r"__[A-Z_]+__", body)) <= substituted
+
+
+def test_the_worker_advertises_the_address_its_dashboard_binds(plist, dashboard_plist) -> None:
+    # The relay only has something to relay when these two agree.
+    advertised = _rendered(plist)["ProgramArguments"]
+    url = advertised[advertised.index("--dashboard-url") + 1]
+    argv = dashboard_plist["ProgramArguments"].copy()
+    host = argv[argv.index("--host") + 1].replace("__TAILNET_IP__", TAILNET_IP)
+    port = argv[argv.index("--port") + 1]
+    assert url == f"http://{host}:{port}"
+
+
+def test_the_dashboard_binds_the_tailnet_never_every_interface(dashboard_plist) -> None:
+    argv = dashboard_plist["ProgramArguments"]
+    assert argv[argv.index("--host") + 1] == "__TAILNET_IP__"
+    assert "0.0.0.0" not in argv
+
+
+def test_the_dashboard_reads_the_registry_the_worker_writes(plist, dashboard_plist) -> None:
+    assert (
+        dashboard_plist["EnvironmentVariables"]["XDG_STATE_HOME"]
+        == plist["EnvironmentVariables"]["XDG_STATE_HOME"]
+    )
+
+
+def test_dashboard_template_argv_is_accepted_by_sdlc_dashboard(
+    dashboard_plist, tmp_path, monkeypatch
+) -> None:
+    from sdlc.build import IN_TEST_ENV_VAR
+
+    seen: dict = {}
+    monkeypatch.delenv(IN_TEST_ENV_VAR, raising=False)  # the recursion guard would skip serve
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sdlc.dashboard.serve", lambda *a, **kw: seen.update(args=a, kwargs=kw)
+    )
+    text = plistlib.dumps(dashboard_plist).decode().replace("__TAILNET_IP__", TAILNET_IP)
+    argv = plistlib.loads(text.encode())["ProgramArguments"][1:]
+
+    result = runner.invoke(app, argv)
+
+    assert result.exit_code == 0, result.output
+    assert seen["kwargs"]["host"] == TAILNET_IP and seen["kwargs"]["port"] == 8787

@@ -1848,10 +1848,12 @@ line and `--json` carry it; a host that never registered a worker is untouched.
 ### Resident worker on the M3 Max (Story 35.2-004)
 
 `templates/launchd/com.fxmartin.sdlc-worker.plist` runs `sdlc queue run --worker
-m3max --pool claude-m3 --pool codex-shared --follow` as a LaunchAgent so the Mac
+m3max --pool claude-m3 --pool codex-shared --dashboard-url
+http://<tailnet-ip>:8787 --follow` as a LaunchAgent so the Mac
 drains its queue from login on. It has the 35.1-003 service's shape (an
 absolute argv, a pinned environment, launchd's own log keys). The install in
-the template's header fills its `__HOME__` and `__USER__` placeholders with
+the template's header fills its `__HOME__`, `__USER__` and `__TAILNET_IP__`
+placeholders with
 `sed`, writes the result to `~/Library/LaunchAgents/` and loads it with
 `launchctl bootstrap gui/$(id -u)`. It starts at load — at login, not at boot:
 an agent runs in the user's session, where the keychain holding its jobs'
@@ -1938,7 +1940,9 @@ keeps it `online`.
   is a finding, never a doctor crash). A machine without the plist gets no
   finding. It looks for `~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist`
   (`default_worker_plist`); `run_doctor(worker_plist=…)` overrides that, as
-  `queue_service_plist` does for 35.1-003.
+  `queue_service_plist` does for 35.1-003. Beside it, the **Worker dashboard**
+  finding (Story 35.4-006) checks that the dashboard the worker advertises with
+  `--dashboard-url` answers — see the fleet run registry below.
 
 `--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`) or,
 with a fleet URL, on the service's (Story 35.2-005). The registry (`workers`
@@ -2299,6 +2303,32 @@ authoritative for the worker; the table is the fleet's summary.
   story it gathers every story of the run. A worker that does not answer (or never
   advertised a URL) gives `error` plus `logs_root`, the `<db>.logs` directory on
   the worker, which the modal shows. Nothing passes through the queue service.
+- **Run detail (Story 35.4-006).** The 35.4-002 relay, generalised. Selecting a
+  remote run whose record carries a `dashboard_url` makes the XPS fetch the worker
+  dashboard's own `/api/status?run=<id>` (same 5 s / no redirect / no proxy fetch)
+  and pass its JSON through plus `worker` and `origin`, so the header (now naming
+  the worker), counts, stories table, stage attempts, DAG, events, usage/cost and
+  routing banner render as for a local run; stage links go to the worker's own
+  `/log`. One fetch is shared per second between the status request and the SSE
+  change token (`/api/stream?run=<id>`, reconnected on a selection change), which
+  digests what moved on the worker (not its clock-driven durations); a failure is
+  remembered for 10 s. When the worker does not answer, advertised no URL, or has
+  no record of the run, the pushed-record header snapshot is served with
+  `detail_unavailable` (`detail unavailable — m3max dashboard not reachable`),
+  which the page shows in place of `no stories yet…`. A local run is untouched.
+  The **forge panel** resolves from the record's `origin` (migration 13): the
+  repo's git remote, credentials stripped, pushed with the run. Its hostname
+  picks `github`/`gitlab` and a non-public host is the instance to query, so a
+  repo at `/Users/…/Work/…` that does not exist on the XPS still shows its
+  issues/PRs/CI; a run with no `origin` shows the panel as unavailable.
+  The worker's dashboard is its own LaunchAgent,
+  `templates/launchd/com.fxmartin.sdlc-dashboard.plist` (`sdlc dashboard --host
+  <tailnet-ip> --port 8787`, a sibling of the worker agent so a worker restart
+  does not blank the XPS's view), and the worker plist advertises it with
+  `--dashboard-url http://<tailnet-ip>:8787`; both installs `sed` in
+  `__TAILNET_IP__` (`tailscale ip -4`). `sdlc doctor` adds a **Worker dashboard**
+  finding on a machine with the worker agent: `WARN` when the plist advertises no
+  usable URL or the advertised one does not answer (`GET /favicon.ico`, 3 s).
 
 ### Pause per subscription pool (Story 35.2-003)
 
