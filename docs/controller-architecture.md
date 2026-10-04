@@ -2267,8 +2267,10 @@ authoritative for the worker; the table is the fleet's summary.
   A failed write is logged, never fatal to the drain.
 - **Build pushes.** `_registry_register` / `_registry_finish` (and so `build`,
   `fix` and `resume`) call `queue_client.push_fleet_run` after the local write;
-  it reaches the service only where a fleet URL is configured, so it is a no-op
-  inside a worker's jobs. The push never fails the build: 3 s per attempt, and
+  it reaches the service only where a fleet URL is configured — inside the jobs
+  of a worker draining the fleet over HTTP (they inherit its URL), never inside
+  those of a worker draining the store its own host owns, whose writes are then
+  the run's only ones. The push never fails the build: 3 s per attempt, and
   `PUT /runs` is replayed once, so an unreachable service can hold a build's start
   or finish for about 6 s. A record the local write could not store is not
   pushed. The `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its
@@ -2291,7 +2293,9 @@ authoritative for the worker; the table is the fleet's summary.
 - **Transcripts (Story 35.4-002).** A run's row also carries `dashboard_url` (migration
   11): the origin of its worker's own dashboard, started with `sdlc dashboard --host
   <tailnet-ip>`. A worker advertises it with `queue run --worker NAME --dashboard-url
-  http://NAME.<tailnet>:8787`; a bare build reads `SDLC_DASHBOARD_URL`. It is
+  http://NAME.<tailnet>:8787` and hands it to its jobs as `SDLC_DASHBOARD_URL`
+  (Story 35.4-006), which is what a bare build reads — so a job's own start and
+  finish pushes carry the worker's URL instead of blanking it until a beat. It is
   normalised to a bare `http(s)://host[:port]` origin (`registry.normalize_dashboard_url`)
   at the CLI, at `PUT /runs` (400 otherwise) and again where it is used. "view
   session" on a remote run makes the XPS dashboard fetch the worker's `/api/logs`
@@ -2312,8 +2316,9 @@ authoritative for the worker; the table is the fleet's summary.
   `/log`. One fetch is shared per second between the status request and the SSE
   change token (`/api/stream?run=<id>`, reconnected on a selection change), which
   digests what moved on the worker (not its clock-driven durations); a failure is
-  remembered for 10 s. When the worker does not answer, advertised no URL, or has
-  no record of the run, the pushed-record header snapshot is served with
+  remembered for 10 s, and older entries are dropped, so a run nobody watches
+  holds no memory. When the worker does not answer, advertised no URL, or has no
+  record of the run, the pushed-record header snapshot is served with
   `detail_unavailable` (`detail unavailable — m3max dashboard not reachable`),
   which the page shows in place of `no stories yet…`. A local run is untouched.
   Every relay fetch (status and `/api/logs`) carries `X-Sdlc-Relayed`, and a
@@ -2322,7 +2327,8 @@ authoritative for the worker; the table is the fleet's summary.
   (pruned) still names that same dashboard, and without the mark each hop would
   relay again until the server ran out of threads.
   The **forge panel** resolves from the record's `origin` (migration 13): the
-  repo's git remote, credentials stripped, pushed with the run. Its hostname
+  repo's git remote, credentials stripped, stamped on the run's registry record
+  when it registers, so every push of the run carries it. Its hostname
   picks `github`/`gitlab` and a non-public host is the instance to query, so a
   repo at `/Users/…/Work/…` that does not exist on the XPS still shows its
   issues/PRs/CI; a run with no `origin` — or one with an impossible port —
@@ -2336,6 +2342,8 @@ authoritative for the worker; the table is the fleet's summary.
   `__TAILNET_IP__` (`tailscale ip -4`). `sdlc doctor` adds a **Worker dashboard**
   finding on a machine with the worker agent: `WARN` when the plist advertises no
   usable URL or the advertised one does not answer (`GET /favicon.ico`, 3 s).
+  Unlike the worker, the dashboard does not exit on a controller reinstall; restart
+  it with `launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-dashboard`.
 
 ### Pause per subscription pool (Story 35.2-003)
 

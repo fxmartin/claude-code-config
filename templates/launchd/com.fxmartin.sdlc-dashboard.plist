@@ -55,9 +55,11 @@
     <string>__HOME__/.local/state</string>
   </dict>
 
-  <!-- Start at login. KeepAlive covers a crash and the exit that follows a
-       controller reinstall; the throttle keeps a missing tailnet address (the
-       bind fails until Tailscale is up) from spinning. -->
+  <!-- Start at login. KeepAlive covers a crash; the throttle keeps a missing
+       tailnet address (the bind fails until Tailscale is up) from spinning.
+       Unlike the worker, the dashboard has no exit on a controller reinstall:
+       it serves the old code until
+       `launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-dashboard`. -->
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

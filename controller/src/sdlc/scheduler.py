@@ -35,6 +35,7 @@ from sdlc.queue import (
 )
 from sdlc.queue_client import QueueUnavailable
 from sdlc.registry import (
+    DASHBOARD_URL_ENV,
     WORKER_ENV,
     Registry,
     RunRecord,
@@ -739,11 +740,16 @@ def _launcher_for(config: "SchedulerConfig") -> Launcher:
 
     A fleet worker's jobs inherit its name as ``SDLC_WORKER`` (Story 35.4-001),
     so each run's registry record — and the fleet view — says whose run it is.
+    They inherit its dashboard as ``SDLC_DASHBOARD_URL`` too (Story 35.4-006): a
+    job pushes its own start and finish, and a push without the URL would blank
+    the worker's until its next beat — the XPS relays a run's detail through it.
     """
     if config.worker is None:
         return _default_launcher
-    name = config.worker.name
-    return lambda argv, cwd: _default_launcher(argv, cwd, {**os.environ, WORKER_ENV: name})
+    inherited = {WORKER_ENV: config.worker.name}
+    if config.worker.dashboard_url:
+        inherited[DASHBOARD_URL_ENV] = config.worker.dashboard_url
+    return lambda argv, cwd: _default_launcher(argv, cwd, {**os.environ, **inherited})
 
 
 def _utc_now() -> datetime:

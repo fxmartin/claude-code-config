@@ -702,11 +702,16 @@ def _repo_origin(repo: str) -> str | None:
 
     Pushed so the dashboard can resolve the repo's forge on a machine that has no
     checkout of it (Story 35.4-006); a token in the URL must never reach the fleet.
+    Every run reads it as it registers, so it never raises: a remote ``urlsplit``
+    cannot parse cannot be stripped either, and is no origin.
     """
     from sdlc.issue_host import _remote_url, strip_remote_credentials
 
     remote = _remote_url(repo)
-    return strip_remote_credentials(remote) if remote else None
+    try:
+        return strip_remote_credentials(remote) if remote else None
+    except ValueError:
+        return None
 
 
 def push_fleet_run(record: RunRecord) -> None:

@@ -496,12 +496,19 @@ class _WorkerStatusRelay:
         try:
             payload = self._fetch(origin, "/api/status", {"run": run_id})
         except _WorkerUnreachable as exc:
-            with self._lock:
-                self._entries[key] = (self._clock(), None, str(exc))
+            self._remember(key, None, str(exc))
             raise
-        with self._lock:
-            self._entries[key] = (self._clock(), payload, "")
+        self._remember(key, payload, "")
         return payload
+
+    def _remember(self, key: tuple[str, str], payload: dict | None, error: str) -> None:
+        # Past the longer window no read is served from an entry, only refetched;
+        # kept, every remote run ever viewed would hold its payload for good.
+        horizon = max(self._ttl, self._failure_ttl)
+        with self._lock:
+            now = self._clock()
+            self._entries = {k: e for k, e in self._entries.items() if now - e[0] < horizon}
+            self._entries[key] = (now, payload, error)
 
 
 def _remote_origin(fleet_row: dict) -> str | None:

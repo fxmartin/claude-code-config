@@ -7214,10 +7214,13 @@ def _registry_register(
     which sorts run rows by that string, keeps a resumed run in date order (a
     space sorts before ``T``, which sank run 60c2947e to 26th on 2026-09-30).
     """
+    from sdlc.queue_client import _repo_origin, push_fleet_run
+
     try:
+        root = str(Path(repo or Path.cwd()).resolve())
         record = RunRecord(
             run_id=run_id,
-            repo=str(Path(repo or Path.cwd()).resolve()),
+            repo=root,
             db=str(Path(db_path).resolve()),
             scope=scope,
             pid=os.getpid(),
@@ -7227,6 +7230,10 @@ def _registry_register(
             total=total,
             completed=completed,
             worker=_registry_worker(),
+            # Story 35.4-006: on the record, not only on this process's push. A
+            # worker forwards the record on its start, beat and exit writes, and
+            # one draining its own host's store hands its jobs no fleet to push to.
+            origin=_repo_origin(root),
         )
         registry.register(record)
     except OSError:
@@ -7235,8 +7242,6 @@ def _registry_register(
         return
     # Story 35.4-001: the fleet gets the record too, but the local file above
     # stays authoritative — the push is best-effort and never fails the run.
-    from sdlc.queue_client import push_fleet_run
-
     push_fleet_run(record)
 
 

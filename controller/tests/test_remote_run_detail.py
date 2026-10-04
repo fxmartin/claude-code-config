@@ -193,6 +193,19 @@ def test_the_relay_shares_one_fetch_per_ttl_and_remembers_a_failure() -> None:
     assert calls.count("http://down:1") == 2
 
 
+def test_the_relay_forgets_a_run_once_no_read_can_be_served_from_it() -> None:
+    # Otherwise every remote run ever viewed keeps its payload for the dashboard's life.
+    now = [0.0]
+    relay = _WorkerStatusRelay(
+        ttl=1.0, failure_ttl=10.0, clock=lambda: now[0],
+        fetch=lambda origin, path, query: {"run": {"id": query["run"]}},
+    )
+    for i in range(50):
+        relay.get("http://up:1", f"run-{i}")
+        now[0] += 10.0
+    assert list(relay._entries) == [("http://up:1", "run-49")]
+
+
 # --- the SSE change token -----------------------------------------------------------
 
 
