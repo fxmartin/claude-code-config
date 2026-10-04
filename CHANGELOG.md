@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.96.0] - 2026-10-04
+
+### Added
+
+- feat(fleet-execution): a worker proves it can run an agent (#35.2-007) (#843)
+
+
 ## [v2.95.0] - 2026-10-02
 
 ### Added
