@@ -1966,7 +1966,9 @@ class QueueStore:
                 "started_at = excluded.started_at, finished_at = excluded.finished_at, "
                 "total = excluded.total, completed = excluded.completed, "
                 "updated_at = excluded.updated_at, dashboard_url = excluded.dashboard_url, "
-                "origin = excluded.origin "
+                # A push that could not read the remote must not blank a known one:
+                # the finish push is a run's last, so nothing would restore it.
+                "origin = COALESCE(excluded.origin, fleet_runs.origin) "
                 "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL "
                 "OR excluded.pid != fleet_runs.pid",
                 (

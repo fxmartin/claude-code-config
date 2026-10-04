@@ -2316,11 +2316,18 @@ authoritative for the worker; the table is the fleet's summary.
   no record of the run, the pushed-record header snapshot is served with
   `detail_unavailable` (`detail unavailable — m3max dashboard not reachable`),
   which the page shows in place of `no stories yet…`. A local run is untouched.
+  Every relay fetch (status and `/api/logs`) carries `X-Sdlc-Relayed`, and a
+  dashboard answers such a request from its own ledger only, never relaying it
+  on: a worker's dashboard sees the fleet too, so a run it no longer holds
+  (pruned) still names that same dashboard, and without the mark each hop would
+  relay again until the server ran out of threads.
   The **forge panel** resolves from the record's `origin` (migration 13): the
   repo's git remote, credentials stripped, pushed with the run. Its hostname
   picks `github`/`gitlab` and a non-public host is the instance to query, so a
   repo at `/Users/…/Work/…` that does not exist on the XPS still shows its
-  issues/PRs/CI; a run with no `origin` shows the panel as unavailable.
+  issues/PRs/CI; a run with no `origin` — or one with an impossible port —
+  shows the panel as unavailable. A later push that could not read the remote
+  keeps the stored `origin` rather than clearing it.
   The worker's dashboard is its own LaunchAgent,
   `templates/launchd/com.fxmartin.sdlc-dashboard.plist` (`sdlc dashboard --host
   <tailnet-ip> --port 8787`, a sibling of the worker agent so a worker restart

@@ -120,6 +120,39 @@ def test_a_worker_with_no_record_of_the_run_is_not_an_empty_run(xps) -> None:
     assert snap["run"]["id"] == "unknown-to-the-worker"
 
 
+@pytest.mark.parametrize(
+    ("path", "relayed"),
+    [
+        ("/api/status?run=ghost", ["/api/status"]),
+        ("/api/logs?run=ghost", ["/api/status"]),
+        ("/api/logs?run=ghost&story=70.1-001", ["/api/logs"]),
+    ],
+)
+def test_a_dashboard_its_own_fleet_row_names_relays_once_not_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, relayed: list[str]
+) -> None:
+    # A worker's dashboard sees the fleet too: a run it no longer holds (pruned) still
+    # names that dashboard there. Each relayed request must not be relayed again.
+    real = dashboard._fetch_worker_json
+    fetched: list[str] = []
+
+    def counting(origin: str, route: str, query: dict) -> dict:
+        fetched.append(route)
+        if len(fetched) > 5:  # bound a regression so it fails instead of exhausting threads
+            raise _WorkerUnreachable("relay loop")
+        return real(origin, route, query)
+
+    monkeypatch.setattr(dashboard, "_fetch_worker_json", counting)
+    fleet = _Fleet(_remote_row("ghost", tmp_path / ".sdlc-state.db"))
+    with _serve(Registry(tmp_path / "registry.json"), fleet) as url:
+        fleet.rows[0]["dashboard_url"] = url
+        status, body = _get(f"{url}{path}")
+    assert status == 200
+    assert fetched == relayed
+    if path.startswith("/api/status"):
+        assert "no record of this run" in json.loads(body)["detail_unavailable"]
+
+
 def test_the_page_says_why_there_are_no_stories_instead_of_no_stories_yet() -> None:
     page = dashboard._PAGE
     assert "d.detail_unavailable" in page
@@ -208,6 +241,8 @@ def test_the_stream_url_carries_the_selected_run() -> None:
         ("https://ghe.corp.io/o/r.git", ("o/r", "github", "https://ghe.corp.io")),
         ("", (None, "github", None)),
         ("/Users/fxmartin/Work/alpha", (None, "github", None)),
+        # The remote pattern takes any digits; an impossible port is unresolvable, not a crash.
+        ("http://gitlab.test:99999/root/alpha.git", (None, "github", None)),
     ],
 )
 def test_the_forge_is_resolved_from_the_origin_not_a_path(origin: str, expected) -> None:
@@ -257,6 +292,19 @@ def test_the_store_keeps_the_origin_on_the_fleet_row(tmp_path: Path) -> None:
     store.init()
     store.put_fleet_run(_record(origin=ORIGIN))
     assert store.list_fleet_runs()[0]["origin"] == ORIGIN
+
+
+def test_a_push_that_could_not_read_the_origin_keeps_the_known_one(tmp_path: Path) -> None:
+    # The finish push is the run's last: a failed `git remote get-url` there must not
+    # blank the forge panel of a finished remote run for good.
+    store = QueueStore(tmp_path / "q.db")
+    store.init()
+    store.put_fleet_run(_record(origin=ORIGIN))
+    store.put_fleet_run(
+        _record(origin=None, status="DONE", finished_at="2026-10-02T11:00:00+00:00")
+    )
+    (row,) = store.list_fleet_runs()
+    assert row["status"] == "DONE" and row["origin"] == ORIGIN
 
 
 def test_a_push_carries_the_repos_origin_without_credentials(

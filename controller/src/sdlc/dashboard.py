@@ -370,11 +370,18 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 # `ProxyHandler({})`: a tailnet peer is reached directly, never via an env proxy.
 _WORKER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
+# A request one dashboard relays to another is answered from the receiver's own
+# ledger, never relayed on. A worker's dashboard sees the fleet too, so a run it no
+# longer holds (pruned) still names that same dashboard there; without this mark
+# each relay would be relayed again until the server ran out of threads.
+_RELAYED_HEADER = "X-Sdlc-Relayed"
+
 
 def _fetch_worker_json(origin: str, path: str, query: dict[str, str]) -> dict:
     url = f"{origin}{path}?{urlencode(query)}"
+    request = urllib.request.Request(url, headers={_RELAYED_HEADER: "1"})
     try:
-        with _WORKER_OPENER.open(url, timeout=_WORKER_LOGS_TIMEOUT_SECONDS) as resp:
+        with _WORKER_OPENER.open(request, timeout=_WORKER_LOGS_TIMEOUT_SECONDS) as resp:
             body = resp.read(_WORKER_LOGS_MAX_BYTES + 1)
         if len(body) > _WORKER_LOGS_MAX_BYTES:
             raise _WorkerUnreachable(f"{origin} sent more than a transcript viewer can show")
@@ -551,7 +558,9 @@ def _remote_detail_token(relay: _WorkerStatusRelay, origin: str, run_id: str) ->
         snap = relay.get(origin, run_id)
     except _WorkerUnreachable:
         return "unreachable"
-    run = snap.get("run") if isinstance(snap.get("run"), dict) else {}
+    run = snap.get("run")
+    if not isinstance(run, dict):
+        run = {}
     stories = [
         [s.get("story_id"), s.get("status"), s.get("tokens"), s.get("pr_number"), s.get("stages"),
          s.get("activity")]
@@ -579,7 +588,10 @@ def _origin_forge(origin: str) -> tuple[str | None, str, str | None]:
     if hostname in ("github.com", "gitlab.com"):
         return _slug_from_url(web), host, None
     scheme = parts.scheme if parts.scheme in ("http", "https") else "https"
-    port = f":{parts.port}" if scheme == parts.scheme and parts.port else ""
+    try:
+        port = f":{parts.port}" if scheme == parts.scheme and parts.port else ""
+    except ValueError:  # e.g. ":99999" — the remote pattern takes any digits
+        return None, GITHUB, None
     return _slug_from_url(web), host, f"{scheme}://{hostname}{port}"
 
 
@@ -2039,7 +2051,7 @@ class _Handler(BaseHTTPRequestHandler):
         runs in two repos never bleed into one another's detail view.
         """
         rec = self._resolve_run(run_id)
-        if rec is None and run_id:
+        if rec is None and run_id and self._may_relay():
             remote = self._remote_status(run_id)
             if remote is not None:
                 return remote
@@ -2062,6 +2074,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _fleet_runs(self) -> list[dict]:
         fleet = getattr(self.server, "fleet", None)
         return fleet.snapshot()["runs"] if fleet is not None else []
+
+    def _may_relay(self) -> bool:
+        """False when another dashboard relayed this request: one hop, never a loop."""
+        return self.headers.get(_RELAYED_HEADER) is None
 
     def _remote_status(self, run_id: str) -> dict | None:
         """A snapshot of a fleet run, or None if unknown.
@@ -2295,7 +2311,7 @@ class _Handler(BaseHTTPRequestHandler):
         story, or an unreachable ledger, returns an empty list (HTTP 200).
         """
         in_discovery_mode = getattr(self.server, "registry", None) is not None
-        if run_id and in_discovery_mode and self._resolve_run(run_id) is None:
+        if run_id and in_discovery_mode and self._may_relay() and self._resolve_run(run_id) is None:
             fleet_row = next((r for r in self._fleet_runs() if r.get("run_id") == run_id), None)
             if fleet_row is not None:
                 self._json(_remote_logs_payload(fleet_row, run_id, story_id))
