@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import plistlib
 import shutil
 import socket
@@ -742,6 +743,57 @@ def check_fleet_worker_installed(
         f"{local}, so jobs enqueued here never reach it",
         f"point both at one file: set SDLC_QUEUE_PATH={store} in your shell",
     )
+
+
+def check_worker_self_check(
+    *,
+    state_dir: Path | None = None,
+    claude_dir: Path | None = None,
+    home: Path | None = None,
+    system: str | None = None,
+) -> Finding:
+    """What the resident worker last proved about running an agent (Story 35.2-007).
+
+    Doctor runs in a shell, which carries disk access and sees no dialogs, so it
+    cannot witness launchd's context itself. It reads the probe the worker ran
+    from its own process — recorded with where it ran — and is CLEAN only for one
+    that completed from the LaunchAgent. The TCC path verdict is a path test, the
+    same from any context, so it is re-evaluated live.
+    """
+    from sdlc.worker_selfcheck import read_last_result, tcc_verdict
+
+    name = "Worker self-check"
+    kickstart = f"launchctl kickstart -k gui/$(id -u)/{WORKER_LABEL}"
+    tcc = tcc_verdict(claude_dir=claude_dir, home=home, system=system)
+    last = read_last_result(state_dir)
+    if last is None:
+        seen = "no self-check recorded — the worker has not completed one yet"
+    else:
+        outcome = "completed" if last["ok"] else f"failed ({last.get('reason') or 'no reason'})"
+        origin = "the LaunchAgent" if last.get("launchd") else "a shell"
+        seen = f"last probe {outcome} at {last.get('at') or 'an unknown time'} from {origin}"
+    if tcc is not None:
+        return Finding(
+            "worker-self-check", name, "FAIL", f"{tcc}; {seen}",
+            "move the checkout out of the protected folder, then " + kickstart,
+        )
+    verdict = "TCC paths clear" if (system or platform.system()) == "Darwin" else "TCC n/a (not macOS)"
+    detail = f"{seen}; {verdict}"
+    if last is None:
+        return Finding("worker-self-check", name, "WARN", detail, kickstart)
+    if not last["ok"]:
+        return Finding(
+            "worker-self-check", name, "FAIL", detail,
+            "answer the dialog on the Mac (Keychain / Privacy & Security); the worker retries "
+            "every 60 s and registers on its own — see ~/.local/state/sdlc/worker.log",
+        )
+    if not last.get("launchd"):
+        return Finding(
+            "worker-self-check", name, "WARN",
+            f"{detail} — that proves nothing about launchd's context",
+            "restart the LaunchAgent so it probes from its own context: " + kickstart,
+        )
+    return Finding("worker-self-check", name, "CLEAN", detail)
 
 
 def check_queue(queue_path: Path) -> Finding:
@@ -1841,4 +1893,6 @@ def run_doctor(
     worker = check_fleet_worker_installed(agent_path=worker_plist, queue_path=queue_path)
     if worker is not None:
         findings.append(worker)
+    if worker_plist.exists():
+        findings.append(check_worker_self_check())
     return DoctorReport(findings=findings)
