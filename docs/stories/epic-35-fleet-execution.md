@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (12/13)** — authored 2026-10-02; 35.2-005 added 2026-10-03. Thesis: a build pins
+> **Status: IN PROGRESS (13/15)** — authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006 and 35.4-005 added 2026-10-04 from the first fleet job. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 13 | **Total Points**: 46 | **MVP Stories**: 8 (33 pts)
+**Total Stories**: 15 | **Total Points**: 54 | **MVP Stories**: 10 (41 pts)
 
 ## Features in This Epic
 
@@ -389,6 +389,53 @@ Update the worker plist header and `docs/controller-architecture.md`
 **Dependencies**: 35.1-001, 35.1-002, 35.2-001, 35.4-001
 **Risk Level**: High
 
+##### Story 35.2-006: Worker git access is non-interactive, and a stall is a refusal
+**User Story**: As FX watching the first fleet job on the M3 Max, I want the
+worker's repo sync to authenticate to the forge without any UI and to give the
+job back with a reason when it cannot, so that a job never sits `running` for
+minutes behind a Keychain dialog nobody can see.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a worker on macOS whose clone uses an `http(s)://` origin **When**
+  the sync fetches **Then** git runs with the forge CLI's credential helper
+  (`glab auth git-credential` / `gh auth git-credential`, chosen by the
+  origin's host) and `GIT_TERMINAL_PROMPT=0`, never the user's interactive
+  `osxkeychain` helper — observed 2026-10-04: job 1 (`12.4-008`, `m3max`) hung
+  for minutes in `git credential-osxkeychain get` waiting for a Keychain
+  prompt on the Mac's screen; the lease kept renewing, so the queue showed a
+  healthy `running` job.
+- **Given** the forge CLI is not authenticated for that host on the worker
+  **When** the sync runs **Then** the fetch fails within seconds and the job
+  is refused back to `queued` with `reason: worker m3max cannot authenticate
+  to gitlab.test (glab auth login …)`, visible in `sdlc queue list` and on the
+  dashboard queue panel, and the worker heartbeat flags the host as lacking
+  that forge credential so the matcher stops offering it such jobs.
+- **Given** a sync whose git process produces no output for 60 s **When**
+  the worker notices **Then** it kills the process group, refuses the job with
+  `reason: repo sync stalled`, and never renews a lease on a stalled sync.
+- **Given** `sdlc doctor` on a worker **When** run **Then** a finding reports,
+  per forge host it may be offered jobs for, whether the CLI credential is
+  present and usable non-interactively.
+
+**Technical Notes**: `queue_worker.py` already sets `GIT_TERMINAL_PROMPT=0`;
+add `-c credential.helper=` to clear inherited helpers and `-c
+credential.helper=!glab auth git-credential` (or `gh`) per host, with
+`GLAB_CONFIG_DIR`/`GITLAB_HOST` set the way `issue_host.py` does for a
+plaintext instance. The stall watchdog mirrors `dispatch._dispatch_streaming`'s
+heartbeat dead-man (Story 13.4-001) at a smaller scale. The capability flag
+(`forges: {gitlab.test: true}`) rides the existing registration payload.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: helper selection by origin host; unauthenticated → refusal with
+      reason within the timeout; stalled git killed and refused; doctor finding
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-002, 35.2-005
+**Risk Level**: Medium
+
 ### Feature 35.3: Launch from the XPS
 
 #### Stories
@@ -545,6 +592,60 @@ rate-limit notice is attributable to a subscription.
 **Dependencies**: 35.2-003, 35.4-001
 **Risk Level**: Low
 
+##### Story 35.4-005: Preflight is a visible run phase everywhere a run is visible
+**User Story**: As FX watching a run from the XPS dashboard, the acm overlay or
+a worker's own dashboard, I want the run to exist from the moment the
+controller starts it — preflight included — so that a two-minute test suite
+or a preflight failure on a remote Mac is something I can see, not something
+I infer from a `running` job with no run.
+**Priority**: Must Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** `sdlc build` / `sdlc fix` / a worker-launched job **When** the
+  guards that need no run (dry-run, undenied host-auth, forge declaration,
+  dirty tree, parked conflicts) have passed **Then** the ledger is created and
+  the run row registered — locally and, on a fleet, pushed to the fleet
+  registry — **before** preflight starts; the run reads `IN_PROGRESS` with a
+  `preflight` phase and the dashboard header shows `preflight: running
+  (<command>, <elapsed>)` live.
+- **Given** preflight passes **When** the pipeline continues **Then** the
+  header shows `preflight: passed (<duration>)` as today and nothing else
+  about the run changes (same run id, same registry record, same counts).
+- **Given** preflight fails or times out **When** the controller stops
+  **Then** the run is stamped `FAILED` with the preflight reason
+  (`PRE_FLIGHT_RED` / `PRE_FLIGHT_TIMEOUT` and the command) as an `error`
+  event, the registry and fleet records are finished `FAILED`, the fleet job
+  finishes `failed` with that reason, Telegram carries it, and `sdlc status`
+  shows it — today it leaves no run at all.
+- **Given** the acm overlay and the fleet view **When** a remote worker is in
+  preflight **Then** both show the run with its worker and the `preflight`
+  phase, because the fleet record carries a `phase` field updated on each
+  heartbeat.
+- **Given** a resume **When** the interrupted run was in preflight **Then** it
+  resumes by re-running preflight (nothing was dispatched), not by skipping it.
+
+**Technical Notes**: In `run_build` the preflight block sits before "Ledger
+bootstrap" (`build.py` ~7593 → ~7613); swap the order and emit
+`preflight started/passed/failed` events; `fix_issue.run_fix` and
+`run_fix_batch` mirror it (~2268, ~3166). `status_snapshot` gains `phase`
+(`preflight` | `stories` | `closing`), derived from the events, which the
+dashboard header and `/api/runs` surface; `RunRecord` gains `phase` and the
+worker's heartbeat push carries it (35.4-001). `default_preflight` already
+prints `PRE_FLIGHT_TIMEOUT` / `PRE_FLIGHT_RED` lines — route them into the
+ledger as events instead of stderr only. Tests that assert "preflight failure
+leaves no run row" invert to "leaves a FAILED run with the reason".
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: run row exists before preflight on build/fix/batch; failure
+      stamps FAILED with reason + finishes registry/fleet/job; dashboard
+      header string contract; phase in `/api/runs`; resume re-runs preflight
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.4-001
+**Risk Level**: Medium
+
 ## Epic Sequencing
 
 1. **MVP (XPS → M3 Max end to end)**: 35.1-001 → 35.1-002 → 35.2-001 →
@@ -557,6 +658,11 @@ rate-limit notice is attributable to a subscription.
    in pool `claude-shared` (no new story — it is 35.2-004's plist on a second
    Mac).
 3. **Operability**: 35.1-003, 35.4-002, 35.4-003, 35.4-004.
+4. **From the first fleet job (2026-10-04)**: 35.4-005 (preflight is a visible
+   run phase — the job's two-minute Go preflight on the M3 Max was invisible
+   on every dashboard) and 35.2-006 (non-interactive git auth on the worker —
+   the sync hung on a Keychain prompt). Both Must Have before the fleet is
+   trusted unattended.
 
 ## Non-Goals
 
