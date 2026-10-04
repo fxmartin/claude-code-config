@@ -3817,6 +3817,15 @@ def queue_run_cmd(
     `blocked`. While a fetch or clone is in flight the worker keeps beating
     and renewing its leases. A resumed run is never synced.
 
+    The sync never prompts (Story 35.2-006): over `http(s)` git uses the forge
+    CLI as its only credential helper (`glab auth git-credential`, or `gh`),
+    never the interactive Keychain. A forge the CLI is not logged in to refuses
+    the job back to `queued` with `worker NAME cannot authenticate to HOST
+    (glab auth login …)` and the heartbeat flags that host (`forges`) so the
+    worker is offered no more of its jobs until the login is there; a git call
+    silent for 60 s is killed and refused as `repo sync stalled`. `sdlc doctor`
+    reports each forge credential.
+
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
     deliberately not built into the controller.
@@ -4103,7 +4112,8 @@ def queue_serve_cmd(
       POST   /jobs/claim             worker, \\[lease_seconds, host, pools]
                                      -> job, or 204 when nothing is claimable
       POST   /workers                register or heartbeat: worker, host, \\[pools,
-                                     harnesses, sandbox, repos, slots, slots_free]
+                                     harnesses, sandbox, repos, slots, slots_free,
+                                     forges]
                                      -> a claim by a registered worker is matched
                                      on these (see `queue run --worker`)
       GET    /workers                {workers} with an `online` flag each

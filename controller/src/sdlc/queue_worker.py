@@ -1,6 +1,7 @@
 # ABOUTME: What a fleet worker advertises to the queue service — host, pools, harnesses,
 # ABOUTME: sandbox and the clones under ~/Work. Story 35.2-001; registered by `queue run --worker`.
-# ABOUTME: Also the repo auto-sync that runs before dispatch (Story 35.2-002).
+# ABOUTME: Also the repo auto-sync that runs before dispatch (Story 35.2-002), kept non-interactive
+# ABOUTME: through the forge CLI's credential helper and a stall watchdog (Story 35.2-006).
 
 from __future__ import annotations
 
@@ -9,13 +10,15 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator, Mapping, Protocol
 from urllib.parse import urlparse
 
 from sdlc.registry import normalize_dashboard_url
@@ -24,14 +27,21 @@ if TYPE_CHECKING:
     from sdlc.queue import JobRecord, QueueBackend, WorkerRecord
 
 __all__ = [
+    "ForgeUnauthenticated",
     "ForgeUnavailable",
+    "GitAccess",
     "PreparedRepo",
     "RepoBusy",
     "RepoPreparer",
     "RepoRefused",
+    "SyncStalled",
     "WorkerProfile",
+    "clone_forge_hosts",
     "default_work_dir",
     "detect_worker_profile",
+    "forge_cli",
+    "forge_credential_ok",
+    "forge_git_access",
     "origin_requirements",
     "prepare_repo",
     "same_origin",
@@ -61,6 +71,9 @@ class WorkerProfile:
     # Where this worker's `sdlc dashboard --host <tailnet-ip>` answers (Story 35.4-002);
     # stamped on each run it pushes so the XPS can read the run's transcripts.
     dashboard_url: str | None = None
+    # ``{forge host: the forge CLI can authenticate git there non-interactively}`` for the
+    # forges its clones sit on (Story 35.2-006); a host that is False is never offered a job.
+    forges: dict[str, bool] = field(default_factory=dict)
 
     def register_with(
         self, queue: "QueueBackend", *, slots: int, slots_free: int, **extra: Any
@@ -70,6 +83,9 @@ class WorkerProfile:
         ``extra`` passes through to the backend's ``register_worker`` — the local
         store takes a ``now`` so a scheduler on a fake clock stays coherent.
         """
+        # Only when there is something to say: a backend that predates the flag keeps working.
+        if self.forges:
+            extra.setdefault("forges", self.forges)
         return queue.register_worker(
             self.name,
             host=self.host,
@@ -132,6 +148,7 @@ def detect_worker_profile(
     probe: Callable[[str], bool] | None = None,
     runtime: Callable[[], str] | None = None,
     dashboard_url: str | None = None,
+    forge_probe: Callable[[str, str], bool] | None = None,
 ) -> WorkerProfile:
     """Probe this machine for what it can run.
 
@@ -139,7 +156,8 @@ def detect_worker_profile(
     ``--version``) and ``runtime`` the sandbox's container-runtime detection —
     both injectable so a test never depends on the machine it runs on. Pools are
     declared, not detected: they name a subscription, and only the operator
-    knows which one this machine is logged into.
+    knows which one this machine is logged into. ``forge_probe`` answers, per
+    forge host its clones sit on, whether the forge CLI is logged in there.
     """
     from sdlc.dispatch import SandboxUnavailableError, detect_container_runtime
     from sdlc.doctor import _default_dep_probe
@@ -159,14 +177,20 @@ def detect_worker_profile(
         sandbox: str | None = (runtime or detect_container_runtime)()
     except SandboxUnavailableError:
         sandbox = None
+    clones_dir = work_dir if work_dir is not None else default_work_dir()
+    can_authenticate = forge_probe or forge_credential_ok
     return WorkerProfile(
         name=name,
         host=host or socket.gethostname().split(".")[0],
         pools=list(dict.fromkeys(declared)),
         harnesses=harnesses,
         sandbox=sandbox,
-        repos=_clones(work_dir if work_dir is not None else default_work_dir()),
+        repos=_clones(clones_dir),
         dashboard_url=origin,
+        forges={
+            forge: can_authenticate(forge, scheme)
+            for forge, scheme in clone_forge_hosts(clones_dir).items()
+        },
     )
 
 
@@ -186,10 +210,22 @@ def detect_worker_profile(
 # hanging a headless worker on a username prompt.
 _GIT_TIMEOUT_SECONDS = 120
 
+# A git call that prints nothing for this long is stalled, not slow (Story 35.2-006):
+# `--progress` makes a healthy fetch or clone talk throughout, so silence means it is
+# parked behind something nobody can answer — a Keychain dialog on a screen no one
+# watches was the first. Kept well inside the 90 s lease the sync's keepalive extends.
+_STALL_SECONDS = 60
+
+# Grace between SIGTERM and SIGKILL when a watched git call is ended.
+_KILL_GRACE_SECONDS = 2
+
 # How often a worker blocked on a fetch or clone still beats and renews its
 # leases — well inside the 30 s heartbeat, since the call can outlast the 90 s
 # lease and the 90 s offline window on its own.
 _KEEPALIVE_SECONDS = 10
+
+
+_STALLED_REASON = "repo sync stalled"
 
 
 class RepoRefused(Exception):
@@ -222,6 +258,34 @@ class ForgeUnavailable(RepoRefused):
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason, retryable=True)
+
+
+class ForgeUnauthenticated(ForgeUnavailable):
+    """The forge CLI has no credential for ``host`` on this worker: it cannot authenticate git.
+
+    Retryable like any forge outage — an operator's ``glab auth login`` clears it —
+    but the scheduler also flags the host, so the matcher stops offering this
+    worker the forge's jobs until the login is there.
+    """
+
+    def __init__(
+        self, host: str, cli: str, scheme: str = "https", *, worker: str | None = None
+    ) -> None:
+        who = f"worker {worker}" if worker else "this worker"
+        super().__init__(
+            f"{who} cannot authenticate to {host} ({cli} auth login --hostname {host})"
+        )
+        self.host = host
+        self.cli = cli
+        self.scheme = scheme
+
+
+class SyncStalled(Exception):
+    """A watched git process printed nothing for ``seconds``; it has been killed."""
+
+    def __init__(self, seconds: float) -> None:
+        super().__init__(f"no output for {seconds:g}s")
+        self.seconds = seconds
 
 
 class RepoBusy(RepoRefused):
@@ -282,14 +346,190 @@ def same_origin(left: str, right: str) -> bool:
     return _origin_key(left) == _origin_key(right)
 
 
-def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(root), *args],
-        capture_output=True,
-        text=True,
-        timeout=_GIT_TIMEOUT_SECONDS,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+@dataclass(frozen=True)
+class GitAccess:
+    """How git reaches an ``http(s)`` forge without a UI: the forge CLI is its credential helper."""
+
+    cli: str
+    host: str
+    scheme: str
+    config: list[str]  # ``-c`` pairs, for in front of the git subcommand
+    env: dict[str, str]
+
+
+def forge_cli(host: str) -> str:
+    """The forge CLI that vouches for ``host`` to git: ``gh`` for GitHub, ``glab`` otherwise."""
+    return "gh" if host == "github.com" or host.startswith("github.") else "glab"
+
+
+def forge_git_access(origin: str) -> GitAccess | None:
+    """The credential helper and environment for git against ``origin``; ``None`` if not http(s).
+
+    The inherited helpers are cleared first (``credential.helper=``) so the user's
+    interactive ``osxkeychain`` can never be asked, then the forge CLI is installed
+    as the only one — ``gh`` for GitHub hosts, ``glab`` for the rest — with the env
+    that points it at the instance, as :mod:`sdlc.issue_host` does for a plaintext
+    GitLab. Over ssh or a local path git needs no helper, so it is left alone.
+    """
+    from sdlc.issue_host import github_instance_env, gitlab_instance_env
+    from sdlc.queue import origin_forge_host
+
+    host = origin_forge_host(origin)
+    if host is None:
+        return None
+    scheme = urlparse(origin.strip()).scheme
+    cli = forge_cli(host)
+    instance = f"{scheme}://{host}"
+    cli_env = github_instance_env(instance) if cli == "gh" else gitlab_instance_env(instance)
+    return GitAccess(
+        cli=cli,
+        host=host,
+        scheme=scheme,
+        config=["-c", "credential.helper=", "-c", f"credential.helper=!{cli} auth git-credential"],
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **cli_env},
     )
+
+
+def forge_credential_ok(
+    host: str,
+    scheme: str = "https",
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout: float = 10,
+) -> bool:
+    """Whether the forge CLI would hand git a credential for ``host`` without any UI.
+
+    Asks the CLI the question git asks it (``<cli> auth git-credential get``), so a
+    CLI that is missing, logged out, or hangs reads as no — and it is a local read of
+    the CLI's config, not a request to the forge, so it is fast offline.
+    """
+    access = forge_git_access(f"{scheme}://{host}/")
+    if access is None:
+        return False
+    try:
+        done = runner(
+            [access.cli, "auth", "git-credential", "get"],
+            input=f"protocol={scheme}\nhost={host}\n\n",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=access.env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and "password=" in done.stdout
+
+
+def clone_forge_hosts(work_dir: Path) -> dict[str, str]:
+    """``{forge host: scheme}`` for the ``http(s)`` origins of the clones under ``work_dir``."""
+    from sdlc.issue_host import _remote_url
+    from sdlc.queue import origin_forge_host
+
+    hosts: dict[str, str] = {}
+    for name in _clones(work_dir):
+        origin = _remote_url(work_dir / name)
+        host = origin_forge_host(origin) if origin else None
+        if origin and host:
+            hosts.setdefault(host, urlparse(origin).scheme)
+    return hosts
+
+
+def _kill_group(proc: "subprocess.Popen[bytes]") -> None:
+    """End ``proc`` and everything it started: SIGTERM the group, then SIGKILL what is left."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=_KILL_GRACE_SECONDS)
+    except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+        pass
+    try:
+        # The leader may have exited on TERM while a helper it started did not.
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()
+
+
+def _run_group(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    timeout: float = _GIT_TIMEOUT_SECONDS,
+    stall_seconds: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``argv`` in its own process group, ended if it goes quiet or overruns ``timeout``.
+
+    ``subprocess.run`` cannot tell a slow git from one waiting on a dialog nobody
+    sees; this reads stdout and stderr as they arrive. No output for
+    ``stall_seconds`` raises :class:`SyncStalled`, and ``timeout`` overall raises
+    ``subprocess.TimeoutExpired`` — either way the whole group is killed (a credential
+    helper is a child of git), so nothing is left holding the clone.
+    """
+    quiet_limit = _STALL_SECONDS if stall_seconds is None else stall_seconds
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(env),
+        start_new_session=True,
+    )
+    started = last_output = time.monotonic()
+    output: dict[str, list[bytes]] = {"out": [], "err": []}
+
+    def pump(stream: Any, sink: list[bytes]) -> None:
+        nonlocal last_output
+        for chunk in iter(lambda: stream.read1(65536), b""):
+            sink.append(chunk)
+            last_output = time.monotonic()
+
+    readers = [
+        threading.Thread(target=pump, args=(proc.stdout, output["out"]), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, output["err"]), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        while True:
+            try:
+                proc.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            if now - started > timeout:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if now - last_output > quiet_limit:
+                raise SyncStalled(quiet_limit)
+    except BaseException:
+        _kill_group(proc)
+        raise
+    finally:
+        # A helper that outlives git can hold the pipes open; do not wait on it for ever.
+        for reader in readers:
+            reader.join(timeout=_KILL_GRACE_SECONDS)
+    return subprocess.CompletedProcess(
+        argv,
+        proc.returncode,
+        b"".join(output["out"]).decode(errors="replace"),
+        b"".join(output["err"]).decode(errors="replace"),
+    )
+
+
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    argv = list(args)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    config: list[str] = []
+    if args[0] == "fetch":
+        # The one network call here: under the forge CLI's helper, and talking while it
+        # works so the watchdog can tell it from a hang.
+        from sdlc.issue_host import _remote_url
+
+        origin = _remote_url(root)
+        access = forge_git_access(origin) if origin else None
+        if access is not None:
+            config, env = access.config, access.env
+        argv.insert(1, "--progress")
+    return _run_group(["git", "-C", str(root), *config, *argv], env=env)
 
 
 @contextmanager
@@ -360,6 +600,8 @@ def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return _git(root, *args)
     except subprocess.TimeoutExpired as exc:
         raise RepoRefused(f"git {args[0]} timed out in {root}: {exc}", retryable=True) from exc
+    except SyncStalled as exc:
+        raise RepoRefused(_STALLED_REASON, retryable=True) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RepoRefused(f"git {args[0]} failed in {root}: {exc}") from exc
 
@@ -401,6 +643,18 @@ def _dirty_refusal(root: Path, paths: list[str]) -> RepoRefused:
     )
 
 
+# What git says when the credential helper had nothing to give and prompting is off.
+_AUTH_FAILURE = re.compile(
+    r"terminal prompts disabled|could not read (?:Username|Password)|Authentication failed"
+    r"|HTTP Basic: Access denied|returned error: 401",
+    re.IGNORECASE,
+)
+
+
+def _is_auth_failure(stderr: str) -> bool:
+    return bool(_AUTH_FAILURE.search(stderr))
+
+
 def _clone(origin: str, target: Path) -> None:
     from sdlc.issue_host import strip_remote_credentials
 
@@ -415,17 +669,21 @@ def _clone(origin: str, target: Path) -> None:
         # This host's to fix, not the forge's — and the drain catches refusals
         # only, so an `OSError` let through here would stop the whole worker.
         raise RepoRefused(f"could not clone {shown} into {target}: {exc}") from exc
+    access = forge_git_access(origin)
     try:
-        # Plain `git clone`: the worker's own `gh`/`glab` credentials reach git
-        # through the credential helpers `gh auth setup-git` / `glab auth
-        # git-credential` install, so no token is handled here.
-        res = subprocess.run(
-            ["git", "clone", "-q", "--", origin, str(target)],
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        # The forge CLI is the credential helper (see `forge_git_access`), so no
+        # token is handled here and no Keychain dialog can open. `--progress` keeps
+        # a healthy clone talking, which is what the stall watchdog listens for.
+        res = _run_group(
+            [
+                "git", *(access.config if access else []),
+                "clone", "-q", "--progress", "--", origin, str(target),
+            ],
+            env=access.env if access else {**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
+    except SyncStalled as exc:
+        shutil.rmtree(target, ignore_errors=True)
+        raise ForgeUnavailable(_STALLED_REASON) from exc
     except subprocess.TimeoutExpired as exc:
         # The timeout SIGKILLs git, so it cannot remove its half-written clone —
         # which the retry would otherwise find and judge as a (dirty) clone.
@@ -443,6 +701,9 @@ def _clone(origin: str, target: Path) -> None:
         shutil.rmtree(target, ignore_errors=True)
         raise
     if res.returncode != 0:
+        if access is not None and _is_auth_failure(res.stderr):
+            shutil.rmtree(target, ignore_errors=True)
+            raise ForgeUnauthenticated(access.host, access.cli, access.scheme)
         # The forge, not the job: down, rebooting, a credential to renew. That
         # clears without anyone touching the job, so it goes back to be retried.
         raise ForgeUnavailable(
@@ -526,6 +787,9 @@ def prepare_repo(
             raise ForgeUnavailable(exc.reason) from exc
         raise
     if fetch.returncode != 0:
+        access = forge_git_access(actual)
+        if access is not None and _is_auth_failure(fetch.stderr or fetch.stdout):
+            raise ForgeUnauthenticated(access.host, access.cli, access.scheme)
         # The forge, not this clone: down, rebooting, a credential to renew.
         # That clears without anyone touching the job, so it is retried.
         raise ForgeUnavailable(

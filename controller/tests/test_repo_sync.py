@@ -460,7 +460,7 @@ def test_a_clone_that_times_out_leaves_nothing_behind_and_is_retried(
         (target / ".git").mkdir(parents=True)
         raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
 
-    monkeypatch.setattr(queue_worker.subprocess, "run", killed)
+    monkeypatch.setattr(queue_worker, "_run_group", killed)
     with pytest.raises(ForgeUnavailable, match="timed out") as refusal:
         prepare_repo(job, work_dir=work_dir)
 
@@ -475,7 +475,7 @@ def test_an_origin_that_reads_as_a_git_option_is_never_handed_to_git(
 
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        queue_worker.subprocess, "run", lambda argv, **_k: calls.append(list(argv))
+        queue_worker, "_run_group", lambda argv, **_k: calls.append(list(argv))
     )
     job = _job(tmp_path, work_dir / "proj", "--upload-pack=touch pwned")
 
@@ -492,13 +492,13 @@ def test_the_clone_ends_option_parsing_before_the_origin(
     from sdlc import queue_worker
 
     seen: list[list[str]] = []
-    real = queue_worker.subprocess.run
+    real = queue_worker._run_group
 
     def spy(argv, **kwargs):
         seen.append(list(argv))
         return real(argv, **kwargs)
 
-    monkeypatch.setattr(queue_worker.subprocess, "run", spy)
+    monkeypatch.setattr(queue_worker, "_run_group", spy)
     prepare_repo(_job(tmp_path, work_dir / "proj", forge.url), work_dir=work_dir)
 
     clone_argv = next(argv for argv in seen if argv[:2] == ["git", "clone"])
@@ -534,7 +534,7 @@ def test_a_clone_that_cannot_launch_git_is_a_refusal(
     def boom(*_a, **_k):
         raise FileNotFoundError("git")
 
-    monkeypatch.setattr(queue_worker.subprocess, "run", boom)
+    monkeypatch.setattr(queue_worker, "_run_group", boom)
     with pytest.raises(RepoRefused, match="could not clone"):
         prepare_repo(job, work_dir=work_dir)
 
@@ -612,7 +612,7 @@ def test_a_failed_clone_names_the_origin_without_its_credential(
     from sdlc import queue_worker
 
     monkeypatch.setattr(
-        queue_worker.subprocess, "run",
+        queue_worker, "_run_group",
         lambda argv, **_k: subprocess.CompletedProcess(argv, 128, "", "fatal: not found"),
     )
     job = _job(tmp_path, work_dir / "proj", "https://oauth2:s3cret@gitlab.test/root/proj.git")
@@ -681,14 +681,14 @@ def test_a_slow_clone_calls_the_keepalive_until_it_returns(
 
     monkeypatch.setattr(queue_worker, "_KEEPALIVE_SECONDS", 0.01)
     beat = threading.Event()
-    real = queue_worker.subprocess.run
+    real = queue_worker._run_group
 
     def slow_clone(argv, **kwargs):
         if argv[:2] == ["git", "clone"]:
             assert beat.wait(30), "no keepalive while the clone was in flight"
         return real(argv, **kwargs)
 
-    monkeypatch.setattr(queue_worker.subprocess, "run", slow_clone)
+    monkeypatch.setattr(queue_worker, "_run_group", slow_clone)
     prepared = prepare_repo(
         _job(tmp_path, work_dir / "proj", forge.url), work_dir=work_dir, keepalive=beat.set
     )
@@ -709,7 +709,7 @@ def test_a_clone_interrupted_mid_way_leaves_nothing_behind(
         (target / ".git").mkdir(parents=True)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(queue_worker.subprocess, "run", interrupted)
+    monkeypatch.setattr(queue_worker, "_run_group", interrupted)
     with pytest.raises(KeyboardInterrupt):
         prepare_repo(_job(tmp_path, target, forge.url), work_dir=work_dir, keepalive=lambda: None)
 

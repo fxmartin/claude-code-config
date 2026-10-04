@@ -39,6 +39,7 @@ __all__ = [
     "check_controller_version",
     "self_update_controller",
     "check_deny_baseline",
+    "check_forge_credentials",
     "check_glab_dependency",
     "check_harness_pin",
     "check_model_coverage",
@@ -663,6 +664,50 @@ def check_fleet_worker(list_workers: Callable[[], list[WorkerRecord]], *, host: 
         name,
         "CLEAN",
         f"{', '.join(w.name for w in online)} registered and online ({host})",
+    )
+
+
+def check_forge_credentials(
+    *,
+    agent_path: Path | None = None,
+    work_dir: Path | None = None,
+    probe: Callable[[str, str], bool] | None = None,
+) -> Finding | None:
+    """Per forge host this worker may be offered jobs for: can its CLI authenticate git? (35.2-006)
+
+    A worker clones and fetches over ``http(s)`` with the forge CLI as the credential
+    helper and no UI, so a missing login does not prompt — the job is refused. The
+    hosts are the ones its clones under ``~/Work`` sit on. ``None`` on a machine that
+    runs no resident worker, or whose clones are all ssh or local.
+    """
+    from sdlc.queue_worker import (
+        clone_forge_hosts,
+        default_work_dir,
+        forge_cli,
+        forge_credential_ok,
+    )
+
+    if not (agent_path or default_worker_plist()).exists():
+        return None
+    hosts = clone_forge_hosts(work_dir if work_dir is not None else default_work_dir())
+    if not hosts:
+        return None
+    can_authenticate = probe or forge_credential_ok
+    missing = {host: scheme for host, scheme in hosts.items() if not can_authenticate(host, scheme)}
+    name = "Forge credentials"
+    state = ", ".join(
+        f"{host} ({forge_cli(host)}) {'missing' if host in missing else 'ok'}"
+        for host in sorted(hosts)
+    )
+    if not missing:
+        return Finding(
+            "forge-credentials", name, "CLEAN", f"usable non-interactively: {state}"
+        )
+    return Finding(
+        "forge-credentials", name, "FAIL",
+        f"{state} — the worker refuses (and stops being offered) jobs on a missing one "
+        "rather than prompt",
+        "; ".join(f"{forge_cli(host)} auth login --hostname {host}" for host in sorted(missing)),
     )
 
 
@@ -1841,4 +1886,7 @@ def run_doctor(
     worker = check_fleet_worker_installed(agent_path=worker_plist, queue_path=queue_path)
     if worker is not None:
         findings.append(worker)
+    credentials = check_forge_credentials(agent_path=worker_plist)
+    if credentials is not None:
+        findings.append(credentials)
     return DoctorReport(findings=findings)

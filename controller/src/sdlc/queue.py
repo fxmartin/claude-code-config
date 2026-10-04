@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
+from urllib.parse import urlparse
 
 from sdlc.registry import RunRecord
 
@@ -582,7 +583,8 @@ CREATE TABLE IF NOT EXISTS workers (
     slots          INTEGER NOT NULL DEFAULT 1,
     slots_free     INTEGER NOT NULL DEFAULT 1,
     registered_at  TIMESTAMP NOT NULL,
-    last_heartbeat TIMESTAMP NOT NULL
+    last_heartbeat TIMESTAMP NOT NULL,
+    forges         TEXT NOT NULL DEFAULT '{}'
 );
 """
 
@@ -730,6 +732,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (11, "fleet_run_dashboard_url", "fleet_runs", [("dashboard_url", "TEXT")], None),
     # Story 35.2-002: the sha a worker's clone was synced to before dispatch.
     (12, "job_synced_sha", "jobs", [("synced_sha", "TEXT")], None),
+    # Story 35.2-006: which forge hosts a worker can authenticate to non-interactively.
+    (13, "worker_forges", "workers", [("forges", "TEXT NOT NULL DEFAULT '{}'")], None),
 ]
 
 
@@ -798,6 +802,11 @@ CODEX_POOL = "codex-shared"
 # it recognises (and clears) its own and leaves anyone else's alone.
 UNSATISFIABLE_REASON_PREFIX = "no eligible worker"
 
+# A worker's own refusal of a forge it cannot authenticate to (Story 35.2-006) says
+# which worker and what to run; the stamp above would only say "nobody can", so it
+# leaves a reason carrying this alone.
+FORGE_REFUSAL_MARKER = " cannot authenticate to "
+
 # `requirements.sandbox` is a string: these read as "not needed" / "any runtime";
 # anything else names the runtime the worker must have (e.g. ``podman``).
 _SANDBOX_NOT_NEEDED = frozenset({"", "0", "false", "no", "none", "off"})
@@ -818,6 +827,9 @@ class WorkerRecord:
     repos: list[str] = dataclasses.field(default_factory=list)
     slots: int = 1
     slots_free: int = 1
+    # ``{forge host: can authenticate non-interactively}`` (Story 35.2-006). A host a
+    # worker never reported is unknown, which the matcher reads as "may try it".
+    forges: dict[str, bool] = dataclasses.field(default_factory=dict)
 
     def is_online(self, now: datetime | None = None) -> bool:
         """Heard from within :data:`OFFLINE_AFTER_SECONDS` (three missed beats)."""
@@ -862,6 +874,22 @@ def _on_host(host: str) -> _Check:
     return lambda worker: worker.host == host
 
 
+def origin_forge_host(origin: str) -> str | None:
+    """The forge host (``host[:port]``) of an ``http(s)://`` origin; ``None`` for any other.
+
+    Only an http(s) clone authenticates through a credential helper (Story 35.2-006);
+    ssh keys and local paths are not the forge CLI's to vouch for.
+    """
+    parsed = urlparse(origin.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    return parsed.netloc.rpartition("@")[2].lower()
+
+
+def _forge_credential(host: str) -> _Check:
+    return lambda worker: worker.forges.get(host) is not False
+
+
 def _has_repo(repo: str) -> _Check:
     return lambda worker: repo in worker.repos
 
@@ -897,6 +925,9 @@ def job_needs(job: JobRecord) -> list[_Need]:
     requirements = _job_requirements(job)
     if requirements.get("repo") and not requirements.get("origin"):
         needs.append((f"repo {requirements['repo']}", _has_repo(requirements["repo"])))
+    forge_host = origin_forge_host(requirements.get("origin", ""))
+    if forge_host:
+        needs.append((f"forge credential for {forge_host}", _forge_credential(forge_host)))
     harnesses = _csv(requirements.get("harness"))
     for harness in harnesses:
         needs.append((f"harness {harness}", _has_harness(harness)))
@@ -1151,6 +1182,7 @@ class QueueBackend(Protocol):
         repos: Iterable[str] = (),
         slots: int = 1,
         slots_free: int | None = None,
+        forges: Mapping[str, bool] | None = None,
         now: datetime | None = None,
     ) -> WorkerRecord: ...
 
@@ -1875,6 +1907,7 @@ class QueueStore:
         repos: Iterable[str] = (),
         slots: int = 1,
         slots_free: int | None = None,
+        forges: Mapping[str, bool] | None = None,
         now: datetime | None = None,
     ) -> WorkerRecord:
         """Record (or refresh) a worker's capabilities — registration *is* the heartbeat.
@@ -1899,11 +1932,13 @@ class QueueStore:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO workers(name, host, pools, harnesses, sandbox, repos, slots, "
-                "slots_free, registered_at, last_heartbeat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "slots_free, registered_at, last_heartbeat, forges) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET host = excluded.host, pools = excluded.pools, "
                 "harnesses = excluded.harnesses, sandbox = excluded.sandbox, "
                 "repos = excluded.repos, slots = excluded.slots, "
-                "slots_free = excluded.slots_free, last_heartbeat = excluded.last_heartbeat",
+                "slots_free = excluded.slots_free, last_heartbeat = excluded.last_heartbeat, "
+                "forges = excluded.forges",
                 (
                     name,
                     host,
@@ -1915,6 +1950,7 @@ class QueueStore:
                     free,
                     moment,
                     moment,
+                    json.dumps({str(host): bool(ok) for host, ok in (forges or {}).items()}),
                 ),
             )
         self.expire_offline_leases(now=now)
@@ -2033,7 +2069,11 @@ class QueueStore:
         changed = 0
         for job in (j for j in self.list_jobs() if j.state == "queued"):
             reason = _unsatisfiable_reason(job, online)
-            if reason is not None and job.reason != reason:
+            if (
+                reason is not None
+                and job.reason != reason
+                and FORGE_REFUSAL_MARKER not in (job.reason or "")
+            ):
                 self.set_reason(job.id, reason)
                 changed += 1
             elif (
@@ -2539,6 +2579,17 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
     )
 
 
+def _forges(raw: str | None) -> dict[str, bool]:
+    """A ``forges`` column's JSON object; junk or absent reads as no report."""
+    try:
+        parsed = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(host): bool(ok) for host, ok in parsed.items()}
+
+
 def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
     def _names(column: str) -> list[str]:
         try:
@@ -2558,6 +2609,7 @@ def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
         repos=_names("repos"),
         slots=int(row["slots"]),
         slots_free=int(row["slots_free"]),
+        forges=_forges(row["forges"]),
     )
 
 
