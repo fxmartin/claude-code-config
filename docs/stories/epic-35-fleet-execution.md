@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (13/16)** — authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs. Thesis: a build pins
+> **Status: IN PROGRESS (13/17)** — authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 16 | **Total Points**: 59 | **MVP Stories**: 11 (46 pts)
+**Total Stories**: 17 | **Total Points**: 62 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -436,6 +436,66 @@ heartbeat dead-man (Story 13.4-001) at a smaller scale. The capability flag
 **Dependencies**: 35.2-002, 35.2-005
 **Risk Level**: Medium
 
+##### Story 35.2-007: A worker proves it can run an agent before it registers
+**User Story**: As FX, I want a worker to run one real agent turn from its own
+launchd context at startup and to refuse to register — naming the exact
+cause — when that turn does not complete, so that a Mac whose agents would
+stall is never offered a job, instead of failing two stories 300 s at a time.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** `sdlc queue run --worker …` starting under launchd **When** it
+  initialises **Then** before its first registration it runs the harness's
+  own probe (`claude -p ok --model <haiku id> --output-format json`, the
+  Story 34.1-002 entitlement probe) **from the worker's process context**,
+  with a 90 s cap; a completed turn registers the worker as today.
+- **Given** the probe produces no output within the cap **When** the cap
+  lapses **Then** the worker kills the probe's process group, does not
+  register, logs `worker self-check failed: agent produced no output in 90s
+  — a dialog is probably waiting on this Mac (Keychain / Privacy & Security)
+  or ~/.claude resolves into a protected folder`, repeats the check every
+  60 s, and registers the moment a probe completes (the dialog was answered).
+  KeepAlive never restart-loops it: the worker stays up and silent.
+- **Given** `~/.claude`, or any of `settings.json`, `CLAUDE.md`, `hooks`,
+  `commands`, `agents`, `skills` under it, resolves into a macOS
+  TCC-protected folder (`~/Documents`, `~/Desktop`, `~/Downloads`, any
+  cloud-drive root) **When** the self-check runs **Then** it fails fast with
+  `~/.claude/settings.json → ~/Documents/…: launchd agents cannot read TCC
+  protected folders; move the checkout (nix-install: ~/.config/nix-install)`
+  — the 2026-10-04 M3 Max cause, found only after two failed fleet jobs.
+- **Given** `sdlc doctor` on a worker host **When** run **Then** a
+  `worker-self-check` finding reports the last probe result, its timestamp
+  and the TCC path verdict; CLEAN only when the probe completed from the
+  LaunchAgent, not from the shell doctor runs in.
+- **Given** the worker's heartbeat **When** registered **Then** it carries
+  `self_check: {ok, at, reason}` so `sdlc queue workers` and the fleet
+  dashboard show a worker that is online but unable to run agents as such,
+  and the matcher treats it as having zero free slots.
+
+**Technical Notes**: The probe reuses `_probe_model` / the 34.1-002 seam
+rather than a new subprocess path; the stall cap mirrors
+`dispatch._dispatch_streaming`'s dead-man. The TCC check is a path test on
+`os.path.realpath` of each `~/.claude` entry against the protected roots —
+cheap, deterministic, macOS-only (`platform.system() == "Darwin"`). Over ssh
+these checks pass (sshd carries disk access and sees no dialogs), which is
+exactly why the worker must run them itself: the plist header and
+`docs/controller-architecture.md` should say so. The 2026-10-04 incident:
+TCC denial (`Operation not permitted` from a launchd `/bin/sh`), then two
+GUI-session dialogs the user had to accept, each costing a 300 s stall per
+agent before any signal reached the queue.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: probe completes → registers; probe stalls → no registration,
+      retry, registers on later success; TCC path verdict for each root;
+      heartbeat carries `self_check`; doctor finding; non-macOS skips the TCC
+      test
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-001, 35.2-005
+**Risk Level**: Medium
+
 ### Feature 35.3: Launch from the XPS
 
 #### Stories
@@ -722,6 +782,10 @@ dashboard) — one decision for the story.
    XPS dashboard showed only its header (`STARTED · remote · elapsed`, "no
    stories yet…", "GitHub unavailable"); relay the worker dashboard's status
    like 35.4-002 relays its logs.
+6. **From the M3 Max stall (2026-10-04)**: 35.2-007 — the worker proves it
+   can run an agent from its own launchd context before registering, and
+   refuses with the cause (TCC-protected `~/.claude`, pending GUI dialog)
+   instead of failing stories 300 s at a time.
 
 ## Non-Goals
 
