@@ -138,8 +138,8 @@ def _kill_group(proc: "subprocess.Popen[str]") -> None:
     for sig, wait in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 5.0)):
         try:
             os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            pass  # the group is already gone
+        except (ProcessLookupError, PermissionError):
+            pass  # gone — macOS answers EPERM for a group whose leader is a zombie
         try:
             proc.wait(timeout=wait)
         except subprocess.TimeoutExpired:

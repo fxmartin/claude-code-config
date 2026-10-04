@@ -343,3 +343,33 @@ def test_the_group_runner_kills_the_whole_process_group_on_timeout(tmp_path) -> 
         elif time.monotonic() - quiet_since >= 1.0:
             return
     pytest.fail("the probe's child kept running after its process group was killed")
+
+
+def test_the_group_runner_reports_a_missing_command() -> None:
+    assert sc.group_runner(["definitely-not-a-real-binary-35-2-007"]) == (
+        127,
+        "command not found: definitely-not-a-real-binary-35-2-007",
+    )
+
+
+def test_the_group_runner_kills_the_group_when_interrupted(monkeypatch) -> None:
+    killed: list[object] = []
+
+    class _Boom:
+        pid = 1
+
+        def communicate(self, timeout=None):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sc.subprocess, "Popen", lambda *a, **k: _Boom())
+    monkeypatch.setattr(sc, "_kill_group", killed.append)
+
+    with pytest.raises(KeyboardInterrupt):
+        sc.group_runner(["x"])
+    assert len(killed) == 1
+
+
+def test_an_unlistable_home_still_yields_the_named_protected_roots(tmp_path) -> None:
+    missing = tmp_path / "no-such-home"
+    roots = sc._protected_roots(missing)
+    assert missing / "Documents" in roots
