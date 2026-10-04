@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (13/15)** — authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006 and 35.4-005 added 2026-10-04 from the first fleet job. Thesis: a build pins
+> **Status: IN PROGRESS (13/16)** — authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 15 | **Total Points**: 54 | **MVP Stories**: 10 (41 pts)
+**Total Stories**: 16 | **Total Points**: 59 | **MVP Stories**: 11 (46 pts)
 
 ## Features in This Epic
 
@@ -646,6 +646,61 @@ leaves no run row" invert to "leaves a FAILED run with the reason".
 **Dependencies**: 35.4-001
 **Risk Level**: Medium
 
+##### Story 35.4-006: A remote run shows the same detail as a local one
+**User Story**: As FX selecting a run that is executing on the M3 Max from the
+XPS dashboard, I want to see what I see for a local run — stories and their
+stages, the dependency DAG, the live event stream, tokens and cost, the model
+routing banner, the preflight phase and the forge panel — so that watching a
+remote run is not "STARTED · remote · elapsed 4m" and `no stories yet…`.
+**Priority**: Must Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** a fleet run whose record carries its worker's `dashboard_url`
+  (Story 35.4-002) **When** it is selected on the XPS **Then** `/api/status`
+  (and the SSE change token) is served by relaying the worker dashboard's own
+  `/api/status?run=<id>` over the tailnet — the 35.4-002 `/api/logs` relay,
+  generalised — so the header, counts, stories table, stage attempts, DAG,
+  events, usage/cost and routing banner render exactly as for a local run,
+  with the worker named in the header.
+- **Given** the worker's dashboard does not answer **When** the run is
+  selected **Then** the page falls back to today's header-only snapshot and
+  says so (`detail unavailable — m3max dashboard not reachable`), never a
+  blank "no stories yet…" that reads like an empty run.
+- **Given** the run's repo lives at a path that does not exist on the XPS
+  (`/Users/fxmartin/Work/…`) **When** the forge panel renders **Then** it
+  resolves the forge from the fleet record's `origin`/slug, not from a local
+  path, so it shows the repo's issues/PRs/CI instead of `GitHub unavailable`.
+- **Given** a worker **When** it starts **Then** its own dashboard is running
+  and bound to its tailnet address (`sdlc dashboard --host <tailnet-ip>`), as
+  a LaunchAgent alongside the worker (template +
+  `--dashboard-url` advertised by the worker), so the relay has something to
+  relay; `sdlc doctor` on the worker warns when the advertised URL does not
+  answer.
+- **Given** `"view session"` on a remote story **When** clicked **Then** it
+  keeps working as 35.4-002 built it (same relay, same confinement).
+
+**Technical Notes**: `dashboard.py` already proxies `/api/logs` server-side
+with a 5 s timeout, no redirects and no env proxy (35.4-002); add the same
+for `/api/status` and the stream token, keyed on the selected run's
+`dashboard_url`. Relay responses are the worker's JSON passed through, plus
+`worker` and `origin`; nothing is read from the XPS's disk for a remote run.
+Tailnet ACL: XPS → M3 Max is `trusted → trusted` (any port); XPS → home-lab
+needs `tcp:8787`, already granted on 2026-10-04. The worker plist gains a
+sibling `com.fxmartin.sdlc-dashboard.plist` (or the worker spawns the
+dashboard) — one decision for the story.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: relay of `/api/status` and the change token for a remote run;
+      fallback message when unreachable; forge slug from the fleet record;
+      worker advertises and doctor checks the dashboard URL; local runs
+      byte-identical
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.4-001, 35.4-002
+**Risk Level**: Medium
+
 ## Epic Sequencing
 
 1. **MVP (XPS → M3 Max end to end)**: 35.1-001 → 35.1-002 → 35.2-001 →
@@ -663,6 +718,10 @@ leaves no run row" invert to "leaves a FAILED run with the reason".
    on every dashboard) and 35.2-006 (non-interactive git auth on the worker —
    the sync hung on a Keychain prompt). Both Must Have before the fleet is
    trusted unattended.
+5. **From the second fleet job (2026-10-04)**: 35.4-006 — a remote run on the
+   XPS dashboard showed only its header (`STARTED · remote · elapsed`, "no
+   stories yet…", "GitHub unavailable"); relay the worker dashboard's status
+   like 35.4-002 relays its logs.
 
 ## Non-Goals
 
