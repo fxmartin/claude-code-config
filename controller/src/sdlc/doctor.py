@@ -31,6 +31,7 @@ from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
 from sdlc.queue import QueueError, QueueStore, WorkerRecord, default_queue_path
 from sdlc.queue_client import QUEUE_TOKEN_ENV, QueueClient, QueueRefused, resolve_queue_url
 from sdlc.registry import Registry, derive_state
+from sdlc.worker_selfcheck import WORKER_UNIT
 
 __all__ = [
     "MANAGED_PATHS",
@@ -632,11 +633,8 @@ def default_worker_plist() -> Path:
 
 
 # Story 35.2-008: the Linux twin — a systemd --user unit on the Hetzner dev box
-# (template: templates/systemd/sdlc-worker.service). `worker_selfcheck.WORKER_UNIT`
-# names the same file, which is how the worker recognises its own cgroup.
-WORKER_UNIT = "sdlc-worker.service"
-
-
+# (template: templates/systemd/sdlc-worker.service). Its name, `WORKER_UNIT`, comes
+# from `worker_selfcheck`, which is how the worker recognises its own cgroup.
 def default_worker_unit() -> Path:
     """Where `systemctl --user` loads the resident worker's unit from."""
     config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
@@ -664,11 +662,15 @@ def _environment_file(path: Path) -> dict[str, str]:
         if not line or line.startswith(("#", ";")) or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        try:
-            words = shlex.split(value)
-        except ValueError:
-            words = [value]
-        env[key.strip()] = words[0] if words else ""
+        value = value.strip()
+        # As systemd: an unquoted value is the whole rest of the line, spaces and all.
+        if value.startswith(("'", '"')):
+            try:
+                words = shlex.split(value)
+            except ValueError:
+                words = [value]
+            value = words[0] if words else ""
+        env[key.strip()] = value
     return env
 
 

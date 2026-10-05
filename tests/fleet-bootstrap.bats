@@ -82,6 +82,15 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
     grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
 }
 
+@test "a fresh box starts the worker once: enable --now is not followed by a restart" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+    # A restart here would cut the just-started worker's start-up self-check short.
+    ! grep -q "restart" "${CALLS}"
+}
+
 @test "steps run in order: config, plugin, controller, git auth, doctor, then the unit" {
     run "${BOOTSTRAP}" --queue-url "${QUEUE}"
     [ "$status" -eq 0 ]
@@ -155,6 +164,24 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
     [ "$status" -eq 0 ]
     [ "$(cat "${HOME}/.sdlc-fleet.yaml")" = "$(printf 'queue_url: http://elsewhere:1\n# mine')" ]
     [[ "$output" == *"does not name ${QUEUE}"* ]]
+}
+
+@test "the fleet config's URL is compared literally: a '.' in it matches only a '.'" {
+    echo "queue_url: http://home-labXexample.ts.net:8790" >"${HOME}/.sdlc-fleet.yaml"
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"does not name ${QUEUE}"* ]]
+}
+
+@test "the same URL quoted or with a trailing slash is recognised, not flagged" {
+    echo "queue_url: \"${QUEUE}/\"" >"${HOME}/.sdlc-fleet.yaml"
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"does not name"* ]]
 }
 
 @test "a token the operator put in the env file survives a re-run, and its mode is restored" {
@@ -262,4 +289,10 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
     [ "$status" -eq 0 ]
     [[ "$output" == *"nix develop ~/.config/nix-dev-env"* ]]
     [[ "$output" == *"ssh -J home-lab"* ]]
+}
+
+# --- CI wiring -------------------------------------------------------------------------
+
+@test "ci.yml bats job runs the fleet-bootstrap suite" {
+    grep -q 'tests/fleet-bootstrap\.bats' "${BATS_TEST_DIRNAME}/../.github/workflows/ci.yml"
 }

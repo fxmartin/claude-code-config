@@ -39,7 +39,7 @@ SELF_CHECK_CAP_SECONDS = 90
 SELF_CHECK_RETRY_SECONDS = 60
 STATE_FILENAME = "worker-self-check.json"
 # The Linux worker's systemd --user unit (templates/systemd/sdlc-worker.service, Story
-# 35.2-008); `sdlc doctor` names the same file as `doctor.WORKER_UNIT`.
+# 35.2-008); `sdlc doctor` imports it from here rather than naming it twice.
 WORKER_UNIT = "sdlc-worker.service"
 
 # Directly under $HOME, macOS gates these behind a Privacy & Security prompt that

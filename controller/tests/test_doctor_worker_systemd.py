@@ -271,3 +271,9 @@ def test_an_environment_file_value_with_an_unbalanced_quote_is_kept_verbatim(tmp
     path = tmp_path / "worker.env"
     path.write_text("SDLC_QUEUE_TOKEN='abc\n", encoding="utf-8")
     assert doctor._environment_file(path) == {"SDLC_QUEUE_TOKEN": "'abc"}
+
+
+def test_an_unquoted_environment_file_value_is_kept_whole_as_systemd_does(tmp_path) -> None:
+    path = tmp_path / "worker.env"
+    path.write_text('PLAIN=a  b  \nDOUBLE="c d"\nSINGLE=\'e f\'\n', encoding="utf-8")
+    assert doctor._environment_file(path) == {"PLAIN": "a  b", "DOUBLE": "c d", "SINGLE": "e f"}

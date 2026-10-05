@@ -151,7 +151,10 @@ log "gh auth setup-git"
 run gh auth setup-git
 
 # 5. Which queue the worker drains. An existing file is the operator's: never
-#    overwritten, but a different URL is worth saying out loud.
+#    overwritten, but a different URL is worth saying out loud. The URL is data,
+#    not a pattern: each character goes in its own bracket (`^` cannot, so it is
+#    escaped) and a '.' in the hostname matches only a '.'.
+QUEUE_URL_RE="$(printf '%s\n' "${QUEUE_URL}" | sed 's/[^^]/[&]/g; s/\^/\\^/g')"
 if [[ -z "${QUEUE_URL}" ]]; then
   log "${FLEET_CONFIG} left as it is"
 elif [[ ! -f "${FLEET_CONFIG}" ]]; then
@@ -161,7 +164,7 @@ elif [[ ! -f "${FLEET_CONFIG}" ]]; then
   else
     printf 'queue_url: %s\n' "${QUEUE_URL}" >"${FLEET_CONFIG}"
   fi
-elif grep -Eq "^queue_url:[[:space:]]*['\"]?${QUEUE_URL}/?['\"]?[[:space:]]*$" "${FLEET_CONFIG}"; then
+elif grep -Eq "^queue_url:[[:space:]]*['\"]?${QUEUE_URL_RE}/?['\"]?[[:space:]]*$" "${FLEET_CONFIG}"; then
   log "${FLEET_CONFIG} already names ${QUEUE_URL}"
 else
   warn "${FLEET_CONFIG} exists and does not name ${QUEUE_URL}; left untouched — edit it if that is wrong"
@@ -199,13 +202,18 @@ if [[ "${DO_SERVICE}" == true ]]; then
     run install -m 644 "${UNIT_TEMPLATE}" "${UNIT_PATH}"
     CHANGED=true
   fi
+  # Asked before `enable --now`: a worker that call starts already runs the new
+  # unit, and restarting it would cut its start-up self-check short.
+  WAS_ACTIVE=false
+  if [[ "${DRY_RUN}" == false ]] && systemctl --user is-active --quiet "${UNIT_NAME}"; then
+    WAS_ACTIVE=true
+  fi
   if [[ "${CHANGED}" == true ]]; then
     run systemctl --user daemon-reload
   fi
   run systemctl --user enable --now "${UNIT_NAME}"
   # A changed unit does not touch the running worker by itself.
-  if [[ "${CHANGED}" == true && "${DRY_RUN}" == false ]] \
-      && systemctl --user is-active --quiet "${UNIT_NAME}"; then
+  if [[ "${CHANGED}" == true && "${WAS_ACTIVE}" == true ]]; then
     systemctl --user restart "${UNIT_NAME}"
   fi
 
