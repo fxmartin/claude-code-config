@@ -209,17 +209,21 @@ def _registry_runs_view(
     """
     rows: list[dict] = []
     gh_by_repo: dict[str, dict] = {}
+    # Issue #848: many runs share one repo ledger, and `list_runs` prices every
+    # usage row in it — read each ledger once per view, not once per run.
+    counts_by_db: dict[str, dict[str, tuple[int, int]] | None] = {}
     local_ids: set[str] = set()
     for rec in registry.records():
         local_ids.add(rec.run_id)
-        done, total = rec.completed, rec.total
-        try:
-            for r in Ledger(rec.db).list_runs():
-                if r["id"] == rec.run_id:
-                    done, total = r["done"], r["total"]
-                    break
-        except (OSError, sqlite3.Error):
-            pass  # unreachable ledger → keep the registry's cached counts
+        if rec.db not in counts_by_db:
+            try:
+                counts_by_db[rec.db] = {
+                    r["id"]: (r["done"], r["total"]) for r in Ledger(rec.db).list_runs()
+                }
+            except (OSError, sqlite3.Error):
+                counts_by_db[rec.db] = None  # unreachable ledger → registry's cached counts
+        ledger_counts = counts_by_db[rec.db] or {}
+        done, total = ledger_counts.get(rec.run_id, (rec.completed, rec.total))
         row = {
             "id": rec.run_id,
             "repo": rec.repo,
@@ -718,12 +722,17 @@ def _change_token(server, run: str | None = None) -> str:
     registry = getattr(server, "registry", None)
     if registry is not None:
         parts: list[str] = []
-        for rec in registry.records():
-            try:
-                tok = Ledger(rec.db).change_token()
-            except (OSError, sqlite3.Error):
-                tok = "0"
-            parts.append(f"{rec.run_id}:{derive_state(rec)}:{tok}")
+        records = registry.records()
+        # Issue #848: `change_token` digests the whole ledger and this runs every
+        # second per open stream — read each distinct ledger once per tick.
+        tokens: dict[str, str] = {}
+        for rec in records:
+            if rec.db not in tokens:
+                try:
+                    tokens[rec.db] = Ledger(rec.db).change_token()
+                except (OSError, sqlite3.Error):
+                    tokens[rec.db] = "0"
+            parts.append(f"{rec.run_id}:{derive_state(rec)}:{tokens[rec.db]}")
         fleet = getattr(server, "fleet", None)
         if fleet is not None:
             # A remote run has no ledger here, so its pushed progress is the signal.
@@ -733,7 +742,7 @@ def _change_token(server, run: str | None = None) -> str:
                     f":{row.get('worker_online')}"
                 )
             relay = getattr(server, "worker_status", None)
-            local_ids = {rec.run_id for rec in registry.records()}
+            local_ids = {rec.run_id for rec in records}
             if relay is not None and run and run not in local_ids:
                 row = next((r for r in fleet.snapshot()["runs"] if r.get("run_id") == run), None)
                 origin = _remote_origin(row) if row is not None else None

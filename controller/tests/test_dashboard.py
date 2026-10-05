@@ -2984,3 +2984,65 @@ def test_queue_view_carries_worker_and_pool_per_job(
     assert (job["id"], job["pool"], job["worker"], job["claimed_by"]) == (
         job_id, "claude-shared", "home-lab-1", "home-lab-1",
     )
+
+
+# --- Issue #848: one ledger read per distinct ledger, not per run record -----
+
+
+def _shared_ledger_registry(tmp_path: Path, runs: int):
+    """``runs`` registry records that all live in one repo's ledger (the common case)."""
+    import os
+
+    from sdlc.registry import Registry, RunRecord
+
+    db = tmp_path / ".sdlc-state.db"
+    registry = Registry(tmp_path / "registry.json")
+    for i in range(runs):
+        run_id = _seed_run(db, f"epic-{i}", f"S.1-00{i}", "IN_PROGRESS")
+        registry.register(
+            RunRecord(run_id, str(tmp_path), str(db), f"epic-{i}", os.getpid(), "IN_PROGRESS",
+                      f"2026-01-0{i + 1}T00:00:00+00:00", total=9, completed=0)
+        )
+    return registry
+
+
+def test_change_token_reads_each_ledger_once(monkeypatch, tmp_path: Path) -> None:
+    """Five runs in one ledger cost one ``change_token`` read per SSE tick, not five."""
+    from types import SimpleNamespace
+
+    import sdlc.dashboard as dash
+
+    registry = _shared_ledger_registry(tmp_path, runs=5)
+    srv = SimpleNamespace(registry=registry, db_path=None)
+    before = dash._change_token(srv)
+
+    calls: list[str] = []
+    real = dash.Ledger.change_token
+
+    def _counting(self):
+        calls.append(str(self.db_path))
+        return real(self)
+
+    monkeypatch.setattr(dash.Ledger, "change_token", _counting)
+    assert dash._change_token(srv) == before  # same state → same token
+    assert len(calls) == 1
+
+
+def test_registry_runs_view_reads_each_ledger_once(monkeypatch, tmp_path: Path) -> None:
+    """Five runs in one ledger cost one ``list_runs`` per view; rows are unchanged."""
+    import sdlc.dashboard as dash
+
+    registry = _shared_ledger_registry(tmp_path, runs=5)
+    before = dash._registry_runs_view(registry)
+
+    calls: list[str] = []
+    real = dash.Ledger.list_runs
+
+    def _counting(self):
+        calls.append(str(self.db_path))
+        return real(self)
+
+    monkeypatch.setattr(dash.Ledger, "list_runs", _counting)
+    assert dash._registry_runs_view(registry) == before
+    assert len(calls) == 1
+    assert len(before) == 5
