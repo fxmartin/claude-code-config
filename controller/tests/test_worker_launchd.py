@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import os
 import plistlib
 import re
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -21,10 +23,9 @@ from sdlc.scheduler import SchedulerResult
 
 runner = CliRunner()
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "templates/launchd/com.fxmartin.sdlc-worker.plist"
-DASHBOARD_TEMPLATE = (
-    Path(__file__).resolve().parents[2] / "templates/launchd/com.fxmartin.sdlc-dashboard.plist"
-)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TEMPLATE = REPO_ROOT / "templates/launchd/com.fxmartin.sdlc-worker.plist"
+DASHBOARD_TEMPLATE = REPO_ROOT / "templates/launchd/com.fxmartin.sdlc-dashboard.plist"
 HOME = "/Users/fx"
 TAILNET_IP = "100.64.0.9"
 
@@ -258,3 +259,84 @@ def test_dashboard_template_argv_is_accepted_by_sdlc_dashboard(
 
     assert result.exit_code == 0, result.output
     assert seen["kwargs"]["host"] == TAILNET_IP and seen["kwargs"]["port"] == 8787
+
+
+@pytest.mark.parametrize("tailnet_ip", ["", "  "])
+def test_a_dashboard_rendered_without_a_tailnet_ip_never_binds_every_interface(
+    dashboard_plist, tailnet_ip, monkeypatch
+) -> None:
+    # `tailscale ip -4` prints nothing while Tailscale is stopped or logged out, and
+    # Python binds a blank host as every interface: the login-less dashboard would
+    # serve /api/status, /api/logs and /log on whatever network the Mac is on.
+    from sdlc.build import IN_TEST_ENV_VAR
+
+    served: list[dict] = []
+    monkeypatch.delenv(IN_TEST_ENV_VAR, raising=False)  # the refusal, not the recursion guard
+    monkeypatch.setattr("sdlc.dashboard.serve", lambda *a, **kw: served.append(kw))
+    text = plistlib.dumps(dashboard_plist).decode().replace("__TAILNET_IP__", tailnet_ip)
+    argv = plistlib.loads(text.encode())["ProgramArguments"][1:]
+
+    result = runner.invoke(app, argv)
+
+    assert result.exit_code == 2
+    assert served == []
+    assert "every interface" in result.stderr
+
+
+def _install_recipe(template: Path) -> str:
+    """The header's `Install:` commands, exactly as an operator pastes them."""
+    header = template.read_text(encoding="utf-8").partition("-->")[0]
+    recipe = re.search(r"Install:\n\n(.*?)\n\n", header, re.S)
+    assert recipe is not None
+    return textwrap.dedent(recipe.group(1))
+
+
+def _install(template: Path, tmp_path: Path, tailnet_ip: str) -> tuple[subprocess.CompletedProcess, Path, Path]:
+    """Run ``template``'s install recipe under a fake home, `tailscale` and `launchctl`."""
+    home, bin_dir = tmp_path / "home", tmp_path / "bin"
+    (home / "Library/LaunchAgents").mkdir(parents=True)
+    bin_dir.mkdir()
+    printed = f"echo {tailnet_ip}" if tailnet_ip else "true"  # logged out: prints nothing
+    for name, body in (("tailscale", printed), ("launchctl", f'echo "$@" >> "{bin_dir}/launchctl.calls"')):
+        tool = bin_dir / name
+        tool.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        tool.chmod(0o755)
+    result = subprocess.run(
+        ["sh", "-c", _install_recipe(template)],
+        cwd=REPO_ROOT,
+        env={"HOME": str(home), "USER": "fx", "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return result, home / "Library/LaunchAgents" / template.name, bin_dir / "launchctl.calls"
+
+
+@pytest.mark.parametrize("template", [TEMPLATE, DASHBOARD_TEMPLATE])
+def test_the_install_stops_before_writing_an_agent_without_a_tailnet_address(
+    template: Path, tmp_path: Path
+) -> None:
+    # Substituting "" would bind the dashboard to every interface and advertise
+    # `http://:8787`, which the worker rejects at every start.
+    result, installed, launchctl_calls = _install(template, tmp_path, tailnet_ip="")
+
+    assert result.returncode != 0
+    assert "tailscale ip -4 printed no address" in result.stderr
+    assert not installed.exists()
+    assert not launchctl_calls.exists()
+
+
+@pytest.mark.parametrize("template", [TEMPLATE, DASHBOARD_TEMPLATE])
+def test_the_install_renders_the_tailnet_address_and_loads_the_agent(
+    template: Path, tmp_path: Path
+) -> None:
+    result, installed, launchctl_calls = _install(template, tmp_path, tailnet_ip=TAILNET_IP)
+
+    assert result.returncode == 0, result.stderr
+    agent = plistlib.loads(installed.read_bytes())
+    assert not re.search(r"__[A-Z_]+__", plistlib.dumps(agent).decode())  # comments aside
+    argv = agent["ProgramArguments"]
+    assert TAILNET_IP in argv or f"http://{TAILNET_IP}:8787" in argv
+    assert launchctl_calls.read_text(encoding="utf-8").split() == [
+        "bootstrap", f"gui/{os.getuid()}", str(installed),
+    ]

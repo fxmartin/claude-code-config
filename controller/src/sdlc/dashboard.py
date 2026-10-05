@@ -456,6 +456,10 @@ _WORKER_STATUS_CACHE_SECONDS = 1.0
 # A dead worker blackholes rather than refuses (see _FLEET_FAILURE_CACHE_SECONDS):
 # the stream polls every second, so remember a failure for longer than a tick.
 _WORKER_STATUS_FAILURE_CACHE_SECONDS = 10.0
+# A finished run's status no longer moves until a resume reopens it, so a tab left
+# on one re-reads it this often instead of costing the worker a status snapshot
+# (and a `git remote`) every second it stays open.
+_WORKER_STATUS_FINISHED_CACHE_SECONDS = 10.0
 
 
 class _WorkerStatusRelay:
@@ -463,20 +467,23 @@ class _WorkerStatusRelay:
 
     The page's status request and the SSE change token both want the same
     payload every second; sharing one fetch keeps a watched remote run at about
-    one request per second to the worker, and a failure is remembered for
-    ``failure_ttl`` so an unreachable worker costs the stream one timeout per
-    window, not one per tick. ``get`` raises :class:`_WorkerUnreachable`.
+    one request per second to the worker — one per ``finished_ttl`` once the run
+    has finished — and a failure is remembered for ``failure_ttl`` so an
+    unreachable worker costs the stream one timeout per window, not one per tick.
+    ``get`` raises :class:`_WorkerUnreachable`.
     """
 
     def __init__(
         self,
         ttl: float = _WORKER_STATUS_CACHE_SECONDS,
         failure_ttl: float = _WORKER_STATUS_FAILURE_CACHE_SECONDS,
+        finished_ttl: float = _WORKER_STATUS_FINISHED_CACHE_SECONDS,
         clock=time.monotonic,
         fetch=None,
     ) -> None:
         self._ttl = ttl
         self._failure_ttl = failure_ttl
+        self._finished_ttl = finished_ttl
         self._clock = clock
         self._fetch = fetch or _fetch_worker_json
         self._lock = threading.Lock()
@@ -489,7 +496,7 @@ class _WorkerStatusRelay:
             now = self._clock()
             if entry is not None:
                 fetched_at, payload, error = entry
-                if now - fetched_at < (self._ttl if payload is not None else self._failure_ttl):
+                if now - fetched_at < self._ttl_for(payload):
                     if payload is None:
                         raise _WorkerUnreachable(error)
                     return payload
@@ -501,10 +508,17 @@ class _WorkerStatusRelay:
         self._remember(key, payload, "")
         return payload
 
+    def _ttl_for(self, payload: dict | None) -> float:
+        """How long ``payload`` (None: a failure) answers reads before a refetch."""
+        if payload is None:
+            return self._failure_ttl
+        run = payload.get("run")
+        return self._finished_ttl if isinstance(run, dict) and run.get("finished_at") else self._ttl
+
     def _remember(self, key: tuple[str, str], payload: dict | None, error: str) -> None:
-        # Past the longer window no read is served from an entry, only refetched;
+        # Past the longest window no read is served from an entry, only refetched;
         # kept, every remote run ever viewed would hold its payload for good.
-        horizon = max(self._ttl, self._failure_ttl)
+        horizon = max(self._ttl, self._failure_ttl, self._finished_ttl)
         with self._lock:
             now = self._clock()
             self._entries = {k: e for k, e in self._entries.items() if now - e[0] < horizon}
@@ -1141,13 +1155,19 @@ const STAGE_LABELS = {investigation: "investigate", build: "build", coverage: "Q
 const DEFAULT_STAGE_COLUMNS = ["build", "coverage", "review", "merge"];
 function stageLabel(s){return STAGE_LABELS[s] || s;}
 function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(statusLabel(s))+"</span>";}
+// A relayed remote run's snapshot is its worker's JSON passed through (Story
+// 35.4-006), so a field the page treats as a number may not be one: text, never markup.
 function humanTokens(n){
   if(n==null) return "—";
+  if(typeof n !== "number") return esc(n);
   if(n>=1e6) return (n/1e6).toFixed(n>=1e7?0:1)+"M";
   if(n>=1e3) return (n/1e3).toFixed(n>=1e4?0:1)+"k";
   return String(n);
 }
 function usd(n){ return n==null ? "" : "$"+Number(n).toFixed(n<1?3:2); }
+// A snapshot's link target (a relayed run's is its worker's say-so) is an http(s)
+// URL or no link at all — never javascript: or data:.
+function httpUrl(u){ const s = String(u==null?"":u); return /^https?:/i.test(s) ? s : ""; }
 // Repo health (Story 11.2-006 GitHub + 23.7-001 GitLab). The badge/panel read a
 // backend-cached per-repo summary; the client never drives `gh`/`glab`. Both
 // degrade to a muted "<forge> unavailable" state when the summary is absent or
@@ -1218,17 +1238,15 @@ function humanDuration(s){
   return sec+"s";
 }
 // A relayed remote run's transcripts sit on its worker, so its stage links go to
-// the worker's own path-confined /log (Story 35.4-006); "" for every local run.
-let statOrigin = "";
-function stageCell(st){
+// the worker's own path-confined /log (Story 35.4-006): `origin` is "" for every
+// local run. logHref carries the selected run, so registry mode confines /log to
+// that run's logs root (a non-newest run's transcript lives under its own <db>.logs).
+function stageCell(st, origin){
   let title = (st.attempt?("attempt "+st.attempt):"") + (st.failure_category?(" · "+esc(st.failure_category)):"");
   if(st.tokens!=null) title += " · "+humanTokens(st.tokens)+" tok"+(st.cost_usd!=null?(" · "+usd(st.cost_usd)):"");
   const inner = title ? "<span title='"+esc(title)+"'>"+badge(st.status)+"</span>" : badge(st.status);
-  // Carry the selected run so registry mode confines /log to that run's logs
-  // root (a non-newest run's transcript lives under its own <db>.logs).
-  const runQ = sel ? "&run=" + encodeURIComponent(sel) : "";
   return st.output_path
-    ? "<td><a href='"+esc(statOrigin)+"/log?path="+encodeURIComponent(st.output_path)+runQ+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
+    ? "<td><a href='"+esc(logHref(st.output_path, origin))+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
     : "<td>"+inner+"</td>";
 }
 
@@ -1417,7 +1435,7 @@ function renderDag(d){
         + "<span class='nid'>"+esc(id)+"</span> "+badge(s.status||"TODO")
         + "<span class='ntitle' title='"+esc(s.title||"")+"'>"+esc(s.title||"")+"</span></div>";
     }).join("");
-    return "<div class='dag-col'><div class='wave-h'>Wave "+(w.index+1)
+    return "<div class='dag-col'><div class='wave-h'>Wave "+(Number(w.index)+1)
       + " \\u2014 runs in parallel</div>"+nodes+"</div>";
   }).join("");
   el.innerHTML = "<div class='dagwrap'><h3>Dependency DAG \\u00b7 waves left\\u2192right</h3>"
@@ -1529,9 +1547,9 @@ function renderQueue(data){
 
 function renderMain(d){
   const run = d.run, c = d.counts || {}, p = d.project || {};
-  statOrigin = d.origin || "";
+  const projectUrl = httpUrl(p.url);
   document.getElementById("repo").innerHTML = p.name
-    ? "📦 " + (p.url ? "<a href='"+esc(p.url)+"' target='_blank' rel='noopener'>"+esc(p.name)+"</a>" : esc(p.name))
+    ? "📦 " + (projectUrl ? "<a href='"+esc(projectUrl)+"' target='_blank' rel='noopener'>"+esc(p.name)+"</a>" : esc(p.name))
     : "";
   document.title = p.name ? p.name + " · Autonomous SDLC" : "Autonomous SDLC";
   if(!run){
@@ -1614,9 +1632,10 @@ function renderMain(d){
   }
   const total = c.total||0, done = c.done||0;
   document.getElementById("bar").style.width = (total? Math.round(100*done/total):0) + "%";
+  const count = k => Number(c[k.toLowerCase()]) || 0;  // a relayed count is the worker's word
   document.getElementById("chips").innerHTML = ORDER
-    .filter(k => (c[k.toLowerCase()]||0) > 0 || k==="DONE")
-    .map(k => "<span class='chip'><b class='"+k+"'>"+(c[k.toLowerCase()]||0)+"</b> "+statusLabel(k).toLowerCase().replace("_"," ")+"</span>")
+    .filter(k => count(k) > 0 || k==="DONE")
+    .map(k => "<span class='chip'><b class='"+k+"'>"+count(k)+"</b> "+statusLabel(k).toLowerCase().replace("_"," ")+"</span>")
     .join("");
   // Issue #565: the stage columns this run's snapshot populated (build.py's
   // status_snapshot) — a fix run's investigation stage adds a column ahead of
@@ -1625,7 +1644,7 @@ function renderMain(d){
   // drives every colspan below so the header and spanning rows never drift.
   const stageCols = run.stage_columns || DEFAULT_STAGE_COLUMNS;
   const totalCols = stageCols.length + 4;
-  const prBase = d.pr_base;
+  const prBase = httpUrl(d.pr_base);
   const rows = (d.stories||[]).map(s => {
     let pr = "-";
     if(s.pr_number){
@@ -1633,7 +1652,7 @@ function renderMain(d){
         ? "<a href='"+esc(prBase)+"/pull/"+esc(s.pr_number)+"' target='_blank' rel='noopener'>#"+esc(s.pr_number)+"</a>"
         : "#"+esc(s.pr_number);
     }
-    const stageCells = (s.stages||[]).map(stageCell).join("");
+    const stageCells = (s.stages||[]).map(st => stageCell(st, d.origin)).join("");
     const bug = s.bugfix_attempts > 0
       ? " <span class='badge BLOCKED' title='bugfix retries'>🔧×"+esc(s.bugfix_attempts)+"</span>"
       : "";

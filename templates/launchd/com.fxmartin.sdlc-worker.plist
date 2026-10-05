@@ -11,13 +11,15 @@
     __HOME__        the account's home, e.g. /Users/fxmartin
     __USER__        the account's login, for nix-darwin's per-user profile on PATH
     __TAILNET_IP__  this Mac's tailnet address (`tailscale ip -4`), where its
-                    dashboard listens — see com.fxmartin.sdlc-dashboard.plist
+                    dashboard listens — see com.fxmartin.sdlc-dashboard.plist;
+                    the install stops if Tailscale is down and it prints nothing
 
   Install:
 
     mkdir -p ~/.local/state/sdlc
+    ip=$(tailscale ip -4)
     sed -e "s|__HOME__|$HOME|g" -e "s|__USER__|$USER|g" \
-        -e "s|__TAILNET_IP__|$(tailscale ip -4)|g" \
+        -e "s|__TAILNET_IP__|${ip:?tailscale ip -4 printed no address}|g" \
         templates/launchd/com.fxmartin.sdlc-worker.plist \
         > ~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist

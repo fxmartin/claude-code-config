@@ -21,11 +21,16 @@
   Install:
 
     mkdir -p ~/.local/state/sdlc
+    ip=$(tailscale ip -4)
     sed -e "s|__HOME__|$HOME|g" -e "s|__USER__|$USER|g" \
-        -e "s|__TAILNET_IP__|$(tailscale ip -4)|g" \
+        -e "s|__TAILNET_IP__|${ip:?tailscale ip -4 printed no address}|g" \
         templates/launchd/com.fxmartin.sdlc-dashboard.plist \
         > ~/Library/LaunchAgents/com.fxmartin.sdlc-dashboard.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fxmartin.sdlc-dashboard.plist
+
+  `tailscale ip -4` prints nothing while Tailscale is stopped or logged out, and the
+  ${ip:?} stops the install there, before it writes an agent: a blank host would
+  bind every interface (`sdlc dashboard` refuses one as well).
 
   It binds the tailnet address only, never 0.0.0.0: the dashboard has no login of
   its own, so the tailnet ACL is its access control (XPS → M3 Max is trusted →

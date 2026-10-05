@@ -2341,9 +2341,13 @@ authoritative for the worker; the table is the fleet's summary.
   and pass its JSON through plus `worker` and `origin`, so the header (now naming
   the worker), counts, stories table, stage attempts, DAG, events, usage/cost and
   routing banner render as for a local run; stage links go to the worker's own
-  `/log`. One fetch is shared per second between the status request and the SSE
-  change token (`/api/stream?run=<id>`, reconnected on a selection change), which
-  digests what moved on the worker (not its clock-driven durations); a failure is
+  `/log`. The page renders relayed values as text, never markup: numbers it
+  formats are coerced (a non-number is escaped), and the project and PR links are
+  `http(s)` or not links at all. One fetch is shared per second between the
+  status request and the SSE change token (`/api/stream?run=<id>`, reconnected on
+  a selection change), which digests what moved on the worker (not its
+  clock-driven durations); once the run has finished (`finished_at` set) it is
+  re-read every 10 s instead, since only a resume moves it again; a failure is
   remembered for 10 s, and older entries are dropped, so a run nobody watches
   holds no memory. When the worker does not answer, advertised no URL, or has no
   record of the run, the pushed-record header snapshot is served with
@@ -2354,7 +2358,7 @@ authoritative for the worker; the table is the fleet's summary.
   on: a worker's dashboard sees the fleet too, so a run it no longer holds
   (pruned) still names that same dashboard, and without the mark each hop would
   relay again until the server ran out of threads.
-  The **forge panel** resolves from the record's `origin` (migration 13): the
+  The **forge panel** resolves from the record's `origin` (migration 14): the
   repo's git remote, credentials stripped, stamped on the run's registry record
   when it registers, so every push of the run carries it. Its hostname
   picks `github`/`gitlab` and a non-public host is the instance to query, so a
@@ -2367,9 +2371,15 @@ authoritative for the worker; the table is the fleet's summary.
   <tailnet-ip> --port 8787`, a sibling of the worker agent so a worker restart
   does not blank the XPS's view), and the worker plist advertises it with
   `--dashboard-url http://<tailnet-ip>:8787`; both installs `sed` in
-  `__TAILNET_IP__` (`tailscale ip -4`). `sdlc doctor` adds a **Worker dashboard**
-  finding on a machine with the worker agent: `WARN` when the plist advertises no
-  usable URL or the advertised one does not answer (`GET /favicon.ico`, 3 s).
+  `__TAILNET_IP__` (`tailscale ip -4`) and stop, writing nothing, when it prints
+  no address (Tailscale stopped or logged out). `sdlc dashboard` refuses a blank
+  `--host` outright (exit 2): Python binds `""` as every interface, which would
+  put the login-less dashboard on whatever network the Mac is on. `sdlc doctor`
+  adds a **Worker dashboard** finding on a machine with the worker agent: `WARN`
+  when the plist's `--dashboard-url` — the only place `queue run` takes it from;
+  `SDLC_DASHBOARD_URL` in the agent's environment is a bare build's, not the
+  worker's — is missing or unusable, or the advertised dashboard does not answer
+  (`GET /favicon.ico`, 3 s).
   Unlike the worker, the dashboard does not exit on a controller reinstall; restart
   it with `launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-dashboard`.
 

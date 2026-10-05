@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import plistlib
+import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -157,9 +159,52 @@ def test_the_page_says_why_there_are_no_stories_instead_of_no_stories_yet() -> N
     page = dashboard._PAGE
     assert "d.detail_unavailable" in page
     assert page.index("d.detail_unavailable") < page.index("no stories yet…")
-    # A relayed run's stage links go to the worker's own confined /log; local stay relative.
-    assert 'let statOrigin = "";' in page
-    assert "statOrigin = d.origin || \"\";" in page
+    # A relayed run's stage links go to the worker's own confined /log; local stay
+    # relative. One helper builds every /log link, the modal's and the stage cells'.
+    assert "stageCell(st, d.origin)" in page
+    assert "esc(logHref(st.output_path, origin))" in page
+    assert "statOrigin" not in page
+
+
+def test_relayed_values_reach_the_page_as_text_never_as_markup() -> None:
+    # A remote run's snapshot is its worker's JSON passed through: what lands in
+    # HTML is escaped or coerced to a number, and a link is http(s) or no link.
+    page = dashboard._PAGE
+    assert 'if(typeof n !== "number") return esc(n);' in page  # humanTokens
+    assert "Number(c[k.toLowerCase()])" in page  # the status chips
+    assert "Number(w.index)+1" in page  # the DAG's wave headers
+    assert "httpUrl(p.url)" in page and "httpUrl(d.pr_base)" in page
+
+
+def _js_function(page: str, name: str) -> str:
+    """``function name(…){…}`` lifted out of the page script, braces balanced."""
+    start = page.index(f"function {name}(")
+    depth = 0
+    for i in range(page.index("{", start), len(page)):
+        depth += {"{": 1, "}": -1}.get(page[i], 0)
+        if depth == 0:
+            return page[start : i + 1]
+    raise AssertionError(f"function {name} never closes")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is needed to run the page's script")
+def test_the_page_helpers_render_a_hostile_relayed_value_inert() -> None:
+    script = "\n".join(_js_function(dashboard._PAGE, f) for f in ("esc", "humanTokens", "httpUrl"))
+    script += """
+    console.log(JSON.stringify([
+      humanTokens("<img src=x onerror=alert(1)>"), humanTokens(1234), humanTokens(999),
+      humanTokens(null), httpUrl("javascript:alert(1)"), httpUrl(" https://x.test"),
+      httpUrl("https://github.com/o/r"), httpUrl("HTTP://gitlab.test/root/a"), httpUrl(null),
+    ]));
+    """
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert json.loads(out.stdout) == [
+        "&lt;img src=x onerror=alert(1)&gt;", "1.2k", "999",
+        "—", "", "",
+        "https://github.com/o/r", "HTTP://gitlab.test/root/a", "",
+    ]
 
 
 # --- the relay's cache --------------------------------------------------------------
@@ -204,6 +249,31 @@ def test_the_relay_forgets_a_run_once_no_read_can_be_served_from_it() -> None:
         relay.get("http://up:1", f"run-{i}")
         now[0] += 10.0
     assert list(relay._entries) == [("http://up:1", "run-49")]
+
+
+def test_a_finished_runs_status_is_reread_less_often() -> None:
+    # A finished run's status no longer moves: a tab left on it must not cost its
+    # worker a status snapshot and a `git remote` every second it stays open.
+    now = [0.0]
+    calls: list[str] = []
+
+    def fetch(origin: str, path: str, query: dict) -> dict:
+        calls.append(query["run"])
+        finished = "2026-10-02T11:00:00+00:00" if query["run"] == "done" else None
+        return {"run": {"id": query["run"], "finished_at": finished}}
+
+    relay = _WorkerStatusRelay(
+        ttl=1.0, failure_ttl=10.0, finished_ttl=30.0, clock=lambda: now[0], fetch=fetch
+    )
+    relay.get("http://up:1", "done")
+    relay.get("http://up:1", "live")
+    now[0] = 5.0
+    relay.get("http://up:1", "done")
+    relay.get("http://up:1", "live")
+    assert calls == ["done", "live", "live"]  # the live run still refreshes every second
+    now[0] = 31.0
+    relay.get("http://up:1", "done")
+    assert calls.count("done") == 2
 
 
 # --- the SSE change token -----------------------------------------------------------
@@ -379,13 +449,62 @@ def test_doctor_is_clean_when_the_advertised_dashboard_answers(tmp_path: Path) -
     assert probed == [TAILNET_URL]
 
 
-def test_doctor_reads_the_equals_form_and_the_environment_too(tmp_path: Path) -> None:
-    for plist in (
-        _worker_plist(tmp_path, [f"--dashboard-url={TAILNET_URL}"]),
-        _worker_plist(tmp_path, [], {"SDLC_DASHBOARD_URL": TAILNET_URL}),
-    ):
-        finding = check_worker_dashboard(agent_path=plist, probe=lambda _o: None)
-        assert finding is not None and finding.status == "CLEAN"
+@pytest.mark.parametrize(
+    ("args", "env"),
+    [
+        (["--dashboard-url", TAILNET_URL], {}),
+        ([f"--dashboard-url={TAILNET_URL}"], {}),
+        # What a bare build reads, not `queue run`: counted, doctor would call a
+        # worker CLEAN while its every push blanks the run's URL on the XPS.
+        ([], {"SDLC_DASHBOARD_URL": TAILNET_URL}),
+        ([], {}),
+    ],
+)
+def test_doctor_checks_exactly_the_url_the_worker_advertises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str], env: dict
+) -> None:
+    from typer.testing import CliRunner
+
+    from sdlc import queue_worker
+    from sdlc.cli import app
+    from sdlc.scheduler import SchedulerResult
+
+    plist = _worker_plist(tmp_path, args, env)
+    probed: list[str] = []
+    finding = check_worker_dashboard(agent_path=plist, probe=lambda origin: probed.append(origin))
+
+    # Start `queue run` as launchd does: the plist's argv under the plist's environment.
+    monkeypatch.delenv("SDLC_DASHBOARD_URL", raising=False)
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(tmp_path / "registry.json"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    detect = queue_worker.detect_worker_profile
+    monkeypatch.setattr(
+        "sdlc.queue_worker.detect_worker_profile",
+        lambda name, **kw: detect(
+            name, probe=lambda _b: True, runtime=lambda: None, work_dir=tmp_path, **kw
+        ),
+    )
+    profiles = []
+
+    def fake_run_queue(store, **kwargs):
+        profiles.append(kwargs["config"].worker)
+        return SchedulerResult()
+
+    monkeypatch.setattr("sdlc.scheduler.run_queue", fake_run_queue)
+    argv = plistlib.loads(plist.read_bytes())["ProgramArguments"][1:]
+
+    result = CliRunner().invoke(app, argv)
+
+    assert result.exit_code == 0, result.output
+    advertised = profiles[0].dashboard_url
+    assert probed == ([advertised] if advertised else [])
+    assert finding is not None
+    assert finding.status == ("CLEAN" if advertised else "WARN")
 
 
 def test_doctor_warns_when_the_advertised_dashboard_does_not_answer(tmp_path: Path) -> None:

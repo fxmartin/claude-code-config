@@ -712,8 +712,13 @@ def check_worker_dashboard(
     The XPS shows a remote run's stories, events and cost by relaying this
     dashboard, so a worker that advertises none — or one that does not answer —
     leaves every run it owns header-only there.
+
+    Only the plist's ``--dashboard-url`` counts: it is all `queue run` reads.
+    ``SDLC_DASHBOARD_URL`` in the agent's environment is a bare build's input,
+    which the worker ignores — its pushes would still blank the run's URL, so
+    counting it would report CLEAN for a dashboard the XPS is never told of.
     """
-    from sdlc.registry import DASHBOARD_URL_ENV, normalize_dashboard_url
+    from sdlc.registry import normalize_dashboard_url
 
     path = agent_path or default_worker_plist()
     if not path.exists():
@@ -721,7 +726,6 @@ def check_worker_dashboard(
     try:
         plist = plistlib.loads(path.read_bytes())
         args = [str(a) for a in plist.get("ProgramArguments") or []]
-        env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
     except Exception:  # noqa: BLE001 - see check_fleet_worker_installed
         return None
     name = "Worker dashboard"
@@ -729,7 +733,7 @@ def check_worker_dashboard(
         "reinstall both agents from templates/launchd/ (the worker advertises it with "
         f"--dashboard-url; `launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
     )
-    advertised = _plist_option(args, "--dashboard-url") or env.get(DASHBOARD_URL_ENV)
+    advertised = _plist_option(args, "--dashboard-url")
     if not advertised:
         return Finding(
             "worker-dashboard", name, "WARN",
