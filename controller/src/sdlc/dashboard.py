@@ -583,8 +583,8 @@ def _remote_detail_token(relay: _WorkerStatusRelay, origin: str, run_id: str) ->
     if not isinstance(run, dict):
         run = {}
     stories = [
-        [s.get("story_id"), s.get("status"), s.get("tokens"), s.get("pr_number"), s.get("stages"),
-         s.get("activity")]
+        [s.get("story_id"), s.get("status"), s.get("status_detail"), s.get("tokens"),
+         s.get("pr_number"), s.get("stages"), s.get("activity")]
         for s in snap.get("stories") or []
         if isinstance(s, dict)
     ]
@@ -1674,7 +1674,10 @@ function renderMain(d){
       : "";
     return "<tr class='story-title'><td colspan='"+totalCols+"'><code>"+esc(s.story_id)+"</code>"+stitle
     + "<a class='view-session' data-story='"+esc(s.story_id)+"' title='read this story\\u2019s agent transcripts here'>view session</a></td></tr>"
-    + "<tr class='story-stages'><td>"+badge(s.status)+bug+"</td>"
+    + "<tr class='story-stages'><td>"+badge(s.status)+bug
+    // Story 35.5-001: the parked story's "fix pushed / awaiting CI" row, under its badge.
+    + (s.status_detail ? "<div class='muted small'>"+esc(s.status_detail)+"</div>" : "")
+    + "</td>"
     + stageCells
     + "<td>"+pr+"</td>"
     + "<td class='muted small'>"+tok+"</td>"

@@ -252,6 +252,24 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    `feature/<story>` (preserved for manual push/MR, R10), otherwise `FAILED`
    (`_exhausted_status`).
 
+   **Committed recovery work is pushed first (Story 35.5-001).** A round that
+   reports `FIXED` with `tests_passing` false but committed to `feature/<story>`
+   is pushed (`_push_story_branch`, force-with-lease on the pre-round sha) and
+   logged `bugfix commit <sha> pushed to feature/<story>; CI adjudicates`. With
+   CI config and a PR the pipeline is polled through the merge CI-gate seam (same
+   grace, same cap): green counts as `tests_passing`, red buys one more round
+   while the budget lasts. With no CI or no PR yet the worker's local verdict
+   stays authoritative. `baseline_failures` (tests that also fail on the base
+   branch) are excluded from that verdict. When recovery is exhausted at any
+   stage with commits not on `origin`, `_exhausted_status` pushes them first and
+   parks `NEEDS_ATTENTION` for every failure `kind` — `FAILED` is reserved for a
+   round that produced no commit. Worktree teardown does the same: unpushed
+   commits are pushed, or on a rejected push the worktree is kept and the sha
+   logged (*preserved* means on the remote). A parked story's row in
+   `sdlc status` and the dashboards (including the fleet view, which relays the
+   worker's snapshot) reads `fix pushed · awaiting CI` / `· CI red` with the sha
+   and PR (`status_detail`).
+
    **Awaiting human approval (Story 12.3-003).** A merge blocked *only* by the
    high-risk human-approval gate — a PR carrying `risk:high` (from `risk_gate.py`
    / `.github/workflows/risk-gate.yml`) with no `risk-approved` label or
