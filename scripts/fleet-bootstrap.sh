@@ -15,6 +15,12 @@
 #   nix develop ~/.config/nix-dev-env -c scripts/fleet-bootstrap.sh \
 #       --queue-url http://home-lab.<tailnet>:8790
 #
+# Besides claude, gh (logged in) and uv, the dev shell needs glab logged in to the
+# local GitLab (`glab auth login --hostname gitlab.test`) — without it the run is
+# refused, see --github-only — and the scanners doctor checks for, semgrep and
+# osv-scanner: without them doctor is not CLEAN, and a story built here skips its
+# SAST and dependency scans.
+#
 # Steps, in order:
 #   1. ./install.sh --core                    symlink the config into ~/.claude
 #   2. claude plugin marketplace add / install   the fx-claude-config marketplace
@@ -31,11 +37,15 @@
 # the unit is in place so a re-run can repair a worker that is down.
 #
 # Usage:
-#   scripts/fleet-bootstrap.sh --queue-url URL [--skip-service] [--dry-run]
+#   scripts/fleet-bootstrap.sh --queue-url URL [--github-only] [--skip-service] [--dry-run]
 #   scripts/fleet-bootstrap.sh --help
 #
 # --queue-url  the fleet queue's base URL (written to ~/.sdlc-fleet.yaml). Optional
 #              once that file already names one.
+# --github-only  start the worker although glab is missing or not logged in to the
+#              local GitLab. It can then sync GitHub repos only, and its free slots
+#              still make its peers defer GitLab jobs to it: pin those with
+#              --host home-lab. Without the flag such a box is refused, unchanged.
 # --skip-service  do everything but the systemd unit (a box without systemd --user).
 # --dry-run    print what would run; change nothing.
 #
@@ -68,9 +78,10 @@ FLEET_CONFIG="${HOME}/.sdlc-fleet.yaml"
 QUEUE_URL=""
 DO_SERVICE=true
 DRY_RUN=false
+GITHUB_ONLY=false
 
 usage() {
-  sed -n '5,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '5,55p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 log() { printf '==> %s\n' "$*"; }
@@ -90,6 +101,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)       usage; exit 0 ;;
     --dry-run)       DRY_RUN=true ;;
+    --github-only)   GITHUB_ONLY=true ;;
     --skip-service)  DO_SERVICE=false ;;
     --queue-url)     [[ $# -ge 2 ]] || die "--queue-url needs a URL"; QUEUE_URL="$2"; shift ;;
     --queue-url=*)   QUEUE_URL="${1#--queue-url=}" ;;
@@ -114,6 +126,20 @@ for tool in claude gh uv git; do
        nix develop ~/.config/nix-dev-env -c $0 ..."
 done
 gh auth status >/dev/null 2>&1 || die "gh is not logged in (gh auth login); nothing was changed"
+# Most ~/Work repos are private on the local GitLab. A worker that cannot sign in
+# there fails every GitLab clone and backs off in its own memory, while the free
+# slots it keeps reporting make its peers defer GitLab jobs to it (review of #851):
+# worse than no worker. So it is not started without glab unless asked for.
+GITLAB_READY=false
+if command -v glab >/dev/null 2>&1 \
+  && glab auth status --hostname "${GITLAB_HOSTNAME}" >/dev/null 2>&1; then
+  GITLAB_READY=true
+elif [[ "${DO_SERVICE}" == true && "${GITHUB_ONLY}" == false ]]; then
+  die "glab is missing or not logged in to ${GITLAB_HOSTNAME}, so this worker could sync GitHub
+       repos only — yet its free slots would make its peers defer GitLab jobs to it. Nothing was
+       changed. Put glab in the dev shell, run: glab auth login --hostname ${GITLAB_HOSTNAME}
+       and re-run — or re-run with --github-only and pin GitLab jobs with --host home-lab."
+fi
 [[ -x "${INSTALL_SH}" ]] || die "installer not found or not executable: ${INSTALL_SH}"
 [[ -x "${DEPLOY_SH}" ]] || die "deploy script not found or not executable: ${DEPLOY_SH}"
 if [[ "${DO_SERVICE}" == true ]]; then
@@ -159,18 +185,21 @@ run "${DEPLOY_SH}"
 #    collection after a dev-shell update deletes.
 log "gh auth setup-git"
 run env GH_PATH=gh gh auth setup-git
-# Most ~/Work repos live on the local GitLab and are private, so without its
-# helper every GitLab clone here fails — and while this worker reports free
-# slots, its peers defer GitLab jobs to it (review of #851).
-if command -v glab >/dev/null 2>&1 \
-  && glab auth status --hostname "${GITLAB_HOSTNAME}" >/dev/null 2>&1; then
+# The GitLab's helper is glab's, as checked in preflight. A blank entry goes
+# first, as `gh auth setup-git` writes for GitHub: git asks every helper that
+# applies in config order and takes the first answer, so a catch-all helper from
+# /etc/gitconfig or an older credential.helper would answer before glab.
+if [[ "${GITLAB_READY}" == true ]]; then
   log "glab credential helper for ${GITLAB_URL}"
-  run git config --global --replace-all "credential.${GITLAB_URL}.helper" '!glab auth git-credential'
+  run git config --global --replace-all "credential.${GITLAB_URL}.helper" ''
+  run git config --global --add "credential.${GITLAB_URL}.helper" '!glab auth git-credential'
 else
+  # Only with --github-only or --skip-service: preflight refuses a box that would
+  # start a worker this way unasked.
   warn "glab is missing or not logged in to ${GITLAB_HOSTNAME}: this worker can only sync GitHub repos.
          A GitLab job it claims fails its clone and backs off here while peers defer to its free
-         slots — log in (glab auth login --hostname ${GITLAB_HOSTNAME}) and re-run, keep the unit
-         stopped, or pin GitLab jobs with --host home-lab."
+         slots — pin GitLab jobs with --host home-lab, or log in (glab auth login --hostname
+         ${GITLAB_HOSTNAME}) and re-run."
 fi
 
 # 5. Which queue the worker drains. An existing file is the operator's: never

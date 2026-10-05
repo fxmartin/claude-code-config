@@ -118,8 +118,8 @@ def test_no_sleep_inhibitor_wraps_the_worker(service) -> None:
 
 
 def test_worker_is_restarted_on_any_exit_without_spinning(service) -> None:
-    # `always`, not `on-failure`: exit 75 (controller reinstalled under it) is a clean
-    # exit that must still restart on the new code.
+    # `always`: exit 75 (controller reinstalled under it) restarts on the new code, as
+    # `on-failure` would too — and a clean exit must not leave the worker down either.
     assert service["Restart"] == ["always"]
     assert int(service["RestartSec"][0]) >= 10
 

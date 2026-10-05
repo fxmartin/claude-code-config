@@ -61,7 +61,8 @@
 # GIT_TERMINAL_PROMPT=0, so a missing credential fails at once, never at a
 # prompt. Without a logged-in glab this worker can only sync GitHub repos: a
 # GitLab job fails its clone here while peers defer to this worker's free
-# slots, so keep the unit stopped or pin GitLab jobs with --host home-lab.
+# slots. So fleet-bootstrap.sh refuses such a box, changing nothing, unless run
+# with --github-only — and then pin GitLab jobs with --host home-lab.
 #
 # No `caffeinate` or `systemd-inhibit`: on macOS each job runs under
 # `caffeinate -i` to stop the Mac idle-sleeping mid-build (35.2-004); a server

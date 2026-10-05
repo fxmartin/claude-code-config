@@ -36,8 +36,15 @@ setup() {
 
     # gh records GH_PATH so a test can see the helper is written as a PATH lookup.
     stub gh 'echo "gh-env GH_PATH=${GH_PATH:-}" >>"${CALLS}"; exit 0'
-    # glab defaults to "not logged in" so a real glab on the test host never answers.
-    stub glab 'case "$1 $2" in "auth status") exit "${STUB_GLAB_AUTH_RC:-1}" ;; esac; exit 0'
+    # glab is logged in to the local GitLab unless STUB_GLAB_AUTH_RC=1 says otherwise —
+    # the stub, never a real glab on the test host, answers. As git's credential
+    # helper it hands out a token a test can recognise.
+    stub glab '
+case "$1 $2" in
+  "auth status") exit "${STUB_GLAB_AUTH_RC:-0}" ;;
+  "auth git-credential") [ "$3" = get ] && printf "username=oauth2\npassword=glab-token\n" ;;
+esac
+exit 0'
     stub uv 'exit 0'
     stub loginctl 'echo Linger=yes'
     # `claude plugin …`: list/marketplace list read marker files that add/install write.
@@ -309,11 +316,12 @@ exit 0'
     [[ "$output" == *"unknown flag"* ]]
 }
 
-@test "--help documents the nix develop wrapper and how to reach the box" {
+@test "--help documents the nix develop wrapper, --github-only and how to reach the box" {
     run "${BOOTSTRAP}" --help
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"nix develop ~/.config/nix-dev-env"* ]]
+    [[ "$output" == *"--github-only"* ]]
     [[ "$output" == *"ssh -J home-lab"* ]]
 }
 
@@ -332,35 +340,114 @@ exit 0'
     grep -qx "gh-env GH_PATH=gh" "${CALLS}"
 }
 
-@test "a glab logged in to the local GitLab becomes git's credential helper for it" {
-    STUB_GLAB_AUTH_RC=0 run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+# What a run leaves as git's helper list for the local GitLab: a blank entry, which
+# empties the list inherited from /etc/gitconfig or a catch-all credential.helper
+# (as `gh auth setup-git` does for GitHub), then glab's.
+GITLAB_HELPERS="$(printf '\n!glab auth git-credential')"
 
-    [ "$status" -eq 0 ]
-    grep -qx "glab auth status --hostname gitlab.test" "${CALLS}"
-    [ "$(git config --global --get-all credential.http://gitlab.test.helper)" = "!glab auth git-credential" ]
-}
-
-@test "a second run keeps exactly one GitLab credential helper" {
-    STUB_GLAB_AUTH_RC=0 run "${BOOTSTRAP}" --queue-url "${QUEUE}"
-    STUB_GLAB_AUTH_RC=0 run "${BOOTSTRAP}" --queue-url "${QUEUE}"
-
-    [ "$status" -eq 0 ]
-    [ "$(git config --global --get-all credential.http://gitlab.test.helper | wc -l)" -eq 1 ]
-}
-
-@test "without a logged-in glab the box warns that GitLab jobs cannot sync, and still finishes" {
+@test "a glab logged in to the local GitLab becomes git's only credential helper for it" {
     run "${BOOTSTRAP}" --queue-url "${QUEUE}"
 
     [ "$status" -eq 0 ]
-    [[ "${output}" == *"only sync GitHub repos"* ]]
-    [[ "${output}" == *"--host home-lab"* ]]
-    [ -z "$(git config --global --get-all credential.http://gitlab.test.helper || true)" ]
+    grep -qx "glab auth status --hostname gitlab.test" "${CALLS}"
+    [ "$(git config --global --get-all credential.http://gitlab.test.helper)" = "${GITLAB_HELPERS}" ]
+}
+
+@test "a second run leaves the GitLab helper list exactly as the first run wrote it" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    [ "$(git config --global --get-all credential.http://gitlab.test.helper)" = "${GITLAB_HELPERS}" ]
+}
+
+@test "a catch-all credential helper set before the bootstrap never answers for the GitLab" {
+    # git asks every helper that applies, in config order, and takes the first
+    # answer: without the blank entry this older helper's stale credential would be
+    # the one sent to the GitLab, and glab would never be asked.
+    git config --global credential.helper '!f() { echo username=generic; echo password=stale; }; f'
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    [ "$status" -eq 0 ]
+
+    # No system config: the test host's own helper (a Mac's osxkeychain) stays out of it.
+    cred="$(printf 'protocol=http\nhost=gitlab.test\n\n' \
+        | GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git credential fill)"
+    [[ "${cred}" == *"password=glab-token"* ]]
 }
 
 @test "a dry run names the GitLab helper it would set and writes no git config" {
-    STUB_GLAB_AUTH_RC=0 run "${BOOTSTRAP}" --queue-url "${QUEUE}" --dry-run
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --dry-run
 
     [ "$status" -eq 0 ]
     [[ "${output}" == *"credential.http://gitlab.test.helper"* ]]
     [ ! -e "${HOME}/.gitconfig" ]
+}
+
+# --- no worker that cannot sync GitLab (review of #851, round 4) -----------------------
+#
+# A worker without glab's helper fails every GitLab clone and backs off in its own
+# memory, while the free slots it keeps reporting make its peers defer GitLab jobs to
+# it. So the unit is never started on such a box unless the operator opts in.
+
+@test "without a logged-in glab the run is refused before anything changes, naming the way out" {
+    export STUB_GLAB_AUTH_RC=1
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "${output}" == *"glab auth login --hostname gitlab.test"* ]]
+    [[ "${output}" == *"--github-only"* ]]
+    ! grep -qE '^(install.sh|deploy.sh|systemctl)' "${CALLS}" || false
+    [ ! -e "${HOME}/.sdlc-fleet.yaml" ]
+    [ ! -e "$(UNIT)" ]
+    [ ! -e "${HOME}/.gitconfig" ]
+}
+
+@test "a box with no glab at all — the box as found — is refused the same way" {
+    # Only directories the test controls or the OS owns: a glab installed for the
+    # host's user (a nix profile, ~/.local/bin) must not stand in for the absent one.
+    if (PATH="/usr/bin:/bin"; command -v glab) >/dev/null 2>&1; then
+        skip "a system glab in /usr/bin or /bin cannot be hidden from this test"
+    fi
+    rm "${TMP}/bin/glab"
+    stub git 'exit 0'  # git may live outside /usr/bin on a CI image; it is never run here
+
+    PATH="${TMP}/bin:/usr/bin:/bin" run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "${output}" == *"glab auth login --hostname gitlab.test"* ]]
+    ! grep -q "install.sh" "${CALLS}" || false
+    [ ! -e "$(UNIT)" ]
+}
+
+@test "--github-only starts the worker anyway, and says to pin GitLab jobs elsewhere" {
+    export STUB_GLAB_AUTH_RC=1
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --github-only
+
+    [ "$status" -eq 0 ]
+    [[ "${output}" == *"only sync GitHub repos"* ]]
+    [[ "${output}" == *"--host home-lab"* ]]
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+    [ -z "$(git config --global --get-all credential.http://gitlab.test.helper || true)" ]
+}
+
+@test "--github-only only lifts the refusal: a logged-in glab still becomes the helper" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --github-only
+
+    [ "$status" -eq 0 ]
+    [ "$(git config --global --get-all credential.http://gitlab.test.helper)" = "${GITLAB_HELPERS}" ]
+}
+
+@test "--skip-service without glab is not refused: it starts no worker, and warns" {
+    export STUB_GLAB_AUTH_RC=1
+    rm "${TMP}/bin/systemctl"
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --skip-service
+
+    [ "$status" -eq 0 ]
+    [[ "${output}" == *"only sync GitHub repos"* ]]
+    ! grep -q systemctl "${CALLS}" || false
+    [ ! -e "$(UNIT)" ]
 }

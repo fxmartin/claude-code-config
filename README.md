@@ -211,11 +211,12 @@ ssh -J home-lab dev-server       # Tailscale SSH denies the XPS; public port 22 
 # The box starts with no clone; ~/Work/<repo> is where the worker looks for a job's repo
 nix develop ~/.config/nix-dev-env -c git clone https://github.com/fxmartin/claude-code-config.git ~/Work/claude-code-config
 cd ~/Work/claude-code-config
+nix develop ~/.config/nix-dev-env -c glab auth login --hostname gitlab.test   # GitLab repos: see below
 nix develop ~/.config/nix-dev-env -c scripts/fleet-bootstrap.sh --queue-url http://home-lab.<tailnet>:8790
 journalctl --user -u sdlc-worker -f    # the worker's log; `sdlc queue workers` should list `dev`
 ```
 
-The unit runs `nix develop … -c sdlc queue run --worker dev --pool claude-shared --follow` with `Restart=always`. Identity is `tailscale whois`; `SDLC_QUEUE_TOKEN` is only a fallback, read from `~/.config/sdlc/worker.env` (0600). No `caffeinate`/`systemd-inhibit` — a server does not sleep. **GitLab repos need `glab` logged in on the box** (`glab auth login --hostname gitlab.test`, then re-run the bootstrap, which makes `glab` git's credential helper for it): without it `dev` can only sync GitHub repos, fails every GitLab clone, and — because it still reports free slots — makes `home-lab` hold GitLab jobs back. Until then keep the unit stopped or pin GitLab jobs with `--host home-lab`. Details, the `sdlc doctor` findings and the repo-path mapping across home directories: [`docs/controller-architecture.md`](docs/controller-architecture.md#linux-worker-on-the-hetzner-dev-box-story-352-008).
+The unit runs `nix develop … -c sdlc queue run --worker dev --pool claude-shared --follow` with `Restart=always`. Identity is `tailscale whois`; `SDLC_QUEUE_TOKEN` is only a fallback, read from `~/.config/sdlc/worker.env` (0600). No `caffeinate`/`systemd-inhibit` — a server does not sleep. **The dev shell needs `glab` logged in to the local GitLab** (the bootstrap makes it git's credential helper there) **and the `semgrep`/`osv-scanner` scanners** — without the scanners `sdlc doctor` is not CLEAN and a story built on `dev` skips its security scans. Without `glab` the bootstrap refuses and changes nothing: `dev` could sync GitHub repos only, would fail every GitLab clone and — because it still reports free slots — make `home-lab` hold GitLab jobs back. `--github-only` starts the worker anyway; then pin GitLab jobs with `--host home-lab`. Details, the `sdlc doctor` findings and the repo-path mapping across home directories: [`docs/controller-architecture.md`](docs/controller-architecture.md#linux-worker-on-the-hetzner-dev-box-story-352-008).
 
 ### Cross-harness builds — run the pipeline on Claude *or* Codex (Epic-20/21)
 

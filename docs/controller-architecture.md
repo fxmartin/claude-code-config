@@ -2212,12 +2212,18 @@ make one first at `~/Work/claude-code-config`: that is where the worker resolves
 this repo's jobs ("Repo paths" below) and where `install.sh --core` points
 `~/.claude`, so it must be a lasting path. Clone over HTTPS: git authenticates
 through `gh` here, not an SSH key, and the worker matches origins by host and
-path whatever the scheme.
+path whatever the scheme. Besides `claude`, `gh` and `uv`, the dev shell needs
+`glab`, logged in to the local GitLab ("Self-checks" below says why the
+bootstrap insists), and the scanners `sdlc doctor` checks for, `semgrep` and
+`osv-scanner`: without them doctor is not `CLEAN`, and the coverage gate reports
+a missing scanner `SKIPPED` rather than blocking, so a story built on `dev`
+would merge unscanned.
 
 ```bash
 ssh -J home-lab dev-server
 nix develop ~/.config/nix-dev-env -c \
   git clone https://github.com/fxmartin/claude-code-config.git ~/Work/claude-code-config
+nix develop ~/.config/nix-dev-env -c glab auth login --hostname gitlab.test
 nix develop ~/.config/nix-dev-env -c \
   ~/Work/claude-code-config/scripts/fleet-bootstrap.sh --queue-url http://home-lab.<tailnet>:8790
 ```
@@ -2227,24 +2233,31 @@ nix develop ~/.config/nix-dev-env -c \
 the fleet config nor installs a unit, so the script wraps them: `install.sh
 --core`; `claude plugin marketplace add` and `claude plugin install
 autonomous-sdlc@fx-claude-config` when absent; `deploy.sh` (the plugin pointer
-and `sdlc` as a `uv tool`); `gh auth setup-git`, so git authenticates through
-`gh` and `GIT_TERMINAL_PROMPT=0` makes a missing credential fail at once;
+and `sdlc` as a `uv tool`); `gh auth setup-git` and `glab`'s credential helper
+for the local GitLab, so git authenticates through `gh`/`glab` and
+`GIT_TERMINAL_PROMPT=0` makes a missing credential fail at once;
 `~/.sdlc-fleet.yaml` naming the queue (an existing file is never overwritten);
 `sdlc doctor --exit-code`; and finally the unit — copied, enabled and started.
+Preflight refuses, before changing anything, a box whose `gh` is logged out or
+whose `glab` is missing or not logged in to the local GitLab — the latter
+unless `--github-only` (or `--skip-service`, which starts no worker).
 Doctor runs *before* the unit: a worker that has not registered yet is a `FAIL`
 by design, so judging the bootstrap after step 7 would fail every first run. Its
 status is the script's exit status, returned once the unit is in place so a
 re-run can repair a worker that is down. Every step is idempotent: a second run
-reinstalls nothing, restarts nothing and leaves every file byte-identical
-(`tests/fleet-bootstrap.bats`); `--dry-run` prints the steps and `--skip-service`
-stops short of the unit.
+adds no marketplace or plugin, reloads and restarts nothing, and leaves every
+file it writes byte-identical (`tests/fleet-bootstrap.bats`). `deploy.sh` does
+reinstall the controller each time (`uv tool install --force`), which is
+harmless: the worker restarts only when the installed *version* changes.
+`--dry-run` prints the steps and `--skip-service` stops short of the unit.
 
 - **The unit.** `ExecStart` is `/nix/var/nix/profiles/default/bin/nix develop
   %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared
   --follow`: the nix binary by absolute path, then the dev shell supplies
   `claude`, `gh`, `uv` and `node`; `~/.local/bin` (the `sdlc` uv tool) is on the
-  unit's `PATH`. `Restart=always` (not `on-failure`: exit 75, a controller
-  reinstalled under the worker, is a clean exit that must still restart),
+  unit's `PATH`. `Restart=always` (exit 75, a controller reinstalled under the
+  worker, restarts it on the new code, as `on-failure` would too; `always` also
+  restarts a clean exit, so the worker never stays down),
   `RestartSec=30` like the LaunchAgent's `ThrottleInterval`, `KillMode=mixed` and
   `TimeoutStopSec=60` so the worker alone gets SIGTERM and has the 40 s it needs
   to stop two jobs. It starts at boot, because `loginctl enable-linger` is on.
@@ -2283,21 +2296,25 @@ stops short of the unit.
   `gh auth setup-git` (run with `GH_PATH=gh`, so the helper stays a PATH lookup
   rather than a `/nix/store` path a garbage collection deletes) plus
   `GIT_TERMINAL_PROMPT=0`. The bootstrap also makes `glab auth git-credential`
-  the helper for `http://gitlab.test` when `glab` is logged in there, and warns
-  when it is not. **Without that helper `dev` can only sync GitHub repos**, and
-  that hurts more than it helps: most `~/Work` repos are private on the local
-  GitLab, so a GitLab job `dev` claims fails its clone and goes back to
-  `queued` while `dev` backs off privately (`queue_worker.py`), yet `dev` keeps
-  reporting free slots — and a peer skips a job another online worker with
-  more free slots could run (`queue.py`), so `home-lab` holds GitLab jobs back
-  until it is idle. Until `glab` is logged in on the box (or 35.2-006's
-  forge-credential selection lands): keep the unit stopped, or pin GitLab jobs
-  with `--host home-lab`. The sync stall watchdog of 35.2-006 is not part of
-  this story.
+  the helper for `http://gitlab.test`, after a blank entry as `gh auth
+  setup-git` writes for GitHub, so a catch-all helper from `/etc/gitconfig` or
+  an older `credential.helper` is never asked first. **Without that helper
+  `dev` can only sync GitHub repos**, and that hurts more than it helps: most
+  `~/Work` repos are private on the local GitLab, so a GitLab job `dev` claims
+  fails its clone and goes back to `queued` while `dev` backs off privately
+  (`scheduler.py`), yet `dev` keeps reporting free slots — and a peer skips a
+  job another online worker with more free slots could run (`queue.py`), so
+  `home-lab` holds GitLab jobs back until it is idle. So the bootstrap will not
+  make such a box a worker: with `glab` missing or not logged in there it stops
+  before changing anything, unless run with `--github-only` — then pin GitLab
+  jobs with `--host home-lab` until 35.2-006's forge-credential selection
+  lands. The sync stall watchdog of 35.2-006 is not part of this story.
 - **`sdlc doctor`.** Where there is no LaunchAgent but the unit is installed
   (`~/.config/systemd/user/sdlc-worker.service`, or under `$XDG_CONFIG_HOME`;
   `run_doctor(worker_unit=…)` overrides it), the `Fleet worker` finding reads the
-  unit's environment (`Environment=` plus the `EnvironmentFile`, `%h` expanded)
+  unit's environment (`Environment=` plus the `EnvironmentFile`, `%h` expanded,
+  then the `sdlc-worker.service.d/*.conf` drop-ins `systemctl --user edit`
+  writes, in name order, an empty assignment resetting as in systemd)
   instead of a plist, and its remedies name `systemctl --user` and `journalctl
   --user -u sdlc-worker`. `worker-self-check` is `CLEAN` only for a probe that
   completed from the unit, reads `TCC n/a (not macOS)`, and on failure points at

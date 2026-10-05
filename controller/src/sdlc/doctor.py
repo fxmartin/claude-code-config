@@ -680,33 +680,49 @@ def read_worker_unit(path: Path, *, home: Path | None = None) -> tuple[dict[str,
     The systemd counterpart of reading the LaunchAgent plist: the worker is
     started with the unit's environment (and its ``EnvironmentFile``, which
     overrides ``Environment=`` as in systemd), not the shell's, so that is what
-    decides which queue it drains. Raises ``OSError``/``ValueError`` for a unit
+    decides which queue it drains. As systemd does, the unit is followed by its
+    ``*.conf`` drop-ins in ``<unit>.d/`` — where ``systemctl --user edit``
+    writes, and which a bootstrap re-run never overwrites — in name order: a
+    later assignment wins, an empty one resets the list before it, and a key
+    may be spaced from its ``=``. Raises ``OSError``/``ValueError`` for a unit
     that cannot be read; the caller turns that into a FAIL.
     """
     home = home or Path.home()
     env: dict[str, str] = {}
     env_files: list[Path] = []
     argv: list[str] = []
-    in_service = False
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith(("#", ";")):
-            continue
-        if line.startswith("["):
-            in_service = line == "[Service]"
-            continue
-        key, _, value = line.partition("=")
-        if not in_service:
-            continue
-        value = _unit_value(value.strip(), home)
-        if key == "Environment":
-            for word in shlex.split(value):
-                name, _, setting = word.partition("=")
-                env[name] = setting
-        elif key == "EnvironmentFile":
-            env_files.append(Path(value.removeprefix("-")))
-        elif key == "ExecStart" and not argv:
-            argv = shlex.split(value.lstrip("@-:+!"))
+    drop_ins = sorted(path.with_name(f"{path.name}.d").glob("*.conf"))
+    for source in (path, *drop_ins):
+        in_service = False
+        for raw in source.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("["):
+                in_service = line == "[Service]"
+                continue
+            key, _, value = line.partition("=")
+            if not in_service:
+                continue
+            key = key.strip()
+            value = _unit_value(value.strip(), home)
+            if key == "Environment":
+                if not value:
+                    env.clear()
+                for word in shlex.split(value):
+                    name, _, setting = word.partition("=")
+                    env[name] = setting
+            elif key == "EnvironmentFile":
+                if value:
+                    env_files.append(Path(value.removeprefix("-")))
+                else:
+                    env_files.clear()
+            elif key == "ExecStart":
+                # A drop-in replaces the command with `ExecStart=` then a new one.
+                if not value:
+                    argv = []
+                elif not argv:
+                    argv = shlex.split(value.lstrip("@-:+!"))
     for file in env_files:
         env.update(_environment_file(file))
     return env, argv
