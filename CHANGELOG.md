@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.97.1] - 2026-10-05
+
+### Changed
+
+- perf(dashboard): read each run ledger once per tick and view (#850)
+
+
 ## [v2.97.0] - 2026-10-05
 
 ### Added
