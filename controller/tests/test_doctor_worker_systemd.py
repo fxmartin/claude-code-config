@@ -265,3 +265,9 @@ def test_run_doctor_reports_the_worker_and_its_self_check_from_the_unit(tmp_path
     assert found["fleet-worker"].status == "FAIL"  # installed, nothing registered yet
     assert "systemctl" in found["worker-self-check"].remedy
     assert "worker-dashboard" not in found  # the Linux unit advertises no dashboard
+
+
+def test_an_environment_file_value_with_an_unbalanced_quote_is_kept_verbatim(tmp_path) -> None:
+    path = tmp_path / "worker.env"
+    path.write_text("SDLC_QUEUE_TOKEN='abc\n", encoding="utf-8")
+    assert doctor._environment_file(path) == {"SDLC_QUEUE_TOKEN": "'abc"}

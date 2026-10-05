@@ -430,3 +430,16 @@ def test_a_probe_from_the_unit_is_recorded_as_systemd_and_off_macos_tcc_is_skipp
     assert result.systemd is True and result.launchd is False
     recorded = sc.read_last_result(state)
     assert recorded is not None and recorded["systemd"] is True and recorded["launchd"] is False
+
+
+def test_systemd_detection_reads_the_real_cgroup_file_and_tolerates_its_absence(monkeypatch) -> None:
+    env = {"INVOCATION_ID": "abc"}
+    unit_line = f"0::/user.slice/user-1000.slice/user@1000.service/app.slice/{sc.WORKER_UNIT}\n"
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: unit_line)
+    assert sc.running_under_systemd(env) is True
+
+    def _missing(self, *a, **k):
+        raise OSError("no /proc/self/cgroup")
+
+    monkeypatch.setattr(Path, "read_text", _missing)
+    assert sc.running_under_systemd(env) is False
