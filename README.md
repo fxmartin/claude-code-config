@@ -208,6 +208,9 @@ Besides the Macs' LaunchAgents (`templates/launchd/`), the Hetzner `dev-server` 
 
 ```bash
 ssh -J home-lab dev-server       # Tailscale SSH denies the XPS; public port 22 is home-IP-only
+# The box starts with no clone; ~/Work/<repo> is where the worker looks for a job's repo
+nix develop ~/.config/nix-dev-env -c git clone https://github.com/fxmartin/claude-code-config.git ~/Work/claude-code-config
+cd ~/Work/claude-code-config
 nix develop ~/.config/nix-dev-env -c scripts/fleet-bootstrap.sh --queue-url http://home-lab.<tailnet>:8790
 journalctl --user -u sdlc-worker -f    # the worker's log; `sdlc queue workers` should list `dev`
 ```

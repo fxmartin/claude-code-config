@@ -46,7 +46,9 @@
 #
 # Pools are a capability of the login present on the box: the shared Max
 # (mail@fxmartin.me) is `claude-shared`. Codex joins as `codex-shared` only once
-# it is installed and logged in here — add `--pool codex-shared` then; the
+# it is installed and logged in here — add `--pool codex-shared` then, in the
+# repo's templates/systemd/sdlc-worker.service and merged, never in an installed
+# copy: fleet-bootstrap.sh puts the template back over an edited one. The
 # worker's registration advertises the `codex` harness only when its CLI is on
 # the PATH, and a codex stage needs both.
 #

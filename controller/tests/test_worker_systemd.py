@@ -59,10 +59,15 @@ def _sdlc_args(service) -> list[str]:
     return argv[argv.index("-c") + 1 :]
 
 
-def test_the_unit_is_named_for_the_template_doctor_looks_for() -> None:
+def test_the_unit_is_named_for_the_template_doctor_looks_for(tmp_path, monkeypatch) -> None:
+    # The real function (imported by value): conftest stubs `doctor.default_worker_unit`
+    # so no other test reads the host's unit. HOME and XDG_CONFIG_HOME are pinned here.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     assert TEMPLATE.name == WORKER_UNIT
-    assert default_worker_unit().name == WORKER_UNIT
-    assert default_worker_unit().parent.parts[-3:] == (".config", "systemd", "user")
+    assert default_worker_unit() == tmp_path / ".config" / "systemd" / "user" / WORKER_UNIT
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert default_worker_unit() == tmp_path / "xdg" / "systemd" / "user" / WORKER_UNIT
 
 
 def test_the_unit_has_the_three_sections_a_user_unit_needs() -> None:

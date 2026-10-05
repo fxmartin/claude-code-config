@@ -7,6 +7,9 @@
 # the machine. Stubs append to one call log; tests assert on it and on the files
 # the script writes, not on stdout wording. Marketplace/plugin state lives in
 # marker files, so a second run sees what the first one "installed".
+#
+# A negated assertion is written `! cmd || false`: errexit ignores a command
+# inverted with `!`, so on any line but a test's last a bare `! grep` asserts nothing.
 
 BOOTSTRAP="${BATS_TEST_DIRNAME}/../scripts/fleet-bootstrap.sh"
 TEMPLATE="${BATS_TEST_DIRNAME}/../templates/systemd/sdlc-worker.service"
@@ -88,7 +91,7 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
     [ "$status" -eq 0 ]
     grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
     # A restart here would cut the just-started worker's start-up self-check short.
-    ! grep -q "restart" "${CALLS}"
+    ! grep -q "restart" "${CALLS}" || false
 }
 
 @test "steps run in order: config, plugin, controller, git auth, doctor, then the unit" {
@@ -134,13 +137,33 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
 
     [ "$status" -eq 0 ]
     [ "$(cd "${HOME}" && find . -type f -exec cksum {} + | sort)" = "${before}" ]
-    ! grep -q "^claude plugin marketplace add" "${CALLS}"
-    ! grep -q "^claude plugin install" "${CALLS}"
-    ! grep -q "daemon-reload" "${CALLS}"
-    ! grep -q "restart" "${CALLS}"
+    ! grep -q "^claude plugin marketplace add" "${CALLS}" || false
+    ! grep -q "^claude plugin install" "${CALLS}" || false
+    ! grep -q "daemon-reload" "${CALLS}" || false
+    ! grep -q "restart" "${CALLS}" || false
     # …while the idempotent commands still run, converging a half-done box.
     grep -qx "install.sh --core" "${CALLS}"
     grep -qx "gh auth setup-git" "${CALLS}"
+}
+
+@test "a long plugin list still reads as installed: a match is never lost to SIGPIPE" {
+    # `grep -q` stops reading at the first match; the lister's next write then dies of
+    # SIGPIPE, which pipefail reads as "not found", so the step re-adds what is there.
+    # A megabyte after the match outlasts any pipe buffer, so this needs no timing.
+    stub claude '
+case "$2 $3" in
+  "marketplace list") echo "fx-claude-config"; printf "%01000000d\n" 0; exit 0 ;;
+esac
+case "$2" in
+  list) echo "autonomous-sdlc@fx-claude-config"; printf "%01000000d\n" 0; exit 0 ;;
+esac
+exit 0'
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    ! grep -q "^claude plugin marketplace add" "${CALLS}" || false
+    ! grep -q "^claude plugin install" "${CALLS}" || false
 }
 
 @test "a changed unit is reloaded and the running worker restarted" {
@@ -229,7 +252,7 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
 
     [ "$status" -eq 0 ]
     [ ! -e "$(UNIT)" ]
-    ! grep -q systemctl "${CALLS}"
+    ! grep -q systemctl "${CALLS}" || false
 }
 
 @test "--dry-run changes nothing" {
@@ -258,7 +281,7 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
 
     [ "$status" -ne 0 ]
     [[ "$output" == *"gh is not logged in"* ]]
-    ! grep -q "install.sh" "${CALLS}"
+    ! grep -q "install.sh" "${CALLS}" || false
     [ ! -e "${HOME}/.sdlc-fleet.yaml" ]
 }
 

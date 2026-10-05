@@ -111,6 +111,9 @@ def test_an_installed_unit_that_has_not_registered_fails_with_a_systemd_remedy(
 ) -> None:
     monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
     monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    # %h in the unit's EnvironmentFile= is HOME: never the real worker.env, whose
+    # SDLC_QUEUE_URL (doctor's own remedy suggests one) would have this call a live queue.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
     finding = check_fleet_worker_installed(
         agent_path=tmp_path / "x.plist", unit_path=_unit(tmp_path), host="dev-server"
@@ -265,6 +268,23 @@ def test_run_doctor_reports_the_worker_and_its_self_check_from_the_unit(tmp_path
     assert found["fleet-worker"].status == "FAIL"  # installed, nothing registered yet
     assert "systemctl" in found["worker-self-check"].remedy
     assert "worker-dashboard" not in found  # the Linux unit advertises no dashboard
+
+
+def test_the_unit_installed_on_the_host_running_the_suite_is_never_read(tmp_path, monkeypatch) -> None:
+    # `dev` runs this suite for its own story jobs with the unit installed. conftest's
+    # `_no_real_worker_systemd_unit` keeps doctor off it, as its Mac twin does the plist;
+    # XDG_CONFIG_HOME moves the unit, so repointing HOME alone would not hide it.
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    installed = home / ".config" / "systemd" / "user" / WORKER_UNIT
+    installed.parent.mkdir(parents=True)
+    _unit(installed.parent)
+    absent = tmp_path / "absent.plist"
+
+    assert check_fleet_worker_installed(agent_path=absent, host="dev-server") is None
+    checks = {f.check for f in run_doctor(worker_plist=absent, repo_root=tmp_path).findings}
+    assert not {"fleet-worker", "worker-self-check"} & checks
 
 
 def test_an_environment_file_value_with_an_unbalanced_quote_is_kept_verbatim(tmp_path) -> None:

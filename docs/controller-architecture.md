@@ -2207,10 +2207,17 @@ agents. It is the same verb as the Macs' LaunchAgent with a different
 supervisor: `templates/systemd/sdlc-worker.service`.
 
 **Bootstrap** (`scripts/fleet-bootstrap.sh`, run inside the dev shell because
-every tool lives there, not on the login PATH):
+every tool lives there, not on the login PATH). The box starts with no clone, so
+make one first at `~/Work/claude-code-config`: that is where the worker resolves
+this repo's jobs ("Repo paths" below) and where `install.sh --core` points
+`~/.claude`, so it must be a lasting path. Clone over HTTPS: git authenticates
+through `gh` here, not an SSH key, and the worker matches origins by host and
+path whatever the scheme.
 
 ```bash
 ssh -J home-lab dev-server
+nix develop ~/.config/nix-dev-env -c \
+  git clone https://github.com/fxmartin/claude-code-config.git ~/Work/claude-code-config
 nix develop ~/.config/nix-dev-env -c \
   ~/Work/claude-code-config/scripts/fleet-bootstrap.sh --queue-url http://home-lab.<tailnet>:8790
 ```
@@ -2253,9 +2260,14 @@ stops short of the unit.
   (`mail@fxmartin.me`, Max 20x) is `claude-shared`; the unit declares nothing
   else. The `codex` harness is advertised only while its CLI is on the PATH, and
   a codex stage needs both that and the `codex-shared` pool, so `dev` is offered
-  none until Codex is installed *and* its login is declared: add `--pool
-  codex-shared` to the unit then. A `claude-shared` job goes to the least-loaded
-  of `home-lab` and `dev`.
+  none until Codex is installed *and* its login is declared. Declare it in the
+  template, not the installed copy: add `--pool codex-shared` to `ExecStart` in
+  `templates/systemd/sdlc-worker.service`, merge that, then pull and re-run the
+  bootstrap, which reinstalls the changed unit and restarts the worker. A
+  bootstrap run puts the template back over an edited
+  `~/.config/systemd/user/sdlc-worker.service`, and an uncommitted edit to the
+  clone's template is a dirty tree the worker refuses this repo's jobs over. A
+  `claude-shared` job goes to the least-loaded of `home-lab` and `dev`.
 - **Repo paths.** A job enqueued from the XPS carries
   `/home/fxmartin/Work/claude-code-config`. No such path exists on `dev`, whose
   login is `fx`, so the worker resolves the clone under *its own* home —

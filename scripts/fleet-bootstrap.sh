@@ -127,14 +127,18 @@ log "install.sh --core"
 run "${INSTALL_SH}" --core
 
 # 2. Marketplace and plugin. deploy.sh's `claude plugin update` only moves a
-#    pointer that exists, so a fresh box needs them added once.
-if claude plugin marketplace list 2>/dev/null | grep -q "${MARKETPLACE}"; then
+#    pointer that exists, so a fresh box needs them added once. Each list is
+#    captured, not piped: `grep -q` stops reading at its match, and under pipefail
+#    the lister's SIGPIPE would read as "absent" and re-add what is already there.
+MARKETPLACES="$(claude plugin marketplace list 2>/dev/null || true)"
+if grep -q "${MARKETPLACE}" <<<"${MARKETPLACES}"; then
   log "marketplace ${MARKETPLACE} already added"
 else
   log "adding marketplace ${MARKETPLACE} from ${REPO_ROOT}"
   run claude plugin marketplace add "${REPO_ROOT}"
 fi
-if claude plugin list 2>/dev/null | grep -q "${PLUGIN}"; then
+PLUGINS="$(claude plugin list 2>/dev/null || true)"
+if grep -q "${PLUGIN}" <<<"${PLUGINS}"; then
   log "plugin ${PLUGIN} already installed"
 else
   log "installing plugin ${PLUGIN}@${MARKETPLACE}"
