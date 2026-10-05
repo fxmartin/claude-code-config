@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.97.0] - 2026-10-05
+
+### Added
+
+- feat(fleet-execution): a remote run shows the same detail (#35.4-006)
+
+### Fixed
+
+- fix(fleet-execution): a remote run shows the same detail (#35.4-006)
+- fix(fleet-execution): a remote run shows the same detail (#35.4-006)
+- fix(fleet-execution): a remote run shows the same detail (#35.4-006)
+
+
 ## [v2.96.0] - 2026-10-04
 
 ### Added
