@@ -658,3 +658,31 @@ def test_stage_loop_without_ci_keeps_todays_verdict_but_parks(tmp_path, monkeypa
     assert seen["bugfix"] == 1
     assert result.failed == 0 and result.needs_attention == 1  # fix on origin: parked
     assert _remote_sha(work) == _git(work, "rev-parse", "HEAD")
+
+
+def test_remote_tracking_sha_names_the_tracked_tip_or_none(tmp_path) -> None:
+    work = _repo(tmp_path)
+    assert build_mod._remote_tracking_sha(work, BRANCH) == _remote_sha(work)
+    assert build_mod._remote_tracking_sha(work, "feature/nope") is None
+
+
+def test_try_push_branch_reports_success_and_failure(tmp_path) -> None:
+    work = _repo(tmp_path)
+    _commit(work)
+    ok, _ = build_mod._try_push_branch(work, BRANCH)
+    assert ok
+    assert _remote_sha(work) == _git(work, "rev-parse", "HEAD")
+    ok, err = build_mod._try_push_branch(work, "feature/nope")
+    assert not ok and err
+
+
+def test_try_push_branch_swallows_os_errors(tmp_path, monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise OSError("git vanished")
+
+    monkeypatch.setattr(build_mod, "_push_story_branch", boom)
+    assert build_mod._try_push_branch(tmp_path, BRANCH) == (False, "git vanished")
+
+
+def test_story_park_notes_without_a_ledger_is_empty(tmp_path) -> None:
+    assert Ledger(tmp_path / "missing.db").story_park_notes("run-x") == {}
