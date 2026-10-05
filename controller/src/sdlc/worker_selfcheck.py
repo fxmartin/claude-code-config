@@ -22,10 +22,12 @@ __all__ = [
     "SELF_CHECK_RETRY_SECONDS",
     "STATE_FILENAME",
     "SelfCheckResult",
+    "WORKER_UNIT",
     "group_runner",
     "read_last_result",
     "run_self_check",
     "running_under_launchd",
+    "running_under_systemd",
     "tcc_verdict",
 ]
 
@@ -36,6 +38,9 @@ __all__ = [
 SELF_CHECK_CAP_SECONDS = 90
 SELF_CHECK_RETRY_SECONDS = 60
 STATE_FILENAME = "worker-self-check.json"
+# The Linux worker's systemd --user unit (templates/systemd/sdlc-worker.service, Story
+# 35.2-008); `sdlc doctor` names the same file as `doctor.WORKER_UNIT`.
+WORKER_UNIT = "sdlc-worker.service"
 
 # Directly under $HOME, macOS gates these behind a Privacy & Security prompt that
 # a LaunchAgent can neither show nor answer. Cloud-drive roots are protected too.
@@ -159,6 +164,26 @@ def running_under_launchd(environ: Mapping[str, str] | None = None) -> bool:
     return name not in ("", "0") and not name.startswith("application.")
 
 
+def running_under_systemd(
+    environ: Mapping[str, str] | None = None, *, cgroup_text: str | None = None
+) -> bool:
+    """Whether this process is the worker's own systemd unit — not a login shell or ssh.
+
+    ``INVOCATION_ID`` alone is not proof: a shell started from a systemd service
+    (a terminal launched by the compositor) inherits it. The process's cgroup is
+    the witness — a unit's processes live in ``…/<unit>.service``, a login's in
+    ``session-N.scope``. Both must agree, so a shell never counts as the unit.
+    """
+    if not (environ if environ is not None else os.environ).get("INVOCATION_ID"):
+        return False
+    if cgroup_text is None:
+        try:
+            cgroup_text = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+        except OSError:
+            return False  # no cgroup file: not Linux
+    return any(line.rstrip().endswith(f"/{WORKER_UNIT}") for line in cgroup_text.splitlines())
+
+
 @dataclass(frozen=True)
 class SelfCheckResult:
     """One self-check: did an agent turn complete from this worker's own context."""
@@ -168,6 +193,7 @@ class SelfCheckResult:
     reason: str | None = None
     tcc: str | None = None
     launchd: bool = False
+    systemd: bool = False
 
     def to_heartbeat(self) -> dict[str, object]:
         """The ``self_check: {ok, at, reason}`` a registration carries."""
@@ -208,10 +234,12 @@ def run_self_check(
     clock: Callable[[], datetime] | None = None,
     state_dir: Path | None = None,
     environ: Mapping[str, str] | None = None,
+    cgroup_text: str | None = None,
 ) -> SelfCheckResult:
     """The TCC path verdict, then — only if it is clear — one real agent turn.
 
-    Run in the worker's own process, so it sees what launchd lets the agent see.
+    Run in the worker's own process, so it sees what launchd (or the systemd
+    unit, on Linux, where the TCC verdict is always clear) lets the agent see.
     The outcome is recorded under ``state_dir`` for `sdlc doctor`, which runs in
     a shell and cannot witness launchd's context itself.
     """
@@ -224,6 +252,7 @@ def run_self_check(
         reason=reason,
         tcc=tcc,
         launchd=running_under_launchd(environ),
+        systemd=running_under_systemd(environ, cgroup_text=cgroup_text),
     )
     _record(result, state_dir or default_state_dir())
     return result
@@ -236,6 +265,7 @@ def _record(result: SelfCheckResult, state_dir: Path) -> None:
         "reason": result.reason,
         "tcc": result.tcc,
         "launchd": result.launchd,
+        "systemd": result.systemd,
     }
     try:
         state_dir.mkdir(parents=True, exist_ok=True)

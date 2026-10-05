@@ -268,6 +268,7 @@ def test_the_result_is_recorded_for_doctor_with_the_context_it_ran_in(tmp_path) 
     last = sc.read_last_result(state)
     assert last == {
         "ok": True, "at": NOW.isoformat(), "reason": None, "tcc": None, "launchd": True,
+        "systemd": False,
     }
 
 
@@ -383,3 +384,49 @@ def test_an_unlistable_home_still_yields_the_named_protected_roots(tmp_path) -> 
     missing = tmp_path / "no-such-home"
     roots = sc._protected_roots(missing)
     assert missing / "Documents" in roots
+
+
+# --- Story 35.2-008: the probe can run from a systemd --user unit -------------------------
+
+
+@pytest.mark.parametrize(
+    ("invocation", "cgroup", "systemd"),
+    [
+        ("abc123", "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sdlc-worker.service\n", True),
+        ("abc123", "0::/user.slice/user-1000.slice/session-3.scope\n", False),  # an ssh login
+        (None, "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sdlc-worker.service\n", False),
+        ("abc123", "0::/user.slice/user-1000.slice/user@1000.service/app.slice/other.service\n", False),
+        ("abc123", "", False),  # no cgroup file (macOS)
+    ],
+)
+def test_only_the_workers_own_unit_counts_as_systemd(invocation, cgroup, systemd) -> None:
+    env = {} if invocation is None else {"INVOCATION_ID": invocation}
+
+    assert sc.running_under_systemd(env, cgroup_text=cgroup) is systemd
+
+
+def test_the_unit_name_is_the_one_the_template_and_doctor_use() -> None:
+    from sdlc.doctor import WORKER_UNIT
+
+    assert sc.WORKER_UNIT == WORKER_UNIT
+
+
+def test_a_probe_from_the_unit_is_recorded_as_systemd_and_off_macos_tcc_is_skipped(tmp_path) -> None:
+    home, claude = _home(tmp_path)
+    state = tmp_path / "state"
+    (claude / "settings.json").symlink_to(home)  # would be a TCC verdict on a Mac
+
+    result = sc.run_self_check(
+        runner=lambda argv, timeout_s: (0, '{"result": "ok"}'),
+        claude_dir=claude,
+        home=home,
+        system="Linux",
+        state_dir=state,
+        environ={"INVOCATION_ID": "abc"},
+        cgroup_text="0::/user.slice/sdlc-worker.service\n",
+    )
+
+    assert result.ok and result.tcc is None
+    assert result.systemd is True and result.launchd is False
+    recorded = sc.read_last_result(state)
+    assert recorded is not None and recorded["systemd"] is True and recorded["launchd"] is False

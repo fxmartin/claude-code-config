@@ -1903,13 +1903,15 @@ keeps it `online`.
   and the Mac may sleep between jobs. `-i` holds off idle sleep only: closing
   the lid still sleeps the MacBook unless it runs in clamshell mode (on power,
   with an external display), so keep the M3 Max open or docked. Elsewhere
-  nothing is added; the Linux equivalent (`systemd-inhibit`) is a follow-up for
-  a Linux worker. A plain drain without `--worker` is not wrapped. The wrapper
+  nothing is added, and on Linux nothing is needed: the Hetzner dev box is a
+  server that never idle-sleeps, so neither `caffeinate` nor `systemd-inhibit`
+  wraps its jobs (Story 35.2-008 — see "Linux worker on the Hetzner dev box"
+  below). A plain drain without `--worker` is not wrapped. The wrapper
   must *become* the job: the queue links a job to its run by the pid it
   spawned and reads the job's state from that process's exit code.
   `caffeinate` keeps both (its original process execs the job while a forked
   child holds the assertion); `systemd-inhibit` runs the job as its child, so
-  the follow-up cannot be a drop-in.
+  it could never have been a drop-in.
 - **Stopping it.** launchd stops the worker with SIGTERM (`launchctl bootout`,
   which every reinstall of the plist runs, or `kickstart -k`), and the drain
   takes it as it takes Ctrl-C: it stops each running job (SIGTERM to its
@@ -2193,6 +2195,95 @@ launchd.user.agents.sdlc-queue.serviceConfig = {
 nullable: an older `queue.db` upgrades in place and its rows read as "run
 anywhere, held by nobody". `worker` is set by the claim verbs and cleared with
 `claimed_by`.
+
+### Linux worker on the Hetzner dev box (Story 35.2-008)
+
+The Hetzner `dev-server` (Ubuntu 24.04 x86_64, 4 CPU / 7 GB, Determinate Nix,
+`systemd --user` with lingering on) drains the `claude-shared` pool as a third
+worker named `dev`, beside `m3max` and `home-lab`. A shared-pool job then runs
+even when both Macs are busy or gated by a GUI dialog nobody can answer
+remotely; the box has no Keychain, no TCC and no outbound filter in front of its
+agents. It is the same verb as the Macs' LaunchAgent with a different
+supervisor: `templates/systemd/sdlc-worker.service`.
+
+**Bootstrap** (`scripts/fleet-bootstrap.sh`, run inside the dev shell because
+every tool lives there, not on the login PATH):
+
+```bash
+ssh -J home-lab dev-server
+nix develop ~/.config/nix-dev-env -c \
+  ~/Work/claude-code-config/scripts/fleet-bootstrap.sh --queue-url http://home-lab.<tailnet>:8790
+```
+
+`install.sh --core` and `scripts/deploy.sh` are platform-neutral, but
+`deploy.sh` only *updates* a plugin that is already installed and neither writes
+the fleet config nor installs a unit, so the script wraps them: `install.sh
+--core`; `claude plugin marketplace add` and `claude plugin install
+autonomous-sdlc@fx-claude-config` when absent; `deploy.sh` (the plugin pointer
+and `sdlc` as a `uv tool`); `gh auth setup-git`, so git authenticates through
+`gh` and `GIT_TERMINAL_PROMPT=0` makes a missing credential fail at once;
+`~/.sdlc-fleet.yaml` naming the queue (an existing file is never overwritten);
+`sdlc doctor --exit-code`; and finally the unit — copied, enabled and started.
+Doctor runs *before* the unit: a worker that has not registered yet is a `FAIL`
+by design, so judging the bootstrap after step 7 would fail every first run. Its
+status is the script's exit status, returned once the unit is in place so a
+re-run can repair a worker that is down. Every step is idempotent: a second run
+reinstalls nothing, restarts nothing and leaves every file byte-identical
+(`tests/fleet-bootstrap.bats`); `--dry-run` prints the steps and `--skip-service`
+stops short of the unit.
+
+- **The unit.** `ExecStart` is `/nix/var/nix/profiles/default/bin/nix develop
+  %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared
+  --follow`: the nix binary by absolute path, then the dev shell supplies
+  `claude`, `gh`, `uv` and `node`; `~/.local/bin` (the `sdlc` uv tool) is on the
+  unit's `PATH`. `Restart=always` (not `on-failure`: exit 75, a controller
+  reinstalled under the worker, is a clean exit that must still restart),
+  `RestartSec=30` like the LaunchAgent's `ThrottleInterval`, `KillMode=mixed` and
+  `TimeoutStopSec=60` so the worker alone gets SIGTERM and has the 40 s it needs
+  to stop two jobs. It starts at boot, because `loginctl enable-linger` is on.
+  Logs go to the journal: `journalctl --user -u sdlc-worker -f`. `XDG_STATE_HOME`
+  is pinned to `~/.local/state`, as for the Macs.
+- **Identity.** On Linux the `tailscale` CLI works unattended, so the queue
+  service identifies the worker by `tailscale whois` (`tag:trusted`) and the #833
+  misreport does not apply. `SDLC_QUEUE_TOKEN` is only the fallback: put it in
+  `~/.config/sdlc/worker.env` (mode 0600; the bootstrap creates it empty and
+  re-asserts the mode), which the unit reads through an optional
+  `EnvironmentFile=-`. Never in the unit.
+- **Pools are a capability of the login on the box.** The shared Max
+  (`mail@fxmartin.me`, Max 20x) is `claude-shared`; the unit declares nothing
+  else. The `codex` harness is advertised only while its CLI is on the PATH, and
+  a codex stage needs both that and the `codex-shared` pool, so `dev` is offered
+  none until Codex is installed *and* its login is declared: add `--pool
+  codex-shared` to the unit then. A `claude-shared` job goes to the least-loaded
+  of `home-lab` and `dev`.
+- **Repo paths.** A job enqueued from the XPS carries
+  `/home/fxmartin/Work/claude-code-config`. No such path exists on `dev`, whose
+  login is `fx`, so the worker resolves the clone under *its own* home —
+  `/home/fx/Work/claude-code-config` — the way the Macs map it to
+  `/Users/fxmartin/…`, and clones it from the job's recorded origin if absent.
+  `dev` is the first worker whose user name differs from the XPS's, so this
+  mapping is exercised rather than assumed (`test_repo_sync.py`).
+- **Self-checks.** The 35.2-007 probe runs from the unit's own context: one real
+  `claude -p ok` turn on Haiku, capped at 90 s; the TCC path test is skipped off
+  macOS. The worker records where it ran (`systemd: true`, recognised by its
+  cgroup being `…/sdlc-worker.service` — `INVOCATION_ID` alone would also be
+  inherited by a shell started from a service). Git access needs no GUI:
+  `gh auth setup-git` plus `GIT_TERMINAL_PROMPT=0`. The forge-credential
+  helper selection and sync stall watchdog of 35.2-006 are not part of this
+  story.
+- **`sdlc doctor`.** Where there is no LaunchAgent but the unit is installed
+  (`~/.config/systemd/user/sdlc-worker.service`, or under `$XDG_CONFIG_HOME`;
+  `run_doctor(worker_unit=…)` overrides it), the `Fleet worker` finding reads the
+  unit's environment (`Environment=` plus the `EnvironmentFile`, `%h` expanded)
+  instead of a plist, and its remedies name `systemctl --user` and `journalctl
+  --user -u sdlc-worker`. `worker-self-check` is `CLEAN` only for a probe that
+  completed from the unit, reads `TCC n/a (not macOS)`, and on failure points at
+  the journal — there is no dialog to answer. There is no `worker-dashboard`
+  finding: the unit advertises no `--dashboard-url`, so the XPS shows `dev`'s runs
+  with the worker name but header-only.
+- **Reaching the box.** The Tailscale SSH policy denies the XPS, and public port
+  22 is home-IP-only. Operate it through the home-lab: `ssh -J home-lab
+  dev-server`, or widen the ACL in `nix-install`.
 
 ## Using the fleet queue (`QueueClient`, Story 35.1-002)
 

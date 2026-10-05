@@ -1,0 +1,267 @@
+# ABOUTME: `sdlc doctor` on a Linux worker (Story 35.2-008): it finds the systemd --user unit
+# ABOUTME: instead of the LaunchAgent, reads its environment, and words every remedy for systemd.
+
+from __future__ import annotations
+
+import json
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from sdlc import doctor
+from sdlc import worker_selfcheck as sc
+from sdlc.doctor import (
+    WORKER_UNIT,
+    check_fleet_worker_installed,
+    check_worker_self_check,
+    read_worker_unit,
+    run_doctor,
+)
+from sdlc.queue import QueueStore
+from sdlc.registry import Registry
+
+AT = "2026-10-05T09:00:00+00:00"
+NOW = datetime(2026, 10, 5, 9, 0, 0, tzinfo=timezone.utc)
+HOME = Path("/home/fx")
+
+
+def _unit(tmp_path: Path, body: str | None = None) -> Path:
+    path = tmp_path / WORKER_UNIT
+    path.write_text(
+        textwrap.dedent(
+            body
+            or """\
+            [Unit]
+            Description=sdlc fleet worker dev
+
+            [Service]
+            ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared --follow
+            Environment=PATH=%h/.local/bin:/usr/bin
+            Environment=XDG_STATE_HOME=%h/.local/state GIT_TERMINAL_PROMPT=0
+            Environment="QUOTED=two words"
+            EnvironmentFile=-%h/.config/sdlc/worker.env
+            """
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+# --- reading the unit -----------------------------------------------------------------
+
+
+def test_the_units_environment_and_argv_are_read_with_specifiers_expanded(tmp_path) -> None:
+    env, argv = read_worker_unit(_unit(tmp_path), home=HOME)
+
+    assert env["PATH"] == "/home/fx/.local/bin:/usr/bin"
+    assert env["XDG_STATE_HOME"] == "/home/fx/.local/state"  # several per line
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["QUOTED"] == "two words"
+    assert argv[-5:] == ["--worker", "dev", "--pool", "claude-shared", "--follow"]
+
+
+def test_the_environment_file_supplies_the_fallback_token(tmp_path) -> None:
+    home = tmp_path / "home"
+    (home / ".config/sdlc").mkdir(parents=True)
+    (home / ".config/sdlc/worker.env").write_text(
+        "# the fallback\nSDLC_QUEUE_TOKEN=s3cret\nexport OTHER='a b'\n\n", encoding="utf-8"
+    )
+
+    env, _ = read_worker_unit(_unit(tmp_path), home=home)
+
+    assert env["SDLC_QUEUE_TOKEN"] == "s3cret"
+    assert env["OTHER"] == "a b"
+
+
+def test_an_absent_environment_file_is_fine_and_a_unit_is_never_a_crash(tmp_path) -> None:
+    env, _ = read_worker_unit(_unit(tmp_path), home=tmp_path / "nowhere")
+    assert "SDLC_QUEUE_TOKEN" not in env
+
+    with pytest.raises(OSError):
+        read_worker_unit(tmp_path / "missing.service", home=HOME)
+
+
+# --- the fleet-worker finding ---------------------------------------------------------
+
+
+def _heartbeat(store: Path, *, host: str) -> None:
+    queue = QueueStore(store)
+    queue.init()
+    queue.register_worker("dev", host=host, pools=["claude-shared"], harnesses=["claude"])
+
+
+def _pinned(tmp_path: Path) -> tuple[Path, Path]:
+    state = tmp_path / "home" / ".local" / "state"
+    return state, state / "sdlc" / "queue.db"
+
+
+def test_a_machine_with_neither_agent_is_not_nagged(tmp_path) -> None:
+    assert (
+        check_fleet_worker_installed(
+            agent_path=tmp_path / "x.plist", unit_path=tmp_path / "x.service", host="dev-server"
+        )
+        is None
+    )
+
+
+def test_an_installed_unit_that_has_not_registered_fails_with_a_systemd_remedy(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+
+    finding = check_fleet_worker_installed(
+        agent_path=tmp_path / "x.plist", unit_path=_unit(tmp_path), host="dev-server"
+    )
+
+    assert finding is not None and finding.status == "FAIL"
+    assert "not registered" in finding.detail
+    assert "systemctl --user" in finding.remedy and "journalctl --user -u sdlc-worker" in finding.remedy
+    assert "launchctl" not in finding.remedy
+
+
+def test_a_unit_whose_worker_heartbeats_into_its_store_is_clean(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("SDLC_QUEUE_PATH", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(_pinned(tmp_path)[0]))
+    _, store = _pinned(tmp_path)
+    store.parent.mkdir(parents=True)
+    _heartbeat(store, host="dev-server")
+
+    finding = check_fleet_worker_installed(
+        agent_path=tmp_path / "x.plist",
+        unit_path=_unit(tmp_path),
+        host="dev-server",
+        queue_path=store,
+    )
+
+    assert finding is not None and finding.status == "CLEAN", finding
+    assert "dev" in finding.detail and "online" in finding.detail
+
+
+def test_a_unit_that_cannot_be_read_is_a_fail_naming_the_template(tmp_path) -> None:
+    broken = tmp_path / WORKER_UNIT
+    broken.write_bytes(b"\xff\xfe not utf-8")
+
+    finding = check_fleet_worker_installed(
+        agent_path=tmp_path / "x.plist", unit_path=broken, host="dev-server"
+    )
+
+    assert finding is not None and finding.status == "FAIL"
+    assert "templates/systemd/sdlc-worker.service" in finding.remedy
+
+
+def test_the_launch_agent_still_wins_where_both_exist(tmp_path, monkeypatch) -> None:
+    # A Mac has no systemd, but a stray unit must not hide the plist's finding.
+    import plistlib
+
+    plist = tmp_path / "com.fxmartin.sdlc-worker.plist"
+    plist.write_bytes(plistlib.dumps({"Label": "x", "EnvironmentVariables": {}}))
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "q.db"))
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+
+    finding = check_fleet_worker_installed(
+        agent_path=plist, unit_path=_unit(tmp_path), host="dev-server"
+    )
+
+    assert finding is not None and "LaunchAgent" in finding.remedy
+
+
+# --- the self-check finding on Linux --------------------------------------------------
+
+
+def _state(tmp_path: Path, **fields) -> Path:
+    state = tmp_path / "state"
+    state.mkdir()
+    payload = {"ok": True, "at": AT, "reason": None, "tcc": None, "launchd": False, "systemd": True}
+    payload.update(fields)
+    (state / sc.STATE_FILENAME).write_text(json.dumps(payload))
+    return state
+
+
+def _self_check(tmp_path, state, **kwargs):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    return check_worker_self_check(
+        state_dir=state, claude_dir=home / ".claude", home=home, system="Linux", **kwargs
+    )
+
+
+def test_a_probe_from_the_unit_is_clean_and_tcc_is_not_applicable(tmp_path) -> None:
+    finding = _self_check(tmp_path, _state(tmp_path), service="systemd")
+
+    assert (finding.check, finding.status) == ("worker-self-check", "CLEAN")
+    assert "systemd unit" in finding.detail and AT in finding.detail
+    assert "TCC n/a" in finding.detail
+
+
+def test_a_probe_from_a_shell_is_not_clean_and_says_to_restart_the_unit(tmp_path) -> None:
+    finding = _self_check(tmp_path, _state(tmp_path, systemd=False), service="systemd")
+
+    assert finding.status == "WARN"
+    assert "shell" in finding.detail and "launchd" not in finding.detail
+    assert finding.remedy == "systemctl --user restart sdlc-worker"
+
+
+def test_a_failed_probe_points_at_the_journal_not_at_a_mac_dialog(tmp_path) -> None:
+    finding = _self_check(
+        tmp_path, _state(tmp_path, ok=False, reason="agent probe failed (exit 1): not logged in"),
+        service="systemd",
+    )
+
+    assert finding.status == "FAIL"
+    assert "not logged in" in finding.detail
+    assert "journalctl --user -u sdlc-worker" in finding.remedy
+    assert "Keychain" not in finding.remedy and "Mac" not in finding.remedy
+
+
+def test_no_recorded_probe_warns_with_the_systemd_restart(tmp_path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    finding = _self_check(tmp_path, empty, service="systemd")
+
+    assert finding.status == "WARN" and "no self-check recorded" in finding.detail
+    assert finding.remedy == "systemctl --user restart sdlc-worker"
+
+
+def test_the_default_service_is_still_launchd(tmp_path) -> None:
+    finding = _self_check(tmp_path, _state(tmp_path, launchd=True, systemd=False))
+
+    assert finding.status == "CLEAN" and "LaunchAgent" in finding.detail
+
+
+# --- run_doctor on a Linux box --------------------------------------------------------
+
+
+def test_run_doctor_reports_the_worker_and_its_self_check_from_the_unit(tmp_path, monkeypatch) -> None:
+    from test_doctor import _healthy_install  # the shared healthy-install fixture
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    claude_dir, repo_root = _healthy_install(tmp_path)
+
+    def report(unit: Path):
+        return run_doctor(
+            repo_root=repo_root,
+            claude_dir=claude_dir,
+            db_path=tmp_path / "ledger.db",
+            queue_path=tmp_path / "queue.db",
+            registry=Registry(tmp_path / "registry.json"),
+            dep_probe=lambda _b: True,
+            worker_plist=tmp_path / "absent.plist",
+            worker_unit=unit,
+        )
+
+    checks = {f.check for f in report(tmp_path / "absent.service").findings}
+    assert not {"fleet-worker", "worker-self-check", "worker-dashboard"} & checks
+
+    found = {f.check: f for f in report(_unit(tmp_path)).findings}
+    assert found["fleet-worker"].status == "FAIL"  # installed, nothing registered yet
+    assert "systemctl" in found["worker-self-check"].remedy
+    assert "worker-dashboard" not in found  # the Linux unit advertises no dashboard

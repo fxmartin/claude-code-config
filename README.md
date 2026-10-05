@@ -202,6 +202,18 @@ See [`docs/controller-architecture.md`](docs/controller-architecture.md) for the
 
 ---
 
+#### Fleet workers — the Linux dev box (Story 35.2-008)
+
+Besides the Macs' LaunchAgents (`templates/launchd/`), the Hetzner `dev-server` drains the `claude-shared` pool as worker `dev` from a `systemd --user` unit, `templates/systemd/sdlc-worker.service` — a headless box with no Keychain, TCC or outbound filter to stall an agent. Every tool lives in the nix dev shell, so bootstrap from inside it; the script is idempotent and wraps `install.sh --core` + `scripts/deploy.sh`:
+
+```bash
+ssh -J home-lab dev-server       # Tailscale SSH denies the XPS; public port 22 is home-IP-only
+nix develop ~/.config/nix-dev-env -c scripts/fleet-bootstrap.sh --queue-url http://home-lab.<tailnet>:8790
+journalctl --user -u sdlc-worker -f    # the worker's log; `sdlc queue workers` should list `dev`
+```
+
+The unit runs `nix develop … -c sdlc queue run --worker dev --pool claude-shared --follow` with `Restart=always`. Identity is `tailscale whois`; `SDLC_QUEUE_TOKEN` is only a fallback, read from `~/.config/sdlc/worker.env` (0600). No `caffeinate`/`systemd-inhibit` — a server does not sleep. Details, the `sdlc doctor` findings and the repo-path mapping across home directories: [`docs/controller-architecture.md`](docs/controller-architecture.md#linux-worker-on-the-hetzner-dev-box-story-352-008).
+
 ### Cross-harness builds — run the pipeline on Claude *or* Codex (Epic-20/21)
 
 The build is split into two **independent** layers, so either can be Claude or Codex:
