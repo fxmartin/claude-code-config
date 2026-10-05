@@ -20,7 +20,7 @@
 #   2. claude plugin marketplace add / install   the fx-claude-config marketplace
 #                                                and the autonomous-sdlc plugin
 #   3. scripts/deploy.sh                      plugin update + `sdlc` as a uv tool
-#   4. gh auth setup-git                      git authenticates through gh, never a prompt
+#   4. gh auth setup-git (+ glab's helper)    git authenticates through gh/glab, never a prompt
 #   5. ~/.sdlc-fleet.yaml                     queue_url: names the fleet queue
 #   6. `sdlc doctor --exit-code`              the verdict on steps 1-5
 #   7. templates/systemd/sdlc-worker.service  installed, enabled and started
@@ -56,6 +56,9 @@ DEPLOY_SH="${DEPLOY_SH:-${SCRIPT_DIR}/deploy.sh}"
 UNIT_TEMPLATE="${UNIT_TEMPLATE:-${REPO_ROOT}/templates/systemd/sdlc-worker.service}"
 MARKETPLACE="fx-claude-config"
 PLUGIN="autonomous-sdlc"
+# The local GitLab every GitLab-master repo uses (.sdlc-forge.yaml gitlab_url).
+GITLAB_URL="${SDLC_GITLAB_URL:-http://gitlab.test}"
+GITLAB_HOSTNAME="${GITLAB_URL#*://}"
 
 UNIT_NAME="sdlc-worker.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
@@ -149,10 +152,26 @@ fi
 log "scripts/deploy.sh"
 run "${DEPLOY_SH}"
 
-# 4. git authenticates through gh's credential helper; with GIT_TERMINAL_PROMPT=0
-#    (the unit sets it) a missing credential fails at once instead of at a prompt.
+# 4. git authenticates through each forge CLI's credential helper; with
+#    GIT_TERMINAL_PROMPT=0 (the unit sets it) a missing credential fails at once
+#    instead of at a prompt. GH_PATH=gh keeps gh's helper a PATH lookup: inside
+#    the dev shell gh would write its own /nix/store path, which a garbage
+#    collection after a dev-shell update deletes.
 log "gh auth setup-git"
-run gh auth setup-git
+run env GH_PATH=gh gh auth setup-git
+# Most ~/Work repos live on the local GitLab and are private, so without its
+# helper every GitLab clone here fails — and while this worker reports free
+# slots, its peers defer GitLab jobs to it (review of #851).
+if command -v glab >/dev/null 2>&1 \
+  && glab auth status --hostname "${GITLAB_HOSTNAME}" >/dev/null 2>&1; then
+  log "glab credential helper for ${GITLAB_URL}"
+  run git config --global --replace-all "credential.${GITLAB_URL}.helper" '!glab auth git-credential'
+else
+  warn "glab is missing or not logged in to ${GITLAB_HOSTNAME}: this worker can only sync GitHub repos.
+         A GitLab job it claims fails its clone and backs off here while peers defer to its free
+         slots — log in (glab auth login --hostname ${GITLAB_HOSTNAME}) and re-run, keep the unit
+         stopped, or pin GitLab jobs with --host home-lab."
+fi
 
 # 5. Which queue the worker drains. An existing file is the operator's: never
 #    overwritten, but a different URL is worth saying out loud. The URL is data,

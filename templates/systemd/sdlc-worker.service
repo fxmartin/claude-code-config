@@ -56,9 +56,12 @@
 # own context (Story 35.2-007): one real `claude -p ok` turn on Haiku. The TCC
 # check is skipped off macOS. A box that cannot complete the turn stays up,
 # unregistered, and retries every 60 s — Restart= never loops on it. Git
-# authenticates through `gh auth setup-git` (fleet-bootstrap.sh runs it) with
+# authenticates through `gh auth setup-git` and, for http://gitlab.test,
+# `glab auth git-credential` (fleet-bootstrap.sh sets both) with
 # GIT_TERMINAL_PROMPT=0, so a missing credential fails at once, never at a
-# prompt.
+# prompt. Without a logged-in glab this worker can only sync GitHub repos: a
+# GitLab job fails its clone here while peers defer to this worker's free
+# slots, so keep the unit stopped or pin GitLab jobs with --host home-lab.
 #
 # No `caffeinate` or `systemd-inhibit`: on macOS each job runs under
 # `caffeinate -i` to stop the Mac idle-sleeping mid-build (35.2-004); a server

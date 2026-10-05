@@ -34,7 +34,10 @@ setup() {
         chmod +x "${TMP}/bin/${name}"
     }
 
-    stub gh 'exit 0'
+    # gh records GH_PATH so a test can see the helper is written as a PATH lookup.
+    stub gh 'echo "gh-env GH_PATH=${GH_PATH:-}" >>"${CALLS}"; exit 0'
+    # glab defaults to "not logged in" so a real glab on the test host never answers.
+    stub glab 'case "$1 $2" in "auth status") exit "${STUB_GLAB_AUTH_RC:-1}" ;; esac; exit 0'
     stub uv 'exit 0'
     stub loginctl 'echo Linger=yes'
     # `claude plugin …`: list/marketplace list read marker files that add/install write.
@@ -318,4 +321,46 @@ exit 0'
 
 @test "ci.yml bats job runs the fleet-bootstrap suite" {
     grep -q 'tests/fleet-bootstrap\.bats' "${BATS_TEST_DIRNAME}/../.github/workflows/ci.yml"
+}
+
+# --- git credentials for both forges (review of #851) ----------------------------------
+
+@test "gh's credential helper is written as a PATH lookup, not a /nix/store path" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "gh-env GH_PATH=gh" "${CALLS}"
+}
+
+@test "a glab logged in to the local GitLab becomes git's credential helper for it" {
+    STUB_GLAB_AUTH_RC=0 run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "glab auth status --hostname gitlab.test" "${CALLS}"
+    [ "$(git config --global --get-all credential.http://gitlab.test.helper)" = "!glab auth git-credential" ]
+}
+
+@test "a second run keeps exactly one GitLab credential helper" {
+    STUB_GLAB_AUTH_RC=0 run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    STUB_GLAB_AUTH_RC=0 run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    [ "$(git config --global --get-all credential.http://gitlab.test.helper | wc -l)" -eq 1 ]
+}
+
+@test "without a logged-in glab the box warns that GitLab jobs cannot sync, and still finishes" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    [[ "${output}" == *"only sync GitHub repos"* ]]
+    [[ "${output}" == *"--host home-lab"* ]]
+    [ -z "$(git config --global --get-all credential.http://gitlab.test.helper || true)" ]
+}
+
+@test "a dry run names the GitLab helper it would set and writes no git config" {
+    STUB_GLAB_AUTH_RC=0 run "${BOOTSTRAP}" --queue-url "${QUEUE}" --dry-run
+
+    [ "$status" -eq 0 ]
+    [[ "${output}" == *"credential.http://gitlab.test.helper"* ]]
+    [ ! -e "${HOME}/.gitconfig" ]
 }

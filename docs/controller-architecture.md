@@ -2280,9 +2280,20 @@ stops short of the unit.
   macOS. The worker records where it ran (`systemd: true`, recognised by its
   cgroup being `…/sdlc-worker.service` — `INVOCATION_ID` alone would also be
   inherited by a shell started from a service). Git access needs no GUI:
-  `gh auth setup-git` plus `GIT_TERMINAL_PROMPT=0`. The forge-credential
-  helper selection and sync stall watchdog of 35.2-006 are not part of this
-  story.
+  `gh auth setup-git` (run with `GH_PATH=gh`, so the helper stays a PATH lookup
+  rather than a `/nix/store` path a garbage collection deletes) plus
+  `GIT_TERMINAL_PROMPT=0`. The bootstrap also makes `glab auth git-credential`
+  the helper for `http://gitlab.test` when `glab` is logged in there, and warns
+  when it is not. **Without that helper `dev` can only sync GitHub repos**, and
+  that hurts more than it helps: most `~/Work` repos are private on the local
+  GitLab, so a GitLab job `dev` claims fails its clone and goes back to
+  `queued` while `dev` backs off privately (`queue_worker.py`), yet `dev` keeps
+  reporting free slots — and a peer skips a job another online worker with
+  more free slots could run (`queue.py`), so `home-lab` holds GitLab jobs back
+  until it is idle. Until `glab` is logged in on the box (or 35.2-006's
+  forge-credential selection lands): keep the unit stopped, or pin GitLab jobs
+  with `--host home-lab`. The sync stall watchdog of 35.2-006 is not part of
+  this story.
 - **`sdlc doctor`.** Where there is no LaunchAgent but the unit is installed
   (`~/.config/systemd/user/sdlc-worker.service`, or under `$XDG_CONFIG_HOME`;
   `run_doctor(worker_unit=…)` overrides it), the `Fleet worker` finding reads the

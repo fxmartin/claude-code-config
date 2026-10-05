@@ -215,7 +215,7 @@ nix develop ~/.config/nix-dev-env -c scripts/fleet-bootstrap.sh --queue-url http
 journalctl --user -u sdlc-worker -f    # the worker's log; `sdlc queue workers` should list `dev`
 ```
 
-The unit runs `nix develop … -c sdlc queue run --worker dev --pool claude-shared --follow` with `Restart=always`. Identity is `tailscale whois`; `SDLC_QUEUE_TOKEN` is only a fallback, read from `~/.config/sdlc/worker.env` (0600). No `caffeinate`/`systemd-inhibit` — a server does not sleep. Details, the `sdlc doctor` findings and the repo-path mapping across home directories: [`docs/controller-architecture.md`](docs/controller-architecture.md#linux-worker-on-the-hetzner-dev-box-story-352-008).
+The unit runs `nix develop … -c sdlc queue run --worker dev --pool claude-shared --follow` with `Restart=always`. Identity is `tailscale whois`; `SDLC_QUEUE_TOKEN` is only a fallback, read from `~/.config/sdlc/worker.env` (0600). No `caffeinate`/`systemd-inhibit` — a server does not sleep. **GitLab repos need `glab` logged in on the box** (`glab auth login --hostname gitlab.test`, then re-run the bootstrap, which makes `glab` git's credential helper for it): without it `dev` can only sync GitHub repos, fails every GitLab clone, and — because it still reports free slots — makes `home-lab` hold GitLab jobs back. Until then keep the unit stopped or pin GitLab jobs with `--host home-lab`. Details, the `sdlc doctor` findings and the repo-path mapping across home directories: [`docs/controller-architecture.md`](docs/controller-architecture.md#linux-worker-on-the-hetzner-dev-box-story-352-008).
 
 ### Cross-harness builds — run the pipeline on Claude *or* Codex (Epic-20/21)
 
