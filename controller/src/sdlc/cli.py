@@ -1217,6 +1217,10 @@ def status(
                 f"{str(s.get('status', '?')):<13}{str(stage):<11}"
                 f"{pr_disp:<7}{models_disp}"
             )
+            # Story 35.5-001: a story parked on pushed recovery work says so —
+            # "fix pushed · awaiting CI · <sha> · PR #N" — instead of a bare status.
+            if s.get("status_detail"):
+                typer.echo(f"    ↳ {s['status_detail']}")
             # Sub-stage activity for an in-flight story (Story 11.1-002): the
             # latest progress milestone, e.g. "↳ build: editing cli.py". Absent
             # for finished stories or runs without streamed progress.

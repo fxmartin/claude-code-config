@@ -3071,15 +3071,63 @@ class Ledger:
             )
 
     def event_log(
-        self, run_id: str, story_id: str, level: str, source: str, message: str
+        self,
+        run_id: str,
+        story_id: str,
+        level: str,
+        source: str,
+        message: str,
+        *,
+        kind: str | None = None,
     ) -> None:
-        """Append an audit event row (mirrors every cmux log call)."""
+        """Append an audit event row (mirrors every cmux log call).
+
+        ``kind`` (optional) tags a machine-readable event — e.g. the
+        ``park-note`` a parked story's status row is read from (35.5-001).
+        """
         with self._connect() as conn:
+            if kind is None:
+                conn.execute(
+                    "INSERT INTO events(run_id, story_id, level, source, message) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (run_id or None, story_id or None, level, source or None, message),
+                )
+                return
             conn.execute(
-                "INSERT INTO events(run_id, story_id, level, source, message) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (run_id or None, story_id or None, level, source or None, message),
+                "INSERT INTO events(run_id, story_id, level, source, message, kind) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id or None, story_id or None, level, source or None, message, kind),
             )
+
+    def story_park_notes(self, run_id: str) -> dict[str, str]:
+        """The latest ``park-note`` label per story for ``run_id`` (Story 35.5-001).
+
+        A story parked on recovery work it pushed reads ``fix pushed · awaiting
+        CI`` (or ``· CI red``) in ``sdlc status`` and both dashboards. Read-only;
+        an unmigrated ledger without the ``kind`` column degrades to no notes.
+        """
+        if not self.db_path.exists():
+            return {}
+        try:
+            with self._connect_ro() as conn:
+                rows = conn.execute(
+                    "SELECT story_id, message FROM events WHERE id IN ("
+                    "SELECT MAX(id) FROM events WHERE run_id = ? AND kind = 'park-note' "
+                    "GROUP BY story_id)",
+                    (run_id,),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {r[0]: r[1] for r in rows if r[0]}
+
+    def story_status(self, run_id: str, story_id: str) -> str | None:
+        """The story row's current status, or ``None`` when it has no row."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM stories WHERE run_id = ? AND story_id = ?",
+                (run_id, story_id),
+            ).fetchone()
+        return row[0] if row else None
 
     def progress_log(
         self, run_id: str, story_id: str, stage: str, kind: str, message: str
@@ -4266,6 +4314,7 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         if name in _STAGES or name in recorded_stage_names
     )
     activity = ledger.latest_progress(rid)
+    park_notes = ledger.story_park_notes(rid)
     # Story 27.3-004: rate-limit stall time is its own dimension, kept apart
     # from stage durations so quota backoff never masquerades as agent runtime.
     stalls = ledger.run_stall_totals(rid)
@@ -4325,6 +4374,12 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         # for the story, or None for runs with no streamed progress (captured
         # fallback / older runs) so consumers degrade to the stage name.
         s["activity"] = activity.get(s["story_id"])
+        # Story 35.5-001: a story parked on a pushed recovery fix reads "fix
+        # pushed · awaiting CI" — only while it is still parked, so a later
+        # resume that lands it never shows a stale note.
+        s["status_detail"] = (
+            park_notes.get(s["story_id"]) if s.get("status") == "NEEDS_ATTENTION" else None
+        )
         # Rate-limit stall time for the story (Story 27.3-004), shown apart
         # from the duration; None (not 0) when the story never stalled.
         story_stall = stalls["by_story"].get(s["story_id"])
@@ -5904,6 +5959,13 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
         "red and can never turn the gate green. Then re-run the project's FULL "
         "test suite (not the subset you touched, and not a single file) before "
         "reporting tests_passing: only a green full suite may report true.\n"
+        # Story 35.5-001: a failure that is red on the base branch too is not the
+        # fix's doing; name it so the controller can exclude it from the verdict.
+        "If the suite still fails on a test that ALSO fails on the base branch in "
+        "this same environment (check it there; do not assume), list every "
+        "still-failing test in failing_tests and the ones that fail on the base "
+        "branch too in baseline_failures — the controller judges tests_passing as "
+        "'no NEW failures'. Omit both when the suite is green.\n"
         "Then emit the result block.\n"
         + _result_wrapper("bugfix-agent-response.schema.json")
     )
@@ -6436,7 +6498,12 @@ def _git_push(root: Path, branch: str) -> subprocess.CompletedProcess[str]:
 
 
 def _push_bugfix_commit(
-    story: Story, workdir: Path | None, ledger: Ledger, run_id: str
+    story: Story,
+    workdir: Path | None,
+    ledger: Ledger,
+    run_id: str,
+    *,
+    lease_sha: str | None = None,
 ) -> bool:
     """Push the story branch so the retried stage scores the *fixed* head (#527).
 
@@ -6459,7 +6526,14 @@ def _push_bugfix_commit(
         exists = _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
         if exists.returncode != 0:
             return True
-        push = _git_push(root, branch)
+        # Story 35.5-001: a fix already pushed this round may since have been
+        # amended by the commitlint re-ask; a lease on the sha we pushed lets
+        # that amend land without ever clobbering anyone else's push.
+        push = (
+            _push_story_branch(root, branch, lease_sha=lease_sha)
+            if lease_sha
+            else _git_push(root, branch)
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         ledger.event_log(
             run_id, story.id, "error", "controller",
@@ -6479,6 +6553,143 @@ def _push_bugfix_commit(
         "the fixed head",
     )
     return True
+
+
+# --- Story 35.5-001: committed recovery work is pushed, never stranded -------
+
+
+def _unpushed_commits(root: Path, branch: str) -> tuple[int, str]:
+    """``(count, tip sha)`` of the commits on ``branch`` that are not on ``origin``.
+
+    Counted against ``origin/<branch>`` when it is tracked, else against the base
+    branch (a branch that was never pushed). ``(0, "")`` for nothing to push — and
+    for any git failure or a missing branch, so a broken probe can only ever mean
+    "do what happened before this story", never push something unexpected.
+    """
+    try:
+        tip = _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        if tip.returncode != 0:
+            return 0, ""
+        remote = f"refs/remotes/origin/{branch}"
+        floor = remote if _git(root, "rev-parse", "--verify", "--quiet", remote).returncode == 0 else _base_ref(root)
+        if floor is None:
+            return 0, ""
+        ahead = _git(root, "rev-list", "--count", f"{floor}..refs/heads/{branch}")
+        count = int(ahead.stdout.strip()) if ahead.returncode == 0 else 0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0, ""
+    return (count, tip.stdout.strip()) if count > 0 else (0, "")
+
+
+def _remote_tracking_sha(root: Path, branch: str) -> str | None:
+    """The sha ``origin/<branch>`` last pointed at, or ``None`` when untracked."""
+    try:
+        res = _git(root, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return res.stdout.strip() or None if res.returncode == 0 else None
+
+
+def _try_push_branch(
+    root: Path, branch: str, *, lease_sha: str | None = None
+) -> tuple[bool, str]:
+    """:func:`_push_story_branch` that never raises: ``(ok, error text)``."""
+    try:
+        push = _push_story_branch(root, branch, lease_sha=lease_sha)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    if push.returncode == 0:
+        return True, ""
+    return False, push.stderr.strip() or "git push failed"
+
+
+@dataclass(frozen=True)
+class _PushedFix:
+    """Recovery work that reached ``origin`` — what a parked story is read from."""
+
+    sha: str
+    ci_red: bool = False
+    awaiting_ci: bool = False
+
+
+def _park_note_label(sha: str, pr_number: int | None, ci_state: str | None) -> str:
+    """The status row for a story parked on pushed work: ``fix pushed · awaiting CI · <sha> · PR #N``."""
+    parts = ["fix pushed", ci_state, sha[:7], f"PR #{pr_number}" if pr_number else None]
+    return " · ".join(p for p in parts if p)
+
+
+def _record_park_note(
+    ledger: Ledger, run_id: str, story_id: str, pr_number: int | None, fix: _PushedFix
+) -> None:
+    """Persist the parked story's status row as a ``park-note`` event (35.5-001)."""
+    ci_state = "CI red" if fix.ci_red else "awaiting CI" if fix.awaiting_ci else None
+    ledger.event_log(
+        run_id, story_id, "info", "controller",
+        _park_note_label(fix.sha, pr_number, ci_state), kind="park-note",
+    )
+
+
+def _string_list(value: Any) -> list[str] | None:
+    """``value`` as a list of strings, or ``None`` when it is not one."""
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        return None
+    return value
+
+
+def _tests_green_after_baseline(
+    data: dict[str, Any], ledger: Ledger, run_id: str, story_id: str
+) -> bool:
+    """The bugfix envelope's ``tests_passing`` verdict, net of baseline failures.
+
+    A test the agent saw fail on the base branch in the same environment (a
+    macOS-only bats failure) is not the fix's doing. With ``baseline_failures``
+    and the full ``failing_tests`` list both reported, the verdict is "no *new*
+    failure". Anything less (older agent, no enumeration, a non-FIXED round)
+    leaves the reported verdict untouched.
+    """
+    reported = bool(data.get("tests_passing"))
+    baseline = _string_list(data.get("baseline_failures")) or []
+    if not baseline:
+        return reported
+    ledger.event_log(
+        run_id, story_id, "info", "controller",
+        f"bugfix baseline failure(s) also fail on the base branch and are excluded "
+        f"from the tests_passing verdict: {', '.join(baseline)}",
+    )
+    if reported or data.get("fix_status") != "FIXED":
+        return reported
+    failing = _string_list(data.get("failing_tests")) or []
+    return bool(failing) and set(failing) <= set(baseline)
+
+
+def _preserve_unpushed_on_teardown(
+    ledger: Ledger, run_id: str, story_id: str, root: Path, path: str
+) -> bool:
+    """Push a closing story's unpushed commits; False keeps the worktree (35.5-001).
+
+    *Preserved* means on the remote: the #614 sandbox rule for every worker
+    clone. A merged story (DONE) is skipped — its branch is gone by design and
+    must not be resurrected. A rejected push keeps the worktree and names the sha.
+    """
+    if ledger.story_status(run_id, story_id) == "DONE":
+        return True
+    branch = f"feature/{story_id}"
+    count, tip = _unpushed_commits(root, branch)
+    if not count:
+        return True
+    ok, error = _try_push_branch(root, branch)
+    if ok:
+        ledger.event_log(
+            run_id, story_id, "info", "controller",
+            f"teardown: {count} unpushed commit(s) pushed to {branch} ({tip})",
+        )
+        return True
+    ledger.event_log(
+        run_id, story_id, "warn", "controller",
+        f"teardown: {count} commit(s) on {branch} ({tip}) are not on origin and the "
+        f"push failed ({error}); worktree kept at {path} so no commit is lost",
+    )
+    return False
 
 
 def _base_ref(root: Path) -> str | None:
@@ -7097,6 +7308,10 @@ def _teardown_story_workdir(
             f"could not fetch feature/{story_id} back from sandbox clone {path}; "
             "clone kept so no commit is lost",
         )
+        return
+    # Story 35.5-001: "preserved" means on the remote. Commits only on this
+    # machine are pushed first; a rejected push keeps the worktree.
+    if not _preserve_unpushed_on_teardown(ledger, run_id, story_id, Path.cwd(), path):
         return
     if remove_story_worktree(Path.cwd(), Path(path)):
         ledger.event_log(
@@ -8798,6 +9013,7 @@ def _run_story(
                 opts,
             )
         regated = False  # issue #794: one merge re-gate per stage
+        pushed_fix: _PushedFix | None = None  # story 35.5-001: a fix already on origin
         while True:
             # Issue #427: resolve the (harness, model) for this dispatch *before*
             # the ledger write and the estimate, so both record the identical
@@ -9067,35 +9283,50 @@ def _run_story(
                 # reviewer reported (`change_count`) — a cross-file rejection gets
                 # one more round than a single-line one. Every other stage keeps
                 # the flat MAX_BUGFIX_ATTEMPTS.
-                if bugfix_attempts >= _bugfix_budget(stage, result):
-                    # Recovery exhausted (AC2). R10: never discard committed work —
-                    # if the agent already committed the story branch, park it for
-                    # manual push/MR rather than reporting an outright failure.
-                    return _exhausted_status(
-                        kind, stage, story.id, pr_number, ledger, run_id
-                    )
-
-                bugfix_attempts += 1
-                bugfix_seq += 1
-                bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
-                if stage == "merge":
-                    # Issue #794: the merge agent may have advanced the remote
-                    # branch (a drift merge); fast-forward the worktree first so
-                    # the bugfix commit is not pushed non-fast-forward over it.
-                    if not _sync_branch_to_remote(workdir or Path.cwd(), f"feature/{story.id}"):
-                        ledger.event_log(
-                            run_id, story.id, "warn", "controller",
-                            f"could not fast-forward feature/{story.id} to its remote "
-                            "head before bugfix (diverged or no remote branch); the "
-                            "bugfix push may be rejected",
+                # Story 35.5-001: a round whose pushed fix came back CI-red loops
+                # straight into one more round while the budget lasts.
+                while True:
+                    if bugfix_attempts >= _bugfix_budget(stage, result):
+                        # Recovery exhausted (AC2). R10: never discard committed
+                        # work — commits are pushed and the story parked for
+                        # attention rather than reported as an outright failure.
+                        return _exhausted_status(
+                            kind, stage, story.id, pr_number, ledger, run_id,
+                            workdir=workdir, pushed_fix=pushed_fix,
                         )
-                if not _run_bugfix(
-                    story, stage, failure, opts, ledger, run_id, dispatch,
-                    bpath, bugfix_seq,
-                    escalation_steps=stage_escalation_base + bugfix_attempts,
-                ):
+
+                    bugfix_attempts += 1
+                    bugfix_seq += 1
+                    bpath = logs_dir / f"{story.id}-bugfix-{stage}-{bugfix_seq}.log"
+                    if stage == "merge":
+                        # Issue #794: the merge agent may have advanced the remote
+                        # branch (a drift merge); fast-forward the worktree first so
+                        # the bugfix commit is not pushed non-fast-forward over it.
+                        if not _sync_branch_to_remote(workdir or Path.cwd(), f"feature/{story.id}"):
+                            ledger.event_log(
+                                run_id, story.id, "warn", "controller",
+                                f"could not fast-forward feature/{story.id} to its remote "
+                                "head before bugfix (diverged or no remote branch); the "
+                                "bugfix push may be rejected",
+                            )
+                    bugfix_round = _run_bugfix_round(
+                        story, stage, failure, opts, ledger, run_id, dispatch,
+                        bpath, bugfix_seq,
+                        escalation_steps=stage_escalation_base + bugfix_attempts,
+                        root=workdir or Path.cwd(), pr_number=pr_number,
+                    )
+                    pushed_fix = bugfix_round.pushed_fix() or pushed_fix
+                    if bugfix_round.ci_red:
+                        failure = (
+                            f"CI pipeline is red on bugfix commit {bugfix_round.pushed_sha} "
+                            f"pushed to feature/{story.id}; fix what the pipeline reports"
+                        )
+                        continue
+                    break
+                if not bugfix_round.fixed:
                     return _exhausted_status(
-                        kind, stage, story.id, pr_number, ledger, run_id
+                        kind, stage, story.id, pr_number, ledger, run_id,
+                        workdir=workdir, pushed_fix=pushed_fix,
                     )
                 # Story 12.2-002: the bugfix agent authors a commit too — lint its
                 # message and amend early. This is best-effort (no park): the stage
@@ -9111,7 +9342,8 @@ def _run_story(
                 # and exhaust the budget on a diff that never moved. A failed
                 # push is not silently retried — the story parks NEEDS_ATTENTION
                 # with the work preserved on the branch (R10).
-                if not _push_bugfix_commit(story, workdir, ledger, run_id):
+                push_kwargs = {"lease_sha": pushed_fix.sha} if pushed_fix else {}
+                if not _push_bugfix_commit(story, workdir, ledger, run_id, **push_kwargs):
                     ledger.event_log(
                         run_id, story.id, "warn", "controller",
                         f"bugfix fix could not reach origin/feature/{story.id} — "
@@ -9238,6 +9470,14 @@ def _bugfix_budget(stage: str, result: AgentResult | None) -> int:
     )
 
 
+def _park_pushed(
+    ledger: Ledger, run_id: str, story_id: str, pr_number: int | None, fix: _PushedFix
+) -> str:
+    """Record the ``fix pushed · …`` status row and park the story (35.5-001)."""
+    _record_park_note(ledger, run_id, story_id, pr_number, fix)
+    return "NEEDS_ATTENTION"
+
+
 def _exhausted_status(
     kind: str,
     stage: str,
@@ -9245,8 +9485,18 @@ def _exhausted_status(
     pr_number: int | None,
     ledger: Ledger,
     run_id: str,
+    *,
+    workdir: Path | None = None,
+    pushed_fix: _PushedFix | None = None,
 ) -> str:
     """Terminal status once bounded recovery is exhausted (Story 12.1-001 AC2).
+
+    Story 35.5-001: before anything is decided, commits the story branch holds
+    that are not on ``origin`` are pushed, and the story parks ``NEEDS_ATTENTION``
+    for *every* ``kind`` — as it does when a bugfix round already pushed its fix
+    (``pushed_fix``). ``FAILED`` is reserved for a round that produced no commit.
+    A failed push still parks (the commits stay on the branch; teardown keeps the
+    worktree), and says so.
 
     R10: a contract failure (missing/malformed envelope) whose stage already
     produced its expected git artifact is parked ``NEEDS_ATTENTION`` for manual
@@ -9259,6 +9509,32 @@ def _exhausted_status(
     a genuine no-work failure is never masked. The parking decision is recorded
     in the ledger events.
     """
+    root = workdir or Path.cwd()
+    branch = f"feature/{story_id}"
+    count, tip = _unpushed_commits(root, branch)
+    if count:
+        ok, error = _try_push_branch(root, branch)
+        if not ok:
+            ledger.event_log(
+                run_id, story_id, "warn", "controller",
+                f"recovery exhausted; {count} unpushed commit(s) on {branch} ({tip}) "
+                f"could not be pushed ({error}); kept on the local branch",
+            )
+            return "NEEDS_ATTENTION"
+        ledger.event_log(
+            run_id, story_id, "warn", "controller",
+            f"recovery exhausted; {count} unpushed commit(s) pushed to {branch} ({tip})",
+        )
+        return _park_pushed(
+            ledger, run_id, story_id, pr_number,
+            _PushedFix(tip, awaiting_ci=pr_number is not None and _repo_has_ci_config(root)),
+        )
+    if pushed_fix is not None:
+        ledger.event_log(
+            run_id, story_id, "warn", "controller",
+            f"recovery exhausted; bugfix commit {pushed_fix.sha} is on {branch}",
+        )
+        return _park_pushed(ledger, run_id, story_id, pr_number, pushed_fix)
     if kind == "contract" and _stage_artifact_exists(stage, story_id, pr_number):
         ledger.event_log(
             run_id, story_id, "warn", "controller",
@@ -10668,6 +10944,27 @@ def _lint_stage_commit(
     return seq, True
 
 
+@dataclass(frozen=True)
+class _BugfixRound:
+    """One bugfix round's outcome (Story 35.5-001).
+
+    ``pushed_sha`` is the fix commit the round published to ``origin`` while
+    CI-adjudicating a not-green local verdict; ``ci_red`` says that pipeline
+    came back red (the loop spends one more round); ``awaiting_ci`` that it had
+    not finished when the gate's cap lapsed.
+    """
+
+    fixed: bool
+    pushed_sha: str | None = None
+    ci_red: bool = False
+    awaiting_ci: bool = False
+
+    def pushed_fix(self) -> _PushedFix | None:
+        if not self.pushed_sha:
+            return None
+        return _PushedFix(self.pushed_sha, ci_red=self.ci_red, awaiting_ci=self.awaiting_ci)
+
+
 def _run_bugfix(
     story: Story,
     failed_stage: str,
@@ -10688,7 +10985,88 @@ def _run_bugfix(
     or contract error during bugfix is itself a failure (no fix). ``attempt`` is
     a story-level monotonic sequence so each bugfix row is unique (the "bugfix"
     stage recurs across retries and stages and would otherwise collide on the
-    stages UNIQUE key).
+    stages UNIQUE key). The local-verdict-only form of :func:`_run_bugfix_round`:
+    it never pushes or consults CI.
+    """
+    return _run_bugfix_round(
+        story, failed_stage, failure, opts, ledger, run_id, dispatch,
+        transcript_path, attempt, escalation_steps=escalation_steps,
+    ).fixed
+
+
+def _adjudicate_pushed_fix(
+    story: Story,
+    opts: BuildOptions,
+    ledger: Ledger,
+    run_id: str,
+    root: Path,
+    pr_number: int | None,
+    pre_round_sha: str | None,
+) -> _BugfixRound:
+    """Publish a FIXED-but-not-green round's commit and let CI adjudicate (35.5-001).
+
+    The worker's local verdict is advisory wherever hosted CI exists: a fix the
+    agent committed is pushed (lease on the pre-round sha) before anything is
+    declared failed. With CI config and a PR the pipeline is polled through the
+    merge CI-gate seam — same grace, same cap — and a green counts as
+    ``tests_passing``. No CI or no PR: the local verdict stays authoritative.
+    """
+    branch = f"feature/{story.id}"
+    count, sha = _unpushed_commits(root, branch)
+    if not count:
+        return _BugfixRound(fixed=False)
+    ok, error = _try_push_branch(root, branch, lease_sha=pre_round_sha)
+    if not ok:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"bugfix commit {sha} could not be pushed to {branch} ({error}); "
+            "the local verdict stands",
+        )
+        return _BugfixRound(fixed=False)
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"bugfix commit {sha} pushed to {branch}; CI adjudicates",
+    )
+    if pr_number is None or not _repo_has_ci_config(root):
+        return _BugfixRound(fixed=False, pushed_sha=sha)
+    gate = _run_merge_ci_gate("merge", ledger, run_id, story, pr_number, opts, repo_root=root)
+    if gate is None:
+        return _BugfixRound(fixed=False, pushed_sha=sha)
+    if gate.status == CR_SUCCESS:
+        ledger.event_log(
+            run_id, story.id, "success", "controller",
+            f"CI is green on bugfix commit {sha}: counts as tests_passing",
+        )
+        return _BugfixRound(fixed=True, pushed_sha=sha)
+    if gate.status in (CR_FAILED, CR_UNKNOWN):
+        return _BugfixRound(fixed=False, pushed_sha=sha, ci_red=True)
+    # Still running at the cap, no pipeline registered, or an unreadable lookup:
+    # neither green nor red, so the local verdict stands and the push stays.
+    return _BugfixRound(fixed=False, pushed_sha=sha, awaiting_ci=gate.status == CR_PENDING)
+
+
+def _run_bugfix_round(
+    story: Story,
+    failed_stage: str,
+    failure: str,
+    opts: BuildOptions,
+    ledger: Ledger,
+    run_id: str,
+    dispatch: Dispatcher,
+    transcript_path: Path | None = None,
+    attempt: int = 1,
+    *,
+    escalation_steps: int = 0,
+    root: Path | None = None,
+    pr_number: int | None = None,
+) -> _BugfixRound:
+    """Dispatch the bugfix agent and judge the round (Story 35.5-001).
+
+    Like :func:`_run_bugfix`, but with ``root`` (the story's workdir) a round
+    that reports ``FIXED`` with ``tests_passing`` false and committed to
+    ``feature/<id>`` is pushed and handed to CI (:func:`_adjudicate_pushed_fix`)
+    instead of being written off; ``baseline_failures`` are excluded from the
+    local verdict first.
     """
     # Story 14.2-001: route the bugfix agent on the map's `bugfix` tier (its own
     # override beats it) instead of the unconfigured CLI default.
@@ -10724,6 +11102,9 @@ def _run_bugfix(
     )
     _log_effort_omission(ledger, run_id, story.id, effort_choice)
     out = str(transcript_path) if transcript_path is not None else ""
+    pre_round_sha = (
+        _remote_tracking_sha(root, f"feature/{story.id}") if root is not None else None
+    )
     prompt = render_bugfix_prompt(story, failed_stage, failure)
     sink = _make_progress_sink(ledger, run_id, story.id, "bugfix", attempt)
     ledger.event_log(
@@ -10758,10 +11139,17 @@ def _run_bugfix(
         ledger.event_log(
             run_id, story.id, "error", "controller", f"bugfix dispatch failed: {exc}"
         )
-        return False
+        return _BugfixRound(fixed=False)
 
     data = result.data
-    fixed = data.get("fix_status") == "FIXED" and bool(data.get("tests_passing"))
+    reported_fixed = data.get("fix_status") == "FIXED"
+    fixed = reported_fixed and _tests_green_after_baseline(data, ledger, run_id, story.id)
+    adjudication = _BugfixRound(fixed=fixed)
+    if reported_fixed and not fixed and root is not None:
+        adjudication = _adjudicate_pushed_fix(
+            story, opts, ledger, run_id, root, pr_number, pre_round_sha
+        )
+        fixed = adjudication.fixed
     ledger.stage_finish(
         run_id,
         story.id,
@@ -10783,7 +11171,7 @@ def _run_bugfix(
         f"bugfix {'resolved' if fixed else 'exhausted'}: {failed_stage}",
     )
     _surface_finding_dispositions(ledger, run_id, story.id, data)
-    return fixed
+    return replace(adjudication, fixed=fixed)
 
 
 def _surface_finding_dispositions(
