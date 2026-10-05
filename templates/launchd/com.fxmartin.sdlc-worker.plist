@@ -47,6 +47,18 @@
   worker (this plist's ProgramArguments name m3max); a lost network keeps its
   jobs running, and KeepAlive restarts it only if it exits.
 
+  Before it registers, the worker proves it can run an agent from *this* LaunchAgent's
+  context (Story 35.2-007): a TCC path check on ~/.claude (settings.json, CLAUDE.md,
+  hooks, commands, agents, skills), then one real `claude -p ok` turn on Haiku capped
+  at 90 s. It must do so itself: over ssh these checks pass (sshd carries disk access
+  and sees no dialogs), so a Mac that looks healthy from a shell can still stall every
+  agent here. If ~/.claude resolves into ~/Documents, ~/Desktop, ~/Downloads or a
+  cloud-drive root, launchd agents are denied it — move the checkout (nix-install:
+  ~/.config/nix-install). If a Keychain / Privacy & Security dialog is waiting on the
+  Mac, answer it; the worker stays up, unregistered, retries every 60 s and registers
+  as soon as a probe completes — KeepAlive never restart-loops it. See
+  `sdlc doctor` (worker-self-check) and docs/controller-architecture.md.
+
   The dashboard-url argument advertises the dashboard the sibling LaunchAgent
   (com.fxmartin.sdlc-dashboard.plist, Story 35.4-006) serves on this Mac's
   tailnet address. Each run's fleet record carries it, and the XPS dashboard

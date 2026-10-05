@@ -310,6 +310,16 @@ def _string_list(body: Body, key: str) -> list[str] | None:
     return value
 
 
+def _self_check(body: Body) -> dict[str, Any] | None:
+    """A heartbeat's ``self_check`` (Story 35.2-007): ``{ok: bool, at?, reason?}`` or absent."""
+    value = body.get("self_check")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("ok"), bool):
+        raise _ApiError(400, "self_check must be an object with a boolean 'ok'")
+    return value
+
+
 def _int(body: Body, key: str, *, default: int | None = None) -> int | None:
     value = body.get(key, default)
     if value is None:
@@ -434,6 +444,7 @@ class _Routes:
                 slots=_int(body, "slots", default=1) or 0,
                 slots_free=_int(body, "slots_free"),
                 now=self._now(),
+                self_check=_self_check(body),
             )
         except QueueError as exc:
             raise _ApiError(400, str(exc)) from exc

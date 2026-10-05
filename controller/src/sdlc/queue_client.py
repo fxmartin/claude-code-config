@@ -377,6 +377,7 @@ class QueueClient:
         slots: int = 1,
         slots_free: int | None = None,
         now: datetime | None = None,
+        self_check: Mapping[str, object] | None = None,
     ) -> WorkerRecord:
         """``POST /workers`` — register this worker, or heartbeat if it already has."""
         body: dict[str, Any] = {
@@ -391,6 +392,8 @@ class QueueClient:
             body["sandbox"] = sandbox
         if slots_free is not None:
             body["slots_free"] = slots_free
+        if self_check is not None:
+            body["self_check"] = dict(self_check)
         return self._worker(self._call("POST", "/workers", body))
 
     def list_workers(self) -> list[WorkerRecord]:

@@ -3548,6 +3548,11 @@ def _format_since(now: datetime, moment: str) -> str:
     return f"{seconds // 86400}d ago"
 
 
+def _self_check_reason(worker) -> str:
+    """Why a worker's own probe failed (Story 35.2-007), for the STATUS column."""
+    return str((worker.self_check or {}).get("reason") or "self-check failed")
+
+
 @queue_app.command("workers")
 @_queue_errors
 def queue_workers_cmd(
@@ -3562,7 +3567,8 @@ def queue_workers_cmd(
     local one: its host, the subscription pools it serves, free/total agent
     slots as of its last heartbeat, how long ago that was, and whether it is
     `online`. A worker silent for three heartbeats (90 s) is `offline`, and the
-    leases it held become reclaimable. `--json` adds the harnesses, sandbox
+    leases it held become reclaimable. A worker whose own agent probe failed
+    (Story 35.2-007) reads `online — cannot run agents: <why>` with 0 free slots. `--json` adds the harnesses, sandbox
     runtime and repos each worker advertised.
     """
     from sdlc.queue_client import open_queue
@@ -3581,8 +3587,9 @@ def queue_workers_cmd(
     for w in workers:
         typer.echo(
             f"{w.name:<16}{w.host:<20}{','.join(w.pools) or '-':<34}"
-            f"{f'{w.slots_free}/{w.slots}':<8}{_format_since(now, w.last_heartbeat):<12}"
+            f"{f'{w.effective_slots_free}/{w.slots}':<8}{_format_since(now, w.last_heartbeat):<12}"
             f"{'online' if w.is_online(now) else 'offline'}"
+            f"{'' if w.can_run_agents else ' — cannot run agents: ' + _self_check_reason(w)}"
         )
     raise typer.Exit(code=0)
 
@@ -3797,6 +3804,13 @@ def queue_run_cmd(
     35.2-004) it claims nothing more, lets its running jobs finish and exits 75,
     so a supervisor (`KeepAlive`) restarts it on the new code.
 
+    Before its first registration a worker proves it can run an agent from its
+    own process context (Story 35.2-007): a TCC path check on `~/.claude`
+    (macOS), then one `claude -p ok` Haiku turn capped at 90 s. If the probe
+    stalls, the worker logs the cause once, registers nothing, claims nothing,
+    stays up and retries every 60 s, registering the moment a probe completes;
+    each heartbeat then carries `self_check: {ok, at, reason}`.
+
     Before launching a fresh job a worker syncs its clone (Story 35.2-002):
     `git fetch origin && git checkout -q main && git merge --ff-only
     origin/main` — the branch `origin/HEAD` names in place of `main` when the
@@ -3857,6 +3871,12 @@ def queue_run_cmd(
         raise typer.Exit(code=2)
     store.init()
 
+    self_check = None
+    if profile is not None:
+        from sdlc.worker_selfcheck import run_self_check
+
+        self_check = run_self_check
+
     result = run_queue(
         store,
         config=SchedulerConfig(
@@ -3871,6 +3891,7 @@ def queue_run_cmd(
         # The worker name is the claim holder, so the queue's `worker` column,
         # the lease renewals and the registry row all name the same party.
         identity=profile.name if profile is not None else None,
+        self_check=self_check,
     )
 
     if as_json:

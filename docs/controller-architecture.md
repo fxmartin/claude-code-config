@@ -1943,6 +1943,34 @@ keeps it `online`.
   `queue_service_plist` does for 35.1-003. Beside it, the **Worker dashboard**
   finding (Story 35.4-006) checks that the dashboard the worker advertises with
   `--dashboard-url` answers — see the fleet run registry below.
+- **Self-check before registering (Story 35.2-007).** Over ssh the worker's
+  disk and Keychain checks all pass — sshd carries disk access and sees no
+  dialogs — while the same agent under launchd stalls on a macOS dialog (Keychain,
+  Privacy & Security) or reads `~/.claude` through a TCC-protected folder
+  (`~/Documents`, `~/Desktop`, `~/Downloads`, a cloud-drive root) and is denied.
+  The cost used to be a 300 s stall per agent, found only after two failed fleet
+  jobs. So the worker runs the check itself, from its own process context
+  (`sdlc.worker_selfcheck`), before its first registration: first a path test on
+  `os.path.realpath` of `~/.claude` and of its `settings.json`, `CLAUDE.md`,
+  `hooks`, `commands`, `agents` and `skills` (macOS only; it fails fast with
+  `~/.claude/settings.json → ~/Documents/…: launchd agents cannot read TCC protected
+  folders; move the checkout (nix-install: ~/.config/nix-install)`), then one real
+  turn — the 34.1-002 entitlement probe, `claude -p ok --model <haiku id>
+  --output-format json` — under a 90 s cap that kills the probe's whole process
+  group. A completed turn registers the worker. A probe with no output in 90 s does
+  not: the worker logs `worker self-check failed: agent produced no output in 90s —
+  a dialog is probably waiting on this Mac …` (once per distinct cause), stays up
+  unregistered and claiming nothing — `KeepAlive` never restart-loops it — retries
+  every 60 s and registers the moment a probe completes, i.e. once the dialog was
+  answered. The heartbeat carries `self_check: {ok, at, reason}` (`workers.self_check`,
+  migration 13): `sdlc queue workers` reads `online — cannot run agents: <why>` and
+  `0/N` slots for a worker whose probe failed, and the matcher gives it no free slot
+  and does not defer to it. The worker also records each result, and where it ran,
+  in `~/.local/state/sdlc/worker-self-check.json`; **`sdlc doctor`** adds a
+  `worker-self-check` finding beside `Fleet worker` — the last probe result, its
+  timestamp and the TCC verdict — which is `CLEAN` only when that probe completed
+  from the LaunchAgent, not from the shell doctor runs in. A plain drain without
+  `--worker` never probes.
 
 `--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`) or,
 with a fleet URL, on the service's (Story 35.2-005). The registry (`workers`
