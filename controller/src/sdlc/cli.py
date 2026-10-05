@@ -1554,7 +1554,10 @@ def dashboard(
     ),
     port: int = typer.Option(8787, "--port", help="Port to bind (default: 8787)."),
     host: str = typer.Option(
-        "127.0.0.1", "--host", help="Host to bind (default: localhost-only)."
+        "127.0.0.1",
+        "--host",
+        help="Host to bind (default: localhost-only). A blank value is refused: it "
+        "would bind every interface.",
     ),
     open_browser: bool = typer.Option(
         False, "--open", help="Open the dashboard in a browser on start."
@@ -1592,6 +1595,18 @@ def dashboard(
         )
         if stop:
             raise typer.Exit(code=0)
+
+    # Story 35.4-006: Python binds a blank host as every interface, and a worker's
+    # LaunchAgent rendered while `tailscale ip -4` printed nothing passes exactly
+    # that — the login-less dashboard would serve on whatever network the Mac is
+    # on. Refused before any bind; --stop/--restart above still reach such a server.
+    if not host.strip():
+        typer.echo(
+            "error: --host is blank, which would bind every interface — pass the "
+            "address to serve on (e.g. `tailscale ip -4`), or omit it for localhost-only",
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
     # Story 12.1-002: never bind a server when running inside another build's
     # preflight test suite (sentinel set) — a project test that invokes `sdlc
@@ -3720,7 +3735,7 @@ def queue_run_cmd(
         "--dashboard-url",
         help="Origin of this worker's dashboard, e.g. http://m3max.<tailnet>:8787 "
         "(`sdlc dashboard --host <tailnet-ip>`). Pushed with each run so the XPS "
-        "dashboard can open its transcripts. Needs --worker.",
+        "dashboard can show its detail and open its transcripts. Needs --worker.",
     ),
 ) -> None:
     """Drain the host queue in the foreground — claim jobs and run them.

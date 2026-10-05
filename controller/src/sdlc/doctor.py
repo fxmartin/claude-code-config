@@ -47,6 +47,7 @@ __all__ = [
     "check_queue_service",
     "check_stashes",
     "check_usage_agreement",
+    "check_worker_dashboard",
     "run_doctor",
     "worst_status",
 ]
@@ -665,6 +666,92 @@ def check_fleet_worker(list_workers: Callable[[], list[WorkerRecord]], *, host: 
         "CLEAN",
         f"{', '.join(w.name for w in online)} registered and online ({host})",
     )
+
+
+# Story 35.4-006: the worker's own dashboard, which the XPS relays a remote run's
+# detail from (template: templates/launchd/com.fxmartin.sdlc-dashboard.plist).
+DASHBOARD_LABEL = "com.fxmartin.sdlc-dashboard"
+_DASHBOARD_PROBE_TIMEOUT_S = 3.0
+
+
+def _plist_option(args: list[str], flag: str) -> str | None:
+    """``flag``'s value in a ProgramArguments list (`--flag X` or `--flag=X`)."""
+    for i, arg in enumerate(args):
+        if arg == flag:
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg.startswith(f"{flag}="):
+            return arg.removeprefix(f"{flag}=")
+    return None
+
+
+def _dashboard_probe(origin: str) -> str | None:
+    """Why ``origin``'s dashboard does not answer, or None when it does.
+
+    A plain GET of `/favicon.ico` (a 204, no ledger read): read-only and quiet,
+    reached directly like the XPS reaches it — never through an env proxy.
+    """
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"{origin}/favicon.ico", timeout=_DASHBOARD_PROBE_TIMEOUT_S):
+            return None
+    except Exception as exc:  # noqa: BLE001 - any failure to answer is the finding
+        return str(getattr(exc, "reason", None) or exc)
+
+
+def check_worker_dashboard(
+    *,
+    agent_path: Path | None = None,
+    probe: Callable[[str], str | None] | None = None,
+) -> Finding | None:
+    """Does the dashboard this worker advertises answer? (Story 35.4-006)
+
+    ``None`` on a machine that never installed the worker LaunchAgent, and when
+    its plist cannot be read (:func:`check_fleet_worker_installed` reports that).
+    The XPS shows a remote run's stories, events and cost by relaying this
+    dashboard, so a worker that advertises none — or one that does not answer —
+    leaves every run it owns header-only there.
+
+    Only the plist's ``--dashboard-url`` counts: it is all `queue run` reads.
+    ``SDLC_DASHBOARD_URL`` in the agent's environment is a bare build's input,
+    which the worker ignores — its pushes would still blank the run's URL, so
+    counting it would report CLEAN for a dashboard the XPS is never told of.
+    """
+    from sdlc.registry import normalize_dashboard_url
+
+    path = agent_path or default_worker_plist()
+    if not path.exists():
+        return None
+    try:
+        plist = plistlib.loads(path.read_bytes())
+        args = [str(a) for a in plist.get("ProgramArguments") or []]
+    except Exception:  # noqa: BLE001 - see check_fleet_worker_installed
+        return None
+    name = "Worker dashboard"
+    remedy = (
+        "reinstall both agents from templates/launchd/ (the worker advertises it with "
+        f"--dashboard-url; `launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
+    )
+    advertised = _plist_option(args, "--dashboard-url")
+    if not advertised:
+        return Finding(
+            "worker-dashboard", name, "WARN",
+            "the worker advertises no dashboard URL — its runs show header-only on the XPS",
+            remedy,
+        )
+    try:
+        origin = normalize_dashboard_url(advertised)
+    except ValueError as exc:
+        return Finding("worker-dashboard", name, "WARN", f"the advertised URL is unusable: {exc}", remedy)
+    failure = (probe or _dashboard_probe)(origin)
+    if failure is not None:
+        return Finding(
+            "worker-dashboard", name, "WARN",
+            f"{origin} does not answer ({failure}) — its runs show header-only on the XPS",
+            remedy,
+        )
+    return Finding("worker-dashboard", name, "CLEAN", f"{origin} answers")
 
 
 def check_fleet_worker_installed(
@@ -1893,6 +1980,9 @@ def run_doctor(
     worker = check_fleet_worker_installed(agent_path=worker_plist, queue_path=queue_path)
     if worker is not None:
         findings.append(worker)
+    dashboard = check_worker_dashboard(agent_path=worker_plist)
+    if dashboard is not None:
+        findings.append(dashboard)
     if worker_plist.exists():
         findings.append(check_worker_self_check())
     return DoctorReport(findings=findings)

@@ -1848,10 +1848,12 @@ line and `--json` carry it; a host that never registered a worker is untouched.
 ### Resident worker on the M3 Max (Story 35.2-004)
 
 `templates/launchd/com.fxmartin.sdlc-worker.plist` runs `sdlc queue run --worker
-m3max --pool claude-m3 --pool codex-shared --follow` as a LaunchAgent so the Mac
+m3max --pool claude-m3 --pool codex-shared --dashboard-url
+http://<tailnet-ip>:8787 --follow` as a LaunchAgent so the Mac
 drains its queue from login on. It has the 35.1-003 service's shape (an
 absolute argv, a pinned environment, launchd's own log keys). The install in
-the template's header fills its `__HOME__` and `__USER__` placeholders with
+the template's header fills its `__HOME__`, `__USER__` and `__TAILNET_IP__`
+placeholders with
 `sed`, writes the result to `~/Library/LaunchAgents/` and loads it with
 `launchctl bootstrap gui/$(id -u)`. It starts at load — at login, not at boot:
 an agent runs in the user's session, where the keychain holding its jobs'
@@ -1938,7 +1940,9 @@ keeps it `online`.
   is a finding, never a doctor crash). A machine without the plist gets no
   finding. It looks for `~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist`
   (`default_worker_plist`); `run_doctor(worker_plist=…)` overrides that, as
-  `queue_service_plist` does for 35.1-003.
+  `queue_service_plist` does for 35.1-003. Beside it, the **Worker dashboard**
+  finding (Story 35.4-006) checks that the dashboard the worker advertises with
+  `--dashboard-url` answers — see the fleet run registry below.
 - **Self-check before registering (Story 35.2-007).** Over ssh the worker's
   disk and Keychain checks all pass — sshd carries disk access and sees no
   dialogs — while the same agent under launchd stalls on a macOS dialog (Keychain,
@@ -2291,8 +2295,10 @@ authoritative for the worker; the table is the fleet's summary.
   A failed write is logged, never fatal to the drain.
 - **Build pushes.** `_registry_register` / `_registry_finish` (and so `build`,
   `fix` and `resume`) call `queue_client.push_fleet_run` after the local write;
-  it reaches the service only where a fleet URL is configured, so it is a no-op
-  inside a worker's jobs. The push never fails the build: 3 s per attempt, and
+  it reaches the service only where a fleet URL is configured — inside the jobs
+  of a worker draining the fleet over HTTP (they inherit its URL), never inside
+  those of a worker draining the store its own host owns, whose writes are then
+  the run's only ones. The push never fails the build: 3 s per attempt, and
   `PUT /runs` is replayed once, so an unreachable service can hold a build's start
   or finish for about 6 s. A record the local write could not store is not
   pushed. The `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its
@@ -2315,7 +2321,9 @@ authoritative for the worker; the table is the fleet's summary.
 - **Transcripts (Story 35.4-002).** A run's row also carries `dashboard_url` (migration
   11): the origin of its worker's own dashboard, started with `sdlc dashboard --host
   <tailnet-ip>`. A worker advertises it with `queue run --worker NAME --dashboard-url
-  http://NAME.<tailnet>:8787`; a bare build reads `SDLC_DASHBOARD_URL`. It is
+  http://NAME.<tailnet>:8787` and hands it to its jobs as `SDLC_DASHBOARD_URL`
+  (Story 35.4-006), which is what a bare build reads — so a job's own start and
+  finish pushes carry the worker's URL instead of blanking it until a beat. It is
   normalised to a bare `http(s)://host[:port]` origin (`registry.normalize_dashboard_url`)
   at the CLI, at `PUT /runs` (400 otherwise) and again where it is used. "view
   session" on a remote run makes the XPS dashboard fetch the worker's `/api/logs`
@@ -2327,6 +2335,53 @@ authoritative for the worker; the table is the fleet's summary.
   story it gathers every story of the run. A worker that does not answer (or never
   advertised a URL) gives `error` plus `logs_root`, the `<db>.logs` directory on
   the worker, which the modal shows. Nothing passes through the queue service.
+- **Run detail (Story 35.4-006).** The 35.4-002 relay, generalised. Selecting a
+  remote run whose record carries a `dashboard_url` makes the XPS fetch the worker
+  dashboard's own `/api/status?run=<id>` (same 5 s / no redirect / no proxy fetch)
+  and pass its JSON through plus `worker` and `origin`, so the header (now naming
+  the worker), counts, stories table, stage attempts, DAG, events, usage/cost and
+  routing banner render as for a local run; stage links go to the worker's own
+  `/log`. The page renders relayed values as text, never markup: numbers it
+  formats are coerced (a non-number is escaped), and the project and PR links are
+  `http(s)` or not links at all. One fetch is shared per second between the
+  status request and the SSE change token (`/api/stream?run=<id>`, reconnected on
+  a selection change), which digests what moved on the worker (not its
+  clock-driven durations); once the run has finished (`finished_at` set) it is
+  re-read every 10 s instead, since only a resume moves it again; a failure is
+  remembered for 10 s, and older entries are dropped, so a run nobody watches
+  holds no memory. When the worker does not answer, advertised no URL, or has no
+  record of the run, the pushed-record header snapshot is served with
+  `detail_unavailable` (`detail unavailable — m3max dashboard not reachable`),
+  which the page shows in place of `no stories yet…`. A local run is untouched.
+  Every relay fetch (status and `/api/logs`) carries `X-Sdlc-Relayed`, and a
+  dashboard answers such a request from its own ledger only, never relaying it
+  on: a worker's dashboard sees the fleet too, so a run it no longer holds
+  (pruned) still names that same dashboard, and without the mark each hop would
+  relay again until the server ran out of threads.
+  The **forge panel** resolves from the record's `origin` (migration 14): the
+  repo's git remote, credentials stripped, stamped on the run's registry record
+  when it registers, so every push of the run carries it. Its hostname
+  picks `github`/`gitlab` and a non-public host is the instance to query, so a
+  repo at `/Users/…/Work/…` that does not exist on the XPS still shows its
+  issues/PRs/CI; a run with no `origin` — or one with an impossible port —
+  shows the panel as unavailable. A later push that could not read the remote
+  keeps the stored `origin` rather than clearing it.
+  The worker's dashboard is its own LaunchAgent,
+  `templates/launchd/com.fxmartin.sdlc-dashboard.plist` (`sdlc dashboard --host
+  <tailnet-ip> --port 8787`, a sibling of the worker agent so a worker restart
+  does not blank the XPS's view), and the worker plist advertises it with
+  `--dashboard-url http://<tailnet-ip>:8787`; both installs `sed` in
+  `__TAILNET_IP__` (`tailscale ip -4`) and stop, writing nothing, when it prints
+  no address (Tailscale stopped or logged out). `sdlc dashboard` refuses a blank
+  `--host` outright (exit 2): Python binds `""` as every interface, which would
+  put the login-less dashboard on whatever network the Mac is on. `sdlc doctor`
+  adds a **Worker dashboard** finding on a machine with the worker agent: `WARN`
+  when the plist's `--dashboard-url` — the only place `queue run` takes it from;
+  `SDLC_DASHBOARD_URL` in the agent's environment is a bare build's, not the
+  worker's — is missing or unusable, or the advertised dashboard does not answer
+  (`GET /favicon.ico`, 3 s).
+  Unlike the worker, the dashboard does not exit on a controller reinstall; restart
+  it with `launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-dashboard`.
 
 ### Pause per subscription pool (Story 35.2-003)
 

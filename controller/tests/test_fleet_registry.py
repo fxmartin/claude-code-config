@@ -404,6 +404,20 @@ def test_a_malformed_fleet_url_never_costs_a_build_its_local_record(
     assert (local.run_id, local.worker) == ("run-9", None)
 
 
+def test_an_unparseable_origin_never_costs_a_build_its_local_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sdlc.build import _registry_register
+
+    # Every run reads its origin as it registers (Story 35.4-006), fleet or not; one
+    # urlsplit cannot parse is no origin, never a failed build.
+    monkeypatch.setattr("sdlc.issue_host._remote_url", lambda root: "http://[::1")
+    registry = Registry(tmp_path / "registry.json")
+    _registry_register(registry, "run-9", "epic-9", tmp_path / "l.db", 4, repo=tmp_path)
+    (local,) = registry.records()
+    assert (local.run_id, local.origin) == ("run-9", None)
+
+
 def test_an_unreadable_cwd_never_costs_a_build_its_local_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -549,6 +563,27 @@ def test_a_workers_run_row_carries_the_dashboard_url_it_advertises(worker_host) 
     url = "http://m3max.tail1234.ts.net:8787"
     _drain_as_worker(local, registry, _Job(polls=1), dashboard_url=url)
     assert [r["dashboard_url"] for r in local.list_fleet_runs()] == [url]
+
+
+def test_a_workers_run_row_carries_its_repos_origin(
+    worker_host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Story 35.4-006: the XPS names a remote run's forge from this origin. The job's
+    # own push reaches no fleet here, so the worker's writes are the only ones.
+    from sdlc.build import _registry_register
+
+    local, registry = worker_host
+    (job,) = registry.records()
+    remotes = {job.repo: "http://oauth2:glpat-SECRET@gitlab.test/root/alpha.git"}
+    monkeypatch.setattr("sdlc.issue_host._remote_url", lambda root: remotes.get(str(root)))
+    with monkeypatch.context() as child:
+        child.setattr("sdlc.build.os.getpid", lambda: _GONE_PID)  # the job registers as itself
+        _registry_register(
+            registry, job.run_id, job.scope, Path(job.db), job.total, repo=Path(job.repo),
+            completed=job.completed,
+        )
+    _drain_as_worker(local, registry, _Job(polls=1))
+    assert [r["origin"] for r in local.list_fleet_runs()] == ["http://gitlab.test/root/alpha.git"]
 
 
 @pytest.mark.parametrize(
@@ -714,6 +749,36 @@ def test_the_default_launcher_hands_a_job_its_workers_name(
 
     _launcher_for(SchedulerConfig())(["true"], tmp_path)
     assert seen["env"] is None  # a plain drain leaves the environment alone
+
+
+def test_the_default_launcher_hands_a_job_its_workers_dashboard_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Story 35.4-006: a job pushes its own start and finish; without the URL each
+    # push would blank the worker's until its next beat, and the XPS relays through it.
+    from sdlc.queue_worker import WorkerProfile
+    from sdlc.registry import DASHBOARD_URL_ENV
+    from sdlc.scheduler import SchedulerConfig, _launcher_for
+
+    seen: dict = {}
+
+    def fake_popen(argv, cwd, start_new_session, env):
+        seen["env"] = env
+
+        class _P:
+            pid = 1
+
+        return _P()
+
+    monkeypatch.setattr("sdlc.scheduler.subprocess.Popen", fake_popen)
+    monkeypatch.delenv(DASHBOARD_URL_ENV, raising=False)
+    url = "http://m3max.tail1234.ts.net:8787"
+    profile = WorkerProfile(name="m3max", host="h", dashboard_url=url)
+    _launcher_for(SchedulerConfig(worker=profile))(["true"], tmp_path)
+    assert seen["env"][DASHBOARD_URL_ENV] == url
+
+    _launcher_for(SchedulerConfig(worker=WorkerProfile(name="m3max", host="h")))(["true"], tmp_path)
+    assert DASHBOARD_URL_ENV not in seen["env"]  # a worker that advertises none passes none on
 
 
 # --- the dashboard: merge, dedupe, remote state ----------------------------------
