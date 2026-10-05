@@ -99,15 +99,13 @@ def test_exec_start_goes_through_nix_develop_by_absolute_path(service) -> None:
     assert argv[:4] == [NIX, "develop", "%h/.config/nix-dev-env", "-c"]
 
 
-def test_worker_argv_names_dev_and_the_claude_shared_pool_only(service) -> None:
+def test_worker_argv_names_dev_and_declares_both_shared_pools(service) -> None:
+    # codex-shared is declared ahead of Codex being installed: registration, not this
+    # argv, decides whether the worker joins it (the pool tests below).
     assert _sdlc_args(service) == [
-        "sdlc", "queue", "run", "--worker", "dev", "--pool", "claude-shared", "--follow",
+        "sdlc", "queue", "run", "--worker", "dev",
+        "--pool", "claude-shared", "--pool", CODEX_POOL, "--follow",
     ]
-
-
-def test_codex_shared_is_not_declared_by_the_unit(service) -> None:
-    # Codex is not installed on the box: capability registration decides, not the unit.
-    assert CODEX_POOL not in " ".join(_sdlc_args(service))
 
 
 def test_no_sleep_inhibitor_wraps_the_worker(service) -> None:
@@ -169,11 +167,9 @@ def test_the_header_documents_every_step_of_the_install() -> None:
 
 
 def test_the_unit_parses_as_doctor_reads_it(service) -> None:
-    env, argv = read_worker_unit(TEMPLATE, home=Path(HOME))
+    env = read_worker_unit(TEMPLATE, home=Path(HOME))
     assert env["PATH"].startswith(f"{HOME}/.local/bin:")
     assert env["XDG_STATE_HOME"] == f"{HOME}/.local/state"
-    assert argv[:2] == [NIX, "develop"] and argv[2] == f"{HOME}/.config/nix-dev-env"
-    assert argv[-3:] == ["--pool", "claude-shared", "--follow"]
 
 
 def test_template_argv_is_accepted_by_queue_run(service, tmp_path, monkeypatch) -> None:
@@ -198,7 +194,7 @@ def test_template_argv_is_accepted_by_queue_run(service, tmp_path, monkeypatch) 
     result = runner.invoke(app, _sdlc_args(service)[1:])
 
     assert result.exit_code == 0, result.output
-    assert seen["name"] == "dev" and seen["pools"] == ["claude-shared"]
+    assert seen["name"] == "dev" and seen["pools"] == ["claude-shared", CODEX_POOL]
     assert seen["config"].follow is True  # heartbeating while idle keeps it online
 
 
@@ -258,6 +254,26 @@ def test_a_codex_stage_is_not_offered_to_dev_until_codex_exists(service, tmp_pat
     assert _claim(store, "dev") is None
     store.stamp_unsatisfiable(now=T0)
     assert "no eligible worker" in (store.get_job(job_id).reason or "")
+
+
+def test_dev_joins_codex_shared_once_codex_is_installed(service, tmp_path, store) -> None:
+    # Capability registration decides, not the unit file: with the same unit, installing
+    # Codex is all it takes for the pool and the harness to be advertised together.
+    _register(_profile(service, tmp_path, installed={"claude", "codex"}), store)
+
+    [worker] = store.list_workers()
+    assert worker.pools == ["claude-shared", CODEX_POOL]
+    assert worker.harnesses == ["claude", "codex"]
+
+
+def test_a_codex_stage_goes_to_dev_once_codex_exists(service, tmp_path, store) -> None:
+    _register(_profile(service, tmp_path, installed={"claude", "codex"}), store)
+    job_id = store.add_job(
+        repo="/r/proj", kind="build", scope="s", requirements_json=json.dumps({"harness": "codex"})
+    )
+
+    claimed = _claim(store, "dev")
+    assert claimed is not None and claimed.id == job_id
 
 
 def test_a_claude_shared_job_goes_to_the_least_loaded_of_home_lab_and_dev(

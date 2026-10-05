@@ -139,10 +139,14 @@ def detect_worker_profile(
     ``--version``) and ``runtime`` the sandbox's container-runtime detection —
     both injectable so a test never depends on the machine it runs on. Pools are
     declared, not detected: they name a subscription, and only the operator
-    knows which one this machine is logged into.
+    knows which one this machine is logged into. A declared :data:`CODEX_POOL`
+    is still advertised only while the ``codex`` harness is (Story 35.2-008): a
+    codex stage needs both, so a unit may declare the pool before Codex is
+    installed and the box joins it by installing Codex, not by editing the unit.
     """
     from sdlc.dispatch import SandboxUnavailableError, detect_container_runtime
     from sdlc.doctor import _default_dep_probe
+    from sdlc.queue import CODEX_POOL
 
     name = name.strip()
     if not name:
@@ -155,6 +159,8 @@ def detect_worker_profile(
 
     check = probe or _default_dep_probe
     harnesses = [harness for harness, binary in _harness_binaries().items() if check(binary)]
+    if "codex" not in harnesses:
+        declared = [pool for pool in declared if pool != CODEX_POOL]
     try:
         sandbox: str | None = (runtime or detect_container_runtime)()
     except SandboxUnavailableError:

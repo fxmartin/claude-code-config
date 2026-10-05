@@ -1832,7 +1832,9 @@ free-slot count (`--slots` minus the slots running jobs hold):
   pin matches it;
 - `pools` — free-form and declared, never detected, because only the operator
   knows which subscription a machine is signed in to. The recommended names are
-  `claude-m3`, `claude-shared` and `codex-shared`.
+  `claude-m3`, `claude-shared` and `codex-shared`. A declared `codex-shared` is
+  still advertised only while the `codex` harness is (Story 35.2-008): a codex
+  stage needs both, so a worker may declare it before Codex is installed.
 
 **Online/offline.** A worker silent for three heartbeats (90 s) is `offline`
 (`sdlc queue workers`). On every registration and claim the service cuts the
@@ -2217,7 +2219,8 @@ path whatever the scheme. Besides `claude`, `gh` and `uv`, the dev shell needs
 bootstrap insists), and the scanners `sdlc doctor` checks for, `semgrep` and
 `osv-scanner`: without them doctor is not `CLEAN`, and the coverage gate reports
 a missing scanner `SKIPPED` rather than blocking, so a story built on `dev`
-would merge unscanned.
+would merge unscanned — which is why the bootstrap will not start the worker
+without them.
 
 ```bash
 ssh -J home-lab dev-server
@@ -2238,9 +2241,11 @@ for the local GitLab, so git authenticates through `gh`/`glab` and
 `GIT_TERMINAL_PROMPT=0` makes a missing credential fail at once;
 `~/.sdlc-fleet.yaml` naming the queue (an existing file is never overwritten);
 `sdlc doctor --exit-code`; and finally the unit — copied, enabled and started.
-Preflight refuses, before changing anything, a box whose `gh` is logged out or
-whose `glab` is missing or not logged in to the local GitLab — the latter
-unless `--github-only` (or `--skip-service`, which starts no worker).
+Preflight refuses, before changing anything, a box whose `gh` is logged out;
+one whose `glab` is missing or not logged in to the local GitLab, unless
+`--github-only`; and one without `semgrep` or `osv-scanner`, which no flag
+overrides — a worker that merges unscanned work has no safe degraded mode.
+`--skip-service` starts no worker, so neither of the last two refuses it.
 Doctor runs *before* the unit: a worker that has not registered yet is a `FAIL`
 by design, so judging the bootstrap after step 7 would fail every first run. Its
 status is the script's exit status, returned once the unit is in place so a
@@ -2253,11 +2258,11 @@ harmless: the worker restarts only when the installed *version* changes.
 
 - **The unit.** `ExecStart` is `/nix/var/nix/profiles/default/bin/nix develop
   %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared
-  --follow`: the nix binary by absolute path, then the dev shell supplies
-  `claude`, `gh`, `uv` and `node`; `~/.local/bin` (the `sdlc` uv tool) is on the
-  unit's `PATH`. `Restart=always` (exit 75, a controller reinstalled under the
-  worker, restarts it on the new code, as `on-failure` would too; `always` also
-  restarts a clean exit, so the worker never stays down),
+  --pool codex-shared --follow`: the nix binary by absolute path, then the dev
+  shell supplies `claude`, `gh`, `uv` and `node`; `~/.local/bin` (the `sdlc` uv
+  tool) is on the unit's `PATH`. `Restart=always` (exit 75, a controller
+  reinstalled under the worker, restarts it on the new code, as `on-failure`
+  would too; `always` also restarts a clean exit, so the worker never stays down),
   `RestartSec=30` like the LaunchAgent's `ThrottleInterval`, `KillMode=mixed` and
   `TimeoutStopSec=60` so the worker alone gets SIGTERM and has the 40 s it needs
   to stop two jobs. It starts at boot, because `loginctl enable-linger` is on.
@@ -2270,17 +2275,16 @@ harmless: the worker restarts only when the installed *version* changes.
   re-asserts the mode), which the unit reads through an optional
   `EnvironmentFile=-`. Never in the unit.
 - **Pools are a capability of the login on the box.** The shared Max
-  (`mail@fxmartin.me`, Max 20x) is `claude-shared`; the unit declares nothing
-  else. The `codex` harness is advertised only while its CLI is on the PATH, and
-  a codex stage needs both that and the `codex-shared` pool, so `dev` is offered
-  none until Codex is installed *and* its login is declared. Declare it in the
-  template, not the installed copy: add `--pool codex-shared` to `ExecStart` in
-  `templates/systemd/sdlc-worker.service`, merge that, then pull and re-run the
-  bootstrap, which reinstalls the changed unit and restarts the worker. A
-  bootstrap run puts the template back over an edited
-  `~/.config/systemd/user/sdlc-worker.service`, and an uncommitted edit to the
-  clone's template is a dirty tree the worker refuses this repo's jobs over. A
-  `claude-shared` job goes to the least-loaded of `home-lab` and `dev`.
+  (`mail@fxmartin.me`, Max 20x) is `claude-shared`. The unit declares
+  `codex-shared` too, but capability registration decides, not the unit file:
+  a declared `codex-shared` is advertised only while the `codex` CLI is on the
+  PATH — as is the `codex` harness, which a codex stage also needs — so `dev` is
+  offered no codex stage until Codex is installed. To join, put Codex in the dev
+  shell, log it in to the shared account and restart the worker (`systemctl
+  --user restart sdlc-worker`; it reads what is installed at start-up), with no
+  edit to the unit. Install it only with that login ready: registration sees
+  the CLI, not the account. A `claude-shared` job goes to the least-loaded of
+  `home-lab` and `dev`.
 - **Repo paths.** A job enqueued from the XPS carries
   `/home/fxmartin/Work/claude-code-config`. No such path exists on `dev`, whose
   login is `fx`, so the worker resolves the clone under *its own* home —

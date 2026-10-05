@@ -46,6 +46,9 @@ case "$1 $2" in
 esac
 exit 0'
     stub uv 'exit 0'
+    # The scanners the coverage gate runs: present unless a test removes one.
+    stub semgrep 'exit 0'
+    stub osv-scanner 'exit 0'
     stub loginctl 'echo Linger=yes'
     # `claude plugin …`: list/marketplace list read marker files that add/install write.
     stub claude '
@@ -323,6 +326,10 @@ exit 0'
     [[ "$output" == *"nix develop ~/.config/nix-dev-env"* ]]
     [[ "$output" == *"--github-only"* ]]
     [[ "$output" == *"ssh -J home-lab"* ]]
+    [[ "$output" == *"semgrep"* && "$output" == *"osv-scanner"* ]]
+    # The whole header and nothing after it — no line range to fall out of step with it.
+    [[ "$output" == *"at boot." ]]
+    [[ "$output" != *"set -euo pipefail"* ]]
 }
 
 # --- CI wiring -------------------------------------------------------------------------
@@ -448,6 +455,73 @@ GITLAB_HELPERS="$(printf '\n!glab auth git-credential')"
 
     [ "$status" -eq 0 ]
     [[ "${output}" == *"only sync GitHub repos"* ]]
+    ! grep -q systemctl "${CALLS}" || false
+    [ ! -e "$(UNIT)" ]
+}
+
+# --- no worker that would merge unscanned work (review of #851, round 5) ---------------
+#
+# The coverage gate reports a missing scanner SKIPPED, and SKIPPED passes: a story built
+# on a box without semgrep or osv-scanner would merge without the SAST and dependency
+# scans a Mac blocks it on. So the unit is never started there, and no flag lifts that.
+
+# Run the bootstrap without TOOL, on a PATH of only directories the test controls or the
+# OS owns: a scanner installed for the host's user (a nix profile, ~/.local/bin,
+# Homebrew) must not stand in for the one the test removed.
+run_without() {  # run_without TOOL BOOTSTRAP-ARG…
+    local tool="$1"; shift
+    if (PATH="/usr/bin:/bin"; command -v "${tool}") >/dev/null 2>&1; then
+        skip "a system ${tool} in /usr/bin or /bin cannot be hidden from this test"
+    fi
+    rm "${TMP}/bin/${tool}"
+    stub git 'exit 0'  # git may live outside /usr/bin on a CI image
+    PATH="${TMP}/bin:/usr/bin:/bin" run "${BOOTSTRAP}" "$@"
+}
+
+@test "without semgrep the run is refused before anything changes, naming the way out" {
+    run_without semgrep --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "${output}" == *"semgrep not found on PATH"* ]]
+    [[ "${output}" == *"SKIPPED"* ]]  # why: the gate would pass the story unscanned
+    [[ "${output}" == *"uv tool install semgrep"* && "${output}" == *"--skip-service"* ]]
+    ! grep -qE '^(install.sh|deploy.sh|git|systemctl)' "${CALLS}" || false
+    [ ! -e "${HOME}/.sdlc-fleet.yaml" ]
+    [ ! -e "$(UNIT)" ]
+}
+
+@test "without osv-scanner the run is refused the same way" {
+    run_without osv-scanner --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "${output}" == *"osv-scanner not found on PATH"* ]]
+    ! grep -qE '^(install.sh|deploy.sh|git|systemctl)' "${CALLS}" || false
+    [ ! -e "$(UNIT)" ]
+}
+
+@test "with neither scanner the refusal names both" {
+    rm "${TMP}/bin/osv-scanner"
+    run_without semgrep --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "${output}" == *"semgrep and osv-scanner not found on PATH"* ]]
+}
+
+@test "--github-only does not lift the scanner refusal" {
+    run_without semgrep --queue-url "${QUEUE}" --github-only
+
+    [ "$status" -ne 0 ]
+    [[ "${output}" == *"semgrep not found on PATH"* ]]
+    ! grep -qE '^(install.sh|systemctl)' "${CALLS}" || false
+    [ ! -e "$(UNIT)" ]
+}
+
+@test "--skip-service without the scanners is not refused: it starts no worker" {
+    rm "${TMP}/bin/systemctl"
+    run_without semgrep --queue-url "${QUEUE}" --skip-service
+
+    [ "$status" -eq 0 ]
+    grep -qx "install.sh --core" "${CALLS}"
     ! grep -q systemctl "${CALLS}" || false
     [ ! -e "$(UNIT)" ]
 }

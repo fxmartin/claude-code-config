@@ -45,12 +45,13 @@
 # tailscale whois alone.
 #
 # Pools are a capability of the login present on the box: the shared Max
-# (mail@fxmartin.me) is `claude-shared`. Codex joins as `codex-shared` only once
-# it is installed and logged in here — add `--pool codex-shared` then, in the
-# repo's templates/systemd/sdlc-worker.service and merged, never in an installed
-# copy: fleet-bootstrap.sh puts the template back over an edited one. The
-# worker's registration advertises the `codex` harness only when its CLI is on
-# the PATH, and a codex stage needs both.
+# (mail@fxmartin.me) is `claude-shared`. `codex-shared` is declared too, but the
+# worker's registration advertises it — like the `codex` harness, which a codex
+# stage also needs — only while the codex CLI is on the PATH. So the box joins
+# that pool once Codex is installed in the dev shell and logged in to the shared
+# account, with no edit here: restart the worker (`systemctl --user restart
+# sdlc-worker`), which reads what is installed at start-up. Install Codex only
+# with that login ready — registration sees the CLI, not the account.
 #
 # Before it registers, the worker proves it can run an agent from *this* unit's
 # own context (Story 35.2-007): one real `claude -p ok` turn on Haiku. The TCC
@@ -62,7 +63,10 @@
 # prompt. Without a logged-in glab this worker can only sync GitHub repos: a
 # GitLab job fails its clone here while peers defer to this worker's free
 # slots. So fleet-bootstrap.sh refuses such a box, changing nothing, unless run
-# with --github-only — and then pin GitLab jobs with --host home-lab.
+# with --github-only — and then pin GitLab jobs with --host home-lab. It refuses
+# a box without semgrep or osv-scanner too, and no flag lifts that: the coverage
+# gate passes a missing scanner as SKIPPED, so a story built here would merge
+# without its SAST and dependency scans.
 #
 # No `caffeinate` or `systemd-inhibit`: on macOS each job runs under
 # `caffeinate -i` to stop the Mac idle-sleeping mid-build (35.2-004); a server
@@ -77,7 +81,7 @@ Description=sdlc fleet worker dev (claude-shared)
 
 [Service]
 Type=simple
-ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared --follow
+ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared --pool codex-shared --follow
 
 # systemd --user hands a service a bare PATH. Jobs need `sdlc` (~/.local/bin) and
 # nix itself; the dev shell prepends claude, gh, uv and node to this.

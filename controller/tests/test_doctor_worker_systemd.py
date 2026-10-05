@@ -52,14 +52,13 @@ def _unit(tmp_path: Path, body: str | None = None) -> Path:
 # --- reading the unit -----------------------------------------------------------------
 
 
-def test_the_units_environment_and_argv_are_read_with_specifiers_expanded(tmp_path) -> None:
-    env, argv = read_worker_unit(_unit(tmp_path), home=HOME)
+def test_the_units_environment_is_read_with_specifiers_expanded(tmp_path) -> None:
+    env = read_worker_unit(_unit(tmp_path), home=HOME)
 
     assert env["PATH"] == "/home/fx/.local/bin:/usr/bin"
     assert env["XDG_STATE_HOME"] == "/home/fx/.local/state"  # several per line
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert env["QUOTED"] == "two words"
-    assert argv[-5:] == ["--worker", "dev", "--pool", "claude-shared", "--follow"]
 
 
 def test_the_environment_file_supplies_the_fallback_token(tmp_path) -> None:
@@ -69,14 +68,14 @@ def test_the_environment_file_supplies_the_fallback_token(tmp_path) -> None:
         "# the fallback\nSDLC_QUEUE_TOKEN=s3cret\nexport OTHER='a b'\n\n", encoding="utf-8"
     )
 
-    env, _ = read_worker_unit(_unit(tmp_path), home=home)
+    env = read_worker_unit(_unit(tmp_path), home=home)
 
     assert env["SDLC_QUEUE_TOKEN"] == "s3cret"
     assert env["OTHER"] == "a b"
 
 
 def test_an_absent_environment_file_is_fine_and_a_unit_is_never_a_crash(tmp_path) -> None:
-    env, _ = read_worker_unit(_unit(tmp_path), home=tmp_path / "nowhere")
+    env = read_worker_unit(_unit(tmp_path), home=tmp_path / "nowhere")
     assert "SDLC_QUEUE_TOKEN" not in env
 
     with pytest.raises(OSError):
@@ -93,10 +92,9 @@ def test_a_key_may_be_spaced_from_its_value_as_systemd_allows(tmp_path) -> None:
         """,
     )
 
-    env, argv = read_worker_unit(unit, home=HOME)
+    env = read_worker_unit(unit, home=HOME)
 
     assert env["SDLC_QUEUE_URL"] == "http://elsewhere:8790"
-    assert argv == ["/usr/bin/sdlc", "queue", "run", "--worker", "dev"]
 
 
 def test_an_empty_assignment_resets_what_came_before_it(tmp_path) -> None:
@@ -115,7 +113,7 @@ def test_an_empty_assignment_resets_what_came_before_it(tmp_path) -> None:
         """,
     )
 
-    env, _ = read_worker_unit(unit, home=home)
+    env = read_worker_unit(unit, home=home)
 
     assert env == {"GIT_TERMINAL_PROMPT": "0"}
 
@@ -136,12 +134,11 @@ def test_drop_ins_are_read_after_the_unit_in_name_order(tmp_path) -> None:
     )
     (drop_ins / "notes.txt").write_text("[Service]\nEnvironment=IGNORED=1\n", encoding="utf-8")
 
-    env, argv = read_worker_unit(unit, home=HOME)
+    env = read_worker_unit(unit, home=HOME)
 
     assert env["SDLC_QUEUE_URL"] == "http://override:8790"  # "override" sorts after "10-early"
     assert env["EARLY"] == "1" and env["GIT_TERMINAL_PROMPT"] == "0"
     assert "IGNORED" not in env  # only *.conf is a drop-in
-    assert argv == ["/usr/bin/sdlc", "queue", "run", "--worker", "dev2"]
 
 
 # --- the fleet-worker finding ---------------------------------------------------------

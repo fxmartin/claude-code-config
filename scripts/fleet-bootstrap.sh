@@ -18,8 +18,9 @@
 # Besides claude, gh (logged in) and uv, the dev shell needs glab logged in to the
 # local GitLab (`glab auth login --hostname gitlab.test`) — without it the run is
 # refused, see --github-only — and the scanners doctor checks for, semgrep and
-# osv-scanner: without them doctor is not CLEAN, and a story built here skips its
-# SAST and dependency scans.
+# osv-scanner. Without them the run is refused too, and no flag lifts that: the
+# coverage gate passes a missing scanner as SKIPPED, so a story built here would
+# merge without its SAST and dependency scans.
 #
 # Steps, in order:
 #   1. ./install.sh --core                    symlink the config into ~/.claude
@@ -47,6 +48,7 @@
 #              still make its peers defer GitLab jobs to it: pin those with
 #              --host home-lab. Without the flag such a box is refused, unchanged.
 # --skip-service  do everything but the systemd unit (a box without systemd --user).
+#              Starting no worker, it is not refused for a missing glab or scanner.
 # --dry-run    print what would run; change nothing.
 #
 # Reaching the box: Tailscale SSH policy denies the XPS and public port 22 is
@@ -81,7 +83,8 @@ DRY_RUN=false
 GITHUB_ONLY=false
 
 usage() {
-  sed -n '5,55p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # The header comment from line 5 to its end: no line number to keep in step with it.
+  awk 'NR < 5 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
 
 log() { printf '==> %s\n' "$*"; }
@@ -139,6 +142,22 @@ elif [[ "${DO_SERVICE}" == true && "${GITHUB_ONLY}" == false ]]; then
        repos only — yet its free slots would make its peers defer GitLab jobs to it. Nothing was
        changed. Put glab in the dev shell, run: glab auth login --hostname ${GITLAB_HOSTNAME}
        and re-run — or re-run with --github-only and pin GitLab jobs with --host home-lab."
+fi
+# The coverage gate reports a missing scanner SKIPPED, and SKIPPED passes: a story
+# built here would merge without the SAST and dependency scans a Mac blocks it on
+# (review of #851). Unlike --github-only, there is no safe way to run such a worker,
+# so no flag starts it.
+if [[ "${DO_SERVICE}" == true ]]; then
+  MISSING_SCANNERS=""
+  for scanner in semgrep osv-scanner; do
+    command -v "${scanner}" >/dev/null 2>&1 \
+      || MISSING_SCANNERS="${MISSING_SCANNERS:+${MISSING_SCANNERS} and }${scanner}"
+  done
+  [[ -z "${MISSING_SCANNERS}" ]] || die "${MISSING_SCANNERS} not found on PATH, so a story built here would
+       merge without its SAST and dependency scans: the coverage gate reports a missing scanner
+       SKIPPED, which passes. Nothing was changed. Put semgrep and osv-scanner in the dev shell
+       (semgrep also installs with: uv tool install semgrep) and re-run — or bootstrap without
+       the worker: --skip-service."
 fi
 [[ -x "${INSTALL_SH}" ]] || die "installer not found or not executable: ${INSTALL_SH}"
 [[ -x "${DEPLOY_SH}" ]] || die "deploy script not found or not executable: ${DEPLOY_SH}"

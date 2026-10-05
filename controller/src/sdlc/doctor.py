@@ -674,8 +674,8 @@ def _environment_file(path: Path) -> dict[str, str]:
     return env
 
 
-def read_worker_unit(path: Path, *, home: Path | None = None) -> tuple[dict[str, str], list[str]]:
-    """The worker unit's own environment and ``ExecStart`` argv — what systemd would run.
+def read_worker_unit(path: Path, *, home: Path | None = None) -> dict[str, str]:
+    """The worker unit's own environment — what systemd starts the worker with.
 
     The systemd counterpart of reading the LaunchAgent plist: the worker is
     started with the unit's environment (and its ``EnvironmentFile``, which
@@ -690,7 +690,6 @@ def read_worker_unit(path: Path, *, home: Path | None = None) -> tuple[dict[str,
     home = home or Path.home()
     env: dict[str, str] = {}
     env_files: list[Path] = []
-    argv: list[str] = []
     drop_ins = sorted(path.with_name(f"{path.name}.d").glob("*.conf"))
     for source in (path, *drop_ins):
         in_service = False
@@ -717,15 +716,9 @@ def read_worker_unit(path: Path, *, home: Path | None = None) -> tuple[dict[str,
                     env_files.append(Path(value.removeprefix("-")))
                 else:
                     env_files.clear()
-            elif key == "ExecStart":
-                # A drop-in replaces the command with `ExecStart=` then a new one.
-                if not value:
-                    argv = []
-                elif not argv:
-                    argv = shlex.split(value.lstrip("@-:+!"))
     for file in env_files:
         env.update(_environment_file(file))
-    return env, argv
+    return env
 
 
 def check_fleet_worker(
@@ -902,7 +895,7 @@ def check_fleet_worker_installed(
             plist = plistlib.loads(path.read_bytes())
             env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
         else:
-            env, _ = read_worker_unit(unit)
+            env = read_worker_unit(unit)
     # As in check_queue_service: plistlib's errors are not a closed set, and a
     # plist that is not a dict fails on `.get` — a FAIL either way, never a crash.
     except Exception as exc:  # noqa: BLE001

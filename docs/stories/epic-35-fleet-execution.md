@@ -532,11 +532,9 @@ outbound filter in front of its agents.
   proven, not assumed.
 - **Given** the worker registers **When** `sdlc queue workers` runs on the XPS
   **Then** it lists `dev` (host `dev-server`, pool `claude-shared`, harness
-  `claude`; `codex-shared` only once Codex is installed there — registration
-  advertises the `codex` harness only while its CLI is on the PATH, and the
-  pool itself is declared in the unit template, as 35.2-001 declares every
-  pool rather than detecting it), and a `claude-shared` job goes to the
-  least-loaded of `home-lab`/`dev`.
+  `claude`; `codex-shared` only once Codex is installed there — capability
+  registration decides, not the unit file), and a `claude-shared` job goes to
+  the least-loaded of `home-lab`/`dev`.
 - **Given** the 35.2-006 and 35.2-007 self-checks **When** the worker starts
   on Linux **Then** both pass without a GUI (`GIT_TERMINAL_PROMPT=0`, `gh auth
   setup-git`; the TCC check is skipped off-macOS) and the probe completes

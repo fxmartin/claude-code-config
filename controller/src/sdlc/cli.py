@@ -3726,7 +3726,8 @@ def queue_run_cmd(
         [],
         "--pool",
         help="Subscription pool this worker serves, repeatable (e.g. claude-m3, "
-        "claude-shared, codex-shared). Needs --worker.",
+        "claude-shared, codex-shared — advertised only while the codex CLI is "
+        "installed). Needs --worker.",
     ),
     host: str | None = typer.Option(
         None,
@@ -3796,9 +3797,11 @@ def queue_run_cmd(
 
     With `--worker NAME` the drain is a fleet worker (Story 35.2-001). It
     registers `{worker, host, pools, harnesses, sandbox, repos under ~/Work,
-    slots_free}` (`--pool`/`--host` declare the pools and host name) and
-    heartbeats every 30 s with its live free-slot count; a worker silent for
-    three beats is `offline` in `sdlc queue workers` and its leases become
+    slots_free}` (`--pool`/`--host` declare the pools and host name; a
+    declared `codex-shared` is registered only while the `codex` CLI is
+    installed, Story 35.2-008) and heartbeats every 30 s with its live
+    free-slot count; a worker silent for three beats is `offline` in
+    `sdlc queue workers` and its leases become
     reclaimable. It claims only jobs it is eligible for — the job's
     `requirements` (repo, harness, sandbox), `--host` pin and `--pool` met by
     what it registered, a `codex` stage also needing the `codex-shared` pool —

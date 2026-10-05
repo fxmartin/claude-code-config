@@ -407,7 +407,8 @@ def keep_awake_prefix(
 
     Prefixed to a worker's job argv so the idle-sleep assertion lives exactly as
     long as the job does — the Mac may sleep between jobs. ``caffeinate`` is
-    macOS-only; the Linux equivalent (``systemd-inhibit``) is a follow-up.
+    macOS-only, and nothing replaces it elsewhere: the Linux worker is a server,
+    which does not idle-sleep (Story 35.2-008).
 
     A wrapper here must *become* the job, not run it as a child: the pid the
     launcher returns is the join key :meth:`_Scheduler._attach_runs` matches to
