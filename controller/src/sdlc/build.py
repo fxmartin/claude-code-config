@@ -6658,7 +6658,7 @@ def _tests_green_after_baseline(
     )
     if reported or data.get("fix_status") != "FIXED":
         return reported
-    failing = _string_list(data.get("failing_tests"))
+    failing = _string_list(data.get("failing_tests")) or []
     return bool(failing) and set(failing) <= set(baseline)
 
 
