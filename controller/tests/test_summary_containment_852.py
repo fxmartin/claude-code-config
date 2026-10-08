@@ -116,3 +116,44 @@ def test_guard_downgrades_done_and_logs_when_main_ahead(monkeypatch) -> None:
     ledger = _FakeLedger()
     assert _guard_main_not_ahead(ledger, "r", "DONE") == "FAILED"
     assert "sneaky" in ledger.events[0][-1]
+
+
+def test_guard_ignores_commits_already_ahead_at_run_start(monkeypatch) -> None:
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: ["a1 operator wip"])
+    ledger = _FakeLedger()
+    assert _guard_main_not_ahead(ledger, "r", "DONE", ["a1 operator wip"]) == "DONE"
+    assert ledger.events == []
+
+
+def test_guard_flags_only_commits_added_during_run(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fix_issue, "_commits_ahead_of_origin", lambda *_: ["b2 sneaky", "a1 operator wip"]
+    )
+    ledger = _FakeLedger()
+    assert _guard_main_not_ahead(ledger, "r", "DONE", ["a1 operator wip"]) == "FAILED"
+    msg = ledger.events[0][-1]
+    assert "sneaky" in msg and "operator wip" not in msg
+
+
+def test_finish_fix_run_fails_done_when_main_gained_commit(monkeypatch) -> None:
+    calls: dict = {}
+    monkeypatch.setattr(fix_issue, "_run_summary", lambda *a, **k: None)
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: ["b2 sneaky"])
+
+    class L(_FakeLedger):
+        def set_story_status(self, run_id, sid, status) -> None:
+            calls["status"] = status
+
+    def fake_finalize(ledger, run_id, status, **k):
+        calls["final"] = status
+        return type("O", (), {"run_terminal": "FAILED"})()
+
+    monkeypatch.setattr(fix_issue, "finalize_run", fake_finalize)
+    issue = type("I", (), {"number": 1})()
+    story = type("S", (), {"id": "issue-1"})()
+    opts = type("O", (), {"issue": 1})()
+    res = fix_issue._finish_fix_run(
+        issue, {}, story, opts, L(), "r", None, Path("."), terminal="DONE", pr_number=2,
+    )
+    assert calls["status"] == "FAILED" and calls["final"] == {"issue-1": "FAILED"}
+    assert res.status == "FAILED"
