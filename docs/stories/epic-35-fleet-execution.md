@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (17/19)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, parked on the M3 Max). authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (17/20)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, parked on the M3 Max); 35.3-002 (fleet PRs close their issues) added 2026-10-08. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 19 | **Total Points**: 72 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 20 | **Total Points**: 75 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -603,6 +603,65 @@ without `--enqueue`).
 **Dependencies**: 35.1-002
 **Risk Level**: Low
 
+##### Story 35.3-002: A fleet-built story's change request closes its issue
+**User Story**: As FX, I want a story built on any fleet worker to open its
+PR/MR with `Closes #N` for the story's mirrored issue, so that merging it
+closes the issue exactly as a local build does — instead of every fleet-merged
+story leaving its issue open for me to close by hand.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** `sdlc build <story…> --enqueue` on a host whose ledger maps those
+  stories to issues (`sdlc issues init` ran there) **When** the job is
+  recorded **Then** it carries each scoped story's `{story_id: (host, ref)}`
+  mapping — data, not a credential, so the "jobs carry no tokens" rule holds —
+  and `sdlc queue list --json` shows it.
+- **Given** a worker claims such a job **When** it dispatches the run **Then**
+  it writes the carried mappings into its clone's ledger inventory before the
+  first stage (`inventory_set_mapping`), so `build_issue.close_link` resolves
+  locally and the change request opens with `Closes #N` — for the
+  deterministic opener's body (`_open_story_cr`, including the review-entry
+  path of #698) and the agent-opened path alike.
+- **Given** a job with no carried mapping (enqueued from an unmirrored host,
+  or before this story) and a worker clone whose inventory is empty **When**
+  the controller resolves the close-link **Then** the marker search
+  (`_recover_ref` on `<!-- sdlc-story: ID -->`) runs anyway whenever the repo
+  declares a forge (`.sdlc-forge.yaml`, or an auto-detected origin): an empty
+  local inventory is no longer read as "this repo does not mirror". A
+  genuine miss still logs the #677 `warn` naming the story.
+- **Given** a repo that has never mirrored and declares no forge **When** a
+  build runs **Then** behaviour is unchanged: no host search, no warn
+  (the reason `_mirrors_stories` exists).
+- **Given** a fleet run whose change request merged **When** the story is
+  `DONE` **Then** its issue is closed by the forge (`Closes #N`), and
+  `sdlc issues init` on any host reconciles it as Done.
+
+**Technical Notes**: Found 2026-10-08. Five fleet-built stories merged with no
+close-link — #843, #844, #849, #851 and earlier — and their issues
+(#839, #841, #845, #847) were closed by hand. Root cause: `sdlc issues init`
+ran only on the XPS, so home-lab's worker clone has an empty
+`story_inventory`; `build_issue._adapter_and_ref` then calls `_repo_adapter`,
+whose `_mirrors_stories` evidence gate (`inventory_any_mapped`) returns
+False, so `_recover_ref` never runs, no #677 warn is logged, and
+`close_link` is `None`. The marker it would have found is on every mirrored
+issue. Carry the mapping on the job (an additive `issues` JSON column via a
+`_MIGRATIONS` entry — renumber on collision, per the 35.2-007/35.4-006
+precedent) as the primary path; relax the evidence gate to "inventory mapped
+*or* forge declared" as the fallback. Not in scope: the epic-file status
+lines, which fleet merges also leave stale (`sdlc issues init` reads them).
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: enqueue records the mapping for each scoped story; worker seeds
+      its inventory before dispatch; deterministic CR body carries `Closes #N`
+      on a fresh clone; empty inventory + declared forge → marker search;
+      no forge + no inventory → no host call; migration applies cleanly
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.3-001, 35.2-005
+**Risk Level**: Low
+
 ### Feature 35.4: Fleet Visibility and Control
 
 #### Stories
@@ -948,6 +1007,10 @@ change in verdict).
    Mac; committed recovery work is pushed and CI adjudicates before a story
    is declared failed. Must Have before unattended fleet bugfix rounds are
    trusted.
+9. **From the fleet merges (2026-10-08)**: 35.3-002 — every fleet-built PR
+   opened without `Closes #N` because the worker clone's ledger had never
+   mirrored, so four issues were closed by hand; the job carries the
+   story→issue mapping and the marker search no longer needs local evidence.
 
 ## Non-Goals
 
