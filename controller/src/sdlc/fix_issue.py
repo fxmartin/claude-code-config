@@ -2018,6 +2018,40 @@ def _render_core_prompt(
     )
 
 
+def _commits_ahead_of_origin(root: Path, branch: str = "main") -> list[str]:
+    """One-line subjects of local ``branch`` commits not on ``origin/branch``.
+
+    Issue #852: a controller stage must never leave unpushed commits on the
+    operator's main checkout. Anything unreadable (not a repo, no remote) yields
+    ``[]`` — the guard only fires on positive evidence.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--oneline", f"origin/{branch}..{branch}"],
+            cwd=root, capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _guard_main_not_ahead(ledger: Ledger, run_id: str, terminal: str) -> str:
+    """Downgrade a ``DONE`` terminal to ``FAILED`` when local main is ahead (#852)."""
+    if terminal != "DONE":
+        return terminal
+    ahead = _commits_ahead_of_origin(Path.cwd())
+    if not ahead:
+        return terminal
+    ledger.event_log(
+        run_id, "", "error", "controller",
+        "local main is ahead of origin/main after the run — unpushed commits: "
+        + "; ".join(ahead),
+    )
+    return "FAILED"
+
+
 def _run_summary(
     issue: FixIssue,
     inv: dict,
@@ -2415,6 +2449,7 @@ def _finish_fix_run(
     # Stamp the story row's terminal status (build.py does this in run_build's
     # caller; the loop leaves the row IN_PROGRESS) so `sdlc status` / the
     # dashboard see the finished story, then close the run out.
+    terminal = _guard_main_not_ahead(ledger, run_id, terminal)
     ledger.set_story_status(run_id, story.id, terminal)
 
     # --- Close out via the shared finalize (counts, terminal, run_finished) ---
@@ -3392,6 +3427,8 @@ def run_fix_batch(
         host=host, instance_url=instance_url,
     )
 
+    if "DONE" in status.values() and _guard_main_not_ahead(ledger, run_id, "DONE") != "DONE":
+        status = {k: ("FAILED" if v == "DONE" else v) for k, v in status.items()}
     outcome = finalize_run(
         ledger, run_id, status,
         reconcile=real_run, root=Path.cwd(),
