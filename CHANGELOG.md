@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.99.0] - 2026-10-08
+
+### Added
+
+- feat(fleet-execution): resident linux worker on the (#35.2-008)
+
+### Fixed
+
+- fix(fleet-execution): run bootstrap doctor from the repo root
+- fix(fleet-execution): resident linux worker on the hetzner (#35.2-008)
+- fix(fleet-execution): resident linux worker on the hetzner (#35.2-008)
+- fix(fleet-execution): wire glab credentials on the linux worker
+- fix(fleet-execution): resident linux worker on the hetzner (#35.2-008)
+- fix(fleet-execution): resident linux worker on the hetzner (#35.2-008)
+
+
 ## [v2.98.1] - 2026-10-08
 
 ### Fixed
