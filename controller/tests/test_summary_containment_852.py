@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from sdlc.dispatch import DENY_BASELINE_ENV, resolve_agent_cmd, resolve_deny_rules
-from sdlc.fix_issue import _commits_ahead_of_origin
+from sdlc import fix_issue
+from sdlc.fix_issue import _commits_ahead_of_origin, _guard_main_not_ahead
 
 
 def _bash_denied(rules: list[str], command: str) -> bool:
@@ -80,3 +81,38 @@ def test_guard_lists_unpushed_commit_on_main(clone: Path) -> None:
 
 def test_guard_ignores_non_git_directory(tmp_path: Path) -> None:
     assert _commits_ahead_of_origin(tmp_path) == []
+
+
+def test_guard_swallows_missing_git_binary(tmp_path: Path, monkeypatch) -> None:
+    def boom(*a, **k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(fix_issue.subprocess, "run", boom)
+    assert _commits_ahead_of_origin(tmp_path) == []
+
+
+class _FakeLedger:
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+
+    def event_log(self, *args) -> None:
+        self.events.append(args)
+
+
+def test_guard_passes_non_done_terminal_without_probing(monkeypatch) -> None:
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: pytest.fail("probed"))
+    assert _guard_main_not_ahead(_FakeLedger(), "r", "FAILED") == "FAILED"
+
+
+def test_guard_keeps_done_when_main_in_sync(monkeypatch) -> None:
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: [])
+    ledger = _FakeLedger()
+    assert _guard_main_not_ahead(ledger, "r", "DONE") == "DONE"
+    assert ledger.events == []
+
+
+def test_guard_downgrades_done_and_logs_when_main_ahead(monkeypatch) -> None:
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: ["abc fix: sneaky"])
+    ledger = _FakeLedger()
+    assert _guard_main_not_ahead(ledger, "r", "DONE") == "FAILED"
+    assert "sneaky" in ledger.events[0][-1]
