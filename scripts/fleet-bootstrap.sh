@@ -248,7 +248,9 @@ if [[ "${DRY_RUN}" == true ]]; then
   log "[dry-run] would run: sdlc doctor --exit-code"
 else
   log "sdlc doctor"
-  sdlc doctor --exit-code || DOCTOR_RC=$?
+  # From the repo, not the caller's directory: doctor finds its repo from the
+  # cwd's git root, and from ~ the harness-pin check WARNs on a healthy box.
+  (cd "${REPO_ROOT}" && sdlc doctor --exit-code) || DOCTOR_RC=$?
 fi
 
 # 7. The resident worker. Nothing to substitute: the unit uses %h for the home.

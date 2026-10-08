@@ -61,7 +61,8 @@ case "$2" in
   list) [ -e "$TMP/plugin" ] && echo "autonomous-sdlc@fx-claude-config" ; exit 0 ;;
 esac
 exit 0'
-    stub sdlc 'exit "${STUB_DOCTOR_RC:-0}"'
+    # sdlc records its working directory: doctor judges the repo it is run from.
+    stub sdlc 'echo "sdlc-cwd ${PWD}" >>"${CALLS}"; exit "${STUB_DOCTOR_RC:-0}"'
     stub systemctl '
 case "$2" in
   is-active) [ -e "$TMP/active" ] ;;
@@ -524,4 +525,12 @@ run_without() {  # run_without TOOL BOOTSTRAP-ARG…
     grep -qx "install.sh --core" "${CALLS}"
     ! grep -q systemctl "${CALLS}" || false
     [ ! -e "$(UNIT)" ]
+}
+
+@test "doctor judges the repo even when the bootstrap is run from another directory" {
+    cd "${HOME}"
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --github-only
+
+    [ "$status" -eq 0 ]
+    grep -qx "sdlc-cwd $(cd "${BATS_TEST_DIRNAME}/.." && pwd)" "${CALLS}"
 }
