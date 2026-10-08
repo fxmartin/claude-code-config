@@ -73,6 +73,23 @@ def _no_real_worker_launch_agent(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_worker_systemd_unit(monkeypatch, tmp_path_factory):
+    """Keep the Linux dev box's installed worker unit out of `sdlc doctor` (Story 35.2-008).
+
+    The twin of `_no_real_worker_launch_agent`. Where
+    `~/.config/systemd/user/sdlc-worker.service` exists — on `dev`, which runs this
+    suite for its own story jobs — doctor reads that unit, its `worker.env`, the
+    worker's real self-check record and its live queue. `XDG_CONFIG_HOME` moves the
+    unit, so repointing `HOME` does not hide it. Tests that exercise the check pass
+    `unit_path` / `worker_unit` explicitly.
+    """
+    from sdlc import doctor
+
+    absent = tmp_path_factory.getbasetemp() / "no-systemd-user" / doctor.WORKER_UNIT
+    monkeypatch.setattr(doctor, "default_worker_unit", lambda: absent)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_model_probe(monkeypatch):
     """Never spend a real ``claude -p`` call on the model entitlement probe.
 

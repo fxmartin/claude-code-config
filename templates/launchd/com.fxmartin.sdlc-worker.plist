@@ -72,6 +72,10 @@
   Each job runs under `caffeinate -i` (macOS only): the Mac may idle-sleep
   between jobs, and a closed lid still sleeps it unless it runs in clamshell
   mode on power with an external display.
+
+  The Linux dev box has its own twin, templates/systemd/sdlc-worker.service (Story
+  35.2-008). It needs no `caffeinate` or `systemd-inhibit`: a server never
+  idle-sleeps.
 -->
 <plist version="1.0">
 <dict>
