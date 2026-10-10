@@ -3922,6 +3922,20 @@ class Ledger:
             [s.get("status") for s in self.story_rows(run_id)],
         )
 
+    def preflight_owed(self, run_id: str) -> bool:
+        """True when ``run_id`` began a preflight gate that never passed (Story 35.4-005).
+
+        It died mid-suite (``running``) or came back red or timed out (``failed``):
+        either way nothing was dispatched, so a resume re-runs the gate before any
+        story. ``failed`` counts as much as ``running`` because that FAILED run
+        keeps its stories TODO, and ``sdlc resume --run`` (the "failed with
+        resumable stories" hint) and a fleet reclaim both resume it. A run that
+        never began one (``--skip-preflight``, or from before preflight was a
+        phase) owes none.
+        """
+        state = self.preflight_state(run_id)
+        return state is not None and state["state"] != "passed"
+
     def events_by_source(self, run_id: str, source: str) -> list[str]:
         """Every event message for ``run_id`` from ``source``, earliest first.
 
@@ -4160,10 +4174,13 @@ class Ledger:
                     "failed": by_status.get("FAILED", 0),
                     "total_tokens": u["tok"] if u else None,
                     "total_cost_usd": u["cost"] if u else None,
-                    # Story 35.4-005: only a live run has a phase (and only it is
-                    # worth the extra reads, on a list the page polls every tick).
+                    # Story 35.4-005: only a live run has a phase. Its status and
+                    # story statuses are already in hand, so only its preflight
+                    # events are read — not a `run_phase` re-read per run on a
+                    # list the page polls every tick.
                     "phase": (
-                        self.run_phase(r["id"]) if r["status"] == "IN_PROGRESS" else None
+                        _run_phase(r["status"], self.preflight_state(r["id"]), list(by_status))
+                        if r["status"] == "IN_PROGRESS" else None
                     ),
                 }
             )
@@ -8071,8 +8088,8 @@ def run_build(
     # a minute, so the phase opens before it. The gate itself still runs only once
     # routing, config and story rows are recorded, which a resume of a run
     # interrupted in the gate replays.
-    preflight_command = "preflight" if preflight else preflight_command_text()
     if not opts.skip_preflight:
+        preflight_command = "preflight" if preflight else preflight_command_text()
         open_preflight_phase(ledger, run_id, preflight_command, registry)
     _probe_tier_models(ledger, run_id, opts)
     routing = _resolve_run_routing(opts)

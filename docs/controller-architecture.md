@@ -72,11 +72,15 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    command) as an `error` event, finishes its registry and fleet records `FAILED`,
    finishes the fleet job `failed` with that reason, and sends it to Telegram — it
    no longer leaves *no* run at all. `sdlc resume` of a build or single-issue
-   fix run interrupted in preflight re-runs the gate (nothing was dispatched)
-   rather than skipping it. An `sdlc fix all` batch run has no supported resume
-   path (`resume_fix` takes only an `issue-<N>` scope, and the epic resume cannot
-   rebuild an issue queue), so one interrupted in preflight is left `IN_PROGRESS`
-   and the dashboard shows it `DEAD` once its pid is gone; re-run the batch.
+   fix run whose gate never passed re-runs the gate (nothing was dispatched)
+   rather than skipping it — whether the run was interrupted in preflight or
+   came back red and was closed `FAILED`, which `sdlc resume --run <id>` (the
+   "failed with resumable stories" hint) and a fleet reclaim both resume; a red
+   re-run exits with `PRE_FLIGHT_FAILURE`. An `sdlc fix all` batch run has no
+   supported resume path (`resume_fix` takes only an `issue-<N>` scope, and the
+   epic resume cannot rebuild an issue queue), so one interrupted in preflight is
+   left `IN_PROGRESS` and the dashboard shows it `DEAD` once its pid is gone;
+   re-run the batch.
    `sdlc build` opens the phase before its live tier-model probe
    (Story 34.1-002), which is part of preflight, but runs the gate itself only
    after the run's routing, config and story rows are recorded — the state a
@@ -2502,7 +2506,7 @@ authoritative for the worker; the table is the fleet's summary.
   shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
   `/api/runs`, `/api/fleet` and the SSE change token; a failed fetch is kept
   for 30 s, so an offline service stalls the page at most once per window.
-- **Phase (Story 35.4-005).** A run's row also carries `phase` (migration 13):
+- **Phase (Story 35.4-005).** A run's row also carries `phase` (migration 15):
   `preflight` while its gate runs, then `stories`, then `closing`, empty once the run
   is finished. A build pushes it as the phase changes and a worker refreshes it from
   the run's own ledger on each heartbeat, so the runs sidebar shows a remote run in

@@ -37,8 +37,8 @@ from sdlc.fix_issue import (
 )
 from sdlc.queue import QueueStore
 from sdlc.registry import Registry, RunRecord, live_record
-from sdlc.resume import run_resume
-from sdlc.scheduler import ledger_preflight_failure
+from sdlc.resume import has_resumable_work, run_resume
+from sdlc.scheduler import ledger_preflight_failure, ledger_run_terminal
 from sdlc.status import format_preflight
 
 RED = "PRE_FLIGHT_RED: 'uv run pytest' exited 1 — the suite is failing. Fix it, or bypass with --skip-preflight."
@@ -253,6 +253,20 @@ def test_skip_preflight_records_no_phase(tmp_path) -> None:
     assert status_snapshot(Ledger(db))["run"]["preflight"] is None
 
 
+def test_skip_preflight_never_detects_the_preflight_command(tmp_path, monkeypatch) -> None:
+    # `--skip-preflight` is the bypass: it must not read the repo's Makefile /
+    # pyproject / uv.lock for a gate command it will never run.
+    def _must_not_detect(root=None) -> str:
+        raise AssertionError("--skip-preflight detected the preflight command")
+
+    monkeypatch.setattr(build_mod, "preflight_command_text", _must_not_detect)
+    result = run_build(
+        BuildOptions(scope="epic-99", sequential=True, skip_preflight=True),
+        queue=_sample_queue(), ledger=Ledger(tmp_path / "ledger.db"), dispatcher=FakeDispatcher(),
+    )
+    assert result.completed == 3
+
+
 # ---------------------------------------------------------------------------
 # Ledger: the derived phase
 # ---------------------------------------------------------------------------
@@ -305,6 +319,41 @@ def test_preflight_state_reports_command_and_latest_attempt(tmp_path) -> None:
     # A resume's re-run is the latest attempt.
     ledger.event_log(run_id, "", "info", "preflight", "started: make test")
     assert ledger.preflight_state(run_id)["state"] == "running"
+
+
+def test_list_runs_derives_phase_from_the_rows_it_already_read(tmp_path, monkeypatch) -> None:
+    # `list_runs` already holds each run's status and story counts: a live run's
+    # phase needs only its preflight events on top, not a `run_phase` re-read
+    # (run row + events + stories) per run on a list polled every tick.
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    gate = ledger.run_create("epic-1", "serial")
+    ledger.story_upsert(gate, "s-1", "1", "t", "P1", 1, "py", "", None, "TODO")
+    ledger.event_log(gate, "", "info", "preflight", "started: make test")
+    working = ledger.run_create("epic-2", "serial")
+    ledger.story_upsert(working, "s-2", "1", "t", "P1", 1, "py", "", None, "IN_PROGRESS")
+    closing = ledger.run_create("epic-3", "serial")
+    ledger.story_upsert(closing, "s-3", "1", "t", "P1", 1, "py", "", None, "DONE")
+    finished = ledger.run_create("epic-4", "serial")
+    ledger.run_update_status(finished, "DONE")
+    looked_up: list[str] = []
+    real_preflight_state = Ledger.preflight_state
+
+    def _counting(self, run_id, **kwargs):
+        looked_up.append(run_id)
+        return real_preflight_state(self, run_id, **kwargs)
+
+    def _no_reread(self, run_id):
+        raise AssertionError("list_runs re-read a run it already holds")
+
+    monkeypatch.setattr(Ledger, "preflight_state", _counting)
+    for name in ("run_phase", "run_row", "story_rows"):
+        monkeypatch.setattr(Ledger, name, _no_reread)
+
+    phases = {r["id"]: r["phase"] for r in ledger.list_runs()}
+
+    assert phases == {gate: "preflight", working: "stories", closing: "closing", finished: None}
+    assert sorted(looked_up) == sorted([gate, working, closing])  # a finished run pays nothing
 
 
 def test_format_preflight_matches_the_header_contract() -> None:
@@ -691,6 +740,126 @@ def test_fix_resume_with_a_red_preflight_fails_the_run(tmp_path) -> None:
         preflight=lambda: False,
     )
     assert result.preflight_failed is True and result.status == "FAILED"
+    assert dispatch.calls == []
+    assert Ledger(db).run_row(run_id)["status"] == "FAILED"
+
+
+def _build_that_failed_preflight(tmp_path: Path) -> tuple[Ledger, str]:
+    db = tmp_path / "ledger.db"
+    run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(), ledger=Ledger(db), dispatcher=FakeDispatcher(),
+        preflight=lambda: False,
+    )
+    ledger = Ledger(db)
+    [run] = _runs(db)
+    assert run["status"] == "FAILED"
+    assert ledger.preflight_state(run["id"])["state"] == "failed"
+    return ledger, run["id"]
+
+
+def test_a_run_that_failed_preflight_is_offered_for_resume(tmp_path) -> None:
+    # Why a red gate must not be skippable on resume: its FAILED run keeps every
+    # story TODO, so the CLI names it ("failed with resumable stories — try:
+    # sdlc resume --run <id>") and a fleet reclaim of a lapsed job resumes it.
+    ledger, run_id = _build_that_failed_preflight(tmp_path)
+    assert ledger.latest_failed_run("epic-99") == run_id
+    assert has_resumable_work(ledger, run_id)
+    assert ledger_run_terminal(str(ledger.db_path), run_id) is None
+
+
+def test_resume_of_a_run_that_failed_preflight_reruns_the_gate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("sdlc.resume.discover_queue", lambda scope, root: _sample_queue())
+    ledger, run_id = _build_that_failed_preflight(tmp_path)
+    calls = {"n": 0}
+
+    def preflight() -> bool:
+        calls["n"] += 1
+        return True
+
+    result = run_resume(
+        "epic-99", ledger=ledger, dispatcher=FakeDispatcher(), run_id=run_id, preflight=preflight,
+    )
+    assert calls["n"] == 1  # the gate never passed, so it is re-run — not skipped
+    assert result.preflight_failed is False and result.completed == 3
+    assert ledger.preflight_state(run_id)["state"] == "passed"
+    assert len(_runs(ledger.db_path)) == 1  # same run
+
+
+def test_resume_of_a_run_that_failed_preflight_dispatches_nothing_while_red(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("sdlc.resume.discover_queue", lambda scope, root: _sample_queue())
+    ledger, run_id = _build_that_failed_preflight(tmp_path)
+    dispatcher = FakeDispatcher()
+    result = run_resume(
+        "epic-99", ledger=ledger, dispatcher=dispatcher, run_id=run_id, preflight=lambda: False,
+    )
+    assert result.preflight_failed is True
+    assert dispatcher.calls == []
+    assert ledger.run_row(run_id)["status"] == "FAILED"
+    assert [lvl for lvl, _m in _events(ledger.db_path, "preflight")] == ["info", "error", "info", "error"]
+
+
+def test_fix_resume_of_a_run_that_failed_preflight_reruns_the_gate(tmp_path) -> None:
+    # Not refused as a run that "predates the Issue #547 freeze": it has no plan
+    # only because its gate never passed, so nothing was investigated.
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+    run_fix(
+        FixOptions(issue=1), ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+        preflight=lambda: False, runner=gh, root=tmp_path,
+    )
+    run_id = _runs(db)[0]["id"]
+    calls = {"n": 0}
+
+    def preflight() -> bool:
+        calls["n"] += 1
+        return True
+
+    result = resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=RecordingDispatcher(), runner=gh,
+        root=tmp_path, preflight=preflight,
+    )
+    assert calls["n"] == 1
+    assert result.status == "DONE" and result.aborted is False
+    assert Ledger(db).preflight_state(run_id)["state"] == "passed"
+
+
+def test_resume_hands_a_fix_run_its_preflight_and_reports_a_red_gate(tmp_path, monkeypatch) -> None:
+    # `run_resume` delegates a fix run to `resume_fix`: the injected gate must
+    # reach it (never the real suite), and a red re-run must read as the same
+    # PRE_FLIGHT_FAILURE a build resume gives — not "0 done, 1 failed".
+    import sdlc.fix_issue as fix_mod
+
+    def _real_suite(**_kw) -> bool:
+        raise AssertionError("run_resume did not forward its preflight to resume_fix")
+
+    monkeypatch.setattr(fix_mod, "default_preflight", _real_suite)
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+
+    def killed() -> bool:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_fix(
+            FixOptions(issue=1), ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+            preflight=killed, runner=gh, root=tmp_path,
+        )
+    run_id = _runs(db)[0]["id"]
+    calls = {"n": 0}
+
+    def red() -> bool:
+        calls["n"] += 1
+        return False
+
+    dispatch = RecordingDispatcher()
+    result = run_resume(
+        "issue-1", ledger=Ledger(db), dispatcher=dispatch, run_id=run_id,
+        runner=gh, root=tmp_path, preflight=red,
+    )
+    assert calls["n"] == 1
+    assert result.preflight_failed is True
+    assert (result.resumed, result.failed) == (0, 0)
     assert dispatch.calls == []
     assert Ledger(db).run_row(run_id)["status"] == "FAILED"
 

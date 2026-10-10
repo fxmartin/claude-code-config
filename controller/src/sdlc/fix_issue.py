@@ -2557,10 +2557,11 @@ def resume_fix(
     ``1 done`` finish immediately followed by ``0 done, 1 failed`` for the same
     run). ``force`` is the documented override, "only if that pid is gone".
 
-    Story 35.4-005: a run interrupted *in* preflight has no plan to recover and
-    nothing was dispatched, so it is resumed by re-running preflight (``preflight``
-    is the seam, as in :func:`run_fix`) and then investigating as a fresh fix
-    would — not refused, and not by skipping the gate.
+    Story 35.4-005: a run whose preflight gate never passed — interrupted *in* it,
+    or red and closed FAILED — has no plan to recover and nothing was dispatched,
+    so it is resumed by re-running preflight (``preflight`` is the seam, as in
+    :func:`run_fix`) and then investigating as a fresh fix would — not refused,
+    and not by skipping the gate.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
@@ -2594,10 +2595,8 @@ def resume_fix(
     opts.harness_map = ledger.run_harness_routing(run_id)
 
     plan = _recover_fix_plan(ledger, run_id)
-    preflight_interrupted = plan is None and (
-        (ledger.preflight_state(run_id) or {}).get("state") == "running"
-    )
-    if plan is None and not preflight_interrupted:
+    preflight_owed = plan is None and ledger.preflight_owed(run_id)
+    if plan is None and not preflight_owed:
         reason = (
             f"run {run_id[:8]} recorded no investigation plan (it predates the "
             f"Issue #547 freeze) — re-run `sdlc fix {issue_number}` instead; the "
@@ -2644,7 +2643,7 @@ def resume_fix(
             registry, run_id, scope, ledger.db_path, 1, repo=root or Path.cwd()
         )
 
-    if plan is None:  # refused above unless the run was interrupted in preflight
+    if plan is None:  # refused above unless the run's preflight gate never passed
         failures: list[str] = []
         check_preflight = preflight or (
             lambda: default_preflight(on_failure=failures.append)

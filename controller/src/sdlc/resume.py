@@ -171,6 +171,10 @@ def _resume_fix_run(
     and must not collapse into the generic ``nothing_to_resume`` above — that would
     swallow the message naming the owning pid, which is the entire point of the
     guard. It is surfaced as ``refused``/``refusal_reason`` instead.
+
+    Story 35.4-005: a re-run preflight gate that comes back red is reported as
+    ``preflight_failed``, exactly as a build resume reports it — not as one
+    resumed story that failed.
     """
     from sdlc.fix_issue import resume_fix
 
@@ -183,6 +187,8 @@ def _resume_fix_run(
         return ResumeResult(run_id=run_id, refused=True, refusal_reason=result.abort_reason)
     if result.aborted:
         return ResumeResult(run_id=run_id, nothing_to_resume=True)
+    if result.preflight_failed:
+        return ResumeResult(run_id=run_id, preflight_failed=True)
     story_id = f"issue-{result.issue}"
     return ResumeResult(
         run_id=run_id,
@@ -449,10 +455,12 @@ def run_resume(
     ``force`` is the documented override, "only if that pid is gone". The check
     covers the fix-mode delegation below too, since it runs before that branch.
 
-    Story 35.4-005: a run interrupted *in* preflight dispatched nothing, so it is
-    resumed by re-running preflight (``preflight`` is the seam, as in
-    :func:`run_build`) — never by skipping it. A red or timed-out gate stamps the
-    run FAILED with its reason and returns ``preflight_failed``.
+    Story 35.4-005: a run whose preflight gate never passed — interrupted *in*
+    it, or red and closed FAILED — dispatched nothing, so it is resumed by
+    re-running preflight (``preflight`` is the seam, as in :func:`run_build`, and
+    is handed on to a fix run's resume) — never by skipping it. A red or
+    timed-out gate stamps the run FAILED with its reason and returns
+    ``preflight_failed``.
     """
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
@@ -487,7 +495,7 @@ def run_resume(
     if str(run_row.get("mode") or "") in _FIX_RUN_MODES:
         return _resume_fix_run(
             rid, ledger=ledger, dispatcher=dispatcher, render_view=render_view,
-            root=root, registry=registry, runner=runner, force=force,
+            root=root, registry=registry, runner=runner, force=force, preflight=preflight,
         )
 
     config = ledger.run_config(rid)
@@ -644,9 +652,10 @@ def run_resume(
     except Exception:
         pass
 
-    # Story 35.4-005: the run died while its gate was running, so nothing was
-    # dispatched and the gate is still owed — re-run it before any story is.
-    if (ledger.preflight_state(rid) or {}).get("state") == "running":
+    # Story 35.4-005: the run's gate never passed — it died mid-suite, or came
+    # back red and left the run FAILED — so nothing was dispatched and the gate
+    # is still owed: re-run it before any story is.
+    if ledger.preflight_owed(rid):
         preflight_failures: list[str] = []
         check_preflight = preflight or (
             lambda: default_preflight(
