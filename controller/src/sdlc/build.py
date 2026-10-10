@@ -358,11 +358,17 @@ def _run_phase(
     return "stories"
 
 
-def _fold_preflight(rows: Iterable, *, now: datetime | None = None) -> dict | None:
+def _fold_preflight(
+    rows: Iterable, *, now: datetime | None = None, run_status: str | None = None
+) -> dict | None:
     """The preflight state one run's ``preflight`` events describe, oldest first.
 
     See :meth:`Ledger.preflight_state`, which reads the rows for one run;
     :meth:`Ledger.list_runs` reads every live run's in a single query instead.
+    A gate with no outcome on a run no longer ``IN_PROGRESS`` (``run_status``) is
+    ``interrupted``, not ``running``: whatever closed the run — a fresh run that
+    superseded it, a batch closed ``ABORTED`` — did so without the gate's process,
+    so it has no elapsed to keep counting.
     """
     state: dict | None = None
     for row in rows:
@@ -381,6 +387,9 @@ def _fold_preflight(rows: Iterable, *, now: datetime | None = None) -> dict | No
             state.update(state="failed", finished_at=row["ts"], reason=message)
     if state is None:
         return None
+    if state["state"] == "running" and run_status not in (None, "IN_PROGRESS"):
+        state.update(state="interrupted", duration_seconds=None)
+        return state
     state["duration_seconds"] = _duration_seconds(
         state["started_at"], state["finished_at"], now=now
     )
@@ -3557,6 +3566,18 @@ class Ledger:
                 ).fetchone()
         return row["id"] if row else None
 
+    def in_progress_runs(self, scope: str) -> list[str]:
+        """Every ``IN_PROGRESS`` run id of exactly ``scope``, oldest first (Story 35.4-005)."""
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                "SELECT id FROM runs WHERE status = 'IN_PROGRESS' AND scope = ? "
+                "ORDER BY started_at, rowid",
+                (scope,),
+            ).fetchall()
+        return [row["id"] for row in rows]
+
     def latest_failed_run(self, scope: str | None = None) -> str | None:
         """The most recent ``FAILED`` run id (optionally for ``scope``), or None.
 
@@ -3902,9 +3923,11 @@ class Ledger:
         ``None`` when the run never began one (``--skip-preflight``, or a run from
         before preflight was a phase). Otherwise ``{state, command, reason,
         started_at, finished_at, duration_seconds}``: ``state`` is ``running`` /
-        ``passed`` / ``failed``, ``reason`` the ``PRE_FLIGHT_*`` line of a failure,
-        and ``duration_seconds`` the elapsed time so far while running. The latest
-        ``started`` event wins, so a resume that re-ran the gate reports its own.
+        ``passed`` / ``failed``, or ``interrupted`` for a gate with no outcome on a
+        run that is no longer ``IN_PROGRESS``; ``reason`` the ``PRE_FLIGHT_*`` line
+        of a failure, and ``duration_seconds`` the elapsed time so far while
+        running (None once interrupted). The latest ``started`` event wins, so a
+        resume that re-ran the gate reports its own.
         """
         if not self.db_path.exists():
             return None
@@ -3914,7 +3937,8 @@ class Ledger:
                 "ORDER BY id",
                 (run_id,),
             ).fetchall()
-        return _fold_preflight(rows, now=now)
+            run = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return _fold_preflight(rows, now=now, run_status=run["status"] if run else None)
 
     def run_phase(self, run_id: str) -> str | None:
         """The phase a live run is in: ``preflight`` | ``stories`` | ``closing`` (Story 35.4-005).
@@ -4904,6 +4928,39 @@ def run_preflight_phase(
         except Exception:
             pass
     return reason
+
+
+def close_superseded_runs(
+    ledger: "Ledger", run_id: str, scope: str, registry: "Registry | None"
+) -> list[str]:
+    """Close ``ABORTED`` each dead ``scope`` run that never passed its gate (Story 35.4-005).
+
+    A run opens before its gate, so one killed mid-suite (Ctrl-C on a slow suite)
+    is left ``IN_PROGRESS`` with every story ``TODO``. ``run_id``, a fresh run of
+    the same scope, takes it over: left open, the dead run is the newest
+    ``IN_PROGRESS`` one once ``run_id`` finishes, and a bare ``sdlc resume`` would
+    build its whole scope again — stories ``run_id`` shipped included. Nothing was
+    dispatched under it, so closing it loses nothing. Only a run the registry
+    proves dead is closed (a live one may be in its gate right now), so with no
+    registry none is. Returns the ids closed.
+    """
+    if registry is None:
+        return []
+    closed: list[str] = []
+    for old in ledger.in_progress_runs(scope):
+        if old == run_id or not ledger.preflight_owed(old):
+            continue
+        if registry.find_live_owner(run_id=old) is not None:
+            continue
+        ledger.event_log(
+            old, "", "warn", "controller",
+            f"superseded by run {run_id[:8]}: interrupted before its preflight gate "
+            "passed, nothing was dispatched — closed ABORTED",
+        )
+        ledger.run_update_status(old, "ABORTED")
+        _registry_finish(registry, old, "ABORTED", 0)
+        closed.append(old)
+    return closed
 
 
 def _routed_roles_by_harness(opts: "BuildOptions") -> dict[str, list[str]]:
@@ -8094,6 +8151,9 @@ def run_build(
     ledger.event_log(
         run_id, "", "info", "controller", f"run started: scope={opts.scope} mode={mode}"
     )
+    # Story 35.4-005: this run takes over any dead run of its scope that died in
+    # its gate, so a later bare `sdlc resume` cannot rebuild the scope under it.
+    close_superseded_runs(ledger, run_id, opts.scope, registry)
     # Story 20.5-001: resolve and log the dispatch harness's capabilities so a
     # heterogeneous run is auditable and any mode downgrade is explicit. The
     # default slot is the built-in Claude harness (no probe, all capabilities),

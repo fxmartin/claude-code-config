@@ -79,19 +79,26 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    (nothing was dispatched) rather than skipping it — whether the run was
    interrupted in preflight or came back red and was closed `FAILED`, which
    `sdlc resume --run <id>` (the "failed with resumable stories" hint) and a
-   fleet reclaim both resume; a red re-run exits with `PRE_FLIGHT_FAILURE`. So
-   continue a build interrupted in its gate with `sdlc resume`, not a fresh
-   `sdlc build`: the fresh run leaves it `IN_PROGRESS` with every story `TODO`,
-   and a later bare `sdlc resume` picks it and builds those stories again, even
-   ones the fresh run has since shipped. An
+   fleet reclaim both resume; a red re-run exits with `PRE_FLIGHT_FAILURE`. A
+   resumed fix re-applies `sdlc fix`'s stop conditions before its gate: an issue
+   closed, labelled `wontfix` or reassigned since the run died stops the resume,
+   and an interrupted run is closed `ABORTED` (a red one stays `FAILED`).
+   Starting the scope afresh instead — `sdlc build` / `sdlc fix` / `sdlc fix all`
+   of the same scope — supersedes a run that died in its gate: once the
+   registry shows its process gone, the fresh run closes it `ABORTED` (nothing
+   was dispatched), so a later bare `sdlc resume` cannot pick it and build the
+   scope again under the fresh run, and a fleet reclaim of its job starts afresh
+   rather than resuming it. A run still alive, one past its gate, or one of
+   another scope is left alone. An
    `sdlc fix all` / `next` batch has no resume path (`resume_fix` takes only an
    `issue-<N>` scope, and the epic resume cannot rebuild an issue queue), so a
    batch whose gate never passed is not resumed at all: `sdlc resume` refuses it
    and its hint never names it, and a fleet reclaim restarts the job as a fresh
    `sdlc fix` — exactly as when the gate ran before the run existed. A batch
    interrupted in the gate (left `IN_PROGRESS`) is closed `ABORTED` by that
-   refusal or reclaim, so it does not stay the run a bare `sdlc resume` picks
-   ahead of an older interrupted build; a red one stays `FAILED`.
+   refusal or reclaim — or by a fresh batch of its scope, as above — so it does
+   not stay the run a bare `sdlc resume` picks ahead of an older interrupted
+   build; a red one stays `FAILED`.
    `sdlc build` opens the phase before its live tier-model probe
    (Story 34.1-002), which is part of preflight, but runs the gate itself only
    after the run's routing, config and story rows are recorded — the state a
@@ -101,7 +108,10 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    none unless the run is `IN_PROGRESS`, so a finished or `RATE_LIMITED` run has
    none) and `run.preflight` (`state`, `command`,
    `duration_seconds`, `reason`), both derived from the ledger's `preflight`
-   events. `/api/runs` rows carry `phase`, and the fleet record's `phase` is
+   events. A gate with no outcome on a run that is no longer `IN_PROGRESS` (one
+   superseded, or a batch closed `ABORTED`) is `state: interrupted` with no
+   duration, and the header and `sdlc status` read `preflight: interrupted` —
+   never a `running` gate whose elapsed keeps counting. `/api/runs` rows carry `phase`, and the fleet record's `phase` is
    refreshed on each worker heartbeat, so the runs sidebar names a remote run's
    worker *and* its phase.
    The whole command is bounded by `--preflight-timeout` (default 1800s), and when

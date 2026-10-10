@@ -71,8 +71,9 @@ def format_preflight(preflight: dict | None, *, phase: str | None = None) -> str
     """The run's preflight gate as one line, or ``None`` when it never ran one (Story 35.4-005).
 
     Mirrors the dashboard header, durations included: ``preflight: running
-    (<command>, <elapsed>)``, ``preflight: passed (<duration>)`` or ``preflight:
-    failed — <PRE_FLIGHT_* reason>``. A remote run carries only its ``phase``,
+    (<command>, <elapsed>)``, ``preflight: passed (<duration>)``, ``preflight:
+    failed — <PRE_FLIGHT_* reason>`` or, for a run closed with its gate still
+    open, ``preflight: interrupted``. A remote run carries only its ``phase``,
     which still says it is in preflight.
     """
     if not preflight:
@@ -86,6 +87,8 @@ def format_preflight(preflight: dict | None, *, phase: str | None = None) -> str
         return f"preflight: passed ({took})"
     if state == "failed":
         return f"preflight: failed — {preflight.get('reason') or 'no reason recorded'}"
+    if state == "interrupted":
+        return "preflight: interrupted"
     return None
 
 

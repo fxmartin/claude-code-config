@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
 import threading
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -40,7 +43,7 @@ from sdlc.fix_issue import (
 )
 from sdlc.queue import QueueStore
 from sdlc.registry import Registry, RunRecord, live_record
-from sdlc.resume import has_resumable_work, run_resume
+from sdlc.resume import close_unstarted_fix_batch, has_resumable_work, run_resume
 from sdlc.scheduler import (
     ledger_close_unstarted_batch,
     ledger_preflight_failure,
@@ -377,6 +380,28 @@ def test_preflight_state_reports_command_and_latest_attempt(tmp_path) -> None:
     assert ledger.preflight_state(run_id)["state"] == "running"
 
 
+@pytest.mark.parametrize("closed_as", ["ABORTED", "NEEDS_ATTENTION", "FAILED"])
+def test_an_open_gate_on_a_run_no_longer_in_progress_reads_interrupted(tmp_path, closed_as) -> None:
+    # Whatever closed the run (a superseding run, a batch closed ABORTED, a hand
+    # `sdlc run-close`) did so without the gate's process: the gate is not still
+    # running, and the header must not tick its elapsed up forever.
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-1", "serial")
+    ledger.event_log(run_id, "", "info", "preflight", "started: make test")
+    ledger.run_update_status(run_id, closed_as)
+
+    state = ledger.preflight_state(run_id, now=datetime.now(timezone.utc) + timedelta(hours=5))
+
+    assert (state["state"], state["command"]) == ("interrupted", "make test")
+    assert state["duration_seconds"] is None and state["finished_at"] is None
+    assert ledger.preflight_owed(run_id) is True  # nothing was dispatched: still owed
+    snap = status_snapshot(ledger, run_id)
+    assert snap["run"]["phase"] is None
+    assert snap["run"]["preflight"]["state"] == "interrupted"
+    assert format_preflight(snap["run"]["preflight"], phase=None) == "preflight: interrupted"
+
+
 def test_list_runs_derives_phase_from_the_rows_it_already_read(tmp_path, monkeypatch) -> None:
     # `list_runs` already holds each run's status and story counts, and reads every
     # live run's preflight events in the same pass: no `run_phase` re-read (run
@@ -424,6 +449,9 @@ def test_format_preflight_matches_the_header_contract() -> None:
     assert format_preflight({"state": "passed", "duration_seconds": 125}) == "preflight: passed (2m 05s)"
     assert format_preflight({"state": "running", "duration_seconds": 3725}) == "preflight: running (1h 02m)"
     assert format_preflight({"state": "failed", "reason": RED}) == f"preflight: failed — {RED}"
+    assert format_preflight(
+        {"state": "interrupted", "command": "make test", "duration_seconds": None}
+    ) == "preflight: interrupted"
     assert format_preflight(None, phase="preflight") == "preflight: running"
 
 
@@ -592,6 +620,7 @@ def test_dashboard_header_states_preflight_running_command_and_elapsed() -> None
     assert "preflight-elapsed" in page  # the live-ticking elapsed
     assert "preflight: passed (" in page
     assert "preflight: failed" in page
+    assert "preflight: interrupted" in page
     # ...and the sidebar names a run's phase beside its worker.
     assert "r.phase" in page
 
@@ -609,6 +638,7 @@ def test_dashboard_preflight_line_renders_the_header_contract() -> None:
       preflightLine({preflight: {state: "running", command: "make test", duration_seconds: 125}}, cfg),
       preflightLine({preflight: {state: "passed", duration_seconds: 42}}, cfg),
       preflightLine({preflight: {state: "failed", reason: "PRE_FLIGHT_RED: 'make test' exited 1"}}, cfg),
+      preflightLine({preflight: {state: "interrupted", command: "make test", duration_seconds: null}}, cfg),
       preflightLine({phase: "preflight"}, {}),
       preflightLine({preflight: {state: "running", command: "<img src=x>", duration_seconds: 5}}, cfg),
       preflightLine({}, {preflight: "skipped"}),
@@ -622,6 +652,7 @@ def test_dashboard_preflight_line_renders_the_header_contract() -> None:
         "preflight: running (make test, <span id='preflight-elapsed'>2m 05s</span>)",
         "preflight: passed (42s)",
         "preflight: failed &mdash; PRE_FLIGHT_RED: &#39;make test&#39; exited 1",
+        "preflight: interrupted",
         "preflight: running",
         "preflight: running (&lt;img src=x&gt;, <span id='preflight-elapsed'>5s</span>)",
         "preflight: skipped",
@@ -1119,6 +1150,208 @@ def test_a_batch_past_its_gate_keeps_the_existing_resume_rule(tmp_path) -> None:
     ledger.set_story_status(run_id, "issue-1", "IN_PROGRESS")
     assert ledger.preflight_owed(run_id) is False
     assert ledger_run_terminal(str(ledger.db_path), run_id) != "fix batch never passed preflight"
+
+
+def test_a_batch_closed_aborted_in_its_gate_reads_interrupted_not_running(tmp_path) -> None:
+    # Its gate's `started` event has no outcome, but the run is closed: the header
+    # and `sdlc status` must not say `preflight: running` with an elapsed ticking on.
+    ledger, run_id = _batch_killed_in_preflight(tmp_path)
+    assert close_unstarted_fix_batch(ledger, run_id) is True
+
+    snap = status_snapshot(ledger, run_id)
+
+    assert snap["run"]["status"] == "ABORTED" and snap["run"]["phase"] is None
+    assert snap["run"]["preflight"]["state"] == "interrupted"
+    assert snap["run"]["preflight"]["duration_seconds"] is None
+
+
+# ---------------------------------------------------------------------------
+# a fresh run supersedes a dead same-scope run whose gate never passed
+# ---------------------------------------------------------------------------
+
+
+def _dead_record(run_id: str, db: Path, scope: str, repo: Path) -> RunRecord:
+    """A registry record for ``run_id`` whose process is certainly gone."""
+    from test_scheduler import _dead_pid
+
+    return RunRecord(
+        run_id=run_id, repo=str(repo.resolve()), db=str(db), scope=scope,
+        pid=_dead_pid(), status="IN_PROGRESS", started_at="",
+    )
+
+
+def test_a_fresh_build_supersedes_a_dead_run_of_its_scope_that_never_passed_its_gate(
+    tmp_path, monkeypatch
+) -> None:
+    # Ctrl-C on a slow suite leaves the run IN_PROGRESS with every story TODO. A
+    # fresh `sdlc build` of the scope used to run beside it; once that finished, the
+    # dead run was the newest IN_PROGRESS one, so a bare `sdlc resume` picked it and
+    # built every story again — even those the fresh run had just shipped.
+    monkeypatch.setattr("sdlc.resume.discover_queue", lambda scope, root: _sample_queue())
+    ledger, stale = _interrupted_build_in_preflight(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(_dead_record(stale, ledger.db_path, "epic-99", tmp_path))
+
+    fresh = run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(), ledger=ledger, dispatcher=FakeDispatcher(),
+        preflight=lambda: True, registry=registry,
+    )
+
+    assert fresh.completed == 3
+    assert ledger.run_row(stale)["status"] == "ABORTED"
+    assert any(
+        f"superseded by run {fresh.run_id[:8]}" in message
+        for _level, message in _events(ledger.db_path, "controller")
+    )
+    [record] = [r for r in registry.records() if r.run_id == stale]
+    assert (record.status, bool(record.finished_at)) == ("ABORTED", True)
+    assert status_snapshot(ledger, stale)["run"]["preflight"]["state"] == "interrupted"
+    # ...so a later bare resume has nothing left to rebuild.
+    dispatcher = FakeDispatcher()
+    later = run_resume("all", ledger=ledger, dispatcher=dispatcher, registry=registry)
+    assert (later.run_id, later.nothing_to_resume) == (None, True)
+    assert dispatcher.calls == []
+
+
+def test_a_fresh_build_supersedes_only_dead_runs_of_its_scope_that_owe_their_gate(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    registry = Registry(tmp_path / "registry.json")
+
+    def _run(scope: str, *gate: str, alive: bool = False) -> str:
+        run_id = ledger.run_create(scope, "serial")
+        for message in gate:
+            ledger.event_log(run_id, "", "info", "preflight", message)
+        record = _dead_record(run_id, ledger.db_path, scope, tmp_path)
+        registry.register(replace(record, pid=os.getpid()) if alive else record)
+        return run_id
+
+    owed = _run("epic-99", "started: make test")
+    past_gate = _run("epic-99", "started: make test", "passed")  # its stories hold work
+    skipped = _run("epic-99")  # --skip-preflight: it owes no gate
+    other_scope = _run("epic-98", "started: make test")
+    alive = _run("epic-99", "started: make test", alive=True)  # in its gate right now
+
+    run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(), ledger=ledger, dispatcher=FakeDispatcher(),
+        preflight=lambda: True, registry=registry,
+    )
+
+    assert {rid: ledger.run_row(rid)["status"] for rid in (owed, past_gate, skipped, other_scope, alive)} == {
+        owed: "ABORTED",
+        past_gate: "IN_PROGRESS",
+        skipped: "IN_PROGRESS",
+        other_scope: "IN_PROGRESS",
+        alive: "IN_PROGRESS",
+    }
+
+
+def test_without_a_registry_no_run_is_proven_dead_so_none_is_superseded(tmp_path) -> None:
+    ledger, stale = _interrupted_build_in_preflight(tmp_path)
+    run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(), ledger=ledger, dispatcher=FakeDispatcher(), preflight=lambda: True,
+    )
+    assert ledger.run_row(stale)["status"] == "IN_PROGRESS"
+
+
+def test_a_fresh_fix_supersedes_a_dead_run_of_its_issue_that_never_passed_its_gate(tmp_path) -> None:
+    db = tmp_path / ".sdlc-state.db"
+    gh = FakeGh(_issue_json())
+
+    def killed() -> bool:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_fix(
+            FixOptions(issue=1), ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+            preflight=killed, runner=gh, root=tmp_path,
+        )
+    [stale] = [r["id"] for r in _runs(db)]
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(_dead_record(stale, db, "issue-1", tmp_path))
+
+    fresh = run_fix(
+        FixOptions(issue=1), ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+        preflight=lambda: True, runner=gh, root=tmp_path, registry=registry,
+    )
+
+    assert fresh.status == "DONE"
+    assert Ledger(db).run_row(stale)["status"] == "ABORTED"
+    assert Ledger(db).latest_resumable_run() is None
+
+
+def test_a_fresh_batch_supersedes_a_dead_batch_of_its_scope_that_never_passed_its_gate(tmp_path) -> None:
+    ledger, stale = _batch_killed_in_preflight(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(_dead_record(stale, ledger.db_path, "issues-all", tmp_path))
+
+    run_fix_batch(
+        FixBatchOptions(target="all"), ledger=ledger, dispatcher=BatchProbeDispatcher(),
+        preflight=lambda: True, runner=FakeBatchGh([_batch_issue(1), _batch_issue(2)]),
+        root=tmp_path, registry=registry,
+    )
+
+    assert ledger.run_row(stale)["status"] == "ABORTED"
+    assert ledger.latest_resumable_run() is None
+
+
+def test_a_reclaim_starts_a_superseded_run_afresh_rather_than_resuming_it(tmp_path) -> None:
+    # Closed ABORTED with every story TODO, it would still read as resumable work:
+    # a fleet reclaim of its job must not `sdlc resume --run` what a fresh run of
+    # the same scope has taken over.
+    ledger, stale = _interrupted_build_in_preflight(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(_dead_record(stale, ledger.db_path, "epic-99", tmp_path))
+    run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(), ledger=ledger, dispatcher=FakeDispatcher(),
+        preflight=lambda: True, registry=registry,
+    )
+    assert ledger.run_row(stale)["status"] == "ABORTED"
+
+    assert ledger_run_terminal(str(ledger.db_path), stale) == "run closed before its preflight gate passed"
+
+
+@pytest.mark.parametrize("gate", ["interrupted", "red"])
+def test_fix_resume_of_a_run_whose_gate_never_passed_stops_on_a_closed_issue(tmp_path, gate) -> None:
+    # It resumes "as a fresh fix would", so it first re-applies a fresh fix's stop
+    # conditions: an issue closed since the run died is not investigated, built and
+    # merged again. An interrupted run is closed ABORTED so a bare resume stops
+    # picking it; a red one keeps its FAILED status and PRE_FLIGHT reason.
+    db = tmp_path / ".sdlc-state.db"
+
+    def killed() -> bool:
+        raise KeyboardInterrupt
+
+    if gate == "interrupted":
+        with pytest.raises(KeyboardInterrupt):
+            run_fix(
+                FixOptions(issue=1), ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+                preflight=killed, runner=FakeGh(_issue_json()), root=tmp_path,
+            )
+    else:
+        run_fix(
+            FixOptions(issue=1), ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+            preflight=lambda: False, runner=FakeGh(_issue_json()), root=tmp_path,
+        )
+    [run_id] = [r["id"] for r in _runs(db)]
+
+    def must_not_run() -> bool:
+        raise AssertionError("a resume that stops must not re-run the gate")
+
+    dispatch = RecordingDispatcher()
+    result = resume_fix(
+        run_id, ledger=Ledger(db), dispatcher=dispatch,
+        runner=FakeGh(_issue_json(state="CLOSED")), root=tmp_path, preflight=must_not_run,
+    )
+
+    assert result.aborted is True and result.abort_reason == "issue is closed"
+    assert dispatch.calls == []
+    assert Ledger(db).run_row(run_id)["status"] == ("ABORTED" if gate == "interrupted" else "FAILED")
+    assert Ledger(db).latest_resumable_run() is None
 
 
 # ---------------------------------------------------------------------------

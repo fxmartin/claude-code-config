@@ -1263,7 +1263,8 @@ function humanDuration(s){
 }
 // Story 35.4-005: the preflight gate as the run header states it. A live gate shows
 // its command and a ticking elapsed (`#preflight-elapsed`), a passed one its
-// duration, a red one its PRE_FLIGHT_* reason. A remote run's ledger is out of
+// duration, a red one its PRE_FLIGHT_* reason, and one a closed run left open is
+// interrupted (no ticker: nothing is running). A remote run's ledger is out of
 // reach, so only its pushed phase says it is in preflight; a run with no
 // preflight events (skipped, or older) falls back to the frozen option.
 function preflightLine(run, cfg){
@@ -1274,6 +1275,7 @@ function preflightLine(run, cfg){
   }
   if(pf && pf.state === "passed") return "preflight: passed ("+esc(humanDuration(pf.duration_seconds))+")";
   if(pf && pf.state === "failed") return "preflight: failed &mdash; "+esc(pf.reason||"");
+  if(pf && pf.state === "interrupted") return "preflight: interrupted";
   if(run.phase === "preflight") return "preflight: running";
   return Object.keys(cfg).length ? "preflight: "+esc(cfg.preflight||"?") : "";
 }

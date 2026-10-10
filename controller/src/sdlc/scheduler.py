@@ -708,6 +708,10 @@ def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
     Story 35.4-005: an `sdlc fix` batch whose preflight gate never passed has
     dispatched nothing and cannot be resumed, so it reads ``"fix batch never
     passed preflight"`` and the job starts afresh — as when no run had started.
+    So does a run closed ``ABORTED`` before its gate passed — superseded by a
+    fresh run of its scope, or a fix stopped on a closed issue: nothing was
+    dispatched, and resuming it would rebuild what the fresh run took over or
+    stop again (``"run closed before its preflight gate passed"``).
     """
     from sdlc.build import Ledger
     from sdlc.resume import _FIX_RUN_MODES, has_resumable_work, unstarted_fix_batch
@@ -720,6 +724,8 @@ def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
         run_row = ledger.run_row(run_id) or {}
         if unstarted_fix_batch(ledger, run_id, run_row):
             return "fix batch never passed preflight"
+        if run_row.get("status") == "ABORTED" and ledger.preflight_owed(run_id):
+            return "run closed before its preflight gate passed"
         if str(run_row.get("mode") or "") in _FIX_RUN_MODES:
             # `resume_fix` re-enters a story only mid-flight; a BLOCKED/FAILED
             # one is a refusal ("nothing to resume"), not work it can pick up.

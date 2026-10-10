@@ -63,6 +63,7 @@ from sdlc.build import (
     _sync_branch_to_remote,
     _StoryDispatch,
     _StoryRunOutcome,
+    close_superseded_runs,
     create_story_worktree,
     default_preflight,
     preflight_command_text,
@@ -2363,6 +2364,9 @@ def run_fix(
     _log_fix_controller_version_check(ledger, run_id, root or Path.cwd())
     ledger.run_set_harness_routing(run_id, opts.harness_map)
     ledger.event_log(run_id, "", "info", "controller", f"fix started: scope={scope}")
+    # Story 35.4-005: as in `run_build` — this run takes over any dead run of the
+    # issue that died in its gate, which a bare `sdlc resume` would otherwise re-fix.
+    close_superseded_runs(ledger, run_id, scope, registry)
     try:
         notify(
             "run_started", run=run_id, scope=scope, mode="fix",
@@ -2561,7 +2565,9 @@ def resume_fix(
     or red and closed FAILED — has no plan to recover and nothing was dispatched,
     so it is resumed by re-running preflight (``preflight`` is the seam, as in
     :func:`run_fix`) and then investigating as a fresh fix would — not refused,
-    and not by skipping the gate.
+    and not by skipping the gate. A fresh fix's stop conditions come first: an
+    issue closed, labelled wontfix or reassigned since stops the resume, and an
+    interrupted run is closed ABORTED.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
@@ -2622,6 +2628,24 @@ def resume_fix(
             issue=issue_number, run_id=run_id, aborted=True, status="ABORTED",
             abort_reason=str(exc),
         )
+
+    # Story 35.4-005: a run whose gate never passed resumes as a fresh fix would,
+    # so it first re-applies a fresh fix's stop conditions: an issue closed (or
+    # labelled wontfix, or reassigned) since the run died is not fixed again. An
+    # interrupted run is closed ABORTED so a bare resume stops picking it; a red
+    # one keeps its FAILED status and PRE_FLIGHT reason.
+    if plan is None:
+        stop = stop_reason(issue, runner=runner, host=host, instance_url=instance_url)
+        if stop:
+            ledger.event_log(run_id, "", "warn", "controller", f"resume stopped: {stop}")
+            if run_row.get("status") == "IN_PROGRESS":
+                ledger.run_update_status(run_id, "ABORTED")
+                if registry is not None:
+                    _registry_finish(registry, run_id, "ABORTED", 0)
+            return FixResult(
+                issue=issue_number, run_id=run_id, aborted=True, status="ABORTED",
+                abort_reason=stop,
+            )
 
     story = issue_story(issue, root=root)
     logs_dir = logs_dir or (Path(f"{ledger.db_path}.logs") / run_id)
@@ -3339,6 +3363,9 @@ def run_fix_batch(
         run_id, "", "info", "controller",
         f"fix batch started: scope={scope} mode={mode} ({len(candidates)} issues)",
     )
+    # Story 35.4-005: as in `run_build` — a dead batch of this scope that died in
+    # its gate is taken over here, not left IN_PROGRESS for a bare resume to refuse.
+    close_superseded_runs(ledger, run_id, scope, registry)
     try:
         notify(
             "run_started", run=run_id, scope=scope, mode=f"fix-{batch.target}",
