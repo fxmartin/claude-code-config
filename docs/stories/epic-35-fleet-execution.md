@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (17/20)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, resumed on the M3 Max 2026-10-10); 35.3-002 (fleet PRs close their issues) added 2026-10-08. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (17/21)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, resumed on the M3 Max 2026-10-10); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002 (a stopped job kills its agents) added 2026-10-10 from job 3. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 20 | **Total Points**: 75 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 21 | **Total Points**: 78 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -971,6 +971,58 @@ change in verdict).
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.2-005, 35.4-001
+**Risk Level**: Medium
+
+##### Story 35.5-002: A stopped job takes its agents down with it
+**User Story**: As FX, I want a worker that stops a job (budget exhausted,
+cancel, or its own shutdown) to terminate every agent that job dispatched, so
+that no orphaned `claude -p` keeps editing a worktree that nothing owns and the
+run never sits `IN_PROGRESS` in a ledger whose controller is dead.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** an in-flight job whose controller has dispatched an agent **When**
+  the scheduler stops it for any reason (budget cap, `cancel_requested`, worker
+  SIGTERM/shutdown) **Then** the controller and every agent process it started
+  are gone within the SIGTERM → grace → SIGKILL window, and none is re-parented
+  to launchd/systemd.
+- **Given** the controller receives SIGTERM **When** agents are live **Then** it
+  terminates each agent's process group through the existing
+  `_terminate_process_group`, records the interrupted story (stage, `stopped by
+  worker: <reason>`) and closes the run in the ledger (not left `IN_PROGRESS`),
+  then exits; a resumed run picks the story up from that stage.
+- **Given** the controller is SIGKILLed before it can clean up **When** the
+  scheduler finishes `stop()` **Then** a backstop reaps any surviving agent of
+  that job (tracked pid/pgid file in the run's log dir, or equivalent) and logs
+  `job N: reaped orphaned agent pid P`.
+- **Given** a local run with no fleet (Ctrl-C / `kill` of `sdlc build`) **When**
+  the same handler runs **Then** agents are terminated the same way; behaviour
+  is otherwise unchanged and the full controller suite stays green on both
+  platforms.
+
+**Technical Notes**: `_PopenProcess.stop()` (`scheduler.py`) `killpg`s the
+job's own group, but `dispatch.py` launches each agent with
+`start_new_session=True` (Story 13.4-001 / #643) — a separate group the stop
+never reaches — and the build/resume/fix controller installs no SIGTERM
+handler, so its agents survive it. All three stop sites are affected
+(budget, cancel, shutdown). Keep the agents' own sessions (they exist so a
+stall kill hits the agent's whole tree); fix it by having the controller own
+teardown on SIGTERM plus a scheduler-side backstop. Tests must kill process
+*groups*, escalate SIGTERM→SIGKILL, and wait with headroom (CI contract).
+Incident: fleet job 3, run `46e76670` on the M3 Max (2026-10-10) — the 5-round
+cap stopped the job at 12:14, the 35.2-006 bugfix agent (pid 80312, PPID 1)
+kept running in `.claude/worktrees/agent-46e76670-35.2-006` until killed by
+hand at ~12:20; the ledger still read `IN_PROGRESS · bugfix: agent started`.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: budget/cancel/shutdown stop leaves no agent alive; SIGTERM handler
+      closes the run and records the story; SIGKILL backstop reaps; local
+      Ctrl-C parity
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-001, 35.5-001
 **Risk Level**: Medium
 
 ## Epic Sequencing
