@@ -775,6 +775,7 @@ def check_fleet_worker(
 def check_forge_credentials(
     *,
     agent_path: Path | None = None,
+    unit_path: Path | None = None,
     work_dir: Path | None = None,
     probe: Callable[[str, str], bool] | None = None,
 ) -> Finding | None:
@@ -783,7 +784,8 @@ def check_forge_credentials(
     A worker clones and fetches over ``http(s)`` with the forge CLI as the credential
     helper and no UI, so a missing login does not prompt — the job is refused. The
     hosts are the ones its clones under ``~/Work`` sit on. ``None`` on a machine that
-    runs no resident worker, or whose clones are all ssh or local.
+    runs no resident worker — neither the LaunchAgent nor the systemd unit (Story
+    35.2-008) — or whose clones are all ssh or local.
     """
     from sdlc.queue_worker import (
         clone_forge_hosts,
@@ -792,7 +794,8 @@ def check_forge_credentials(
         forge_credential_ok,
     )
 
-    if not (agent_path or default_worker_plist()).exists():
+    installed = (agent_path or default_worker_plist(), unit_path or default_worker_unit())
+    if not any(path.exists() for path in installed):
         return None
     hosts = clone_forge_hosts(work_dir if work_dir is not None else default_work_dir())
     if not hosts:
@@ -2175,7 +2178,7 @@ def run_doctor(
     )
     if worker is not None:
         findings.append(worker)
-    credentials = check_forge_credentials(agent_path=worker_plist)
+    credentials = check_forge_credentials(agent_path=worker_plist, unit_path=worker_unit)
     if credentials is not None:
         findings.append(credentials)
     dashboard = check_worker_dashboard(agent_path=worker_plist)

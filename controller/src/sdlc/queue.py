@@ -1977,7 +1977,7 @@ class QueueStore:
                     moment,
                     moment,
                     json.dumps(check) if check is not None else None,
-                    json.dumps({str(host): bool(ok) for host, ok in (forges or {}).items()}),
+                    json.dumps({str(forge): bool(ok) for forge, ok in (forges or {}).items()}),
                 ),
             )
         self.expire_offline_leases(now=now)
@@ -2639,7 +2639,7 @@ def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
         repos=_names("repos"),
         slots=int(row["slots"]),
         slots_free=int(row["slots_free"]),
-        forges=_forges(row["forges"]),
+        forges=_forges(_optional_column(row, "forges")),
         self_check=_decode_self_check(_optional_column(row, "self_check")),
     )
 

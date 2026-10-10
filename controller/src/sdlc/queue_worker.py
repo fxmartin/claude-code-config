@@ -705,8 +705,8 @@ def _clone(origin: str, target: Path) -> None:
         shutil.rmtree(target, ignore_errors=True)
         raise ForgeUnavailable(_STALLED_REASON) from exc
     except subprocess.TimeoutExpired as exc:
-        # The timeout SIGKILLs git, so it cannot remove its half-written clone —
-        # which the retry would otherwise find and judge as a (dirty) clone.
+        # The timeout kills git's whole group, so it may not remove its half-written
+        # clone — which the retry would otherwise find and judge as a (dirty) clone.
         shutil.rmtree(target, ignore_errors=True)
         # Not `exc`: its text is the argv, origin and all.
         raise ForgeUnavailable(
@@ -716,8 +716,8 @@ def _clone(origin: str, target: Path) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         raise RepoRefused(f"could not clone {shown} into {target}: {exc}") from exc
     except BaseException:
-        # Ctrl-C mid-clone: `subprocess.run` SIGKILLs git on the way out, so the
-        # half-written clone is ours to remove. The target did not exist before.
+        # Ctrl-C mid-clone: `_run_group` kills git's whole group on the way out, so
+        # the half-written clone is ours to remove. The target did not exist before.
         shutil.rmtree(target, ignore_errors=True)
         raise
     if res.returncode != 0:

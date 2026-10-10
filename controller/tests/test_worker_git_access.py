@@ -114,7 +114,15 @@ def test_a_github_origin_gets_the_gh_helper() -> None:
     assert "GITLAB_HOST" not in access.env
 
 
-def test_a_plaintext_gitlab_gets_the_private_glab_config_the_issue_host_uses() -> None:
+def test_a_plaintext_gitlab_gets_the_private_glab_config_the_issue_host_uses(
+    tmp_path, monkeypatch
+) -> None:
+    from sdlc import issue_host
+
+    # Never the developer's own glab config: its gitlab.test token would be copied in.
+    monkeypatch.setattr(issue_host, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path / "glab-cli"))
+
     access = forge_git_access("http://gitlab.test/root/proj.git")
 
     assert access is not None
@@ -312,10 +320,12 @@ def test_local_plumbing_is_held_to_the_timeout_not_the_silence_limit(tmp_path, m
 
 
 def test_a_process_that_keeps_talking_is_not_stalled() -> None:
-    code = "import time\nfor i in range(8):\n    print(i, flush=True)\n    time.sleep(0.25)\n"
+    # It outlives the silence limit, but no gap comes near it. Headroom: the first gap
+    # includes the interpreter's start, which can take seconds on a loaded CI host.
+    code = "import time\nfor i in range(8):\n    print(i, flush=True)\n    time.sleep(0.8)\n"
 
     done = queue_worker._run_group([sys.executable, "-c", code], env=dict(os.environ),
-                                   timeout=60, stall_seconds=1.5)
+                                   timeout=60, stall_seconds=5.0)
 
     assert done.returncode == 0
     assert done.stdout.split() == [str(i) for i in range(8)]
@@ -611,6 +621,27 @@ def test_a_workers_forges_survive_a_pre_existing_queue_db(tmp_path) -> None:
     assert worker is not None and worker.forges == {"gitlab.test": True}
 
 
+def test_a_queue_db_that_predates_the_forges_column_still_lists_its_workers(tmp_path) -> None:
+    """Read verbs never migrate, so `sdlc queue workers` and doctor meet a queue.db
+    written before migration 15 until some write verb runs: missing reads as no report."""
+    import sqlite3
+
+    from sdlc.doctor import check_fleet_worker
+
+    path = tmp_path / "queue.db"
+    store = QueueStore(path)
+    store.init()
+    store.register_worker("w", host="h")
+    with sqlite3.connect(path) as conn:  # a queue.db written before the column existed
+        conn.execute("ALTER TABLE workers DROP COLUMN forges")
+        conn.execute("DELETE FROM _migrations WHERE version = 15")
+
+    [worker] = QueueStore(path).list_workers()
+
+    assert worker.name == "w" and worker.forges == {}
+    assert check_fleet_worker(QueueStore(path).list_workers, host="h").status == "CLEAN"
+
+
 # --- detection and the doctor finding --------------------------------------------
 
 
@@ -708,7 +739,24 @@ def test_doctor_reports_each_forge_credential_on_a_worker(tmp_path) -> None:
     assert clean is not None and clean.status == "CLEAN"
 
 
+def test_doctor_reports_forge_credentials_on_a_linux_worker_too(tmp_path) -> None:
+    """The systemd unit (Story 35.2-008) is as much a resident worker as the LaunchAgent."""
+    work = tmp_path / "Work"
+    _http_clone(work / "a", "http://gitlab.test/root/a.git")
+    unit = tmp_path / "sdlc-worker.service"
+    unit.write_text("[Service]\n", encoding="utf-8")
+
+    finding = check_forge_credentials(
+        agent_path=tmp_path / "absent.plist", unit_path=unit, work_dir=work,
+        probe=lambda host, scheme: False,
+    )
+
+    assert finding is not None and finding.status == "FAIL"
+    assert finding.remedy == "glab auth login --hostname gitlab.test"
+
+
 def test_doctor_stays_quiet_on_a_machine_with_no_worker(tmp_path) -> None:
     assert check_forge_credentials(
-        agent_path=tmp_path / "absent.plist", work_dir=tmp_path, probe=lambda *_: False
+        agent_path=tmp_path / "absent.plist", unit_path=tmp_path / "absent.service",
+        work_dir=tmp_path, probe=lambda *_: False,
     ) is None

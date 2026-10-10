@@ -3588,7 +3588,8 @@ def queue_workers_cmd(
     `online`. A worker silent for three heartbeats (90 s) is `offline`, and the
     leases it held become reclaimable. A worker whose own agent probe failed
     (Story 35.2-007) reads `online — cannot run agents: <why>` with 0 free slots. `--json` adds the harnesses, sandbox
-    runtime and repos each worker advertised.
+    runtime and repos each worker advertised, and its `forges` — whether its forge
+    CLI can authenticate git to each forge host (Story 35.2-006).
     """
     from sdlc.queue_client import open_queue
 

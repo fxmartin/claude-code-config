@@ -2068,8 +2068,10 @@ core.askPass=` with `GIT_ASKPASS`/`SSH_ASKPASS` dropped from its env (git asks
 an askpass program before it honours `GIT_TERMINAL_PROMPT=0`, and an IDE
 terminal exports one), plus `GIT_TERMINAL_PROMPT=0` and the
 `GITLAB_HOST`/`GLAB_CONFIG_DIR` (or `GH_HOST`) that `issue_host` sets for a
-plaintext instance. ssh and local-path origins are left to git. Two guards turn
-a hang into a refusal back to `queued`:
+plaintext instance. ssh and local-path origins are left to git. Any `http(s)`
+host but GitHub is taken for a GitLab, so a clone from another forge (Gitea,
+Bitbucket) is refused with a `glab` remedy that cannot help — give it an ssh
+origin. Two guards turn a hang into a refusal back to `queued`:
 
 - **No credential.** If the fetch or clone fails the way git does when its
   helper had nothing and prompting is off (`terminal prompts disabled`, a 401),
@@ -2362,7 +2364,8 @@ harmless: the worker restarts only when the installed *version* changes.
   completed from the unit, reads `TCC n/a (not macOS)`, and on failure points at
   the journal — there is no dialog to answer. There is no `worker-dashboard`
   finding: the unit advertises no `--dashboard-url`, so the XPS shows `dev`'s runs
-  with the worker name but header-only.
+  with the worker name but header-only. The *Forge credentials* finding (Story
+  35.2-006) reports for the unit as it does for the LaunchAgent.
 - **Reaching the box.** The Tailscale SSH policy denies the XPS, and public port
   22 is home-IP-only. Operate it through the home-lab: `ssh -J home-lab
   dev-server`, or widen the ACL in `nix-install`.
