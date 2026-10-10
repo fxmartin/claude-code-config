@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (17/20)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, parked on the M3 Max); 35.3-002 (fleet PRs close their issues) added 2026-10-08. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (17/20)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, resumed on the M3 Max 2026-10-10); 35.3-002 (fleet PRs close their issues) added 2026-10-08. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
