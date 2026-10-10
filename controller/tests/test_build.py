@@ -1662,7 +1662,10 @@ def test_fix_issue_preflight_uses_the_same_default() -> None:
     from sdlc import fix_issue
 
     src = inspect.getsource(fix_issue)
-    assert "default_preflight()" in src
+    # Story 35.4-005: the only addition is the callback that carries the failure
+    # reason into the run's ledger — still no timeout argument.
+    assert "default_preflight(on_failure=failures.append)" in src
+    assert "default_preflight(timeout" not in src
 
 
 # ---------------------------------------------------------------------------

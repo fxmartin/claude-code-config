@@ -490,6 +490,7 @@ class _Routes:
             worker=_required(body, "worker"),
             dashboard_url=dashboard_url,
             origin=_text(body, "origin"),
+            phase=_text(body, "phase"),
         )
         try:
             self.store.put_fleet_run(record, now=self._now())

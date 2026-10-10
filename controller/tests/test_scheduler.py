@@ -1322,7 +1322,11 @@ def test_a_registry_record_from_another_repo_is_never_attached(tmp_path) -> None
 
 
 def test_a_finished_registry_record_is_never_attached(tmp_path) -> None:
-    """A stale record whose run already ended cannot be this child's run."""
+    """A stale record whose run already ended cannot be this child's run.
+
+    It started before this launch (the Clock's noon), so not even the reap-time
+    link of a run that opened and finished between two polls takes it.
+    """
     store = _store(tmp_path)
     repo = _repo(tmp_path, "alpha")
     job_id = store.add_job(repo=repo, kind="fix", scope="42")
@@ -1337,7 +1341,8 @@ def test_a_finished_registry_record_is_never_attached(tmp_path) -> None:
             registry.register(
                 RunRecord(run_id="stale", repo=repo, db=str(tmp_path / "x.db"),
                           scope="42", pid=launcher.procs[0].pid, status="DONE",
-                          started_at="", finished_at="2026-09-07T11:00:00+00:00")
+                          started_at="2026-09-07T10:00:00+00:00",
+                          finished_at="2026-09-07T11:00:00+00:00")
             )
         clock.advance(seconds)
 

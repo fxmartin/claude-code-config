@@ -8,7 +8,9 @@ from pathlib import Path
 from sdlc.build import Ledger
 from sdlc.model_routing import BALANCED, is_routing_off
 
-__all__ = ["state_report", "format_state", "format_markdown", "format_routing"]
+__all__ = [
+    "state_report", "format_state", "format_markdown", "format_routing", "format_preflight",
+]
 
 
 def state_report(ledger: Ledger, run_id: str) -> list[dict]:
@@ -50,6 +52,44 @@ def format_state(rows: list[dict]) -> list[str]:
             f"{pr_disp:<7}{branch}"
         )
     return lines
+
+
+def _human_duration(seconds: float | None) -> str:
+    """``seconds`` as the dashboard's ``humanDuration`` shows it: ``42s``, ``2m 05s``, ``1h 02m``."""
+    if seconds is None or seconds < 0:
+        return "—"
+    whole = int(seconds)
+    hours, minutes, secs = whole // 3600, (whole % 3600) // 60, whole % 60
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def format_preflight(preflight: dict | None, *, phase: str | None = None) -> str | None:
+    """The run's preflight gate as one line, or ``None`` when it never ran one (Story 35.4-005).
+
+    Mirrors the dashboard header, durations included: ``preflight: running
+    (<command>, <elapsed>)``, ``preflight: passed (<duration>)``, ``preflight:
+    failed — <PRE_FLIGHT_* reason>`` or, for a run closed with its gate still
+    open, ``preflight: interrupted``. A remote run carries only its ``phase``,
+    which still says it is in preflight.
+    """
+    if not preflight:
+        return "preflight: running" if phase == "preflight" else None
+    state = preflight.get("state")
+    took = _human_duration(preflight.get("duration_seconds"))
+    if state == "running":
+        command = preflight.get("command")
+        return f"preflight: running ({command + ', ' if command else ''}{took})"
+    if state == "passed":
+        return f"preflight: passed ({took})"
+    if state == "failed":
+        return f"preflight: failed — {preflight.get('reason') or 'no reason recorded'}"
+    if state == "interrupted":
+        return "preflight: interrupted"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +227,10 @@ def format_markdown(
             f"(scope={run.get('scope', '?')}, mode={run.get('mode', '?')})"
         )
         lines.append("")
+        preflight_line = format_preflight(run.get("preflight"), phase=run.get("phase"))
+        if preflight_line:
+            lines.append(preflight_line)
+            lines.append("")
         lines.append(
             f"{counts.get('done', 0)}/{counts.get('total', 0)} done, "
             f"{counts.get('failed', 0)} failed, {counts.get('blocked', 0)} blocked, "

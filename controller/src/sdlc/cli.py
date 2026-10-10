@@ -370,7 +370,7 @@ Flags:
                             mode (default 5; --sequential forces 1)
   --limit=N                 build at most N stories
   --coverage-threshold=N    required new-code coverage % (default 90)
-  --preflight-timeout=SEC   abort the preflight gate after SEC seconds (default 600)
+  --preflight-timeout=SEC   abort the preflight gate after SEC seconds (default 1800)
   --host=HOST               github|gitlab — override host auto-detection for the
                             deterministic change-request open (issue #608).
                             Default: the story's own `story_inventory` mapping
@@ -962,6 +962,14 @@ def resume(
     started before that plan was persisted — is refused and left resumable rather
     than continued on a freshly invented plan.
 
+    Story 35.4-005: a run whose preflight gate never passed re-runs the gate
+    before any story. An ``sdlc fix all`` / ``next`` batch has no resume path, so
+    one whose gate never passed is refused (exit 1) — re-run the batch instead.
+    One interrupted in the gate is closed ABORTED, so the next resume moves on.
+    A fresh ``sdlc build`` / ``sdlc fix`` of the same scope closes a dead run whose
+    gate never passed — died in it, or came back red — ABORTED too, so neither
+    resume nor its "failed with resumable stories" hint rebuilds what it took over.
+
     Issue #595: refused (exit 1, run untouched) when the host registry shows this
     run already live under another pid — two processes must never drive the same
     run at once. Pass ``--force`` to take over, but only once you have confirmed
@@ -1026,6 +1034,17 @@ def resume(
 
     if result.refused:
         typer.echo(result.refusal_reason, err=True)
+        raise typer.Exit(code=1)
+
+    if result.preflight_failed:
+        typer.echo(
+            "PRE_FLIGHT_FAILURE: the preflight gate did not pass on resume — see the "
+            "PRE_FLIGHT_TIMEOUT or PRE_FLIGHT_RED line above for which. "
+            "The run is marked FAILED and nothing was dispatched: fix the suite and "
+            "resume again, or start a fresh run, which is where --skip-preflight "
+            "(and, for `sdlc build`, --preflight-timeout) apply.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     if result.nothing_to_resume:
@@ -1188,6 +1207,15 @@ def status(
         f"{counts['blocked']} blocked, {counts['in_progress']} in progress  "
         f"(scope={snap['run'].get('scope', '?')}, {snap['run'].get('mode', '?')}{workers})"
     )
+    # Story 35.4-005: the preflight gate, named while it runs and — for a run it
+    # failed — with the PRE_FLIGHT_* reason, which no story row can carry.
+    from sdlc.status import format_preflight
+
+    preflight_line = format_preflight(
+        snap["run"].get("preflight"), phase=snap["run"].get("phase")
+    )
+    if preflight_line:
+        typer.echo(preflight_line)
     # Story 27.3-004: rate-limit stall time, kept apart from stage durations so
     # quota backoff is diagnosable at a glance. Silent when the run never stalled.
     stall_s = snap["run"].get("stall_seconds") or 0
@@ -4162,8 +4190,9 @@ def queue_serve_cmd(
                                      on these (see `queue run --worker`)
       GET    /workers                {workers} with an `online` flag each
       PUT    /runs                   a build pushes its run record (the registry.json
-                                     fields + worker) on start and finish; a worker
-                                     pushes its runs' rows the same way
+                                     fields + worker + phase) on start, on each phase
+                                     change and on finish; a worker pushes its runs'
+                                     rows the same way
       GET    /runs                   {runs}: each with its worker's `worker_online`
                                      (the XPS dashboard's fleet view)
       POST   /jobs/{id}/renew        worker, \\[lease_seconds]

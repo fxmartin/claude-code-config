@@ -330,6 +330,72 @@ _TERMINAL_RUN_STATES = {
     "DONE", "FAILED", "ABORTED", "NEEDS_ATTENTION", "AWAITING_APPROVAL",
 }
 
+# Story 35.4-005: preflight is a run phase, recorded as ``preflight``-sourced
+# events — ``started: <command>``, then ``passed`` or the ``PRE_FLIGHT_*`` failure
+# line — so every surface reads one run's gate from the ledger it already reads.
+_PREFLIGHT_SOURCE = "preflight"
+_PREFLIGHT_STARTED = "started: "
+_PREFLIGHT_PASSED = "passed"
+
+
+def _run_phase(
+    run_status: str | None, preflight: dict | None, story_statuses: list
+) -> str | None:
+    """``preflight`` | ``stories`` | ``closing`` for a run, else None (Story 35.4-005).
+
+    Only an ``IN_PROGRESS`` run has a phase: a finished run is done, and a parked
+    one (``RATE_LIMITED``) is waiting, not closing. ``closing`` is a run whose
+    stories have all settled but which has not yet stamped its terminal status
+    (reconciliation, summary, close-out). Takes reads the caller already holds, so
+    :func:`status_snapshot` derives the phase without re-reading the ledger.
+    """
+    if run_status != "IN_PROGRESS":
+        return None
+    if preflight is not None and preflight["state"] == "running":
+        return "preflight"
+    if story_statuses and not any(st in ("TODO", "IN_PROGRESS") for st in story_statuses):
+        return "closing"
+    return "stories"
+
+
+def _fold_preflight(
+    rows: Iterable, *, now: datetime | None = None, run_status: str | None = None
+) -> dict | None:
+    """The preflight state one run's ``preflight`` events describe, oldest first.
+
+    See :meth:`Ledger.preflight_state`, which reads the rows for one run;
+    :meth:`Ledger.list_runs` reads every live run's in a single query instead.
+    A gate with no outcome on a run no longer ``IN_PROGRESS`` (``run_status``) is
+    ``interrupted``, not ``running``: whatever closed the run — a fresh run that
+    superseded it, a batch closed ``ABORTED`` — did so without the gate's process,
+    so it has no elapsed to keep counting.
+    """
+    state: dict | None = None
+    for row in rows:
+        message = row["message"] or ""
+        if message.startswith(_PREFLIGHT_STARTED):
+            state = {
+                "state": "running",
+                "command": message[len(_PREFLIGHT_STARTED):],
+                "reason": None,
+                "started_at": row["ts"],
+                "finished_at": None,
+            }
+        elif state is not None and message.startswith(_PREFLIGHT_PASSED):
+            state.update(state="passed", finished_at=row["ts"])
+        elif state is not None and message.startswith("PRE_FLIGHT_"):
+            state.update(state="failed", finished_at=row["ts"], reason=message)
+    if state is None:
+        return None
+    if state["state"] == "running" and run_status not in (None, "IN_PROGRESS"):
+        state.update(state="interrupted", duration_seconds=None)
+        return state
+    state["duration_seconds"] = _duration_seconds(
+        state["started_at"], state["finished_at"], now=now
+    )
+    return state
+
+
 # Story statuses whose measured usage is a story's *complete* cost, so the row is
 # a valid training example for the Story 28.2-002 predictor. Deliberately not
 # named ``_TERMINAL_*``: `resume.py` already owns a `_TERMINAL_STORY_STATES` with
@@ -3500,6 +3566,18 @@ class Ledger:
                 ).fetchone()
         return row["id"] if row else None
 
+    def in_progress_or_failed_runs(self, scope: str) -> list[str]:
+        """Every ``IN_PROGRESS`` or ``FAILED`` run id of exactly ``scope``, oldest first (Story 35.4-005)."""
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                "SELECT id FROM runs WHERE status IN ('IN_PROGRESS', 'FAILED') AND scope = ? "
+                "ORDER BY started_at, rowid",
+                (scope,),
+            ).fetchall()
+        return [row["id"] for row in rows]
+
     def latest_failed_run(self, scope: str | None = None) -> str | None:
         """The most recent ``FAILED`` run id (optionally for ``scope``), or None.
 
@@ -3839,6 +3917,43 @@ class Ledger:
         except (ValueError, TypeError):
             return {}
 
+    def preflight_state(self, run_id: str, *, now: datetime | None = None) -> dict | None:
+        """Where ``run_id``'s preflight stands, from its ``preflight`` events (Story 35.4-005).
+
+        ``None`` when the run never began one (``--skip-preflight``, or a run from
+        before preflight was a phase). Otherwise ``{state, command, reason,
+        started_at, finished_at, duration_seconds}``: ``state`` is ``running`` /
+        ``passed`` / ``failed``, or ``interrupted`` for a gate with no outcome on a
+        run that is no longer ``IN_PROGRESS``; ``reason`` the ``PRE_FLIGHT_*`` line
+        of a failure, and ``duration_seconds`` the elapsed time so far while
+        running (None once interrupted). The latest ``started`` event wins, so a
+        resume that re-ran the gate reports its own.
+        """
+        if not self.db_path.exists():
+            return None
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                "SELECT ts, message FROM events WHERE run_id = ? AND source = 'preflight' "
+                "ORDER BY id",
+                (run_id,),
+            ).fetchall()
+            run = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return _fold_preflight(rows, now=now, run_status=run["status"] if run else None)
+
+    def preflight_owed(self, run_id: str) -> bool:
+        """True when ``run_id`` began a preflight gate that never passed (Story 35.4-005).
+
+        It died mid-suite (``running``) or came back red or timed out (``failed``):
+        either way nothing was dispatched, so a resume re-runs the gate before any
+        story. ``failed`` counts as much as ``running`` because that FAILED run
+        keeps its stories TODO, and ``sdlc resume --run`` (the "failed with
+        resumable stories" hint) and a fleet reclaim both resume it. A run that
+        never began one (``--skip-preflight``, or from before preflight was a
+        phase) owes none.
+        """
+        state = self.preflight_state(run_id)
+        return state is not None and state["state"] != "passed"
+
     def events_by_source(self, run_id: str, source: str) -> list[str]:
         """Every event message for ``run_id`` from ``source``, earliest first.
 
@@ -4008,7 +4123,8 @@ class Ledger:
         """The most recent ``limit`` runs (newest first) for the runs browser.
 
         Each entry is ``{id, scope, mode, status, started_at, finished_at,
-        duration_seconds, total, done, failed, total_tokens, total_cost_usd}``.
+        duration_seconds, total, done, failed, total_tokens, total_cost_usd,
+        phase}`` — ``phase`` as :func:`_run_phase` derives it (Story 35.4-005).
         ``duration_seconds`` is the run's total span (elapsed-so-far while
         in-progress), or None when the start is missing (renders "—"). The
         ``total/done/failed`` tallies are computed live from the per-story rows
@@ -4040,7 +4156,22 @@ class Ledger:
                 ).fetchall()
                 if "input_tokens" in stage_cols else []
             )
+            # Story 35.4-005: every live run's preflight events in one query on
+            # this connection, not a connection per run on a list polled every tick.
+            live_ids = [r["id"] for r in runs if r["status"] == "IN_PROGRESS"]
+            placeholders = ",".join("?" for _ in live_ids)
+            preflight_rows = (
+                conn.execute(
+                    "SELECT run_id, ts, message FROM events WHERE source = 'preflight' "
+                    f"AND run_id IN ({placeholders}) ORDER BY id",
+                    live_ids,
+                ).fetchall()
+                if live_ids else []
+            )
 
+        preflight_events: dict[str, list] = {}
+        for row in preflight_rows:
+            preflight_events.setdefault(row["run_id"], []).append(row)
         counts: dict[str, dict[str, int]] = {}
         for g in grouped:
             counts.setdefault(g["run_id"], {})[g["status"]] = g["n"]
@@ -4077,6 +4208,16 @@ class Ledger:
                     "failed": by_status.get("FAILED", 0),
                     "total_tokens": u["tok"] if u else None,
                     "total_cost_usd": u["cost"] if u else None,
+                    # Story 35.4-005: only a live run has a phase. Its status, story
+                    # statuses and preflight events are all already in hand — no
+                    # per-run ledger re-read on a list the page polls every tick.
+                    "phase": (
+                        _run_phase(
+                            r["status"], _fold_preflight(preflight_events.get(r["id"], [])),
+                            list(by_status),
+                        )
+                        if r["status"] == "IN_PROGRESS" else None
+                    ),
                 }
             )
         return out
@@ -4405,11 +4546,20 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "active": _count("IN_PROGRESS"),
     }
 
+    preflight = ledger.preflight_state(rid, now=now)
     payload["run"] = {
         "id": rid,
         "scope": run_row.get("scope"),
         "mode": run_row.get("mode"),
         "status": run_row.get("status"),
+        # Story 35.4-005: where the live run is (`preflight` | `stories` |
+        # `closing`; None unless IN_PROGRESS) and how its preflight gate stands
+        # (`running` | `passed` | `failed` + command/duration/reason; None when
+        # it never ran one), both from the one read of its preflight events.
+        "phase": _run_phase(
+            run_row.get("status"), preflight, [s.get("status") for s in stories]
+        ),
+        "preflight": preflight,
         "started_at": run_row.get("started_at"),
         "finished_at": run_row.get("finished_at"),
         "duration_seconds": _duration_seconds(
@@ -4622,13 +4772,24 @@ def _has_pytest_timeout(root: Path) -> bool:
     return False
 
 
-def default_preflight(root: Path | None = None, timeout: int = 1800) -> bool:
+def default_preflight(
+    root: Path | None = None,
+    timeout: int = 1800,
+    on_failure: Callable[[str], None] | None = None,
+) -> bool:
     """Run the detected preflight command and return True when it is green.
 
     Streams the command's output (no capture) so the user sees progress instead
     of a silent hang, and bounds it with ``timeout`` seconds — on expiry it
     prints a clear message and fails (use ``--skip-preflight`` to bypass).
     ``run_build`` accepts a ``preflight`` callable so tests inject a stub.
+
+    ``on_failure`` receives the ``PRE_FLIGHT_TIMEOUT`` / ``PRE_FLIGHT_RED`` line
+    (Story 35.4-005) so the caller can record *why* in the run's ledger instead of
+    only the ``bool`` — which cannot tell a cut-off suite from a failing one. A
+    command that cannot start at all (not on this host's PATH, not executable) is
+    a ``PRE_FLIGHT_RED`` too: the gate runs inside an open run now, so an escaping
+    ``OSError`` would strand that run ``IN_PROGRESS`` in ``preflight`` for good.
     """
     root = root or Path.cwd()
     cmd = detect_test_command(root)
@@ -4644,11 +4805,22 @@ def default_preflight(root: Path | None = None, timeout: int = 1800) -> bool:
     try:
         completed = subprocess.run(cmd, cwd=root, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
-        print(
+        line = (
             f"PRE_FLIGHT_TIMEOUT: '{' '.join(cmd)}' exceeded {timeout}s — aborting. "
-            "Raise --preflight-timeout=N or bypass with --skip-preflight.",
-            file=sys.stderr,
+            "Raise --preflight-timeout=N or bypass with --skip-preflight."
         )
+        print(line, file=sys.stderr)
+        if on_failure is not None:
+            on_failure(line)
+        return False
+    except OSError as exc:
+        line = (
+            f"PRE_FLIGHT_RED: '{' '.join(cmd)}' could not start ({exc}) — install "
+            "it on this host, or bypass with --skip-preflight."
+        )
+        print(line, file=sys.stderr)
+        if on_failure is not None:
+            on_failure(line)
         return False
     if completed.returncode != 0:
         # Distinct from PRE_FLIGHT_TIMEOUT above (claude-code-config#688): the
@@ -4656,13 +4828,127 @@ def default_preflight(root: Path | None = None, timeout: int = 1800) -> bool:
         # one that was cut off mid-flight, and it used to report both as "test
         # suite is red on main". Each case now names itself here, where the
         # difference is actually known.
-        print(
+        line = (
             f"PRE_FLIGHT_RED: '{' '.join(cmd)}' exited {completed.returncode} — "
-            "the suite is failing. Fix it, or bypass with --skip-preflight.",
-            file=sys.stderr,
+            "the suite is failing. Fix it, or bypass with --skip-preflight."
         )
+        print(line, file=sys.stderr)
+        if on_failure is not None:
+            on_failure(line)
         return False
     return True
+
+
+def preflight_command_text(root: Path | None = None) -> str:
+    """The command :func:`default_preflight` will run, for the run's ``preflight started`` event."""
+    cmd = detect_test_command(root or Path.cwd())
+    return " ".join(cmd) if cmd else "preflight"
+
+
+def open_preflight_phase(
+    ledger: "Ledger", run_id: str, command: str, registry: "Registry | None" = None
+) -> None:
+    """Put ``run_id`` in its ``preflight`` phase: the ``started`` event + registry phase.
+
+    :func:`run_preflight_phase` does this itself; ``run_build`` opens it earlier so
+    the live tier-model probe, which is part of preflight, already reads as it.
+    """
+    ledger.event_log(run_id, "", "info", _PREFLIGHT_SOURCE, f"{_PREFLIGHT_STARTED}{command}")
+    _registry_phase(registry, run_id, "preflight")
+
+
+def run_preflight_phase(
+    ledger: "Ledger",
+    run_id: str,
+    check: Callable[[], bool],
+    failures: list[str],
+    *,
+    command: str,
+    registry: "Registry | None" = None,
+    repo: str | None = None,
+    subject: str | None = None,
+    render_view: Callable[[str], None] | None = None,
+    opened: bool = False,
+) -> str | None:
+    """Run the preflight gate *as a phase of an existing run* (Story 35.4-005).
+
+    The run row already exists, so a two-minute suite is something a dashboard can
+    watch and a red one leaves a record. Emits ``preflight started`` (unless the
+    caller already did, ``opened``), then either ``passed`` or — on a red or
+    timed-out gate — the ``PRE_FLIGHT_*`` reason as an ``error`` event, stamps the
+    run ``FAILED``, finishes its registry and fleet records and tells Telegram, and
+    returns that reason. ``None`` means the gate passed and the run carries on,
+    same id and counts.
+
+    ``failures`` is the collector :func:`default_preflight` reports its reason
+    into; an injected ``check`` that merely returns False gets a generic one.
+    """
+    if not opened:
+        open_preflight_phase(ledger, run_id, command, registry)
+    failures.clear()
+    # An interrupt or crash in `check` leaves the `started` event open, which is
+    # exactly what tells a resume to re-run the gate (nothing was dispatched).
+    if check():
+        ledger.event_log(run_id, "", "info", _PREFLIGHT_SOURCE, _PREFLIGHT_PASSED)
+        _registry_phase(registry, run_id, "stories")
+        return None
+    reason = failures[-1] if failures else (
+        f"PRE_FLIGHT_RED: '{command}' failed — the suite is failing. "
+        "Fix it, or bypass with --skip-preflight."
+    )
+    ledger.event_log(run_id, "", "error", _PREFLIGHT_SOURCE, reason)
+    ledger.run_update_status(run_id, "FAILED")
+    try:  # best-effort lifecycle notification; never fail a run
+        notify(
+            "run_finished", run=run_id, terminal="FAILED", repo=repo, subject=subject,
+            reason=reason,
+        )
+    except Exception:
+        pass
+    if registry is not None:
+        _registry_finish(registry, run_id, "FAILED", 0)
+    if render_view is not None:
+        try:
+            render_view(run_id)
+        except Exception:
+            pass
+    return reason
+
+
+def close_superseded_runs(
+    ledger: "Ledger", run_id: str, scope: str, registry: "Registry | None"
+) -> list[str]:
+    """Close ``ABORTED`` each dead ``scope`` run that never passed its gate (Story 35.4-005).
+
+    A run opens before its gate, so one killed mid-suite (Ctrl-C on a slow suite)
+    is left ``IN_PROGRESS`` with every story ``TODO``, and one whose gate came back
+    red or timed out is closed ``FAILED`` with every story ``TODO``. ``run_id``, a
+    fresh run of the same scope, takes either over: left open, the dead run is the
+    newest ``IN_PROGRESS`` one once ``run_id`` finishes; left ``FAILED``, it is the
+    run the "failed with resumable stories" hint of a bare ``sdlc resume`` names.
+    Resuming either builds its whole scope again — stories ``run_id`` shipped
+    included. Nothing was dispatched under it, so closing it loses nothing, and a
+    red one keeps its ``PRE_FLIGHT_*`` reason. Only a run the registry proves dead
+    is closed (a live one may be in its gate right now, or still on its way out of
+    a red one), so with no registry none is. Returns the ids closed.
+    """
+    if registry is None:
+        return []
+    closed: list[str] = []
+    for old in ledger.in_progress_or_failed_runs(scope):
+        if old == run_id or not ledger.preflight_owed(old):
+            continue
+        if registry.find_live_owner(run_id=old) is not None:
+            continue
+        ledger.event_log(
+            old, "", "warn", "controller",
+            f"superseded by run {run_id[:8]}: its preflight gate never passed, "
+            "nothing was dispatched — closed ABORTED",
+        )
+        ledger.run_update_status(old, "ABORTED")
+        _registry_finish(registry, old, "ABORTED", 0)
+        closed.append(old)
+    return closed
 
 
 def _routed_roles_by_harness(opts: "BuildOptions") -> dict[str, list[str]]:
@@ -7460,6 +7746,23 @@ def _registry_register(
     push_fleet_run(record)
 
 
+def _registry_phase(registry: "Registry | None", run_id: str, phase: str) -> None:
+    """Record ``run_id``'s phase in the local registry and push it to the fleet.
+
+    Story 35.4-005: the push is what lets the fleet view show a remote run in
+    ``preflight`` now rather than at the worker's next heartbeat. Best-effort,
+    like every registry write. (:func:`_push_finished_run` pushes whatever the
+    local record currently says, finished or not.)
+    """
+    if registry is None:
+        return
+    try:
+        registry.set_phase(run_id, phase)
+    except OSError:
+        return
+    _push_finished_run(registry, run_id)
+
+
 def _registry_worker() -> str | None:
     """The fleet worker this run belongs to, or None when no fleet is in play.
 
@@ -7715,7 +8018,12 @@ def run_build(
     injected dispatcher gets no probe, so tests never shell out.
     """
     dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
-    check_preflight = preflight or (lambda: default_preflight(timeout=opts.preflight_timeout))
+    preflight_failures: list[str] = []
+    check_preflight = preflight or (
+        lambda: default_preflight(
+            timeout=opts.preflight_timeout, on_failure=preflight_failures.append
+        )
+    )
     check_dirty = dirty_check or (
         (lambda: dirty_tree_paths(root or Path.cwd()))
         if dispatcher is None
@@ -7810,11 +8118,6 @@ def run_build(
     if forge_error:
         return BuildResult(forge_error=forge_error, planned=len(buildable))
 
-    # --- Phase 1: Preflight (real runs only) ---------------------------------
-    if not opts.skip_preflight:
-        if not check_preflight():
-            return BuildResult(preflight_failed=True)
-
     # --- Ledger bootstrap ----------------------------------------------------
     ledger.init()  # also excludes the ledger files from git status (R9)
     # Story 17.3-001: the label is derived from the worker cap the executor will
@@ -7836,6 +8139,10 @@ def run_build(
     ledger.event_log(
         run_id, "", "info", "controller", f"run started: scope={opts.scope} mode={mode}"
     )
+    # Story 35.4-005: this run takes over any dead run of its scope whose gate never
+    # passed (died in it, or came back red), so a later bare `sdlc resume` — or its
+    # "failed with resumable stories" hint — cannot rebuild the scope under it.
+    close_superseded_runs(ledger, run_id, opts.scope, registry)
     # Story 20.5-001: resolve and log the dispatch harness's capabilities so a
     # heterogeneous run is auditable and any mode downgrade is explicit. The
     # default slot is the built-in Claude harness (no probe, all capabilities),
@@ -7865,6 +8172,13 @@ def run_build(
     # longer fail silent-and-expensive.
     # Story 34.1-002: prove the tier ids on this host first, so a substituted
     # (previous-generation) id is what the banner and every dispatch show.
+    # Story 35.4-005: the probe is part of preflight (skipped with it) and can take
+    # a minute, so the phase opens before it. The gate itself still runs only once
+    # routing, config and story rows are recorded, which a resume of a run
+    # interrupted in the gate replays.
+    if not opts.skip_preflight:
+        preflight_command = "preflight" if preflight else preflight_command_text()
+        open_preflight_phase(ledger, run_id, preflight_command, registry)
     _probe_tier_models(ledger, run_id, opts)
     routing = _resolve_run_routing(opts)
     opts.model_routing_snapshot = routing
@@ -7893,7 +8207,11 @@ def run_build(
     ledger.event_log(
         run_id, "", "info", "config",
         json.dumps({
-            "preflight": "skipped" if opts.skip_preflight else "passed",
+            # Preflight now runs *after* this event (Story 35.4-005), so the gate's
+            # own outcome lives in the run's `preflight` events; only the option
+            # is frozen here, with the timeout a resume re-runs the gate under.
+            "preflight": "skipped" if opts.skip_preflight else "pending",
+            "preflight_timeout": opts.preflight_timeout,
             "skip_coverage": opts.skip_coverage,
             "coverage_threshold": opts.coverage_threshold,
             "mode": mode,
@@ -7975,6 +8293,22 @@ def run_build(
     # out of the cohorts (NULL wave) — they are not part of the build's DAG.
     persist_cohort_structure(ledger, run_id, cohorts)
     status: dict[str, str] = {s.id: "TODO" for s in buildable}
+
+    # --- Phase 1: Preflight (real runs only) ---------------------------------
+    # Story 35.4-005: a phase of the run, not a gate in front of it. The ledger
+    # row and the registry/fleet record exist by now, so a long suite is visible
+    # as `preflight: running` and a red one stamps this run FAILED with its
+    # reason. Still strictly before any dispatch. The phase itself was opened
+    # above, before the model probe; this runs its gate.
+    if not opts.skip_preflight:
+        failure = run_preflight_phase(
+            ledger, run_id, check_preflight, preflight_failures,
+            command=preflight_command,
+            registry=registry, repo=(root or Path.cwd()).name,
+            subject=f"build {opts.scope}", render_view=render_view, opened=True,
+        )
+        if failure is not None:
+            return BuildResult(preflight_failed=True, run_id=run_id)
 
     # --- Phase 2: story dispatch ----------------------------------------------
     # Story 14.1-001: the budget gate is checked *before* dispatching each story

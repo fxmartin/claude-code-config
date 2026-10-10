@@ -57,8 +57,68 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
 
 1. **Preflight** — `default_preflight` shells out to the detected test command
    (`uv run pytest`, `npm test`, `make test`, or `bats test/`). A red suite
-   aborts the run before any agent is dispatched (skip with `--skip-preflight`).
-   The whole command is bounded by `--preflight-timeout` (default 600s), and when
+   stops the run before any agent is dispatched (skip with `--skip-preflight`).
+
+   **Preflight is a run phase (Story 35.4-005).** Once the guards that need no
+   run have passed (dry-run, undenied host-auth, forge declaration, dirty tree,
+   parked conflicts), `sdlc build` / `sdlc fix` / `sdlc fix all` open the run —
+   ledger row, local registry record and, on a fleet, the pushed fleet record —
+   *then* run the gate as the run's first phase. The run reads `IN_PROGRESS` with
+   `phase: preflight`, and the dashboard header (and `sdlc status`) show
+   `preflight: running (<command>, <elapsed>)` live, then
+   `preflight: passed (<duration>)`; the run id, registry record and counts are
+   the same ones the rest of the pipeline carries. A red or timed-out gate — or
+   a test command that cannot start on this host (`PRE_FLIGHT_RED … could not
+   start`) — stamps the run `FAILED` with the `PRE_FLIGHT_RED` /
+   `PRE_FLIGHT_TIMEOUT` line (and the command) as an `error` event, finishes its
+   registry and fleet records `FAILED`, finishes the fleet job `failed` with that
+   reason (a run that opened and finished between two scheduler polls is linked
+   to its job when the job's process is reaped: the record of the job's repo
+   with that pid that started after the launch, so the job no longer reads
+   `run status 1`), and
+   sends it to Telegram — it no longer leaves *no* run at all. `sdlc resume` of a
+   build or single-issue fix run whose gate never passed re-runs the gate
+   (nothing was dispatched) rather than skipping it — whether the run was
+   interrupted in preflight or came back red and was closed `FAILED`, which
+   `sdlc resume --run <id>` (the "failed with resumable stories" hint) and a
+   fleet reclaim both resume; a red re-run exits with `PRE_FLIGHT_FAILURE`. A
+   resumed fix re-applies `sdlc fix`'s stop conditions before its gate: an issue
+   closed, labelled `wontfix` or reassigned since the run died stops the resume,
+   and an interrupted run is closed `ABORTED` (a red one stays `FAILED`).
+   Starting the scope afresh instead — `sdlc build` / `sdlc fix` / `sdlc fix all`
+   of the same scope — supersedes a run whose gate never passed, whether it died
+   in its gate or came back red and was closed `FAILED`: once the registry shows
+   its process gone, the fresh run closes it `ABORTED` (nothing was dispatched;
+   a red one keeps its `PRE_FLIGHT_*` reason), so a later bare `sdlc resume`
+   cannot pick it — nor its "failed with resumable stories" hint name it — and
+   build the scope again under the fresh run, and a fleet reclaim of its job
+   starts afresh rather than resuming it. A run still alive, one past its gate,
+   or one of another scope is left alone. An
+   `sdlc fix all` / `next` batch has no resume path (`resume_fix` takes only an
+   `issue-<N>` scope, and the epic resume cannot rebuild an issue queue), so a
+   batch whose gate never passed is not resumed at all: `sdlc resume` refuses it
+   and its hint never names it, and a fleet reclaim restarts the job as a fresh
+   `sdlc fix` — exactly as when the gate ran before the run existed. A batch
+   interrupted in the gate (left `IN_PROGRESS`) is closed `ABORTED` by that
+   refusal or reclaim — or by a fresh batch of its scope, as above — so it does
+   not stay the run a bare `sdlc resume` picks ahead of an older interrupted
+   build; a red one stays `FAILED` until a fresh batch of its scope supersedes it.
+   `sdlc build` opens the phase before its live tier-model probe
+   (Story 34.1-002), which is part of preflight, but runs the gate itself only
+   after the run's routing, config and story rows are recorded — the state a
+   resume of a run interrupted in the gate replays.
+
+   `status_snapshot` carries `run.phase` (`preflight` | `stories` | `closing`;
+   none unless the run is `IN_PROGRESS`, so a finished or `RATE_LIMITED` run has
+   none) and `run.preflight` (`state`, `command`,
+   `duration_seconds`, `reason`), both derived from the ledger's `preflight`
+   events. A gate with no outcome on a run that is no longer `IN_PROGRESS` (one
+   superseded, or a batch closed `ABORTED`) is `state: interrupted` with no
+   duration, and the header and `sdlc status` read `preflight: interrupted` —
+   never a `running` gate whose elapsed keeps counting. `/api/runs` and `sdlc runs --json` rows carry the live `phase` read from the run's ledger, and the fleet record's `phase` is
+   refreshed on each worker heartbeat, so the runs sidebar names a remote run's
+   worker *and* its phase.
+   The whole command is bounded by `--preflight-timeout` (default 1800s), and when
    the project ships `pytest-timeout` the detected pytest command also gets a
    per-test bound (`--timeout=60 --timeout-method=thread`, `PER_TEST_TIMEOUT`) so
    a single hanging agent-added test fails fast instead of stalling the suite
@@ -2523,6 +2583,11 @@ authoritative for the worker; the table is the fleet's summary.
   shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
   `/api/runs`, `/api/fleet` and the SSE change token; a failed fetch is kept
   for 30 s, so an offline service stalls the page at most once per window.
+- **Phase (Story 35.4-005).** A run's row also carries `phase` (migration 16):
+  `preflight` while its gate runs, then `stories`, then `closing`, empty once the run
+  is finished. A build pushes it as the phase changes and a worker refreshes it from
+  the run's own ledger on each heartbeat, so the runs sidebar shows a remote run in
+  preflight beside its worker without anyone reading the worker's ledger.
 - **Transcripts (Story 35.4-002).** A run's row also carries `dashboard_url` (migration
   11): the origin of its worker's own dashboard, started with `sdlc dashboard --host
   <tailnet-ip>`. A worker advertises it with `queue run --worker NAME --dashboard-url
