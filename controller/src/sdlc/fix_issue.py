@@ -2644,7 +2644,7 @@ def resume_fix(
             registry, run_id, scope, ledger.db_path, 1, repo=root or Path.cwd()
         )
 
-    if preflight_interrupted:
+    if plan is None:  # refused above unless the run was interrupted in preflight
         failures: list[str] = []
         check_preflight = preflight or (
             lambda: default_preflight(on_failure=failures.append)
@@ -2664,7 +2664,6 @@ def resume_fix(
             registry=registry,
         )
 
-    assert plan is not None  # only a preflight-interrupted run lacks one, handled above
     main_baseline = _commits_ahead_of_origin(Path.cwd())
     terminal, pr_number = _run_stage_loop(
         issue, plan, story, opts, ledger, run_id, dispatch, logs_dir, root=root,

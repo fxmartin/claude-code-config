@@ -337,6 +337,27 @@ _PREFLIGHT_SOURCE = "preflight"
 _PREFLIGHT_STARTED = "started: "
 _PREFLIGHT_PASSED = "passed"
 
+
+def _run_phase(
+    run_status: str | None, preflight: dict | None, story_statuses: list
+) -> str | None:
+    """``preflight`` | ``stories`` | ``closing`` for a run, else None (Story 35.4-005).
+
+    Only an ``IN_PROGRESS`` run has a phase: a finished run is done, and a parked
+    one (``RATE_LIMITED``) is waiting, not closing. ``closing`` is a run whose
+    stories have all settled but which has not yet stamped its terminal status
+    (reconciliation, summary, close-out). Takes reads the caller already holds, so
+    :func:`status_snapshot` derives the phase without re-reading the ledger.
+    """
+    if run_status != "IN_PROGRESS":
+        return None
+    if preflight is not None and preflight["state"] == "running":
+        return "preflight"
+    if story_statuses and not any(st in ("TODO", "IN_PROGRESS") for st in story_statuses):
+        return "closing"
+    return "stories"
+
+
 # Story statuses whose measured usage is a story's *complete* cost, so the row is
 # a valid training example for the Story 28.2-002 predictor. Deliberately not
 # named ``_TERMINAL_*``: `resume.py` already owns a `_TERMINAL_STORY_STATES` with
@@ -3890,20 +3911,16 @@ class Ledger:
         """The phase a live run is in: ``preflight`` | ``stories`` | ``closing`` (Story 35.4-005).
 
         Derived from the ledger rather than stored, so it can never disagree with
-        what the run has actually done. A finished run is in no phase. ``closing``
-        is a run whose stories have all settled but which has not yet stamped its
-        terminal status (reconciliation, summary, close-out).
+        what the run has actually done. See :func:`_run_phase` for the rules.
         """
         run_row = self.run_row(run_id)
-        if run_row is None or run_row.get("status") in _TERMINAL_RUN_STATES:
-            return None
-        preflight = self.preflight_state(run_id)
-        if preflight is not None and preflight["state"] == "running":
-            return "preflight"
-        statuses = [s.get("status") for s in self.story_rows(run_id)]
-        if statuses and not any(st in ("TODO", "IN_PROGRESS") for st in statuses):
-            return "closing"
-        return "stories"
+        if run_row is None or run_row.get("status") != "IN_PROGRESS":
+            return None  # no phase, so skip the event and story reads
+        return _run_phase(
+            run_row.get("status"),
+            self.preflight_state(run_id),
+            [s.get("status") for s in self.story_rows(run_id)],
+        )
 
     def events_by_source(self, run_id: str, source: str) -> list[str]:
         """Every event message for ``run_id`` from ``source``, earliest first.
@@ -4476,17 +4493,20 @@ def status_snapshot(ledger: Ledger, run_id: str | None = None) -> dict:
         "active": _count("IN_PROGRESS"),
     }
 
+    preflight = ledger.preflight_state(rid, now=now)
     payload["run"] = {
         "id": rid,
         "scope": run_row.get("scope"),
         "mode": run_row.get("mode"),
         "status": run_row.get("status"),
         # Story 35.4-005: where the live run is (`preflight` | `stories` |
-        # `closing`; None once finished) and how its preflight gate stands
+        # `closing`; None unless IN_PROGRESS) and how its preflight gate stands
         # (`running` | `passed` | `failed` + command/duration/reason; None when
-        # it never ran one), both read from the same ledger events.
-        "phase": ledger.run_phase(rid),
-        "preflight": ledger.preflight_state(rid, now=now),
+        # it never ran one), both from the one read of its preflight events.
+        "phase": _run_phase(
+            run_row.get("status"), preflight, [s.get("status") for s in stories]
+        ),
+        "preflight": preflight,
         "started_at": run_row.get("started_at"),
         "finished_at": run_row.get("finished_at"),
         "duration_seconds": _duration_seconds(
@@ -4760,6 +4780,18 @@ def preflight_command_text(root: Path | None = None) -> str:
     return " ".join(cmd) if cmd else "preflight"
 
 
+def open_preflight_phase(
+    ledger: "Ledger", run_id: str, command: str, registry: "Registry | None" = None
+) -> None:
+    """Put ``run_id`` in its ``preflight`` phase: the ``started`` event + registry phase.
+
+    :func:`run_preflight_phase` does this itself; ``run_build`` opens it earlier so
+    the live tier-model probe, which is part of preflight, already reads as it.
+    """
+    ledger.event_log(run_id, "", "info", _PREFLIGHT_SOURCE, f"{_PREFLIGHT_STARTED}{command}")
+    _registry_phase(registry, run_id, "preflight")
+
+
 def run_preflight_phase(
     ledger: "Ledger",
     run_id: str,
@@ -4771,21 +4803,23 @@ def run_preflight_phase(
     repo: str | None = None,
     subject: str | None = None,
     render_view: Callable[[str], None] | None = None,
+    opened: bool = False,
 ) -> str | None:
     """Run the preflight gate *as a phase of an existing run* (Story 35.4-005).
 
     The run row already exists, so a two-minute suite is something a dashboard can
-    watch and a red one leaves a record. Emits ``preflight started``, then either
-    ``passed`` or — on a red or timed-out gate — the ``PRE_FLIGHT_*`` reason as an
-    ``error`` event, stamps the run ``FAILED``, finishes its registry and fleet
-    records and tells Telegram, and returns that reason. ``None`` means the gate
-    passed and the run carries on, same id and counts.
+    watch and a red one leaves a record. Emits ``preflight started`` (unless the
+    caller already did, ``opened``), then either ``passed`` or — on a red or
+    timed-out gate — the ``PRE_FLIGHT_*`` reason as an ``error`` event, stamps the
+    run ``FAILED``, finishes its registry and fleet records and tells Telegram, and
+    returns that reason. ``None`` means the gate passed and the run carries on,
+    same id and counts.
 
     ``failures`` is the collector :func:`default_preflight` reports its reason
     into; an injected ``check`` that merely returns False gets a generic one.
     """
-    ledger.event_log(run_id, "", "info", _PREFLIGHT_SOURCE, f"{_PREFLIGHT_STARTED}{command}")
-    _registry_phase(registry, run_id, "preflight")
+    if not opened:
+        open_preflight_phase(ledger, run_id, command, registry)
     failures.clear()
     # An interrupt or crash in `check` leaves the `started` event open, which is
     # exactly what tells a resume to re-run the gate (nothing was dispatched).
@@ -8033,6 +8067,13 @@ def run_build(
     # longer fail silent-and-expensive.
     # Story 34.1-002: prove the tier ids on this host first, so a substituted
     # (previous-generation) id is what the banner and every dispatch show.
+    # Story 35.4-005: the probe is part of preflight (skipped with it) and can take
+    # a minute, so the phase opens before it. The gate itself still runs only once
+    # routing, config and story rows are recorded, which a resume of a run
+    # interrupted in the gate replays.
+    preflight_command = "preflight" if preflight else preflight_command_text()
+    if not opts.skip_preflight:
+        open_preflight_phase(ledger, run_id, preflight_command, registry)
     _probe_tier_models(ledger, run_id, opts)
     routing = _resolve_run_routing(opts)
     opts.model_routing_snapshot = routing
@@ -8152,13 +8193,14 @@ def run_build(
     # Story 35.4-005: a phase of the run, not a gate in front of it. The ledger
     # row and the registry/fleet record exist by now, so a long suite is visible
     # as `preflight: running` and a red one stamps this run FAILED with its
-    # reason. Still strictly before any dispatch.
+    # reason. Still strictly before any dispatch. The phase itself was opened
+    # above, before the model probe; this runs its gate.
     if not opts.skip_preflight:
         failure = run_preflight_phase(
             ledger, run_id, check_preflight, preflight_failures,
-            command="preflight" if preflight else preflight_command_text(),
+            command=preflight_command,
             registry=registry, repo=(root or Path.cwd()).name,
-            subject=f"build {opts.scope}", render_view=render_view,
+            subject=f"build {opts.scope}", render_view=render_view, opened=True,
         )
         if failure is not None:
             return BuildResult(preflight_failed=True, run_id=run_id)

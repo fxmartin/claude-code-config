@@ -189,19 +189,58 @@ def test_build_default_preflight_reason_reaches_the_ledger(tmp_path, monkeypatch
     assert ledger_preflight_failure(str(db), result.run_id) == reason
 
 
-def test_default_preflight_reports_the_reason_line(tmp_path, capsys) -> None:
+# The suite itself is faked at the `subprocess.run` seam: a CI job image only
+# guarantees `sh` (no `make`), and a real timed-out `make` would orphan its child.
+
+
+def test_default_preflight_reports_the_reason_line(tmp_path, monkeypatch, capsys) -> None:
     (tmp_path / "Makefile").write_text("test:\n\t@exit 1\n")
+
+    class _Red:
+        returncode = 1
+
+    monkeypatch.setattr(build_mod.subprocess, "run", lambda *a, **k: _Red())
     lines: list[str] = []
     assert default_preflight(root=tmp_path, timeout=30, on_failure=lines.append) is False
-    assert len(lines) == 1 and lines[0].startswith("PRE_FLIGHT_RED") and "exited" in lines[0]
+    assert lines == [
+        "PRE_FLIGHT_RED: 'make test' exited 1 — the suite is failing. "
+        "Fix it, or bypass with --skip-preflight."
+    ]
     assert lines[0] in capsys.readouterr().err  # still printed, as before
 
 
-def test_default_preflight_timeout_reports_the_reason_line(tmp_path) -> None:
+def test_default_preflight_timeout_reports_the_reason_line(tmp_path, monkeypatch) -> None:
     (tmp_path / "Makefile").write_text("test:\n\t@sleep 30\n")
+
+    def _hang(cmd, **kwargs):
+        raise build_mod.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(build_mod.subprocess, "run", _hang)
     lines: list[str] = []
     assert default_preflight(root=tmp_path, timeout=1, on_failure=lines.append) is False
-    assert len(lines) == 1 and lines[0].startswith("PRE_FLIGHT_TIMEOUT")
+    assert len(lines) == 1 and lines[0].startswith("PRE_FLIGHT_TIMEOUT: 'make test' exceeded 1s")
+
+
+def test_build_model_probe_runs_inside_the_preflight_phase(tmp_path, monkeypatch) -> None:
+    # The live tier-model probe is part of preflight (`--skip-preflight` skips
+    # it), so the run must already read `preflight` while it spends its seconds.
+    db = tmp_path / "ledger.db"
+    registry = Registry(tmp_path / "registry.json")
+    seen: list[tuple] = []
+    monkeypatch.setattr(
+        build_mod, "_probe_tier_models",
+        lambda ledger, run_id, opts: seen.append(
+            (ledger.run_phase(run_id), [r.phase for r in registry.records()])
+        ),
+    )
+    run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(), ledger=Ledger(db), dispatcher=FakeDispatcher(),
+        preflight=lambda: True, registry=registry,
+    )
+    assert seen == [("preflight", ["preflight"])]
+    # Opening the phase early does not open it twice: one gate, one start.
+    assert [m for _, m in _events(db, "preflight")] == ["started: preflight", "passed"]
 
 
 def test_skip_preflight_records_no_phase(tmp_path) -> None:
@@ -234,6 +273,21 @@ def test_run_phase_walks_preflight_stories_closing_and_ends(tmp_path) -> None:
     ledger.run_update_status(run_id, "DONE")
     assert ledger.run_phase(run_id) is None
     assert ledger.run_phase("no-such-run") is None
+
+
+def test_run_phase_is_none_for_a_run_that_is_not_in_progress(tmp_path) -> None:
+    # A parked run (RATE_LIMITED is resumable, so not terminal) is in no phase:
+    # its settled stories must not read as `closing`, nor its TODO ones as `stories`.
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-1", "serial")
+    ledger.story_upsert(run_id, "s-1", "1", "t", "P1", 1, "py", "", None, "RATE_LIMITED")
+    ledger.run_update_status(run_id, "RATE_LIMITED")
+    assert ledger.run_phase(run_id) is None
+    assert status_snapshot(ledger, run_id)["run"]["phase"] is None
+    ledger.set_story_status(run_id, "s-1", "TODO")
+    assert ledger.run_phase(run_id) is None
+    assert status_snapshot(ledger, run_id)["run"]["phase"] is None
 
 
 def test_preflight_state_reports_command_and_latest_attempt(tmp_path) -> None:
@@ -369,6 +423,35 @@ def test_api_runs_carries_phase_for_local_and_remote_runs(tmp_path) -> None:
     assert rows["remote-1"]["phase"] == "preflight" and rows["remote-1"]["worker"] == "xps"
 
 
+def test_api_runs_takes_phase_from_the_memoized_list_runs_read(tmp_path, monkeypatch) -> None:
+    # `list_runs` already derives a live run's phase; the view must not pay a
+    # second ledger pass (three connections) per run on a list polled every tick.
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_ids = [ledger.run_create("epic-1", "serial") for _ in range(2)]
+    ledger.event_log(run_ids[0], "", "info", "preflight", "started: make test")
+    registry = Registry(tmp_path / "registry.json")
+    for run_id in run_ids:
+        registry.register(_record(run_id=run_id, db=str(ledger.db_path), pid=__import__("os").getpid(), worker=None))
+    reads: list[str] = []
+    real_list_runs = Ledger.list_runs
+
+    def _list_runs(self, *args, **kwargs):
+        reads.append(str(self.db_path))
+        rows = real_list_runs(self, *args, **kwargs)
+        monkeypatch.setattr(Ledger, "run_phase", _no_second_pass)
+        return rows
+
+    def _no_second_pass(self, run_id):
+        raise AssertionError("phase re-derived outside the memoized list_runs read")
+
+    monkeypatch.setattr(Ledger, "list_runs", _list_runs)
+    rows = {r["id"]: r for r in _registry_runs_view(registry, None, [])}
+    assert rows[run_ids[0]]["phase"] == "preflight"
+    assert rows[run_ids[1]]["phase"] == "stories"
+    assert reads == [str(ledger.db_path)]  # one read for both runs of one ledger
+
+
 def test_remote_run_finished_has_no_phase(tmp_path) -> None:
     done = {
         **_record(run_id="remote-2", status="FAILED", finished_at="2026-10-02T11:00:00+00:00", phase="preflight").to_dict(),
@@ -397,6 +480,24 @@ def test_status_snapshot_exposes_phase_and_preflight_for_the_header(tmp_path) ->
     assert snap["run"]["phase"] == "preflight"
     assert snap["run"]["preflight"]["command"] == "make test"
     assert isinstance(snap["run"]["preflight"]["duration_seconds"], int)
+
+
+def test_status_snapshot_reads_the_preflight_events_once(tmp_path, monkeypatch) -> None:
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-1", "serial")
+    ledger.event_log(run_id, "", "info", "preflight", "started: make test")
+    calls: list[str] = []
+    real = Ledger.preflight_state
+
+    def _counting(self, rid, **kwargs):
+        calls.append(rid)
+        return real(self, rid, **kwargs)
+
+    monkeypatch.setattr(Ledger, "preflight_state", _counting)
+    snap = status_snapshot(ledger, run_id)
+    assert snap["run"]["phase"] == "preflight" and snap["run"]["preflight"]["state"] == "running"
+    assert calls == [run_id]
 
 
 # ---------------------------------------------------------------------------

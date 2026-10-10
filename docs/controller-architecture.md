@@ -71,16 +71,25 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    the run `FAILED` with the `PRE_FLIGHT_RED` / `PRE_FLIGHT_TIMEOUT` line (and the
    command) as an `error` event, finishes its registry and fleet records `FAILED`,
    finishes the fleet job `failed` with that reason, and sends it to Telegram — it
-   no longer leaves *no* run at all. `sdlc resume` of a run interrupted in
-   preflight re-runs the gate (nothing was dispatched) rather than skipping it.
+   no longer leaves *no* run at all. `sdlc resume` of a build or single-issue
+   fix run interrupted in preflight re-runs the gate (nothing was dispatched)
+   rather than skipping it. An `sdlc fix all` batch run has no supported resume
+   path (`resume_fix` takes only an `issue-<N>` scope, and the epic resume cannot
+   rebuild an issue queue), so one interrupted in preflight is left `IN_PROGRESS`
+   and the dashboard shows it `DEAD` once its pid is gone; re-run the batch.
+   `sdlc build` opens the phase before its live tier-model probe
+   (Story 34.1-002), which is part of preflight, but runs the gate itself only
+   after the run's routing, config and story rows are recorded — the state a
+   resume of a run interrupted in the gate replays.
 
    `status_snapshot` carries `run.phase` (`preflight` | `stories` | `closing`;
-   none once finished) and `run.preflight` (`state`, `command`,
+   none unless the run is `IN_PROGRESS`, so a finished or `RATE_LIMITED` run has
+   none) and `run.preflight` (`state`, `command`,
    `duration_seconds`, `reason`), both derived from the ledger's `preflight`
    events. `/api/runs` rows carry `phase`, and the fleet record's `phase` is
    refreshed on each worker heartbeat, so the runs sidebar names a remote run's
    worker *and* its phase.
-   The whole command is bounded by `--preflight-timeout` (default 600s), and when
+   The whole command is bounded by `--preflight-timeout` (default 1800s), and when
    the project ships `pytest-timeout` the detected pytest command also gets a
    per-test bound (`--timeout=60 --timeout-method=thread`, `PER_TEST_TIMEOUT`) so
    a single hanging agent-added test fails fast instead of stalling the suite
