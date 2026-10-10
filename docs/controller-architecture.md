@@ -922,7 +922,9 @@ the client renders as a muted **"no queue"** line — the same graceful-degrade
 precedent as the GitHub panel's "unavailable" state, never an error.
 
 The client groups jobs by `state` (known states ordered first, any future
-state sorted after), shows each job's repo/scope/priority/age, and computes
+state sorted after), shows each job's repo/scope/priority/age — and beneath it
+the job's `reason`, as `sdlc queue list` prints it (Story 35.2-006: a worker
+that cannot authenticate to the forge, `repo sync stalled`) — and computes
 **slot usage** as a live count of `running` jobs (there is no configured slot
 *cap* to show a fraction against yet — that lands with the scheduler in Story
 32.1-002). The rate-limit pause is read off `data.pauses` (`data.pause` for an older server) — the **queue's** own
@@ -2071,8 +2073,8 @@ launching it (a resumed run re-enters its own tree and is never synced):
    claimed and handed back on every poll — so two builds in one repo take
    turns on a worker;
 2. absent clone → `git clone -- <recorded origin>` (an origin starting with `-`
-   is refused; git reaches the forge with the worker's own `gh`/`glab`
-   credential helper); a clone cut short — timed out, or Ctrl-C — has its
+   is refused; git reaches an `http(s)` forge only through the forge CLI —
+   see *Non-interactive git access* below); a clone cut short — timed out, or Ctrl-C — has its
    half-written directory removed, since git killed mid-way cannot;
 3. the clone's `origin` must be the recorded one (compared by host + path, so
    `git@host:o/r.git`, `ssh://…` and `https://…` agree) — otherwise the job is
@@ -2103,6 +2105,55 @@ launching it (a resumed run re-enters its own tree and is never synced):
    (migration 12, in `sdlc queue list --json`), and launches the job there.
    Run attach, resume, reconcile and the approval probe all read `repo`, so
    they follow the clone, not the path the enqueuing machine recorded.
+
+**Non-interactive git access (Story 35.2-006).** A worker has no one at its
+screen, so its fetch and clone never prompt. For an `http(s)` origin git runs
+with `-c credential.helper=` (clearing every inherited helper, so the user's
+`osxkeychain` is never consulted — the first fleet job hung for minutes behind
+its Keychain dialog while its lease kept renewing) then `-c
+credential.helper=!glab auth git-credential` (`gh` for a GitHub host) and `-c
+core.askPass=` with `GIT_ASKPASS`/`SSH_ASKPASS` dropped from its env (git asks
+an askpass program before it honours `GIT_TERMINAL_PROMPT=0`, and an IDE
+terminal exports one), plus `GIT_TERMINAL_PROMPT=0` and the
+`GITLAB_HOST`/`GLAB_CONFIG_DIR` (or `GH_HOST`) that `issue_host` sets for a
+plaintext instance. ssh and local-path origins are left to git. Any `http(s)`
+host but GitHub is taken for a GitLab, so a clone from another forge (Gitea,
+Bitbucket) is refused with a `glab` remedy that cannot help — give it an ssh
+origin. Two guards turn a hang into a refusal back to `queued`:
+
+- **No credential.** If the fetch or clone fails the way git does when its
+  helper had nothing and prompting is off (`terminal prompts disabled`, a 401),
+  the job is refused with `worker <name> cannot authenticate to <host> (glab
+  auth login --hostname <host>)`. The scheduler flags the host
+  `forges: {<host>: false}` on a heartbeat of its own — `forges` rides the
+  worker registration (queue.db migration 15) — and the matcher stops offering
+  that worker jobs whose origin is on it (`forge credential for <host>` in
+  `no eligible worker (needs …)`; a host a worker never reported is "may try").
+  The refusal reason is kept on the job rather than overwritten by that stamp,
+  and shows in `sdlc queue list` and beneath the job's row on the dashboard's
+  queue panel. The worker looks for a login again every 5 minutes (`<cli> auth
+  git-credential get`, a local read; an empty `password=` counts as none) over
+  the scheme its clone uses — a host flagged at start-up included, since an
+  `http://` GitLab's login is read through the private `GLAB_CONFIG_DIR` — and
+  clears the flag when it finds one.
+- **Stall.** Every sync git call runs in its own process group. Fetch and
+  clone — the calls that can wait on a credential — run with `--progress` (the
+  clone without `-q`, which would leave its checkout, and off http its download,
+  silent despite it), so a healthy transfer talks throughout, and 60 s with no
+  output kills the group (SIGTERM, then SIGKILL) and refuses the job with
+  `repo sync stalled`; the
+  sync's keepalive is joined before the refusal, so a stalled sync's lease is
+  never renewed past it. Local plumbing (`status`, `checkout`, `merge
+  --ff-only`) is silent on a pipe however long a big tree takes, so it is held
+  only to the 120 s timeout, never to the silence limit. A fetch or clone that
+  fails after its transfer began is refused with git's `fatal:`/`error:` lines
+  alone, not the meters `--progress` redrew with `\r` ahead of them; output with
+  no meter in it is kept whole.
+
+`sdlc doctor` on a machine running the resident worker reports a *Forge
+credentials* finding: for each forge host its clones under `~/Work` sit on,
+whether the CLI credential is present and usable non-interactively, with the
+`glab auth login --hostname …` remedy when not.
 
 **Retries.** A refusal that clears on its own — a dirty tree, a held lock, a
 forge that failed the fetch or clone — is not retried on the next poll: every
@@ -2370,7 +2421,8 @@ harmless: the worker restarts only when the installed *version* changes.
   completed from the unit, reads `TCC n/a (not macOS)`, and on failure points at
   the journal — there is no dialog to answer. There is no `worker-dashboard`
   finding: the unit advertises no `--dashboard-url`, so the XPS shows `dev`'s runs
-  with the worker name but header-only.
+  with the worker name but header-only. The *Forge credentials* finding (Story
+  35.2-006) reports for the unit as it does for the LaunchAgent.
 - **Reaching the box.** The Tailscale SSH policy denies the XPS, and public port
   22 is home-IP-only. Operate it through the home-lab: `ssh -J home-lab
   dev-server`, or widen the ACL in `nix-install`.
@@ -2517,7 +2569,7 @@ authoritative for the worker; the table is the fleet's summary.
   shows a muted "fleet unavailable" line. One cached fetch (2 s) serves
   `/api/runs`, `/api/fleet` and the SSE change token; a failed fetch is kept
   for 30 s, so an offline service stalls the page at most once per window.
-- **Phase (Story 35.4-005).** A run's row also carries `phase` (migration 15):
+- **Phase (Story 35.4-005).** A run's row also carries `phase` (migration 16):
   `preflight` while its gate runs, then `stories`, then `closing`, empty once the run
   is finished. A build pushes it as the phase changes and a worker refreshes it from
   the run's own ledger on each heartbeat, so the runs sidebar shows a remote run in
@@ -3290,10 +3342,13 @@ on every call, and because most host seams are best-effort those failures are
 silent. The only mechanism `glab` honours for the protocol is a config file's
 per-host `api_protocol`, so `gitlab_instance_env` also emits a
 **controller-owned** `GLAB_CONFIG_DIR`: a 0700 temp dir (one per instance URL
-per process, `atexit`-removed) whose 0600 `config.yml` carries just that host's
+per process, `atexit`-removed, made again if a temp cleaner removes it under a
+long-lived process) whose 0600 `config.yml` carries just that host's
 entry with `api_protocol: http`. The user's `~/.config/glab-cli/config.yml` is
-read-only input — that one host's entry is copied so a `glab auth login` token
-still authenticates, and no unrelated forge's token is duplicated to disk.
+read-only input — that one host's entry is re-copied on every call, so a `glab
+auth login` token still authenticates even when it was made after a long-lived
+process (the resident fleet worker, the dashboard) started, and no unrelated
+forge's token is duplicated to disk.
 
 The declaration-aware call sites: `sdlc
 build` (`_open_story_cr`/`_bake_review_packet`, the run-start actor-identity

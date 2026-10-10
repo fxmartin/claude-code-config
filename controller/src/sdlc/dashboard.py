@@ -1019,6 +1019,8 @@ _PAGE = """<!doctype html>
      own panel, never the page — a horizontal scrollbar on the table, not `.main`. */
   .queue-scroll { overflow-x: auto; padding-bottom: 6px; }
   .queue-scroll table { min-width: 760px; }
+  /* Story 35.2-006: why a job stands still, beneath its row; git's lines kept as lines. */
+  .queue-reason td { padding-top: 0; font-size: 11px; color: var(--sub); white-space: pre-wrap; }
   /* Story 11.2-010: in-dashboard transcript viewer. A "view session" control
      per story opens a modal listing that story's stage transcripts and renders
      each inline — no leaving the page. The new-tab /log link stays as fallback. */
@@ -1565,12 +1567,15 @@ function renderQueue(data){
       + (pause.paused_until ? " · resumes " + esc(fmtLocal(pause.paused_until)) : "")
       + (pause.reason ? " · " + esc(pause.reason) : "") + "</div>").join("");
   const running = jobs.filter(j => j.state === "running").length;
+  // Why a job stands still sits beneath its row, as `sdlc queue list` prints it (Story
+  // 35.2-006: a worker that cannot authenticate to the forge, `repo sync stalled`).
   const groups = order.map(state => {
     const rows = byState[state].map(j =>
       "<tr><td>"+queueRepoLabel(j.repo)+"</td><td>"+esc(j.scope)+"</td>"
       + "<td>"+esc(j.priority)+"</td><td>"+queueAge(j.created_at)+"</td>"
       + "<td>"+esc(j.worker || j.claimed_by || "-")+"</td><td>"+esc(j.pool || "-")+"</td>"
       + "<td>"+queuePrLink(j)+"</td></tr>"
+      + (j.reason ? "<tr class='queue-reason'><td colspan='7'>\\u2514 "+esc(j.reason)+"</td></tr>" : "")
     ).join("");
     return "<div class='queue-group'><h4>"+esc(state)+" ("+byState[state].length+")</h4>"
       + "<div class='queue-scroll'><table><tr><th>repo</th><th>scope</th><th>priority</th>"

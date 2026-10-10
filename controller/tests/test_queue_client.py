@@ -684,6 +684,23 @@ def test_a_registered_client_claim_is_capability_matched(client: QueueClient) ->
     assert claimed is not None and claimed.id == job_id
 
 
+def test_a_forge_flag_rides_the_fleet_heartbeat_and_gates_the_claim(client: QueueClient) -> None:
+    """Story 35.2-006 on the path the incident ran on — the M3 worker beating the fleet
+    service over HTTP: a forge it cannot authenticate to holds its claim, a login lifts it."""
+    job_id = client.add_job(
+        repo="/r/a", kind="build", scope="1",
+        requirements_json='{"origin": "https://gitlab.test/root/a.git"}',
+    )
+
+    client.register_worker("m3max", host="m3", forges={"gitlab.test": False})
+    assert [w.forges for w in client.list_workers()] == [{"gitlab.test": False}]
+    assert client.claim_next(claimed_by="m3max", lease_seconds=90) is None
+
+    client.register_worker("m3max", host="m3", forges={"gitlab.test": True})
+    claimed = client.claim_next(claimed_by="m3max", lease_seconds=90)
+    assert claimed is not None and claimed.id == job_id
+
+
 def test_client_pool_pauses_are_independent_and_clear_by_pool(client: QueueClient) -> None:
     """Story 35.2-003: one window per pool, over the wire."""
     until = datetime.now(timezone.utc) + timedelta(minutes=30)

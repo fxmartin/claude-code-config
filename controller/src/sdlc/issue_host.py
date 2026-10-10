@@ -649,25 +649,38 @@ def _user_glab_host_entry(netloc: str) -> dict:
 def _glab_http_config_dir(instance_url: str) -> str:
     """A private `glab` config dir pinning ``instance_url``'s host to plain http.
 
-    Built once per instance URL per process (adapters are constructed per
-    operation) and removed at interpreter exit. Only the one host's entry is
-    copied from the user's config, so no unrelated forge token is duplicated
-    onto disk; the file is written 0600 inside a 0700 temp dir.
+    One dir per instance URL per process (adapters are constructed per
+    operation), removed at interpreter exit. Its entry is re-copied from the
+    user's config on every call, so a `glab auth login` (or logout) made after
+    the process started reaches a long-lived caller — the resident fleet worker
+    re-checks a missing login on its beat (Story 35.2-006). That worker also
+    outlives the dir itself: a temp cleaner (`systemd-tmpfiles`, macOS's
+    $TMPDIR purge) may remove it, so a dir that is gone is made again. Only the
+    one host's entry is copied, so no unrelated forge token is duplicated onto
+    disk; the file is written 0600 inside a 0700 temp dir, replaced atomically
+    so a `glab` reading it never sees a half-written one.
     """
+    netloc = urlparse(instance_url).netloc
+    entry = _user_glab_host_entry(netloc)
+    entry["api_protocol"] = "http"
+    entry.setdefault("api_host", netloc)
+    wanted = yaml.safe_dump({"hosts": {netloc: entry}})
     with _GLAB_HTTP_CONFIG_LOCK:
-        cached = _GLAB_HTTP_CONFIG_DIRS.get(instance_url)
-        if cached is not None:
-            return cached
-        netloc = urlparse(instance_url).netloc
-        entry = _user_glab_host_entry(netloc)
-        entry["api_protocol"] = "http"
-        entry.setdefault("api_host", netloc)
-        config_dir = tempfile.mkdtemp(prefix="sdlc-glab-")
+        config_dir = _GLAB_HTTP_CONFIG_DIRS.get(instance_url)
+        if config_dir is None or not os.path.isdir(config_dir):
+            config_dir = tempfile.mkdtemp(prefix="sdlc-glab-")
+            atexit.register(shutil.rmtree, config_dir, True)
+            _GLAB_HTTP_CONFIG_DIRS[instance_url] = config_dir
         config = Path(config_dir, "config.yml")
-        config.write_text(yaml.safe_dump({"hosts": {netloc: entry}}), encoding="utf-8")
-        config.chmod(0o600)
-        atexit.register(shutil.rmtree, config_dir, True)
-        _GLAB_HTTP_CONFIG_DIRS[instance_url] = config_dir
+        try:
+            current = config.read_text(encoding="utf-8")
+        except OSError:
+            current = None
+        if current != wanted:
+            staged = Path(config_dir, "config.yml.tmp")
+            staged.write_text(wanted, encoding="utf-8")
+            staged.chmod(0o600)
+            os.replace(staged, config)
         return config_dir
 
 

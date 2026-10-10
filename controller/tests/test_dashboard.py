@@ -2851,6 +2851,19 @@ def _render_queue_body() -> str:
     return _PAGE[render_start:_PAGE.index("\n}", render_start)]
 
 
+def test_page_queue_rows_show_why_a_job_stands_still() -> None:
+    """Story 35.2-006: a job's reason — a worker that cannot authenticate to its forge,
+    `repo sync stalled`, no eligible worker — is on the panel beneath its row, as
+    `sdlc queue list` prints it, and escaped: it carries git's own words."""
+    from sdlc.dashboard import _PAGE
+
+    body = _render_queue_body()
+    assert "j.reason ?" in body
+    assert "esc(j.reason)" in body
+    assert "<tr class='queue-reason'><td colspan='7'>" in body
+    assert ".queue-reason td" in _PAGE
+
+
 def test_page_queue_panel_is_collapsible_and_collapsed_by_default() -> None:
     """The panel is a native <details>: a long queue must not push the run's own
     stories below the fold. `open` is emitted only from the remembered state,

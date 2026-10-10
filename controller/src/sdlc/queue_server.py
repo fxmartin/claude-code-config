@@ -310,6 +310,15 @@ def _string_list(body: Body, key: str) -> list[str] | None:
     return value
 
 
+def _bool_map(body: Body, key: str) -> dict[str, bool] | None:
+    value = body.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(isinstance(v, bool) for v in value.values()):
+        raise _ApiError(400, f"{key} must be an object of booleans")
+    return value
+
+
 def _self_check(body: Body) -> dict[str, Any] | None:
     """A heartbeat's ``self_check`` (Story 35.2-007): ``{ok: bool, at?, reason?}`` or absent."""
     value = body.get("self_check")
@@ -443,6 +452,7 @@ class _Routes:
                 repos=_string_list(body, "repos") or (),
                 slots=_int(body, "slots", default=1) or 0,
                 slots_free=_int(body, "slots_free"),
+                forges=_bool_map(body, "forges"),
                 now=self._now(),
                 self_check=_self_check(body),
             )

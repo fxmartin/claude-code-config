@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.100.0] - 2026-10-10
+
+### Added
+
+- feat(fleet-execution): worker git access is (#35.2-006)
+
+### Fixed
+
+- fix(fleet-execution): worker git access is non-interactive (#35.2-006)
+- fix(fleet-execution): worker git access is (#35.2-006)
+- fix(fleet-execution): worker git access is (#35.2-006)
+- fix(fleet-execution): worker git access is non-interactive (#35.2-006)
+
+
 ## [v2.99.0] - 2026-10-08
 
 ### Added
