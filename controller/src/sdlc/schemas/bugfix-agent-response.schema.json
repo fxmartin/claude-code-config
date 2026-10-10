@@ -46,6 +46,16 @@
       "type": "boolean",
       "description": "Whether the test suite is green after the fix."
     },
+    "failing_tests": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Story 35.5-001: names of every test still failing after the fix. Paired with baseline_failures so the controller can judge tests_passing as 'no new failures'. Omit when the suite is green."
+    },
+    "baseline_failures": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Story 35.5-001: names of failing tests that ALSO fail on the base branch in the same environment (e.g. a macOS-only bats failure that is green on Linux CI). The controller excludes them from the tests_passing verdict and logs them. Omit when none; older agents never send it."
+    },
     "bugs_fixed": {
       "type": "integer",
       "minimum": 0,

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import http.client
 import json
@@ -35,6 +36,7 @@ from sdlc.issue_host import (
     GITHUB,
     IssueHostError,
     detect_host,
+    host_from_remote,
     load_repo_forge_declaration,
 )
 from sdlc.portfolio import portfolio_view
@@ -207,19 +209,28 @@ def _registry_runs_view(
     """
     rows: list[dict] = []
     gh_by_repo: dict[str, dict] = {}
+    # Issue #848: many runs share one repo ledger, and `list_runs` prices every
+    # usage row in it — read each ledger once per view, not once per run.
+    counts_by_db: dict[str, dict[str, tuple[int, int, str | None]] | None] = {}
     local_ids: set[str] = set()
     for rec in registry.records():
         local_ids.add(rec.run_id)
-        done, total, phase = rec.completed, rec.total, rec.phase
-        try:
-            ledger = Ledger(rec.db)
-            for r in ledger.list_runs():
-                if r["id"] == rec.run_id:
-                    done, total = r["done"], r["total"]
-                    break
-            phase = None if rec.finished_at else ledger.run_phase(rec.run_id)
-        except (OSError, sqlite3.Error):
-            pass  # unreachable ledger → keep the registry's cached counts and phase
+        if rec.db not in counts_by_db:
+            try:
+                counts_by_db[rec.db] = {
+                    r["id"]: (r["done"], r["total"], r["phase"])
+                    for r in Ledger(rec.db).list_runs()
+                }
+            except (OSError, sqlite3.Error):
+                counts_by_db[rec.db] = None  # unreachable ledger → registry's cached counts
+        ledger_counts = counts_by_db[rec.db] or {}
+        # Story 35.4-005: `list_runs` already derives a live run's phase, so the
+        # memoized read carries it too — no second ledger pass per run.
+        done, total, phase = ledger_counts.get(
+            rec.run_id, (rec.completed, rec.total, rec.phase)
+        )
+        if rec.finished_at:
+            phase = None  # a finished run is in no phase
         row = {
             "id": rec.run_id,
             "repo": rec.repo,
@@ -373,11 +384,18 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 # `ProxyHandler({})`: a tailnet peer is reached directly, never via an env proxy.
 _WORKER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
+# A request one dashboard relays to another is answered from the receiver's own
+# ledger, never relayed on. A worker's dashboard sees the fleet too, so a run it no
+# longer holds (pruned) still names that same dashboard there; without this mark
+# each relay would be relayed again until the server ran out of threads.
+_RELAYED_HEADER = "X-Sdlc-Relayed"
+
 
 def _fetch_worker_json(origin: str, path: str, query: dict[str, str]) -> dict:
     url = f"{origin}{path}?{urlencode(query)}"
+    request = urllib.request.Request(url, headers={_RELAYED_HEADER: "1"})
     try:
-        with _WORKER_OPENER.open(url, timeout=_WORKER_LOGS_TIMEOUT_SECONDS) as resp:
+        with _WORKER_OPENER.open(request, timeout=_WORKER_LOGS_TIMEOUT_SECONDS) as resp:
             body = resp.read(_WORKER_LOGS_MAX_BYTES + 1)
         if len(body) > _WORKER_LOGS_MAX_BYTES:
             raise _WorkerUnreachable(f"{origin} sent more than a transcript viewer can show")
@@ -440,6 +458,176 @@ def _remote_logs_payload(fleet_row: dict, run_id: str, story_id: str) -> dict:
         return payload
     payload["transcripts"] = transcripts
     return payload
+
+
+# --- a remote run's detail, relayed from its worker (Story 35.4-006) -----------
+# The fleet record only carries a header, so the stories, stage attempts, events,
+# usage and routing a local run shows live in the worker's own ledger. The worker's
+# dashboard already renders them (`/api/status?run=<id>`); the XPS passes that JSON
+# through, plus who served it. Nothing is read from the XPS's disk for a remote run.
+
+_WORKER_STATUS_CACHE_SECONDS = 1.0
+# A dead worker blackholes rather than refuses (see _FLEET_FAILURE_CACHE_SECONDS):
+# the stream polls every second, so remember a failure for longer than a tick.
+_WORKER_STATUS_FAILURE_CACHE_SECONDS = 10.0
+# A finished run's status no longer moves until a resume reopens it, so a tab left
+# on one re-reads it this often instead of costing the worker a status snapshot
+# (and a `git remote`) every second it stays open.
+_WORKER_STATUS_FINISHED_CACHE_SECONDS = 10.0
+
+
+class _WorkerStatusRelay:
+    """A worker dashboard's ``/api/status?run=``, fetched at most once per ttl.
+
+    The page's status request and the SSE change token both want the same
+    payload every second; sharing one fetch keeps a watched remote run at about
+    one request per second to the worker — one per ``finished_ttl`` once the run
+    has finished — and a failure is remembered for ``failure_ttl`` so an
+    unreachable worker costs the stream one timeout per window, not one per tick.
+    ``get`` raises :class:`_WorkerUnreachable`.
+    """
+
+    def __init__(
+        self,
+        ttl: float = _WORKER_STATUS_CACHE_SECONDS,
+        failure_ttl: float = _WORKER_STATUS_FAILURE_CACHE_SECONDS,
+        finished_ttl: float = _WORKER_STATUS_FINISHED_CACHE_SECONDS,
+        clock=time.monotonic,
+        fetch=None,
+    ) -> None:
+        self._ttl = ttl
+        self._failure_ttl = failure_ttl
+        self._finished_ttl = finished_ttl
+        self._clock = clock
+        self._fetch = fetch or _fetch_worker_json
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, str], tuple[float, dict | None, str]] = {}
+
+    def get(self, origin: str, run_id: str) -> dict:
+        key = (origin, run_id)
+        with self._lock:
+            entry = self._entries.get(key)
+            now = self._clock()
+            if entry is not None:
+                fetched_at, payload, error = entry
+                if now - fetched_at < self._ttl_for(payload):
+                    if payload is None:
+                        raise _WorkerUnreachable(error)
+                    return payload
+        try:
+            payload = self._fetch(origin, "/api/status", {"run": run_id})
+        except _WorkerUnreachable as exc:
+            self._remember(key, None, str(exc))
+            raise
+        self._remember(key, payload, "")
+        return payload
+
+    def _ttl_for(self, payload: dict | None) -> float:
+        """How long ``payload`` (None: a failure) answers reads before a refetch."""
+        if payload is None:
+            return self._failure_ttl
+        run = payload.get("run")
+        return self._finished_ttl if isinstance(run, dict) and run.get("finished_at") else self._ttl
+
+    def _remember(self, key: tuple[str, str], payload: dict | None, error: str) -> None:
+        # Past the longest window no read is served from an entry, only refetched;
+        # kept, every remote run ever viewed would hold its payload for good.
+        horizon = max(self._ttl, self._failure_ttl, self._finished_ttl)
+        with self._lock:
+            now = self._clock()
+            self._entries = {k: e for k, e in self._entries.items() if now - e[0] < horizon}
+            self._entries[key] = (now, payload, error)
+
+
+def _remote_origin(fleet_row: dict) -> str | None:
+    """The worker dashboard origin a fleet record advertises, or None."""
+    try:
+        return normalize_dashboard_url(fleet_row.get("dashboard_url") or "")
+    except ValueError:
+        return None
+
+
+def _relay_remote_status(
+    fleet_row: dict, run_id: str, header_only: dict, relay: _WorkerStatusRelay
+) -> dict:
+    """The worker's own snapshot of ``run_id`` with ``worker``/``origin`` added.
+
+    When the worker's dashboard cannot be read — or has nothing for the run — the
+    pushed-record ``header_only`` snapshot is served instead, flagged with
+    ``detail_unavailable`` so the page says why there are no stories rather than
+    rendering what reads like an empty run.
+    """
+    worker = fleet_row.get("worker") or "its worker"
+    origin = _remote_origin(fleet_row)
+    if origin is None:
+        return {
+            **header_only,
+            "detail_unavailable": f"detail unavailable — {worker} advertises no dashboard",
+        }
+    try:
+        snap = relay.get(origin, run_id)
+    except _WorkerUnreachable as exc:
+        return {
+            **header_only,
+            "origin": origin,
+            "detail_unavailable": f"detail unavailable — {worker} dashboard not reachable",
+            "detail_error": str(exc),
+        }
+    if not isinstance(snap.get("run"), dict):
+        return {
+            **header_only,
+            "origin": origin,
+            "detail_unavailable": f"detail unavailable — {worker} dashboard has no record of this run",
+        }
+    # Copy: the relay hands the same payload to every reader within its ttl.
+    return {**snap, "run": {**snap["run"], "worker": worker}, "worker": worker, "origin": origin}
+
+
+def _remote_detail_token(relay: _WorkerStatusRelay, origin: str, run_id: str) -> str:
+    """A digest of what a worker's status says moved, for the SSE change token.
+
+    Excludes the clock-driven fields (durations), which would change it every
+    tick and turn the stream into polling.
+    """
+    try:
+        snap = relay.get(origin, run_id)
+    except _WorkerUnreachable:
+        return "unreachable"
+    run = snap.get("run")
+    if not isinstance(run, dict):
+        run = {}
+    stories = [
+        [s.get("story_id"), s.get("status"), s.get("status_detail"), s.get("tokens"),
+         s.get("pr_number"), s.get("stages"), s.get("activity")]
+        for s in snap.get("stories") or []
+        if isinstance(s, dict)
+    ]
+    moved = [run.get("status"), run.get("usage"), snap.get("counts"), stories, snap.get("events")]
+    return hashlib.sha1(json.dumps(moved, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def _origin_forge(origin: str) -> tuple[str | None, str, str | None]:
+    """``(slug, host, instance URL)`` for a repo known only by its git ``origin``.
+
+    The forge half of :func:`repo_forge` and :func:`repo_slug` for a run whose
+    checkout is on another machine (Story 35.4-006): there is no
+    ``.sdlc-forge.yaml`` to read, so the host comes from the remote's hostname and
+    any host that is not the forge's public one is the instance to query.
+    """
+    web = _web_url_from_remote(origin)
+    if web is None:
+        return None, GITHUB, None
+    host = host_from_remote(origin) or GITHUB
+    parts = urlsplit(origin.strip())
+    hostname = urlsplit(web).hostname
+    if hostname in ("github.com", "gitlab.com"):
+        return _slug_from_url(web), host, None
+    scheme = parts.scheme if parts.scheme in ("http", "https") else "https"
+    try:
+        port = f":{parts.port}" if scheme == parts.scheme and parts.port else ""
+    except ValueError:  # e.g. ":99999" — the remote pattern takes any digits
+        return None, GITHUB, None
+    return _slug_from_url(web), host, f"{scheme}://{hostname}{port}"
 
 
 # --- wave-column dependency DAG (Story 11.2-008) ---------------------------
@@ -526,7 +714,7 @@ def queue_view() -> dict:
 # which keeps the transport simple and free of duplicate-row bugs on reconnect.
 
 
-def _change_token(server) -> str:
+def _change_token(server, run: str | None = None) -> str:
     """A cheap token of ledger activity used by the SSE stream to detect change.
 
     Single-db mode: the ledger's max event id (as a string). Registry-discovery
@@ -535,16 +723,26 @@ def _change_token(server) -> str:
     state across repos. An unreachable ledger contributes 0 rather than breaking
     the stream (the registry is best-effort). Returns ``"0"`` when there is no
     source yet, so an idle dashboard simply stays quiet.
+
+    ``run`` is the run the page has selected (Story 35.4-006). A remote run whose
+    worker advertised a dashboard adds the digest of that worker's own status, so
+    the stream fires on the stories/events/usage moving there — not only when the
+    pushed done-count does.
     """
     registry = getattr(server, "registry", None)
     if registry is not None:
         parts: list[str] = []
-        for rec in registry.records():
-            try:
-                tok = Ledger(rec.db).change_token()
-            except (OSError, sqlite3.Error):
-                tok = "0"
-            parts.append(f"{rec.run_id}:{derive_state(rec)}:{tok}")
+        records = registry.records()
+        # Issue #848: `change_token` digests the whole ledger and this runs every
+        # second per open stream — read each distinct ledger once per tick.
+        tokens: dict[str, str] = {}
+        for rec in records:
+            if rec.db not in tokens:
+                try:
+                    tokens[rec.db] = Ledger(rec.db).change_token()
+                except (OSError, sqlite3.Error):
+                    tokens[rec.db] = "0"
+            parts.append(f"{rec.run_id}:{derive_state(rec)}:{tokens[rec.db]}")
         fleet = getattr(server, "fleet", None)
         if fleet is not None:
             # A remote run has no ledger here, so its pushed progress is the signal.
@@ -553,6 +751,13 @@ def _change_token(server) -> str:
                     f"fleet:{row.get('run_id')}:{row.get('status')}:{row.get('completed')}"
                     f":{row.get('worker_online')}"
                 )
+            relay = getattr(server, "worker_status", None)
+            local_ids = {rec.run_id for rec in records}
+            if relay is not None and run and run not in local_ids:
+                row = next((r for r in fleet.snapshot()["runs"] if r.get("run_id") == run), None)
+                origin = _remote_origin(row) if row is not None else None
+                if origin is not None:
+                    parts.append(f"detail:{run}:{_remote_detail_token(relay, origin, run)}")
         return "|".join(parts)
     db_path = getattr(server, "db_path", None)
     if db_path is None:
@@ -972,13 +1177,19 @@ const STAGE_LABELS = {investigation: "investigate", build: "build", coverage: "Q
 const DEFAULT_STAGE_COLUMNS = ["build", "coverage", "review", "merge"];
 function stageLabel(s){return STAGE_LABELS[s] || s;}
 function badge(s){return "<span class='badge "+esc(s)+"'>"+esc(statusLabel(s))+"</span>";}
+// A relayed remote run's snapshot is its worker's JSON passed through (Story
+// 35.4-006), so a field the page treats as a number may not be one: text, never markup.
 function humanTokens(n){
   if(n==null) return "—";
+  if(typeof n !== "number") return esc(n);
   if(n>=1e6) return (n/1e6).toFixed(n>=1e7?0:1)+"M";
   if(n>=1e3) return (n/1e3).toFixed(n>=1e4?0:1)+"k";
   return String(n);
 }
 function usd(n){ return n==null ? "" : "$"+Number(n).toFixed(n<1?3:2); }
+// A snapshot's link target (a relayed run's is its worker's say-so) is an http(s)
+// URL or no link at all — never javascript: or data:.
+function httpUrl(u){ const s = String(u==null?"":u); return /^https?:/i.test(s) ? s : ""; }
 // Repo health (Story 11.2-006 GitHub + 23.7-001 GitLab). The badge/panel read a
 // backend-cached per-repo summary; the client never drives `gh`/`glab`. Both
 // degrade to a muted "<forge> unavailable" state when the summary is absent or
@@ -1064,15 +1275,16 @@ function preflightLine(run, cfg){
   if(run.phase === "preflight") return "preflight: running";
   return Object.keys(cfg).length ? "preflight: "+esc(cfg.preflight||"?") : "";
 }
-function stageCell(st){
+// A relayed remote run's transcripts sit on its worker, so its stage links go to
+// the worker's own path-confined /log (Story 35.4-006): `origin` is "" for every
+// local run. logHref carries the selected run, so registry mode confines /log to
+// that run's logs root (a non-newest run's transcript lives under its own <db>.logs).
+function stageCell(st, origin){
   let title = (st.attempt?("attempt "+st.attempt):"") + (st.failure_category?(" · "+esc(st.failure_category)):"");
   if(st.tokens!=null) title += " · "+humanTokens(st.tokens)+" tok"+(st.cost_usd!=null?(" · "+usd(st.cost_usd)):"");
   const inner = title ? "<span title='"+esc(title)+"'>"+badge(st.status)+"</span>" : badge(st.status);
-  // Carry the selected run so registry mode confines /log to that run's logs
-  // root (a non-newest run's transcript lives under its own <db>.logs).
-  const runQ = sel ? "&run=" + encodeURIComponent(sel) : "";
   return st.output_path
-    ? "<td><a href='/log?path="+encodeURIComponent(st.output_path)+runQ+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
+    ? "<td><a href='"+esc(logHref(st.output_path, origin))+"' target='_blank' rel='noopener'>"+inner+"</a></td>"
     : "<td>"+inner+"</td>";
 }
 
@@ -1264,7 +1476,7 @@ function renderDag(d){
         + "<span class='nid'>"+esc(id)+"</span> "+badge(s.status||"TODO")
         + "<span class='ntitle' title='"+esc(s.title||"")+"'>"+esc(s.title||"")+"</span></div>";
     }).join("");
-    return "<div class='dag-col'><div class='wave-h'>Wave "+(w.index+1)
+    return "<div class='dag-col'><div class='wave-h'>Wave "+(Number(w.index)+1)
       + " \\u2014 runs in parallel</div>"+nodes+"</div>";
   }).join("");
   el.innerHTML = "<div class='dagwrap'><h3>Dependency DAG \\u00b7 waves left\\u2192right</h3>"
@@ -1376,8 +1588,9 @@ function renderQueue(data){
 
 function renderMain(d){
   const run = d.run, c = d.counts || {}, p = d.project || {};
+  const projectUrl = httpUrl(p.url);
   document.getElementById("repo").innerHTML = p.name
-    ? "📦 " + (p.url ? "<a href='"+esc(p.url)+"' target='_blank' rel='noopener'>"+esc(p.name)+"</a>" : esc(p.name))
+    ? "📦 " + (projectUrl ? "<a href='"+esc(projectUrl)+"' target='_blank' rel='noopener'>"+esc(p.name)+"</a>" : esc(p.name))
     : "";
   document.title = p.name ? p.name + " · Autonomous SDLC" : "Autonomous SDLC";
   if(!run){
@@ -1446,7 +1659,8 @@ function renderMain(d){
     : "";
   document.getElementById("head").innerHTML =
     "run <code>"+esc(run.id.slice(0,8))+"</code> &middot; "+badge(run.status)
-    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode) + durLine + stallLine + cfgline + usageLine
+    + " &middot; scope=<code>"+esc(run.scope)+"</code> &middot; "+esc(run.mode)
+    + (run.worker ? " &middot; on <code>"+esc(run.worker)+"</code>" : "") + durLine + stallLine + cfgline + usageLine
     // Story 35.4-002: a fleet run's stories live in its worker's ledger, so there
     // is no per-story row to click — one run-level control reads the worker instead.
     + (run.mode === "remote"
@@ -1465,9 +1679,10 @@ function renderMain(d){
   preflightAnchor = pfRunning ? Date.now() : null;
   const total = c.total||0, done = c.done||0;
   document.getElementById("bar").style.width = (total? Math.round(100*done/total):0) + "%";
+  const count = k => Number(c[k.toLowerCase()]) || 0;  // a relayed count is the worker's word
   document.getElementById("chips").innerHTML = ORDER
-    .filter(k => (c[k.toLowerCase()]||0) > 0 || k==="DONE")
-    .map(k => "<span class='chip'><b class='"+k+"'>"+(c[k.toLowerCase()]||0)+"</b> "+statusLabel(k).toLowerCase().replace("_"," ")+"</span>")
+    .filter(k => count(k) > 0 || k==="DONE")
+    .map(k => "<span class='chip'><b class='"+k+"'>"+count(k)+"</b> "+statusLabel(k).toLowerCase().replace("_"," ")+"</span>")
     .join("");
   // Issue #565: the stage columns this run's snapshot populated (build.py's
   // status_snapshot) — a fix run's investigation stage adds a column ahead of
@@ -1476,7 +1691,7 @@ function renderMain(d){
   // drives every colspan below so the header and spanning rows never drift.
   const stageCols = run.stage_columns || DEFAULT_STAGE_COLUMNS;
   const totalCols = stageCols.length + 4;
-  const prBase = d.pr_base;
+  const prBase = httpUrl(d.pr_base);
   const rows = (d.stories||[]).map(s => {
     let pr = "-";
     if(s.pr_number){
@@ -1484,7 +1699,7 @@ function renderMain(d){
         ? "<a href='"+esc(prBase)+"/pull/"+esc(s.pr_number)+"' target='_blank' rel='noopener'>#"+esc(s.pr_number)+"</a>"
         : "#"+esc(s.pr_number);
     }
-    const stageCells = (s.stages||[]).map(stageCell).join("");
+    const stageCells = (s.stages||[]).map(st => stageCell(st, d.origin)).join("");
     const bug = s.bugfix_attempts > 0
       ? " <span class='badge BLOCKED' title='bugfix retries'>🔧×"+esc(s.bugfix_attempts)+"</span>"
       : "";
@@ -1506,7 +1721,10 @@ function renderMain(d){
       : "";
     return "<tr class='story-title'><td colspan='"+totalCols+"'><code>"+esc(s.story_id)+"</code>"+stitle
     + "<a class='view-session' data-story='"+esc(s.story_id)+"' title='read this story\\u2019s agent transcripts here'>view session</a></td></tr>"
-    + "<tr class='story-stages'><td>"+badge(s.status)+bug+"</td>"
+    + "<tr class='story-stages'><td>"+badge(s.status)+bug
+    // Story 35.5-001: the parked story's "fix pushed / awaiting CI" row, under its badge.
+    + (s.status_detail ? "<div class='muted small'>"+esc(s.status_detail)+"</div>" : "")
+    + "</td>"
     + stageCells
     + "<td>"+pr+"</td>"
     + "<td class='muted small'>"+tok+"</td>"
@@ -1522,7 +1740,9 @@ function renderMain(d){
   document.getElementById("stories").innerHTML = rows
     ? "<table><tr><th>status</th>"+stageHeader
       + "<th>PR</th><th>tokens</th><th>duration</th></tr>"+rows+"</table>"
-    : "<p class='muted'>no stories yet…</p>";
+    : d.detail_unavailable
+      ? "<p class='muted' title='"+esc(d.detail_error||"")+"'>"+esc(d.detail_unavailable)+"</p>"
+      : "<p class='muted'>no stories yet…</p>";
   renderDag(d);
   document.getElementById("events").innerHTML = (d.events||[]).slice().reverse().map(e =>
     "<div><span class='muted' title='"+esc(e.ts)+"'>"+esc(fmtLocal(e.ts))+"</span> <span class='lvl-"+esc(e.level)+"'>"+esc(e.level)+"</span> "+esc(e.message)+"</div>"
@@ -1537,8 +1757,10 @@ document.getElementById("runs").addEventListener("click", e => {
   // a run switch must dismiss it and invalidate its in-flight /api/logs fetch
   // (closeSession bumps the token) — otherwise the old run's reply could paint
   // into a modal that now belongs to a different run. closeSession is hoisted.
+  const changed = next !== sel;
   if(next !== sel) closeSession();
   sel = next;
+  if(changed) connectStream();
   tick();
 });
 
@@ -1572,9 +1794,17 @@ document.getElementById("sideHint").addEventListener("click", e => {
 // pushed "change". EventSource reconnects on its own, and tick() re-renders the
 // whole snapshot, so a dropped connection resumes without duplicated rows. If
 // EventSource is unavailable, fall back to gentle polling.
+// The stream carries the selected run so a remote run's token follows its worker
+// (Story 35.4-006); a selection change reconnects it.
+let stream = null;
 function connectStream(){
-  if(!("EventSource" in window)){ setInterval(tick, 2500); return; }
-  const es = new EventSource("/api/stream");
+  if(!("EventSource" in window)){
+    if(!stream){ stream = true; setInterval(tick, 2500); }
+    return;
+  }
+  if(stream && stream.close) stream.close();
+  const es = new EventSource("/api/stream" + (sel ? "?run=" + encodeURIComponent(sel) : ""));
+  stream = es;
   es.addEventListener("change", tick);
   es.addEventListener("error", () => {
     document.getElementById("updated").textContent = "reconnecting…";
@@ -1869,7 +2099,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/queue":
             self._json(queue_view())
         elif path == "/api/stream":
-            self._serve_stream()
+            self._serve_stream(query.get("run", [None])[0])
         elif path == "/log":
             self._serve_log(query.get("path", [""])[0], run)
         elif path == "/api/logs":
@@ -1901,7 +2131,7 @@ class _Handler(BaseHTTPRequestHandler):
         runs in two repos never bleed into one another's detail view.
         """
         rec = self._resolve_run(run_id)
-        if rec is None and run_id:
+        if rec is None and run_id and self._may_relay():
             remote = self._remote_status(run_id)
             if remote is not None:
                 return remote
@@ -1925,12 +2155,18 @@ class _Handler(BaseHTTPRequestHandler):
         fleet = getattr(self.server, "fleet", None)
         return fleet.snapshot()["runs"] if fleet is not None else []
 
-    def _remote_status(self, run_id: str) -> dict | None:
-        """A snapshot of a fleet run from its pushed record, or None if unknown.
+    def _may_relay(self) -> bool:
+        """False when another dashboard relayed this request: one hop, never a loop."""
+        return self.headers.get(_RELAYED_HEADER) is None
 
-        The worker's ledger is not reachable from here, so there are no stories
-        or events to show — only the run header and the done/total the worker
-        last pushed (Story 35.4-001).
+    def _remote_status(self, run_id: str) -> dict | None:
+        """A snapshot of a fleet run, or None if unknown.
+
+        Served by relaying the worker's own dashboard, so a remote run renders
+        like a local one (Story 35.4-006). When that dashboard does not answer,
+        it is the run header and the done/total the worker last pushed
+        (Story 35.4-001) — flagged ``detail_unavailable``, since the worker's
+        ledger is not reachable from here.
         """
         for fleet_row in self._fleet_runs():
             if fleet_row.get("run_id") != run_id:
@@ -1939,7 +2175,7 @@ class _Handler(BaseHTTPRequestHandler):
             if row is None:
                 return None
             counts = {**_EMPTY_COUNTS, "total": row["total"] or 0, "done": row["done"] or 0}
-            return {
+            header_only = {
                 "db": None,
                 "run": {
                     "id": row["id"],
@@ -1959,7 +2195,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "events": [],
                 "pr_base": None,
                 "project": {"name": Path(row["repo"]).name, "url": None},
+                "worker": row["worker"],
             }
+            relay = getattr(self.server, "worker_status", None) or _WorkerStatusRelay()
+            return _relay_remote_status(fleet_row, run_id, header_only, relay)
         return None
 
     # --- GitHub repo health (Story 11.2-006) -------------------------------
@@ -1980,7 +2219,15 @@ class _Handler(BaseHTTPRequestHandler):
         if self.server.registry is not None:
             rec = self._resolve_run(run_id)
             if rec is None:
-                return github_stats.unavailable(None, "no-run")
+                # Story 35.4-006: a remote run's repo path is the worker's, so its
+                # forge comes from the origin its fleet record carries.
+                fleet_row = next(
+                    (r for r in self._fleet_runs() if run_id and r.get("run_id") == run_id), None
+                )
+                if fleet_row is None:
+                    return github_stats.unavailable(None, "no-run")
+                slug, host, instance_url = _origin_forge(fleet_row.get("origin") or "")
+                return cache.get(slug, host, instance_url)
             root: str | Path = rec.repo
         else:
             db_path = self.server.db_path
@@ -2023,7 +2270,7 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             return False
 
-    def _serve_stream(self) -> None:
+    def _serve_stream(self, run: str | None = None) -> None:
         """Server-Sent Events: push a ``change`` event when the ledger advances.
 
         Polls the cheap change token (:func:`_change_token`) on a short interval
@@ -2034,6 +2281,7 @@ class _Handler(BaseHTTPRequestHandler):
         traffic negligible. Runs in the handler's own thread
         (``ThreadingHTTPServer``), so multiple browser tabs each get an
         independent stream; the loop exits as soon as the client disconnects.
+        ``run`` is the page's selected run: a remote run's token follows its worker.
         """
         try:
             self.send_response(200)
@@ -2055,7 +2303,7 @@ class _Handler(BaseHTTPRequestHandler):
         last_token: str | None = None
         idle = 0.0
         while not getattr(self.server, "_sse_stop", False):
-            token = _change_token(self.server)
+            token = _change_token(self.server, run)
             if token != last_token:
                 last_token = token
                 if not self._sse_write(f"event: change\ndata: {token}\n\n"):
@@ -2146,7 +2394,7 @@ class _Handler(BaseHTTPRequestHandler):
         story, or an unreachable ledger, returns an empty list (HTTP 200).
         """
         in_discovery_mode = getattr(self.server, "registry", None) is not None
-        if run_id and in_discovery_mode and self._resolve_run(run_id) is None:
+        if run_id and in_discovery_mode and self._may_relay() and self._resolve_run(run_id) is None:
             fleet_row = next((r for r in self._fleet_runs() if r.get("run_id") == run_id), None)
             if fleet_row is not None:
                 self._json(_remote_logs_payload(fleet_row, run_id, story_id))
@@ -2256,6 +2504,8 @@ def make_server(
         server.registry = reg  # type: ignore[attr-defined]
         # Story 35.4-001: the fleet's runs, merged into the registry view.
         server.fleet = _FleetView()  # type: ignore[attr-defined]
+        # Story 35.4-006: a remote run's detail is its worker dashboard's own.
+        server.worker_status = _WorkerStatusRelay()  # type: ignore[attr-defined]
         server.db_path = None  # type: ignore[attr-defined]
         server.project_url = None  # type: ignore[attr-defined]
         server.project_name = None  # type: ignore[attr-defined]

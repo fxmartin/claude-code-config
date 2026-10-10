@@ -582,7 +582,8 @@ CREATE TABLE IF NOT EXISTS workers (
     slots          INTEGER NOT NULL DEFAULT 1,
     slots_free     INTEGER NOT NULL DEFAULT 1,
     registered_at  TIMESTAMP NOT NULL,
-    last_heartbeat TIMESTAMP NOT NULL
+    last_heartbeat TIMESTAMP NOT NULL,
+    self_check     TEXT
 );
 """
 
@@ -605,6 +606,7 @@ CREATE TABLE IF NOT EXISTS fleet_runs (
     completed   INTEGER,
     updated_at  TIMESTAMP NOT NULL,
     dashboard_url TEXT,
+    origin TEXT,
     phase       TEXT
 );
 """
@@ -731,8 +733,12 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (11, "fleet_run_dashboard_url", "fleet_runs", [("dashboard_url", "TEXT")], None),
     # Story 35.2-002: the sha a worker's clone was synced to before dispatch.
     (12, "job_synced_sha", "jobs", [("synced_sha", "TEXT")], None),
+    # Story 35.2-007: the worker's last agent self-check, JSON `{ok, at, reason}`.
+    (13, "worker_self_check", "workers", [("self_check", "TEXT")], None),
+    # Story 35.4-006: the repo's git origin, for a fleet_runs written before it.
+    (14, "fleet_run_origin", "fleet_runs", [("origin", "TEXT")], None),
     # Story 35.4-005: the phase a pushed run is in, for a fleet_runs written before it.
-    (13, "fleet_run_phase", "fleet_runs", [("phase", "TEXT")], None),
+    (15, "fleet_run_phase", "fleet_runs", [("phase", "TEXT")], None),
 ]
 
 
@@ -821,6 +827,19 @@ class WorkerRecord:
     repos: list[str] = dataclasses.field(default_factory=list)
     slots: int = 1
     slots_free: int = 1
+    # Story 35.2-007: `{ok, at, reason}` from the worker's own agent probe; ``None``
+    # for a worker that predates it (or never reported), which is not a failure.
+    self_check: dict | None = None
+
+    @property
+    def can_run_agents(self) -> bool:
+        """False only when the worker's own probe says an agent turn does not complete."""
+        return not (isinstance(self.self_check, dict) and self.self_check.get("ok") is False)
+
+    @property
+    def effective_slots_free(self) -> int:
+        """Free slots as the matcher sees them: none while the worker cannot run an agent."""
+        return self.slots_free if self.can_run_agents else 0
 
     def is_online(self, now: datetime | None = None) -> bool:
         """Heard from within :data:`OFFLINE_AFTER_SECONDS` (three missed beats)."""
@@ -1155,6 +1174,7 @@ class QueueBackend(Protocol):
         slots: int = 1,
         slots_free: int | None = None,
         now: datetime | None = None,
+        self_check: Mapping[str, object] | None = None,
     ) -> WorkerRecord: ...
 
     def list_workers(self) -> list[WorkerRecord]: ...
@@ -1879,6 +1899,7 @@ class QueueStore:
         slots: int = 1,
         slots_free: int | None = None,
         now: datetime | None = None,
+        self_check: Mapping[str, object] | None = None,
     ) -> WorkerRecord:
         """Record (or refresh) a worker's capabilities — registration *is* the heartbeat.
 
@@ -1888,6 +1909,10 @@ class QueueStore:
         Each call also sweeps the fleet — leases held by workers that have gone
         silent are made reclaimable, and queued jobs are re-judged for whether
         anyone can run them — so those states move on the beat, not on a timer.
+
+        ``self_check`` (Story 35.2-007) is the worker's last agent probe,
+        ``{ok, at, reason}``; a worker whose probe failed is online but is
+        matched as having no free slot.
         """
         name = name.strip()
         host = host.strip()
@@ -1898,15 +1923,18 @@ class QueueStore:
         if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:
             raise QueueError(f"worker slots must be a positive integer, got {slots!r}")
         free = slots if slots_free is None else max(0, min(int(slots_free), slots))
+        check = _normalise_self_check(self_check)
         moment = _at(now).isoformat()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO workers(name, host, pools, harnesses, sandbox, repos, slots, "
-                "slots_free, registered_at, last_heartbeat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "slots_free, registered_at, last_heartbeat, self_check) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET host = excluded.host, pools = excluded.pools, "
                 "harnesses = excluded.harnesses, sandbox = excluded.sandbox, "
                 "repos = excluded.repos, slots = excluded.slots, "
-                "slots_free = excluded.slots_free, last_heartbeat = excluded.last_heartbeat",
+                "slots_free = excluded.slots_free, last_heartbeat = excluded.last_heartbeat, "
+                "self_check = excluded.self_check",
                 (
                     name,
                     host,
@@ -1918,6 +1946,7 @@ class QueueStore:
                     free,
                     moment,
                     moment,
+                    json.dumps(check) if check is not None else None,
                 ),
             )
         self.expire_offline_leases(now=now)
@@ -1958,21 +1987,25 @@ class QueueStore:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO fleet_runs(run_id, worker, repo, db, scope, pid, status, "
-                "started_at, finished_at, total, completed, updated_at, dashboard_url, phase) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "started_at, finished_at, total, completed, updated_at, dashboard_url, origin, "
+                "phase) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET worker = excluded.worker, "
                 "repo = excluded.repo, db = excluded.db, scope = excluded.scope, "
                 "pid = excluded.pid, status = excluded.status, "
                 "started_at = excluded.started_at, finished_at = excluded.finished_at, "
                 "total = excluded.total, completed = excluded.completed, "
                 "updated_at = excluded.updated_at, dashboard_url = excluded.dashboard_url, "
+                # A push that could not read the remote must not blank a known one:
+                # the finish push is a run's last, so nothing would restore it.
+                "origin = COALESCE(excluded.origin, fleet_runs.origin), "
                 "phase = excluded.phase "
                 "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL "
                 "OR excluded.pid != fleet_runs.pid",
                 (
                     record.run_id, worker, record.repo, record.db, record.scope, record.pid,
                     record.status, record.started_at, record.finished_at, record.total,
-                    record.completed, _at(now).isoformat(), record.dashboard_url,
+                    record.completed, _at(now).isoformat(), record.dashboard_url, record.origin,
                     record.phase,
                 ),
             )
@@ -2073,13 +2106,13 @@ class QueueStore:
             return candidates
         if slots_free is not None:
             me = dataclasses.replace(me, slots_free=slots_free)
-        if me.slots_free <= 0:
+        if me.effective_slots_free <= 0:
             return []
         moment = _at(now)
         rivals = [
             w
             for w in workers
-            if w.name != name and w.is_online(moment) and w.slots_free > me.slots_free
+            if w.name != name and w.is_online(moment) and w.effective_slots_free > me.slots_free
         ]
         kept: list[JobRecord] = []
         for job in candidates:
@@ -2563,7 +2596,30 @@ def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
         repos=_names("repos"),
         slots=int(row["slots"]),
         slots_free=int(row["slots_free"]),
+        self_check=_decode_self_check(_optional_column(row, "self_check")),
     )
+
+
+def _normalise_self_check(value: Mapping[str, object] | None) -> dict[str, object] | None:
+    """``{ok, at, reason}`` from a heartbeat's ``self_check``; ``None`` when it sent none."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not isinstance(value.get("ok"), bool):
+        raise QueueError("worker self_check must be an object with a boolean 'ok'")
+    at, reason = value.get("at"), value.get("reason")
+    return {
+        "ok": value["ok"],
+        "at": at if isinstance(at, str) else None,
+        "reason": reason if isinstance(reason, str) else None,
+    }
+
+
+def _decode_self_check(raw: str | None) -> dict | None:
+    try:
+        parsed = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _decode_files(raw: str | None) -> set[str]:

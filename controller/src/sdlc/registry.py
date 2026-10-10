@@ -103,6 +103,9 @@ class RunRecord:
     worker: str | None = None
     # The worker's dashboard origin (Story 35.4-002); None when it advertises none.
     dashboard_url: str | None = None
+    # The repo's git ``origin`` remote, credentials stripped (Story 35.4-006), so a
+    # machine without the worker's checkout can still name the repo's forge.
+    origin: str | None = None
     # Where the run is right now (Story 35.4-005): ``preflight`` | ``stories`` |
     # ``closing``; None for a finished run or one a registry from before this
     # field wrote. The fleet view shows it beside the worker.

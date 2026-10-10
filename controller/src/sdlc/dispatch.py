@@ -151,6 +151,25 @@ DESTRUCTIVE_DENY_FLOOR: tuple[str, ...] = (
 READ_ONLY_ROLES: frozenset[str] = frozenset({"investigation", "review", "summary"})
 
 
+# Issue #852: the summary stage reports on a merged fix, so it gets no file-writing
+# tools and no way to commit or build. A Stop hook once sent it back to "fix"
+# findings and it committed (with a build artifact) on the operator's main.
+SUMMARY_DENY_RULES: tuple[str, ...] = (
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "Bash(git add*)",
+    "Bash(git commit*)",
+    "Bash(git push*)",
+    "Bash(git merge*)",
+    "Bash(go build*)",
+)
+
+# Inline settings that switch off every hook (user, plugin and project) so a
+# plugin's Stop gate cannot redirect a controller-spawned stage.
+NO_HOOKS_SETTINGS = '{"disableAllHooks": true}'
+
+
 def resolve_deny_rules(role: str | None = None) -> list[str]:
     """The deny rules to apply to the built-in dispatch command.
 
@@ -171,6 +190,8 @@ def resolve_deny_rules(role: str | None = None) -> list[str]:
         rules = list(DENY_BASELINE)
     if role in READ_ONLY_ROLES:
         rules += [rule for rule in DESTRUCTIVE_DENY_FLOOR if rule not in rules]
+    if role == "summary":
+        rules += [rule for rule in SUMMARY_DENY_RULES if rule not in rules]
     return rules
 
 
@@ -251,6 +272,8 @@ def resolve_agent_cmd(
     deny = resolve_deny_rules(role)
     if deny:
         cmd += ["--disallowedTools", ",".join(deny)]
+    if role == "summary":
+        cmd += ["--settings", NO_HOOKS_SETTINGS]
     if model:
         cmd += ["--model", model]
         # Story 34.1-002: only a probe-verified current id carries a fallback, so

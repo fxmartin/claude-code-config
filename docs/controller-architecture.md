@@ -274,6 +274,24 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    `feature/<story>` (preserved for manual push/MR, R10), otherwise `FAILED`
    (`_exhausted_status`).
 
+   **Committed recovery work is pushed first (Story 35.5-001).** A round that
+   reports `FIXED` with `tests_passing` false but committed to `feature/<story>`
+   is pushed (`_push_story_branch`, force-with-lease on the pre-round sha) and
+   logged `bugfix commit <sha> pushed to feature/<story>; CI adjudicates`. With
+   CI config and a PR the pipeline is polled through the merge CI-gate seam (same
+   grace, same cap): green counts as `tests_passing`, red buys one more round
+   while the budget lasts. With no CI or no PR yet the worker's local verdict
+   stays authoritative. `baseline_failures` (tests that also fail on the base
+   branch) are excluded from that verdict. When recovery is exhausted at any
+   stage with commits not on `origin`, `_exhausted_status` pushes them first and
+   parks `NEEDS_ATTENTION` for every failure `kind` — `FAILED` is reserved for a
+   round that produced no commit. Worktree teardown does the same: unpushed
+   commits are pushed, or on a rejected push the worktree is kept and the sha
+   logged (*preserved* means on the remote). A parked story's row in
+   `sdlc status` and the dashboards (including the fleet view, which relays the
+   worker's snapshot) reads `fix pushed · awaiting CI` / `· CI red` with the sha
+   and PR (`status_detail`).
+
    **Awaiting human approval (Story 12.3-003).** A merge blocked *only* by the
    high-risk human-approval gate — a PR carrying `risk:high` (from `risk_gate.py`
    / `.github/workflows/risk-gate.yml`) with no `risk-approved` label or
@@ -1836,7 +1854,9 @@ free-slot count (`--slots` minus the slots running jobs hold):
   pin matches it;
 - `pools` — free-form and declared, never detected, because only the operator
   knows which subscription a machine is signed in to. The recommended names are
-  `claude-m3`, `claude-shared` and `codex-shared`.
+  `claude-m3`, `claude-shared` and `codex-shared`. A declared `codex-shared` is
+  still advertised only while the `codex` harness is (Story 35.2-008): a codex
+  stage needs both, so a worker may declare it before Codex is installed.
 
 **Online/offline.** A worker silent for three heartbeats (90 s) is `offline`
 (`sdlc queue workers`). On every registration and claim the service cuts the
@@ -1870,10 +1890,12 @@ line and `--json` carry it; a host that never registered a worker is untouched.
 ### Resident worker on the M3 Max (Story 35.2-004)
 
 `templates/launchd/com.fxmartin.sdlc-worker.plist` runs `sdlc queue run --worker
-m3max --pool claude-m3 --pool codex-shared --follow` as a LaunchAgent so the Mac
+m3max --pool claude-m3 --pool codex-shared --dashboard-url
+http://<tailnet-ip>:8787 --follow` as a LaunchAgent so the Mac
 drains its queue from login on. It has the 35.1-003 service's shape (an
 absolute argv, a pinned environment, launchd's own log keys). The install in
-the template's header fills its `__HOME__` and `__USER__` placeholders with
+the template's header fills its `__HOME__`, `__USER__` and `__TAILNET_IP__`
+placeholders with
 `sed`, writes the result to `~/Library/LaunchAgents/` and loads it with
 `launchctl bootstrap gui/$(id -u)`. It starts at load — at login, not at boot:
 an agent runs in the user's session, where the keychain holding its jobs'
@@ -1905,13 +1927,15 @@ keeps it `online`.
   and the Mac may sleep between jobs. `-i` holds off idle sleep only: closing
   the lid still sleeps the MacBook unless it runs in clamshell mode (on power,
   with an external display), so keep the M3 Max open or docked. Elsewhere
-  nothing is added; the Linux equivalent (`systemd-inhibit`) is a follow-up for
-  a Linux worker. A plain drain without `--worker` is not wrapped. The wrapper
+  nothing is added, and on Linux nothing is needed: the Hetzner dev box is a
+  server that never idle-sleeps, so neither `caffeinate` nor `systemd-inhibit`
+  wraps its jobs (Story 35.2-008 — see "Linux worker on the Hetzner dev box"
+  below). A plain drain without `--worker` is not wrapped. The wrapper
   must *become* the job: the queue links a job to its run by the pid it
   spawned and reads the job's state from that process's exit code.
   `caffeinate` keeps both (its original process execs the job while a forked
   child holds the assertion); `systemd-inhibit` runs the job as its child, so
-  the follow-up cannot be a drop-in.
+  it could never have been a drop-in.
 - **Stopping it.** launchd stops the worker with SIGTERM (`launchctl bootout`,
   which every reinstall of the plist runs, or `kickstart -k`), and the drain
   takes it as it takes Ctrl-C: it stops each running job (SIGTERM to its
@@ -1960,7 +1984,37 @@ keeps it `online`.
   is a finding, never a doctor crash). A machine without the plist gets no
   finding. It looks for `~/Library/LaunchAgents/com.fxmartin.sdlc-worker.plist`
   (`default_worker_plist`); `run_doctor(worker_plist=…)` overrides that, as
-  `queue_service_plist` does for 35.1-003.
+  `queue_service_plist` does for 35.1-003. Beside it, the **Worker dashboard**
+  finding (Story 35.4-006) checks that the dashboard the worker advertises with
+  `--dashboard-url` answers — see the fleet run registry below.
+- **Self-check before registering (Story 35.2-007).** Over ssh the worker's
+  disk and Keychain checks all pass — sshd carries disk access and sees no
+  dialogs — while the same agent under launchd stalls on a macOS dialog (Keychain,
+  Privacy & Security) or reads `~/.claude` through a TCC-protected folder
+  (`~/Documents`, `~/Desktop`, `~/Downloads`, a cloud-drive root) and is denied.
+  The cost used to be a 300 s stall per agent, found only after two failed fleet
+  jobs. So the worker runs the check itself, from its own process context
+  (`sdlc.worker_selfcheck`), before its first registration: first a path test on
+  `os.path.realpath` of `~/.claude` and of its `settings.json`, `CLAUDE.md`,
+  `hooks`, `commands`, `agents` and `skills` (macOS only; it fails fast with
+  `~/.claude/settings.json → ~/Documents/…: launchd agents cannot read TCC protected
+  folders; move the checkout (nix-install: ~/.config/nix-install)`), then one real
+  turn — the 34.1-002 entitlement probe, `claude -p ok --model <haiku id>
+  --output-format json` — under a 90 s cap that kills the probe's whole process
+  group. A completed turn registers the worker. A probe with no output in 90 s does
+  not: the worker logs `worker self-check failed: agent produced no output in 90s —
+  a dialog is probably waiting on this Mac …` (once per distinct cause), stays up
+  unregistered and claiming nothing — `KeepAlive` never restart-loops it — retries
+  every 60 s and registers the moment a probe completes, i.e. once the dialog was
+  answered. The heartbeat carries `self_check: {ok, at, reason}` (`workers.self_check`,
+  migration 13): `sdlc queue workers` reads `online — cannot run agents: <why>` and
+  `0/N` slots for a worker whose probe failed, and the matcher gives it no free slot
+  and does not defer to it. The worker also records each result, and where it ran,
+  in `~/.local/state/sdlc/worker-self-check.json`; **`sdlc doctor`** adds a
+  `worker-self-check` finding beside `Fleet worker` — the last probe result, its
+  timestamp and the TCC verdict — which is `CLEAN` only when that probe completed
+  from the LaunchAgent, not from the shell doctor runs in. A plain drain without
+  `--worker` never probes.
 
 `--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`) or,
 with a fleet URL, on the service's (Story 35.2-005). The registry (`workers`
@@ -2166,6 +2220,137 @@ nullable: an older `queue.db` upgrades in place and its rows read as "run
 anywhere, held by nobody". `worker` is set by the claim verbs and cleared with
 `claimed_by`.
 
+### Linux worker on the Hetzner dev box (Story 35.2-008)
+
+The Hetzner `dev-server` (Ubuntu 24.04 x86_64, 4 CPU / 7 GB, Determinate Nix,
+`systemd --user` with lingering on) drains the `claude-shared` pool as a third
+worker named `dev`, beside `m3max` and `home-lab`. A shared-pool job then runs
+even when both Macs are busy or gated by a GUI dialog nobody can answer
+remotely; the box has no Keychain, no TCC and no outbound filter in front of its
+agents. It is the same verb as the Macs' LaunchAgent with a different
+supervisor: `templates/systemd/sdlc-worker.service`.
+
+**Bootstrap** (`scripts/fleet-bootstrap.sh`, run inside the dev shell because
+every tool lives there, not on the login PATH). The box starts with no clone, so
+make one first at `~/Work/claude-code-config`: that is where the worker resolves
+this repo's jobs ("Repo paths" below) and where `install.sh --core` points
+`~/.claude`, so it must be a lasting path. Clone over HTTPS: git authenticates
+through `gh` here, not an SSH key, and the worker matches origins by host and
+path whatever the scheme. Besides `claude`, `gh` and `uv`, the dev shell needs
+`glab`, logged in to the local GitLab ("Self-checks" below says why the
+bootstrap insists), and the scanners `sdlc doctor` checks for, `semgrep` and
+`osv-scanner`: without them doctor is not `CLEAN`, and the coverage gate reports
+a missing scanner `SKIPPED` rather than blocking, so a story built on `dev`
+would merge unscanned — which is why the bootstrap will not start the worker
+without them.
+
+```bash
+ssh -J home-lab dev-server
+nix develop ~/.config/nix-dev-env -c \
+  git clone https://github.com/fxmartin/claude-code-config.git ~/Work/claude-code-config
+nix develop ~/.config/nix-dev-env -c glab auth login --hostname gitlab.test
+nix develop ~/.config/nix-dev-env -c \
+  ~/Work/claude-code-config/scripts/fleet-bootstrap.sh --queue-url http://home-lab.<tailnet>:8790
+```
+
+`install.sh --core` and `scripts/deploy.sh` are platform-neutral, but
+`deploy.sh` only *updates* a plugin that is already installed and neither writes
+the fleet config nor installs a unit, so the script wraps them: `install.sh
+--core`; `claude plugin marketplace add` and `claude plugin install
+autonomous-sdlc@fx-claude-config` when absent; `deploy.sh` (the plugin pointer
+and `sdlc` as a `uv tool`); `gh auth setup-git` and `glab`'s credential helper
+for the local GitLab, so git authenticates through `gh`/`glab` and
+`GIT_TERMINAL_PROMPT=0` makes a missing credential fail at once;
+`~/.sdlc-fleet.yaml` naming the queue (an existing file is never overwritten);
+`sdlc doctor --exit-code`; and finally the unit — copied, enabled and started.
+Preflight refuses, before changing anything, a box whose `gh` is logged out;
+one whose `glab` is missing or not logged in to the local GitLab, unless
+`--github-only`; and one without `semgrep` or `osv-scanner`, which no flag
+overrides — a worker that merges unscanned work has no safe degraded mode.
+`--skip-service` starts no worker, so neither of the last two refuses it.
+Doctor runs *before* the unit: a worker that has not registered yet is a `FAIL`
+by design, so judging the bootstrap after step 7 would fail every first run. Its
+status is the script's exit status, returned once the unit is in place so a
+re-run can repair a worker that is down. Every step is idempotent: a second run
+adds no marketplace or plugin, reloads and restarts nothing, and leaves every
+file it writes byte-identical (`tests/fleet-bootstrap.bats`). `deploy.sh` does
+reinstall the controller each time (`uv tool install --force`), which is
+harmless: the worker restarts only when the installed *version* changes.
+`--dry-run` prints the steps and `--skip-service` stops short of the unit.
+
+- **The unit.** `ExecStart` is `/nix/var/nix/profiles/default/bin/nix develop
+  %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared
+  --pool codex-shared --follow`: the nix binary by absolute path, then the dev
+  shell supplies `claude`, `gh`, `uv` and `node`; `~/.local/bin` (the `sdlc` uv
+  tool) is on the unit's `PATH`. `Restart=always` (exit 75, a controller
+  reinstalled under the worker, restarts it on the new code, as `on-failure`
+  would too; `always` also restarts a clean exit, so the worker never stays down),
+  `RestartSec=30` like the LaunchAgent's `ThrottleInterval`, `KillMode=mixed` and
+  `TimeoutStopSec=60` so the worker alone gets SIGTERM and has the 40 s it needs
+  to stop two jobs. It starts at boot, because `loginctl enable-linger` is on.
+  Logs go to the journal: `journalctl --user -u sdlc-worker -f`. `XDG_STATE_HOME`
+  is pinned to `~/.local/state`, as for the Macs.
+- **Identity.** On Linux the `tailscale` CLI works unattended, so the queue
+  service identifies the worker by `tailscale whois` (`tag:trusted`) and the #833
+  misreport does not apply. `SDLC_QUEUE_TOKEN` is only the fallback: put it in
+  `~/.config/sdlc/worker.env` (mode 0600; the bootstrap creates it empty and
+  re-asserts the mode), which the unit reads through an optional
+  `EnvironmentFile=-`. Never in the unit.
+- **Pools are a capability of the login on the box.** The shared Max
+  (`mail@fxmartin.me`, Max 20x) is `claude-shared`. The unit declares
+  `codex-shared` too, but capability registration decides, not the unit file:
+  a declared `codex-shared` is advertised only while the `codex` CLI is on the
+  PATH — as is the `codex` harness, which a codex stage also needs — so `dev` is
+  offered no codex stage until Codex is installed. To join, put Codex in the dev
+  shell, log it in to the shared account and restart the worker (`systemctl
+  --user restart sdlc-worker`; it reads what is installed at start-up), with no
+  edit to the unit. Install it only with that login ready: registration sees
+  the CLI, not the account. A `claude-shared` job goes to the least-loaded of
+  `home-lab` and `dev`.
+- **Repo paths.** A job enqueued from the XPS carries
+  `/home/fxmartin/Work/claude-code-config`. No such path exists on `dev`, whose
+  login is `fx`, so the worker resolves the clone under *its own* home —
+  `/home/fx/Work/claude-code-config` — the way the Macs map it to
+  `/Users/fxmartin/…`, and clones it from the job's recorded origin if absent.
+  `dev` is the first worker whose user name differs from the XPS's, so this
+  mapping is exercised rather than assumed (`test_repo_sync.py`).
+- **Self-checks.** The 35.2-007 probe runs from the unit's own context: one real
+  `claude -p ok` turn on Haiku, capped at 90 s; the TCC path test is skipped off
+  macOS. The worker records where it ran (`systemd: true`, recognised by its
+  cgroup being `…/sdlc-worker.service` — `INVOCATION_ID` alone would also be
+  inherited by a shell started from a service). Git access needs no GUI:
+  `gh auth setup-git` (run with `GH_PATH=gh`, so the helper stays a PATH lookup
+  rather than a `/nix/store` path a garbage collection deletes) plus
+  `GIT_TERMINAL_PROMPT=0`. The bootstrap also makes `glab auth git-credential`
+  the helper for `http://gitlab.test`, after a blank entry as `gh auth
+  setup-git` writes for GitHub, so a catch-all helper from `/etc/gitconfig` or
+  an older `credential.helper` is never asked first. **Without that helper
+  `dev` can only sync GitHub repos**, and that hurts more than it helps: most
+  `~/Work` repos are private on the local GitLab, so a GitLab job `dev` claims
+  fails its clone and goes back to `queued` while `dev` backs off privately
+  (`scheduler.py`), yet `dev` keeps reporting free slots — and a peer skips a
+  job another online worker with more free slots could run (`queue.py`), so
+  `home-lab` holds GitLab jobs back until it is idle. So the bootstrap will not
+  make such a box a worker: with `glab` missing or not logged in there it stops
+  before changing anything, unless run with `--github-only` — then pin GitLab
+  jobs with `--host home-lab` until 35.2-006's forge-credential selection
+  lands. The sync stall watchdog of 35.2-006 is not part of this story.
+- **`sdlc doctor`.** Where there is no LaunchAgent but the unit is installed
+  (`~/.config/systemd/user/sdlc-worker.service`, or under `$XDG_CONFIG_HOME`;
+  `run_doctor(worker_unit=…)` overrides it), the `Fleet worker` finding reads the
+  unit's environment (`Environment=` plus the `EnvironmentFile`, `%h` expanded,
+  then the `sdlc-worker.service.d/*.conf` drop-ins `systemctl --user edit`
+  writes, in name order, an empty assignment resetting as in systemd)
+  instead of a plist, and its remedies name `systemctl --user` and `journalctl
+  --user -u sdlc-worker`. `worker-self-check` is `CLEAN` only for a probe that
+  completed from the unit, reads `TCC n/a (not macOS)`, and on failure points at
+  the journal — there is no dialog to answer. There is no `worker-dashboard`
+  finding: the unit advertises no `--dashboard-url`, so the XPS shows `dev`'s runs
+  with the worker name but header-only.
+- **Reaching the box.** The Tailscale SSH policy denies the XPS, and public port
+  22 is home-IP-only. Operate it through the home-lab: `ssh -J home-lab
+  dev-server`, or widen the ACL in `nix-install`.
+
 ## Using the fleet queue (`QueueClient`, Story 35.1-002)
 
 Remote execution is additive: every queue consumer (`sdlc queue list|add|cancel|
@@ -2285,8 +2470,10 @@ authoritative for the worker; the table is the fleet's summary.
   A failed write is logged, never fatal to the drain.
 - **Build pushes.** `_registry_register` / `_registry_finish` (and so `build`,
   `fix` and `resume`) call `queue_client.push_fleet_run` after the local write;
-  it reaches the service only where a fleet URL is configured, so it is a no-op
-  inside a worker's jobs. The push never fails the build: 3 s per attempt, and
+  it reaches the service only where a fleet URL is configured — inside the jobs
+  of a worker draining the fleet over HTTP (they inherit its URL), never inside
+  those of a worker draining the store its own host owns, whose writes are then
+  the run's only ones. The push never fails the build: 3 s per attempt, and
   `PUT /runs` is replayed once, so an unreachable service can hold a build's start
   or finish for about 6 s. A record the local write could not store is not
   pushed. The `worker` name is `SDLC_WORKER` (set by `queue run --worker` for its
@@ -2314,7 +2501,9 @@ authoritative for the worker; the table is the fleet's summary.
 - **Transcripts (Story 35.4-002).** A run's row also carries `dashboard_url` (migration
   11): the origin of its worker's own dashboard, started with `sdlc dashboard --host
   <tailnet-ip>`. A worker advertises it with `queue run --worker NAME --dashboard-url
-  http://NAME.<tailnet>:8787`; a bare build reads `SDLC_DASHBOARD_URL`. It is
+  http://NAME.<tailnet>:8787` and hands it to its jobs as `SDLC_DASHBOARD_URL`
+  (Story 35.4-006), which is what a bare build reads — so a job's own start and
+  finish pushes carry the worker's URL instead of blanking it until a beat. It is
   normalised to a bare `http(s)://host[:port]` origin (`registry.normalize_dashboard_url`)
   at the CLI, at `PUT /runs` (400 otherwise) and again where it is used. "view
   session" on a remote run makes the XPS dashboard fetch the worker's `/api/logs`
@@ -2326,6 +2515,53 @@ authoritative for the worker; the table is the fleet's summary.
   story it gathers every story of the run. A worker that does not answer (or never
   advertised a URL) gives `error` plus `logs_root`, the `<db>.logs` directory on
   the worker, which the modal shows. Nothing passes through the queue service.
+- **Run detail (Story 35.4-006).** The 35.4-002 relay, generalised. Selecting a
+  remote run whose record carries a `dashboard_url` makes the XPS fetch the worker
+  dashboard's own `/api/status?run=<id>` (same 5 s / no redirect / no proxy fetch)
+  and pass its JSON through plus `worker` and `origin`, so the header (now naming
+  the worker), counts, stories table, stage attempts, DAG, events, usage/cost and
+  routing banner render as for a local run; stage links go to the worker's own
+  `/log`. The page renders relayed values as text, never markup: numbers it
+  formats are coerced (a non-number is escaped), and the project and PR links are
+  `http(s)` or not links at all. One fetch is shared per second between the
+  status request and the SSE change token (`/api/stream?run=<id>`, reconnected on
+  a selection change), which digests what moved on the worker (not its
+  clock-driven durations); once the run has finished (`finished_at` set) it is
+  re-read every 10 s instead, since only a resume moves it again; a failure is
+  remembered for 10 s, and older entries are dropped, so a run nobody watches
+  holds no memory. When the worker does not answer, advertised no URL, or has no
+  record of the run, the pushed-record header snapshot is served with
+  `detail_unavailable` (`detail unavailable — m3max dashboard not reachable`),
+  which the page shows in place of `no stories yet…`. A local run is untouched.
+  Every relay fetch (status and `/api/logs`) carries `X-Sdlc-Relayed`, and a
+  dashboard answers such a request from its own ledger only, never relaying it
+  on: a worker's dashboard sees the fleet too, so a run it no longer holds
+  (pruned) still names that same dashboard, and without the mark each hop would
+  relay again until the server ran out of threads.
+  The **forge panel** resolves from the record's `origin` (migration 14): the
+  repo's git remote, credentials stripped, stamped on the run's registry record
+  when it registers, so every push of the run carries it. Its hostname
+  picks `github`/`gitlab` and a non-public host is the instance to query, so a
+  repo at `/Users/…/Work/…` that does not exist on the XPS still shows its
+  issues/PRs/CI; a run with no `origin` — or one with an impossible port —
+  shows the panel as unavailable. A later push that could not read the remote
+  keeps the stored `origin` rather than clearing it.
+  The worker's dashboard is its own LaunchAgent,
+  `templates/launchd/com.fxmartin.sdlc-dashboard.plist` (`sdlc dashboard --host
+  <tailnet-ip> --port 8787`, a sibling of the worker agent so a worker restart
+  does not blank the XPS's view), and the worker plist advertises it with
+  `--dashboard-url http://<tailnet-ip>:8787`; both installs `sed` in
+  `__TAILNET_IP__` (`tailscale ip -4`) and stop, writing nothing, when it prints
+  no address (Tailscale stopped or logged out). `sdlc dashboard` refuses a blank
+  `--host` outright (exit 2): Python binds `""` as every interface, which would
+  put the login-less dashboard on whatever network the Mac is on. `sdlc doctor`
+  adds a **Worker dashboard** finding on a machine with the worker agent: `WARN`
+  when the plist's `--dashboard-url` — the only place `queue run` takes it from;
+  `SDLC_DASHBOARD_URL` in the agent's environment is a bare build's, not the
+  worker's — is missing or unusable, or the advertised dashboard does not answer
+  (`GET /favicon.ico`, 3 s).
+  Unlike the worker, the dashboard does not exit on a controller reinstall; restart
+  it with `launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-dashboard`.
 
 ### Pause per subscription pool (Story 35.2-003)
 

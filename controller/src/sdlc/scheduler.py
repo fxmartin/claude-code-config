@@ -35,6 +35,7 @@ from sdlc.queue import (
 )
 from sdlc.queue_client import QueueUnavailable
 from sdlc.registry import (
+    DASHBOARD_URL_ENV,
     WORKER_ENV,
     Registry,
     RunRecord,
@@ -43,10 +44,12 @@ from sdlc.registry import (
     pid_alive,
 )
 from sdlc.risk_gate import RISK_APPROVED_LABEL
+from sdlc.worker_selfcheck import SELF_CHECK_RETRY_SECONDS
 
 if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
     from sdlc.build import Ledger
     from sdlc.queue_worker import RepoPreparer, RepoRefused, WorkerProfile
+    from sdlc.worker_selfcheck import SelfCheckResult
 
 __all__ = [
     "DEFAULT_APPROVAL_POLL_SECONDS",
@@ -183,6 +186,8 @@ SelfUpdater = Callable[[Path, str], "str | None"]
 # be read right now (Story 35.2-004). The real one is
 # :func:`installed_controller_version`.
 InstalledProbe = Callable[[], "str | None"]
+# Story 35.2-007: a worker's proof that an agent turn completes from its own context.
+SelfCheck = Callable[[], "SelfCheckResult"]
 # One read of a parked job's change request: ``(repo_root, cr_number)`` →
 # verdict, or None when the host could not be read (Story 32.2-002).
 ApprovalProbe = Callable[[Path, int], "ApprovalVerdict | None"]
@@ -403,7 +408,8 @@ def keep_awake_prefix(
 
     Prefixed to a worker's job argv so the idle-sleep assertion lives exactly as
     long as the job does — the Mac may sleep between jobs. ``caffeinate`` is
-    macOS-only; the Linux equivalent (``systemd-inhibit``) is a follow-up.
+    macOS-only, and nothing replaces it elsewhere: the Linux worker is a server,
+    which does not idle-sleep (Story 35.2-008).
 
     A wrapper here must *become* the job, not run it as a child: the pid the
     launcher returns is the join key :meth:`_Scheduler._attach_runs` matches to
@@ -758,11 +764,16 @@ def _launcher_for(config: "SchedulerConfig") -> Launcher:
 
     A fleet worker's jobs inherit its name as ``SDLC_WORKER`` (Story 35.4-001),
     so each run's registry record — and the fleet view — says whose run it is.
+    They inherit its dashboard as ``SDLC_DASHBOARD_URL`` too (Story 35.4-006): a
+    job pushes its own start and finish, and a push without the URL would blank
+    the worker's until its next beat — the XPS relays a run's detail through it.
     """
     if config.worker is None:
         return _default_launcher
-    name = config.worker.name
-    return lambda argv, cwd: _default_launcher(argv, cwd, {**os.environ, WORKER_ENV: name})
+    inherited = {WORKER_ENV: config.worker.name}
+    if config.worker.dashboard_url:
+        inherited[DASHBOARD_URL_ENV] = config.worker.dashboard_url
+    return lambda argv, cwd: _default_launcher(argv, cwd, {**os.environ, **inherited})
 
 
 def _utc_now() -> datetime:
@@ -871,8 +882,15 @@ class _Scheduler:
         run_terminal: RunTerminal = ledger_run_terminal,
         prepare_repo: "RepoPreparer | None" = None,
         installed_probe: InstalledProbe = installed_controller_version,
+        self_check: SelfCheck | None = None,
     ) -> None:
         self._run_terminal_of = run_terminal
+        # Story 35.2-007: a worker runs this before its first registration and
+        # stays unregistered — and claims nothing — until an agent turn completes.
+        self._self_check = self_check
+        self._self_check_result: "SelfCheckResult | None" = None
+        self._next_self_check: datetime | None = None
+        self._self_check_logged: str | None = None
         # Story 35.2-002: a fleet worker syncs the job's clone before dispatch.
         self._prepare_repo = prepare_repo
         # Jobs the sync sent back to `queued` during this `_fill_slots` pass, so
@@ -964,6 +982,8 @@ class _Scheduler:
 
     def _pass(self) -> bool:
         """One turn of the loop; True when the drain is done."""
+        if not self._self_check_passed():
+            return False  # never "drained": the worker waits, silently, for its dialog
         if self._last_beat is None and self._heartbeat(force=True):
             # register before anything else; retried every pass until it lands
             self._release_dead_holdings()
@@ -1001,6 +1021,33 @@ class _Scheduler:
             return 0
         return max(0, self._config.slots - self._used_slots())
 
+    def _self_check_passed(self) -> bool:
+        """Whether this worker has proven it can run an agent (Story 35.2-007).
+
+        Probes on the first pass, then every ``SELF_CHECK_RETRY_SECONDS`` while it
+        fails, and never again once it passes. The probe blocks this thread for up
+        to its cap, which is safe only because nothing is registered, claimed or
+        in flight yet. A failure is logged once per distinct cause, so a dialog
+        nobody answers does not fill the worker log a retry at a time.
+        """
+        if self._self_check is None or self._config.worker is None:
+            return True
+        if self._self_check_result is not None and self._self_check_result.ok:
+            return True
+        if self._next_self_check is not None and self._clock() < self._next_self_check:
+            return False
+        result = self._self_check()
+        self._self_check_result = result
+        if result.ok:
+            if self._self_check_logged is not None:
+                self._echo("worker self-check passed — registering")
+            return True
+        self._next_self_check = self._clock() + timedelta(seconds=SELF_CHECK_RETRY_SECONDS)
+        if result.reason != self._self_check_logged:
+            self._self_check_logged = result.reason
+            self._echo(f"worker self-check failed: {result.reason}")
+        return False
+
     def _heartbeat(self, *, force: bool = False) -> bool:
         """Register as a fleet worker, then re-register every HEARTBEAT_SECONDS.
 
@@ -1019,8 +1066,12 @@ class _Scheduler:
             and (now - self._last_beat).total_seconds() < HEARTBEAT_SECONDS
         ):
             return False
+        extra: dict[str, Any] = {}
+        if self._self_check_result is not None:
+            extra["self_check"] = self._self_check_result.to_heartbeat()
         profile.register_with(
-            self._store, slots=self._config.slots, slots_free=self._free_slots(), now=now
+            self._store, slots=self._config.slots, slots_free=self._free_slots(), now=now,
+            **extra,
         )
         self._last_beat = now
         # The fleet cannot read this worker's ledgers, so each beat also carries
@@ -2483,6 +2534,7 @@ def run_queue(
     installed_version: str | None = None,
     prepare_repo: "RepoPreparer | None" = None,
     installed_probe: InstalledProbe | None = None,
+    self_check: SelfCheck | None = None,
 ) -> SchedulerResult:
     """Drain the host queue: claim jobs under a lease and run them as subprocesses.
 
@@ -2517,6 +2569,9 @@ def run_queue(
     fleet worker (``config.worker``).
     ``installed_probe`` re-reads the installed controller version so a fleet
     worker can exit for a restart after an upgrade (Story 35.2-004).
+    ``self_check`` (Story 35.2-007) is a worker's agent probe, run before its first
+    registration and every 60 s while it fails: until it completes the worker is
+    unregistered, claims nothing and stays up.
 
     Daemonisation is deliberately *not* built here: the documented path is the
     Epic-30 30.3-001 LaunchAgent pattern (KeepAlive, standard logs, secrets from
@@ -2547,6 +2602,7 @@ def run_queue(
         installed_version=installed_version or __version__,
         prepare_repo=prepare_repo,
         installed_probe=installed_probe or installed_controller_version,
+        self_check=self_check,
     )
 
     # Story 35.2-004: launchd stops a resident worker with SIGTERM (`launchctl

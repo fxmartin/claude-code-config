@@ -1235,6 +1235,10 @@ def status(
                 f"{str(s.get('status', '?')):<13}{str(stage):<11}"
                 f"{pr_disp:<7}{models_disp}"
             )
+            # Story 35.5-001: a story parked on pushed recovery work says so —
+            # "fix pushed · awaiting CI · <sha> · PR #N" — instead of a bare status.
+            if s.get("status_detail"):
+                typer.echo(f"    ↳ {s['status_detail']}")
             # Sub-stage activity for an in-flight story (Story 11.1-002): the
             # latest progress milestone, e.g. "↳ build: editing cli.py". Absent
             # for finished stories or runs without streamed progress.
@@ -1572,7 +1576,10 @@ def dashboard(
     ),
     port: int = typer.Option(8787, "--port", help="Port to bind (default: 8787)."),
     host: str = typer.Option(
-        "127.0.0.1", "--host", help="Host to bind (default: localhost-only)."
+        "127.0.0.1",
+        "--host",
+        help="Host to bind (default: localhost-only). A blank value is refused: it "
+        "would bind every interface.",
     ),
     open_browser: bool = typer.Option(
         False, "--open", help="Open the dashboard in a browser on start."
@@ -1610,6 +1617,18 @@ def dashboard(
         )
         if stop:
             raise typer.Exit(code=0)
+
+    # Story 35.4-006: Python binds a blank host as every interface, and a worker's
+    # LaunchAgent rendered while `tailscale ip -4` printed nothing passes exactly
+    # that — the login-less dashboard would serve on whatever network the Mac is
+    # on. Refused before any bind; --stop/--restart above still reach such a server.
+    if not host.strip():
+        typer.echo(
+            "error: --host is blank, which would bind every interface — pass the "
+            "address to serve on (e.g. `tailscale ip -4`), or omit it for localhost-only",
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
     # Story 12.1-002: never bind a server when running inside another build's
     # preflight test suite (sentinel set) — a project test that invokes `sdlc
@@ -3566,6 +3585,11 @@ def _format_since(now: datetime, moment: str) -> str:
     return f"{seconds // 86400}d ago"
 
 
+def _self_check_reason(worker) -> str:
+    """Why a worker's own probe failed (Story 35.2-007), for the STATUS column."""
+    return str((worker.self_check or {}).get("reason") or "self-check failed")
+
+
 @queue_app.command("workers")
 @_queue_errors
 def queue_workers_cmd(
@@ -3580,7 +3604,8 @@ def queue_workers_cmd(
     local one: its host, the subscription pools it serves, free/total agent
     slots as of its last heartbeat, how long ago that was, and whether it is
     `online`. A worker silent for three heartbeats (90 s) is `offline`, and the
-    leases it held become reclaimable. `--json` adds the harnesses, sandbox
+    leases it held become reclaimable. A worker whose own agent probe failed
+    (Story 35.2-007) reads `online — cannot run agents: <why>` with 0 free slots. `--json` adds the harnesses, sandbox
     runtime and repos each worker advertised.
     """
     from sdlc.queue_client import open_queue
@@ -3599,8 +3624,9 @@ def queue_workers_cmd(
     for w in workers:
         typer.echo(
             f"{w.name:<16}{w.host:<20}{','.join(w.pools) or '-':<34}"
-            f"{f'{w.slots_free}/{w.slots}':<8}{_format_since(now, w.last_heartbeat):<12}"
+            f"{f'{w.effective_slots_free}/{w.slots}':<8}{_format_since(now, w.last_heartbeat):<12}"
             f"{'online' if w.is_online(now) else 'offline'}"
+            f"{'' if w.can_run_agents else ' — cannot run agents: ' + _self_check_reason(w)}"
         )
     raise typer.Exit(code=0)
 
@@ -3718,7 +3744,8 @@ def queue_run_cmd(
         [],
         "--pool",
         help="Subscription pool this worker serves, repeatable (e.g. claude-m3, "
-        "claude-shared, codex-shared). Needs --worker.",
+        "claude-shared, codex-shared — advertised only while the codex CLI is "
+        "installed). Needs --worker.",
     ),
     host: str | None = typer.Option(
         None,
@@ -3731,7 +3758,7 @@ def queue_run_cmd(
         "--dashboard-url",
         help="Origin of this worker's dashboard, e.g. http://m3max.<tailnet>:8787 "
         "(`sdlc dashboard --host <tailnet-ip>`). Pushed with each run so the XPS "
-        "dashboard can open its transcripts. Needs --worker.",
+        "dashboard can show its detail and open its transcripts. Needs --worker.",
     ),
 ) -> None:
     """Drain the host queue in the foreground — claim jobs and run them.
@@ -3788,9 +3815,11 @@ def queue_run_cmd(
 
     With `--worker NAME` the drain is a fleet worker (Story 35.2-001). It
     registers `{worker, host, pools, harnesses, sandbox, repos under ~/Work,
-    slots_free}` (`--pool`/`--host` declare the pools and host name) and
-    heartbeats every 30 s with its live free-slot count; a worker silent for
-    three beats is `offline` in `sdlc queue workers` and its leases become
+    slots_free}` (`--pool`/`--host` declare the pools and host name; a
+    declared `codex-shared` is registered only while the `codex` CLI is
+    installed, Story 35.2-008) and heartbeats every 30 s with its live
+    free-slot count; a worker silent for three beats is `offline` in
+    `sdlc queue workers` and its leases become
     reclaimable. It claims only jobs it is eligible for — the job's
     `requirements` (repo, harness, sandbox), `--host` pin and `--pool` met by
     what it registered, a `codex` stage also needing the `codex-shared` pool —
@@ -3814,6 +3843,13 @@ def queue_run_cmd(
     keeps retrying. Once the controller is reinstalled under a worker (Story
     35.2-004) it claims nothing more, lets its running jobs finish and exits 75,
     so a supervisor (`KeepAlive`) restarts it on the new code.
+
+    Before its first registration a worker proves it can run an agent from its
+    own process context (Story 35.2-007): a TCC path check on `~/.claude`
+    (macOS), then one `claude -p ok` Haiku turn capped at 90 s. If the probe
+    stalls, the worker logs the cause once, registers nothing, claims nothing,
+    stays up and retries every 60 s, registering the moment a probe completes;
+    each heartbeat then carries `self_check: {ok, at, reason}`.
 
     Before launching a fresh job a worker syncs its clone (Story 35.2-002):
     `git fetch origin && git checkout -q main && git merge --ff-only
@@ -3875,6 +3911,12 @@ def queue_run_cmd(
         raise typer.Exit(code=2)
     store.init()
 
+    self_check = None
+    if profile is not None:
+        from sdlc.worker_selfcheck import run_self_check
+
+        self_check = run_self_check
+
     result = run_queue(
         store,
         config=SchedulerConfig(
@@ -3889,6 +3931,7 @@ def queue_run_cmd(
         # The worker name is the claim holder, so the queue's `worker` column,
         # the lease renewals and the registry row all name the same party.
         identity=profile.name if profile is not None else None,
+        self_check=self_check,
     )
 
     if as_json:

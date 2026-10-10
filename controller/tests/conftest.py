@@ -73,6 +73,23 @@ def _no_real_worker_launch_agent(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_worker_systemd_unit(monkeypatch, tmp_path_factory):
+    """Keep the Linux dev box's installed worker unit out of `sdlc doctor` (Story 35.2-008).
+
+    The twin of `_no_real_worker_launch_agent`. Where
+    `~/.config/systemd/user/sdlc-worker.service` exists — on `dev`, which runs this
+    suite for its own story jobs — doctor reads that unit, its `worker.env`, the
+    worker's real self-check record and its live queue. `XDG_CONFIG_HOME` moves the
+    unit, so repointing `HOME` does not hide it. Tests that exercise the check pass
+    `unit_path` / `worker_unit` explicitly.
+    """
+    from sdlc import doctor
+
+    absent = tmp_path_factory.getbasetemp() / "no-systemd-user" / doctor.WORKER_UNIT
+    monkeypatch.setattr(doctor, "default_worker_unit", lambda: absent)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_model_probe(monkeypatch):
     """Never spend a real ``claude -p`` call on the model entitlement probe.
 
@@ -85,6 +102,25 @@ def _no_real_model_probe(monkeypatch):
     monkeypatch.setattr(
         probe_mod, "_default_runner", lambda argv, timeout_s=60: (127, "hermetic")
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_worker_self_check(monkeypatch):
+    """Never run a real agent turn for a fleet worker's self-check (Story 35.2-007).
+
+    `sdlc queue run --worker` probes with `claude -p` before it registers, reads
+    the real ``~/.claude`` for the TCC verdict and writes ``~/.local/state/sdlc``.
+    A probe that fails — no `claude` on a CI runner — keeps the worker retrying
+    every 60 s, so a CLI test driving the real drain would never return. A passing
+    probe keeps the pre-35.2-007 drain unchanged. test_worker_selfcheck.py
+    overrides this to test the real function with injected runners and paths.
+    """
+    import sdlc.worker_selfcheck as selfcheck_mod
+
+    def _passed(**_kwargs):
+        return selfcheck_mod.SelfCheckResult(ok=True, at="2026-01-01T00:00:00+00:00")
+
+    monkeypatch.setattr(selfcheck_mod, "run_self_check", _passed)
 
 
 @pytest.fixture(autouse=True)

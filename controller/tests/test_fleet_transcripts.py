@@ -126,8 +126,10 @@ def test_a_queue_db_written_before_dashboard_urls_upgrades_in_place(tmp_path: Pa
             "status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, total INTEGER, "
             "completed INTEGER, updated_at TIMESTAMP NOT NULL)"
         )
-        conn.execute("DELETE FROM _migrations WHERE name = 'fleet_run_dashboard_url'")
-        conn.execute("DELETE FROM _migrations WHERE name = 'fleet_run_phase'")  # Story 35.4-005
+        conn.execute(
+            "DELETE FROM _migrations WHERE name IN "
+            "('fleet_run_dashboard_url', 'fleet_run_origin', 'fleet_run_phase')"
+        )
     old.ensure_migrated()
     old.put_fleet_run(_record())
     assert old.list_fleet_runs()[0]["dashboard_url"] == TAILNET_URL

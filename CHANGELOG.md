@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.99.0] - 2026-10-08
+
+### Added
+
+- feat(fleet-execution): resident linux worker on the (#35.2-008)
+
+### Fixed
+
+- fix(fleet-execution): run bootstrap doctor from the repo root
+- fix(fleet-execution): resident linux worker on the hetzner (#35.2-008)
+- fix(fleet-execution): resident linux worker on the hetzner (#35.2-008)
+- fix(fleet-execution): wire glab credentials on the linux worker
+- fix(fleet-execution): resident linux worker on the hetzner (#35.2-008)
+- fix(fleet-execution): resident linux worker on the hetzner (#35.2-008)
+
+
+## [v2.98.1] - 2026-10-08
+
+### Fixed
+
+- fix(controller): contain summary stage and guard main (#852) (#853)
+
+
+## [v2.98.0] - 2026-10-05
+
+### Added
+
+- feat(fleet-execution): committed recovery work is pushed (#35.5-001)
+
+### Fixed
+
+- fix(fleet-execution): committed recovery work is pushed (#35.5-001)
+
+
+## [v2.97.1] - 2026-10-05
+
+### Changed
+
+- perf(dashboard): read each run ledger once per tick and view (#850)
+
+
+## [v2.97.0] - 2026-10-05
+
+### Added
+
+- feat(fleet-execution): a remote run shows the same detail (#35.4-006)
+
+### Fixed
+
+- fix(fleet-execution): a remote run shows the same detail (#35.4-006)
+- fix(fleet-execution): a remote run shows the same detail (#35.4-006)
+- fix(fleet-execution): a remote run shows the same detail (#35.4-006)
+
+
+## [v2.96.0] - 2026-10-04
+
+### Added
+
+- feat(fleet-execution): a worker proves it can run an agent (#35.2-007) (#843)
+
+
 ## [v2.95.0] - 2026-10-02
 
 ### Added
