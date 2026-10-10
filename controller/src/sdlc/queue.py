@@ -897,9 +897,13 @@ def origin_forge_host(origin: str) -> str | None:
     """The forge host (``host[:port]``) of an ``http(s)://`` origin; ``None`` for any other.
 
     Only an http(s) clone authenticates through a credential helper (Story 35.2-006);
-    ssh keys and local paths are not the forge CLI's to vouch for.
+    ssh keys and local paths are not the forge CLI's to vouch for. Nor is an origin
+    ``urlparse`` rejects (``http://[host/x``): this runs on every worker's heartbeat.
     """
-    parsed = urlparse(origin.strip())
+    try:
+        parsed = urlparse(origin.strip())
+    except ValueError:
+        return None
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
     return parsed.netloc.rpartition("@")[2].lower()

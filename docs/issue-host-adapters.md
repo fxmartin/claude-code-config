@@ -175,7 +175,8 @@ host except the one hardcoded GDK default `127.0.0.1:8080`. So
 since most host seams are best-effort. The only knob `glab` honours for the
 protocol is a config file's per-host `api_protocol`, so an `http://`
 declaration also gets a **controller-owned** `GLAB_CONFIG_DIR` (a 0700 temp dir,
-one per instance per process, removed at exit) holding just that host's entry
+one per instance per process, removed at exit and made again if a temp cleaner
+removes it first) holding just that host's entry
 with `api_protocol: http`. Your own `~/.config/glab-cli/config.yml` is never
 written to; its entry for that one host is re-copied on every call so a `glab
 auth login` token — even one made after the process started — still

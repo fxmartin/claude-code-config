@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -1185,6 +1186,22 @@ def test_gitlab_instance_env_follows_a_login_made_after_the_first_call(monkeypat
 
     user_config.write_text("hosts: {}\n")
     assert "token" not in private_entry(ih.gitlab_instance_env("http://gitlab.test"))
+
+
+def test_gitlab_instance_env_makes_again_a_config_dir_removed_under_it(monkeypatch, tmp_path) -> None:
+    """The resident fleet worker outlives its temp dir — `systemd-tmpfiles` and macOS's
+    $TMPDIR purge remove idle entries — so a removed dir is made again rather than
+    written into, which raised `FileNotFoundError` on every later call (Story 35.2-006)."""
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "config.yml").write_text("hosts:\n  gitlab.test:\n    token: tok\n")
+    shutil.rmtree(ih.gitlab_instance_env("http://gitlab.test")["GLAB_CONFIG_DIR"])
+
+    again = ih.gitlab_instance_env("http://gitlab.test")["GLAB_CONFIG_DIR"]
+
+    config = yaml.safe_load(Path(again, "config.yml").read_text())
+    assert config["hosts"]["gitlab.test"]["token"] == "tok"
+    assert config["hosts"]["gitlab.test"]["api_protocol"] == "http"
 
 
 @pytest.mark.parametrize(

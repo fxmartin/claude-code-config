@@ -419,11 +419,13 @@ def forge_credential_ok(
     CLI that is missing, logged out, or hangs reads as no — and it is a local read of
     the CLI's config, not a request to the forge, so it is fast offline. An empty
     ``password=`` is no as well: git would send it, and the forge would refuse it.
+    So is a plaintext GitLab's private glab config that cannot be written: the beat
+    asks from the sync's keepalive thread too, which an escaping error would end.
     """
-    access = forge_git_access(f"{scheme}://{host}/")
-    if access is None:
-        return False
     try:
+        access = forge_git_access(f"{scheme}://{host}/")
+        if access is None:
+            return False
         done = runner(
             [access.cli, "auth", "git-credential", "get"],
             input=f"protocol={scheme}\nhost={host}\n\n",
@@ -496,9 +498,10 @@ def _run_group(
 
     def pump(stream: Any, sink: list[bytes]) -> None:
         nonlocal last_output
-        for chunk in iter(lambda: stream.read1(65536), b""):
-            sink.append(chunk)
-            last_output = time.monotonic()
+        with stream:  # closed by the thread draining it, never from under a blocked read
+            for chunk in iter(lambda: stream.read1(65536), b""):
+                sink.append(chunk)
+                last_output = time.monotonic()
 
     readers = [
         threading.Thread(target=pump, args=(proc.stdout, output["out"]), daemon=True),
@@ -707,11 +710,12 @@ def _clone(origin: str, target: Path) -> None:
         raise RepoRefused(f"refusing to clone {shown!r}: an origin that reads as a git option")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        # Writes a plaintext GitLab's private glab config into a temp dir.
+        access = forge_git_access(origin)
     except OSError as exc:
         # This host's to fix, not the forge's — and the drain catches refusals
         # only, so an `OSError` let through here would stop the whole worker.
         raise RepoRefused(f"could not clone {shown} into {target}: {exc}") from exc
-    access = forge_git_access(origin)
     try:
         # The forge CLI is the credential helper (see `forge_git_access`), so no
         # token is handled here and no Keychain dialog can open. `--progress` keeps

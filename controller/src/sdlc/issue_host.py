@@ -653,10 +653,12 @@ def _glab_http_config_dir(instance_url: str) -> str:
     operation), removed at interpreter exit. Its entry is re-copied from the
     user's config on every call, so a `glab auth login` (or logout) made after
     the process started reaches a long-lived caller — the resident fleet worker
-    re-checks a missing login on its beat (Story 35.2-006). Only the one host's
-    entry is copied, so no unrelated forge token is duplicated onto disk; the
-    file is written 0600 inside a 0700 temp dir, replaced atomically so a `glab`
-    reading it never sees a half-written one.
+    re-checks a missing login on its beat (Story 35.2-006). That worker also
+    outlives the dir itself: a temp cleaner (`systemd-tmpfiles`, macOS's
+    $TMPDIR purge) may remove it, so a dir that is gone is made again. Only the
+    one host's entry is copied, so no unrelated forge token is duplicated onto
+    disk; the file is written 0600 inside a 0700 temp dir, replaced atomically
+    so a `glab` reading it never sees a half-written one.
     """
     netloc = urlparse(instance_url).netloc
     entry = _user_glab_host_entry(netloc)
@@ -665,7 +667,7 @@ def _glab_http_config_dir(instance_url: str) -> str:
     wanted = yaml.safe_dump({"hosts": {netloc: entry}})
     with _GLAB_HTTP_CONFIG_LOCK:
         config_dir = _GLAB_HTTP_CONFIG_DIRS.get(instance_url)
-        if config_dir is None:
+        if config_dir is None or not os.path.isdir(config_dir):
             config_dir = tempfile.mkdtemp(prefix="sdlc-glab-")
             atexit.register(shutil.rmtree, config_dir, True)
             _GLAB_HTTP_CONFIG_DIRS[instance_url] = config_dir

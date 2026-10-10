@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -256,6 +257,52 @@ def test_a_clone_the_cli_cannot_authenticate_is_refused_and_leaves_nothing(
     assert not target.exists()
 
 
+def test_a_fetch_after_the_os_removed_the_private_glab_config_still_asks_the_forge(
+    tmp_path, unauthorized_forge, no_forge_login, monkeypatch
+) -> None:
+    """The resident worker outlives its temp dir (`systemd-tmpfiles`, macOS's $TMPDIR purge).
+    The next fetch makes the plaintext GitLab's glab config again and asks the forge —
+    here a 401, refused to be retried — rather than park every job on the forge `blocked`
+    on a `FileNotFoundError`."""
+    from sdlc import issue_host
+
+    monkeypatch.setattr(issue_host, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path / "glab-cli"))
+    url = f"http://{unauthorized_forge}/root/proj.git"
+    job = _job(tmp_path, _http_clone(tmp_path / "Work" / "proj", url), url)
+    with pytest.raises(ForgeUnauthenticated):
+        prepare_repo(job, work_dir=tmp_path / "Work")
+    [config_dir] = issue_host._GLAB_HTTP_CONFIG_DIRS.values()
+    shutil.rmtree(config_dir)
+
+    with pytest.raises(ForgeUnauthenticated) as refusal:
+        prepare_repo(job, work_dir=tmp_path / "Work")
+
+    assert refusal.value.retryable is True
+
+
+def _no_space(_origin: str) -> None:
+    """``forge_git_access`` on a host whose temp disk cannot take the private glab config."""
+    raise OSError(28, "No space left on device")
+
+
+def test_a_clone_whose_git_access_cannot_be_set_up_is_refused_not_raised(
+    tmp_path, monkeypatch
+) -> None:
+    """The drain catches refusals only: an `OSError` out of the clone would stop the worker."""
+    monkeypatch.setattr(queue_worker, "forge_git_access", _no_space)
+    target = tmp_path / "Work" / "proj"
+
+    with pytest.raises(RepoRefused) as refusal:
+        prepare_repo(
+            _job(tmp_path, target, "http://gitlab.test/root/proj.git"), work_dir=tmp_path / "Work"
+        )
+
+    assert "No space left on device" in refusal.value.reason
+    assert refusal.value.retryable is False  # this host's to fix, as an unwritable ~/Work is
+    assert not target.exists()
+
+
 def test_the_refusal_names_the_worker_when_the_scheduler_has_one() -> None:
     refusal = ForgeUnauthenticated("gitlab.test", "glab", "https", worker="m3max")
 
@@ -338,6 +385,27 @@ def test_the_overall_timeout_still_applies_to_a_chatty_process() -> None:
     with pytest.raises(subprocess.TimeoutExpired):
         queue_worker._run_group([sys.executable, "-c", code], env=dict(os.environ),
                                 timeout=1.0, stall_seconds=30)
+
+
+def test_a_watched_process_leaves_no_pipe_open(monkeypatch) -> None:
+    """Each pipe is closed by the reader that drained it, not left to the garbage collector
+    (a `ResourceWarning` per pipe, per fetch, in a worker that runs for weeks)."""
+    started: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def recording(*args, **kwargs):
+        started.append(real_popen(*args, **kwargs))
+        return started[-1]
+
+    monkeypatch.setattr(subprocess, "Popen", recording)
+    queue_worker._run_group([sys.executable, "-c", "print('hi')"], env=dict(os.environ))
+
+    [proc] = started
+    pipes = [proc.stdout, proc.stderr]
+    deadline = time.monotonic() + 30  # headroom: each reader closes its pipe on its own thread
+    while not all(pipe is not None and pipe.closed for pipe in pipes):
+        assert time.monotonic() < deadline, "a pipe was left open"
+        time.sleep(0.05)
 
 
 def test_a_stalled_fetch_is_refused_as_a_stalled_sync(tmp_path, monkeypatch) -> None:
@@ -790,6 +858,22 @@ def test_only_http_origins_need_a_forge_credential(tmp_path) -> None:
     assert labels == []
 
 
+def test_an_unparseable_origin_never_fails_a_workers_heartbeat(tmp_path) -> None:
+    """Every beat re-reads each queued job's needs, so one origin `urlparse` rejects — only
+    a hand-built `POST /jobs` can carry one — must not fail every worker's registration."""
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(
+        repo="/x/p", kind="build", scope="s",
+        requirements_json=json.dumps({"origin": "http://[gitlab.test/root/p.git"}),
+    )
+
+    store.register_worker("m3max", host="m3", forges={"gitlab.test": False})
+
+    job = store.get_job(job_id)
+    assert job is not None and job_needs(job) == []
+
+
 def test_a_workers_forges_survive_a_pre_existing_queue_db(tmp_path) -> None:
     import sqlite3
 
@@ -955,6 +1039,14 @@ def test_credential_probe_is_false_without_the_cli_or_when_it_hangs(tmp_path, mo
         raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
 
     assert forge_credential_ok("gitlab.test", "https", runner=hangs) is False
+
+
+def test_credential_probe_is_false_when_its_git_access_cannot_be_set_up(monkeypatch) -> None:
+    """The beat re-checks a flagged forge from the sync's keepalive thread too: an `OSError`
+    escaping there would end that thread, and the job's lease renewals with it."""
+    monkeypatch.setattr(queue_worker, "forge_git_access", _no_space)
+
+    assert forge_credential_ok("gitlab.test", "http") is False
 
 
 def test_doctor_reports_each_forge_credential_on_a_worker(tmp_path) -> None:

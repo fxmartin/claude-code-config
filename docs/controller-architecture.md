@@ -3291,7 +3291,8 @@ on every call, and because most host seams are best-effort those failures are
 silent. The only mechanism `glab` honours for the protocol is a config file's
 per-host `api_protocol`, so `gitlab_instance_env` also emits a
 **controller-owned** `GLAB_CONFIG_DIR`: a 0700 temp dir (one per instance URL
-per process, `atexit`-removed) whose 0600 `config.yml` carries just that host's
+per process, `atexit`-removed, made again if a temp cleaner removes it under a
+long-lived process) whose 0600 `config.yml` carries just that host's
 entry with `api_protocol: http`. The user's `~/.config/glab-cli/config.yml` is
 read-only input — that one host's entry is re-copied on every call, so a `glab
 auth login` token still authenticates even when it was made after a long-lived
