@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (17/21)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, resumed on the M3 Max 2026-10-10); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002 (a stopped job kills its agents) added 2026-10-10 from job 3. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (17/22)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, resumed on the M3 Max 2026-10-10); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002 (a stopped job kills its agents) and 35.5-003 (approved green CRs merge deterministically) added 2026-10-10 from job 3. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 21 | **Total Points**: 78 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 22 | **Total Points**: 83 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -1023,6 +1023,56 @@ hand at ~12:20; the ledger still read `IN_PROGRESS · bugfix: agent started`.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.2-001, 35.5-001
+**Risk Level**: Medium
+
+##### Story 35.5-003: An approved, green change request merges deterministically
+**User Story**: As FX, I want a story whose review is `APPROVED` and whose CI
+gate has passed to be merged by the controller itself through the host
+adapter's `cr_merge`, and a merge refused by policy to park rather than enter
+the bugfix loop, so that an unattended worker never burns its fix budget on a
+merge an LLM fumbled.
+**Priority**: Must Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** review returned `APPROVED` **And** the merge CI gate passed **And**
+  the change request is mergeable with no high-risk block **When** the merge
+  stage runs **Then** the controller calls `cr_merge` on the story's host
+  adapter (GitHub, GitLab, local) with the repo's merge method, records the
+  merge sha, and no merge agent is dispatched.
+- **Given** the change request is not cleanly mergeable (behind base,
+  conflicts, drift) **When** the merge stage runs **Then** the existing merge
+  agent handles it as today; the prompt says outright to use the plain merge
+  command and never `--admin`.
+- **Given** a merge attempt (deterministic or agent) is refused by policy — a
+  deny-floor rule (`gh pr merge *--admin*`), branch protection, or a missing
+  `risk-approved` label — **When** the controller evaluates it **Then** the
+  story parks `AWAITING_APPROVAL`/`NEEDS_ATTENTION` with the refusal text and
+  the operator's merge command; it does **not** start a bugfix round and does
+  not count against the job's fix-round budget.
+- **Given** a local run with no fleet **When** the same path runs **Then** the
+  only visible difference is the absent merge-agent dispatch; the full
+  controller suite stays green on both platforms.
+
+**Technical Notes**: `cr_merge` is implemented on all three adapters
+(`issue_host.py`) but no build-path caller uses it; `render_merge_prompt`
+(`build.py`) leaves the command to the agent. The #653 deny floor
+(`dispatch.py`, `Bash(gh pr merge *--admin*)`) is correct and stays; the
+defect is what happens after it fires. Incident: fleet job 3, run `46e76670`
+on the M3 Max (2026-10-10) — #858 was `APPROVED` (0 blocking) with CI green and
+`CLEAN`; the Haiku merge agent's first merge call was `gh pr merge 858 --merge
+--admin`, denied, reported `MERGE_COMMAND_BLOCKED_PERMISSION`; the controller
+started "bugfix attempt 8 for merge", which exhausted the 5-round cap and
+stopped the job with the PR unmerged.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: approved + green + clean → `cr_merge` called, no agent; not clean
+      → agent path with no-`--admin` prompt; policy refusal → parked, no bugfix,
+      budget untouched; each adapter; local-mode parity
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.5-001
 **Risk Level**: Medium
 
 ## Epic Sequencing
