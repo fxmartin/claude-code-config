@@ -54,20 +54,31 @@ def format_state(rows: list[dict]) -> list[str]:
     return lines
 
 
-# ---------------------------------------------------------------------------
+def _human_duration(seconds: float | None) -> str:
+    """``seconds`` as the dashboard's ``humanDuration`` shows it: ``42s``, ``2m 05s``, ``1h 02m``."""
+    if seconds is None or seconds < 0:
+        return "—"
+    whole = int(seconds)
+    hours, minutes, secs = whole // 3600, (whole % 3600) // 60, whole % 60
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
 def format_preflight(preflight: dict | None, *, phase: str | None = None) -> str | None:
     """The run's preflight gate as one line, or ``None`` when it never ran one (Story 35.4-005).
 
-    Mirrors the dashboard header: ``preflight: running (<command>, <elapsed>)``,
-    ``preflight: passed (<duration>)`` or ``preflight: failed — <PRE_FLIGHT_*
-    reason>``. A remote run carries only its ``phase``, which still says it is in
-    preflight.
+    Mirrors the dashboard header, durations included: ``preflight: running
+    (<command>, <elapsed>)``, ``preflight: passed (<duration>)`` or ``preflight:
+    failed — <PRE_FLIGHT_* reason>``. A remote run carries only its ``phase``,
+    which still says it is in preflight.
     """
     if not preflight:
         return "preflight: running" if phase == "preflight" else None
     state = preflight.get("state")
-    seconds = preflight.get("duration_seconds")
-    took = f"{seconds}s" if seconds is not None else "?"
+    took = _human_duration(preflight.get("duration_seconds"))
     if state == "running":
         command = preflight.get("command")
         return f"preflight: running ({command + ', ' if command else ''}{took})"
@@ -78,6 +89,7 @@ def format_preflight(preflight: dict | None, *, phase: str | None = None) -> str
     return None
 
 
+# ---------------------------------------------------------------------------
 # Story 15.1-002: portable markdown handoff (`sdlc status --markdown`)
 # ---------------------------------------------------------------------------
 

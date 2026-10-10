@@ -358,6 +358,35 @@ def _run_phase(
     return "stories"
 
 
+def _fold_preflight(rows: Iterable, *, now: datetime | None = None) -> dict | None:
+    """The preflight state one run's ``preflight`` events describe, oldest first.
+
+    See :meth:`Ledger.preflight_state`, which reads the rows for one run;
+    :meth:`Ledger.list_runs` reads every live run's in a single query instead.
+    """
+    state: dict | None = None
+    for row in rows:
+        message = row["message"] or ""
+        if message.startswith(_PREFLIGHT_STARTED):
+            state = {
+                "state": "running",
+                "command": message[len(_PREFLIGHT_STARTED):],
+                "reason": None,
+                "started_at": row["ts"],
+                "finished_at": None,
+            }
+        elif state is not None and message.startswith(_PREFLIGHT_PASSED):
+            state.update(state="passed", finished_at=row["ts"])
+        elif state is not None and message.startswith("PRE_FLIGHT_"):
+            state.update(state="failed", finished_at=row["ts"], reason=message)
+    if state is None:
+        return None
+    state["duration_seconds"] = _duration_seconds(
+        state["started_at"], state["finished_at"], now=now
+    )
+    return state
+
+
 # Story statuses whose measured usage is a story's *complete* cost, so the row is
 # a valid training example for the Story 28.2-002 predictor. Deliberately not
 # named ``_TERMINAL_*``: `resume.py` already owns a `_TERMINAL_STORY_STATES` with
@@ -3885,27 +3914,7 @@ class Ledger:
                 "ORDER BY id",
                 (run_id,),
             ).fetchall()
-        state: dict | None = None
-        for row in rows:
-            message = row["message"] or ""
-            if message.startswith(_PREFLIGHT_STARTED):
-                state = {
-                    "state": "running",
-                    "command": message[len(_PREFLIGHT_STARTED):],
-                    "reason": None,
-                    "started_at": row["ts"],
-                    "finished_at": None,
-                }
-            elif state is not None and message.startswith(_PREFLIGHT_PASSED):
-                state.update(state="passed", finished_at=row["ts"])
-            elif state is not None and message.startswith("PRE_FLIGHT_"):
-                state.update(state="failed", finished_at=row["ts"], reason=message)
-        if state is None:
-            return None
-        state["duration_seconds"] = _duration_seconds(
-            state["started_at"], state["finished_at"], now=now
-        )
-        return state
+        return _fold_preflight(rows, now=now)
 
     def run_phase(self, run_id: str) -> str | None:
         """The phase a live run is in: ``preflight`` | ``stories`` | ``closing`` (Story 35.4-005).
@@ -4138,7 +4147,22 @@ class Ledger:
                 ).fetchall()
                 if "input_tokens" in stage_cols else []
             )
+            # Story 35.4-005: every live run's preflight events in one query on
+            # this connection, not a connection per run on a list polled every tick.
+            live_ids = [r["id"] for r in runs if r["status"] == "IN_PROGRESS"]
+            placeholders = ",".join("?" for _ in live_ids)
+            preflight_rows = (
+                conn.execute(
+                    "SELECT run_id, ts, message FROM events WHERE source = 'preflight' "
+                    f"AND run_id IN ({placeholders}) ORDER BY id",
+                    live_ids,
+                ).fetchall()
+                if live_ids else []
+            )
 
+        preflight_events: dict[str, list] = {}
+        for row in preflight_rows:
+            preflight_events.setdefault(row["run_id"], []).append(row)
         counts: dict[str, dict[str, int]] = {}
         for g in grouped:
             counts.setdefault(g["run_id"], {})[g["status"]] = g["n"]
@@ -4175,12 +4199,14 @@ class Ledger:
                     "failed": by_status.get("FAILED", 0),
                     "total_tokens": u["tok"] if u else None,
                     "total_cost_usd": u["cost"] if u else None,
-                    # Story 35.4-005: only a live run has a phase. Its status and
-                    # story statuses are already in hand, so only its preflight
-                    # events are read — not a `run_phase` re-read per run on a
-                    # list the page polls every tick.
+                    # Story 35.4-005: only a live run has a phase. Its status, story
+                    # statuses and preflight events are all already in hand — no
+                    # `run_phase` re-read per run on a list the page polls every tick.
                     "phase": (
-                        _run_phase(r["status"], self.preflight_state(r["id"]), list(by_status))
+                        _run_phase(
+                            r["status"], _fold_preflight(preflight_events.get(r["id"], [])),
+                            list(by_status),
+                        )
                         if r["status"] == "IN_PROGRESS" else None
                     ),
                 }

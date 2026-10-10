@@ -67,6 +67,7 @@ __all__ = [
     "approval_poll_interval",
     "controller_argv",
     "job_argv",
+    "ledger_close_unstarted_batch",
     "ledger_fix_rounds",
     "ledger_plan_files",
     "ledger_preflight_failure",
@@ -673,6 +674,23 @@ def ledger_preflight_failure(db_path: str, run_id: str) -> str | None:
     return None
 
 
+def ledger_close_unstarted_batch(db_path: str, run_id: str, registry: Registry) -> bool:
+    """Close ``run_id`` ``ABORTED`` if it is a fix batch that died in preflight (Story 35.4-005).
+
+    The reclaim restarts such a job as a fresh run, and nothing else would ever
+    finish the old one: left ``IN_PROGRESS`` it is the run a bare `sdlc resume`
+    keeps picking and refusing. The reclaim has already found its pid gone. Any
+    ledger failure degrades to ``False``: it must never fail a drain.
+    """
+    from sdlc.build import Ledger
+    from sdlc.resume import close_unstarted_fix_batch
+
+    try:
+        return close_unstarted_fix_batch(Ledger(Path(db_path)), run_id, registry=registry)
+    except Exception:  # noqa: BLE001 - a ledger write must never fail a drain
+        return False
+
+
 def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
     """Why ``run_id`` cannot be resumed, or ``None`` when resuming is right (#716).
 
@@ -1245,6 +1263,11 @@ class _Scheduler:
             terminal = self._run_terminal(job.run_id)
             if terminal is not None:
                 # #716: nothing to resume — a new run must re-read the scope.
+                # Story 35.4-005: the old run is closed first if it is a batch
+                # that died in preflight; nothing else would ever finish it.
+                record = self._registry_record(job.run_id)
+                if record is not None and record.db:
+                    ledger_close_unstarted_batch(record.db, job.run_id, self._registry)
                 self._store.restart_fresh(
                     job.id, reason=f"run is terminal ({terminal}) — fresh run",
                     now=self._clock(),

@@ -41,7 +41,11 @@ from sdlc.fix_issue import (
 from sdlc.queue import QueueStore
 from sdlc.registry import Registry, RunRecord, live_record
 from sdlc.resume import has_resumable_work, run_resume
-from sdlc.scheduler import ledger_preflight_failure, ledger_run_terminal
+from sdlc.scheduler import (
+    ledger_close_unstarted_batch,
+    ledger_preflight_failure,
+    ledger_run_terminal,
+)
 from sdlc.status import format_preflight
 
 RED = "PRE_FLIGHT_RED: 'uv run pytest' exited 1 — the suite is failing. Fix it, or bypass with --skip-preflight."
@@ -374,9 +378,9 @@ def test_preflight_state_reports_command_and_latest_attempt(tmp_path) -> None:
 
 
 def test_list_runs_derives_phase_from_the_rows_it_already_read(tmp_path, monkeypatch) -> None:
-    # `list_runs` already holds each run's status and story counts: a live run's
-    # phase needs only its preflight events on top, not a `run_phase` re-read
-    # (run row + events + stories) per run on a list polled every tick.
+    # `list_runs` already holds each run's status and story counts, and reads every
+    # live run's preflight events in the same pass: no `run_phase` re-read (run
+    # row + events + stories) and no connection per run on a list polled every tick.
     ledger = Ledger(tmp_path / "l.db")
     ledger.init()
     gate = ledger.run_create("epic-1", "serial")
@@ -384,28 +388,30 @@ def test_list_runs_derives_phase_from_the_rows_it_already_read(tmp_path, monkeyp
     ledger.event_log(gate, "", "info", "preflight", "started: make test")
     working = ledger.run_create("epic-2", "serial")
     ledger.story_upsert(working, "s-2", "1", "t", "P1", 1, "py", "", None, "IN_PROGRESS")
+    ledger.event_log(working, "", "info", "preflight", "started: make test")
+    ledger.event_log(working, "", "info", "preflight", "passed")
     closing = ledger.run_create("epic-3", "serial")
     ledger.story_upsert(closing, "s-3", "1", "t", "P1", 1, "py", "", None, "DONE")
     finished = ledger.run_create("epic-4", "serial")
     ledger.run_update_status(finished, "DONE")
-    looked_up: list[str] = []
-    real_preflight_state = Ledger.preflight_state
+    real_connect_ro = Ledger._connect_ro
+    connections = {"n": 0}
 
-    def _counting(self, run_id, **kwargs):
-        looked_up.append(run_id)
-        return real_preflight_state(self, run_id, **kwargs)
+    def _counting(self):
+        connections["n"] += 1
+        return real_connect_ro(self)
 
-    def _no_reread(self, run_id):
+    def _no_reread(self, run_id, **kwargs):
         raise AssertionError("list_runs re-read a run it already holds")
 
-    monkeypatch.setattr(Ledger, "preflight_state", _counting)
-    for name in ("run_phase", "run_row", "story_rows"):
+    monkeypatch.setattr(Ledger, "_connect_ro", _counting)
+    for name in ("run_phase", "run_row", "story_rows", "preflight_state"):
         monkeypatch.setattr(Ledger, name, _no_reread)
 
     phases = {r["id"]: r["phase"] for r in ledger.list_runs()}
 
     assert phases == {gate: "preflight", working: "stories", closing: "closing", finished: None}
-    assert sorted(looked_up) == sorted([gate, working, closing])  # a finished run pays nothing
+    assert connections["n"] == 1  # one connection, however many runs are live
 
 
 def test_format_preflight_matches_the_header_contract() -> None:
@@ -414,6 +420,9 @@ def test_format_preflight_matches_the_header_contract() -> None:
         "preflight: running (make test, 42s)"
     )
     assert format_preflight({"state": "passed", "duration_seconds": 7}) == "preflight: passed (7s)"
+    # The same durations the dashboard header shows (its `humanDuration`).
+    assert format_preflight({"state": "passed", "duration_seconds": 125}) == "preflight: passed (2m 05s)"
+    assert format_preflight({"state": "running", "duration_seconds": 3725}) == "preflight: running (1h 02m)"
     assert format_preflight({"state": "failed", "reason": RED}) == f"preflight: failed — {RED}"
     assert format_preflight(None, phase="preflight") == "preflight: running"
 
@@ -1011,11 +1020,63 @@ def test_a_batch_interrupted_in_preflight_is_refused_not_closed_done(tmp_path) -
     assert result.refused is True
     assert "batch" in result.refusal_reason and "sdlc fix all" in result.refusal_reason
     assert dispatch.calls == []
-    assert ledger.run_row(run_id)["status"] == "IN_PROGRESS"  # not DONE
+    assert ledger.run_row(run_id)["status"] == "ABORTED"  # closed, never DONE
     assert _story_statuses(ledger, run_id) == ["TODO", "TODO"]
     # Neither the CLI hint nor a fleet reclaim treats it as resumable work.
     assert has_resumable_work(ledger, run_id) is False
     assert ledger_run_terminal(str(ledger.db_path), run_id) == "fix batch never passed preflight"
+
+
+def test_a_batch_killed_in_preflight_stops_hiding_older_runs_from_bare_resume(tmp_path, monkeypatch) -> None:
+    # Left IN_PROGRESS, the dead batch was the run every bare `sdlc resume` picked
+    # — and refused — for good, even after the batch was re-run as the refusal
+    # says, so the interrupted build behind it could never be resumed.
+    from test_scheduler import _dead_pid
+
+    monkeypatch.setattr("sdlc.resume.discover_queue", lambda scope, root: _sample_queue())
+    db = tmp_path / ".sdlc-state.db"
+    run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(), ledger=Ledger(db), dispatcher=FakeDispatcher(),
+        preflight=lambda: True,
+    )
+    ledger = Ledger(db)
+    [build] = _runs(db)
+    ledger.run_update_status(build["id"], "IN_PROGRESS")  # interrupted mid-stories
+    ledger.set_story_status(build["id"], "s1-003", "IN_PROGRESS")
+
+    def killed() -> bool:
+        raise KeyboardInterrupt  # Ctrl-C during the batch's gate
+
+    gh = FakeBatchGh([_batch_issue(1), _batch_issue(2)])
+    with pytest.raises(KeyboardInterrupt):
+        run_fix_batch(
+            FixBatchOptions(target="all"), ledger=ledger, dispatcher=BatchProbeDispatcher(),
+            preflight=killed, runner=gh, root=tmp_path,
+        )
+    [batch_id] = [r["id"] for r in _runs(db) if r["id"] != build["id"]]
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord(run_id=batch_id, repo=str(tmp_path), db=str(db), scope="issues-all",
+                  pid=_dead_pid(), status="IN_PROGRESS", started_at="")
+    )
+
+    first = run_resume("all", ledger=ledger, dispatcher=FakeDispatcher(), registry=registry,
+                       root=tmp_path)
+    assert first.refused is True and first.run_id == batch_id
+    assert "closed ABORTED" in first.refusal_reason
+    assert ledger.run_row(batch_id)["status"] == "ABORTED"
+    [record] = registry.records()
+    assert (record.status, bool(record.finished_at)) == ("ABORTED", True)
+
+    run_fix_batch(  # re-run, as the refusal says
+        FixBatchOptions(target="all"), ledger=ledger, dispatcher=BatchProbeDispatcher(),
+        preflight=lambda: True, runner=gh, root=tmp_path,
+    )
+    second = run_resume("all", ledger=ledger, dispatcher=FakeDispatcher(), registry=registry,
+                        root=tmp_path)
+    assert second.refused is False
+    assert second.run_id == build["id"]
 
 
 def test_a_batch_that_failed_preflight_is_not_offered_for_resume(tmp_path) -> None:
@@ -1147,7 +1208,10 @@ def test_a_lapsed_batch_job_whose_run_died_in_preflight_restarts_fresh(tmp_path)
     assert launcher.calls[0][0][-2:] == ["fix", "all"]
     assert "resume" not in launcher.calls[0][0]
     assert any("fix batch never passed preflight" in line for line in lines)
-    assert ledger.run_row(run_id)["status"] == "IN_PROGRESS"  # never closed DONE
+    # Closed, never DONE — and not left IN_PROGRESS for a bare resume to keep picking.
+    assert ledger.run_row(run_id)["status"] == "ABORTED"
+    old = next(r for r in registry.records() if r.run_id == run_id)
+    assert (old.status, bool(old.finished_at)) == ("ABORTED", True)
 
 
 def test_a_workers_heartbeat_push_carries_the_runs_phase(tmp_path) -> None:
@@ -1234,7 +1298,8 @@ def test_registry_phase_tolerates_an_unwritable_registry() -> None:
 
 
 def test_format_preflight_edge_cases() -> None:
-    assert format_preflight({"state": "running"}) == "preflight: running (?)"
+    assert format_preflight({"state": "running"}) == "preflight: running (—)"
+    assert format_preflight({"state": "passed", "duration_seconds": -1}) == "preflight: passed (—)"
     assert format_preflight({"state": "failed"}) == "preflight: failed — no reason recorded"
     assert format_preflight({"state": "mystery"}) is None
 
@@ -1250,6 +1315,12 @@ def test_ledger_preflight_failure_degrades_to_none_on_unreadable_ledger(tmp_path
     bad = tmp_path / "not-a-db"
     bad.write_text("garbage")
     assert ledger_preflight_failure(str(bad), "run-1") is None
+
+
+def test_ledger_close_unstarted_batch_degrades_to_false_on_unreadable_ledger(tmp_path) -> None:
+    bad = tmp_path / "not-a-db"
+    bad.write_text("garbage")
+    assert ledger_close_unstarted_batch(str(bad), "run-1", Registry(tmp_path / "r.json")) is False
 
 
 def test_ledger_preflight_failure_without_a_reason_is_none(tmp_path, monkeypatch) -> None:

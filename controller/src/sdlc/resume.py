@@ -22,6 +22,7 @@ from sdlc.build import (
     _log_routing_banner,
     _make_rate_limit_context,
     _prepare_story_workdir,
+    _registry_finish,
     _registry_register,
     _reposition_head,
     _resolve_dispatch,
@@ -165,6 +166,36 @@ def unstarted_fix_batch(ledger: Ledger, run_id: str, run_row: dict | None = None
         str(row.get("scope") or "").startswith(_FIX_BATCH_SCOPE_PREFIX)
         and ledger.preflight_owed(run_id)
     )
+
+
+def close_unstarted_fix_batch(
+    ledger: Ledger,
+    run_id: str,
+    *,
+    registry: Registry | None = None,
+    run_row: dict | None = None,
+) -> bool:
+    """Close an interrupted :func:`unstarted_fix_batch` run ``ABORTED`` (Story 35.4-005).
+
+    Nothing ever resumes such a batch — it is started afresh — so left
+    ``IN_PROGRESS`` it stays the run a bare `sdlc resume` picks, and refuses, for
+    good: every older interrupted run hides behind it. Call this only once the
+    run is known dead (its live-owner check has passed). Nothing was dispatched,
+    so nothing is lost. A batch a red gate already closed ``FAILED`` keeps that
+    status and its reason. Returns whether the run was closed.
+    """
+    row = run_row if run_row is not None else (ledger.run_row(run_id) or {})
+    if row.get("status") != "IN_PROGRESS" or not unstarted_fix_batch(ledger, run_id, row):
+        return False
+    ledger.event_log(
+        run_id, "", "warn", "controller",
+        "fix batch interrupted before its preflight gate passed — closed ABORTED; "
+        "a batch is started afresh, never resumed",
+    )
+    ledger.run_update_status(run_id, "ABORTED")
+    if registry is not None:
+        _registry_finish(registry, run_id, "ABORTED", 0)
+    return True
 
 
 def _resume_fix_run(
@@ -487,8 +518,9 @@ def run_resume(
     is handed on to a fix run's resume) — never by skipping it. A red or
     timed-out gate stamps the run FAILED with its reason and returns
     ``preflight_failed``. The exception is an `sdlc fix` batch, which has no
-    resume path: one whose gate never passed is ``refused``, its status and
-    stories untouched (:func:`unstarted_fix_batch`).
+    resume path: one whose gate never passed is ``refused``, its stories
+    untouched (:func:`unstarted_fix_batch`); one left ``IN_PROGRESS`` is closed
+    ``ABORTED`` (:func:`close_unstarted_fix_batch`), a red one stays ``FAILED``.
     """
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
@@ -526,12 +558,15 @@ def run_resume(
             root=root, registry=registry, runner=runner, force=force, preflight=preflight,
         )
     # Story 35.4-005: refused before anything below re-stamps it — the queue
-    # rebuilt below could only close it DONE with every issue still TODO.
+    # rebuilt below could only close it DONE with every issue still TODO. An
+    # interrupted one is closed ABORTED too, or the next bare resume picks it again.
     if unstarted_fix_batch(ledger, rid, run_row):
+        closed = close_unstarted_fix_batch(ledger, rid, registry=registry, run_row=run_row)
         reason = (
             f"run {rid[:8]} is an `sdlc fix` batch that never passed preflight — "
-            "nothing was dispatched and a batch cannot be resumed; run it again "
-            "(`sdlc fix all` / `sdlc fix next`)"
+            "nothing was dispatched and a batch cannot be resumed"
+            + (", so it is closed ABORTED" if closed else "")
+            + "; run it again (`sdlc fix all` / `sdlc fix next`)"
         )
         ledger.event_log(rid, "", "warn", "controller", f"resume refused: {reason}")
         return ResumeResult(run_id=rid, refused=True, refusal_reason=reason)
