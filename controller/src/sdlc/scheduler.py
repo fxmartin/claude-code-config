@@ -681,9 +681,13 @@ def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
     e.g. an investigation parked on a human decision. Returns ``"story
     BLOCKED"`` (or ``FAILED``) then. A run with no stories, resumable work, or
     an unreadable ledger returns ``None``: the existing resume behaviour.
+
+    Story 35.4-005: an `sdlc fix` batch whose preflight gate never passed has
+    dispatched nothing and cannot be resumed, so it reads ``"fix batch never
+    passed preflight"`` and the job starts afresh — as when no run had started.
     """
     from sdlc.build import Ledger
-    from sdlc.resume import _FIX_RUN_MODES, has_resumable_work
+    from sdlc.resume import _FIX_RUN_MODES, has_resumable_work, unstarted_fix_batch
 
     try:
         ledger = Ledger(Path(db_path))
@@ -691,6 +695,8 @@ def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
         if not statuses:
             return None
         run_row = ledger.run_row(run_id) or {}
+        if unstarted_fix_batch(ledger, run_id, run_row):
+            return "fix batch never passed preflight"
         if str(run_row.get("mode") or "") in _FIX_RUN_MODES:
             # `resume_fix` re-enters a story only mid-flight; a BLOCKED/FAILED
             # one is a refusal ("nothing to resume"), not work it can pick up.

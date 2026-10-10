@@ -4105,7 +4105,8 @@ class Ledger:
         """The most recent ``limit`` runs (newest first) for the runs browser.
 
         Each entry is ``{id, scope, mode, status, started_at, finished_at,
-        duration_seconds, total, done, failed, total_tokens, total_cost_usd}``.
+        duration_seconds, total, done, failed, total_tokens, total_cost_usd,
+        phase}`` — ``phase`` as :func:`_run_phase` derives it (Story 35.4-005).
         ``duration_seconds`` is the run's total span (elapsed-so-far while
         in-progress), or None when the start is missing (renders "—"). The
         ``total/done/failed`` tallies are computed live from the per-story rows
@@ -4750,7 +4751,10 @@ def default_preflight(
 
     ``on_failure`` receives the ``PRE_FLIGHT_TIMEOUT`` / ``PRE_FLIGHT_RED`` line
     (Story 35.4-005) so the caller can record *why* in the run's ledger instead of
-    only the ``bool`` — which cannot tell a cut-off suite from a failing one.
+    only the ``bool`` — which cannot tell a cut-off suite from a failing one. A
+    command that cannot start at all (not on this host's PATH, not executable) is
+    a ``PRE_FLIGHT_RED`` too: the gate runs inside an open run now, so an escaping
+    ``OSError`` would strand that run ``IN_PROGRESS`` in ``preflight`` for good.
     """
     root = root or Path.cwd()
     cmd = detect_test_command(root)
@@ -4769,6 +4773,15 @@ def default_preflight(
         line = (
             f"PRE_FLIGHT_TIMEOUT: '{' '.join(cmd)}' exceeded {timeout}s — aborting. "
             "Raise --preflight-timeout=N or bypass with --skip-preflight."
+        )
+        print(line, file=sys.stderr)
+        if on_failure is not None:
+            on_failure(line)
+        return False
+    except OSError as exc:
+        line = (
+            f"PRE_FLIGHT_RED: '{' '.join(cmd)}' could not start ({exc}) — install "
+            "it on this host, or bypass with --skip-preflight."
         )
         print(line, file=sys.stderr)
         if on_failure is not None:

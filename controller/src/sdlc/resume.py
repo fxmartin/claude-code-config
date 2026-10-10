@@ -131,6 +131,8 @@ class ResumeResult:
     # untouched, left exactly as it was, and ``refusal_reason`` names the owning
     # pid and the ``--force`` override. Distinct from ``nothing_to_resume`` (an
     # honest "no work left"): this is "work is already in flight elsewhere".
+    # Story 35.4-005: also set, with the reason, for an `sdlc fix` batch whose
+    # gate never passed — see :func:`unstarted_fix_batch`.
     refused: bool = False
     refusal_reason: str = ""
     # Story 35.4-005: the run was interrupted in preflight, the resume re-ran the
@@ -142,6 +144,27 @@ class ResumeResult:
 # controller's `run_fix` writes; ``fix-issue`` is the legacy value the retired
 # markdown skill's `sdlc run-open` used, and those runs are in existing ledgers.
 _FIX_RUN_MODES = frozenset({"fix", "fix-issue"})
+
+# The scope prefix `fix_issue._batch_scope` gives an `sdlc fix all` / `next` batch
+# run. Its mode is `serial`/`parallel`, so only the scope tells it from a build.
+_FIX_BATCH_SCOPE_PREFIX = "issues-"
+
+
+def unstarted_fix_batch(ledger: Ledger, run_id: str, run_row: dict | None = None) -> bool:
+    """True for an `sdlc fix` batch run whose preflight gate never passed (Story 35.4-005).
+
+    A batch opens its run before its gate, so one interrupted in preflight — or
+    closed FAILED by a red gate — has dispatched nothing. It has no resume path:
+    :func:`sdlc.fix_issue.resume_fix` takes only an ``issue-<N>`` scope, and the
+    epic queue :func:`run_resume` rebuilds holds no issue stories, so it would
+    dispatch nothing and close the run DONE with every issue still TODO. Such a
+    batch is started afresh instead, exactly as before its gate ran inside the run.
+    """
+    row = run_row if run_row is not None else (ledger.run_row(run_id) or {})
+    return (
+        str(row.get("scope") or "").startswith(_FIX_BATCH_SCOPE_PREFIX)
+        and ledger.preflight_owed(run_id)
+    )
 
 
 def _resume_fix_run(
@@ -295,8 +318,11 @@ def has_resumable_work(ledger: Ledger, run_id: str) -> bool:
     Issue #679: mirrors the incomplete/end-crash check :func:`run_resume` uses
     to decide ``nothing_to_resume``, factored out so the CLI can tell whether a
     ``FAILED`` run it is *not* auto-resuming would actually finish via an
-    explicit ``sdlc resume --run <id>`` before suggesting it.
+    explicit ``sdlc resume --run <id>`` before suggesting it. A batch whose gate
+    never passed has none: :func:`run_resume` refuses it (Story 35.4-005).
     """
+    if unstarted_fix_batch(ledger, run_id):
+        return False
     config = ledger.run_config(run_id)
     plan = compute_resume_plan(ledger, run_id, skip_coverage=bool(config.get("skip_coverage")))
     return any(st.status not in _TERMINAL_STORY_STATES for st in plan.values())
@@ -460,7 +486,9 @@ def run_resume(
     re-running preflight (``preflight`` is the seam, as in :func:`run_build`, and
     is handed on to a fix run's resume) — never by skipping it. A red or
     timed-out gate stamps the run FAILED with its reason and returns
-    ``preflight_failed``.
+    ``preflight_failed``. The exception is an `sdlc fix` batch, which has no
+    resume path: one whose gate never passed is ``refused``, its status and
+    stories untouched (:func:`unstarted_fix_batch`).
     """
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
@@ -497,6 +525,16 @@ def run_resume(
             rid, ledger=ledger, dispatcher=dispatcher, render_view=render_view,
             root=root, registry=registry, runner=runner, force=force, preflight=preflight,
         )
+    # Story 35.4-005: refused before anything below re-stamps it — the queue
+    # rebuilt below could only close it DONE with every issue still TODO.
+    if unstarted_fix_batch(ledger, rid, run_row):
+        reason = (
+            f"run {rid[:8]} is an `sdlc fix` batch that never passed preflight — "
+            "nothing was dispatched and a batch cannot be resumed; run it again "
+            "(`sdlc fix all` / `sdlc fix next`)"
+        )
+        ledger.event_log(rid, "", "warn", "controller", f"resume refused: {reason}")
+        return ResumeResult(run_id=rid, refused=True, refusal_reason=reason)
 
     config = ledger.run_config(rid)
     skip_coverage = bool(config.get("skip_coverage"))

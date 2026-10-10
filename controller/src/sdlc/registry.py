@@ -191,11 +191,13 @@ def format_live_owner_refusal(record: RunRecord) -> str:
     )
 
 
-def _live_counts(rec: RunRecord) -> tuple[int | None, int | None]:
-    """Live ``(done, total)`` from the run's own ledger, else the cached counts.
+def _live_counts(rec: RunRecord) -> tuple[int | None, int | None, str | None]:
+    """Live ``(done, total, phase)`` from the run's own ledger, else the cached ones.
 
     The registry's counts are only written at registration and close-out, so an
     in-flight run would read ``0/N`` until it ends; the ledger is authoritative.
+    The phase (Story 35.4-005) rides on the same ``list_runs`` row, so a
+    heartbeat reads the ledger once.
     """
     # Lazy import: build.py imports this module.
     import sqlite3
@@ -205,22 +207,10 @@ def _live_counts(rec: RunRecord) -> tuple[int | None, int | None]:
     try:
         for r in Ledger(rec.db).list_runs():
             if r["id"] == rec.run_id:
-                return r["done"], r["total"]
+                return r["done"], r["total"], r["phase"]
     except (OSError, sqlite3.Error):
-        pass  # unreachable ledger → keep the registry's cached counts
-    return rec.completed, rec.total
-
-
-def _live_phase(rec: RunRecord) -> str | None:
-    """The run's phase from its own ledger, else the cached one (Story 35.4-005)."""
-    import sqlite3
-
-    from sdlc.build import Ledger
-
-    try:
-        return Ledger(rec.db).run_phase(rec.run_id)
-    except (OSError, sqlite3.Error):
-        return rec.phase  # unreachable ledger → keep the registry's cached phase
+        pass  # unreachable ledger → keep the registry's cached counts and phase
+    return rec.completed, rec.total, rec.phase
 
 
 def live_record(record: RunRecord) -> RunRecord:
@@ -229,10 +219,10 @@ def live_record(record: RunRecord) -> RunRecord:
     What a worker pushes on each heartbeat (Story 35.4-001): the fleet view
     cannot reach the ledger, so the pushed counts and phase are all it has.
     """
-    completed, total = _live_counts(record)
+    completed, total, phase = _live_counts(record)
     return replace(
         record, completed=completed, total=total,
-        phase=None if record.finished_at else _live_phase(record),
+        phase=None if record.finished_at else phase,
     )
 
 
@@ -437,6 +427,6 @@ class Registry:
             row = rec.to_dict()
             row["state"] = derive_state(rec)
             if not rec.finished_at:
-                row["completed"], row["total"] = _live_counts(rec)
+                row["completed"], row["total"], _phase = _live_counts(rec)
             rows.append(row)
         return rows

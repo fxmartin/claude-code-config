@@ -962,6 +962,10 @@ def resume(
     started before that plan was persisted — is refused and left resumable rather
     than continued on a freshly invented plan.
 
+    Story 35.4-005: a run whose preflight gate never passed re-runs the gate
+    before any story. An ``sdlc fix all`` / ``next`` batch has no resume path, so
+    one whose gate never passed is refused (exit 1) — re-run the batch instead.
+
     Issue #595: refused (exit 1, run untouched) when the host registry shows this
     run already live under another pid — two processes must never drive the same
     run at once. Pass ``--force`` to take over, but only once you have confirmed
@@ -1032,7 +1036,9 @@ def resume(
         typer.echo(
             "PRE_FLIGHT_FAILURE: the preflight gate did not pass on resume — see the "
             "PRE_FLIGHT_TIMEOUT or PRE_FLIGHT_RED line above for which. "
-            "The run is marked FAILED; fix before building.",
+            "The run is marked FAILED and nothing was dispatched: fix the suite and "
+            "resume again, or start a fresh run, which is where --skip-preflight "
+            "(and, for `sdlc build`, --preflight-timeout) apply.",
             err=True,
         )
         raise typer.Exit(code=1)

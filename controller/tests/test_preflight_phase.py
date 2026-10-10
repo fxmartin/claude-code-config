@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import sqlite3
+import subprocess
 import threading
 from pathlib import Path
 
@@ -221,6 +224,55 @@ def test_default_preflight_timeout_reports_the_reason_line(tmp_path, monkeypatch
     assert len(lines) == 1 and lines[0].startswith("PRE_FLIGHT_TIMEOUT: 'make test' exceeded 1s")
 
 
+def _make_is_missing(monkeypatch) -> None:
+    """``make`` is not on this host's PATH; every other command runs for real."""
+    real_run = build_mod.subprocess.run
+
+    def _run(cmd, *args, **kwargs):
+        if isinstance(cmd, (list, tuple)) and list(cmd[:1]) == ["make"]:
+            raise FileNotFoundError(2, "No such file or directory", "make")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(build_mod.subprocess, "run", _run)
+
+
+def test_default_preflight_reports_a_command_that_cannot_start(tmp_path, monkeypatch, capsys) -> None:
+    # A worker without the repo's test tool: the gate must fail like a red suite,
+    # not raise out of the run it now sits inside.
+    (tmp_path / "Makefile").write_text("test:\n\t@exit 0\n")
+    _make_is_missing(monkeypatch)
+    lines: list[str] = []
+    assert default_preflight(root=tmp_path, timeout=30, on_failure=lines.append) is False
+    assert len(lines) == 1
+    assert lines[0].startswith("PRE_FLIGHT_RED: 'make test' could not start")
+    assert "No such file or directory" in lines[0]
+    assert lines[0] in capsys.readouterr().err
+
+
+def test_build_whose_preflight_command_cannot_start_fails_the_run(tmp_path, monkeypatch, fleet_pushes) -> None:
+    # Before the fix the FileNotFoundError escaped `run_build`: the run sat
+    # IN_PROGRESS in `preflight` for good and a fleet job parked as "resumable".
+    (tmp_path / "Makefile").write_text("test:\n\t@exit 0\n")
+    monkeypatch.chdir(tmp_path)
+    _make_is_missing(monkeypatch)
+    db = tmp_path / "ledger.db"
+    registry = Registry(tmp_path / "registry.json")
+    result = run_build(
+        BuildOptions(scope="epic-99", sequential=True),
+        queue=_sample_queue(), ledger=Ledger(db), dispatcher=FakeDispatcher(),
+        registry=registry,
+    )
+    assert result.preflight_failed is True
+    [run] = _runs(db)
+    assert run["status"] == "FAILED" and Ledger(db).run_phase(run["id"]) is None
+    level, reason = _events(db, "preflight")[-1]
+    assert level == "error" and reason.startswith("PRE_FLIGHT_RED: 'make test' could not start")
+    [rec] = registry.records()
+    assert rec.status == "FAILED" and rec.finished_at
+    assert fleet_pushes[-1].status == "FAILED"
+    assert ledger_preflight_failure(str(db), run["id"]) == reason
+
+
 def test_build_model_probe_runs_inside_the_preflight_phase(tmp_path, monkeypatch) -> None:
     # The live tier-model probe is part of preflight (`--skip-preflight` skips
     # it), so the run must already read `preflight` while it spends its seconds.
@@ -411,6 +463,21 @@ def test_live_record_reads_phase_from_the_ledger(tmp_path) -> None:
     assert live_record(_record(run_id=run_id, db=str(ledger.db_path), finished_at="2026-10-02T11:00:00+00:00")).phase is None
 
 
+def test_live_record_reads_counts_and_phase_in_one_ledger_pass(tmp_path, monkeypatch) -> None:
+    # Every worker heartbeat calls this: the phase rides on the `list_runs` row
+    # the counts already come from, not on a second `run_phase` read.
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-1", "serial")
+    ledger.event_log(run_id, "", "info", "preflight", "started: make test")
+
+    def _second_pass(self, rid):
+        raise AssertionError("live_record re-read the ledger for the phase")
+
+    monkeypatch.setattr(Ledger, "run_phase", _second_pass)
+    assert live_record(_record(run_id=run_id, db=str(ledger.db_path))).phase == "preflight"
+
+
 def test_fleet_store_keeps_phase_per_push(tmp_path) -> None:
     store = QueueStore(tmp_path / "queue.db")
     store.init()
@@ -518,6 +585,39 @@ def test_dashboard_header_states_preflight_running_command_and_elapsed() -> None
     assert "preflight: failed" in page
     # ...and the sidebar names a run's phase beside its worker.
     assert "r.phase" in page
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is needed to run the page's script")
+def test_dashboard_preflight_line_renders_the_header_contract() -> None:
+    # The header strings themselves, from the page's own `preflightLine` under
+    # node: the contract, a remote run's bare phase, and a hostile command inert.
+    from test_remote_run_detail import _js_function
+
+    script = "\n".join(_js_function(_PAGE, f) for f in ("esc", "humanDuration", "preflightLine"))
+    script += """
+    const cfg = {preflight: "pending"};
+    console.log(JSON.stringify([
+      preflightLine({preflight: {state: "running", command: "make test", duration_seconds: 125}}, cfg),
+      preflightLine({preflight: {state: "passed", duration_seconds: 42}}, cfg),
+      preflightLine({preflight: {state: "failed", reason: "PRE_FLIGHT_RED: 'make test' exited 1"}}, cfg),
+      preflightLine({phase: "preflight"}, {}),
+      preflightLine({preflight: {state: "running", command: "<img src=x>", duration_seconds: 5}}, cfg),
+      preflightLine({}, {preflight: "skipped"}),
+      preflightLine({}, {}),
+    ]));
+    """
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert json.loads(out.stdout) == [
+        "preflight: running (make test, <span id='preflight-elapsed'>2m 05s</span>)",
+        "preflight: passed (42s)",
+        "preflight: failed &mdash; PRE_FLIGHT_RED: &#39;make test&#39; exited 1",
+        "preflight: running",
+        "preflight: running (&lt;img src=x&gt;, <span id='preflight-elapsed'>5s</span>)",
+        "preflight: skipped",
+        "",
+    ]
 
 
 def test_status_snapshot_exposes_phase_and_preflight_for_the_header(tmp_path) -> None:
@@ -865,6 +965,102 @@ def test_resume_hands_a_fix_run_its_preflight_and_reports_a_red_gate(tmp_path, m
 
 
 # ---------------------------------------------------------------------------
+# a batch whose gate never passed is not resumed — it starts afresh
+# ---------------------------------------------------------------------------
+
+
+def _batch_with_preflight(root: Path, preflight) -> tuple[Ledger, str]:
+    """A `sdlc fix all` batch over issues 1 and 2 whose gate is ``preflight``."""
+    db = root / ".sdlc-state.db"
+    run_fix_batch(
+        FixBatchOptions(target="all"), ledger=Ledger(db), dispatcher=BatchProbeDispatcher(),
+        preflight=preflight, runner=FakeBatchGh([_batch_issue(1), _batch_issue(2)]), root=root,
+    )
+    ledger = Ledger(db)
+    [run] = _runs(db)
+    return ledger, run["id"]
+
+
+def _batch_killed_in_preflight(root: Path) -> tuple[Ledger, str]:
+    def killed() -> bool:
+        raise KeyboardInterrupt  # the worker died mid-suite: no outcome event
+
+    with pytest.raises(KeyboardInterrupt):
+        _batch_with_preflight(root, killed)
+    [run] = _runs(root / ".sdlc-state.db")
+    return Ledger(root / ".sdlc-state.db"), run["id"]
+
+
+def _story_statuses(ledger: Ledger, run_id: str) -> list[str]:
+    return sorted(str(s["status"]) for s in ledger.story_rows(run_id))
+
+
+def test_a_batch_interrupted_in_preflight_is_refused_not_closed_done(tmp_path) -> None:
+    # The epic resume cannot rebuild issue stories: it used to re-run the gate,
+    # dispatch nothing and stamp the run DONE with every issue still TODO.
+    ledger, run_id = _batch_killed_in_preflight(tmp_path)
+
+    def must_not_run() -> bool:
+        raise AssertionError("a batch that cannot be resumed must not re-run its gate")
+
+    dispatch = BatchProbeDispatcher()
+    result = run_resume(
+        "all", ledger=ledger, dispatcher=dispatch, run_id=run_id, root=tmp_path,
+        preflight=must_not_run,
+    )
+    assert result.refused is True
+    assert "batch" in result.refusal_reason and "sdlc fix all" in result.refusal_reason
+    assert dispatch.calls == []
+    assert ledger.run_row(run_id)["status"] == "IN_PROGRESS"  # not DONE
+    assert _story_statuses(ledger, run_id) == ["TODO", "TODO"]
+    # Neither the CLI hint nor a fleet reclaim treats it as resumable work.
+    assert has_resumable_work(ledger, run_id) is False
+    assert ledger_run_terminal(str(ledger.db_path), run_id) == "fix batch never passed preflight"
+
+
+def test_a_batch_that_failed_preflight_is_not_offered_for_resume(tmp_path) -> None:
+    ledger, run_id = _batch_with_preflight(tmp_path, lambda: False)
+    assert ledger.run_row(run_id)["status"] == "FAILED"
+    assert has_resumable_work(ledger, run_id) is False
+    assert ledger_run_terminal(str(ledger.db_path), run_id) == "fix batch never passed preflight"
+    result = run_resume(
+        "all", ledger=ledger, dispatcher=BatchProbeDispatcher(), run_id=run_id,
+        root=tmp_path, preflight=lambda: True,
+    )
+    assert result.refused is True
+    assert ledger.run_row(run_id)["status"] == "FAILED"
+    assert _story_statuses(ledger, run_id) == ["TODO", "TODO"]
+
+
+def test_cli_resume_never_names_a_red_batch(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    ledger, run_id = _batch_with_preflight(tmp_path, lambda: False)
+    db = str(ledger.db_path)
+    bare = CliRunner().invoke(app, ["resume", "--db", db])
+    assert bare.exit_code == 0, bare.output
+    assert "nothing to resume: no incomplete run for scope 'all'." in bare.output
+    assert run_id[:8] not in bare.output  # no "failed with resumable stories" hint
+
+    explicit = CliRunner().invoke(app, ["resume", "--db", db, "--run", run_id])
+    assert explicit.exit_code == 1
+    assert "never passed preflight" in explicit.output
+    assert ledger.run_row(run_id)["status"] == "FAILED"
+
+
+def test_a_batch_past_its_gate_keeps_the_existing_resume_rule(tmp_path) -> None:
+    # Only a batch whose gate never passed is refused; one that got past it (or
+    # skipped it) is judged exactly as before this story.
+    ledger, run_id = _batch_with_preflight(tmp_path, lambda: True)
+    ledger.run_update_status(run_id, "IN_PROGRESS")  # interrupted after its gate
+    ledger.set_story_status(run_id, "issue-1", "IN_PROGRESS")
+    assert ledger.preflight_owed(run_id) is False
+    assert ledger_run_terminal(str(ledger.db_path), run_id) != "fix batch never passed preflight"
+
+
+# ---------------------------------------------------------------------------
 # fleet job: finishes failed with the preflight reason
 # ---------------------------------------------------------------------------
 
@@ -919,6 +1115,39 @@ def test_a_job_whose_run_died_in_preflight_finishes_failed_with_that_reason(tmp_
     job = store.get_job(job_id)
     assert job.state == "failed"
     assert job.reason == RED
+
+
+def test_a_lapsed_batch_job_whose_run_died_in_preflight_restarts_fresh(tmp_path) -> None:
+    # The worker died mid-gate: reclaiming must re-run `sdlc fix all` — as it did
+    # when no run existed yet — never `sdlc resume --run`, which closed it DONE.
+    from datetime import datetime, timezone
+
+    from test_scheduler import _dead_pid
+
+    Clock, FakeLauncher, _repo, _run, _store = _scheduler_world(tmp_path)
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "alpha")
+    ledger, run_id = _batch_killed_in_preflight(Path(repo))
+    job_id = store.add_job(repo=repo, kind="fix", scope="all")
+    store.claim_job(job_id, claimed_by="dead:1", lease_seconds=0,
+                    now=datetime(2026, 9, 7, 11, 0, tzinfo=timezone.utc))
+    store.attach_run(job_id, run_id)
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(
+        RunRecord(run_id=run_id, repo=repo, db=str(ledger.db_path), scope="issues-all",
+                  pid=_dead_pid(), status="IN_PROGRESS", started_at="")
+    )
+    launcher = FakeLauncher(alive_polls=1)
+    lines: list[str] = []
+
+    result = _run(store, tmp_path=tmp_path, launcher=launcher, registry=registry,
+                  echo=lines.append)
+
+    assert result.resumed == 0
+    assert launcher.calls[0][0][-2:] == ["fix", "all"]
+    assert "resume" not in launcher.calls[0][0]
+    assert any("fix batch never passed preflight" in line for line in lines)
+    assert ledger.run_row(run_id)["status"] == "IN_PROGRESS"  # never closed DONE
 
 
 def test_a_workers_heartbeat_push_carries_the_runs_phase(tmp_path) -> None:
@@ -1044,6 +1273,9 @@ def test_cli_resume_reports_a_preflight_failure(tmp_path, monkeypatch) -> None:
     result = CliRunner().invoke(app, ["resume", "--db", str(tmp_path / ".sdlc-state.db")])
     assert result.exit_code == 1
     assert "PRE_FLIGHT_FAILURE" in result.output
+    # The gate's PRE_FLIGHT_* line suggests --preflight-timeout / --skip-preflight,
+    # which `sdlc resume` does not take: say where they do apply.
+    assert "start a fresh run" in result.output and "--skip-preflight" in result.output
 
 
 def test_cli_status_prints_the_preflight_header(tmp_path) -> None:
