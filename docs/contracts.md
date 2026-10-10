@@ -41,7 +41,7 @@ inside the `sdlc` package so they ship in the installed wheel) in
 | `coverage` | `coverage-agent-response.schema.json` | `pr_number`, `pr_url`, `coverage_pct`, `tests_added`, `coverage_status` |
 | `review`   | `review-agent-response.schema.json`   | `pr_number`, `approval_status`, `change_count`, `final_status` |
 | `merge`    | `merge-agent-response.schema.json`    | `pr_number`, `merge_status`, `merge_sha`, `merged_at` |
-| `bugfix`   | `bugfix-agent-response.schema.json`   | `failure_category`, `root_cause`, `fix_status`, `tests_passing`, `bugs_fixed`, `tests_fixed` (optional `issue_number`, `finding_dispositions`) |
+| `bugfix`   | `bugfix-agent-response.schema.json`   | `failure_category`, `root_cause`, `fix_status`, `tests_passing`, `bugs_fixed`, `tests_fixed` (optional `issue_number`, `finding_dispositions`, `failing_tests`, `baseline_failures`) |
 
 ### Status enums
 
@@ -65,6 +65,18 @@ exactly like any other schema violation. The field enforces the
 root-cause-first discipline the bugfix prompts require (investigation before
 any fix), so a symptom patch cannot silently consume a bounded,
 cost-escalating retry cycle.
+
+### Bugfix baseline failures (Story 35.5-001)
+
+When the bugfix agent's own suite run still fails on a test that **also fails
+on the base branch in the same environment** (a macOS-only bats failure that is
+green on Linux CI), it lists every still-failing test in `failing_tests` and the
+ones that fail on the base branch too in `baseline_failures` (both arrays of
+test names, additive and optional — older agents omit them and the verdict is
+unchanged). The controller judges `tests_passing` as "no *new* failures":
+failures all inside `baseline_failures` no longer veto a `FIXED` round, and the
+excluded names are logged. Without `failing_tests` the reported
+`tests_passing` stands.
 
 ### Bugfix finding dispositions (Story 26.2-001)
 

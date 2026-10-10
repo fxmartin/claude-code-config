@@ -163,6 +163,34 @@ def test_a_repo_path_from_another_machine_is_cloned_under_the_work_dir(
     assert (prepared.path / ".git").exists()
 
 
+@pytest.mark.parametrize(
+    "recorded_home",
+    ["/home/fxmartin", "/Users/fxmartin"],  # the XPS (Linux) and the Macs
+)
+def test_the_enqueuers_home_maps_to_this_workers_home_whatever_the_user_name(
+    tmp_path, forge, monkeypatch, recorded_home
+) -> None:
+    """Story 35.2-008: `dev` (user ``fx``) is the first worker whose login differs from the XPS's.
+
+    The job carries ``/home/fxmartin/Work/proj``; no such path exists on this
+    worker, and the clone lands under *its* home — ``~/Work/proj`` — by the same
+    rule that maps it to ``/Users/fxmartin/…`` on a Mac. Nothing under the
+    recorded home is read or created.
+    """
+    home = tmp_path / "home" / "fx"
+    monkeypatch.setenv("HOME", str(home))
+    recorded = Path(recorded_home) / "Work" / "proj"
+    assert not recorded.exists()
+    job = _job(tmp_path, recorded, forge.url)
+
+    prepared = prepare_repo(job)  # the default work dir: ~/Work of the worker's own login
+
+    assert prepared.path == (home / "Work" / "proj").resolve()
+    assert (prepared.path / ".git").exists()
+    assert prepared.sha == git(forge.seed, "rev-parse", "HEAD")
+    assert not recorded.exists()
+
+
 def test_a_tracked_dirty_file_refuses_the_job_and_is_never_stashed(
     tmp_path, forge, work_dir
 ) -> None:

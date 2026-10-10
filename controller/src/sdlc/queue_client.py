@@ -378,6 +378,7 @@ class QueueClient:
         slots_free: int | None = None,
         forges: Mapping[str, bool] | None = None,
         now: datetime | None = None,
+        self_check: Mapping[str, object] | None = None,
     ) -> WorkerRecord:
         """``POST /workers`` — register this worker, or heartbeat if it already has."""
         body: dict[str, Any] = {
@@ -394,6 +395,8 @@ class QueueClient:
             body["slots_free"] = slots_free
         if forges:
             body["forges"] = dict(forges)
+        if self_check is not None:
+            body["self_check"] = dict(self_check)
         return self._worker(self._call("POST", "/workers", body))
 
     def list_workers(self) -> list[WorkerRecord]:
@@ -700,6 +703,23 @@ def _advertised_dashboard_url() -> str | None:
         return None
 
 
+def _repo_origin(repo: str) -> str | None:
+    """``repo``'s ``origin`` remote with any credential stripped, or None.
+
+    Pushed so the dashboard can resolve the repo's forge on a machine that has no
+    checkout of it (Story 35.4-006); a token in the URL must never reach the fleet.
+    Every run reads it as it registers, so it never raises: a remote ``urlsplit``
+    cannot parse cannot be stripped either, and is no origin.
+    """
+    from sdlc.issue_host import _remote_url, strip_remote_credentials
+
+    remote = _remote_url(repo)
+    try:
+        return strip_remote_credentials(remote) if remote else None
+    except ValueError:
+        return None
+
+
 def push_fleet_run(record: RunRecord) -> None:
     """Best-effort ``PUT /runs`` of ``record``; a no-op with no fleet configured.
 
@@ -719,6 +739,7 @@ def push_fleet_run(record: RunRecord) -> None:
                 record,
                 worker=record.worker or fleet_worker_name(),
                 dashboard_url=record.dashboard_url or _advertised_dashboard_url(),
+                origin=record.origin or _repo_origin(record.repo),
             )
         )
     except (QueueError, OSError, ValueError):

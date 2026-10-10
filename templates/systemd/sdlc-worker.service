@@ -1,0 +1,118 @@
+# ABOUTME: systemd --user unit that keeps a fleet worker (`sdlc queue run` as worker dev,
+# ABOUTME: Story 35.2-008) resident on the Hetzner dev box. The Linux twin of the launchd worker plist.
+#
+# The Linux sibling of templates/launchd/com.fxmartin.sdlc-worker.plist (Story
+# 35.2-004): the same verb, the same restart contract, a different supervisor.
+# It drains the `claude-shared` pool as worker `dev`, so a shared-pool job runs
+# even when both Macs are busy or sitting behind a GUI dialog nobody can answer
+# remotely. A headless Linux box has no Keychain, no TCC and no outbound filter
+# in front of its agents.
+#
+# Nothing to substitute: systemd expands %h (the user's home) itself. Install —
+# scripts/fleet-bootstrap.sh does all of this, and is the documented path:
+#
+#   mkdir -p ~/.config/systemd/user ~/.config/sdlc ~/.local/state/sdlc
+#   cp templates/systemd/sdlc-worker.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sdlc-worker.service
+#
+# `loginctl enable-linger $USER` must already be on, so the user manager (and
+# this unit) starts at boot rather than at login. Check:
+#
+#   loginctl show-user $USER -p Linger        # Linger=yes
+#   systemctl --user status sdlc-worker
+#   journalctl --user -u sdlc-worker -f       # the worker's log: the journal
+#
+# Why `nix develop`: every tool the worker and its jobs need (claude, gh, uv,
+# node) lives in the dev shell at ~/.config/nix-dev-env, not on the login PATH,
+# so ExecStart goes through the nix binary by absolute path and the dev shell
+# supplies the rest. ~/.local/bin (uv tools: `sdlc`) is on the unit's PATH.
+#
+# Which queue it drains: the one `queue_url:` names in ~/.sdlc-fleet.yaml, which
+# the worker reads as you (Story 35.2-005) — it registers, heartbeats, claims,
+# renews and finishes there over HTTP.
+#
+# Identity: on Linux the `tailscale` CLI works unattended, so the queue service
+# knows this worker by `tailscale whois` (tag:trusted) and nothing is configured
+# here. SDLC_QUEUE_TOKEN is only the fallback for a box without a working
+# Tailscale CLI. Put it in ~/.config/sdlc/worker.env (chmod 600), never in this
+# unit:
+#
+#   install -m 600 /dev/null ~/.config/sdlc/worker.env
+#   echo 'SDLC_QUEUE_TOKEN=<the service shared secret>' >> ~/.config/sdlc/worker.env
+#
+# The file is optional (the leading `-` below): absent, the worker goes by
+# tailscale whois alone.
+#
+# Pools are a capability of the login present on the box: the shared Max
+# (mail@fxmartin.me) is `claude-shared`. `codex-shared` is declared too, but the
+# worker's registration advertises it — like the `codex` harness, which a codex
+# stage also needs — only while the codex CLI is on the PATH. So the box joins
+# that pool once Codex is installed in the dev shell and logged in to the shared
+# account, with no edit here: restart the worker (`systemctl --user restart
+# sdlc-worker`), which reads what is installed at start-up. Install Codex only
+# with that login ready — registration sees the CLI, not the account.
+#
+# Before it registers, the worker proves it can run an agent from *this* unit's
+# own context (Story 35.2-007): one real `claude -p ok` turn on Haiku. The TCC
+# check is skipped off macOS. A box that cannot complete the turn stays up,
+# unregistered, and retries every 60 s — Restart= never loops on it. Git
+# authenticates through `gh auth setup-git` and, for http://gitlab.test,
+# `glab auth git-credential` (fleet-bootstrap.sh sets both) with
+# GIT_TERMINAL_PROMPT=0, so a missing credential fails at once, never at a
+# prompt. Without a logged-in glab this worker can only sync GitHub repos: a
+# GitLab job fails its clone here while peers defer to this worker's free
+# slots. So fleet-bootstrap.sh refuses such a box, changing nothing, unless run
+# with --github-only — and then pin GitLab jobs with --host home-lab. It refuses
+# a box without semgrep or osv-scanner too, and no flag lifts that: the coverage
+# gate passes a missing scanner as SKIPPED, so a story built here would merge
+# without its SAST and dependency scans.
+#
+# No `caffeinate` or `systemd-inhibit`: on macOS each job runs under
+# `caffeinate -i` to stop the Mac idle-sleeping mid-build (35.2-004); a server
+# does not sleep, so there is nothing to inhibit.
+#
+# No After=network-online.target: a user manager cannot order against system
+# units. The worker tolerates a missing network (a lost network keeps its jobs
+# running) and registers once the queue answers.
+
+[Unit]
+Description=sdlc fleet worker dev (claude-shared)
+
+[Service]
+Type=simple
+ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared --pool codex-shared --follow
+
+# systemd --user hands a service a bare PATH. Jobs need `sdlc` (~/.local/bin) and
+# nix itself; the dev shell prepends claude, gh, uv and node to this.
+Environment=PATH=%h/.local/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
+# Pinned like the LaunchAgent's: the worker records its runs in
+# ~/.local/state/sdlc/registry.json, where a shell exporting the same value (and
+# its `sdlc doctor` and dashboard) looks. Its jobs inherit it.
+Environment=XDG_STATE_HOME=%h/.local/state
+# A missing credential must fail the repo sync at once, not wait at a prompt.
+Environment=GIT_TERMINAL_PROMPT=0
+EnvironmentFile=-%h/.config/sdlc/worker.env
+
+# Always, not on-failure: the worker exits 75 once the controller is reinstalled
+# under it, so the restart runs the new code — and a clean exit is no reason to
+# stay down. RestartSec mirrors the LaunchAgent's ThrottleInterval.
+Restart=always
+RestartSec=30
+
+# SIGTERM (`systemctl --user stop|restart`) takes the Ctrl-C path: each in-flight
+# job gets SIGTERM, then SIGKILL after 10 s, and its lease is released. With two
+# in flight that is 40 s; systemd's 90 s default would do, but this is pinned so
+# a changed default cannot cut it short. `mixed` signals only the worker first,
+# so it — not systemd — decides how its jobs are stopped; whatever is left at
+# the deadline is SIGKILLed.
+KillMode=mixed
+TimeoutStopSec=60
+
+# The worker's progress and errors, in order, in the journal.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sdlc-worker
+
+[Install]
+WantedBy=default.target

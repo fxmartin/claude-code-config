@@ -136,6 +136,20 @@ def test_run_with_a_worker_registers_the_profile_and_uses_its_name_as_identity(
     assert seen["identity"] == "m3max"
 
 
+def test_a_worker_drain_runs_the_agent_self_check_and_a_plain_one_does_not(
+    store, monkeypatch
+) -> None:
+    from sdlc.worker_selfcheck import run_self_check
+
+    seen = _capture(monkeypatch)
+    assert runner.invoke(app, ["queue", "run", "--worker", "m3max"]).exit_code == 0
+    assert seen["self_check"] is run_self_check
+
+    seen = _capture(monkeypatch)
+    assert runner.invoke(app, ["queue", "run"]).exit_code == 0
+    assert seen["self_check"] is None
+
+
 def test_run_host_overrides_the_detected_host(store, monkeypatch) -> None:
     seen = _capture(monkeypatch)
 

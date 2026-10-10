@@ -518,7 +518,7 @@ def test_a_workers_forges_survive_a_pre_existing_queue_db(tmp_path) -> None:
     store.init()
     with sqlite3.connect(path) as conn:  # a queue.db written before the column existed
         conn.execute("ALTER TABLE workers DROP COLUMN forges")
-        conn.execute("DELETE FROM _migrations WHERE version = 13")
+        conn.execute("DELETE FROM _migrations WHERE version = 15")
 
     QueueStore(path).ensure_migrated()
     QueueStore(path).register_worker("w", host="h", forges={"gitlab.test": True})

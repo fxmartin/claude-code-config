@@ -37,7 +37,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 from sdlc import build_issue, change_class, issue_host
 from sdlc.build import (
@@ -2018,6 +2018,52 @@ def _render_core_prompt(
     )
 
 
+def _commits_ahead_of_origin(root: Path, branch: str = "main") -> list[str]:
+    """One-line subjects of local ``branch`` commits not on ``origin/branch``.
+
+    Issue #852: a controller stage must never leave unpushed commits on the
+    operator's main checkout. Anything unreadable (not a repo, no remote) yields
+    ``[]`` — the guard only fires on positive evidence.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--oneline", f"origin/{branch}..{branch}"],
+            cwd=root, capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _log_new_main_commits(
+    ledger: Ledger, run_id: str, baseline: Sequence[str] = ()
+) -> list[str]:
+    """Log + return commits on local main ahead of origin that appeared during the run.
+
+    ``baseline`` is the ahead-set captured at run start, so the operator's own
+    pre-existing unpushed commits are never blamed on the run.
+    """
+    new = [c for c in _commits_ahead_of_origin(Path.cwd()) if c not in baseline]
+    if new:
+        ledger.event_log(
+            run_id, "", "error", "controller",
+            "local main is ahead of origin/main after the run — unpushed commits: "
+            + "; ".join(new),
+        )
+    return new
+
+
+def _guard_main_not_ahead(
+    ledger: Ledger, run_id: str, terminal: str, baseline: Sequence[str] = ()
+) -> str:
+    """Downgrade a ``DONE`` terminal to ``FAILED`` when the run left main ahead (#852)."""
+    if terminal != "DONE":
+        return terminal
+    return "FAILED" if _log_new_main_commits(ledger, run_id, baseline) else terminal
+
+
 def _run_summary(
     issue: FixIssue,
     inv: dict,
@@ -2362,6 +2408,7 @@ def run_fix(
     _record_fix_plan(ledger, run_id, inv)
 
     # --- Core stage loop ------------------------------------------------------
+    main_baseline = _commits_ahead_of_origin(Path.cwd())
     terminal, pr_number = _run_stage_loop(
         issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
         host=host, instance_url=instance_url, protected_files=protected_files,
@@ -2370,7 +2417,7 @@ def run_fix(
     return _finish_fix_run(
         issue, inv, story, opts, ledger, run_id, dispatch, logs_dir,
         terminal=terminal, pr_number=pr_number,
-        render_view=render_view, registry=registry,
+        render_view=render_view, registry=registry, main_baseline=main_baseline,
     )
 
 
@@ -2388,6 +2435,7 @@ def _finish_fix_run(
     pr_number: int | None,
     render_view=None,
     registry: Registry | None = None,
+    main_baseline: Sequence[str] = (),
 ) -> FixResult:
     """Summary, rate-limit park, and close-out for a finished stage loop.
 
@@ -2415,6 +2463,7 @@ def _finish_fix_run(
     # Stamp the story row's terminal status (build.py does this in run_build's
     # caller; the loop leaves the row IN_PROGRESS) so `sdlc status` / the
     # dashboard see the finished story, then close the run out.
+    terminal = _guard_main_not_ahead(ledger, run_id, terminal, main_baseline)
     ledger.set_story_status(run_id, story.id, terminal)
 
     # --- Close out via the shared finalize (counts, terminal, run_finished) ---
@@ -2541,6 +2590,7 @@ def resume_fix(
             registry, run_id, scope, ledger.db_path, 1, repo=root or Path.cwd()
         )
 
+    main_baseline = _commits_ahead_of_origin(Path.cwd())
     terminal, pr_number = _run_stage_loop(
         issue, plan, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
         host=host, instance_url=instance_url, done_stages=done_stages,
@@ -2549,7 +2599,7 @@ def resume_fix(
     return _finish_fix_run(
         issue, plan, story, opts, ledger, run_id, dispatch, logs_dir,
         terminal=terminal, pr_number=pr_number,
-        render_view=render_view, registry=registry,
+        render_view=render_view, registry=registry, main_baseline=main_baseline,
     )
 
 
@@ -3161,6 +3211,8 @@ def run_fix_batch(
             ),
         )
 
+    main_baseline = _commits_ahead_of_origin(Path.cwd())
+
     # --- Preflight ------------------------------------------------------------
     check_preflight = preflight or (lambda: default_preflight())
     if not batch.skip_preflight and not check_preflight():
@@ -3392,6 +3444,10 @@ def run_fix_batch(
         host=host, instance_url=instance_url,
     )
 
+    # Report-only: the fixes already merged, so flipping them to FAILED would
+    # mislabel good work. The error event is what surfaces the stray commits.
+    if "DONE" in status.values():
+        _log_new_main_commits(ledger, run_id, main_baseline)
     outcome = finalize_run(
         ledger, run_id, status,
         reconcile=real_run, root=Path.cwd(),

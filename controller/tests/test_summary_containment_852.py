@@ -1,0 +1,159 @@
+"""Issue #852: the summary stage must be read-only, hook-free, and guarded."""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from sdlc.dispatch import DENY_BASELINE_ENV, resolve_agent_cmd, resolve_deny_rules
+from sdlc import fix_issue
+from sdlc.fix_issue import _commits_ahead_of_origin, _guard_main_not_ahead
+
+
+def _bash_denied(rules: list[str], command: str) -> bool:
+    import fnmatch
+
+    return any(
+        fnmatch.fnmatch(command, r[len("Bash("):-1])
+        for r in rules
+        if r.startswith("Bash(")
+    )
+
+
+@pytest.mark.parametrize("tool", ["Edit", "Write", "NotebookEdit"])
+def test_summary_denies_file_writing_tools(tool, monkeypatch) -> None:
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    assert tool in resolve_deny_rules("summary")
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["git add -A", "git commit -m x", "git push origin main", "git merge x", "go build ./cmd/acm"],
+)
+def test_summary_denies_commit_and_build_commands(command, monkeypatch) -> None:
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    assert _bash_denied(resolve_deny_rules("summary"), command)
+
+
+def test_other_read_only_roles_keep_edit_tools(monkeypatch) -> None:
+    monkeypatch.delenv(DENY_BASELINE_ENV, raising=False)
+    assert "Edit" not in resolve_deny_rules("review")
+
+
+def test_summary_command_disables_user_hooks(monkeypatch) -> None:
+    monkeypatch.delenv("SDLC_AGENT_CMD", raising=False)
+    cmd = resolve_agent_cmd(role="summary")
+    assert cmd[cmd.index("--settings") + 1] == '{"disableAllHooks": true}'
+    assert "--settings" not in resolve_agent_cmd(role="review")
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+@pytest.fixture
+def clone(tmp_path: Path) -> Path:
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    work = tmp_path / "work"
+    _git(tmp_path, "clone", str(origin), str(work))
+    for k, v in (("user.email", "t@t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _git(work, "config", k, v)
+    (work / "a").write_text("a")
+    _git(work, "add", "a")
+    _git(work, "commit", "-m", "init")
+    _git(work, "push", "origin", "main")
+    return work
+
+
+def test_guard_clean_checkout_reports_nothing(clone: Path) -> None:
+    assert _commits_ahead_of_origin(clone) == []
+
+
+def test_guard_lists_unpushed_commit_on_main(clone: Path) -> None:
+    (clone / "b").write_text("b")
+    _git(clone, "add", "b")
+    _git(clone, "commit", "-m", "fix: sneaky")
+    ahead = _commits_ahead_of_origin(clone)
+    assert len(ahead) == 1 and "sneaky" in ahead[0]
+
+
+def test_guard_ignores_non_git_directory(tmp_path: Path) -> None:
+    assert _commits_ahead_of_origin(tmp_path) == []
+
+
+def test_guard_swallows_missing_git_binary(tmp_path: Path, monkeypatch) -> None:
+    def boom(*a, **k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(fix_issue.subprocess, "run", boom)
+    assert _commits_ahead_of_origin(tmp_path) == []
+
+
+class _FakeLedger:
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+
+    def event_log(self, *args) -> None:
+        self.events.append(args)
+
+
+def test_guard_passes_non_done_terminal_without_probing(monkeypatch) -> None:
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: pytest.fail("probed"))
+    assert _guard_main_not_ahead(_FakeLedger(), "r", "FAILED") == "FAILED"
+
+
+def test_guard_keeps_done_when_main_in_sync(monkeypatch) -> None:
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: [])
+    ledger = _FakeLedger()
+    assert _guard_main_not_ahead(ledger, "r", "DONE") == "DONE"
+    assert ledger.events == []
+
+
+def test_guard_downgrades_done_and_logs_when_main_ahead(monkeypatch) -> None:
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: ["abc fix: sneaky"])
+    ledger = _FakeLedger()
+    assert _guard_main_not_ahead(ledger, "r", "DONE") == "FAILED"
+    assert "sneaky" in ledger.events[0][-1]
+
+
+def test_guard_ignores_commits_already_ahead_at_run_start(monkeypatch) -> None:
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: ["a1 operator wip"])
+    ledger = _FakeLedger()
+    assert _guard_main_not_ahead(ledger, "r", "DONE", ["a1 operator wip"]) == "DONE"
+    assert ledger.events == []
+
+
+def test_guard_flags_only_commits_added_during_run(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fix_issue, "_commits_ahead_of_origin", lambda *_: ["b2 sneaky", "a1 operator wip"]
+    )
+    ledger = _FakeLedger()
+    assert _guard_main_not_ahead(ledger, "r", "DONE", ["a1 operator wip"]) == "FAILED"
+    msg = ledger.events[0][-1]
+    assert "sneaky" in msg and "operator wip" not in msg
+
+
+def test_finish_fix_run_fails_done_when_main_gained_commit(monkeypatch) -> None:
+    calls: dict = {}
+    monkeypatch.setattr(fix_issue, "_run_summary", lambda *a, **k: None)
+    monkeypatch.setattr(fix_issue, "_commits_ahead_of_origin", lambda *_: ["b2 sneaky"])
+
+    class L(_FakeLedger):
+        def set_story_status(self, run_id, sid, status) -> None:
+            calls["status"] = status
+
+    def fake_finalize(ledger, run_id, status, **k):
+        calls["final"] = status
+        return type("O", (), {"run_terminal": "FAILED"})()
+
+    monkeypatch.setattr(fix_issue, "finalize_run", fake_finalize)
+    issue = type("I", (), {"number": 1})()
+    story = type("S", (), {"id": "issue-1"})()
+    opts = type("O", (), {"issue": 1})()
+    res = fix_issue._finish_fix_run(
+        issue, {}, story, opts, L(), "r", None, Path("."), terminal="DONE", pr_number=2,
+    )
+    assert calls["status"] == "FAILED" and calls["final"] == {"issue-1": "FAILED"}
+    assert res.status == "FAILED"

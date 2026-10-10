@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import plistlib
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -29,6 +31,7 @@ from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
 from sdlc.queue import QueueError, QueueStore, WorkerRecord, default_queue_path
 from sdlc.queue_client import QUEUE_TOKEN_ENV, QueueClient, QueueRefused, resolve_queue_url
 from sdlc.registry import Registry, derive_state
+from sdlc.worker_selfcheck import WORKER_UNIT
 
 __all__ = [
     "MANAGED_PATHS",
@@ -47,6 +50,9 @@ __all__ = [
     "check_queue_service",
     "check_stashes",
     "check_usage_agreement",
+    "check_worker_dashboard",
+    "default_worker_unit",
+    "read_worker_unit",
     "run_doctor",
     "worst_status",
 ]
@@ -627,17 +633,116 @@ def default_worker_plist() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{WORKER_LABEL}.plist"
 
 
-def check_fleet_worker(list_workers: Callable[[], list[WorkerRecord]], *, host: str) -> Finding:
+# Story 35.2-008: the Linux twin — a systemd --user unit on the Hetzner dev box
+# (template: templates/systemd/sdlc-worker.service). Its name, `WORKER_UNIT`, comes
+# from `worker_selfcheck`, which is how the worker recognises its own cgroup.
+def default_worker_unit() -> Path:
+    """Where `systemctl --user` loads the resident worker's unit from."""
+    config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(config) / "systemd" / "user" / WORKER_UNIT
+
+
+def _unit_value(value: str, home: Path) -> str:
+    """Expand the two specifiers the template uses: ``%h`` (home) and ``%%``."""
+    return value.replace("%%", "\0").replace("%h", str(home)).replace("\0", "%")
+
+
+def _environment_file(path: Path) -> dict[str, str]:
+    """``KEY=VALUE`` lines of an ``EnvironmentFile``; absent or unreadable is empty.
+
+    The file is optional (``EnvironmentFile=-…``): it only carries the fallback
+    ``SDLC_QUEUE_TOKEN``, and a worker without it simply goes by `tailscale whois`.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    env: dict[str, str] = {}
+    for raw in lines:
+        line = raw.strip().removeprefix("export ").strip()
+        if not line or line.startswith(("#", ";")) or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        # As systemd: an unquoted value is the whole rest of the line, spaces and all.
+        if value.startswith(("'", '"')):
+            try:
+                words = shlex.split(value)
+            except ValueError:
+                words = [value]
+            value = words[0] if words else ""
+        env[key.strip()] = value
+    return env
+
+
+def read_worker_unit(path: Path, *, home: Path | None = None) -> dict[str, str]:
+    """The worker unit's own environment — what systemd starts the worker with.
+
+    The systemd counterpart of reading the LaunchAgent plist: the worker is
+    started with the unit's environment (and its ``EnvironmentFile``, which
+    overrides ``Environment=`` as in systemd), not the shell's, so that is what
+    decides which queue it drains. As systemd does, the unit is followed by its
+    ``*.conf`` drop-ins in ``<unit>.d/`` — where ``systemctl --user edit``
+    writes, and which a bootstrap re-run never overwrites — in name order: a
+    later assignment wins, an empty one resets the list before it, and a key
+    may be spaced from its ``=``. Raises ``OSError``/``ValueError`` for a unit
+    that cannot be read; the caller turns that into a FAIL.
+    """
+    home = home or Path.home()
+    env: dict[str, str] = {}
+    env_files: list[Path] = []
+    drop_ins = sorted(path.with_name(f"{path.name}.d").glob("*.conf"))
+    for source in (path, *drop_ins):
+        in_service = False
+        for raw in source.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("["):
+                in_service = line == "[Service]"
+                continue
+            key, _, value = line.partition("=")
+            if not in_service:
+                continue
+            key = key.strip()
+            value = _unit_value(value.strip(), home)
+            if key == "Environment":
+                if not value:
+                    env.clear()
+                for word in shlex.split(value):
+                    name, _, setting = word.partition("=")
+                    env[name] = setting
+            elif key == "EnvironmentFile":
+                if value:
+                    env_files.append(Path(value.removeprefix("-")))
+                else:
+                    env_files.clear()
+    for file in env_files:
+        env.update(_environment_file(file))
+    return env
+
+
+def check_fleet_worker(
+    list_workers: Callable[[], list[WorkerRecord]], *, host: str, service: str = "launchd"
+) -> Finding:
     """Is this machine's resident worker registered with the queue and online? (Story 35.2-004)
 
     Matches on ``host`` rather than a worker name: the LaunchAgent template owns
     the name, and "a worker for this machine is heartbeating" is the question.
+    ``service`` says which supervisor owns the worker (``systemd`` on the Linux
+    dev box, Story 35.2-008) and so which remedy reads right.
     """
     name = "Fleet worker"
-    remedy = (
-        f"check the LaunchAgent is loaded (`launchctl print gui/$(id -u)/{WORKER_LABEL}`) "
-        "and read ~/.local/state/sdlc/worker.log"
-    )
+    if service == "systemd":
+        remedy = (
+            "check the unit is running (`systemctl --user status sdlc-worker`) "
+            "and read `journalctl --user -u sdlc-worker`"
+        )
+    else:
+        remedy = (
+            f"check the LaunchAgent is loaded (`launchctl print gui/$(id -u)/{WORKER_LABEL}`) "
+            "and read ~/.local/state/sdlc/worker.log"
+        )
     try:
         workers = [w for w in list_workers() if w.host == host]
     # A local store that is not a database raises sqlite3.DatabaseError
@@ -711,22 +816,111 @@ def check_forge_credentials(
     )
 
 
+# Story 35.4-006: the worker's own dashboard, which the XPS relays a remote run's
+# detail from (template: templates/launchd/com.fxmartin.sdlc-dashboard.plist).
+DASHBOARD_LABEL = "com.fxmartin.sdlc-dashboard"
+_DASHBOARD_PROBE_TIMEOUT_S = 3.0
+
+
+def _plist_option(args: list[str], flag: str) -> str | None:
+    """``flag``'s value in a ProgramArguments list (`--flag X` or `--flag=X`)."""
+    for i, arg in enumerate(args):
+        if arg == flag:
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg.startswith(f"{flag}="):
+            return arg.removeprefix(f"{flag}=")
+    return None
+
+
+def _dashboard_probe(origin: str) -> str | None:
+    """Why ``origin``'s dashboard does not answer, or None when it does.
+
+    A plain GET of `/favicon.ico` (a 204, no ledger read): read-only and quiet,
+    reached directly like the XPS reaches it — never through an env proxy.
+    """
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"{origin}/favicon.ico", timeout=_DASHBOARD_PROBE_TIMEOUT_S):
+            return None
+    except Exception as exc:  # noqa: BLE001 - any failure to answer is the finding
+        return str(getattr(exc, "reason", None) or exc)
+
+
+def check_worker_dashboard(
+    *,
+    agent_path: Path | None = None,
+    probe: Callable[[str], str | None] | None = None,
+) -> Finding | None:
+    """Does the dashboard this worker advertises answer? (Story 35.4-006)
+
+    ``None`` on a machine that never installed the worker LaunchAgent, and when
+    its plist cannot be read (:func:`check_fleet_worker_installed` reports that).
+    The XPS shows a remote run's stories, events and cost by relaying this
+    dashboard, so a worker that advertises none — or one that does not answer —
+    leaves every run it owns header-only there.
+
+    Only the plist's ``--dashboard-url`` counts: it is all `queue run` reads.
+    ``SDLC_DASHBOARD_URL`` in the agent's environment is a bare build's input,
+    which the worker ignores — its pushes would still blank the run's URL, so
+    counting it would report CLEAN for a dashboard the XPS is never told of.
+    """
+    from sdlc.registry import normalize_dashboard_url
+
+    path = agent_path or default_worker_plist()
+    if not path.exists():
+        return None
+    try:
+        plist = plistlib.loads(path.read_bytes())
+        args = [str(a) for a in plist.get("ProgramArguments") or []]
+    except Exception:  # noqa: BLE001 - see check_fleet_worker_installed
+        return None
+    name = "Worker dashboard"
+    remedy = (
+        "reinstall both agents from templates/launchd/ (the worker advertises it with "
+        f"--dashboard-url; `launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
+    )
+    advertised = _plist_option(args, "--dashboard-url")
+    if not advertised:
+        return Finding(
+            "worker-dashboard", name, "WARN",
+            "the worker advertises no dashboard URL — its runs show header-only on the XPS",
+            remedy,
+        )
+    try:
+        origin = normalize_dashboard_url(advertised)
+    except ValueError as exc:
+        return Finding("worker-dashboard", name, "WARN", f"the advertised URL is unusable: {exc}", remedy)
+    failure = (probe or _dashboard_probe)(origin)
+    if failure is not None:
+        return Finding(
+            "worker-dashboard", name, "WARN",
+            f"{origin} does not answer ({failure}) — its runs show header-only on the XPS",
+            remedy,
+        )
+    return Finding("worker-dashboard", name, "CLEAN", f"{origin} answers")
+
+
 def check_fleet_worker_installed(
     *,
     agent_path: Path | None = None,
+    unit_path: Path | None = None,
     host: str | None = None,
     queue_path: Path | None = None,
 ) -> Finding | None:
-    """:func:`check_fleet_worker`, but only on a machine that installed the worker LaunchAgent.
+    """:func:`check_fleet_worker`, but only on a machine that installed the worker agent.
 
-    ``None`` elsewhere: a laptop that never runs a resident worker has nothing
-    to report, and doctor must not nag it.
+    That is the LaunchAgent on a Mac or — Story 35.2-008 — the systemd ``--user``
+    unit on the Linux dev box; the LaunchAgent wins where both exist. ``None``
+    elsewhere: a laptop that never runs a resident worker has nothing to report,
+    and doctor must not nag it.
 
-    launchd starts the worker with the plist's environment, not this shell's, so
-    that is what decides which queue it drains. When the plist (or the per-user
-    ``~/.sdlc-fleet.yaml`` it reads) names a fleet queue (Story 35.2-005) the
-    worker registers *there*, and that service is the one asked. Otherwise it
-    registers in the store its plist pins, which is asked instead; when that
+    launchd and systemd start the worker with the agent's environment, not this
+    shell's, so that is what decides which queue it drains. When the agent (or the
+    per-user ``~/.sdlc-fleet.yaml`` it reads) names a fleet queue (Story 35.2-005)
+    the worker registers *there*, and that service is the one asked. Otherwise it
+    registers in the store its agent pins, which is asked instead; when that
     differs from this shell's (``queue_path``, default ``default_queue_path()``),
     an online worker is a WARN: jobs enqueued from this shell land in a file it
     never drains. So is a fleet queue only this shell resolves
@@ -734,18 +928,26 @@ def check_fleet_worker_installed(
     pointed at.
     """
     path = agent_path or default_worker_plist()
-    if not path.exists():
+    unit = unit_path or default_worker_unit()
+    if path.exists():
+        service, installed, template = "launchd", path, "templates/launchd/com.fxmartin.sdlc-worker.plist"
+    elif unit.exists():
+        service, installed, template = "systemd", unit, "templates/systemd/sdlc-worker.service"
+    else:
         return None
     try:
-        plist = plistlib.loads(path.read_bytes())
-        env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
+        if service == "launchd":
+            plist = plistlib.loads(path.read_bytes())
+            env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
+        else:
+            env = read_worker_unit(unit)
     # As in check_queue_service: plistlib's errors are not a closed set, and a
     # plist that is not a dict fails on `.get` — a FAIL either way, never a crash.
     except Exception as exc:  # noqa: BLE001
         return Finding(
             "fleet-worker", "Fleet worker", "FAIL",
-            f"{path} is unreadable: {exc}",
-            "reinstall it from templates/launchd/com.fxmartin.sdlc-worker.plist",
+            f"{installed} is unreadable: {exc}",
+            f"reinstall it from {template}",
         )
     host = host or socket.gethostname().split(".")[0]
     try:
@@ -754,14 +956,17 @@ def check_fleet_worker_installed(
         return Finding(
             "fleet-worker", "Fleet worker", "FAIL",
             f"the worker's fleet queue URL is unusable: {exc}",
-            "fix queue_url: in ~/.sdlc-fleet.yaml, or SDLC_QUEUE_URL in the worker's plist",
+            "fix queue_url: in ~/.sdlc-fleet.yaml, or SDLC_QUEUE_URL in the worker's "
+            + ("plist" if service == "launchd" else "~/.config/sdlc/worker.env"),
         )
     if worker_url is not None:
         # The worker drains the service, so it is the service that knows it.
         token = env.get(QUEUE_TOKEN_ENV) or os.environ.get(QUEUE_TOKEN_ENV) or None
-        return check_fleet_worker(QueueClient(worker_url, token=token).list_workers, host=host)
+        return check_fleet_worker(
+            QueueClient(worker_url, token=token).list_workers, host=host, service=service
+        )
     store = _service_store_path(env)
-    finding = check_fleet_worker(QueueStore(store).list_workers, host=host)
+    finding = check_fleet_worker(QueueStore(store).list_workers, host=host, service=service)
     if finding.status != "CLEAN":
         return finding
     try:
@@ -769,14 +974,25 @@ def check_fleet_worker_installed(
     except QueueError:
         url = None  # malformed: `--enqueue` refuses it and the fleet-queue finding FAILs it
     if url is not None:
+        if service == "systemd":
+            owner = "the unit's environment"
+            fix = (
+                "set queue_url: in ~/.sdlc-fleet.yaml (the unit reads it as you) so it drains "
+                "the fleet queue, or unset SDLC_QUEUE_URL here to enqueue to this box's own queue"
+            )
+        else:
+            owner = "launchd's environment"
+            fix = (
+                "set SDLC_QUEUE_URL in the worker plist's EnvironmentVariables (or queue_url: in "
+                "~/.sdlc-fleet.yaml) so it drains the fleet queue, or unset it here to enqueue "
+                "to this Mac's own queue"
+            )
         return Finding(
             "fleet-worker", "Fleet worker", "WARN",
             f"{finding.detail} — but this shell enqueues to the fleet queue at {url}, which "
-            "the worker is not pointed at (launchd's environment does not carry it), so jobs "
+            f"the worker is not pointed at ({owner} does not carry it), so jobs "
             "enqueued here never reach it",
-            "set SDLC_QUEUE_URL in the worker plist's EnvironmentVariables (or queue_url: in "
-            "~/.sdlc-fleet.yaml) so it drains the fleet queue, or unset it here to enqueue "
-            "to this Mac's own queue",
+            fix,
         )
     local = queue_path if queue_path is not None else default_queue_path()
     if store == local:
@@ -787,6 +1003,75 @@ def check_fleet_worker_installed(
         f"{local}, so jobs enqueued here never reach it",
         f"point both at one file: set SDLC_QUEUE_PATH={store} in your shell",
     )
+
+
+def check_worker_self_check(
+    *,
+    state_dir: Path | None = None,
+    claude_dir: Path | None = None,
+    home: Path | None = None,
+    system: str | None = None,
+    service: str = "launchd",
+) -> Finding:
+    """What the resident worker last proved about running an agent (Story 35.2-007).
+
+    Doctor runs in a shell, which carries disk access and sees no dialogs, so it
+    cannot witness launchd's context itself. It reads the probe the worker ran
+    from its own process — recorded with where it ran — and is CLEAN only for one
+    that completed from the LaunchAgent. The TCC path verdict is a path test, the
+    same from any context, so it is re-evaluated live.
+
+    ``service="systemd"`` (Story 35.2-008) is the Linux dev box: the probe must
+    have completed from the systemd unit, TCC does not exist there, and a failed
+    probe is read from the journal — there is no dialog to answer.
+    """
+    from sdlc.worker_selfcheck import read_last_result, tcc_verdict
+
+    name = "Worker self-check"
+    systemd = service == "systemd"
+    restart = (
+        "systemctl --user restart sdlc-worker"
+        if systemd
+        else f"launchctl kickstart -k gui/$(id -u)/{WORKER_LABEL}"
+    )
+    context = "systemd unit" if systemd else "LaunchAgent"
+    tcc = tcc_verdict(claude_dir=claude_dir, home=home, system=system)
+    last = read_last_result(state_dir)
+    if last is None:
+        seen = "no self-check recorded — the worker has not completed one yet"
+    else:
+        outcome = "completed" if last["ok"] else f"failed ({last.get('reason') or 'no reason'})"
+        from_service = last.get("systemd" if systemd else "launchd")
+        origin = f"the {context}" if from_service else "a shell"
+        seen = f"last probe {outcome} at {last.get('at') or 'an unknown time'} from {origin}"
+    if tcc is not None:
+        return Finding(
+            "worker-self-check", name, "FAIL", f"{tcc}; {seen}",
+            "move the checkout out of the protected folder, then " + restart,
+        )
+    verdict = "TCC paths clear" if (system or platform.system()) == "Darwin" else "TCC n/a (not macOS)"
+    detail = f"{seen}; {verdict}"
+    if last is None:
+        return Finding("worker-self-check", name, "WARN", detail, restart)
+    if not last["ok"]:
+        return Finding(
+            "worker-self-check", name, "FAIL", detail,
+            (
+                "read `journalctl --user -u sdlc-worker` (is `claude` logged in inside the dev "
+                "shell?); the worker retries every 60 s and registers on its own"
+                if systemd
+                else "answer the dialog on the Mac (Keychain / Privacy & Security); the worker "
+                "retries every 60 s and registers on its own — see ~/.local/state/sdlc/worker.log"
+            ),
+        )
+    if not last.get("systemd" if systemd else "launchd"):
+        context_name = "the unit's" if systemd else "launchd's"
+        return Finding(
+            "worker-self-check", name, "WARN",
+            f"{detail} — that proves nothing about {context_name} context",
+            restart if systemd else "restart the LaunchAgent so it probes from its own context: " + restart,
+        )
+    return Finding("worker-self-check", name, "CLEAN", detail)
 
 
 def check_queue(queue_path: Path) -> Finding:
@@ -1839,6 +2124,7 @@ def run_doctor(
     queue_path: Path | None = None,
     queue_service_plist: Path | None = None,
     worker_plist: Path | None = None,
+    worker_unit: Path | None = None,
     registry: Registry | None = None,
     dep_probe: Callable[[str], bool] | None = None,
     now: datetime | None = None,
@@ -1857,6 +2143,7 @@ def run_doctor(
     queue_path = queue_path or default_queue_path()
     queue_service_plist = queue_service_plist or default_queue_service_plist()
     worker_plist = worker_plist or default_worker_plist()
+    worker_unit = worker_unit or default_worker_unit()
     registry = registry or Registry()
     dep_probe = dep_probe or _default_dep_probe
 
@@ -1883,10 +2170,20 @@ def run_doctor(
     fleet = check_fleet_queue_configured()
     if fleet is not None:
         findings.append(fleet)
-    worker = check_fleet_worker_installed(agent_path=worker_plist, queue_path=queue_path)
+    worker = check_fleet_worker_installed(
+        agent_path=worker_plist, unit_path=worker_unit, queue_path=queue_path
+    )
     if worker is not None:
         findings.append(worker)
     credentials = check_forge_credentials(agent_path=worker_plist)
     if credentials is not None:
         findings.append(credentials)
+    dashboard = check_worker_dashboard(agent_path=worker_plist)
+    if dashboard is not None:
+        findings.append(dashboard)
+    # The Linux unit advertises no dashboard, so there is no worker-dashboard finding for it.
+    if worker_plist.exists():
+        findings.append(check_worker_self_check())
+    elif worker_unit.exists():
+        findings.append(check_worker_self_check(service="systemd"))
     return DoctorReport(findings=findings)

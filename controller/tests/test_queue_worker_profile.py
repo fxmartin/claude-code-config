@@ -85,12 +85,27 @@ def test_host_defaults_to_the_short_hostname_and_can_be_overridden(tmp_path, mon
 
 
 def test_pools_are_free_form_but_must_be_non_blank_and_unique(tmp_path) -> None:
-    kwargs = {"work_dir": tmp_path, "probe": lambda tool: False, "runtime": _runtime(None)}
+    # Codex installed: a declared codex-shared is advertised only with it (next test).
+    kwargs = {
+        "work_dir": tmp_path, "probe": lambda tool: tool in {"claude", "codex"}, "runtime": _runtime(None)
+    }
 
     profile = detect_worker_profile("w", pools=["claude-m3", "codex-shared", "claude-m3"], **kwargs)
     assert profile.pools == ["claude-m3", "codex-shared"]
     with pytest.raises(ValueError):
         detect_worker_profile("w", pools=["claude-m3", " "], **kwargs)
+
+
+def test_a_declared_codex_shared_is_advertised_only_while_codex_is_installed(tmp_path) -> None:
+    # Story 35.2-008: a codex stage needs both the pool and the harness, so a box joins
+    # codex-shared by installing Codex — its unit may declare the pool ahead of that.
+    kwargs = {"pools": ["claude-m3", "codex-shared"], "work_dir": tmp_path, "runtime": _runtime(None)}
+
+    without = detect_worker_profile("w", probe=lambda tool: tool == "claude", **kwargs)
+    with_codex = detect_worker_profile("w", probe=lambda tool: tool in {"claude", "codex"}, **kwargs)
+
+    assert without.pools == ["claude-m3"]
+    assert with_codex.pools == ["claude-m3", "codex-shared"]
 
 
 def test_a_blank_worker_name_is_refused(tmp_path) -> None:
