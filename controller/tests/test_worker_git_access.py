@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import stat
@@ -398,6 +399,117 @@ def test_a_stalled_clone_is_refused_and_its_half_clone_removed(tmp_path, monkeyp
     assert not target.exists()
 
 
+def _heard(monkeypatch) -> list[tuple[list[str], str]]:
+    """Each watched git call's argv and what it printed on stderr, run for real."""
+    heard: list[tuple[list[str], str]] = []
+    real = queue_worker._run_group
+
+    def listening(argv, **kwargs):
+        done = real(argv, **kwargs)
+        heard.append((list(argv), done.stderr))
+        return done
+
+    monkeypatch.setattr(queue_worker, "_run_group", listening)
+    return heard
+
+
+def test_a_clone_keeps_talking_through_its_checkout(tmp_path, monkeypatch) -> None:
+    """The watchdog hears only what git prints. `-q` silences a clone's checkout even under
+    `--progress` (and, off http, its download), so a big tree would read as stalled."""
+    from test_repo_sync import Forge
+
+    forge = Forge(tmp_path)
+    monkeypatch.setenv("GIT_PROGRESS_DELAY", "0")  # a meter from the first file, not after 2 s
+    heard = _heard(monkeypatch)
+
+    prepare_repo(_job(tmp_path, tmp_path / "Work" / "proj", forge.url), work_dir=tmp_path / "Work")
+
+    [clone_stderr] = [stderr for argv, stderr in heard if "clone" in argv]
+    assert re.search(r"(Updating|Checking out) files", clone_stderr)
+
+
+# --- refusal reasons: git's error, never its progress meters ----------------------
+
+
+@pytest.mark.parametrize(
+    ("output", "reason"),
+    [
+        pytest.param(
+            "git@gitlab.test: Permission denied (publickey).\n"
+            "fatal: Could not read from remote repository.\n",
+            "git@gitlab.test: Permission denied (publickey).\n"
+            "fatal: Could not read from remote repository.",
+            id="no-meter-kept-whole",
+        ),
+        pytest.param(
+            "remote: Counting objects:  50% (1/2)        \r"
+            "remote: Counting objects: 100% (2/2), done.        \n"
+            "Receiving objects:  45% (9/20)\rerror: RPC failed; curl 18 transfer closed\n"
+            "fatal: early EOF\n",
+            "error: RPC failed; curl 18 transfer closed\nfatal: early EOF",
+            id="meters-then-errors",
+        ),
+        pytest.param(
+            "Objets reçus:  50% (1/2)\rObjets reçus: 100% (2/2), fait.\n"
+            "la référence est verrouillée\n",
+            "Objets reçus: 100% (2/2), fait.\nla référence est verrouillée",
+            id="meters-no-prefixed-line",
+        ),
+    ],
+)
+def test_a_refusal_reason_keeps_gits_error_without_its_progress_meters(
+    output: str, reason: str
+) -> None:
+    assert queue_worker._git_error(output) == reason
+
+
+def test_a_fetch_failing_after_its_transfer_is_refused_with_gits_error_alone(
+    tmp_path, monkeypatch
+) -> None:
+    """`--progress` redraws meters with `\\r` all through a transfer. A fetch that fails after
+    it — a ref an IDE's auto-fetch holds locked — must not bury git's error under them in a
+    reason the queue stores, copies to every job on the origin and `queue list` prints."""
+    from test_repo_sync import Forge
+
+    forge = Forge(tmp_path)
+    clone = tmp_path / "Work" / "proj"
+    _git(tmp_path, "clone", "-q", forge.url, str(clone))
+    forge.advance()
+    held = clone / ".git" / "refs" / "remotes" / "origin" / "main.lock"
+    held.parent.mkdir(parents=True, exist_ok=True)
+    held.touch()
+    heard = _heard(monkeypatch)
+
+    with pytest.raises(ForgeUnavailable) as refusal:
+        prepare_repo(_job(tmp_path, clone, forge.url), work_dir=tmp_path / "Work")
+
+    [fetch_stderr] = [stderr for argv, stderr in heard if "fetch" in argv]
+    assert "\r" in fetch_stderr  # git drew its meters...
+    reason = refusal.value.reason
+    assert "cannot lock ref" in reason
+    assert "\r" not in reason and "objects:" not in reason  # ...and none reached the reason
+
+
+def test_a_clone_failing_after_its_transfer_is_refused_with_gits_error_alone(
+    tmp_path, monkeypatch
+) -> None:
+    meters = "".join(f"Receiving objects: {n:3d}% ({n}/100)\r" for n in range(100))
+
+    def fails_late(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv, 128, "", f"Cloning into 'proj'...\n{meters}fatal: early EOF\n"
+        )
+
+    monkeypatch.setattr(queue_worker, "_run_group", fails_late)
+    with pytest.raises(ForgeUnavailable) as refusal:
+        prepare_repo(
+            _job(tmp_path, tmp_path / "Work" / "proj", "https://gitlab.test/root/proj.git"),
+            work_dir=tmp_path / "Work",
+        )
+
+    assert refusal.value.reason.endswith(": fatal: early EOF")
+
+
 # --- the scheduler: refuse to queued, flag the host, stop being offered the job --
 
 
@@ -421,13 +533,13 @@ class _Launcher:
         raise AssertionError("a refused sync must never launch")
 
 
-def _drain_once(tmp_path, store, preparer, *, clock=None, follow=False, sleeper=None):
+def _drain_once(tmp_path, store, preparer, *, clock=None, follow=False, sleeper=None, worker=None):
     clock = clock or _Clock()
     return run_queue(
         store,
         config=SchedulerConfig(
             slots=1, poll_seconds=1.0, follow=follow,
-            worker=WorkerProfile(name="m3max", host="macbook-pro-m3-max"),
+            worker=worker or WorkerProfile(name="m3max", host="macbook-pro-m3-max"),
         ),
         registry=Registry(tmp_path / "registry.json"),
         launcher=_Launcher(),
@@ -507,6 +619,80 @@ def test_a_login_made_since_clears_the_flag_on_the_next_beat(tmp_path, monkeypat
 
     assert flags[0] == {"gitlab.test": False}
     assert flags[-1].get("gitlab.test") is not False
+
+
+def _flagged_at_start() -> WorkerProfile:
+    """A worker whose plaintext GitLab clone had no login when it started."""
+    return WorkerProfile(
+        name="m3max", host="m3", forges={"gitlab.test": False},
+        forge_schemes={"gitlab.test": "http"},
+    )
+
+
+def test_a_forge_flagged_at_start_is_rechecked_over_the_scheme_its_clone_uses(
+    tmp_path, monkeypatch
+) -> None:
+    """A plaintext GitLab's login is read through the private glab config `http` selects:
+    re-checked over `https`, the probe would read another config than the fetch does."""
+    asked: list[tuple[str, str]] = []
+
+    def probe(host: str, scheme: str = "https", **_kwargs) -> bool:
+        asked.append((host, scheme))
+        return True
+
+    monkeypatch.setattr(queue_worker, "forge_credential_ok", probe)
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    clock = _Clock()
+    sleeps: list[float] = []
+
+    def sleeper(seconds: float) -> None:
+        sleeps.append(seconds)
+        if asked or len(sleeps) > 3:
+            raise KeyboardInterrupt
+        clock.advance(301)  # past the 5-minute re-check wait
+
+    _drain_once(
+        tmp_path, store, _refusing_with(AssertionError("the queue is empty")),
+        clock=clock, follow=True, sleeper=sleeper, worker=_flagged_at_start(),
+    )
+
+    assert asked == [("gitlab.test", "http")]
+    worker = store.get_worker("m3max")
+    assert worker is not None and worker.forges == {"gitlab.test": True}
+
+
+def test_a_forge_still_logged_out_stays_flagged_and_is_asked_again_a_window_later(
+    tmp_path, monkeypatch
+) -> None:
+    clock = _Clock()
+    started = clock.now
+    asked_at: list[float] = []
+
+    def probe(*_args, **_kwargs) -> bool:
+        asked_at.append((clock.now - started).total_seconds())
+        return False
+
+    monkeypatch.setattr(queue_worker, "forge_credential_ok", probe)
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    steps = iter([301, 100, 201])
+
+    def sleeper(_seconds: float) -> None:
+        try:
+            clock.advance(next(steps))
+        except StopIteration:
+            raise KeyboardInterrupt from None
+
+    _drain_once(
+        tmp_path, store, _refusing_with(AssertionError("the queue is empty")),
+        clock=clock, follow=True, sleeper=sleeper, worker=_flagged_at_start(),
+    )
+
+    # Asked at 301 s; the beat at 401 s does not ask, since the wait restarted then.
+    assert asked_at == [301.0, 602.0]
+    worker = store.get_worker("m3max")
+    assert worker is not None and worker.forges == {"gitlab.test": False}
 
 
 def test_a_stalled_sync_requeues_the_job_with_its_lease_released(tmp_path) -> None:
@@ -664,6 +850,60 @@ def test_the_profile_advertises_each_forge_its_clones_sit_on(tmp_path) -> None:
 
     assert profile.forges == {"gitlab.test": True, "github.com": False}
     assert sorted(probed) == [("github.com", "https"), ("gitlab.test", "https")]
+
+
+def test_the_profile_keeps_the_scheme_each_forge_is_reached_over(tmp_path) -> None:
+    """The scheduler re-checks a flagged forge later, and must ask over the same scheme."""
+    work = tmp_path / "Work"
+    _http_clone(work / "a", "http://gitlab.test/root/a.git")
+    _http_clone(work / "c", "https://github.com/fxmartin/c.git")
+    probed: list[tuple[str, str]] = []
+
+    def probe_forge(host: str, scheme: str) -> bool:
+        probed.append((host, scheme))
+        return False
+
+    profile = detect_worker_profile(
+        "m3max", work_dir=work, probe=lambda _b: False, runtime=lambda: None,
+        forge_probe=probe_forge,
+    )
+
+    assert profile.forge_schemes == {"gitlab.test": "http", "github.com": "https"}
+    assert sorted(probed) == [("github.com", "https"), ("gitlab.test", "http")]
+
+
+def test_the_suite_never_runs_a_real_forge_cli_to_probe_a_login(tmp_path, monkeypatch) -> None:
+    """conftest's `_no_real_forge_probe`. On a dev Mac `~/Work` sits on real forges, and a
+    real probe copies the developer's gitlab.test token into a temp dir and has `gh` read
+    its token store — the Keychain this story keeps the worker away from."""
+    asked = tmp_path / "asked"
+    bin_dir = tmp_path / "bin"
+    for cli in ("glab", "gh"):
+        _fake_cli(bin_dir, cli, f'echo {cli} >> "{asked}"\nprintf "password=t\\n"')
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    work = tmp_path / "Work"
+    _http_clone(work / "a", "https://gitlab.test/root/a.git")
+    _http_clone(work / "c", "https://github.com/fxmartin/c.git")
+    plist = tmp_path / "worker.plist"
+    plist.write_bytes(b"<plist/>")
+
+    profile = detect_worker_profile(
+        "m3max", work_dir=work, probe=lambda _b: False, runtime=lambda: None
+    )
+    finding = check_forge_credentials(agent_path=plist, work_dir=work)
+
+    assert not asked.exists()
+    assert profile.forges == {"gitlab.test": True, "github.com": True}
+    assert finding is not None and finding.status == "CLEAN"
+
+
+def test_an_empty_password_from_the_cli_is_no_credential() -> None:
+    """git would send it, and the forge would refuse it: no login, whatever the exit code."""
+
+    def blank(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, "username=oauth2\npassword=\n", "")
+
+    assert forge_credential_ok("gitlab.test", "https", runner=blank) is False
 
 
 def test_credential_probe_asks_the_cli_exactly_what_git_would(tmp_path, monkeypatch) -> None:

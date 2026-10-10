@@ -74,6 +74,9 @@ class WorkerProfile:
     # ``{forge host: the forge CLI can authenticate git there non-interactively}`` for the
     # forges its clones sit on (Story 35.2-006); a host that is False is never offered a job.
     forges: dict[str, bool] = field(default_factory=dict)
+    # ``{forge host: the scheme its clones reach it over}`` — never sent, but the scheduler's
+    # later look for a login must ask over it: a plaintext GitLab's lives in another config.
+    forge_schemes: dict[str, str] = field(default_factory=dict)
 
     def register_with(
         self, queue: "QueueBackend", *, slots: int, slots_free: int, **extra: Any
@@ -186,6 +189,7 @@ def detect_worker_profile(
         sandbox = None
     clones_dir = work_dir if work_dir is not None else default_work_dir()
     can_authenticate = forge_probe or forge_credential_ok
+    forge_schemes = clone_forge_hosts(clones_dir)
     return WorkerProfile(
         name=name,
         host=host or socket.gethostname().split(".")[0],
@@ -194,10 +198,8 @@ def detect_worker_profile(
         sandbox=sandbox,
         repos=_clones(clones_dir),
         dashboard_url=origin,
-        forges={
-            forge: can_authenticate(forge, scheme)
-            for forge, scheme in clone_forge_hosts(clones_dir).items()
-        },
+        forges={forge: can_authenticate(forge, scheme) for forge, scheme in forge_schemes.items()},
+        forge_schemes=forge_schemes,
     )
 
 
@@ -415,7 +417,8 @@ def forge_credential_ok(
 
     Asks the CLI the question git asks it (``<cli> auth git-credential get``), so a
     CLI that is missing, logged out, or hangs reads as no — and it is a local read of
-    the CLI's config, not a request to the forge, so it is fast offline.
+    the CLI's config, not a request to the forge, so it is fast offline. An empty
+    ``password=`` is no as well: git would send it, and the forge would refuse it.
     """
     access = forge_git_access(f"{scheme}://{host}/")
     if access is None:
@@ -431,7 +434,8 @@ def forge_credential_ok(
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return done.returncode == 0 and "password=" in done.stdout
+    has_password = re.search(r"^password=\S", done.stdout, re.MULTILINE) is not None
+    return done.returncode == 0 and has_password
 
 
 def clone_forge_hosts(work_dir: Path) -> dict[str, str]:
@@ -675,6 +679,24 @@ def _is_auth_failure(stderr: str) -> bool:
     return bool(_AUTH_FAILURE.search(stderr))
 
 
+def _git_error(output: str) -> str:
+    """What a failed fetch or clone said went wrong, without the meters ``--progress`` draws.
+
+    A meter redraws its line with ``\\r`` all through the transfer, so a call that fails
+    after it leaves thousands of characters ahead of git's error — and a refusal's reason
+    is stored on the queue, copied to every job waiting on the origin and printed by
+    `sdlc queue list`. Once a meter was drawn, only git's ``fatal:``/``error:`` lines are
+    kept (what was left on screen, if it said neither); output with no meter in it — a
+    forge that was never reached, an ssh key refused — is kept whole, as it was.
+    """
+    if "\r" not in output:
+        return output.strip()
+    lines = [line.rsplit("\r", 1)[-1].strip() for line in output.split("\n")]
+    lines = [line for line in lines if line]
+    errors = [line for line in lines if line.startswith(("fatal:", "error:"))]
+    return "\n".join(errors or lines)
+
+
 def _clone(origin: str, target: Path) -> None:
     from sdlc.issue_host import strip_remote_credentials
 
@@ -693,11 +715,12 @@ def _clone(origin: str, target: Path) -> None:
     try:
         # The forge CLI is the credential helper (see `forge_git_access`), so no
         # token is handled here and no Keychain dialog can open. `--progress` keeps
-        # a healthy clone talking, which is what the stall watchdog listens for.
+        # a healthy clone talking, which is what the stall watchdog listens for — and
+        # no `-q`, which silences the checkout (and, off http, the download) despite it.
         res = _run_group(
             [
                 "git", *(access.config if access else []),
-                "clone", "-q", "--progress", "--", origin, str(target),
+                "clone", "--progress", "--", origin, str(target),
             ],
             env=access.env if access else {**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
@@ -728,7 +751,7 @@ def _clone(origin: str, target: Path) -> None:
         # clears without anyone touching the job, so it goes back to be retried.
         raise ForgeUnavailable(
             f"could not clone {shown} into {target}: "
-            f"{res.stderr.strip() or 'git clone failed'}"
+            f"{_git_error(res.stderr) or 'git clone failed'}"
         )
 
 
@@ -813,7 +836,7 @@ def prepare_repo(
         # The forge, not this clone: down, rebooting, a credential to renew.
         # That clears without anyone touching the job, so it is retried.
         raise ForgeUnavailable(
-            f"could not fetch origin in {target}: {(fetch.stderr or fetch.stdout).strip()}"
+            f"could not fetch origin in {target}: {_git_error(fetch.stderr or fetch.stdout)}"
         )
     branch = _default_branch(target)
     steps: tuple[tuple[str, ...], ...] = (

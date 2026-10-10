@@ -1943,6 +1943,10 @@ class QueueStore:
         ``self_check`` (Story 35.2-007) is the worker's last agent probe,
         ``{ok, at, reason}``; a worker whose probe failed is online but is
         matched as having no free slot.
+
+        ``forges`` (Story 35.2-006) is ``{forge host: its CLI can authenticate git
+        there non-interactively}``; a job whose origin is on a host reported False
+        is never matched to the worker, and a host it never reported may be tried.
         """
         name = name.strip()
         host = host.strip()

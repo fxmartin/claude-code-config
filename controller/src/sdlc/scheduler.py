@@ -134,12 +134,12 @@ _WINDOW_SERVED_REASON = "rate-limited: the window reopened — awaiting a free s
 # (its clone, its credentials, its route to the forge), so it lives in memory,
 # not in the store its peers read.
 _SYNC_RETRY_SECONDS = 30.0
+_SYNC_RETRY_MAX_SECONDS = 600.0
 # How long a forge flagged "cannot authenticate" stays flagged before the worker
 # looks again for a login (Story 35.2-006). A credential the CLI holds but the forge
 # rejects (an expired token) reads as present locally, so the look is rationed:
 # one refused sync per window, not one per heartbeat.
 _FORGE_RECHECK_SECONDS = 300.0
-_SYNC_RETRY_MAX_SECONDS = 600.0
 
 # Registry *terminal* statuses that mean parked-for-a-human rather than failed:
 # the run reached an end state, but one a human decision reopens (approve the
@@ -894,8 +894,9 @@ class _Scheduler:
         # waits on the one forge, not one fetch per job.
         self._sync_retry: dict[str, _SyncRetry] = {}
         # What this worker advertises as `forges` (Story 35.2-006): host -> can the forge
-        # CLI authenticate git there. Seeded from the profile on the first beat; a sync
-        # the forge refuses flips its host to False, and the beat looks again later.
+        # CLI authenticate git there. Seeded from the profile on the first beat, with the
+        # scheme each host is reached over; a sync the forge refuses flips its host to
+        # False, and the beat looks again later over that same scheme.
         self._forges: dict[str, bool] | None = None
         self._forge_schemes: dict[str, str] = {}
         self._forge_denied_at: dict[str, datetime] = {}
@@ -1081,6 +1082,7 @@ class _Scheduler:
 
         if self._forges is None:
             self._forges = dict(profile.forges)
+            self._forge_schemes = dict(profile.forge_schemes)
             self._forge_denied_at = {host: now for host, ok in self._forges.items() if not ok}
         for host, denied_at in list(self._forge_denied_at.items()):
             if (now - denied_at).total_seconds() < _FORGE_RECHECK_SECONDS:

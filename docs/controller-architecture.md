@@ -876,7 +876,9 @@ the client renders as a muted **"no queue"** line — the same graceful-degrade
 precedent as the GitHub panel's "unavailable" state, never an error.
 
 The client groups jobs by `state` (known states ordered first, any future
-state sorted after), shows each job's repo/scope/priority/age, and computes
+state sorted after), shows each job's repo/scope/priority/age — and beneath it
+the job's `reason`, as `sdlc queue list` prints it (Story 35.2-006: a worker
+that cannot authenticate to the forge, `repo sync stalled`) — and computes
 **slot usage** as a live count of `running` jobs (there is no configured slot
 *cap* to show a fraction against yet — that lands with the scheduler in Story
 32.1-002). The rate-limit pause is read off `data.pauses` (`data.pause` for an older server) — the **queue's** own
@@ -2081,17 +2083,26 @@ origin. Two guards turn a hang into a refusal back to `queued`:
   worker registration (queue.db migration 15) — and the matcher stops offering
   that worker jobs whose origin is on it (`forge credential for <host>` in
   `no eligible worker (needs …)`; a host a worker never reported is "may try").
-  The refusal reason is kept on the job rather than overwritten by that stamp.
-  The worker looks for a login again every 5 minutes (`<cli> auth git-credential
-  get`, a local read) and clears the flag when it finds one.
+  The refusal reason is kept on the job rather than overwritten by that stamp,
+  and shows in `sdlc queue list` and beneath the job's row on the dashboard's
+  queue panel. The worker looks for a login again every 5 minutes (`<cli> auth
+  git-credential get`, a local read; an empty `password=` counts as none) over
+  the scheme its clone uses — a host flagged at start-up included, since an
+  `http://` GitLab's login is read through the private `GLAB_CONFIG_DIR` — and
+  clears the flag when it finds one.
 - **Stall.** Every sync git call runs in its own process group. Fetch and
-  clone — the calls that can wait on a credential — run with `--progress`, so a
-  healthy transfer talks throughout, and 60 s with no output kills the group
-  (SIGTERM, then SIGKILL) and refuses the job with `repo sync stalled`; the
+  clone — the calls that can wait on a credential — run with `--progress` (the
+  clone without `-q`, which would leave its checkout, and off http its download,
+  silent despite it), so a healthy transfer talks throughout, and 60 s with no
+  output kills the group (SIGTERM, then SIGKILL) and refuses the job with
+  `repo sync stalled`; the
   sync's keepalive is joined before the refusal, so a stalled sync's lease is
   never renewed past it. Local plumbing (`status`, `checkout`, `merge
   --ff-only`) is silent on a pipe however long a big tree takes, so it is held
-  only to the 120 s timeout, never to the silence limit.
+  only to the 120 s timeout, never to the silence limit. A fetch or clone that
+  fails after its transfer began is refused with git's `fatal:`/`error:` lines
+  alone, not the meters `--progress` redrew with `\r` ahead of them; output with
+  no meter in it is kept whole.
 
 `sdlc doctor` on a machine running the resident worker reports a *Forge
 credentials* finding: for each forge host its clones under `~/Work` sit on,

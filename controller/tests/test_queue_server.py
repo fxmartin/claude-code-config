@@ -998,11 +998,26 @@ def test_posting_again_is_a_heartbeat_not_a_second_worker(api) -> None:
 
 @pytest.mark.parametrize(
     "overrides",
-    [{"slots": 0}, {"slots": "2"}, {"pools": "claude-m3"}, {"host": ""}, {"worker": " "}],
-    ids=["zero-slots", "string-slots", "pools-not-a-list", "blank-host", "blank-name"],
+    [
+        {"slots": 0}, {"slots": "2"}, {"pools": "claude-m3"}, {"host": ""}, {"worker": " "},
+        {"forges": ["gitlab.test"]}, {"forges": {"gitlab.test": "yes"}},
+    ],
+    ids=[
+        "zero-slots", "string-slots", "pools-not-a-list", "blank-host", "blank-name",
+        "forges-not-an-object", "forges-not-booleans",
+    ],
 )
 def test_bad_worker_input_is_400(api, overrides) -> None:
     assert _register(api, **overrides)[0] == 400
+
+
+def test_a_workers_forge_flags_round_trip_through_the_api(api) -> None:
+    """Story 35.2-006: which forges the worker's CLI can authenticate git to rides the beat."""
+    status, record = _register(api, forges={"gitlab.test": False, "github.com": True})
+    assert status == 200 and record["forges"] == {"gitlab.test": False, "github.com": True}
+
+    [listed] = api.call("GET", "/workers")[1]["workers"]
+    assert listed["forges"] == {"gitlab.test": False, "github.com": True}
 
 
 def test_claim_by_a_registered_worker_is_capability_matched(api) -> None:
