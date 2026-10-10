@@ -1743,6 +1743,8 @@ class _Scheduler:
 
     def _finish_reaped(self, job_id: int, entry: _InFlight, code: int) -> None:
         """Record how ``entry``'s exited child ended: park, pause or finish the job."""
+        if entry.run_id is None:
+            self._attach_finished_run(job_id, entry)
         self._push_run(entry.run_id, ended=True)
         if entry.run_id and self._rate_limit_park(job_id, entry.run_id) is not None:
             # Story 32.2-001: a run that parked itself on a closed window
@@ -2514,7 +2516,9 @@ class _Scheduler:
         (``--dry-run``, a `fix` that aborts pre-run), where ``run_id`` stays
         ``None`` and every pass re-scans. Two more predicates close it: the
         record must belong to *this job's repo*, and it must still be open —
-        our child is by definition still running when we scan.
+        our child is by definition still running when we scan. A run that opens
+        and finishes between two polls is linked once its child is reaped
+        (:meth:`_attach_finished_run`).
         """
         pending = {
             entry.proc.pid: job_id
@@ -2532,6 +2536,30 @@ class _Scheduler:
             self._in_flight[job_id].run_id = record.run_id
             self._store.attach_run(job_id, record.run_id)
             self._push_run(record.run_id)  # the run's start, on the fleet now — not a beat later
+
+    def _attach_finished_run(self, job_id: int, entry: _InFlight) -> None:
+        """Link reaped ``entry`` to a run its child opened and finished between two polls.
+
+        Story 35.4-005: :meth:`_attach_runs` links only an open record, so a run
+        that registered and finished within one poll — a preflight gate whose
+        command cannot start, say — was never linked, and its job read ``run
+        status 1`` instead of the gate's reason. The pid is still the join key: no
+        other process could hold it until this scheduler reaped the child, so a
+        finished record of the job's repo with that pid that started after this
+        launch is the child's own. One that started before it is a stale record of
+        a reused pid — the case the open-record rule guards against.
+        """
+        for record in self._registry.records():
+            if record.pid != entry.proc.pid or not record.finished_at:
+                continue
+            if Path(record.repo) != Path(entry.job.repo):
+                continue
+            started = _as_datetime(record.started_at)
+            if started is None or started < entry.started_at:
+                continue
+            self._store.attach_run(job_id, record.run_id)
+            entry.run_id = record.run_id
+            return
 
     def _registry_record(self, run_id: str) -> RunRecord | None:
         for record in self._registry.records():

@@ -2365,7 +2365,8 @@ def run_fix(
     ledger.run_set_harness_routing(run_id, opts.harness_map)
     ledger.event_log(run_id, "", "info", "controller", f"fix started: scope={scope}")
     # Story 35.4-005: as in `run_build` — this run takes over any dead run of the
-    # issue that died in its gate, which a bare `sdlc resume` would otherwise re-fix.
+    # issue whose gate never passed (died in it, or came back red), which a bare
+    # `sdlc resume` would otherwise re-fix or keep naming.
     close_superseded_runs(ledger, run_id, scope, registry)
     try:
         notify(
@@ -3363,8 +3364,8 @@ def run_fix_batch(
         run_id, "", "info", "controller",
         f"fix batch started: scope={scope} mode={mode} ({len(candidates)} issues)",
     )
-    # Story 35.4-005: as in `run_build` — a dead batch of this scope that died in
-    # its gate is taken over here, not left IN_PROGRESS for a bare resume to refuse.
+    # Story 35.4-005: as in `run_build` — a dead batch of this scope whose gate never
+    # passed is taken over here, not left IN_PROGRESS for a bare resume to refuse.
     close_superseded_runs(ledger, run_id, scope, registry)
     try:
         notify(

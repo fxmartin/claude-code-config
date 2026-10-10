@@ -966,8 +966,9 @@ def resume(
     before any story. An ``sdlc fix all`` / ``next`` batch has no resume path, so
     one whose gate never passed is refused (exit 1) — re-run the batch instead.
     One interrupted in the gate is closed ABORTED, so the next resume moves on.
-    A fresh ``sdlc build`` / ``sdlc fix`` of the same scope closes a dead run that
-    died in its gate ABORTED too, so resume never rebuilds what it took over.
+    A fresh ``sdlc build`` / ``sdlc fix`` of the same scope closes a dead run whose
+    gate never passed — died in it, or came back red — ABORTED too, so neither
+    resume nor its "failed with resumable stories" hint rebuilds what it took over.
 
     Issue #595: refused (exit 1, run untouched) when the host registry shows this
     run already live under another pid — two processes must never drive the same

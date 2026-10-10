@@ -427,6 +427,8 @@ class Registry:
             row = rec.to_dict()
             row["state"] = derive_state(rec)
             if not rec.finished_at:
-                row["completed"], row["total"], _phase = _live_counts(rec)
+                # The live phase too (Story 35.4-005): the cached one is never
+                # `closing`, and `/api/runs` shows the ledger's.
+                row["completed"], row["total"], row["phase"] = _live_counts(rec)
             rows.append(row)
         return rows
