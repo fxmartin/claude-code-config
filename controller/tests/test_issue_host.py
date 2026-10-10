@@ -1162,6 +1162,31 @@ def test_gitlab_instance_env_copies_the_users_token_for_that_host(monkeypatch, t
     assert "gitlab.com" not in config["hosts"]
 
 
+def test_gitlab_instance_env_follows_a_login_made_after_the_first_call(monkeypatch, tmp_path) -> None:
+    """A long-lived caller (the resident fleet worker, the dashboard) keeps one
+    config dir per instance, but its entry tracks the user's — a later `glab auth
+    login` authenticates, and a logout stops authenticating (Story 35.2-006)."""
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path))
+    user_config = tmp_path / "config.yml"
+
+    def private_entry(env: dict[str, str]) -> dict:
+        config = yaml.safe_load(Path(env["GLAB_CONFIG_DIR"], "config.yml").read_text())
+        return config["hosts"]["gitlab.test"]
+
+    before = ih.gitlab_instance_env("http://gitlab.test")
+    assert "token" not in private_entry(before)
+
+    user_config.write_text("hosts:\n  gitlab.test:\n    token: fresh\n")
+    after_login = ih.gitlab_instance_env("http://gitlab.test")
+    assert after_login["GLAB_CONFIG_DIR"] == before["GLAB_CONFIG_DIR"]
+    assert private_entry(after_login)["token"] == "fresh"
+    assert private_entry(after_login)["api_protocol"] == "http"
+
+    user_config.write_text("hosts: {}\n")
+    assert "token" not in private_entry(ih.gitlab_instance_env("http://gitlab.test"))
+
+
 @pytest.mark.parametrize(
     "user_config",
     [

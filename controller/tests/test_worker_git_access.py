@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import stat
 import subprocess
@@ -16,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
+import yaml
 
 from sdlc import queue_worker
 from sdlc.doctor import check_forge_credentials
@@ -96,6 +98,7 @@ def test_a_gitlab_origin_gets_the_glab_helper_and_no_interactive_prompt() -> Non
     assert access.config == [
         "-c", "credential.helper=",
         "-c", "credential.helper=!glab auth git-credential",
+        "-c", "core.askPass=",
     ]
     assert access.env["GIT_TERMINAL_PROMPT"] == "0"
     assert access.env["GITLAB_HOST"] == "https://gitlab.test"
@@ -106,7 +109,7 @@ def test_a_github_origin_gets_the_gh_helper() -> None:
 
     assert access is not None
     assert access.cli == "gh"
-    assert access.config[-1] == "credential.helper=!gh auth git-credential"
+    assert access.config[3] == "credential.helper=!gh auth git-credential"
     assert access.env["GH_HOST"] == "github.com"
     assert "GITLAB_HOST" not in access.env
 
@@ -137,9 +140,11 @@ def test_the_fetch_runs_under_the_forge_helper_and_a_local_one_does_not(
     tmp_path, monkeypatch
 ) -> None:
     calls: list[tuple[list[str], dict[str, str]]] = []
+    stall_limits: list[float | None] = []
 
-    def fake(argv, *, env, **_kwargs):
+    def fake(argv, *, env, stall_seconds=None, **_kwargs):
         calls.append((list(argv), env))
+        stall_limits.append(stall_seconds)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(queue_worker, "_run_group", fake)
@@ -159,6 +164,8 @@ def test_the_fetch_runs_under_the_forge_helper_and_a_local_one_does_not(
     assert remote_env["GIT_TERMINAL_PROMPT"] == "0"
     assert "-c" not in local_argv and local_env["GIT_TERMINAL_PROMPT"] == "0"
     assert "-c" not in plain_argv  # local plumbing never needs the forge
+    # Network calls get the default silence watchdog; local plumbing only the timeout.
+    assert stall_limits[:2] == [None, None] and stall_limits[2] == float("inf")
 
 
 # --- unauthenticated: refused within seconds, not hung --------------------------
@@ -201,6 +208,33 @@ def test_a_fetch_the_cli_cannot_authenticate_is_refused_quickly_naming_the_host(
     assert f"cannot authenticate to {unauthorized_forge} (glab auth login" in refusal.value.reason
 
 
+@pytest.mark.parametrize("via", ["GIT_ASKPASS", "core.askPass", "SSH_ASKPASS"])
+def test_an_inherited_askpass_program_is_never_asked(
+    tmp_path, unauthorized_forge, no_forge_login, monkeypatch, via
+) -> None:
+    """git asks an askpass program *before* it honours `GIT_TERMINAL_PROMPT=0`, and one
+    inherited from an IDE terminal or a gitconfig is a dialog nobody at the worker sees."""
+    asked = tmp_path / "asked"
+    _fake_cli(no_forge_login, "askpass", f'echo "$1" >> "{asked}"\necho nope')
+    askpass = str(no_forge_login / "askpass")
+    monkeypatch.delenv("GIT_ASKPASS", raising=False)
+    monkeypatch.delenv("SSH_ASKPASS", raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    if via == "core.askPass":
+        gitconfig = tmp_path / "gitconfig"
+        gitconfig.write_text(f"[core]\n\taskPass = {askpass}\n", encoding="utf-8")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    else:
+        monkeypatch.setenv(via, askpass)
+    url = f"http://{unauthorized_forge}/root/proj.git"
+    clone = _http_clone(tmp_path / "Work" / "proj", url)
+
+    with pytest.raises(ForgeUnauthenticated):
+        prepare_repo(_job(tmp_path, clone, url), work_dir=tmp_path / "Work")
+
+    assert not asked.exists()
+
+
 def test_a_clone_the_cli_cannot_authenticate_is_refused_and_leaves_nothing(
     tmp_path, unauthorized_forge, no_forge_login
 ) -> None:
@@ -224,6 +258,20 @@ def test_the_refusal_names_the_worker_when_the_scheduler_has_one() -> None:
 # --- stall watchdog -------------------------------------------------------------
 
 
+def _gone(pid: int) -> bool:
+    """Dead, or a zombie: an orphan's zombie lingers where PID 1 does not reap (a CI job
+    container's bare `sh`), and `kill(pid, 0)` still succeeds on one."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False  # no procfs (macOS), where launchd reaps orphans promptly
+    return stat.rsplit(")", 1)[-1].split()[0] == "Z"
+
+
 def test_a_process_that_goes_quiet_is_killed_with_its_whole_group(tmp_path, monkeypatch) -> None:
     grandchild = tmp_path / "grandchild.pid"
     code = (
@@ -234,21 +282,33 @@ def test_a_process_that_goes_quiet_is_killed_with_its_whole_group(tmp_path, monk
         "time.sleep(120)\n"
     )
     started = time.monotonic()
+    # Headroom: the pid file is written before the first output, and an interpreter can
+    # take seconds to start on a loaded CI host.
     with pytest.raises(SyncStalled):
         queue_worker._run_group([sys.executable, "-c", code], env=dict(os.environ),
-                                timeout=120, stall_seconds=1.0)
+                                timeout=120, stall_seconds=5.0)
 
     assert time.monotonic() - started < 60
     pid = int(grandchild.read_text())
     deadline = time.monotonic() + 30  # headroom: a loaded CI host reaps slowly
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if _gone(pid):
             return
         time.sleep(0.1)
     os.kill(pid, signal.SIGKILL)
     pytest.fail("the stalled process's child survived the group kill")
+
+
+def test_local_plumbing_is_held_to_the_timeout_not_the_silence_limit(tmp_path, monkeypatch) -> None:
+    """Only a network call can be parked behind a credential; a checkout or merge on a big
+    tree is silent on a pipe while it works, and must not read as a stalled sync."""
+    monkeypatch.setattr(queue_worker, "_STALL_SECONDS", 0.5)
+    repo = _http_clone(tmp_path / "proj", "https://gitlab.test/root/proj.git")
+    quiet = f"!{shlex.quote(sys.executable)} -c 'import time; time.sleep(2)'"
+
+    done = queue_worker._git(repo, "-c", f"alias.quiet={quiet}", "quiet")
+
+    assert done.returncode == 0
 
 
 def test_a_process_that_keeps_talking_is_not_stalled() -> None:
@@ -285,6 +345,30 @@ def test_a_stalled_fetch_is_refused_as_a_stalled_sync(tmp_path, monkeypatch) -> 
 
     assert refusal.value.reason == "repo sync stalled"
     assert refusal.value.retryable is True
+
+
+def test_a_stalled_fetch_stops_renewing_the_lease_before_it_is_refused(tmp_path, monkeypatch) -> None:
+    """The keepalive renews the job's lease while git works; a stalled sync must not keep
+    renewing it, or the queue shows a healthy `running` job the way the Keychain hang did."""
+    origin = "https://gitlab.test/root/proj.git"
+    clone = _http_clone(tmp_path / "Work" / "proj", origin)
+    monkeypatch.setattr(queue_worker, "_KEEPALIVE_SECONDS", 0.01)
+    renewed = threading.Event()
+
+    def stall(argv, **_kwargs):
+        if "fetch" in argv:
+            assert renewed.wait(30), "no keepalive while the fetch was in flight"
+            raise SyncStalled(60)
+        return subprocess.run(argv, capture_output=True, text=True, env=_GIT_ENV)
+
+    monkeypatch.setattr(queue_worker, "_run_group", stall)
+    with pytest.raises(ForgeUnavailable) as refusal:
+        prepare_repo(_job(tmp_path, clone, origin), work_dir=tmp_path / "Work",
+                     keepalive=renewed.set)
+
+    assert refusal.value.reason == "repo sync stalled"
+    # Joined before the refusal surfaces, so nothing can renew the lease after it.
+    assert [t for t in threading.enumerate() if t.name == "sdlc-sync-keepalive"] == []
 
 
 def test_a_stalled_clone_is_refused_and_its_half_clone_removed(tmp_path, monkeypatch) -> None:
@@ -415,7 +499,7 @@ def test_a_login_made_since_clears_the_flag_on_the_next_beat(tmp_path, monkeypat
     assert flags[-1].get("gitlab.test") is not False
 
 
-def test_a_stalled_sync_requeues_the_job_and_never_renews_its_lease(tmp_path) -> None:
+def test_a_stalled_sync_requeues_the_job_with_its_lease_released(tmp_path) -> None:
     store = QueueStore(tmp_path / "queue.db")
     store.init()
     job_id = store.add_job(
@@ -564,6 +648,32 @@ def test_credential_probe_asks_the_cli_exactly_what_git_would(tmp_path, monkeypa
 
     assert forge_credential_ok("gitlab.test", "https") is True
     assert forge_credential_ok("other.test", "https") is False
+
+
+def test_a_login_made_after_the_worker_started_reaches_a_plaintext_gitlab_probe(
+    tmp_path, monkeypatch
+) -> None:
+    """The resident worker outlives any login, so the private glab config a plaintext
+    instance needs must carry a token written since the first probe — the 5-minute
+    re-check and the fetch both read it through :func:`forge_git_access`."""
+    from sdlc import issue_host
+
+    monkeypatch.setattr(issue_host, "_GLAB_HTTP_CONFIG_DIRS", {})
+    user_config = tmp_path / "glab-cli"
+    user_config.mkdir()
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(user_config))
+
+    def glab(argv, *, input, env, **_kwargs):  # answers from the config it is pointed at
+        host = dict(line.split("=", 1) for line in input.splitlines() if "=" in line)["host"]
+        config = yaml.safe_load(Path(env["GLAB_CONFIG_DIR"], "config.yml").read_text())
+        token = (config["hosts"].get(host) or {}).get("token")
+        out = f"username=oauth2\npassword={token}\n" if token else ""
+        return subprocess.CompletedProcess(argv, 0 if token else 1, out, "")
+
+    assert forge_credential_ok("gitlab.test", "http", runner=glab) is False
+    (user_config / "config.yml").write_text("hosts:\n  gitlab.test:\n    token: fresh\n")
+
+    assert forge_credential_ok("gitlab.test", "http", runner=glab) is True
 
 
 def test_credential_probe_is_false_without_the_cli_or_when_it_hangs(tmp_path, monkeypatch) -> None:

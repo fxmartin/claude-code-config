@@ -2063,10 +2063,13 @@ screen, so its fetch and clone never prompt. For an `http(s)` origin git runs
 with `-c credential.helper=` (clearing every inherited helper, so the user's
 `osxkeychain` is never consulted — the first fleet job hung for minutes behind
 its Keychain dialog while its lease kept renewing) then `-c
-credential.helper=!glab auth git-credential` (`gh` for a GitHub host), plus
-`GIT_TERMINAL_PROMPT=0` and the `GITLAB_HOST`/`GLAB_CONFIG_DIR` (or `GH_HOST`)
-that `issue_host` sets for a plaintext instance. ssh and local-path origins are
-left to git. Two guards turn a hang into a refusal back to `queued`:
+credential.helper=!glab auth git-credential` (`gh` for a GitHub host) and `-c
+core.askPass=` with `GIT_ASKPASS`/`SSH_ASKPASS` dropped from its env (git asks
+an askpass program before it honours `GIT_TERMINAL_PROMPT=0`, and an IDE
+terminal exports one), plus `GIT_TERMINAL_PROMPT=0` and the
+`GITLAB_HOST`/`GLAB_CONFIG_DIR` (or `GH_HOST`) that `issue_host` sets for a
+plaintext instance. ssh and local-path origins are left to git. Two guards turn
+a hang into a refusal back to `queued`:
 
 - **No credential.** If the fetch or clone fails the way git does when its
   helper had nothing and prompting is off (`terminal prompts disabled`, a 401),
@@ -2079,11 +2082,14 @@ left to git. Two guards turn a hang into a refusal back to `queued`:
   The refusal reason is kept on the job rather than overwritten by that stamp.
   The worker looks for a login again every 5 minutes (`<cli> auth git-credential
   get`, a local read) and clears the flag when it finds one.
-- **Stall.** Fetch and clone run in their own process group with `--progress`,
-  so a healthy transfer talks throughout. 60 s with no output kills the group
+- **Stall.** Every sync git call runs in its own process group. Fetch and
+  clone — the calls that can wait on a credential — run with `--progress`, so a
+  healthy transfer talks throughout, and 60 s with no output kills the group
   (SIGTERM, then SIGKILL) and refuses the job with `repo sync stalled`; the
   sync's keepalive is joined before the refusal, so a stalled sync's lease is
-  never renewed past it.
+  never renewed past it. Local plumbing (`status`, `checkout`, `merge
+  --ff-only`) is silent on a pipe however long a big tree takes, so it is held
+  only to the 120 s timeout, never to the silence limit.
 
 `sdlc doctor` on a machine running the resident worker reports a *Forge
 credentials* finding: for each forge host its clones under `~/Work` sit on,
@@ -3273,8 +3279,10 @@ per-host `api_protocol`, so `gitlab_instance_env` also emits a
 **controller-owned** `GLAB_CONFIG_DIR`: a 0700 temp dir (one per instance URL
 per process, `atexit`-removed) whose 0600 `config.yml` carries just that host's
 entry with `api_protocol: http`. The user's `~/.config/glab-cli/config.yml` is
-read-only input — that one host's entry is copied so a `glab auth login` token
-still authenticates, and no unrelated forge's token is duplicated to disk.
+read-only input — that one host's entry is re-copied on every call, so a `glab
+auth login` token still authenticates even when it was made after a long-lived
+process (the resident fleet worker, the dashboard) started, and no unrelated
+forge's token is duplicated to disk.
 
 The declaration-aware call sites: `sdlc
 build` (`_open_story_cr`/`_bake_review_packet`, the run-start actor-identity

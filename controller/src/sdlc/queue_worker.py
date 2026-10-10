@@ -376,7 +376,10 @@ def forge_git_access(origin: str) -> GitAccess | None:
     interactive ``osxkeychain`` can never be asked, then the forge CLI is installed
     as the only one — ``gh`` for GitHub hosts, ``glab`` for the rest — with the env
     that points it at the instance, as :mod:`sdlc.issue_host` does for a plaintext
-    GitLab. Over ssh or a local path git needs no helper, so it is left alone.
+    GitLab. Any askpass program is cleared too: git asks one (``GIT_ASKPASS``,
+    ``core.askPass``, ``SSH_ASKPASS``) *before* it honours ``GIT_TERMINAL_PROMPT=0``,
+    and one inherited from an IDE terminal is a dialog as unseen as the Keychain's.
+    Over ssh or a local path git needs no helper, so it is left alone.
     """
     from sdlc.issue_host import github_instance_env, gitlab_instance_env
     from sdlc.queue import origin_forge_host
@@ -388,12 +391,16 @@ def forge_git_access(origin: str) -> GitAccess | None:
     cli = forge_cli(host)
     instance = f"{scheme}://{host}"
     cli_env = github_instance_env(instance) if cli == "gh" else gitlab_instance_env(instance)
+    inherited = {k: v for k, v in os.environ.items() if k not in ("GIT_ASKPASS", "SSH_ASKPASS")}
     return GitAccess(
         cli=cli,
         host=host,
         scheme=scheme,
-        config=["-c", "credential.helper=", "-c", f"credential.helper=!{cli} auth git-credential"],
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **cli_env},
+        config=[
+            "-c", "credential.helper=", "-c", f"credential.helper=!{cli} auth git-credential",
+            "-c", "core.askPass=",
+        ],
+        env={**inherited, "GIT_TERMINAL_PROMPT": "0", **cli_env},
     )
 
 
@@ -526,6 +533,9 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     argv = list(args)
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     config: list[str] = []
+    # Local plumbing (status, checkout, merge) never waits on a credential, and is silent
+    # on a pipe while a big tree takes its time — only the overall timeout holds it.
+    stall_seconds: float | None = float("inf")
     if args[0] == "fetch":
         # The one network call here: under the forge CLI's helper, and talking while it
         # works so the watchdog can tell it from a hang.
@@ -536,7 +546,10 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         if access is not None:
             config, env = access.config, access.env
         argv.insert(1, "--progress")
-    return _run_group(["git", "-C", str(root), *config, *argv], env=env)
+        stall_seconds = None  # the default :data:`_STALL_SECONDS` watchdog
+    return _run_group(
+        ["git", "-C", str(root), *config, *argv], env=env, stall_seconds=stall_seconds
+    )
 
 
 @contextmanager

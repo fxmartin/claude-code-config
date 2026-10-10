@@ -177,8 +177,9 @@ protocol is a config file's per-host `api_protocol`, so an `http://`
 declaration also gets a **controller-owned** `GLAB_CONFIG_DIR` (a 0700 temp dir,
 one per instance per process, removed at exit) holding just that host's entry
 with `api_protocol: http`. Your own `~/.config/glab-cli/config.yml` is never
-written to; its entry for that one host is copied in so a `glab auth login`
-token still authenticates (otherwise `GITLAB_TOKEN` from the environment does).
+written to; its entry for that one host is re-copied on every call so a `glab
+auth login` token — even one made after the process started — still
+authenticates (otherwise `GITLAB_TOKEN` from the environment does).
 
 ## Issue rendering & the label/board taxonomy (Story 22.2-002)
 

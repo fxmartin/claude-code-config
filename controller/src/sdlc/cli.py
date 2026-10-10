@@ -3855,12 +3855,12 @@ def queue_run_cmd(
 
     The sync never prompts (Story 35.2-006): over `http(s)` git uses the forge
     CLI as its only credential helper (`glab auth git-credential`, or `gh`),
-    never the interactive Keychain. A forge the CLI is not logged in to refuses
-    the job back to `queued` with `worker NAME cannot authenticate to HOST
-    (glab auth login …)` and the heartbeat flags that host (`forges`) so the
-    worker is offered no more of its jobs until the login is there; a git call
-    silent for 60 s is killed and refused as `repo sync stalled`. `sdlc doctor`
-    reports each forge credential.
+    never the interactive Keychain or an inherited askpass. A forge the CLI is
+    not logged in to refuses the job back to `queued` with `worker NAME cannot
+    authenticate to HOST (glab auth login …)` and the heartbeat flags that host
+    (`forges`) so the worker is offered no more of its jobs until the login is
+    there; a fetch or clone silent for 60 s is killed and refused as `repo sync
+    stalled`. `sdlc doctor` reports each forge credential.
 
     This is the foreground command. Daemonising it is the Epic-30 30.3-001
     LaunchAgent pattern (KeepAlive, standard logs) wrapping this same verb —
