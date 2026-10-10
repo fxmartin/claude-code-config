@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (17/22)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 and 35.4-005 remain (fleet job 3, resumed on the M3 Max 2026-10-10); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002 (a stopped job kills its agents) and 35.5-003 (approved green CRs merge deterministically) added 2026-10-10 from job 3. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (18/23)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 merged 2026-10-10 (#858, v2.100.0); 35.4-005 remains (fleet job 3, M3 Max); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002 (a stopped job kills its agents) 35.5-003 (approved green CRs merge deterministically) and 35.5-004 (agents hold no fleet credentials) added 2026-10-10 from job 3. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 22 | **Total Points**: 83 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 23 | **Total Points**: 86 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -1073,6 +1073,59 @@ stopped the job with the PR unmerged.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.5-001
+**Risk Level**: Medium
+
+##### Story 35.5-004: Dispatched agents hold no fleet credentials
+**User Story**: As FX, I want every agent the controller dispatches to run
+without the worker's fleet credentials, and the fleet to let me prune a bogus
+run record, so that an agent's ad-hoc controller code can never register
+ghost runs, requeue or cancel jobs, or overwrite run records on the live
+fleet service.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a worker job whose controller has `SDLC_QUEUE_URL`,
+  `SDLC_QUEUE_TOKEN` and `SDLC_WORKER` set (or a `~/.sdlc-fleet.yaml`) **When**
+  it dispatches any agent (Claude or a registry harness, sandboxed or not)
+  **Then** the agent's environment carries none of those variables and fleet
+  resolution inside the agent finds no queue URL (an explicit
+  `SDLC_FLEET_DISABLED=1`, or equivalent, that `resolve_queue_url` and the
+  registry push honour ahead of the user config file).
+- **Given** controller code running under `SDLC_IN_TEST=1` (the marker every
+  dispatch already sets) **When** it would push a run record to the fleet
+  **Then** it does not; the local ledger is untouched in behaviour.
+- **Given** a bogus or stale run record on the fleet service **When** FX runs
+  `sdlc queue runs prune <run-id>` (or the dashboard's equivalent) **Then** the
+  record is removed through an authenticated `DELETE /runs/<id>` and the XPS
+  dashboard no longer lists it.
+- **Given** a local run with no fleet configured **When** the same path runs
+  **Then** behaviour is identical; the full controller suite stays green on
+  both platforms.
+
+**Technical Notes**: `_agent_env` (`dispatch.py`) copies `os.environ`
+wholesale and adds `SDLC_IN_TEST=1`, but the fleet registry push does not
+honour that marker, and `queue_client._home()` reads `~/.sdlc-fleet.yaml`
+regardless of env. The suite is protected only by conftest's
+`_no_fleet_queue`, which never applies to an agent's throwaway script. The
+token is a write credential for the whole fleet (enqueue, requeue, cancel,
+`PUT /runs`) — the same privilege-ceiling class as the #653 `--admin` deny
+floor. Incident: fleet job 3, run `46e76670` on the M3 Max (2026-10-10 22:36)
+— during the 35.4-005 bugfix round the agent (env: `SDLC_QUEUE_TOKEN`,
+`SDLC_WORKER=m3max`) ran fake `run_build`s outside pytest; three `epic-99`
+ghost runs appeared on the XPS dashboard (two `ABORTED`, `e351034a` stuck
+`IN_PROGRESS` until FX upserted it `ABORTED` by hand, the service having no
+delete route).
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: agent env has no fleet vars on every dispatch path; fleet
+      resolution disabled inside an agent despite a user config file;
+      `SDLC_IN_TEST` blocks the registry push; `DELETE /runs/<id>` (auth, 404,
+      dashboard drop); local-mode parity
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.1-002, 35.4-001
 **Risk Level**: Medium
 
 ## Epic Sequencing
