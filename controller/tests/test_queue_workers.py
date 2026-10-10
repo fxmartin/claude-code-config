@@ -211,7 +211,9 @@ def test_a_recorded_origin_is_never_stamped_as_a_missing_repo(store) -> None:
 
     job = store.get_job(job_id)
     assert job.reason is None
-    assert [label for label, _ in job_needs(job)] == ["harness claude"]
+    assert [label for label, _ in job_needs(job)] == [
+        "forge credential for gitlab.test", "harness claude",
+    ]
 
 
 def test_a_job_goes_only_to_a_worker_with_the_harness(store) -> None:

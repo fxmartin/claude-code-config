@@ -124,6 +124,22 @@ def _no_real_worker_self_check(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_forge_probe(monkeypatch):
+    """Never ask a real ``glab``/``gh`` whether it holds a forge login (Story 35.2-006).
+
+    `sdlc queue run --worker` and `sdlc doctor` probe each forge the clones under the
+    real ``~/Work`` sit on, in a subprocess the ``_no_real_host_cli`` seam does not
+    cover. On a dev Mac that copies the developer's plaintext-GitLab token into a temp
+    dir and has `gh` read its Keychain-backed token store. The stub reads as logged in,
+    so a profile flags nothing — the matching before 35.2-006. test_worker_git_access.py
+    imports the real function by name and drives it with injected runners and fake CLIs.
+    """
+    import sdlc.queue_worker as queue_worker_mod
+
+    monkeypatch.setattr(queue_worker_mod, "forge_credential_ok", lambda *_args, **_kw: True)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_host_cli(monkeypatch):
     """Block real ``gh``/``glab`` invocations for every test by default.
 

@@ -372,6 +372,37 @@ def test_run_doctor_reports_the_worker_and_its_self_check_from_the_unit(tmp_path
     assert "worker-dashboard" not in found  # the Linux unit advertises no dashboard
 
 
+def test_run_doctor_reports_the_units_forge_credentials(tmp_path, monkeypatch) -> None:
+    # Story 35.2-006: the unit's worker syncs its http(s) clones with no UI, as the Mac's does.
+    from test_doctor import _healthy_install  # the shared healthy-install fixture
+    from test_worker_git_access import _http_clone
+
+    from sdlc import queue_worker
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("SDLC_QUEUE_PATH", str(tmp_path / "queue.db"))
+    monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    _http_clone(tmp_path / "home" / "Work" / "a", "http://gitlab.test/root/a.git")
+    monkeypatch.setattr(queue_worker, "forge_credential_ok", lambda host, scheme: False)
+
+    report = run_doctor(
+        repo_root=repo_root,
+        claude_dir=claude_dir,
+        db_path=tmp_path / "ledger.db",
+        queue_path=tmp_path / "queue.db",
+        registry=Registry(tmp_path / "registry.json"),
+        dep_probe=lambda _b: True,
+        worker_plist=tmp_path / "absent.plist",
+        worker_unit=_unit(tmp_path),
+    )
+
+    found = {f.check: f for f in report.findings}
+    assert found["forge-credentials"].status == "FAIL"
+    assert found["forge-credentials"].remedy == "glab auth login --hostname gitlab.test"
+
+
 def test_the_unit_installed_on_the_host_running_the_suite_is_never_read(tmp_path, monkeypatch) -> None:
     # `dev` runs this suite for its own story jobs with the unit installed. conftest's
     # `_no_real_worker_systemd_unit` keeps doctor off it, as its Mac twin does the plist;

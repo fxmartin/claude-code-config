@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -1160,6 +1161,47 @@ def test_gitlab_instance_env_copies_the_users_token_for_that_host(monkeypatch, t
     assert config["hosts"]["127.0.0.1:8080"]["username"] == "fx"
     assert config["hosts"]["127.0.0.1:8080"]["api_protocol"] == "http"
     assert "gitlab.com" not in config["hosts"]
+
+
+def test_gitlab_instance_env_follows_a_login_made_after_the_first_call(monkeypatch, tmp_path) -> None:
+    """A long-lived caller (the resident fleet worker, the dashboard) keeps one
+    config dir per instance, but its entry tracks the user's — a later `glab auth
+    login` authenticates, and a logout stops authenticating (Story 35.2-006)."""
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path))
+    user_config = tmp_path / "config.yml"
+
+    def private_entry(env: dict[str, str]) -> dict:
+        config = yaml.safe_load(Path(env["GLAB_CONFIG_DIR"], "config.yml").read_text())
+        return config["hosts"]["gitlab.test"]
+
+    before = ih.gitlab_instance_env("http://gitlab.test")
+    assert "token" not in private_entry(before)
+
+    user_config.write_text("hosts:\n  gitlab.test:\n    token: fresh\n")
+    after_login = ih.gitlab_instance_env("http://gitlab.test")
+    assert after_login["GLAB_CONFIG_DIR"] == before["GLAB_CONFIG_DIR"]
+    assert private_entry(after_login)["token"] == "fresh"
+    assert private_entry(after_login)["api_protocol"] == "http"
+
+    user_config.write_text("hosts: {}\n")
+    assert "token" not in private_entry(ih.gitlab_instance_env("http://gitlab.test"))
+
+
+def test_gitlab_instance_env_makes_again_a_config_dir_removed_under_it(monkeypatch, tmp_path) -> None:
+    """The resident fleet worker outlives its temp dir — `systemd-tmpfiles` and macOS's
+    $TMPDIR purge remove idle entries — so a removed dir is made again rather than
+    written into, which raised `FileNotFoundError` on every later call (Story 35.2-006)."""
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "config.yml").write_text("hosts:\n  gitlab.test:\n    token: tok\n")
+    shutil.rmtree(ih.gitlab_instance_env("http://gitlab.test")["GLAB_CONFIG_DIR"])
+
+    again = ih.gitlab_instance_env("http://gitlab.test")["GLAB_CONFIG_DIR"]
+
+    config = yaml.safe_load(Path(again, "config.yml").read_text())
+    assert config["hosts"]["gitlab.test"]["token"] == "tok"
+    assert config["hosts"]["gitlab.test"]["api_protocol"] == "http"
 
 
 @pytest.mark.parametrize(

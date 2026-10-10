@@ -48,7 +48,7 @@ from sdlc.worker_selfcheck import SELF_CHECK_RETRY_SECONDS
 
 if TYPE_CHECKING:  # `build` is heavy and only needed on the rate-limit path
     from sdlc.build import Ledger
-    from sdlc.queue_worker import RepoPreparer, RepoRefused, WorkerProfile
+    from sdlc.queue_worker import ForgeUnauthenticated, RepoPreparer, RepoRefused, WorkerProfile
     from sdlc.worker_selfcheck import SelfCheckResult
 
 __all__ = [
@@ -135,6 +135,11 @@ _WINDOW_SERVED_REASON = "rate-limited: the window reopened — awaiting a free s
 # not in the store its peers read.
 _SYNC_RETRY_SECONDS = 30.0
 _SYNC_RETRY_MAX_SECONDS = 600.0
+# How long a forge flagged "cannot authenticate" stays flagged before the worker
+# looks again for a login (Story 35.2-006). A credential the CLI holds but the forge
+# rejects (an expired token) reads as present locally, so the look is rationed:
+# one refused sync per window, not one per heartbeat.
+_FORGE_RECHECK_SECONDS = 300.0
 
 # Registry *terminal* statuses that mean parked-for-a-human rather than failed:
 # the run reached an end state, but one a human decision reopens (approve the
@@ -888,6 +893,13 @@ class _Scheduler:
         # <host/path>` when the forge failed it — then every job on that origin
         # waits on the one forge, not one fetch per job.
         self._sync_retry: dict[str, _SyncRetry] = {}
+        # What this worker advertises as `forges` (Story 35.2-006): host -> can the forge
+        # CLI authenticate git there. Seeded from the profile on the first beat, with the
+        # scheme each host is reached over; a sync the forge refuses flips its host to
+        # False, and the beat looks again later over that same scheme.
+        self._forges: dict[str, bool] | None = None
+        self._forge_schemes: dict[str, str] = {}
+        self._forge_denied_at: dict[str, datetime] = {}
         # The job whose sync a Ctrl-C or SIGTERM cut short: claimed, never launched.
         self._interrupted_sync: int | None = None
         self._installed_probe = installed_probe
@@ -1050,6 +1062,9 @@ class _Scheduler:
         extra: dict[str, Any] = {}
         if self._self_check_result is not None:
             extra["self_check"] = self._self_check_result.to_heartbeat()
+        forges = self._advertised_forges(profile, now)
+        if forges:
+            extra["forges"] = forges
         profile.register_with(
             self._store, slots=self._config.slots, slots_free=self._free_slots(), now=now,
             **extra,
@@ -1060,6 +1075,45 @@ class _Scheduler:
         for entry in self._in_flight.values():
             self._push_run(entry.run_id)
         return True
+
+    def _advertised_forges(self, profile: "WorkerProfile", now: datetime) -> dict[str, bool]:
+        """The ``forges`` flags for this beat, re-checking the hosts flagged False for a login."""
+        from sdlc import queue_worker
+
+        if self._forges is None:
+            self._forges = dict(profile.forges)
+            self._forge_schemes = dict(profile.forge_schemes)
+            self._forge_denied_at = {host: now for host, ok in self._forges.items() if not ok}
+        for host, denied_at in list(self._forge_denied_at.items()):
+            if (now - denied_at).total_seconds() < _FORGE_RECHECK_SECONDS:
+                continue
+            if queue_worker.forge_credential_ok(host, self._forge_schemes.get(host, "https")):
+                self._forges[host] = True
+                del self._forge_denied_at[host]
+            else:
+                self._forge_denied_at[host] = now
+        return self._forges
+
+    def _flag_forge_denied(self, exc: "ForgeUnauthenticated") -> "ForgeUnauthenticated":
+        """Stop offering this worker the forge's jobs, and say which worker it was.
+
+        The flag goes out on a beat of its own, before the job is handed back, so the
+        matcher never re-offers this worker the very job that just failed.
+        """
+        from sdlc.queue_worker import ForgeUnauthenticated
+
+        profile = self._config.worker
+        if profile is not None:
+            self._advertised_forges(profile, self._clock())
+            assert self._forges is not None
+            self._forges[exc.host] = False
+            self._forge_schemes[exc.host] = exc.scheme
+            self._forge_denied_at[exc.host] = self._clock()
+            self._heartbeat(force=True)
+        return ForgeUnauthenticated(
+            exc.host, exc.cli, exc.scheme,
+            worker=profile.name if profile is not None else self._identity,
+        )
 
     def _release_dead_holdings(self) -> None:
         """On a beat, hand back the jobs this worker holds whose run is gone (Story 35.2-005).
@@ -1430,7 +1484,7 @@ class _Scheduler:
         — wrong origin, a diverged default branch, no clone — so the job parks
         ``blocked``.
         """
-        from sdlc.queue_worker import RepoBusy, RepoRefused, prepare_repo
+        from sdlc.queue_worker import ForgeUnauthenticated, RepoBusy, RepoRefused, prepare_repo
 
         prepare = self._prepare_repo or prepare_repo
         # Not the claim's rule (a build only stays clear of a fix): two builds
@@ -1446,6 +1500,8 @@ class _Scheduler:
             self._interrupted_sync = job.id
             raise
         except RepoRefused as exc:
+            if isinstance(exc, ForgeUnauthenticated):
+                exc = self._flag_forge_denied(exc)
             # Refused or not, the sync held the loop up: renew what is running.
             self._renew()
             if isinstance(exc, RepoBusy):

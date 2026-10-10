@@ -376,6 +376,7 @@ class QueueClient:
         repos: Iterable[str] = (),
         slots: int = 1,
         slots_free: int | None = None,
+        forges: Mapping[str, bool] | None = None,
         now: datetime | None = None,
         self_check: Mapping[str, object] | None = None,
     ) -> WorkerRecord:
@@ -392,6 +393,8 @@ class QueueClient:
             body["sandbox"] = sandbox
         if slots_free is not None:
             body["slots_free"] = slots_free
+        if forges:
+            body["forges"] = dict(forges)
         if self_check is not None:
             body["self_check"] = dict(self_check)
         return self._worker(self._call("POST", "/workers", body))
