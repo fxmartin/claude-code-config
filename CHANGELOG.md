@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.102.0] - 2026-10-11
+
+### Added
+
+- feat(fleet-execution): dispatched agents hold no fleet (#35.5-004) (#867)
+
+
 ## [v2.101.0] - 2026-10-11
 
 ### Added
