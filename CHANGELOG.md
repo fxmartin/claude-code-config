@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.103.0] - 2026-10-11
+
+### Added
+
+- feat(fleet-execution): a stopped job takes its agents down (#35.5-002) (#868)
+
+
 ## [v2.102.0] - 2026-10-11
 
 ### Added
