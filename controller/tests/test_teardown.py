@@ -581,3 +581,68 @@ def test_an_agent_registered_after_a_stop_began_ends_itself(monkeypatch) -> None
     finally:
         _kill_leftovers(late.pid)
         late.wait(WAIT_S)
+
+
+def test_a_non_popen_object_is_never_registered_as_an_agent() -> None:
+    class Fake:
+        pid = os.getpid()
+
+    teardown.register_agent(Fake())  # must not track (or signal) a foreign pid
+
+
+def test_the_pid_file_falls_back_to_the_pid_when_the_group_is_unreadable(
+    tmp_path, monkeypatch
+) -> None:
+    def boom(_pid: int) -> int:
+        raise OSError
+
+    monkeypatch.setattr(os, "getpgid", boom)
+    target = tmp_path / "agent-1"
+    teardown._write_pid_file(target, 4242)
+    assert target.read_text() == "4242 4242\n"
+
+
+def test_an_unwritable_pid_file_never_fails_the_dispatch(tmp_path) -> None:
+    teardown._write_pid_file(tmp_path / "missing-dir" / "agent-1", os.getpid())
+
+
+def test_an_unreadable_handle_counts_as_exited() -> None:
+    class Broken:
+        def poll(self) -> int:
+            raise RuntimeError
+
+    assert teardown._has_exited(Broken())
+
+
+def test_recording_a_stop_without_a_bound_run_is_a_no_op() -> None:
+    teardown._bound = None
+    teardown.close_stopped_run("sigterm")  # must not raise
+
+
+def test_a_foreign_group_still_counts_as_alive(monkeypatch) -> None:
+    def denied(_pgid: int, _sig: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(os, "killpg", denied)
+    assert teardown._group_alive(1)
+
+
+def test_a_vanished_group_is_not_alive(monkeypatch) -> None:
+    def gone(_pgid: int, _sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "killpg", gone)
+    assert not teardown._group_alive(1)
+
+
+def test_the_guard_is_inert_off_the_main_thread() -> None:
+    seen: list[bool] = []
+
+    def run() -> None:
+        with stop_guard():
+            seen.append(True)
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(timeout=30)
+    assert seen == [True]
