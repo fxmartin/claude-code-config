@@ -30,6 +30,7 @@ from sdlc.queue import (
 from sdlc.registry import DASHBOARD_URL_ENV, WORKER_ENV, RunRecord, normalize_dashboard_url
 
 __all__ = [
+    "FLEET_DISABLED_ENV",
     "QUEUE_CONFIG_FILENAME",
     "QUEUE_TOKEN_ENV",
     "QUEUE_URL_ENV",
@@ -45,6 +46,14 @@ __all__ = [
 ]
 
 QUEUE_URL_ENV = "SDLC_QUEUE_URL"
+# Story 35.5-004: set in every dispatched agent's environment. Resolution then finds
+# no fleet — ahead of SDLC_QUEUE_URL and both config files — so an agent's own
+# controller code cannot reach the fleet through `~/.sdlc-fleet.yaml`.
+FLEET_DISABLED_ENV = "SDLC_FLEET_DISABLED"
+# The marker every dispatch sets (build.IN_TEST_ENV_VAR): controller code an agent
+# runs must not write to the live fleet.
+_IN_TEST_ENV = "SDLC_IN_TEST"
+_TRUTHY = {"1", "true", "yes", "on"}
 # The same shared secret `sdlc queue serve` reads: one variable on both ends.
 QUEUE_TOKEN_ENV = "SDLC_QUEUE_TOKEN"
 # The file form of SDLC_QUEUE_URL, mirroring `.sdlc-forge.yaml`: a repo-level
@@ -119,6 +128,10 @@ def _url_from_file(path: Path) -> str | None:
     return _clean_url(raw["queue_url"], path.name)
 
 
+def _flag(source: Mapping[str, str], name: str) -> bool:
+    return source.get(name, "").strip().lower() in _TRUTHY
+
+
 def resolve_queue_url(
     *,
     cwd: Path | None = None,
@@ -133,11 +146,17 @@ def resolve_queue_url(
     than quietly falling back — a typo must not turn a fleet enqueue into a
     local one.
 
+    ``SDLC_FLEET_DISABLED`` (a truthy value) outranks all of it: no fleet at all
+    (Story 35.5-004).
+
     ``environ`` resolves for *another process* — a LaunchAgent's own environment,
     say — in which case that process's working directory is unknown and the
     repo-level file is skipped; only its variable and the per-user file count.
     """
-    env = (os.environ if environ is None else environ).get(QUEUE_URL_ENV, "").strip()
+    source = os.environ if environ is None else environ
+    if _flag(source, FLEET_DISABLED_ENV):
+        return None
+    env = source.get(QUEUE_URL_ENV, "").strip()
     if env:
         return _clean_url(env, QUEUE_URL_ENV)
     candidates = [(home or _home()) / USER_CONFIG_FILENAME]
@@ -413,6 +432,16 @@ class QueueClient:
     def put_fleet_run(self, record: RunRecord, *, now: datetime | None = None) -> None:
         """``PUT /runs`` — push one run's record to the fleet registry (Story 35.4-001)."""
         self._call("PUT", "/runs", record.to_dict())
+
+    def delete_fleet_run(self, run_id: str) -> bool:
+        """``DELETE /runs/<id>`` — drop a bogus run record; False when the fleet has none."""
+        try:
+            self._call("DELETE", f"/runs/{quote(run_id, safe='')}")
+        except QueueRequestError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
 
     def list_fleet_runs(self) -> list[dict[str, Any]]:
         """``GET /runs`` — every pushed run, each with its worker's ``worker_online`` flag."""
@@ -726,7 +755,12 @@ def push_fleet_run(record: RunRecord) -> None:
     The worker's local registry file stays authoritative, so no failure here —
     a down service, a refused identity, a malformed ``SDLC_QUEUE_URL`` — may
     reach the build that called it: the fleet view just stays a push behind.
+
+    Also a no-op under ``SDLC_IN_TEST`` (Story 35.5-004): every agent dispatch
+    sets it, so controller code an agent runs never lands a run on the live fleet.
     """
+    if _flag(os.environ, _IN_TEST_ENV):
+        return
     try:
         url = resolve_queue_url()
         if url is None:

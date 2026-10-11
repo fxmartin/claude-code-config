@@ -70,6 +70,11 @@ THINKING_CAP_ENV = "MAX_THINKING_TOKENS"
 # so a doc/visual story can never kick off a second real orchestration. The value
 # is presence-/truthy-based on the build side, so ``"1"`` satisfies the guard.
 _DISPATCH_IN_TEST_ENV = "SDLC_IN_TEST"
+# Story 35.5-004: the fleet's write credential and identity (queue_client.QUEUE_URL_ENV,
+# QUEUE_TOKEN_ENV, registry.WORKER_ENV) never reach an agent; SDLC_FLEET_DISABLED
+# (queue_client.FLEET_DISABLED_ENV) also shuts out ~/.sdlc-fleet.yaml.
+_FLEET_ENV_VARS = ("SDLC_QUEUE_URL", "SDLC_QUEUE_TOKEN", "SDLC_WORKER")
+_DISPATCH_FLEET_DISABLED_ENV = "SDLC_FLEET_DISABLED"
 
 # The env var gh/glab consult to open a URL; forced to a no-op for every dispatch
 # (see ``_dispatch_env``) because a headless agent must never open a browser.
@@ -223,6 +228,12 @@ def _dispatch_env(thinking_cap: int | None) -> dict[str, str]:
     # Issue #145: mark the dispatch as in-test so a nested ``sdlc build`` the agent
     # might shell out short-circuits instead of launching a second real run.
     env[_DISPATCH_IN_TEST_ENV] = "1"
+    # Story 35.5-004: the token is a write credential for the whole fleet (enqueue,
+    # requeue, cancel, PUT /runs). An agent's ad-hoc controller code must not be able
+    # to register ghost runs, so it gets no fleet identity and resolves no fleet.
+    for name in _FLEET_ENV_VARS:
+        env.pop(name, None)
+    env[_DISPATCH_FLEET_DISABLED_ENV] = "1"
     # gh/glab (and python's webbrowser) honour $BROWSER before falling back to
     # xdg-open. Point it at the coreutils no-op so a dispatched agent that finds
     # a route past the `--web` deny rules still cannot open a window on the

@@ -48,9 +48,14 @@ def _no_fleet_queue(monkeypatch, tmp_path_factory):
     service (Story 35.1-002). Tests that exercise the switch set the variable.
     `SDLC_WORKER` is set for every job a fleet worker launches (Story 35.4-001),
     so a suite run inside one would otherwise name every run it registers.
+    `SDLC_IN_TEST` and `SDLC_FLEET_DISABLED` are what a dispatched agent runs
+    under (Story 35.5-004); both switch the registry push off, so a suite run
+    inside an agent would never exercise it.
     """
     import sdlc.queue_client as queue_client
 
+    monkeypatch.delenv("SDLC_IN_TEST", raising=False)
+    monkeypatch.delenv("SDLC_FLEET_DISABLED", raising=False)
     monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
     monkeypatch.delenv("SDLC_QUEUE_TOKEN", raising=False)
     monkeypatch.delenv("SDLC_WORKER", raising=False)

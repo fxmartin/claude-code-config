@@ -498,6 +498,12 @@ class _Routes:
             raise _ApiError(400, str(exc)) from exc
         return 200, {"ok": True}
 
+    def delete_run(self, run_id: str) -> Reply:
+        """Drop one pushed run record — the prune for a bogus or stale one (Story 35.5-004)."""
+        if not self.store.delete_fleet_run(run_id):
+            raise _ApiError(404, f"no such run: {run_id}")
+        return 200, {"ok": True}
+
     def list_runs(self, _query: Any, _body: Body) -> Reply:
         """Every pushed run, each flagged with whether its worker is still heartbeating.
 
@@ -819,6 +825,11 @@ def _route(method: str, path: str, routes: _Routes) -> Callable[[dict[str, list[
         return lambda _query, body: verb(job_id, body)
     if any(key[1] == tuple(parts) for key in table):
         raise _ApiError(405, f"{method} not allowed on {path}")
+    if len(parts) == 2 and parts[0] == "runs":
+        if method != "DELETE":
+            raise _ApiError(405, f"{method} not allowed on {path}")
+        run_id = unquote(parts[1])
+        return lambda _query, _body: routes.delete_run(run_id)
     if len(parts) == 2 and parts[0] == "workers":
         if method != "GET":
             raise _ApiError(405, f"{method} not allowed on {path}")

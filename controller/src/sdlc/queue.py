@@ -1217,6 +1217,8 @@ class QueueBackend(Protocol):
 
     def put_fleet_run(self, record: RunRecord, *, now: datetime | None = None) -> None: ...
 
+    def delete_fleet_run(self, run_id: str) -> bool: ...
+
     def list_fleet_runs(self) -> list[dict[str, Any]]: ...
 
 
@@ -2051,6 +2053,18 @@ class QueueStore:
                     record.phase,
                 ),
             )
+
+    def delete_fleet_run(self, run_id: str) -> bool:
+        """Remove ``run_id``'s fleet row (Story 35.5-004); False when there was none."""
+        if not self.db_path.exists():
+            return False
+        try:
+            with self._connect() as conn:
+                return conn.execute(
+                    "DELETE FROM fleet_runs WHERE run_id = ?", (run_id,)
+                ).rowcount > 0
+        except sqlite3.OperationalError:  # no `fleet_runs` table yet: nothing was ever pushed
+            return False
 
     def list_fleet_runs(self) -> list[dict[str, Any]]:
         """Every pushed run, newest start first, as :meth:`RunRecord.to_dict` + ``updated_at``.
