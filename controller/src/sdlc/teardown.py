@@ -12,7 +12,9 @@ SIGTERM (or Ctrl-C) terminates every live agent's process group through
 closes the run in the ledger, then exits. Each agent's pid/pgid is also written to
 ``$SDLC_AGENT_PIDS_DIR`` (when the scheduler set one) so a scheduler that had to
 SIGKILL a controller before it could clean up can still reap the survivors
-(:func:`reap_tracked_agents`).
+(:func:`reap_tracked_agents`). The scheduler leaves *why* it stopped the job in
+the same directory (:func:`write_stop_reason`), so the ledger names the budget
+cap, the cancel or the shutdown rather than a bare signal.
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ from typing import Any, Iterator
 # The scheduler sets this on a job it launches; the controller then tracks each
 # agent there, one ``agent-<pid>`` file holding ``<pid> <pgid>``.
 AGENT_PIDS_ENV = "SDLC_AGENT_PIDS_DIR"
+# Written there by the scheduler just before it signals the job's controller.
+_STOP_REASON_FILE = "stop-reason"
 
 # SIGTERM → SIGKILL grace for an agent being torn down, per phase. Agents are
 # terminated concurrently, so the whole teardown takes at most twice this — well
@@ -228,6 +232,25 @@ def close_stopped_run(reason: str) -> None:
 # --- the handler -----------------------------------------------------------------
 
 
+def write_stop_reason(pids_dir: Path, reason: str) -> None:
+    """Scheduler side: tell a job's controller why it is about to be stopped."""
+    with contextlib.suppress(OSError):
+        (pids_dir / _STOP_REASON_FILE).write_text(reason)
+
+
+def _reason_for(signum: int) -> str:
+    """The worker's stated reason for this stop, else the signal's own name."""
+    directory = os.environ.get(AGENT_PIDS_ENV)
+    if directory:
+        try:
+            stated = (Path(directory) / _STOP_REASON_FILE).read_text().strip()
+        except OSError:
+            stated = ""
+        if stated:
+            return stated
+    return signal.Signals(signum).name
+
+
 def _on_signal(signum: int, _frame: Any) -> None:
     global _stop_reason, _deferred
     if _stop_reason is not None:
@@ -235,7 +258,7 @@ def _on_signal(signum: int, _frame: Any) -> None:
     if _spawning:
         _deferred = signum  # replayed once the agent being spawned is registered
         return
-    reason = signal.Signals(signum).name
+    reason = _reason_for(signum)
     _stop_reason = reason
     terminate_agents()
     close_stopped_run(reason)
@@ -325,6 +348,8 @@ def reap_tracked_agents(
     for pgid in pending:
         with contextlib.suppress(OSError):
             os.killpg(pgid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        (pids_dir / _STOP_REASON_FILE).unlink()
     with contextlib.suppress(OSError):
         pids_dir.rmdir()
     return [pid for pid, _ in victims]

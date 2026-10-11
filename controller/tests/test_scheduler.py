@@ -740,9 +740,18 @@ class ReapingProc(FakeProc):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.reaped = 0
+        self.steps: list[str] = []
+
+    def note_stop_reason(self, reason: str) -> None:
+        self.steps.append(f"reason: {reason}")
+
+    def stop(self) -> None:
+        self.steps.append("stop")
+        super().stop()
 
     def reap_orphans(self) -> list[int]:
         self.reaped += 1
+        self.steps.append("reap")
         return [4242]
 
 
@@ -778,6 +787,8 @@ def test_a_cancelled_running_job_has_its_orphaned_agents_reaped(tmp_path) -> Non
     assert store.get_job(job_id).state == "cancelled"
     assert launcher.procs[0].stopped is True and launcher.procs[0].reaped == 1
     assert f"job {job_id}: reaped orphaned agent pid 4242" in echoed
+    # The controller is told why before it is signalled, so its ledger can say so.
+    assert launcher.procs[0].steps == ["reason: cancelled by operator", "stop", "reap"]
 
 
 def test_a_budget_stop_has_its_orphaned_agents_reaped(tmp_path) -> None:
@@ -798,6 +809,8 @@ def test_a_budget_stop_has_its_orphaned_agents_reaped(tmp_path) -> None:
     assert store.get_job(job_id).state == "needs_attention"
     assert launcher.procs[0].reaped == 1
     assert f"job {job_id}: reaped orphaned agent pid 4242" in echoed
+    reason, *rest = launcher.procs[0].steps
+    assert reason.startswith("reason: budget exhausted: wall-clock") and rest == ["stop", "reap"]
 
 
 def test_a_worker_shutdown_has_its_orphaned_agents_reaped(tmp_path) -> None:
@@ -821,6 +834,7 @@ def test_a_worker_shutdown_has_its_orphaned_agents_reaped(tmp_path) -> None:
 
     assert launcher.procs[0].reaped == 1
     assert f"job {job_id}: reaped orphaned agent pid 4242" in echoed
+    assert launcher.procs[0].steps == ["reason: worker shutdown", "stop", "reap"]
 
 
 # --- slot accounting ------------------------------------------------------

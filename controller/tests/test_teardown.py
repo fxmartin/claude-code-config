@@ -17,6 +17,7 @@ import pytest
 from sdlc import dispatch, scheduler, teardown
 from sdlc.build import Ledger
 from sdlc.dispatch import dispatch_agent
+from sdlc.resume import compute_resume_plan, has_resumable_work
 from sdlc.teardown import StoppedByWorker, stop_guard
 
 # Generous: a loaded CI container (2 CPUs, shared with GitLab) is slow to reap.
@@ -45,6 +46,12 @@ def _default_stop_signal_dispositions():
     yield
     signal.signal(signal.SIGTERM, previous[0])
     signal.signal(signal.SIGINT, previous[1])
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_agent_tracking(monkeypatch):
+    """A suite run inside a fleet job inherits that job's tracking dir; keep it out."""
+    monkeypatch.delenv(teardown.AGENT_PIDS_ENV, raising=False)
 
 
 # --- helpers ---------------------------------------------------------------------
@@ -262,6 +269,85 @@ def test_the_guard_restores_the_default_handlers_and_state() -> None:
     assert teardown.stop_requested() is None
 
 
+def test_a_stopped_run_resumes_the_story_from_the_interrupted_stage(tmp_path) -> None:
+    """AC2: the run is closed, yet `sdlc resume --run` re-enters the stage it was in."""
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-35", "serial")
+    ledger.set_total(run_id, 1)
+    ledger.story_upsert(run_id, "35.5-002", "", "t", "Must", 3, "backend", "", None, "TODO")
+    ledger.set_story_status(run_id, "35.5-002", "IN_PROGRESS")
+    ledger.stage_start(run_id, "35.5-002", "build", 1)
+
+    with stop_guard():
+        teardown.bind_run(ledger, run_id)
+        teardown.close_stopped_run("worker shutdown")
+
+    assert ledger.run_row(run_id)["status"] == "FAILED"
+    assert "build: stopped by worker: worker shutdown" in _events(ledger, run_id)
+    story = compute_resume_plan(ledger, run_id)["35.5-002"]
+    assert (story.next_stage, story.start_attempt) == ("build", 2)
+    assert has_resumable_work(ledger, run_id)
+
+
+@pytest.mark.parametrize(
+    ("stated", "recorded"),
+    [
+        ("cancelled by operator", "cancelled by operator"),
+        # A fleet job's controller `kill`ed by hand: the worker stated nothing.
+        (None, "SIGTERM"),
+    ],
+)
+def test_the_stop_is_recorded_under_the_worker_s_reason_else_the_signal(
+    tmp_path, ledger_run, monkeypatch, stated, recorded
+) -> None:
+    tracking = tmp_path / "agents"
+    tracking.mkdir()
+    monkeypatch.setenv(teardown.AGENT_PIDS_ENV, str(tracking))
+    if stated is not None:
+        teardown.write_stop_reason(tracking, stated)
+    ledger, run_id = ledger_run
+    with pytest.raises(SystemExit):
+        with stop_guard():
+            teardown.bind_run(ledger, run_id)
+            os.kill(os.getpid(), signal.SIGTERM)
+            deadline = time.monotonic() + WAIT_S
+            while time.monotonic() < deadline:
+                time.sleep(0.05)  # the handler's exit interrupts this
+    assert f"bugfix: stopped by worker: {recorded}" in _events(ledger, run_id)
+
+
+def test_a_stop_finishes_the_run_in_the_registry_too(ledger_run) -> None:
+    """The dashboard sidebar reads the registry: a stopped run must not stay live there."""
+    ledger, run_id = ledger_run
+    finished: list[tuple[str, str, int]] = []
+
+    class Registry:
+        def mark_finished(self, rid: str, status: str, *, completed: int) -> None:
+            finished.append((rid, status, completed))
+
+    with stop_guard():
+        teardown.bind_run(ledger, run_id, Registry())
+        teardown.close_stopped_run("worker shutdown")
+    assert finished == [(run_id, "FAILED", 0)]
+
+
+def test_a_ledger_that_cannot_be_written_never_masks_the_stop() -> None:
+    class LockedLedger:
+        def in_progress_stages(self, _run_id: str) -> list[tuple[str, str]]:
+            raise sqlite3.OperationalError("database is locked")
+
+    with stop_guard():
+        teardown.bind_run(LockedLedger(), "run-1")
+        teardown.close_stopped_run("SIGTERM")  # swallowed: the teardown carries on
+
+
+def test_a_second_signal_mid_teardown_is_ignored(monkeypatch) -> None:
+    monkeypatch.setattr(teardown, "_stop_reason", "SIGTERM")
+    teardown._on_signal(signal.SIGINT, None)  # no re-entry, no second raise
+    assert teardown.stop_requested() == "SIGTERM"
+
+
 # --- tracking ---------------------------------------------------------------------
 
 
@@ -330,6 +416,51 @@ def test_stopping_a_job_takes_its_controller_and_agent_down(tmp_path) -> None:
         _kill_leftovers(job.pid, agent, tool)
 
 
+# A controller with a live ledger run, so the test can read what it recorded.
+LEDGER_CONTROLLER = """
+import sys
+from sdlc import teardown
+from sdlc.build import Ledger
+from sdlc.dispatch import dispatch_agent
+from sdlc.teardown import stop_guard
+
+with stop_guard():
+    teardown.bind_run(Ledger(sys.argv[2]), sys.argv[3])
+    dispatch_agent("build", "go", agent_cmd=[sys.executable, "-c", {agent!r}, sys.argv[1]])
+"""
+
+
+def test_the_ledger_records_why_the_worker_stopped_the_job(tmp_path) -> None:
+    """AC2 in the fleet: the worker's reason, not just the signal, names the stop."""
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.init()
+    run_id = ledger.run_create("epic-35", "serial")
+    ledger.story_upsert(run_id, "35.5-002", "", "t", "Must", 3, "backend", "", None, "TODO")
+    ledger.stage_start(run_id, "35.5-002", "bugfix", 1)
+    pidfile = tmp_path / "pids"
+    job = scheduler._default_launcher(
+        [
+            sys.executable, "-c", LEDGER_CONTROLLER.format(agent=AGENT),
+            str(pidfile), str(ledger.db_path), run_id,
+        ],
+        tmp_path,
+    )
+    agent = tool = 0
+    try:
+        agent, tool = _agent_pids(pidfile)
+        job.note_stop_reason("budget exhausted: 5 fix rounds (cap 5)")
+        job.stop()
+        _assert_gone(job.pid, agent, tool)
+        assert job.reap_orphans() == []
+    finally:
+        _kill_leftovers(job.pid, agent, tool)
+
+    assert "bugfix: stopped by worker: budget exhausted: 5 fix rounds (cap 5)" in _events(
+        ledger, run_id
+    )
+    assert ledger.run_row(run_id)["status"] == "FAILED"
+
+
 def test_a_sigkilled_controller_leaves_nothing_after_the_backstop(tmp_path, monkeypatch) -> None:
     """AC3: the controller never got to clean up; `stop()` + the backstop reap its agent."""
     monkeypatch.setattr(scheduler, "_STOP_GRACE_SECONDS", 0.5)
@@ -352,6 +483,22 @@ def test_a_sigkilled_controller_leaves_nothing_after_the_backstop(tmp_path, monk
 def test_reaping_with_nothing_tracked_is_a_no_op(tmp_path) -> None:
     assert teardown.reap_tracked_agents(tmp_path) == []
     assert teardown.reap_tracked_agents(tmp_path / "missing") == []
+
+
+def test_reaping_tidies_the_worker_s_stop_reason_away(tmp_path) -> None:
+    tracking = tmp_path / "agents"
+    tracking.mkdir()
+    teardown.write_stop_reason(tracking, "cancelled by operator")
+    assert teardown.reap_tracked_agents(tracking) == []
+    assert not tracking.exists()
+
+
+def test_a_job_without_a_tracking_dir_takes_no_stop_reason(tmp_path) -> None:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(WAIT_S)
+    job = scheduler._PopenProcess(proc)
+    job.note_stop_reason("worker shutdown")  # nowhere to write it: a no-op
+    assert job.reap_orphans() == []
 
 
 def test_a_stale_pid_file_for_a_dead_agent_reaps_nothing(tmp_path) -> None:
