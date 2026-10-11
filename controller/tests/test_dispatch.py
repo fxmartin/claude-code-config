@@ -2424,3 +2424,83 @@ def test_dispatch_env_neutralises_browser_when_unset(monkeypatch) -> None:
     env = _dispatch_env(4096)
     assert env["BROWSER"] == "true"
     assert env["MAX_THINKING_TOKENS"] == "4096"
+
+
+# --- Story 35.5-004: dispatched agents hold no fleet credentials ------------
+
+_FLEET_VARS = ("SDLC_QUEUE_URL", "SDLC_QUEUE_TOKEN", "SDLC_WORKER")
+
+
+def _fleet_worker_env(monkeypatch) -> None:
+    monkeypatch.setenv("SDLC_QUEUE_URL", "http://fleet.example:8790")
+    monkeypatch.setenv("SDLC_QUEUE_TOKEN", "write-credential")
+    monkeypatch.setenv("SDLC_WORKER", "m3max")
+
+
+def test_dispatch_env_strips_fleet_credentials_and_disables_the_fleet(monkeypatch) -> None:
+    """The agent inherits none of the worker's fleet variables and is told the fleet is off."""
+    _fleet_worker_env(monkeypatch)
+    env = _dispatch_env(None)
+    for name in _FLEET_VARS:
+        assert name not in env
+    assert env["SDLC_FLEET_DISABLED"] == "1"
+    # The worker's own process keeps its credentials: only the copy is changed.
+    assert os.environ["SDLC_QUEUE_TOKEN"] == "write-credential"
+
+
+def test_agent_env_has_no_fleet_vars_on_the_captured_path(monkeypatch) -> None:
+    _fleet_worker_env(monkeypatch)
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "Popen", _popen(fake_run))
+    dispatch_agent("build", "prompt", agent_cmd=["fake-claude"])
+    assert not set(_FLEET_VARS) & set(seen["env"])
+    assert seen["env"]["SDLC_FLEET_DISABLED"] == "1"
+
+
+def test_agent_env_has_no_fleet_vars_on_the_streaming_path(monkeypatch) -> None:
+    _fleet_worker_env(monkeypatch)
+    seen = {}
+
+    def make(*a, **kw):
+        seen["env"] = kw.get("env")
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", make)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD)
+    assert not set(_FLEET_VARS) & set(seen["env"])
+    assert seen["env"]["SDLC_FLEET_DISABLED"] == "1"
+
+
+def test_agent_env_has_no_fleet_vars_on_the_sandboxed_path(monkeypatch, tmp_path, pinned_image) -> None:
+    _fleet_worker_env(monkeypatch)
+    monkeypatch.setattr("sdlc.dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
+    seen: dict = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["cmd"], seen["env"] = cmd, kwargs.get("env")
+        return _FakePopen([_stream_result_event(_wrap(_VALID_BUILD))])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    dispatch_agent("build", "prompt", agent_cmd=_STREAM_CMD, sandbox=True, cwd=tmp_path)
+    assert not set(_FLEET_VARS) & set(seen["env"])
+    assert not any(name in arg for arg in seen["cmd"] for name in _FLEET_VARS)
+
+
+def test_a_registry_harness_dispatch_carries_no_fleet_vars(monkeypatch) -> None:
+    """A non-Claude harness (parser id set) goes through the same env."""
+    _fleet_worker_env(monkeypatch)
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return _FakeCompleted(_wrap(_VALID_BUILD))
+
+    monkeypatch.setattr(subprocess, "Popen", _popen(fake_run))
+    dispatch_agent("build", "prompt", agent_cmd=["fake-codex", "exec"], parser="codex-exec")
+    assert not set(_FLEET_VARS) & set(seen["env"])
+    assert seen["env"]["SDLC_FLEET_DISABLED"] == "1"

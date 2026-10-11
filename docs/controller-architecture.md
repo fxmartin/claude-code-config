@@ -2623,6 +2623,23 @@ authoritative for the worker; the table is the fleet's summary.
   record of the run, the pushed-record header snapshot is served with
   `detail_unavailable` (`detail unavailable — m3max dashboard not reachable`),
   which the page shows in place of `no stories yet…`. A local run is untouched.
+- **Agents hold no fleet credentials (Story 35.5-004).** The token is a write
+  credential for the whole fleet (enqueue, requeue, cancel, `PUT /runs`), so
+  `_dispatch_env` — the one environment every agent dispatch runs under, Claude or
+  registry harness, sandboxed or not — drops `SDLC_QUEUE_URL`, `SDLC_QUEUE_TOKEN` and
+  `SDLC_WORKER` from the copy it hands the agent and sets `SDLC_FLEET_DISABLED=1`.
+  `resolve_queue_url` returns no fleet for that marker ahead of the variable and both
+  config files, so an agent's ad-hoc controller code finds nothing even with a
+  `~/.sdlc-fleet.yaml` on disk. `push_fleet_run` is also a no-op under `SDLC_IN_TEST`
+  (the marker every dispatch sets), so a fake `run_build` an agent runs outside pytest
+  cannot register ghost runs; the local registry is unchanged either way. The worker's
+  own process keeps its credentials.
+- **Pruning a record (Story 35.5-004).** `sdlc queue runs prune <run-id>` sends an
+  authenticated `DELETE /runs/<id>` (200 `{"ok": true}`, 404 for an unknown id, 403
+  without the token or an allowed identity; `DELETE /runs` is 405), so a bogus or
+  stale record leaves the XPS dashboard on its next fleet refresh. It removes only
+  the pushed record, never a run's ledger or its worker's registry entry; with no
+  fleet configured it prunes the local queue's copy and exits 2 when there is none.
   Every relay fetch (status and `/api/logs`) carries `X-Sdlc-Relayed`, and a
   dashboard answers such a request from its own ledger only, never relaying it
   on: a worker's dashboard sees the fleet too, so a run it no longer holds

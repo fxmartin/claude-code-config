@@ -3457,6 +3457,14 @@ queue_app = typer.Typer(
 )
 app.add_typer(queue_app, name="queue")
 
+queue_runs_app = typer.Typer(
+    name="runs",
+    help="Manage the run records workers push to the fleet.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+queue_app.add_typer(queue_runs_app, name="runs")
+
 
 def _queue_errors(func: Callable[..., None]) -> Callable[..., None]:
     """Turn a refused/unreachable queue into one `error:` line and exit 2.
@@ -3639,6 +3647,35 @@ def queue_workers_cmd(
             f"{'online' if w.is_online(now) else 'offline'}"
             f"{'' if w.can_run_agents else ' — cannot run agents: ' + _self_check_reason(w)}"
         )
+    raise typer.Exit(code=0)
+
+
+@queue_runs_app.command("prune")
+@_queue_errors
+def queue_runs_prune_cmd(
+    run_id: str = typer.Argument(..., help="Id of the run record to remove."),
+) -> None:
+    """Remove a bogus or stale run record from the fleet registry (Story 35.5-004).
+
+    Sends an authenticated ``DELETE /runs/<id>`` to the fleet service
+    (``SDLC_QUEUE_URL`` + ``SDLC_QUEUE_TOKEN``), so the record drops off the XPS
+    dashboard; with no fleet configured it prunes the local queue's copy. Only the
+    pushed record goes — a run's own ledger and registry entry on its worker are
+    untouched. Exits 2 when no such record exists.
+    """
+    from sdlc.queue_client import open_queue
+
+    store = open_queue()
+    store.ensure_migrated()
+    try:
+        removed = store.delete_fleet_run(run_id)
+    except QueueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if not removed:
+        typer.echo(f"error: no run record {run_id!r} on the fleet", err=True)
+        raise typer.Exit(code=2)
+    typer.echo(f"pruned: run {run_id}")
     raise typer.Exit(code=0)
 
 
