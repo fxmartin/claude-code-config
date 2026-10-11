@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.101.0] - 2026-10-11
+
+### Added
+
+- feat(fleet-execution): preflight is a visible run phase (#35.4-005) (#857)
+
+
 ## [v2.100.0] - 2026-10-10
 
 ### Added
