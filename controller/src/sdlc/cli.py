@@ -25,6 +25,7 @@ from sdlc.scheduler import (
     MAX_APPROVAL_POLL_SECONDS,
     MIN_APPROVAL_POLL_SECONDS,
 )
+from sdlc.teardown import stop_guard
 
 # The full set of planned subcommands with one-line descriptions. `--help`
 # renders these even while the bodies are stubs, so the surface area is visible
@@ -550,14 +551,16 @@ def build(ctx: typer.Context) -> None:
         actor_adapter = get_adapter(resolution.host, instance_url=resolution.instance_url)
     except IssueHostError:
         actor_adapter = None
-    result = run_build(
-        opts,
-        queue=queue,
-        ledger=ledger,
-        render_view=make_render_view(ledger.db_path),
-        registry=Registry(),
-        actor_adapter=actor_adapter,
-    )
+    # Story 35.5-002: SIGTERM / Ctrl-C take the agents down and close the run.
+    with stop_guard():
+        result = run_build(
+            opts,
+            queue=queue,
+            ledger=ledger,
+            render_view=make_render_view(ledger.db_path),
+            registry=Registry(),
+            actor_adapter=actor_adapter,
+        )
 
     if result.skipped_in_test:
         # Story 12.1-002: the recursion guard fired (SDLC_IN_TEST set) — a project
@@ -785,13 +788,14 @@ def fix(ctx: typer.Context) -> None:
     # traceback out of the command. Only the declaration error is caught here;
     # `_run_fix_batch_cli`'s own `typer.Exit` passes straight through.
     try:
-        if isinstance(opts, FixBatchOptions):
-            # _run_fix_batch_cli always raises typer.Exit — it never returns here.
-            _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view)
+        with stop_guard():  # Story 35.5-002: a stop takes the agents down
+            if isinstance(opts, FixBatchOptions):
+                # _run_fix_batch_cli always raises typer.Exit — it never returns here.
+                _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view)
 
-        result = run_fix(
-            opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
-        )
+            result = run_fix(
+                opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
+            )
     except IssueHostError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
@@ -1017,17 +1021,18 @@ def resume(
     # actionable line here too rather than escaping as a traceback — the same
     # contract `sdlc fix` honours.
     try:
-        result = run_resume(
-            scope_label,
-            ledger=ledger,
-            run_id=run,
-            render_view=make_render_view(db_path),
-            budget=budget_tokens,
-            budget_policy=budget_policy,
-            cost_threshold=cost_threshold_tokens,
-            concurrency=concurrency,
-            force=force,
-        )
+        with stop_guard():  # Story 35.5-002: a stop takes the agents down
+            result = run_resume(
+                scope_label,
+                ledger=ledger,
+                run_id=run,
+                render_view=make_render_view(db_path),
+                budget=budget_tokens,
+                budget_policy=budget_policy,
+                cost_threshold=cost_threshold_tokens,
+                concurrency=concurrency,
+                force=force,
+            )
     except IssueHostError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc

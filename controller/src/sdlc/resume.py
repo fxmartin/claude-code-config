@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from sdlc import teardown
 from sdlc.build import (
     _STAGES,
     BuildOptions,
@@ -693,6 +694,7 @@ def run_resume(
 
     # Mark the run live again and announce the resume.
     ledger.run_update_status(rid, "IN_PROGRESS")
+    teardown.bind_run(ledger, rid, registry)
     ledger.event_log(rid, "", "info", "controller", f"run resumed: scope={scope}")
     # Issue #683: re-announce the run under this process's own pid before any
     # dispatch. Left unregistered, the record still carries the crashed

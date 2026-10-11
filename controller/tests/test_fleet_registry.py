@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import urllib.error
@@ -748,7 +749,10 @@ def test_the_default_launcher_hands_a_job_its_workers_name(
     assert seen["env"][WORKER_ENV] == "m3max"
 
     _launcher_for(SchedulerConfig())(["true"], tmp_path)
-    assert seen["env"] is None  # a plain drain leaves the environment alone
+    # A plain drain leaves the environment alone — bar the agent-tracking dir every
+    # job gets (Story 35.5-002), and no worker name.
+    assert WORKER_ENV not in seen["env"]
+    assert set(seen["env"]) - set(os.environ) == {"SDLC_AGENT_PIDS_DIR"}
 
 
 def test_the_default_launcher_hands_a_job_its_workers_dashboard_url(

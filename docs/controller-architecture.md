@@ -3609,6 +3609,24 @@ machine) hostage, so `_dispatch_streaming` bounds *any* stall and kills cleanly:
   agent can flush and exit, waits `_TERM_GRACE_S` (10 s), then escalates to
   `SIGKILL` so a runaway is terminated for certain. A child that exits on
   `SIGTERM` is never `SIGKILL`-ed.
+- **A stopped controller takes its agents down (Story 35.5-002).** Each agent's
+  own session is out of reach of a signal aimed at the controller's group — the
+  scheduler's `killpg` on a stopped job (budget cap, `cancel_requested`, the
+  worker's shutdown) and a bare `kill` of `sdlc build` alike. So `sdlc build`,
+  `fix` and `resume` run under `teardown.stop_guard()`: on SIGTERM or Ctrl-C the
+  controller terminates every live agent's group through
+  `_terminate_process_group` (concurrently, 3 s grace each), writes
+  `<stage>: stopped by worker: <SIGNAL>` for every interrupted stage, closes the
+  run `FAILED` (never left `IN_PROGRESS`; the stage rows stay as crashed attempts,
+  so `sdlc resume --run <id>` re-enters from that stage) and exits `128 + signal`
+  (143 / 130). No new agent is dispatched once a stop is under way, and the stop
+  is a `BaseException`, so no stage or bugfix handler records it as a failure.
+  A foreign SIGTERM/SIGINT handler already in place is left alone.
+- **Backstop for a controller killed first.** The scheduler launches every job
+  with `SDLC_AGENT_PIDS_DIR` set; the controller keeps one `agent-<pid>` file
+  (`<pid> <pgid>`) there for each live agent. After stopping a job the scheduler
+  kills any group still on file (SIGTERM, then SIGKILL) and logs
+  `job N: reaped orphaned agent pid P` — at all three stop sites.
 - **Two independent kill triggers.** The existing wall-clock `timeout` (default
   `DEFAULT_TIMEOUT_S`, 3600 s) is joined by a **heartbeat dead-man**: an
   output-idle monitor thread that kills the agent after `stall_timeout` seconds
