@@ -731,6 +731,112 @@ def test_cancelled_jobs_are_never_dispatched(tmp_path) -> None:
     assert launcher.calls == []
 
 
+# --- Story 35.5-002: every stop site reaps the agents the controller left ---
+
+
+class ReapingProc(FakeProc):
+    """A job process whose controller left one orphaned agent behind."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.reaped = 0
+        self.steps: list[str] = []
+
+    def note_stop_reason(self, reason: str) -> None:
+        self.steps.append(f"reason: {reason}")
+
+    def stop(self) -> None:
+        self.steps.append("stop")
+        super().stop()
+
+    def reap_orphans(self) -> list[int]:
+        self.reaped += 1
+        self.steps.append("reap")
+        return [4242]
+
+
+class ReapingLauncher(FakeLauncher):
+    def __call__(self, argv, cwd):
+        self._next_pid += 1
+        self.calls.append((list(argv), str(cwd)))
+        proc = ReapingProc(self._next_pid, alive_polls=self._alive, code=self._code)
+        self.procs.append(proc)
+        return proc
+
+
+def test_a_cancelled_running_job_has_its_orphaned_agents_reaped(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="build", scope="epic-3")
+    launcher = ReapingLauncher(alive_polls=99)
+    clock = Clock()
+    calls = {"n": 0}
+    echoed: list[str] = []
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        clock.advance(seconds)
+        if calls["n"] == 2:
+            store.cancel_job(job_id)
+        assert calls["n"] < 10, "the cancel never stopped the job"
+
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, sleeper=sleeper,
+        echo=echoed.append,
+    )
+
+    assert store.get_job(job_id).state == "cancelled"
+    assert launcher.procs[0].stopped is True and launcher.procs[0].reaped == 1
+    assert f"job {job_id}: reaped orphaned agent pid 4242" in echoed
+    # The controller is told why before it is signalled, so its ledger can say so.
+    assert launcher.procs[0].steps == ["reason: cancelled by operator", "stop", "reap"]
+
+
+def test_a_budget_stop_has_its_orphaned_agents_reaped(tmp_path) -> None:
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="fix", scope="1")
+    budget = store.get_job(job_id).job_budget()
+    launcher = ReapingLauncher(alive_polls=99)
+    echoed: list[str] = []
+
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher,
+        config=SchedulerConfig(slots=2, poll_seconds=budget.wall_clock_seconds + 1),
+        echo=echoed.append,
+    )
+
+    assert store.get_job(job_id).state == "needs_attention"
+    assert launcher.procs[0].reaped == 1
+    assert f"job {job_id}: reaped orphaned agent pid 4242" in echoed
+    reason, *rest = launcher.procs[0].steps
+    assert reason.startswith("reason: budget exhausted: wall-clock") and rest == ["stop", "reap"]
+
+
+def test_a_worker_shutdown_has_its_orphaned_agents_reaped(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = store.add_job(repo=_repo(tmp_path, "alpha"), kind="build", scope="epic-3")
+    launcher = ReapingLauncher(alive_polls=99)
+    clock = Clock()
+    calls = {"n": 0}
+    echoed: list[str] = []
+
+    def sleeper(seconds: float) -> None:
+        calls["n"] += 1
+        clock.advance(seconds)
+        if calls["n"] >= 2:
+            raise KeyboardInterrupt
+
+    _run(
+        store, tmp_path=tmp_path, launcher=launcher, clock=clock, sleeper=sleeper,
+        echo=echoed.append,
+    )
+
+    assert launcher.procs[0].reaped == 1
+    assert f"job {job_id}: reaped orphaned agent pid 4242" in echoed
+    assert launcher.procs[0].steps == ["reason: worker shutdown", "stop", "reap"]
+
+
 # --- slot accounting ------------------------------------------------------
 
 

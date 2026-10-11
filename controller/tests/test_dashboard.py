@@ -43,12 +43,17 @@ def _running(db_path: Path, *, sse_poll: float | None = None, sse_heartbeat: flo
         server.sse_poll_interval = sse_poll  # type: ignore[attr-defined]
     if sse_heartbeat is not None:
         server.sse_heartbeat_interval = sse_heartbeat  # type: ignore[attr-defined]
+    # A stream's handler only notices a closed client on its next write (up to a
+    # heartbeat away) and daemon handlers are never joined — so it would outlive
+    # the test, polling the ledger. Track handlers so `server_close` joins them.
+    server.daemon_threads = False
     thread = threading.Thread(target=server.serve_forever, kwargs=_FAST_SHUTDOWN, daemon=True)
     thread.start()
     host, port = server.server_address
     try:
         yield f"http://127.0.0.1:{port}"
     finally:
+        server._sse_stop = True  # type: ignore[attr-defined]  # end any open stream loop
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
@@ -1154,6 +1159,29 @@ def test_stream_heartbeat_when_idle(tmp_path: Path) -> None:
         finally:
             resp.close()
     assert ": heartbeat" in raw  # idle keep-alive comment (ignored by EventSource)
+
+
+def test_stream_thread_ends_with_its_server(tmp_path: Path) -> None:
+    """A closed stream's handler thread is gone once ``_running`` exits.
+
+    Otherwise it keeps polling ``Ledger.change_token`` into later tests, where a
+    class-level counting patch picks its calls up (the #848 counting test flaked).
+    """
+    db = tmp_path / ".sdlc-state.db"
+    _seed(db)
+    with _running(db, sse_poll=0.05, sse_heartbeat=5.0) as base:
+        before = set(threading.enumerate())
+        resp = urllib.request.urlopen(base + "/api/stream", timeout=3.0)  # noqa: S310
+        try:
+            _read_sse_records(resp, want_changes=1, deadline=3.0)
+        finally:
+            resp.close()
+        handlers = [
+            t for t in threading.enumerate()
+            if t not in before and "process_request_thread" in t.name
+        ]
+    assert handlers  # the stream ran on its own handler thread...
+    assert not any(t.is_alive() for t in handlers)  # ...which ended with the server
 
 
 def test_page_uses_eventsource_transport() -> None:

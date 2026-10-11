@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from sdlc import teardown
 from sdlc.model_routing import fallback_model_for
 from sdlc.rate_limit import RateLimitSignal
 from sdlc.sanitize import sanitize_prompt
@@ -965,6 +966,21 @@ def _isolate_host_stage(cmd: list[str]) -> list[str]:
     return [*cmd, *HOST_STAGE_ISOLATION_FLAGS]
 
 
+def _spawn_agent(cmd: list[str], **popen_kwargs: Any) -> "subprocess.Popen[str]":
+    """Launch an agent in its own session and register it for teardown (Story 35.5-002).
+
+    The session (``start_new_session=True``, Story 13.4-001) is what lets a stall
+    kill reach the agent's whole tool tree — and also what keeps a signal aimed at
+    the controller's group away from it, so the controller tracks every agent
+    itself (:mod:`sdlc.teardown`) and takes it down when the controller is stopped.
+    """
+    teardown.raise_if_stopping()
+    with teardown.spawning():
+        proc = subprocess.Popen(cmd, start_new_session=True, **popen_kwargs)
+        teardown.register_agent(proc)
+    return proc
+
+
 def dispatch_agent(
     agent_type: str,
     prompt: str,
@@ -1051,16 +1067,28 @@ def dispatch_agent(
     # prompts round-trip unchanged; suspicious payloads are logged (and flagged
     # for review above a threshold) rather than silently obeyed.
     prompt = sanitize_prompt(prompt, source=agent_type).cleaned
-    if _is_streaming_cmd(cmd):
-        return _dispatch_streaming(
-            agent_type, prompt, cmd, timeout=timeout, stall_timeout=stall_timeout,
-            transcript_path=transcript_path, on_progress=on_progress, env=env,
-            cwd=cwd, parser=parser,
-        )
-    return _dispatch_captured(
-        agent_type, prompt, cmd, timeout=timeout,
-        transcript_path=transcript_path, env=env, cwd=cwd, parser=parser,
-    )
+    teardown.raise_if_stopping()
+    try:
+        if _is_streaming_cmd(cmd):
+            result = _dispatch_streaming(
+                agent_type, prompt, cmd, timeout=timeout, stall_timeout=stall_timeout,
+                transcript_path=transcript_path, on_progress=on_progress, env=env,
+                cwd=cwd, parser=parser,
+            )
+        else:
+            result = _dispatch_captured(
+                agent_type, prompt, cmd, timeout=timeout,
+                transcript_path=transcript_path, env=env, cwd=cwd, parser=parser,
+            )
+    except Exception:
+        # Story 35.5-002: an agent the controller's own teardown killed is a stop,
+        # not an agent failure — it must never reach the bugfix loop.
+        teardown.raise_if_stopping()
+        raise
+    finally:
+        teardown.prune_finished()
+    teardown.raise_if_stopping()
+    return result
 
 
 def _dispatch_captured(
@@ -1108,7 +1136,7 @@ def _dispatch_captured(
     torn down, instead of being swallowed into an ``AgentDispatchError``.
     """
     try:
-        proc = subprocess.Popen(
+        proc = _spawn_agent(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1116,7 +1144,6 @@ def _dispatch_captured(
             text=True,
             env=env,
             cwd=cwd,
-            start_new_session=True,
         )
     except (FileNotFoundError, OSError) as exc:
         _write_transcript(transcript_path, "", f"could not launch {cmd[0]!r}: {exc}")
@@ -1206,7 +1233,10 @@ def _dispatch_streaming(
     path is unchanged.
     """
     try:
-        proc = subprocess.Popen(
+        # Story 13.4-001: ``_spawn_agent`` leads a new session/process group so the
+        # controller can signal the whole group (the agent + any tool subprocess it
+        # spawned) on timeout/stall — no orphaned child survives the kill.
+        proc = _spawn_agent(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1214,10 +1244,6 @@ def _dispatch_streaming(
             text=True,
             env=env,
             cwd=cwd,
-            # Story 13.4-001: lead a new session/process group so the controller
-            # can signal the whole group (the agent + any tool subprocess it
-            # spawned) on timeout/stall — no orphaned child survives the kill.
-            start_new_session=True,
         )
     except (FileNotFoundError, OSError) as exc:
         _write_transcript(transcript_path, "", f"could not launch {cmd[0]!r}: {exc}")

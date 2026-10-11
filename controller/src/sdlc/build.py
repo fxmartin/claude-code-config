@@ -29,6 +29,7 @@ from sdlc.capability import (
 from sdlc import build_issue
 from sdlc import change_class
 from sdlc import coverage_precheck
+from sdlc import teardown
 from sdlc.degradation import evaluate_degradations
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
 from sdlc.commitlint import (
@@ -4040,6 +4041,23 @@ class Ledger:
                 (run_id, stage_name),
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    def in_progress_stages(self, run_id: str) -> list[tuple[str, str]]:
+        """``(story_id, stage_name)`` of every stage attempt still ``IN_PROGRESS``.
+
+        What a stopped controller was in the middle of (Story 35.5-002): those
+        rows stay as crashed attempts for `sdlc resume` to re-enter, and the stop
+        names each one in the ledger. Read-only; an absent ledger has none.
+        """
+        if not self.db_path.exists():
+            return []
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                "SELECT story_id, stage_name FROM stages "
+                "WHERE run_id = ? AND status = 'IN_PROGRESS' ORDER BY started_at, rowid",
+                (run_id,),
+            ).fetchall()
+        return [(r["story_id"], r["stage_name"]) for r in rows]
 
     def stage_usage_rows(self, run_id: str) -> list[dict]:
         """Every stage attempt of ``run_id`` with its recorded usage (28.1-001).
@@ -8124,6 +8142,7 @@ def run_build(
     # actually use, so `--concurrency=1` reports `serial` rather than lying.
     mode = authoritative_mode(opts)
     run_id = ledger.run_create(opts.scope, mode)
+    teardown.bind_run(ledger, run_id, registry)
     # Story 22.5-001 AC1: stamp the run's actor from host identity, resolved once
     # per run. Best-effort and self-degrading — no adapter (host indeterminate)
     # or absent host auth yields `unknown`, never a crash (AC3).

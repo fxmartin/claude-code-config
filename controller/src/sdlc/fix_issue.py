@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from sdlc import build_issue, change_class, issue_host
+from sdlc import build_issue, change_class, issue_host, teardown
 from sdlc.build import (
     _GATE_BLOCK,
     MAX_BUGFIX_ATTEMPTS,
@@ -2334,6 +2334,7 @@ def run_fix(
     # --- Ledger bootstrap + run open -----------------------------------------
     ledger.init()
     run_id = ledger.run_create(scope, "fix")
+    teardown.bind_run(ledger, run_id, registry)
     story = issue_story(issue, root=root)
     ledger.set_total(run_id, 1)
     ledger.story_upsert(
@@ -2659,6 +2660,7 @@ def resume_fix(
     pr_number = story_row.get("pr_number")
 
     ledger.run_update_status(run_id, "IN_PROGRESS")
+    teardown.bind_run(ledger, run_id, registry)
     ledger.event_log(
         run_id, "", "info", "controller",
         f"fix resumed: scope={scope} done={','.join(sorted(done_stages)) or '-'}",
@@ -3347,6 +3349,7 @@ def run_fix_batch(
     ledger.init()
     mode = "serial" if workers == 1 else "parallel"
     run_id = ledger.run_create(scope, mode)
+    teardown.bind_run(ledger, run_id, registry)
     ledger.set_total(run_id, len(candidates))
     if registry is not None:
         _registry_register(

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
@@ -14,12 +15,14 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, cast
 
+from sdlc import teardown
 from sdlc.approval import ApprovalVerdict, poll_approval
 from sdlc.queue import (
     HEARTBEAT_SECONDS,
@@ -366,15 +369,24 @@ class _PopenProcess:
     way out we escalate SIGTERM → SIGKILL rather than assuming a prompt death.
     """
 
-    def __init__(self, proc: "subprocess.Popen[bytes]") -> None:
+    def __init__(
+        self, proc: "subprocess.Popen[bytes]", pids_dir: Path | None = None
+    ) -> None:
         self._proc = proc
+        # Where the job's controller tracks the agents it dispatched, for the
+        # backstop in :meth:`reap_orphans` (Story 35.5-002).
+        self._pids_dir = pids_dir
 
     @property
     def pid(self) -> int:
         return self._proc.pid
 
     def poll(self) -> int | None:
-        return self._proc.poll()
+        code = self._proc.poll()
+        if code is not None and self._pids_dir is not None:
+            with contextlib.suppress(OSError):
+                self._pids_dir.rmdir()  # only an empty dir: no agent is left on file
+        return code
 
     def stop(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -391,6 +403,25 @@ class _PopenProcess:
                 return
             except subprocess.TimeoutExpired:
                 continue
+
+    def note_stop_reason(self, reason: str) -> None:
+        """Leave the controller why it is being stopped, ahead of :meth:`stop`'s SIGTERM.
+
+        The controller records it against each interrupted stage (Story 35.5-002).
+        """
+        if self._pids_dir is not None:
+            teardown.write_stop_reason(self._pids_dir, reason)
+
+    def reap_orphans(self) -> list[int]:
+        """Kill any agent the stopped controller left behind; return their pids.
+
+        Agents live in sessions of their own, out of reach of :meth:`stop`'s group
+        kill. A controller that handles SIGTERM takes them down itself; this is the
+        backstop for one that was SIGKILLed (or crashed) first (Story 35.5-002).
+        """
+        if self._pids_dir is None:
+            return []
+        return teardown.reap_tracked_agents(self._pids_dir)
 
 
 def controller_argv() -> list[str]:
@@ -783,15 +814,26 @@ def ledger_plan_files(db_path: str, run_id: str) -> list[str]:
 
 def _default_launcher(
     argv: Sequence[str], cwd: Path, env: dict[str, str] | None = None
-) -> JobProcess:
+) -> "_PopenProcess":
     """Spawn a job as a detached process group under ``cwd``.
 
     Runs as a subprocess, never in-process, so a job's crash cannot take the
     scheduler down with it and a process-group kill reaches the job's own
     agents. ``env`` replaces the inherited environment when given.
     """
-    proc = subprocess.Popen(list(argv), cwd=str(cwd), start_new_session=True, env=env)
-    return _PopenProcess(proc)
+    # The job's controller tracks each agent it dispatches here (Story 35.5-002),
+    # so a stop can reap any it was killed too soon to take down itself.
+    pids_dir = Path(tempfile.mkdtemp(prefix="sdlc-agents-"))
+    job_env = {**(os.environ if env is None else env), teardown.AGENT_PIDS_ENV: str(pids_dir)}
+    try:
+        proc = subprocess.Popen(
+            list(argv), cwd=str(cwd), start_new_session=True, env=job_env
+        )
+    except BaseException:
+        with contextlib.suppress(OSError):
+            pids_dir.rmdir()
+        raise
+    return _PopenProcess(proc, pids_dir)
 
 
 def _launcher_for(config: "SchedulerConfig") -> Launcher:
@@ -1869,10 +1911,7 @@ class _Scheduler:
             if reason is None:
                 continue
             del self._in_flight[job_id]
-            try:
-                entry.proc.stop()
-            except OSError as exc:
-                self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            self._stop_job(job_id, entry, reason)
             self._push_run(entry.run_id, ended=True)
             try:
                 if fix_rounds_exhausted(entry.budget, rounds):
@@ -1886,6 +1925,27 @@ class _Scheduler:
             self._result.parked += 1
             self._echo(f"job {job_id} parked (needs_attention): {reason}")
             self._announce(entry.job, entry.run_id, "needs_attention")
+
+    def _stop_job(self, job_id: int, entry: "_InFlight", reason: str) -> None:
+        """Stop ``entry``'s process group, then reap any agent it left behind.
+
+        The group kill reaches the controller, which takes its own agents down on
+        SIGTERM and records ``reason`` against the interrupted stage. An agent it
+        was SIGKILLed too soon to take down sits in a session of its own and
+        survives that — the backstop finds it from the controller's pid file and
+        kills it (Story 35.5-002). Common to all three stop sites: budget, cancel
+        and the worker's own shutdown.
+        """
+        note = getattr(entry.proc, "note_stop_reason", None)
+        if callable(note):
+            note(reason)
+        try:
+            entry.proc.stop()
+        except OSError as exc:
+            self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+        reap = getattr(entry.proc, "reap_orphans", None)
+        for pid in reap() if callable(reap) else ():
+            self._echo(f"job {job_id}: reaped orphaned agent pid {pid}")
 
     def _honour_cancels(self) -> None:
         """Stop every in-flight job an operator has cancelled (Story 35.4-003).
@@ -1908,10 +1968,7 @@ class _Scheduler:
             if current is None or not (current.cancel_requested or current.state == "cancelled"):
                 continue
             del self._in_flight[job_id]
-            try:
-                entry.proc.stop()
-            except OSError as exc:
-                self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            self._stop_job(job_id, entry, "cancelled by operator")
             self._push_run(entry.run_id, ended=True)
             try:
                 self._store.finish_job(
@@ -2603,10 +2660,7 @@ class _Scheduler:
         """
         self._echo("interrupted — stopping jobs and releasing leases")
         for job_id, entry in list(self._in_flight.items()):
-            try:
-                entry.proc.stop()
-            except OSError as exc:
-                self._echo(f"job {job_id}: could not stop pid {entry.proc.pid}: {exc}")
+            self._stop_job(job_id, entry, "worker shutdown")
             self._push_run(entry.run_id, ended=True)
             if self._release_on_shutdown(job_id):
                 self._echo(f"job {job_id}: lease released")
