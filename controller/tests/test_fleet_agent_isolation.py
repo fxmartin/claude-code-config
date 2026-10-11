@@ -308,3 +308,35 @@ def test_with_no_fleet_configured_the_push_is_still_a_noop(
     monkeypatch.setattr(QueueClient, "put_fleet_run", lambda self, record: called.append(record))
     push_fleet_run(_record())
     assert called == []
+
+
+def test_a_store_that_was_never_initialised_has_no_run_to_delete(tmp_path: Path) -> None:
+    assert QueueStore(tmp_path / "absent.db").delete_fleet_run("ghost") is False
+
+
+def test_a_store_without_a_fleet_runs_table_has_no_run_to_delete(tmp_path: Path) -> None:
+    import sqlite3
+
+    db = tmp_path / "bare.db"
+    sqlite3.connect(db).close()
+    assert QueueStore(db).delete_fleet_run("ghost") is False
+
+
+def test_other_methods_on_a_run_are_not_allowed(live: _Live) -> None:
+    request = urllib.request.Request(
+        f"{live.url}/runs/ghost", method="GET", headers={"Authorization": f"Bearer {TOKEN}"}
+    )
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(request, timeout=10)  # noqa: S310 - loopback test server
+    assert caught.value.code == 405
+
+
+def test_the_client_surfaces_a_non_404_delete_failure(
+    live: _Live, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(self, method, path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise qc.QueueRequestError(500, "boom")
+
+    monkeypatch.setattr(QueueClient, "_call", boom)
+    with pytest.raises(qc.QueueRequestError):
+        QueueClient(live.url, token=TOKEN).delete_fleet_run("ghost")
