@@ -67,8 +67,10 @@ __all__ = [
     "approval_poll_interval",
     "controller_argv",
     "job_argv",
+    "ledger_close_unstarted_batch",
     "ledger_fix_rounds",
     "ledger_plan_files",
+    "ledger_preflight_failure",
     "ledger_run_terminal",
     "run_queue",
 ]
@@ -659,6 +661,41 @@ def ledger_fix_rounds(db_path: str, run_id: str) -> int:
         return 0
 
 
+def ledger_preflight_failure(db_path: str, run_id: str) -> str | None:
+    """The ``PRE_FLIGHT_*`` reason ``run_id`` was stamped FAILED with, or ``None`` (Story 35.4-005).
+
+    What a job that never got past its preflight gate should say it died of —
+    ``run status FAILED`` names nothing an operator can act on. Reads the run's
+    own ledger; any read failure degrades to ``None`` (the generic reason).
+    """
+    from sdlc.build import Ledger
+
+    try:
+        state = Ledger(Path(db_path)).preflight_state(run_id)
+    except Exception:  # noqa: BLE001 - a ledger read must never fail a drain
+        return None
+    if state is not None and state["state"] == "failed":
+        return str(state["reason"]) if state["reason"] else None
+    return None
+
+
+def ledger_close_unstarted_batch(db_path: str, run_id: str, registry: Registry) -> bool:
+    """Close ``run_id`` ``ABORTED`` if it is a fix batch that died in preflight (Story 35.4-005).
+
+    The reclaim restarts such a job as a fresh run, and nothing else would ever
+    finish the old one: left ``IN_PROGRESS`` it is the run a bare `sdlc resume`
+    keeps picking and refusing. The reclaim has already found its pid gone. Any
+    ledger failure degrades to ``False``: it must never fail a drain.
+    """
+    from sdlc.build import Ledger
+    from sdlc.resume import close_unstarted_fix_batch
+
+    try:
+        return close_unstarted_fix_batch(Ledger(Path(db_path)), run_id, registry=registry)
+    except Exception:  # noqa: BLE001 - a ledger write must never fail a drain
+        return False
+
+
 def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
     """Why ``run_id`` cannot be resumed, or ``None`` when resuming is right (#716).
 
@@ -667,9 +704,17 @@ def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
     e.g. an investigation parked on a human decision. Returns ``"story
     BLOCKED"`` (or ``FAILED``) then. A run with no stories, resumable work, or
     an unreadable ledger returns ``None``: the existing resume behaviour.
+
+    Story 35.4-005: an `sdlc fix` batch whose preflight gate never passed has
+    dispatched nothing and cannot be resumed, so it reads ``"fix batch never
+    passed preflight"`` and the job starts afresh — as when no run had started.
+    So does a run closed ``ABORTED`` before its gate passed — superseded by a
+    fresh run of its scope, or a fix stopped on a closed issue: nothing was
+    dispatched, and resuming it would rebuild what the fresh run took over or
+    stop again (``"run closed before its preflight gate passed"``).
     """
     from sdlc.build import Ledger
-    from sdlc.resume import _FIX_RUN_MODES, has_resumable_work
+    from sdlc.resume import _FIX_RUN_MODES, has_resumable_work, unstarted_fix_batch
 
     try:
         ledger = Ledger(Path(db_path))
@@ -677,6 +722,10 @@ def ledger_run_terminal(db_path: str, run_id: str) -> str | None:
         if not statuses:
             return None
         run_row = ledger.run_row(run_id) or {}
+        if unstarted_fix_batch(ledger, run_id, run_row):
+            return "fix batch never passed preflight"
+        if run_row.get("status") == "ABORTED" and ledger.preflight_owed(run_id):
+            return "run closed before its preflight gate passed"
         if str(run_row.get("mode") or "") in _FIX_RUN_MODES:
             # `resume_fix` re-enters a story only mid-flight; a BLOCKED/FAILED
             # one is a refusal ("nothing to resume"), not work it can pick up.
@@ -1274,6 +1323,11 @@ class _Scheduler:
             terminal = self._run_terminal(job.run_id)
             if terminal is not None:
                 # #716: nothing to resume — a new run must re-read the scope.
+                # Story 35.4-005: the old run is closed first if it is a batch
+                # that died in preflight; nothing else would ever finish it.
+                record = self._registry_record(job.run_id)
+                if record is not None and record.db:
+                    ledger_close_unstarted_batch(record.db, job.run_id, self._registry)
                 self._store.restart_fresh(
                     job.id, reason=f"run is terminal ({terminal}) — fresh run",
                     now=self._clock(),
@@ -1689,6 +1743,8 @@ class _Scheduler:
 
     def _finish_reaped(self, job_id: int, entry: _InFlight, code: int) -> None:
         """Record how ``entry``'s exited child ended: park, pause or finish the job."""
+        if entry.run_id is None:
+            self._attach_finished_run(job_id, entry)
         self._push_run(entry.run_id, ended=True)
         if entry.run_id and self._rate_limit_park(job_id, entry.run_id) is not None:
             # Story 32.2-001: a run that parked itself on a closed window
@@ -1735,6 +1791,9 @@ class _Scheduler:
                 return
         reason = self._finish_reason(state, code, run_status, entry.run_id,
                                      run_finished)
+        if state == "failed" and record is not None and record.db and entry.run_id:
+            # Story 35.4-005: a run that died in preflight says why, not just FAILED.
+            reason = ledger_preflight_failure(record.db, entry.run_id) or reason
         self._store.finish_job(job_id, state, reason=reason)
         if state == "done":
             self._result.done += 1
@@ -2457,7 +2516,9 @@ class _Scheduler:
         (``--dry-run``, a `fix` that aborts pre-run), where ``run_id`` stays
         ``None`` and every pass re-scans. Two more predicates close it: the
         record must belong to *this job's repo*, and it must still be open —
-        our child is by definition still running when we scan.
+        our child is by definition still running when we scan. A run that opens
+        and finishes between two polls is linked once its child is reaped
+        (:meth:`_attach_finished_run`).
         """
         pending = {
             entry.proc.pid: job_id
@@ -2475,6 +2536,30 @@ class _Scheduler:
             self._in_flight[job_id].run_id = record.run_id
             self._store.attach_run(job_id, record.run_id)
             self._push_run(record.run_id)  # the run's start, on the fleet now — not a beat later
+
+    def _attach_finished_run(self, job_id: int, entry: _InFlight) -> None:
+        """Link reaped ``entry`` to a run its child opened and finished between two polls.
+
+        Story 35.4-005: :meth:`_attach_runs` links only an open record, so a run
+        that registered and finished within one poll — a preflight gate whose
+        command cannot start, say — was never linked, and its job read ``run
+        status 1`` instead of the gate's reason. The pid is still the join key: no
+        other process could hold it until this scheduler reaped the child, so a
+        finished record of the job's repo with that pid that started after this
+        launch is the child's own. One that started before it is a stale record of
+        a reused pid — the case the open-record rule guards against.
+        """
+        for record in self._registry.records():
+            if record.pid != entry.proc.pid or not record.finished_at:
+                continue
+            if Path(record.repo) != Path(entry.job.repo):
+                continue
+            started = _as_datetime(record.started_at)
+            if started is None or started < entry.started_at:
+                continue
+            self._store.attach_run(job_id, record.run_id)
+            entry.run_id = record.run_id
+            return
 
     def _registry_record(self, run_id: str) -> RunRecord | None:
         for record in self._registry.records():

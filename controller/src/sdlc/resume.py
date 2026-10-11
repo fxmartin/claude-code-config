@@ -22,6 +22,7 @@ from sdlc.build import (
     _log_routing_banner,
     _make_rate_limit_context,
     _prepare_story_workdir,
+    _registry_finish,
     _registry_register,
     _reposition_head,
     _resolve_dispatch,
@@ -32,11 +33,14 @@ from sdlc.build import (
     apply_cost_gate_pause,
     apply_rate_limit_park,
     authoritative_mode,
+    default_preflight,
     default_rate_limit_probe,
     effective_concurrency,
     _filter_git_landed,
     finalize_run,
     persist_cohort_structure,
+    preflight_command_text,
+    run_preflight_phase,
 )
 from sdlc.capability import ProbeStatus
 from sdlc.cohort import Story, compute_cohorts
@@ -128,14 +132,70 @@ class ResumeResult:
     # untouched, left exactly as it was, and ``refusal_reason`` names the owning
     # pid and the ``--force`` override. Distinct from ``nothing_to_resume`` (an
     # honest "no work left"): this is "work is already in flight elsewhere".
+    # Story 35.4-005: also set, with the reason, for an `sdlc fix` batch whose
+    # gate never passed — see :func:`unstarted_fix_batch`.
     refused: bool = False
     refusal_reason: str = ""
+    # Story 35.4-005: the run was interrupted in preflight, the resume re-ran the
+    # gate, and it failed — the run is stamped FAILED with the PRE_FLIGHT_* reason.
+    preflight_failed: bool = False
 
 
 # The run modes that mark a fix-issue run (Issue #547). ``fix`` is what the
 # controller's `run_fix` writes; ``fix-issue`` is the legacy value the retired
 # markdown skill's `sdlc run-open` used, and those runs are in existing ledgers.
 _FIX_RUN_MODES = frozenset({"fix", "fix-issue"})
+
+# The scope prefix `fix_issue._batch_scope` gives an `sdlc fix all` / `next` batch
+# run. Its mode is `serial`/`parallel`, so only the scope tells it from a build.
+_FIX_BATCH_SCOPE_PREFIX = "issues-"
+
+
+def unstarted_fix_batch(ledger: Ledger, run_id: str, run_row: dict | None = None) -> bool:
+    """True for an `sdlc fix` batch run whose preflight gate never passed (Story 35.4-005).
+
+    A batch opens its run before its gate, so one interrupted in preflight — or
+    closed FAILED by a red gate — has dispatched nothing. It has no resume path:
+    :func:`sdlc.fix_issue.resume_fix` takes only an ``issue-<N>`` scope, and the
+    epic queue :func:`run_resume` rebuilds holds no issue stories, so it would
+    dispatch nothing and close the run DONE with every issue still TODO. Such a
+    batch is started afresh instead, exactly as before its gate ran inside the run.
+    """
+    row = run_row if run_row is not None else (ledger.run_row(run_id) or {})
+    return (
+        str(row.get("scope") or "").startswith(_FIX_BATCH_SCOPE_PREFIX)
+        and ledger.preflight_owed(run_id)
+    )
+
+
+def close_unstarted_fix_batch(
+    ledger: Ledger,
+    run_id: str,
+    *,
+    registry: Registry | None = None,
+    run_row: dict | None = None,
+) -> bool:
+    """Close an interrupted :func:`unstarted_fix_batch` run ``ABORTED`` (Story 35.4-005).
+
+    Nothing ever resumes such a batch — it is started afresh — so left
+    ``IN_PROGRESS`` it stays the run a bare `sdlc resume` picks, and refuses, for
+    good: every older interrupted run hides behind it. Call this only once the
+    run is known dead (its live-owner check has passed). Nothing was dispatched,
+    so nothing is lost. A batch a red gate already closed ``FAILED`` keeps that
+    status and its reason. Returns whether the run was closed.
+    """
+    row = run_row if run_row is not None else (ledger.run_row(run_id) or {})
+    if row.get("status") != "IN_PROGRESS" or not unstarted_fix_batch(ledger, run_id, row):
+        return False
+    ledger.event_log(
+        run_id, "", "warn", "controller",
+        "fix batch interrupted before its preflight gate passed — closed ABORTED; "
+        "a batch is started afresh, never resumed",
+    )
+    ledger.run_update_status(run_id, "ABORTED")
+    if registry is not None:
+        _registry_finish(registry, run_id, "ABORTED", 0)
+    return True
 
 
 def _resume_fix_run(
@@ -148,6 +208,7 @@ def _resume_fix_run(
     registry: "Registry | None" = None,
     runner=None,
     force: bool = False,
+    preflight: Callable[[], bool] | None = None,
 ) -> ResumeResult:
     """Delegate a fix-issue run to :func:`sdlc.fix_issue.resume_fix` (#547).
 
@@ -164,17 +225,24 @@ def _resume_fix_run(
     and must not collapse into the generic ``nothing_to_resume`` above — that would
     swallow the message naming the owning pid, which is the entire point of the
     guard. It is surfaced as ``refused``/``refusal_reason`` instead.
+
+    Story 35.4-005: a re-run preflight gate that comes back red is reported as
+    ``preflight_failed``, exactly as a build resume reports it — not as one
+    resumed story that failed.
     """
     from sdlc.fix_issue import resume_fix
 
     result = resume_fix(
         run_id, ledger=ledger, dispatcher=dispatcher, runner=runner,
         render_view=render_view, root=root, registry=registry, force=force,
+        preflight=preflight,
     )
     if result.live_owner_blocked:
         return ResumeResult(run_id=run_id, refused=True, refusal_reason=result.abort_reason)
     if result.aborted:
         return ResumeResult(run_id=run_id, nothing_to_resume=True)
+    if result.preflight_failed:
+        return ResumeResult(run_id=run_id, preflight_failed=True)
     story_id = f"issue-{result.issue}"
     return ResumeResult(
         run_id=run_id,
@@ -281,8 +349,11 @@ def has_resumable_work(ledger: Ledger, run_id: str) -> bool:
     Issue #679: mirrors the incomplete/end-crash check :func:`run_resume` uses
     to decide ``nothing_to_resume``, factored out so the CLI can tell whether a
     ``FAILED`` run it is *not* auto-resuming would actually finish via an
-    explicit ``sdlc resume --run <id>`` before suggesting it.
+    explicit ``sdlc resume --run <id>`` before suggesting it. A batch whose gate
+    never passed has none: :func:`run_resume` refuses it (Story 35.4-005).
     """
+    if unstarted_fix_batch(ledger, run_id):
+        return False
     config = ledger.run_config(run_id)
     plan = compute_resume_plan(ledger, run_id, skip_coverage=bool(config.get("skip_coverage")))
     return any(st.status not in _TERMINAL_STORY_STATES for st in plan.values())
@@ -371,6 +442,8 @@ def _options_from_config(
         # predicting + reconciling its remaining stories. Defaults to off for
         # runs that predate the field — unchanged behaviour.
         predict=bool(config.get("predict", False)),
+        # Story 35.4-005: the timeout a re-run of an interrupted preflight uses.
+        preflight_timeout=int(config.get("preflight_timeout", 1800) or 1800),
     )
 
 
@@ -392,6 +465,7 @@ def run_resume(
     rate_limit_probe: Callable[[], ProbeStatus] | None = None,
     runner=None,
     force: bool = False,
+    preflight: Callable[[], bool] | None = None,
 ) -> ResumeResult:
     """Resume the most recent interrupted run for ``scope`` from the ledger.
 
@@ -437,6 +511,16 @@ def run_resume(
     record immediately followed by ``0 done, 1 failed`` for the same run).
     ``force`` is the documented override, "only if that pid is gone". The check
     covers the fix-mode delegation below too, since it runs before that branch.
+
+    Story 35.4-005: a run whose preflight gate never passed — interrupted *in*
+    it, or red and closed FAILED — dispatched nothing, so it is resumed by
+    re-running preflight (``preflight`` is the seam, as in :func:`run_build`, and
+    is handed on to a fix run's resume) — never by skipping it. A red or
+    timed-out gate stamps the run FAILED with its reason and returns
+    ``preflight_failed``. The exception is an `sdlc fix` batch, which has no
+    resume path: one whose gate never passed is ``refused``, its stories
+    untouched (:func:`unstarted_fix_batch`); one left ``IN_PROGRESS`` is closed
+    ``ABORTED`` (:func:`close_unstarted_fix_batch`), a red one stays ``FAILED``.
     """
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
@@ -471,8 +555,21 @@ def run_resume(
     if str(run_row.get("mode") or "") in _FIX_RUN_MODES:
         return _resume_fix_run(
             rid, ledger=ledger, dispatcher=dispatcher, render_view=render_view,
-            root=root, registry=registry, runner=runner, force=force,
+            root=root, registry=registry, runner=runner, force=force, preflight=preflight,
         )
+    # Story 35.4-005: refused before anything below re-stamps it — the queue
+    # rebuilt below could only close it DONE with every issue still TODO. An
+    # interrupted one is closed ABORTED too, or the next bare resume picks it again.
+    if unstarted_fix_batch(ledger, rid, run_row):
+        closed = close_unstarted_fix_batch(ledger, rid, registry=registry, run_row=run_row)
+        reason = (
+            f"run {rid[:8]} is an `sdlc fix` batch that never passed preflight — "
+            "nothing was dispatched and a batch cannot be resumed"
+            + (", so it is closed ABORTED" if closed else "")
+            + "; run it again (`sdlc fix all` / `sdlc fix next`)"
+        )
+        ledger.event_log(rid, "", "warn", "controller", f"resume refused: {reason}")
+        return ResumeResult(run_id=rid, refused=True, refusal_reason=reason)
 
     config = ledger.run_config(rid)
     skip_coverage = bool(config.get("skip_coverage"))
@@ -627,6 +724,24 @@ def run_resume(
         )
     except Exception:
         pass
+
+    # Story 35.4-005: the run's gate never passed — it died mid-suite, or came
+    # back red and left the run FAILED — so nothing was dispatched and the gate
+    # is still owed: re-run it before any story is.
+    if ledger.preflight_owed(rid):
+        preflight_failures: list[str] = []
+        check_preflight = preflight or (
+            lambda: default_preflight(
+                timeout=opts.preflight_timeout, on_failure=preflight_failures.append
+            )
+        )
+        if run_preflight_phase(
+            ledger, rid, check_preflight, preflight_failures,
+            command="preflight" if preflight else preflight_command_text(),
+            registry=registry, repo=(root or Path.cwd()).name,
+            subject=f"resume {scope}", render_view=render_view,
+        ) is not None:
+            return ResumeResult(run_id=rid, preflight_failed=True)
 
     logs_dir = Path(f"{ledger.db_path}.logs") / rid
     cohorts = compute_cohorts(run_queue)

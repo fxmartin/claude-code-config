@@ -64,7 +64,7 @@ The dashboard (Catppuccin Latte theme) auto-refreshes — run summary, progress
 bar, clickable PRs, recent events. Each story shows its **full pipeline**
 (`build · QA · review · merge`, with PENDING/SKIPPED and a `🔧×N` bugfix marker);
 a failed stage links to its **transcript** via `/log`. The run header shows the
-**run config** (preflight / QA gate / mode) and **token & cost** totals, with a
+**run config** (preflight / QA gate / mode — preflight shows live as `preflight: running (<command>, <elapsed>)`) and **token & cost** totals, with a
 per-story token column and per-stage tooltips — captured from Claude Code's
 `--output-format json` envelope (override the agent command with `$SDLC_AGENT_CMD`;
 omitting the flag simply records no usage). A **left sidebar lists this repo's

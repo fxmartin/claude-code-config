@@ -106,6 +106,10 @@ class RunRecord:
     # The repo's git ``origin`` remote, credentials stripped (Story 35.4-006), so a
     # machine without the worker's checkout can still name the repo's forge.
     origin: str | None = None
+    # Where the run is right now (Story 35.4-005): ``preflight`` | ``stories`` |
+    # ``closing``; None for a finished run or one a registry from before this
+    # field wrote. The fleet view shows it beside the worker.
+    phase: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -187,11 +191,13 @@ def format_live_owner_refusal(record: RunRecord) -> str:
     )
 
 
-def _live_counts(rec: RunRecord) -> tuple[int | None, int | None]:
-    """Live ``(done, total)`` from the run's own ledger, else the cached counts.
+def _live_counts(rec: RunRecord) -> tuple[int | None, int | None, str | None]:
+    """Live ``(done, total, phase)`` from the run's own ledger, else the cached ones.
 
     The registry's counts are only written at registration and close-out, so an
     in-flight run would read ``0/N`` until it ends; the ledger is authoritative.
+    The phase (Story 35.4-005) rides on the same ``list_runs`` row, so a
+    heartbeat reads the ledger once.
     """
     # Lazy import: build.py imports this module.
     import sqlite3
@@ -201,20 +207,23 @@ def _live_counts(rec: RunRecord) -> tuple[int | None, int | None]:
     try:
         for r in Ledger(rec.db).list_runs():
             if r["id"] == rec.run_id:
-                return r["done"], r["total"]
+                return r["done"], r["total"], r["phase"]
     except (OSError, sqlite3.Error):
-        pass  # unreachable ledger → keep the registry's cached counts
-    return rec.completed, rec.total
+        pass  # unreachable ledger → keep the registry's cached counts and phase
+    return rec.completed, rec.total, rec.phase
 
 
 def live_record(record: RunRecord) -> RunRecord:
-    """``record`` with its counts read live from the run's own ledger.
+    """``record`` with its counts and phase read live from the run's own ledger.
 
     What a worker pushes on each heartbeat (Story 35.4-001): the fleet view
-    cannot reach the ledger, so the pushed counts are the only ones it has.
+    cannot reach the ledger, so the pushed counts and phase are all it has.
     """
-    completed, total = _live_counts(record)
-    return replace(record, completed=completed, total=total)
+    completed, total, phase = _live_counts(record)
+    return replace(
+        record, completed=completed, total=total,
+        phase=None if record.finished_at else phase,
+    )
 
 
 class Registry:
@@ -300,11 +309,23 @@ class Registry:
                 if row.get("run_id") == run_id:
                     row["status"] = status
                     row["finished_at"] = _now_iso()
+                    row["phase"] = None  # a finished run is in no phase
                     if completed is not None:
                         row["completed"] = completed
             return rows
 
         self._mutate(_finish)
+
+    def set_phase(self, run_id: str, phase: str | None) -> None:
+        """Record which phase ``run_id`` is in (Story 35.4-005); a no-op if unknown."""
+
+        def _set(rows: list[dict]) -> list[dict]:
+            for row in rows:
+                if row.get("run_id") == run_id:
+                    row["phase"] = phase
+            return rows
+
+        self._mutate(_set)
 
     def prune(self, *, include_finished: bool = False) -> int:
         """Drop dead (crashed) entries; optionally also drop finished ones.
@@ -406,6 +427,8 @@ class Registry:
             row = rec.to_dict()
             row["state"] = derive_state(rec)
             if not rec.finished_at:
-                row["completed"], row["total"] = _live_counts(rec)
+                # The live phase too (Story 35.4-005): the cached one is never
+                # `closing`, and `/api/runs` shows the ledger's.
+                row["completed"], row["total"], row["phase"] = _live_counts(rec)
             rows.append(row)
         return rows

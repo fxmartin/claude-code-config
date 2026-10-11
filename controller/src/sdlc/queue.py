@@ -608,7 +608,8 @@ CREATE TABLE IF NOT EXISTS fleet_runs (
     completed   INTEGER,
     updated_at  TIMESTAMP NOT NULL,
     dashboard_url TEXT,
-    origin TEXT
+    origin TEXT,
+    phase       TEXT
 );
 """
 
@@ -740,6 +741,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (14, "fleet_run_origin", "fleet_runs", [("origin", "TEXT")], None),
     # Story 35.2-006: which forge hosts a worker can authenticate to non-interactively.
     (15, "worker_forges", "workers", [("forges", "TEXT NOT NULL DEFAULT '{}'")], None),
+    # Story 35.4-005: the phase a pushed run is in, for a fleet_runs written before it.
+    (16, "fleet_run_phase", "fleet_runs", [("phase", "TEXT")], None),
 ]
 
 
@@ -2026,8 +2029,9 @@ class QueueStore:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO fleet_runs(run_id, worker, repo, db, scope, pid, status, "
-                "started_at, finished_at, total, completed, updated_at, dashboard_url, origin) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "started_at, finished_at, total, completed, updated_at, dashboard_url, origin, "
+                "phase) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET worker = excluded.worker, "
                 "repo = excluded.repo, db = excluded.db, scope = excluded.scope, "
                 "pid = excluded.pid, status = excluded.status, "
@@ -2036,13 +2040,15 @@ class QueueStore:
                 "updated_at = excluded.updated_at, dashboard_url = excluded.dashboard_url, "
                 # A push that could not read the remote must not blank a known one:
                 # the finish push is a run's last, so nothing would restore it.
-                "origin = COALESCE(excluded.origin, fleet_runs.origin) "
+                "origin = COALESCE(excluded.origin, fleet_runs.origin), "
+                "phase = excluded.phase "
                 "WHERE fleet_runs.finished_at IS NULL OR excluded.finished_at IS NOT NULL "
                 "OR excluded.pid != fleet_runs.pid",
                 (
                     record.run_id, worker, record.repo, record.db, record.scope, record.pid,
                     record.status, record.started_at, record.finished_at, record.total,
                     record.completed, _at(now).isoformat(), record.dashboard_url, record.origin,
+                    record.phase,
                 ),
             )
 
