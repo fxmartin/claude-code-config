@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (21/25)** — 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (21/26)** — 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 25 | **Total Points**: 93 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 26 | **Total Points**: 95 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -677,6 +677,55 @@ template's `sed` install.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.2-004, 35.2-008, 35.4-006
+**Risk Level**: Medium
+
+##### Story 35.2-010: The Linux worker advertises its dashboard
+**User Story**: As FX, I want the Hetzner worker's unit to pass
+`--dashboard-url` like the Macs' worker plists do, so that a run on `dev`
+shows the same detail on the XPS dashboard as a run on the M3 Max or
+home-lab, instead of "detail unavailable".
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** `templates/systemd/sdlc-worker.service` **When**
+  `scripts/fleet-bootstrap.sh` renders it on Linux **Then** the `ExecStart`
+  carries `--dashboard-url http://<tailnet ip>:8787`, filled from the same
+  `tailscale ip -4` value that `sdlc-dashboard.service` binds to. A blank
+  address stops the bootstrap before it writes either unit.
+- **Given** a job claimed by `dev` **When** its run record reaches the fleet
+  **Then** it carries `dashboard_url` and `origin`, and the XPS dashboard
+  opens the run's stories, phases and transcripts as it does for a Mac run
+  (35.4-006).
+- **Given** a Linux worker whose installed unit lacks `--dashboard-url`, or
+  whose dashboard unit is not running **When** `sdlc doctor` runs **Then**
+  `fleet-agent-drift` / `worker-dashboard` flag it with the bootstrap command
+  as the remedy, as they do on a Mac (35.2-009).
+- **Given** an already-current Linux box **When** the bootstrap re-runs
+  **Then** nothing is rewritten or restarted (byte-for-byte idempotent), and a
+  busy worker is not restarted under a live job.
+
+**Technical Notes**: Follow-up from review 4 of fleet job 9 (35.2-009,
+#877, advisory A3). 35.2-009 adds `templates/systemd/sdlc-dashboard.service`
+and installs it on Linux, but the worker unit's `ExecStart` (`sdlc queue run
+--worker dev --pool claude-shared --pool codex-shared --follow`) never gained
+`--dashboard-url`, and the bats suite asserts the unit is unchanged. So the
+dashboard runs but the fleet record never points to it. Add an
+`__TAILNET_IP__` placeholder to the worker unit, render it in the bootstrap's
+`install_systemd_unit` path, and update the bats fixtures. The review also
+noted the dashboard's forge panel needs `gh`/`glab`. The 35.2-009 unit
+already runs through `nix develop`; verify that the panel loads on the dev
+box. `dev` is not registered with the fleet today; finishing this story
+includes bringing it online and running one job on it end to end.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: bats for the rendered unit (address filled, blank refused,
+      idempotent re-run); doctor drift on a Linux unit missing
+      `--dashboard-url`
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-008, 35.2-009, 35.4-006
 **Risk Level**: Medium
 
 ### Feature 35.3: Launch from the XPS
