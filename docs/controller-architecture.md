@@ -2485,14 +2485,35 @@ Each agent is compared byte for byte with what is installed:
 | identical, loaded | left alone |
 | identical, not loaded | `launchctl bootstrap` only |
 | different or absent | written, `bootout` + `bootstrap`; `--dry-run` prints the `diff -u` instead |
-| different, **worker with a job in flight** | `pending restart (job N running)`: file and process left for the next run |
+| different, **worker with a job in flight** | `pending restart (job N running)`: file and process left for the next run; the script exits 1 |
 
 "In flight" is `sdlc queue list --json` (the fleet queue once `queue_url:` is
 configured) filtered to `state == running` on the name the installed worker
 agent registered (a rename's old jobs are the ones a bootout kills); a queue that cannot
 be read counts as busy, since a lost build costs more than a delayed restart. If
 `tailscale ip -4` prints nothing the run stops in preflight, before any agent is
-written: a blank host would bind every interface.
+written: a blank host would bind every interface. A `bootstrap` launchd refuses
+right after the `bootout` (it may still hold the label) is retried briefly, then
+fails the run naming the agent left unloaded.
+
+No template carries a queue token, yet the M3's worker has one by hand
+(`tailscale whois` fails under launchd, #833) and the client reads it only from
+its environment. So the render keeps an installed agent's `SDLC_QUEUE_TOKEN` —
+appended to `EnvironmentVariables` through awk's environment, never an argv
+`ps` would show — installs that plist `0600`, asks the in-flight question with
+the worker's own token, and masks the value in the `--dry-run` diff.
+
+Step 6's verdict (`sdlc doctor --exit-code`) leaves out, on a Mac,
+`fleet-agent-drift` and `worker-dashboard` (`sdlc doctor --skip CHECK`): both
+judge the agents step 7 is about to re-render, so counting them would exit 1 on
+exactly the run that repairs them. Step 7 answers for them instead — a worker
+left pending restart exits 1. Step 4 on a home-manager Mac, whose global git
+config links into the read-only `/nix/store`, cannot write the credential
+helpers: there it warns and goes on (the helpers belong in nix-install; the M3
+uses `osxkeychain`), where it used to stop before rendering any agent. Linux
+still stops. `--queue-service` assumes the queue agent is installed from its
+template, as home-lab's is today; if nix-install renders it (the
+nix-install wiring of the queue service, above), leave the flag off.
 
 `sdlc doctor` closes the loop with `fleet-agent-drift` (`check_fleet_agent_drift`):
 for each installed worker, dashboard and queue agent it compares

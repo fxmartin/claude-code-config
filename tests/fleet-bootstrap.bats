@@ -65,6 +65,7 @@ exit 0'
     # `queue list --json` answers from $TMP/queue.json (no jobs unless a test writes it).
     stub sdlc '
 if [ "$1 $2" = "queue list" ]; then
+  echo "queue-token ${SDLC_QUEUE_TOKEN:-}" >>"${CALLS}"
   [ "${STUB_QUEUE_RC:-0}" = 0 ] || exit "${STUB_QUEUE_RC}"
   if [ -f "$TMP/queue.json" ]; then cat "$TMP/queue.json"; else echo "{\"jobs\": []}"; fi
   exit 0
@@ -813,7 +814,7 @@ mac() { "${BOOTSTRAP}" --worker m3max --pool claude-m3 --pool codex-shared --que
 
     run "${BOOTSTRAP}" --worker m3-max --pool claude-m3 --queue-url "${QUEUE}"
 
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 1 ]
     [[ "$output" == *"pending restart (job 7 running)"* ]]
     cmp "${TMP}/stale.plist" "$(AGENT worker)"
 }
@@ -828,7 +829,9 @@ mac() { "${BOOTSTRAP}" --worker m3max --pool claude-m3 --pool codex-shared --que
 
     run mac
 
-    [ "$status" -eq 0 ]
+    # Not converged, so not 0: the Mac still runs the agent it had, and the run says to re-run.
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"re-run this script once the worker is idle"* ]]
     [[ "$output" == *"pending restart (job 7 running)"* ]]
     cmp "${TMP}/stale.plist" "$(AGENT worker)"
     ! grep -q "bootout gui/$(id -u)/com.fxmartin.sdlc-worker" "${CALLS}" || false
@@ -855,7 +858,7 @@ mac() { "${BOOTSTRAP}" --worker m3max --pool claude-m3 --pool codex-shared --que
 
     STUB_QUEUE_RC=1 run mac
 
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 1 ]
     [[ "$output" == *"pending restart"* ]]
     grep -q "stale" "$(AGENT worker)"
     ! grep -q "launchctl bootout" "${CALLS}" || false
@@ -949,4 +952,166 @@ mac() { "${BOOTSTRAP}" --worker m3max --pool claude-m3 --pool codex-shared --que
     [[ "$output" == *"--queue-service"* ]]
     [[ "$output" == *"pending restart (job N running)"* ]]
     [[ "$output" == *"at boot." ]]
+}
+
+# --- a home-manager Mac, the run that repairs drift, the queue token (review of #877) ----
+
+# git's global config is a read-only /nix/store link there: gh and git fail every write.
+# A stub fails it, not a read-only file — CI runs as root, which a chmod does not stop.
+unwritable_git_config() {
+    stub gh 'case "$1 $2" in "auth setup-git") echo "could not lock config file" >&2; exit 1 ;; esac; exit 0'
+    stub git 'case "$1 $2" in "config --global") echo "error: could not lock config file" >&2; exit 255 ;; esac; exit 0'
+}
+
+@test "a Mac whose global git config cannot be written warns at step 4 and still renders its agents" {
+    darwin
+    unwritable_git_config
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"could not write gh's credential helper"* ]]
+    [[ "$output" == *"could not write credential.http://gitlab.test.helper"* ]]
+    [ -e "$(AGENT worker)" ] && [ -e "$(AGENT dashboard)" ]
+    grep -q "^sdlc doctor" "${CALLS}"
+}
+
+@test "linux still stops at an unwritable git config, before the unit is installed" {
+    unwritable_git_config
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 1 ]
+    [ ! -e "$(UNIT)" ]
+    ! grep -q "^sdlc doctor" "${CALLS}" || false
+}
+
+@test "a Mac's doctor skips the two checks step 7 settles; --skip-service and linux skip none" {
+    darwin
+    run mac
+    grep -qx "sdlc doctor --exit-code --skip fleet-agent-drift --skip worker-dashboard" "${CALLS}"
+
+    : >"${CALLS}"
+    run mac --skip-service
+    [ "$status" -eq 0 ]
+    grep -qx "sdlc doctor --exit-code" "${CALLS}"
+
+    : >"${CALLS}"
+    unset STUB_UNAME
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    grep -qx "sdlc doctor --exit-code" "${CALLS}"
+}
+
+@test "the run that repairs a drifted worker exits 0, though doctor warned about that drift" {
+    darwin
+    run mac
+    # A worker from before 35.4-006: doctor's drift and dashboard checks WARN on it — unless skipped.
+    sed -i.bak '/<string>--dashboard-url<\/string>/,/<string>http:/d' "$(AGENT worker)"
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then echo "{\"jobs\": []}"; exit 0; fi
+case " $* " in *" --skip fleet-agent-drift --skip worker-dashboard "*) exit 0 ;; esac
+exit 1'
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --dashboard-url)" = "http://100.64.0.9:8787" ]
+}
+
+# The token an operator put in the installed worker by hand, as the M3's was (#833).
+TOKEN="dummy-token-0123"
+hand_add_token() {  # AGENT-FILE
+    awk -v t="${TOKEN}" '/<key>EnvironmentVariables<\/key>/ { e = 1 }
+        e && /<\/dict>/ { print "\t\t<key>SDLC_QUEUE_TOKEN</key>"; print "\t\t<string>" t "</string>"; e = 0 }
+        { print }' "$1" >"$1.new" && mv "$1.new" "$1"
+    printf '<!-- stale -->\n' >>"$1"
+}
+
+@test "a re-render keeps the installed worker's queue token, installs it 0600, and asks the queue with it" {
+    darwin
+    run mac
+    hand_add_token "$(AGENT worker)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    ! grep -q "stale" "$(AGENT worker)" || false
+    [ "$(grep -A1 '<key>SDLC_QUEUE_TOKEN</key>' "$(AGENT worker)" | tail -n1)" = "    <string>${TOKEN}</string>" ]
+    [ "$(ls -l "$(AGENT worker)" | cut -c1-10)" = "-rw-------" ]
+    [ "$(ls -l "$(AGENT dashboard)" | cut -c1-10)" = "-rw-r--r--" ]
+    grep -qx "queue-token ${TOKEN}" "${CALLS}"
+    # The token never reaches a command line, where `ps` would show it.
+    ! grep -v "^queue-token " "${CALLS}" | grep -q "${TOKEN}" || false
+
+    # And a second run, token and all, changes nothing.
+    before="$(cksum "$(AGENT worker)")"; : >"${CALLS}"
+    run mac
+    [ "$status" -eq 0 ]
+    [ "$(cksum "$(AGENT worker)")" = "${before}" ]
+    ! grep -q "launchctl bootout" "${CALLS}" || false
+}
+
+@test "a dry-run diff masks the queue token" {
+    darwin
+    run mac
+    hand_add_token "$(AGENT worker)"
+
+    run mac --dry-run
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"would replace"*"-<!-- stale -->"* ]]
+    [[ "$output" == *"<string>(redacted)</string>"* ]]
+    [[ "$output" != *"${TOKEN}"* ]]
+}
+
+# launchd may still hold a label just booted out: the first bootstrap after a bootout fails.
+slow_launchd() {
+    stub launchctl '
+case "$1" in
+  print) [ -e "$TMP/loaded.${2##*/}" ] ;;
+  bootstrap)
+    if [ -e "$TMP/booting-out" ] && [ "${STUB_BOOTSTRAP_FAILS:-1}" != 0 ]; then
+      [ "${STUB_BOOTSTRAP_FAILS:-1}" = always ] || rm -f "$TMP/booting-out"
+      echo "Bootstrap failed: 5: Input/output error" >&2; exit 5
+    fi
+    touch "$TMP/loaded.$(basename "$3" .plist)" ;;
+  bootout) rm -f "$TMP/loaded.${2##*/}"; touch "$TMP/booting-out" ;;
+esac'
+    export BOOTSTRAP_RETRY_DELAY=0
+}
+
+@test "a bootstrap refused right after a bootout is retried, and the agent ends loaded" {
+    darwin
+    run mac
+    slow_launchd
+    printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "^launchctl bootstrap gui/$(id -u) $(AGENT dashboard)$" "${CALLS}")" -eq 2 ]
+    [ -e "${TMP}/loaded.com.fxmartin.sdlc-dashboard" ]
+}
+
+@test "a bootstrap that keeps failing stops the run, naming the agent left unloaded" {
+    darwin
+    run mac
+    slow_launchd
+    export STUB_BOOTSTRAP_FAILS=always
+    printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+
+    run mac
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"launchctl bootstrap com.fxmartin.sdlc-dashboard kept failing"* ]]
+}
+
+@test "--help says --skip-service skips a Mac's LaunchAgents too, and that the token is kept" {
+    run "${BOOTSTRAP}" --help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"the LaunchAgents on a Mac"* ]]
+    [[ "$output" == *"SDLC_QUEUE_TOKEN"*"0600"* ]]
 }

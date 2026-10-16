@@ -1350,6 +1350,11 @@ def doctor(
         "--target",
         help="Target repo root for the GitLab preflight (default: cwd).",
     ),
+    skip: list[str] = typer.Option(
+        [],
+        "--skip",
+        help="Leave out every finding of this check id (repeatable), e.g. fleet-agent-drift.",
+    ),
 ) -> None:
     """Check the install and run state, reporting a remedy for each problem.
 
@@ -1389,6 +1394,11 @@ def doctor(
 
     Always exits 0 by default so it is safe to run anywhere; ``--exit-code`` makes
     a WARN exit 1 and a FAIL exit 2 so a wrapping script can gate on health.
+
+    ``--skip CHECK`` drops that check's findings from the report and its status —
+    for a wrapper about to settle the check itself: ``scripts/fleet-bootstrap.sh``
+    skips ``fleet-agent-drift`` and ``worker-dashboard`` on a Mac, since the agents
+    it re-renders next are what those two judge (Story 35.2-009).
     """
     from sdlc.doctor import run_doctor
 
@@ -1404,6 +1414,9 @@ def doctor(
 
         preflight = run_gitlab_preflight(repo_root=target or Path.cwd())
         report.findings.extend(preflight.findings)
+
+    if skip:
+        report.findings = [f for f in report.findings if f.check not in skip]
 
     if as_json:
         typer.echo(json.dumps(report.to_dict(), default=str))

@@ -883,8 +883,9 @@ def check_worker_dashboard(
         return None
     name = "Worker dashboard"
     remedy = (
-        "reinstall both agents from templates/launchd/ (the worker advertises it with "
-        f"--dashboard-url; `launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
+        "re-run scripts/fleet-bootstrap.sh from the config repo: it renders both agents from "
+        "templates/launchd/, the worker advertising the dashboard with --dashboard-url "
+        f"(`launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
     )
     advertised = _plist_option(args, "--dashboard-url")
     if not advertised:

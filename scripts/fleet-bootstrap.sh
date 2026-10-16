@@ -30,7 +30,8 @@
 #   3. scripts/deploy.sh                      plugin update + `sdlc` as a uv tool
 #   4. gh auth setup-git (+ glab's helper)    git authenticates through gh/glab, never a prompt
 #   5. ~/.sdlc-fleet.yaml                     queue_url: names the fleet queue
-#   6. `sdlc doctor --exit-code`              the verdict on steps 1-5
+#   6. `sdlc doctor --exit-code`              the verdict on steps 1-5 (a Mac skips the two
+#                                                checks that judge step 7's agents)
 #   7. Linux: templates/systemd/sdlc-worker.service and sdlc-dashboard.service
 #                                             installed, enabled and started
 #      macOS: templates/launchd/ worker + dashboard (+ queue with --queue-service),
@@ -39,7 +40,12 @@
 # Doctor runs before the unit is installed: a worker that has not registered yet is
 # a FAIL by design, so judging steps 1-5 after step 7 would fail every first run.
 # Its status is the script's exit status (0 CLEAN, 1 WARN, 2 FAIL), reported after
-# the unit is in place so a re-run can repair a worker that is down.
+# the unit is in place so a re-run can repair a worker that is down. On a Mac it
+# skips fleet-agent-drift and worker-dashboard, which judge the very agents step 7
+# re-renders — counted, they would fail every run that repairs them; a worker step 7
+# leaves pending restart exits 1 instead. A Mac whose global git config cannot be
+# written (home-manager links it into the read-only /nix/store) warns at step 4 and
+# goes on: its credential helpers are declared there.
 #
 # Usage:
 #   scripts/fleet-bootstrap.sh --queue-url URL [--github-only] [--skip-service] [--dry-run]
@@ -53,8 +59,10 @@
 #              local GitLab. It can then sync GitHub repos only, and its free slots
 #              still make its peers defer GitLab jobs to it: pin those with
 #              --host home-lab. Without the flag such a box is refused, unchanged.
-# --skip-service  do everything but the systemd unit (a box without systemd --user).
-#              Starting no worker, it is not refused for a missing glab or scanner.
+# --skip-service  do everything but the worker's units — the systemd units on Linux (a
+#              box without systemd --user), the LaunchAgents on a Mac — so it needs no
+#              tailnet address. Starting no worker, it is not refused for a missing
+#              glab or scanner.
 # --dry-run    print what would run, and on a Mac the diff of every agent it would
 #              replace; change nothing.
 #
@@ -69,6 +77,9 @@
 #     `pending restart (job N running)` and left for the next run;
 #   - without a tailnet address (`tailscale ip -4` prints nothing) the run stops
 #     before anything is written: a blank host would bind every interface.
+# An SDLC_QUEUE_TOKEN put in an installed agent's EnvironmentVariables by hand is kept
+# across the re-render: the plist holding it is installed 0600, the in-flight check asks
+# the queue with it, and a dry-run diff masks it.
 # --host, --slots  the host name the worker registers as (a job's `--host` pin matches
 #              it; default `hostname -s` — the M3 Max, host m3-max, registers as m3max)
 #              and its slot cap, passed to `sdlc queue run`. Omitted, each keeps the
@@ -318,16 +329,26 @@ run "${DEPLOY_SH}"
 #    instead of at a prompt. GH_PATH=gh keeps gh's helper a PATH lookup: inside
 #    the dev shell gh would write its own /nix/store path, which a garbage
 #    collection after a dev-shell update deletes.
+#    On a home-manager Mac git's global config is a link into the read-only
+#    /nix/store, so every write here fails: its helpers are declared in nix-install
+#    (the M3's is osxkeychain). Stopping would leave the agents unrendered after
+#    steps 1-3 already ran, so a Mac warns and goes on; Linux stops, as it always has.
+git_auth_unwritable() {  # RC ENTRY — a step-4 write failed with RC
+  [[ "${IS_DARWIN}" == true ]] || exit "$1"
+  warn "could not write ${2} to git's global config (read-only? home-manager links it into
+         /nix/store) — declare it there unless git already authenticates; carrying on"
+}
 log "gh auth setup-git"
-run env GH_PATH=gh gh auth setup-git
+run env GH_PATH=gh gh auth setup-git || git_auth_unwritable $? "gh's credential helper (gh auth setup-git)"
 # The GitLab's helper is glab's, as checked in preflight. A blank entry goes
 # first, as `gh auth setup-git` writes for GitHub: git asks every helper that
 # applies in config order and takes the first answer, so a catch-all helper from
 # /etc/gitconfig or an older credential.helper would answer before glab.
 if [[ "${GITLAB_READY}" == true ]]; then
   log "glab credential helper for ${GITLAB_URL}"
-  run git config --global --replace-all "credential.${GITLAB_URL}.helper" ''
-  run git config --global --add "credential.${GITLAB_URL}.helper" '!glab auth git-credential'
+  { run git config --global --replace-all "credential.${GITLAB_URL}.helper" '' \
+      && run git config --global --add "credential.${GITLAB_URL}.helper" '!glab auth git-credential'; } \
+    || git_auth_unwritable $? "credential.${GITLAB_URL}.helper = !glab auth git-credential"
 else
   # Only with --github-only or --skip-service: preflight refuses a box that would
   # start a worker this way unasked.
@@ -358,15 +379,22 @@ else
 fi
 
 # 6. The verdict on steps 1-5. Reported, not fatal yet: the unit below is what
-#    repairs a worker that is down.
+#    repairs a worker that is down. On a Mac, fleet-agent-drift and worker-dashboard
+#    judge the very agents step 7 re-renders: counted here, they would fail every
+#    run that repairs them. Step 7 answers for them — a worker it leaves pending
+#    restart exits 1.
 DOCTOR_RC=0
+DOCTOR_ARGS=(--exit-code)
+if [[ "${DO_SERVICE}" == true && "${IS_DARWIN}" == true ]]; then
+  DOCTOR_ARGS+=(--skip fleet-agent-drift --skip worker-dashboard)
+fi
 if [[ "${DRY_RUN}" == true ]]; then
-  log "[dry-run] would run: sdlc doctor --exit-code"
+  log "[dry-run] would run: sdlc doctor ${DOCTOR_ARGS[*]}"
 else
   log "sdlc doctor"
   # From the repo, not the caller's directory: doctor finds its repo from the
   # cwd's git root, and from ~ the harness-pin check WARNs on a healthy box.
-  (cd "${REPO_ROOT}" && sdlc doctor --exit-code) || DOCTOR_RC=$?
+  (cd "${REPO_ROOT}" && sdlc doctor "${DOCTOR_ARGS[@]}") || DOCTOR_RC=$?
 fi
 
 # 7. The resident worker and its dashboard. Rendered copies live in a scratch
@@ -434,18 +462,55 @@ render_worker_agent() {
     { print }'
 }
 
+# The queue token an agent was given by hand — the M3's worker carries one, as
+# `tailscale whois` fails under launchd (#833). No template has it, so a re-render
+# keeps it (passed through awk's environment, never its argv), a plist holding it is
+# installed 0600, and a dry-run diff masks it.
+TOKEN_KEY="SDLC_QUEUE_TOKEN"
+installed_token() {  # LABEL — the installed agent's token, or nothing
+  sed -n "/<key>${TOKEN_KEY}<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;q;}" \
+    "${AGENT_DIR}/$1.plist" 2>/dev/null || true
+}
+with_installed_token() {  # LABEL — the plist on stdin, plus LABEL's installed token, on stdout
+  TOKEN="$(installed_token "$1")" awk -v key="${TOKEN_KEY}" '
+    /<key>EnvironmentVariables<\/key>/ { in_env = 1 }
+    in_env && /<\/dict>/ {
+      if (ENVIRON["TOKEN"] != "") { print "    <key>" key "</key>"; print "    <string>" ENVIRON["TOKEN"] "</string>" }
+      in_env = 0
+    }
+    { print }'
+}
+redact_token() {  # FILE — FILE with its token masked
+  sed "/<key>${TOKEN_KEY}<\/key>/{n;s|<string>.*</string>|<string>(redacted)</string>|;}" "$1"
+}
+
 # The job ids running on this worker, comma-separated; nonzero if the queue cannot be read.
 # Under the name the installed agent registered: a rename's old jobs are the ones a bootout kills.
+# Asked with the worker's own token, if it has one: from a shell without it the queue may refuse.
 worker_jobs_in_flight() {
-  local listing worker
+  local listing worker token
   worker="$(installed_worker_arg --worker)"
-  listing="$(sdlc queue list --json 2>/dev/null)" || return 1
+  token="$(installed_token "${WORKER_LABEL}")"
+  listing="$([[ -z "${token}" ]] || export SDLC_QUEUE_TOKEN="${token}"; sdlc queue list --json 2>/dev/null)" || return 1
   jq -r --arg worker "${worker:-${WORKER_NAME}}" \
     '[.jobs[] | select(.state == "running" and .worker == $worker) | .id] | join(", ")' <<<"${listing}"
 }
 
+# Right after a bootout launchd may still hold the label, and a bootstrap then fails
+# ("Bootstrap failed: 5"): under errexit that would leave the agent unloaded. Retried
+# briefly before giving up.
+bootstrap_agent() {  # DOMAIN PLIST
+  local tries=1
+  until launchctl bootstrap "$1" "$2"; do
+    [[ ${tries} -lt 5 ]] || return 1
+    tries=$((tries + 1))
+    sleep "${BOOTSTRAP_RETRY_DELAY:-1}"
+  done
+}
+
+PENDING_RESTART=false
 install_launch_agent() {  # LABEL RENDERED_FILE
-  local label="$1" rendered="$2" dest="${AGENT_DIR}/$1.plist" loaded=false domain
+  local label="$1" rendered="$2" dest="${AGENT_DIR}/$1.plist" loaded=false domain mode=644
   domain="gui/$(id -u)"
   launchctl print "${domain}/${label}" >/dev/null 2>&1 && loaded=true
 
@@ -463,7 +528,7 @@ install_launch_agent() {  # LABEL RENDERED_FILE
     local before=/dev/null verb=install
     if [[ -f "${dest}" ]]; then before="${dest}"; verb=replace; fi
     log "[dry-run] would ${verb} ${dest}:"
-    diff -u "${before}" "${rendered}" || true
+    diff -u -L "${before}" -L "${rendered}" <(redact_token "${before}") <(redact_token "${rendered}") || true
     return
   fi
 
@@ -476,31 +541,35 @@ install_launch_agent() {  # LABEL RENDERED_FILE
         local noun="job ${running} running"
         [[ "${running}" == *,* ]] && noun="jobs ${running} running"
         log "${label}: pending restart (${noun}); left as installed — re-run once it is idle"
+        PENDING_RESTART=true
         return
       fi
     else
       log "${label}: pending restart (cannot read the queue to tell whether a job is running); left as installed"
+      PENDING_RESTART=true
       return
     fi
   fi
 
   log "installing ${dest}"
   mkdir -p "${AGENT_DIR}" "${HOME}/.local/state/sdlc"
-  install -m 644 "${rendered}" "${dest}"
+  grep -q "<key>${TOKEN_KEY}</key>" "${rendered}" && mode=600
+  install -m "${mode}" "${rendered}" "${dest}"
   if [[ "${loaded}" == true ]]; then
     launchctl bootout "${domain}/${label}"
   fi
-  launchctl bootstrap "${domain}" "${dest}"
+  bootstrap_agent "${domain}" "${dest}" \
+    || die "launchctl bootstrap ${label} kept failing: the agent is not loaded — re-run this script"
 }
 
 if [[ "${DO_SERVICE}" == true && "${IS_DARWIN}" == true ]]; then
   # The dashboard first: the worker advertises it.
-  render_launch_agent "${DASHBOARD_LABEL}" >"${WORK_DIR}/dashboard.plist"
-  render_worker_agent >"${WORK_DIR}/worker.plist"
+  render_launch_agent "${DASHBOARD_LABEL}" | with_installed_token "${DASHBOARD_LABEL}" >"${WORK_DIR}/dashboard.plist"
+  render_worker_agent | with_installed_token "${WORKER_LABEL}" >"${WORK_DIR}/worker.plist"
   install_launch_agent "${DASHBOARD_LABEL}" "${WORK_DIR}/dashboard.plist"
   install_launch_agent "${WORKER_LABEL}" "${WORK_DIR}/worker.plist"
   if [[ "${QUEUE_SERVICE}" == true ]]; then
-    render_launch_agent "${QUEUE_LABEL}" >"${WORK_DIR}/queue.plist"
+    render_launch_agent "${QUEUE_LABEL}" | with_installed_token "${QUEUE_LABEL}" >"${WORK_DIR}/queue.plist"
     install_launch_agent "${QUEUE_LABEL}" "${WORK_DIR}/queue.plist"
   fi
 elif [[ "${DO_SERVICE}" == true ]]; then
@@ -534,6 +603,10 @@ fi
 if [[ "${DOCTOR_RC}" -ne 0 ]]; then
   warn "sdlc doctor was not CLEAN (exit ${DOCTOR_RC}) before the unit/agents were installed — see above; re-run this script after fixing it"
   exit "${DOCTOR_RC}"
+fi
+if [[ "${PENDING_RESTART}" == true ]]; then
+  warn "${WORKER_LABEL} is pending restart (see above): this Mac still runs the agent it had — re-run this script once the worker is idle"
+  exit 1
 fi
 log "done. The worker registers once its agent probe completes (up to ~90 s); then:"
 if [[ "${IS_DARWIN}" == true ]]; then

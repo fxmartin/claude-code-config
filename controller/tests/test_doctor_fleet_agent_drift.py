@@ -16,11 +16,13 @@ HOME = Path("/Users/fx")
 TAILNET_IP = "100.64.0.9"
 
 
-def _rendered_args(label: str, *, worker: str = "m3max", pools: tuple[str, ...] = ("claude-m3", "codex-shared")) -> list[str]:
-    """The ProgramArguments the bootstrap installs for ``label`` on a Mac at ``HOME``."""
+def _rendered_args(
+    label: str, *, worker: str = "m3max", pools: tuple[str, ...] = ("claude-m3", "codex-shared"), home: Path = HOME
+) -> list[str]:
+    """The ProgramArguments the bootstrap installs for ``label`` on a Mac at ``home``."""
     with (TEMPLATES / f"{label}.plist").open("rb") as fh:
         args = [str(a) for a in plistlib.load(fh)["ProgramArguments"]]
-    args = [a.replace("__HOME__", str(HOME)).replace("__TAILNET_IP__", TAILNET_IP) for a in args]
+    args = [a.replace("__HOME__", str(home)).replace("__TAILNET_IP__", TAILNET_IP) for a in args]
     if "--worker" in args:
         i = args.index("--worker")
         args[i + 1] = worker
@@ -170,7 +172,8 @@ def test_an_unreadable_plist_is_left_to_the_installed_checks(agents, tmp_path) -
 
 def test_run_doctor_reports_drift_for_the_installed_worker(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    args = _rendered_args("com.fxmartin.sdlc-worker")
+    # Rendered for the home doctor reads, so only the missing --dashboard-url can drift.
+    args = _rendered_args("com.fxmartin.sdlc-worker", home=tmp_path)
     del args[args.index("--dashboard-url") : args.index("--dashboard-url") + 2]
     worker = _install(tmp_path, "com.fxmartin.sdlc-worker", args)
 
@@ -188,6 +191,10 @@ def test_run_doctor_reports_drift_for_the_installed_worker(tmp_path, monkeypatch
 
     drift = [f for f in report.findings if f.check == "fleet-agent-drift"]
     assert len(drift) == 1 and drift[0].status == "WARN"
+    assert drift[0].detail == (
+        "installed agent no longer matches its template — "
+        "com.fxmartin.sdlc-worker: missing `--dashboard-url http://<tailnet ip>:8787`"
+    )
 
 
 def test_the_remedy_falls_back_to_a_placeholder_when_no_queue_url_resolves(agents, tmp_path, monkeypatch) -> None:
@@ -206,3 +213,54 @@ def test_the_remedy_falls_back_to_a_placeholder_when_no_queue_url_resolves(agent
 
     assert finding.status == "WARN"
     assert "--queue-url URL" in finding.remedy
+
+
+# --- `sdlc doctor --skip`: the bootstrap leaves out the checks its next step settles ---
+
+
+def _cli_report(monkeypatch) -> None:
+    """``run_doctor`` reports one CLEAN check, plus the two WARNs a drifted Mac shows."""
+    from sdlc import doctor
+    from sdlc.doctor import DoctorReport, Finding
+
+    report = DoctorReport(
+        findings=[
+            Finding("install", "Install", "CLEAN", "all symlinks resolve"),
+            Finding("fleet-agent-drift", "Fleet agents", "WARN", "worker drifted", "fleet-bootstrap.sh"),
+            Finding("worker-dashboard", "Worker dashboard", "WARN", "no dashboard URL", "fleet-bootstrap.sh"),
+        ]
+    )
+    monkeypatch.setattr(doctor, "run_doctor", lambda **_kw: report)
+
+
+def test_doctor_skip_leaves_the_named_checks_out_of_the_exit_status(monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    _cli_report(monkeypatch)
+    runner = CliRunner()
+
+    assert runner.invoke(app, ["doctor", "--exit-code"]).exit_code == 1
+    skipped = runner.invoke(
+        app, ["doctor", "--exit-code", "--skip", "fleet-agent-drift", "--skip", "worker-dashboard"]
+    )
+    assert skipped.exit_code == 0
+    assert "Fleet agents" not in skipped.stdout and "Worker dashboard" not in skipped.stdout
+    assert "all 1 checks passed (CLEAN)" in skipped.stdout
+
+
+def test_doctor_skip_of_one_check_still_reports_the_other(monkeypatch) -> None:
+    import json
+
+    from typer.testing import CliRunner
+
+    from sdlc.cli import app
+
+    _cli_report(monkeypatch)
+
+    result = CliRunner().invoke(app, ["doctor", "--json", "--skip", "fleet-agent-drift"])
+
+    payload = json.loads(result.stdout)
+    assert [f["check"] for f in payload["findings"]] == ["install", "worker-dashboard"]
+    assert payload["status"] == "WARN"

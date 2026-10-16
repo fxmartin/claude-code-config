@@ -47,7 +47,8 @@
 
   Which queue it drains: this Mac's own (the SDLC_QUEUE_PATH above) unless a
   fleet queue is named — SDLC_QUEUE_URL (add it to EnvironmentVariables with
-  SDLC_QUEUE_TOKEN if this Mac has no Tailscale CLI for the identity gate) or a
+  SDLC_QUEUE_TOKEN if this Mac has no Tailscale CLI for the identity gate — the
+  bootstrap keeps that token when it re-renders this agent, installed 0600) or a
   `queue_url:` in ~/.sdlc-fleet.yaml, which the agent reads as you. Then
   this worker drains the fleet queue on home-lab over HTTP
   (Story 35.2-005): it registers, heartbeats, claims, renews and finishes there,
