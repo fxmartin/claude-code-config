@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.104.0] - 2026-10-16
+
+### Added
+
+- feat(fleet-execution): an approved, green change request (#35.5-003)
+
+
 ## [v2.103.0] - 2026-10-11
 
 ### Added
