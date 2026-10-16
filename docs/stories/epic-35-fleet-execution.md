@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (18/23)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08 by fleet workers; 35.2-006 merged 2026-10-10 (#858, v2.100.0); 35.4-005 remains (fleet job 3, M3 Max); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002 (a stopped job kills its agents) 35.5-003 (approved green CRs merge deterministically) and 35.5-004 (agents hold no fleet credentials) added 2026-10-10 from job 3. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (21/24)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 23 | **Total Points**: 86 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 24 | **Total Points**: 91 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -566,6 +566,69 @@ headless Linux box. Relaxes the Non-Goal "provisioning the Hetzner box".
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.2-004, 35.2-005, 35.2-006
+**Risk Level**: Medium
+
+##### Story 35.2-009: One command sets up a macOS worker, and doctor catches drift
+**User Story**: As FX, I want `scripts/fleet-bootstrap.sh` to set up a macOS
+worker as it already sets up the Linux one, rendering every LaunchAgent the
+worker needs from the repo's templates, and `sdlc doctor` to flag an installed
+agent that no longer matches its template, so that a story which changes a
+worker's launch arguments (as 35.4-006 did) cannot merge and then sit
+uninstalled on every Mac.
+**Priority**: Must Have
+**Story Points**: 5
+
+**Acceptance Criteria**:
+- **Given** a Mac with `claude`, `gh`, `uv` and Tailscale **When** FX runs
+  `scripts/fleet-bootstrap.sh --worker NAME --pool P [--pool P ...]
+  --queue-url URL` **Then** on Darwin it renders and (re)loads
+  `com.fxmartin.sdlc-worker` (with `--dashboard-url
+  http://<tailscale ip -4>:8787` and the given pools) and
+  `com.fxmartin.sdlc-dashboard` from `templates/launchd/`, and on home-lab,
+  with `--queue-service`, `com.fxmartin.sdlc-queue`; Linux keeps today's
+  systemd path, and gains the dashboard as a second user unit.
+- **Given** the script is re-run **When** a rendered agent is byte-identical
+  to what is installed **Then** it is left loaded and untouched; when it
+  differs it is replaced and restarted, except the worker while it has a job
+  in flight, which is reported as `pending restart (job N running)` and left
+  for the next run. `--dry-run` prints the diff and changes nothing.
+- **Given** `tailscale ip -4` prints nothing **When** the script runs **Then**
+  it stops before writing any agent (the dashboard must never bind every
+  interface).
+- **Given** an installed worker, dashboard or queue agent whose arguments
+  differ from what the current templates render (for example a worker plist
+  with no `--dashboard-url`) **When** `sdlc doctor` runs on that host **Then**
+  it reports a WARN `fleet-agent-drift` naming the agent and the missing or
+  different arguments, with the bootstrap command that fixes it.
+- **Given** a release is deployed to a worker (`deploy.sh` + `install.sh
+  --core`) **When** the deploy finishes **Then** the README's worker upgrade
+  procedure ends with a `fleet-bootstrap.sh` run, so template changes ship
+  with the release that introduced them.
+
+**Technical Notes**: Templates and their documented `sed` installs live in
+`templates/launchd/` (worker, dashboard, queue) and `templates/systemd/`; the
+Linux bootstrap is `scripts/fleet-bootstrap.sh` (35.2-008). Reuse its
+idempotent `run` helper, flag parsing and dry-run; branch on `uname -s`.
+Doctor already reads the worker plist (`default_worker_plist`) and checks the
+advertised dashboard answers (35.4-006); drift is a comparison of
+`ProgramArguments` against a render of the template with the host's values.
+Tests use rendered fixtures and a stubbed `launchctl` / `systemctl` /
+`tailscale`, never the real agents (CI is Linux, root, offline). Incident
+2026-10-16: 35.4-006 merged on 2026-10-05, but neither the M3 Max nor home-lab
+ever got the dashboard agent or `--dashboard-url`, so every remote run on the
+XPS read "detail unavailable — m3max advertises no dashboard" and "GitHub
+unavailable" (no `origin` either). Fixed by hand on 2026-10-16 with the
+template's `sed` install.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests (bats + pytest): Darwin render of each agent, idempotent re-run,
+      replace-and-restart on change, in-flight worker deferred, no-tailnet
+      refusal, dry-run diff; doctor `fleet-agent-drift` on a missing
+      `--dashboard-url`; Linux path unchanged plus the dashboard unit
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-004, 35.2-008, 35.4-006
 **Risk Level**: Medium
 
 ### Feature 35.3: Launch from the XPS
