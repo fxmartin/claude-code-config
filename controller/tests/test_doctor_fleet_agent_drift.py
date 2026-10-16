@@ -166,3 +166,21 @@ def test_run_doctor_reports_drift_for_the_installed_worker(tmp_path, monkeypatch
 
     drift = [f for f in report.findings if f.check == "fleet-agent-drift"]
     assert len(drift) == 1 and drift[0].status == "WARN"
+
+
+def test_the_remedy_falls_back_to_a_placeholder_when_no_queue_url_resolves(agents, tmp_path, monkeypatch) -> None:
+    from sdlc import doctor
+    from sdlc.queue import QueueError
+
+    def _unresolvable() -> str:
+        raise QueueError("no queue url")
+
+    monkeypatch.setattr(doctor, "resolve_queue_url", _unresolvable)
+    args = _rendered_args("com.fxmartin.sdlc-worker")
+    del args[args.index("--dashboard-url") : args.index("--dashboard-url") + 2]
+    agents["com.fxmartin.sdlc-worker"] = _install(tmp_path, "com.fxmartin.sdlc-worker", args)
+
+    finding = _check(agents)
+
+    assert finding.status == "WARN"
+    assert "--queue-url URL" in finding.remedy
