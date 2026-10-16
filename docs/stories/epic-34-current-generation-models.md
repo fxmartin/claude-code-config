@@ -1,6 +1,6 @@
 # Epic 34: Current-Generation Model Alignment
 
-> **Status: IN PROGRESS (8/10)** — authored 2026-09-30. Thesis: the controller
+> **Status: IN PROGRESS (8/11)** — authored 2026-09-30. Thesis: the controller
 > routes Claude work through the bare aliases `haiku` / `sonnet` / `opus`
 > (`model_routing.py`) and lets the Claude CLI decide what they mean, so the
 > ledger records whatever the CLI resolved that day and no run is reproducible
@@ -80,7 +80,7 @@ One place to move when the next generation lands.
   default flip is held with the delta recorded in `docs/optimization/BASELINE.md`.
 
 ## Epic Scope
-**Total Stories**: 10 | **Total Points**: 29 | **MVP Stories**: 5 (14 pts)
+**Total Stories**: 11 | **Total Points**: 31 | **MVP Stories**: 5 (14 pts)
 
 ## Features in This Epic
 
@@ -562,6 +562,57 @@ routing side: no predictor weight changes, no new judge, no Jev.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 28.3-001 (thresholds), 28.2-002 (prediction)
+**Risk Level**: Low
+
+##### Story 34.5-003: Effort escalation stops at a per-stage ceiling
+**Status**: Not Started
+**User Story**: As FX, I want each stage's effort escalation to stop at a
+configurable ceiling, so that a stage that keeps failing retries on a
+stronger model rather than climbing to Opus at `max` effort, and one stuck
+review cannot cost more than the whole story it is reviewing.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** the balanced routing map **When** a stage retries after a failure
+  **Then** `escalate_effort` climbs one level per step as today but never past
+  that stage's ceiling; the defaults are `xhigh` for review and bugfix, `high`
+  for build, `medium` for discovery, docs, coverage and merge.
+- **Given** an escalation the ceiling held back **When** the stage dispatches
+  **Then** the event reads `effort held at <ceiling> for <stage> (would have
+  been <level>; ceiling from <default|.sdlc-model-routing.yaml>)`, and model
+  escalation (`escalate_model`) is unchanged.
+- **Given** `.sdlc-model-routing.yaml` sets `effort_ceiling: {review: max}`
+  (or any stage → level in `EFFORT_LEVELS`) **When** routing loads **Then**
+  that stage's ceiling is overridden; a ceiling below the stage's base effort
+  is rejected with a clear error; an unknown level is rejected as `effort` is
+  today.
+- **Given** the routing banner and `sdlc status` **When** a run starts
+  **Then** each stage's effort reads `base→ceiling` (for example `review
+  xhigh→xhigh`, `build high→high`), so the bound is visible before any money is
+  spent.
+- **Given** a repo with no routing file **When** a stage succeeds first time
+  **Then** behaviour is identical to today; the full controller suite stays
+  green on both platforms.
+
+**Technical Notes**: `escalate_effort` and `select_effort` in
+`controller/src/sdlc/model_routing.py`; `stage_efforts` and its YAML loader
+(`effort:` section) are the pattern for `effort_ceiling:`; the cheap-first
+ladder is Story 14.2-003. The ceiling bounds effort only: the model still
+climbs Haiku → Sonnet → Opus. A model that rejects effort (Haiku 4.5) is
+unaffected. Incident: fleet job 3, run `46e76670` (2026-10-10) — the 35.4-005
+review climbed to `opus effort=max` over six attempts; the controller
+estimated one attempt at ~6.9M tokens (~$83 API-equivalent), more than the
+rest of the story combined.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: climb stops at the default ceiling per stage; held-back event
+      text; YAML override and both rejections; banner shows base→ceiling;
+      model escalation unchanged; no-file parity
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 34.4-001 (effort map), 14.2-003 (cheap-first escalation)
 **Risk Level**: Low
 
 ## Non-Goals
