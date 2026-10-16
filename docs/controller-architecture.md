@@ -1841,7 +1841,9 @@ reaches the job's own agents rather than just its parent.
 (`queue.db`, the same file every `sdlc queue` verb reads) behind an HTTP API so
 a job enqueued on one machine can be claimed on another — no second database.
 It is `sdlc/queue_server.py`: stdlib `ThreadingHTTPServer`, the pattern
-`dashboard.py` uses, no new dependency.
+`dashboard.py` uses, no new dependency. Its `listen()` backlog is 64 (not the
+stdlib's 5): macOS resets the overflow of a burst of simultaneous clients where
+Linux retries it.
 
 **API.** One route per `QueueStore` method of the same name; JSON in, JSON out,
 errors as `{"error": "..."}`. Job responses are `JobRecord.to_dict()` — exactly
