@@ -687,7 +687,15 @@ returns `None`), so builds are unchanged unless the mirror has run.
   **PR-opening stage's** prompt only — the coverage agent on the default path, or
   the build agent under `--skip-coverage` — so the opened PR carries the link and
   **merging it auto-closes the story issue**. Review/merge prompts (the PR already
-  exists) are untouched.
+  exists) are untouched. The mapping is a per-checkout cache, so a fleet-built
+  story reaches it two ways (Story 35.3-002). `sdlc build <story…> --enqueue`
+  records each scoped story's `{story_id: [host, ref]}` on the job (the additive
+  `issues` column — data, never a credential; `sdlc queue list --json` shows it),
+  and a worker writes it into its clone's inventory before the first stage. A job
+  carrying none (enqueued from an unmirrored host) falls back to the marker
+  search, which now runs whenever the repo names a forge — an `.sdlc-forge.yaml`
+  or an auto-detected `origin` — even with an empty inventory; only a repo with
+  no mapping *and* no resolvable forge skips the host call and the `warn`.
 - **Live status.** On entering each stage, `_run_story` calls
   `build_issue.announce_status(ledger, story_id, slug)` where `slug` is the coarse
   status (`build`/`coverage` → `building`, `review` → `in-review`, `merge` →

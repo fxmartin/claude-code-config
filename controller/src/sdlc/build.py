@@ -3314,6 +3314,20 @@ class Ledger:
                 rows,
             )
 
+    def inventory_ensure_row(self, story_id: str) -> None:
+        """Insert a bare inventory row for ``story_id`` when none exists (Story 35.3-002).
+
+        A fleet worker's fresh clone has no projected specs, and
+        :meth:`inventory_set_mapping` is a no-op on an absent row — so seeding a
+        carried mapping needs the row first. Only the key is written; the
+        projector fills the spec columns later and leaves the mapping alone.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO story_inventory (story_id) VALUES (?)",
+                (story_id,),
+            )
+
     def inventory_get_mapping(self, story_id: str) -> tuple[str, str] | None:
         """Return ``(host, issue_ref)`` for a mapped story, or None when unmapped.
 

@@ -65,6 +65,8 @@ def test_init_creates_wal_schema(tmp_path) -> None:
             "cancel_requested",
             # Story 35.2-002: the sha a worker synced the clone to.
             "synced_sha",
+            # Story 35.3-002: the story->issue mappings the job carries.
+            "issues",
         }
     finally:
         conn.close()

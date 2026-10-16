@@ -397,6 +397,11 @@ class JobRecord:
     # job was dispatched — what the build actually started from. ``None`` until a
     # worker has synced the repo for this job.
     synced_sha: str | None = None
+    # Story 35.3-002: JSON text ``{story_id: [host, ref]}`` — the issue each story
+    # in the scope is mirrored to on the enqueuing host, so a worker whose clone
+    # never ran `sdlc issues init` can still open the change request with
+    # ``Closes #N``. Data, not a credential. ``None`` = nothing mirrored there.
+    issues: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -424,6 +429,7 @@ class JobRecord:
             "worker": self.worker,
             "cancel_requested": self.cancel_requested,
             "synced_sha": self.synced_sha,
+            "issues": self.issues,
         }
 
     def job_budget(self) -> JobBudget:
@@ -641,7 +647,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     requirements TEXT,
     worker      TEXT,
     cancel_requested INTEGER,
-    synced_sha  TEXT
+    synced_sha  TEXT,
+    issues      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -743,6 +750,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (15, "worker_forges", "workers", [("forges", "TEXT NOT NULL DEFAULT '{}'")], None),
     # Story 35.4-005: the phase a pushed run is in, for a fleet_runs written before it.
     (16, "fleet_run_phase", "fleet_runs", [("phase", "TEXT")], None),
+    # Story 35.3-002: the story→issue mappings a job carries to its worker.
+    (17, "job_issues", "jobs", [("issues", "TEXT")], None),
 ]
 
 
@@ -1033,6 +1042,7 @@ class QueueBackend(Protocol):
         host: str | None = None,
         pool: str | None = None,
         requirements_json: str | None = None,
+        issues_json: str | None = None,
     ) -> int: ...
 
     def get_job(self, job_id: int) -> JobRecord | None: ...
@@ -1287,6 +1297,7 @@ class QueueStore:
         host: str | None = None,
         pool: str | None = None,
         requirements_json: str | None = None,
+        issues_json: str | None = None,
     ) -> int:
         """Insert a fresh ``queued`` job and return its id.
 
@@ -1315,11 +1326,11 @@ class QueueStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO jobs(repo, kind, scope, priority, state, options, "
-                "created_at, updated_at, budget, host, pool, requirements) "
-                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, updated_at, budget, host, pool, requirements, issues) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     repo, kind, scope, priority, options_json, now, now, budget,
-                    host, pool, requirements_json,
+                    host, pool, requirements_json, issues_json,
                 ),
             )
             assert cur.lastrowid is not None  # INSERT always assigns a rowid
@@ -2634,6 +2645,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         worker=_optional_column(row, "worker"),
         cancel_requested=bool(_optional_column(row, "cancel_requested")),
         synced_sha=_optional_column(row, "synced_sha"),
+        issues=_optional_column(row, "issues"),
     )
 
 
