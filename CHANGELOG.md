@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.106.0] - 2026-10-16
+
+### Added
+
+- feat(fleet-execution): one command sets up a macos worker, (#35.2-009)
+
+### Fixed
+
+- fix(fleet-execution): one command sets up a macos worker, (#35.2-009)
+- fix(fleet-execution): one command sets up a macos worker, (#35.2-009)
+- fix(fleet-execution): one command sets up a macos worker, (#35.2-009)
+
+
 ## [v2.105.0] - 2026-10-16
 
 ### Added
