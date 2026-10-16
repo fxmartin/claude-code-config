@@ -1,6 +1,6 @@
 # Epic 34: Current-Generation Model Alignment
 
-> **Status: NOT STARTED (0/8)** — authored 2026-09-30. Thesis: the controller
+> **Status: NOT STARTED (0/9)** — authored 2026-09-30. Thesis: the controller
 > routes Claude work through the bare aliases `haiku` / `sonnet` / `opus`
 > (`model_routing.py`) and lets the Claude CLI decide what they mean, so the
 > ledger records whatever the CLI resolved that day and no run is reproducible
@@ -80,7 +80,7 @@ One place to move when the next generation lands.
   default flip is held with the delta recorded in `docs/optimization/BASELINE.md`.
 
 ## Epic Scope
-**Total Stories**: 8 | **Total Points**: 24 | **MVP Stories**: 5 (14 pts)
+**Total Stories**: 9 | **Total Points**: 27 | **MVP Stories**: 5 (14 pts)
 
 ## Features in This Epic
 
@@ -413,6 +413,96 @@ queue is idle.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 34.1-002, 34.2-001, 34.4-001
+**Risk Level**: Low
+
+### Feature 34.5: Haiku 5.5 Tier and Escalation Calibration
+
+Added 2026-10-16 from `docs/optimization/JEV-DECISION-RECORD.md`: the two
+config-level cost levers that analysis found to be worth more than a
+third-party routing judge. The haiku tier still resolves to Haiku 4.5
+($1 / $5 per MTok) while Haiku 5.5 lists at $0.10 / $0.50, and the two
+prediction-keyed escalation thresholds (28.3-001) are still the documented
+priors rather than figures taken from this repo's own ledger.
+
+#### Stories
+
+##### Story 34.5-001: Haiku 5.5 tier and ledger-calibrated escalation thresholds
+**Status**: Not Started
+**User Story**: As FX, I want the `haiku` tier to resolve to
+`claude-haiku-5-5` once a live probe proves it on my plan, and the
+`predicted_tokens_threshold` / `rework_threshold` escalation bars set from
+this repo's reconciled story totals, so that the cheap tier is actually cheap
+(merge, reask, summary and the self-check probes ran 13 percent of the
+baseline bill on Haiku 4.5 prices) and Opus is paid only on the heavy tail
+rather than on a `points >= 8` fallback the code itself documents as noise.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** `claude -p ok --model claude-haiku-5-5` answers and is billed as
+  that id on FX's plan (the 34.1-002 probe) **When** `TIER_MODEL_IDS` is
+  bumped **Then** `haiku → claude-haiku-5-5`,
+  `TIER_FALLBACK_IDS["claude-haiku-5-5"] == "claude-haiku-4-5"`, the routing
+  banner prints `merge=haiku → claude-haiku-5-5`, and a host where the probe
+  fails degrades to `claude-haiku-4-5` with the existing `warn` event.
+- **Given** Haiku 5.5 accepts `--effort` (`low` to `max`, default `medium`)
+  **When** a `merge` stage dispatches on it **Then** the argv carries
+  `--effort medium` from `BALANCED_STAGE_EFFORT` and
+  `TIER_EFFORT_LEVELS[HAIKU] == EFFORT_LEVELS`; the "haiku omits effort"
+  branch survives only for a stage that resolved to `claude-haiku-4-5`
+  through the fallback.
+- **Given** the price table **When** bumped **Then** `claude-haiku-5-5` is
+  priced at list ($0.10 input / $0.50 output per MTok, with the cache-read
+  rate and the above-100K-token prompt tier of $0.50 / $2.50 confirmed from
+  the pricing page at build time), `PRICE_TABLE_VINTAGE` moves to the build
+  date, and the `claude-haiku-4-5` row stays so old ledger rows still price.
+- **Given** the literal id in `harnesses.yaml` `rate_limit_probe`, the README
+  routing sentence and the `docs/controller-architecture.md` tier table
+  **When** the story ships **Then** each names `claude-haiku-5-5` and the new
+  vintage date.
+- **Given** the Epic-31 eval harness **When** `sdlc eval` runs the strutils
+  tickets with merge and reask on `claude-haiku-5-5` **Then**
+  `sdlc eval-compare` against the 34.4-003 new-map scoreboard at the default
+  10 percent tolerance reports `qual` unchanged and `cost$` not worse, and
+  the result is committed under `controller/eval/results/`.
+- **Given** this repo's ledger holds at least `MIN_GLOBAL_SAMPLE` reconciled
+  stories **When** `sdlc predict-quality --json` and a p75 of actual
+  story-total tokens plus the observed rework rate are computed from
+  `.sdlc-state.db` **Then** both figures are recorded in
+  `docs/optimization/BASELINE.md` as a dated section and written to a root
+  `.sdlc-model-routing.yaml` as `predicted_tokens_threshold` /
+  `rework_threshold` with a dated comment; with fewer samples the story
+  records "no sample" there and leaves the priors untouched.
+- **Given** queue and fleet jobs enqueue `sdlc build` without `--predict`
+  (off by default) **When** the thresholds are written **Then** the story
+  records FX's decision on enabling `--predict` for this repo's jobs, because
+  without it the thresholds are dormant and the points fallback governs.
+
+**Technical Notes**: Model map and effort table in
+`controller/src/sdlc/model_routing.py` (`TIER_MODEL_IDS`,
+`TIER_EFFORT_LEVELS`, `TIER_FALLBACK_IDS`); price table and vintage in
+`controller/src/sdlc/cost_estimate.py`; literal probe string at
+`controller/src/sdlc/config/harnesses.yaml:50` (the OpenCode per-stage map
+at lines 243 to 250 may follow, optional); `README.md:356`;
+`docs/controller-architecture.md` tier table and the Haiku effort note. Tests
+that pin the old id and the no-effort branch: `controller/tests/test_model_ids.py`,
+`test_effort_routing.py`, `test_cost_estimate.py`, `test_model_tier.py`,
+`test_model_probe.py`, `tests/opencode-worktree-smoke.bats`. Haiku 5.5 runs
+adaptive thinking by default and takes `effort`; its above-100K-token prompt
+tier is five times the base rate, so check merge-stage prompt sizes in the
+ledger before claiming the full tenfold saving (the worst case is still
+twice cheaper than Haiku 4.5). Threshold calibration is config only: no
+predictor weight changes, no new judge, no Jev.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: tier→id resolution for Haiku 5.5, fallback to 4.5 on probe
+      failure, effort flag present on Haiku 5.5 and absent on 4.5, price
+      lookup for both ids, literal probe string updated
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 34.1-001, 34.1-002, 34.2-001, 34.4-001 (effort map),
+28.3-001 (thresholds)
 **Risk Level**: Low
 
 ## Non-Goals
