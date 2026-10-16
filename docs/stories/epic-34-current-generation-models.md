@@ -1,6 +1,6 @@
 # Epic 34: Current-Generation Model Alignment
 
-> **Status: NOT STARTED (0/8)** — authored 2026-09-30. Thesis: the controller
+> **Status: IN PROGRESS (8/10)** — authored 2026-09-30. Thesis: the controller
 > routes Claude work through the bare aliases `haiku` / `sonnet` / `opus`
 > (`model_routing.py`) and lets the Claude CLI decide what they mean, so the
 > ledger records whatever the CLI resolved that day and no run is reproducible
@@ -80,7 +80,7 @@ One place to move when the next generation lands.
   default flip is held with the delta recorded in `docs/optimization/BASELINE.md`.
 
 ## Epic Scope
-**Total Stories**: 8 | **Total Points**: 24 | **MVP Stories**: 5 (14 pts)
+**Total Stories**: 10 | **Total Points**: 29 | **MVP Stories**: 5 (14 pts)
 
 ## Features in This Epic
 
@@ -413,6 +413,155 @@ queue is idle.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 34.1-002, 34.2-001, 34.4-001
+**Risk Level**: Low
+
+### Feature 34.5: Haiku 5.5 Tier and Escalation Calibration
+
+Added 2026-10-16 from `docs/optimization/JEV-DECISION-RECORD.md`: the two
+config-level cost levers that analysis found to be worth more than a
+third-party routing judge. The haiku tier still resolves to Haiku 4.5
+($1 / $5 per MTok), and the two prediction-keyed escalation thresholds
+(28.3-001) are still the documented priors rather than figures taken from
+this repo's own ledgers. The two stories are independent: either can ship
+or stop without the other.
+
+#### Stories
+
+##### Story 34.5-001: Haiku 5.5 tier, gated on official availability and pricing
+**Status**: Not Started
+**User Story**: As FX, I want the `haiku` tier to resolve to
+`claude-haiku-5-5` only once Anthropic's own documentation lists that model
+and its price and a live probe proves it on my plan, so that the cheap tier
+is actually cheap (merge, reask, summary and the self-check probes ran 13
+percent of the baseline bill on Haiku 4.5 prices) without the controller
+ever routing to, or pricing, a model id that is not real.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** the build starts **When** the agent checks the official Anthropic
+  models overview and pricing pages (docs.claude.com / anthropic.com, not
+  third-party round-ups) **Then** it records the page URLs and the listed
+  model id, input / output / cache-read rates, any long-prompt tier and
+  whether the model takes `effort`. **If either page does not list
+  `claude-haiku-5-5`, or it cannot be reached, the story fails closed**: no
+  code change, a dated "not available" note in
+  `docs/optimization/BASELINE.md`, story parked `NEEDS_ATTENTION` with that
+  reason. No price, capability or id is taken from memory or from the
+  decision record's figures.
+- **Given** the docs list it **And** `claude -p ok --model claude-haiku-5-5
+  --output-format json` answers on FX's plan with `modelUsage` keyed by that
+  id (the 34.1-002 probe) **When** `TIER_MODEL_IDS` is bumped **Then**
+  `haiku → claude-haiku-5-5`, `TIER_FALLBACK_IDS["claude-haiku-5-5"] ==
+  "claude-haiku-4-5"`, the routing banner prints `merge=haiku →
+  claude-haiku-5-5`, and a host where the probe fails degrades to
+  `claude-haiku-4-5` with the existing `warn` event.
+- **Given** the docs say Haiku 5.5 takes `effort` **When** a `merge` stage
+  dispatches on it **Then** the argv carries the `BALANCED_STAGE_EFFORT`
+  level and `TIER_EFFORT_LEVELS[HAIKU]` matches the documented levels; the
+  "haiku omits effort" branch survives for `claude-haiku-4-5` (including via
+  fallback). If the docs say it does not, the branch stays as is.
+- **Given** the price table **When** bumped **Then** `claude-haiku-5-5` is
+  priced exactly as the official page lists (including any long-prompt
+  tier), `PRICE_TABLE_VINTAGE` moves to the build date, and the
+  `claude-haiku-4-5` row stays so old ledger rows still price.
+- **Given** the literal id in `harnesses.yaml` `rate_limit_probe`, the README
+  routing sentence and the `docs/controller-architecture.md` tier table
+  **When** the story ships **Then** each names `claude-haiku-5-5` and the new
+  vintage date.
+- **Given** the Epic-31 eval harness **When** `sdlc eval` runs the strutils
+  tickets with merge and reask on `claude-haiku-5-5` **Then**
+  `sdlc eval-compare` against the 34.4-003 new-map scoreboard at the default
+  10 percent tolerance reports `qual` unchanged and `cost$` not worse, and
+  the result is committed under `controller/eval/results/`; a quality drop
+  holds the flip (fallback id stays the tier default) with the delta
+  recorded.
+
+**Technical Notes**: Model map and effort table in
+`controller/src/sdlc/model_routing.py` (`TIER_MODEL_IDS`,
+`TIER_EFFORT_LEVELS`, `TIER_FALLBACK_IDS`); price table and vintage in
+`controller/src/sdlc/cost_estimate.py`; literal probe string at
+`controller/src/sdlc/config/harnesses.yaml:50` (the OpenCode per-stage map
+may follow, optional); `README.md:356`; `docs/controller-architecture.md`
+tier table and the Haiku effort note. Tests that pin the old id and the
+no-effort branch: `controller/tests/test_model_ids.py`,
+`test_effort_routing.py`, `test_cost_estimate.py`, `test_model_tier.py`,
+`test_model_probe.py`, `tests/opencode-worktree-smoke.bats`. The decision
+record's $0.10 / $0.50 and long-prompt figures came from a session that
+could not reach the official docs; treat them as a hypothesis the first
+criterion confirms or refutes. If a long-prompt tier exists, check
+merge-stage prompt sizes in the ledger before claiming the full saving.
+
+**Definition of Done**:
+- [ ] Availability and pricing verified from official pages (URLs recorded), or the fail-closed note written and the story parked
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: tier→id resolution for Haiku 5.5, fallback to 4.5 on probe
+      failure, effort flag per documented capability, price lookup for both
+      ids, literal probe string updated
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 34.1-001, 34.1-002, 34.2-001, 34.4-001 (effort map)
+**Risk Level**: Low
+
+##### Story 34.5-002: Escalation thresholds calibrated from the fleet's ledgers
+**Status**: Not Started
+**User Story**: As FX, I want a command that computes the
+`predicted_tokens_threshold` / `rework_threshold` escalation bars from the
+reconciled story totals in one or more ledgers, and a repo-level switch that
+turns prediction on for every build of the repo, so that Opus is paid only
+on the heavy tail rather than on a `points >= 8` fallback the code itself
+documents as noise, and fleet jobs use the same thresholds as local runs.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** one or more ledger paths **When** FX runs `sdlc routing
+  calibrate --ledger PATH [--ledger PATH ...]` **Then** it merges their
+  reconciled stories (deduplicated by story id and run id, scoped to the
+  current repo's origin), and prints the sample size, the p75 of actual
+  story-total tokens, the observed rework rate and the proposed YAML; with
+  `--write` it updates the root `.sdlc-model-routing.yaml` with those two
+  keys and a dated comment naming the ledgers and sample size.
+- **Given** fewer than `MIN_GLOBAL_SAMPLE` reconciled stories across the
+  ledgers **When** the command runs **Then** it reports "no sample", exits
+  non-zero, and `--write` leaves the file untouched.
+- **Given** `.sdlc-model-routing.yaml` sets `predict: true` (decided by FX
+  2026-10-16: yes for this repo) **When** any `sdlc build` runs for the repo,
+  local or as a queue/fleet job, without an explicit `--predict` /
+  `--no-predict` **Then** prediction is on, so the calibrated thresholds
+  govern escalation; the CLI flag still wins in either direction, and the
+  routing banner says where the setting came from.
+- **Given** the story ships **Then** this repo's `.sdlc-model-routing.yaml`
+  sets `predict: true`. The calibration itself is an operator step after
+  merge, not part of the build: the README documents running `sdlc routing
+  calibrate` with the XPS, home-lab and M3 Max ledgers
+  (`~/Work/claude-code-config/.sdlc-state.db` on each, copied locally) and
+  recording the figures as a dated section in
+  `docs/optimization/BASELINE.md`.
+- **Given** a repo with no routing file **When** builds run **Then**
+  behaviour is identical to today; the full controller suite stays green on
+  both platforms.
+
+**Technical Notes**: Thresholds and their defaults in
+`controller/src/sdlc/model_routing.py` (`predicted_tokens_threshold`,
+`rework_threshold`, `load_routing_config`, `OVERRIDE_FILENAME`);
+`--predict` is today only a CLI flag (`build.py`, `predict: bool = False`),
+so a fleet job never carries it; sample floor `MIN_GLOBAL_SAMPLE` in
+`predictor.py`; reuse the `predict-quality` readers for the reconciled
+totals. Each host keeps its own ledger, so a fleet agent building this story
+sees only its worker's history, which is why calibration is a command plus
+an operator step rather than a value the build computes. Config only on the
+routing side: no predictor weight changes, no new judge, no Jev.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: multi-ledger merge and dedup, origin scoping, p75 and rework
+      math, below-floor refusal, `--write` round-trip, `predict: true`
+      honoured locally and in a queue-launched argv, CLI flag precedence,
+      no-file parity
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 28.3-001 (thresholds), 28.2-002 (prediction)
 **Risk Level**: Low
 
 ## Non-Goals
