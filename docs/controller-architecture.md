@@ -2464,6 +2464,77 @@ harmless: the worker restarts only when the installed *version* changes.
   22 is home-IP-only. Operate it through the home-lab: `ssh -J home-lab
   dev-server`, or widen the ACL in `nix-install`.
 
+### One command sets up a Mac worker; doctor catches drift (Story 35.2-009)
+
+`scripts/fleet-bootstrap.sh` branches on `uname -s`. On Darwin, `--worker NAME
+--pool P [--pool P ...]` renders `com.fxmartin.sdlc-worker` and
+`com.fxmartin.sdlc-dashboard` from `templates/launchd/` — the templates' `sed`
+install, done for you: `__HOME__`, `__USER__`, `__TAILNET_IP__` (`tailscale ip
+-4`), the worker's name and one `--pool` pair per pool, plus `--host HOST` /
+`--slots N` when given (which a re-run keeps from the installed worker agent: an
+M3 re-rendered without its `--host m3max` would register as `m3-max` and strand
+every job pinned to `m3max`) — and, with
+`--queue-service` (home-lab), `com.fxmartin.sdlc-queue` (`--queue-allow LOGIN`
+fills `__LOGIN__`; a re-run keeps the login of the installed agent). Linux keeps
+its systemd path and gains `sdlc-dashboard.service` as a second user unit.
+
+Each agent is compared byte for byte with what is installed:
+
+| Installed | Result |
+|-----------|--------|
+| identical, loaded | left alone |
+| identical, not loaded | `launchctl bootstrap` only |
+| different or absent | `bootout`, written, `bootstrap`; `--dry-run` prints the `diff -u` instead |
+| different, **worker with a job in flight** | `pending restart (job N running)`: file and process left for the next run; the script exits 1 |
+
+"In flight" is `sdlc queue list --json` (the fleet queue once `queue_url:` is
+configured) filtered to `state == running` on the name the installed worker
+agent registered (a rename's old jobs are the ones a bootout kills); a queue that cannot
+be read counts as busy, since a lost build costs more than a delayed restart. It
+asks the queue the worker drains: the agent's own `SDLC_QUEUE_URL`, else
+`~/.sdlc-fleet.yaml` — never the shell's `SDLC_QUEUE_URL` or `SDLC_FLEET_DISABLED`,
+which launchd does not hand the worker. If
+`tailscale ip -4` prints nothing the run stops in preflight, before any agent is
+written: a blank host would bind every interface. The agent is booted out before
+its file is replaced: the file is what a re-run and doctor judge, so a `bootout`
+that fails stops the run with the old file in place, still a visible difference,
+rather than a file that reads current over the old agent launchd keeps running. A
+`bootstrap` launchd refuses right after the `bootout` (it may still hold the label)
+is retried briefly, then fails the run naming the agent left unloaded.
+
+No template carries a queue token, yet the M3's worker has one by hand
+(`tailscale whois` fails under launchd, #833) and the client reads it only from
+its environment. So the render keeps an installed agent's `SDLC_QUEUE_TOKEN` —
+appended to `EnvironmentVariables` through awk's environment, never an argv
+`ps` would show — installs that plist `0600`, asks the in-flight question with
+the worker's own token, and masks the value in the `--dry-run` diff.
+
+Step 6's verdict (`sdlc doctor --exit-code`) leaves out, on a Mac,
+`fleet-agent-drift` and `worker-dashboard` (`sdlc doctor --skip CHECK`): both
+judge the agents step 7 is about to re-render, so counting them would exit 1 on
+exactly the run that repairs them. Step 7 answers for them instead — a worker
+left pending restart exits 1. Step 4 on a home-manager Mac, whose global git
+config links into the read-only `/nix/store`, cannot write the credential
+helpers: there it warns and goes on (the helpers belong in nix-install; the M3
+uses `osxkeychain`), where it used to stop before rendering any agent. Linux
+still stops. `--queue-service` assumes the queue agent is installed from its
+template, as home-lab's is today; if nix-install renders it (the
+nix-install wiring of the queue service, above), leave the flag off.
+
+`sdlc doctor` closes the loop with `fleet-agent-drift` (`check_fleet_agent_drift`):
+for each installed worker, dashboard and queue agent it compares
+`ProgramArguments` with the template rendered for this host — `__HOME__` is the
+home, the worker's own `--worker` / `--pool` / `--host` / `--slots` choices stand
+(the worker's only: the dashboard's `--host` must still be a tailnet address), and
+any tailnet (`100.64.0.0/10`) address satisfies `__TAILNET_IP__`, so doctor never
+asks tailscale. A difference is a WARN naming the agent and its missing or
+unexpected arguments, with the `fleet-bootstrap.sh` command that re-renders them
+(repeating the worker's own choices).
+It reads `templates/launchd/` from the checkout doctor runs in, else from the
+config checkout `~/.claude/CLAUDE.md` links into (`install.sh --core`), so it
+checks from `~` or any project too; a host with neither, or without any of the
+agents, has nothing to report.
+
 ## Using the fleet queue (`QueueClient`, Story 35.1-002)
 
 Remote execution is additive: every queue consumer (`sdlc queue list|add|cancel|

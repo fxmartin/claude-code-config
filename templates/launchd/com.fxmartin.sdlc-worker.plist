@@ -14,6 +14,12 @@
                     dashboard listens — see com.fxmartin.sdlc-dashboard.plist;
                     the install stops if Tailscale is down and it prints nothing
 
+  scripts/fleet-bootstrap.sh is the documented install: it does all of the below
+  for any worker name and pools (its worker and pool flags), replaces an installed
+  agent that differs from this template, and `sdlc doctor` warns
+  (fleet-agent-drift) when an installed agent no longer matches. By hand, for the
+  M3 Max as it stands here:
+
   Install:
 
     mkdir -p ~/.local/state/sdlc
@@ -41,7 +47,8 @@
 
   Which queue it drains: this Mac's own (the SDLC_QUEUE_PATH above) unless a
   fleet queue is named — SDLC_QUEUE_URL (add it to EnvironmentVariables with
-  SDLC_QUEUE_TOKEN if this Mac has no Tailscale CLI for the identity gate) or a
+  SDLC_QUEUE_TOKEN if this Mac has no Tailscale CLI for the identity gate — the
+  bootstrap keeps that token when it re-renders this agent, installed 0600) or a
   `queue_url:` in ~/.sdlc-fleet.yaml, which the agent reads as you. Then
   this worker drains the fleet queue on home-lab over HTTP
   (Story 35.2-005): it registers, heartbeats, claims, renews and finishes there,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
-# ABOUTME: Behavior tests for scripts/fleet-bootstrap.sh (Story 35.2-008): the Linux dev box
-# ABOUTME: becomes a worker — and a second run changes nothing (idempotent).
+# ABOUTME: Behavior tests for scripts/fleet-bootstrap.sh (Stories 35.2-008, 35.2-009): the Linux dev
+# ABOUTME: box and the Mac become workers — and a second run changes nothing (idempotent).
 #
 # Everything the script would install or start is a stub earlier on PATH (or an
 # INSTALL_SH / DEPLOY_SH seam), and HOME is a scratch directory, so no run touches
@@ -62,11 +62,33 @@ case "$2" in
 esac
 exit 0'
     # sdlc records its working directory: doctor judges the repo it is run from.
-    stub sdlc 'echo "sdlc-cwd ${PWD}" >>"${CALLS}"; exit "${STUB_DOCTOR_RC:-0}"'
+    # `queue list --json` answers from $TMP/queue.json (no jobs unless a test writes it).
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then
+  echo "queue-token ${SDLC_QUEUE_TOKEN:-}" >>"${CALLS}"
+  [ "${STUB_QUEUE_RC:-0}" = 0 ] || exit "${STUB_QUEUE_RC}"
+  if [ -f "$TMP/queue.json" ]; then cat "$TMP/queue.json"; else echo "{\"jobs\": []}"; fi
+  exit 0
+fi
+echo "sdlc-cwd ${PWD}" >>"${CALLS}"; exit "${STUB_DOCTOR_RC:-0}"'
+    # One marker per unit: enable --now NAME starts NAME.
     stub systemctl '
 case "$2" in
-  is-active) [ -e "$TMP/active" ] ;;
-  enable) touch "$TMP/active" ;;
+  is-active) [ -e "$TMP/active.$4" ] ;;
+  enable) touch "$TMP/active.$4" ;;
+esac'
+    # The platform is the stub's to say, so these suites read the same on a Mac and in CI:
+    # Linux unless a test sets STUB_UNAME=Darwin.
+    printf '#!/bin/sh\necho "${STUB_UNAME:-Linux}"\n' >"${TMP}/bin/uname"
+    chmod +x "${TMP}/bin/uname"
+    # `tailscale ip -4` prints a tailnet address, or nothing when STUB_TAILSCALE_IP is set empty.
+    stub tailscale 'echo "${STUB_TAILSCALE_IP-100.64.0.9}"'
+    # launchctl keeps one marker per loaded label, as the real one keeps its domain.
+    stub launchctl '
+case "$1" in
+  print) [ -e "$TMP/loaded.${2##*/}" ] ;;
+  bootstrap) touch "$TMP/loaded.$(basename "$3" .plist)" ;;
+  bootout) rm -f "$TMP/loaded.${2##*/}" ;;
 esac'
 
     export INSTALL_SH="${TMP}/install.sh" DEPLOY_SH="${TMP}/deploy.sh"
@@ -113,7 +135,7 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
     [ "$status" -eq 0 ]
 
     order="$(grep -nE '^(install.sh|claude plugin install|deploy.sh|gh auth setup-git|sdlc doctor|systemctl --user enable)' "${CALLS}" | cut -d: -f2 | cut -d' ' -f1-2 | tr '\n' '|')"
-    [ "${order}" = "install.sh --core|claude plugin|deploy.sh |gh auth|sdlc doctor|systemctl --user|" ]
+    [ "${order}" = "install.sh --core|claude plugin|deploy.sh |gh auth|sdlc doctor|systemctl --user|systemctl --user|" ]
 }
 
 @test "doctor is asked for an exit status so automation can tell CLEAN from not" {
@@ -533,4 +555,634 @@ run_without() {  # run_without TOOL BOOTSTRAP-ARG…
 
     [ "$status" -eq 0 ]
     grep -qx "sdlc-cwd $(cd "${BATS_TEST_DIRNAME}/.." && pwd)" "${CALLS}"
+}
+
+# --- the Linux dashboard unit (35.2-009) -------------------------------------------------
+
+DASHBOARD_UNIT() { echo "${HOME}/.config/systemd/user/sdlc-dashboard.service"; }
+
+@test "linux gains the dashboard as a second user unit, bound to the tailnet address" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    # Through the dev shell, as the worker is: the forge panel runs gh and glab, which live there.
+    grep -qx "ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc dashboard --host 100.64.0.9 --port 8787" "$(DASHBOARD_UNIT)"
+    ! grep -q "__" "$(DASHBOARD_UNIT)" || false
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+    grep -qx "systemctl --user enable --now sdlc-dashboard.service" "${CALLS}"
+    # The worker unit is today's, untouched.
+    cmp "${TEMPLATE}" "$(UNIT)"
+}
+
+@test "linux: a changed dashboard unit is restarted, and the worker is left running" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    printf '\n# stale\n' >>"$(DASHBOARD_UNIT)"
+    : >"${CALLS}"
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "systemctl --user restart sdlc-dashboard.service" "${CALLS}"
+    ! grep -q "restart sdlc-worker" "${CALLS}" || false
+}
+
+@test "linux without a tailnet address stops before writing any unit" {
+    STUB_TAILSCALE_IP="" run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"every"*"interface"* ]]
+    [ ! -e "$(UNIT)" ] && [ ! -e "$(DASHBOARD_UNIT)" ]
+    ! grep -q "install.sh" "${CALLS}" || false
+}
+
+@test "linux refuses the macOS-only options: the unit is worker dev on claude-shared" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --worker m3 --pool p
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"macOS options"* ]]
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --host dev
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"macOS options"* ]]
+}
+
+# --- macOS: LaunchAgents rendered from templates/launchd (35.2-009) ---------------------
+
+LAUNCHD="${BATS_TEST_DIRNAME}/../templates/launchd"
+AGENT() { echo "${HOME}/Library/LaunchAgents/com.fxmartin.sdlc-$1.plist"; }
+
+# The string that follows <string>FLAG</string> in a rendered plist.
+value_after() { awk -v flag="<string>$2</string>" 'index($0, flag) { getline; print }' "$1" | sed 's/.*<string>\(.*\)<\/string>.*/\1/'; }
+
+darwin() { export STUB_UNAME=Darwin; }
+mac() { "${BOOTSTRAP}" --worker m3max --pool claude-m3 --pool codex-shared --queue-url "${QUEUE}" "$@"; }
+
+@test "a Mac gets a worker and a dashboard agent rendered for it, and both are loaded" {
+    darwin
+    run mac
+
+    [ "$status" -eq 0 ]
+    w="$(AGENT worker)"; d="$(AGENT dashboard)"
+    ! grep -q "__[A-Z_]*__" <(sed '/^<!--/,/^-->/d' "$w") || false
+    ! grep -q "__[A-Z_]*__" <(sed '/^<!--/,/^-->/d' "$d") || false
+    [ "$(value_after "$w" --worker)" = "m3max" ]
+    [ "$(value_after "$w" --pool | tr '\n' ' ')" = "claude-m3 codex-shared " ]
+    [ "$(value_after "$w" --dashboard-url)" = "http://100.64.0.9:8787" ]
+    [ "$(value_after "$d" --host)" = "100.64.0.9" ]
+    grep -qF "<string>${HOME}/.local/bin/sdlc</string>" "$w"
+    grep -qx "launchctl bootstrap gui/$(id -u) ${w}" "${CALLS}"
+    grep -qx "launchctl bootstrap gui/$(id -u) ${d}" "${CALLS}"
+    # No queue service unless asked for, and no systemd unit on a Mac.
+    [ ! -e "$(AGENT queue)" ]
+    [ ! -e "$(UNIT)" ]
+}
+
+@test "a Mac's worker plist differs from the template only in its name, its pools and its values" {
+    darwin
+    run mac
+    [ "$status" -eq 0 ]
+
+    expected="$(sed -e "s|__HOME__|${HOME}|g" -e "s|__USER__|$(id -un)|g" -e "s|__TAILNET_IP__|100.64.0.9|g" "${LAUNCHD}/com.fxmartin.sdlc-worker.plist")"
+    # The template already names the M3 Max and its pools, so rendering it for them is the identity.
+    [ "$expected" = "$(cat "$(AGENT worker)")" ]
+}
+
+@test "a Mac's own worker name and a single pool replace the template's" {
+    darwin
+    run "${BOOTSTRAP}" --worker home-lab --pool claude-shared --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --worker)" = "home-lab" ]
+    [ "$(value_after "$(AGENT worker)" --pool)" = "claude-shared" ]
+    ! grep -q "m3max\|claude-m3\|codex-shared" <(sed '/^<!--/,/^-->/d' "$(AGENT worker)") || false
+}
+
+@test "the dashboard is installed before the worker that advertises it" {
+    darwin
+    run mac
+    [ "$status" -eq 0 ]
+
+    order="$(grep -n '^launchctl bootstrap' "${CALLS}" | sed 's/.*sdlc-\([a-z]*\)\.plist/\1/' | tr '\n' ' ')"
+    [ "${order}" = "dashboard worker " ]
+}
+
+@test "--queue-service on home-lab renders the queue agent too, with the login it is given" {
+    darwin
+    run mac --queue-service --queue-allow fx@example.com
+
+    [ "$status" -eq 0 ]
+    q="$(AGENT queue)"
+    [ "$(value_after "$q" --bind)" = "100.64.0.9:8790" ]
+    grep -qF "<string>fx@example.com</string>" "$q"
+    grep -qx "launchctl bootstrap gui/$(id -u) ${q}" "${CALLS}"
+}
+
+@test "--queue-service keeps the login of the queue agent already installed" {
+    darwin
+    run mac --queue-service --queue-allow fx@example.com
+    [ "$status" -eq 0 ]
+    before="$(cat "$(AGENT queue)")"
+    : >"${CALLS}"
+
+    run mac --queue-service
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$(AGENT queue)")" = "${before}" ]
+    ! grep -q "launchctl boot" "${CALLS}" || false
+}
+
+@test "--queue-service with no login anywhere is refused before anything changes" {
+    darwin
+    run mac --queue-service
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--queue-allow"* ]]
+    ! grep -q "install.sh" "${CALLS}" || false
+}
+
+@test "re-running a Mac with nothing changed leaves every agent loaded and untouched" {
+    darwin
+    run mac
+    [ "$status" -eq 0 ]
+    before="$(cd "${HOME}" && find . -type f -exec cksum {} + | sort)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(cd "${HOME}" && find . -type f -exec cksum {} + | sort)" = "${before}" ]
+    ! grep -qE "^launchctl (bootstrap|bootout)" "${CALLS}" || false
+    [[ "$output" == *"already installed and current"* ]]
+}
+
+@test "an agent that is current but not loaded is loaded, not rewritten" {
+    darwin
+    run mac
+    rm "${TMP}/loaded.com.fxmartin.sdlc-dashboard"
+    before="$(cksum <"$(AGENT dashboard)")"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(cksum <"$(AGENT dashboard)")" = "${before}" ]
+    grep -qx "launchctl bootstrap gui/$(id -u) $(AGENT dashboard)" "${CALLS}"
+}
+
+@test "an agent that differs from its template is replaced: booted out, then bootstrapped" {
+    darwin
+    run mac
+    printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    ! grep -q "stale" "$(AGENT dashboard)" || false
+    out="$(grep -n 'sdlc-dashboard' "${CALLS}" | grep launchctl | sed 's/^[0-9]*:launchctl \([a-z]*\).*/\1/' | tr '\n' ' ')"
+    [ "${out}" = "print bootout bootstrap " ] || [ "${out}" = "bootout bootstrap " ]
+    [ -e "${TMP}/loaded.com.fxmartin.sdlc-dashboard" ]
+}
+
+@test "a worker plist from before 35.4-006 is replaced and gains --dashboard-url" {
+    darwin
+    run mac
+    # What the M3 Max was left with: no --dashboard-url pair.
+    grep -v -e '--dashboard-url' -e 'http://100.64.0.9:8787' "$(AGENT worker)" >"${TMP}/old.plist"
+    cp "${TMP}/old.plist" "$(AGENT worker)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --dashboard-url)" = "http://100.64.0.9:8787" ]
+    grep -qx "launchctl bootout gui/$(id -u)/com.fxmartin.sdlc-worker" "${CALLS}"
+}
+
+@test "a re-run keeps the --host the installed worker registers as, and its slot cap" {
+    darwin
+    run mac
+    # The M3 as found: `--host m3max` (its hostname -s is m3-max) and no --dashboard-url yet.
+    awk '{ print } /<string>--follow<\/string>/ {
+        print "    <string>--host</string>"; print "    <string>m3max</string>"
+        print "    <string>--slots</string>"; print "    <string>3</string>" }' "$(AGENT worker)" \
+        | grep -v -e '--dashboard-url' -e 'http://100.64.0.9:8787' >"${TMP}/old.plist"
+    cp "${TMP}/old.plist" "$(AGENT worker)"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --dashboard-url)" = "http://100.64.0.9:8787" ]
+    [ "$(value_after "$(AGENT worker)" --host)" = "m3max" ]
+    [ "$(value_after "$(AGENT worker)" --slots)" = "3" ]
+}
+
+@test "--host and --slots land in the worker agent, and a re-run without them changes nothing" {
+    darwin
+    run mac --host m3max --slots 3
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --host)" = "m3max" ]
+    [ "$(value_after "$(AGENT worker)" --slots)" = "3" ]
+    before="$(cksum <"$(AGENT worker)")"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(cksum <"$(AGENT worker)")" = "${before}" ]
+    ! grep -qE "^launchctl (bootstrap|bootout)" "${CALLS}" || false
+}
+
+@test "a host name or slot cap that is not valid is refused" {
+    darwin
+    run mac --host 'a|b'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--host must be"* ]]
+
+    run mac --slots 0
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--slots must be"* ]]
+    ! grep -q "install.sh" "${CALLS}" || false
+}
+
+@test "a renamed worker's job in flight under its installed name still holds it back" {
+    darwin
+    run mac
+    printf '<!-- stale -->\n' >>"$(AGENT worker)"
+    cp "$(AGENT worker)" "${TMP}/stale.plist"
+    # Job 7 runs under the name the installed agent registered: booting it out would SIGTERM it.
+    echo '{"jobs": [{"id": 7, "state": "running", "worker": "m3max"}]}' >"${TMP}/queue.json"
+
+    run "${BOOTSTRAP}" --worker m3-max --pool claude-m3 --queue-url "${QUEUE}"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"pending restart (job 7 running)"* ]]
+    cmp "${TMP}/stale.plist" "$(AGENT worker)"
+}
+
+@test "a worker with a job in flight is not restarted: pending restart, left for the next run" {
+    darwin
+    run mac
+    printf '<!-- stale -->\n' >>"$(AGENT worker)"
+    cp "$(AGENT worker)" "${TMP}/stale.plist"
+    echo '{"jobs": [{"id": 7, "state": "running", "worker": "m3max"}, {"id": 8, "state": "queued", "worker": null}]}' >"${TMP}/queue.json"
+    : >"${CALLS}"
+
+    run mac
+
+    # Not converged, so not 0: the Mac still runs the agent it had, and the run says to re-run.
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"re-run this script once the worker is idle"* ]]
+    [[ "$output" == *"pending restart (job 7 running)"* ]]
+    cmp "${TMP}/stale.plist" "$(AGENT worker)"
+    ! grep -q "bootout gui/$(id -u)/com.fxmartin.sdlc-worker" "${CALLS}" || false
+    [ -e "${TMP}/loaded.com.fxmartin.sdlc-worker" ]
+}
+
+@test "the job in flight on another worker does not hold this worker back" {
+    darwin
+    run mac
+    printf '<!-- stale -->\n' >>"$(AGENT worker)"
+    echo '{"jobs": [{"id": 7, "state": "running", "worker": "dev"}]}' >"${TMP}/queue.json"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    ! grep -q "stale" "$(AGENT worker)" || false
+}
+
+@test "a worker whose queue cannot be read is not restarted either" {
+    darwin
+    run mac
+    printf '<!-- stale -->\n' >>"$(AGENT worker)"
+    : >"${CALLS}"
+
+    STUB_QUEUE_RC=1 run mac
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"pending restart"* ]]
+    grep -q "stale" "$(AGENT worker)"
+    ! grep -q "launchctl bootout" "${CALLS}" || false
+}
+
+@test "an unloaded worker is replaced without asking the queue about jobs" {
+    darwin
+    run mac
+    printf '<!-- stale -->\n' >>"$(AGENT worker)"
+    rm "${TMP}/loaded.com.fxmartin.sdlc-worker"
+    echo '{"jobs": [{"id": 7, "state": "running", "worker": "m3max"}]}' >"${TMP}/queue.json"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    ! grep -q "stale" "$(AGENT worker)" || false
+}
+
+@test "without a tailnet address a Mac stops before writing any agent" {
+    darwin
+    STUB_TAILSCALE_IP="" run mac
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"every"*"interface"* ]]
+    [ ! -e "$(AGENT worker)" ] && [ ! -e "$(AGENT dashboard)" ]
+    ! grep -qE "^(install.sh|launchctl)" "${CALLS}" || false
+}
+
+@test "--dry-run on a Mac prints the diff of an agent it would replace and changes nothing" {
+    darwin
+    run mac
+    printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+    before="$(cd "${HOME}" && find . -type f -exec cksum {} + | sort)"
+    : >"${CALLS}"
+
+    run mac --dry-run
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"would replace"* ]]
+    [[ "$output" == *"-<!-- stale -->"* ]]
+    [ "$(cd "${HOME}" && find . -type f -exec cksum {} + | sort)" = "${before}" ]
+    ! grep -qE "^launchctl (bootstrap|bootout)" "${CALLS}" || false
+}
+
+@test "--dry-run on a Mac with no agents installed names what it would install" {
+    darwin
+    run mac --dry-run
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"would install"*"com.fxmartin.sdlc-worker.plist"* ]]
+    [[ "$output" == *"+    <string>http://100.64.0.9:8787</string>"* ]]
+    [ -z "$(find "${HOME}" -type f)" ]
+}
+
+@test "a Mac needs a worker name and at least one pool" {
+    darwin
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --pool p
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--worker NAME is required"* ]]
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --worker w
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--pool"* ]]
+}
+
+@test "a worker name or pool that is not a plain word is refused" {
+    darwin
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --worker 'a|b' --pool p
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--worker must be"* ]]
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --worker w --pool '<x>'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--pool must be"* ]]
+}
+
+@test "--skip-service on a Mac installs no agent and needs no tailnet" {
+    darwin
+    STUB_TAILSCALE_IP="" run "${BOOTSTRAP}" --queue-url "${QUEUE}" --skip-service
+
+    [ "$status" -eq 0 ]
+    [ ! -e "$(AGENT worker)" ]
+    ! grep -q launchctl "${CALLS}" || false
+}
+
+@test "--help documents the Mac options and the in-flight rule" {
+    run "${BOOTSTRAP}" --help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--worker NAME --pool P"* ]]
+    [[ "$output" == *"--queue-service"* ]]
+    [[ "$output" == *"pending restart (job N running)"* ]]
+    [[ "$output" == *"at boot." ]]
+}
+
+# --- a home-manager Mac, the run that repairs drift, the queue token (review of #877) ----
+
+# git's global config is a read-only /nix/store link there: gh and git fail every write.
+# A stub fails it, not a read-only file — CI runs as root, which a chmod does not stop.
+unwritable_git_config() {
+    stub gh 'case "$1 $2" in "auth setup-git") echo "could not lock config file" >&2; exit 1 ;; esac; exit 0'
+    stub git 'case "$1 $2" in "config --global") echo "error: could not lock config file" >&2; exit 255 ;; esac; exit 0'
+}
+
+@test "a Mac whose global git config cannot be written warns at step 4 and still renders its agents" {
+    darwin
+    unwritable_git_config
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"could not write gh's credential helper"* ]]
+    [[ "$output" == *"could not write credential.http://gitlab.test.helper"* ]]
+    [ -e "$(AGENT worker)" ] && [ -e "$(AGENT dashboard)" ]
+    grep -q "^sdlc doctor" "${CALLS}"
+}
+
+@test "linux still stops at an unwritable git config, before the unit is installed" {
+    unwritable_git_config
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 1 ]
+    [ ! -e "$(UNIT)" ]
+    ! grep -q "^sdlc doctor" "${CALLS}" || false
+}
+
+@test "a Mac's doctor skips the two checks step 7 settles; --skip-service and linux skip none" {
+    darwin
+    run mac
+    grep -qx "sdlc doctor --exit-code --skip fleet-agent-drift --skip worker-dashboard" "${CALLS}"
+
+    : >"${CALLS}"
+    run mac --skip-service
+    [ "$status" -eq 0 ]
+    grep -qx "sdlc doctor --exit-code" "${CALLS}"
+
+    : >"${CALLS}"
+    unset STUB_UNAME
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    grep -qx "sdlc doctor --exit-code" "${CALLS}"
+}
+
+@test "the run that repairs a drifted worker exits 0, though doctor warned about that drift" {
+    darwin
+    run mac
+    # A worker from before 35.4-006: doctor's drift and dashboard checks WARN on it — unless skipped.
+    sed -i.bak '/<string>--dashboard-url<\/string>/,/<string>http:/d' "$(AGENT worker)"
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then echo "{\"jobs\": []}"; exit 0; fi
+case " $* " in *" --skip fleet-agent-drift --skip worker-dashboard "*) exit 0 ;; esac
+exit 1'
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --dashboard-url)" = "http://100.64.0.9:8787" ]
+}
+
+# The token an operator put in the installed worker by hand, as the M3's was (#833).
+TOKEN="dummy-token-0123"
+hand_add_token() {  # AGENT-FILE
+    awk -v t="${TOKEN}" '/<key>EnvironmentVariables<\/key>/ { e = 1 }
+        e && /<\/dict>/ { print "\t\t<key>SDLC_QUEUE_TOKEN</key>"; print "\t\t<string>" t "</string>"; e = 0 }
+        { print }' "$1" >"$1.new" && mv "$1.new" "$1"
+    printf '<!-- stale -->\n' >>"$1"
+}
+
+@test "a re-render keeps the installed worker's queue token, installs it 0600, and asks the queue with it" {
+    darwin
+    run mac
+    hand_add_token "$(AGENT worker)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    ! grep -q "stale" "$(AGENT worker)" || false
+    [ "$(grep -A1 '<key>SDLC_QUEUE_TOKEN</key>' "$(AGENT worker)" | tail -n1)" = "    <string>${TOKEN}</string>" ]
+    [ "$(ls -l "$(AGENT worker)" | cut -c1-10)" = "-rw-------" ]
+    [ "$(ls -l "$(AGENT dashboard)" | cut -c1-10)" = "-rw-r--r--" ]
+    grep -qx "queue-token ${TOKEN}" "${CALLS}"
+    # The token never reaches a command line, where `ps` would show it.
+    ! grep -v "^queue-token " "${CALLS}" | grep -q "${TOKEN}" || false
+
+    # And a second run, token and all, changes nothing.
+    before="$(cksum "$(AGENT worker)")"; : >"${CALLS}"
+    run mac
+    [ "$status" -eq 0 ]
+    [ "$(cksum "$(AGENT worker)")" = "${before}" ]
+    ! grep -q "launchctl bootout" "${CALLS}" || false
+}
+
+@test "a dry-run diff masks the queue token" {
+    darwin
+    run mac
+    hand_add_token "$(AGENT worker)"
+
+    run mac --dry-run
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"would replace"*"-<!-- stale -->"* ]]
+    [[ "$output" == *"<string>(redacted)</string>"* ]]
+    [[ "$output" != *"${TOKEN}"* ]]
+}
+
+# launchd may still hold a label just booted out: the first bootstrap after a bootout fails.
+slow_launchd() {
+    stub launchctl '
+case "$1" in
+  print) [ -e "$TMP/loaded.${2##*/}" ] ;;
+  bootstrap)
+    if [ -e "$TMP/booting-out" ] && [ "${STUB_BOOTSTRAP_FAILS:-1}" != 0 ]; then
+      [ "${STUB_BOOTSTRAP_FAILS:-1}" = always ] || rm -f "$TMP/booting-out"
+      echo "Bootstrap failed: 5: Input/output error" >&2; exit 5
+    fi
+    touch "$TMP/loaded.$(basename "$3" .plist)" ;;
+  bootout) rm -f "$TMP/loaded.${2##*/}"; touch "$TMP/booting-out" ;;
+esac'
+    export BOOTSTRAP_RETRY_DELAY=0
+}
+
+@test "a bootstrap refused right after a bootout is retried, and the agent ends loaded" {
+    darwin
+    run mac
+    slow_launchd
+    printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "^launchctl bootstrap gui/$(id -u) $(AGENT dashboard)$" "${CALLS}")" -eq 2 ]
+    [ -e "${TMP}/loaded.com.fxmartin.sdlc-dashboard" ]
+}
+
+@test "a bootstrap that keeps failing stops the run, naming the agent left unloaded" {
+    darwin
+    run mac
+    slow_launchd
+    export STUB_BOOTSTRAP_FAILS=always
+    printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+
+    run mac
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"launchctl bootstrap com.fxmartin.sdlc-dashboard kept failing"* ]]
+}
+
+# The file on disk is the convergence proof: a re-run and doctor both read it. Written
+# before a bootout that fails, it would say "current" while launchd runs the old agent.
+@test "a bootout that fails leaves the old plist installed, so the next run still replaces it" {
+    darwin
+    run mac
+    # What the M3 Max was left with: no --dashboard-url pair.
+    grep -v -e '--dashboard-url' -e 'http://100.64.0.9:8787' "$(AGENT worker)" >"${TMP}/old.plist"
+    cp "${TMP}/old.plist" "$(AGENT worker)"
+    stub launchctl '
+case "$1" in
+  print) [ -e "$TMP/loaded.${2##*/}" ] ;;
+  bootstrap) touch "$TMP/loaded.$(basename "$3" .plist)" ;;
+  bootout)
+    if [ -e "$TMP/bootout-fails" ]; then echo "Boot-out failed: 5: Input/output error" >&2; exit 5; fi
+    rm -f "$TMP/loaded.${2##*/}" ;;
+esac'
+    touch "${TMP}/bootout-fails"
+
+    run mac
+
+    [ "$status" -ne 0 ]
+    cmp -s "${TMP}/old.plist" "$(AGENT worker)"
+    [ -e "${TMP}/loaded.com.fxmartin.sdlc-worker" ]
+    [[ "$output" == *"launchctl bootout com.fxmartin.sdlc-worker failed"* ]]
+
+    rm "${TMP}/bootout-fails"
+    : >"${CALLS}"
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --dashboard-url)" = "http://100.64.0.9:8787" ]
+    grep -qx "launchctl bootout gui/$(id -u)/com.fxmartin.sdlc-worker" "${CALLS}"
+}
+
+# launchd hands the worker its plist's EnvironmentVariables, never this shell's.
+@test "the in-flight check asks the queue the installed worker drains, not the shell's" {
+    darwin
+    run mac
+    awk '/<key>EnvironmentVariables<\/key>/ { e = 1 }
+        e && /<\/dict>/ { print "    <key>SDLC_QUEUE_URL</key>"; print "    <string>http://worker-queue.example:8790</string>"; e = 0 }
+        { print }' "$(AGENT worker)" >"${TMP}/w.plist"
+    mv "${TMP}/w.plist" "$(AGENT worker)"
+    printf '<!-- stale -->\n' >>"$(AGENT worker)"
+    printf '{"jobs": [{"id": 7, "state": "running", "worker": "m3max"}]}' >"${TMP}/queue.json"
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then
+  echo "queue-url ${SDLC_QUEUE_URL:-} fleet-disabled ${SDLC_FLEET_DISABLED:-}" >>"${CALLS}"
+  cat "$TMP/queue.json"; exit 0
+fi
+exit 0'
+    export SDLC_QUEUE_URL=http://shell-queue.example:8790 SDLC_FLEET_DISABLED=1
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 1 ]
+    grep -qx "queue-url http://worker-queue.example:8790 fleet-disabled " "${CALLS}"
+    [[ "$output" == *"pending restart (job 7 running)"* ]]
+
+    # Without one in its plist, the worker reads ~/.sdlc-fleet.yaml: so does the check.
+    sed '/<key>SDLC_QUEUE_URL<\/key>/,+1d' "$(AGENT worker)" >"${TMP}/w.plist"
+    mv "${TMP}/w.plist" "$(AGENT worker)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 1 ]
+    grep -qx "queue-url  fleet-disabled " "${CALLS}"
+}
+
+@test "--help says --skip-service skips a Mac's LaunchAgents too, and that the token is kept" {
+    run "${BOOTSTRAP}" --help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"the LaunchAgents on a Mac"* ]]
+    [[ "$output" == *"SDLC_QUEUE_TOKEN"*"0600"* ]]
 }

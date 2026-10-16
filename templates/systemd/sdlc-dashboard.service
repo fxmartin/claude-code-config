@@ -1,0 +1,43 @@
+# ABOUTME: systemd --user unit that keeps this fleet worker's own dashboard (`sdlc dashboard` bound
+# ABOUTME: to its tailnet address) running beside the worker (Story 35.2-009). Twin of the launchd dashboard plist.
+#
+# The Linux sibling of templates/launchd/com.fxmartin.sdlc-dashboard.plist (Story
+# 35.4-006): a sibling unit rather than part of the worker's, so a worker restart
+# (it exits 75 on every controller upgrade) does not blank the XPS's view of the
+# runs it is finishing, and a dashboard crash does not take jobs down with it.
+#
+# One placeholder, filled by scripts/fleet-bootstrap.sh (the documented install):
+#
+#   __TAILNET_IP__  this box's tailnet address (`tailscale ip -4`)
+#
+# `tailscale ip -4` prints nothing while Tailscale is stopped or logged out, and
+# the bootstrap stops there, before it writes a unit: a blank host would bind every
+# interface (`sdlc dashboard` refuses one as well). The dashboard has no login of
+# its own; the tailnet ACL is its access control.
+#
+# Through `nix develop`, as the worker is: gh and glab live in the dev shell, not on
+# the login PATH, and the dashboard's forge panel runs both — without them it reads
+# "unavailable". XDG_STATE_HOME is pinned to the worker unit's so it reads the same
+# registry and ledgers the worker's runs land in. Unlike the worker, the dashboard does not exit
+# when the controller is reinstalled: it serves the old code until
+# `systemctl --user restart sdlc-dashboard` (the bootstrap does that on a changed unit).
+
+[Unit]
+Description=sdlc fleet worker dashboard (tailnet)
+
+[Service]
+Type=simple
+ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc dashboard --host __TAILNET_IP__ --port 8787
+Environment=PATH=%h/.local/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_STATE_HOME=%h/.local/state
+
+# Always, with the worker's 30 s: a bind that fails before Tailscale is up must not spin.
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sdlc-dashboard
+
+[Install]
+WantedBy=default.target

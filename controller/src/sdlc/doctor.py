@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import plistlib
+import re
 import shlex
 import shutil
 import socket
@@ -42,6 +43,7 @@ __all__ = [
     "check_controller_version",
     "self_update_controller",
     "check_deny_baseline",
+    "check_fleet_agent_drift",
     "check_forge_credentials",
     "check_glab_dependency",
     "check_harness_pin",
@@ -881,8 +883,9 @@ def check_worker_dashboard(
         return None
     name = "Worker dashboard"
     remedy = (
-        "reinstall both agents from templates/launchd/ (the worker advertises it with "
-        f"--dashboard-url; `launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
+        "re-run scripts/fleet-bootstrap.sh from the config repo: it renders both agents from "
+        "templates/launchd/, the worker advertising the dashboard with --dashboard-url "
+        f"(`launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
     )
     advertised = _plist_option(args, "--dashboard-url")
     if not advertised:
@@ -903,6 +906,148 @@ def check_worker_dashboard(
             remedy,
         )
     return Finding("worker-dashboard", name, "CLEAN", f"{origin} answers")
+
+
+# Story 35.2-009: an installed agent whose arguments no longer match its template.
+# 35.4-006 added `--dashboard-url` to the worker template, merged, and no Mac ever
+# re-rendered the agent — so every remote run read "detail unavailable".
+_FLEET_AGENT_LABELS = (WORKER_LABEL, DASHBOARD_LABEL, QUEUE_SERVICE_LABEL)
+_TAILNET_IP = "__TAILNET_IP__"
+# `tailscale ip -4` is always in the CGNAT block 100.64.0.0/10 — never 0.0.0.0 or a LAN address.
+_TAILNET_IPV4 = r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}"
+# What the worker's host chooses, not the template: the M3's name and pools are its defaults,
+# and a registered `--host` (the M3 is `m3max`, its hostname `m3-max`) or `--slots` cap is its
+# own — the bootstrap keeps both. Worker only: the dashboard's `--host` must stay a tailnet IP.
+_HOST_CHOSEN_FLAGS = ("--worker", "--pool", "--host", "--slots")
+
+
+def default_dashboard_plist() -> Path:
+    """Where `launchctl` loads the worker's dashboard LaunchAgent from."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{DASHBOARD_LABEL}.plist"
+
+
+def _argument_groups(args: list[str]) -> list[str]:
+    """ProgramArguments as comparable units: ``--flag value`` is one, a bare word is one."""
+    groups: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--") and "=" in arg:
+            flag, _, value = arg.partition("=")
+            groups.append(f"{flag} {value}")
+        elif arg.startswith("--") and i + 1 < len(args) and not args[i + 1].startswith("--"):
+            groups.append(f"{arg} {args[i + 1]}")
+            i += 1
+        else:
+            groups.append(arg)
+        i += 1
+    return groups
+
+
+def _drift(
+    expected: list[str], installed: list[str], host_chosen: tuple[str, ...] = ()
+) -> tuple[list[str], list[str]]:
+    """(missing, unexpected) argument groups. A tailnet address matches any tailnet address.
+
+    A ``host_chosen`` flag's installed value stands in for the template's, and is
+    no drift where the template has none.
+    """
+    for flag in host_chosen:
+        own = [g for g in installed if g.startswith(f"{flag} ")]
+        template_own = [g for g in expected if g.startswith(f"{flag} ")]
+        if template_own or own:
+            expected = [g for g in expected if g not in template_own] + (
+                own or [f"{flag} <{flag.removeprefix('--')}>"]
+            )
+    remaining = list(installed)
+    missing: list[str] = []
+    for want in expected:
+        pattern = re.compile(_TAILNET_IPV4.join(re.escape(part) for part in want.split(_TAILNET_IP)))
+        hit = next((g for g in remaining if pattern.fullmatch(g)), None)
+        if hit is None:
+            missing.append(want.replace(_TAILNET_IP, "<tailnet ip>"))
+        else:
+            remaining.remove(hit)
+    return missing, remaining
+
+
+def check_fleet_agent_drift(
+    repo_root: Path,
+    *,
+    agents: dict[str, Path] | None = None,
+    home: Path | None = None,
+) -> Finding | None:
+    """Do the installed fleet LaunchAgents still match their templates? (Story 35.2-009)
+
+    Each installed worker, dashboard or queue agent's ``ProgramArguments`` is
+    compared with ``templates/launchd/<label>.plist`` rendered for this host
+    (``__HOME__`` is the home; the worker's own ``--worker`` / ``--pool`` /
+    ``--host`` / ``--slots`` choices stand; any tailnet (100.64.0.0/10) address satisfies ``__TAILNET_IP__``, so doctor never asks
+    tailscale). The templates are this checkout's, else those of the config checkout
+    ``~/.claude/CLAUDE.md`` links into (``install.sh --core``), so doctor run from
+    ``~`` or another project still checks. ``None`` when no agent is installed here
+    or neither checkout carries templates; an agent whose plist cannot be read is
+    left to the checks that report it. A WARN names each drifting agent and its
+    missing or unexpected arguments, and the bootstrap run that re-renders them.
+    """
+    home = home or Path.home()
+    agents = agents or {
+        WORKER_LABEL: default_worker_plist(),
+        DASHBOARD_LABEL: default_dashboard_plist(),
+        QUEUE_SERVICE_LABEL: default_queue_service_plist(),
+    }
+    if not (repo_root / "templates" / "launchd").is_dir():
+        try:
+            repo_root = (home / ".claude" / "CLAUDE.md").resolve().parent
+        except (OSError, RuntimeError):  # a symlink loop (RuntimeError before 3.13): no checkout
+            return None
+    templates = repo_root / "templates" / "launchd"
+    installed_args: dict[str, list[str]] = {}
+    drifting: list[str] = []
+    checked = 0
+    for label in _FLEET_AGENT_LABELS:
+        path, template = agents.get(label), templates / f"{label}.plist"
+        if path is None or not path.is_file() or not template.is_file():
+            continue
+        try:
+            args = [str(a) for a in plistlib.loads(path.read_bytes()).get("ProgramArguments") or []]
+            expected = [
+                str(a).replace("__HOME__", str(home))
+                for a in plistlib.loads(template.read_bytes())["ProgramArguments"]
+            ]
+        except Exception:  # noqa: BLE001 - see check_queue_service
+            continue
+        checked += 1
+        installed_args[label] = args
+        host_chosen = _HOST_CHOSEN_FLAGS if label == WORKER_LABEL else ()
+        missing, unexpected = _drift(_argument_groups(expected), _argument_groups(args), host_chosen)
+        if missing or unexpected:
+            parts = [f"missing `{g}`" for g in missing] + [f"unexpected `{g}`" for g in unexpected]
+            drifting.append(f"{label}: {'; '.join(parts)}")
+    name = "Fleet agents"
+    if not checked:
+        return None
+    if not drifting:
+        return Finding("fleet-agent-drift", name, "CLEAN", f"{checked} installed agent(s) match their templates")
+
+    worker = _argument_groups(installed_args.get(WORKER_LABEL, []))
+    name_flag = next((g for g in worker if g.startswith("--worker ")), "--worker NAME")
+    pools = [g for g in worker if g.startswith("--pool ")] or ["--pool POOL"]
+    # Repeated so the re-render keeps them even where the installed plist cannot be read back.
+    own = [g for g in worker if g.startswith(("--host ", "--slots "))]
+    command = f"{repo_root}/scripts/fleet-bootstrap.sh {name_flag} {' '.join(pools + own)}"
+    try:
+        url = resolve_queue_url()
+    except QueueError:
+        url = None
+    command += f" --queue-url {url or 'URL'}"
+    if QUEUE_SERVICE_LABEL in installed_args:
+        command += " --queue-service"
+    return Finding(
+        "fleet-agent-drift", name, "WARN",
+        "installed agent no longer matches its template — " + " | ".join(drifting),
+        f"{command} (re-renders every agent from templates/launchd/; --dry-run shows the diff)",
+    )
 
 
 def check_fleet_worker_installed(
@@ -2126,6 +2271,7 @@ def run_doctor(
     db_path: Path | None = None,
     queue_path: Path | None = None,
     queue_service_plist: Path | None = None,
+    dashboard_plist: Path | None = None,
     worker_plist: Path | None = None,
     worker_unit: Path | None = None,
     registry: Registry | None = None,
@@ -2145,6 +2291,7 @@ def run_doctor(
     db_path = db_path or default_db_path()
     queue_path = queue_path or default_queue_path()
     queue_service_plist = queue_service_plist or default_queue_service_plist()
+    dashboard_plist = dashboard_plist or default_dashboard_plist()
     worker_plist = worker_plist or default_worker_plist()
     worker_unit = worker_unit or default_worker_unit()
     registry = registry or Registry()
@@ -2184,6 +2331,16 @@ def run_doctor(
     dashboard = check_worker_dashboard(agent_path=worker_plist)
     if dashboard is not None:
         findings.append(dashboard)
+    drift = check_fleet_agent_drift(
+        repo_root,
+        agents={
+            WORKER_LABEL: worker_plist,
+            DASHBOARD_LABEL: dashboard_plist,
+            QUEUE_SERVICE_LABEL: queue_service_plist,
+        },
+    )
+    if drift is not None:
+        findings.append(drift)
     # The Linux unit advertises no dashboard, so there is no worker-dashboard finding for it.
     if worker_plist.exists():
         findings.append(check_worker_self_check())
