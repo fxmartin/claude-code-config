@@ -27,10 +27,10 @@ Only the controller's existing decision points: tier per stage (`model_routing.s
 
 ## What we do instead
 
-Story 34.5-001 in `docs/stories/epic-34-current-generation-models.md`:
+Feature 34.5 in `docs/stories/epic-34-current-generation-models.md`:
 
-1. Bump the `haiku` tier from `claude-haiku-4-5` ($1 / $5 per MTok) to `claude-haiku-5-5` ($0.10 / $0.50) after a live entitlement probe. Merge, reask, summary and the self-check probes ran 13 percent of the baseline bill on Haiku 4.5 prices.
-2. Calibrate `predicted_tokens_threshold` and `rework_threshold` in `.sdlc-model-routing.yaml` from this repo's own reconciled story totals, and decide whether queue jobs run with `--predict`. Without it the thresholds are dormant and the `points >= 8` fallback, which the code itself calls noise, governs escalation.
+1. Story 34.5-001: bump the `haiku` tier from `claude-haiku-4-5` ($1 / $5 per MTok) to `claude-haiku-5-5` (reported at $0.10 / $0.50; unverified, since the official docs were unreachable here) only after the official model and pricing pages list it and a live entitlement probe passes. It fails closed otherwise. Merge, reask, summary and the self-check probes ran 13 percent of the baseline bill on Haiku 4.5 prices.
+2. Story 34.5-002: an `sdlc routing calibrate` command sets `predicted_tokens_threshold` and `rework_threshold` in `.sdlc-model-routing.yaml` from the reconciled story totals of every host's ledger, and a repo-level `predict: true` (decided yes, 2026-10-16) turns prediction on for queue and fleet jobs too. Without it the thresholds are dormant and the `points >= 8` fallback, which the code itself calls noise, governs escalation.
 
 ## Sources
 
