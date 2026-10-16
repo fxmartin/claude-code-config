@@ -380,19 +380,29 @@ def test_unknown_route_404_malformed_and_oversized_bodies(api) -> None:
 # --- concurrency ---------------------------------------------------------------
 
 
+# Workers the concurrent-claims test fires at once; the listen() backlog must cover them.
+_CLAIM_BURST = 12
+
+
 def test_concurrent_claims_give_each_job_exactly_one_winner(api, store) -> None:
     ids = {_add(api, repo=f"/r/{n}")["id"] for n in range(6)}
 
     def claim(worker: str):
         return api.call("POST", "/jobs/claim", {"worker": worker})
 
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        results = list(pool.map(claim, [f"w{n}" for n in range(12)]))
+    with ThreadPoolExecutor(max_workers=_CLAIM_BURST) as pool:
+        results = list(pool.map(claim, [f"w{n}" for n in range(_CLAIM_BURST)]))
 
     won = [body["id"] for status, body in results if status == 200]
     assert sorted(won) == sorted(ids)  # every job claimed, none twice
     assert sum(1 for status, _ in results if status == 204) == 6
     assert {j.state for j in store.list_jobs()} == {"running"}
+
+
+def test_listen_backlog_covers_the_concurrent_claim_burst(api) -> None:
+    # socketserver's default backlog of 5 overflows on a 12-client burst; macOS
+    # answers the overflow with ECONNRESET where Linux silently retries the SYN.
+    assert api.server.request_queue_size >= _CLAIM_BURST
 
 
 def test_claim_next_loses_a_raced_job_to_its_claimer_and_takes_the_next(store) -> None:

@@ -979,6 +979,11 @@ class _Handler(BaseHTTPRequestHandler):
 
 class _QueueServer(ThreadingHTTPServer):
     daemon_threads = True
+    # listen() backlog. socketserver's default of 5 overflows when a dozen
+    # clients connect at once (workers claiming while the dashboard polls):
+    # macOS answers the overflow with a reset (ECONNRESET), Linux drops the SYN
+    # and the client retries, so only the Macs fail.
+    request_queue_size = 64
 
     def __init__(
         self,
