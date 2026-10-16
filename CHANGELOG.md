@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.107.0] - 2026-10-16
+
+### Added
+
+- feat(fleet-execution): the queue service accepts a burst (#35.1-004)
+
+
 ## [v2.106.0] - 2026-10-16
 
 ### Added
