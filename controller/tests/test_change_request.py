@@ -174,7 +174,7 @@ def test_github_cr_merge() -> None:
     runner = FakeRunner({"pr merge": (0, "", "")})
     cr = ih.GitHubAdapter(runner=runner).cr_merge("123")
     assert cr.host == ih.GITHUB and cr.ref == "123" and cr.state == "merged"
-    argv = runner.calls[-1]
+    argv = runner.calls[0]
     assert argv[:4] == ["gh", "pr", "merge", "123"]
     assert "--merge" in argv
 
@@ -287,7 +287,7 @@ def test_gitlab_cr_merge() -> None:
     runner = FakeRunner({"mr merge": (0, "", "")})
     cr = ih.GitLabAdapter(runner=runner).cr_merge("5")
     assert cr.host == ih.GITLAB and cr.ref == "5" and cr.state == "merged"
-    argv = runner.calls[-1]
+    argv = runner.calls[0]
     assert argv[:4] == ["glab", "mr", "merge", "5"]
     assert "--yes" in argv
 

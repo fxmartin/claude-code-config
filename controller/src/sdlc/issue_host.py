@@ -190,6 +190,26 @@ class ChangeRequest:
     source_branch: str | None = None
     target_branch: str | None = None
     status: str | None = None
+    # The sha the change request landed at; set by :meth:`IssueHostAdapter.cr_merge`
+    # when the host reports it (Story 35.5-003), None otherwise.
+    merge_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class ChangeRequestMergeability:
+    """Whether the host would merge a change request as it stands (Story 35.5-003).
+
+    ``clean`` is true only when the host itself reports the change request
+    mergeable with nothing left to resolve — not behind its base, no conflicts, no
+    unmet protection rule. ``detail`` is the host's own word for the state
+    (GitHub ``mergeStateStatus`` / GitLab ``detailed_merge_status``) so a refusal
+    to merge deterministically can say why; ``labels`` are the CR's label names
+    verbatim, for the high-risk check.
+    """
+
+    clean: bool
+    detail: str = ""
+    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -916,9 +936,32 @@ class IssueHostAdapter(ABC):
         """
         raise IssueHostError(f"{self.host} adapter does not implement cr_approval")
 
+    def cr_mergeability(self, ref: "str | ChangeRequest") -> ChangeRequestMergeability:
+        """Return whether the host reports a change request cleanly mergeable.
+
+        Story 35.5-003: the read the controller gates its own :meth:`cr_merge`
+        on. Like :meth:`cr_checks` it is deliberately **not** abstract — a
+        backend without an implementation raises :class:`IssueHostError`, which
+        the best-effort caller degrades to None (the merge agent handles it).
+        """
+        raise IssueHostError(f"{self.host} adapter does not implement cr_mergeability")
+
     @abstractmethod
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
-        """Merge a change request; return it with ``state`` set to ``merged``."""
+        """Merge a change request; return it with ``state`` set to ``merged``.
+
+        Story 35.5-003: ``merge_sha`` is set when the host reports the landing
+        sha. A refusal (branch protection, a missing label, a denied command)
+        raises :class:`IssueHostError` carrying the host's own text.
+        """
+
+    def merge_command(self, ref: "str | ChangeRequest") -> str:
+        """The shell command that merges a change request as :meth:`cr_merge` does.
+
+        Story 35.5-003: what the controller shows the operator when a merge is
+        refused by policy and parks for a human to run it.
+        """
+        raise IssueHostError(f"{self.host} adapter does not implement merge_command")
 
     @abstractmethod
     def cr_url(self, ref: "str | ChangeRequest") -> str:
@@ -1229,10 +1272,40 @@ class GitHubAdapter(IssueHostAdapter):
             approved=approved,
         )
 
+    def cr_mergeability(self, ref: "str | ChangeRequest") -> ChangeRequestMergeability:
+        out = self._run(
+            "pr", "view", _cr_ref_of(ref), "--json", "mergeable,mergeStateStatus,labels"
+        ).stdout
+        row = _parse_json_object(out)
+        if not row:
+            raise IssueHostError(f"gh pr view {_cr_ref_of(ref)} returned no change request")
+        state = str(row.get("mergeStateStatus") or "").upper()
+        mergeable = str(row.get("mergeable") or "").upper()
+        return ChangeRequestMergeability(
+            clean=state == "CLEAN" and mergeable == "MERGEABLE",
+            detail=state or mergeable,
+            labels=_label_names(row.get("labels")),
+        )
+
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
         ref = _cr_ref_of(ref)
         self._run("pr", "merge", ref, "--merge")
-        return ChangeRequest(host=self.host, ref=ref, state="merged")
+        return ChangeRequest(
+            host=self.host, ref=ref, state="merged", merge_sha=self._landing_sha(ref)
+        )
+
+    def merge_command(self, ref: "str | ChangeRequest") -> str:
+        return f"gh pr merge {_cr_ref_of(ref)} --merge"
+
+    def _landing_sha(self, ref: str) -> str | None:
+        """The sha a just-merged PR landed at, or None — never fails the merge."""
+        try:
+            out = self._run("pr", "view", ref, "--json", "mergeCommit").stdout
+        except IssueHostError:
+            return None
+        commit = _parse_json_object(out).get("mergeCommit")
+        sha = commit.get("oid") if isinstance(commit, dict) else None
+        return sha if isinstance(sha, str) and sha.strip() else None
 
     def cr_url(self, ref: "str | ChangeRequest") -> str:
         if isinstance(ref, ChangeRequest) and ref.url:
@@ -1525,10 +1598,37 @@ class GitLabAdapter(IssueHostAdapter):
                 approved = False
         return ChangeRequestApproval(state=state, labels=labels, approved=approved)
 
+    def cr_mergeability(self, ref: "str | ChangeRequest") -> ChangeRequestMergeability:
+        out = self._run("mr", "view", _cr_ref_of(ref), "--output", "json").stdout
+        row = _parse_json_object(out)
+        if not row:
+            raise IssueHostError(f"glab mr view {_cr_ref_of(ref)} returned no change request")
+        detail = str(row.get("detailed_merge_status") or row.get("merge_status") or "")
+        return ChangeRequestMergeability(
+            clean=detail == "mergeable" and not row.get("has_conflicts"),
+            detail=detail,
+            labels=_label_names(row.get("labels")),
+        )
+
     def cr_merge(self, ref: "str | ChangeRequest") -> ChangeRequest:
         ref = _cr_ref_of(ref)
         self._run("mr", "merge", ref, "--yes")
-        return ChangeRequest(host=self.host, ref=ref, state="merged")
+        return ChangeRequest(
+            host=self.host, ref=ref, state="merged", merge_sha=self._landing_sha(ref)
+        )
+
+    def merge_command(self, ref: "str | ChangeRequest") -> str:
+        return f"glab mr merge {_cr_ref_of(ref)} --yes"
+
+    def _landing_sha(self, ref: str) -> str | None:
+        """The sha a just-merged MR landed at, or None — never fails the merge."""
+        try:
+            out = self._run("mr", "view", ref, "--output", "json").stdout
+        except IssueHostError:
+            return None
+        row = _parse_json_object(out)
+        sha = row.get("merge_commit_sha") or row.get("squash_commit_sha")
+        return sha if isinstance(sha, str) and sha.strip() else None
 
     def cr_url(self, ref: "str | ChangeRequest") -> str:
         if isinstance(ref, ChangeRequest) and ref.url:

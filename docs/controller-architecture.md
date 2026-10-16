@@ -823,6 +823,21 @@ adapter and the GitLab loop ends the same way the GitHub one does:
   the ledger marks the story **DONE *with* the GitLab/GitHub merge sha**. The same
   column holds either host's merge commit; an unmerged outcome (FAILED/SKIPPED)
   leaves it NULL. A landing event is logged for the audit trail.
+- **The controller merges a clean CR itself (Story 35.5-003).** Once review is
+  `APPROVED` and the merge CI gate has passed, the controller reads
+  `cr_mergeability` (GitHub `mergeStateStatus == CLEAN`; GitLab
+  `detailed_merge_status == mergeable`, no conflicts) and, when the CR is clean and
+  carries no unapproved `risk:high` label, calls `cr_merge` on the story's host
+  adapter. No merge agent is dispatched; the landing sha comes from the host and is
+  recorded as above. A CR that is behind its base, conflicts, or cannot be read
+  goes to the merge agent as before — whose prompt now names the plain
+  `gh pr merge` / `glab mr merge` command and forbids `--admin`. A merge refused
+  by policy — the #653 deny floor, branch protection, a missing `risk-approved`
+  label — on either path parks the story (`AWAITING_APPROVAL` for the missing
+  label, `NEEDS_ATTENTION` otherwise) with the refusal text and the operator's
+  merge command in the run events; it never starts a bugfix round, so the stage's
+  fix budget is untouched. Any other `cr_merge` error falls back to the agent.
+  `merge_command(ref)` on each adapter is the command shown to the operator.
 - **Branch cleanup.** The story branch and its worktree are torn down by the
   **existing** worktree/branch GC (`hooks/worktree-gc.sh` /
   `remove_story_worktree`) — host-agnostic local git, so it works unchanged on a

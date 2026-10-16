@@ -28,7 +28,7 @@
     },
     "block_reason": {
       "type": "string",
-      "description": "Additive (Story 12.3-003): why a non-MERGED merge was blocked. 'BLOCKED_HIGH_RISK' signals the run is awaiting human approval (PR carries risk:high with no risk-approved label / risk-approver review) rather than a fixable failure."
+      "description": "Additive (Story 12.3-003): why a non-MERGED merge was blocked. 'BLOCKED_HIGH_RISK' signals the run is awaiting human approval (PR carries risk:high with no risk-approved label / risk-approver review) rather than a fixable failure. 'MERGE_REFUSED_BY_POLICY' (Story 35.5-003) signals the merge was refused by branch protection, the deny floor or a missing label: the run parks for the operator instead of entering the bugfix loop."
     }
   },
   "if": {

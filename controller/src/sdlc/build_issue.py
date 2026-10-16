@@ -12,6 +12,7 @@ from sdlc.issue_host import (
     GITHUB_CR_TERMS,
     ChangeRequest,
     ChangeRequestChecks,
+    ChangeRequestMergeability,
     ChangeRequestTerms,
     IssueHostError,
     Runner,
@@ -375,6 +376,59 @@ def change_request_checks(
         return adapter.cr_checks(str(cr_ref))
     except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
         log.debug("change_request_checks failed for %s", story_id, exc_info=True)
+        return None
+
+
+def change_request_mergeability(
+    ledger: "Ledger", story_id: str, cr_ref: object, *, runner: Runner | None = None
+) -> ChangeRequestMergeability | None:
+    """Whether a story's CR is cleanly mergeable on its forge, or None (Story 35.5-003).
+
+    The gate the controller's own merge sits behind. Best-effort: an unmapped
+    story, an unsupported host, or any host failure yields None — never raises —
+    so the caller falls back to the merge agent rather than merging blind.
+    """
+    try:
+        adapter = _cr_adapter(ledger, story_id, runner)
+        if adapter is None:
+            return None
+        return adapter.cr_mergeability(str(cr_ref))
+    except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
+        log.debug("change_request_mergeability failed for %s", story_id, exc_info=True)
+        return None
+
+
+def change_request_merge(
+    ledger: "Ledger", story_id: str, cr_ref: object, *, runner: Runner | None = None
+) -> ChangeRequest | None:
+    """Merge a story's CR through its host adapter (Story 35.5-003).
+
+    Returns None only when no adapter resolves (the caller hands the merge to the
+    agent). Unlike the read seams this does **not** swallow a host error: a
+    refusal's text is what the caller classifies as policy or not, so
+    :class:`IssueHostError` propagates.
+    """
+    adapter = _cr_adapter(ledger, story_id, runner)
+    if adapter is None:
+        return None
+    return adapter.cr_merge(str(cr_ref))
+
+
+def change_request_merge_command(
+    ledger: "Ledger", story_id: str, cr_ref: object, *, runner: Runner | None = None
+) -> str | None:
+    """The command an operator runs to merge a story's CR by hand, or None.
+
+    Best-effort: names what the controller itself would have run. None when the
+    host does not resolve, so the caller words a generic instruction instead.
+    """
+    try:
+        adapter = _cr_adapter(ledger, story_id, runner)
+        if adapter is None:
+            return None
+        return adapter.merge_command(str(cr_ref))
+    except Exception:  # noqa: BLE001 — best-effort; only decorates a parked story's message
+        log.debug("change_request_merge_command failed for %s", story_id, exc_info=True)
         return None
 
 
