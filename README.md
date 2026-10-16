@@ -218,6 +218,32 @@ journalctl --user -u sdlc-worker -f    # the worker's log; `sdlc queue workers` 
 
 The unit runs `nix develop … -c sdlc queue run --worker dev --pool claude-shared --pool codex-shared --follow` with `Restart=always`; registration advertises `codex-shared` only while the `codex` CLI is installed, so `dev` joins that pool once Codex is in the dev shell (and logged in to the shared account) and the worker restarts — no edit to the unit. Identity is `tailscale whois`; `SDLC_QUEUE_TOKEN` is only a fallback, read from `~/.config/sdlc/worker.env` (0600). No `caffeinate`/`systemd-inhibit` — a server does not sleep. **The dev shell needs `glab` logged in to the local GitLab** (the bootstrap makes it git's credential helper there) **and the `semgrep`/`osv-scanner` scanners.** Without either scanner the bootstrap refuses and changes nothing, with no flag to override: the coverage gate passes a missing scanner as `SKIPPED`, so a story built on `dev` would merge without its security scans. Without `glab` it refuses too: `dev` could sync GitHub repos only, would fail every GitLab clone and — because it still reports free slots — make `home-lab` hold GitLab jobs back. `--github-only` starts the worker anyway; then pin GitLab jobs with `--host home-lab`. Details, the `sdlc doctor` findings and the repo-path mapping across home directories: [`docs/controller-architecture.md`](docs/controller-architecture.md#linux-worker-on-the-hetzner-dev-box-story-352-008).
 
+The dev box also gets a second user unit, `templates/systemd/sdlc-dashboard.service` (`sdlc dashboard` bound to the box's tailnet address). It is installed in the same run and refused the same way when `tailscale ip -4` prints nothing.
+
+#### Fleet workers — a Mac, and upgrading any worker (Story 35.2-009)
+
+One command sets a Mac up, rendering every LaunchAgent from `templates/launchd/` with this account's home and `tailscale ip -4` — the worker (with `--dashboard-url http://<tailnet ip>:8787`), its dashboard, and on `home-lab` the queue service:
+
+```bash
+scripts/fleet-bootstrap.sh --worker m3max --pool claude-m3 --pool codex-shared \
+    --queue-url http://home-lab.<tailnet>:8790                 # an M3 Max
+scripts/fleet-bootstrap.sh --worker home-lab --pool claude-shared --queue-url http://home-lab.<tailnet>:8790 \
+    --queue-service --queue-allow you@example.com               # home-lab (the login is kept from the installed agent on re-runs)
+scripts/fleet-bootstrap.sh <same flags> --dry-run               # print each agent's diff, change nothing
+```
+
+A re-run leaves an agent that is byte-identical to its render loaded and untouched, and replaces (boots out, bootstraps) one that differs — except the worker while it has a job in flight, reported as `pending restart (job N running)` and left for the next run. Without a tailnet address it stops before writing any agent: a blank host would bind every interface. `sdlc doctor` warns `fleet-agent-drift` when an installed worker, dashboard or queue agent's arguments no longer match its template (a worker plist with no `--dashboard-url`, say) and prints the bootstrap command that fixes it.
+
+**Upgrading a worker** — a template change ships with the release that introduced it only if the agents are re-rendered, so the procedure ends with a bootstrap run:
+
+```bash
+git pull
+./scripts/deploy.sh                       # controller CLI + plugin, one version
+./install.sh --core                       # the config symlinks
+scripts/fleet-bootstrap.sh <the flags this worker was set up with>   # re-render the agents; no-op when nothing changed
+sdlc doctor                               # expect no fleet-agent-drift
+```
+
 ### Cross-harness builds — run the pipeline on Claude *or* Codex (Epic-20/21)
 
 The build is split into two **independent** layers, so either can be Claude or Codex:

@@ -14,6 +14,12 @@
                     dashboard listens — see com.fxmartin.sdlc-dashboard.plist;
                     the install stops if Tailscale is down and it prints nothing
 
+  scripts/fleet-bootstrap.sh is the documented install: it does all of the below
+  for any worker name and pools (its worker and pool flags), replaces an installed
+  agent that differs from this template, and `sdlc doctor` warns
+  (fleet-agent-drift) when an installed agent no longer matches. By hand, for the
+  M3 Max as it stands here:
+
   Install:
 
     mkdir -p ~/.local/state/sdlc

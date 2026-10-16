@@ -2464,6 +2464,43 @@ harmless: the worker restarts only when the installed *version* changes.
   22 is home-IP-only. Operate it through the home-lab: `ssh -J home-lab
   dev-server`, or widen the ACL in `nix-install`.
 
+### One command sets up a Mac worker; doctor catches drift (Story 35.2-009)
+
+`scripts/fleet-bootstrap.sh` branches on `uname -s`. On Darwin, `--worker NAME
+--pool P [--pool P ...]` renders `com.fxmartin.sdlc-worker` and
+`com.fxmartin.sdlc-dashboard` from `templates/launchd/` — the templates' `sed`
+install, done for you: `__HOME__`, `__USER__`, `__TAILNET_IP__` (`tailscale ip
+-4`), the worker's name and one `--pool` pair per pool — and, with
+`--queue-service` (home-lab), `com.fxmartin.sdlc-queue` (`--queue-allow LOGIN`
+fills `__LOGIN__`; a re-run keeps the login of the installed agent). Linux keeps
+its systemd path and gains `sdlc-dashboard.service` as a second user unit.
+
+Each agent is compared byte for byte with what is installed:
+
+| Installed | Result |
+|-----------|--------|
+| identical, loaded | left alone |
+| identical, not loaded | `launchctl bootstrap` only |
+| different or absent | written, `bootout` + `bootstrap`; `--dry-run` prints the `diff -u` instead |
+| different, **worker with a job in flight** | `pending restart (job N running)`: file and process left for the next run |
+
+"In flight" is `sdlc queue list --json` (the fleet queue once `queue_url:` is
+configured) filtered to `state == running` on this worker; a queue that cannot
+be read counts as busy, since a lost build costs more than a delayed restart. If
+`tailscale ip -4` prints nothing the run stops in preflight, before any agent is
+written: a blank host would bind every interface.
+
+`sdlc doctor` closes the loop with `fleet-agent-drift` (`check_fleet_agent_drift`):
+for each installed worker, dashboard and queue agent it compares
+`ProgramArguments` with the template rendered for this host — `__HOME__` is the
+home, the worker's own `--worker` / `--pool` choices stand, and any tailnet
+(`100.64.0.0/10`) address satisfies `__TAILNET_IP__`, so doctor never asks
+tailscale. A difference is a WARN naming the agent and its missing or
+unexpected arguments, with the `fleet-bootstrap.sh` command that re-renders them.
+It needs the repo's `templates/launchd/` (doctor runs from the checkout, as the
+bootstrap runs it); a host without them, or without any of the agents, has
+nothing to report.
+
 ## Using the fleet queue (`QueueClient`, Story 35.1-002)
 
 Remote execution is additive: every queue consumer (`sdlc queue list|add|cancel|
