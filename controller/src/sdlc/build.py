@@ -98,11 +98,14 @@ from sdlc.issue_host import (
     CR_PENDING,
     CR_SUCCESS,
     CR_UNKNOWN,
+    GITHUB,
     GITHUB_CR_TERMS,
+    GITLAB,
     SUPPORTED_HOSTS,
     ChangeRequestChecks,
     ChangeRequestTerms,
     IssueHostAdapter,
+    IssueHostError,
 )
 from sdlc.risk_gate import RISK_APPROVED_LABEL, RISK_LABEL
 from sdlc.registry import WORKER_ENV, Registry, RunRecord
@@ -5586,6 +5589,14 @@ def render_merge_drift_block(
     )
 
 
+# The plain merge command per host (Story 35.5-003): what the merge prompt tells the
+# agent to run, in place of whatever flag set it would reach for on its own.
+_PLAIN_MERGE_CMD = {GITHUB: "gh pr merge", GITLAB: "glab mr merge"}
+
+# The block_reason the merge prompt asks for when the merge is refused by policy.
+_POLICY_REFUSED_MARKER = "MERGE_REFUSED_BY_POLICY"
+
+
 def render_merge_prompt(
     story: Story,
     pr_number: int | None,
@@ -5614,6 +5625,17 @@ def render_merge_prompt(
         f"Merge the {abbr}{cr_terms.merge_cli_hint} for story {story.id}: "
         f"{story.title} ({abbr} #{pr_number}).\n"
         + forge_only
+        # Story 35.5-003, fleet job 3 run 46e76670: a Haiku merge agent's first call
+        # was `gh pr merge 858 --merge --admin`; the deny floor (#653) refused it
+        # and the controller read the refusal as a failure to fix. Name the plain
+        # command, forbid the override, and give a policy refusal its own report.
+        + f"Merge with the plain `{_PLAIN_MERGE_CMD.get(cr_terms.host, 'merge')} "
+        f"{pr_number}` command and never `--admin` (or any flag that overrides branch "
+        "protection or the risk gate). If the merge is refused by policy — branch "
+        "protection, a missing `risk-approved` label, a denied command — do not look "
+        'for another route: report merge_status="FAILED", set block_reason to '
+        f'"{_POLICY_REFUSED_MARKER}" and put the refusal text in error_summary, so the '
+        "run parks for the operator.\n"
         + render_merge_drift_block(abbr, ci_status=ci_status, ci_configured=ci_configured)
         + "Then emit the result block.\n"
         # Story 12.3-003: surface a high-risk human-approval block additively so
@@ -9461,13 +9483,27 @@ def _run_story(
                 if gate is not None and gate.verdict == _GATE_BLOCK:
                     ok, result, failure, kind = False, None, gate.reason, "ci-gate"
                 else:
-                    ok, result, failure, kind = _dispatch_stage(
-                        stage, story, opts, pr_number, dispatch, tpath,
-                        on_progress=sink, escalation_steps=escalation_steps,
-                        close_link=close_link, cr_terms=cr_terms, base_ref=base_ref,
-                        precheck=precheck,
-                        review_packet=review_packet_block, ci_gate=gate,
+                    # Story 35.5-003: an approved, green, cleanly mergeable CR is
+                    # merged by the controller itself; anything else dispatches
+                    # the merge agent as before.
+                    controller_merge = _controller_merge(
+                        stage, gate, ledger, run_id, story, pr_number
                     )
+                    if controller_merge.merged is not None:
+                        ok, result, failure, kind = (
+                            True, controller_merge.merged, "", ""
+                        )
+                    elif controller_merge.refused is not None:
+                        ok, result, kind = False, None, controller_merge.refused
+                        failure = controller_merge.reason
+                    else:
+                        ok, result, failure, kind = _dispatch_stage(
+                            stage, story, opts, pr_number, dispatch, tpath,
+                            on_progress=sink, escalation_steps=escalation_steps,
+                            close_link=close_link, cr_terms=cr_terms, base_ref=base_ref,
+                            precheck=precheck,
+                            review_packet=review_packet_block, ci_gate=gate,
+                        )
                     if ok and stage == "merge":
                         # Issue #699: never mark DONE on an agent's word alone.
                         unverified = _merge_unverified_reason(ledger, story, pr_number)
@@ -9564,7 +9600,19 @@ def _run_story(
                         f"merge blocked awaiting human approval (high-risk) — parking "
                         f"AWAITING_APPROVAL; PR/branch on feature/{story.id} preserved",
                     )
-                    return "AWAITING_APPROVAL"
+                    return _park_merge_refusal(
+                        ledger, run_id, story, pr_number, cr_terms, kind, failure
+                    )
+
+                # Story 35.5-003: a merge refused by policy (deny-floor `--admin`,
+                # branch protection) is the operator's call. Park it before any
+                # recovery: a bugfix round cannot lift a policy, and would only
+                # spend the stage's fix budget on a merge that was never broken
+                # (run 46e76670: five rounds, PR #858 left unmerged).
+                if kind == "policy_refused":
+                    return _park_merge_refusal(
+                        ledger, run_id, story, pr_number, cr_terms, kind, failure
+                    )
 
                 # Issue #794: the merge agent pushed a head (a drift merge for a
                 # real conflict) and the forge's checks on it were still running
@@ -10481,7 +10529,9 @@ def _dispatch_stage(
             # caller re-polls the CI gate and retries the merge, no bugfix.
             kind = "checks_pending"
         else:
-            kind = "reported"
+            # Story 35.5-003: a policy refusal is the operator's call, never a
+            # bugfix round's — the caller parks it.
+            kind = _merge_refusal_kind(stage, result.data) or "reported"
         return False, result, _stage_failure_summary(stage, result.data), kind
     return True, result, "", ""
 
@@ -10557,6 +10607,8 @@ def _stage_failure_summary(stage: str, data: dict) -> str:
         return data.get("error_summary", "build reported FAILED")
     if stage == "merge" and _merge_awaiting_approval(stage, data):
         return "merge blocked awaiting human approval (high-risk gate)"
+    if _merge_refusal_kind(stage, data) is not None:
+        return f"merge refused by policy: {_merge_refusal_text(data)}"
     return f"{stage} reported non-success status"
 
 
@@ -10588,6 +10640,44 @@ def _merge_awaiting_approval(stage: str, data: dict) -> bool:
         return True
     haystack = " ".join(str(data.get(k, "")) for k in _BLOCK_TEXT_FIELDS).upper()
     return any(marker in haystack for marker in _AWAITING_APPROVAL_MARKERS)
+
+
+# Story 35.5-003: a merge the forge or the controller's deny floor refused on
+# policy grounds — the #653 `--admin` deny rule, branch protection, a missing
+# `risk-approved` label. None of these is a defect the bugfix agent can fix; the
+# operator decides. The first two are what the harness and `gh`/`glab` themselves
+# say (run 46e76670: MERGE_COMMAND_BLOCKED_PERMISSION after a denied `--admin`).
+_POLICY_REFUSAL_PATTERNS = (
+    _POLICY_REFUSED_MARKER, "MERGE_COMMAND_BLOCKED", "--ADMIN", "BRANCH PROTECTION",
+    "PROTECTED BRANCH", "BRANCH POLICY", "HAS BEEN DENIED", "PERMISSION DENIED",
+    "RISK-APPROVED",
+)
+
+
+def _merge_refusal_text(data: dict) -> str:
+    """The refusal wording a merge response carries, in the order the agent gave it."""
+    parts = [str(data.get(k, "")).strip() for k in _BLOCK_TEXT_FIELDS]
+    return "; ".join(p for p in parts if p) or "no reason given"
+
+
+def _classify_merge_refusal(text: str) -> str | None:
+    """``awaiting_approval`` / ``policy_refused`` when ``text`` is a policy refusal, else None.
+
+    A refusal naming the missing ``risk-approved`` label is the high-risk gate
+    waiting on FX (the existing AWAITING_APPROVAL park); any other policy marker
+    is a refusal only the operator can lift.
+    """
+    upper = text.upper()
+    if not any(pattern in upper for pattern in _POLICY_REFUSAL_PATTERNS):
+        return None
+    return "awaiting_approval" if "RISK-APPROVED" in upper else "policy_refused"
+
+
+def _merge_refusal_kind(stage: str, data: dict) -> str | None:
+    """:func:`_classify_merge_refusal` over a non-success merge response (merge only)."""
+    if stage != "merge":
+        return None
+    return _classify_merge_refusal(_merge_refusal_text(data))
 
 
 # Issue #794: the merge agent pushed a head itself (a drift merge for a real
@@ -10690,6 +10780,120 @@ def _merge_gate_only_block(
         f"(risk:high unapproved, cr=#{pr_number}) — treating as awaiting approval",
     )
     return True
+
+
+@dataclass(frozen=True)
+class _ControllerMerge:
+    """The outcome of the controller's own merge attempt (Story 35.5-003).
+
+    ``merged`` carries a synthetic ``MERGED`` result (no agent ran); ``refused``
+    names the park kind (``awaiting_approval`` / ``policy_refused``) with the
+    host's refusal text in ``reason``. Neither set means the merge was not
+    attempted or failed for a non-policy reason, and the merge agent handles it.
+    """
+
+    merged: AgentResult | None = None
+    refused: str | None = None
+    reason: str = ""
+
+
+def _high_risk_unapproved(labels: tuple[str, ...]) -> bool:
+    """True when ``labels`` carry ``risk:high`` without ``risk-approved``."""
+    names = {label.strip().lower() for label in labels}
+    return RISK_LABEL in names and RISK_APPROVED_LABEL not in names
+
+
+def _controller_merge(
+    stage: str,
+    gate: _MergeCIGate | None,
+    ledger: Ledger,
+    run_id: str,
+    story: Story,
+    pr_number: int | None,
+) -> _ControllerMerge:
+    """Merge an approved, green, cleanly mergeable CR through the host adapter.
+
+    Story 35.5-003: review returned ``APPROVED`` and the merge CI gate passed by
+    the time this runs, so the only open questions are the host's — is the CR
+    cleanly mergeable, and does it carry a high-risk block. When both are fine
+    the controller calls ``cr_merge`` itself and no merge agent is dispatched
+    (fleet job 3, run 46e76670: a Haiku agent fumbled a merge the controller
+    could have made). Anything short of a clean, unblocked CR — behind base,
+    conflicts, drift, an unreadable host — is the merge agent's, as before. A
+    refusal that reads as policy is returned as such so the caller parks it
+    instead of starting a bugfix round; any other host error falls back to the
+    agent.
+    """
+    if stage != "merge" or pr_number is None or gate is None or gate.verdict != _GATE_PASS:
+        return _ControllerMerge()
+    view = build_issue.change_request_mergeability(ledger, story.id, pr_number)
+    if view is None or not view.clean or _high_risk_unapproved(view.labels):
+        why = "host state unreadable" if view is None else (view.detail or "not clean")
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            f"merge by the controller skipped ({why}, cr=#{pr_number}) — "
+            "dispatching the merge agent",
+        )
+        return _ControllerMerge()
+    try:
+        cr = build_issue.change_request_merge(ledger, story.id, pr_number)
+    except IssueHostError as exc:
+        refused = _classify_merge_refusal(str(exc))
+        if refused is not None:
+            return _ControllerMerge(refused=refused, reason=str(exc))
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"merge by the controller failed ({exc}) — dispatching the merge agent",
+        )
+        return _ControllerMerge()
+    if cr is None:
+        return _ControllerMerge()
+    if not cr.merge_sha:
+        ledger.event_log(
+            run_id, story.id, "warn", "controller",
+            f"cr=#{pr_number} merged by the controller but the host reported no "
+            "landing sha — none recorded",
+        )
+    ledger.event_log(
+        run_id, story.id, "info", "controller",
+        f"cr=#{pr_number} merged by the controller via cr_merge on {cr.host} — "
+        "no merge agent dispatched",
+    )
+    return _ControllerMerge(merged=AgentResult(
+        agent_type="merge",
+        data={
+            "pr_number": pr_number,
+            "merge_status": "MERGED",
+            "merge_sha": cr.merge_sha or "",
+            "merged_at": datetime.now(timezone.utc).isoformat(),
+        },
+        raw="",
+    ))
+
+
+def _park_merge_refusal(
+    ledger: Ledger, run_id: str, story: Story, pr_number: int | None,
+    cr_terms: ChangeRequestTerms, kind: str, failure: str,
+) -> str:
+    """Log a policy-refused merge with the operator's command; return the park status.
+
+    Story 35.5-003: ``awaiting_approval`` (the missing ``risk-approved`` label)
+    parks AWAITING_APPROVAL, every other policy refusal NEEDS_ATTENTION. Either
+    way the refusal text and the command that merges the CR by hand reach the
+    ledger, and no bugfix round runs — so the job's fix-round budget is untouched.
+    The committed work and open CR are preserved (R10).
+    """
+    command = (
+        build_issue.change_request_merge_command(ledger, story.id, pr_number)
+        if pr_number is not None else None
+    ) or f"merge {cr_terms.abbr} #{pr_number} with the {cr_terms.host} CLI"
+    status = "AWAITING_APPROVAL" if kind == "awaiting_approval" else "NEEDS_ATTENTION"
+    ledger.event_log(
+        run_id, story.id, "warn", "controller",
+        f"merge blocked by policy — parking {status} without a bugfix round; "
+        f"refusal: {failure}; once policy allows, merge it with: {command}",
+    )
+    return status
 
 
 def _manual_acceptance_block(story: Story) -> bool:
