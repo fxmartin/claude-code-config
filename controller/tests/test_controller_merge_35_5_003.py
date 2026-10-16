@@ -393,3 +393,20 @@ def test_build_issue_seams_degrade_when_no_adapter_resolves(monkeypatch):
     assert build_issue.change_request_mergeability(None, "s", 7) is None
     assert build_issue.change_request_merge(None, "s", 7) is None
     assert build_issue.change_request_merge_command(None, "s", 7) is None
+
+
+def test_github_mergeability_with_an_empty_view_raises():
+    runner = FakeRunner({"pr view": (0, "", "")})
+    with pytest.raises(ih.IssueHostError, match="no change request"):
+        ih.GitHubAdapter(runner=runner).cr_mergeability("858")
+
+
+def test_gitlab_mergeability_with_an_empty_view_raises():
+    runner = FakeRunner({"mr view": (0, "", "")})
+    with pytest.raises(ih.IssueHostError, match="no change request"):
+        ih.GitLabAdapter(runner=runner).cr_mergeability("5")
+
+
+def test_gitlab_cr_merge_survives_an_unreadable_landing_sha():
+    runner = FakeRunner({"mr view": (1, "", "boom"), "mr merge": (0, "", "")})
+    assert ih.GitLabAdapter(runner=runner).cr_merge("5").merge_sha is None
