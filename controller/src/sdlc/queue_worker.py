@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
@@ -26,6 +27,8 @@ from sdlc.registry import normalize_dashboard_url
 if TYPE_CHECKING:
     from sdlc.queue import JobRecord, QueueBackend, WorkerRecord
 
+log = logging.getLogger(__name__)
+
 __all__ = [
     "ForgeUnauthenticated",
     "ForgeUnavailable",
@@ -45,6 +48,7 @@ __all__ = [
     "origin_requirements",
     "prepare_repo",
     "same_origin",
+    "seed_issue_mappings",
     "sync_origin",
 ]
 
@@ -619,6 +623,47 @@ def sync_origin(job: "JobRecord") -> str | None:
     """
     recorded = _recorded_origin(job)
     return _origin_key(recorded) if recorded is not None else None
+
+
+def _carried_issues(job: "JobRecord") -> dict[str, tuple[str, str]]:
+    """The ``{story_id: (host, ref)}`` a job carries; junk reads as nothing carried."""
+    if not job.issues:
+        return {}
+    try:
+        data = json.loads(job.issues)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        story_id: (pair[0], pair[1])
+        for story_id, pair in data.items()
+        if isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) and p for p in pair)
+    }
+
+
+def seed_issue_mappings(job: "JobRecord") -> None:
+    """Write the issue mappings ``job`` carries into its clone's ledger inventory (35.3-002).
+
+    Run before the first stage so ``build_issue.close_link`` resolves locally on
+    a worker whose clone never ran ``sdlc issues init`` — the change request then
+    opens with ``Closes #N`` exactly as a local build's does. Best-effort, like
+    every mirror seam: a ledger hiccup is logged and the run goes ahead without a
+    close-link rather than being held up.
+    """
+    issues = _carried_issues(job)
+    if not issues:
+        return
+    from sdlc.ledger_view import Ledger, default_db_path
+
+    try:
+        ledger = Ledger(default_db_path(Path(job.repo)))
+        ledger.init()
+        for story_id, (host, ref) in issues.items():
+            ledger.inventory_ensure_row(story_id)
+            ledger.inventory_set_mapping(story_id, host, ref)
+    except Exception:  # noqa: BLE001 — a build is never blocked on the mirror
+        log.warning("could not seed issue mappings for job %s", job.id, exc_info=True)
 
 
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:

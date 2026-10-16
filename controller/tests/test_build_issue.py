@@ -155,7 +155,8 @@ def test_announce_status_uses_host_comment_verb(tmp_path, host, cli, comment_ver
     assert any(f"{cli} issue {comment_verb} 5" in c for c in joined)
 
 
-def test_announce_status_unmapped_is_noop(tmp_path):
+def test_announce_status_unmapped_is_noop(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no forge to resolve: the repo never mirrored
     ledger = _ledger(tmp_path)
     ledger.inventory_upsert_specs([("22.4-002", "22", "22.4", "t", 5, "High")])
     runner = FakeRunner()
@@ -488,16 +489,69 @@ def test_unmapped_story_logs_a_warn_event_naming_the_story(tmp_path, monkeypatch
     assert warns, f"no warn event naming the story: {[e['message'] for e in events]}"
 
 
-def test_no_host_search_when_the_repo_never_mirrored(tmp_path, monkeypatch):
-    """A repo that never ran `sdlc issues init` keeps today's zero-host-call path."""
+def test_empty_inventory_with_a_declared_forge_still_searches_by_marker(
+    tmp_path, monkeypatch
+):
+    """Story 35.3-002: a fleet worker's fresh clone has an empty inventory — that is
+    not evidence the repo does not mirror, so the marker search runs anyway."""
     ledger = _ledger(tmp_path)
     ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
     (tmp_path / ".sdlc-forge.yaml").write_text("forge: github\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
+    runner = FakeRunner({"issue list": (0, _found_payload("29.4-004", 573), "")})
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner) == "Closes #573"
+    assert any("list" in c for c in runner.calls)
+
+
+def test_empty_inventory_with_an_auto_detected_origin_searches_by_marker(
+    tmp_path, monkeypatch
+):
+    """No declaration needed: an origin that auto-detects as a forge counts too."""
+    import subprocess
+
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         "https://github.com/acme/proj.git"], check=True,
+    )
+    monkeypatch.chdir(tmp_path)
+    runner = FakeRunner({"issue list": (0, _found_payload("29.4-004", 573), "")})
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner) == "Closes #573"
+
+
+def test_empty_inventory_and_declared_forge_miss_still_warns_naming_the_story(
+    tmp_path, monkeypatch
+):
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: github\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    run_id = ledger.run_create("epic-29", "build")
+    runner = FakeRunner({"issue list": (0, "[]", "")})
+
+    assert bi.close_link(ledger, "29.4-004", runner=runner, run_id=run_id) is None
+
+    warns = [e for e in ledger.recent_events(run_id, limit=50) if e["level"] == "warn"]
+    assert any("29.4-004" in e["message"] for e in warns)
+
+
+def test_no_host_search_when_the_repo_never_mirrored_and_declares_no_forge(
+    tmp_path, monkeypatch
+):
+    """No mapping and no forge anywhere: keeps today's zero-host-call, no-warn path."""
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    monkeypatch.chdir(tmp_path)  # no .sdlc-forge.yaml, not a git repo
+    run_id = ledger.run_create("epic-29", "build")
     runner = FakeRunner()
 
-    assert bi.close_link(ledger, "29.4-004", runner=runner) is None
+    assert bi.close_link(ledger, "29.4-004", runner=runner, run_id=run_id) is None
     assert runner.calls == []
+    assert not [e for e in ledger.recent_events(run_id, limit=50) if e["level"] == "warn"]
 
 
 def _never_mirrored_gitlab(tmp_path, monkeypatch) -> Ledger:

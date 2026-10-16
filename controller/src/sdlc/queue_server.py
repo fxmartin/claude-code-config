@@ -367,6 +367,19 @@ def _requirements_json(body: Body) -> str | None:
     return json.dumps(value, sort_keys=True)
 
 
+def _issues_json(body: Body) -> str | None:
+    """The ``issues`` a job carries: ``{story_id: [host, ref]}``, strings all the way down."""
+    value = body.get("issues")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(
+        isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) for p in pair)
+        for pair in value.values()
+    ):
+        raise _ApiError(400, "issues must be an object of story id -> [host, issue ref] strings")
+    return json.dumps(value, sort_keys=True)
+
+
 def _job(store: QueueStore, job_id: int) -> JobRecord:
     job = store.get_job(job_id)
     if job is None:
@@ -430,6 +443,7 @@ class _Routes:
                 host=_text(body, "host"),
                 pool=_text(body, "pool"),
                 requirements_json=_requirements_json(body),
+                issues_json=_issues_json(body),
             )
         except QueueError as exc:
             raise _ApiError(400, str(exc)) from exc

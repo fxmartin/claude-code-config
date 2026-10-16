@@ -94,14 +94,24 @@ _RECOVERED_REFS: dict[tuple[str, str], str | None] = {}
 
 
 def _mirrors_stories(ledger: "Ledger") -> bool:
-    """True when this checkout's inventory maps at least one story to an issue.
+    """True when the marker-recovery search is worth a live host call here.
 
-    The evidence gate for the recovery path: a repo that never ran
-    ``sdlc issues init`` has no mirror to recover from, so it must keep today's
-    zero-host-call behaviour rather than pay a live marker search (and emit a
-    warn) on every seam of every build.
+    The evidence gate for the recovery path. An inventory that maps a story is
+    proof this checkout mirrors; so is a repo that names its forge (a
+    ``.sdlc-forge.yaml``, or an ``origin`` that auto-detects). Story 35.3-002: an
+    *empty* inventory used to read as "this repo does not mirror", which is
+    simply what a fleet worker's fresh clone looks like — its stories' markers
+    sat on the host unread and every merge lost its ``Closes #N``. Only a repo
+    with neither (no mapping, no resolvable forge) keeps the zero-host-call
+    behaviour, rather than pay a live search and a warn on every seam of every build.
     """
-    return ledger.inventory_any_mapped()
+    if ledger.inventory_any_mapped():
+        return True
+    try:
+        resolve_forge(Path.cwd())
+    except IssueHostError:
+        return False
+    return True
 
 
 def _repo_adapter(ledger: "Ledger", runner: Runner | None):

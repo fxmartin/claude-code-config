@@ -237,6 +237,35 @@ def _job_requirements(cli_args: list[str], harness_map: dict[str, str]) -> dict[
     return requirements
 
 
+def _scope_issue_mappings(scope: str) -> str | None:
+    """The ``{story_id: [host, ref]}`` JSON for a build scope's mirrored stories (35.3-002).
+
+    Read from this checkout's ledger inventory — what ``sdlc issues init`` left
+    here — so a worker whose clone never mirrored can still open each change
+    request with ``Closes #N``. Stories with no mapping are left out; ``None``
+    when nothing in the scope is mapped, or there is no ledger (it is never
+    created here). Best-effort: enqueueing stays offline and instant, and a
+    ledger or discovery hiccup just means the job carries nothing.
+    """
+    from sdlc.discovery import discover_queue
+    from sdlc.ledger_view import Ledger, default_db_path
+
+    db_path = default_db_path()
+    if not db_path.exists():
+        return None
+    try:
+        ledger = Ledger(db_path)
+        ledger.ensure_migrated()
+        mappings: dict[str, list[str]] = {}
+        for story in discover_queue(scope):
+            mapping = ledger.inventory_get_mapping(story.id)
+            if mapping is not None:
+                mappings[story.id] = list(mapping)
+    except Exception:  # noqa: BLE001 — the mirror never blocks an enqueue
+        return None
+    return json.dumps(mappings, sort_keys=True) if mappings else None
+
+
 def _enqueue_job(
     *,
     kind: str,
@@ -270,6 +299,10 @@ def _enqueue_job(
     pool with no fleet queue configured is refused, since nothing would honour it.
     A local job carries only its ``origin`` (Story 35.2-002), which is what a
     worker syncs or clones the repo from before dispatch.
+
+    Story 35.3-002: a ``build`` job also carries the issue mapping of each story in
+    its scope (:func:`_scope_issue_mappings`) — data, never a token — which the
+    worker seeds into its clone's ledger before the first stage.
     """
     from sdlc.queue_client import QueueClient, open_queue
     from sdlc.queue_worker import origin_requirements
@@ -300,7 +333,9 @@ def _enqueue_job(
         fleet_fields: dict[str, Any] = {"host": host, "pool": pool} if fleet else {}
         job_id = store.add_job(
             repo=repo, kind=kind, scope=scope, options_json=json.dumps(cli_args),
-            requirements_json=requirements_json, **fleet_fields
+            requirements_json=requirements_json,
+            issues_json=_scope_issue_mappings(scope) if kind == "build" else None,
+            **fleet_fields,
         )
     except QueueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -4222,7 +4257,7 @@ def queue_serve_cmd(
       GET    /health                 {ok, controller_version} — `sdlc doctor`
       GET    /jobs[?repo=PATH]       {pause, pauses, jobs} — `queue list --json`
       POST   /jobs                   add: repo, kind, scope, \\[priority, options,
-                                     labels, host, pool, requirements] -> 201
+                                     labels, host, pool, requirements, issues] -> 201
       POST   /jobs/claim             worker, \\[lease_seconds, host, pools]
                                      -> job, or 204 when nothing is claimable
       POST   /workers                register or heartbeat: worker, host, \\[pools,

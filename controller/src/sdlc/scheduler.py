@@ -1506,6 +1506,12 @@ class _Scheduler:
             if prepared is None:
                 return False
             job = prepared
+        if action in ("start", "resume") and self._config.worker is not None:
+            # Story 35.3-002: the clone's ledger learns the issues this job's
+            # stories are mirrored to before the run's first stage needs them.
+            from sdlc.queue_worker import seed_issue_mappings
+
+            seed_issue_mappings(job)
         finding = self._check_version(job.repo)
         if getattr(finding, "status", "CLEAN") != "CLEAN" and self._self_update(job.repo):
             finding = self._check_version(job.repo)

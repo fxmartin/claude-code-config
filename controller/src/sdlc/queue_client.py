@@ -336,6 +336,7 @@ class QueueClient:
         host: str | None = None,
         pool: str | None = None,
         requirements_json: str | None = None,
+        issues_json: str | None = None,
     ) -> int:
         body: dict[str, Any] = {"repo": repo, "kind": kind, "scope": scope}
         optional: dict[str, Any] = {
@@ -345,6 +346,7 @@ class QueueClient:
             "host": host,
             "pool": pool,
             "requirements": self._json_field("requirements_json", requirements_json),
+            "issues": self._json_field("issues_json", issues_json),
         }
         body.update({key: value for key, value in optional.items() if value is not None})
         return self._job(self._call("POST", "/jobs", body)).id
