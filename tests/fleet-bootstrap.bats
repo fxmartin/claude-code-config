@@ -565,7 +565,8 @@ DASHBOARD_UNIT() { echo "${HOME}/.config/systemd/user/sdlc-dashboard.service"; }
     run "${BOOTSTRAP}" --queue-url "${QUEUE}"
 
     [ "$status" -eq 0 ]
-    grep -qx "ExecStart=%h/.local/bin/sdlc dashboard --host 100.64.0.9 --port 8787" "$(DASHBOARD_UNIT)"
+    # Through the dev shell, as the worker is: the forge panel runs gh and glab, which live there.
+    grep -qx "ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc dashboard --host 100.64.0.9 --port 8787" "$(DASHBOARD_UNIT)"
     ! grep -q "__" "$(DASHBOARD_UNIT)" || false
     grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
     grep -qx "systemctl --user enable --now sdlc-dashboard.service" "${CALLS}"
@@ -1106,6 +1107,76 @@ esac'
 
     [ "$status" -ne 0 ]
     [[ "$output" == *"launchctl bootstrap com.fxmartin.sdlc-dashboard kept failing"* ]]
+}
+
+# The file on disk is the convergence proof: a re-run and doctor both read it. Written
+# before a bootout that fails, it would say "current" while launchd runs the old agent.
+@test "a bootout that fails leaves the old plist installed, so the next run still replaces it" {
+    darwin
+    run mac
+    # What the M3 Max was left with: no --dashboard-url pair.
+    grep -v -e '--dashboard-url' -e 'http://100.64.0.9:8787' "$(AGENT worker)" >"${TMP}/old.plist"
+    cp "${TMP}/old.plist" "$(AGENT worker)"
+    stub launchctl '
+case "$1" in
+  print) [ -e "$TMP/loaded.${2##*/}" ] ;;
+  bootstrap) touch "$TMP/loaded.$(basename "$3" .plist)" ;;
+  bootout)
+    if [ -e "$TMP/bootout-fails" ]; then echo "Boot-out failed: 5: Input/output error" >&2; exit 5; fi
+    rm -f "$TMP/loaded.${2##*/}" ;;
+esac'
+    touch "${TMP}/bootout-fails"
+
+    run mac
+
+    [ "$status" -ne 0 ]
+    cmp -s "${TMP}/old.plist" "$(AGENT worker)"
+    [ -e "${TMP}/loaded.com.fxmartin.sdlc-worker" ]
+    [[ "$output" == *"launchctl bootout com.fxmartin.sdlc-worker failed"* ]]
+
+    rm "${TMP}/bootout-fails"
+    : >"${CALLS}"
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --dashboard-url)" = "http://100.64.0.9:8787" ]
+    grep -qx "launchctl bootout gui/$(id -u)/com.fxmartin.sdlc-worker" "${CALLS}"
+}
+
+# launchd hands the worker its plist's EnvironmentVariables, never this shell's.
+@test "the in-flight check asks the queue the installed worker drains, not the shell's" {
+    darwin
+    run mac
+    awk '/<key>EnvironmentVariables<\/key>/ { e = 1 }
+        e && /<\/dict>/ { print "    <key>SDLC_QUEUE_URL</key>"; print "    <string>http://worker-queue.example:8790</string>"; e = 0 }
+        { print }' "$(AGENT worker)" >"${TMP}/w.plist"
+    mv "${TMP}/w.plist" "$(AGENT worker)"
+    printf '<!-- stale -->\n' >>"$(AGENT worker)"
+    printf '{"jobs": [{"id": 7, "state": "running", "worker": "m3max"}]}' >"${TMP}/queue.json"
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then
+  echo "queue-url ${SDLC_QUEUE_URL:-} fleet-disabled ${SDLC_FLEET_DISABLED:-}" >>"${CALLS}"
+  cat "$TMP/queue.json"; exit 0
+fi
+exit 0'
+    export SDLC_QUEUE_URL=http://shell-queue.example:8790 SDLC_FLEET_DISABLED=1
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 1 ]
+    grep -qx "queue-url http://worker-queue.example:8790 fleet-disabled " "${CALLS}"
+    [[ "$output" == *"pending restart (job 7 running)"* ]]
+
+    # Without one in its plist, the worker reads ~/.sdlc-fleet.yaml: so does the check.
+    sed '/<key>SDLC_QUEUE_URL<\/key>/,+1d' "$(AGENT worker)" >"${TMP}/w.plist"
+    mv "${TMP}/w.plist" "$(AGENT worker)"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 1 ]
+    grep -qx "queue-url  fleet-disabled " "${CALLS}"
 }
 
 @test "--help says --skip-service skips a Mac's LaunchAgents too, and that the token is kept" {

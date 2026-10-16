@@ -218,7 +218,7 @@ journalctl --user -u sdlc-worker -f    # the worker's log; `sdlc queue workers` 
 
 The unit runs `nix develop … -c sdlc queue run --worker dev --pool claude-shared --pool codex-shared --follow` with `Restart=always`; registration advertises `codex-shared` only while the `codex` CLI is installed, so `dev` joins that pool once Codex is in the dev shell (and logged in to the shared account) and the worker restarts — no edit to the unit. Identity is `tailscale whois`; `SDLC_QUEUE_TOKEN` is only a fallback, read from `~/.config/sdlc/worker.env` (0600). No `caffeinate`/`systemd-inhibit` — a server does not sleep. **The dev shell needs `glab` logged in to the local GitLab** (the bootstrap makes it git's credential helper there) **and the `semgrep`/`osv-scanner` scanners.** Without either scanner the bootstrap refuses and changes nothing, with no flag to override: the coverage gate passes a missing scanner as `SKIPPED`, so a story built on `dev` would merge without its security scans. Without `glab` it refuses too: `dev` could sync GitHub repos only, would fail every GitLab clone and — because it still reports free slots — make `home-lab` hold GitLab jobs back. `--github-only` starts the worker anyway; then pin GitLab jobs with `--host home-lab`. Details, the `sdlc doctor` findings and the repo-path mapping across home directories: [`docs/controller-architecture.md`](docs/controller-architecture.md#linux-worker-on-the-hetzner-dev-box-story-352-008).
 
-The dev box also gets a second user unit, `templates/systemd/sdlc-dashboard.service` (`sdlc dashboard` bound to the box's tailnet address). It is installed in the same run and refused the same way when `tailscale ip -4` prints nothing.
+The dev box also gets a second user unit, `templates/systemd/sdlc-dashboard.service` (`sdlc dashboard` bound to the box's tailnet address, run through the dev shell like the worker so its forge panel finds `gh` and `glab`). It is installed in the same run and refused the same way when `tailscale ip -4` prints nothing.
 
 #### Fleet workers — a Mac, and upgrading any worker (Story 35.2-009)
 
@@ -236,12 +236,13 @@ scripts/fleet-bootstrap.sh <same flags> --dry-run               # print each age
 
 The exit status is doctor's verdict on the setup steps (0 CLEAN, 1 WARN, 2 FAIL), minus `fleet-agent-drift` and `worker-dashboard` — they judge the agents the same run re-renders, so the run that repairs them exits 0; a worker left `pending restart` exits 1 (re-run once it is idle). On a home-manager Mac git's global config is a read-only `/nix/store` link: the bootstrap warns that it cannot write the gh/glab credential helpers (declare them in nix-install, or rely on the `osxkeychain` helper already there) and carries on. Pass `--queue-service` only where the queue agent is installed from its template, as home-lab's is today: if nix-install ever renders it, leave the flag off, or each tool will rewrite the other's file.
 
-**Upgrading a worker** — a template change ships with the release that introduced it only if the agents are re-rendered, so the procedure ends with a bootstrap run:
+**Upgrading a worker** — a template change ships with the release that introduced it only if the agents are re-rendered, so the procedure ends with a bootstrap run. The worker restarts itself on the new controller (it exits 75); the dashboard does not, and the bootstrap restarts it only when its agent changed, so restart it first:
 
 ```bash
 git pull
 ./scripts/deploy.sh                       # controller CLI + plugin, one version
 ./install.sh --core                       # the config symlinks
+launchctl kickstart -k gui/$(id -u)/com.fxmartin.sdlc-dashboard   # the dashboard on the new controller (Linux: systemctl --user restart sdlc-dashboard)
 scripts/fleet-bootstrap.sh <the flags this worker was set up with>   # re-render the agents; no-op when nothing changed
 sdlc doctor                               # expect no fleet-agent-drift
 ```

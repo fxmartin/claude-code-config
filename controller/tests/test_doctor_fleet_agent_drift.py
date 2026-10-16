@@ -162,6 +162,31 @@ def test_a_checkout_without_templates_has_nothing_to_compare(agents, tmp_path) -
     assert check_fleet_agent_drift(tmp_path, agents=agents, home=HOME) is None
 
 
+def test_outside_the_checkout_the_templates_come_from_the_one_claude_md_links_into(tmp_path) -> None:
+    # install.sh --core links ~/.claude/CLAUDE.md to the config checkout's own, so doctor
+    # run from ~ or another project still compares against that checkout's templates.
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "CLAUDE.md").symlink_to(REPO_ROOT / "CLAUDE.md")
+    args = _rendered_args("com.fxmartin.sdlc-worker", home=home)
+    del args[args.index("--dashboard-url") : args.index("--dashboard-url") + 2]
+    agents = {"com.fxmartin.sdlc-worker": _install(tmp_path, "com.fxmartin.sdlc-worker", args)}
+
+    finding = check_fleet_agent_drift(tmp_path / "another-project", agents=agents, home=home)
+
+    assert finding is not None and finding.status == "WARN"
+    assert "missing `--dashboard-url http://<tailnet ip>:8787`" in finding.detail
+    assert finding.remedy.startswith(f"{REPO_ROOT}/scripts/fleet-bootstrap.sh ")
+
+
+def test_a_claude_md_link_that_loops_has_nothing_to_compare(agents, tmp_path) -> None:
+    claude_md = tmp_path / "home" / ".claude" / "CLAUDE.md"
+    claude_md.parent.mkdir(parents=True)
+    claude_md.symlink_to(claude_md)
+
+    assert check_fleet_agent_drift(tmp_path / "another-project", agents=agents, home=tmp_path / "home") is None
+
+
 def test_an_unreadable_plist_is_left_to_the_installed_checks(agents, tmp_path) -> None:
     broken = tmp_path / "broken.plist"
     broken.write_text("not a plist", encoding="utf-8")

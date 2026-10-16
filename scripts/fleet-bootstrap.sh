@@ -72,8 +72,10 @@
 # `--dashboard-url http://<tailnet ip>:8787`, the dashboard binds that address), and
 # compared with what is installed in ~/Library/LaunchAgents:
 #   - byte-identical and loaded: left alone;
-#   - different or absent: written, then booted out and bootstrapped again —
-#     except the worker while it has a job in flight, which is reported as
+#   - different or absent: booted out, written, then bootstrapped again (a bootout
+#     that fails stops the run with the old file in place, so the next run still
+#     sees the difference) — except the worker while it has a job in flight
+#     (asked of the queue its own agent names), which is reported as
 #     `pending restart (job N running)` and left for the next run;
 #   - without a tailnet address (`tailscale ip -4` prints nothing) the run stops
 #     before anything is written: a blank host would bind every interface.
@@ -467,10 +469,11 @@ render_worker_agent() {
 # keeps it (passed through awk's environment, never its argv), a plist holding it is
 # installed 0600, and a dry-run diff masks it.
 TOKEN_KEY="SDLC_QUEUE_TOKEN"
-installed_token() {  # LABEL — the installed agent's token, or nothing
-  sed -n "/<key>${TOKEN_KEY}<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;q;}" \
+installed_env() {  # LABEL KEY — KEY's value in the installed agent's plist, or nothing
+  sed -n "/<key>$2<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;q;}" \
     "${AGENT_DIR}/$1.plist" 2>/dev/null || true
 }
+installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the installed agent's token, or nothing
 with_installed_token() {  # LABEL — the plist on stdin, plus LABEL's installed token, on stdout
   TOKEN="$(installed_token "$1")" awk -v key="${TOKEN_KEY}" '
     /<key>EnvironmentVariables<\/key>/ { in_env = 1 }
@@ -487,11 +490,19 @@ redact_token() {  # FILE — FILE with its token masked
 # The job ids running on this worker, comma-separated; nonzero if the queue cannot be read.
 # Under the name the installed agent registered: a rename's old jobs are the ones a bootout kills.
 # Asked with the worker's own token, if it has one: from a shell without it the queue may refuse.
+# Asked of the worker's own queue: launchd hands it none of this shell's SDLC_QUEUE_URL or
+# SDLC_FLEET_DISABLED, so its agent's SDLC_QUEUE_URL names it, else ~/.sdlc-fleet.yaml.
 worker_jobs_in_flight() {
-  local listing worker token
+  local listing worker token url
   worker="$(installed_worker_arg --worker)"
   token="$(installed_token "${WORKER_LABEL}")"
-  listing="$([[ -z "${token}" ]] || export SDLC_QUEUE_TOKEN="${token}"; sdlc queue list --json 2>/dev/null)" || return 1
+  url="$(installed_env "${WORKER_LABEL}" SDLC_QUEUE_URL)"
+  listing="$(
+    unset SDLC_QUEUE_URL SDLC_FLEET_DISABLED
+    [[ -z "${token}" ]] || export SDLC_QUEUE_TOKEN="${token}"
+    [[ -z "${url}" ]] || export SDLC_QUEUE_URL="${url}"
+    sdlc queue list --json 2>/dev/null
+  )" || return 1
   jq -r --arg worker "${worker:-${WORKER_NAME}}" \
     '[.jobs[] | select(.state == "running" and .worker == $worker) | .id] | join(", ")' <<<"${listing}"
 }
@@ -554,10 +565,15 @@ install_launch_agent() {  # LABEL RENDERED_FILE
   log "installing ${dest}"
   mkdir -p "${AGENT_DIR}" "${HOME}/.local/state/sdlc"
   grep -q "<key>${TOKEN_KEY}</key>" "${rendered}" && mode=600
-  install -m "${mode}" "${rendered}" "${dest}"
+  # Booted out before the file is written: the file is what a re-run and doctor judge,
+  # so written first, a failed bootout would leave it "current" over the old agent
+  # launchd still runs. Each failure below leaves a diff or an unloaded agent instead.
   if [[ "${loaded}" == true ]]; then
-    launchctl bootout "${domain}/${label}"
+    launchctl bootout "${domain}/${label}" \
+      || die "launchctl bootout ${label} failed: ${dest} left as installed — re-run this script"
   fi
+  install -m "${mode}" "${rendered}" "${dest}" \
+    || die "could not write ${dest}: ${label} is not loaded — re-run this script"
   bootstrap_agent "${domain}" "${dest}" \
     || die "launchctl bootstrap ${label} kept failing: the agent is not loaded — re-run this script"
 }

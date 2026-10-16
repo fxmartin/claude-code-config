@@ -2484,17 +2484,23 @@ Each agent is compared byte for byte with what is installed:
 |-----------|--------|
 | identical, loaded | left alone |
 | identical, not loaded | `launchctl bootstrap` only |
-| different or absent | written, `bootout` + `bootstrap`; `--dry-run` prints the `diff -u` instead |
+| different or absent | `bootout`, written, `bootstrap`; `--dry-run` prints the `diff -u` instead |
 | different, **worker with a job in flight** | `pending restart (job N running)`: file and process left for the next run; the script exits 1 |
 
 "In flight" is `sdlc queue list --json` (the fleet queue once `queue_url:` is
 configured) filtered to `state == running` on the name the installed worker
 agent registered (a rename's old jobs are the ones a bootout kills); a queue that cannot
-be read counts as busy, since a lost build costs more than a delayed restart. If
+be read counts as busy, since a lost build costs more than a delayed restart. It
+asks the queue the worker drains: the agent's own `SDLC_QUEUE_URL`, else
+`~/.sdlc-fleet.yaml` — never the shell's `SDLC_QUEUE_URL` or `SDLC_FLEET_DISABLED`,
+which launchd does not hand the worker. If
 `tailscale ip -4` prints nothing the run stops in preflight, before any agent is
-written: a blank host would bind every interface. A `bootstrap` launchd refuses
-right after the `bootout` (it may still hold the label) is retried briefly, then
-fails the run naming the agent left unloaded.
+written: a blank host would bind every interface. The agent is booted out before
+its file is replaced: the file is what a re-run and doctor judge, so a `bootout`
+that fails stops the run with the old file in place, still a visible difference,
+rather than a file that reads current over the old agent launchd keeps running. A
+`bootstrap` launchd refuses right after the `bootout` (it may still hold the label)
+is retried briefly, then fails the run naming the agent left unloaded.
 
 No template carries a queue token, yet the M3's worker has one by hand
 (`tailscale whois` fails under launchd, #833) and the client reads it only from
@@ -2524,9 +2530,10 @@ any tailnet (`100.64.0.0/10`) address satisfies `__TAILNET_IP__`, so doctor neve
 asks tailscale. A difference is a WARN naming the agent and its missing or
 unexpected arguments, with the `fleet-bootstrap.sh` command that re-renders them
 (repeating the worker's own choices).
-It needs the repo's `templates/launchd/` (doctor runs from the checkout, as the
-bootstrap runs it); a host without them, or without any of the agents, has
-nothing to report.
+It reads `templates/launchd/` from the checkout doctor runs in, else from the
+config checkout `~/.claude/CLAUDE.md` links into (`install.sh --core`), so it
+checks from `~` or any project too; a host with neither, or without any of the
+agents, has nothing to report.
 
 ## Using the fleet queue (`QueueClient`, Story 35.1-002)
 

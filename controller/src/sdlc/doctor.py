@@ -983,10 +983,12 @@ def check_fleet_agent_drift(
     compared with ``templates/launchd/<label>.plist`` rendered for this host
     (``__HOME__`` is the home; the worker's own ``--worker`` / ``--pool`` /
     ``--host`` / ``--slots`` choices stand; any tailnet (100.64.0.0/10) address satisfies ``__TAILNET_IP__``, so doctor never asks
-    tailscale). ``None`` when no agent is installed here or this checkout carries
-    no templates; an agent whose plist cannot be read is left to the checks that
-    report it. A WARN names each drifting agent and its missing or unexpected
-    arguments, and the bootstrap run that re-renders them.
+    tailscale). The templates are this checkout's, else those of the config checkout
+    ``~/.claude/CLAUDE.md`` links into (``install.sh --core``), so doctor run from
+    ``~`` or another project still checks. ``None`` when no agent is installed here
+    or neither checkout carries templates; an agent whose plist cannot be read is
+    left to the checks that report it. A WARN names each drifting agent and its
+    missing or unexpected arguments, and the bootstrap run that re-renders them.
     """
     home = home or Path.home()
     agents = agents or {
@@ -994,6 +996,11 @@ def check_fleet_agent_drift(
         DASHBOARD_LABEL: default_dashboard_plist(),
         QUEUE_SERVICE_LABEL: default_queue_service_plist(),
     }
+    if not (repo_root / "templates" / "launchd").is_dir():
+        try:
+            repo_root = (home / ".claude" / "CLAUDE.md").resolve().parent
+        except (OSError, RuntimeError):  # a symlink loop (RuntimeError before 3.13): no checkout
+            return None
     templates = repo_root / "templates" / "launchd"
     installed_args: dict[str, list[str]] = {}
     drifting: list[str] = []
