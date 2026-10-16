@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (21/24)** — 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (21/25)** — 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 24 | **Total Points**: 91 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 25 | **Total Points**: 93 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -185,6 +185,54 @@ doctor check and the doc.
 - [ ] Code implemented and peer reviewed
 - [ ] Tests: plist template validates (`plutil -lint` in CI on macOS);
       doctor finding
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.1-001
+**Risk Level**: Low
+
+##### Story 35.1-004: The queue service accepts a burst of connections on macOS
+**User Story**: As FX, I want the queue service to accept a burst of
+simultaneous connections without resetting any, so that
+`test_concurrent_claims_give_each_job_exactly_one_winner` passes on every
+platform and a fleet bugfix round never burns its time budget chasing it.
+**Priority**: Must Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** the queue service on a macOS host **When** 12 or more clients
+  connect at once (the concurrent-claims test, or several workers and the
+  dashboard at the same moment) **Then** every connection is accepted and
+  answered; none fails with `ECONNRESET` (`[Errno 54] Connection reset by
+  peer`).
+- **Given** `test_concurrent_claims_give_each_job_exactly_one_winner` **When**
+  the controller suite runs on the M3 Max, on home-lab and in the Linux CI
+  container **Then** it passes, repeated at least 20 times in a row on macOS
+  (`pytest --count` or an equivalent loop) without one failure.
+- **Given** a burst of concurrent claims **When** the service answers them
+  **Then** claim semantics are unchanged: each job has exactly one winner and
+  the extra claimants get `204`.
+
+**Technical Notes**: `_QueueServer` (`queue_server.py`) subclasses
+`ThreadingHTTPServer` and inherits `socketserver.TCPServer.request_queue_size
+= 5`, the `listen()` backlog. The test fires 12 claims through a 12-thread
+pool. When the accept queue overflows, macOS answers the extra SYNs with a
+reset, while Linux drops them and the client retries, so the test passes in
+CI and fails intermittently on the Macs. Set an explicit
+`request_queue_size` (e.g. 64) on `_QueueServer`, with a comment explaining
+why. Production exposure is small (few workers), but a dashboard poll
+landing during worker claims can hit the same overflow. Do not retry in the
+test client; that would mask the server bug.
+Incident: fleet job 9 (35.2-009, run `8e648473`, M3 Max, 2026-10-16). Bugfix
+round 2 ran the full suite, hit this failure (`1 failed, 3056 passed`), and
+spent the rest of its 3600 s stage timeout building a `main` baseline worktree
+to prove the failure pre-existed. It was killed before committing its fix,
+which was lost with the story worktree.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: a regression test asserting the server's backlog is at least the
+      concurrency the suite uses; the concurrent-claims test is stable in a
+      repeated run on macOS
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.1-001
