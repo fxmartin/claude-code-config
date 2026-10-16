@@ -393,3 +393,34 @@ def test_a_fresh_clone_opens_its_change_request_with_the_close_link(
         BuildOptions(), body="Coverage gate passed.", context="post-coverage",
     )
     assert fake.created and "Closes #7" in fake.created[0]["body"]
+
+
+def test_a_ledger_failure_while_seeding_never_blocks_the_run(tmp_path, monkeypatch) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    store = QueueStore(tmp_path / "q.db")
+    store.init()
+    job_id = store.add_job(
+        repo=str(clone), kind="build", scope="s", issues_json=json.dumps(MAPPING)
+    )
+
+    def _boom(*_a, **_kw):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(Ledger, "init", _boom)
+
+    seed_issue_mappings(store.get_job(job_id))  # logged, not raised
+
+
+def test_enqueue_survives_a_ledger_failure_and_carries_nothing(tmp_path, monkeypatch) -> None:
+    _project(tmp_path)
+    _mirror(tmp_path, "99.1-001", "gitlab", "7")
+
+    def _boom(*_a, **_kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(Ledger, "ensure_migrated", _boom)
+
+    job = _enqueue(tmp_path, monkeypatch, "99.1-001")
+
+    assert job.issues is None
