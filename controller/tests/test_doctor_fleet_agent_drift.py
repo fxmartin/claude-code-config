@@ -91,6 +91,28 @@ def test_the_hosts_own_worker_name_and_pools_are_not_drift(tmp_path) -> None:
     assert finding.status == "CLEAN"
 
 
+def test_the_workers_own_host_name_and_slot_cap_are_not_drift(agents, tmp_path) -> None:
+    # The M3 registers as `--host m3max` (its `hostname -s` is m3-max) so `--host m3max` pins match it.
+    args = _rendered_args("com.fxmartin.sdlc-worker") + ["--host", "m3max", "--slots", "3"]
+    agents["com.fxmartin.sdlc-worker"] = _install(tmp_path, "com.fxmartin.sdlc-worker", args)
+
+    assert _check(agents).status == "CLEAN"
+
+
+def test_the_remedy_repeats_the_workers_own_host_name_and_slot_cap(agents, tmp_path) -> None:
+    # The bootstrap would otherwise re-render the worker without them, and it would register as `hostname -s`.
+    args = _rendered_args("com.fxmartin.sdlc-worker") + ["--host", "m3max", "--slots", "3"]
+    del args[args.index("--dashboard-url") : args.index("--dashboard-url") + 2]
+    agents["com.fxmartin.sdlc-worker"] = _install(tmp_path, "com.fxmartin.sdlc-worker", args)
+
+    finding = _check(agents)
+
+    assert finding.status == "WARN"
+    assert "--host m3max" in finding.remedy
+    assert "--slots 3" in finding.remedy
+    assert "unexpected" not in finding.detail
+
+
 def test_a_dashboard_bound_to_every_interface_is_different_not_missing(agents, tmp_path) -> None:
     args = _rendered_args("com.fxmartin.sdlc-dashboard")
     args[args.index("--host") + 1] = "0.0.0.0"

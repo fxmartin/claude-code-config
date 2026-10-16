@@ -43,8 +43,8 @@
 #
 # Usage:
 #   scripts/fleet-bootstrap.sh --queue-url URL [--github-only] [--skip-service] [--dry-run]
-#   scripts/fleet-bootstrap.sh --worker NAME --pool P [--pool P ...] --queue-url URL \
-#       [--queue-service [--queue-allow LOGIN]] [--github-only] [--skip-service] [--dry-run]
+#   scripts/fleet-bootstrap.sh --worker NAME --pool P [--pool P ...] [--host HOST] [--slots N] \
+#       --queue-url URL [--queue-service [--queue-allow LOGIN]] [--github-only] [--skip-service] [--dry-run]
 #   scripts/fleet-bootstrap.sh --help
 #
 # --queue-url  the fleet queue's base URL (written to ~/.sdlc-fleet.yaml). Optional
@@ -69,6 +69,10 @@
 #     `pending restart (job N running)` and left for the next run;
 #   - without a tailnet address (`tailscale ip -4` prints nothing) the run stops
 #     before anything is written: a blank host would bind every interface.
+# --host, --slots  the host name the worker registers as (a job's `--host` pin matches
+#              it; default `hostname -s` — the M3 Max, host m3-max, registers as m3max)
+#              and its slot cap, passed to `sdlc queue run`. Omitted, each keeps the
+#              installed worker agent's value, so a re-run never drops them.
 # --queue-service  also install com.fxmartin.sdlc-queue (home-lab only). The Tailscale
 #              login(s) allowed to call it come from --queue-allow, else from the
 #              queue agent already installed.
@@ -115,6 +119,8 @@ PLATFORM="$(uname -s)"
 QUEUE_URL=""
 WORKER_NAME=""
 POOLS=()
+WORKER_HOST=""
+SLOTS=""
 QUEUE_SERVICE=false
 QUEUE_ALLOW=""
 DO_SERVICE=true
@@ -150,6 +156,10 @@ while [[ $# -gt 0 ]]; do
     --worker=*)      WORKER_NAME="${1#--worker=}" ;;
     --pool)          [[ $# -ge 2 ]] || die "--pool needs a name"; POOLS+=("$2"); shift ;;
     --pool=*)        POOLS+=("${1#--pool=}") ;;
+    --host)          [[ $# -ge 2 ]] || die "--host needs a name"; WORKER_HOST="$2"; shift ;;
+    --host=*)        WORKER_HOST="${1#--host=}" ;;
+    --slots)         [[ $# -ge 2 ]] || die "--slots needs a number"; SLOTS="$2"; shift ;;
+    --slots=*)       SLOTS="${1#--slots=}" ;;
     --queue-allow)   [[ $# -ge 2 ]] || die "--queue-allow needs a login"; QUEUE_ALLOW="$2"; shift ;;
     --queue-allow=*) QUEUE_ALLOW="${1#--queue-allow=}" ;;
     --queue-url)     [[ $# -ge 2 ]] || die "--queue-url needs a URL"; QUEUE_URL="$2"; shift ;;
@@ -170,20 +180,32 @@ QUEUE_URL="${QUEUE_URL%/}"
 IS_DARWIN=false
 [[ "${PLATFORM}" == Darwin ]] && IS_DARWIN=true
 valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+# The string after <string>FLAG</string> in the installed worker agent, or nothing.
+installed_worker_arg() {
+  sed -n "/<string>$1<\/string>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;q;}" \
+    "${AGENT_DIR}/${WORKER_LABEL}.plist" 2>/dev/null || true
+}
 if [[ "${IS_DARWIN}" == true ]]; then
   if [[ "${DO_SERVICE}" == true ]]; then
     [[ -n "${WORKER_NAME}" ]] || die "--worker NAME is required on macOS (the name this Mac's worker registers as)"
     [[ ${#POOLS[@]} -gt 0 ]] || die "at least one --pool P is required on macOS (the subscription pools this Mac serves)"
+    # Not in the template, so a re-render would drop them: an M3 back on host m3-max
+    # strands every job pinned --host m3max. Kept like the queue agent's login.
+    WORKER_HOST="${WORKER_HOST:-$(installed_worker_arg --host)}"
+    SLOTS="${SLOTS:-$(installed_worker_arg --slots)}"
   fi
   [[ -z "${WORKER_NAME}" ]] || valid_name "${WORKER_NAME}" || die "--worker must be letters, digits, '.', '_' or '-': ${WORKER_NAME}"
   for pool in ${POOLS[@]+"${POOLS[@]}"}; do
     valid_name "${pool}" || die "--pool must be letters, digits, '.', '_' or '-': ${pool}"
   done
+  [[ -z "${WORKER_HOST}" ]] || valid_name "${WORKER_HOST}" || die "--host must be letters, digits, '.', '_' or '-': ${WORKER_HOST}"
+  [[ -z "${SLOTS}" || "${SLOTS}" =~ ^[1-9][0-9]*$ ]] || die "--slots must be a whole number, at least 1: ${SLOTS}"
   [[ -z "${QUEUE_ALLOW}" || "${QUEUE_ALLOW}" =~ ^[A-Za-z0-9@._+,-]+$ ]] || die "--queue-allow is a Tailscale login (or a comma-separated list): ${QUEUE_ALLOW}"
 else
   # The unit is one worker, `dev`, on claude-shared: there is nothing to name.
-  { [[ -z "${WORKER_NAME}" && ${#POOLS[@]} -eq 0 && "${QUEUE_SERVICE}" == false && -z "${QUEUE_ALLOW}" ]]; } \
-    || die "--worker, --pool, --queue-service and --queue-allow are macOS options: the Linux unit is worker dev on claude-shared"
+  { [[ -z "${WORKER_NAME}" && ${#POOLS[@]} -eq 0 && -z "${WORKER_HOST}" && -z "${SLOTS}" \
+      && "${QUEUE_SERVICE}" == false && -z "${QUEUE_ALLOW}" ]]; } \
+    || die "--worker, --pool, --host, --slots, --queue-service and --queue-allow are macOS options: the Linux unit is worker dev on claude-shared"
 fi
 
 # uv tools (`sdlc`) land in ~/.local/bin, which a fresh dev shell may not carry.
@@ -389,10 +411,17 @@ render_launch_agent() {  # LABEL — the rendered plist on stdout
       "${LAUNCHD_TEMPLATES}/$1.plist"
 }
 # The worker template carries the M3 Max's name and pools; this Mac's own replace
-# them — every `--pool` pair collapses into one pair per requested pool.
+# them — every `--pool` pair collapses into one pair per requested pool — and its
+# --host / --slots, which the template has none of, follow the name.
 render_worker_agent() {
-  render_launch_agent "${WORKER_LABEL}" | awk -v worker="${WORKER_NAME}" -v pools="$(IFS=,; echo "${POOLS[*]}")" '
-    /<string>--worker<\/string>/ { print; if ((getline) > 0) print "    <string>" worker "</string>"; next }
+  render_launch_agent "${WORKER_LABEL}" | awk -v worker="${WORKER_NAME}" -v pools="$(IFS=,; echo "${POOLS[*]}")" \
+      -v host="${WORKER_HOST}" -v slots="${SLOTS}" '
+    /<string>--worker<\/string>/ {
+      print; if ((getline) > 0) print "    <string>" worker "</string>"
+      if (host != "") { print "    <string>--host</string>"; print "    <string>" host "</string>" }
+      if (slots != "") { print "    <string>--slots</string>"; print "    <string>" slots "</string>" }
+      next
+    }
     /<string>--pool<\/string>/ {
       getline
       if (!pooled) {
@@ -406,10 +435,12 @@ render_worker_agent() {
 }
 
 # The job ids running on this worker, comma-separated; nonzero if the queue cannot be read.
+# Under the name the installed agent registered: a rename's old jobs are the ones a bootout kills.
 worker_jobs_in_flight() {
-  local listing
+  local listing worker
+  worker="$(installed_worker_arg --worker)"
   listing="$(sdlc queue list --json 2>/dev/null)" || return 1
-  jq -r --arg worker "${WORKER_NAME}" \
+  jq -r --arg worker "${worker:-${WORKER_NAME}}" \
     '[.jobs[] | select(.state == "running" and .worker == $worker) | .id] | join(", ")' <<<"${listing}"
 }
 

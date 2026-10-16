@@ -914,8 +914,10 @@ _FLEET_AGENT_LABELS = (WORKER_LABEL, DASHBOARD_LABEL, QUEUE_SERVICE_LABEL)
 _TAILNET_IP = "__TAILNET_IP__"
 # `tailscale ip -4` is always in the CGNAT block 100.64.0.0/10 — never 0.0.0.0 or a LAN address.
 _TAILNET_IPV4 = r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}"
-# What the host chooses, not the template: the M3's name and pools are its defaults.
-_HOST_CHOSEN_FLAGS = ("--worker", "--pool")
+# What the worker's host chooses, not the template: the M3's name and pools are its defaults,
+# and a registered `--host` (the M3 is `m3max`, its hostname `m3-max`) or `--slots` cap is its
+# own — the bootstrap keeps both. Worker only: the dashboard's `--host` must stay a tailnet IP.
+_HOST_CHOSEN_FLAGS = ("--worker", "--pool", "--host", "--slots")
 
 
 def default_dashboard_plist() -> Path:
@@ -941,12 +943,18 @@ def _argument_groups(args: list[str]) -> list[str]:
     return groups
 
 
-def _drift(expected: list[str], installed: list[str]) -> tuple[list[str], list[str]]:
-    """(missing, unexpected) argument groups. A tailnet address matches any tailnet address."""
-    for flag in _HOST_CHOSEN_FLAGS:
+def _drift(
+    expected: list[str], installed: list[str], host_chosen: tuple[str, ...] = ()
+) -> tuple[list[str], list[str]]:
+    """(missing, unexpected) argument groups. A tailnet address matches any tailnet address.
+
+    A ``host_chosen`` flag's installed value stands in for the template's, and is
+    no drift where the template has none.
+    """
+    for flag in host_chosen:
         own = [g for g in installed if g.startswith(f"{flag} ")]
         template_own = [g for g in expected if g.startswith(f"{flag} ")]
-        if template_own:
+        if template_own or own:
             expected = [g for g in expected if g not in template_own] + (
                 own or [f"{flag} <{flag.removeprefix('--')}>"]
             )
@@ -972,8 +980,8 @@ def check_fleet_agent_drift(
 
     Each installed worker, dashboard or queue agent's ``ProgramArguments`` is
     compared with ``templates/launchd/<label>.plist`` rendered for this host
-    (``__HOME__`` is the home; the worker's own ``--worker`` / ``--pool`` choices
-    stand; any tailnet (100.64.0.0/10) address satisfies ``__TAILNET_IP__``, so doctor never asks
+    (``__HOME__`` is the home; the worker's own ``--worker`` / ``--pool`` /
+    ``--host`` / ``--slots`` choices stand; any tailnet (100.64.0.0/10) address satisfies ``__TAILNET_IP__``, so doctor never asks
     tailscale). ``None`` when no agent is installed here or this checkout carries
     no templates; an agent whose plist cannot be read is left to the checks that
     report it. A WARN names each drifting agent and its missing or unexpected
@@ -1003,7 +1011,8 @@ def check_fleet_agent_drift(
             continue
         checked += 1
         installed_args[label] = args
-        missing, unexpected = _drift(_argument_groups(expected), _argument_groups(args))
+        host_chosen = _HOST_CHOSEN_FLAGS if label == WORKER_LABEL else ()
+        missing, unexpected = _drift(_argument_groups(expected), _argument_groups(args), host_chosen)
         if missing or unexpected:
             parts = [f"missing `{g}`" for g in missing] + [f"unexpected `{g}`" for g in unexpected]
             drifting.append(f"{label}: {'; '.join(parts)}")
@@ -1016,7 +1025,9 @@ def check_fleet_agent_drift(
     worker = _argument_groups(installed_args.get(WORKER_LABEL, []))
     name_flag = next((g for g in worker if g.startswith("--worker ")), "--worker NAME")
     pools = [g for g in worker if g.startswith("--pool ")] or ["--pool POOL"]
-    command = f"{repo_root}/scripts/fleet-bootstrap.sh {name_flag} {' '.join(pools)}"
+    # Repeated so the re-render keeps them even where the installed plist cannot be read back.
+    own = [g for g in worker if g.startswith(("--host ", "--slots "))]
+    command = f"{repo_root}/scripts/fleet-bootstrap.sh {name_flag} {' '.join(pools + own)}"
     try:
         url = resolve_queue_url()
     except QueueError:

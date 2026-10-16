@@ -598,6 +598,10 @@ DASHBOARD_UNIT() { echo "${HOME}/.config/systemd/user/sdlc-dashboard.service"; }
 
     [ "$status" -ne 0 ]
     [[ "$output" == *"macOS options"* ]]
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --host dev
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"macOS options"* ]]
 }
 
 # --- macOS: LaunchAgents rendered from templates/launchd (35.2-009) ---------------------
@@ -751,6 +755,67 @@ mac() { "${BOOTSTRAP}" --worker m3max --pool claude-m3 --pool codex-shared --que
     [ "$status" -eq 0 ]
     [ "$(value_after "$(AGENT worker)" --dashboard-url)" = "http://100.64.0.9:8787" ]
     grep -qx "launchctl bootout gui/$(id -u)/com.fxmartin.sdlc-worker" "${CALLS}"
+}
+
+@test "a re-run keeps the --host the installed worker registers as, and its slot cap" {
+    darwin
+    run mac
+    # The M3 as found: `--host m3max` (its hostname -s is m3-max) and no --dashboard-url yet.
+    awk '{ print } /<string>--follow<\/string>/ {
+        print "    <string>--host</string>"; print "    <string>m3max</string>"
+        print "    <string>--slots</string>"; print "    <string>3</string>" }' "$(AGENT worker)" \
+        | grep -v -e '--dashboard-url' -e 'http://100.64.0.9:8787' >"${TMP}/old.plist"
+    cp "${TMP}/old.plist" "$(AGENT worker)"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --dashboard-url)" = "http://100.64.0.9:8787" ]
+    [ "$(value_after "$(AGENT worker)" --host)" = "m3max" ]
+    [ "$(value_after "$(AGENT worker)" --slots)" = "3" ]
+}
+
+@test "--host and --slots land in the worker agent, and a re-run without them changes nothing" {
+    darwin
+    run mac --host m3max --slots 3
+    [ "$status" -eq 0 ]
+    [ "$(value_after "$(AGENT worker)" --host)" = "m3max" ]
+    [ "$(value_after "$(AGENT worker)" --slots)" = "3" ]
+    before="$(cksum <"$(AGENT worker)")"
+    : >"${CALLS}"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [ "$(cksum <"$(AGENT worker)")" = "${before}" ]
+    ! grep -qE "^launchctl (bootstrap|bootout)" "${CALLS}" || false
+}
+
+@test "a host name or slot cap that is not valid is refused" {
+    darwin
+    run mac --host 'a|b'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--host must be"* ]]
+
+    run mac --slots 0
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--slots must be"* ]]
+    ! grep -q "install.sh" "${CALLS}" || false
+}
+
+@test "a renamed worker's job in flight under its installed name still holds it back" {
+    darwin
+    run mac
+    printf '<!-- stale -->\n' >>"$(AGENT worker)"
+    cp "$(AGENT worker)" "${TMP}/stale.plist"
+    # Job 7 runs under the name the installed agent registered: booting it out would SIGTERM it.
+    echo '{"jobs": [{"id": 7, "state": "running", "worker": "m3max"}]}' >"${TMP}/queue.json"
+
+    run "${BOOTSTRAP}" --worker m3-max --pool claude-m3 --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"pending restart (job 7 running)"* ]]
+    cmp "${TMP}/stale.plist" "$(AGENT worker)"
 }
 
 @test "a worker with a job in flight is not restarted: pending restart, left for the next run" {
