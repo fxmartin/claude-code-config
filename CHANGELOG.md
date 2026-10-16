@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.105.0] - 2026-10-16
+
+### Added
+
+- feat(fleet-execution): a fleet-built story's change (#35.3-002)
+
+
 ## [v2.104.0] - 2026-10-16
 
 ### Added
