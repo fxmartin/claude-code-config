@@ -385,3 +385,49 @@ claude-sonnet-5-5 --effort high --n 3 --json > eval/results/new.json`, then
 `sdlc eval-compare --baseline eval/baseline.json --candidate
 eval/results/new.json` for a higher-`n` confirmation, or to re-check a future
 tier-map change against this one.
+
+## Haiku 5.5 tier (Story 34.5-001, 2026-10-17)
+
+**Availability gate — passed.** Read from Anthropic's own pages on 2026-10-17, not
+from the decision record's figures:
+
+- Models overview — <https://platform.claude.com/docs/en/about-claude/models/overview>
+  (`docs.claude.com` redirects here): lists Claude Haiku 5.5, API id
+  `claude-haiku-5-5`, default effort `medium`, 1M context.
+- Pricing — <https://platform.claude.com/docs/en/about-claude/pricing>: prompts up
+  to 100,000 tokens `$0.10` in / `$0.50` out / `$0.125` 5m cache write / `$0.20`
+  1h write / `$0.01` cache read; prompts **over** 100,000 tokens (counting cache
+  reads and writes, priced per request) `$0.50` / `$2.50` / `$0.625` / `$1` /
+  `$0.05`. The decision record's `$0.10 / $0.50` and long-prompt tier are confirmed.
+- Effort — <https://platform.claude.com/docs/en/build-with-claude/effort>:
+  `claude-haiku-5-5` is a supported model and takes all five levels
+  (`low`…`max`), so `TIER_EFFORT_LEVELS[haiku]` is the full ladder. Haiku 4.5 is
+  not on the supported list; the omit-effort branch is now keyed on the model id.
+- Live probe: `claude -p ok --model claude-haiku-5-5 --output-format json`
+  answered on FX's plan with `modelUsage` keyed `claude-haiku-5-5`.
+
+**Eval gate** (`sdlc eval --model claude-haiku-5-5 --effort medium --n 2`, the
+strutils tickets; `controller/eval/results/haiku-5-5-scoreboard-34.5-001.json`,
+compare in `eval-compare-34.5-001.txt` against
+`new-map-scoreboard-34.4-003.json` at the default 10% tolerance):
+
+| | Sonnet 5.5 / high (34.4-003) | Haiku 5.5 / medium |
+|---|--:|--:|
+| qual (pass rate) | 1.00 | 1.00 — **unchanged** |
+| tokens / run | 143,744 | 228,969 (+59%) |
+| `cost$` as the CLI envelope reports it | 0.139 | 0.701 (**+405%, flagged WORSE**) |
+| `cost$` repriced from tokens with the official table | 0.0997 | 0.0065 (−93%) |
+
+The envelope figure is **not** a Haiku 5.5 list price: the installed `claude` CLI
+logs `unrecognized_model` for the id and reports `costBasis: unknown`, so its
+`total_cost_usd` prices the tokens at a default rate. A 20k-token cache-write turn
+reported `$0.41` where the list price is about `$0.0025`. Every `$` the controller
+displays is table-priced (`cost_estimate._priced_cost`), so the controller is
+unaffected; only `sdlc eval-compare`'s `cost$`, which reads the envelope, is. The
+literal "cost$ not worse" criterion therefore fails as measured and holds when
+repriced — flagged for FX to confirm the flip. Haiku also wrote more code on these
+tickets (net LOC 5.8 vs 0), with quality unchanged. Per-request prompts in the eval
+stay far below the 100,000-token tier; the merge-stage prompt sizes in the live
+ledger were not available in this worktree, so the long-prompt saving is not
+claimed in full (`usage_cost` prices an aggregated row at the short tier, a lower
+bound).

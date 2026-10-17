@@ -27,10 +27,10 @@ TIER_LADDER: tuple[str, ...] = (HAIKU, SONNET, OPUS)
 # profiles keep speaking in tiers; the alias is resolved to an id only at the
 # point it leaves the routing layer (see :func:`resolve_model_id`), so a ledger
 # row and the `claude --model` argv name the precise model a stage ran on.
-# Vintage: 2026-09-30. Bump here (and the README routing table) on a new
+# Vintage: 2026-10-17. Bump here (and the README routing table) on a new
 # generation.
 TIER_MODEL_IDS: dict[str, str] = {
-    HAIKU: "claude-haiku-4-5",
+    HAIKU: "claude-haiku-5-5",
     SONNET: "claude-sonnet-5-5",
     OPUS: "claude-opus-5-5",
 }
@@ -40,14 +40,29 @@ TIER_MODEL_IDS: dict[str, str] = {
 # tier, capped at `max`.
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
-# Levels each tier's model accepts (Anthropic thinking/effort table). Haiku 4.5
-# has no `effort` parameter at all, so the flag is omitted rather than risking a
-# CLI error. Fable is deliberately absent — it is not a routed tier.
+# Levels each tier's current model accepts (Anthropic effort page; Haiku 5.5
+# takes all five, verified 2026-10-17). Fable is deliberately absent — it is not
+# a routed tier.
 TIER_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
-    HAIKU: (),
+    HAIKU: EFFORT_LEVELS,
     SONNET: EFFORT_LEVELS,
     OPUS: EFFORT_LEVELS,
 }
+
+# Haiku 4.5 has no `effort` parameter at all, so the flag is omitted rather than
+# risking a CLI error. It is no longer a tier default, but it still runs when the
+# probe degrades the haiku tier to it (or a repo pins it), so the check is by
+# model id, not tier.
+NO_EFFORT_MODEL_IDS: tuple[str, ...] = ("claude-haiku-4-5",)
+
+
+def effort_levels_for(model: str | None, tier: str) -> tuple[str, ...]:
+    """The effort levels ``model`` (a tier alias or id) accepts; ``()`` for none."""
+    resolved = (resolve_model_id(model) or "").lower()
+    if any(resolved.startswith(no_effort) for no_effort in NO_EFFORT_MODEL_IDS):
+        return ()
+    return TIER_EFFORT_LEVELS[tier]
+
 
 # Balanced per-stage effort: mechanical stages low, build high, review xhigh so
 # Opus 5.5's `medium` default never silently under-thinks a review.
@@ -67,7 +82,7 @@ BALANCED_STAGE_EFFORT: dict[str, str] = {
 TIER_FALLBACK_IDS: dict[str, str] = {
     "claude-opus-5-5": "claude-opus-5",
     "claude-sonnet-5-5": "claude-sonnet-5",
-    "claude-haiku-4-5": "claude-haiku-4-5",
+    "claude-haiku-5-5": "claude-haiku-4-5",
 }
 
 # Process-wide result of this run's entitlement probe (see ``sdlc.model_probe``).
@@ -445,7 +460,7 @@ def select_effort(
 
     The mapped level is climbed ``escalation_steps`` levels (the cheap-first retry
     lever, in step with :func:`escalate_model`) and then checked against what
-    ``model``'s tier accepts. A model that does not support it — Haiku 4.5 has no
+    ``model`` accepts. A model that does not support it — Haiku 4.5 has no
     ``effort`` — or one the router cannot identify yields no level plus a reason.
     """
     if config is None:
@@ -460,7 +475,7 @@ def select_effort(
             reason=f"effort {level} omitted for {stage}: model {model or 'cli-default'} "
             "is not a known tier"
         )
-    supported = TIER_EFFORT_LEVELS[tier]
+    supported = effort_levels_for(model, tier)
     if level not in supported:
         return EffortChoice(
             reason=f"effort {level} omitted for {stage}: {model} does not "
@@ -775,7 +790,7 @@ def _banner_entry(stage: str, model: str, effort: str | None) -> str:
     states what the dispatch will actually carry (Story 34.4-001).
     """
     tier = tier_of(model)
-    if effort and tier and effort in TIER_EFFORT_LEVELS[tier]:
+    if effort and tier and effort in effort_levels_for(model, tier):
         return f"{stage}={resolve_model_id(model)}@{effort}"
     return f"{stage}={_with_model_id(model)}"
 

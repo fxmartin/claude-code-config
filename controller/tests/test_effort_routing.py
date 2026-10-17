@@ -14,13 +14,19 @@ from sdlc.dispatch import AgentResult, resolve_agent_cmd
 from sdlc.harness import HarnessConfig
 from sdlc.model_routing import (
     BALANCED,
+    BALANCED_STAGE_EFFORT,
+    EFFORT_LEVELS,
+    HAIKU,
     QUALITY_FIRST,
+    TIER_EFFORT_LEVELS,
     EffortChoice,
     escalate_effort,
     load_routing_config,
+    reset_probe_state,
     routing_banner,
     routing_snapshot,
     select_effort,
+    set_probe_state,
     tier_of,
 )
 
@@ -168,20 +174,51 @@ def test_snapshot_round_trips_effort() -> None:
 # --- unsupported level ------------------------------------------------------
 
 
-def test_haiku_omits_effort_with_reason() -> None:
+def test_haiku_5_5_takes_the_documented_effort_levels() -> None:
+    # Anthropic's effort page (2026-10-17): Haiku 5.5 supports all five levels.
+    assert TIER_EFFORT_LEVELS[HAIKU] == EFFORT_LEVELS
+    assert select_effort("merge", BALANCED, "claude-haiku-5-5").level == "medium"
+
+
+def test_haiku_4_5_omits_effort_with_reason() -> None:
     choice = select_effort("merge", BALANCED, "claude-haiku-4-5")
     assert choice.level is None
     assert "merge" in choice.reason and "does not support effort" in choice.reason
+
+
+def test_dated_haiku_4_5_snapshot_omits_effort() -> None:
+    assert select_effort("merge", BALANCED, "claude-haiku-4-5-20251001").level is None
+
+
+def test_banner_shows_effort_only_on_the_model_that_takes_it() -> None:
+    assert "merge=claude-haiku-5-5@medium" in "\n".join(routing_banner(routing_snapshot(BALANCED)))
+    try:
+        set_probe_state({"claude-haiku-5-5": "claude-haiku-4-5"}, set())
+        banner = "\n".join(routing_banner(routing_snapshot(BALANCED)))
+    finally:
+        reset_probe_state()
+    assert "merge=haiku → claude-haiku-4-5 (claude-haiku-5-5 unavailable on this host)" in banner
 
 
 def test_unknown_model_omits_effort() -> None:
     assert select_effort("build", BALANCED, "gpt-9").level is None
 
 
-def test_haiku_stage_dispatch_omits_flag_and_logs_debug(tmp_path, monkeypatch) -> None:
+def test_haiku_5_5_merge_dispatch_carries_the_balanced_level(tmp_path, monkeypatch) -> None:
     disp = _Dispatcher()
     _run(tmp_path, monkeypatch, disp)
-    assert disp.effort("merge") is None  # Balanced merge runs on Haiku
+    assert disp.effort("merge") == BALANCED_STAGE_EFFORT["merge"]
+    assert dict(_rows(tmp_path, "SELECT stage_name, effort FROM stages"))["merge"] == "medium"
+
+
+def test_haiku_merge_via_fallback_omits_flag_and_logs_debug(tmp_path, monkeypatch) -> None:
+    disp = _Dispatcher()
+    set_probe_state({"claude-haiku-5-5": "claude-haiku-4-5"}, set())
+    try:
+        _run(tmp_path, monkeypatch, disp)
+    finally:
+        reset_probe_state()
+    assert disp.effort("merge") is None  # probe degraded the tier to Haiku 4.5
     assert dict(_rows(tmp_path, "SELECT stage_name, effort FROM stages"))["merge"] is None
     debug = _rows(tmp_path, "SELECT message FROM events WHERE level = 'debug'")
     assert any("effort medium omitted for merge" in m for (m,) in debug)
@@ -257,3 +294,12 @@ def test_registry_failure_keeps_effort(tmp_path, monkeypatch) -> None:
         BuildOptions(scope="epic-34", model_profile="balanced", harness_map={"build": "codex"}),
     )
     assert choice.level == "high"
+
+
+def test_effort_levels_for_is_decided_by_model_id_not_tier() -> None:
+    from sdlc.model_routing import EFFORT_LEVELS, HAIKU, effort_levels_for
+
+    assert effort_levels_for("claude-haiku-4-5", HAIKU) == ()
+    assert effort_levels_for("claude-haiku-5-5", HAIKU) == EFFORT_LEVELS
+    # The tier alias resolves to the current default, which takes effort.
+    assert effort_levels_for("haiku", HAIKU) == EFFORT_LEVELS
