@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.109.0] - 2026-10-17
+
+### Added
+
+- feat(current-generation-models): haiku 5.5 tier, gated on (#34.5-001)
+
+
 ## [v2.108.0] - 2026-10-17
 
 ### Added
