@@ -163,6 +163,20 @@ def test_banner_reflects_yaml_ceiling() -> None:
     assert "review xhigh→max" in banner
 
 
+def test_banner_off_state_carries_no_effort_bounds() -> None:
+    banner = "\n".join(routing_banner({}))
+    assert "MODEL ROUTING OFF" in banner
+    assert "base→ceiling" not in banner
+
+
+def test_banner_lists_overrides_and_agent_cmd_after_bounds() -> None:
+    snap = {**routing_snapshot(BALANCED), "overrides": {"review": "opus"}, "agent_cmd": "x"}
+    lines = routing_banner(snap)
+    assert any("effort base→ceiling" in ln for ln in lines)
+    assert any("review=opus" in ln for ln in lines)
+    assert any("SDLC_AGENT_CMD" in ln for ln in lines)
+
+
 def test_banner_has_no_effort_line_without_efforts() -> None:
     banner = "\n".join(routing_banner(routing_snapshot(QUALITY_FIRST)))
     assert "base→ceiling" not in banner
