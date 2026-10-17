@@ -294,3 +294,12 @@ def test_registry_failure_keeps_effort(tmp_path, monkeypatch) -> None:
         BuildOptions(scope="epic-34", model_profile="balanced", harness_map={"build": "codex"}),
     )
     assert choice.level == "high"
+
+
+def test_effort_levels_for_is_decided_by_model_id_not_tier() -> None:
+    from sdlc.model_routing import EFFORT_LEVELS, HAIKU, effort_levels_for
+
+    assert effort_levels_for("claude-haiku-4-5", HAIKU) == ()
+    assert effort_levels_for("claude-haiku-5-5", HAIKU) == EFFORT_LEVELS
+    # The tier alias resolves to the current default, which takes effort.
+    assert effort_levels_for("haiku", HAIKU) == EFFORT_LEVELS
