@@ -630,11 +630,11 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
                 f"'effort_ceiling' must be a mapping of stage → one of {list(EFFORT_LEVELS)}"
             )
         for stage, ceiling in explicit.items():
-            base_level = stage_efforts.get(stage)
-            if base_level and EFFORT_LEVELS.index(ceiling) < EFFORT_LEVELS.index(base_level):
+            stage_base = stage_efforts.get(stage)
+            if stage_base and EFFORT_LEVELS.index(ceiling) < EFFORT_LEVELS.index(stage_base):
                 raise ValueError(
                     f"'effort_ceiling' for {stage!r} is {ceiling}, below its base "
-                    f"effort {base_level}"
+                    f"effort {stage_base}"
                 )
         ceilings.update(explicit)
         ceiling_overrides.update(explicit)
