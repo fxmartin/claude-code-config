@@ -353,6 +353,7 @@ def test_historical_tokens_backward_compat_null_rows(tmp_path: Path) -> None:
         ("claude-opus-5-5", "claude-opus-5-5"),
         ("claude-sonnet-5-5", "claude-sonnet-5-5"),
         ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),  # dated snapshot
+        ("claude-haiku-5-5", "claude-haiku-5-5"),
         ("haiku", HAIKU_ID),  # tier aliases resolve through the routing map
         ("sonnet", SONNET_ID),
         ("opus", _IDS[_O]),
@@ -366,11 +367,13 @@ def test_price_id_resolution(model, key) -> None:
 
 
 def test_table_has_per_id_rates_and_vintage() -> None:
-    assert PRICE_TABLE_VINTAGE == "2026-09-30"
+    assert PRICE_TABLE_VINTAGE == "2026-10-17"
     t = MODEL_USD_PER_MILLION_TOKENS
     assert (t["claude-opus-5-5"].input, t["claude-opus-5-5"].output) == (4, 20)
     assert (t["claude-sonnet-5"].input, t["claude-sonnet-5"].output) == (2, 10)
     assert (t["claude-haiku-4-5"].input, t["claude-haiku-4-5"].output) == (1, 5)
+    # Official pricing page, 2026-10-17: Haiku 5.5 up to 100k-token prompts.
+    assert t["claude-haiku-5-5"][:3] == (0.10, 0.50, 0.01)
     assert (t["claude-opus-5"].input, t["claude-opus-5"].output) == (5, 25)
     assert (t["claude-sonnet-4-6"].input, t["claude-sonnet-4-6"].output) == (3, 15)
     assert "claude-sonnet-5-5" in t
@@ -385,6 +388,29 @@ def test_usage_cost_prices_each_token_class_separately() -> None:
     assert cost == pytest.approx(4 + 20 + 0.20)  # cache read at the read rate
 
 
+def test_haiku_5_5_prices_both_prompt_length_tiers_and_keeps_the_4_5_row() -> None:
+    kwargs = dict(
+        input_tokens=1_000_000, output_tokens=1_000_000,
+        cache_read_tokens=1_000_000, cache_creation_tokens=1_000_000,
+    )
+    # <=100k prompt: 0.10 in, 0.50 out, 0.01 cache read, 0.125 5m cache write.
+    assert usage_cost("claude-haiku-5-5", **kwargs) == pytest.approx(0.10 + 0.50 + 0.01 + 0.125)
+    # >100k prompt: 0.50 / 2.50 / 0.05 / 0.625.
+    assert usage_cost("claude-haiku-5-5", long_prompt=True, **kwargs) == pytest.approx(
+        0.50 + 2.50 + 0.05 + 0.625
+    )
+    assert usage_cost("haiku", **kwargs) == usage_cost("claude-haiku-5-5", **kwargs)
+    # The retired-tier row stays so old ledger rows still price.
+    assert usage_cost("claude-haiku-4-5", **kwargs) == pytest.approx(1 + 5 + 0.10 + 1.25)
+
+
+def test_long_prompt_flag_is_a_noop_for_flat_priced_models() -> None:
+    kwargs = dict(input_tokens=1_000_000, output_tokens=1_000_000)
+    assert usage_cost("claude-sonnet-5-5", long_prompt=True, **kwargs) == usage_cost(
+        "claude-sonnet-5-5", **kwargs
+    )
+
+
 def test_usage_cost_unknown_id_uses_opus_default() -> None:
     kwargs = dict(input_tokens=500_000, output_tokens=100_000)
     assert usage_cost("gpt-6-astra", **kwargs) == usage_cost("claude-opus-5-5", **kwargs)
@@ -392,8 +418,8 @@ def test_usage_cost_unknown_id_uses_opus_default() -> None:
 
 
 def test_price_vintage_label_renders_figure_beside_vintage() -> None:
-    assert price_vintage_label(0.231) == "$0.231 · prices 2026-09-30"
-    assert price_vintage_label(12.5) == "$12.50 · prices 2026-09-30"
+    assert price_vintage_label(0.231) == "$0.231 · prices 2026-10-17"
+    assert price_vintage_label(12.5) == "$12.50 · prices 2026-10-17"
 
 
 def test_blended_rate_is_input_output_average() -> None:

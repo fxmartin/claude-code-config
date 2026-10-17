@@ -26,7 +26,7 @@ DEFAULT_USD_PER_MILLION_TOKENS = 15.0
 # Date the price table below was read from the published pricing page. Rendered
 # beside every `$` figure (dashboard run header, `sdlc status`) so a reader knows
 # which list prices produced it. Bump together with the table (Story 34.2-001).
-PRICE_TABLE_VINTAGE = "2026-09-30"
+PRICE_TABLE_VINTAGE = "2026-10-17"
 
 
 class ModelRate(NamedTuple):
@@ -35,6 +35,9 @@ class ModelRate(NamedTuple):
     input: float
     output: float
     cache_read: float
+    # The rate a request over :data:`LONG_PROMPT_TOKENS` pays, for models priced by
+    # prompt length (Haiku 5.5); None for the flat-priced rest.
+    long_prompt: ModelRate | None = None
 
 
 # Notional list-price equivalents keyed by exact model id (Story 34.2-001).
@@ -49,7 +52,14 @@ MODEL_USD_PER_MILLION_TOKENS: dict[str, ModelRate] = {
     "claude-sonnet-5": ModelRate(2.0, 10.0, 0.20),
     "claude-sonnet-4-6": ModelRate(3.0, 15.0, 0.30),
     "claude-haiku-4-5": ModelRate(1.0, 5.0, 0.10),
+    "claude-haiku-5-5": ModelRate(0.10, 0.50, 0.01, ModelRate(0.50, 2.50, 0.05)),
 }
+
+# A request whose prompt (input + cache reads + cache writes) exceeds this pays
+# the model's ``long_prompt`` rate. Stage ledger rows aggregate many requests, so
+# the notional figure prices at the short tier unless the caller knows better —
+# a lower bound for a model with a long tier.
+LONG_PROMPT_TOKENS = 100_000
 
 # The entry an unpriced id (Codex free-form ids, a future model) costs at.
 FALLBACK_PRICE_ID = "claude-opus-5-5"
@@ -74,9 +84,14 @@ def price_id(model: str | None) -> str | None:
     return max(matches, key=len) if matches else None
 
 
-def model_rate(model: str | None) -> ModelRate:
-    """The list rate for ``model``, falling back to the opus default if unpriced."""
-    return MODEL_USD_PER_MILLION_TOKENS[price_id(model) or FALLBACK_PRICE_ID]
+def model_rate(model: str | None, *, long_prompt: bool = False) -> ModelRate:
+    """The list rate for ``model``, falling back to the opus default if unpriced.
+
+    ``long_prompt`` selects the over-:data:`LONG_PROMPT_TOKENS` tier where the
+    model has one; flat-priced models ignore it.
+    """
+    rate = MODEL_USD_PER_MILLION_TOKENS[price_id(model) or FALLBACK_PRICE_ID]
+    return rate.long_prompt if long_prompt and rate.long_prompt else rate
 
 
 def blended_usd_per_million(model: str | None) -> float:
@@ -92,9 +107,10 @@ def usage_cost(
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
+    long_prompt: bool = False,
 ) -> float:
     """Notional dollars for one stage usage row, each token class at its own rate."""
-    rate = model_rate(model)
+    rate = model_rate(model, long_prompt=long_prompt)
     usd = (
         input_tokens * rate.input
         + output_tokens * rate.output
@@ -105,7 +121,7 @@ def usage_cost(
 
 
 def price_vintage_label(cost_usd: float) -> str:
-    """``$0.231 · prices 2026-09-30`` — a `$` figure stamped with its price table."""
+    """``$0.231 · prices 2026-10-17`` — a `$` figure stamped with its price table."""
     digits = 3 if cost_usd < 1 else 2
     return f"${cost_usd:.{digits}f} · prices {PRICE_TABLE_VINTAGE}"
 
