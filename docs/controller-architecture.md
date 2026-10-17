@@ -1333,7 +1333,8 @@ model, and the report must not let it read as one.
 ### Off by default, safe to roll out
 
 `--predict` (persisted in the run config, so a resume keeps the posture) enables
-the whole path. Without it the controller behaves exactly as today — the 14.1-002
+the whole path — as does `predict: true` in the repo's `.sdlc-model-routing.yaml`
+(Story 34.5-002; see *Repo-level `predict` and calibrated bars* below). Without it the controller behaves exactly as today — the 14.1-002
 stage estimate and gate, unchanged — and logs a note saying so **once per run**
 (`_log_predictor_posture`, at run start). Per run, not per story: the posture is a
 property of the run, and the flag is off by default, so a per-story note would add
@@ -4239,6 +4240,29 @@ documented $15/Mtok rate) marks a story forecast to sit in the heavy tail of the
 factory's own story totals; an even-odds rework forecast means the cheap tier is
 more likely than not to pay for a retry. The per-repo override is the
 calibration lever as a repo's own reconciled history accumulates.
+
+#### Repo-level `predict` and calibrated bars (Story 34.5-002)
+
+`--predict` used to exist only as a CLI flag, and a queue/fleet job replays a
+frozen flag vector that never carries it — so a fleet build silently ran the
+points-keyed fallback. `model_routing: {predict: true}` in
+`.sdlc-model-routing.yaml` now turns prediction on for every build of the repo.
+`resolve_predict` (called at the top of `run_build`) settles it once:
+`--predict` / `--no-predict` > the repo file > off, and the routing banner prints
+the winner (`model routing: prediction on (from .sdlc-model-routing.yaml)`). A
+repo with no routing file, or one without the key, behaves exactly as before; a
+resume replays the `predict` its run persisted rather than re-resolving.
+
+The bars themselves are fitted by `sdlc routing calibrate` (`calibrate.py`), an
+operator command rather than something a build computes, because each host's
+ledger holds only its own history. It merges the reconciled stories of every
+`--ledger` (the `prediction_training_rows` reader the predictor trains on),
+deduplicates by `(run_id, story_id)`, and drops runs whose `config` event stamped
+a different `origin` than the current repo's (a run that stamped none — one
+predating this story — is kept). `predicted_tokens_threshold` is the p75 of actual
+story-total tokens; `rework_threshold` is twice the observed rework rate, clamped
+to [0.05, 0.95]. Fewer than `MIN_GLOBAL_SAMPLE` stories → "no sample", exit 1,
+nothing written.
 
 The plumbing: `_predict_story_cost` (the shared build/resume pre-dispatch hook)
 mirrors whichever forecast governs the story — a fresh prediction, or the

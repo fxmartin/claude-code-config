@@ -466,7 +466,11 @@ Flags:
                             fit; each falls back to the point-keyed estimate,
                             logged, when no usable prediction exists. Off by
                             default (stage estimates then use the 14.1-002
-                            heuristic); score it with `sdlc predict-quality`
+                            heuristic) unless the repo's .sdlc-model-routing.yaml
+                            sets `predict: true` (the routing banner says which);
+                            score it with `sdlc predict-quality`
+  --no-predict              switch prediction off for this run, beating a
+                            repo-level `predict: true`
 """
 
 
@@ -2297,6 +2301,84 @@ def predict_quality(
         )
     if report.versions:
         typer.echo(f"predictor version(s) in sample: {', '.join(report.versions)}")
+    raise typer.Exit(code=0)
+
+
+# --- `sdlc routing` command group (Story 34.5-002) --------------------------
+routing_app = typer.Typer(
+    name="routing",
+    help="Model-routing tooling (escalation-threshold calibration).",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(routing_app, name="routing")
+
+
+@routing_app.command(name="calibrate")
+def routing_calibrate(
+    ledger: list[Path] = typer.Option(
+        [], "--ledger",
+        help="A ledger (.sdlc-state.db) to merge, repeatable — e.g. a copy of each "
+        "host's. Stories are deduplicated by run id + story id.",
+    ),
+    write: bool = typer.Option(
+        False, "--write",
+        help="Write the two bars into the routing file with a dated comment.",
+    ),
+    file: Path = typer.Option(
+        Path(".sdlc-model-routing.yaml"), "--file",
+        help="Routing file --write updates (default: ./.sdlc-model-routing.yaml).",
+    ),
+) -> None:
+    """Propose `predicted_tokens_threshold` / `rework_threshold` from real history.
+
+    Merges the reconciled stories (DONE, usage measured) of every `--ledger`,
+    scoped to this repo's origin, and prints the sample size, the p75 of actual
+    story-total tokens, the observed rework rate and the YAML to adopt. Below the
+    predictor's `MIN_GLOBAL_SAMPLE` it reports "no sample", exits 1 and `--write`
+    leaves the file untouched.
+    """
+    from datetime import UTC, datetime
+
+    from sdlc.calibrate import calibrate, load_sample, write_thresholds
+    from sdlc.queue_client import _repo_origin
+
+    if not ledger:
+        typer.echo("error: pass at least one --ledger PATH", err=True)
+        raise typer.Exit(code=2)
+    missing = [str(p) for p in ledger if not p.is_file()]
+    if missing:
+        typer.echo(f"error: no such ledger: {', '.join(missing)}", err=True)
+        raise typer.Exit(code=2)
+
+    sample = load_sample(ledger, origin=_repo_origin(str(Path.cwd())))
+    result = calibrate(sample)
+    if result is None:
+        from sdlc.predictor import MIN_GLOBAL_SAMPLE
+
+        typer.echo(
+            f"no sample: {len(sample.rows)} reconciled stories across "
+            f"{sample.ledgers} ledger(s), need at least {MIN_GLOBAL_SAMPLE}; "
+            "nothing written."
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"sample: {result.sample_size} reconciled stories from {sample.ledgers} "
+        f"ledger(s) ({sample.duplicates} duplicate(s), "
+        f"{sample.out_of_scope} from other origins dropped)"
+    )
+    typer.echo(f"p75 actual story tokens: {result.p75_tokens:,}")
+    typer.echo(f"rework rate: {result.rework_rate:.0%}")
+    typer.echo("proposed:")
+    typer.echo(result.proposed_yaml().rstrip("\n"))
+    if write:
+        try:
+            write_thresholds(file, result, ledgers=ledger, today=datetime.now(UTC).date())
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+        typer.echo(f"wrote {file}")
     raise typer.Exit(code=0)
 
 

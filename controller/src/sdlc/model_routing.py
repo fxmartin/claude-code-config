@@ -483,7 +483,10 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
       escalation bar (Story 28.3-001);
     * ``escalation_model`` — the model a stage escalates / is pinned to;
     * ``effort`` — a mapping of stage → effort level (``low``…``max``), merged
-      over the base profile's per-stage efforts (Story 34.4-001).
+      over the base profile's per-stage efforts (Story 34.4-001);
+    * ``predict`` — a boolean that turns the per-story predictor on for every
+      build of the repo (Story 34.5-002). It is validated here but read by
+      :func:`repo_predict_setting`, since it is a build option, not routing.
 
     The override is additive: any stage it omits keeps the base profile's value,
     so a repo can tune a single stage without restating the whole map. A
@@ -541,6 +544,8 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
             raise ValueError("'rework_threshold' must be a number")
         rework_threshold = float(raw_rework)
 
+    _check_predict(section)
+
     escalation_model = cfg.escalation_model
     if "escalation_model" in section:
         if not isinstance(section["escalation_model"], str):
@@ -567,6 +572,38 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
         rework_threshold=rework_threshold,
         escalation_model=escalation_model,
     )
+
+
+def _check_predict(section: dict) -> None:
+    if "predict" in section and not isinstance(section["predict"], bool):
+        raise ValueError("'predict' must be true or false")
+
+
+def repo_predict_setting(
+    override_path: Path | None = None, *, text: str | None = None
+) -> bool | None:
+    """The repo's ``predict`` switch from its routing override, or ``None`` if unset.
+
+    Story 34.5-002: ``--predict`` was only ever a CLI flag, so a fleet job — which
+    replays a frozen flag vector — never carried it. The routing file travels with
+    the checkout, so a ``predict: true`` there reaches local and queued builds
+    alike. ``None`` (no file, no key) leaves the build option untouched. A present
+    but malformed file or a non-boolean value is a hard error, like every other
+    key in the file.
+    """
+    if text is None and override_path is not None and override_path.is_file():
+        text = override_path.read_text(encoding="utf-8")
+    if text is None:
+        return None
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"model-routing override is not valid YAML: {exc}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get(ROUTING_KEY), dict):
+        raise ValueError(f"override must define a top-level {ROUTING_KEY!r} mapping")
+    section = raw[ROUTING_KEY]
+    _check_predict(section)
+    return section.get("predict")
 
 
 def load_routing_config(
@@ -621,6 +658,8 @@ def routing_snapshot(
     *,
     overrides: dict[str, str] | None = None,
     agent_cmd: str | None = None,
+    predict: bool | None = None,
+    predict_source: str | None = None,
 ) -> dict:
     """Freeze ``config`` (plus its overrides) into a JSON-able routing snapshot.
 
@@ -629,16 +668,22 @@ def routing_snapshot(
     over the map and are therefore merged into ``stage_models`` so the snapshot
     states the *effective* model each stage starts on; ``agent_cmd`` records a
     ``SDLC_AGENT_CMD`` override so the banner can say the whole command was
-    replaced. A routing-off snapshot keeps an empty map and an explicit ``off``
+    replaced; ``predict`` / ``predict_source`` record whether prediction is on and
+    where that came from (Story 34.5-002), omitted when not stated so a legacy
+    snapshot shape is unchanged. A routing-off snapshot keeps an empty map and an explicit ``off``
     profile — never an absent key, so "off" is always a stated fact.
     """
     overrides = dict(overrides or {})
+    stated: dict = {}
+    if predict_source:
+        stated = {"predict": bool(predict), "predict_source": predict_source}
     if config is None:
         return {
             "profile": OFF,
             "stage_models": {},
             "overrides": overrides,
             "agent_cmd": agent_cmd or "",
+            **stated,
         }
     stage_models = dict(config.stage_models)
     stage_models.update(overrides)
@@ -654,6 +699,7 @@ def routing_snapshot(
         "pinned_stages": sorted(config.pinned_stages),
         "overrides": overrides,
         "agent_cmd": agent_cmd or "",
+        **stated,
     }
 
 
@@ -777,6 +823,11 @@ def routing_banner(snapshot: dict) -> list[str]:
                 f"model routing: pinned to {snapshot.get('escalation_model')}: "
                 f"{','.join(pinned)}"
             )
+    if snapshot.get("predict_source"):
+        state = "on" if snapshot.get("predict") else "off"
+        lines.append(
+            f"model routing: prediction {state} (from {snapshot['predict_source']})"
+        )
     overrides = snapshot.get("overrides") or {}
     if overrides:
         pins = " ".join(f"{s}={m}" for s, m in sorted(overrides.items()))
