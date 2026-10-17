@@ -9467,6 +9467,7 @@ def _run_story(
                 effort=effort_choice.level,
             )
             _log_effort_omission(ledger, run_id, story.id, effort_choice)
+            _log_effort_held(ledger, run_id, story.id, effort_choice)
             tpath = logs_dir / f"{story.id}-{stage}-{attempt}.log"
             sink = _make_progress_sink(ledger, run_id, story.id, stage, attempt)
             # Story 14.1-002: estimate this stage's usage before dispatch, record
@@ -10472,6 +10473,14 @@ def _resolved_stage_effort(
         reason=f"effort {choice.level} omitted for {stage}: {owner} does not "
         "declare effort_aware"
     )
+
+
+def _log_effort_held(
+    ledger: Ledger, run_id: str, story_id: str, choice: EffortChoice
+) -> None:
+    """Say at ``info`` that the stage's effort ceiling held a retry's climb back."""
+    if choice.held:
+        ledger.event_log(run_id, story_id, "info", "controller", choice.held)
 
 
 def _log_effort_omission(
@@ -11744,6 +11753,7 @@ def _run_bugfix_round(
         effort=effort_choice.level,
     )
     _log_effort_omission(ledger, run_id, story.id, effort_choice)
+    _log_effort_held(ledger, run_id, story.id, effort_choice)
     out = str(transcript_path) if transcript_path is not None else ""
     pre_round_sha = (
         _remote_tracking_sha(root, f"feature/{story.id}") if root is not None else None

@@ -235,13 +235,15 @@ def test_escalate_effort_climbs_and_caps() -> None:
     assert escalate_effort(None, 2) is None
 
 
-def test_retry_climbs_effort_with_tier_and_event_names_both(tmp_path, monkeypatch) -> None:
+def test_retry_effort_is_held_at_ceiling_and_event_names_both(tmp_path, monkeypatch) -> None:
+    # Story 34.5-003: build's ceiling is `high`, so the retry's model climbs but
+    # its effort does not (the climb itself is covered in test_effort_ceiling.py).
     disp = _Dispatcher(fail_build_once=True)
     _run(tmp_path, monkeypatch, disp)
     build_efforts = [e for (a, _m, e) in disp.calls if a == "build"]
-    assert build_efforts == ["high", "xhigh"]
+    assert build_efforts == ["high", "high"]
     events = [m for (m,) in _rows(tmp_path, "SELECT message FROM events")]
-    assert any("escalated to" in m and "model=" in m and "effort=xhigh" in m for m in events)
+    assert any("escalated to" in m and "model=" in m and "effort=high" in m for m in events)
 
 
 # --- non-claude harness -----------------------------------------------------

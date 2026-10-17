@@ -75,6 +75,23 @@ BALANCED_STAGE_EFFORT: dict[str, str] = {
     "merge": "medium",
     "bugfix": "high",
 }
+
+# Story 34.5-003: the highest level each stage's retry escalation may reach. A
+# stage that keeps failing climbs to a stronger *model* (escalate_model), not to
+# `max` effort on Opus — one stuck review once cost more than the story it was
+# reviewing. Every ceiling sits at or above the stage's base effort above.
+BALANCED_EFFORT_CEILING: dict[str, str] = {
+    "discovery": "medium",
+    "docs": "medium",
+    "coverage": "medium",
+    "build": "high",
+    "review": "xhigh",
+    "merge": "medium",
+    "bugfix": "xhigh",
+}
+# Where a held-back event says a ceiling came from.
+CEILING_SOURCE_DEFAULT = "default"
+CEILING_SOURCE_FILE = ".sdlc-model-routing.yaml"
 # Current-generation id → previous-generation id (Story 34.1-002). Used twice:
 # when the live entitlement probe finds the current id unusable on this host, the
 # tier resolves to the fallback instead; and when the probe succeeds the fallback
@@ -212,6 +229,12 @@ class ModelRoutingConfig:
     # Story 34.4-001: stage → `--effort` level. A stage absent here gets no flag
     # (CLI default), so only profiles that opt in change today's argv.
     stage_efforts: dict[str, str] = field(default_factory=dict)
+    # Story 34.5-003: stage → highest level retry escalation may climb to. A stage
+    # absent here is uncapped (today's behaviour). ``effort_ceiling_overrides``
+    # names the stages whose ceiling came from `.sdlc-model-routing.yaml`, so the
+    # held-back event can say where the bound was set.
+    effort_ceilings: dict[str, str] = field(default_factory=dict)
+    effort_ceiling_overrides: frozenset[str] = frozenset()
 
 
 # --- Built-in profiles ------------------------------------------------------
@@ -236,6 +259,7 @@ BALANCED = ModelRoutingConfig(
     },
     points_threshold=8,
     stage_efforts=dict(BALANCED_STAGE_EFFORT),
+    effort_ceilings=dict(BALANCED_EFFORT_CEILING),
 )
 
 QUALITY_FIRST = ModelRoutingConfig(
@@ -429,11 +453,20 @@ def tier_of(model: str | None) -> str | None:
     return None
 
 
-def escalate_effort(effort: str | None, steps: int) -> str | None:
-    """Climb ``effort`` ``steps`` levels, capped at ``max`` (Story 34.4-001)."""
+def escalate_effort(
+    effort: str | None, steps: int, ceiling: str | None = None
+) -> str | None:
+    """Climb ``effort`` ``steps`` levels, capped at ``ceiling`` (default ``max``).
+
+    Story 34.4-001 introduced the climb; Story 34.5-003 added the per-stage
+    ``ceiling`` so a stage that keeps failing is not driven to ``max`` effort.
+    """
     if effort is None or steps <= 0 or effort not in EFFORT_LEVELS:
         return effort
-    return EFFORT_LEVELS[min(EFFORT_LEVELS.index(effort) + steps, len(EFFORT_LEVELS) - 1)]
+    top = len(EFFORT_LEVELS) - 1
+    if ceiling in EFFORT_LEVELS:
+        top = min(top, EFFORT_LEVELS.index(ceiling))
+    return EFFORT_LEVELS[min(EFFORT_LEVELS.index(effort) + steps, top)]
 
 
 @dataclass(frozen=True)
@@ -447,6 +480,9 @@ class EffortChoice:
 
     level: str | None = None
     reason: str = ""
+    # Story 34.5-003: set when the stage's ceiling held the climb back; the event
+    # text the caller logs at ``info``. Empty on every dispatch the ceiling spared.
+    held: str = ""
 
 
 def select_effort(
@@ -468,7 +504,9 @@ def select_effort(
     base = config.stage_efforts.get(stage)
     if base is None:
         return EffortChoice()
-    level = escalate_effort(base, escalation_steps)
+    ceiling = config.effort_ceilings.get(stage)
+    wanted = escalate_effort(base, escalation_steps)
+    level = escalate_effort(base, escalation_steps, ceiling)
     tier = tier_of(model)
     if tier is None:
         return EffortChoice(
@@ -481,7 +519,18 @@ def select_effort(
             reason=f"effort {level} omitted for {stage}: {model} does not "
             + ("support effort" if not supported else f"support level {level}")
         )
-    return EffortChoice(level=level)
+    held = ""
+    if level != wanted:
+        source = (
+            CEILING_SOURCE_FILE
+            if stage in config.effort_ceiling_overrides
+            else CEILING_SOURCE_DEFAULT
+        )
+        held = (
+            f"effort held at {level} for {stage} (would have been {wanted}; "
+            f"ceiling from {source})"
+        )
+    return EffortChoice(level=level, held=held)
 
 
 def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
@@ -499,6 +548,9 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
     * ``escalation_model`` — the model a stage escalates / is pinned to;
     * ``effort`` — a mapping of stage → effort level (``low``…``max``), merged
       over the base profile's per-stage efforts (Story 34.4-001);
+    * ``effort_ceiling`` — a mapping of stage → the highest effort level retry
+      escalation may reach, merged over the profile's ceilings; a ceiling below
+      the stage's base effort is rejected (Story 34.5-003);
     * ``predict`` — a boolean that turns the per-story predictor on for every
       build of the repo (Story 34.5-002). It is validated here but read by
       :func:`repo_predict_setting`, since it is a build option, not routing.
@@ -578,9 +630,40 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
             )
         stage_efforts.update(efforts)
 
+    # Story 34.5-003: an operator who raises a stage's base effort above its
+    # *default* ceiling has asked for that level, so the default follows it up
+    # rather than silently clamping the base. An explicit ceiling never does.
+    ceilings = dict(cfg.effort_ceilings)
+    ceiling_overrides = set(cfg.effort_ceiling_overrides)
+    for stage, base_level in stage_efforts.items():
+        current = ceilings.get(stage)
+        if current and stage not in ceiling_overrides and (
+            EFFORT_LEVELS.index(current) < EFFORT_LEVELS.index(base_level)
+        ):
+            ceilings[stage] = base_level
+    explicit = section.get("effort_ceiling", {})
+    if explicit:
+        if not isinstance(explicit, dict) or not all(
+            isinstance(k, str) and v in EFFORT_LEVELS for k, v in explicit.items()
+        ):
+            raise ValueError(
+                f"'effort_ceiling' must be a mapping of stage → one of {list(EFFORT_LEVELS)}"
+            )
+        for stage, ceiling in explicit.items():
+            stage_base = stage_efforts.get(stage)
+            if stage_base and EFFORT_LEVELS.index(ceiling) < EFFORT_LEVELS.index(stage_base):
+                raise ValueError(
+                    f"'effort_ceiling' for {stage!r} is {ceiling}, below its base "
+                    f"effort {stage_base}"
+                )
+        ceilings.update(explicit)
+        ceiling_overrides.update(explicit)
+
     return replace(
         cfg,
         stage_efforts=stage_efforts,
+        effort_ceilings=ceilings,
+        effort_ceiling_overrides=frozenset(ceiling_overrides),
         stage_models=stage_models,
         points_threshold=threshold,
         predicted_tokens_threshold=tokens_threshold,
@@ -710,6 +793,8 @@ def routing_snapshot(
         "rework_threshold": config.rework_threshold,
         "escalation_model": config.escalation_model,
         "stage_efforts": dict(config.stage_efforts),
+        "effort_ceilings": dict(config.effort_ceilings),
+        "effort_ceiling_overrides": sorted(config.effort_ceiling_overrides),
         "escalatable_stages": sorted(config.escalatable_stages),
         "pinned_stages": sorted(config.pinned_stages),
         "overrides": overrides,
@@ -764,6 +849,12 @@ def config_from_snapshot(snapshot: dict | None) -> ModelRoutingConfig | None:
         stage_efforts={
             str(k): str(v) for k, v in (snapshot.get("stage_efforts") or {}).items()
         },
+        # A snapshot frozen before Story 34.5-003 carries no ceilings; it replays
+        # uncapped so a resumed run climbs exactly as it did when it started.
+        effort_ceilings={
+            str(k): str(v) for k, v in (snapshot.get("effort_ceilings") or {}).items()
+        },
+        effort_ceiling_overrides=frozenset(snapshot.get("effort_ceiling_overrides") or ()),
         escalatable_stages=(
             frozenset(escalatable) if escalatable is not None
             else BALANCED.escalatable_stages
@@ -793,6 +884,21 @@ def _banner_entry(stage: str, model: str, effort: str | None) -> str:
     if effort and tier and effort in effort_levels_for(model, tier):
         return f"{stage}={resolve_model_id(model)}@{effort}"
     return f"{stage}={_with_model_id(model)}"
+
+
+def format_effort_bounds(snapshot: dict) -> str:
+    """``build high→high review xhigh→xhigh …`` — each stage's base→ceiling effort.
+
+    Empty when the snapshot maps no efforts. A stage with no ceiling reads
+    ``→max``: that is the real bound, so the line states what a retry can reach
+    before any money is spent (Story 34.5-003).
+    """
+    efforts = snapshot.get("stage_efforts") or {}
+    ceilings = snapshot.get("effort_ceilings") or {}
+    return " ".join(
+        f"{stage} {base}→{ceilings.get(stage, EFFORT_LEVELS[-1])}"
+        for stage, base in sorted(efforts.items())
+    )
 
 
 def routing_banner(snapshot: dict) -> list[str]:
@@ -832,6 +938,9 @@ def routing_banner(snapshot: dict) -> list[str]:
             "predictor fallback: points >= "
             f"{snapshot.get('points_threshold')})",
         ]
+        bounds = format_effort_bounds(snapshot)
+        if bounds:
+            lines.append(f"model routing: effort base→ceiling {bounds}")
         pinned = snapshot.get("pinned_stages") or []
         if pinned:
             lines.append(
