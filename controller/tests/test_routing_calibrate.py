@@ -217,6 +217,18 @@ def test_write_creates_a_missing_file(tmp_path: Path) -> None:
     assert yaml.safe_load(target.read_text())["model_routing"]["predicted_tokens_threshold"] == 100
 
 
+def test_write_refuses_a_file_without_a_routing_block(tmp_path: Path) -> None:
+    target = tmp_path / ".sdlc-model-routing.yaml"
+    target.write_text("predict: true\n")
+    db = tmp_path / "x.db"
+    _ledger(db, _stories("s", [100] * 12))
+    result = calibrate(load_sample([db], origin=None))
+    assert result is not None
+    with pytest.raises(ValueError, match="no block-style"):
+        write_thresholds(target, result, ledgers=[db], today=date(2026, 10, 17))
+    assert target.read_text() == "predict: true\n"
+
+
 # --- CLI -------------------------------------------------------------------
 
 
