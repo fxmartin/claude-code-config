@@ -185,7 +185,8 @@ Claude Code). The plugin half needs a Claude Code restart to take effect.
 | `sdlc clean` · `sdlc repair` · `sdlc rollback` · `sdlc reconcile` | Workspace GC · ledger repair · checkpoint unwind · terminal-status reconciliation vs `origin/main` |
 | `sdlc usage-reconcile [--all]` | Backfill per-stage token/cost usage from the session logs and score ledger-vs-logs agreement (`sdlc doctor` reports the rate) |
 | `sdlc model-backfill [--all]` | Backfill per-stage model attribution (`stages.model`) from the session logs; unrecoverable rows are counted, never coerced (`sdlc doctor` reports the coverage) |
-| `sdlc predict-quality [run] [--json]` | Score the per-story predictions `sdlc build --predict` recorded against their reconciled actuals — median absolute token error + rework calibration, each with its sample size |
+| `sdlc predict-quality [run] [--json]` | Score the per-story predictions `sdlc build --predict` (or the repo's `predict: true`) recorded against their reconciled actuals — median absolute token error + rework calibration, each with its sample size |
+| `sdlc routing calibrate --ledger PATH [--ledger PATH ...] [--write]` | Propose the escalation bars (`predicted_tokens_threshold` = p75 of actual story-total tokens, `rework_threshold` = twice the observed rework rate) from the reconciled stories of one or more ledgers, scoped to this repo's origin and deduplicated by run + story id. Below the predictor's sample floor it reports "no sample" and exits non-zero; `--write` records the two keys, with a dated comment, in the root `.sdlc-model-routing.yaml` |
 | `sdlc sast` · `sdlc depscan` · `sdlc supplychain` | Classify SAST/dependency scan reports · scan hooks/skills/MCP/settings for dangerous patterns — all exit non-zero on `BLOCK` for CI gating |
 | `sdlc typecheck` | Gate a mypy report against `controller/.mypy-baseline.json` — new type violations `BLOCK`, the known backlog does not. Driven by `scripts/run-type-check.sh`; ladder documented in [`docs/python-best-practices.md`](docs/python-best-practices.md) |
 | `sdlc eval` · `sdlc eval-compare` · `sdlc eval-baseline` | Agent-output evaluation harness (A/B, regression baselines) |
@@ -193,6 +194,26 @@ Claude Code). The plugin half needs a Claude Code restart to take effect.
 | `sdlc sync-check <src> <dst>` | Verify shared-skills parity between repos |
 
 `sdlc build` accepts the same arguments as `/build-stories` — the skill simply shells out to it. Migration is invisible to end users.
+
+#### Calibrating the escalation thresholds (operator step)
+
+This repo's `.sdlc-model-routing.yaml` sets `predict: true`, so every `sdlc build`
+— local, or a queue/fleet job that never carries `--predict` — runs the predictor
+and the routing banner says where the setting came from. `--predict` /
+`--no-predict` still wins for one run. Opus is then paid only where a confident
+forecast crosses `predicted_tokens_threshold` / `rework_threshold`. Each host keeps
+its own ledger, so the bars are fitted by an operator, not by a build:
+
+```bash
+# Copy ~/Work/claude-code-config/.sdlc-state.db from the XPS, home-lab and M3 Max
+# next to each other, then from the repo root:
+sdlc routing calibrate --ledger xps.db --ledger home-lab.db --ledger m3max.db
+sdlc routing calibrate --ledger xps.db --ledger home-lab.db --ledger m3max.db --write
+```
+
+Record the printed sample size, p75 and rework rate as a dated section in
+[`docs/optimization/BASELINE.md`](docs/optimization/BASELINE.md), and commit the
+updated `.sdlc-model-routing.yaml`.
 
 #### Agent I/O contracts
 

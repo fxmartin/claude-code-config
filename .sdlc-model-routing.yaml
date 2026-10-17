@@ -1,0 +1,11 @@
+# Per-repo model-routing override (Story 14.2-001), read by every `sdlc build`.
+#
+# predict: true turns the per-story predictor on for every build of this repo —
+# local, queued or fleet — without a --predict flag (decided 2026-10-16). The CLI
+# still wins: `--no-predict` switches it off for one run. The routing banner says
+# where the setting came from.
+#
+# The escalation bars (predicted_tokens_threshold / rework_threshold) are set by
+# the operator step in the README: `sdlc routing calibrate --ledger ... --write`.
+model_routing:
+  predict: true
