@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.110.0] - 2026-10-17
+
+### Added
+
+- feat(current-generation-models): effort escalation stops (#34.5-003)
+
+### Fixed
+
+- fix(current-generation-models): effort escalation stops at (#34.5-003)
+
+
 ## [v2.109.0] - 2026-10-17
 
 ### Added
