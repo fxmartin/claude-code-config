@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sdlc.build import Ledger
-from sdlc.model_routing import BALANCED, is_routing_off
+from sdlc.model_routing import BALANCED, format_effort_bounds, is_routing_off
 
 __all__ = [
     "state_report", "format_state", "format_markdown", "format_routing", "format_preflight",
@@ -132,6 +132,9 @@ def format_routing(routing: dict) -> list[str]:
         f"fallback: points ≥ {routing.get('points_threshold')}).",
         "",
     ]
+    bounds = format_effort_bounds(routing)
+    if bounds:
+        lines.extend([f"Effort base→ceiling: {bounds}.", ""])
     overrides = routing.get("overrides") or {}
     if overrides:
         pins = " ".join(f"{s}={m}" for s, m in sorted(overrides.items()))

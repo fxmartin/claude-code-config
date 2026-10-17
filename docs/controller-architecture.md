@@ -4355,8 +4355,30 @@ event giving the reason when the routed model takes no `effort` (Haiku 4.5), the
 model is not a known tier, or the stage's harness does not declare
 `effort_aware: true` (codex and every other registry harness, and an
 `SDLC_AGENT_CMD` override, which owns its own command). On a cheap-first retry the
-level climbs one step per escalation step (`escalate_effort`, capped at `max`) and
-the escalation event names both the model and the effort.
+level climbs one step per escalation step (`escalate_effort`) and the escalation
+event names both the model and the effort.
+
+#### Effort ceiling (Story 34.5-003)
+
+The climb stops at a per-stage ceiling, so a stage that keeps failing retries on a
+stronger *model* (Haiku → Sonnet → Opus, unchanged) instead of climbing to Opus at
+`max` effort. Balanced defaults: `xhigh` for review and bugfix, `high` for build,
+`medium` for discovery, docs, coverage and merge. Override per repo in
+`.sdlc-model-routing.yaml`:
+
+```yaml
+model_routing:
+  effort_ceiling: {review: max}   # any stage → low | medium | high | xhigh | max
+```
+
+An unknown level, or a ceiling below the stage's base effort, is rejected when
+routing loads. Raising a stage's base `effort:` above its *default* ceiling lifts
+that default to match. When a ceiling holds a retry back the dispatch logs
+`effort held at xhigh for review (would have been max; ceiling from default)`
+(`default` or `.sdlc-model-routing.yaml`). The run-start banner and the
+`sdlc status --markdown` handoff print each stage's `base→ceiling`
+(`review xhigh→xhigh`, `build high→high`). A run whose frozen snapshot predates
+the ceilings replays uncapped, and a profile with no effort map has none.
 
 ### Live entitlement probe and previous-generation fallback (Story 34.1-002)
 
