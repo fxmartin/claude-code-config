@@ -119,7 +119,7 @@ def test_banner_is_printed_and_ledger_logged(tmp_path, monkeypatch, capsys) -> N
     events = _routing_events(ledger, rid)
     joined = "\n".join(m for _, m in events)
     assert "model routing: profile=balanced" in joined
-    assert "merge=haiku" in joined                       # the per-stage map
+    assert "merge=claude-haiku-5-5@medium" in joined     # the per-stage map
     assert "escalation → opus" in joined                 # the thresholds in effect
     assert "points >= 8" in joined
     assert all(level == "info" for level, _ in events)

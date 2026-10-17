@@ -27,10 +27,10 @@ TIER_LADDER: tuple[str, ...] = (HAIKU, SONNET, OPUS)
 # profiles keep speaking in tiers; the alias is resolved to an id only at the
 # point it leaves the routing layer (see :func:`resolve_model_id`), so a ledger
 # row and the `claude --model` argv name the precise model a stage ran on.
-# Vintage: 2026-09-30. Bump here (and the README routing table) on a new
+# Vintage: 2026-10-17. Bump here (and the README routing table) on a new
 # generation.
 TIER_MODEL_IDS: dict[str, str] = {
-    HAIKU: "claude-haiku-4-5",
+    HAIKU: "claude-haiku-5-5",
     SONNET: "claude-sonnet-5-5",
     OPUS: "claude-opus-5-5",
 }
@@ -40,14 +40,29 @@ TIER_MODEL_IDS: dict[str, str] = {
 # tier, capped at `max`.
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
-# Levels each tier's model accepts (Anthropic thinking/effort table). Haiku 4.5
-# has no `effort` parameter at all, so the flag is omitted rather than risking a
-# CLI error. Fable is deliberately absent — it is not a routed tier.
+# Levels each tier's current model accepts (Anthropic effort page; Haiku 5.5
+# takes all five, verified 2026-10-17). Fable is deliberately absent — it is not
+# a routed tier.
 TIER_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
-    HAIKU: (),
+    HAIKU: EFFORT_LEVELS,
     SONNET: EFFORT_LEVELS,
     OPUS: EFFORT_LEVELS,
 }
+
+# Haiku 4.5 has no `effort` parameter at all, so the flag is omitted rather than
+# risking a CLI error. It is no longer a tier default, but it still runs when the
+# probe degrades the haiku tier to it (or a repo pins it), so the check is by
+# model id, not tier.
+NO_EFFORT_MODEL_IDS: tuple[str, ...] = ("claude-haiku-4-5",)
+
+
+def effort_levels_for(model: str | None, tier: str) -> tuple[str, ...]:
+    """The effort levels ``model`` (a tier alias or id) accepts; ``()`` for none."""
+    resolved = (resolve_model_id(model) or "").lower()
+    if any(resolved.startswith(no_effort) for no_effort in NO_EFFORT_MODEL_IDS):
+        return ()
+    return TIER_EFFORT_LEVELS[tier]
+
 
 # Balanced per-stage effort: mechanical stages low, build high, review xhigh so
 # Opus 5.5's `medium` default never silently under-thinks a review.
@@ -84,7 +99,7 @@ CEILING_SOURCE_FILE = ".sdlc-model-routing.yaml"
 TIER_FALLBACK_IDS: dict[str, str] = {
     "claude-opus-5-5": "claude-opus-5",
     "claude-sonnet-5-5": "claude-sonnet-5",
-    "claude-haiku-4-5": "claude-haiku-4-5",
+    "claude-haiku-5-5": "claude-haiku-4-5",
 }
 
 # Process-wide result of this run's entitlement probe (see ``sdlc.model_probe``).
@@ -481,7 +496,7 @@ def select_effort(
 
     The mapped level is climbed ``escalation_steps`` levels (the cheap-first retry
     lever, in step with :func:`escalate_model`) and then checked against what
-    ``model``'s tier accepts. A model that does not support it — Haiku 4.5 has no
+    ``model`` accepts. A model that does not support it — Haiku 4.5 has no
     ``effort`` — or one the router cannot identify yields no level plus a reason.
     """
     if config is None:
@@ -498,7 +513,7 @@ def select_effort(
             reason=f"effort {level} omitted for {stage}: model {model or 'cli-default'} "
             "is not a known tier"
         )
-    supported = TIER_EFFORT_LEVELS[tier]
+    supported = effort_levels_for(model, tier)
     if level not in supported:
         return EffortChoice(
             reason=f"effort {level} omitted for {stage}: {model} does not "
@@ -535,7 +550,10 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
       over the base profile's per-stage efforts (Story 34.4-001);
     * ``effort_ceiling`` — a mapping of stage → the highest effort level retry
       escalation may reach, merged over the profile's ceilings; a ceiling below
-      the stage's base effort is rejected (Story 34.5-003).
+      the stage's base effort is rejected (Story 34.5-003);
+    * ``predict`` — a boolean that turns the per-story predictor on for every
+      build of the repo (Story 34.5-002). It is validated here but read by
+      :func:`repo_predict_setting`, since it is a build option, not routing.
 
     The override is additive: any stage it omits keeps the base profile's value,
     so a repo can tune a single stage without restating the whole map. A
@@ -592,6 +610,8 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
         if not isinstance(raw_rework, (int, float)) or isinstance(raw_rework, bool):
             raise ValueError("'rework_threshold' must be a number")
         rework_threshold = float(raw_rework)
+
+    _check_predict(section)
 
     escalation_model = cfg.escalation_model
     if "escalation_model" in section:
@@ -652,6 +672,38 @@ def _coerce_override(base: ModelRoutingConfig, raw: Any) -> ModelRoutingConfig:
     )
 
 
+def _check_predict(section: dict) -> None:
+    if "predict" in section and not isinstance(section["predict"], bool):
+        raise ValueError("'predict' must be true or false")
+
+
+def repo_predict_setting(
+    override_path: Path | None = None, *, text: str | None = None
+) -> bool | None:
+    """The repo's ``predict`` switch from its routing override, or ``None`` if unset.
+
+    Story 34.5-002: ``--predict`` was only ever a CLI flag, so a fleet job — which
+    replays a frozen flag vector — never carried it. The routing file travels with
+    the checkout, so a ``predict: true`` there reaches local and queued builds
+    alike. ``None`` (no file, no key) leaves the build option untouched. A present
+    but malformed file or a non-boolean value is a hard error, like every other
+    key in the file.
+    """
+    if text is None and override_path is not None and override_path.is_file():
+        text = override_path.read_text(encoding="utf-8")
+    if text is None:
+        return None
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"model-routing override is not valid YAML: {exc}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get(ROUTING_KEY), dict):
+        raise ValueError(f"override must define a top-level {ROUTING_KEY!r} mapping")
+    section = raw[ROUTING_KEY]
+    _check_predict(section)
+    return section.get("predict")
+
+
 def load_routing_config(
     profile: str | None,
     *,
@@ -704,6 +756,8 @@ def routing_snapshot(
     *,
     overrides: dict[str, str] | None = None,
     agent_cmd: str | None = None,
+    predict: bool | None = None,
+    predict_source: str | None = None,
 ) -> dict:
     """Freeze ``config`` (plus its overrides) into a JSON-able routing snapshot.
 
@@ -712,16 +766,22 @@ def routing_snapshot(
     over the map and are therefore merged into ``stage_models`` so the snapshot
     states the *effective* model each stage starts on; ``agent_cmd`` records a
     ``SDLC_AGENT_CMD`` override so the banner can say the whole command was
-    replaced. A routing-off snapshot keeps an empty map and an explicit ``off``
+    replaced; ``predict`` / ``predict_source`` record whether prediction is on and
+    where that came from (Story 34.5-002), omitted when not stated so a legacy
+    snapshot shape is unchanged. A routing-off snapshot keeps an empty map and an explicit ``off``
     profile — never an absent key, so "off" is always a stated fact.
     """
     overrides = dict(overrides or {})
+    stated: dict = {}
+    if predict_source:
+        stated = {"predict": bool(predict), "predict_source": predict_source}
     if config is None:
         return {
             "profile": OFF,
             "stage_models": {},
             "overrides": overrides,
             "agent_cmd": agent_cmd or "",
+            **stated,
         }
     stage_models = dict(config.stage_models)
     stage_models.update(overrides)
@@ -739,6 +799,7 @@ def routing_snapshot(
         "pinned_stages": sorted(config.pinned_stages),
         "overrides": overrides,
         "agent_cmd": agent_cmd or "",
+        **stated,
     }
 
 
@@ -820,7 +881,7 @@ def _banner_entry(stage: str, model: str, effort: str | None) -> str:
     states what the dispatch will actually carry (Story 34.4-001).
     """
     tier = tier_of(model)
-    if effort and tier and effort in TIER_EFFORT_LEVELS[tier]:
+    if effort and tier and effort in effort_levels_for(model, tier):
         return f"{stage}={resolve_model_id(model)}@{effort}"
     return f"{stage}={_with_model_id(model)}"
 
@@ -886,6 +947,11 @@ def routing_banner(snapshot: dict) -> list[str]:
                 f"model routing: pinned to {snapshot.get('escalation_model')}: "
                 f"{','.join(pinned)}"
             )
+    if snapshot.get("predict_source"):
+        state = "on" if snapshot.get("predict") else "off"
+        lines.append(
+            f"model routing: prediction {state} (from {snapshot['predict_source']})"
+        )
     overrides = snapshot.get("overrides") or {}
     if overrides:
         pins = " ".join(f"{s}={m}" for s, m in sorted(overrides.items()))

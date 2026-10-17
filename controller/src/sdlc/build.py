@@ -81,6 +81,7 @@ from sdlc.model_routing import (
     escalate_model,
     is_routing_off,
     load_routing_config,
+    repo_predict_setting,
     resolve_model_id,
     routing_banner,
     routing_config,
@@ -1086,6 +1087,11 @@ class BuildOptions:
     # point-keyed stage estimate (Story 14.1-002) with a logged note. Persisted
     # per run so a resume keeps the same posture.
     predict: bool = False
+    # Story 34.5-002: where ``predict`` came from — ``--predict`` / ``--no-predict``
+    # (an explicit flag, which wins in either direction), the routing file name
+    # (repo-level ``predict: true``), or ``default``. Blank until
+    # :func:`resolve_predict` has run; the routing banner prints it.
+    predict_source: str = ""
     # Story 28.3-001: per-story escalation signal cache — the *committed*
     # 28.2-002 prediction, keyed by story id, that `_select_stage_model` feeds
     # into `select_model` in place of `story.points`. Populated on the shared
@@ -2166,7 +2172,7 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
     Accepts the exact flags the skill documents:
     ``[scope...] [--dry-run] [--auto] [--skip-coverage] [--limit=N]
     [--sequential] [--concurrency=N] [--coverage-threshold=N] [--skip-preflight]
-    [--allow-dirty] [--allow-undenied]
+    [--allow-dirty] [--allow-undenied] [--predict | --no-predict]
     [--rebuild] [--preflight-timeout=SEC]``. Each ``scope`` is ``all``,
     ``epic-NN``, an epic name, or a single story id ``X.Y-NNN`` (default ``all``).
     Several scopes may be given (space- or comma-separated); they are collapsed
@@ -2176,12 +2182,19 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
     """
     opts = BuildOptions()
     scopes: list[str] = []
+    args = list(args)
+    seen = {a for a in args if a in ("--predict", "--no-predict")}
     # An explicit iterator lets a two-token flag (`--harness build=claude,…`,
     # Story 20.2-001) consume its value; every other flag stays single-token.
     arg_iter = iter(args)
     for arg in arg_iter:
-        if arg in _BOOL_FLAGS:
+        if arg == "--no-predict":
+            # Story 34.5-002: the explicit opt-out that beats a repo `predict: true`.
+            opts.predict, opts.predict_source = False, arg
+        elif arg in _BOOL_FLAGS:
             setattr(opts, _BOOL_FLAGS[arg], True)
+            if arg == "--predict":
+                opts.predict_source = arg
         elif arg.startswith("--limit="):
             opts.limit = int(arg.split("=", 1)[1])
         elif arg.startswith("--coverage-threshold="):
@@ -2317,6 +2330,8 @@ def parse_build_args(args: Iterable[str]) -> BuildOptions:
     # (`all`) is left untouched so the single-scope and `all` paths are unchanged.
     if scopes:
         opts.scope = canonical_scope(scopes)
+    if "--predict" in seen and "--no-predict" in seen:
+        raise ValueError("--predict and --no-predict are mutually exclusive")
     return opts
 
 
@@ -3934,6 +3949,30 @@ class Ledger:
             return json.loads(row["message"])
         except (ValueError, TypeError):
             return {}
+
+    def run_origins(self) -> dict[str, str | None]:
+        """Run id → the origin remote its ``config`` event stamped (Story 34.5-002).
+
+        Only runs that recorded a config event appear; ``None`` is a run that
+        predates origin stamping (or had no origin remote), which the calibrator
+        cannot attribute to any repo. Read-only and tolerant of a missing ledger.
+        """
+        if not self.db_path.exists():
+            return {}
+        with self._connect_ro() as conn:
+            rows = conn.execute(
+                "SELECT run_id, message FROM events WHERE source = 'config' "
+                "AND run_id IS NOT NULL ORDER BY id"
+            ).fetchall()
+        origins: dict[str, str | None] = {}
+        for row in rows:  # the latest config event per run wins
+            try:
+                config = json.loads(row["message"])
+            except (ValueError, TypeError):
+                continue
+            origin = config.get("origin") if isinstance(config, dict) else None
+            origins[row["run_id"]] = origin if isinstance(origin, str) and origin else None
+        return origins
 
     def preflight_state(self, run_id: str, *, now: datetime | None = None) -> dict | None:
         """Where ``run_id``'s preflight stands, from its ``preflight`` events (Story 35.4-005).
@@ -8071,6 +8110,7 @@ def run_build(
     It defaults to :func:`default_rate_limit_probe` only on a *real* run; an
     injected dispatcher gets no probe, so tests never shell out.
     """
+    resolve_predict(opts, (root or Path.cwd()) / MODEL_ROUTING_OVERRIDE_FILENAME)
     dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
     preflight_failures: list[str] = []
     check_preflight = preflight or (
@@ -8314,6 +8354,9 @@ def run_build(
             # predicting (and reconciling) rather than silently degrading to the
             # point-keyed estimate halfway through a run's story set.
             "predict": opts.predict,
+            # Story 34.5-002: the repo this run built, so `sdlc routing calibrate`
+            # can keep a pooled ledger to one origin. None: no origin remote.
+            "origin": _run_origin(root or Path.cwd()),
         }),
     )
     # Record shipped stories as SKIPPED for the audit trail. They are NOT part of
@@ -10123,6 +10166,33 @@ def _harness_dispatch_kwargs(
 _RISK_AWARE_STAGES = frozenset({"review"})
 
 
+def _run_origin(root: Path) -> str | None:
+    """The credential-free ``origin`` remote of ``root``, or None (never raises)."""
+    from sdlc.queue_client import _repo_origin
+
+    return _repo_origin(str(root))
+
+
+def resolve_predict(opts: BuildOptions, override_path: Path) -> None:
+    """Settle whether this build predicts, and record where that came from (34.5-002).
+
+    Precedence: an explicit ``--predict`` / ``--no-predict`` wins in either
+    direction; else the repo's ``predict:`` key in ``.sdlc-model-routing.yaml``;
+    else off, exactly as before. The file is the only way a queue/fleet job —
+    which replays a frozen flag vector that never carries ``--predict`` — can
+    run with the same thresholds as a local build. A resume does not come through
+    here: it replays the ``predict`` its run persisted.
+    """
+    if opts.predict_source:
+        return
+    repo_setting = repo_predict_setting(override_path)
+    if repo_setting is None:
+        opts.predict_source = "default"
+        return
+    opts.predict = repo_setting
+    opts.predict_source = MODEL_ROUTING_OVERRIDE_FILENAME
+
+
 def _routing_config_for(opts: BuildOptions) -> ModelRoutingConfig | None:
     """Resolve (and memoize) the run's model-routing config (Story 14.2-001).
 
@@ -10166,6 +10236,8 @@ def _resolve_run_routing(opts: BuildOptions) -> dict:
         config,
         overrides=opts.model_overrides,
         agent_cmd=os.environ.get("SDLC_AGENT_CMD", ""),
+        predict=opts.predict,
+        predict_source=opts.predict_source,
     )
 
 

@@ -30,7 +30,7 @@ def _story():
 def test_every_ladder_tier_has_a_model_id() -> None:
     assert set(TIER_MODEL_IDS) == set(TIER_LADDER)
     assert TIER_MODEL_IDS == {
-        HAIKU: "claude-haiku-4-5",
+        HAIKU: "claude-haiku-5-5",
         SONNET: "claude-sonnet-5-5",
         OPUS: "claude-opus-5-5",
     }
@@ -68,7 +68,7 @@ def test_escalation_climbs_by_tier_then_dispatches_the_mapped_id() -> None:
     climbed = [escalate_model(HAIKU, n) for n in range(3)]
     assert climbed == [HAIKU, SONNET, OPUS]
     assert [resolve_model_id(t) for t in climbed] == [
-        "claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5",
+        "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5",
     ]
 
 
@@ -76,7 +76,7 @@ def test_routing_banner_prints_alias_and_id() -> None:
     snap = routing_snapshot(BALANCED, overrides={"build": "opus"})
     banner = "\n".join(routing_banner(snap))
     assert "build=claude-opus-5-5@high" in banner  # 34.4-001: effort attached
-    assert "merge=haiku → claude-haiku-4-5" in banner
+    assert "merge=claude-haiku-5-5@medium" in banner  # 34.4-001: effort attached
 
 
 def test_banner_leaves_a_pinned_full_id_bare() -> None:

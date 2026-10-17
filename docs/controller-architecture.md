@@ -1333,7 +1333,8 @@ model, and the report must not let it read as one.
 ### Off by default, safe to roll out
 
 `--predict` (persisted in the run config, so a resume keeps the posture) enables
-the whole path. Without it the controller behaves exactly as today — the 14.1-002
+the whole path — as does `predict: true` in the repo's `.sdlc-model-routing.yaml`
+(Story 34.5-002; see *Repo-level `predict` and calibrated bars* below). Without it the controller behaves exactly as today — the 14.1-002
 stage estimate and gate, unchanged — and logs a note saying so **once per run**
 (`_log_predictor_posture`, at run start). Per run, not per story: the posture is a
 property of the run, and the flag is off by default, so a per-story note would add
@@ -4056,8 +4057,12 @@ tokens, notional `$`, and a `calibrated` flag):
   mistaken for real spend on the subscription.
 - **Price table (Story 34.2-001).** `MODEL_USD_PER_MILLION_TOKENS` is keyed by
   exact model id (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-sonnet-5`,
-  `claude-haiku-4-5`, …) with separate input / output / cache-read rates, and
-  carries `PRICE_TABLE_VINTAGE`. Tier aliases resolve through
+  `claude-haiku-5-5`, `claude-haiku-4-5`, …) with separate input / output /
+  cache-read rates, and carries `PRICE_TABLE_VINTAGE`. `claude-haiku-5-5` is
+  priced by prompt length ($0.10 / $0.50 up to 100,000 prompt tokens, $0.50 /
+  $2.50 above, per Anthropic's pricing page): a stage row aggregates many
+  requests, so `usage_cost()` prices it at the short tier unless the caller
+  passes `long_prompt=True` — a lower bound for a long-prompt stage. Tier aliases resolve through
   `model_routing.TIER_MODEL_IDS`; a dated snapshot id matches its base id.
   `usage_cost()` prices a stage usage row per token class (cache writes at 1.25×
   input). Every displayed `$` — run header, runs list, per-story cell,
@@ -4066,7 +4071,7 @@ tokens, notional `$`, and a `calibrated` flag):
   otherwise), so one run never shows two totals; the ledger `cost_usd` column
   stays harness-reported for `usage-reconcile`. The pre-dispatch estimate, which only knows a token total, uses the
   input/output average (`blended_usd_per_million`). The dashboard run header and
-  `sdlc status` show the vintage beside the `$` (`$0.231 · prices 2026-09-30`).
+  `sdlc status` show the vintage beside the `$` (`$0.231 · prices 2026-10-17`).
   An id with no entry costs at the opus default and `sdlc doctor` warns once per
   id (`Model pricing`). `DEFAULT_USD_PER_MILLION_TOKENS` (the budget-gate prior)
   is unchanged for the routing-off path.
@@ -4240,6 +4245,29 @@ factory's own story totals; an even-odds rework forecast means the cheap tier is
 more likely than not to pay for a retry. The per-repo override is the
 calibration lever as a repo's own reconciled history accumulates.
 
+#### Repo-level `predict` and calibrated bars (Story 34.5-002)
+
+`--predict` used to exist only as a CLI flag, and a queue/fleet job replays a
+frozen flag vector that never carries it — so a fleet build silently ran the
+points-keyed fallback. `model_routing: {predict: true}` in
+`.sdlc-model-routing.yaml` now turns prediction on for every build of the repo.
+`resolve_predict` (called at the top of `run_build`) settles it once:
+`--predict` / `--no-predict` > the repo file > off, and the routing banner prints
+the winner (`model routing: prediction on (from .sdlc-model-routing.yaml)`). A
+repo with no routing file, or one without the key, behaves exactly as before; a
+resume replays the `predict` its run persisted rather than re-resolving.
+
+The bars themselves are fitted by `sdlc routing calibrate` (`calibrate.py`), an
+operator command rather than something a build computes, because each host's
+ledger holds only its own history. It merges the reconciled stories of every
+`--ledger` (the `prediction_training_rows` reader the predictor trains on),
+deduplicates by `(run_id, story_id)`, and drops runs whose `config` event stamped
+a different `origin` than the current repo's (a run that stamped none — one
+predating this story — is kept). `predicted_tokens_threshold` is the p75 of actual
+story-total tokens; `rework_threshold` is twice the observed rework rate, clamped
+to [0.05, 0.95]. Fewer than `MIN_GLOBAL_SAMPLE` stories → "no sample", exit 1,
+nothing written.
+
 The plumbing: `_predict_story_cost` (the shared build/resume pre-dispatch hook)
 mirrors whichever forecast governs the story — a fresh prediction, or the
 committed ledger row a re-entered story already carries (`Ledger.story_prediction`)
@@ -4319,11 +4347,11 @@ runs a stage, never how its output is parsed.
 Profiles speak in tiers; the tier is resolved to an exact model id only where it
 leaves the routing layer, so the `claude --model` argv and the ledger's
 `stage_attempts.model` name the model a stage actually ran on. The single source
-of truth is `TIER_MODEL_IDS` in `sdlc/model_routing.py` (vintage 2026-09-30):
+of truth is `TIER_MODEL_IDS` in `sdlc/model_routing.py` (vintage 2026-10-17):
 
 | Tier | Model id |
 |------|----------|
-| `haiku` | `claude-haiku-4-5` |
+| `haiku` | `claude-haiku-5-5` |
 | `sonnet` | `claude-sonnet-5-5` |
 | `opus` | `claude-opus-5-5` |
 
@@ -4337,7 +4365,7 @@ reads the same table.
 ### Per-stage effort (Story 34.4-001)
 
 The Balanced profile also carries a per-stage `--effort` level so Opus 5.5's
-`medium` default never silently under-thinks review and Haiku stages do not
+`medium` default never silently under-thinks review and mechanical stages do not
 over-spend: `discovery: low, docs: low, coverage: medium, build: high, review:
 xhigh, merge: medium, bugfix: high`. A stage absent from the map (and every stage
 on Quality-first / Quota-max) passes no flag. Override per repo, additively, in
@@ -4351,7 +4379,8 @@ model_routing:
 The level is frozen in the run's routing snapshot, printed in the banner
 (`review=claude-opus-5-5@max`) and recorded on the `stages.effort` ledger column
 (NULL = no flag passed). It is **omitted — never a CLI error —** with a `debug`
-event giving the reason when the routed model takes no `effort` (Haiku 4.5), the
+event giving the reason when the routed model takes no `effort` (Haiku 4.5 — what the `haiku` tier
+resolves to when the probe degrades it; Haiku 5.5 takes all five levels), the
 model is not a known tier, or the stage's harness does not declare
 `effort_aware: true` (codex and every other registry harness, and an
 `SDLC_AGENT_CMD` override, which owns its own command). On a cheap-first retry the
@@ -4387,7 +4416,7 @@ controller runs `claude -p ok --model <id>` for each id in `TIER_MODEL_IDS`
 (`sdlc/model_probe.py`). A non-zero exit with model-not-found / entitlement
 wording substitutes the previous generation from `TIER_FALLBACK_IDS`
 (`claude-opus-5-5 → claude-opus-5`, `claude-sonnet-5-5 → claude-sonnet-5`,
-`claude-haiku-4-5 → claude-haiku-4-5`): a `warn` `harness` event names the
+`claude-haiku-5-5 → claude-haiku-4-5`): a `warn` `harness` event names the
 substitution, the routing banner shows it (`opus → claude-opus-5 (claude-opus-5-5
 unavailable on this host)`), and the run proceeds. A rate-limit error is never
 read as an entitlement failure — the RATE_LIMITED path owns it — and a timeout or
@@ -4543,7 +4572,7 @@ detects on its own wording or on the parser's structured 429 envelope fields
 (issue #109's lesson, applied in reverse). Second, the gate — before honouring a
 persisted epoch, `_honor_parked_reset` runs one cheap live request through the
 harness's `rate_limit_probe` (`capability.probe_rate_limit`; the built-in Claude
-slot declares `claude -p ok --model claude-haiku-4-5`). Only an `AVAILABLE` verdict — zero
+slot declares `claude -p ok --model claude-haiku-5-5`). Only an `AVAILABLE` verdict — zero
 exit *and* no rate-limit wording in the output — clears `rate_limit_reset_at` via
 a corrected config event and lets the run proceed. `UNAVAILABLE` (still closed)
 and `UNKNOWN` (no probe declared, or the probe itself errored) both keep the
