@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.108.0] - 2026-10-17
+
+### Added
+
+- feat(current-generation-models): escalation thresholds (#34.5-002)
+
+
 ## [v2.107.0] - 2026-10-16
 
 ### Added
