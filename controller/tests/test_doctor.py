@@ -1901,6 +1901,121 @@ def test_fleet_worker_draining_the_fleet_queue_is_asked_of_the_service(tmp_path,
     assert seen == {"url": "http://home-lab:8790", "token": "tok"}
 
 
+def _plist_with_host(tmp_path, *, host: str, token: str | None = None) -> Path:
+    """A worker plist registered under ``--host``, as `fleet-bootstrap.sh --host` renders it."""
+    path = tmp_path / "com.fxmartin.sdlc-worker.plist"
+    env = {"SDLC_QUEUE_URL": "http://home-lab:8790"}
+    if token is not None:
+        env["SDLC_QUEUE_TOKEN"] = token
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.fxmartin.sdlc-worker",
+                "ProgramArguments": [
+                    "/Users/fx/.local/bin/sdlc", "queue", "run", "--worker", "m3max", "--host", host,
+                ],
+                "EnvironmentVariables": env,
+            }
+        )
+    )
+    return path
+
+
+def test_fleet_worker_is_looked_up_under_the_host_its_agent_registers_as(tmp_path, monkeypatch) -> None:
+    # Story 35.2-011: the M3 Max's hostname is `m3-max`, its agent's `--host` is `m3max`;
+    # the worker registers as the latter, so "no worker for host m3-max" was a false FAIL.
+    import socket
+
+    from sdlc.doctor import check_fleet_worker_installed
+    from sdlc.queue_client import QueueClient
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "m3-max.local")
+    monkeypatch.setattr(
+        QueueClient, "list_workers", lambda self: [_worker_record("m3max", seconds_ago=5)]
+    )
+
+    finding = check_fleet_worker_installed(agent_path=_plist_with_host(tmp_path, host="m3max"))
+
+    assert finding is not None and finding.status == "CLEAN"
+
+
+def test_fleet_worker_without_an_agent_host_still_goes_by_the_hostname(tmp_path, monkeypatch) -> None:
+    import socket
+
+    from sdlc.doctor import check_fleet_worker_installed
+    from sdlc.queue_client import QueueClient
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "m3.local")
+    monkeypatch.setattr(QueueClient, "list_workers", lambda self: [_worker_record("m3", seconds_ago=5)])
+
+    finding = check_fleet_worker_installed(agent_path=_plist_with_fleet_url(tmp_path))
+
+    assert finding is not None and finding.status == "CLEAN"
+
+
+def test_an_explicit_host_beats_the_agents(tmp_path, monkeypatch) -> None:
+    from sdlc.doctor import check_fleet_worker_installed
+    from sdlc.queue_client import QueueClient
+
+    monkeypatch.setattr(QueueClient, "list_workers", lambda self: [_worker_record("m3", seconds_ago=5)])
+
+    finding = check_fleet_worker_installed(agent_path=_plist_with_host(tmp_path, host="m3max"), host="m3")
+
+    assert finding is not None and finding.status == "CLEAN"
+
+
+def test_fleet_queue_check_uses_the_installed_agents_token_without_one_in_the_shell(
+    tmp_path, monkeypatch
+) -> None:
+    # Story 35.2-011: an SSH shell has no SDLC_QUEUE_TOKEN, so the queue refused it (403)
+    # while the worker, which carries its own, was registered and heartbeating.
+    from sdlc.doctor import check_fleet_queue_configured
+    from sdlc.queue_client import QueueClient
+
+    seen: dict[str, object] = {}
+
+    def health(self):
+        seen["token"] = self._token
+        return {"controller_version": "2.110.0"}
+
+    monkeypatch.setattr(QueueClient, "health", health)
+    monkeypatch.delenv("SDLC_QUEUE_TOKEN", raising=False)
+    monkeypatch.setenv("SDLC_QUEUE_URL", "http://home-lab:8790")
+
+    finding = check_fleet_queue_configured(agent_path=_plist_with_host(tmp_path, host="m3max", token="agent-tok"))
+
+    assert finding is not None and finding.status == "CLEAN"
+    assert seen == {"token": "agent-tok"}
+
+
+def test_fleet_queue_check_prefers_the_shells_token(tmp_path, monkeypatch) -> None:
+    from sdlc.doctor import check_fleet_queue_configured
+    from sdlc.queue_client import QueueClient
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(QueueClient, "health", lambda self: seen.update(token=self._token) or {})
+    monkeypatch.setenv("SDLC_QUEUE_TOKEN", "shell-tok")
+    monkeypatch.setenv("SDLC_QUEUE_URL", "http://home-lab:8790")
+
+    check_fleet_queue_configured(agent_path=_plist_with_host(tmp_path, host="m3max", token="agent-tok"))
+
+    assert seen == {"token": "shell-tok"}
+
+
+def test_fleet_queue_check_without_any_agent_sends_no_token(tmp_path, monkeypatch) -> None:
+    from sdlc.doctor import check_fleet_queue_configured
+    from sdlc.queue_client import QueueClient
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(QueueClient, "health", lambda self: seen.update(token=self._token) or {})
+    monkeypatch.delenv("SDLC_QUEUE_TOKEN", raising=False)
+    monkeypatch.setenv("SDLC_QUEUE_URL", "http://home-lab:8790")
+
+    check_fleet_queue_configured(agent_path=tmp_path / "absent.plist", unit_path=tmp_path / "absent.service")
+
+    assert seen == {"token": None}
+
+
 def test_fleet_worker_is_a_failure_when_its_fleet_queue_is_unreachable(tmp_path, monkeypatch) -> None:
     from sdlc.doctor import check_fleet_worker_installed
     from sdlc.queue_client import QueueClient, QueueUnavailable

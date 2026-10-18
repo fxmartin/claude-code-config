@@ -43,7 +43,11 @@
 # the unit is in place so a re-run can repair a worker that is down. On a Mac it
 # skips fleet-agent-drift and worker-dashboard, which judge the very agents step 7
 # re-renders — counted, they would fail every run that repairs them; a worker step 7
-# leaves pending restart exits 1 instead. A Mac whose global git config cannot be
+# leaves pending restart exits 1 instead. From a shell without SDLC_QUEUE_TOKEN (SSH)
+# doctor asks the queue with the installed worker agent's token, and finds the worker
+# under the agent's --host. A launchctl bootstrap refused right after a bootout is
+# retried (up to 5 tries, stderr captured and logged); only the last refusal, or an
+# agent `launchctl print` does not show loaded, ends the run in failure. A Mac whose global git config cannot be
 # written (home-manager links it into the read-only /nix/store) warns at step 4 and
 # goes on: its credential helpers are declared there.
 #
@@ -380,6 +384,17 @@ else
   warn "${FLEET_CONFIG} exists and does not name ${QUEUE_URL}; left untouched — edit it if that is wrong"
 fi
 
+# The queue token an agent was given by hand — the M3's worker carries one, as
+# `tailscale whois` fails under launchd (#833). No template has it, so a re-render
+# keeps it (passed through awk's environment, never its argv), a plist holding it is
+# installed 0600, and a dry-run diff masks it.
+TOKEN_KEY="SDLC_QUEUE_TOKEN"
+installed_env() {  # LABEL KEY — KEY's value in the installed agent's plist, or nothing
+  sed -n "/<key>$2<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;q;}" \
+    "${AGENT_DIR}/$1.plist" 2>/dev/null || true
+}
+installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the installed agent's token, or nothing
+
 # 6. The verdict on steps 1-5. Reported, not fatal yet: the unit below is what
 #    repairs a worker that is down. On a Mac, fleet-agent-drift and worker-dashboard
 #    judge the very agents step 7 re-renders: counted here, they would fail every
@@ -396,7 +411,15 @@ else
   log "sdlc doctor"
   # From the repo, not the caller's directory: doctor finds its repo from the
   # cwd's git root, and from ~ the harness-pin check WARNs on a healthy box.
-  (cd "${REPO_ROOT}" && sdlc doctor "${DOCTOR_ARGS[@]}") || DOCTOR_RC=$?
+  # With the installed worker agent's token when this shell has none (an SSH
+  # session): the queue refuses it otherwise (403) while the worker is registered.
+  # Doctor reads the agent's `--host` itself.
+  agent_token="$(installed_token "${WORKER_LABEL}")"
+  (
+    cd "${REPO_ROOT}"
+    [[ -n "${SDLC_QUEUE_TOKEN:-}" || -z "${agent_token}" ]] || export SDLC_QUEUE_TOKEN="${agent_token}"
+    sdlc doctor "${DOCTOR_ARGS[@]}"
+  ) || DOCTOR_RC=$?
 fi
 
 # 7. The resident worker and its dashboard. Rendered copies live in a scratch
@@ -464,16 +487,6 @@ render_worker_agent() {
     { print }'
 }
 
-# The queue token an agent was given by hand — the M3's worker carries one, as
-# `tailscale whois` fails under launchd (#833). No template has it, so a re-render
-# keeps it (passed through awk's environment, never its argv), a plist holding it is
-# installed 0600, and a dry-run diff masks it.
-TOKEN_KEY="SDLC_QUEUE_TOKEN"
-installed_env() {  # LABEL KEY — KEY's value in the installed agent's plist, or nothing
-  sed -n "/<key>$2<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;q;}" \
-    "${AGENT_DIR}/$1.plist" 2>/dev/null || true
-}
-installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the installed agent's token, or nothing
 with_installed_token() {  # LABEL — the plist on stdin, plus LABEL's installed token, on stdout
   TOKEN="$(installed_token "$1")" awk -v key="${TOKEN_KEY}" '
     /<key>EnvironmentVariables<\/key>/ { in_env = 1 }
@@ -509,14 +522,23 @@ worker_jobs_in_flight() {
 
 # Right after a bootout launchd may still hold the label, and a bootstrap then fails
 # ("Bootstrap failed: 5"): under errexit that would leave the agent unloaded. Retried
-# briefly before giving up.
+# briefly before giving up. A refused try's stderr is captured, not printed: it is only
+# a failure once the tries run out, and then it is reported. Success is what `launchctl
+# print` shows, not a try's exit status alone.
 bootstrap_agent() {  # DOMAIN PLIST
-  local tries=1
-  until launchctl bootstrap "$1" "$2"; do
-    [[ ${tries} -lt 5 ]] || return 1
+  local domain="$1" plist="$2" label tries=1 refusal
+  label="$(basename "${plist}" .plist)"
+  until refusal="$(launchctl bootstrap "${domain}" "${plist}" 2>&1)"; do
+    refusal="${refusal#Bootstrap failed: }"
+    if [[ ${tries} -ge 5 ]]; then
+      warn "launchctl bootstrap ${label}: ${refusal}"
+      return 1
+    fi
+    log "${label}: launchctl bootstrap was refused (${refusal}); retrying (${tries}/5)"
     tries=$((tries + 1))
     sleep "${BOOTSTRAP_RETRY_DELAY:-1}"
   done
+  launchctl print "${domain}/${label}" >/dev/null 2>&1
 }
 
 PENDING_RESTART=false
@@ -575,7 +597,7 @@ install_launch_agent() {  # LABEL RENDERED_FILE
   install -m "${mode}" "${rendered}" "${dest}" \
     || die "could not write ${dest}: ${label} is not loaded — re-run this script"
   bootstrap_agent "${domain}" "${dest}" \
-    || die "launchctl bootstrap ${label} kept failing: the agent is not loaded — re-run this script"
+    || die "launchctl bootstrap ${label} kept failing, or did not leave it loaded: the agent is not loaded — re-run this script"
 }
 
 if [[ "${DO_SERVICE}" == true && "${IS_DARWIN}" == true ]]; then

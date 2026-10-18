@@ -70,7 +70,9 @@ if [ "$1 $2" = "queue list" ]; then
   if [ -f "$TMP/queue.json" ]; then cat "$TMP/queue.json"; else echo "{\"jobs\": []}"; fi
   exit 0
 fi
-echo "sdlc-cwd ${PWD}" >>"${CALLS}"; exit "${STUB_DOCTOR_RC:-0}"'
+echo "sdlc-cwd ${PWD}" >>"${CALLS}"
+echo "doctor-token ${SDLC_QUEUE_TOKEN:-}" >>"${CALLS}"
+exit "${STUB_DOCTOR_RC:-0}"'
     # One marker per unit: enable --now NAME starts NAME.
     stub systemctl '
 case "$2" in
@@ -740,7 +742,8 @@ mac() { "${BOOTSTRAP}" --worker m3max --pool claude-m3 --pool codex-shared --que
     [ "$status" -eq 0 ]
     ! grep -q "stale" "$(AGENT dashboard)" || false
     out="$(grep -n 'sdlc-dashboard' "${CALLS}" | grep launchctl | sed 's/^[0-9]*:launchctl \([a-z]*\).*/\1/' | tr '\n' ' ')"
-    [ "${out}" = "print bootout bootstrap " ] || [ "${out}" = "bootout bootstrap " ]
+    # The closing `print` is bootstrap_agent confirming the agent is loaded (35.2-011).
+    [ "${out}" = "print bootout bootstrap print " ] || [ "${out}" = "bootout bootstrap print " ]
     [ -e "${TMP}/loaded.com.fxmartin.sdlc-dashboard" ]
 }
 
@@ -1043,7 +1046,7 @@ hand_add_token() {  # AGENT-FILE
     [ "$(ls -l "$(AGENT dashboard)" | cut -c1-10)" = "-rw-r--r--" ]
     grep -qx "queue-token ${TOKEN}" "${CALLS}"
     # The token never reaches a command line, where `ps` would show it.
-    ! grep -v "^queue-token " "${CALLS}" | grep -q "${TOKEN}" || false
+    ! grep -Ev "^(queue|doctor)-token " "${CALLS}" | grep -q "${TOKEN}" || false
 
     # And a second run, token and all, changes nothing.
     before="$(cksum "$(AGENT worker)")"; : >"${CALLS}"
@@ -1096,17 +1099,87 @@ esac'
     [ -e "${TMP}/loaded.com.fxmartin.sdlc-dashboard" ]
 }
 
+# Story 35.2-011: launchctl's stderr from a try the retry loop recovers from is not a failure.
+@test "a bootstrap refused once is captured and logged as a retry, not printed as a failure" {
+    darwin
+    run mac
+    slow_launchd
+    printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Bootstrap failed"* ]]
+    [[ "$output" == *"retrying"*"sdlc-dashboard"* || "$output" == *"sdlc-dashboard"*"retrying"* ]]
+    [[ "$output" == *"done."* ]]
+}
+
+@test "a bootstrap that succeeds but leaves the agent unloaded fails the run" {
+    darwin
+    run mac
+    stub launchctl '
+case "$1" in
+  print) exit 1 ;;
+  bootstrap) exit 0 ;;
+  bootout) rm -f "$TMP/loaded.${2##*/}" ;;
+esac'
+    printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+
+    run mac
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"sdlc-dashboard"*"not loaded"* ]]
+}
+
 @test "a bootstrap that keeps failing stops the run, naming the agent left unloaded" {
     darwin
     run mac
     slow_launchd
     export STUB_BOOTSTRAP_FAILS=always
     printf '<!-- stale -->\n' >>"$(AGENT dashboard)"
+    : >"${CALLS}"
 
     run mac
 
     [ "$status" -ne 0 ]
     [[ "$output" == *"launchctl bootstrap com.fxmartin.sdlc-dashboard kept failing"* ]]
+    # The last refusal is reported once the tries run out, not hidden.
+    [[ "$output" == *"5: Input/output error"* ]]
+    [ "$(grep -c "^launchctl bootstrap gui/$(id -u) $(AGENT dashboard)$" "${CALLS}")" -eq 5 ]
+}
+
+# Story 35.2-011: an SSH shell has no SDLC_QUEUE_TOKEN; the installed worker agent does.
+@test "the doctor step asks with the installed worker agent's queue token" {
+    darwin
+    run mac
+    hand_add_token "$(AGENT worker)"
+    : >"${CALLS}"
+
+    run env -u SDLC_QUEUE_TOKEN "${BOOTSTRAP}" --worker m3max --pool claude-m3 --pool codex-shared --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "doctor-token ${TOKEN}" "${CALLS}"
+}
+
+@test "the doctor step keeps a token the shell already has" {
+    darwin
+    run mac
+    hand_add_token "$(AGENT worker)"
+    : >"${CALLS}"
+
+    SDLC_QUEUE_TOKEN=shell-token run mac
+
+    grep -qx "doctor-token shell-token" "${CALLS}"
+}
+
+@test "the doctor step sends no token when no worker agent carries one" {
+    darwin
+    : >"${CALLS}"
+
+    run env -u SDLC_QUEUE_TOKEN "${BOOTSTRAP}" --worker m3max --pool claude-m3 --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "doctor-token " "${CALLS}"
 }
 
 # The file on disk is the convergence proof: a re-run and doctor both read it. Written

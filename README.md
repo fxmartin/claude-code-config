@@ -268,6 +268,8 @@ scripts/fleet-bootstrap.sh <the flags this worker was set up with>   # re-render
 sdlc doctor                               # expect no fleet-agent-drift
 ```
 
+Run over SSH (no `SDLC_QUEUE_TOKEN` in the shell), the bootstrap's doctor step uses the installed worker agent's token, and `sdlc doctor` looks for the worker under the agent's `--host`. A `launchctl bootstrap` that launchd refuses once right after the bootout is retried, not reported as a failure. On a Mac, GitLab-master repos find `glab auth login`'s token in `~/Library/Application Support/glab-cli/` as well as `~/.config/glab-cli/`.
+
 ### Cross-harness builds — run the pipeline on Claude *or* Codex (Epic-20/21)
 
 The build is split into two **independent** layers, so either can be Claude or Codex:

@@ -1122,6 +1122,80 @@ def test_gitlab_instance_env_http_adds_config_dir_pinning_api_protocol(monkeypat
     assert config["hosts"]["gitlab.corp:8080"]["api_host"] == "gitlab.corp:8080"
 
 
+# --- where `glab` keeps the login (Story 35.2-011) ----------------------------
+
+
+def _glab_login(config_dir: Path, token: str) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.yml").write_text(f"hosts:\n  gitlab.test:\n    token: {token}\n")
+
+
+@pytest.fixture
+def glab_home(tmp_path, monkeypatch) -> Path:
+    """A home with no glab config anywhere, and no env override."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GLAB_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    return tmp_path
+
+
+def test_user_glab_entry_is_found_in_the_macos_config_dir(glab_home) -> None:
+    """glab's macOS default is ~/Library/Application Support/glab-cli, not ~/.config."""
+    _glab_login(glab_home / "Library" / "Application Support" / "glab-cli", "mac-token")
+    assert ih._user_glab_host_entry("gitlab.test") == {"token": "mac-token"}
+
+
+def test_user_glab_entry_prefers_xdg_over_the_macos_dir(glab_home) -> None:
+    _glab_login(glab_home / ".config" / "glab-cli", "xdg-token")
+    _glab_login(glab_home / "Library" / "Application Support" / "glab-cli", "mac-token")
+    assert ih._user_glab_host_entry("gitlab.test")["token"] == "xdg-token"
+
+
+def test_user_glab_entry_honours_xdg_config_home(glab_home, monkeypatch) -> None:
+    _glab_login(glab_home / "xdg" / "glab-cli", "xdg-token")
+    _glab_login(glab_home / "Library" / "Application Support" / "glab-cli", "mac-token")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(glab_home / "xdg"))
+    assert ih._user_glab_host_entry("gitlab.test")["token"] == "xdg-token"
+
+
+def test_user_glab_entry_prefers_glab_config_dir_over_everything(glab_home, monkeypatch) -> None:
+    _glab_login(glab_home / "explicit", "env-token")
+    _glab_login(glab_home / ".config" / "glab-cli", "xdg-token")
+    _glab_login(glab_home / "Library" / "Application Support" / "glab-cli", "mac-token")
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(glab_home / "explicit"))
+    assert ih._user_glab_host_entry("gitlab.test")["token"] == "env-token"
+
+
+def test_user_glab_entry_skips_a_dir_without_a_config_file(glab_home, monkeypatch) -> None:
+    """The first config *file* that exists wins, not the first directory."""
+    (glab_home / "explicit").mkdir()
+    monkeypatch.setenv("GLAB_CONFIG_DIR", str(glab_home / "explicit"))
+    _glab_login(glab_home / "Library" / "Application Support" / "glab-cli", "mac-token")
+    assert ih._user_glab_host_entry("gitlab.test")["token"] == "mac-token"
+
+
+def test_user_glab_entry_stops_at_the_first_existing_file(glab_home) -> None:
+    """A present ~/.config file with no entry for the host is not skipped past."""
+    _glab_login(glab_home / ".config" / "glab-cli", "other")
+    (glab_home / ".config" / "glab-cli" / "config.yml").write_text("hosts:\n  elsewhere:\n    token: x\n")
+    _glab_login(glab_home / "Library" / "Application Support" / "glab-cli", "mac-token")
+    assert ih._user_glab_host_entry("gitlab.test") == {}
+
+
+def test_user_glab_entry_is_empty_without_any_config(glab_home) -> None:
+    assert ih._user_glab_host_entry("gitlab.test") == {}
+
+
+def test_private_glab_config_carries_the_macos_token(glab_home, monkeypatch) -> None:
+    """The controller's private plaintext-GitLab config gets the Mac user's token."""
+    monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    _glab_login(glab_home / "Library" / "Application Support" / "glab-cli", "mac-token")
+    env = ih.gitlab_instance_env("http://gitlab.test")
+    config = yaml.safe_load(Path(env["GLAB_CONFIG_DIR"], "config.yml").read_text())
+    assert config["hosts"]["gitlab.test"]["token"] == "mac-token"
+    assert config["hosts"]["gitlab.test"]["api_protocol"] == "http"
+
+
 def test_gitlab_instance_env_https_passes_only_gitlab_host(monkeypatch) -> None:
     monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
     assert ih.gitlab_instance_env("https://gitlab.corp") == {
@@ -1168,6 +1242,10 @@ def test_gitlab_instance_env_follows_a_login_made_after_the_first_call(monkeypat
     config dir per instance, but its entry tracks the user's — a later `glab auth
     login` authenticates, and a logout stops authenticating (Story 35.2-006)."""
     monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
+    # Before the login there is no config at GLAB_CONFIG_DIR, so the lookup falls
+    # through to ~/.config and the macOS dir: keep them off the developer's real home.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path))
     user_config = tmp_path / "config.yml"
 
