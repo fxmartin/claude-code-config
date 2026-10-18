@@ -1,6 +1,6 @@
 # Epic 34: Current-Generation Model Alignment
 
-> **Status: IN PROGRESS (8/11)** — authored 2026-09-30. Thesis: the controller
+> **Status: COMPLETE (11/11)** — 34.5-001, 34.5-002 and 34.5-003 merged 2026-10-17 (fleet job 11, #888, #887, #886; v2.108.0..v2.110.0). Authored 2026-09-30. Thesis: the controller
 > routes Claude work through the bare aliases `haiku` / `sonnet` / `opus`
 > (`model_routing.py`) and lets the Claude CLI decide what they mean, so the
 > ledger records whatever the CLI resolved that day and no run is reproducible
