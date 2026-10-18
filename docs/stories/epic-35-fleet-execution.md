@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (23/26)** — 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (23/27)** — 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 26 | **Total Points**: 95 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 27 | **Total Points**: 98 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -726,6 +726,69 @@ includes bringing it online and running one job on it end to end.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.2-008, 35.2-009, 35.4-006
+**Risk Level**: Medium
+
+##### Story 35.2-011: A Mac worker finds its glab login, and the bootstrap reports what happened
+**User Story**: As FX, I want the controller to read glab's login where glab
+keeps it on macOS, and `fleet-bootstrap.sh` on a Mac to report its own result
+truthfully, so that a Mac worker can sync and serve GitLab-master repos and a
+successful bootstrap does not end in "Bootstrap failed" and exit 2.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a Mac where `glab auth login --hostname gitlab.test` stored its
+  token in `~/Library/Application Support/glab-cli/config.yml` (glab's macOS
+  default; `~/.config/glab-cli/` does not exist) **When** the controller
+  builds its private plaintext-GitLab config (`_user_glab_host_entry`)
+  **Then** it finds that entry, in this order: `GLAB_CONFIG_DIR`,
+  `$XDG_CONFIG_HOME/glab-cli` / `~/.config/glab-cli`, then the macOS
+  `~/Library/Application Support/glab-cli`. The first config file that
+  exists wins, and Linux behaviour is unchanged.
+- **Given** that Mac **When** `sdlc doctor` runs, or the worker's beat probes
+  forge credentials (`forge_credential_ok`) **Then** `gitlab.test (glab)`
+  reads `ok`, and the worker is offered GitLab jobs.
+- **Given** `launchctl bootstrap` failing with `5: Input/output error` on its
+  first try right after a `bootout`, then succeeding on a retry **When**
+  `bootstrap_agent` runs **Then** the first attempt's stderr is captured, not
+  printed as "Bootstrap failed". The log says it retried, and the run ends
+  `done` (exit 0). Only five failed tries, or an agent that `launchctl print`
+  does not show loaded, end the run in failure.
+- **Given** the bootstrap's doctor step on a Mac worker, run over SSH or from
+  a fresh shell without `SDLC_QUEUE_TOKEN` **When** it checks the fleet queue
+  and worker registration **Then** it uses the installed worker agent's
+  token and `--host` (as the in-flight check already reuses its token), so a
+  registered worker is not reported `403` / "no worker for host m3-max".
+
+**Technical Notes**: Found running `scripts/fleet-bootstrap.sh` on the M3
+Max on 2026-10-18 (v2.110.0).
+- The run exited 2 although it installed and loaded the new worker plist
+  (pid 38409, `--dashboard-url` in place, registered and sending heartbeats).
+- Doctor reported three FAILs:
+  - **Fleet queue 403** and **"no worker for host m3-max"**: the SSH shell
+    had no token, and the host is looked up by `hostname -s` (`m3-max`)
+    rather than the agent's `--host m3max`.
+  - **"gitlab.test (glab) missing"**: a real bug, not an SSH artifact. glab
+    1.114 keeps its config under `~/Library/Application Support/glab-cli/`
+    on both Macs, while `issue_host._user_glab_host_entry` reads only
+    `~/.config/glab-cli/config.yml`. `glab auth git-credential get` as the
+    user returns the password; the controller's private
+    `GLAB_CONFIG_DIR` copy has no token, so its probe returns nothing.
+- The doctor exit code is what `exit "${DOCTOR_RC}"` returned. The
+  "Bootstrap failed: 5: Input/output error" line was launchctl's stderr from
+  `bootstrap_agent`'s first try; its retry loop loaded the agent.
+- Check how home-lab authenticates its GitLab jobs today (a `GITLAB_TOKEN`
+  in its plist, or no GitLab sync at all) before choosing the fix.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: glab config lookup order (env, XDG, macOS path; first existing
+      wins; Linux unchanged); bats for a first-try `bootstrap` EIO followed
+      by success (exit 0, no "Bootstrap failed"), and for five failures (exit
+      non-zero); doctor in the bootstrap uses the agent's token and `--host`
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-006, 35.2-009
 **Risk Level**: Medium
 
 ### Feature 35.3: Launch from the XPS
