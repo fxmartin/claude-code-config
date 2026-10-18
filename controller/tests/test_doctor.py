@@ -2174,3 +2174,30 @@ def test_doctor_never_reads_a_real_worker_launch_agent_under_test() -> None:
 
     assert not default_worker_plist().exists()
     assert default_worker_plist().name == "com.fxmartin.sdlc-worker.plist"
+
+
+def test_installed_worker_agent_reads_a_systemd_unit_without_a_host(tmp_path):
+    from sdlc.doctor import _installed_worker_agent
+
+    unit = tmp_path / "sdlc-worker.service"
+    unit.write_text("[Service]\nEnvironment=SDLC_QUEUE_TOKEN=unit-token\n")
+
+    env, host = _installed_worker_agent(tmp_path / "absent.plist", unit)
+
+    assert env["SDLC_QUEUE_TOKEN"] == "unit-token"
+    assert host is None
+
+
+def test_installed_worker_agent_yields_nothing_for_an_unreadable_plist(tmp_path):
+    from sdlc.doctor import _installed_worker_agent
+
+    plist = tmp_path / "worker.plist"
+    plist.write_bytes(b"not a plist")
+
+    assert _installed_worker_agent(plist, tmp_path / "absent.service") == ({}, None)
+
+
+def test_installed_worker_agent_yields_nothing_when_neither_agent_exists(tmp_path):
+    from sdlc.doctor import _installed_worker_agent
+
+    assert _installed_worker_agent(tmp_path / "a.plist", tmp_path / "b.service") == ({}, None)
