@@ -529,7 +529,8 @@ bootstrap_agent() {  # DOMAIN PLIST
   local domain="$1" plist="$2" label tries=1 refusal
   label="$(basename "${plist}" .plist)"
   until refusal="$(launchctl bootstrap "${domain}" "${plist}" 2>&1)"; do
-    refusal="${refusal#Bootstrap failed: }"
+    # Its first line: launchctl's second is a generic "re-run as root" hint.
+    refusal="${refusal#Bootstrap failed: }"; refusal="${refusal%%$'\n'*}"
     if [[ ${tries} -ge 5 ]]; then
       warn "launchctl bootstrap ${label}: ${refusal}"
       return 1

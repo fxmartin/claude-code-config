@@ -1077,7 +1077,8 @@ case "$1" in
   bootstrap)
     if [ -e "$TMP/booting-out" ] && [ "${STUB_BOOTSTRAP_FAILS:-1}" != 0 ]; then
       [ "${STUB_BOOTSTRAP_FAILS:-1}" = always ] || rm -f "$TMP/booting-out"
-      echo "Bootstrap failed: 5: Input/output error" >&2; exit 5
+      # A real launchctl refusal is two lines, as on the M3 Max.
+      printf "Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors.\n" >&2; exit 5
     fi
     touch "$TMP/loaded.$(basename "$3" .plist)" ;;
   bootout) rm -f "$TMP/loaded.${2##*/}"; touch "$TMP/booting-out" ;;
@@ -1111,6 +1112,9 @@ esac'
     [ "$status" -eq 0 ]
     [[ "$output" != *"Bootstrap failed"* ]]
     [[ "$output" == *"retrying"*"sdlc-dashboard"* || "$output" == *"sdlc-dashboard"*"retrying"* ]]
+    # One log line per retry: the refusal's first line, not launchctl's run-as-root hint.
+    [[ "$output" == *"(5: Input/output error); retrying (1/5)"* ]]
+    [[ "$output" != *"richer errors"* ]]
     [[ "$output" == *"done."* ]]
 }
 

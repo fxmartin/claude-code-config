@@ -653,13 +653,23 @@ def _user_glab_config_files() -> list[Path]:
     then glab's macOS default ``~/Library/Application Support/glab-cli`` — where
     ``glab auth login`` stores it on a Mac that has no ``~/.config/glab-cli``.
     """
-    xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    home = _home()
+    xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
     dirs = [
         os.environ.get("GLAB_CONFIG_DIR"),
         os.path.join(xdg_config, "glab-cli"),
-        os.path.expanduser("~/Library/Application Support/glab-cli"),
+        os.path.join(home, "Library", "Application Support", "glab-cli"),
     ]
     return [Path(d, "config.yml") for d in dirs if d]
+
+
+def _home() -> str:
+    """The user's home, under which glab's default config dirs live.
+
+    The seam the test suite repoints: a dev Mac's real ``gitlab.test`` token sits in
+    ``~/Library/Application Support/glab-cli``, and must never be copied into a test.
+    """
+    return os.path.expanduser("~")
 
 
 def _user_glab_host_entry(netloc: str) -> dict:

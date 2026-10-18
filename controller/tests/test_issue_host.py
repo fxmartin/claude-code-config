@@ -1133,7 +1133,7 @@ def _glab_login(config_dir: Path, token: str) -> None:
 @pytest.fixture
 def glab_home(tmp_path, monkeypatch) -> Path:
     """A home with no glab config anywhere, and no env override."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(ih, "_home", lambda: str(tmp_path))
     monkeypatch.delenv("GLAB_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     return tmp_path
@@ -1184,6 +1184,15 @@ def test_user_glab_entry_stops_at_the_first_existing_file(glab_home) -> None:
 
 def test_user_glab_entry_is_empty_without_any_config(glab_home) -> None:
     assert ih._user_glab_host_entry("gitlab.test") == {}
+
+
+def test_the_suite_never_reads_the_developers_own_glab_login() -> None:
+    """conftest's `_no_real_glab_login` keeps every candidate off the real home: on a
+    dev Mac, ~/Library/Application Support/glab-cli holds a real gitlab.test token."""
+    real_home = Path.home().resolve()
+    candidates = [f.resolve() for f in ih._user_glab_config_files()]
+    assert candidates
+    assert not [f for f in candidates if f.is_relative_to(real_home)]
 
 
 def test_private_glab_config_carries_the_macos_token(glab_home, monkeypatch) -> None:
@@ -1242,10 +1251,6 @@ def test_gitlab_instance_env_follows_a_login_made_after_the_first_call(monkeypat
     config dir per instance, but its entry tracks the user's — a later `glab auth
     login` authenticates, and a logout stops authenticating (Story 35.2-006)."""
     monkeypatch.setattr(ih, "_GLAB_HTTP_CONFIG_DIRS", {})
-    # Before the login there is no config at GLAB_CONFIG_DIR, so the lookup falls
-    # through to ~/.config and the macOS dir: keep them off the developer's real home.
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path))
     user_config = tmp_path / "config.yml"
 

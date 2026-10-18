@@ -121,7 +121,8 @@ def test_a_plaintext_gitlab_gets_the_private_glab_config_the_issue_host_uses(
 ) -> None:
     from sdlc import issue_host
 
-    # Never the developer's own glab config: its gitlab.test token would be copied in.
+    # Never the developer's own glab config: its gitlab.test token would be copied in
+    # (conftest's `_no_real_glab_login` keeps the home's glab dirs out as well).
     monkeypatch.setattr(issue_host, "_GLAB_HTTP_CONFIG_DIRS", {})
     monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path / "glab-cli"))
 
@@ -1016,10 +1017,6 @@ def test_a_login_made_after_the_worker_started_reaches_a_plaintext_gitlab_probe(
     monkeypatch.setattr(issue_host, "_GLAB_HTTP_CONFIG_DIRS", {})
     user_config = tmp_path / "glab-cli"
     user_config.mkdir()
-    # The lookup falls through to ~/.config and the macOS dir while this one is
-    # empty: keep it off the developer's real home.
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("GLAB_CONFIG_DIR", str(user_config))
 
     def glab(argv, *, input, env, **_kwargs):  # answers from the config it is pointed at
