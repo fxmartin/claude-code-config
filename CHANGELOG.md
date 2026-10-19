@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.111.0] - 2026-10-19
+
+### Added
+
+- feat(fleet-execution): a mac worker finds its glab login, (#35.2-011)
+
+### Fixed
+
+- fix(fleet-execution): a mac worker finds its glab login, (#35.2-011)
+
+
 ## [v2.110.0] - 2026-10-17
 
 ### Added
