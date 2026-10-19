@@ -1454,10 +1454,10 @@ job on a worker that has never seen the run.
 **Risk Level**: Medium
 
 ##### Story 35.5-006: Reconcile updates the run's fleet record
-**User Story**: As FX, I want `sdlc reconcile` to send the run's new final
-status and to the
-registry its worker reads so that a run closed by hand stops showing as
-live on the XPS dashboard and the desk widget.
+**User Story**: As FX, I want `sdlc reconcile` to write a run's new final
+status to the fleet registry and to the registry its worker reads, so that
+a run closed by hand stops showing as live on the XPS dashboard and the
+desk widget.
 **Priority**: Should Have
 **Story Points**: 3
 
