@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 30 | **Total Points**: 104 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 30 | **Total Points**: 105 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -1455,10 +1455,11 @@ job on a worker that has never seen the run.
 
 ##### Story 35.5-006: Reconcile updates the run's fleet record
 **User Story**: As FX, I want `sdlc reconcile` to send the run's new final
-status to the fleet registry so that a run closed by hand stops showing as
+status and to the
+registry its worker reads so that a run closed by hand stops showing as
 live on the XPS dashboard and the desk widget.
 **Priority**: Should Have
-**Story Points**: 2
+**Story Points**: 3
 
 **Acceptance Criteria**:
 - **Given** a fleet is configured (`SDLC_QUEUE_URL` or `queue_url:` in
@@ -1476,6 +1477,12 @@ live on the XPS dashboard and the desk widget.
 - **Given** reconcile runs inside a dispatched agent (`SDLC_IN_TEST` or
   `SDLC_FLEET_DISABLED`) **When** it closes a run **Then** it pushes
   nothing, as 35.5-004 requires.
+- **Given** a worker host whose LaunchAgents set `XDG_STATE_HOME` while an
+  operator's SSH shell does not **When** the operator runs `sdlc reconcile`
+  there **Then** the run's record is updated in the registry the worker
+  and its dashboard read, not in a second registry that never held the run;
+  and `sdlc doctor` warns when the shell and the worker resolve different
+  registry paths.
 
 **Technical Notes**: Incident: run `d72324cb` (35.2-011, fleet job 12).
 - It parked `AWAITING_APPROVAL` on the M3 Max on 2026-10-18 and pushed that
@@ -1487,6 +1494,12 @@ live on the XPS dashboard and the desk widget.
 - **Cause:** `reconcile.py` (~449) stamps only the host registry
   (`registry.mark_finished`). The only fleet push is `Scheduler._push_run`
   (`scheduler.py:1236`), which runs only inside `sdlc queue run`.
+- **Second cause:** on the M3 Max the worker and dashboard plists set
+  `XDG_STATE_HOME`, so they use `~/.local/state/sdlc/registry.json`. An SSH
+  shell has no `XDG_STATE_HOME`, so `default_registry_path()`
+  (`registry.py:66`) gives `~/.sdlc/registry.json`. The reconcile stamped
+  that file, which has no row for the run, and `mark_finished` silently did
+  nothing. The worker's registry kept `AWAITING_APPROVAL` too.
 - **Fix direction:** after `registry.mark_finished`, push the finished
   record through `open_queue().put_fleet_run` when a fleet is configured and
   `list_fleet_runs` has the run, reusing the worker's own fields. Keep it
@@ -1497,7 +1510,8 @@ live on the XPS dashboard and the desk widget.
 **Definition of Done**:
 - [ ] Code implemented and peer reviewed
 - [ ] Tests: a reconciled fleet run's record is pushed with the final status
-      and its worker kept; no push without a fleet or without a record;
+      and its worker kept; reconcile without `XDG_STATE_HOME` updates the
+      worker's registry; doctor flags a split registry path; no push without a fleet or without a record;
       unreachable service warns and still closes the ledger; no push under
       `SDLC_FLEET_DISABLED`
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
