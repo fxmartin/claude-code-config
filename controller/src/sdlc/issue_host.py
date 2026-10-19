@@ -639,10 +639,37 @@ def resolve_host(root: str | Path, override: str | None = None) -> str:
 # mechanism `glab` honours for the protocol is a config file's per-host
 # `api_protocol`, so an http declaration gets a **controller-owned** config dir
 # (`GLAB_CONFIG_DIR`) holding just that host's entry. The user's own
-# `~/.config/glab-cli/config.yml` is never written to; its entry for that host
+# glab config (`~/.config/glab-cli/` or macOS's `~/Library/Application Support/`)
+# is never written to; its entry for that host
 # is copied in read-only so a `glab auth login` token still authenticates.
 _GLAB_HTTP_CONFIG_DIRS: dict[str, str] = {}
 _GLAB_HTTP_CONFIG_LOCK = threading.Lock()
+
+
+def _user_glab_config_files() -> list[Path]:
+    """Where the user's own `glab` login may live, most specific first.
+
+    ``GLAB_CONFIG_DIR``, then ``$XDG_CONFIG_HOME/glab-cli`` (``~/.config/glab-cli``),
+    then glab's macOS default ``~/Library/Application Support/glab-cli`` — where
+    ``glab auth login`` stores it on a Mac that has no ``~/.config/glab-cli``.
+    """
+    home = _home()
+    xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    dirs = [
+        os.environ.get("GLAB_CONFIG_DIR"),
+        os.path.join(xdg_config, "glab-cli"),
+        os.path.join(home, "Library", "Application Support", "glab-cli"),
+    ]
+    return [Path(d, "config.yml") for d in dirs if d]
+
+
+def _home() -> str:
+    """The user's home, under which glab's default config dirs live.
+
+    The seam the test suite repoints: a dev Mac's real ``gitlab.test`` token sits in
+    ``~/Library/Application Support/glab-cli``, and must never be copied into a test.
+    """
+    return os.path.expanduser("~")
 
 
 def _user_glab_host_entry(netloc: str) -> dict:
@@ -650,13 +677,14 @@ def _user_glab_host_entry(netloc: str) -> dict:
 
     Read-only and best-effort: an absent/unreadable/malformed config yields an
     empty entry, and authentication then falls back to ``GITLAB_TOKEN`` in the
-    environment — the same credential source a fresh machine uses.
+    environment — the same credential source a fresh machine uses. The first
+    config file that exists is the one read (see :func:`_user_glab_config_files`).
     """
-    base = os.environ.get("GLAB_CONFIG_DIR") or os.path.join(
-        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "glab-cli"
-    )
+    config = next((f for f in _user_glab_config_files() if f.exists()), None)
+    if config is None:
+        return {}
     try:
-        raw = yaml.safe_load(Path(base, "config.yml").read_text(encoding="utf-8"))
+        raw = yaml.safe_load(config.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return {}
     if not isinstance(raw, dict):

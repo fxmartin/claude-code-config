@@ -145,6 +145,24 @@ def _no_real_forge_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_glab_login(monkeypatch, tmp_path_factory):
+    """Never copy the developer's own ``glab`` login into a test (Story 35.2-011).
+
+    A plaintext-GitLab call copies the user's ``gitlab.test`` entry into a private
+    config dir, read from the first ``config.yml`` in ``GLAB_CONFIG_DIR``,
+    ``$XDG_CONFIG_HOME/glab-cli`` / ``~/.config/glab-cli`` or macOS's
+    ``~/Library/Application Support/glab-cli`` — where a dev Mac keeps a real token.
+    An empty ``GLAB_CONFIG_DIR`` falls through to the others, so pointing it away is
+    not enough: the home is repointed too. test_issue_host.py's lookup tests repoint
+    ``_home`` and set the variables themselves.
+    """
+    monkeypatch.delenv("GLAB_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    nohome = tmp_path_factory.mktemp("no-glab-home")
+    monkeypatch.setattr(issue_host, "_home", lambda: str(nohome))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_host_cli(monkeypatch):
     """Block real ``gh``/``glab`` invocations for every test by default.
 

@@ -121,7 +121,8 @@ def test_a_plaintext_gitlab_gets_the_private_glab_config_the_issue_host_uses(
 ) -> None:
     from sdlc import issue_host
 
-    # Never the developer's own glab config: its gitlab.test token would be copied in.
+    # Never the developer's own glab config: its gitlab.test token would be copied in
+    # (conftest's `_no_real_glab_login` keeps the home's glab dirs out as well).
     monkeypatch.setattr(issue_host, "_GLAB_HTTP_CONFIG_DIRS", {})
     monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path / "glab-cli"))
 

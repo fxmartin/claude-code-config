@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import platform
@@ -608,8 +609,15 @@ def check_fleet_queue(client: QueueClient) -> Finding:
     )
 
 
-def check_fleet_queue_configured() -> Finding | None:
-    """:func:`check_fleet_queue` for the configured URL, or ``None`` when there is none."""
+def check_fleet_queue_configured(
+    *, agent_path: Path | None = None, unit_path: Path | None = None
+) -> Finding | None:
+    """:func:`check_fleet_queue` for the configured URL, or ``None`` when there is none.
+
+    The token is this shell's ``SDLC_QUEUE_TOKEN``, else the one the installed worker
+    agent carries (Story 35.2-011): an SSH shell has none, and the service would
+    refuse it (403) while the worker it admits is registered and heartbeating.
+    """
     try:
         url = resolve_queue_url()
     except QueueError as exc:
@@ -622,7 +630,11 @@ def check_fleet_queue_configured() -> Finding | None:
         )
     if url is None:
         return None
-    return check_fleet_queue(QueueClient(url, token=os.environ.get("SDLC_QUEUE_TOKEN") or None))
+    agent_env, _ = _installed_worker_agent(
+        agent_path or default_worker_plist(), unit_path or default_worker_unit()
+    )
+    token = os.environ.get(QUEUE_TOKEN_ENV) or agent_env.get(QUEUE_TOKEN_ENV) or None
+    return check_fleet_queue(QueueClient(url, token=token))
 
 
 # Story 35.2-004: the LaunchAgent that keeps a fleet worker resident on the M3
@@ -1050,6 +1062,34 @@ def check_fleet_agent_drift(
     )
 
 
+def _installed_worker_agent(plist: Path, unit: Path) -> tuple[dict[str, str], str | None]:
+    """The installed worker's environment and its ``--host``, or ``({}, None)``.
+
+    Best-effort, for the checks that only borrow the agent's identity: an absent or
+    unreadable agent yields nothing, and :func:`check_fleet_worker_installed` is the
+    one that reports it. Only the LaunchAgent carries ``--host``.
+    """
+    try:
+        if plist.exists():
+            data = plistlib.loads(plist.read_bytes())
+            env = {str(k): str(v) for k, v in (data.get("EnvironmentVariables") or {}).items()}
+            return env, _agent_host(data)
+        if unit.exists():
+            return read_worker_unit(unit), None
+    except Exception:  # noqa: BLE001 - see check_fleet_worker_installed
+        return {}, None
+    return {}, None
+
+
+def _agent_host(plist_data: dict) -> str | None:
+    """The name after ``--host`` in a worker plist's ``ProgramArguments``, if any."""
+    args = [str(a) for a in plist_data.get("ProgramArguments") or []]
+    for flag, value in itertools.pairwise(args):
+        if flag == "--host":
+            return value
+    return None
+
+
 def check_fleet_worker_installed(
     *,
     agent_path: Path | None = None,
@@ -1087,6 +1127,8 @@ def check_fleet_worker_installed(
         if service == "launchd":
             plist = plistlib.loads(path.read_bytes())
             env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
+            # The worker registers as its agent's `--host` (the M3 Max: `m3max`, not `m3-max`).
+            host = host or _agent_host(plist)
         else:
             env = read_worker_unit(unit)
     # As in check_queue_service: plistlib's errors are not a closed set, and a
@@ -2317,7 +2359,7 @@ def run_doctor(
     ]
     findings.extend(check_dependencies(dep_probe))
     findings.append(check_glab_dependency(repo_root, dep_probe))
-    fleet = check_fleet_queue_configured()
+    fleet = check_fleet_queue_configured(agent_path=worker_plist, unit_path=worker_unit)
     if fleet is not None:
         findings.append(fleet)
     worker = check_fleet_worker_installed(
