@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (24/29)** — 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (24/30)** — 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 29 | **Total Points**: 102 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 30 | **Total Points**: 105 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -1452,6 +1452,72 @@ job on a worker that has never seen the run.
 
 **Dependencies**: 35.2-001, 35.2-005
 **Risk Level**: Medium
+
+##### Story 35.5-006: Reconcile updates the run's fleet record
+**User Story**: As FX, I want `sdlc reconcile` to write a run's new final
+status to the fleet registry and to the registry its worker reads, so that
+a run closed by hand stops showing as live on the XPS dashboard and the
+desk widget.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a fleet is configured (`SDLC_QUEUE_URL` or `queue_url:` in
+  `~/.sdlc-fleet.yaml`) and the fleet registry holds a record for the run
+  **When** `sdlc reconcile` moves that run to a final status (`DONE`,
+  `FAILED`) **Then** it `PUT`s the record with the new status, done count and
+  `finished_at`, keeping the record's `worker` and `dashboard_url` as pushed.
+- **Given** no fleet is configured, or the registry has no record for the
+  run **When** reconcile closes the run **Then** nothing is pushed and the
+  output is unchanged (local mode stays byte-identical).
+- **Given** the fleet service is unreachable **When** reconcile closes the
+  run **Then** the ledger and local registry are still updated, reconcile
+  exits as before, and one warning line names the run whose fleet record
+  is now stale and the `sdlc queue runs prune <id>` exit.
+- **Given** reconcile runs inside a dispatched agent (`SDLC_IN_TEST` or
+  `SDLC_FLEET_DISABLED`) **When** it closes a run **Then** it pushes
+  nothing, as 35.5-004 requires.
+- **Given** a worker host whose LaunchAgents set `XDG_STATE_HOME` while an
+  operator's SSH shell does not **When** the operator runs `sdlc reconcile`
+  there **Then** the run's record is updated in the registry the worker
+  and its dashboard read, not in a second registry that never held the run;
+  and `sdlc doctor` warns when the shell and the worker resolve different
+  registry paths.
+
+**Technical Notes**: Incident: run `d72324cb` (35.2-011, fleet job 12).
+- It parked `AWAITING_APPROVAL` on the M3 Max on 2026-10-18 and pushed that
+  status. FX merged #891 by hand on 2026-10-19, and `sdlc reconcile` on the
+  M3 Max set the ledger and the local registry to `DONE`.
+- The fleet record kept `AWAITING_APPROVAL`, so the M3 Max dashboard, acmd
+  and the XPS desk widget showed a live run on an idle worker until the
+  record was pruned by hand.
+- **Cause:** `reconcile.py` (~449) stamps only the host registry
+  (`registry.mark_finished`). The only fleet push is `Scheduler._push_run`
+  (`scheduler.py:1236`), which runs only inside `sdlc queue run`.
+- **Second cause:** on the M3 Max the worker and dashboard plists set
+  `XDG_STATE_HOME`, so they use `~/.local/state/sdlc/registry.json`. An SSH
+  shell has no `XDG_STATE_HOME`, so `default_registry_path()`
+  (`registry.py:66`) gives `~/.sdlc/registry.json`. The reconcile stamped
+  that file, which has no row for the run, and `mark_finished` silently did
+  nothing. The worker's registry kept `AWAITING_APPROVAL` too.
+- **Fix direction:** after `registry.mark_finished`, push the finished
+  record through `open_queue().put_fleet_run` when a fleet is configured and
+  `list_fleet_runs` has the run, reusing the worker's own fields. Keep it
+  best-effort, like `_push_run`.
+- 35.5-005 makes a hand merge reconcile on the owning worker; this story
+  makes any reconcile, wherever it runs, leave the fleet view correct.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: a reconciled fleet run's record is pushed with the final status
+      and its worker kept; reconcile without `XDG_STATE_HOME` updates the
+      worker's registry; doctor flags a split registry path; no push without a fleet or without a record;
+      unreachable service warns and still closes the ledger; no push under
+      `SDLC_FLEET_DISABLED`
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.4-001, 35.5-004
+**Risk Level**: Low
 
 ## Epic Sequencing
 
