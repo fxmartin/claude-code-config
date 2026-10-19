@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (23/27)** — 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (24/29)** — 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 27 | **Total Points**: 98 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 29 | **Total Points**: 102 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -791,6 +791,48 @@ Max on 2026-10-18 (v2.110.0).
 **Dependencies**: 35.2-006, 35.2-009
 **Risk Level**: Medium
 
+##### Story 35.2-012: Doctor checks the plugin marketplace the way the installer sets it up
+**User Story**: As FX, I want `sdlc doctor`'s install-integrity check to
+verify the `fx-claude-config` marketplace the way `install.sh --core`
+registers it today, so that a correctly installed Mac reads CLEAN and the
+fleet bootstrap exits 0 instead of 2.
+**Priority**: Should Have
+**Story Points**: 1
+
+**Acceptance Criteria**:
+- **Given** a machine where `install.sh --core` registered `fx-claude-config`
+  as a `directory` marketplace in `~/.claude/settings.json` pointing at this
+  checkout, and `~/.claude/plugins/marketplaces/fx-claude-config` does not
+  exist **When** `sdlc doctor` runs **Then** "Install integrity" is CLEAN.
+- **Given** a settings.json whose `fx-claude-config` marketplace is missing,
+  or points at a directory that does not exist **When** doctor runs **Then**
+  it FAILs with `./install.sh --core` as the remedy.
+- **Given** a leftover `plugins/marketplaces/fx-claude-config` (a symlink, or
+  a real directory such as home-lab's from 2026-10-01) **When** doctor runs
+  **Then** it WARNs that the stale install location should be removed. It
+  does not count it as the marketplace being present.
+
+**Technical Notes**: Found on the M3 Max on 2026-10-19 (v2.111.0).
+- `install/core.sh` (`register_local_marketplace`, then `remove_symlink` on
+  that path; #743, #800) deliberately removes the old marketplace path,
+  because Claude Code flags it as a corrupted installLocation.
+- `doctor.MANAGED_PATHS` (`doctor.py:77`) still requires it. Every freshly
+  installed machine therefore FAILs, and `fleet-bootstrap.sh` exits 2 on
+  doctor's code even when everything else is clean.
+- `claude plugin marketplace list` on both Macs shows `fx-claude-config` as
+  `Folder (~/.config/nix-install/config/claude-code-config)`.
+- home-lab still has a real directory at the old path; the installer's
+  `remove_symlink` only removes a symlink pointing at the repo.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: settings.json directory marketplace present → CLEAN; missing or
+      dangling → FAIL; a leftover symlink or directory at the old path → WARN
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-009
+**Risk Level**: Low
+
 ### Feature 35.3: Launch from the XPS
 
 #### Stories
@@ -1349,6 +1391,66 @@ delete route).
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.1-002, 35.4-001
+**Risk Level**: Medium
+
+##### Story 35.5-005: An approved parked job resumes on the worker that holds its run
+**User Story**: As FX, I want a job that parked awaiting approval to be
+resumed only by the worker that ran it, within its host and pool pins, so
+that adding `risk-approved` merges the change request instead of failing the
+job on a worker that has never seen the run.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a job pinned `--host m3max --pool claude-m3` that parked
+  `AWAITING_APPROVAL` on the M3 Max **When** its change request is approved
+  and every online worker polls due parked jobs **Then** only the worker
+  that ran it (recorded at park time, not cleared) takes it back. Others
+  skip it without reading its CR, and the job's host and pool pins apply
+  exactly as they do to a claim (35.2-001).
+- **Given** a CR merged by hand while its job is parked **When** the due
+  poll sees `merged` **Then** the `reconcile` also runs on the worker that
+  holds the run, so its ledger reads `DONE` without an operator.
+- **Given** the run's worker has been offline for longer than a stated
+  window (e.g. 24 h) **When** the approval lands **Then** the job does not
+  fail. It stays parked and its `reason` names the worker it waits for;
+  `sdlc queue requeue` and `cancel` remain the operator's exits.
+- **Given** a worker that takes a parked job back and finds no such run in
+  its ledger (`unknown run id`) **When** that happens anyway (e.g. a legacy
+  row) **Then** it releases the job back to `parked` with that reason rather
+  than marking it `failed`.
+
+**Technical Notes**: Incident: fleet job 12 (35.2-011, run `d72324cb`,
+2026-10-18..19).
+- The job was enqueued `--host m3max --pool claude-m3`. It parked on the
+  M3 Max awaiting the high-risk label, which FX added on 2026-10-19.
+- home-lab (`claude-shared`) took it back at 06:43 UTC and logged
+  `error: unknown run id: d72324cb-…` / `job 12 finished: failed`.
+- PR #891 was clean, so FX merged it by hand, and `sdlc reconcile` on the
+  M3 Max closed the run.
+- **Cause:**
+  - `Scheduler` (`scheduler.py` ~2104) walks `store.due_parked_jobs()`, and
+    `/jobs/due-parked` (`queue_server.py:639`) filters on nothing but
+    `poll_after`.
+  - `take_parked_job` (`queue.py:2454`) guards only state and repo
+    exclusivity.
+  - `park_job` clears `worker` and `claimed_by`, so no record says which
+    worker holds the run.
+- **Fix direction:** keep the parking worker's name on the row (a
+  `parked_by` column, or stop clearing `worker`), filter the due list by it
+  and by the job's host and pool, and re-assert both in the guarded UPDATE.
+  A new column takes a migration, so watch the migration-number collision
+  noted in memory.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: two schedulers on one store, the job parked by A: B never takes
+      it, A does on approval and on a hand merge; host/pool pins honoured on
+      take-back; an offline owner leaves the job parked with a reason; an
+      `unknown run id` take-back returns the job to parked, not failed
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-001, 35.2-005
 **Risk Level**: Medium
 
 ## Epic Sequencing
