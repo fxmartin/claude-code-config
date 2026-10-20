@@ -6,7 +6,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from sdlc.build import _STAGES, Ledger, _base_ref, _git
 from sdlc.issue_host import (
@@ -27,6 +27,10 @@ __all__ = ["ReconcileResult", "reconcile_run", "render_docs"]
 # genuinely merged. Reconciliation re-checks each of these against origin/main.
 _PARKED = {"NEEDS_ATTENTION", "FAILED", "BLOCKED", "AWAITING_APPROVAL"}
 
+# Run terminals that close a run for good; only these update its fleet record
+# (Story 35.5-006) — a still-parked run stays as the worker pushed it.
+_FLEET_FINAL = {"DONE", "FAILED"}
+
 
 @dataclass
 class ReconcileResult:
@@ -44,6 +48,8 @@ class ReconcileResult:
     run_status_after: str | None = None
     fetched: bool = False
     skipped: bool = False
+    # Story 35.5-006: set when the run closed but its fleet record could not be updated.
+    fleet_warning: str | None = None
 
     @property
     def changed(self) -> bool:
@@ -334,6 +340,8 @@ def reconcile_run(
     root: Path | None = None,
     fetch: bool = True,
     registry: "Registry | None" = None,
+    worker_registry: "Registry | None" = None,
+    fleet_sync: Callable[[str, str, int], str | None] | None = None,
 ) -> ReconcileResult:
     """Reconcile a run's parked stories against ``origin/main``, then re-terminal.
 
@@ -357,6 +365,13 @@ def reconcile_run(
     when you actually want the epic markdown's ``**Status**: Done`` markers
     rendered into the checkout — the ``sdlc reconcile`` CLI command does this
     after calling this function.
+
+    Story 35.5-006: a run closed by hand must stop reading as live elsewhere. The
+    final status is also stamped into ``worker_registry`` (the registry the run's
+    worker and its dashboard read, which differs from ``registry`` when the shell
+    lacks the worker's ``XDG_STATE_HOME``), and ``fleet_sync(run_id, status,
+    completed)`` updates the fleet record when the run lands ``DONE``/``FAILED``;
+    its returned warning surfaces as ``ReconcileResult.fleet_warning``.
     """
     root = root or Path.cwd()
     rid = run_id or ledger.latest_run_id()
@@ -449,11 +464,16 @@ def reconcile_run(
     # Mirror the normal build close-out: stamp the host registry so the
     # dashboard reflects the reconciled terminal + done count instead of the
     # stale pre-reconcile values. A run absent from the registry is a no-op.
-    if registry is not None:
+    for host_registry in (registry, worker_registry):
+        if host_registry is None:
+            continue
         try:
-            registry.mark_finished(rid, after, completed=completed)
+            host_registry.mark_finished(rid, after, completed=completed)
         except OSError:
             pass
+    fleet_warning = None
+    if fleet_sync is not None and after in _FLEET_FINAL:
+        fleet_warning = fleet_sync(rid, after, completed)
 
     if reclassified:
         ledger.event_log(
@@ -470,6 +490,7 @@ def reconcile_run(
         run_status_before=before,
         run_status_after=after,
         fetched=fetched,
+        fleet_warning=fleet_warning,
     )
 
 

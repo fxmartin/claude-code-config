@@ -1964,7 +1964,9 @@ def reconcile(
     is reported but does not change the command's exit code (mirrors the old
     best-effort write-back's non-fatal posture).
     """
+    from sdlc.doctor import worker_registry_path
     from sdlc.ledger_view import Ledger, default_db_path
+    from sdlc.queue_client import finish_fleet_run
     from sdlc.reconcile import reconcile_run, render_docs
     from sdlc.registry import Registry
 
@@ -1980,7 +1982,20 @@ def reconcile(
         typer.echo(f"error: no such run '{run}' in ledger: {db_path}", err=True)
         raise typer.Exit(code=2)
 
-    result = reconcile_run(ledger, run, registry=Registry())
+    # Story 35.5-006: an SSH shell may lack the XDG_STATE_HOME the worker's agent
+    # pins, so its default registry never held the run. Stamp the worker's too,
+    # but only one that exists — never conjure a registry the worker does not read.
+    shell_registry = Registry()
+    agent_path = worker_registry_path()
+    worker_registry = (
+        Registry(agent_path)
+        if agent_path is not None and agent_path != shell_registry.path and agent_path.is_file()
+        else None
+    )
+    result = reconcile_run(
+        ledger, run, registry=shell_registry, worker_registry=worker_registry,
+        fleet_sync=finish_fleet_run,
+    )
 
     if not result.run_id:
         typer.echo(f"no build run found in ledger: {db_path}")
@@ -2000,6 +2015,8 @@ def reconcile(
         typer.echo(f"epic markdown render failed (non-fatal): {exc}", err=True)
     for epic_file, story_ids in rendered.items():
         typer.echo(f"  rendered {', '.join(story_ids)} → {epic_file}")
+    if result.fleet_warning:
+        typer.echo(result.fleet_warning, err=True)
 
     if not result.changed:
         typer.echo(f"nothing to reconcile: run {result.run_id[:8]} unchanged.")

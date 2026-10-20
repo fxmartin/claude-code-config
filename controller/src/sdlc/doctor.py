@@ -32,7 +32,7 @@ from sdlc.model_routing import is_routing_off
 from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
 from sdlc.queue import QueueError, QueueStore, WorkerRecord, default_queue_path
 from sdlc.queue_client import QUEUE_TOKEN_ENV, QueueClient, QueueRefused, resolve_queue_url
-from sdlc.registry import Registry, derive_state
+from sdlc.registry import Registry, derive_state, registry_path_for
 from sdlc.worker_selfcheck import WORKER_UNIT
 
 __all__ = [
@@ -51,6 +51,7 @@ __all__ = [
     "check_model_coverage",
     "check_model_routing",
     "check_queue_service",
+    "check_registry_path",
     "check_stashes",
     "check_usage_agreement",
     "check_worker_dashboard",
@@ -1079,6 +1080,53 @@ def _installed_worker_agent(plist: Path, unit: Path) -> tuple[dict[str, str], st
     except Exception:  # noqa: BLE001 - see check_fleet_worker_installed
         return {}, None
     return {}, None
+
+
+def worker_registry_path(
+    *, agent_path: Path | None = None, unit_path: Path | None = None
+) -> Path | None:
+    """The registry the installed worker agent resolves, or None with no agent installed.
+
+    launchd and systemd start the worker with the agent's environment, not the
+    shell's, so ``XDG_STATE_HOME`` pinned there sends its runs (and its dashboard's
+    reads) to a registry an SSH shell without it never opens (Story 35.5-006).
+    """
+    plist = agent_path or default_worker_plist()
+    unit = unit_path or default_worker_unit()
+    if not (plist.exists() or unit.exists()):
+        return None
+    env, _host = _installed_worker_agent(plist, unit)
+    return registry_path_for(env)
+
+
+def check_registry_path(
+    *,
+    agent_path: Path | None = None,
+    unit_path: Path | None = None,
+    shell_path: Path | None = None,
+) -> Finding | None:
+    """WARN when this shell and the installed worker agent resolve different registries.
+
+    Story 35.5-006. A run the worker registered is only found, and a hand-closed
+    one only updated, in the worker's registry; a shell resolving another file
+    reads a registry that never held the run. ``None`` where no worker is
+    installed: there is no second registry to disagree with.
+    """
+    worker = worker_registry_path(agent_path=agent_path, unit_path=unit_path)
+    if worker is None:
+        return None
+    shell = shell_path if shell_path is not None else registry_path_for(os.environ)
+    if worker == shell:
+        return Finding(
+            "registry-path", "Run registry path", "CLEAN",
+            f"this shell and the worker agent both use {worker}",
+        )
+    return Finding(
+        "registry-path", "Run registry path", "WARN",
+        f"the worker agent keeps its runs in {worker} but this shell resolves {shell}",
+        f"export XDG_STATE_HOME to the worker agent's value (e.g. $HOME/.local/state) in "
+        f"your shell profile, or set SDLC_REGISTRY_PATH={worker}",
+    )
 
 
 def _agent_host(plist_data: dict) -> str | None:
@@ -2367,6 +2415,11 @@ def run_doctor(
     )
     if worker is not None:
         findings.append(worker)
+    registry_split = check_registry_path(
+        agent_path=worker_plist, unit_path=worker_unit, shell_path=registry.path
+    )
+    if registry_split is not None:
+        findings.append(registry_split)
     credentials = check_forge_credentials(agent_path=worker_plist, unit_path=worker_unit)
     if credentials is not None:
         findings.append(credentials)

@@ -11,7 +11,7 @@ import os
 import socket
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote, urlencode, urlsplit
@@ -780,3 +780,51 @@ def push_fleet_run(record: RunRecord) -> None:
         )
     except (QueueError, OSError, ValueError):
         pass
+
+
+def finish_fleet_run(run_id: str, status: str, completed: int | None) -> str | None:
+    """Write a closed run's final ``status`` to its fleet record (Story 35.5-006).
+
+    ``sdlc reconcile`` closes a run outside the worker that pushed it, so the fleet
+    record would stay live. The fleet's own row is the base — worker, dashboard
+    and origin as pushed — and only the close-out fields change. Nothing is pushed
+    with no fleet configured, none holding the run, or under ``SDLC_IN_TEST`` /
+    ``SDLC_FLEET_DISABLED`` (35.5-004).
+
+    Never raises: the ledger and local registry are already closed. When the
+    service cannot be reached, returns the one warning line that names the run
+    left stale and the prune that clears it; otherwise ``None``.
+    """
+    if _flag(os.environ, _IN_TEST_ENV):
+        return None
+    try:
+        url = resolve_queue_url()
+    except QueueConfigError:
+        return None  # a malformed URL names no fleet to be stale in
+    if url is None:
+        return None
+    try:
+        client = QueueClient(
+            url, token=os.environ.get(QUEUE_TOKEN_ENV) or None, timeout=PUSH_TIMEOUT_SECONDS
+        )
+        row = next((r for r in client.list_fleet_runs() if r.get("run_id") == run_id), None)
+        if row is None:
+            return None
+        record = RunRecord.from_dict(row)
+        if record.finished_at and record.status == status:
+            return None
+        client.put_fleet_run(
+            dataclasses.replace(
+                record,
+                status=status,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                completed=record.completed if completed is None else completed,
+                phase=None,
+            )
+        )
+    except (QueueError, OSError, ValueError, TypeError) as exc:
+        return (
+            f"warning: fleet record for run {run_id[:8]} is now stale ({exc}); "
+            f"remove it with `sdlc queue runs prune {run_id}`"
+        )
+    return None
