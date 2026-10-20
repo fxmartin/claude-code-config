@@ -1078,6 +1078,20 @@ longer shows FAILED days after the work actually shipped.
 - **Clean absence.** No ledger / no runs reports cleanly and never materialises a
   spurious empty ledger; only a genuinely-unknown *explicit* run id exits
   non-zero (CLI exit 2).
+- **Fleet record and worker registry (Story 35.5-006).** A run closed by hand must
+  stop reading as live on the XPS dashboard and the desk widget. When `reconcile`
+  lands a run `DONE`/`FAILED` and a fleet is configured (`SDLC_QUEUE_URL` or
+  `queue_url:` in `~/.sdlc-fleet.yaml`) that holds a record for it,
+  `queue_client.finish_fleet_run` `PUT`s that record with the new status, done count
+  and `finished_at`, keeping its `worker`, `dashboard_url` and `origin` as the worker
+  pushed them. No fleet, no record, or `SDLC_IN_TEST` / `SDLC_FLEET_DISABLED` pushes
+  nothing and prints nothing. An unreachable service leaves the ledger and local
+  registry closed and exit code unchanged, with one warning line naming the stale run
+  and `sdlc queue runs prune <id>`. The final status is also stamped into the registry
+  the installed worker agent resolves from its own environment (`XDG_STATE_HOME`
+  pinned in the plist or unit), which an SSH shell without it would never open;
+  `sdlc doctor` WARNs (`registry-path`) when the shell and the agent resolve
+  different registry files.
 - **The on-demand epic-markdown renderer (Story 32.1-003).** `reconcile_run`
   itself never touches the shared checkout — it only ever updates the ledger,
   so two build runs sharing a repo never trip the #590 dirty-tree guard on

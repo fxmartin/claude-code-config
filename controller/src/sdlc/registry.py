@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Mapping
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     "live_record",
     "normalize_dashboard_url",
     "pid_alive",
+    "registry_path_for",
 ]
 
 # Registry filename under the chosen state directory.
@@ -63,21 +64,29 @@ def normalize_dashboard_url(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def default_registry_path() -> Path:
-    """Resolve the host-level registry path, XDG-aware.
+def registry_path_for(environ: Mapping[str, str], *, home: Path | None = None) -> Path:
+    """The registry path a process with ``environ`` resolves, XDG-aware.
 
     Resolution order:
     1. ``SDLC_REGISTRY_PATH`` — an explicit file path (used by tests and power users).
     2. ``XDG_STATE_HOME/sdlc/registry.json`` when ``XDG_STATE_HOME`` is set.
     3. ``~/.sdlc/registry.json`` — the documented default.
+
+    Takes the environment as an argument so a caller can ask where *another*
+    process looks — a LaunchAgent's bare environment, say (Story 35.5-006).
     """
-    explicit = os.environ.get("SDLC_REGISTRY_PATH")
+    explicit = environ.get("SDLC_REGISTRY_PATH")
     if explicit:
         return Path(explicit)
-    xdg = os.environ.get("XDG_STATE_HOME")
+    xdg = environ.get("XDG_STATE_HOME")
     if xdg:
         return Path(xdg) / "sdlc" / _REGISTRY_NAME
-    return Path.home() / ".sdlc" / _REGISTRY_NAME
+    return (home or Path.home()) / ".sdlc" / _REGISTRY_NAME
+
+
+def default_registry_path() -> Path:
+    """Resolve this process's host-level registry path (see :func:`registry_path_for`)."""
+    return registry_path_for(os.environ)
 
 
 @dataclass
