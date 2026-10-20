@@ -74,8 +74,14 @@ MANAGED_PATHS: tuple[str, ...] = (
     "docs",
     "skills",
     "hooks",
-    "plugins/marketplaces/fx-claude-config",
 )
+
+# The plugin marketplace is not a managed path: since #743/#800 `install.sh
+# --core` registers it as a `directory` source in settings.json and removes the
+# old `plugins/marketplaces/<name>` location (Claude Code flags it as a
+# corrupted installLocation). `check_install` verifies the registration instead.
+MARKETPLACE_NAME = "fx-claude-config"
+_LEGACY_MARKETPLACE_PATH = Path("plugins") / "marketplaces" / MARKETPLACE_NAME
 
 # External tools the framework shells out to. `gh`/`claude` drive the core
 # workflow; `semgrep`/`osv-scanner` gate the security stages. A missing tool
@@ -180,8 +186,27 @@ class DoctorReport:
 # ---------------------------------------------------------------------------
 
 
+def _marketplace_problem(claude_dir: Path) -> str | None:
+    """Why the ``fx-claude-config`` marketplace registration is unusable, or None.
+
+    Reads ``settings.json`` (through the ~/.claude symlink) the way
+    ``install.sh --core`` writes it: a ``directory`` source whose path exists.
+    """
+    try:
+        settings = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+        source = settings["extraKnownMarketplaces"][MARKETPLACE_NAME]["source"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return f"marketplace {MARKETPLACE_NAME} is not registered in settings.json"
+    if not isinstance(source, dict) or source.get("source") != "directory":
+        return f"marketplace {MARKETPLACE_NAME} is not a directory source in settings.json"
+    path = source.get("path")
+    if not isinstance(path, str) or not Path(path).expanduser().is_dir():
+        return f"marketplace {MARKETPLACE_NAME} points at a missing directory: {path}"
+    return None
+
+
 def check_install(claude_dir: Path) -> Finding:
-    """Verify the managed ~/.claude symlinks/files are present and resolvable."""
+    """Verify the managed ~/.claude symlinks/files and the plugin marketplace."""
     if not claude_dir.exists():
         return Finding(
             "install",
@@ -193,19 +218,34 @@ def check_install(claude_dir: Path) -> Finding:
     # A name is broken when it is absent or a dangling symlink (a symlink whose
     # target is gone): Path.exists() follows the link, so it is False for both.
     broken = [name for name in MANAGED_PATHS if not (claude_dir / name).exists()]
-    if broken:
+    problems = [f"missing/broken managed paths under {claude_dir}: {', '.join(broken)}"] if broken else []
+    marketplace_problem = _marketplace_problem(claude_dir)
+    if marketplace_problem:
+        problems.append(marketplace_problem)
+    if problems:
         return Finding(
             "install",
             "Install integrity",
             "FAIL",
-            f"missing/broken managed paths under {claude_dir}: {', '.join(broken)}",
-            "run: ./install.sh --core (restores managed symlinks)",
+            "; ".join(problems),
+            "run: ./install.sh --core (restores managed symlinks and the marketplace)",
+        )
+    # lexists, not exists: a dangling symlink is just as stale. It never counts
+    # as the marketplace being present — the registration above decides that.
+    legacy = claude_dir / _LEGACY_MARKETPLACE_PATH
+    if os.path.lexists(legacy):
+        return Finding(
+            "install",
+            "Install integrity",
+            "WARN",
+            f"stale marketplace install location {legacy} — Claude Code flags it as a corrupted installLocation",
+            f"remove it: rm -rf {legacy}",
         )
     return Finding(
         "install",
         "Install integrity",
         "CLEAN",
-        f"all {len(MANAGED_PATHS)} managed paths present under {claude_dir}",
+        f"all {len(MANAGED_PATHS)} managed paths and the {MARKETPLACE_NAME} marketplace present under {claude_dir}",
     )
 
 
