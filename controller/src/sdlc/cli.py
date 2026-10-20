@@ -4402,13 +4402,15 @@ def queue_serve_cmd(
       GET    /jobs/claimable[?busy=PATH&fix_busy=PATH]   {jobs} in dispatch order
       POST   /jobs/eligible          worker, job_ids, \\[slots_free] -> {jobs} it may take
       GET    /jobs/expired           {jobs}: running with a lapsed lease
-      GET    /jobs/due               {jobs}: parked, change request due a re-read
+      GET    /jobs/due[?worker=NAME] {jobs}: parked, change request due a re-read —
+                                     only those NAME may take back (its own parks)
       GET    /jobs/running-repos[?kind=K&excluding=ID]   {repos}
       GET    /jobs/holds             {holds}: file-overlap holds {job: holder}
       POST   /jobs/{id}/claim        claimed_by, \\[lease_seconds, worker]  (409: lost)
       POST   /jobs/{id}/reclaim      same, for a lapsed lease
-      POST   /jobs/{id}/take         same, for a parked job
+      POST   /jobs/{id}/take         same, for a parked job (its parker only)
       POST   /jobs/{id}/park         pr_number, reason, \\[poll_after]
+      POST   /jobs/{id}/repark       claimed_by, reason, \\[poll_after]  -> {parked}
       POST   /jobs/{id}/poll         \\[poll_after]
       POST   /jobs/{id}/reason       \\[reason]
       POST   /jobs/{id}/run          run_id

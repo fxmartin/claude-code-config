@@ -603,8 +603,10 @@ class QueueClient:
     def expired_running_jobs(self, *, now: datetime | None = None) -> list[JobRecord]:
         return self._jobs("/jobs/expired")
 
-    def due_parked_jobs(self, *, now: datetime | None = None) -> list[JobRecord]:
-        return self._jobs("/jobs/due")
+    def due_parked_jobs(
+        self, *, now: datetime | None = None, worker: str | None = None
+    ) -> list[JobRecord]:
+        return self._jobs("/jobs/due" + (f"?{urlencode({'worker': worker})}" if worker else ""))
 
     def running_repos(
         self, *, kind: str | None = None, excluding: int | None = None
@@ -675,6 +677,20 @@ class QueueClient:
         worker: str | None = None,
     ) -> JobRecord | None:
         return self._take("take", job_id, claimed_by, lease_seconds, worker)
+
+    def repark_job(
+        self, job_id: int, *, claimed_by: str, reason: str, poll_after: datetime | None
+    ) -> bool:
+        payload = self._call(
+            "POST",
+            f"/jobs/{job_id}/repark",
+            {
+                "claimed_by": claimed_by,
+                "reason": reason,
+                "poll_after": poll_after.isoformat() if poll_after is not None else None,
+            },
+        )
+        return bool(isinstance(payload, dict) and payload.get("parked"))
 
     def park_job(
         self, job_id: int, *, pr_number: int, reason: str, poll_after: datetime | None

@@ -23,7 +23,7 @@ T0 = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
 SCHEDULER_SURFACE = (
     "peek_claimable", "claim_job", "claimable_for_worker", "reclaim_job",
     "expired_running_jobs", "running_repos", "overlap_holds", "park_job",
-    "take_parked_job", "due_parked_jobs", "schedule_poll", "set_reason",
+    "take_parked_job", "repark_job", "due_parked_jobs", "schedule_poll", "set_reason",
     "attach_run", "record_sync", "record_files", "record_fix_rounds_baseline",
     "restart_fresh", "requeue_job", "dispatch_pause", "dispatch_pauses",
     "mark_pause_probed", "get_worker", "register_worker", "put_fleet_run",
@@ -286,6 +286,36 @@ def test_park_take_and_due_round_trip(client: QueueClient, store: QueueStore, cl
     taken = client.take_parked_job(job_id, claimed_by="m3max", lease_seconds=90, now=clock(), worker="m3max")
     assert taken is not None and taken.state == "running" and taken.worker == "m3max"
     assert client.take_parked_job(job_id, claimed_by="xps", lease_seconds=90) is None
+
+
+def test_due_parked_jobs_over_http_are_the_asking_workers_own(
+    client: QueueClient, store: QueueStore, clock: FakeClock
+) -> None:
+    """Story 35.5-005: a peer is never offered a job another registered worker parked."""
+    for name in ("m3max", "home-lab"):
+        store.register_worker(name, host=name, harnesses=["claude"], now=clock())
+    job_id = _running_with_run(client, store)
+    client.park_job(job_id, pr_number=891, reason="awaiting approval", poll_after=None)
+
+    assert [j.id for j in client.due_parked_jobs(now=clock(), worker="m3max")] == [job_id]
+    assert client.due_parked_jobs(now=clock(), worker="home-lab") == []
+    assert client.take_parked_job(job_id, claimed_by="home-lab", lease_seconds=90, worker="home-lab") is None
+
+
+def test_repark_job_over_http_returns_a_take_back_to_its_park(
+    client: QueueClient, store: QueueStore, clock: FakeClock
+) -> None:
+    store.register_worker("m3max", host="m3max", harnesses=["claude"], now=clock())
+    job_id = _running_with_run(client, store)
+    client.park_job(job_id, pr_number=891, reason="awaiting approval", poll_after=None)
+    client.take_parked_job(job_id, claimed_by="m3max", lease_seconds=90, worker="m3max")
+    later = T0 + timedelta(minutes=5)
+
+    assert client.repark_job(job_id, claimed_by="m3max", reason="unknown run id: run-1", poll_after=later) is True
+    job = store.get_job(job_id)
+    assert job is not None and job.state == "parked" and job.parked_by == "m3max"
+    assert job.reason == "unknown run id: run-1" and job.poll_after == later.isoformat()
+    assert client.repark_job(job_id, claimed_by="m3max", reason="again", poll_after=None) is False
 
 
 def test_park_job_with_no_poll_time_is_due_at_once(

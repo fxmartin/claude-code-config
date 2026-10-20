@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from sdlc.queue import QueueError, QueueStore
+from sdlc.queue import QueueError, QueueStore, WorkerRecord
 
 
 def _store(tmp_path) -> QueueStore:
@@ -260,3 +260,193 @@ def test_ensure_migrated_adds_the_approval_columns_in_place(tmp_path) -> None:
     assert {"pr_number", "poll_after"} <= cols
     # And the pre-existing row survived untouched.
     assert [r.scope for r in store.list_jobs()] == ["42"]
+
+
+# --- Story 35.5-005: the worker that parked a job takes it back ------------
+
+
+def _worker(store: QueueStore, name: str, *, host: str | None = None, pools=(), now=None):
+    return store.register_worker(
+        name, host=host or name, pools=list(pools), harnesses=["claude"],
+        slots=2, slots_free=2, now=now or _now(),
+    )
+
+
+def _parked_by(store: QueueStore, worker: str | None, *, repo: str = "/a", **pins) -> int:
+    """A job ``worker`` ran (``None``: a local drain) that parked awaiting approval."""
+    job_id = store.add_job(repo=repo, kind="build", scope="epic-3", **pins)
+    store.claim_job(job_id, claimed_by=f"{worker}:1", lease_seconds=90, now=_now(), worker=worker)
+    store.attach_run(job_id, "run-abc")
+    store.park_job(job_id, pr_number=12, reason="awaiting approval", poll_after=None)
+    return job_id
+
+
+def test_park_job_records_the_worker_that_held_the_run(tmp_path) -> None:
+    store = _store(tmp_path)
+    _worker(store, "m3max")
+    job_id = _parked_by(store, "m3max")
+
+    parked = store.get_job(job_id)
+    assert parked.parked_by == "m3max"
+    assert parked.worker is None and parked.claimed_by is None  # it holds no claim
+    assert parked.to_dict()["parked_by"] == "m3max"
+
+
+def test_a_local_park_records_no_owner(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = _parked_by(store, None)
+
+    assert store.get_job(job_id).parked_by is None
+
+
+def test_only_the_owner_sees_a_job_it_parked_as_due(tmp_path) -> None:
+    store = _store(tmp_path)
+    _worker(store, "m3max")
+    _worker(store, "home-lab")
+    job_id = _parked_by(store, "m3max")
+
+    assert [j.id for j in store.due_parked_jobs(now=_now(), worker="m3max")] == [job_id]
+    assert store.due_parked_jobs(now=_now(), worker="home-lab") == []
+    assert store.due_parked_jobs(now=_now()) == []  # a plain drain is not its owner either
+
+
+def test_a_job_parked_by_an_unregistered_holder_is_anyones(tmp_path) -> None:
+    """Nobody can come back for it — the pre-fleet rule, as a lapsed lease keeps it."""
+    store = _store(tmp_path)
+    _worker(store, "home-lab")
+    job_id = _parked_by(store, "gone-worker")
+
+    assert [j.id for j in store.due_parked_jobs(now=_now(), worker="home-lab")] == [job_id]
+    assert [j.id for j in store.due_parked_jobs(now=_now())] == [job_id]
+
+
+def test_a_peer_cannot_take_back_a_job_another_worker_parked(tmp_path) -> None:
+    store = _store(tmp_path)
+    _worker(store, "m3max")
+    _worker(store, "home-lab")
+    job_id = _parked_by(store, "m3max")
+
+    assert store.take_parked_job(
+        job_id, claimed_by="home-lab:1", lease_seconds=90, now=_now(), worker="home-lab"
+    ) is None
+    assert store.take_parked_job(job_id, claimed_by="plain:1", lease_seconds=90, now=_now()) is None
+    taken = store.take_parked_job(
+        job_id, claimed_by="m3max:1", lease_seconds=90, now=_now(), worker="m3max"
+    )
+    assert taken is not None and taken.worker == "m3max"
+    assert taken.parked_by == "m3max"  # kept, not cleared, by the take-back
+
+
+def test_host_and_pool_pins_apply_to_a_take_back(tmp_path) -> None:
+    """A legacy row (no owner) still only goes where a claim of it could."""
+    store = _store(tmp_path)
+    _worker(store, "m3max", host="m3max", pools=["claude-m3"])
+    _worker(store, "home-lab", host="home-lab", pools=["claude-shared"])
+    _worker(store, "m3-other-pool", host="m3max", pools=["claude-shared"])
+    job_id = _parked_by(store, None, host="m3max", pool="claude-m3")
+
+    assert store.due_parked_jobs(now=_now(), worker="home-lab") == []
+    assert store.due_parked_jobs(now=_now(), worker="m3-other-pool") == []
+    assert [j.id for j in store.due_parked_jobs(now=_now(), worker="m3max")] == [job_id]
+    for peer in ("home-lab", "m3-other-pool"):
+        assert store.take_parked_job(
+            job_id, claimed_by=f"{peer}:1", lease_seconds=90, now=_now(), worker=peer
+        ) is None
+    assert store.take_parked_job(
+        job_id, claimed_by="m3max:1", lease_seconds=90, now=_now(), worker="m3max"
+    ) is not None
+
+
+def test_repark_job_hands_a_take_back_straight_back_to_its_park(tmp_path) -> None:
+    store = _store(tmp_path)
+    _worker(store, "m3max")
+    job_id = _parked_by(store, "m3max")
+    store.take_parked_job(job_id, claimed_by="m3max:1", lease_seconds=90, now=_now(), worker="m3max")
+    later = _now() + timedelta(seconds=300)
+
+    assert store.repark_job(
+        job_id, claimed_by="m3max:1", reason="unknown run id: run-abc", poll_after=later
+    ) is True
+
+    job = store.get_job(job_id)
+    assert job.state == "parked"
+    assert job.reason == "unknown run id: run-abc"
+    assert job.poll_after == later.isoformat()
+    assert job.claimed_by is None and job.worker is None and job.lease_until is None
+    assert job.parked_by == "m3max" and job.pr_number == 12 and job.run_id == "run-abc"
+    assert store.running_repos() == set()
+
+
+def test_repark_job_keeps_a_legacy_row_ownerless(tmp_path) -> None:
+    store = _store(tmp_path)
+    _worker(store, "home-lab")
+    job_id = _parked_by(store, None)
+    store.take_parked_job(
+        job_id, claimed_by="home-lab:1", lease_seconds=90, now=_now(), worker="home-lab"
+    )
+
+    store.repark_job(job_id, claimed_by="home-lab:1", reason="unknown run id", poll_after=None)
+
+    assert store.get_job(job_id).parked_by is None  # still anyone's, so the right worker can find it
+
+
+def test_repark_job_needs_the_holder(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = _parked_by(store, None)
+    store.take_parked_job(job_id, claimed_by="a:1", lease_seconds=90, now=_now())
+
+    assert store.repark_job(job_id, claimed_by="b:1", reason="x", poll_after=None) is False
+    assert store.get_job(job_id).state == "running"
+
+
+def test_repark_job_honours_a_cancel_that_landed_meanwhile(tmp_path) -> None:
+    store = _store(tmp_path)
+    job_id = _parked_by(store, None)
+    store.take_parked_job(job_id, claimed_by="a:1", lease_seconds=90, now=_now())
+    store.cancel_job(job_id)
+
+    assert store.repark_job(job_id, claimed_by="a:1", reason="x", poll_after=None) is False
+    assert store.get_job(job_id).state == "cancelled"
+
+
+def test_a_parked_job_names_its_owner_once_it_has_been_offline_a_day(tmp_path) -> None:
+    from sdlc.queue import PARKED_OWNER_OFFLINE_SECONDS, PARKED_OWNER_REASON_PREFIX
+
+    store = _store(tmp_path)
+    _worker(store, "m3max")
+    job_id = _parked_by(store, "m3max")
+
+    _worker(store, "home-lab", now=_now() + timedelta(seconds=PARKED_OWNER_OFFLINE_SECONDS - 60))
+    assert store.get_job(job_id).reason == "awaiting approval"  # a reboot is not a day
+
+    _worker(store, "home-lab", now=_now() + timedelta(seconds=PARKED_OWNER_OFFLINE_SECONDS + 60))
+    job = store.get_job(job_id)
+    assert job.state == "parked"
+    assert job.reason.startswith(PARKED_OWNER_REASON_PREFIX + "m3max")
+    assert "#12" in job.reason and "sdlc queue requeue" in job.reason and "cancel" in job.reason
+    # Still the owner's alone: nobody else is offered it.
+    later = _now() + timedelta(seconds=PARKED_OWNER_OFFLINE_SECONDS + 60)
+    assert store.due_parked_jobs(now=later, worker="home-lab") == []
+
+
+def test_ensure_migrated_adds_the_parked_by_column(tmp_path) -> None:
+    store = _pre_32_2_store(tmp_path)
+
+    store.ensure_migrated()
+
+    with sqlite3.connect(store.db_path) as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    assert "parked_by" in cols
+    assert store.list_jobs()[0].parked_by is None
+
+
+def test_silent_seconds_unreadable_heartbeat_is_never_online() -> None:
+    worker = WorkerRecord(name="w", host="h", registered_at="x", last_heartbeat="garbage")
+    assert worker.silent_seconds() == float("inf")
+    assert not worker.is_online()
+
+
+def test_silent_seconds_reads_naive_heartbeat_as_utc() -> None:
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    worker = WorkerRecord(name="w", host="h", registered_at="x", last_heartbeat="2026-01-01T11:59:00")
+    assert worker.silent_seconds(now) == 60.0

@@ -402,6 +402,10 @@ class JobRecord:
     # never ran `sdlc issues init` can still open the change request with
     # ``Closes #N``. Data, not a credential. ``None`` = nothing mirrored there.
     issues: str | None = None
+    # Story 35.5-005: the worker that held the job when it parked, so only that
+    # worker — the one whose disk holds the run — takes it back. Kept through the
+    # take-back; ``None`` for a local drain's park and every row older than it.
+    parked_by: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -430,6 +434,7 @@ class JobRecord:
             "cancel_requested": self.cancel_requested,
             "synced_sha": self.synced_sha,
             "issues": self.issues,
+            "parked_by": self.parked_by,
         }
 
     def job_budget(self) -> JobBudget:
@@ -648,7 +653,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     worker      TEXT,
     cancel_requested INTEGER,
     synced_sha  TEXT,
-    issues      TEXT
+    issues      TEXT,
+    parked_by   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS _migrations (
@@ -752,6 +758,8 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (16, "fleet_run_phase", "fleet_runs", [("phase", "TEXT")], None),
     # Story 35.3-002: the story→issue mappings a job carries to its worker.
     (17, "job_issues", "jobs", [("issues", "TEXT")], None),
+    # Story 35.5-005: the worker a parked job waits for.
+    (18, "job_parked_by", "jobs", [("parked_by", "TEXT")], None),
 ]
 
 
@@ -825,6 +833,20 @@ UNSATISFIABLE_REASON_PREFIX = "no eligible worker"
 # leaves a reason carrying this alone.
 FORGE_REFUSAL_MARKER = " cannot authenticate to "
 
+# A parked job waits for the worker that parked it (Story 35.5-005): the run is on
+# that worker's disk, and a peer that took it back would fail it on `unknown run
+# id`. Silent for longer than this, the owner is named in the job's reason — the
+# job still waits, with `sdlc queue requeue|cancel` as the operator's exits.
+PARKED_OWNER_OFFLINE_SECONDS = 24 * 3600
+PARKED_OWNER_REASON_PREFIX = "awaiting worker "
+
+# Who may take a parked job back: the worker that parked it, or anyone when there
+# is nobody to wait for — a local park, a legacy row, an owner no longer registered
+# (the rule a lapsed lease follows, Story 35.2-005). Binds the asking worker's name.
+_PARK_OWNER_SQL = (
+    "(parked_by IS NULL OR parked_by = ? OR parked_by NOT IN (SELECT name FROM workers))"
+)
+
 # `requirements.sandbox` is a string: these read as "not needed" / "any runtime";
 # anything else names the runtime the worker must have (e.g. ``podman``).
 _SANDBOX_NOT_NEEDED = frozenset({"", "0", "false", "no", "none", "off"})
@@ -862,15 +884,19 @@ class WorkerRecord:
         """Free slots as the matcher sees them: none while the worker cannot run an agent."""
         return self.slots_free if self.can_run_agents else 0
 
-    def is_online(self, now: datetime | None = None) -> bool:
-        """Heard from within :data:`OFFLINE_AFTER_SECONDS` (three missed beats)."""
+    def silent_seconds(self, now: datetime | None = None) -> float:
+        """Seconds since the last heartbeat; forever when it cannot be read."""
         try:
             beat = datetime.fromisoformat(self.last_heartbeat)
         except ValueError:
-            return False
+            return float("inf")
         if beat.tzinfo is None:
             beat = beat.replace(tzinfo=timezone.utc)
-        return (_at(now) - beat).total_seconds() <= OFFLINE_AFTER_SECONDS
+        return (_at(now) - beat).total_seconds()
+
+    def is_online(self, now: datetime | None = None) -> bool:
+        """Heard from within :data:`OFFLINE_AFTER_SECONDS` (three missed beats)."""
+        return self.silent_seconds(now) <= OFFLINE_AFTER_SECONDS
 
     def to_dict(self, now: datetime | None = None) -> dict:
         return {**dataclasses.asdict(self), "online": self.is_online(now)}
@@ -1012,6 +1038,13 @@ def _unsatisfiable_reason(job: JobRecord, online: Sequence[WorkerRecord]) -> str
     return f"{UNSATISFIABLE_REASON_PREFIX} (needs {', '.join(missing or [l for l, _ in needs])})"
 
 
+def _pins_met(job: JobRecord, worker: WorkerRecord) -> bool:
+    """The job's ``--host``/``--pool`` pins, judged as a claim judges them (Story 35.2-001)."""
+    return (job.host is None or job.host == worker.host) and (
+        job.pool is None or job.pool in worker.pools
+    )
+
+
 class QueueBackend(Protocol):
     """What a queue consumer needs from "the queue" — local SQLite or the fleet.
 
@@ -1079,7 +1112,9 @@ class QueueBackend(Protocol):
 
     def expired_running_jobs(self, *, now: datetime | None = None) -> list[JobRecord]: ...
 
-    def due_parked_jobs(self, *, now: datetime | None = None) -> list[JobRecord]: ...
+    def due_parked_jobs(
+        self, *, now: datetime | None = None, worker: str | None = None
+    ) -> list[JobRecord]: ...
 
     def running_repos(
         self, *, kind: str | None = None, excluding: int | None = None
@@ -1120,6 +1155,15 @@ class QueueBackend(Protocol):
         now: datetime | None = None,
         worker: str | None = None,
     ) -> JobRecord | None: ...
+
+    def repark_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        reason: str,
+        poll_after: datetime | None,
+    ) -> bool: ...
 
     def renew_lease(
         self,
@@ -2006,6 +2050,7 @@ class QueueStore:
             )
         self.expire_offline_leases(now=now)
         self.stamp_unsatisfiable(now=now)
+        self.stamp_parked_owners(now=now)
         record = self.get_worker(name)
         assert record is not None  # just written
         return record
@@ -2151,6 +2196,35 @@ class QueueStore:
                 and job.reason.startswith(UNSATISFIABLE_REASON_PREFIX)
             ):
                 self.set_reason(job.id, None)
+                changed += 1
+        return changed
+
+    def stamp_parked_owners(self, *, now: datetime | None = None) -> int:
+        """Name the worker on each parked job whose owner is long gone; how many changed.
+
+        Story 35.5-005. A job parked by a worker silent for longer than
+        :data:`PARKED_OWNER_OFFLINE_SECONDS` stays parked for it — nobody else has
+        the run — and its reason says so, which is all `sdlc queue list` can offer
+        the operator who must choose between waiting, `requeue` and `cancel`. The
+        owner's own scheduler puts its approval reason back once it is polling again.
+        """
+        workers = {w.name: w for w in self.list_workers()}
+        moment = _at(now)
+        changed = 0
+        for job in self.list_jobs():
+            owner = workers.get(job.parked_by or "")
+            if job.state != "parked" or owner is None:
+                continue
+            if owner.silent_seconds(moment) <= PARKED_OWNER_OFFLINE_SECONDS:
+                continue
+            reason = (
+                f"{PARKED_OWNER_REASON_PREFIX}{owner.name} (offline since "
+                f"{owner.last_heartbeat}): its run {job.run_id} is on that worker, which "
+                f"resumes it once #{job.pr_number} is approved — or `sdlc queue requeue "
+                f"{job.id}` / `sdlc queue cancel {job.id}`"
+            )
+            if job.reason != reason:
+                self.set_reason(job.id, reason)
                 changed += 1
         return changed
 
@@ -2419,10 +2493,12 @@ class QueueStore:
             ).rowcount
             if cancelled:
                 return False
+            # ``parked_by`` is read from the row, not taken from the caller: the
+            # holder at this instant is the worker whose disk the run is on.
             conn.execute(
-                "UPDATE jobs SET state = 'parked', claimed_by = NULL, worker = NULL, "
-                "lease_until = NULL, pr_number = ?, poll_after = ?, reason = ?, "
-                "updated_at = ? WHERE id = ?",
+                "UPDATE jobs SET state = 'parked', parked_by = worker, claimed_by = NULL, "
+                "worker = NULL, lease_until = NULL, pr_number = ?, poll_after = ?, "
+                "reason = ?, updated_at = ? WHERE id = ?",
                 (
                     pr_number,
                     poll_after.isoformat() if poll_after is not None else None,
@@ -2474,13 +2550,28 @@ class QueueStore:
         read. ``pr_number`` is deliberately kept — it is the record of which CR
         this job's work landed on — while ``poll_after`` is cleared, since a job
         that is running is no longer being polled.
+
+        Story 35.5-005 re-asserts :meth:`due_parked_jobs`' filter here, for the
+        same read-then-write reason: only the worker that parked the job (or
+        anyone, when it has no registered owner) may take it, and a registered
+        ``worker`` only within the job's host and pool pins. ``parked_by`` is
+        kept, so a resume that parks again — or a :meth:`repark_job` — still
+        waits for the same worker.
         """
         moment = _at(now)
+        me = self.get_worker(worker) if worker else None
+        pins = ""
+        pin_args: tuple[str, ...] = ()
+        if me is not None:
+            pools = ", ".join("?" for _ in me.pools) or "NULL"
+            pins = f" AND (host IS NULL OR host = ?) AND (pool IS NULL OR pool IN ({pools}))"
+            pin_args = (me.host, *me.pools)
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = 'running', claimed_by = ?, lease_until = ?, "
                 "poll_after = NULL, reason = NULL, cancel_requested = 0, updated_at = ?, "
                 "worker = ? WHERE id = ? AND state = 'parked' "
+                f"AND {_PARK_OWNER_SQL}{pins} "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM jobs AS busy "
                 "  WHERE busy.repo = jobs.repo AND busy.state = 'running'"
@@ -2491,11 +2582,54 @@ class QueueStore:
                     moment.isoformat(),
                     worker,
                     job_id,
+                    worker,
+                    *pin_args,
                 ),
             )
             if cur.rowcount != 1:
                 return None
         return self.get_job(job_id)
+
+    def repark_job(
+        self,
+        job_id: int,
+        *,
+        claimed_by: str,
+        reason: str,
+        poll_after: datetime | None,
+    ) -> bool:
+        """Hand a job taken back from its park straight back to it; ``False`` if not ours.
+
+        Story 35.5-005: the take-back found no such run on this worker (`unknown
+        run id` — a legacy row, a lost registry). That is not the job failing: the
+        run may well be on another worker, so the job goes back to ``parked`` with
+        ``reason`` and its next poll, and ``parked_by`` is left as it was — an
+        ownerless row stays anyone's, so the worker that does hold the run can
+        still take it. Guarded on the holder, like :meth:`finish_job`; a cancel
+        that landed since the take is honoured instead, as :meth:`park_job` does.
+        """
+        moment = _now_iso()
+        with self._connect() as conn:
+            if conn.execute(
+                "UPDATE jobs SET state = 'cancelled', claimed_by = NULL, worker = NULL, "
+                "lease_until = NULL, cancel_requested = 0, reason = ?, updated_at = ? "
+                "WHERE id = ? AND state = 'running' AND claimed_by = ? AND cancel_requested = 1",
+                ("cancelled by operator", moment, job_id, claimed_by),
+            ).rowcount:
+                return False
+            cur = conn.execute(
+                "UPDATE jobs SET state = 'parked', claimed_by = NULL, worker = NULL, "
+                "lease_until = NULL, poll_after = ?, reason = ?, updated_at = ? "
+                "WHERE id = ? AND state = 'running' AND claimed_by = ?",
+                (
+                    poll_after.isoformat() if poll_after is not None else None,
+                    reason,
+                    moment,
+                    job_id,
+                    claimed_by,
+                ),
+            )
+            return cur.rowcount == 1
 
     # --- readers ----------------------------------------------------------
 
@@ -2551,7 +2685,9 @@ class QueueStore:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
-    def due_parked_jobs(self, *, now: datetime | None = None) -> list[JobRecord]:
+    def due_parked_jobs(
+        self, *, now: datetime | None = None, worker: str | None = None
+    ) -> list[JobRecord]:
         """``parked`` jobs whose change request is due for another read (AC1).
 
         Filtered in SQL on ``poll_after`` so a scheduler that loops every two
@@ -2563,6 +2699,12 @@ class QueueStore:
         Restricted to ``parked`` by the same predicate that makes polling stop
         at a terminal state: a job that has been cancelled, resumed or failed is
         simply not in this list any more.
+
+        Story 35.5-005: only the jobs ``worker`` may take back — the ones it
+        parked, or that have no registered owner to wait for — and, for a
+        registered worker, only within the job's host and pool pins. A peer is
+        never handed another worker's park, so it never reads that CR either.
+        ``worker=None`` (a plain drain) gets the ownerless ones.
         """
         if not self.db_path.exists():
             return []
@@ -2571,10 +2713,13 @@ class QueueStore:
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE state = 'parked' "
                 "AND (poll_after IS NULL OR poll_after <= ?) "
+                f"AND {_PARK_OWNER_SQL} "
                 "ORDER BY id ASC",
-                (cutoff,),
+                (cutoff, worker),
             ).fetchall()
-        return [_row_to_record(row) for row in rows]
+        jobs = [_row_to_record(row) for row in rows]
+        me = self.get_worker(worker) if worker else None
+        return [job for job in jobs if me is None or _pins_met(job, me)]
 
     def running_repos(
         self, *, kind: str | None = None, excluding: int | None = None
@@ -2646,6 +2791,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         cancel_requested=bool(_optional_column(row, "cancel_requested")),
         synced_sha=_optional_column(row, "synced_sha"),
         issues=_optional_column(row, "issues"),
+        parked_by=_optional_column(row, "parked_by"),
     )
 
 
