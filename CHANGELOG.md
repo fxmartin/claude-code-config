@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.112.0] - 2026-10-20
+
+### Added
+
+- feat(fleet-execution): reconcile updates the run's fleet (#35.5-006)
+
+
 ## [v2.111.0] - 2026-10-19
 
 ### Added
