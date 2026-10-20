@@ -67,6 +67,8 @@ def test_init_creates_wal_schema(tmp_path) -> None:
             "synced_sha",
             # Story 35.3-002: the story->issue mappings the job carries.
             "issues",
+            # Story 35.5-005: the worker a parked job waits for.
+            "parked_by",
         }
     finally:
         conn.close()

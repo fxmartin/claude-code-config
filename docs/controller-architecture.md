@@ -2607,7 +2607,7 @@ Every verb the scheduler uses has a route on `sdlc queue serve` (listed in its
 `expired_running_jobs`, `due_parked_jobs`, `running_repos`, `overlap_holds`,
 `get_worker`, the three lease takes (`claim_job`, `reclaim_job`,
 `take_parked_job` — `409` is a lost race and reads as `None`), `park_job`,
-`schedule_poll`, `set_reason`, `attach_run`, `record_sync`, `record_files`,
+`repark_job`, `schedule_poll`, `set_reason`, `attach_run`, `record_sync`, `record_files`,
 `record_fix_rounds_baseline`, `restart_fresh`, `mark_pause_probed`, and a *raw*
 `GET /pause` (an elapsed window stays listed, which is how the worker tells a
 resume from never-paused). `now` is accepted and ignored by the client: the
@@ -2843,6 +2843,27 @@ for FX's label in the morning rather than for the label *and* three
   `queue_job_resumed` names the signal that released it. Both are queue events
   beside the run's own `run_finished`, the same separation `queue_job_finished`
   draws.
+- **On a fleet, the worker that ran it takes it back (Story 35.5-005).** The
+  run lives on one worker's disk, so a peer that resumed it would fail it on
+  `unknown run id`. `park_job` records the holder as `parked_by` (migration 18),
+  and the take-back keeps it, so a resume that parks again still waits for the
+  same worker. `due_parked_jobs(worker=…)` (`GET /jobs/due?worker=`) hands a
+  worker only the parks it may take back: its own, or ones with no registered
+  owner (a local drain's park, a legacy row, a worker since removed — the rule a
+  lapsed lease follows). For a registered worker the job's `--host`/`--pool` pins
+  also apply, as they do to a claim. Peers skip the job without reading its CR,
+  and `take_parked_job` re-asserts the owner and pins in its guarded UPDATE. This
+  applies to the reconcile after a hand merge as well as to the resume.
+  - *Owner offline.* The job never fails over to a peer. Once its owner has
+    been silent for 24 h (`PARKED_OWNER_OFFLINE_SECONDS`), every heartbeat's
+    sweep sets its reason to `awaiting worker <name> (offline since …)`. The
+    reason names the run and the `sdlc queue requeue` / `cancel` exits. The
+    owner's first poll after it comes back restores the approval reason.
+  - *No such run.* A worker that takes a job back and finds no record of its
+    run (a legacy row, a lost registry) does not launch it. `repark_job` puts it
+    back to `parked` with an `unknown run id: …` reason and the next poll time.
+    `parked_by` is left as it was, so an ownerless row stays open to the worker
+    that does hold the run.
 - **Where the loop ends.** Without `--follow` a drain polls its parks once and
   exits, leaving them in the store for the next `sdlc queue run` — so a morning
   `sdlc queue run` picks up last night's approvals and drives them to DONE. With

@@ -26,6 +26,7 @@ from sdlc import teardown
 from sdlc.approval import ApprovalVerdict, poll_approval
 from sdlc.queue import (
     HEARTBEAT_SECONDS,
+    PARKED_OWNER_REASON_PREFIX,
     JobBudget,
     JobRecord,
     QueueBackend,
@@ -2051,14 +2052,21 @@ class _Scheduler:
         """When this job's change request may next be read."""
         return self._clock() + timedelta(seconds=self._poll_interval)
 
-    def _park_for_approval(self, entry: _InFlight, pr_number: int) -> None:
-        """Hand a job's approval wait to the queue instead of ending it (AC1)."""
-        job = entry.job
-        reason = (
+    def _approval_reason(self, pr_number: int) -> str:
+        """What a job parked on ``pr_number`` says while it waits."""
+        return (
             f"awaiting approval on #{pr_number} — polling every "
             f"{int(self._poll_interval)}s for the `{RISK_APPROVED_LABEL}` label "
             f"or an approving review"
         )
+
+    def _worker_name(self) -> str | None:
+        return self._config.worker.name if self._config.worker is not None else None
+
+    def _park_for_approval(self, entry: _InFlight, pr_number: int) -> None:
+        """Hand a job's approval wait to the queue instead of ending it (AC1)."""
+        job = entry.job
+        reason = self._approval_reason(pr_number)
         if not self._store.park_job(
             job.id, pr_number=pr_number, reason=reason, poll_after=self._next_poll()
         ):
@@ -2098,10 +2106,15 @@ class _Scheduler:
         window is shut. The parks keep their ``poll_after`` and are re-read on
         the pass after the window reopens. A worker awaiting its restart leaves
         them for its successor.
+
+        A fleet worker is handed only the parks it may take back (Story
+        35.5-005): its own, or ones nobody registered is waiting for, within the
+        job's host and pool pins — so it never reads a CR whose run is on
+        another worker's disk.
         """
         if self._dispatch_paused() or self._restart_pending:
             return False
-        due = self._store.due_parked_jobs(now=self._clock())
+        due = self._store.due_parked_jobs(now=self._clock(), worker=self._worker_name())
         if not due:
             return False
         busy = self._store.running_repos()
@@ -2121,6 +2134,9 @@ class _Scheduler:
                 continue
             verdict = self._approval_probe(Path(job.repo), job.pr_number)
             self._store.schedule_poll(job.id, self._next_poll())
+            if (job.reason or "").startswith(PARKED_OWNER_REASON_PREFIX):
+                # Its owner — this worker — is back: the job waits on the CR again.
+                self._store.set_reason(job.id, self._approval_reason(job.pr_number))
             if verdict is None:
                 # Unreadable host (offline, unauthenticated, rate-limited). Stay
                 # parked and try again next interval — never guess.
@@ -2154,13 +2170,32 @@ class _Scheduler:
     def _drive_parked(
         self, job: JobRecord, *, action: str, cost: int, signal: str = ""
     ) -> bool:
-        """Take a parked job back under a lease and launch ``action`` on it."""
+        """Take a parked job back under a lease and launch ``action`` on it.
+
+        A fleet worker that finds no such run on its own disk (Story 35.5-005 —
+        a legacy row with no owner recorded, a lost registry) hands the job
+        straight back to its park: `sdlc resume`/`reconcile` would only fail it
+        on `unknown run id`, and the run may well be on another worker.
+        """
         claimed = self._store.take_parked_job(
             job.id, claimed_by=self._identity,
             lease_seconds=self._config.lease_seconds, now=self._clock(),
+            worker=self._worker_name(),
         )
         if claimed is None:
             return False  # another scheduler got there first, or the repo went busy
+        name = self._worker_name()
+        if name is not None and claimed.run_id and self._registry_record(claimed.run_id) is None:
+            reason = (
+                f"unknown run id: {claimed.run_id} — worker {name} has no such run; "
+                f"left parked for the worker that does (`sdlc queue requeue {job.id}` "
+                f"or `sdlc queue cancel {job.id}` to move it)"
+            )
+            self._store.repark_job(
+                job.id, claimed_by=self._identity, reason=reason, poll_after=self._next_poll()
+            )
+            self._echo(f"job {job.id}: {reason}")
+            return False
         launched = self._start(claimed, action=action, cost=cost)
         if launched and action == "resume":
             # Announced only once the resume is genuinely in flight — a version

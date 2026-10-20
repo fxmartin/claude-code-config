@@ -635,8 +635,10 @@ class _Routes:
         jobs = self.store.expired_running_jobs(now=self._now())
         return 200, {"jobs": [job.to_dict() for job in jobs]}
 
-    def due_parked(self, _query: Any, _body: Body) -> Reply:
-        jobs = self.store.due_parked_jobs(now=self._now())
+    def due_parked(self, query: dict[str, list[str]], _body: Body) -> Reply:
+        jobs = self.store.due_parked_jobs(
+            now=self._now(), worker=query.get("worker", [None])[0] or None
+        )
         return 200, {"jobs": [job.to_dict() for job in jobs]}
 
     def running_repos(self, query: dict[str, list[str]], _body: Body) -> Reply:
@@ -696,6 +698,16 @@ class _Routes:
             )
         except QueueError as exc:
             raise _ApiError(409, str(exc)) from exc
+        return 200, {"parked": parked, "job": _job(self.store, job_id).to_dict()}
+
+    def repark(self, job_id: int, body: Body) -> Reply:
+        _job(self.store, job_id)
+        parked = self.store.repark_job(
+            job_id,
+            claimed_by=_required(body, "claimed_by"),
+            reason=_required(body, "reason"),
+            poll_after=_timestamp(body, "poll_after"),
+        )
         return 200, {"parked": parked, "job": _job(self.store, job_id).to_dict()}
 
     def poll(self, job_id: int, body: Body) -> Reply:
@@ -793,6 +805,7 @@ _JOB_VERBS = {
     "reclaim": "reclaim",
     "take": "take",
     "park": "park",
+    "repark": "repark",
     "poll": "poll",
     "reason": "reason",
     "run": "run",
