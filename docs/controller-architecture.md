@@ -1452,7 +1452,13 @@ it on the next real run).
 - **Checks** (each yields a `CLEAN` / `WARN` / `FAIL` `Finding` with a remedy):
   - **Install integrity** — every managed `~/.claude` symlink/file from
     `install/core.sh` is present and resolves (a dangling link counts as broken).
-    Missing/broken → `FAIL`, remedy `./install.sh --core`.
+    Missing/broken → `FAIL`, remedy `./install.sh --core`. The
+    `fx-claude-config` plugin marketplace is checked as `install.sh --core`
+    registers it (Story 35.2-012): a `directory` source in `settings.json` whose
+    path exists. Unregistered or dangling → `FAIL`, same remedy. A leftover
+    `plugins/marketplaces/fx-claude-config` (symlink or directory) is a stale
+    install location → `WARN` to remove it; it never counts as the marketplace
+    being present.
   - **Installed controller vs checkout** (Story 15.1-004) — compares
     `sdlc.__version__` (the PATH-installed `uv tool install` snapshot) against
     `[project].version` in the target repo's `controller/pyproject.toml` (the

@@ -55,8 +55,12 @@ def _healthy_install(tmp_path: Path) -> tuple[Path, Path]:
     """
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    # A valid settings.json so the config check passes.
-    (repo_root / "settings.json").write_text("{}\n", encoding="utf-8")
+    # A valid settings.json so the config check passes; it registers the
+    # fx-claude-config marketplace as a `directory` source the way
+    # `install.sh --core` does (#800), pointing at this checkout.
+    (repo_root / "settings.json").write_text(
+        json.dumps(_marketplace_settings(repo_root)) + "\n", encoding="utf-8"
+    )
     # A harness pin, so the healthy fixture is healthy under the #551 follow-up
     # check too: an unpinned repo follows whatever registry a reinstall leaves
     # behind, which is a WARN, not a clean bill of health.
@@ -70,7 +74,9 @@ def _healthy_install(tmp_path: Path) -> tuple[Path, Path]:
         target.parent.mkdir(parents=True, exist_ok=True)
         # A file for *.json/*.sh/*.md names, a directory otherwise — only
         # existence + a resolvable symlink matters to the install check.
-        if name.endswith((".json", ".sh", ".md")):
+        if name == "settings.json":
+            pass  # already written above, with the marketplace registration
+        elif name.endswith((".json", ".sh", ".md")):
             target.write_text("{}\n", encoding="utf-8")
         else:
             target.mkdir(parents=True, exist_ok=True)
@@ -78,6 +84,14 @@ def _healthy_install(tmp_path: Path) -> tuple[Path, Path]:
         link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(target)
     return claude_dir, repo_root
+
+
+def _marketplace_settings(path: Path) -> dict:
+    return {
+        "extraKnownMarketplaces": {
+            "fx-claude-config": {"source": {"source": "directory", "path": str(path)}}
+        }
+    }
 
 
 def _fresh_ledger(tmp_path: Path) -> Path:
@@ -182,6 +196,100 @@ def test_install_not_installed_fails(tmp_path: Path) -> None:
     install = _finding(report, "install")
     assert install.status == "FAIL"
     assert "install.sh" in install.remedy
+
+
+# --- plugin marketplace (35.2-012) -------------------------------------------
+
+
+def _install_finding(tmp_path: Path, claude_dir: Path, repo_root: Path) -> Finding:
+    report = run_doctor(
+        repo_root=repo_root,
+        claude_dir=claude_dir,
+        db_path=_fresh_ledger(tmp_path),
+        registry=Registry(path=tmp_path / "registry.json"),
+        dep_probe=_all_present_probe,
+    )
+    return _finding(report, "install")
+
+
+def _set_marketplace(repo_root: Path, settings: dict) -> None:
+    (repo_root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+
+
+def test_install_clean_without_the_legacy_marketplace_path(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    assert not (claude_dir / "plugins" / "marketplaces" / "fx-claude-config").exists()
+    install = _install_finding(tmp_path, claude_dir, repo_root)
+    assert install.status == "CLEAN"
+    assert install.remedy == ""
+
+
+def test_install_marketplace_missing_from_settings_fails(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    _set_marketplace(repo_root, {})
+    install = _install_finding(tmp_path, claude_dir, repo_root)
+    assert install.status == "FAIL"
+    assert "fx-claude-config" in install.detail
+    assert "./install.sh --core" in install.remedy
+
+
+def test_install_marketplace_pointing_at_a_missing_directory_fails(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    _set_marketplace(repo_root, _marketplace_settings(tmp_path / "gone"))
+    install = _install_finding(tmp_path, claude_dir, repo_root)
+    assert install.status == "FAIL"
+    assert "gone" in install.detail
+    assert "./install.sh --core" in install.remedy
+
+
+def test_install_marketplace_with_a_non_directory_source_fails(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    _set_marketplace(
+        repo_root,
+        {
+            "extraKnownMarketplaces": {
+                "fx-claude-config": {"source": {"source": "github", "repo": "x/y"}}
+            }
+        },
+    )
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "FAIL"
+
+
+def test_install_marketplace_expands_a_home_relative_path(tmp_path: Path, monkeypatch) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _set_marketplace(repo_root, _marketplace_settings(Path("~") / "repo"))
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "CLEAN"
+
+
+def test_install_leftover_marketplace_symlink_warns(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    old = claude_dir / "plugins" / "marketplaces" / "fx-claude-config"
+    old.parent.mkdir(parents=True)
+    old.symlink_to(repo_root)
+    install = _install_finding(tmp_path, claude_dir, repo_root)
+    assert install.status == "WARN"
+    assert "stale" in install.detail
+    assert str(old) in install.remedy
+
+
+def test_install_leftover_marketplace_directory_warns(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    (claude_dir / "plugins" / "marketplaces" / "fx-claude-config").mkdir(parents=True)
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "WARN"
+
+
+def test_install_leftover_does_not_stand_in_for_a_missing_registration(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    (claude_dir / "plugins" / "marketplaces" / "fx-claude-config").mkdir(parents=True)
+    _set_marketplace(repo_root, {})
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "FAIL"
+
+
+def test_install_unreadable_settings_fails_the_marketplace(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    (repo_root / "settings.json").write_text("{not json", encoding="utf-8")
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "FAIL"
 
 
 # --- ledger schema + integrity ---------------------------------------------
