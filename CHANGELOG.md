@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.113.0] - 2026-10-20
+
+### Added
+
+- feat(fleet-execution): doctor checks the plugin (#35.2-012)
+
+
 ## [v2.112.0] - 2026-10-20
 
 ### Added
