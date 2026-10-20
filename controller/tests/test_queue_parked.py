@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from sdlc.queue import QueueError, QueueStore
+from sdlc.queue import QueueError, QueueStore, WorkerRecord
 
 
 def _store(tmp_path) -> QueueStore:
@@ -438,3 +438,15 @@ def test_ensure_migrated_adds_the_parked_by_column(tmp_path) -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     assert "parked_by" in cols
     assert store.list_jobs()[0].parked_by is None
+
+
+def test_silent_seconds_unreadable_heartbeat_is_never_online() -> None:
+    worker = WorkerRecord(name="w", host="h", registered_at="x", last_heartbeat="garbage")
+    assert worker.silent_seconds() == float("inf")
+    assert not worker.is_online()
+
+
+def test_silent_seconds_reads_naive_heartbeat_as_utc() -> None:
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    worker = WorkerRecord(name="w", host="h", registered_at="x", last_heartbeat="2026-01-01T11:59:00")
+    assert worker.silent_seconds(now) == 60.0
