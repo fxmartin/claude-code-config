@@ -119,3 +119,15 @@ def test_one_line_field_shape_is_found_with_points_and_risk_missing(tmp_path) ->
     # Not lifted from mid-line, and not guessed: missing stays None.
     assert spec.points is None
     assert spec.risk is None
+
+
+def test_template_story_without_risk_line_reports_risk_missing(tmp_path) -> None:
+    filled = _fill(_template())
+    without_risk = "\n".join(
+        line for line in filled.splitlines() if not line.startswith("**Risk Level**:")
+    )
+    _write_nfr(tmp_path, without_risk)
+
+    specs = parse_inventory_specs(tmp_path)
+    assert specs, "stories must still be found without a risk line"
+    assert all(s.points == _POINTS and s.risk is None for s in specs)
