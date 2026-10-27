@@ -159,7 +159,12 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    `sdlc reconcile` stamps its `**Status**: Done` line and, when the file has a
    `## NFR Progress` table with a `Status` column, that story's row. `sdlc
    issues init`/`sync` mirror NFR stories like epic stories (labels
-   `epic:nfr`, `feature:nfr-<area>`).
+   `epic:nfr`, `feature:nfr-<area>`). The generate-epics NFR template writes
+   each story's fields (`**Story Points**`, `**Risk Level**`, ...) on their own
+   lines, the only form the parser reads (Story 36.2-001);
+   `tests/test_nfr_template.py` parses that template, so the two cannot drift.
+   A legacy one-line `**Priority**: … · **Story Points**: N` story is still
+   found, with its points and risk left missing rather than guessed.
 
    **Dependencies-line convention (Story 12.5-001).** Edge extraction reads only
    the *leading edge list* of a `**Dependencies**:` line — the run of bare

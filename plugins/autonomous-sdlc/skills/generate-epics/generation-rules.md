@@ -97,6 +97,13 @@ Every story must be:
 
 ## NFR File Template
 
+NFR stories are built by the same controller as epic stories, so each carries
+the Story Template's fields, **each on its own line**. The controller reads a
+field only at the start of a line: never combine fields into one line
+(`**Priority**: Must Have · **Story Points**: 3`), or the story builds without
+its points and risk. `controller/tests/test_nfr_template.py` parses this
+template — keep the two in step.
+
 ```markdown
 # Non-Functional Requirements
 
@@ -105,18 +112,98 @@ Every story must be:
 
 ## Performance Requirements
 ### Story NFR-PERF-001: [Title]
+**User Story**: As a [persona], I want [response time / throughput target] so that [benefit]
+**Priority**: Must Have / Should Have / Could Have
+**Story Points**: [N]
+
+**Acceptance Criteria**:
+- **Given** [load profile] **When** [action] **Then** [measurable threshold, e.g. p95 < 200 ms]
+
+**Technical Notes**: [implementation considerations]
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests written and passing
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: [other story IDs]
+**Risk Level**: High / Medium / Low
 
 ## Security Requirements
 ### Story NFR-SEC-001: [Title]
+**User Story**: As a [persona], I want [security control] so that [threat mitigated]
+**Priority**: Must Have / Should Have / Could Have
+**Story Points**: [N]
+
+**Acceptance Criteria**:
+- **Given** [context] **When** [attack or misuse] **Then** [verifiable defence]
+
+**Technical Notes**: [implementation considerations]
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests written and passing
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: [other story IDs]
+**Risk Level**: High / Medium / Low
 
 ## Accessibility Requirements
 ### Story NFR-ACC-001: [Title]
+**User Story**: As a [persona], I want [accessibility capability] so that [benefit]
+**Priority**: Must Have / Should Have / Could Have
+**Story Points**: [N]
+
+**Acceptance Criteria**:
+- **Given** [context] **When** [action] **Then** [standard met, e.g. WCAG 2.1 AA criterion]
+
+**Technical Notes**: [implementation considerations]
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests written and passing
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: [other story IDs]
+**Risk Level**: High / Medium / Low
 
 ## Integration Requirements
 ### Story NFR-INT-001: [Title]
+**User Story**: As a [persona], I want [integration guarantee] so that [benefit]
+**Priority**: Must Have / Should Have / Could Have
+**Story Points**: [N]
+
+**Acceptance Criteria**:
+- **Given** [external system state] **When** [action] **Then** [contract honoured]
+
+**Technical Notes**: [implementation considerations]
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests written and passing
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: [other story IDs]
+**Risk Level**: High / Medium / Low
 
 ## Infrastructure Requirements
 ### Story NFR-INF-001: [Title]
+**User Story**: As a [persona], I want [operational capability] so that [benefit]
+**Priority**: Must Have / Should Have / Could Have
+**Story Points**: [N]
+
+**Acceptance Criteria**:
+- **Given** [environment] **When** [action] **Then** [observable outcome]
+
+**Technical Notes**: [implementation considerations]
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests written and passing
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: [other story IDs]
+**Risk Level**: High / Medium / Low
 ```
 
 ## Story Point Distribution
