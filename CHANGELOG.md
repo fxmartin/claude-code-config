@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.115.0] - 2026-10-27
+
+### Added
+
+- feat(buildable-nfr-stories): discover, select and mark nfr (#36.1-001)
+
+
 ## [v2.114.0] - 2026-10-20
 
 ### Added
