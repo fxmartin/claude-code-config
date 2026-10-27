@@ -374,6 +374,9 @@ Scope (positional, default `all`):
   epic-NN          one epic by number, e.g. epic-34
   <name>           epic-name substring, e.g. user-management
   X.Y-NNN          a single story, e.g. 34.5-003
+  nfr              every NFR story in non-functional-requirements.md
+  NFR-AREA-NNN     a single NFR story, e.g. NFR-SEC-002 (story ids match in
+                   any case)
   epic-A epic-B    several scopes (space- or comma-separated, any order) build the
                    union of their incomplete stories in one run, e.g.
                    `epic-15 epic-18` or `epic-15,epic-18`; `all` mixed in wins
@@ -482,7 +485,8 @@ Flags:
 def build(ctx: typer.Context) -> None:
     """Run the full build-stories orchestration for a scope.
 
-    Scope is ``all``, ``epic-NN``, an epic name, or a single story ``X.Y-NNN``.
+    Scope is ``all``, ``epic-NN``, ``nfr``, an epic name, or a single story
+    ``X.Y-NNN`` / ``NFR-<AREA>-NNN``.
     Flags: ``--dry-run --auto --skip-coverage --skip-preflight --rebuild
     --sequential --limit=N --coverage-threshold=N --preflight-timeout=SEC`` (see
     the epilog in ``build --help``). The controller owns the state machine;

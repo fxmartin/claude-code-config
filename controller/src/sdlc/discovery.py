@@ -10,8 +10,19 @@ from pathlib import Path
 
 from sdlc.cohort import Story
 
-# `##### Story 7.3-001: Port build-stories ...`
-_STORY_HEADER = re.compile(r"^#{2,6}\s*Story\s+([0-9]+\.[0-9]+-[0-9]+):\s*(.+?)\s*$")
+# A story id (Story 36.1-001): an epic story `X.Y-NNN`, or an NFR story
+# `NFR-<AREA>-NNN` from the NFR file generate-epics writes. The one id pattern
+# discovery, `story_markdown` and the issue mirror share, so they cannot drift.
+# The NFR form matches in any case; `canonical_story_id` restores its spelling.
+STORY_ID = r"(?:[0-9]+\.[0-9]+-[0-9]+|\b(?i:NFR-[A-Z][A-Z0-9]*-[0-9]+))"
+# The NFR stories' file (in the story dir) and the epic key they group under —
+# the non-numeric `nfr` epic the portfolio view already sorts.
+NFR_FILE_NAME = "non-functional-requirements.md"
+NFR_EPIC = "nfr"
+_NFR_ID = re.compile(r"^NFR-([A-Z0-9]+)-[0-9]+$", re.IGNORECASE)
+
+# `##### Story 7.3-001: Port build-stories ...` / `### Story NFR-SEC-002: ...`
+_STORY_HEADER = re.compile(r"^#{2,6}\s*Story\s+(" + STORY_ID + r"):\s*(.+?)\s*$")
 _PRIORITY = re.compile(r"^\*\*Priority\*\*:\s*(\S+)")
 # Accept both `**Points**:` and the `**Story Points**:` form epics actually use.
 _POINTS = re.compile(r"^\*\*(?:Story\s+)?Points\*\*:\s*([0-9]+)")
@@ -20,7 +31,7 @@ _DEPENDENCIES = re.compile(r"^\*\*Dependencies\*\*:\s*(.+?)\s*$")
 # extraction is constrained to the *leading head* of the line — see
 # `_dependency_head` / `_parse_dependency_edges` — so prose-mentioned ids do not
 # become phantom edges (Story 12.5-001).
-_DEP_ID = re.compile(r"[0-9]+\.[0-9]+-[0-9]+")
+_DEP_ID = re.compile(STORY_ID)
 # At parenthesis-depth 0 these begin explanatory prose, ending the edge list.
 _DEP_PROSE_DELIMS = (";", "—", "–")
 # A leading one of these words means "no dependencies".
@@ -36,8 +47,8 @@ _STATUS = re.compile(r"^\*\*Status\*\*:\s*(.+?)\s*$")
 _MANUAL = re.compile(r"^\*\*(?:Manual|Hand-Run)\*\*:\s*(.+?)\s*$")
 _MANUAL_TRUE_VALUES = {"yes", "true", "y", "hand-run", "manual"}
 _DOD_BOX = re.compile(r"^\s*-\s*\[([ xX])\]")
-# A bare scope that names exactly one story, e.g. `34.5-003`.
-_STORY_ID_SCOPE = re.compile(r"^[0-9]+\.[0-9]+-[0-9]+$")
+# A bare scope that names exactly one story, e.g. `34.5-003` or `nfr-sec-002`.
+_STORY_ID_SCOPE = re.compile("^" + STORY_ID + "$")
 # Scope tokens are separated by commas and/or whitespace (`epic-15,epic-18` or
 # `epic-15 epic-18`) so both forms a user can type resolve identically.
 _SCOPE_SEP = re.compile(r"[,\s]+")
@@ -73,6 +84,40 @@ _PATH_EXT = (
 )
 
 _STORY_DIR_CANDIDATES = ("docs/stories", "stories")
+
+
+def canonical_story_id(story_id: str) -> str:
+    """The canonical spelling of a story id: ``nfr-sec-002`` → ``NFR-SEC-002``.
+
+    Ids compare case-insensitively (Story 36.1-001) but the ledger, registry and
+    branch names keep one spelling. Upper-casing is the identity on ``X.Y-NNN``.
+    """
+    return story_id.upper()
+
+
+def nfr_epic_feature(story_id: str) -> tuple[str, str] | None:
+    """``(epic, feature)`` for an NFR story id, or None for any other id.
+
+    ``NFR-SEC-002`` → ``('nfr', 'nfr-sec')``: every NFR story groups under the
+    one ``nfr`` epic, with its area as the feature.
+    """
+    m = _NFR_ID.match(story_id)
+    if m is None:
+        return None
+    return NFR_EPIC, f"{NFR_EPIC}-{m.group(1).lower()}"
+
+
+def story_files(story_dir: Path) -> list[Path]:
+    """Every story-bearing markdown file in ``story_dir``, in a stable order.
+
+    The sorted ``epic-*.md`` files, then the NFR file when one exists (Story
+    36.1-001). A prose-only NFR file parses to no stories, so listing it is safe.
+    """
+    files = sorted(story_dir.glob("epic-*.md"))
+    nfr_file = story_dir / NFR_FILE_NAME
+    if nfr_file.is_file():
+        files.append(nfr_file)
+    return files
 
 
 def _dependency_head(content: str) -> str:
@@ -122,7 +167,8 @@ def _parse_dependency_edges(content: str, self_id: str) -> list[str]:
     first_word = head.split(None, 1)[0].rstrip(".").lower()
     if first_word in _DEP_NONE_MARKERS:
         return []
-    return [d for d in _DEP_ID.findall(head) if d != self_id]
+    edges = (canonical_story_id(d) for d in _DEP_ID.findall(head))
+    return [d for d in edges if d != self_id]
 
 
 def _acceptance_criteria_count(section_lines: list[str]) -> int | None:
@@ -213,7 +259,12 @@ def _dependency_depths(records: list[dict]) -> dict[str, int | None]:
 
 
 def _epic_id_from_story(story_id: str) -> str:
-    """`7.3-001` → `07` style epic id (the leading major number, zero-padded)."""
+    """`7.3-001` → `07` style epic id (the leading major number, zero-padded).
+
+    An NFR story (``NFR-SEC-002``) belongs to the ``nfr`` epic.
+    """
+    if nfr_epic_feature(story_id) is not None:
+        return NFR_EPIC
     major = story_id.split(".", 1)[0]
     return major.zfill(2)
 
@@ -301,7 +352,7 @@ def parse_epic_file(epic_path: Path) -> list[Story]:
         if header:
             _flush()
             current = {
-                "id": header.group(1),
+                "id": canonical_story_id(header.group(1)),
                 "title": header.group(2),
                 "section_lines": [line],
             }
@@ -381,21 +432,29 @@ def canonical_scope(scope: str | Iterable[str]) -> str:
 def _resolve_scope_token(token: str, epic_files: list[Path]) -> list[Story]:
     """Resolve a single scope token to its stories (the pre-19.1-001 behaviour).
 
-    ``token`` is ``all`` (every epic), ``epic-NN`` (one epic by number), a bare
-    epic name substring, or a single story id ``X.Y-NNN`` (resolved to its epic
-    by the leading major number, returning only that story).
+    ``token`` is ``all`` (every epic), ``epic-NN`` (one epic by number), ``nfr``
+    (every NFR story), a bare epic name substring, or a single story id
+    ``X.Y-NNN`` / ``NFR-<AREA>-NNN`` (resolved to its file — the epic by the
+    leading major number, or the NFR file — returning only that story). Story
+    ids match case-insensitively (Story 36.1-001).
     """
     token = token.strip()
 
-    # Single-story scope: find the epic by major number and return just that story.
+    # Single-story scope: find the story's file and return just that story.
     if _STORY_ID_SCOPE.match(token):
-        major = int(token.split(".", 1)[0])
-        for epic in epic_files:
-            m = _EPIC_FILE_NUM.match(epic.stem.lower())
-            if m and int(m.group(1)) == major:
-                for story in parse_epic_file(epic):
-                    if story.id == token:
-                        return [story]
+        story_id = canonical_story_id(token)
+        if nfr_epic_feature(story_id) is not None:
+            candidates = [f for f in epic_files if f.name == NFR_FILE_NAME]
+        else:
+            major = int(story_id.split(".", 1)[0])
+            candidates = [
+                f for f in epic_files
+                if (m := _EPIC_FILE_NUM.match(f.stem.lower())) and int(m.group(1)) == major
+            ]
+        for epic in candidates:
+            for story in parse_epic_file(epic):
+                if story.id == story_id:
+                    return [story]
         return []
 
     selected: list[Path] = []
@@ -403,6 +462,11 @@ def _resolve_scope_token(token: str, epic_files: list[Path]) -> list[Story]:
     for epic in epic_files:
         if token_l == "all":
             selected.append(epic)
+        elif token_l == NFR_EPIC:
+            # Its own branch: `nfr` names no file stem, yet is a substring of
+            # e.g. `epic-12-infra-*.md`, which it must never select.
+            if epic.name == NFR_FILE_NAME:
+                selected.append(epic)
         elif token_l.startswith("epic-"):
             # Match epic-07 against epic-07-external-controller.md.
             number = token_l.split("-", 1)[1]
@@ -421,9 +485,9 @@ def discover_queue(scope: str, root: Path | None = None) -> list[Story]:
     """Build the story queue for ``scope`` from the markdown epic files.
 
     ``scope`` accepts one *or several* tokens (comma-/space-separated): ``all``
-    (every epic), ``epic-NN`` (one epic by number), a bare epic name, or a single
-    story id ``X.Y-NNN`` (resolved to its epic by the leading major number,
-    returning only that story). Multiple tokens are resolved independently and
+    (every epic and the NFR file), ``epic-NN`` (one epic by number), ``nfr``
+    (every NFR story), a bare epic name, or a single story id ``X.Y-NNN`` /
+    ``NFR-<AREA>-NNN`` (any case; returning only that story). Multiple tokens are resolved independently and
     unioned, deduped by ``Story.id`` with first-seen order preserved (Story
     19.1-001); ``all`` anywhere in the list resolves to every epic. Returns an
     empty queue when nothing matches — the caller decides whether that is an error.
@@ -433,7 +497,7 @@ def discover_queue(scope: str, root: Path | None = None) -> list[Story]:
     if story_dir is None:
         return []
 
-    epic_files = sorted(story_dir.glob("epic-*.md"))
+    epic_files = story_files(story_dir)
 
     tokens = _split_scope(scope)
     if any(t.lower() == "all" for t in tokens):

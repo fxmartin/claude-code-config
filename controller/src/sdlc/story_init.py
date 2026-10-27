@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sdlc.build import Ledger
-from sdlc.discovery import _story_dir, parse_epic_file
+from sdlc.discovery import _story_dir, parse_epic_file, story_files
 from sdlc.issue_host import IssueHostAdapter
 from sdlc.risk_gate import GATE_LABELS
 from sdlc.story_inventory import project_specs
@@ -47,7 +47,7 @@ class InitResult:
 
 
 def done_story_ids(root: Path | None = None) -> set[str]:
-    """The ids of every shipped story across all ``docs/stories/epic-*.md``.
+    """The ids of every shipped story across all ``docs/stories/epic-*.md`` + NFR file.
 
     A story is Done when its ``**Status**:`` line starts "Done" or its
     Definition-of-Done checklist is fully checked — the same git-agnostic rule
@@ -58,7 +58,7 @@ def done_story_ids(root: Path | None = None) -> set[str]:
     if story_dir is None:
         return set()
     done: set[str] = set()
-    for epic_file in sorted(story_dir.glob("epic-*.md")):
+    for epic_file in story_files(story_dir):
         for story in parse_epic_file(epic_file):
             if story.done:
                 done.add(story.id)

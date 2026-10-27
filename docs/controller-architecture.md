@@ -148,6 +148,19 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    from `docs/stories/epic-*.md`, extracting priority, points, intra-project
    dependencies, and the [predictor features](#predictor-features-and-points-as-metadata-story-282-001).
 
+   **NFR stories (Story 36.1-001).** `### Story NFR-<AREA>-NNN:` headings in
+   `docs/stories/non-functional-requirements.md` (the file generate-epics
+   writes) parse the same way, as epic `nfr`. A prose-only NFR file yields no
+   stories. The scope `nfr` selects every NFR story; `all` includes them; an
+   NFR id is a single-story scope. Story ids match in any case (`nfr-sec-002`)
+   but keep their canonical spelling (`NFR-SEC-002`) in the ledger, registry
+   and branch names, and a `**Dependencies**:` line may name an NFR id in
+   either direction. `find_epic_file` resolves an `NFR-` id to the NFR file, so
+   `sdlc reconcile` stamps its `**Status**: Done` line and, when the file has a
+   `## NFR Progress` table with a `Status` column, that story's row. `sdlc
+   issues init`/`sync` mirror NFR stories like epic stories (labels
+   `epic:nfr`, `feature:nfr-<area>`).
+
    **Dependencies-line convention (Story 12.5-001).** Edge extraction reads only
    the *leading edge list* of a `**Dependencies**:` line — the run of bare
    `X.Y-NNN` ids before the first parenthetical (`(`), `;`, em/en-dash, or

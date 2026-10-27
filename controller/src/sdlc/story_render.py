@@ -7,7 +7,13 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from sdlc.discovery import _STORY_HEADER, _story_dir
+from sdlc.discovery import (
+    _STORY_HEADER,
+    _story_dir,
+    canonical_story_id,
+    nfr_epic_feature,
+    story_files,
+)
 from sdlc.issue_host import GITHUB, GITLAB, SUPPORTED_HOSTS, IssueHostError
 
 __all__ = [
@@ -224,6 +230,8 @@ def status_surface(
 
 def _feature_and_epic(story_id: str) -> tuple[str, str]:
     """Derive ``(epic, feature)`` from a story id (``22.2-002`` → ``('22', '22.2')``)."""
+    if (nfr := nfr_epic_feature(story_id)) is not None:
+        return nfr  # Story 36.1-001: NFR-SEC-002 -> ('nfr', 'nfr-sec')
     feature = story_id.split("-", 1)[0]
     epic = feature.split(".", 1)[0]
     return epic, feature
@@ -261,7 +269,7 @@ def _parse_epic_file(path: Path) -> list[StoryDoc]:
         header = _STORY_HEADER.match(line)
         if header:
             _flush()
-            current = {"id": header.group(1), "title": header.group(2)}
+            current = {"id": canonical_story_id(header.group(1)), "title": header.group(2)}
             lines = []
             continue
         # A non-story heading (`### Feature …`, `#### Stories`, the next epic's
@@ -284,7 +292,7 @@ def _parse_epic_file(path: Path) -> list[StoryDoc]:
 
 
 def parse_story_docs(root: Path | None = None) -> list[StoryDoc]:
-    """Parse every story across all ``docs/stories/epic-*.md`` into render docs.
+    """Parse every story across all ``docs/stories/epic-*.md`` and the NFR file into render docs.
 
     Returns an empty list when no story directory exists. Files are read in sorted
     order so the projection is deterministic.
@@ -293,6 +301,6 @@ def parse_story_docs(root: Path | None = None) -> list[StoryDoc]:
     if story_dir is None:
         return []
     docs: list[StoryDoc] = []
-    for epic_file in sorted(story_dir.glob("epic-*.md")):
+    for epic_file in story_files(story_dir):
         docs.extend(_parse_epic_file(epic_file))
     return docs
