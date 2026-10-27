@@ -8,8 +8,10 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
-# Mirrors discovery.py's `_STORY_HEADER`, capturing only the story id.
-_STORY_HEADER = re.compile(r"^#{2,6}\s*Story\s+([0-9]+\.[0-9]+-[0-9]+):")
+from sdlc.discovery import NFR_FILE_NAME, STORY_ID, canonical_story_id, nfr_epic_feature
+
+# discovery.py's `_STORY_HEADER` over the shared id pattern, capturing only the id.
+_STORY_HEADER = re.compile(r"^#{2,6}\s*Story\s+(" + STORY_ID + r"):")
 _STATUS = re.compile(r"^\*\*Status\*\*:\s*(.+?)\s*$")
 _ANY_HEADING = re.compile(r"^#{1,6}\s")
 # The numeric epic id embedded in an `epic-34-*.md` / `epic-07-*.md` filename,
@@ -17,6 +19,11 @@ _ANY_HEADING = re.compile(r"^#{1,6}\s")
 _EPIC_FILE_NUM = re.compile(r"^epic-0*([0-9]+)")
 
 _STORY_DIR_CANDIDATES = ("docs/stories", "stories")
+
+# Story 36.1-001: the NFR file's optional `## NFR Progress` table, whose row for
+# a merged NFR story gets its `Status` cell set to Done alongside the status line.
+_NFR_PROGRESS_HEADING = re.compile(r"^#{1,6}\s*NFR\s+Progress\s*$", re.IGNORECASE)
+_TABLE_SEPARATOR_CELL = re.compile(r"^\s*:?-+:?\s*$")
 
 __all__ = [
     "find_epic_file",
@@ -35,7 +42,15 @@ def find_epic_file(story_id: str, root: Path) -> Path | None:
     name — the same convention :func:`sdlc.discovery.parse_epic_file` files
     under. Used by callers (e.g. reconcile) whose ledger row does not carry the
     ``epic_file`` a discovery-sourced :class:`~sdlc.cohort.Story` already has.
+    An ``NFR-<AREA>-NNN`` id resolves to the story dir's NFR file instead
+    (Story 36.1-001).
     """
+    if nfr_epic_feature(story_id) is not None:
+        for candidate in _STORY_DIR_CANDIDATES:
+            nfr_file = root / candidate / NFR_FILE_NAME
+            if nfr_file.is_file():
+                return nfr_file
+        return None
     major = story_id.split(".", 1)[0]
     if not major.isdigit():
         return None
@@ -57,18 +72,27 @@ def render_story_done(text: str, story_id: str) -> tuple[str, bool]:
     Replaces an existing ``**Status**:`` line's value with ``Done``, or inserts
     one right after the story's header when the story states none — the same
     fast-path :func:`sdlc.discovery.parse_epic_file`'s ``_is_done`` reads.
-    Returns ``(text, False)`` unchanged for a no-op (the story id has no
-    matching header, or its status already reads "Done"), else the rendered
-    text and ``True``. Touches no disk — the on-demand writers
-    (:func:`mark_story_done`, :func:`render_epic_file`) are thin wrappers
-    around this (Story 32.1-003).
+    Story 36.1-001: also sets the story's ``Status`` cell in a ``## NFR
+    Progress`` table, when the text has one. Returns ``(text, False)``
+    unchanged for a no-op (the story id has no matching header, or its status
+    already reads "Done"), else the rendered text and ``True``. Touches no disk
+    — the on-demand writers (:func:`mark_story_done`, :func:`render_epic_file`)
+    are thin wrappers around this (Story 32.1-003).
     """
+    text, status_changed = _render_status_line(text, story_id)
+    text, row_changed = _render_progress_row(text, story_id)
+    return text, status_changed or row_changed
+
+
+def _render_status_line(text: str, story_id: str) -> tuple[str, bool]:
+    """Set ``**Status**: Done`` in ``story_id``'s own block (see :func:`render_story_done`)."""
     lines = text.splitlines(keepends=True)
+    story_id = canonical_story_id(story_id)
 
     start: int | None = None
     for i, line in enumerate(lines):
         m = _STORY_HEADER.match(line)
-        if m and m.group(1) == story_id:
+        if m and canonical_story_id(m.group(1)) == story_id:
             start = i
             break
     if start is None:
@@ -93,6 +117,48 @@ def render_story_done(text: str, story_id: str) -> tuple[str, bool]:
         lines[start] = lines[start] + "\n"
     lines.insert(start + 1, "**Status**: Done\n")
     return "".join(lines), True
+
+
+def _render_progress_row(text: str, story_id: str) -> tuple[str, bool]:
+    """Set ``story_id``'s ``Status`` cell to Done in a ``## NFR Progress`` table.
+
+    A no-op when there is no such section, its table has no ``Status`` column,
+    no row names the story, or the cell already reads Done. Only that one cell
+    is rewritten, so the rest of the table is byte-identical.
+    """
+    id_token = re.compile(
+        r"(?<![A-Za-z0-9-])" + re.escape(story_id) + r"(?![A-Za-z0-9-])", re.IGNORECASE
+    )
+    lines = text.splitlines(keepends=True)
+    in_section = False
+    status_col: int | None = None  # resolved from the table's header row
+    for i, line in enumerate(lines):
+        if _ANY_HEADING.match(line):
+            in_section = bool(_NFR_PROGRESS_HEADING.match(line))
+            status_col = None
+            continue
+        if not in_section or not line.lstrip().startswith("|"):
+            continue
+        body = line.rstrip("\r\n")
+        # `parts[0]`/`parts[-1]` are what sits outside the outer pipes.
+        parts = body.split("|")
+        cells = parts[1:-1]
+        if status_col is None:
+            headers = [c.strip().lower() for c in cells]
+            status_col = headers.index("status") if "status" in headers else -1
+            continue
+        if status_col < 0 or status_col >= len(cells):
+            continue
+        if all(_TABLE_SEPARATOR_CELL.match(c) for c in cells):
+            continue
+        if not any(id_token.search(c) for j, c in enumerate(cells) if j != status_col):
+            continue
+        if cells[status_col].strip().lower().startswith("done"):
+            return text, False
+        parts[status_col + 1] = " Done "
+        lines[i] = "|".join(parts) + line[len(body):]
+        return "".join(lines), True
+    return text, False
 
 
 def render_done_markers(text: str, done_story_ids: Iterable[str]) -> tuple[str, list[str]]:

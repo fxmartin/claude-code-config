@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sdlc.build import Ledger
-from sdlc.discovery import _STORY_HEADER, _story_dir
+from sdlc.discovery import (
+    _STORY_HEADER,
+    _story_dir,
+    canonical_story_id,
+    nfr_epic_feature,
+    story_files,
+)
 
 __all__ = ["StorySpec", "ProjectionResult", "parse_inventory_specs", "project_specs"]
 
@@ -53,6 +59,8 @@ class ProjectionResult:
 
 def _feature_and_epic(story_id: str) -> tuple[str, str]:
     """Derive ``(epic, feature)`` from a story id, e.g. ``22.1-002`` → ``('22', '22.1')``."""
+    if (nfr := nfr_epic_feature(story_id)) is not None:
+        return nfr  # Story 36.1-001: NFR-SEC-002 -> ('nfr', 'nfr-sec')
     feature = story_id.split("-", 1)[0]
     epic = feature.split(".", 1)[0]
     return epic, feature
@@ -88,7 +96,7 @@ def _parse_epic_file(path: Path) -> list[StorySpec]:
         header = _STORY_HEADER.match(line)
         if header:
             _flush()
-            current = {"id": header.group(1), "title": header.group(2)}
+            current = {"id": canonical_story_id(header.group(1)), "title": header.group(2)}
             continue
         if current is None:
             continue
@@ -102,7 +110,7 @@ def _parse_epic_file(path: Path) -> list[StorySpec]:
 
 
 def parse_inventory_specs(root: Path | None = None) -> list[StorySpec]:
-    """Parse every story across all ``docs/stories/epic-*.md`` into specs.
+    """Parse every story across all ``docs/stories/epic-*.md`` and the NFR file into specs.
 
     The epic files are the authoritative per-story source (``STORIES.md`` is the
     epic-level index and carries no per-story spec rows). Returns an empty list
@@ -113,7 +121,7 @@ def parse_inventory_specs(root: Path | None = None) -> list[StorySpec]:
     if story_dir is None:
         return []
     specs: list[StorySpec] = []
-    for epic_file in sorted(story_dir.glob("epic-*.md")):
+    for epic_file in story_files(story_dir):
         specs.extend(_parse_epic_file(epic_file))
     return specs
 
