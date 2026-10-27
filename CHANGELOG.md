@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.116.0] - 2026-10-27
+
+### Added
+
+- feat(buildable-nfr-stories): nfr template emits standard (#36.2-001)
+
+
 ## [v2.115.0] - 2026-10-27
 
 ### Added
