@@ -265,3 +265,127 @@ def test_reconcile_is_listed_in_help() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "reconcile" in result.output
+
+
+# --- Story 35.5-010: reconcile on a fleet worker leaves its clone clean -----
+
+
+def _worker_host(tmp_path: Path, monkeypatch) -> None:
+    """Install a worker LaunchAgent where `worker_registry_path` looks for one."""
+    import plistlib
+
+    from sdlc import doctor
+
+    plist = tmp_path / "LaunchAgents" / f"{doctor.WORKER_LABEL}.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(plistlib.dumps({
+        "Label": doctor.WORKER_LABEL,
+        "EnvironmentVariables": {"XDG_STATE_HOME": str(tmp_path / "worker-state")},
+    }))
+    monkeypatch.setattr(doctor, "default_worker_plist", lambda: plist)
+
+
+_NOT_STARTED = "##### Story 99.1-010: Worker landing\n**Status**: Not started\n"
+
+
+def _landed_run_with_epic(tmp_path: Path, epic_text: str = _NOT_STARTED) -> tuple[Path, Path, Path]:
+    """A landed FAILED story whose epic file is committed on main: (root, db, epic)."""
+    root = _init_repo_with_origin(tmp_path)
+    epic_file = root / "docs" / "stories" / "epic-99-sample.md"
+    epic_file.parent.mkdir(parents=True)
+    epic_file.write_text(epic_text, encoding="utf-8")
+    _git(root, "add", "docs")
+    _git(root, "commit", "-q", "-m", "docs: epic 99")
+    _git(root, "push", "-q", "origin", "main")
+    _land_story(root, "99.1-010")
+    db = tmp_path / "ledger.db"
+    _seed_run(db, [("99.1-010", "FAILED", 110)])
+    return root, db, epic_file
+
+
+def _clean(root: Path) -> bool:
+    out = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return out.strip() == ""
+
+
+def test_reconcile_on_a_worker_lists_pending_markers_without_writing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root, db, epic_file = _landed_run_with_epic(tmp_path)
+    _worker_host(tmp_path, monkeypatch)
+
+    monkeypatch.chdir(root)
+    result = runner.invoke(app, ["reconcile", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert _status(db, Ledger(db).latest_run_id(), "99.1-010") == "DONE"
+    assert epic_file.read_text(encoding="utf-8") == _NOT_STARTED
+    assert _clean(root)
+    assert "rendered" not in result.output
+    assert "pending 99.1-010" in result.output
+    assert str(epic_file) in result.output
+    assert "PR" in result.output
+
+
+def test_reconcile_on_a_worker_with_render_docs_writes_and_warns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root, db, epic_file = _landed_run_with_epic(tmp_path)
+    _worker_host(tmp_path, monkeypatch)
+
+    monkeypatch.chdir(root)
+    result = runner.invoke(app, ["reconcile", "--render-docs", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+    assert "rendered 99.1-010" in result.output
+    assert "refuses jobs" in result.output
+    assert "commit" in result.output
+
+
+def test_reconcile_without_a_worker_renders_as_before(tmp_path: Path, monkeypatch) -> None:
+    root, db, epic_file = _landed_run_with_epic(tmp_path)
+
+    monkeypatch.chdir(root)
+    result = runner.invoke(app, ["reconcile", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert "**Status**: Done" in epic_file.read_text(encoding="utf-8")
+    assert "rendered 99.1-010" in result.output
+    assert "refuses jobs" not in result.output
+    assert "pending" not in result.output
+
+
+def test_reconcile_no_render_docs_writes_nothing_on_any_host(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root, db, epic_file = _landed_run_with_epic(tmp_path)
+
+    monkeypatch.chdir(root)
+    result = runner.invoke(app, ["reconcile", "--no-render-docs", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert epic_file.read_text(encoding="utf-8") == _NOT_STARTED
+    assert _clean(root)
+    assert "pending 99.1-010" in result.output
+    assert "refuses jobs" not in result.output
+
+
+def test_reconcile_on_a_worker_says_nothing_when_markers_are_on_main(
+    tmp_path: Path, monkeypatch
+) -> None:
+    done = "##### Story 99.1-010: Worker landing\n**Status**: Done\n"
+    root, db, _epic_file = _landed_run_with_epic(tmp_path, done)
+    _worker_host(tmp_path, monkeypatch)
+
+    monkeypatch.chdir(root)
+    result = runner.invoke(app, ["reconcile", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert _clean(root)
+    assert "pending" not in result.output
+    assert "marker" not in result.output.lower()
+    assert "PR" not in result.output

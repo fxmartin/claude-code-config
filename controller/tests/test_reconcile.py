@@ -1159,6 +1159,25 @@ def test_render_docs_is_idempotent(tmp_path: Path) -> None:
     assert second == {}
 
 
+def test_render_docs_dry_run_lists_pending_markers_without_writing(tmp_path: Path) -> None:
+    """Story 35.5-010: a dry run names what a write would change, and writes nothing."""
+    root = _init_repo(tmp_path)
+    story_dir = root / "docs" / "stories"
+    story_dir.mkdir(parents=True)
+    epic_file = story_dir / "epic-99-sample.md"
+    original = "##### Story 99.1-001: Fast-forward landing\n**Status**: Not started\n"
+    epic_file.write_text(original, encoding="utf-8")
+
+    db = tmp_path / "ledger.db"
+    run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
+    Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
+
+    pending = render_docs(Ledger(db), run_id, root=root, dry_run=True)
+
+    assert pending == {str(epic_file): ["99.1-001"]}
+    assert epic_file.read_text(encoding="utf-8") == original
+
+
 def test_render_docs_without_epic_file_is_non_fatal(tmp_path: Path) -> None:
     """No docs/stories dir at all must not raise — the story is silently skipped."""
     root = _init_repo(tmp_path)
@@ -1184,7 +1203,7 @@ def test_render_docs_raises_on_write_failure(tmp_path: Path, monkeypatch) -> Non
     run_id = _seed_run(db, [("99.1-001", "FAILED", 100)])
     Ledger(db).set_story_status(run_id, "99.1-001", "DONE")
 
-    def _boom(epic_file, done_story_ids):
+    def _boom(epic_file, done_story_ids, dry_run=False):
         raise OSError("disk full")
 
     monkeypatch.setattr(reconcile_mod, "render_epic_file", _boom)
