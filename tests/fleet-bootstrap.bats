@@ -13,6 +13,8 @@
 
 BOOTSTRAP="${BATS_TEST_DIRNAME}/../scripts/fleet-bootstrap.sh"
 TEMPLATE="${BATS_TEST_DIRNAME}/../templates/systemd/sdlc-worker.service"
+# The worker unit as the bootstrap installs it: the template with the stub's tailnet address.
+RENDERED_UNIT() { sed "s|__TAILNET_IP__|${1:-100.64.0.9}|g" "${TEMPLATE}"; }
 QUEUE="http://home-lab.example.ts.net:8790"
 
 setup() {
@@ -119,7 +121,7 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
     grep -qx "deploy.sh " "${CALLS}"
     grep -qx "gh auth setup-git" "${CALLS}"
     [ "$(cat "${HOME}/.sdlc-fleet.yaml")" = "queue_url: ${QUEUE}" ]
-    cmp "${TEMPLATE}" "$(UNIT)"
+    cmp <(RENDERED_UNIT) "$(UNIT)"
     grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
 }
 
@@ -143,7 +145,7 @@ UNIT() { echo "${HOME}/.config/systemd/user/sdlc-worker.service"; }
 @test "doctor is asked for an exit status so automation can tell CLEAN from not" {
     run "${BOOTSTRAP}" --queue-url "${QUEUE}"
 
-    grep -qx "sdlc doctor --exit-code" "${CALLS}"
+    grep -q "^sdlc doctor --exit-code" "${CALLS}"
 }
 
 @test "the token file is created empty with mode 600 and the unit may read it" {
@@ -212,7 +214,7 @@ exit 0'
     run "${BOOTSTRAP}" --queue-url "${QUEUE}"
 
     [ "$status" -eq 0 ]
-    cmp "${TEMPLATE}" "$(UNIT)"
+    cmp <(RENDERED_UNIT) "$(UNIT)"
     grep -qx "systemctl --user daemon-reload" "${CALLS}"
     grep -qx "systemctl --user restart sdlc-worker.service" "${CALLS}"
 }
@@ -572,8 +574,7 @@ DASHBOARD_UNIT() { echo "${HOME}/.config/systemd/user/sdlc-dashboard.service"; }
     ! grep -q "__" "$(DASHBOARD_UNIT)" || false
     grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
     grep -qx "systemctl --user enable --now sdlc-dashboard.service" "${CALLS}"
-    # The worker unit is today's, untouched.
-    cmp "${TEMPLATE}" "$(UNIT)"
+    cmp <(RENDERED_UNIT) "$(UNIT)"
 }
 
 @test "linux: a changed dashboard unit is restarted, and the worker is left running" {
@@ -606,6 +607,120 @@ DASHBOARD_UNIT() { echo "${HOME}/.config/systemd/user/sdlc-dashboard.service"; }
     run "${BOOTSTRAP}" --queue-url "${QUEUE}" --host dev
     [ "$status" -ne 0 ]
     [[ "$output" == *"macOS options"* ]]
+}
+
+# --- the Linux worker advertises its dashboard (35.2-010) --------------------------------
+
+# The worker unit 35.2-008 installed: its ExecStart carries no --dashboard-url.
+OLD_UNIT() { RENDERED_UNIT | sed 's| --dashboard-url http://100.64.0.9:8787||'; }
+
+@test "linux: the worker unit advertises the dashboard at the address the dashboard binds" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared --pool codex-shared --dashboard-url http://100.64.0.9:8787 --follow" "$(UNIT)"
+    ! grep -q "__TAILNET_IP__" "$(UNIT)" || false
+    grep -q -- "--host 100.64.0.9 --port 8787" "$(DASHBOARD_UNIT)"
+}
+
+@test "linux: both units take the one address tailscale ip -4 prints" {
+    STUB_TAILSCALE_IP="100.101.7.42" run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    cmp <(RENDERED_UNIT 100.101.7.42) "$(UNIT)"
+    grep -q -- "--host 100.101.7.42 --port 8787" "$(DASHBOARD_UNIT)"
+}
+
+@test "linux: the dashboard unit is installed before the worker that advertises it" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    order="$(grep '^systemctl --user enable --now' "${CALLS}" | cut -d' ' -f5 | tr '\n' ' ')"
+    [ "${order}" = "sdlc-dashboard.service sdlc-worker.service " ]
+}
+
+@test "linux: a box already installed keeps both units when the address goes blank" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    before="$(cksum <"$(UNIT)") $(cksum <"$(DASHBOARD_UNIT)")"
+    : >"${CALLS}"
+
+    STUB_TAILSCALE_IP="" run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [ "$(cksum <"$(UNIT)") $(cksum <"$(DASHBOARD_UNIT)")" = "${before}" ]
+    ! grep -q "^systemctl" "${CALLS}" || false
+}
+
+@test "linux: an idle worker unit from before 35.2-010 is replaced and restarted" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    OLD_UNIT >"$(UNIT)"
+    : >"${CALLS}"
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    cmp <(RENDERED_UNIT) "$(UNIT)"
+    grep -qx "systemctl --user daemon-reload" "${CALLS}"
+    grep -qx "systemctl --user restart sdlc-worker.service" "${CALLS}"
+    ! grep -q "restart sdlc-dashboard" "${CALLS}" || false
+}
+
+@test "linux: a worker with a job in flight is not restarted: pending restart, left as installed" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    OLD_UNIT >"$(UNIT)"
+    OLD_UNIT >"${TMP}/old.service"
+    echo '{"jobs": [{"id": 44, "state": "running", "worker": "dev"}, {"id": 45, "state": "running", "worker": "m3max"}]}' >"${TMP}/queue.json"
+    : >"${CALLS}"
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    # Not converged, so not 0: the box still runs the worker it had.
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"pending restart (job 44 running)"* ]]
+    [[ "$output" == *"re-run this script once the worker is idle"* ]]
+    cmp "${TMP}/old.service" "$(UNIT)"
+    ! grep -q "daemon-reload" "${CALLS}" || false
+    ! grep -q "restart sdlc-worker" "${CALLS}" || false
+}
+
+@test "linux: a worker whose queue cannot be read is not restarted either" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    OLD_UNIT >"$(UNIT)"
+    : >"${CALLS}"
+
+    STUB_QUEUE_RC=1 run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"pending restart"* ]]
+    cmp <(OLD_UNIT) "$(UNIT)"
+    ! grep -q "restart sdlc-worker" "${CALLS}" || false
+}
+
+@test "linux: the in-flight check asks with the worker's own token from worker.env" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    echo 'SDLC_QUEUE_TOKEN=worker-secret' >>"${HOME}/.config/sdlc/worker.env"
+    OLD_UNIT >"$(UNIT)"
+    : >"${CALLS}"
+
+    SDLC_QUEUE_URL="http://elsewhere:1" run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "queue-token worker-secret" "${CALLS}"
+    # The token reaches the stub through the environment, never an argv `ps` would show.
+    ! grep -q "^sdlc .*worker-secret" "${CALLS}" || false
+}
+
+@test "linux: a stopped worker unit is replaced without asking the queue about jobs" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    OLD_UNIT >"$(UNIT)"
+    rm "${TMP}/active.sdlc-worker.service"
+    : >"${CALLS}"
+
+    STUB_QUEUE_RC=1 run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    cmp <(RENDERED_UNIT) "$(UNIT)"
+    ! grep -q "^sdlc queue list" "${CALLS}" || false
 }
 
 # --- macOS: LaunchAgents rendered from templates/launchd (35.2-009) ---------------------
@@ -990,7 +1105,7 @@ unwritable_git_config() {
     ! grep -q "^sdlc doctor" "${CALLS}" || false
 }
 
-@test "a Mac's doctor skips the two checks step 7 settles; --skip-service and linux skip none" {
+@test "doctor skips the two checks step 7 settles, on a Mac and on linux; --skip-service skips none" {
     darwin
     run mac
     grep -qx "sdlc doctor --exit-code --skip fleet-agent-drift --skip worker-dashboard --skip worker-keychain" "${CALLS}"
@@ -1000,9 +1115,14 @@ unwritable_git_config() {
     [ "$status" -eq 0 ]
     grep -qx "sdlc doctor --exit-code" "${CALLS}"
 
+    # Linux judges its units the same way since 35.2-010; worker-keychain is a Mac's alone.
     : >"${CALLS}"
     unset STUB_UNAME
     run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    grep -qx "sdlc doctor --exit-code --skip fleet-agent-drift --skip worker-dashboard" "${CALLS}"
+
+    : >"${CALLS}"
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --skip-service
     grep -qx "sdlc doctor --exit-code" "${CALLS}"
 }
 

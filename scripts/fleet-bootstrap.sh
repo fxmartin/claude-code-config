@@ -30,10 +30,11 @@
 #   3. scripts/deploy.sh                      plugin update + `sdlc` as a uv tool
 #   4. gh auth setup-git (+ glab's helper)    git authenticates through gh/glab, never a prompt
 #   5. ~/.sdlc-fleet.yaml                     queue_url: names the fleet queue
-#   6. `sdlc doctor --exit-code`              the verdict on steps 1-5 (a Mac skips the three
-#                                                checks that judge step 7's agents)
-#   7. Linux: templates/systemd/sdlc-worker.service and sdlc-dashboard.service
-#                                             installed, enabled and started
+#   6. `sdlc doctor --exit-code`              the verdict on steps 1-5 (skipping the checks
+#                                                that judge step 7's units or agents)
+#   7. Linux: templates/systemd/sdlc-dashboard.service and sdlc-worker.service
+#             rendered with `tailscale ip -4` (the worker gets `--dashboard-url
+#             http://<tailnet ip>:8787`), installed, enabled and started
 #      macOS: templates/launchd/ worker + dashboard (+ queue with --queue-service),
 #             rendered for this Mac and (re)loaded — see "On a Mac" below
 #   8. macOS: `sdlc doctor --only worker-keychain`   the summary: WARN (exit 1) when the
@@ -42,10 +43,10 @@
 # Doctor runs before the unit is installed: a worker that has not registered yet is
 # a FAIL by design, so judging steps 1-5 after step 7 would fail every first run.
 # Its status is the script's exit status (0 CLEAN, 1 WARN, 2 FAIL), reported after
-# the unit is in place so a re-run can repair a worker that is down. On a Mac it
-# skips fleet-agent-drift and worker-dashboard, which judge the very agents step 7
+# the unit is in place so a re-run can repair a worker that is down. It skips
+# fleet-agent-drift and worker-dashboard, which judge the very units and agents step 7
 # re-renders — counted, they would fail every run that repairs them; a worker step 7
-# leaves pending restart exits 1 instead. It skips worker-keychain too, which has no
+# leaves pending restart exits 1 instead. A Mac skips worker-keychain too, which has no
 # worker agent to gate on before step 7: step 8 shows it once the agent is in place,
 # and a Keychain that can lock exits 1. From a shell without SDLC_QUEUE_TOKEN (SSH)
 # doctor asks the queue with the installed worker agent's token, and finds the worker
@@ -98,7 +99,10 @@
 #              login(s) allowed to call it come from --queue-allow, else from the
 #              queue agent already installed.
 # Linux gains the dashboard as a second user unit, sdlc-dashboard.service, bound to the
-# same address (and refused the same way without one).
+# same address (and refused the same way without one), and the worker unit advertises
+# it with --dashboard-url (35.2-010). As on a Mac, a changed worker unit is not
+# restarted while worker dev has a job in flight: it is left as installed, reported as
+# `pending restart (job N running)`, and the run exits 1.
 #
 # Reaching the box: Tailscale SSH policy denies the XPS and public port 22 is
 # home-IP-only, so operate it with `ssh -J home-lab dev-server` (or widen the ACL
@@ -403,12 +407,14 @@ installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the instal
 #    repairs a worker that is down. On a Mac, fleet-agent-drift and worker-dashboard
 #    judge the very agents step 7 re-renders: counted here, they would fail every
 #    run that repairs them. Step 7 answers for them — a worker it leaves pending
-#    restart exits 1. worker-keychain is n/a until step 7 installs the worker
-#    agent, so the summary judges it instead (Story 35.2-014).
+#    restart exits 1. Linux judges its units the same way (35.2-010). On a Mac
+#    worker-keychain is n/a until step 7 installs the worker agent, so the
+#    summary judges it instead (Story 35.2-014).
 DOCTOR_RC=0
 DOCTOR_ARGS=(--exit-code)
-if [[ "${DO_SERVICE}" == true && "${IS_DARWIN}" == true ]]; then
-  DOCTOR_ARGS+=(--skip fleet-agent-drift --skip worker-dashboard --skip worker-keychain)
+if [[ "${DO_SERVICE}" == true ]]; then
+  DOCTOR_ARGS+=(--skip fleet-agent-drift --skip worker-dashboard)
+  [[ "${IS_DARWIN}" == false ]] || DOCTOR_ARGS+=(--skip worker-keychain)
 fi
 if [[ "${DRY_RUN}" == true ]]; then
   log "[dry-run] would run: sdlc doctor ${DOCTOR_ARGS[*]}"
@@ -436,17 +442,22 @@ trap 'rm -rf "${WORK_DIR}"' EXIT
 # Linux: install one unit file, enable it, and restart it only if it changed under
 # a running process. Asked before `enable --now`: a unit that call starts already
 # runs the new file, and restarting it would cut a worker's start-up self-check short.
+# A running worker with a job in flight is left as installed (see install_launch_agent).
+PENDING_RESTART=false
 install_systemd_unit() {  # NAME SOURCE — SOURCE is the exact text to install
   local name="$1" source="$2" path="${UNIT_DIR}/$1" changed=false was_active=false
+  if [[ "${DRY_RUN}" == false ]] && systemctl --user is-active --quiet "${name}"; then
+    was_active=true
+  fi
   if [[ -f "${path}" ]] && cmp -s "${source}" "${path}"; then
     log "${name} already installed and current"
   else
+    if [[ "${name}" == "${UNIT_NAME}" && "${was_active}" == true ]] && ! worker_is_idle "${name}"; then
+      return
+    fi
     log "installing ${path}"
     run install -m 644 "${source}" "${path}"
     changed=true
-  fi
-  if [[ "${DRY_RUN}" == false ]] && systemctl --user is-active --quiet "${name}"; then
-    was_active=true
   fi
   if [[ "${changed}" == true ]]; then
     run systemctl --user daemon-reload
@@ -505,16 +516,28 @@ redact_token() {  # FILE — FILE with its token masked
   sed "/<key>${TOKEN_KEY}<\/key>/{n;s|<string>.*</string>|<string>(redacted)</string>|;}" "$1"
 }
 
+# KEY's value in the Linux worker's EnvironmentFile (worker.env), quotes stripped, or nothing.
+unit_env() {
+  { sed -n "s/^$1=//p" "${ENV_FILE}" 2>/dev/null || true; } | tail -n1 | sed -e "s/^[\"']//" -e "s/[\"']\$//"
+}
+
 # The job ids running on this worker, comma-separated; nonzero if the queue cannot be read.
 # Under the name the installed agent registered: a rename's old jobs are the ones a bootout kills.
 # Asked with the worker's own token, if it has one: from a shell without it the queue may refuse.
-# Asked of the worker's own queue: launchd hands it none of this shell's SDLC_QUEUE_URL or
-# SDLC_FLEET_DISABLED, so its agent's SDLC_QUEUE_URL names it, else ~/.sdlc-fleet.yaml.
+# Asked of the worker's own queue: launchd and systemd hand it none of this shell's
+# SDLC_QUEUE_URL or SDLC_FLEET_DISABLED, so its agent's (or worker.env's) SDLC_QUEUE_URL
+# names it, else ~/.sdlc-fleet.yaml. The Linux unit is always worker dev.
 worker_jobs_in_flight() {
   local listing worker token url
-  worker="$(installed_worker_arg --worker)"
-  token="$(installed_token "${WORKER_LABEL}")"
-  url="$(installed_env "${WORKER_LABEL}" SDLC_QUEUE_URL)"
+  if [[ "${IS_DARWIN}" == true ]]; then
+    worker="$(installed_worker_arg --worker)"
+    token="$(installed_token "${WORKER_LABEL}")"
+    url="$(installed_env "${WORKER_LABEL}" SDLC_QUEUE_URL)"
+  else
+    worker=dev
+    token="$(unit_env "${TOKEN_KEY}")"
+    url="$(unit_env SDLC_QUEUE_URL)"
+  fi
   listing="$(
     unset SDLC_QUEUE_URL SDLC_FLEET_DISABLED
     [[ -z "${token}" ]] || export SDLC_QUEUE_TOKEN="${token}"
@@ -523,6 +546,24 @@ worker_jobs_in_flight() {
   )" || return 1
   jq -r --arg worker "${worker:-${WORKER_NAME}}" \
     '[.jobs[] | select(.state == "running" and .worker == $worker) | .id] | join(", ")' <<<"${listing}"
+}
+
+# Replacing a running worker kills its jobs' supervisor: SIGTERM stops each in-flight job.
+# Unknown counts as busy — a lost build costs more than a run's delay. Nonzero (and
+# PENDING_RESTART set) when NAME must be left as installed for the next run.
+worker_is_idle() {  # NAME — the worker agent's label or unit name, for the log
+  local running noun
+  if ! running="$(worker_jobs_in_flight)"; then
+    log "$1: pending restart (cannot read the queue to tell whether a job is running); left as installed"
+    PENDING_RESTART=true
+    return 1
+  fi
+  [[ -n "${running}" ]] || return 0
+  noun="job ${running} running"
+  [[ "${running}" == *,* ]] && noun="jobs ${running} running"
+  log "$1: pending restart (${noun}); left as installed — re-run once it is idle"
+  PENDING_RESTART=true
+  return 1
 }
 
 # Right after a bootout launchd may still hold the label, and a bootstrap then fails
@@ -547,7 +588,6 @@ bootstrap_agent() {  # DOMAIN PLIST
   launchctl print "${domain}/${label}" >/dev/null 2>&1
 }
 
-PENDING_RESTART=false
 install_launch_agent() {  # LABEL RENDERED_FILE
   local label="$1" rendered="$2" dest="${AGENT_DIR}/$1.plist" loaded=false domain mode=644
   domain="gui/$(id -u)"
@@ -571,23 +611,8 @@ install_launch_agent() {  # LABEL RENDERED_FILE
     return
   fi
 
-  # Replacing the worker kills its jobs' supervisor: SIGTERM stops each in-flight job.
-  # Unknown counts as busy — a lost build costs more than a run's delay.
-  if [[ "${label}" == "${WORKER_LABEL}" && "${loaded}" == true ]]; then
-    local running
-    if running="$(worker_jobs_in_flight)"; then
-      if [[ -n "${running}" ]]; then
-        local noun="job ${running} running"
-        [[ "${running}" == *,* ]] && noun="jobs ${running} running"
-        log "${label}: pending restart (${noun}); left as installed — re-run once it is idle"
-        PENDING_RESTART=true
-        return
-      fi
-    else
-      log "${label}: pending restart (cannot read the queue to tell whether a job is running); left as installed"
-      PENDING_RESTART=true
-      return
-    fi
+  if [[ "${label}" == "${WORKER_LABEL}" && "${loaded}" == true ]] && ! worker_is_idle "${label}"; then
+    return
   fi
 
   log "installing ${dest}"
@@ -628,10 +653,12 @@ elif [[ "${DO_SERVICE}" == true ]]; then
     chmod 600 "${ENV_FILE}"
   fi
 
-  # Nothing to substitute in the worker unit: it uses %h for the home.
+  # Both units take the one tailnet address (validated above); %h is systemd's to expand.
+  # The dashboard first: the worker advertises it.
   sed "s|__TAILNET_IP__|${TAILNET_IP}|g" "${DASHBOARD_UNIT_TEMPLATE}" >"${WORK_DIR}/${DASHBOARD_UNIT_NAME}"
-  install_systemd_unit "${UNIT_NAME}" "${UNIT_TEMPLATE}"
+  sed "s|__TAILNET_IP__|${TAILNET_IP}|g" "${UNIT_TEMPLATE}" >"${WORK_DIR}/${UNIT_NAME}"
   install_systemd_unit "${DASHBOARD_UNIT_NAME}" "${WORK_DIR}/${DASHBOARD_UNIT_NAME}"
+  install_systemd_unit "${UNIT_NAME}" "${WORK_DIR}/${UNIT_NAME}"
 
   if command -v loginctl >/dev/null 2>&1 \
       && ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q '=yes'; then
@@ -662,7 +689,11 @@ if [[ "${DOCTOR_RC}" -ne 0 ]]; then
   exit "${DOCTOR_RC}"
 fi
 if [[ "${PENDING_RESTART}" == true ]]; then
-  warn "${WORKER_LABEL} is pending restart (see above): this Mac still runs the agent it had — re-run this script once the worker is idle"
+  if [[ "${IS_DARWIN}" == true ]]; then
+    warn "${WORKER_LABEL} is pending restart (see above): this Mac still runs the agent it had — re-run this script once the worker is idle"
+  else
+    warn "${UNIT_NAME} is pending restart (see above): this box still runs the unit it had — re-run this script once the worker is idle"
+  fi
   exit 1
 fi
 if [[ "${KEYCHAIN_RC}" -ne 0 ]]; then

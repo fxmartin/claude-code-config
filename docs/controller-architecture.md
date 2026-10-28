@@ -2548,10 +2548,10 @@ harmless: the worker restarts only when the installed *version* changes.
   instead of a plist, and its remedies name `systemctl --user` and `journalctl
   --user -u sdlc-worker`. `worker-self-check` is `CLEAN` only for a probe that
   completed from the unit, reads `TCC n/a (not macOS)`, and on failure points at
-  the journal — there is no dialog to answer. There is no `worker-dashboard`
-  finding: the unit advertises no `--dashboard-url`, so the XPS shows `dev`'s runs
-  with the worker name but header-only. The *Forge credentials* finding (Story
-  35.2-006) reports for the unit as it does for the LaunchAgent.
+  the journal — there is no dialog to answer. The *Forge credentials* finding (Story
+  35.2-006) reports for the unit as it does for the LaunchAgent, and so — since
+  Story 35.2-010 — do `worker-dashboard` (the `--dashboard-url` in the unit's
+  `ExecStart`, drop-ins included) and `fleet-agent-drift` (below).
 - **Reaching the box.** The Tailscale SSH policy denies the XPS, and public port
   22 is home-IP-only. Operate it through the home-lab: `ssh -J home-lab
   dev-server`, or widen the ACL in `nix-install`.
@@ -2568,7 +2568,15 @@ M3 re-rendered without its `--host m3max` would register as `m3-max` and strand
 every job pinned to `m3max`) — and, with
 `--queue-service` (home-lab), `com.fxmartin.sdlc-queue` (`--queue-allow LOGIN`
 fills `__LOGIN__`; a re-run keeps the login of the installed agent). Linux keeps
-its systemd path and gains `sdlc-dashboard.service` as a second user unit.
+its systemd path and gains `sdlc-dashboard.service` as a second user unit. Story
+35.2-010 gives the worker unit the same `__TAILNET_IP__` placeholder, rendered into
+`--dashboard-url http://<tailnet ip>:8787` from the one `tailscale ip -4` value the
+dashboard unit binds: before it, `dev`'s runs reached the XPS without a dashboard
+URL and read "detail unavailable". The dashboard unit is installed first, and a
+changed worker unit is restarted only once `sdlc queue list --json` shows worker
+`dev` with nothing running (asked with `worker.env`'s `SDLC_QUEUE_TOKEN` /
+`SDLC_QUEUE_URL` when it has them) — otherwise it is left as installed, pending
+restart, and the run exits 1, as on a Mac.
 
 Each agent is compared byte for byte with what is installed:
 
@@ -2601,8 +2609,8 @@ appended to `EnvironmentVariables` through awk's environment, never an argv
 `ps` would show — installs that plist `0600`, asks the in-flight question with
 the worker's own token, and masks the value in the `--dry-run` diff.
 
-Step 6's verdict (`sdlc doctor --exit-code`) leaves out, on a Mac,
-`fleet-agent-drift` and `worker-dashboard` (`sdlc doctor --skip CHECK`): both
+Step 6's verdict (`sdlc doctor --exit-code`) leaves out, on a Mac and (since
+35.2-010) on Linux, `fleet-agent-drift` and `worker-dashboard` (`sdlc doctor --skip CHECK`): both
 judge the agents step 7 is about to re-render, so counting them would exit 1 on
 exactly the run that repairs them. Step 7 answers for them instead — a worker
 left pending restart exits 1. `worker-keychain` is left out of step 6 too: it is
@@ -2629,7 +2637,10 @@ unexpected arguments, with the `fleet-bootstrap.sh` command that re-renders them
 It reads `templates/launchd/` from the checkout doctor runs in, else from the
 config checkout `~/.claude/CLAUDE.md` links into (`install.sh --core`), so it
 checks from `~` or any project too; a host with neither, or without any of the
-agents, has nothing to report.
+agents, has nothing to report. On Linux it compares each installed
+`sdlc-worker.service` / `sdlc-dashboard.service` `ExecStart` (drop-ins included)
+with `templates/systemd/` the same way; nothing in those is the host's to choose,
+and the remedy is the plain `fleet-bootstrap.sh --queue-url URL` the box takes.
 
 ## Using the fleet queue (`QueueClient`, Story 35.1-002)
 

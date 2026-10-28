@@ -102,9 +102,11 @@ def test_exec_start_goes_through_nix_develop_by_absolute_path(service) -> None:
 def test_worker_argv_names_dev_and_declares_both_shared_pools(service) -> None:
     # codex-shared is declared ahead of Codex being installed: registration, not this
     # argv, decides whether the worker joins it (the pool tests below).
+    # Story 35.2-010: it advertises the dashboard unit's tailnet address, as the Macs do.
     assert _sdlc_args(service) == [
         "sdlc", "queue", "run", "--worker", "dev",
-        "--pool", "claude-shared", "--pool", CODEX_POOL, "--follow",
+        "--pool", "claude-shared", "--pool", CODEX_POOL,
+        "--dashboard-url", "http://__TAILNET_IP__:8787", "--follow",
     ]
 
 
