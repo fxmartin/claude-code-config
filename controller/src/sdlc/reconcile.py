@@ -494,7 +494,9 @@ def reconcile_run(
     )
 
 
-def render_docs(ledger: Ledger, run_id: str, root: Path | None = None) -> dict[str, list[str]]:
+def render_docs(
+    ledger: Ledger, run_id: str, root: Path | None = None, *, dry_run: bool = False
+) -> dict[str, list[str]]:
     """Render every ``DONE`` story's epic-markdown marker into the checkout, on request.
 
     Story 32.1-003: the on-demand counterpart to the write-back
@@ -510,6 +512,8 @@ def render_docs(ledger: Ledger, run_id: str, root: Path | None = None) -> dict[s
     Returns ``{epic_file_path: [story_id, ...]}`` for the files actually
     changed — an unchanged epic (already-stamped or nothing to stamp) is
     omitted, keeping the CLI summary and any test byte-identical to a no-op.
+    With ``dry_run`` nothing is written and the same mapping names the markers
+    still pending (Story 35.5-010).
     """
     root = root or Path.cwd()
     done_ids = [
@@ -526,7 +530,7 @@ def render_docs(ledger: Ledger, run_id: str, root: Path | None = None) -> dict[s
 
     rendered: dict[str, list[str]] = {}
     for epic_file, sids in by_epic_file.items():
-        changed_ids = render_epic_file(epic_file, sids)
+        changed_ids = render_epic_file(epic_file, sids, dry_run=dry_run)
         if changed_ids:
             rendered[str(epic_file)] = changed_ids
     return rendered

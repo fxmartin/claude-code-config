@@ -1954,6 +1954,15 @@ def reconcile(
     db: Path | None = typer.Option(
         None, "--db", help="Ledger DB path (default: ./.sdlc-state.db)."
     ),
+    render_docs_flag: bool | None = typer.Option(
+        None,
+        "--render-docs/--no-render-docs",
+        help=(
+            "Write the run's **Status**: Done markers into the epic files "
+            "(default: yes, except on a host with an installed worker agent, "
+            "where they are only listed)."
+        ),
+    ),
 ) -> None:
     """Re-check a finished/interrupted run against ``origin/main``, then re-terminal.
 
@@ -1978,6 +1987,12 @@ def reconcile(
     of the run into its epic file via ``render_docs``. A write failure there
     is reported but does not change the command's exit code (mirrors the old
     best-effort write-back's non-fatal posture).
+
+    Story 35.5-010: on a fleet worker host (an installed LaunchAgent or systemd
+    unit) the markers are only listed by default — a written marker would leave
+    the worker's clone dirty and it would refuse its next job
+    (``DIRTY_WORKING_TREE``). ``--render-docs`` writes them anyway, with a
+    warning; ``--no-render-docs`` lists them on any host.
     """
     from sdlc.doctor import worker_registry_path
     from sdlc.ledger_view import Ledger, default_db_path
@@ -2023,13 +2038,31 @@ def reconcile(
         )
         raise typer.Exit(code=0)
 
+    worker_host = agent_path is not None
+    write_docs = render_docs_flag if render_docs_flag is not None else not worker_host
     try:
-        rendered = render_docs(ledger, result.run_id)
+        if write_docs:
+            rendered = render_docs(ledger, result.run_id)
+        else:
+            rendered = render_docs(ledger, result.run_id, dry_run=True)
     except OSError as exc:
         rendered = {}
         typer.echo(f"epic markdown render failed (non-fatal): {exc}", err=True)
+    verb = "rendered" if write_docs else "pending"
     for epic_file, story_ids in rendered.items():
-        typer.echo(f"  rendered {', '.join(story_ids)} → {epic_file}")
+        typer.echo(f"  {verb} {', '.join(story_ids)} → {epic_file}")
+    if rendered and not write_docs:
+        typer.echo(
+            "  **Status**: Done markers not written to this checkout — land them "
+            "through a PR (`sdlc reconcile --render-docs` in a clone that is not "
+            "a fleet worker, then commit)."
+        )
+    elif rendered and worker_host:
+        typer.echo(
+            "warning: this host runs a fleet worker, which refuses jobs "
+            "(DIRTY_WORKING_TREE) until these markers are committed.",
+            err=True,
+        )
     if result.fleet_warning:
         typer.echo(result.fleet_warning, err=True)
 

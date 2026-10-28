@@ -195,17 +195,21 @@ def mark_story_done(epic_file: str | Path, story_id: str) -> bool:
     return changed
 
 
-def render_epic_file(epic_file: str | Path, done_story_ids: Iterable[str]) -> list[str]:
+def render_epic_file(
+    epic_file: str | Path, done_story_ids: Iterable[str], *, dry_run: bool = False
+) -> list[str]:
     """Write :func:`render_done_markers`'s result to ``epic_file`` on request.
 
     The batch counterpart to :func:`mark_story_done`: renders every id in
     ``done_story_ids`` in one read/write pass and returns the ids that actually
-    changed. Writes only when at least one id changed something. Raises
-    ``OSError`` (e.g. the epic file does not exist) — the caller's job.
+    changed. Writes only when at least one id changed something, and never with
+    ``dry_run`` — which still returns the ids a write would change (Story
+    35.5-010 lists them on a worker host). Raises ``OSError`` (e.g. the epic
+    file does not exist) — the caller's job.
     """
     path = Path(epic_file)
     text = path.read_text(encoding="utf-8")
     new_text, changed_ids = render_done_markers(text, done_story_ids)
-    if changed_ids:
+    if changed_ids and not dry_run:
         path.write_text(new_text, encoding="utf-8")
     return changed_ids

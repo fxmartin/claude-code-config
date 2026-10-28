@@ -1103,7 +1103,7 @@ new orchestration. Its job is to rescue a run that aborted (e.g. a 429) before
 its already-open PRs were merged by hand the next morning, so the ledger no
 longer shows FAILED days after the work actually shipped.
 
-- **`sdlc reconcile [run] [--db PATH]`** (`sdlc/cli.py`) runs `ledger.ensure_migrated()`
+- **`sdlc reconcile [run] [--db PATH] [--render-docs/--no-render-docs]`** (`sdlc/cli.py`) runs `ledger.ensure_migrated()`
   and then the shared `reconcile.reconcile_run` (see
   [Reconciliation](#reconciliation-against-originmain)) — the identical algorithm
   close-out runs — and prints a human summary of the reclassifications and the
@@ -1148,6 +1148,17 @@ longer shows FAILED days after the work actually shipped.
   text out, touch no disk); `mark_story_done`/`render_epic_file` are its thin
   write-on-request wrappers, so this is the only place in the controller that
   writes the shared checkout's status markers.
+- **No markers on a worker host (Story 35.5-010).** A fleet worker never
+  stashes (#590), so a marker `reconcile` wrote into its clone held its next job
+  as `DIRTY_WORKING_TREE`. Where a worker agent is installed (the LaunchAgent
+  plist or systemd unit `doctor.worker_registry_path` finds), `sdlc reconcile`
+  updates the ledger, registries and fleet record as usual but writes no epic
+  file: it calls `render_docs(..., dry_run=True)` and prints each still-pending
+  marker as `pending <ids> → <epic file>` with a hint to land them through a PR.
+  `--render-docs` writes them anyway and warns that the worker refuses jobs until
+  the change is committed; `--no-render-docs` lists instead of writing on any
+  host. A host with no worker agent (the XPS) renders as before, and with every
+  marker already on `main` nothing about markers is printed.
 
 ## Usage reconciliation (ledger vs session logs)
 
