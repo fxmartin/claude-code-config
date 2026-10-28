@@ -6306,6 +6306,8 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
     # findings, each is a claim to verify against the code — not an order — with
     # a structured dispute channel (finding_dispositions) for the ones the agent
     # can refute, so a wrong finding is disputed rather than blindly implemented.
+    # Story 26.2-003: a right finding the story cannot fix is needs_decision, so
+    # the agent's reasoning parks the story instead of failing schema validation.
     return (
         f"Bugfix story {story.id}: {story.title}. Stage '{failed_stage}' failed.\n"
         f"Failure: {failure}\n"
@@ -6321,9 +6323,14 @@ def render_bugfix_prompt(story: Story, failed_stage: str, failure: str) -> str:
         "performatively. Implement a finding only once you have confirmed it; "
         "dispute — with concrete technical reasoning — any finding you can refute "
         "against the code. Report every finding's verdict in finding_dispositions "
-        "(each an object: finding, disposition implemented|disputed, and reasoning "
-        "— required when disputed). A disputed finding is surfaced, not silently "
-        "dropped, and is never reported as fixed.\n"
+        "(each an object: finding, disposition implemented|disputed|needs_decision, "
+        "and reasoning — required when disputed or needs_decision). A disputed "
+        "finding is surfaced, not silently dropped, and is never reported as fixed. "
+        "Use needs_decision only for a finding you verified is right but this story "
+        "cannot fix (e.g. it needs wiring no story owns); say in reasoning why it is "
+        "right and why this story cannot fix it. The story then parks for FX's "
+        "decision with no retry. It is never a way to skip a finding the story can "
+        "fix.\n"
         "Classify (CODE_BUG/TEST_BUG/ENV_ISSUE), fix where possible. If you "
         "commit the fix, use this exact, conventional-commit-compliant message "
         f"— do not alter it:\n   {commit_header}\n"
@@ -9788,6 +9795,13 @@ def _run_story(
                         root=workdir or Path.cwd(), pr_number=pr_number,
                     )
                     pushed_fix = bugfix_round.pushed_fix() or pushed_fix
+                    if bugfix_round.decisions:
+                        # Story 26.2-003: a retry cannot settle a finding the story
+                        # cannot fix — park for FX now, burning no further attempts.
+                        return _park_for_decision(
+                            story.id, ledger, run_id,
+                            bugfix_round.decisions, workdir=workdir,
+                        )
                     if bugfix_round.ci_red:
                         failure = (
                             f"CI pipeline is red on bugfix commit {bugfix_round.pushed_sha} "
@@ -9973,6 +9987,44 @@ def _park_pushed(
 ) -> str:
     """Record the ``fix pushed · …`` status row and park the story (35.5-001)."""
     _record_park_note(ledger, run_id, story_id, pr_number, fix)
+    return "NEEDS_ATTENTION"
+
+
+# Story 26.2-003: the park-note prefix the queue keys its job reason on.
+DECISION_PARK_PREFIX = "needs decision · "
+
+
+def _park_for_decision(
+    story_id: str,
+    ledger: Ledger,
+    run_id: str,
+    decisions: tuple[str, ...],
+    *,
+    workdir: Path | None = None,
+) -> str:
+    """Park a story on review findings only FX can decide (Story 26.2-003).
+
+    The bugfix agent confirmed each finding but could not fix it inside the
+    story. Commits it made for other findings are pushed, as on any park, and the
+    findings with their reasoning become the story's ``park-note`` — read by
+    ``sdlc status``, both dashboards and the queue job's reason. Recorded after
+    the push, so it is the note that stands.
+    """
+    root = workdir or Path.cwd()
+    branch = f"feature/{story_id}"
+    count, tip = _unpushed_commits(root, branch)
+    if count:
+        ok, error = _try_push_branch(root, branch)
+        ledger.event_log(
+            run_id, story_id, "warn", "controller",
+            f"{count} unpushed commit(s) pushed to {branch} ({tip})" if ok else
+            f"{count} unpushed commit(s) on {branch} ({tip}) could not be pushed "
+            f"({error}); kept on the local branch",
+        )
+    ledger.event_log(
+        run_id, story_id, "warn", "controller",
+        DECISION_PARK_PREFIX + "; ".join(decisions), kind="park-note",
+    )
     return "NEEDS_ATTENTION"
 
 
@@ -11712,13 +11764,16 @@ class _BugfixRound:
     ``pushed_sha`` is the fix commit the round published to ``origin`` while
     CI-adjudicating a not-green local verdict; ``ci_red`` says that pipeline
     came back red (the loop spends one more round); ``awaiting_ci`` that it had
-    not finished when the gate's cap lapsed.
+    not finished when the gate's cap lapsed. ``decisions`` (Story 26.2-003) are
+    the ``finding: reasoning`` lines of the review findings the agent confirmed but
+    could not fix in this story; any one of them parks the story for FX.
     """
 
     fixed: bool
     pushed_sha: str | None = None
     ci_red: bool = False
     awaiting_ci: bool = False
+    decisions: tuple[str, ...] = ()
 
     def pushed_fix(self) -> _PushedFix | None:
         if not self.pushed_sha:
@@ -11904,7 +11959,10 @@ def _run_bugfix_round(
         return _BugfixRound(fixed=False)
 
     data = result.data
-    reported_fixed = data.get("fix_status") == "FIXED"
+    # Story 26.2-003: a finding left for FX's decision means the stage cannot pass
+    # on a retry, so the round is never a fix — whatever fix_status says.
+    decisions = _needs_decision_findings(data)
+    reported_fixed = data.get("fix_status") == "FIXED" and not decisions
     fixed = reported_fixed and _tests_green_after_baseline(data, ledger, run_id, story.id)
     adjudication = _BugfixRound(fixed=fixed)
     if reported_fixed and not fixed and root is not None:
@@ -11925,15 +11983,43 @@ def _run_bugfix_round(
         ledger, run_id, story.id, "bugfix", attempt, result,
         capabilities=_stage_capabilities(failed_stage, opts),
     )
+    outcome = (
+        "resolved" if fixed else "parked for a decision" if decisions else "exhausted"
+    )
     ledger.event_log(
         run_id,
         story.id,
         "success" if fixed else "error",
         "controller",
-        f"bugfix {'resolved' if fixed else 'exhausted'}: {failed_stage}",
+        f"bugfix {outcome}: {failed_stage}",
     )
     _surface_finding_dispositions(ledger, run_id, story.id, data)
-    return replace(adjudication, fixed=fixed)
+    return replace(adjudication, fixed=fixed, decisions=decisions)
+
+
+# Story 26.2-003: the ledger wording for each surfaced disposition.
+_SURFACED_DISPOSITIONS = {
+    "disputed": "review finding disputed",
+    "needs_decision": "review finding needs a decision",
+}
+
+
+def _disposition_line(item: dict[str, Any]) -> str:
+    """``finding: reasoning`` for one disposition, or just the finding."""
+    finding = str(item.get("finding", "")).strip() or "(unnamed finding)"
+    reasoning = str(item.get("reasoning", "")).strip()
+    return f"{finding}: {reasoning}" if reasoning else finding
+
+
+def _needs_decision_findings(data: dict[str, Any]) -> tuple[str, ...]:
+    """The ``needs_decision`` findings of a bugfix response (Story 26.2-003)."""
+    dispositions = data.get("finding_dispositions")
+    if not isinstance(dispositions, list):
+        return ()
+    return tuple(
+        _disposition_line(item) for item in dispositions
+        if isinstance(item, dict) and item.get("disposition") == "needs_decision"
+    )
 
 
 def _surface_finding_dispositions(
@@ -11942,23 +12028,26 @@ def _surface_finding_dispositions(
     """Surface each disputed review finding as a visible ledger event (Story 26.2-001).
 
     A bugfix agent dispatched with review findings reports each one's disposition
-    in ``finding_dispositions`` (``implemented`` | ``disputed``). A dispute is a
-    claim the agent refuted against the code — it must never be silently swallowed,
-    and the story must not falsely report the finding as fixed. Each dispute
-    becomes a ``warn`` audit event so it shows up in ``sdlc status`` and the
-    dashboard's recent-events, in front of FX and the ledger. Implemented
-    dispositions are the normal path and stay quiet so the log is not flooded.
+    in ``finding_dispositions`` (``implemented`` | ``disputed`` | ``needs_decision``).
+    A dispute is a claim the agent refuted against the code — it must never be
+    silently swallowed, and the story must not falsely report the finding as fixed.
+    Each dispute becomes a ``warn`` audit event so it shows up in ``sdlc status``
+    and the dashboard's recent-events, in front of FX and the ledger. A
+    ``needs_decision`` finding (Story 26.2-003) surfaces the same way, with the
+    agent's reasoning.
+    Implemented dispositions are the normal path and stay quiet so the log is not
+    flooded.
     """
     dispositions = data.get("finding_dispositions")
     if not isinstance(dispositions, list):
         return
     for item in dispositions:
-        if not isinstance(item, dict) or item.get("disposition") != "disputed":
+        if not isinstance(item, dict):
             continue
-        finding = str(item.get("finding", "")).strip() or "(unnamed finding)"
-        reasoning = str(item.get("reasoning", "")).strip()
-        detail = f": {reasoning}" if reasoning else ""
+        label = _SURFACED_DISPOSITIONS.get(str(item.get("disposition")))
+        if label is None:
+            continue
         ledger.event_log(
             run_id, story_id, "warn", "controller",
-            f"review finding disputed — {finding}{detail}",
+            f"{label} — {_disposition_line(item)}",
         )

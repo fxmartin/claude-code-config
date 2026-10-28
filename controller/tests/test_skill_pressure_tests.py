@@ -26,7 +26,13 @@ _EVALS_ROOT = _REPO_ROOT / "plugins/autonomous-sdlc/evals"
 
 # The two pressure-test cases the story ships, each keyed to the discipline
 # (and the prompt files) it proves under pressure.
-_CASES = ["root-cause-discipline", "finding-verification"]
+# Story 26.2-003 nests a second finding-verification case: a right finding the
+# story cannot fix, answered needs_decision.
+_CASES = [
+    "root-cause-discipline",
+    "finding-verification",
+    "finding-verification/needs-decision",
+]
 
 # The dispatched bugfix prompts that carry the discipline being pressure-tested.
 # The discipline is cross-shipped in BOTH skills, so every scenario must name
@@ -130,6 +136,17 @@ def test_finding_grader_scores_reasoned_dispute() -> None:
     assert "finding_dispositions" in grader
     # A dispute without technical reasoning is performative — the rubric says so.
     assert "reasoning" in grader
+
+
+def test_needs_decision_case_rewards_needs_decision_and_rejects_invented_values() -> None:
+    """A right finding outside the story's scope is answered needs_decision; the
+    issue #900 invented value is an automatic FAIL (Story 26.2-003)."""
+    case = _case_dir("finding-verification/needs-decision")
+    grader = _read(case / "graders" / "criteria.md")
+    assert '"disposition": "needs_decision"' in grader
+    assert "confirmed_unfixed" in grader
+    assert "confirmed_unfixed" in _read(case / "baseline.md")
+    assert "no story" in _read(case / "prompt.md").lower()
 
 
 def test_finding_baseline_records_blind_implementation() -> None:

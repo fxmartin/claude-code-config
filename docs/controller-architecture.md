@@ -348,6 +348,13 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    worker's snapshot) reads `fix pushed · awaiting CI` / `· CI red` with the sha
    and PR (`status_detail`).
 
+   **Parked for a decision (Story 26.2-003).** A bugfix round that reports a
+   review finding `needs_decision` is not a fix and is not retried. The finding
+   is right, but this story cannot fix it. `_park_for_decision` pushes any
+   unpushed commits and parks the story `NEEDS_ATTENTION` at once. Its
+   `status_detail` reads `needs decision · <finding>: <reasoning>`. The queue
+   job's reason carries the same text (`ledger_decision_park`).
+
    **A merge round that only re-ran CI re-checks the gate (Story 35.5-007).** A
    merge-stage bugfix round that leaves `feature/<story>` where it was (the
    agent re-ran a timed-out or cancelled job) is not written off as exhausted:

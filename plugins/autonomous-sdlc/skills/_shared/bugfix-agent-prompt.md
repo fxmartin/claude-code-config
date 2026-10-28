@@ -75,9 +75,13 @@ cycle. Process every finding through this reception sequence:
    defect exists. A finding is a hypothesis until the code confirms it.
 4. **Evaluate** — correct, partially correct, or wrong? Correct code flagged as buggy is
    a wrong finding.
-5. **Respond** with a disposition: `implemented` (verified, then fixed) or `disputed`
-   (refuted against the code, with concrete technical reasoning naming the file/line and
-   why the finding does not hold).
+5. **Respond** with one of three dispositions: `implemented` (verified, then fixed),
+   `disputed` (refuted against the code, with concrete technical reasoning naming the
+   file/line and why the finding does not hold), or `needs_decision` (verified as right,
+   but this story cannot fix it — e.g. it needs wiring in a composition root no story
+   owns; the reasoning says why the finding is right and why this story cannot fix it).
+   `needs_decision` parks the story for FX's decision, with no retry. It is never a way
+   to skip a finding the story can fix: if the fix fits inside this story, implement it.
 6. **Implement** only the findings you verified. Never agree performatively —
    implementing a finding you have not verified is exactly the failure this step exists
    to prevent.
@@ -190,9 +194,11 @@ Include the optional "issue_number" (integer) when you opened a GitHub issue.
 
 When the failure carried review findings (Step 1d), also include a
 `finding_dispositions` array — one entry per finding you processed, each an object
-`{"finding": "...", "disposition": "implemented" | "disputed", "reasoning": "..."}`.
-`reasoning` is required and must be concrete for a `disputed` finding (a dispute
-without technical reasoning is performative and is rejected by the schema). Example:
+`{"finding": "...", "disposition": "implemented" | "disputed" | "needs_decision", "reasoning": "..."}`.
+`reasoning` is required and must be concrete for a `disputed` or `needs_decision`
+finding (a dispute without technical reasoning is performative, and a decision needs
+the why; both are rejected by the schema without it). Any other disposition value
+fails validation. Example:
 
 ```
 <<<RESULT_JSON>>>
