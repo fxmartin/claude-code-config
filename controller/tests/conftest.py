@@ -50,10 +50,14 @@ def _no_fleet_queue(monkeypatch, tmp_path_factory):
     so a suite run inside one would otherwise name every run it registers.
     `SDLC_IN_TEST` and `SDLC_FLEET_DISABLED` are what a dispatched agent runs
     under (Story 35.5-004); both switch the registry push off, so a suite run
-    inside an agent would never exercise it.
+    inside an agent would never exercise it. `SDLC_AGENT_PIDS_DIR` is every
+    dispatched agent's tracking dir (Story 35.5-002); inherited, it would hide
+    the launcher adding it and point teardown tests at a live job (Story 35.5-009).
     """
     import sdlc.queue_client as queue_client
+    from sdlc.teardown import AGENT_PIDS_ENV
 
+    monkeypatch.delenv(AGENT_PIDS_ENV, raising=False)
     monkeypatch.delenv("SDLC_IN_TEST", raising=False)
     monkeypatch.delenv("SDLC_FLEET_DISABLED", raising=False)
     monkeypatch.delenv("SDLC_QUEUE_URL", raising=False)
