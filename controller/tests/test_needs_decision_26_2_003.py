@@ -245,3 +245,15 @@ def test_queue_job_parked_on_a_decision_carries_the_reasoning(tmp_path) -> None:
     job = store.get_job(job_id)
     assert job.state == "blocked"
     assert FINDING in job.reason and REASONING in job.reason
+
+
+@pytest.mark.parametrize("dispositions", [None, "not-a-list", ["not-a-dict", 3]])
+def test_malformed_dispositions_are_ignored_not_surfaced(tmp_path, dispositions) -> None:
+    ledger, run_id = _ledger(tmp_path)
+    before = len(ledger.recent_events(run_id, limit=50))
+    data = {"finding_dispositions": dispositions}
+
+    _surface_finding_dispositions(ledger, run_id, SID, data)
+
+    assert len(ledger.recent_events(run_id, limit=50)) == before
+    assert build_mod._needs_decision_findings(data) == ()
