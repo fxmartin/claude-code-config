@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.117.0] - 2026-10-28
+
+### Added
+
+- feat(fleet-execution): a failed worker self-check names (#35.2-013) (#910)
+
+
 ## [v2.116.0] - 2026-10-27
 
 ### Added
