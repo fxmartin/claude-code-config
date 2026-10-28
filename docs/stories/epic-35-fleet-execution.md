@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (31/35)** — 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (34/36)** — 35.5-010 (reconcile on a worker leaves its clone clean) added 2026-10-28 from job 44's `DIRTY_WORKING_TREE` hold; 35.5-007, 35.5-008 and 35.5-009 merged 2026-10-28 (job 44, #920/#919/#921, v2.119.0–v2.121.0); 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 35 | **Total Points**: 115 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 36 | **Total Points**: 117 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -1606,6 +1606,7 @@ desk widget.
 **Risk Level**: Low
 
 ##### Story 35.5-007: A bugfix that only re-ran CI re-checks the merge gate
+**Status**: Done
 **User Story**: As FX, I want the controller to check the merge gate again
 after a bugfix round that made no commit, so that a story whose CI went green
 on a re-run merges, and one blocked only by the approval gate parks for me,
@@ -1659,6 +1660,7 @@ instead of both reading FAILED.
 **Risk Level**: Medium
 
 ##### Story 35.5-008: Reconcile from an SSH shell can reach the fleet queue
+**Status**: Done
 **User Story**: As FX, I want `sdlc reconcile` run over SSH on a worker to
 update the run's fleet record with the worker's own queue token, so that a
 hand-closed run doesn't leave a stale record I have to prune by hand.
@@ -1701,6 +1703,7 @@ moved run `1e1b38db` to DONE but printed `fleet queue … refused this caller
 **Risk Level**: Low
 
 ##### Story 35.5-009: Controller tests pass inside an agent's worktree
+**Status**: Done
 **User Story**: As FX, I want the controller suite to pass when run inside a
 dispatched agent's worktree, so that agents stop spending time proving a
 known failure is inherited rather than theirs.
@@ -1731,6 +1734,57 @@ and re-ran the suite to prove it pre-existing. Constant: `AGENT_PIDS_ENV`
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.5-002
+**Risk Level**: Low
+
+##### Story 35.5-010: Reconcile on a worker leaves its clone clean
+**User Story**: As FX, I want `sdlc reconcile` run by hand on a fleet worker
+to leave that worker's clone clean, so that the Done markers it renders don't
+block the worker's next job with `DIRTY_WORKING_TREE`.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** a host with an installed worker agent (LaunchAgent plist or
+  systemd unit) **When** `sdlc reconcile` runs there without a flag **Then**
+  the ledger, registries and fleet record are updated as today, no epic file
+  is written, and the command prints which `**Status**: Done` markers are
+  still to land (epic file and story ids) with a hint to land them through a
+  PR.
+- **Given** the same worker host **When** `sdlc reconcile --render-docs`
+  runs **Then** the markers are rendered into the checkout as today, and the
+  output warns that the worker refuses jobs until the change is committed.
+- **Given** a host with no installed worker agent (the XPS) **When**
+  `sdlc reconcile` runs **Then** the markers are rendered as today, so the
+  usual "reconcile, then PR the markers" flow is unchanged.
+- **Given** `sdlc reconcile --no-render-docs` on any host **When** it runs
+  **Then** nothing is written to the checkout and the pending markers are
+  listed.
+- **Given** every marker is already on `main` **When** reconcile runs on a
+  worker **Then** it prints nothing about markers.
+
+**Technical Notes**: After job 43, `sdlc reconcile` on the M3 Max moved
+35.2-013 and 35.2-014 to DONE and left their markers uncommitted in
+`~/Work/claude-code-config`. The worker then held job 44 as
+`DIRTY_WORKING_TREE` (`queue_worker.py:_dirty_refusal`, issue #590: the
+worker never stashes) until the markers landed via #918 and FX discarded the
+local edit by hand.
+- The CLI renders unconditionally after `reconcile_run`
+  (`cli.py` `reconcile`, `render_docs` in `reconcile.py:497`);
+  `reconcile_run` itself already never touches the checkout (32.1-003).
+- Detect a worker host with the existing lookup: `worker_registry_path` /
+  `_installed_worker_agent` in `doctor.py` (35.5-006 already uses it here).
+- Listing pending markers needs a dry run of `render_epic_file`
+  (`story_markdown.render_done_markers` is already a pure transform).
+- No PR is opened by reconcile; landing the markers stays a deliberate step.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: worker host → no write, markers listed; worker host +
+      `--render-docs` → written with warning; no agent → written;
+      `--no-render-docs` → no write; nothing pending → no marker output
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.5-006
 **Risk Level**: Low
 
 ## Epic Sequencing

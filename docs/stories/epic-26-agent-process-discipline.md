@@ -1,6 +1,6 @@
 # Epic 26: Agent Process Discipline (Superpowers-Inspired)
 
-> **Status: IN PROGRESS (4/5)** — 26.2-003 (a confirmed finding the story can't fix parks for a decision) added 2026-10-28 from issue #900. The original 4 stories implemented, tested, and merged (26.1-001 → 26.3-001,
+> **Status: COMPLETE (5/5)** — 26.2-003 (a confirmed finding the story can't fix parks for a decision) added 2026-10-28 from issue #900, merged 2026-10-28 (job 44, #922, v2.121.0). The original 4 stories implemented, tested, and merged (26.1-001 → 26.3-001,
 > released v2.12.0–v2.15.0). Created 2026-07-11 from a comparative analysis of
 > [obra/superpowers](https://github.com/obra/superpowers) (MIT, Jesse Vincent). Superpowers keeps
 > *orchestration* in markdown skills an LLM follows — the model Epic-07 deliberately replaced with
@@ -198,6 +198,7 @@ editing — the instruction belongs wherever a report crosses into a reviewer's 
 **Risk Level**: Low
 
 ##### Story 26.2-003: A confirmed finding the story can't fix parks for a decision
+**Status**: Done
 **User Story**: As FX, I want a bugfix agent that agrees with a review finding
 but cannot fix it inside the story to say so in its contract, with its
 reasoning, so that the story parks for my decision instead of failing schema
