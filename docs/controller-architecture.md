@@ -2118,7 +2118,14 @@ keeps it `online`.
   `worker-self-check` finding beside `Fleet worker` — the last probe result, its
   timestamp and the TCC verdict — which is `CLEAN` only when that probe completed
   from the LaunchAgent, not from the shell doctor runs in. A plain drain without
-  `--worker` never probes.
+  `--worker` never probes. Beside it, **`worker-keychain`** (Story 35.2-014) reads
+  `security show-keychain-info ~/Library/Keychains/login.keychain-db`: `CLEAN` for
+  `no-timeout`; a `timeout=<n>s` or `lock-on-sleep` is a WARN — the Keychain holds the
+  Claude login, so the worker drops out when it locks — remedied by `security
+  set-keychain-settings ~/Library/Keychains/login.keychain-db` (no flags: no
+  auto-lock, no lock on sleep). A Keychain locked right now cannot be read ("User
+  interaction is not allowed"): a WARN naming `security unlock-keychain`. Linux and a
+  Mac without the worker LaunchAgent skip it; it is never a FAIL.
 
 `--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`) or,
 with a fleet URL, on the service's (Story 35.2-005). The registry (`workers`
@@ -2554,7 +2561,11 @@ Step 6's verdict (`sdlc doctor --exit-code`) leaves out, on a Mac,
 `fleet-agent-drift` and `worker-dashboard` (`sdlc doctor --skip CHECK`): both
 judge the agents step 7 is about to re-render, so counting them would exit 1 on
 exactly the run that repairs them. Step 7 answers for them instead — a worker
-left pending restart exits 1. Step 4 on a home-manager Mac, whose global git
+left pending restart exits 1. `worker-keychain` is left out of step 6 too: it is
+n/a until the worker agent exists, so on a first run step 6 could never show it.
+The closing summary runs `sdlc doctor --exit-code --only worker-keychain` once step 7
+has installed the agent, and its WARN is the run's exit status (Story 35.2-014).
+Step 4 on a home-manager Mac, whose global git
 config links into the read-only `/nix/store`, cannot write the credential
 helpers: there it warns and goes on (the helpers belong in nix-install; the M3
 uses `osxkeychain`), where it used to stop before rendering any agent. Linux

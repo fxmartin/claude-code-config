@@ -1363,6 +1363,11 @@ def doctor(
         "--skip",
         help="Leave out every finding of this check id (repeatable), e.g. fleet-agent-drift.",
     ),
+    only: list[str] = typer.Option(
+        [],
+        "--only",
+        help="Report only the findings of this check id (repeatable), e.g. worker-keychain.",
+    ),
 ) -> None:
     """Check the install and run state, reporting a remedy for each problem.
 
@@ -1407,6 +1412,10 @@ def doctor(
     for a wrapper about to settle the check itself: ``scripts/fleet-bootstrap.sh``
     skips ``fleet-agent-drift`` and ``worker-dashboard`` on a Mac, since the agents
     it re-renders next are what those two judge (Story 35.2-009).
+
+    ``--only CHECK`` keeps just that check's findings: the bootstrap's closing
+    summary on a Mac shows ``worker-keychain`` once the worker agent it gates is
+    installed (Story 35.2-014).
     """
     from sdlc.doctor import run_doctor
 
@@ -1425,6 +1434,8 @@ def doctor(
 
     if skip:
         report.findings = [f for f in report.findings if f.check not in skip]
+    if only:
+        report.findings = [f for f in report.findings if f.check in only]
 
     if as_json:
         typer.echo(json.dumps(report.to_dict(), default=str))

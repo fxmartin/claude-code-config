@@ -55,6 +55,7 @@ __all__ = [
     "check_stashes",
     "check_usage_agreement",
     "check_worker_dashboard",
+    "check_worker_keychain",
     "default_worker_unit",
     "read_worker_unit",
     "run_doctor",
@@ -1352,6 +1353,74 @@ def check_worker_self_check(
     return Finding("worker-self-check", name, "CLEAN", detail)
 
 
+# Story 35.2-014: the login Keychain holds the Claude login. When it locks — after an
+# inactivity timeout or on sleep — the LaunchAgent's `claude` reads as not logged in
+# and the worker drops out of the fleet until someone unlocks it at the Mac.
+_LOGIN_KEYCHAIN = Path("Library") / "Keychains" / "login.keychain-db"
+_KEYCHAIN_REMEDY = f"security set-keychain-settings ~/{_LOGIN_KEYCHAIN}"
+_KEYCHAIN_TIMEOUT_S = 10
+
+
+def _security_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, capture_output=True, text=True, timeout=_KEYCHAIN_TIMEOUT_S, check=False)
+
+
+def check_worker_keychain(
+    *,
+    agent_path: Path | None = None,
+    home: Path | None = None,
+    system: str | None = None,
+    runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> Finding | None:
+    """Can this Mac worker's login Keychain lock on its own? (Story 35.2-014)
+
+    ``None`` (n/a) off macOS and on a Mac without the worker LaunchAgent. Reads
+    ``security show-keychain-info``: CLEAN only for ``no-timeout`` without
+    ``lock-on-sleep``. A Keychain locked right now cannot be read ("User
+    interaction is not allowed") — a WARN too, since the worker cannot reach the
+    Claude login through it. Never FAIL: the worker may be up at this moment.
+    """
+    if (system or platform.system()) != "Darwin":
+        return None
+    if not (agent_path or default_worker_plist()).exists():
+        return None
+    keychain = (home or Path.home()) / _LOGIN_KEYCHAIN
+    argv = ["security", "show-keychain-info", str(keychain)]
+    name = "Worker Keychain"
+    try:
+        proc = (runner or _security_runner)(argv)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return Finding(
+            "worker-keychain", name, "WARN", f"could not read the login Keychain's settings: {exc}",
+            f"run `security show-keychain-info ~/{_LOGIN_KEYCHAIN}` to see why",
+        )
+    output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+    if proc.returncode != 0:
+        if "user interaction is not allowed" in output.lower():
+            return Finding(
+                "worker-keychain", name, "WARN",
+                "the login Keychain is locked — the worker cannot reach the Claude login it holds",
+                f"security unlock-keychain ~/{_LOGIN_KEYCHAIN}, then {_KEYCHAIN_REMEDY} "
+                "so it stays unlocked",
+            )
+        first = next((line for line in output.splitlines() if line.strip()), "no output")
+        return Finding(
+            "worker-keychain", name, "WARN", f"could not read the login Keychain's settings: {first}",
+            f"run `security show-keychain-info ~/{_LOGIN_KEYCHAIN}` to see why",
+        )
+    # The settings follow the quoted keychain path, which may itself contain any word.
+    settings = output.rpartition('"')[2].split()
+    locks = [s for s in settings if s == "lock-on-sleep" or s.startswith("timeout=")]
+    if locks:
+        return Finding(
+            "worker-keychain", name, "WARN",
+            f"the login Keychain locks on its own ({' '.join(locks)}) — the worker drops out "
+            "of the fleet when it does",
+            f"{_KEYCHAIN_REMEDY} (no flags: no auto-lock, no lock on sleep)",
+        )
+    return Finding("worker-keychain", name, "CLEAN", f"the login Keychain never locks on its own ({' '.join(settings)})")
+
+
 def check_queue(queue_path: Path) -> Finding:
     """Verify the host-level development queue is readable and current.
 
@@ -2481,4 +2550,7 @@ def run_doctor(
         findings.append(check_worker_self_check())
     elif worker_unit.exists():
         findings.append(check_worker_self_check(service="systemd"))
+    keychain = check_worker_keychain(agent_path=worker_plist)
+    if keychain is not None:
+        findings.append(keychain)
     return DoctorReport(findings=findings)
