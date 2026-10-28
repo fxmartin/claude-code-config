@@ -176,6 +176,11 @@ def test_default_runner_maps_subprocess_outcomes(monkeypatch):
     monkeypatch.setattr(model_probe.subprocess, "run", lambda *a, **k: done)
     assert REAL_DEFAULT_RUNNER(["claude"]) == (1, "out")
 
+    # Story 35.2-013: stderr must not hide stdout.
+    both = subprocess.CompletedProcess(["claude"], 1, stdout='{"result":"x"}', stderr="warn")
+    monkeypatch.setattr(model_probe.subprocess, "run", lambda *a, **k: both)
+    assert REAL_DEFAULT_RUNNER(["claude"]) == (1, 'warn\n{"result":"x"}')
+
 
 def test_default_state_dir_is_under_home(monkeypatch, tmp_path):
     monkeypatch.setattr(model_probe.Path, "home", classmethod(lambda cls: tmp_path))

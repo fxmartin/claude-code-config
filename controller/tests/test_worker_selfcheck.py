@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -443,3 +444,102 @@ def test_systemd_detection_reads_the_real_cgroup_file_and_tolerates_its_absence(
 
     monkeypatch.setattr(Path, "read_text", _missing)
     assert sc.running_under_systemd(env) is False
+
+
+# --- the real error, not the first stderr line (Story 35.2-013) ----------------
+
+_WARNING = '[claude-code:unrecognized_model] {"model":"claude-haiku-5-5","fallback":"x"}'
+_NOT_LOGGED_IN = json.dumps(
+    {"type": "result", "is_error": True, "result": "Not logged in \u00b7 Please run /login"}
+)
+
+
+def _check(tmp_path, detail: str, *, keychain_check=lambda: False, code: int = 1):
+    home, claude = _home(tmp_path)
+    return sc.run_self_check(
+        runner=_runner(code, detail),
+        claude_dir=claude, home=home, system="Darwin", clock=lambda: NOW,
+        state_dir=tmp_path / "state", environ={}, keychain_check=keychain_check,
+    )
+
+
+def test_a_json_error_on_stdout_beats_a_warning_on_stderr(tmp_path) -> None:
+    result = _check(tmp_path, f"{_WARNING}\n{_NOT_LOGGED_IN}")
+    assert result.reason == "agent probe failed (exit 1): Not logged in \u00b7 Please run /login"
+
+
+def test_non_json_output_skips_the_benign_catalog_warning(tmp_path) -> None:
+    result = _check(tmp_path, f"{_WARNING}\nsomething real broke\nmore")
+    assert result.reason == "agent probe failed (exit 1): something real broke"
+
+
+def test_malformed_and_non_error_json_lines_are_skipped_for_the_real_error(tmp_path) -> None:
+    detail = '{broken json\n{"is_error": false, "result": "fine"}\n' + _NOT_LOGGED_IN
+    result = _check(tmp_path, detail)
+    assert result.reason == "agent probe failed (exit 1): Not logged in \u00b7 Please run /login"
+
+
+def test_a_probe_with_only_a_benign_warning_still_names_it(tmp_path) -> None:
+    result = _check(tmp_path, _WARNING)
+    assert "unrecognized_model" in (result.reason or "")
+
+
+def test_a_locked_keychain_is_named_with_its_fix(tmp_path) -> None:
+    result = _check(tmp_path, f"{_WARNING}\n{_NOT_LOGGED_IN}", keychain_check=lambda: True)
+    assert not result.ok
+    assert "Keychain is locked" in result.reason
+    assert "security unlock-keychain" in result.reason
+    assert json.loads((tmp_path / "state" / sc.STATE_FILENAME).read_text())["reason"] == result.reason
+
+
+def test_an_unlocked_keychain_leaves_the_login_error_alone(tmp_path) -> None:
+    result = _check(tmp_path, _NOT_LOGGED_IN, keychain_check=lambda: False)
+    assert "Keychain" not in result.reason and "Not logged in" in result.reason
+
+
+def test_the_keychain_is_only_asked_about_a_login_failure(tmp_path) -> None:
+    asked: list[int] = []
+    _check(tmp_path, "Invalid API key", keychain_check=lambda: asked.append(1) or True)
+    assert asked == []
+
+
+def test_the_keychain_is_never_asked_off_macos(tmp_path) -> None:
+    home, claude = _home(tmp_path)
+    asked: list[int] = []
+    result = sc.run_self_check(
+        runner=_runner(1, _NOT_LOGGED_IN),
+        claude_dir=claude, home=home, system="Linux", clock=lambda: NOW,
+        state_dir=tmp_path / "state", environ={},
+        keychain_check=lambda: asked.append(1) or True,
+    )
+    assert asked == [] and "Keychain" not in result.reason
+
+
+def test_keychain_locked_reads_the_security_cli(monkeypatch) -> None:
+    def fake(rc, err):
+        return lambda *a, **k: subprocess.CompletedProcess(a, rc, stdout="", stderr=err)
+
+    monkeypatch.setattr(sc.subprocess, "run", fake(36, "User interaction is not allowed."))
+    assert sc.keychain_locked() is True
+    monkeypatch.setattr(sc.subprocess, "run", fake(0, ""))
+    assert sc.keychain_locked() is False
+
+    def missing(*a, **k):
+        raise FileNotFoundError
+
+    monkeypatch.setattr(sc.subprocess, "run", missing)
+    assert sc.keychain_locked() is False
+
+
+def test_the_group_runner_keeps_both_streams() -> None:
+    script = "import sys; print('warn', file=sys.stderr); print('{\"result\":1}')"
+    code, detail = sc.group_runner([sys.executable, "-c", script], timeout_s=30)
+    assert code == 0 and detail.splitlines() == ["warn", '{"result":1}']
+
+
+def test_the_entitlement_probe_sees_a_rate_limit_on_stdout_behind_a_warning(tmp_path) -> None:
+    from sdlc.model_probe import INCONCLUSIVE, classify_probe
+
+    detail = f"{_WARNING}\nAPI Error: 429 rate_limit_error: too many requests"
+    assert classify_probe(1, detail) == INCONCLUSIVE
+    assert _check(tmp_path, detail).ok

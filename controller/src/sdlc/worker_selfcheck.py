@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import signal
 import subprocess
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
 
-from sdlc.model_probe import OK, ProbeRunner, classify_probe, default_state_dir
+from sdlc.model_probe import OK, ProbeRunner, classify_probe, default_state_dir, join_streams
 from sdlc.model_routing import HAIKU, TIER_MODEL_IDS
 from sdlc.rate_limit import detect_rate_limit
 
@@ -24,6 +25,7 @@ __all__ = [
     "SelfCheckResult",
     "WORKER_UNIT",
     "group_runner",
+    "keychain_locked",
     "read_last_result",
     "run_self_check",
     "running_under_launchd",
@@ -135,7 +137,7 @@ def group_runner(argv: list[str], timeout_s: float = SELF_CHECK_CAP_SECONDS) -> 
     except BaseException:  # Ctrl-C / SIGTERM mid-probe must not orphan the agent
         _kill_group(proc)
         raise
-    return proc.returncode, (stderr or stdout or "").strip()
+    return proc.returncode, join_streams(stderr, stdout)
 
 
 def _kill_group(proc: "subprocess.Popen[str]") -> None:
@@ -200,12 +202,59 @@ class SelfCheckResult:
         return {"ok": self.ok, "at": self.at, "reason": self.reason}
 
 
+# Catalog notices the CLI prints on stderr for a model id it has not heard of; they
+# say nothing about why the turn failed (the 2026-10-28 incident led with one).
+_BENIGN_WARNINGS = (re.compile(r"^\[claude-code:unrecognized_model\]"),)
+_NOT_LOGGED_IN = re.compile(r"\bnot logged in\b", re.I)
+_KEYCHAIN_LOCKED = (
+    "login Keychain is locked, so claude cannot read its credentials — "
+    "run `security unlock-keychain` on this Mac (Not logged in)"
+)
+
+
+def keychain_locked() -> bool:
+    """Whether the macOS login Keychain refuses to answer without a user prompt.
+
+    ``security show-keychain-info`` fails with "User interaction is not allowed"
+    while the keychain is locked. Any other failure (no ``security``, a timeout)
+    is not proof, so it reads as unlocked.
+    """
+    try:
+        proc = subprocess.run(
+            ["security", "show-keychain-info"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode != 0 and "user interaction is not allowed" in (
+        f"{proc.stderr}\n{proc.stdout}".lower()
+    )
+
+
+def _json_error(text: str) -> str | None:
+    """The ``result`` of an ``"is_error": true`` JSON line in the probe output, if any."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and doc.get("is_error") and isinstance(doc.get("result"), str):
+            return doc["result"].strip() or None
+    return None
+
+
 def _first_line(text: str, limit: int = 200) -> str:
-    line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "no output")
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    meaningful = [ln for ln in lines if not any(p.match(ln) for p in _BENIGN_WARNINGS)]
+    # All-benign output still beats "no output": it is all there is to show.
+    line = next(iter(meaningful or lines), "no output")
     return line[:limit]
 
 
-def _probe(runner: ProbeRunner | None, cap: int) -> str | None:
+def _probe(runner: ProbeRunner | None, cap: int, *, mac: bool, locked: Callable[[], bool]) -> str | None:
     """Run the 34.1-002 entitlement probe; ``None`` when a turn completed, else why not."""
     argv = ["claude", "-p", "ok", "--model", TIER_MODEL_IDS[HAIKU], "--output-format", "json"]
     try:
@@ -221,7 +270,10 @@ def _probe(runner: ProbeRunner | None, cap: int) -> str | None:
     # A rate limit means a turn ran and was refused: the queue's pause owns that.
     if detect_rate_limit(detail) is not None:
         return None
-    return f"agent probe failed (exit {code}): {_first_line(detail)}"
+    why = _json_error(detail) or _first_line(detail)
+    if mac and _NOT_LOGGED_IN.search(why) and locked():
+        why = _KEYCHAIN_LOCKED
+    return f"agent probe failed (exit {code}): {why}"
 
 
 def run_self_check(
@@ -235,6 +287,7 @@ def run_self_check(
     state_dir: Path | None = None,
     environ: Mapping[str, str] | None = None,
     cgroup_text: str | None = None,
+    keychain_check: Callable[[], bool] | None = None,
 ) -> SelfCheckResult:
     """The TCC path verdict, then — only if it is clear — one real agent turn.
 
@@ -245,7 +298,12 @@ def run_self_check(
     """
     at = (clock or (lambda: datetime.now(timezone.utc)))().isoformat()
     tcc = tcc_verdict(claude_dir=claude_dir, home=home, system=system)
-    reason = tcc if tcc is not None else _probe(runner, cap)
+    reason = tcc if tcc is not None else _probe(
+        runner,
+        cap,
+        mac=(system or platform.system()) == "Darwin",
+        locked=keychain_check or keychain_locked,
+    )
     result = SelfCheckResult(
         ok=reason is None,
         at=at,
@@ -283,3 +341,4 @@ def read_last_result(state_dir: Path | None = None) -> dict[str, object] | None:
     if not isinstance(data, dict) or not isinstance(data.get("ok"), bool):
         return None
     return data
+
