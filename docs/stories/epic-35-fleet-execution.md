@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (29/32)** — 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (31/35)** — 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 32 | **Total Points**: 109 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 35 | **Total Points**: 115 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -1601,6 +1601,134 @@ desk widget.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.4-001, 35.5-004
+**Risk Level**: Low
+
+##### Story 35.5-007: A bugfix that only re-ran CI re-checks the merge gate
+**User Story**: As FX, I want the controller to check the merge gate again
+after a bugfix round that made no commit, so that a story whose CI went green
+on a re-run merges, and one blocked only by the approval gate parks for me,
+instead of both reading FAILED.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a merge blocked by a red or cancelled CI job **When** the bugfix
+  round ends with no commit (the agent re-ran the job and reports it green)
+  **Then** the controller re-polls the merge CI gate on the same head before
+  deciding; a green gate retries the merge stage, and the round does not
+  count as exhausted.
+- **Given** that re-poll finds every check green except the high-risk approval
+  gate (`risk:high`, no `risk-approved`) **When** the controller decides
+  **Then** the story parks `AWAITING_APPROVAL` (12.3-003), not FAILED, and
+  burns no further bugfix rounds.
+- **Given** the re-poll is still red on a check other than the approval gate
+  **When** the budget allows **Then** the next round gets that check's name
+  as its failure; when the budget is spent, the existing exhausted path runs.
+- **Given** the re-poll's own cap lapses with checks still running **When**
+  the controller decides **Then** it reports "awaiting CI" as 35.5-001 does,
+  never DONE.
+- **Given** a bugfix round that committed a fix **When** it ends **Then**
+  behaviour is unchanged (35.5-001 already adjudicates a pushed fix on CI).
+
+**Technical Notes**: Incident: fleet job 43 (run `1e1b38db`, M3 Max,
+2026-10-28). Both stories ended FAILED with nothing wrong in the code:
+- 35.2-013 (#910): a CI job timed out installing a tool. The bugfix agent
+  re-ran it, all 13 checks went green, then `bugfix exhausted: merge`.
+- 35.2-014 (#911): a macOS runner shortage cancelled a smoke job. The agent
+  re-ran it; afterwards only the high-risk gate (`fleet-bootstrap.sh`) was
+  red, yet the story ended FAILED rather than `AWAITING_APPROVAL`.
+- **Cause:** the merge-stage loop in `build.py` (~9770-9790) returns
+  `_exhausted_status` whenever `_BugfixRound.fixed` is false, and a round
+  without a commit is never fixed. `ci_red`/`pushed_sha` only cover a round
+  that pushed. The approval-gate park is decided from the merge agent's
+  response (`_merge_awaiting_approval`, `build.py:10720`), which saw the
+  cancelled job too.
+- Reuse the merge CI gate poller (`_run_merge_ci_gate`, `build.py:5860`) rather
+  than a second poll loop.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: no-commit round + gate now green → merge retried; + only the
+      approval gate red → `AWAITING_APPROVAL`; + still red → next round or
+      exhausted; + cap lapses → awaiting CI
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.5-001, 35.5-003
+**Risk Level**: Medium
+
+##### Story 35.5-008: Reconcile from an SSH shell can reach the fleet queue
+**User Story**: As FX, I want `sdlc reconcile` run over SSH on a worker to
+update the run's fleet record with the worker's own queue token, so that a
+hand-closed run doesn't leave a stale record I have to prune by hand.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** a worker host whose shell has no `SDLC_QUEUE_TOKEN` but whose
+  installed worker agent (LaunchAgent plist or systemd unit) carries one
+  **When** `sdlc reconcile` closes a run **Then** the fleet update uses the
+  agent's token and succeeds.
+- **Given** the shell has its own `SDLC_QUEUE_TOKEN` **When** reconcile runs
+  **Then** that token wins, as in doctor.
+- **Given** neither carries a token, or the service still refuses **When**
+  reconcile closes the run **Then** the existing 35.5-006 warning and
+  `sdlc queue runs prune` hint are printed, and the ledger is still updated.
+- **Given** reconcile runs inside a dispatched agent (`SDLC_IN_TEST` or
+  `SDLC_FLEET_DISABLED`) **When** it closes a run **Then** it still pushes
+  nothing and never reads the agent's token (35.5-004).
+- **Given** `sdlc queue runs prune` or any other queue command from the same
+  SSH shell **When** it needs a token **Then** it uses the same fallback.
+
+**Technical Notes**: Same job 43. `sdlc reconcile` over SSH on the M3 Max
+moved run `1e1b38db` to DONE but printed `fleet queue … refused this caller
+(403): identity not accepted`; FX pruned the record from the XPS.
+- `finish_fleet_run` (`queue_client.py:801`) takes the token only from
+  `os.environ[SDLC_QUEUE_TOKEN]`.
+- Doctor already falls back to the installed agent's token
+  (`doctor.py:655-679`, `_installed_worker_agent` at `doctor.py:1107`, Story
+  35.2-011). Move that lookup to one shared helper rather than a copy.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: no shell token + agent token → push succeeds; shell token wins;
+      none → 35.5-006 warning; `SDLC_FLEET_DISABLED` → no push, agent token
+      never read
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.5-006, 35.2-011
+**Risk Level**: Low
+
+##### Story 35.5-009: Controller tests pass inside an agent's worktree
+**User Story**: As FX, I want the controller suite to pass when run inside a
+dispatched agent's worktree, so that agents stop spending time proving a
+known failure is inherited rather than theirs.
+**Priority**: Could Have
+**Story Points**: 1
+
+**Acceptance Criteria**:
+- **Given** a shell where `SDLC_AGENT_PIDS_DIR` is already set (every agent
+  the scheduler dispatches inherits it) **When** the controller suite runs
+  **Then** `test_fleet_registry.py` and every other test pass.
+- **Given** the conftest fixtures **When** any test runs **Then**
+  `SDLC_AGENT_PIDS_DIR` is removed from the test's environment, as
+  `_no_fleet_queue` already does for the fleet variables, so no test depends
+  on whether it is set.
+
+**Technical Notes**: `test_fleet_registry.py:755` asserts
+`set(seen["env"]) - set(os.environ) == {"SDLC_AGENT_PIDS_DIR"}`: the launcher
+must *add* the variable. Inside an agent worktree it is already inherited, so
+the difference is empty and the test fails. Job 43's agents met it in both
+stories ("Known agent-worktree baseline (inherited `SDLC_AGENT_PIDS_DIR`)")
+and re-ran the suite to prove it pre-existing. Constant: `AGENT_PIDS_ENV`
+(`teardown.py:33`); fixture: `controller/tests/conftest.py`.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: the suite passes with `SDLC_AGENT_PIDS_DIR` set in the outer
+      environment
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.5-002
 **Risk Level**: Low
 
 ## Epic Sequencing
