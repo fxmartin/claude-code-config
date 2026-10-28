@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.122.0] - 2026-10-28
+
+### Added
+
+- feat(fleet-execution): reconcile on a worker leaves its (#35.5-010)
+
+
 ## [v2.121.0] - 2026-10-28
 
 ### Added
