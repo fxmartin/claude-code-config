@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: IN PROGRESS (24/30)** — 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (29/32)** — 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 30 | **Total Points**: 105 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 32 | **Total Points**: 109 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -828,6 +828,90 @@ fleet bootstrap exits 0 instead of 2.
 - [ ] Code implemented and peer reviewed
 - [ ] Tests: settings.json directory marketplace present → CLEAN; missing or
       dangling → FAIL; a leftover symlink or directory at the old path → WARN
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-009
+**Risk Level**: Low
+
+##### Story 35.2-013: A failed worker self-check names the real error
+**User Story**: As FX, I want a failed worker self-check to report the error
+the agent CLI actually returned, so that a login problem reads as a login
+problem instead of an unrelated warning.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** the probe exits non-zero, prints a warning on stderr and a JSON
+  result on stdout with `"is_error": true` **When** the self-check records the
+  failure **Then** the reason is the JSON `result` (e.g. `Not logged in ·
+  Please run /login`), not the first line of stderr.
+- **Given** the probe's output is not JSON **When** it fails **Then** the
+  reason is the first meaningful line of stderr and stdout together, skipping
+  known benign warnings such as `[claude-code:unrecognized_model]`.
+- **Given** a macOS worker whose login Keychain is locked **When** the probe
+  fails as not logged in **Then** the reason says the Keychain is locked and
+  names `security unlock-keychain`, and the heartbeat, `sdlc queue workers`
+  and the worker log all carry that reason.
+- **Given** the entitlement probe (`model_probe.classify_probe`) **When** it
+  reads a probe result **Then** it sees both streams too, so a rate limit or
+  entitlement message on stdout is not missed.
+
+**Technical Notes**: Incident: home-lab, 2026-10-28. After the v2.116.0
+deploy the worker registered offline with `agent probe failed (exit 1):
+[claude-code:unrecognized_model] {"model":"claude-haiku-5-5",...}`. The model
+was fine (the M3 Max passed the same probe on the same CLI 2.1.287); the login
+Keychain was locked, and `claude` returned `"result": "Not logged in · Please
+run /login"` on stdout.
+- **Cause:** `group_runner` (`worker_selfcheck.py:138`) and `_default_runner`
+  (`model_probe.py:64`) return `stderr or stdout`, so any stderr text hides
+  stdout entirely. `_first_line` then picks the benign catalog warning.
+- The probe already passes `--output-format json`; parse it when present.
+- Detecting a locked Keychain: `security show-keychain-info` fails with
+  "User interaction is not allowed" while locked.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: warning on stderr + JSON error on stdout → JSON `result` is the
+      reason; non-JSON output → first non-benign line; both runners keep
+      both streams
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-007
+**Risk Level**: Low
+
+##### Story 35.2-014: Doctor warns when a Mac worker's Keychain can lock
+**User Story**: As FX, I want `sdlc doctor` on a Mac worker to warn when the
+login Keychain is set to lock on its own, so that the worker doesn't silently
+drop out of the fleet the next time the Mac is idle or sleeps.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** a macOS host with the worker LaunchAgent installed and a login
+  Keychain set to lock after inactivity or on sleep **When** `sdlc doctor`
+  runs **Then** it reports WARN naming the setting and the remedy
+  `security set-keychain-settings ~/Library/Keychains/login.keychain-db`.
+- **Given** the Keychain is set to no-timeout **When** doctor runs **Then**
+  the check is CLEAN.
+- **Given** the Keychain is locked, so its settings can't be read **When**
+  doctor runs **Then** it reports WARN that the Keychain is locked and the
+  worker cannot reach the Claude login, naming `security unlock-keychain`.
+- **Given** a Linux host or a Mac without the worker **When** doctor runs
+  **Then** the check is skipped (n/a), never FAIL.
+- **Given** `fleet-bootstrap.sh` sets up a Mac worker **When** it finishes
+  **Then** its summary shows this check.
+
+**Technical Notes**: Same incident as 35.2-013. FX fixed home-lab by hand
+with `security set-keychain-settings` (no flags = no auto-lock, no lock on
+sleep). Read the setting with `security show-keychain-info <path>`: it prints
+`no-timeout` or `timeout=<n>s` and `lock-on-sleep`, and fails with "User
+interaction is not allowed" while the Keychain is locked. Inject the command
+runner so tests never call `security`.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: no-timeout → CLEAN; timeout or lock-on-sleep → WARN; locked →
+      WARN; Linux or no worker → n/a
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.2-009
