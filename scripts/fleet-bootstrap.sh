@@ -16,7 +16,7 @@
 #   nix develop ~/.config/nix-dev-env -c scripts/fleet-bootstrap.sh \
 #       --queue-url http://home-lab.<tailnet>:8790
 #
-# Besides claude, gh (logged in) and uv, the dev shell needs glab logged in to the
+# Besides claude, gh (logged in), uv and jq, the dev shell needs glab logged in to the
 # local GitLab (`glab auth login --hostname gitlab.test`) — without it the run is
 # refused, see --github-only — and the scanners doctor checks for, semgrep and
 # osv-scanner. Without them the run is refused too, and no flag lifts that: the
@@ -305,6 +305,10 @@ if [[ "${DO_SERVICE}" == true ]]; then
     [[ -f "${DASHBOARD_UNIT_TEMPLATE}" ]] || die "unit template not found: ${DASHBOARD_UNIT_TEMPLATE}"
     command -v systemctl >/dev/null 2>&1 \
       || die "systemctl not found — pass --skip-service to bootstrap without the unit"
+    # Without it the queue reads as unreadable, so a changed worker unit would be left
+    # pending restart on every run.
+    command -v jq >/dev/null 2>&1 \
+      || die "jq not found — needed to tell whether the worker has a job in flight before restarting it; pass --skip-service to bootstrap without the unit"
   fi
 fi
 if [[ -z "${QUEUE_URL}" && ! -f "${FLEET_CONFIG}" ]]; then

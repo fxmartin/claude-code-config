@@ -2441,6 +2441,7 @@ this repo's jobs ("Repo paths" below) and where `install.sh --core` points
 `~/.claude`, so it must be a lasting path. Clone over HTTPS: git authenticates
 through `gh` here, not an SSH key, and the worker matches origins by host and
 path whatever the scheme. Besides `claude`, `gh` and `uv`, the dev shell needs
+`jq` (the bootstrap reads the queue with it before restarting a busy worker),
 `glab`, logged in to the local GitLab ("Self-checks" below says why the
 bootstrap insists), and the scanners `sdlc doctor` checks for, `semgrep` and
 `osv-scanner`: without them doctor is not `CLEAN`, and the coverage gate reports

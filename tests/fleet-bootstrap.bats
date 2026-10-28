@@ -723,6 +723,37 @@ OLD_UNIT() { RENDERED_UNIT | sed 's| --dashboard-url http://100.64.0.9:8787||'; 
     ! grep -q "^sdlc queue list" "${CALLS}" || false
 }
 
+# jq ships in /usr/bin on macOS and on the CI images, where run_without cannot hide it:
+# run the bootstrap on a PATH of the stubs and every /usr/bin and /bin command but TOOL.
+run_without_system() {  # run_without_system TOOL BOOTSTRAP-ARG…
+    local tool="$1"; shift
+    mkdir "${TMP}/sys"
+    ln -s /usr/bin/* /bin/* "${TMP}/sys/" 2>/dev/null || true  # a merged /usr names each twice
+    rm -f "${TMP}/sys/${tool}" "${TMP}/bin/${tool}"
+    stub git 'exit 0'  # git may live outside /usr/bin on a CI image
+    PATH="${TMP}/bin:${TMP}/sys" run "${BOOTSTRAP}" "$@"
+}
+
+# Without jq the in-flight check cannot read the queue, so every re-run would leave a
+# changed worker unit "pending restart" for a queue that works (review of #926).
+@test "linux: without jq the run is refused before anything changes" {
+    run_without_system jq --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "${output}" == *"jq not found"* && "${output}" == *"--skip-service"* ]]
+    ! grep -qE '^(install.sh|deploy.sh|git|systemctl)' "${CALLS}" || false
+    [ ! -e "${HOME}/.sdlc-fleet.yaml" ]
+    [ ! -e "$(UNIT)" ]
+}
+
+@test "linux: --skip-service without jq is not refused: it installs no unit" {
+    run_without_system jq --queue-url "${QUEUE}" --skip-service
+
+    [ "$status" -eq 0 ]
+    grep -qx "install.sh --core" "${CALLS}"
+    [ ! -e "$(UNIT)" ]
+}
+
 # --- macOS: LaunchAgents rendered from templates/launchd (35.2-009) ---------------------
 
 LAUNCHD="${BATS_TEST_DIRNAME}/../templates/launchd"
