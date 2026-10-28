@@ -48,10 +48,10 @@ def _default_stop_signal_dispositions():
     signal.signal(signal.SIGINT, previous[1])
 
 
-@pytest.fixture(autouse=True)
-def _no_inherited_agent_tracking(monkeypatch):
-    """A suite run inside a fleet job inherits that job's tracking dir; keep it out."""
-    monkeypatch.delenv(teardown.AGENT_PIDS_ENV, raising=False)
+def test_no_test_inherits_a_fleet_jobs_agent_tracking_dir() -> None:
+    # Story 35.5-009: every agent the scheduler dispatches runs under its job's
+    # tracking dir; conftest keeps it out so a suite run inside one still passes.
+    assert teardown.AGENT_PIDS_ENV not in os.environ
 
 
 # --- helpers ---------------------------------------------------------------------
