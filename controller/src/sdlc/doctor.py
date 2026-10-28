@@ -31,7 +31,13 @@ from sdlc.ledger_view import default_db_path
 from sdlc.model_routing import is_routing_off
 from sdlc.queue import _MIGRATIONS as _QUEUE_MIGRATIONS
 from sdlc.queue import QueueError, QueueStore, WorkerRecord, default_queue_path
-from sdlc.queue_client import QUEUE_TOKEN_ENV, QueueClient, QueueRefused, resolve_queue_url
+from sdlc.queue_client import (
+    QUEUE_TOKEN_ENV,
+    QueueClient,
+    QueueRefused,
+    resolve_queue_token,
+    resolve_queue_url,
+)
 from sdlc.registry import Registry, derive_state, registry_path_for
 from sdlc.worker_selfcheck import WORKER_UNIT
 
@@ -672,10 +678,7 @@ def check_fleet_queue_configured(
         )
     if url is None:
         return None
-    agent_env, _ = _installed_worker_agent(
-        agent_path or default_worker_plist(), unit_path or default_worker_unit()
-    )
-    token = os.environ.get(QUEUE_TOKEN_ENV) or agent_env.get(QUEUE_TOKEN_ENV) or None
+    token = resolve_queue_token(agent_path=agent_path, unit_path=unit_path)
     return check_fleet_queue(QueueClient(url, token=token))
 
 
