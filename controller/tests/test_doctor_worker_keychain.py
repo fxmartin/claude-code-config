@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from sdlc import cli, doctor
 
+REAL_SECURITY_RUNNER = doctor._security_runner  # conftest stubs the module attribute
 REMEDY = "security set-keychain-settings ~/Library/Keychains/login.keychain-db"
 
 
@@ -171,3 +172,18 @@ def test_doctor_only_keeps_just_the_named_check(monkeypatch) -> None:
     assert result.exit_code == 1  # the WARN alone — the FAIL it left out does not count
     assert "Worker Keychain" in result.output
     assert "Install" not in result.output
+
+
+def test_default_runner_shells_out_to_security_with_a_timeout(monkeypatch) -> None:
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return subprocess.CompletedProcess(argv, 0, "no-timeout", "")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+    proc = REAL_SECURITY_RUNNER(["security", "show-keychain-info", "k"])
+    assert proc.stdout == "no-timeout"
+    assert seen["argv"][0] == "security"
+    assert seen["timeout"] == doctor._KEYCHAIN_TIMEOUT_S
+    assert seen["check"] is False
