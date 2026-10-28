@@ -2118,7 +2118,17 @@ keeps it `online`.
   `worker-self-check` finding beside `Fleet worker` — the last probe result, its
   timestamp and the TCC verdict — which is `CLEAN` only when that probe completed
   from the LaunchAgent, not from the shell doctor runs in. A plain drain without
-  `--worker` never probes. Beside it, **`worker-keychain`** (Story 35.2-014) reads
+  `--worker` never probes.
+  **A failed probe names the real error (Story 35.2-013).** The probe runners keep
+  stderr *and* stdout, so a benign warning on stderr (`[claude-code:unrecognized_model]`)
+  cannot hide the answer on stdout. The reason is the `result` of the `"is_error": true`
+  JSON the CLI printed (e.g. `Not logged in · Please run /login`); for non-JSON output
+  it is the first line that is not a known benign warning. On macOS, a "Not logged in"
+  failure while `security show-keychain-info` reports the login Keychain locked reads
+  `login Keychain is locked … run security unlock-keychain` instead. The heartbeat,
+  `sdlc queue workers` and the worker log all carry that one reason; the entitlement
+  probe (`model_probe.classify_probe`) reads both streams too.
+  Beside the probe, doctor's **`worker-keychain`** check (Story 35.2-014) reads
   `security show-keychain-info ~/Library/Keychains/login.keychain-db`: `CLEAN` for
   `no-timeout`; a `timeout=<n>s` or `lock-on-sleep` is a WARN — the Keychain holds the
   Claude login, so the worker drops out when it locks — remedied by `security

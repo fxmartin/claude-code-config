@@ -1,6 +1,6 @@
 # Epic 26: Agent Process Discipline (Superpowers-Inspired)
 
-> **Status: COMPLETE (4/4)** — all 4 stories implemented, tested, and merged (26.1-001 → 26.3-001,
+> **Status: IN PROGRESS (4/5)** — 26.2-003 (a confirmed finding the story can't fix parks for a decision) added 2026-10-28 from issue #900. The original 4 stories implemented, tested, and merged (26.1-001 → 26.3-001,
 > released v2.12.0–v2.15.0). Created 2026-07-11 from a comparative analysis of
 > [obra/superpowers](https://github.com/obra/superpowers) (MIT, Jesse Vincent). Superpowers keeps
 > *orchestration* in markdown skills an LLM follows — the model Epic-07 deliberately replaced with
@@ -50,7 +50,7 @@ to its own process documentation.
 
 ## Epic Scope
 
-**Total Stories**: 4 | **Total Points**: 13 | **MVP Stories**: 0 (roadmap)
+**Total Stories**: 5 | **Total Points**: 16 | **MVP Stories**: 0 (roadmap)
 
 ## Out of Scope (Non-Goals)
 
@@ -196,6 +196,68 @@ editing — the instruction belongs wherever a report crosses into a reviewer's 
 
 **Dependencies**: None
 **Risk Level**: Low
+
+##### Story 26.2-003: A confirmed finding the story can't fix parks for a decision
+**User Story**: As FX, I want a bugfix agent that agrees with a review finding
+but cannot fix it inside the story to say so in its contract, with its
+reasoning, so that the story parks for my decision instead of failing schema
+validation and losing the agent's explanation.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** the bugfix response contract **When** the agent reports a finding
+  **Then** `disposition` accepts a third value, `needs_decision`, and like
+  `disputed` it requires non-empty `reasoning` (why the finding is right and
+  why this story cannot fix it, e.g. it needs wiring no story owns).
+- **Given** the bugfix prompt in `build.py` and
+  `plugins/autonomous-sdlc/skills/_shared/bugfix-agent-prompt.md` **When** an
+  agent is dispatched with review findings **Then** both list all three
+  dispositions, say when `needs_decision` applies, and say it is never a way
+  to skip a finding the story can fix.
+- **Given** a response with one or more `needs_decision` findings **When** the
+  controller processes it **Then** it is accepted (not a validation failure),
+  does not count as a fix, burns no further bugfix or recovery attempts, and
+  parks the story `NEEDS_ATTENTION` with the finding and reasoning in the
+  ledger event, `sdlc status`, the queue job's detail and the dashboard.
+- **Given** the same response also implemented other findings **When** the
+  story parks **Then** those commits are pushed, as on any park.
+- **Given** a response with a disposition outside the enum **When** it is
+  validated **Then** it still fails as today; only the three named values are
+  accepted.
+- **Given** `docs/contracts.md` and the finding-verification eval
+  (`plugins/autonomous-sdlc/evals/finding-verification/`) **When** this ships
+  **Then** both describe the third disposition, and the eval has a case where
+  a correct finding outside the story's scope is answered with
+  `needs_decision`.
+
+**Technical Notes**: From issue #900. A fleet run on a GitLab-master repo
+returned `finding_dispositions[0].disposition = "confirmed_unfixed"` for a
+valid blocking finding that needed an unowned composition-root story. The
+controller rejected the whole response (`bugfix-agent response failed
+validation at field 'finding_dispositions/0/disposition'`, from
+`contracts.py:299`), logged `recovery exhausted`, and parked the job with only
+the schema error, losing the agent's reasoning.
+- Schema enum: `schemas/bugfix-agent-response.schema.json:84`; mirror the
+  `disputed` → `reasoning` rule (the `allOf` `if`/`then` below it).
+- Prompt text: `build.py:6324` ("disposition implemented|disputed").
+- Surfacing: `_surface_finding_dispositions` (`build.py:11830`) logs only
+  `disputed`; extend it, and route `needs_decision` to the existing
+  `NEEDS_ATTENTION` park instead of the retry loop.
+- 26.2-001 kept "a dispute is information, not a new state-machine branch".
+  `needs_decision` deliberately does change routing, because retrying cannot
+  resolve it; reuse the existing park state rather than adding one.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: schema accepts `needs_decision` with reasoning and rejects it
+      without; an unknown value still fails; a `needs_decision` response
+      parks `NEEDS_ATTENTION` with the reasoning visible and no further
+      attempts
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 26.2-001
+**Risk Level**: Medium
 
 ### Feature 26.3: Behavioral Skill Testing (Skill TDD)
 
