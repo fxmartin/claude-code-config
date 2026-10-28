@@ -1109,7 +1109,11 @@ longer shows FAILED days after the work actually shipped.
   the installed worker agent resolves from its own environment (`XDG_STATE_HOME`
   pinned in the plist or unit), which an SSH shell without it would never open;
   `sdlc doctor` WARNs (`registry-path`) when the shell and the agent resolve
-  different registry files.
+  different registry files. The fleet `PUT` (and every other queue command)
+  presents this shell's `SDLC_QUEUE_TOKEN`, else the one the installed worker agent
+  carries (Story 35.5-008, `queue_client.resolve_queue_token`, the lookup `sdlc
+  doctor` already made): an SSH shell has none and the service would answer 403.
+  Under `SDLC_IN_TEST` / `SDLC_FLEET_DISABLED` the agent's token is never read.
 - **The on-demand epic-markdown renderer (Story 32.1-003).** `reconcile_run`
   itself never touches the shared checkout — it only ever updates the ledger,
   so two build runs sharing a repo never trip the #590 dirty-tree guard on

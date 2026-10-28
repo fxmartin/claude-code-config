@@ -42,6 +42,7 @@ __all__ = [
     "QueueUnavailable",
     "open_queue",
     "push_fleet_run",
+    "resolve_queue_token",
     "resolve_queue_url",
 ]
 
@@ -170,6 +171,31 @@ def resolve_queue_url(
     return None
 
 
+def resolve_queue_token(
+    *, agent_path: Path | None = None, unit_path: Path | None = None
+) -> str | None:
+    """The shared secret this process presents to the fleet queue, or ``None``.
+
+    This shell's ``SDLC_QUEUE_TOKEN`` wins; without one, the token the installed
+    worker agent carries (Story 35.5-008, the lookup doctor made in 35.2-011): an
+    SSH shell has none, so the service would refuse a caller its own worker is
+    admitted as. Never read under ``SDLC_IN_TEST`` / ``SDLC_FLEET_DISABLED`` — a
+    dispatched agent must not borrow the worker's credential (35.5-004).
+    """
+    shell = os.environ.get(QUEUE_TOKEN_ENV)
+    if shell:
+        return shell
+    if _flag(os.environ, _IN_TEST_ENV) or _flag(os.environ, FLEET_DISABLED_ENV):
+        return None
+    # doctor imports this module, so the agent reader is imported at call time.
+    from sdlc.doctor import _installed_worker_agent, default_worker_plist, default_worker_unit
+
+    agent_env, _host = _installed_worker_agent(
+        agent_path or default_worker_plist(), unit_path or default_worker_unit()
+    )
+    return agent_env.get(QUEUE_TOKEN_ENV) or None
+
+
 def open_queue() -> QueueBackend:
     """The queue every consumer opens: the fleet's when configured, else local SQLite.
 
@@ -180,7 +206,7 @@ def open_queue() -> QueueBackend:
     url = resolve_queue_url()
     if url is None:
         return QueueStore(default_queue_path())
-    return QueueClient(url, token=os.environ.get(QUEUE_TOKEN_ENV) or None)
+    return QueueClient(url, token=resolve_queue_token())
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +810,7 @@ def push_fleet_run(record: RunRecord) -> None:
         if url is None:
             return
         client = QueueClient(
-            url, token=os.environ.get(QUEUE_TOKEN_ENV) or None, timeout=PUSH_TIMEOUT_SECONDS
+            url, token=resolve_queue_token(), timeout=PUSH_TIMEOUT_SECONDS
         )
         client.put_fleet_run(
             dataclasses.replace(
@@ -821,7 +847,7 @@ def finish_fleet_run(run_id: str, status: str, completed: int | None) -> str | N
         return None
     try:
         client = QueueClient(
-            url, token=os.environ.get(QUEUE_TOKEN_ENV) or None, timeout=PUSH_TIMEOUT_SECONDS
+            url, token=resolve_queue_token(), timeout=PUSH_TIMEOUT_SECONDS
         )
         row = next((r for r in client.list_fleet_runs() if r.get("run_id") == run_id), None)
         if row is None:
