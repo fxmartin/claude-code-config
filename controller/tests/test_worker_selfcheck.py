@@ -473,6 +473,12 @@ def test_non_json_output_skips_the_benign_catalog_warning(tmp_path) -> None:
     assert result.reason == "agent probe failed (exit 1): something real broke"
 
 
+def test_malformed_and_non_error_json_lines_are_skipped_for_the_real_error(tmp_path) -> None:
+    detail = '{broken json\n{"is_error": false, "result": "fine"}\n' + _NOT_LOGGED_IN
+    result = _check(tmp_path, detail)
+    assert result.reason == "agent probe failed (exit 1): Not logged in \u00b7 Please run /login"
+
+
 def test_a_probe_with_only_a_benign_warning_still_names_it(tmp_path) -> None:
     result = _check(tmp_path, _WARNING)
     assert "unrecognized_model" in (result.reason or "")
