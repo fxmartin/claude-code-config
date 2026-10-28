@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.118.0] - 2026-10-28
+
+### Added
+
+- feat(fleet-execution): doctor warns when a mac worker's (#35.2-014) (#911)
+
+
 ## [v2.117.0] - 2026-10-28
 
 ### Added
