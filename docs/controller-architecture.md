@@ -355,6 +355,18 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    `status_detail` reads `needs decision · <finding>: <reasoning>`. The queue
    job's reason carries the same text (`ledger_decision_park`).
 
+   **A merge round that only re-ran CI re-checks the gate (Story 35.5-007).** A
+   merge-stage bugfix round that leaves `feature/<story>` where it was (the
+   agent re-ran a timed-out or cancelled job) is not written off as exhausted:
+   the controller re-polls the merge CI gate (`_run_merge_ci_gate`, same grace,
+   same cap) on the same head. Green retries the merge stage; red only on the
+   high-risk approval gate (`risk:high` without `risk-approved`) parks
+   `AWAITING_APPROVAL` with no further rounds; red on any other check hands that
+   check's name to the next round, or runs the exhausted path once the budget is
+   spent; a cap that lapses with checks still running parks `NEEDS_ATTENTION`
+   reading `CI re-run · awaiting CI` with the sha and PR, never `DONE`. A round
+   that committed is unchanged (CI adjudicates its pushed fix, above).
+
    **Awaiting human approval (Story 12.3-003).** A merge blocked *only* by the
    high-risk human-approval gate — a PR carrying `risk:high` (from `risk_gate.py`
    / `.github/workflows/risk-gate.yml`) with no `risk-approved` label or
@@ -1116,7 +1128,11 @@ longer shows FAILED days after the work actually shipped.
   the installed worker agent resolves from its own environment (`XDG_STATE_HOME`
   pinned in the plist or unit), which an SSH shell without it would never open;
   `sdlc doctor` WARNs (`registry-path`) when the shell and the agent resolve
-  different registry files.
+  different registry files. The fleet `PUT` (and every other queue command)
+  presents this shell's `SDLC_QUEUE_TOKEN`, else the one the installed worker agent
+  carries (Story 35.5-008, `queue_client.resolve_queue_token`, the lookup `sdlc
+  doctor` already made): an SSH shell has none and the service would answer 403.
+  Under `SDLC_IN_TEST` / `SDLC_FLEET_DISABLED` the agent's token is never read.
 - **The on-demand epic-markdown renderer (Story 32.1-003).** `reconcile_run`
   itself never touches the shared checkout — it only ever updates the ledger,
   so two build runs sharing a repo never trip the #590 dirty-tree guard on

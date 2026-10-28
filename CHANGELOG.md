@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.120.0] - 2026-10-28
+
+### Added
+
+- feat(fleet-execution): a bugfix that only re-ran ci (#35.5-007)
+
+
+## [v2.119.0] - 2026-10-28
+
+### Added
+
+- feat(fleet-execution): reconcile from an ssh shell can (#35.5-008)
+
+
 ## [v2.118.0] - 2026-10-28
 
 ### Added
