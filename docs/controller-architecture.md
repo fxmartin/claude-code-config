@@ -2119,6 +2119,15 @@ keeps it `online`.
   timestamp and the TCC verdict — which is `CLEAN` only when that probe completed
   from the LaunchAgent, not from the shell doctor runs in. A plain drain without
   `--worker` never probes.
+  **A failed probe names the real error (Story 35.2-013).** The probe runners keep
+  stderr *and* stdout, so a benign warning on stderr (`[claude-code:unrecognized_model]`)
+  cannot hide the answer on stdout. The reason is the `result` of the `"is_error": true`
+  JSON the CLI printed (e.g. `Not logged in · Please run /login`); for non-JSON output
+  it is the first line that is not a known benign warning. On macOS, a "Not logged in"
+  failure while `security show-keychain-info` reports the login Keychain locked reads
+  `login Keychain is locked … run security unlock-keychain` instead. The heartbeat,
+  `sdlc queue workers` and the worker log all carry that one reason; the entitlement
+  probe (`model_probe.classify_probe`) reads both streams too.
 
 `--worker` drives the scheduler on the queue this host owns (`SDLC_QUEUE_PATH`) or,
 with a fleet URL, on the service's (Story 35.2-005). The registry (`workers`

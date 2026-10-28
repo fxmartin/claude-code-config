@@ -54,6 +54,11 @@ def classify_probe(returncode: int, detail: str) -> str:
     return INCONCLUSIVE
 
 
+def join_streams(stderr: str | None, stdout: str | None) -> str:
+    """Both streams, stderr first: a warning on one must not hide the answer on the other."""
+    return "\n".join(part for part in ((stderr or "").strip(), (stdout or "").strip()) if part)
+
+
 def _default_runner(argv: list[str], timeout_s: int = _PROBE_TIMEOUT_SECONDS) -> tuple[int, str]:
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
@@ -61,7 +66,7 @@ def _default_runner(argv: list[str], timeout_s: int = _PROBE_TIMEOUT_SECONDS) ->
         return 127, f"command not found: {argv[0] if argv else ''}"
     except subprocess.TimeoutExpired:
         return 124, "probe command timed out"
-    return proc.returncode, (proc.stderr or proc.stdout or "").strip()
+    return proc.returncode, join_streams(proc.stderr, proc.stdout)
 
 
 def default_state_dir() -> Path:
