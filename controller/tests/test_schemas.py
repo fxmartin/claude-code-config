@@ -297,10 +297,45 @@ def test_bugfix_disputed_finding_empty_reasoning_rejected() -> None:
 
 
 def test_bugfix_finding_disposition_bad_enum_rejected() -> None:
-    """disposition is a closed enum: implemented | disputed only."""
+    """disposition is a closed enum: implemented | disputed | needs_decision only."""
     data = dict(VALID_RESPONSES["bugfix"])
     data["finding_dispositions"] = [
         {"finding": "x", "disposition": "ignored"}
+    ]
+    with pytest.raises(SchemaValidationError):
+        validate_response("bugfix", data)
+
+
+def test_bugfix_needs_decision_finding_with_reasoning_valid() -> None:
+    """A right finding the story cannot fix is answered needs_decision (26.2-003)."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [
+        {
+            "finding": "cache is never wired into the app",
+            "disposition": "needs_decision",
+            "reasoning": "correct, but the wiring lives in the composition root no story owns",
+        }
+    ]
+    assert validate_response("bugfix", data) == data
+
+
+@pytest.mark.parametrize("reasoning", [None, ""], ids=["missing", "empty"])
+def test_bugfix_needs_decision_without_reasoning_rejected(reasoning) -> None:
+    """Like a dispute, a needs_decision finding must say why (26.2-003)."""
+    entry = {"finding": "cache is never wired", "disposition": "needs_decision"}
+    if reasoning is not None:
+        entry["reasoning"] = reasoning
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [entry]
+    with pytest.raises(SchemaValidationError):
+        validate_response("bugfix", data)
+
+
+def test_bugfix_unknown_disposition_still_rejected() -> None:
+    """Issue #900's invented value stays a validation failure: only three are accepted."""
+    data = dict(VALID_RESPONSES["bugfix"])
+    data["finding_dispositions"] = [
+        {"finding": "x", "disposition": "confirmed_unfixed", "reasoning": "needs wiring"}
     ]
     with pytest.raises(SchemaValidationError):
         validate_response("bugfix", data)

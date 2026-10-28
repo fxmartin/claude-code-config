@@ -78,7 +78,7 @@ failures all inside `baseline_failures` no longer veto a `FIXED` round, and the
 excluded names are logged. Without `failing_tests` the reported
 `tests_passing` stands.
 
-### Bugfix finding dispositions (Story 26.2-001)
+### Bugfix finding dispositions (Stories 26.2-001, 26.2-003)
 
 `finding_dispositions` is an **optional** array — present only when the bugfix
 was dispatched with review findings (it is absent for a plain build/test/coverage
@@ -87,11 +87,15 @@ verified it against the code:
 
 - `finding` (required, non-empty): the finding being addressed, so the verdict is
   traceable to its claim.
-- `disposition` (required): `implemented` (verified, then fixed) or `disputed`
-  (refuted against the code).
-- `reasoning` (required and non-empty **when disputed**): the concrete technical
-  argument that refutes the finding. A dispute without reasoning is performative,
-  not a refutation, and fails schema validation.
+- `disposition` (required): `implemented` (verified, then fixed), `disputed`
+  (refuted against the code) or `needs_decision` (verified as right, but this
+  story cannot fix it, e.g. it needs wiring no story owns — Story 26.2-003). Any
+  other value fails schema validation.
+- `reasoning` (required and non-empty **when disputed or needs_decision**): for a
+  dispute, the concrete technical argument that refutes the finding (a dispute
+  without reasoning is performative, not a refutation); for `needs_decision`, why
+  the finding is right and why this story cannot fix it. Without it the response
+  fails schema validation.
 
 Review findings are claims, not orders: the bugfix prompts require per-finding
 verification before implementation and forbid performative agreement, so a wrong
@@ -99,6 +103,16 @@ finding is disputed rather than blindly "fixed" into the codebase. The controlle
 surfaces every `disputed` disposition as a `warn` ledger event (visible in
 `sdlc status` and the dashboard's recent-events), so a dispute is never silently
 swallowed and the story never falsely reports a disputed finding as fixed.
+
+A `needs_decision` finding changes routing, because a retry cannot resolve it
+(Story 26.2-003). The response is accepted and the round does not count as a
+fix, even when `fix_status` is `FIXED`. The story parks `NEEDS_ATTENTION` at
+once, with no further bugfix or recovery attempts. Commits the agent made for
+other findings are pushed first, as on any park. Each such finding and its
+reasoning become a `warn` ledger event and the story's
+`needs decision · <finding>: <reasoning>` status detail. That detail shows in
+`sdlc status`, both dashboards and the queue job's reason. `needs_decision` is
+never a way to skip a finding the story can fix.
 
 ## Examples
 

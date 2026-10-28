@@ -711,6 +711,31 @@ def ledger_preflight_failure(db_path: str, run_id: str) -> str | None:
     return None
 
 
+def ledger_decision_park(db_path: str, run_id: str) -> str | None:
+    """Why ``run_id`` parked on findings only FX can decide, or ``None`` (26.2-003).
+
+    One ``<story>: needs decision · <finding>: <reasoning>`` entry per story still
+    parked ``NEEDS_ATTENTION`` on one, so the queue job says what to decide rather
+    than ``run status NEEDS_ATTENTION``. Any read failure degrades to ``None``.
+    """
+    from sdlc.build import DECISION_PARK_PREFIX, Ledger
+
+    try:
+        ledger = Ledger(Path(db_path))
+        notes = ledger.story_park_notes(run_id)
+        parked = {
+            row["story_id"] for row in ledger.story_rows(run_id)
+            if row.get("status") == "NEEDS_ATTENTION"
+        }
+    except Exception:  # noqa: BLE001 - a ledger read must never fail a drain
+        return None
+    decisions = [
+        f"{story_id}: {note}" for story_id, note in sorted(notes.items())
+        if story_id in parked and note.startswith(DECISION_PARK_PREFIX)
+    ]
+    return "; ".join(decisions) or None
+
+
 def ledger_close_unstarted_batch(db_path: str, run_id: str, registry: Registry) -> bool:
     """Close ``run_id`` ``ABORTED`` if it is a fix batch that died in preflight (Story 35.4-005).
 
@@ -1843,6 +1868,10 @@ class _Scheduler:
         if state == "failed" and record is not None and record.db and entry.run_id:
             # Story 35.4-005: a run that died in preflight says why, not just FAILED.
             reason = ledger_preflight_failure(record.db, entry.run_id) or reason
+        if state == "blocked" and record is not None and record.db and entry.run_id:
+            # Story 26.2-003: a story parked on a finding only FX can decide says
+            # which finding and why, not just the run status.
+            reason = ledger_decision_park(record.db, entry.run_id) or reason
         self._store.finish_job(job_id, state, reason=reason)
         if state == "done":
             self._result.done += 1

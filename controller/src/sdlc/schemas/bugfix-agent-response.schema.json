@@ -68,7 +68,7 @@
     },
     "finding_dispositions": {
       "type": "array",
-      "description": "Per-review-finding disposition (Story 26.2-001). Present only when the bugfix was dispatched with review findings: every finding the agent processed, each verified against the code and marked implemented or disputed. A dispute is structured data the controller surfaces, not prose lost in a log.",
+      "description": "Per-review-finding disposition (Story 26.2-001). Present only when the bugfix was dispatched with review findings: every finding the agent processed, each verified against the code and marked implemented, disputed or needs_decision (Story 26.2-003). A dispute is structured data the controller surfaces, not prose lost in a log; a needs_decision finding parks the story for FX.",
       "items": {
         "type": "object",
         "additionalProperties": true,
@@ -81,19 +81,19 @@
           },
           "disposition": {
             "type": "string",
-            "enum": ["implemented", "disputed"],
-            "description": "implemented = verified against the code and fixed; disputed = refuted against the code with concrete technical reasoning."
+            "enum": ["implemented", "disputed", "needs_decision"],
+            "description": "implemented = verified against the code and fixed; disputed = refuted against the code with concrete technical reasoning; needs_decision = verified as right but not fixable inside this story (e.g. it needs wiring no story owns) — the story parks NEEDS_ATTENTION for a human decision (Story 26.2-003)."
           },
           "reasoning": {
             "type": "string",
-            "description": "Concrete technical reasoning for the disposition. Required and non-empty when disposition is 'disputed' — a dispute without reasoning is performative, not a refutation."
+            "description": "Concrete technical reasoning for the disposition. Required and non-empty when disposition is 'disputed' or 'needs_decision' — a dispute without reasoning is performative, not a refutation, and a decision needs to know why the finding is right and why this story cannot fix it."
           }
         },
         "allOf": [
           {
             "if": {
               "required": ["disposition"],
-              "properties": { "disposition": { "const": "disputed" } }
+              "properties": { "disposition": { "enum": ["disputed", "needs_decision"] } }
             },
             "then": {
               "required": ["reasoning"],

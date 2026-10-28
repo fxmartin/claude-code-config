@@ -348,6 +348,13 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    worker's snapshot) reads `fix pushed · awaiting CI` / `· CI red` with the sha
    and PR (`status_detail`).
 
+   **Parked for a decision (Story 26.2-003).** A bugfix round that reports a
+   review finding `needs_decision` is not a fix and is not retried. The finding
+   is right, but this story cannot fix it. `_park_for_decision` pushes any
+   unpushed commits and parks the story `NEEDS_ATTENTION` at once. Its
+   `status_detail` reads `needs decision · <finding>: <reasoning>`. The queue
+   job's reason carries the same text (`ledger_decision_park`).
+
    **Awaiting human approval (Story 12.3-003).** A merge blocked *only* by the
    high-risk human-approval gate — a PR carrying `risk:high` (from `risk_gate.py`
    / `.github/workflows/risk-gate.yml`) with no `risk-approved` label or

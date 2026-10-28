@@ -86,7 +86,11 @@ evals/
 └── finding-verification/             # proves Story 26.2-001
     ├── prompt.md                     # deliberately wrong review finding
     ├── baseline.md                   # recorded RED behaviour
-    └── graders/criteria.md           # GREEN compliance rubric
+    ├── graders/criteria.md           # GREEN compliance rubric
+    └── needs-decision/               # proves Story 26.2-003
+        ├── prompt.md                 # a right finding the story cannot fix
+        ├── baseline.md               # recorded RED behaviour (issue #900)
+        └── graders/criteria.md       # GREEN: a reasoned needs_decision
 ```
 
 ## Add a new case in an hour, not a design session
