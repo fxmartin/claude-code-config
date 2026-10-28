@@ -246,3 +246,36 @@ def test_ci_rerun_park_note_label_wording() -> None:
     assert f("abcdef1234", 7, "awaiting CI", lead="CI re-run") == (
         "CI re-run · awaiting CI · abcdef1 · PR #7"
     )
+
+
+def test_local_branch_sha_reads_the_head_and_is_none_when_unreadable(
+    tmp_path, monkeypatch
+) -> None:
+    work = _repo(tmp_path)
+    assert build_mod._local_branch_sha(work, BRANCH) == _git(work, "rev-parse", "HEAD")
+    assert build_mod._local_branch_sha(work, "feature/missing") is None
+
+    def boom(*_a, **_k):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(build_mod, "_git", boom)
+    assert build_mod._local_branch_sha(work, BRANCH) is None
+
+
+def _regate(tmp_path, monkeypatch, gate):
+    monkeypatch.setattr(build_mod, "_run_merge_ci_gate", lambda *_a, **_k: gate)
+    return build_mod._regate_after_ci_rerun(
+        _story(), None, "run", 100, None, None, tmp_path
+    )
+
+
+def test_regate_without_a_gate_result_defers_to_the_exhausted_path(tmp_path, monkeypatch) -> None:
+    assert _regate(tmp_path, monkeypatch, None) == build_mod._CIRerunRegate()
+
+
+def test_regate_with_an_unclassified_status_defers_to_the_exhausted_path(
+    tmp_path, monkeypatch
+) -> None:
+    gate = _MergeCIGate(_GATE_BLOCK, "unclassified", "no verdict", 1, 0.0)
+    monkeypatch.setattr(build_mod, "_merge_gate_only_block", lambda *_a, **_k: False)
+    assert _regate(tmp_path, monkeypatch, gate) == build_mod._CIRerunRegate()
