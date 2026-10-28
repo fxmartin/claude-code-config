@@ -6960,6 +6960,15 @@ def _unpushed_commits(root: Path, branch: str) -> tuple[int, str]:
     return (count, tip.stdout.strip()) if count > 0 else (0, "")
 
 
+def _local_branch_sha(root: Path, branch: str) -> str | None:
+    """The sha the local ``branch`` points at, or ``None`` when it is unreadable."""
+    try:
+        res = _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return res.stdout.strip() or None if res.returncode == 0 else None
+
+
 def _remote_tracking_sha(root: Path, branch: str) -> str | None:
     """The sha ``origin/<branch>`` last pointed at, or ``None`` when untracked."""
     try:
@@ -6991,9 +7000,11 @@ class _PushedFix:
     awaiting_ci: bool = False
 
 
-def _park_note_label(sha: str, pr_number: int | None, ci_state: str | None) -> str:
+def _park_note_label(
+    sha: str, pr_number: int | None, ci_state: str | None, *, lead: str = "fix pushed"
+) -> str:
     """The status row for a story parked on pushed work: ``fix pushed · awaiting CI · <sha> · PR #N``."""
-    parts = ["fix pushed", ci_state, sha[:7], f"PR #{pr_number}" if pr_number else None]
+    parts = [lead, ci_state, sha[:7], f"PR #{pr_number}" if pr_number else None]
     return " · ".join(p for p in parts if p)
 
 
@@ -9446,6 +9457,7 @@ def _run_story(
             )
         regated = False  # issue #794: one merge re-gate per stage
         pushed_fix: _PushedFix | None = None  # story 35.5-001: a fix already on origin
+        ci_rerun_green = False  # story 35.5-007: a no-commit round's re-gate was green
         while True:
             # Issue #427: resolve the (harness, model) for this dispatch *before*
             # the ledger write and the estimate, so both record the identical
@@ -9768,6 +9780,7 @@ def _run_story(
                                 "head before bugfix (diverged or no remote branch); the "
                                 "bugfix push may be rejected",
                             )
+                    head_before = _local_branch_sha(workdir or Path.cwd(), f"feature/{story.id}")
                     bugfix_round = _run_bugfix_round(
                         story, stage, failure, opts, ledger, run_id, dispatch,
                         bpath, bugfix_seq,
@@ -9781,7 +9794,33 @@ def _run_story(
                             f"pushed to feature/{story.id}; fix what the pipeline reports"
                         )
                         continue
+                    # Story 35.5-007: a merge round that committed nothing (the
+                    # agent re-ran a red/cancelled job) is judged by the gate on
+                    # the same head, not written off as exhausted.
+                    if (
+                        stage == "merge"
+                        and not bugfix_round.fixed
+                        and head_before is not None
+                        and _local_branch_sha(workdir or Path.cwd(), f"feature/{story.id}")
+                        == head_before
+                    ):
+                        regate = _regate_after_ci_rerun(
+                            story, ledger, run_id, pr_number, opts, cr_terms,
+                            workdir or Path.cwd(),
+                        )
+                        if regate.park is not None:
+                            return regate.park
+                        if regate.failure:
+                            failure = regate.failure
+                            continue
+                        ci_rerun_green = regate.green
                     break
+                if ci_rerun_green:
+                    # Nothing was committed, so there is nothing to lint or push:
+                    # retry the merge on the head the gate just found green.
+                    ci_rerun_green = False
+                    attempt += 1
+                    continue
                 if not bugfix_round.fixed:
                     return _exhausted_status(
                         kind, stage, story.id, pr_number, ledger, run_id,
@@ -10963,6 +11002,76 @@ def _controller_merge(
             "merged_at": datetime.now(timezone.utc).isoformat(),
         },
         raw="",
+    ))
+
+
+@dataclass(frozen=True)
+class _CIRerunRegate:
+    """The merge CI gate re-polled after a bugfix round that committed nothing (35.5-007).
+
+    ``green`` retries the merge; ``park`` is the story's terminal status
+    (``AWAITING_APPROVAL`` for a gate-only block, ``NEEDS_ATTENTION`` awaiting
+    CI); ``failure`` names the still-red check for the next round. None set:
+    the existing exhausted path decides.
+    """
+
+    green: bool = False
+    park: str | None = None
+    failure: str = ""
+
+
+def _regate_after_ci_rerun(
+    story: Story,
+    ledger: Ledger,
+    run_id: str,
+    pr_number: int | None,
+    opts: _CIGateOptions,
+    cr_terms: ChangeRequestTerms,
+    root: Path,
+) -> _CIRerunRegate:
+    """Re-poll the merge CI gate on the same head after a no-commit bugfix round.
+
+    Story 35.5-007 (fleet job 43): a bugfix agent that re-ran a timed-out or
+    cancelled job has nothing to commit, so its round is never ``fixed`` — and
+    the story read FAILED with every check green, or with only the high-risk
+    gate red. The gate (:func:`_run_merge_ci_gate`, same grace and cap) decides
+    instead: green retries the merge, a gate-only block parks
+    ``AWAITING_APPROVAL``, a lapsed cap parks "awaiting CI" as 35.5-001 does,
+    and a non-gate red hands that check's name to the next round.
+    """
+    gate = _run_merge_ci_gate("merge", ledger, run_id, story, pr_number, opts, repo_root=root)
+    if gate is None:
+        return _CIRerunRegate()
+    if gate.verdict == _GATE_PASS:
+        ledger.event_log(
+            run_id, story.id, "success", "controller",
+            "merge CI gate passed after a bugfix round that re-ran CI without a "
+            "commit — retrying the merge",
+        )
+        return _CIRerunRegate(green=True)
+    if gate.status == CR_PENDING:
+        sha = _remote_tracking_sha(root, f"feature/{story.id}") or ""
+        ledger.event_log(
+            run_id, story.id, "info", "controller",
+            _park_note_label(sha, pr_number, "awaiting CI", lead="CI re-run"),
+            kind="park-note",
+        )
+        return _CIRerunRegate(park="NEEDS_ATTENTION")
+    if _merge_gate_only_block(ledger, run_id, story, pr_number):
+        return _CIRerunRegate(park=_park_merge_refusal(
+            ledger, run_id, story, pr_number, cr_terms, "awaiting_approval", gate.reason
+        ))
+    if gate.status not in (CR_FAILED, CR_UNKNOWN):
+        return _CIRerunRegate()
+    view = build_issue.change_request_checks(ledger, story.id, pr_number)
+    red = [
+        name for name, status in (view.checks if view is not None else ())
+        if status == CR_FAILED and name.strip().lower() not in _GATE_CHECK_NAMES
+    ]
+    checks = f"check(s) {', '.join(red)}" if red else "pipeline"
+    return _CIRerunRegate(failure=(
+        f"CI {checks} still red on feature/{story.id} after a bugfix round that "
+        "re-ran CI without a commit; fix what it reports"
     ))
 
 

@@ -348,6 +348,18 @@ preflight ─▶ discovery ─▶ cohorts ─▶ for each story:
    worker's snapshot) reads `fix pushed · awaiting CI` / `· CI red` with the sha
    and PR (`status_detail`).
 
+   **A merge round that only re-ran CI re-checks the gate (Story 35.5-007).** A
+   merge-stage bugfix round that leaves `feature/<story>` where it was (the
+   agent re-ran a timed-out or cancelled job) is not written off as exhausted:
+   the controller re-polls the merge CI gate (`_run_merge_ci_gate`, same grace,
+   same cap) on the same head. Green retries the merge stage; red only on the
+   high-risk approval gate (`risk:high` without `risk-approved`) parks
+   `AWAITING_APPROVAL` with no further rounds; red on any other check hands that
+   check's name to the next round, or runs the exhausted path once the budget is
+   spent; a cap that lapses with checks still running parks `NEEDS_ATTENTION`
+   reading `CI re-run · awaiting CI` with the sha and PR, never `DONE`. A round
+   that committed is unchanged (CI adjudicates its pushed fix, above).
+
    **Awaiting human approval (Story 12.3-003).** A merge blocked *only* by the
    high-risk human-approval gate — a PR carrying `risk:high` (from `risk_gate.py`
    / `.github/workflows/risk-gate.yml`) with no `risk-approved` label or
