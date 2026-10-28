@@ -95,6 +95,24 @@ def _no_real_worker_systemd_unit(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_keychain(monkeypatch):
+    """Never ask a real ``security`` about the login Keychain (Story 35.2-014).
+
+    A `run_doctor` test that passes a worker plist runs `worker-keychain` on a Mac;
+    this answers ``no-timeout`` so its finding stays CLEAN. test_doctor_worker_keychain.py
+    injects its own runner.
+    """
+    import subprocess
+
+    from sdlc import doctor
+
+    monkeypatch.setattr(
+        doctor, "_security_runner",
+        lambda argv: subprocess.CompletedProcess(argv, 0, stdout="", stderr='Keychain "x" no-timeout\n'),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_model_probe(monkeypatch):
     """Never spend a real ``claude -p`` call on the model entitlement probe.
 

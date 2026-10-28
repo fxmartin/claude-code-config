@@ -30,12 +30,14 @@
 #   3. scripts/deploy.sh                      plugin update + `sdlc` as a uv tool
 #   4. gh auth setup-git (+ glab's helper)    git authenticates through gh/glab, never a prompt
 #   5. ~/.sdlc-fleet.yaml                     queue_url: names the fleet queue
-#   6. `sdlc doctor --exit-code`              the verdict on steps 1-5 (a Mac skips the two
+#   6. `sdlc doctor --exit-code`              the verdict on steps 1-5 (a Mac skips the three
 #                                                checks that judge step 7's agents)
 #   7. Linux: templates/systemd/sdlc-worker.service and sdlc-dashboard.service
 #                                             installed, enabled and started
 #      macOS: templates/launchd/ worker + dashboard (+ queue with --queue-service),
 #             rendered for this Mac and (re)loaded — see "On a Mac" below
+#   8. macOS: `sdlc doctor --only worker-keychain`   the summary: WARN (exit 1) when the
+#             login Keychain locks on a timeout or on sleep, or is locked now
 #
 # Doctor runs before the unit is installed: a worker that has not registered yet is
 # a FAIL by design, so judging steps 1-5 after step 7 would fail every first run.
@@ -43,7 +45,9 @@
 # the unit is in place so a re-run can repair a worker that is down. On a Mac it
 # skips fleet-agent-drift and worker-dashboard, which judge the very agents step 7
 # re-renders — counted, they would fail every run that repairs them; a worker step 7
-# leaves pending restart exits 1 instead. From a shell without SDLC_QUEUE_TOKEN (SSH)
+# leaves pending restart exits 1 instead. It skips worker-keychain too, which has no
+# worker agent to gate on before step 7: step 8 shows it once the agent is in place,
+# and a Keychain that can lock exits 1. From a shell without SDLC_QUEUE_TOKEN (SSH)
 # doctor asks the queue with the installed worker agent's token, and finds the worker
 # under the agent's --host. A launchctl bootstrap refused right after a bootout is
 # retried (up to 5 tries, stderr captured and logged); only the last refusal, or an
@@ -399,11 +403,12 @@ installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the instal
 #    repairs a worker that is down. On a Mac, fleet-agent-drift and worker-dashboard
 #    judge the very agents step 7 re-renders: counted here, they would fail every
 #    run that repairs them. Step 7 answers for them — a worker it leaves pending
-#    restart exits 1.
+#    restart exits 1. worker-keychain is n/a until step 7 installs the worker
+#    agent, so the summary judges it instead (Story 35.2-014).
 DOCTOR_RC=0
 DOCTOR_ARGS=(--exit-code)
 if [[ "${DO_SERVICE}" == true && "${IS_DARWIN}" == true ]]; then
-  DOCTOR_ARGS+=(--skip fleet-agent-drift --skip worker-dashboard)
+  DOCTOR_ARGS+=(--skip fleet-agent-drift --skip worker-dashboard --skip worker-keychain)
 fi
 if [[ "${DRY_RUN}" == true ]]; then
   log "[dry-run] would run: sdlc doctor ${DOCTOR_ARGS[*]}"
@@ -634,6 +639,19 @@ elif [[ "${DO_SERVICE}" == true ]]; then
   fi
 fi
 
+# The summary's Keychain line (Story 35.2-014): a login Keychain that locks on an
+# inactivity timeout or on sleep drops this Mac's worker out of the fleet. Judged now
+# that step 7 has installed the worker agent the check is gated on.
+KEYCHAIN_RC=0
+if [[ "${DO_SERVICE}" == true && "${IS_DARWIN}" == true ]]; then
+  if [[ "${DRY_RUN}" == true ]]; then
+    log "[dry-run] would run: sdlc doctor --exit-code --only worker-keychain"
+  else
+    log "sdlc doctor --only worker-keychain"
+    (cd "${REPO_ROOT}" && sdlc doctor --exit-code --only worker-keychain) || KEYCHAIN_RC=$?
+  fi
+fi
+
 if [[ "${DRY_RUN}" == true ]]; then
   log "dry run complete; nothing was changed"
   exit 0
@@ -646,6 +664,10 @@ fi
 if [[ "${PENDING_RESTART}" == true ]]; then
   warn "${WORKER_LABEL} is pending restart (see above): this Mac still runs the agent it had — re-run this script once the worker is idle"
   exit 1
+fi
+if [[ "${KEYCHAIN_RC}" -ne 0 ]]; then
+  warn "this Mac's login Keychain can lock, or is locked (see above): the worker drops out of the fleet when it does — apply the remedy; the agents are in place"
+  exit "${KEYCHAIN_RC}"
 fi
 log "done. The worker registers once its agent probe completes (up to ~90 s); then:"
 if [[ "${IS_DARWIN}" == true ]]; then

@@ -993,7 +993,7 @@ unwritable_git_config() {
 @test "a Mac's doctor skips the two checks step 7 settles; --skip-service and linux skip none" {
     darwin
     run mac
-    grep -qx "sdlc doctor --exit-code --skip fleet-agent-drift --skip worker-dashboard" "${CALLS}"
+    grep -qx "sdlc doctor --exit-code --skip fleet-agent-drift --skip worker-dashboard --skip worker-keychain" "${CALLS}"
 
     : >"${CALLS}"
     run mac --skip-service
@@ -1006,6 +1006,52 @@ unwritable_git_config() {
     grep -qx "sdlc doctor --exit-code" "${CALLS}"
 }
 
+# Story 35.2-014: doctor's worker-keychain check is n/a until the worker agent exists, so a
+# first run's step 6 cannot show it. The summary does, once step 7 has installed the agent.
+@test "a Mac's summary shows the Keychain check, after the worker agent is loaded" {
+    darwin
+    run mac
+
+    [ "$status" -eq 0 ]
+    grep -qx "sdlc doctor --exit-code --only worker-keychain" "${CALLS}"
+    loaded="$(grep -n "^launchctl bootstrap .*com.fxmartin.sdlc-worker.plist" "${CALLS}" | tail -n1 | cut -d: -f1)"
+    shown="$(grep -n "^sdlc doctor --exit-code --only worker-keychain" "${CALLS}" | cut -d: -f1)"
+    [ -n "${loaded}" ] && [ "${shown}" -gt "${loaded}" ]
+}
+
+@test "a Keychain that can lock is the Mac run's exit status, with its agents in place" {
+    darwin
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then echo "{\"jobs\": []}"; exit 0; fi
+case " $* " in *" --only worker-keychain "*) echo "[WARN] Worker Keychain — timeout=300s"; exit 1 ;; esac
+exit 0'
+
+    run mac
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"[WARN] Worker Keychain"* ]]
+    [[ "$output" == *"login Keychain"* ]]
+    [ -e "$(AGENT worker)" ] && [ -e "$(AGENT dashboard)" ]
+}
+
+@test "linux, --skip-service and --dry-run never run the summary's Keychain check" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    [ "$status" -eq 0 ]
+    ! grep -q -- "--only worker-keychain" "${CALLS}" || false
+
+    darwin
+    : >"${CALLS}"
+    run mac --skip-service
+    [ "$status" -eq 0 ]
+    ! grep -q -- "--only worker-keychain" "${CALLS}" || false
+
+    : >"${CALLS}"
+    run mac --dry-run
+    [ "$status" -eq 0 ]
+    ! grep -q -- "--only worker-keychain" "${CALLS}" || false
+    [[ "$output" == *"would run: sdlc doctor --exit-code --only worker-keychain"* ]]
+}
+
 @test "the run that repairs a drifted worker exits 0, though doctor warned about that drift" {
     darwin
     run mac
@@ -1013,7 +1059,7 @@ unwritable_git_config() {
     sed -i.bak '/<string>--dashboard-url<\/string>/,/<string>http:/d' "$(AGENT worker)"
     stub sdlc '
 if [ "$1 $2" = "queue list" ]; then echo "{\"jobs\": []}"; exit 0; fi
-case " $* " in *" --skip fleet-agent-drift --skip worker-dashboard "*) exit 0 ;; esac
+case " $* " in *" --skip fleet-agent-drift --skip worker-dashboard "*|*" --only worker-keychain "*) exit 0 ;; esac
 exit 1'
 
     run mac
