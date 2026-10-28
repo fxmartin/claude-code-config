@@ -834,6 +834,7 @@ fleet bootstrap exits 0 instead of 2.
 **Risk Level**: Low
 
 ##### Story 35.2-013: A failed worker self-check names the real error
+**Status**: Done
 **User Story**: As FX, I want a failed worker self-check to report the error
 the agent CLI actually returned, so that a login problem reads as a login
 problem instead of an unrelated warning.
@@ -880,6 +881,7 @@ run /login"` on stdout.
 **Risk Level**: Low
 
 ##### Story 35.2-014: Doctor warns when a Mac worker's Keychain can lock
+**Status**: Done
 **User Story**: As FX, I want `sdlc doctor` on a Mac worker to warn when the
 login Keychain is set to lock on its own, so that the worker doesn't silently
 drop out of the fleet the next time the Mac is idle or sleeps.
