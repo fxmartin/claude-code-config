@@ -241,3 +241,30 @@ def test_the_rendered_units_exec_start_starts_a_worker_advertising_its_dashboard
     assert result.exit_code == 0, result.output
     assert profiles[0].name == "dev"
     assert profiles[0].dashboard_url == f"http://{TAILNET_IP}:8787"
+
+
+# --- unreadable units and missing checkouts ------------------------------------------------
+
+
+def test_a_unit_that_cannot_be_decoded_is_left_to_other_checks_for_the_dashboard(tmp_path) -> None:
+    unit = tmp_path / WORKER_UNIT
+    unit.write_bytes(b"[Service]\nExecStart=\xff\xfe\n")
+
+    assert check_worker_dashboard(agent_path=None, unit_path=unit) is None
+
+
+def test_a_unit_that_cannot_be_decoded_is_not_counted_as_drift(units) -> None:
+    units[WORKER_UNIT].write_bytes(b"[Service]\nExecStart=\xff\xfe\n")
+
+    finding = _drift(units)
+
+    assert finding is not None and finding.status == "CLEAN"
+    assert "1 installed agent(s)" in finding.detail
+
+
+def test_drift_without_a_templates_checkout_is_not_reported(units, tmp_path) -> None:
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "CLAUDE.md").write_text("x", encoding="utf-8")
+
+    assert check_fleet_agent_drift(tmp_path / "no-checkout", agents={}, units=units, home=home) is None
